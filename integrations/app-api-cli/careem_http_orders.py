@@ -80,10 +80,12 @@ def track(order, timeout=12, *, service='food', latitude=None, longitude=None,
         raise CareemError(str(exc)) from None
 
 
+@toollog.timed('careem', 'provider.orders')
 def orders(*args, **kwargs):
     raise CareemError('ORDER_LIST_HOST_BINDING_UNVERIFIED')
 
 
+@toollog.entrypoint('commerce-cmd', 'track')
 def main():
     import json
     p = argparse.ArgumentParser(description=__doc__)

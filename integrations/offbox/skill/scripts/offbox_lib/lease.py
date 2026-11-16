@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import shlex
@@ -14,6 +15,7 @@ from . import api, capacity, common, ssh_sync
 from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      SshHostKeyMismatch, file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner, write)
 from .identity import remote_dir_for
+from .home import StartWaitFailed
 
 # Direct (non-pool) callers only: pool callers skip an archiving box instead of waiting under the pool lock.
 ARCHIVING_WAIT_S = 120
@@ -37,6 +39,35 @@ def pinned_until(con, box_id: str) -> float:
     return (row[0] or 0) if row else 0
 
 
+def foreign_pin(con, box_id, me=None):
+    until = pinned_until(con, box_id)
+    if until <= now():
+        return None
+    owner = kv_get(con, 'pin_owner:' + box_id)
+    if owner and me and me.get('proven', True) and owner == me.get('owner'):
+        return None
+    return owner or 'an unknown thread (legacy pin)', until
+
+
+def boot_dead(con, box_id):
+    return kv_get(con, 'boot_dead:' + box_id)
+
+
+def _set_aside_boot(con, box_id, error):
+    from . import allocation, home
+    if not home.active() or home.probe() is not None:
+        # A per-box response alone cannot prove the replacement backend is healthy.
+        raise ResumeUnresolved(str(error), OffboxError(str(error), outage=home.may_fail_over())) from error
+    reason = getattr(error, 'reason', str(error))
+    note = 'boot-dead: ' + reason
+    with write(con):
+        con.execute('INSERT OR REPLACE INTO kv VALUES (?,?,?)', ('boot_dead:' + box_id, json.dumps(note), now()))
+        con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?", (note, box_id))
+    allocation.clear_resume(con, box_id)
+    event(con, box_id, 'resume_boot_timeout', reason)
+    say(f"{box_id} can't boot on home (server: {reason}); set aside, using another home box")
+
+
 def check_deletion(con, box_id: str) -> None:
     if kv_get(con, 'delete_pending:' + box_id) is not None:
         raise OffboxError(f"{box_id} deletion is unresolved; keep and reuse are blocked. "
@@ -44,10 +75,10 @@ def check_deletion(con, box_id: str) -> None:
 
 
 @contextlib.contextmanager
-def unpinned(con, box_id: str):
+def unpinned(con, box_id: str, *, locked: bool = False):
     # Separate from the run's box lock: keep must work during a run, and its acknowledgement must serialize
     # with deletion, including the network request. A stale pool/reaper selection cannot overrule a new pin.
-    with file_lock('pin-' + box_id, timeout=120):
+    with contextlib.nullcontext() if locked else file_lock('pin-' + box_id, timeout=120):
         until = pinned_until(con, box_id)
         if until > now():
             by = kv_get(con, 'pin_owner:' + box_id) or 'an unknown thread (legacy pin)'
@@ -56,8 +87,8 @@ def unpinned(con, box_id: str):
         yield
 
 
-def forget_box(con, box_id: str, kind: str, detail: str) -> None:
-    with unpinned(con, box_id):
+def forget_box(con, box_id: str, kind: str, detail: str, *, pin_locked: bool = False) -> None:
+    with unpinned(con, box_id, locked=pin_locked):
         con.execute("UPDATE leases SET state='deleted', deleted_at=? WHERE box_id=?", (now(), box_id))
         from . import allocation
         allocation.clear_resume(con, box_id)
@@ -400,6 +431,9 @@ def ensure_ttl(box_id: str, ttl: int, s: dict | None = None) -> bool:
         api.set_ttl(box_id, ttl)
         return True
     except OffboxError as e:
+        if isinstance(e, StartWaitFailed) or (api.BACKEND == "server" and getattr(e, 'status', None) == 503
+                and getattr(e, 'api_code', None) in ('server_not_ready', 'server_starting')):
+            raise
         say(f"warning: could not set auto-stop on {box_id}: {e}")
         return False
 
@@ -424,7 +458,9 @@ def idle_ttl(box_id: str) -> None:
 
 def bootstrap_fresh(box_id: str) -> None:
     """Fresh box (not from a template/base): put tool caches under $HOME so stop/fork keep them."""
-    script = (TEMPLATES_DIR / "common-env.sh").read_bytes()
+    script = ("bash -c " + shlex.quote((TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n" +
+                                     (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) +
+              " || exit 1\n" + (TEMPLATES_DIR / "common-env.sh").read_text()).encode()
     p = ssh_sync.ssh(box_id, "bash -s", input=script, timeout=120)
     if p.returncode != 0:
         say(f"warning: cache env bootstrap failed on {box_id}: {p.stderr.decode(errors='replace')[-200:]}")
@@ -621,7 +657,7 @@ def run_recipe(box_id: str, name: str, box_held: bool = False) -> None:
             pid = r["processId"]
             event(db(), box_id, "lease_recipe_pid", str(pid))
             code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
-    except SshHostKeyMismatch:
+    except (SshHostKeyMismatch, StartWaitFailed):
         raise
     except Exception as e:  # noqa: BLE001 - an upload/start/follow error is a failed recipe like any other
         code = f"error: {e}"
@@ -672,16 +708,23 @@ def _follow_bounded(box_id: str, pid: int, log_path, timeout_s: float):
 _FOLLOW_STOP_S = 160
 
 
+def _check_held(box_id, remote):
+    if remote and remote.get('heldRuns'):
+        from . import allocation
+        raise allocation.Busy(f"{box_id} is held by an unfinished command: {', '.join(remote['heldRuns'])}")
+
+
 def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_held: bool = False,
               since: float | None = None, stale_error: str | None = None, on_state=None) -> dict:
     from . import outage, prepare
     options = {"on_state": on_state} if on_state is not None else {}
     with prepare.phase("bring_up", box_id), outage.accepted_machine():
         s = api.wait_state(box_id, api.LIVE_STATES, timeout=900, since=since, stale_error=stale_error, **options)
+        _check_held(box_id, s)
         try:
             ssh_sync.setup(box_id)
             ssh_sync.wait_ssh(box_id)
-        except (capacity.CapacityError, SshHostKeyMismatch):
+        except (capacity.CapacityError, SshHostKeyMismatch, StartWaitFailed):
             raise
         except OffboxError as e:
             raise BoxNotReady(box_id, s, e) from e
@@ -846,15 +889,19 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
     con.commit()
     event(con, box_id, "lease_new", f"source={source} size={sz} owner={me['owner']} repo={me['repo_root']}")
     try:
-        _bring_up(box_id, fresh=(source == "fresh"),
-                  recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held, since=since)
-        try:
-            api.rename(box_id, box_name(me, me["repo_key"]))
-        except OffboxError:
-            pass
-        if relocating:
-            _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
-    except SshHostKeyMismatch:
+        from . import outage
+        with outage.accepted_machine():
+            _bring_up(box_id, fresh=(source == "fresh"),
+                      recipe=source.split(":", 1)[1] if is_recipe else None, box_held=box_held, since=since)
+            try:
+                api.rename(box_id, box_name(me, me["repo_key"]))
+            except StartWaitFailed:
+                raise
+            except OffboxError:
+                pass
+            if relocating:
+                _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
+    except (SshHostKeyMismatch, StartWaitFailed):
         raise
     except api.SupplyOut as e:
         # boat never gave the box a machine: a plain box is dropped from our records; a recipe box is retired below.
@@ -992,8 +1039,17 @@ class ResumeProvisionStalled(OffboxError):
         super().__init__(message, outage=home.may_fail_over())
 
 
+def _readiness_get(box_id, *, deadline=None):
+    from . import home
+    try:
+        return api.readiness_get(box_id, deadline=deadline) if deadline is not None else api.readiness_get(box_id)
+    except api.NetworkError as error:
+        return home.recover_slow_read(error, lambda end: api.get(box_id, deadline=end), box=box_id, deadline=deadline)
+
+
 def _wait_unanswered_resume(con, box_id):
-    from . import outage
+    from . import outage, allocation
+    from .pool import PoolBusyError
     seconds = capacity.setting("OFFBOX_RESUME_PROVISION_SECONDS", 300, minimum=1, maximum=900)
     key = f'resume_provision:{box_id}'
     saved = con.execute('SELECT v FROM kv WHERE k=?', (key,)).fetchone()
@@ -1004,7 +1060,12 @@ def _wait_unanswered_resume(con, box_id):
     with outage.accepted_machine():
         network_failures = 0
         while True:
+            allocation.check_queue()
             left = end - time.time()
+            # An unresolved resume still belongs to the queue, even while provisioning gets its own API budget.
+            queue_left = allocation.queue_left()
+            if queue_left is not None:
+                left = min(left, queue_left)
             budget_left = api.left()
             if budget_left is not None:
                 if budget_left <= 0.05:
@@ -1016,8 +1077,9 @@ def _wait_unanswered_resume(con, box_id):
                 raise ResumeProvisionStalled(f"unanswered resume of {box_id} stayed provisioning for {seconds}s; "
                                              "nothing ran; set aside and trying a new box")
             try:
-                state = api.readiness_get(box_id, deadline=time.time() + left)
-            except api.BudgetExpired:
+                state = _readiness_get(box_id, deadline=time.time() + left)
+            except (api.BudgetExpired, StartWaitFailed, PoolBusyError):
+                allocation.check_queue()
                 raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
@@ -1034,6 +1096,9 @@ def _wait_unanswered_resume(con, box_id):
                 from . import allocation
                 allocation.clear_resume(con, box_id)
                 return
+            failure = api.box_boot_failure(box_id, state or {})
+            if failure:
+                raise failure
             pause = min(2, max(0, end - time.time()))
             budget_left = api.left()
             if budget_left is not None:
@@ -1102,8 +1167,8 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
             if left <= 0:
                 break
             try:
-                last = api.readiness_get(box_id, deadline=time.time() + left)
-            except api.BudgetExpired:
+                last = _readiness_get(box_id, deadline=time.time() + left)
+            except (api.BudgetExpired, StartWaitFailed):
                 raise
             except OffboxError as error:
                 network_failures = network_failures + 1 if isinstance(error, api.NetworkError) else 0
@@ -1119,6 +1184,10 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
                     _forget_expired(con, box_id, 'confirmed missing or expired after unanswered resume')
                     raise _ResumeExpired
             allocation.check_queue()
+            stamp = con.execute('SELECT ts FROM kv WHERE k=?', (key,)).fetchone()
+            failure = api.box_boot_failure(box_id, last or {}, since=stamp[0] if stamp else None)
+            if failure:
+                raise failure
             if last is None:
                 unreadable = True
             read_at = time.monotonic()
@@ -1214,6 +1283,7 @@ def _resume_under_guard(con, box_id: str, ttl: int, size: str | None, pending: b
 
 def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, since=None, stale_error=None,
                       skip_archiving=False):
+    _check_held(box_id, confirmed)
     left_stopped = bool(confirmed)
     if confirmed and confirmed.get('state') in api.STARTING_STATES:
         _wait_unanswered_resume(con, box_id)
@@ -1249,7 +1319,8 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
     except (allocation.Busy, allocation.Fenced) as error:
         error.resume_retry_box = box_id
         raise
-    except (api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady, SshHostKeyMismatch):
+    except (api.BoxBootFailed, api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady,
+            SshHostKeyMismatch, StartWaitFailed):
         raise
     except OffboxError as e:
         if isinstance(e, common.SourceGone):
@@ -1269,6 +1340,21 @@ def _resumed_row(con, box_id, size, elapsed, prior_state):
 
 
 def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: bool = False, before_grow=None):
+    if boot_dead(con, row['box_id']):
+        return None
+    try:
+        return _reuse_available(con, row, size, skip_archiving, retrying, before_grow)
+    except (api.BoxBootFailed, api.ApiError) as error:
+        from . import home
+        if not home.active():
+            raise
+        if not isinstance(error, api.BoxBootFailed) and error.api_code not in api.BOX_BOOT_CODES:
+            raise
+        _set_aside_boot(con, row['box_id'], error)
+        return None
+
+
+def _reuse_available(con, row, size, skip_archiving=False, retrying=False, before_grow=None):
     check_deletion(con, row['box_id'])
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
@@ -1319,6 +1405,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
             if p.returncode == 255:
                 ssh_sync.check_host_key(box_id, p.stderr)
             if p.returncode == 0:
+                if api.BACKEND == 'server':
+                    _check_held(box_id, _readiness_get(box_id))
                 ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
                 if pending_grow and not _bigger(pending_grow[0], row['size']):
                     con.execute("DELETE FROM kv WHERE k=?", (f"resize_size:{box_id}",))
@@ -1328,7 +1416,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         ssh_sync.close_master(box_id)
         event(con, box_id, "ssh_master_stale", reason)
     try:
-        s = api.readiness_get(box_id)
+        s = _readiness_get(box_id)
     except api.NetworkError as error:
         if allocation.in_queue() and pending_grow and api.left() is not None and api.left() <= 0:
             raise ArchivingSkip(f"{box_id} status read reached its affinity deadline; waiting in the pool queue",
@@ -1341,10 +1429,14 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
     if s is None or s.get("state") in ("error", "cancelled"):
         forget_box(con, box_id, "lease_gone", f"state={s and s.get('state')}")
         return None
+    _check_held(box_id, s)
     if s.get("dataExpiredAt"):
         _forget_expired(con, box_id, f"boat deleted its data at {s['dataExpiredAt']}")
         return None
     st = s.get("state")
+    failure = api.box_boot_failure(box_id, s)
+    if failure:
+        raise failure
     if st in api.STOPPING_STATES:
         queued = skip_archiving or allocation.in_queue()
         action = "skipping it for now" if queued else "retry in a moment"
@@ -1388,6 +1480,8 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
         # archiving, or a box that bounces back to idle, must not hold the caller for 15 minutes.
         try:
             s = api.wait_state(box_id, api.STOPPED_STATES, timeout=ARCHIVING_WAIT_S)
+        except StartWaitFailed:
+            raise
         except OffboxError:
             s = api.get(box_id)
             st = s and s.get("state")
@@ -1467,7 +1561,7 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
     elif st in api.LIVE_STATES or st in api.STARTING_STATES:
         try:
             _bring_up(box_id)
-        except (BoxNotReady, SshHostKeyMismatch):
+        except (allocation.Busy, allocation.Fenced, api.BoxBootFailed, BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
             raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e
@@ -1600,9 +1694,11 @@ def release_hold_if_worker_gone(con, box_id: str) -> bool:
         return False
 
 
-def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True, locked: bool = False) -> bool:
+def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = True, locked: bool = False,
+             pin_locked: bool = False) -> bool:
     """Stop a box. locked=True when the caller already holds 'box-<id>' (reap, release, save); then the hold is
-    released with _release_locked, since the lock is not reentrant."""
+    released with _release_locked, since the lock is not reentrant. pin_locked=True also requires 'pin-<id>'
+    held, including when a 404 settles the missing lease."""
     if images:
         keep_images(box_id)
     release = _release_locked if locked else release_if_confirmed
@@ -1616,7 +1712,7 @@ def stop_box(con, box_id: str, reason: str, wait: bool = False, images: bool = T
             # state and the hold, so the reaper revisits this box and releases it on a later pass.
             if release(con, box_id):
                 try:
-                    forget_box(con, box_id, "lease_gone", f"404 during stop: {reason}")
+                    forget_box(con, box_id, "lease_gone", f"404 during stop: {reason}", pin_locked=pin_locked)
                 except PinnedLeaseError as pin:
                     say(str(pin))
             return False

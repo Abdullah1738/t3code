@@ -5,6 +5,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Logger from "effect/Logger";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
@@ -17,6 +18,9 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 
 import * as ProcessRunner from "./processRunner.ts";
+import * as OffMainSpawner from "./ardud/process/OffMainSpawner.ts";
+
+const layerNative = OffMainSpawner.layer.pipe(Layer.provideMerge(NodeServices.layer));
 import { writeFakeCli } from "@t3tools/provider-testing/fakeCli";
 import { makeProcessProbe, processProbeSource } from "./testUtils/processProbe.ts";
 
@@ -205,6 +209,90 @@ describe("runProcess", () => {
       expect(error).not.toHaveProperty("args");
       expect(error).not.toHaveProperty("resolvedArgs");
       expect(error.message).not.toContain("secret-token-value");
+    }),
+  );
+
+  it.effect.each([
+    {
+      platform: "darwin",
+      executable: "fj",
+      pathKey: "PATH",
+      path: "/test/bin:/usr/bin",
+      defect: false,
+    },
+    {
+      platform: "linux",
+      executable: "fj",
+      pathKey: "PATH",
+      path: "/test/bin:/usr/bin",
+      defect: true,
+    },
+    {
+      platform: "win32",
+      executable: "C:\\Tools\\fj.cmd",
+      pathKey: "PATH",
+      path: "C:\\Tools;C:\\Windows",
+      defect: false,
+    },
+    {
+      platform: "win32",
+      executable: "C:\\Tools\\fj.bat",
+      pathKey: "Path",
+      path: "C:\\Tools;C:\\Windows",
+      defect: false,
+    },
+    {
+      platform: "win32",
+      executable: "C:\\Tools\\fj.exe",
+      pathKey: "path",
+      path: "C:\\Tools;C:\\Windows",
+      defect: false,
+    },
+    {
+      platform: "win32",
+      executable: undefined,
+      pathKey: "PATH",
+      path: "C:\\Tools;C:\\Windows",
+      defect: false,
+    },
+  ] as const)("logs ENOENT without exposing arguments: %s", (scenario) =>
+    Effect.gen(function* () {
+      const messages: unknown[] = [];
+      const spawner = makeSpawner((command) => {
+        if (scenario.executable?.match(/\.(cmd|bat)$/)) {
+          expect(command.options.shell).toBe(true);
+          expect(command.command).toContain("secret-argument");
+        }
+        return scenario.defect
+          ? Effect.die(Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }))
+          : Effect.fail(
+              PlatformError.systemError({
+                _tag: "NotFound",
+                module: "ChildProcess",
+                method: "spawn",
+              }),
+            );
+      });
+      yield* runWith(spawner)({
+        command: "fj",
+        args: ["secret-argument"],
+        env: { [scenario.pathKey]: scenario.path },
+      }).pipe(
+        Effect.flip,
+        Effect.provideService(HostProcess.Platform, scenario.platform),
+        Effect.provideService(HostProcess.Environment, {}),
+        Effect.provideService(SpawnExecutableResolution, () => scenario.executable),
+        Effect.provide(
+          Logger.layer([
+            Logger.make(({ message }) => {
+              messages.push(message);
+            }),
+          ]),
+        ),
+      );
+      expect(messages).toEqual([
+        ["process spawn ENOENT", { command: "fj", path: scenario.path, pathEntryCount: 2 }],
+      ]);
     }),
   );
 
@@ -423,7 +511,7 @@ describe("runProcess", () => {
       yield* TestClock.adjust("1 second");
       yield* probe.exited;
       expect((yield* Fiber.join(fiber))._tag).toBe("ProcessTimeoutError");
-    }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer)))),
+    }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(layerNative)))),
   );
 
   for (const wrapperExit of ["timeout", "success"] as const) {
@@ -467,7 +555,7 @@ describe("runProcess", () => {
               success: { code: 0, timedOut: false },
             });
           }
-        }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer)))),
+        }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(layerNative)))),
     );
   }
 
@@ -497,11 +585,13 @@ describe("runProcess", () => {
           import * as Layer from "effect/Layer";
           import * as NodeServices from "@effect/platform-node/NodeServices";
           import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
+          import * as OffMainSpawner from ${JSON.stringify(new URL("./ardud/process/OffMainSpawner.ts", import.meta.url).href)};
+          const layerNative = OffMainSpawner.layer.pipe(Layer.provideMerge(NodeServices.layer));
           import * as ProcessRunner from ${JSON.stringify(new URL("./processRunner.ts", import.meta.url).href)};
           NodeRuntime.runMain(Effect.gen(function* () {
             const runner = yield* ProcessRunner.ProcessRunner;
             yield* runner.run({ command: ${JSON.stringify(helper)}, args: [] });
-          }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(NodeServices.layer)))));
+          }).pipe(Effect.provide(ProcessRunner.layer.pipe(Layer.provideMerge(layerNative)))));
         `,
             ],
             {
@@ -519,7 +609,7 @@ describe("runProcess", () => {
           [backend.exitCode.pipe(Effect.timeout("4 seconds"), TestClock.withLive), probe.exited],
           { concurrency: "unbounded" },
         );
-      }).pipe(Effect.provide(NodeServices.layer)),
+      }).pipe(Effect.provide(layerNative)),
   );
 
   it.effect("returns a synthetic timed out result when timeoutBehavior is timedOutResult", () =>

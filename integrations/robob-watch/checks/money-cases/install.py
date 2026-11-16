@@ -8,14 +8,18 @@ from pathlib import Path
 import signal
 import subprocess
 import tempfile
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pin_data import pin_data_dir
+from data_io import materialize_io
 
 SOURCE = Path(__file__).resolve().parent
 LIVE = Path.home() / '.local/share/robob-watch/watchers/money-cases'
-DATA = Path.home() / 'Documents/assistant/money-cases'
+DATA = Path(os.environ.get('MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser()
 BIN = Path.home() / '.local/bin/money-cases'
-SOURCE_FILES = ('payments.py', 'cases.py', 'charges.py', 'toollog.py', 'check.sh', 'install.py', 'test_cases.py', 'test_charges.py',
+SOURCE_FILES = ('data_io.py', 'pin_data.py', 'test_data_io.py', 'payments.py', 'cases.py', 'charges.py', 'toollog.py', 'check.sh', 'install.py', 'test_cases.py', 'test_charges.py',
                 'daily_legacy.fixture.json', 'test_install.py', 'test_subscriptions.py', 'test_unanswered.py', 'test_daily_list.py', 'README.md', 'settings.json',
-                'order_lookup.py', 'state_json.py', 'test_order_lookup.py', 'test_accuracy.py')
+                'order_lookup.py', 'marketplace.py', 'state_json.py', 'test_order_lookup.py', 'test_accuracy.py', 'order_charges.py', 'test_order_charges.py')
 EXECUTABLE = ('cases.py', 'check.sh', 'install.py')
 
 
@@ -77,7 +81,8 @@ def install(source=SOURCE, live=LIVE, data=DATA, link=BIN, cli='robob-watch'):
     os.umask(0o077)
     check_link(link)
     live.mkdir(parents=True, exist_ok=True)
-    data.mkdir(parents=True, exist_ok=True)
+    materialize_io(lambda: data.mkdir(parents=True, exist_ok=True), data)
+    print(pin_data_dir(data))
     # One installer at a time, through the resume: a second one must not read or delete the first one's intent.
     with (live / 'install.lock').open('a') as install_lock:
         take_lock(install_lock, 'another install still running after 65s; deployment not started')

@@ -65,6 +65,7 @@ const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
   );
   if (request === undefined || item?.type !== "user_input_request")
     return yield* new OrchestratorMcpFailure({
+      reason: "invalid_args",
       code: "invalid_request",
       message: "The pending user-input request was not found.",
     });
@@ -82,6 +83,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       const { tasks } = yield* scheduler.list().pipe(Effect.mapError(unavailable));
       if (!tasks.some((task) => task.id === input.taskId))
         return yield* new OrchestratorMcpFailure({
+          reason: "invalid_args",
           code: "invalid_request",
           message: "The scheduled task was not found.",
         });
@@ -251,6 +253,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       return (
         entry ??
         (yield* new OrchestratorMcpFailure({
+          reason: "invalid_args",
           code: "invalid_request",
           message: "The queued message was not found.",
         }))
@@ -269,6 +272,8 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
     dispatch(input.threadId, (common) => ({
       ...common,
       type: "queued-run.cancel",
+      reason: "queued_cancel",
+      detail: "Queued message cancelled through MCP.",
       runId: input.queuedRunId,
     })),
   ),
@@ -302,6 +307,7 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
         case "snooze":
           if (input.snoozedUntil === undefined) {
             return yield* new OrchestratorMcpFailure({
+              reason: "invalid_args",
               code: "invalid_request",
               message: "snooze requires snoozedUntil.",
             });

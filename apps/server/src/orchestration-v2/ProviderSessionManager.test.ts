@@ -1,3 +1,4 @@
+import * as SqlClient from "effect/sql/SqlClient";
 import * as NetAddress from "effect/net/NetAddress";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -652,6 +653,7 @@ function layerTest(input: {
     ),
   );
   return Layer.mergeAll(
+    layerTestDatabase,
     layerTestStores,
     layerConfiguredEventSink,
     EffectOutbox.layer.pipe(Layer.provide(layerTestDatabase)),
@@ -1628,8 +1630,117 @@ it.effect(
     }),
 );
 
+it.effect.each(["update", "refresh"] as const)(
+  "a blocked session %s does not stall another session's update or turn acceptance",
+  (blockedWrite) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const hook = yield* Ref.make<SessionWriteHook>(() => Effect.void);
+      const paused = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state);
+        const otherThread = ThreadId.make("unblocked-session");
+        yield* f.eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({
+              idAllocator: f.idAllocator,
+              threadId: otherThread,
+              now: f.now,
+            }),
+          ],
+        });
+        const otherSessionId = yield* f.idAllocator.allocate.providerSession({
+          threadId: otherThread,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const other = yield* f.manager.open({
+          threadId: otherThread,
+          providerSessionId: otherSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* observeSessionUpdates(f.manager, otherThread);
+        yield* Ref.set(hook, (input) =>
+          input.events.some(
+            (event) =>
+              event.type === "provider-session.updated" && event.payload.id === f.providerSessionId,
+          )
+            ? Ref.set(hook, () => Effect.void).pipe(
+                Effect.andThen(Deferred.succeed(paused, undefined)),
+                Effect.andThen(Deferred.await(release)),
+              )
+            : Effect.void,
+        );
+        const blocked = yield* (
+          blockedWrite === "update"
+            ? f.emit({ ...f.runtime.providerSession, status: "running" })
+            : f.manager.refreshThreadSessionUpdates(f.threadIds[0]!)
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(paused);
+        const unblocked = yield* Effect.gen(function* () {
+          const subscription = yield* Effect.acquireRelease(
+            other.subscribeEvents!,
+            (sub) => sub.close,
+          );
+          const queue = (yield* Ref.get(state)).eventQueues.get(String(otherSessionId))!;
+          const running = { ...other.providerSession, status: "running" as const };
+          const runId = f.idAllocator.derive.run({ threadId: otherThread, ordinal: 1 });
+          const accepted = {
+            type: "provider_turn.updated",
+            driver: other.driver,
+            threadId: otherThread,
+            providerTurn: {
+              id: f.idAllocator.derive.providerTurn({
+                driver: other.driver,
+                nativeTurnId: "accepted",
+              }),
+              providerThreadId: f.providerThreadOf(otherThread).id,
+              nodeId: f.idAllocator.derive.rootNode({ runId }),
+              runAttemptId: f.idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "running",
+              startedAt: f.now,
+              completedAt: null,
+            },
+          } satisfies ProviderAdapter.ProviderAdapterV2Event;
+          const update = {
+            type: "provider_session.updated",
+            driver: other.driver,
+            providerSession: running,
+          } satisfies ProviderAdapter.ProviderAdapterV2Event;
+          const before = yield* f.eventStore.latestSequence();
+          yield* Queue.offer(queue, update);
+          yield* Queue.offer(queue, accepted);
+          assert.deepEqual(yield* subscription.events.pipe(Stream.take(2), Stream.runCollect), [
+            update,
+            accepted,
+          ]);
+          assertSessionRecipients(yield* f.updatesSince(before), [otherThread], running);
+          assert.isFalse(yield* Deferred.isDone(release));
+          yield* observeSessionUpdates(f.manager, otherThread);
+          yield* f.manager.refreshThreadSessionUpdates(otherThread);
+        }).pipe(Effect.forkScoped);
+        yield* Fiber.join(unblocked).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+        yield* Fiber.join(blocked);
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 60_000,
+            driver: OPENCODE_DRIVER,
+            sessionUpdateFanout: "interested_threads",
+            sessionWriteHook: hook,
+          }),
+        ),
+      );
+    }),
+);
+
 it.effect(
-  "audience selection holds its lock through commit while new attachments survive the persisted-session update",
+  "late observers wait for their session fan-out before snapshots and refreshes while new attachments survive bookkeeping",
   () =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
@@ -1722,7 +1833,7 @@ it.effect(
 );
 
 it.effect(
-  "failed pump writes release the audience lock without advancing the successful comparison baseline",
+  "failed pump writes release the session lock without advancing the successful comparison baseline",
   () =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
@@ -1760,7 +1871,7 @@ it.effect(
 );
 
 it.effect.each(["failure", "interruption"] as const)(
-  "a refresh %s releases the audience lock for subsequent leases and status writes",
+  "a refresh %s releases the session lock for subsequent leases and status writes",
   (outcome) =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
@@ -1817,8 +1928,78 @@ it.effect.each(["failure", "interruption"] as const)(
     }),
 );
 
+it.effect("a blocked session status write does not hold another session's native events", () =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const hook = yield* Ref.make<SessionWriteHook>(() => Effect.void);
+    const paused = yield* Deferred.make<void>();
+    const commit = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const f = yield* makeSessionAudienceFixture(state, 1);
+      const otherThread = ThreadId.make("independent-claude-session");
+      yield* f.eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({
+            idAllocator: f.idAllocator,
+            threadId: otherThread,
+            now: f.now,
+          }),
+        ],
+      });
+      const otherSessionId = yield* f.idAllocator.allocate.providerSession({
+        threadId: otherThread,
+        providerInstanceId: modelSelection.instanceId,
+      });
+      const other = yield* f.manager.open({
+        threadId: otherThread,
+        providerSessionId: otherSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const subscription = yield* Effect.acquireRelease(other.subscribeEvents!, (sub) => sub.close);
+      yield* Ref.set(hook, (input) =>
+        input.events.some(
+          (event) =>
+            event.type === "provider-session.updated" &&
+            event.payload.id === f.providerSessionId &&
+            event.payload.status === "running",
+        )
+          ? Deferred.succeed(paused, undefined).pipe(Effect.andThen(Deferred.await(commit)))
+          : Effect.void,
+      );
+      const queues = (yield* Ref.get(state)).eventQueues;
+      yield* Queue.offer(queues.get(String(f.providerSessionId))!, {
+        type: "provider_session.updated",
+        driver: f.runtime.driver,
+        providerSession: { ...f.runtime.providerSession, status: "running" },
+      });
+      yield* Deferred.await(paused);
+      const running = {
+        type: "provider_session.updated" as const,
+        driver: other.driver,
+        providerSession: { ...other.providerSession, status: "running" as const },
+      };
+      yield* Queue.offer(queues.get(String(otherSessionId))!, running);
+      assert.deepEqual(yield* subscription.events.pipe(Stream.runHead), Option.some(running));
+      assert.isFalse(yield* Deferred.isDone(commit));
+      const records = yield* f.projectionStore.getThreadRecords(otherThread, ["providerSessions"]);
+      assert.equal(records.providerSessions.at(-1)?.status, "running");
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(commit, undefined)),
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 60_000,
+          driver: ProviderDriverKind.make("claudeAgent"),
+          sessionWriteHook: hook,
+        }),
+      ),
+    );
+  }),
+);
+
 it.effect(
-  "interrupting a pump write releases the audience permit for a different live session",
+  "interrupting a pump write releases the session permit for a different live session",
   () =>
     Effect.gen(function* () {
       const state = yield* Ref.make(emptyState);
@@ -4366,7 +4547,9 @@ const openSessionWithBackgroundCommand = (fixtureName: string) =>
     yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
     const rosters = Effect.gen(function* () {
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
-      const projection = yield* projectionStore.getThreadProjection(threadId);
+      const projection = yield* projectionStore.getThreadRecords(threadId, ["providerThreads"], {
+        providerThreadIds: providerThreads.map((p) => p.id),
+      });
       return providerThreads.map((seeded) =>
         (
           projection.providerThreads.find((thread) => thread.id === seeded.id)
@@ -4384,10 +4567,10 @@ it.effect(
       const state = yield* Ref.make(emptyState);
       const effect = Effect.gen(function* () {
         const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
-        const { threadId, providerSessionId, rosters } = yield* openSessionWithBackgroundCommand(
-          "provider-session-manager-detach-roster",
-        );
+        const { threadId, providerSessionId, providerThreads, rosters } =
+          yield* openSessionWithBackgroundCommand("provider-session-manager-detach-roster");
         assert.deepStrictEqual(yield* rosters, [["dev-server"], ["dev-server"]]);
+        yield* seedUnreadProviderHistory(providerThreads[0]!.id);
 
         yield* manager.detach({ providerSessionId, threadId, detail: "Thread settled." });
 
@@ -6302,6 +6485,9 @@ function runIdleThreadUnloadScenario(
     ) => Effect.Effect<void>;
     readonly endTurn: (threadId: ThreadId, ordinal: number) => Effect.Effect<void>;
     readonly resume: (threadId: ThreadId) => Effect.Effect<void>;
+    readonly setRunStatus: (
+      status: "preparing" | "queued" | "starting" | "running" | "waiting" | "completed",
+    ) => Effect.Effect<void>;
     readonly subscribe: NonNullable<
       ProviderAdapter.ProviderAdapterV2SessionRuntime["subscribeEvents"]
     >;
@@ -6384,6 +6570,46 @@ function runIdleThreadUnloadScenario(
             runtimePolicy,
           });
         }).pipe(Effect.orDie);
+      const setRunStatus = Effect.fn("test.setRunStatus")(function* (
+        status: "preparing" | "queued" | "starting" | "running" | "waiting" | "completed",
+      ) {
+        const threadId = threadA;
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: providerThreadOf(threadId),
+            },
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: runId,
+                threadId,
+                ordinal: 1,
+                providerInstanceId: modelSelection.instanceId,
+                modelSelection,
+                providerThreadId: providerThreadOf(threadId).id,
+                userMessageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+                rootNodeId: idAllocator.derive.rootNode({ runId }),
+                activeAttemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+                status,
+                requestedAt: now,
+                startedAt: null,
+                completedAt: status === "completed" ? now : null,
+                checkpointId: null,
+                contextHandoffId: null,
+              },
+            },
+          ],
+        });
+      }, Effect.orDie);
       const subscribe = runtime.subscribeEvents;
       assert.isDefined(subscribe);
       const endTurn = (threadId: ThreadId, ordinal: number) =>
@@ -6425,6 +6651,7 @@ function runIdleThreadUnloadScenario(
         endTurn,
         resume,
         subscribe: subscribe!,
+        setRunStatus,
       }).pipe(Effect.scoped);
     }).pipe(
       Effect.provide(
@@ -6443,6 +6670,29 @@ function runIdleThreadUnloadScenario(
     );
   });
 }
+
+it.effect.each(["preparing", "queued", "starting", "running", "waiting"] as const)(
+  "ProviderSessionManagerV2 keeps never-turned native state during %s preparation",
+  (status) =>
+    runIdleThreadUnloadScenario(
+      `pending-${status}`,
+      ({ state, threadA, resume, startTurn, endTurn, setRunStatus }) =>
+        Effect.gen(function* () {
+          yield* setRunStatus(status);
+          yield* resume(threadA);
+          // TestClock crosses the unload timer while the first native offer is still pending.
+          yield* TestClock.adjust("3 seconds");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+          const resumed = (yield* Ref.get(state)).resumeCount;
+          yield* startTurn(threadA, 1, { resume: false });
+          assert.equal((yield* Ref.get(state)).resumeCount, resumed);
+          yield* setRunStatus("completed");
+          yield* endTurn(threadA, 1);
+          yield* TestClock.adjust("1 second");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+        }),
+    ),
+);
 
 it.effect(
   "ProviderSessionManagerV2 unloads a shared-runtime thread left idle, and reloads it on its next turn",
@@ -7304,6 +7554,28 @@ it.effect(
     }),
 );
 
+const seedUnreadProviderHistory = Effect.fn("test.seedUnreadProviderHistory")(function* (
+  providerThreadId: string,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`INSERT INTO orchestration_v2_projection_provider_threads
+    (provider_thread_id, thread_id, owner_node_id, provider, provider_instance_id,
+      provider_session_id, status, first_run_ordinal, last_run_ordinal, updated_at, payload_json)
+    SELECT provider_thread_id || '-history-' || value, thread_id, NULL, provider, provider_instance_id,
+      provider_session_id, 'idle', NULL, NULL, updated_at,
+      json_object('nativeThreadRef', json_object('nativeId', 'old-' || value))
+    FROM orchestration_v2_projection_provider_threads
+    CROSS JOIN json_each(${JSON.stringify(Array.from({ length: 2000 }, (_, i) => i))})
+    WHERE provider_thread_id = ${providerThreadId}`;
+  yield* sql`INSERT INTO orchestration_v2_projection_runs
+    (run_id, thread_id, ordinal, provider, status, requested_at, completed_at, payload_json)
+    SELECT provider_thread_id || '-old-run-' || value, thread_id, value, provider, 'completed',
+      updated_at, updated_at, '{}'
+    FROM orchestration_v2_projection_provider_threads
+    CROSS JOIN json_each(${JSON.stringify(Array.from({ length: 2000 }, (_, i) => i + 1))})
+    WHERE provider_thread_id = ${providerThreadId}`;
+});
+
 const orphanSweepFixture = Effect.fn("test.orphanSweepFixture")(function* (count: number) {
   const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
   const eventSink = yield* EventSink.EventSinkV2;
@@ -7384,6 +7656,7 @@ it.effect("orphan sweep reaps missed registrations and keeps busy and unknown th
     const state = yield* Ref.make(emptyState);
     yield* Effect.gen(function* () {
       const fixture = yield* orphanSweepFixture(2);
+      yield* seedUnreadProviderHistory(fixture.threads[0]!.providerThread.id);
       yield* TestClock.adjust("1 second");
       yield* fixture.sweep;
       assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, ["orphan-native-0"]);

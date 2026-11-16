@@ -11,12 +11,14 @@ export const layer = McpToolAccess.toLayer(AnalyticsToolkit, {
       const scope = yield* McpInvocationContext.McpInvocationContext;
       if (!scope.capabilities.has("orchestration"))
         return yield* new OrchestratorMcpFailure({
+          reason: "capability_missing",
           code: "capability_denied",
           message: "This credential cannot read analytics.",
         });
       const analytics = yield* Effect.serviceOption(Analytics.Analytics);
       if (analytics._tag === "None")
         return yield* new OrchestratorMcpFailure({
+          reason: "analytics_unavailable",
           code: "capability_denied",
           message: "Local analytics is unavailable.",
         });

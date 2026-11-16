@@ -4,6 +4,8 @@ import io
 import json
 import os
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -80,8 +82,15 @@ class FakePhone:
 
 class WakeTests(unittest.TestCase):
     def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for name, value in [('LOCK_DIR', Path(tmp.name)), ('HOLD', Path(tmp.name)/'priority-hold'),
+                            ('LEASE', Path(tmp.name)/'lease.json')]:
+            p = patch.object(ph.phonelock, name, value)
+            p.start(); self.addCleanup(p.stop)
         self.phone = FakePhone()
         for target, replacement in [
+            ("lock_event", lambda *a, **kw: None),
             ("adb", self.phone.adb), ("_run", self.phone.run),
             ("d", self.phone.device), ("time.monotonic", lambda: self.phone.now),
             ("time.sleep", self.phone.sleep),

@@ -265,6 +265,22 @@ describe("summarizeT3ToolCalls", () => {
     ).toBe("Requested deletion of 1 scheduled task");
   });
 
+  it("summarizes background session lists and counts successful session stops once", () => {
+    expect(summarizeT3ToolCalls("exec-sessions", [completed({}, { sessions: [] })])).toEqual({
+      label: "Listed background exec sessions 1 time",
+      failedCount: 0,
+    });
+    const stopped = completed({ sessionId: "89673" }, { terminated: true, alreadyGone: false });
+    expect(
+      summarizeT3ToolCalls("exec-session-stop", [
+        stopped,
+        stopped,
+        completed({ sessionId: "89674" }, { terminated: true, alreadyGone: true }),
+        completed({ sessionId: "89675" }, { isError: true }),
+      ]),
+    ).toEqual({ label: "Stopped 2 background exec sessions", failedCount: 1 });
+  });
+
   it("counts workflow stop requests by coordinator and excludes failed requests", () => {
     const first = completed({ threadId: "parent", subagentId: "workflow-1" }, {});
     const failed = completed({ threadId: "parent", subagentId: "workflow-3" }, { isError: true });

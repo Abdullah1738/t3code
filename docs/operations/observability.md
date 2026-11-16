@@ -5,12 +5,12 @@
 T3 Code has one server-side observability model:
 
 - pretty logs go to stdout for humans
+- structured logs go to a rotating local NDJSON file
 - completed spans go to a local NDJSON trace file
 - traces, metrics, and logs can also be exported over OTLP to a real backend like Grafana LGTM
 
-The local trace file is the persisted source of truth for normal local launches. Those launches do not
-write a separate server log file, but SSH-managed launches also persist the remote process's
-stdout/stderr at `~/.t3/ssh-launch/<state>/server.log`.
+The server persists logs independently of desktop output capture and OTLP. SSH-managed launches
+also persist the remote process's stdout/stderr at `~/.t3/ssh-launch/<state>/server.log`.
 
 ## Where To Find Things
 
@@ -20,17 +20,24 @@ Logs are human-facing:
 
 - destination: stdout
 - format: `Logger.consolePretty()`
-- normal local persistence: none
+- local persistence: `<logsDir>/server.log`, next to `server.trace.ndjson`
 - SSH-managed launch persistence: `~/.t3/ssh-launch/<state>/server.log`
 - remote export: OTLP only, when configured
+
+The file uses Effect's structured JSON formatter and redaction hooks, at the configured
+`T3CODE_LOG_LEVEL` (Info by default). Writes batch every second and flush on graceful shutdown.
+It rotates at 10 MiB with ten backups (`server.log.1` through `server.log.10`). A record larger
+than the file limit is replaced by a structured size-limit notice. For Robob's installed home,
+the active file is `~/.robob/userdata/logs/server.log`. The desktop's `server-child.log` contains
+failure snapshots only; use the server-owned file for ongoing orchestration logs.
 
 If you want a log message to show up in the trace file, emit it inside an active span with `Effect.log...`. `Logger.tracerLogger` will attach it as a span event.
 
 Configuring a logs endpoint takes over that job. The server then exports log records, which cover
 every message instead of only the ones inside an active span and carry the trace and span ids so
 they still line up with the trace. `Logger.tracerLogger` is dropped in that mode, so the same
-message is not exported twice and the trace file stops carrying log messages. stdout output and
-SSH-managed launch persistence stay unchanged either way.
+message is not exported twice and the trace file stops carrying log messages. stdout output,
+the local log file and SSH-managed launch persistence stay unchanged either way.
 
 ### Traces
 
@@ -68,12 +75,52 @@ cover full records only.
 The `TraceRecord`, `EffectTraceRecord`, and `OtlpTraceRecord` schemas live in
 `packages/shared/src/observability.ts`.
 
-SQL statement spans (named `sqlite`) and `sql.transaction` spans carry `db.connection` and
-`db.lock_wait_ms`. `db.connection` is `writer` for the main connection, which runs on the event loop,
-or `reader` for the read-only connection in a worker thread. `db.lock_wait_ms` is the part of the
-span spent waiting for that connection, behind other SQL. That wait does not block the event loop,
-so subtract it before you blame a slow span on the query. Statements inside a transaction use its
-connection and do not carry these attributes.
+SQL statement spans (named `sqlite`) carry `sql.fingerprint`, a hash of token-normalized
+SQL with comments, literals and parameter names removed. `db.query.text` stays a short,
+sanitized preview. The first retained occurrence per fingerprint embeds a `sql.statement`
+event containing the normalized text; it survives the fast-span filter. Each tracer boot
+retains at most 2,000 fingerprints, each statement event at most 16 KiB. A truncated event
+cannot be used for EXPLAIN. Preserve the first occurrence along with incident traces:
+once-only text can rotate out before a later slow occurrence.
+
+`db.connection` identifies the writer or reader; readers also carry `db.reader.lane` and
+`db.reader.slot`. `db.lock_wait_ms` measures connection acquisition separately from
+`db.statement.execution_ms`. `db.statement.connection_wait_ms` makes statement wait explicit:
+it copies the acquisition wait, or is zero when a transaction reuses its connection. The
+transaction span owns that original wait; reused statements leave `db.lock_wait_ms` unset.
+On slow statements, `db.rows_returned` counts returned rows before result-name transforms;
+failed statements return zero rows and retain their wait and execution timing. `db.stmt_status.available=false`
+means node:sqlite exposes neither rows read nor VM-step counts; returned rows do not measure scan work.
+On watchdog abandonment or retirement, `db.statement.execution_is_lower_bound=true` labels
+elapsed time since the parent observed execution start. Work that never started has no execution sample.
+
+Execution taking at least one second emits one `sql.plan` event per retained fingerprint,
+with `sql.plan.mode=disposable-copy` and `sql.plan.status=required`. No EXPLAIN runs on a
+live connection or in a caller's transaction. From an **offline snapshot**, generate a
+structural plan with:
+
+```bash
+node apps/server/scripts/explain-sql.ts /snapshots/statev2.sqlite /evidence/server.trace.ndjson FINGERPRINT \
+  ardud_archive=/snapshots/archive.sqlite ardud_base=/snapshots/base.sqlite
+```
+
+The helper refuses the installed live userdata directories, copies each supplied database
+and its WAL/SHM into a private temporary directory next to the main snapshot, and opens
+only those copies. Files over 64 MiB require same-volume copy-on-write support; the helper
+never silently makes a full copy of a large database. It prints
+one `sql.plan` JSON record; save it with the incident evidence. Decompress rotated trace
+files first. Supply both archive snapshots when the query names them. With `ardud_archive` attached,
+the helper restores the current source's history-reader TEMP views (and an empty base
+schema when no base snapshot is supplied). Other missing connection-local views fail
+without opening live state.
+
+All redacted parameters bind as NULL. The resulting plan describes the snapshot schema,
+not historical bindings or I/O. Value-sensitive plans can differ, and forced partial
+indexes can make EXPLAIN fail after predicate literals are stripped. For those cases, recover the source predicates separately and pass a JSON array through
+`--parameters-file /private/parameters.json`, in normalized placeholder order. The helper
+restores supplied values as quoted SQLite literals only in memory, so forced partial indexes
+can match during prepare. It never includes those values in its output. This still
+cannot establish the exact historical bindings, snapshot or plan.
 
 DPoP proof failures include the safe `environment.dpop.failure_code` span
 attribute. A `time_window` failure means that a signed proof was too old or too
@@ -151,7 +198,7 @@ Provider event NDJSON files still exist for provider runtime streams. Those are 
 
 There are two useful modes:
 
-- local-only: stdout + local `server.trace.ndjson`
+- local-only: stdout + local `server.log` and `server.trace.ndjson`
 - full local observability: stdout + local trace file + OTLP export to Grafana/Tempo/Prometheus
 
 The local trace file is always on. OTLP export is opt-in.

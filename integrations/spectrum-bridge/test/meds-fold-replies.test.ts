@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { createApi } from "../src/api.ts";
 import type { ChatContext, ChatInfo } from "../src/chats.ts";
 import { Delivery } from "../src/delivery.ts";
@@ -34,7 +34,7 @@ class Backend extends OpenChamber {
 }
 
 const harnesses: { store: Store; fake: ReturnType<typeof fakeFold> }[] = [];
-function setup(opts: { kind?: ChatInfo["kind"]; slug?: string; tool?: boolean; body?: string; disabled?: boolean } = {}) {
+function setup(opts: { kind?: ChatInfo["kind"]; slug?: string; tool?: boolean; body?: string; disabled?: boolean; omitMedsFold?: boolean } = {}) {
   const fake = fakeFold(opts.body);
   const store = new Store(":memory:");
   const backend = new Backend();
@@ -44,7 +44,8 @@ function setup(opts: { kind?: ChatInfo["kind"]; slug?: string; tool?: boolean; b
   const transport = { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("Unexpected download"); } };
   const router = new Router(store, backend, transport, { owner: "+15555550123", chatGuid: chat.key, context,
     timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alert", alertSocketPath: "/test/socket",
-    openCodeConfigRoot: "/nonexistent", quietMs: 0, replyMode: opts.tool ? "tool" : "final", medsFold: opts.disabled ? false : fake.options });
+    openCodeConfigRoot: "/nonexistent", quietMs: 0, replyMode: opts.tool ? "tool" : "final",
+    ...(opts.omitMedsFold ? {} : { medsFold: opts.disabled ? false as const : fake.options }) });
   const api = createApi({ store, photon: { react: async () => {} },
     router: () => router, chatGuid: () => chat.key, enabled: () => true, health: () => ({}),
     foldText: (text, operationId) => router.foldToolText(text, operationId) });
@@ -79,6 +80,18 @@ function setup(opts: { kind?: ChatInfo["kind"]; slug?: string; tool?: boolean; b
   return h;
 }
 afterEach(() => { for (const h of harnesses.splice(0).reverse()) { h.store.close(); h.fake.close(); } });
+
+test.each([false, true])("Router without medsFold sends owner replies without spawning (tool=%s)", async tool => {
+  const h = setup({ tool, omitMedsFold: true });
+  const spawn = spyOn(Bun, "spawn").mockImplementation(() => { throw new Error("Unexpected process spawn"); });
+  try {
+    await h.start();
+    if (tool) expect((await h.send("Reply")).status).toBe(202); else await h.finish();
+    expect(h.sends().map(row => row.text)).toEqual(["Reply"]);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(h.fake.logs().some(log => log.component === "meds-fold")).toBe(false);
+  } finally { spawn.mockRestore(); }
+});
 
 test("final replies append to the last queued text, and another poll never folds again", async () => {
   const h = setup(); await h.start(); await h.finish(["First", "Last"]);

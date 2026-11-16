@@ -92,6 +92,40 @@ class LoggingTests(unittest.TestCase):
         self.assertNotIn('fixture.dropped', tail)
         self.assertIn('fixture.error', tail)
 
+    def test_operational_messages_match_js_without_retaining_arbitrary_text(self):
+        for message in ('Robob replica is stale; recovery deferred',
+                        'Bearer opaque /home/user@example.invalid/key sk-private', 'private prompt'):
+            toollog.emit('test', 'fixture.failure', kind='error',
+                         error={'tag': 'REPLICA_UNAVAILABLE', 'message': message})
+        rows = self.rows()
+        self.assertEqual(rows[0]['error']['message'], 'Robob replica is stale; recovery deferred')
+        self.assertEqual(rows[1]['error']['message'], 'REPLICA_UNAVAILABLE')
+        self.assertEqual(rows[2]['error']['message'], 'REPLICA_UNAVAILABLE')
+
+    def test_200_mib_cap_boundaries_preserve_errors(self):
+        self.assertEqual(toollog.CAP, 200 * 1024 * 1024)
+        for offset in (-1, 0, 1):
+            with self.subTest(offset=offset):
+                root = self.root / str(offset)
+                root.mkdir(parents=True)
+                day = dt.datetime.now(dt.timezone.utc).date().isoformat()
+                path = root / (day + '.ndjson')
+                with path.open('wb') as out:
+                    out.truncate(toollog.CAP + offset)
+                with patch.dict(os.environ, ROUTER_LOG_DIR=str(root)):
+                    toollog.emit('test', 'fixture.first')
+                    self.assertEqual((root / ('.cap-' + day)).exists(), offset >= 0)
+                    toollog.emit('test', 'fixture.dropped')
+                    toollog.emit('test', 'fixture.dropped')
+                    toollog.emit('test', 'fixture.error', kind='error', error={'tag': 'http_502'})
+                with path.open('rb') as source:
+                    source.seek(toollog.CAP + offset)
+                    tail = source.read(4096).decode()
+                self.assertEqual(tail.count('log.cap'), 1)
+                self.assertEqual('fixture.first' in tail, offset < 0)
+                self.assertNotIn('fixture.dropped', tail)
+                self.assertIn('fixture.error', tail)
+
     def test_rollup_fixture_and_cli(self):
         self.root.mkdir()
         rows = [dict(tool='9router', name='img.result', kind='perf', ok=True, durationMs=n) for n in range(1, 101)]
@@ -254,7 +288,7 @@ finally:
         assert body.reads == 1
 '''
         return subprocess.run(
-            [sys.executable, '-I', '-c', command, str(script), 'private prompt', str(Path(self.tmp.name) / 'out.png')],
+            [sys.executable, '-I', '-c', command, str(script), 'private prompt', str(Path(self.tmp.name) / 'out.png'), '--route', '9router'],
             input=json.dumps(fixture), text=True, capture_output=True, timeout=15,
         )
 
@@ -274,7 +308,7 @@ finally:
                 result = self.image_cli(fixture)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertEqual(result.stdout, '')
-                self.assertEqual(result.stderr, message + '\n')
+                self.assertEqual(result.stderr, 'genimg: route=9router cx/gpt-image-2; ' + message.rstrip() + '\n')
                 row = self.rows()[-1]
                 self.assertEqual(row['name'], 'img.result')
                 self.assertIs(row['ok'], False)
@@ -290,7 +324,7 @@ finally:
                 result = self.image_cli({'status': 502, 'body': base64.b64encode(body).decode()})
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertEqual(result.stdout, '')
-                self.assertEqual(result.stderr, 'error 502: ' + body.decode()[:500] + '\n')
+                self.assertEqual(result.stderr, 'genimg: route=9router cx/gpt-image-2; error 502: ' + body.decode()[:500] + '\n')
                 self.assertEqual(self.rows()[-1]['error'], {'tag': 'http_502_not_entitled', 'message': 'http_502_not_entitled'})
         log = ''.join(p.read_text() for p in self.root.glob('*.ndjson'))
         self.assertNotIn('SECRETBODY', log)
@@ -300,7 +334,7 @@ finally:
         result = self.image_cli({'response': {'data': [{'b64_json': 'aGVsbG8='}]}})
         path = Path(self.tmp.name) / 'out.png'
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stderr, '')
+        self.assertEqual(result.stderr, 'genimg: route=9router cx/gpt-image-2\n')
         self.assertEqual(result.stdout, str(path) + '\n')
         self.assertEqual(path.read_bytes(), b'hello')
         rows = self.rows()
@@ -309,12 +343,12 @@ finally:
         self.assertNotIn('private prompt', json.dumps(rows))
 
     def test_image_write_paths(self):
-        args = ['genimg', 'private prompt', str(Path(self.tmp.name)/'out.png')]
+        args = ['genimg', 'private prompt', str(Path(self.tmp.name)/'out.png'), '--route', '9router']
         with patch.object(sys, 'argv', args), patch.object(image, 'request_image', return_value={'data': [{'b64_json': 'aGVsbG8='}]}), contextlib.redirect_stdout(io.StringIO()):
             image.main()
-        args[-1] = str(Path(self.tmp.name)/'missing/out.png')
-        with patch.object(sys, 'argv', args), patch.object(image, 'request_image', return_value={'data': [{'b64_json': 'aGVsbG8='}]}), self.assertRaises(SystemExit):
-            image.main()
+        args[2] = str(Path(self.tmp.name)/'missing/out.png')
+        with patch.object(sys, 'argv', args), patch.object(image, 'request_image', return_value={'data': [{'b64_json': 'aGVsbG8='}]}), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(image.main(), 1)
         self.assertEqual([r['ok'] for r in self.rows() if r['name'] == 'img.write'], [True, False])
 
     def test_keyhelper_stdout_and_log_privacy(self):

@@ -60,6 +60,109 @@ test("health projects safe fields and never exposes credentials, tokens, or chat
   expect(logs.text()).not.toContain("PRIVATE_");
 });
 
+test("health exposes only safe board counters and refresh reasons", async () => {
+  const h = setup();
+  const board = { boardFetches: 3, boardCacheHits: 40, boardFetchErrors: 1, boardBackoffMs: 10_000, lastFetchDurationMs: 25, lastFetchReason: "dirty",
+    fetchesByReason: { cold: 1, age: 0, hard: 1, soft: 1 }, dirtyEventsByType: { "thread.updated:thread.metadata-updated": { hard: 0, soft: 3 }, constructor: { hard: 0, soft: 1 } },
+    windowStartedAt: "2026-09-10T00:00:00.000Z" };
+  h.state.health = { board: { ...board, title: "PRIVATE_TITLE", token: "PRIVATE_TOKEN", error: "PRIVATE_ERROR",
+    fetchesByReason: { ...board.fetchesByReason, title: "PRIVATE_TITLE", token: "PRIVATE_TOKEN" },
+    dirtyEventsByType: { "thread.updated:thread.metadata-updated": { hard: 0, soft: 3, threadId: "PRIVATE_ID", title: "PRIVATE_TITLE" }, constructor: { hard: 0, soft: 1 } } } };
+  expect((await (await h.get("/health")).json()).board).toEqual(board);
+  h.state.health = { board: { boardFetches: -1, boardCacheHits: Infinity, boardFetchErrors: "PRIVATE_VALUE", boardBackoffMs: -1,
+    lastFetchDurationMs: NaN, lastFetchReason: "PRIVATE_REASON" } };
+  expect((await (await h.get("/health")).json()).board).toEqual({});
+  h.state.health = { board: { boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null } };
+  expect((await (await h.get("/health")).json()).board).toEqual(h.state.health.board);
+  for (const value of [null, [], "PRIVATE_VALUE"]) {
+    h.state.health = { board: value };
+    expect(await (await h.get("/health")).json()).not.toHaveProperty("board");
+  }
+});
+
+test("health bounds dirty event names, merges overflow and excludes malformed nested telemetry", async () => {
+  const h = setup();
+  h.state.health = { board: {
+    fetchesByReason: { cold: -1, age: Infinity, hard: "PRIVATE_VALUE", soft: 0.5, token: "PRIVATE_TOKEN" },
+    dirtyEventsByType: { other: { hard: 2, soft: 3 },
+      ...Object.fromEntries(Array.from({ length: 60 }, (_, index) => [`future.event-${index}`, { hard: 1, soft: 2, title: "PRIVATE_TITLE" }])),
+      "PRIVATE_TITLE": { hard: 1, soft: 1 }, "thread:PRIVATE_ID": { hard: 1, soft: 1 },
+      "thread:private-id": { hard: 1, soft: 1 }, "request.opened:private-id": { hard: 1, soft: 1 },
+      "future.negative": { hard: -1, soft: 1 }, "future.infinite": { hard: 0, soft: Infinity },
+      "future.fraction": { hard: 0.5, soft: 1 }, "future.string": "PRIVATE_VALUE", "future.array": [],
+      "future.missing": { soft: 1 }, "future.null": null },
+    windowStartedAt: "PRIVATE_TIME",
+  } };
+  const health = await (await h.get("/health")).json();
+  expect(health.board.fetchesByReason).toEqual({});
+  expect(Object.keys(health.board.dirtyEventsByType)).toHaveLength(51);
+  expect(health.board.dirtyEventsByType.other).toEqual({ hard: 12, soft: 23 });
+  expect(health.board).not.toHaveProperty("windowStartedAt");
+  expect(JSON.stringify(health)).not.toContain("PRIVATE_");
+  for (const value of [null, [], "PRIVATE_VALUE"]) {
+    h.state.health = { board: { fetchesByReason: value, dirtyEventsByType: value, windowStartedAt: value } };
+    expect((await (await h.get("/health")).json()).board).toEqual({});
+  }
+});
+
+test("health exposes bounded status subkeys and local counts without payload identities", async () => {
+  const h = setup();
+  h.state.health = { board: { dirtyEventsByType: {
+    ...Object.fromEntries(["same", "move", "join", "leave", "offboard"].map(kind => [`thread.status:${kind}`, { hard: 0, soft: 0, local: 2, threadId: "PRIVATE_ID", title: "PRIVATE_TITLE" }])),
+    "thread.status:private-id": { hard: 1, soft: 0, local: 1 },
+    "thread.status:PRIVATE_TITLE": { hard: 1, soft: 0 },
+    "future.negative": { hard: 0, soft: 0, local: -1 },
+    "future.fraction": { hard: 0, soft: 0, local: 0.5 },
+    "future.string": { hard: 0, soft: 0, local: "PRIVATE_VALUE" },
+  } } };
+  const health = await (await h.get("/health")).json();
+  for (const kind of ["same", "move", "join", "leave", "offboard"]) expect(health.board.dirtyEventsByType[`thread.status:${kind}`]).toEqual({ hard: 0, soft: 0, local: 2 });
+  for (const kind of ["negative", "fraction", "string"]) expect(health.board.dirtyEventsByType[`future.${kind}`]).toEqual({ hard: 0, soft: 0 });
+  expect(health.board.dirtyEventsByType).not.toHaveProperty("thread.status:private-id");
+  expect(JSON.stringify(health)).not.toContain("PRIVATE_");
+});
+
+test("health allows only bounded single-thread read counters and reasons", async () => {
+  const h = setup();
+  h.state.health = { board: { threadReads: 5, threadReadErrors: 1,
+    threadReadsByReason: { run: 2, state: 2, followup: 1, created: 3, threadId: "PRIVATE_ID", title: "PRIVATE_TITLE" } } };
+  expect((await (await h.get("/health")).json()).board).toEqual({ threadReads: 5, threadReadErrors: 1,
+    threadReadsByReason: { run: 2, state: 2, followup: 1, created: 3 } });
+  h.state.health = { board: { threadReads: -1, threadReadErrors: 0.5, threadReadsByReason: { run: Infinity, state: "PRIVATE_ID", followup: -1 } } };
+  expect((await (await h.get("/health")).json()).board).toEqual({ threadReadsByReason: {} });
+});
+
+test("health exposes stream counters and bounds codes without identities or malformed values", async () => {
+  const h = setup();
+  const endAt = "2026-11-16T00:00:00.000Z";
+  h.state.health = { board: {
+    streamConnects: 4, streamEndsByKind: { errorFrame: 1, clean: 1, thrown: 1, aborted: 1, title: "PRIVATE_TITLE", threadId: "PRIVATE_ID" },
+    streamLastConnectedMs: 85, streamMinConnectedMs: 0, streamMaxConnectedMs: 200,
+    lastStreamEndAt: endAt, lastStreamEndKind: "errorFrame",
+    streamErrorCodes: { replica_lag: 2, ["__proto__"]: 1, constructor: 1, other: 3,
+      ...Object.fromEntries(Array.from({ length: 25 }, (_, index) => [`code-${index}`, 1])),
+      "thread:PRIVATE_ID": 2, "PRIVATE_TITLE": 1, ["x".repeat(41)]: 1, negative: -1, fraction: 0.5, infinite: Infinity, text: "PRIVATE_VALUE" },
+    threadId: "PRIVATE_ID", title: "PRIVATE_TITLE",
+  } };
+  const health = await (await h.get("/health")).json();
+  expect(health.board).toMatchObject({ streamConnects: 4, streamEndsByKind: { errorFrame: 1, clean: 1, thrown: 1, aborted: 1 },
+    streamLastConnectedMs: 85, streamMinConnectedMs: 0, streamMaxConnectedMs: 200, lastStreamEndAt: endAt, lastStreamEndKind: "errorFrame" });
+  expect(Object.keys(health.board.streamErrorCodes)).toHaveLength(21);
+  expect(health.board.streamErrorCodes).toMatchObject({ replica_lag: 2, ["__proto__"]: 1, constructor: 1, other: 15 });
+  expect(JSON.stringify(health)).not.toContain("PRIVATE_");
+  h.state.health = { board: { streamConnects: -1, streamEndsByKind: { clean: -1, thrown: 0.5, aborted: Infinity, errorFrame: "PRIVATE_TITLE" },
+    streamLastConnectedMs: -1, streamMinConnectedMs: Infinity, streamMaxConnectedMs: "PRIVATE_VALUE", lastStreamEndAt: "PRIVATE_DATE", lastStreamEndKind: "PRIVATE_KIND",
+    streamErrorCodes: { broken: "PRIVATE_VALUE" } } };
+  expect((await (await h.get("/health")).json()).board).toEqual({ streamEndsByKind: {}, streamErrorCodes: {} });
+  const empty = { streamLastConnectedMs: null, streamMinConnectedMs: null, streamMaxConnectedMs: null, lastStreamEndAt: null, lastStreamEndKind: null };
+  h.state.health = { board: empty };
+  expect((await (await h.get("/health")).json()).board).toEqual(empty);
+  for (const value of [null, [], "PRIVATE_VALUE"]) {
+    h.state.health = { board: { streamEndsByKind: value, streamErrorCodes: value } };
+    expect((await (await h.get("/health")).json()).board).toEqual({});
+  }
+});
+
 test("notify queues one stable operation and never touches reminders or session notices", async () => {
   const h = setup();
   const first = await h.post("/notify", notify);

@@ -820,11 +820,37 @@ it.effect("restarts a running Claude delegated child with interrupt and next-tur
           createdBy: "agent" as const,
           creationSource: "mcp" as const,
         };
+        const stopped = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.id === activeRun.id &&
+              event.payload.status === "interrupted",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        const restarted = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.threadId === threadId &&
+              event.type === "run.updated" &&
+              event.payload.ordinal === 2 &&
+              event.payload.status === "running",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
         const sent = yield* service.sendToThread(input);
         assert.equal(sent.delivery, "restarted");
+        assert.isNotTrue(sent.run.queueHeld);
         yield* worker.drain();
+        yield* Fiber.join(stopped);
         yield* orchestrator.resumeQueuedRuns;
         yield* worker.drain();
+        yield* Fiber.join(restarted);
         const after = yield* orchestrator.getThreadProjection(threadId);
         assert.equal(after.runs.find((r) => r.id === activeRun.id)?.status, "interrupted");
         assert.lengthOf(after.runs, 2);

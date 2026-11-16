@@ -81,6 +81,14 @@ it.effect("bounds each table's scan and preserves oldest/newest through fresh pa
       .pipe(Effect.provideService(Statement.CurrentTransformer, observe));
     assert.deepEqual(scans, { events: 1, receipts: 1 });
     assert.equal(result.deletedEventCount, 48);
+    assert.deepEqual(
+      (yield* sql<{
+        readonly sequence: number;
+      }>`SELECT sequence FROM ardud_history_compacted_events ORDER BY sequence`).map(
+        (row) => row.sequence,
+      ),
+      Array.from({ length: 48 }, (_, i) => i + 57),
+    );
     assert.equal(result.deletedReceiptCount, 50);
     assert.lengthOf(deletes, 98);
     assert.isTrue(deletes.every((params) => params.length === 1));
@@ -127,6 +135,24 @@ it.effect("stops between single-row deletes when its elapsed budget expires", ()
     assert.deepEqual(yield* sequences, [...Array.from({ length: 101 }, (_, i) => i + 1), 105]);
     yield* maintenance.compactEventStore;
     assert.deepEqual(yield* sequences, [1, 105]);
+  }).pipe(Effect.provide(layer)),
+);
+
+it.effect("a failed compaction journal write rolls its event deletion back", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const maintenance = yield* ProjectionMaintenance.ProjectionMaintenanceV2;
+    yield* seed;
+    yield* maintenance.compactEventStoreWith({ minPageIntervalMs: 0, maxPagesPerScan: 0 });
+    yield* sql`CREATE TRIGGER refuse_tombstone BEFORE INSERT ON ardud_history_compacted_events
+      BEGIN SELECT RAISE(ABORT, 'fixture journal unavailable'); END`;
+    const result = yield* maintenance.compactEventStore.pipe(Effect.result);
+    assert.equal(result._tag, "Failure");
+    assert.deepEqual(
+      yield* sequences,
+      Array.from({ length: 105 }, (_, i) => i + 1),
+    );
+    assert.deepEqual(yield* sql`SELECT * FROM ardud_history_compacted_events`, []);
   }).pipe(Effect.provide(layer)),
 );
 

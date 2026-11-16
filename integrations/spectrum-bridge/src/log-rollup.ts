@@ -2,16 +2,39 @@ import type { LogLine } from "./toollog.ts";
 import { callName, percentiles } from "./log-calls.ts";
 import { createChainAggregation } from "./log-chains.ts";
 
-export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>) {
+export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>, renderLines: LogLine[] = []) {
   const countsByName: Record<string, number> = Object.create(null);
   const countsByKind: Record<string, number> = { event: 0, perf: 0, error: 0 };
   const durations = new Map<string, Map<number, number>>();
   const components = new Map<string, Map<string, { count: number; ok: number; failed: number; histogram: Map<number, number> }>>();
   const errors = new Map<string, { tag: string; name: string; count: number; sampleId?: string; site?: string }>();
+  const causes = new Map<string, { tag: string; causeKey: string; count: number }>();
+  const renderFailures = new Map<string, number>();
   const represented = new Set<string>();
   const individualCalls: LogLine[] = [];
   const chainAggregation = createChainAggregation();
-  let total = 0, ok = 0, failed = 0, recordedRows = 0;
+  const firstReplies = new Map<number, number>();
+  const alerts = new Set<string>();
+  let overdue = 0, requeued_by_watchdog = 0, answered_late = 0;
+  let total = 0, ok = 0, failed = 0, recordedRows = 0, failedCalls = 0;
+  function observeError(line: LogLine) {
+    // Legacy request diagnostics are owned by control.catch1/2, including in mixed-version days.
+    const requestFailure = line.component === "robob" && line.name === "turn.robob_call" && line.kind === "perf" && line.ok === false;
+    if (requestFailure && line.props?.failureFormat === "single") failedCalls++;
+    if (requestFailure && line.props?.failureFormat !== "single" && line.error?.tag === "control.request_failed") return;
+    if (!line.error) return;
+    if (line.error.causeKey) {
+      const key = `${line.error.tag}\0${line.error.causeKey}`;
+      const item = causes.get(key) ?? { tag: line.error.tag, causeKey: line.error.causeKey, count: 0 };
+      item.count++; causes.set(key, item);
+    }
+    const name = line.error.name;
+    const key = `${line.error.tag}\0${name}`;
+    const item = errors.get(key) ?? { tag: line.error.tag, name, count: 0,
+      sampleId: line.ids?.messageId ?? line.ids?.operationId ?? line.ids?.threadId ?? line.ids?.formId ?? line.ids?.runId,
+      ...(line.site ? { site: line.site } : {}) };
+    item.count++; errors.set(key, item);
+  }
   function merge(target: Map<number, number>, values: Iterable<[number, number]>) {
     for (const [ms, count] of values) target.set(ms, (target.get(ms) ?? 0) + count);
   }
@@ -35,19 +58,25 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
       const name = callName(line);
       if (name) component("robob", name, count, oks, failures, values);
     }
-    if (line.error) {
-      const name = line.error.name;
-      const key = `${line.error.tag}\0${name}`;
-      const item = errors.get(key) ?? { tag: line.error.tag, name, count: 0,
-        sampleId: line.ids?.messageId ?? line.ids?.operationId ?? line.ids?.threadId ?? line.ids?.formId ?? line.ids?.runId,
-        ...(line.site ? { site: line.site } : {}) };
-      item.count++; errors.set(key, item);
+    if (line.name === "card.render" && line.ok === false && typeof line.props?.failureCode === "string") {
+      const code = line.props.failureCode;
+      renderFailures.set(code, (renderFailures.get(code) ?? 0) + count);
     }
+    observeError(line);
   }
   for await (const line of lines) {
     recordedRows++;
     chainAggregation.accept(line);
-    if (line.name === "turn.robob_calls" && line.calls) {
+    if (line.name === "inbound.overdue") overdue++;
+    if (line.name === "inbound.watchdog_requeued") requeued_by_watchdog++;
+    if (line.name === "inbound.unanswered_alert" && line.ids?.inboundId) alerts.add(`${line.ids.chat}:${line.ids.inboundId}`);
+    if (line.name === "inbound.answered_late") answered_late++;
+    if (line.name === "inbound.answered" && line.durationMs !== undefined && ["owner", "moni"].includes(line.ids?.chat ?? "")) {
+      const ms = Math.round(line.durationMs); firstReplies.set(ms, (firstReplies.get(ms) ?? 0) + 1);
+    }
+    if (line.name === "card.renders" && line.renders) {
+      consume({ ...line, name: "card.render", renders: undefined }, line.renders.count, line.renders.count, 0, line.renders.histogram);
+    } else if (line.name === "turn.robob_calls" && line.calls) {
       for (const [name, stats] of Object.entries(line.calls)) {
         if (line.ids?.callBatchId) represented.add(`${line.ids.callBatchId}\0${name}`);
         consume({ ...line, name: "turn.robob_call", calls: undefined }, stats.count, stats.ok, stats.failed, stats.histogram);
@@ -56,10 +85,17 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     } else if (line.name === "turn.robob_call" && line.kind === "perf") individualCalls.push(line);
     else consume(line);
   }
+  // Shared counters represent fast renders without adding one NDJSON row per CLI process.
+  for (const line of renderLines) if (line.renders) {
+    consume({ ...line, name: "card.render", renders: undefined }, line.renders.count, line.renders.count, 0, line.renders.histogram);
+  }
   // Later days complete this day's receipts without moving their event counts into this day.
   if (laterLines) for await (const line of laterLines) chainAggregation.accept(line, true);
   // Slow/failed rows remain readable, but their batch histogram already counts them.
-  for (const line of individualCalls) if (!line.ids?.callBatchId || !represented.has(`${line.ids.callBatchId}\0${callName(line)}`)) consume(line);
+  for (const line of individualCalls) {
+    if (!line.ids?.callBatchId || !represented.has(`${line.ids.callBatchId}\0${callName(line)}`)) consume(line);
+    else observeError(line);
+  }
   const durationMs: Record<string, ReturnType<typeof percentiles>> = Object.create(null);
   for (const [name, histogram] of durations) durationMs[name] = percentiles(histogram);
   const byComponent: Record<string, Record<string, { count: number; ok: number; failed: number; errorRate: number; durationMs?: ReturnType<typeof percentiles> }>> = Object.create(null);
@@ -70,8 +106,9 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
       ...(stats.histogram.size ? { durationMs: percentiles(stats.histogram) } : {}),
     };
   }
-  return { total, recordedRows, countsByName, countsByKind, ok, failed,
-    okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? countsByKind.error / total : 0,
-    durationMs, byComponent, chains: chainAggregation.summary(),
+  return { overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: percentiles(firstReplies), total, recordedRows, countsByName, countsByKind, ok, failed,
+    okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countsByKind.error + failedCalls) / total : 0,
+    durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
+    topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20), chains: chainAggregation.summary(),
     topErrorTags: [...errors.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.name.localeCompare(b.name)).slice(0, 20) };
 }

@@ -34,9 +34,11 @@ BACKUP_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'fil
 FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'files',
                   'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
+NUMBERS.update(('probeTimeouts', 'secondsInProbeTimeouts', 'probeAllowanceMedianS', 'allowanceS'))
 NUMBERS.update(('timeouts', 'secondsInTimeouts', 'childrenDescended', 'partsMeasured',
                 'childrenWithPartsInProgress', 'partsDone', 'partsTotal', 'partsFreshnessS'))
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
+NUMBERS.update(('sentBytes', 'dbBytes', 'stageAgeS'))
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
 BACKUP_ARGS = {'memory_backup.sh', 'health_backup.sh', 'backup_control.py', 'redact_lock.py',
@@ -165,7 +167,7 @@ def memory_fields(values, event):
         return result
     numbers = {'pageSize', 'freePages', 'activePages', 'inactivePages', 'wiredPages',
                'speculativePages', 'purgeablePages', 'compressorPages', 'totalMb', 'usedMb',
-               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'cpu', 'count', 'ppid1Count'}
+               'mbPerS', 'tps', 'pid', 'memMb', 'cmprsMb', 'count', 'ppid1Count'}
 
     def numeric(value):
         return finite_number(value) and value >= 0
@@ -193,7 +195,7 @@ def memory_fields(values, event):
                            'wiredPages', 'speculativePages', 'purgeablePages', 'compressorPages')}[key]
             result[key] = None if value is None else row(value, keys)
         elif key in ('top', 'watched', 'counts') and (value is None or isinstance(value, list)):
-            keys = ('command', 'count', 'ppid1Count') if key == 'counts' else ('pid', 'command', 'memMb', 'cmprsMb', 'cpu')
+            keys = ('command', 'count', 'ppid1Count') if key == 'counts' else ('pid', 'command', 'memMb', 'cmprsMb')
             if key == 'watched':
                 keys += ('etime', 'error')
             result[key] = None if value is None else [row(p, keys) for p in value[:{'top': 15, 'watched': 512, 'counts': 5}[key]]]
@@ -210,7 +212,84 @@ def memory_fields(values, event):
     return result
 
 
+def cpu_fields(values):
+    from cpu_labels import janitor_redact, SystemFamily, SECRET_LABEL, command_label
+    result = {}
+    numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
+               'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb',
+               'skippedLines', 'badLines', 'lines', 'exiting', 'systemCpuPct',
+               'userPct', 'sysPct', 'unattributedCpuPct', 'spawned', 'exited'}
+
+    def number(value):
+        return finite_number(value) and 0 <= value <= 1e15
+
+    def label(value, limit):
+        if not isinstance(value, str):
+            return None
+        if isinstance(value, SystemFamily) and '/' not in value and not SECRET_LABEL.search(value):
+            return str(value)[:limit]
+        try:
+            value = janitor_redact(value)
+        except (ImportError, OSError):
+            return None
+        if SECRET.search(value) or '/Users/' in value or '/home/' in value or value.startswith(('/', '~')):
+            return '[redacted]'
+        return ''.join(c if c.isprintable() else ' ' for c in value)[:limit]
+
+    for key, value in (values or {}).items():
+        if key in numeric and (value is None or number(value)):
+            result[key] = value
+        elif key == 'baseline' and type(value) is bool:
+            result[key] = value
+        elif key == 'badLine':
+            result[key] = label(value, 200)
+        elif key in ('failure', 'hintError', 'systemCpuError', 'commandError', 'threadError') and (value is None or value in MEMORY_ERRORS):
+            result[key] = value
+        elif key == 'load' and (value is None or isinstance(value, list)):
+            result[key] = None if value is None else [n for n in value[:3] if number(n)]
+        elif key in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily') and isinstance(value, list):
+            result[key] = []
+            for proc in value[:{'top': 20, 'families': 15, 'spawnedFamilies': 8, 'runnableThreadsByFamily': 8}[key]]:
+                if not isinstance(proc, dict):
+                    continue
+                keys = (('pid', 'ppid', 'family', 'parentFamily', 'state', 'hint', 'cpuS', 'cpuPct', 'rssMb', 'etime', 'cmd', 'parentCmd')
+                        if key == 'top' else ('family', 'count', 'cpuPct', 'parentFamily')
+                        if key == 'spawnedFamilies' else ('family', 'count')
+                        if key == 'runnableThreadsByFamily' else ('family', 'count', 'cpuPct', 'rssMb'))
+                clean = {}
+                for field in keys:
+                    item = proc.get(field)
+                    if field in numeric and number(item):
+                        clean[field] = item
+                    elif field in ('family', 'parentFamily', 'hint'):
+                        clean[field] = label(item, 72 if field == 'hint' else 64)
+                    elif field in ('cmd', 'parentCmd') and field in proc:
+                        clean[field] = command_label(item) if isinstance(item, str) else None
+                    elif field == 'state' and isinstance(item, str) and re.fullmatch(r'[A-Za-z?+<>-]{1,16}', item):
+                        clean[field] = item
+                    elif field == 'etime' and isinstance(item, str) and re.fullmatch(r'\d+(?:-\d+)?(?::\d+){1,2}', item):
+                        clean[field] = item[:32]
+                result[key].append(clean)
+    return result
+
+
 def safe_fields(values, event=None):
+    if event and event.startswith('tailnet.'):
+        result = {}
+        for key, value in (values or {}).items():
+            if key == 'backendState' and value in ('Running', 'Stopped', 'NeedsLogin', 'NeedsMachineAuth', 'Starting', 'NoState', 'Unknown'):
+                result[key] = value
+            elif key in ('statusError', 'extensionError', 'homeProbeError') and value in (None, 'timeout', 'exit', 'parse', 'unavailable'):
+                result[key] = value
+            elif key in ('up', 'selfOnline', 'timedOut', 'homeReachable') and (value is None or type(value) is bool):
+                result[key] = value
+            elif key in ('tailscaleIPsCount', 'exitCode', 'extensionPid', 'notUpChecks', 'outageStart') and (value is None or type(value) is int):
+                result[key] = value
+            elif key == 'extensionPids' and (value is None or isinstance(value, str) and re.fullmatch(r'[0-9 ]{1,180}', value)):
+                result[key] = value
+        return result
+    if event in ('cpu.sample', 'cpu.spike'):
+        return cpu_fields(values)
     if event == 'disk.clone_wedge':
         result = {k: v for k, v in disk_wait_fields(values).items()
                   if k in ('count', 'sampleCount', 'sampling', 'failure')}
@@ -252,6 +331,13 @@ def safe_fields(values, event=None):
         elif event == 'backup.run' and key == 'failureStage' and isinstance(value, str):
             result[key] = value if value in FAILURE_STAGES else 'unknown'
         elif key == 'failReason' and value in ('password_unavailable', 'no_repo_access', 'source_missing', 'other'):
+            result[key] = value
+        elif event in ('crash.collect', 'crash.source', 'crash.unified.chunk') and key in ('stopReason', 'outcome') and value in (
+                'start', 'done', 'deadline', 'timeout', 'permission', 'exit', 'parse', 'error'):
+            result[key] = value
+        elif event in ('crash.collect', 'crash.source', 'crash.unified.skip') and key in ('skipReason', 'reason') and value == 'lag_ceiling':
+            result[key] = value
+        elif event == 'crash.unified.chunk' and key in ('chunk', 'timeoutS') and type(value) in (int, float) and math.isfinite(value) and value >= 0:
             result[key] = value
         elif key == 'stopReason' and value in ('done', 'budget', 'killed'):
             result[key] = value
@@ -304,6 +390,16 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
             if lines:
                 message = '[redacted]' if SECRET.search(lines[0]) else lines[0][:300]
         row['error'] = dict(tag=error_tag, message=message)
+    if name in ('cpu.sample', 'cpu.spike'):
+        # Leave room for 240 spike lines and the other jobs in the daily file.
+        limit = 7000 if name == 'cpu.sample' else 8192
+        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > limit:
+            props = row['props']
+            key = next((k for k in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily') if props.get(k)), None)
+            if not props.get(key):
+                break
+            props[key].pop()
+            props[key+'Omitted'] = props.get(key+'Omitted', 0)+1
     return row
 
 
@@ -345,10 +441,16 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                 else:
                     os.close(capfd)
                     append(fd, record('logger', 'error', 'log.cap', now, ok=False, error_tag='log.cap'))
-                if kind != 'error':
+                # A coverage gap must survive the cap before its checkpoint
+                # retires it. Ordinary crash summaries remain capped.
+                coverage_gap = (component == 'crashes' and name in (
+                    'crash.unified.skip', 'crash.source', 'crash.collect') and
+                    row.get('props', {}).get('skippedS', 0) > 0)
+                if kind != 'error' and not coverage_gap:
                     return
             append(fd, row)
+            return True
         finally:
             os.close(fd)
     except Exception:
-        pass
+        return False

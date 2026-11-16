@@ -16,6 +16,17 @@ def clean_env(**overrides):
     return env
 
 
+def require_shim_interpreter(test, shim):
+    shim = Path(shim)
+    with shim.open() as source:
+        header = source.readline().strip()
+    test.assertTrue(header.startswith("#!") and header[2:].strip(), f"{shim} has no shebang")
+    interpreter = header[2:].split()[0]
+    if not os.access(interpreter, os.X_OK):
+        test.skipTest(f"blockers/{shim.name} needs {interpreter}, which this box doesn't have "
+                      "(offbox-base built before Offbox #206; rebuild is #265; or use --template generic)")
+
+
 def isolate_boat(stack):
     from offbox_lib import api, capacity
 
@@ -35,6 +46,7 @@ def isolate_home(stack, root, *, guard_failover=True):
                            ("BACKEND_PATH", "backend"), ("HOME_FAILURES", "home-failures.jsonl")):
         stack.enter_context(patch.object(common, name, root / filename))
     stack.enter_context(patch.object(common, "_BACKEND", None))
+    stack.enter_context(patch.object(home, "slow_read_reachable", return_value=False))
     if guard_failover:
         stack.enter_context(patch.object(home, "probe", return_value=None))
         stack.enter_context(patch.object(home, "fail_over", side_effect=AssertionError(

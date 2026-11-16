@@ -251,7 +251,10 @@ describe("DesktopObservability", () => {
         });
         yield* outputLog.writeOutputChunk("stdout", new TextEncoder().encode("hello server\n"));
         assert.isFalse(yield* fileSystem.exists(logPath));
-        yield* outputLog.persistFailure({ details: "code=1" });
+        yield* outputLog.persistFailure({
+          details: "pid=123 killed by SIGKILL",
+          annotations: { appQuitReceived: true, appQuitTrigger: "before-quit", appQuitAgeMs: 2000 },
+        });
         yield* outputLog.beginSession({ details: "pid=456" });
         yield* outputLog.writeOutputChunk("stderr", new TextEncoder().encode("normal shutdown\n"));
         yield* outputLog.discardSession;
@@ -287,7 +290,10 @@ describe("DesktopObservability", () => {
       assert.equal(end.level, "ERROR");
       assert.equal(end.annotations.instanceId, "primary");
       assert.equal(end.annotations.phase, "END");
-      assert.equal(end.annotations.details, "code=1");
+      assert.equal(end.annotations.details, "pid=123 killed by SIGKILL");
+      assert.equal(end.annotations.appQuitReceived, true);
+      assert.equal(end.annotations.appQuitTrigger, "before-quit");
+      assert.equal(end.annotations.appQuitAgeMs, 2000);
 
       const traceRecords = (yield* fileSystem.readFileString(tracePath))
         .trim()
@@ -299,13 +305,19 @@ describe("DesktopObservability", () => {
           (record) => record.name === "desktop.observability.backendOutput.writeOutputChunk",
         ),
       );
+      const failureTrace = traceRecords.find(
+        (record) => record.name === "desktop.observability.backendOutput.writeFailure",
+      );
+      assert.equal(failureTrace?.attributes.appQuitReceived, true);
+      assert.equal(failureTrace?.attributes.appQuitTrigger, "before-quit");
+      assert.equal(failureTrace?.attributes.appQuitAgeMs, 2000);
     }).pipe(
       Effect.scoped,
       Effect.provide(Layer.mergeAll(NodeServices.layer, NodeHttpClient.layerUndici, layerEmptyEnv)),
     ),
   );
 
-  it.effect("keeps buffering output after a non-terminal failure snapshot", () =>
+  it.effect("persists only failure snapshots while the child keeps logging after a timeout", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -324,6 +336,9 @@ describe("DesktopObservability", () => {
         yield* outputLog.writeOutputChunk("stdout", new TextEncoder().encode("before timeout\n"));
         yield* outputLog.persistFailureSnapshot({ details: "readiness timeout" });
         yield* outputLog.writeOutputChunk("stderr", new TextEncoder().encode("after timeout\n"));
+        const snapshot = yield* fileSystem.readFileString(logPath);
+        assert.include(snapshot, "before timeout");
+        assert.notInclude(snapshot, "after timeout");
         yield* outputLog.persistFailure({ details: "code=1" });
       }).pipe(
         Effect.annotateLogs({ runId: "test-run" }),

@@ -159,6 +159,33 @@ export function listLoginShellCandidates(
   return candidates;
 }
 
+const MACOS_SYSTEM_PATH_DIRECTORIES = new Set([
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
+  "/library/apple/usr/bin",
+]);
+const MACOS_CRYPTEX_PATH_ROOTS = [
+  "/system/cryptexes",
+  "/system/volumes/preboot/cryptexes",
+  "/var/run/com.apple.security.cryptexd",
+  "/private/var/run/com.apple.security.cryptexd",
+];
+
+export const isBareMacosPath = (value: string | undefined): boolean =>
+  (value ?? "").split(":").every((entry) => {
+    const trimmed = entry.trim();
+    if (trimmed.length === 0) return true;
+    const normalized = NodePath.posix.normalize(trimmed).replace(/\/$/, "").toLowerCase();
+    return (
+      MACOS_SYSTEM_PATH_DIRECTORIES.has(normalized) ||
+      MACOS_CRYPTEX_PATH_ROOTS.some(
+        (root) => normalized === root || normalized.startsWith(`${root}/`),
+      )
+    );
+  });
+
 export function readPathFromLaunchctl(
   execFile: ExecFileSyncLike = NodeChildProcess.execFileSync,
 ): string | undefined {

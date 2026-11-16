@@ -10,9 +10,11 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import data_io
 
 LANES = ('minutes', 'marketplace', 'food', 'nownow')
 SAME_TIME = dt.timedelta(minutes=15)
@@ -60,13 +62,18 @@ def projection(row):
 
 def load_cache(path):
     try:
-        rows = json.loads(path.read_text())
+        rows = json.loads(data_io.read_text(path))
         return [projection(row) for row in rows if terminal(row)] if isinstance(rows, list) else []
     except (OSError, ValueError, TypeError, AttributeError, InvalidOperation):
         return []
 
 
-def read(app, deadline=None, since=None, cache_path=None):
+def read(app, deadline=None, since=None, cache_path=None, *, write_cache=True):
+    with data_io.scope(min(time.time() + 10, deadline) if deadline is not None else time.time() + 10):
+        return _read(app, deadline, since, cache_path, write_cache=write_cache)
+
+
+def _read(app, deadline, since, cache_path, *, write_cache=True):
     from state_json import write_json
     remaining = 10 if deadline is None else min(10, deadline - time.time() - 0.1)
     if remaining < 1:
@@ -78,32 +85,34 @@ def read(app, deadline=None, since=None, cache_path=None):
         'MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser() / 'order-details.json'
     lock_fd = None
     try:
-        if app == 'noon':
+        if app == 'noon' and write_cache:
             # The lock must precede the snapshot and span the subprocess: locking
             # only the write lets a stale reader restore an evicted receipt.
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            lock_fd = os.open(cache_path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+            data_io.materialize_io(lambda: cache_path.parent.mkdir(parents=True, exist_ok=True), cache_path.parent)
+            lock_fd = data_io.materialize_io(lambda: os.open(cache_path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR, 0o600), cache_path.with_suffix('.lock'), deadline)
             while True:
                 left = end - time.monotonic()
                 if left < 1:
                     raise OutOfTime('order lookup out of time')
                 try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    data_io.materialize_io(lambda: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB), cache_path.with_suffix('.lock'), deadline)
                     break
                 except BlockingIOError:
                     time.sleep(min(0.05, left))
         cache = load_cache(cache_path) if app == 'noon' else []
-        # Readers log by default. Their diagnostics are disposable: only our sanitized
-        # lane metrics leave this sandbox. They never write the live app state/logs.
-        with tempfile.TemporaryDirectory(prefix='money-orders-') as scratch:
-            env = {**os.environ, 'ROBOB_TOOL_LOG_DIR': scratch}
-            remaining = end - time.monotonic()
-            if remaining < 1:
-                raise OutOfTime('order lookup out of time')
-            result = subprocess.run([str(python), '-I', '-B', str(Path(__file__).resolve()), app, str(root),
-                                     str(time.time() + remaining - 0.5)],
-                                    input=json.dumps({'since': since.isoformat() if since else None, 'cache': cache}),
-                                    capture_output=True, text=True, timeout=remaining, env=env)
+        from marketplace import load
+        snapshot, snapshot_reason = load(cache_path.parent) if app == 'noon' else (None, None)
+        # Keep the caller's log destination: provider metadata must reach the same
+        # rollup as check.run. The shared logger allowlists every field.
+        env = dict(os.environ)
+        remaining = end - time.monotonic()
+        if remaining < 1:
+            raise OutOfTime('order lookup out of time')
+        result = subprocess.run([str(python), '-I', '-B', str(Path(__file__).resolve()), app, str(root),
+                                 str(time.time() + remaining - 0.5)],
+                                input=json.dumps({'since': since.isoformat() if since else None, 'cache': cache,
+                                                  'snapshot': snapshot, 'snapshot_reason': snapshot_reason}),
+                                capture_output=True, text=True, timeout=remaining, env=env)
         if result.returncode:
             raise ValueError('order lookup unavailable')
         result = json.loads(result.stdout)
@@ -112,7 +121,7 @@ def read(app, deadline=None, since=None, cache_path=None):
         if (not isinstance(result, dict) or not isinstance(result.get('orders'), list)
                 or type(result.get('complete')) is not bool):
             raise ValueError('invalid orders')
-        if app == 'noon':
+        if app == 'noon' and write_cache:
             merged = {(r['service'], r['order']): r for r in cache}
             invalidated = set()
             invalidations = result.get('invalidated', [])
@@ -133,7 +142,13 @@ def read(app, deadline=None, since=None, cache_path=None):
                 if terminal(row) and key not in invalidated:
                     merged[key] = {**row, 'cached_at': dt.datetime.now(dt.timezone.utc).isoformat()}
             try:
-                write_json(cache_path, sorted(merged.values(), key=lambda r: moment(r['placed_at']))[-1000:])
+                ordered = sorted(merged.values(), key=lambda r: moment(r['placed_at']))
+                retained = {(r['service'], r['order']) for r in ordered[-1000:]}
+                # Snapshot delivery proof needs its receipt even when newer
+                # receipts from the other lanes fill the normal cache allowance.
+                protected = {oid for oid, entry in snapshot['orders'].items() if entry['delivered']}
+                write_json(cache_path, [r for r in ordered if (r['service'], r['order']) in retained
+                                       or r['service'] == 'marketplace' and r['order'] in protected])
             except OSError:
                 if invalidated:
                     raise  # A failed eviction must not be reported as a completed lookup.
@@ -156,28 +171,35 @@ def lane_process(connection, service, root, deadline, since, cache):
         connection.close()
 
 
-def parallel_lanes(root, deadline, since, cache):
+def parallel_lanes(root, deadline, since, cache, snapshot=None, snapshot_reason=None):
     # The installed readers require main-thread signal deadlines. Fork before
     # importing them: each lane gets its own main thread and the same time slice.
     started = time.monotonic()
     context = multiprocessing.get_context('fork')
     end = min(deadline, time.time() + 8) if deadline is not None else time.time() + 8
     children, connections, results = [], [], []
+    services, failed = {}, set()
     try:
         for service in LANES:
+            if service == 'marketplace':
+                from marketplace import lane, empty
+                rows, proof = lane(snapshot or empty(), cache or [], snapshot_reason)
+                results.append({'orders': rows, 'lanes': {service: proof}})
+                continue
             receive, send = context.Pipe(duplex=False)
             process = context.Process(target=lane_process, args=(send, service, root, end - 0.2, since, cache), daemon=True)
             process.start()
             send.close()
             children.append(process)
             connections.append(receive)
+            services[receive] = service
         while connections and end > time.time():
             ready = wait(connections, timeout=max(0, end - time.time()))
             for connection in ready:
                 try:
                     results.append(connection.recv())
                 except EOFError:
-                    pass
+                    failed.add(services[connection])
                 connections.remove(connection)
                 connection.close()
     finally:
@@ -188,8 +210,11 @@ def parallel_lanes(root, deadline, since, cache):
                 process.terminate()
             process.join(timeout=0.05)
     lanes = {name: {'exhaustive': False, 'covered_from': None, 'limit': None,
+                    'stop_reason': 'slice_out', 'coverage_cleared_rows': 0,
                     'fetched': 0, 'cached': 0, 'pages': 0, 'ms': round((time.monotonic() - started) * 1000)}
              for name in LANES}
+    for name in failed:
+        lanes[name]['stop_reason'] = 'reader_error'
     rows, invalidated = [], []
     for result in results:
         rows.extend(result['orders'])
@@ -199,7 +224,7 @@ def parallel_lanes(root, deadline, since, cache):
             'invalidated': invalidated}
 
 
-def native(app, root, deadline=None, since=None, cache=None, services=None):
+def native(app, root, deadline=None, since=None, cache=None, services=None, snapshot=None, snapshot_reason=None):
     sys.path.insert(0, root)
     if app == 'careem':
         import careem_http_orders
@@ -210,27 +235,34 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                 return {'limit': BINDING_LIMIT}
             raise ValueError('order lookup unavailable') from None
     if services is None:
-        return parallel_lanes(root, deadline, since, cache)
+        return parallel_lanes(root, deadline, since, cache, snapshot, snapshot_reason)
     end = time.monotonic() + (8 if deadline is None else max(0, min(8, deadline - time.time())))
     import native_orders
     from noon_order_details import details
     since = moment(since) if since is not None else None
     known = {(r['service'], r['order']): r for r in (cache or [])}
     def read_lane(service):
+        if service == 'marketplace':
+            from marketplace import lane, empty
+            rows, proof = lane(snapshot or empty(), cache or [], snapshot_reason)
+            return rows, proof, []
         start = time.monotonic()
         lane_end = end
         rows = []
         lane = {'exhaustive': False, 'covered_from': None, 'limit': None,
-                'fetched': 0, 'cached': 0, 'pages': 0, 'ms': 0}
+                'fetched': 0, 'cached': 0, 'pages': 0, 'ms': 0,
+                'stop_reason': 'slice_out', 'coverage_cleared_rows': 0}
         previous, seen, page, broken, unordered = None, set(), 1, False, False
         cursor, page_ids, cursors = None, set(), set()
-        invalidated = set()
+        invalidated, cleared = set(), 0
+        gap_reason = None
         try:
             while lane_end - time.monotonic() > 0.05:
                 result = native_orders.orders('noon', service=service, page=page,
                                               timeout=lane_end - time.monotonic(),
                                               **({'cursor': cursor} if cursor is not None else {}))
                 if time.monotonic() >= lane_end or not result.get('ok') or result.get('partial'):
+                    lane['stop_reason'] = 'slice_out' if time.monotonic() >= lane_end else 'list_error'
                     break
                 lane['pages'] += 1
                 coverage = (result.get('coverage') or {}).get(service) or {}
@@ -263,6 +295,8 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                     oid = order['order']
                     if service == 'marketplace' and oid in shipment_cancellations:
                         broken = True
+                        gap_reason = gap_reason or 'scoped_cancellation'
+                        cleared += 1
                         lane['covered_from'] = None
                         rows[:] = [row for row in rows if row['order'] != oid]
                         continue
@@ -271,9 +305,12 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                             # A later scoped card can invalidate earlier terminal
                             # evidence. Do not retain its total as a positive match.
                             broken = True
+                            gap_reason = gap_reason or 'scoped_conflict'
+                            cleared += 1
                             rows[:] = [row for row in rows if row['order'] != oid]
                         continue
                     seen.add(oid)
+                    stage = 'unknown_time_row'
                     try:
                         list_time = (moment(order['placed_at'], service) if service == 'minutes' or
                                      (paging and coverage.get('ordered_by_placed_at') is True) else None)
@@ -285,6 +322,7 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                                 page_done = False
                                 if list_time is None:
                                     lane['covered_from'] = None
+                                    cleared += 1
                                 break
                             row = known.get((service, oid))
                             if row is not None and terminal(row) and (
@@ -294,15 +332,20 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                                 lane['cached'] += 1
                             else:
                                 lane['fetched'] += 1
+                                stage = 'detail_error'
                                 detail = details(oid, service, timeout=lane_end - time.monotonic())
                                 if time.monotonic() >= lane_end:
                                     page_done = False
                                     if list_time is None:
                                         lane['covered_from'] = None
+                                        cleared += 1
                                     break
                                 if (detail.get('ok') is not True or detail.get('account_verified') is not True
                                         or detail.get('order') != oid):
                                     raise ValueError('unverified detail')
+                                stage = 'unknown_time_row'
+                                moment(list_time.isoformat() if list_time else detail.get('placed_at'), service)
+                                stage = 'invalid_detail'
                                 row = projection({**detail, 'service': service,
                                                   'placed_at': list_time.isoformat() if list_time else detail.get('placed_at'),
                                                   'status': detail.get('status') if service == 'marketplace' else order.get('status'),
@@ -316,40 +359,51 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                             rows.append(row)
                         if service != 'marketplace' and previous is not None and placed > previous:
                             unordered = True
+                            cleared += 1
                         previous = placed
                         if service != 'marketplace' and not broken and not unordered and page_verified:
                             lane['covered_from'] = placed.isoformat()
                     except Exception:
                         # Preserve earlier proof and later positive evidence, never bridge a gap.
                         broken = True
+                        gap_reason = gap_reason or ('slice_out' if time.monotonic() >= lane_end else stage)
                         # Marketplace lists active shipments before history. An unread
                         # row without a known time can be newer than the verified prefix.
                         try:
                             gap_time = moment(order.get('placed_at'), service)
                             if previous is None or gap_time > previous:
                                 lane['covered_from'] = None
+                                cleared += 1
                         except (ValueError, TypeError):
                             lane['covered_from'] = None
+                            cleared += 1
                 if unordered:
                     lane['covered_from'] = None
                 if not page_done or broken or unordered or repeated_page:
+                    lane['stop_reason'] = ('slice_out' if not page_done else
+                        gap_reason if broken else 'unordered' if unordered else 'repeated_page')
                     break
                 if paging and service != 'marketplace':
                     pages = coverage.get('total_pages')
                     valid = type(pages) is int and pages >= page and coverage.get('page') == page
                     lane['exhaustive'] = valid and page == pages and (page == 1 or bool(seen - before))
                     if not valid or lane['exhaustive'] or (since and previous and previous < since - SAME_TIME):
+                        lane['stop_reason'] = ('invalid_paging' if not valid else
+                            'end_of_history' if lane['exhaustive'] else 'covered')
                         break
                     # An empty or repeated page cannot advance proof of history.
                     if not listed or not (seen - before):
+                        lane['stop_reason'] = 'repeated_page'
                         break
                     page += 1
                 elif paging:
                     if not page_verified:
+                        lane['stop_reason'] = 'invalid_paging'
                         break
                     lane['exhaustive'] = coverage.get('exhaustive') is True
                     nxt = coverage.get('next_cursor')
                     if lane['exhaustive'] or not isinstance(nxt, str) or not nxt or nxt in cursors:
+                        lane['stop_reason'] = 'end_of_history' if lane['exhaustive'] else 'invalid_paging'
                         break
                     cursors.add(nxt)
                     cursor = nxt
@@ -359,9 +413,11 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                     # Older installed readers still expose only the default page.
                     if not lane['exhaustive'] and (since is None or previous is None or previous >= since):
                         lane['limit'] = 'page-1 history only'
+                    lane['stop_reason'] = 'end_of_history' if lane['exhaustive'] else 'unproven_paging'
                     break
         except Exception:
-            pass
+            lane['stop_reason'] = 'slice_out' if time.monotonic() >= lane_end else 'list_error'
+        lane['coverage_cleared_rows'] = cleared
         lane['ms'] = round((time.monotonic() - start) * 1000)
         return rows, lane, [{'service': service, 'order': oid} for oid in sorted(invalidated)]
 
@@ -374,8 +430,28 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
 
 
 if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        payload = json.load(sys.stdin)
-        print(json.dumps(native(sys.argv[1], sys.argv[2], float(sys.argv[3]), **payload)))
+        if sys.argv[1] == 'refresh-marketplace':
+            import argparse
+            from marketplace import refresh
+            parser = argparse.ArgumentParser()
+            parser.add_argument('command')
+            parser.add_argument('--data', type=Path, required=True)
+            parser.add_argument('--root', type=Path, default=Path(os.environ.get('MONEY_CASES_APP_API', '~/.local/share/app-api-cli')).expanduser())
+            parser.add_argument('--budget', type=float, default=120)
+            args = parser.parse_args()
+            if not 0 < args.budget <= 180:
+                parser.error('budget must be between 0 and 180')
+            sys.path.insert(0, str(args.root))
+            import toollog
+            with toollog.caller_context('money-cases', command='refresh-marketplace', run_id=os.environ.get('WATCH_RUN')):
+                print(json.dumps(refresh(args.data, args.root, args.budget)))
+        else:
+            payload = json.load(sys.stdin)
+            sys.path.insert(0, sys.argv[2])
+            import toollog
+            with toollog.caller_context('money-cases', command='order-lookup', run_id=os.environ.get('WATCH_RUN')):
+                print(json.dumps(native(sys.argv[1], sys.argv[2], float(sys.argv[3]), **payload)))
     except Exception:
         sys.exit(1)

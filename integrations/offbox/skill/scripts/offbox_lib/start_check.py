@@ -107,7 +107,7 @@ def check(box: str, run: str, *, claim: bool = True, timeout: float = SSH_TIMEOU
     return Result('started', pid=wrapper_pid)
 
 
-def settle(con, row, result: Result, reason: str, *, until: float | None = None) -> None:
+def settle(con, row, result: Result, reason: str, *, until: float | None = None, foreign: bool = False) -> None:
     """End the row, retaining a separate reservation whenever execution is still possible."""
     rid, box = row['run_id'], row['box_id']
     code = result.code
@@ -115,7 +115,7 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
         from .runs import do_pulls
         pulls = json.loads(row['pulls'] or '[]')
         if pulls:
-            do_pulls(box, dict(row), pulls, until=until)
+            do_pulls(box, dict(row), pulls, until=until, foreign=foreign)
         from .runs import settled_steps_code
         code = settled_steps_code(row, code, locked=True, until=until)
     from .runs import claim_terminal_log, emit_terminal, save_run_state, state_warning, terminal_result
@@ -134,7 +134,10 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None)
                                  (('done' if code == 0 else 'failed'), None))
             elif result.verdict == 'fenced':
                 from .runs import BACKGROUND_RUN_ENV
-                pending = row['mode'] == 'bg' and os.environ.get(BACKGROUND_RUN_ENV) == rid
+                from . import home
+                pending = (row['mode'] == 'bg' and os.environ.get(BACKGROUND_RUN_ENV) == rid) or (
+                    row['mode'] == 'fg' and os.environ.get(home.RETURNED_HOME_ENV)
+                    and home.PRE_START.get() == rid and row['client_pid'] == os.getpid())
                 status, error = ('starting' if pending else 'lost'), f'{reason}; never started, nothing ran'
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{rid}', 'fenced'))
             else:

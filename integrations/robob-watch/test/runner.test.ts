@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CheckSlots, type SlotEvent, type SlotTiming } from "../src/host.ts";
 
 // Drives the real runner and CLI against a sandbox root with stub bridge CLIs; nothing is sent anywhere.
 const sandbox = mkdtempSync(join(tmpdir(), "robob-watch-test-"));
@@ -50,6 +51,159 @@ afterAll(() => {
   rmSync(sandbox, { recursive: true, force: true });
 });
 
+async function busyProbe(script: string) {
+  const root = mkdtempSync(join(sandbox, "dependency-busy-"));
+  const callLog = join(root, "calls.ndjson"), bridge = join(root, "bridge.ts");
+  const accepted = join(root, "accepted-wakes.json");
+  writeFileSync(accepted, "{}");
+  writeFileSync(bridge, `import {appendFileSync,readFileSync,writeFileSync} from "node:fs";
+    const args=process.argv.slice(2);
+    appendFileSync(${JSON.stringify(callLog)},JSON.stringify(args)+"\\n");
+    if(args[0]==="wake"){
+      const opt=name=>args.find(a=>a.startsWith("--"+name+"="))?.slice(name.length+3);
+      const key=opt("key"),spec=JSON.stringify({text:opt("text"),source:opt("source")});
+      const seen=JSON.parse(readFileSync(${JSON.stringify(accepted)},"utf8"));
+      if(seen[key]!==undefined&&seen[key]!==spec){console.error("HTTP 409: changed wake key content");process.exit(1);}
+      seen[key]=spec;writeFileSync(${JSON.stringify(accepted)},JSON.stringify(seen));
+    }
+    console.log(JSON.stringify({id:"fixture",created:true}));`);
+  const child = Bun.spawn([process.execPath, "-e", `
+    import {mkdirSync,readFileSync,writeFileSync} from "node:fs";
+    import {join} from "node:path";
+    const lib=await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
+    const {tickOne}=await import(${JSON.stringify(join(import.meta.dir, "../src/runner.ts"))});
+    let clock=Date.parse("2026-11-16T00:00:00Z"); Date.now=()=>clock;
+    const create=(id,check,extra={})=>{
+      const dir=lib.watcherDir(id); mkdirSync(dir,{recursive:true});
+      writeFileSync(join(dir,"watcher.json"),JSON.stringify(lib.normalize({id,title:id,mode:"wake",context:"Fixture",
+        interval_s:5,max_fires:0,check,...extra})));
+      lib.saveState(id,{status:"active",fires:0,consecutive_failures:0,failure_alerted:false});
+    };
+    const due=async(id,minute)=>{clock=Date.parse("2026-11-16T00:00:00Z")+minute*60_000;
+      const state=lib.loadState(id);state.next_at=0;lib.saveState(id,state);await tickOne(id);return lib.loadState(id);};
+    const change=(id,check)=>writeFileSync(join(lib.watcherDir(id),"watcher.json"),JSON.stringify({...lib.loadWatcher(id),check}));
+    ${script}
+  `], { env: { ...env, ROBOB_WATCH_ROOT: join(root, "root"), TOOLLOG_DIR: join(root, "logs"),
+    ROBOB_WATCH_SPECTRUM_CLI: bridge, ROBOB_WATCH_TELEGRAM_CLI: bridge }, stdout: "pipe", stderr: "pipe" });
+  const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect(error).toBe(""); expect(code).toBe(0);
+  const rows = readFileSync(join(root,"logs/2026-11-16.ndjson"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+  return { root, result: JSON.parse(output.trim().split("\n").at(-1)!), rows,
+    calls: existsSync(callLog) ? readFileSync(callLog,"utf8").trim().split("\n").map(line=>JSON.parse(line) as string[]) : [] };
+}
+
+test("declared dependency busy waits twenty minutes, keeps retrying past the pause threshold and recovers", async () => {
+  const {root,result,calls,rows} = await busyProbe(`
+    const id="archive-busy";
+    create(id,"echo 'busy: msgs: search gave up after 45s' >&2; exit 75");
+    const states=[];for(const minute of [0,1,2,3,4,19,20,21]) states.push(await due(id,minute));
+    change(id,"true"); const recovered=await due(id,22);
+    console.log(JSON.stringify({states,recovered}));
+  `);
+  for (const [index, state] of result.states.entries()) {
+    expect(state.last_error).toBe("busy: msgs: search gave up after 45s");
+    expect(state.consecutive_failures).toBe(index + 1);
+    expect(state.next_at - Date.parse(state.last_run_at)).toBeLessThanOrEqual(120_000);
+    expect(state.failure_alerted).toBe(index >= 6);
+    expect(!!state.failure_escalated).toBe(index >= 6);
+    expect(state.failure_paused_at).toBeUndefined();
+  }
+  expect(result.recovered).toMatchObject({status:"active",consecutive_failures:0});
+  expect(result.recovered.dependency_busy).toBeUndefined();
+  expect(result.recovered.last_error).toBeUndefined();
+  expect(result.recovered.failure_escalated).toBeUndefined();
+  expect(result.recovered.failure_episode).toBeUndefined();
+  const log = readFileSync(join(root, "root/watchers/archive-busy/log"), "utf8");
+  expect(log).toContain("check busy (1) msgs: search gave up after 45s");
+  expect(log).toContain("failure notice held (6/2)");
+  expect(log).toContain("check recovered after 8 failures");
+  const notices=calls.filter(args=>args[0]==="notify");
+  expect(notices).toHaveLength(2);
+  expect(notices[0]!.join(" ")).toContain("Dependency msgs has been busy for 20 min");
+  expect(notices[0]!.join(" ")).toContain("keeps retrying; nothing is lost");
+  const wakes=calls.filter(args=>args[0]==="wake");
+  expect(wakes).toHaveLength(1);
+  expect(wakes[0]!.join(" ")).toContain("Don't edit the watcher");
+  expect(wakes[0]!.join(" ")).toContain("daemon.log");
+  expect(rows.filter(row=>row.name==="watch.run"&&row.props.outcome==="busy")).toHaveLength(8);
+  expect(rows.find(row=>row.name==="watch.run").error.tag).toBe("watch.dependency_busy");
+}, 15_000);
+
+test("busy state clears for real failures and restarts its fuse for a different dependency or resume", async () => {
+  const {root,result} = await busyProbe(`
+    const id="mixed-busy";
+    create(id,"echo 'busy: msgs: search stalled' >&2; exit 75",{max_consecutive_failures:0});
+    await due(id,0); const alerted=await due(id,20);
+    change(id,"echo 'busy: archive: read stalled' >&2; exit 75");const changed=await due(id,21);
+    change(id,"echo 'busy: archive: real error' >&2; exit 1");const failed=await due(id,22);
+    change(id,"echo 'busy: msgs: search stalled' >&2; exit 75");const busyAgain=await due(id,23);
+    console.log(JSON.stringify({alerted,changed,failed,busyAgain}));
+  `);
+  expect(result.alerted.failure_escalated).toBe(true);
+  expect(result.changed.dependency_busy).toEqual({dependency:"archive",since:"2026-11-16T00:21:00.000Z"});
+  expect(result.changed.failure_escalated).toBeUndefined();
+  expect(result.changed.failure_alerted).toBe(false);
+  expect(result.failed.dependency_busy).toBeUndefined();
+  expect(result.failed.last_error).toBe("exit 1: busy: archive: real error");
+  expect(result.failed.failure_escalated).toBe(true);
+  expect(result.busyAgain.dependency_busy.since).toBe("2026-11-16T00:23:00.000Z");
+  expect(result.busyAgain.failure_escalated).toBeUndefined();
+  const resume=Bun.spawnSync([process.execPath,join(import.meta.dir,"../src/cli.ts"),"resume","mixed-busy"],
+    {env:{...env,ROBOB_WATCH_ROOT:join(root,"root"),TOOLLOG_DIR:join(root,"logs")}});
+  expect(resume.exitCode).toBe(0);
+  const resumed=JSON.parse(readFileSync(join(root,"root/watchers/mixed-busy/state.json"),"utf8"));
+  expect(resumed.dependency_busy).toBeUndefined();expect(resumed.consecutive_failures).toBe(0);
+  expect(resumed.failure_episode).toBeUndefined();
+}, 15_000);
+
+test.each([
+  { name: "real busy real", steps: [[0,"real-a"],[15,"real-a"],[16,"msgs"],[36,"msgs"],[37,"real-b"]], wakes: 3 },
+  { name: "busy real busy", steps: [[0,"msgs"],[20,"msgs"],[21,"real-a"],[22,"msgs"],[42,"msgs"]], wakes: 3 },
+  { name: "busy dependency changes and returns", steps: [[0,"msgs"],[20,"msgs"],[21,"archive"],[41,"archive"],[42,"msgs"],[62,"msgs"]], wakes: 3 },
+  { name: "continuous busy", steps: [[0,"msgs"],[20,"msgs"],[21,"msgs"]], wakes: 1 },
+  { name: "continuous real failure", steps: [[0,"real-a"],[15,"real-a"],[16,"real-b"]], wakes: 1 },
+  { name: "real busy pause", steps: [[0,"real-a"],[15,"real-a"],[16,"msgs"],[36,"msgs"],[37,"pause"]], wakes: 3 },
+  { name: "real busy timeout", steps: [[0,"real-a"],[15,"real-a"],[16,"msgs"],[36,"msgs"],[37,"timeout"]], wakes: 3 },
+])("failure episode bridge identity: $name", async ({steps,wakes}) => {
+  const {result,calls}=await busyProbe(`
+    const id="failure-cycle"; create(id,"true",{max_consecutive_failures:0});
+    const states=[];
+    for(const [minute,kind] of ${JSON.stringify(steps)}){
+      change(id,kind==="timeout" ? "sleep 10" : kind.startsWith("real")||kind==="pause" ? "echo '"+kind+"' >&2; exit 1"
+        : "echo 'busy: "+kind+": fixture timeout' >&2; exit 75");
+      if(kind==="pause")writeFileSync(join(lib.watcherDir(id),"watcher.json"),JSON.stringify({...lib.loadWatcher(id),max_consecutive_failures:5}));
+      if(kind==="timeout")writeFileSync(join(lib.watcherDir(id),"watcher.json"),JSON.stringify({...lib.loadWatcher(id),timeout_s:1}));
+      states.push(await due(id,minute));
+    }
+    console.log(JSON.stringify(states));
+  `);
+  const attempts=calls.filter(args=>args[0]==="wake");
+  expect(attempts).toHaveLength(wakes);
+  expect(new Set(attempts.map(args=>args.find(arg=>arg.startsWith("--key=")))).size).toBe(wakes);
+  expect(calls.filter(args=>args[0]==="send")).toHaveLength(0);
+  expect(result.at(-1).failure_escalated).toBe(true);
+  expect(result.at(-1).consecutive_failures).toBe(steps.length);
+  expect(result.at(-1).failing_since).toBe("2026-11-16T00:00:00.000Z");
+},15_000);
+
+test("undeclared busy exits remain real failures and timeout labels use the effective watcher limit", async () => {
+  const {result,rows}=await busyProbe(`
+    const states=[];
+    for(const [id,check] of [
+      ["bare-75","echo 'archive stalled' >&2; exit 75"],
+      ["ordinary-1","echo 'busy: msgs: search stalled' >&2; exit 1"],
+      ["later-error","printf 'busy: msgs: search stalled\\nreal error\\n' >&2; exit 75"],
+      ["actual-timeout","sleep 10"]
+    ]) {create(id,check,{timeout_s:1});states.push(await due(id,0));}
+    console.log(JSON.stringify(states));
+  `);
+  expect(result.map((s:{last_error:string})=>s.last_error)).toEqual([
+    "exit 75: archive stalled","exit 1: busy: msgs: search stalled",
+    "exit 75: busy: msgs: search stalled\nreal error","timed out after 1s"]);
+  expect(result.every((s:{dependency_busy?:unknown})=>!s.dependency_busy)).toBe(true);
+  expect(rows.filter(row=>row.name==="watch.run").map(row=>row.props.outcome)).toEqual(["fail","fail","fail","timeout"]);
+}, 10_000);
+
 test("a wake watcher fires once with its context, falling back to send when wake is unavailable, then disables", async () => {
   const flag = join(sandbox, "event");
   const add = cli("add", "--id", "demo", "--title", "Demo event", "--check", `[[ -f ${flag} ]] && cat ${flag}; true`,
@@ -78,7 +232,7 @@ test("a wake watcher fires once with its context, falling back to send when wake
   const inboundId = "wake:" + new Bun.CryptoHasher("sha256").update(sentKey).digest("hex");
   const correlationKey = new Bun.CryptoHasher("sha256").update(inboundId).digest("hex").slice(0, 24);
   expect(events("wake.sent", "demo")[0].ids.key).toBe(correlationKey);
-  expect(events("watch.fire", "demo")).toEqual([expect.objectContaining({ kind: "event", ok: true, ids: { watcher: "demo", key: correlationKey }, props: { count: 1 } })]);
+  expect(events("watch.fire", "demo")).toEqual([expect.objectContaining({ kind: "event", ok: true, ids: { watcher: "demo", key: correlationKey }, props: expect.objectContaining({ count: 1, events: 1, batched: false, urgent: false, route: "owner", closing: false }) })]);
   expect(rollupFor("demo")).toMatchObject({ runs: 1, fires: 1, outcomes: { fire: 1 } });
   expect(events("watch.fire_cap", "demo")).toHaveLength(1);
   expect(events("watch.disabled", "demo")).toHaveLength(1);
@@ -421,7 +575,149 @@ test("checks run with bounded concurrency; queue time does not count against the
     expect(state(`conc${i}`).consecutive_failures).toBe(0);
     expect(state(`conc${i}`).last_run_ms).toBeGreaterThanOrEqual(900);
   }
+  const rows = readFileSync(join(env.TOOLLOG_DIR, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  const admitted = rows.filter(row => row.name === "slot.start" && /^conc[1-4]$/.test(row.ids?.watcher));
+  expect(admitted).toHaveLength(4);
+  expect(admitted.filter(row => row.props.slotWaitMs >= 900)).toHaveLength(2);
+  expect(admitted.map(row => row.props.slotQueueDepth).sort()).toEqual([0, 0, 0, 1]);
+  expect(admitted.map(row => row.props.slotActiveAtEnqueue).sort()).toEqual([0, 1, 2, 2]);
 }, 20_000);
+
+test("slot telemetry measures four sleeping checks, names holders after 30s, and summarizes only a live backlog each minute", async () => {
+  let clock = 0;
+  const events: SlotEvent[] = [], timings: SlotTiming[] = [], release: (() => void)[] = [];
+  const slots = new CheckSlots(() => 2, { now: () => clock, emit: event => events.push(event) });
+  const jobs = ["one", "two", "three", "four"].map((watcher, i) => slots.run(async timing => {
+    timings[i] = timing;
+    await new Promise<void>(resolve => { release[i] = resolve; });
+  }, { watcher, dueAt: 0, intervalMs: 60_000 }));
+  await Promise.resolve();
+  for (clock of [29_999, 30_000, 59_999, 60_000, 119_999, 120_000]) slots.drain();
+  const waits = events.filter(event => event.name === "slot.wait");
+  expect(waits).toEqual(["three", "four"].map(watcher => ({ name: "slot.wait", request: { watcher, dueAt: 0, intervalMs: 60_000 }, waitMs: 30_000,
+    holders: [{ watcher: "one", elapsedMs: 30_000 }, { watcher: "two", elapsedMs: 30_000 }] })));
+  expect(events.filter(event => event.name === "slot.backlog")).toEqual([60_000, 120_000].map(elapsedMs => ({ name: "slot.backlog", depth: 2, oldestWaitMs: elapsedMs, active: 2, cap: 2,
+    holders: [{ watcher: "one", elapsedMs }, { watcher: "two", elapsedMs }] })));
+  clock = 130_000;
+  release[0]!(); release[1]!();
+  await Promise.all(jobs.slice(0, 2));
+  expect(timings).toEqual([
+    { slotWaitMs: 0, slotQueueDepth: 0, slotActiveAtEnqueue: 0, startLateMs: 0 },
+    { slotWaitMs: 0, slotQueueDepth: 0, slotActiveAtEnqueue: 1, startLateMs: 0 },
+    { slotWaitMs: 130_000, slotQueueDepth: 0, slotActiveAtEnqueue: 2, startLateMs: 130_000 },
+    { slotWaitMs: 130_000, slotQueueDepth: 1, slotActiveAtEnqueue: 2, startLateMs: 130_000 },
+  ]);
+  clock = 131_000;
+  release[2]!(); release[3]!(); await Promise.all(jobs);
+  const before = events.length;
+  clock = 300_000; slots.drain(); slots.drain();
+  expect(events).toHaveLength(before);
+  expect(events.filter(event => event.name === "slot.hold").reduce((sum, event) => sum + event.durationMs, 0)).toBe(262_000);
+  expect(events.filter(event => event.name === "slot.busy").reduce((sum, event) => sum + event.durationMs, 0)).toBe(131_000);
+});
+
+test("runner logs holder snapshots and one backlog summary, then adds slot wait and depth to slow runs", async () => {
+  const root = mkdtempSync(join(sandbox, "slots-"));
+  const child = Bun.spawn([process.execPath, "-e", `
+    import {mkdirSync,writeFileSync} from "node:fs";
+    import {join} from "node:path";
+    let clock=Date.now(); Date.now=()=>clock;
+    const {CheckSlots}=await import(${JSON.stringify(join(import.meta.dir, "../src/host.ts"))});
+    const run=CheckSlots.prototype.run; let limiter, count=0, queued;
+    const ready=new Promise(resolve=>queued=resolve);
+    CheckSlots.prototype.run=function(fn,request){limiter=this;const job=run.call(this,fn,request);if(++count===4)queued();return job};
+    const lib=await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
+    const ids=["one","two","three","four"];
+    for(const id of ids){
+      const dir=lib.watcherDir(id);mkdirSync(dir,{recursive:true});
+      writeFileSync(join(dir,"watcher.json"),JSON.stringify(lib.normalize({id,title:id,check:"sleep 0.2",mode:"notify",interval_s:600,max_fires:0})));
+      lib.saveState(id,{status:"active",fires:0,consecutive_failures:0});
+    }
+    const {tickOne}=await import(${JSON.stringify(join(import.meta.dir, "../src/runner.ts"))});
+    const jobs=ids.map(tickOne);await ready;
+    clock+=30_000;limiter.drain();clock+=30_000;limiter.drain();limiter.drain();
+    await Promise.all(jobs);clock+=60_000;limiter.drain();
+  `], { env: { ...env, ROBOB_WATCH_ROOT: join(root, "root"), TOOLLOG_DIR: join(root, "logs"), ROBOB_WATCH_MAX_CONCURRENT: "2" }, stdout: "pipe", stderr: "pipe" });
+  const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect(error).toBe(""); expect(code).toBe(0);
+  expect(output.match(/slot backlog:/g)).toHaveLength(1);
+  expect(output).toContain("slot backlog: depth 2, oldest 60.0s, active 2/2, holders [one:60.0s,two:60.0s]");
+  for (const id of ["three", "four"]) {
+    const log = readFileSync(join(root, "root/watchers", id, "log"), "utf8");
+    expect(log).toContain("slot wait passed 30s: slot_wait 30.0s, holders [one:30.0s,two:30.0s]");
+    expect(log).toContain(`slot_wait 60.0s, depth ${id === "three" ? 0 : 1}, active 2`);
+  }
+}, 10_000);
+
+test.each([
+  ["unchanged", "original"],
+  ["paused", undefined],
+  ["removed", undefined],
+  ["replaced instance", undefined],
+  ["pending disabled", undefined],
+  ["pending replaced", "replacement"],
+  ["closing", undefined],
+  ["reply handoff", undefined],
+] as const)("pending slot starts reflect admission after the relay lock: %s", async (change, ran) => {
+  const root = mkdtempSync(join(sandbox, "pending-slots-"));
+  const child = Bun.spawn([process.execPath, "-e", `
+    import {mkdirSync,readFileSync,writeFileSync,renameSync,existsSync} from "node:fs";
+    import {join} from "node:path";
+    import {Database} from "bun:sqlite";
+    let clock=Date.now(); Date.now=()=>clock;
+    const lib=await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
+    const dir=lib.watcherDir("pending-admission"), marker=join(dir,"pending-ran");
+    mkdirSync(dir,{recursive:true});
+    const file=join(dir,"watcher.json");
+    writeFileSync(file,JSON.stringify(lib.normalize({id:"pending-admission",title:"Pending",check:"true",
+      pending_check:"printf original > "+JSON.stringify(marker),mode:"notify",interval_s:60,max_fires:0})));
+    lib.saveState("pending-admission",{status:"active",fires:0,consecutive_failures:0});
+    let armed=false, intercepted=false;
+    const {CheckSlots}=await import(${JSON.stringify(join(import.meta.dir, "../src/host.ts"))});
+    const run=CheckSlots.prototype.run;
+    CheckSlots.prototype.run=function(fn,request){return run.call(this,async timing=>{
+      if(request.operation==="pending") armed=true;
+      return fn(timing);
+    },request)};
+    const exec=Database.prototype.exec;
+    Database.prototype.exec=function(sql){
+      if(armed && sql==="BEGIN IMMEDIATE"){
+        armed=false;intercepted=true;clock+=90_000;
+        const watcher=lib.loadWatcher("pending-admission"), state=lib.loadState("pending-admission");
+        switch(${JSON.stringify(change)}){
+          case "paused":watcher.paused=true;break;
+          case "removed":renameSync(dir,dir+"-removed");break;
+          case "replaced instance":renameSync(dir,dir+"-old");mkdirSync(dir);break;
+          case "pending disabled":delete watcher.pending_check;break;
+          case "pending replaced":watcher.pending_check="printf replacement > "+JSON.stringify(marker);break;
+          case "closing":state.status="closing";break;
+          case "reply handoff":state.reply_handoff={run:"old",watcher};break;
+        }
+        if(${JSON.stringify(change)}!=="removed"){
+          writeFileSync(file,JSON.stringify(watcher));lib.saveState("pending-admission",state);
+        }
+      }
+      return exec.call(this,sql);
+    };
+    const {tickOne}=await import(${JSON.stringify(join(import.meta.dir, "../src/runner.ts"))});
+    await tickOne("pending-admission");
+    const {rollup}=await import(${JSON.stringify(join(import.meta.dir, "../src/toollog.ts"))});
+    const day=new Date().toISOString().slice(0,10);
+    const rows=readFileSync(join(process.env.TOOLLOG_DIR,day+".ndjson"),"utf8").trim().split("\\n").map(JSON.parse);
+    console.log(JSON.stringify({intercepted,ran:existsSync(marker)?readFileSync(marker,"utf8"):null,
+      starts:rows.filter(row=>row.name==="slot.start" && row.props.operation==="pending"),
+      watcher:(await rollup(day,process.env.TOOLLOG_DIR)).byWatcher["pending-admission"]}));
+  `], { env: { ...env, ROBOB_WATCH_ROOT: join(root, "root"), TOOLLOG_DIR: join(root, "logs") }, stdout: "pipe", stderr: "pipe" });
+  const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect(error).toBe(""); expect(code).toBe(0);
+  const result = JSON.parse(output.trim().split("\n").at(-1)!);
+  expect(result.intercepted).toBe(true);
+  expect(result.ran).toBe(ran ?? null);
+  expect(result.starts).toHaveLength(ran ? 1 : 0);
+  if (ran) expect(result.starts[0].props).toMatchObject({ slotWaitMs: 0, startLateMs: 90_000, intervalMs: 60_000 });
+  expect(result.watcher.slotWaitMs.count).toBe(ran ? 2 : 1);
+  expect(result.watcher.lateRuns).toBe(ran ? 1 : 0);
+}, 10_000);
 
 test("relays: one stop reaches every watcher of the trip, and ETA updates to a person are throttled", () => {
   const pam = { to: "120363@g.us", name: "Pam group", quote: "Keep Pam's group posted", at: "2026-10-19T04:00:00Z" };
@@ -594,3 +890,24 @@ test("relays: each watcher's ETA moves on its own, while one person still gets a
   expect(cli("remove", "fa").exitCode).toBe(0);
   expect(ok("fc", "2026-10-24T19:50:00Z")).toBe(3);
 });
+
+
+test("health run triggers distinguish CLI checks, scheduled ticks and retries", async () => {
+  const targets = ["fixture-schedule", "fixture-retry"];
+  for (const id of targets) {
+    const file = join(sandbox, id + ".triggers");
+    const check = 'printf "%s\\n" "${HEALTH_TOOLLOG_TRIGGER:-manual}" >> ' + JSON.stringify(file);
+    expect(cli("add", "--id", id, "--title", "Fixture", "--check", check,
+      "--interval", "3600", "--mode", "notify", "--context", "Fixture", "--max-fires", "0", "--no-prime").exitCode).toBe(0);
+    if (id.endsWith("retry")) {
+      const current = state(id);
+      current.consecutive_failures = 1;
+      writeFileSync(join(sandbox, "root/watchers", id, "state.json"), JSON.stringify(current));
+    }
+  }
+  expect(cli("test", "fixture-schedule").exitCode).toBe(0);
+  await runnerFor(2_500);
+  expect(readFileSync(join(sandbox, "fixture-schedule.triggers"), "utf8").trim().split("\n"))
+    .toEqual(["manual", "schedule"]);
+  expect(readFileSync(join(sandbox, "fixture-retry.triggers"), "utf8").trim()).toBe("retry");
+}, 20_000);

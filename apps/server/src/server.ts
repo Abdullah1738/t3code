@@ -22,7 +22,7 @@ import * as DelegatedTaskQuestionReactor from "./orchestration-v2/DelegatedTaskQ
 import * as NodeHttp from "node:http";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
-import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as ServerProcessRuntime from "./serverProcessRuntime.ts";
 import { EnvironmentHttpApi, type RepositoryIdentity } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
@@ -46,6 +46,7 @@ import {
 import { fixPath } from "./os-jank.ts";
 import * as Ws from "./ws.ts";
 import * as AgentScopeLive from "./process/agentScope.ts";
+import * as ProviderProcessRegistry from "./ardud/providers/ProviderProcessRegistry.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as NodePtyAdapter from "./terminal/NodePtyAdapter.ts";
 import * as PullRequestHttp from "./pullRequest/http.ts";
@@ -211,6 +212,7 @@ import { openCodeImportRouteLayer } from "./ardud/opencode-import/http.ts";
 import { ArdudKanbanLive } from "./ardud/kanban/layer.ts";
 import { layer as KanbanWaitPrsLayer } from "./ardud/kanban/engine/waitPrs.ts";
 import * as ReadonlyReplica from "./ardud/persistence/ReadonlyReplica.ts";
+import * as BackupSnapshot from "./ardud/persistence/BackupSnapshot.ts";
 import { kanbanRouteLayer } from "./ardud/kanban/http.ts";
 import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
@@ -357,8 +359,6 @@ const layerHttpServer = Layer.unwrap(
     );
   }),
 ).pipe(StartupPhaseLog.withStartupLayer("http.listen"));
-
-const layerPlatformServices = NodeServices.layer;
 
 const layerPersistence = BoardsDatabase.layerConfig.pipe(
   Layer.provideMerge(layerSqlitePersistence),
@@ -576,7 +576,7 @@ const layerThreadSettlementWorker = Layer.effectDiscard(
 
 const layerThreadPullRequestWorker = Layer.effectDiscard(
   ThreadPullRequestService.make.pipe(Effect.flatMap((service) => service.start())),
-).pipe(Layer.provide(layerPullRequestService));
+).pipe(Layer.provide(layerPullRequestService), Layer.provide(ProjectionStoreV2.layer));
 
 const layerProviderInstallationRefresh = Layer.effectDiscard(
   Effect.gen(function* () {
@@ -668,6 +668,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
     StartupPhaseLog.withStartupLayer("server.kanban"),
   ),
   ReadonlyReplica.layer.pipe(StartupPhaseLog.withStartupLayer("server.readonly-replica")),
+  BackupSnapshot.layer.pipe(StartupPhaseLog.withStartupLayer("server.backup-snapshot")),
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep).pipe(
     StartupPhaseLog.withStartupLayer("server.project-settings-sweep"),
   ),
@@ -850,7 +851,10 @@ const layerMakeServer = Layer.unwrap(
     const routesReady = yield* Deferred.make<void>();
     const layerLauncher = ServiceLauncherClient.layer;
 
-    yield* fixPath({ shellEnvironmentPrepared: config.shellEnvironmentPrepared });
+    yield* fixPath({
+      shellEnvironmentPrepared: config.shellEnvironmentPrepared,
+      shellPathHydration: config.shellPathHydration,
+    });
 
     const layerHttpListening = Layer.effectDiscard(
       Effect.gen(function* () {
@@ -1164,35 +1168,38 @@ const layerMakeServer = Layer.unwrap(
       HeapSnapshot.layer,
     );
 
-    return layerServerApplication.pipe(
-      Layer.provide(CloudLink.layer),
-      Layer.provideMerge(layerRuntimeServices),
-      Layer.provideMerge(
-        McpSessionRegistry.layer.pipe(
-          Layer.provide(CredentialStore.layer),
-          Layer.provide(layerPersistence),
-          Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(layerSecrets))),
+    return layerServerApplication
+      .pipe(
+        Layer.provide(CloudLink.layer),
+        Layer.provideMerge(layerRuntimeServices),
+        Layer.provideMerge(
+          McpSessionRegistry.layer.pipe(
+            Layer.provide(CredentialStore.layer),
+            Layer.provide(layerPersistence),
+            Layer.provide(ServerEnvironment.layer.pipe(Layer.provide(layerSecrets))),
+          ),
         ),
-      ),
-      Layer.provide(layerActivation),
-      Layer.provideMerge(RelayTracing.layerServerRelayBroker),
-      Layer.provideMerge(layerHttpServer),
-      Layer.provide(layerServerAnalyticsErrors),
-      Layer.provide(layerApplicationObservability),
-      Layer.provide(AnalyticsDatabase.layer),
-      Layer.provide(McpCallLedger.layer),
-      Layer.provide(McpAvailability.layer),
-      Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
-      Layer.provide(LargeReplyLog.layer),
-      Layer.provide(ReplyBuilders.layer),
-      Layer.provideMerge(FetchHttpClient.layer),
-      Layer.provide(VcsProcess.layer),
-      Layer.provideMerge(AgentScopeLive.layer),
-      Layer.provideMerge(layerPlatformServices),
-      StartupPhaseLog.withStartupLayer("boot"),
-      Layer.provide(StartupPhaseLog.layer(config.logsDir)),
-    );
+        Layer.provide(layerActivation),
+        Layer.provideMerge(RelayTracing.layerServerRelayBroker),
+        Layer.provideMerge(layerHttpServer),
+        Layer.provide(layerServerAnalyticsErrors),
+        Layer.provide(layerApplicationObservability),
+        Layer.provide(AnalyticsDatabase.layer),
+        Layer.provide(McpCallLedger.layer),
+        Layer.provide(McpAvailability.layer),
+        Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
+        Layer.provide(LargeReplyLog.layer),
+        Layer.provide(ReplyBuilders.layer),
+        Layer.provideMerge(FetchHttpClient.layer),
+        Layer.provide(VcsProcess.layer),
+        Layer.provideMerge(AgentScopeLive.layer),
+        Layer.provideMerge(ProviderProcessRegistry.layer),
+      )
+      .pipe(
+        StartupPhaseLog.withStartupLayer("boot"),
+        Layer.provide(StartupPhaseLog.layer(config.logsDir)),
+      );
   }),
-).pipe(Layer.provide(ProcessRunner.layer));
+).pipe(ServerProcessRuntime.provide);
 
 export const runServer = Layer.launch(layerMakeServer);

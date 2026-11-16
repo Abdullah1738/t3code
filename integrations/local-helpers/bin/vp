@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+. "$here/../libexec/repo-node-pin/shared-deps.sh"
+repo_shared_deps_check vp "$@" || exit 1
+
 if [ "${REPO_VP_SHIM_ACTIVE:-}" = 1 ]; then
   echo 'vp: recursive shim; run offbox run -- vp instead' >&2
   exit 127
@@ -23,10 +27,20 @@ done
 if [ -n "$root" ] && [ ! -e "$root/node_modules" ]; then
   common=$(git rev-parse --path-format=absolute --git-common-dir)
   main=${common%/.git}
+  toolchain=$(git config --get vp.toolchain || true)
+  here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+  have_candidates=0
   if [ "$main" != "$root" ] && [ -x "$main/node_modules/.bin/vp" ]; then
-    here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-    exec node "$here/../libexec/vp/worktree.mjs" "$root" "$main" "$@"
+    set -- "--candidate=main checkout" "$main" -- "$@"
+    have_candidates=1
   fi
+  if [ -n "$toolchain" ] && [ -d "$toolchain" ] && [ -x "$toolchain/node_modules/.bin/vp" ] && ! [ "$toolchain" -ef "$root" ]; then
+    [ "$have_candidates" = 1 ] || set -- -- "$@"
+    set -- "--candidate=toolchain copy" "$toolchain" "$@"
+  fi
+  case "${1:-}" in
+    --candidate=*) exec node "$here/../libexec/vp/worktree.mjs" "$root" "$@" ;;
+  esac
 fi
 echo "vp: no checkout-local node_modules/.bin/vp; run offbox run -- vp $*" >&2
 exit 127

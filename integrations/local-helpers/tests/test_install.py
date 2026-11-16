@@ -66,6 +66,7 @@ exit 0
         os.chmod(self.lctl, 0o755)
         self.fake_bin = os.path.join(self.home, "fake-bin")
         os.makedirs(self.fake_bin)
+        os.symlink(shutil.which("node"), os.path.join(self.fake_bin, "node"))
         # Keep the macOS installer unchanged while exercising its checks on Linux.
         if sys.platform != "darwin" or shutil.which("plutil", path="/usr/bin:/bin:/usr/sbin") is None:
             self.fake_tool("plutil", '''import plistlib, sys
@@ -167,6 +168,11 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         for rel in (".local/libexec/mail/mail_oauth.py", ".local/libexec/mail/kc-read",
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
                     ".local/bin/toollog", ".local/libexec/toollog/toollog.py",
+                    ".local/bin/vp", ".local/libexec/vp/worktree.mjs",
+                    ".local/libexec/vp/config-snapshot.mjs",
+                    ".local/libexec/vp/toolchain-state.mjs", ".local/libexec/vp/toolchain",
+                    ".local/libexec/repo-node-pin/shared-deps.sh",
+                    ".local/libexec/repo-node-pin/pnpm-bin/pnpm",
                     ".local/bin/qcard", ".local/bin/quint", ".local/bin/himalaya-heal", ".local/bin/mailsearch",
                     "Library/LaunchAgents/local.ardud.otp-idle.plist",
                     "Library/LaunchAgents/com.ardud.9router-log-poll.plist",
@@ -178,6 +184,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
         self.assertTrue(os.access(self.live(".local/bin/quint"), os.X_OK))
+        self.assertTrue(os.access(self.live(".local/libexec/vp/toolchain"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
         self.assertEqual(len(loads), 14, self.calls_log())
         self.assertTrue(os.access(self.live(".local/bin/mirage-beacon-keepalive"), os.X_OK))
@@ -533,6 +540,21 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         self.assertIn("someone else's file", err)
         with open(uber) as fh:
             self.assertEqual(fh.read(), "#!/bin/sh\necho mine\n")
+
+    def test_pnpm_guard_payload_is_copied_and_checked_for_drift(self):
+        self.ready()
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.run_install("--check")[0], 0)
+        for name in ("shared-deps.sh", "pnpm-bin/pnpm"):
+            with self.subTest(name=name):
+                target = self.live(".local/libexec/repo-node-pin/" + name)
+                with open(target, "a") as fh:
+                    fh.write("\n# drift\n")
+                rc, _, err = self.run_install("--check")
+                self.assertEqual(rc, 1)
+                self.assertIn(target + " differs", err)
+                self.assertEqual(self.run_install()[0], 0)
 
     def test_quint_guard_link_is_idempotent_and_check_reports_drift(self):
         self.ready()

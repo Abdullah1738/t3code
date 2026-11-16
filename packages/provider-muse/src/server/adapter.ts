@@ -92,6 +92,8 @@ import {
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import { museItemStatus, museToolPresentation } from "./itemPresentation.ts";
 
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+
 const MUSE_PROVIDER = ProviderDriverKind.make("muse");
 const isOpenSessionError = Schema.is(ProviderAdapter.ProviderAdapterOpenSessionError);
 const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
@@ -2251,12 +2253,14 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         interruptTurn: Effect.fn("MuseAdapter.interruptTurn")(
           function* (args) {
             const turn = active;
-            if (
-              !turn ||
-              turn.providerTurn.id !== args.providerTurnId ||
-              !validateThread(args.providerThread)
-            )
+            if (!validateThread(args.providerThread))
               return yield* protocolError("This Muse turn is no longer active");
+            if (!turn || turn.providerTurn.id !== args.providerTurnId)
+              return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+                driver: MUSE_PROVIDER,
+                providerThreadId: args.providerThread.id,
+                providerTurnId: args.providerTurnId,
+              });
             if (args.stopBackgroundWork === false && turn.compact)
               return yield* protocolError(
                 "Muse cannot confirm cancellation of this compaction without stopping inherited work.",
@@ -2304,14 +2308,15 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           (effect, args) =>
             effect.pipe(
               commands.withPermits(1),
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterInterruptError({
-                    driver: MUSE_PROVIDER,
-                    providerThreadId: args.providerThread.id,
-                    providerTurnId: args.providerTurnId,
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                isTurnNotActiveError(cause)
+                  ? cause
+                  : new ProviderAdapter.ProviderAdapterInterruptError({
+                      driver: MUSE_PROVIDER,
+                      providerThreadId: args.providerThread.id,
+                      providerTurnId: args.providerTurnId,
+                      cause,
+                    }),
               ),
             ),
         ),

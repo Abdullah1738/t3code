@@ -1,7 +1,7 @@
 #!/bin/bash
 # static-check.sh: every check of the installer stick that needs no VM (verification layer A).
 #
-#   static-check.sh [--tree DIR]
+#   static-check.sh [--tree DIR] [--update-policy-only]
 #
 #   --tree DIR   build-tree.sh output (default ~/ohv/tree-out). Its ISO files carry the installer's own
 #                subiquity + curtin + Python, which validate the autoinstall config here. Without the tree
@@ -13,16 +13,19 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE" || exit 2
 TREE=$HOME/ohv/tree-out
+POLICY_ONLY=0
 while [ $# -gt 0 ]; do
   case $1 in
     --tree) TREE=$2; shift 2 ;;
-    *) echo "usage: static-check.sh [--tree DIR]" >&2; exit 2 ;;
+    --update-policy-only) POLICY_ONLY=1; shift ;;
+    *) echo "usage: static-check.sh [--tree DIR] [--update-policy-only]" >&2; exit 2 ;;
   esac
 done
+export PYTHONDONTWRITEBYTECODE=1
+if [ "$POLICY_ONLY" = 1 ]; then exec python3 ../../tests/test_update_policy.py; fi
 FAILS=0
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-export PYTHONDONTWRITEBYTECODE=1
 
 # check NAME CMD...: run CMD, print one verdict line; on failure also the first lines of its output
 check() {
@@ -78,7 +81,9 @@ check "python syntax" pyc
 unit() { python3 vmtest/test_plan.py 2>&1 | tail -3 | tr '\n' ' '; return "${PIPESTATUS[0]}"; }
 check "plan.py unit tests (disk decision, wipe scope, storage layout)" unit
 check "box userns persistence and acceptance regression" python3 ../../tests/test_userns.py
+check "control-plane CPU priority regression" python3 ../../tests/test_cpu_priority.py
 check "box tmpfs profile regression" python3 ../../tests/test_tmp_profile.py
+check "daily-update policy: Perl selectors, apt hook, pending JSON and no-restart install" python3 ../../tests/test_update_policy.py
 
 # ---- yaml / cloud-init / netplan / grub
 if need yamllint; then

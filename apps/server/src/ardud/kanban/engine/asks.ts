@@ -9,6 +9,7 @@ import {
   kanbanAskChanges,
   kanbanAskExpired,
   kanbanAskKind,
+  kanbanAskIsNotice,
   kanbanAskResponse,
   kanbanAskRevision,
   kanbanOpenAsks,
@@ -33,7 +34,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 
-import { gateOf } from "./subtasks.ts";
+import { gateOf, inferGate, isNegativeOption, optionApprovalIds } from "./subtasks.ts";
 import { stubBlockAt } from "./messagePages.ts";
 
 /** An upload as a board message or an ask's file field holds it. */
@@ -258,6 +259,7 @@ export interface AskFieldsInput {
             readonly label: string;
             readonly detail?: string | undefined;
             readonly recommended?: boolean | undefined;
+            readonly approves?: ReadonlyArray<string> | undefined;
             readonly consequence?: string | undefined;
             /** Index into `blocks` of what shows this option. */
             readonly block?: number | undefined;
@@ -296,12 +298,23 @@ export interface AskFieldsInput {
 }
 
 export type AskProblem = {
+  readonly reasonClass?: KanbanError["reasonClass"];
+  readonly invalidField?: string;
   readonly code: KanbanError["code"];
   readonly detail: string;
   /** The revision the ask is at, when the answer was refused for giving none or an older one. */
   readonly revision?: number;
 };
-const invalid = (detail: string): AskProblem => ({ code: "invalid", detail });
+const invalid = (
+  detail: string,
+  reasonClass: NonNullable<KanbanError["reasonClass"]> = "other",
+  invalidField?: string,
+): AskProblem => ({
+  code: "invalid",
+  detail,
+  reasonClass,
+  ...(invalidField === undefined ? {} : { invalidField }),
+});
 const isProblem = (value: unknown): value is AskProblem =>
   typeof value === "object" && value !== null && "code" in value && "detail" in value;
 
@@ -369,7 +382,11 @@ const respondTextFields = (
 
 const tooLong = (name: string, value: string, max: number) =>
   value.length > max
-    ? invalid(`${name} is at most ${max} characters (got ${value.length})`)
+    ? invalid(
+        `${name} is at most ${max} characters (got ${value.length})`,
+        "too_long",
+        /^[A-Za-z_][A-Za-z0-9_]{0,79}$/.test(name) ? name : undefined,
+      )
     : undefined;
 
 /** A trimmed optional line: absent when empty. */
@@ -936,6 +953,7 @@ const respondOf = (
 
 export interface AskFieldsContext {
   readonly blocking: boolean;
+  readonly card?: Pick<KanbanCard, "number" | "subtasks"> | undefined;
   /** The tags of the blocks the ask keeps, when the input brings no new ones. */
   readonly keptBlockTags?: ReadonlyArray<string> | undefined;
 }
@@ -951,7 +969,11 @@ export const askFields = (
 ): AskFields | AskProblem => {
   const named = input.kind?.trim();
   if (named !== undefined && named.length > ASK_LIMITS.kind) {
-    return invalid(`kind is a short label, at most ${ASK_LIMITS.kind} characters`);
+    return invalid(
+      `kind is a short label, at most ${ASK_LIMITS.kind} characters`,
+      "too_long",
+      "kind",
+    );
   }
   const kind = named || inferKind(input);
   const rawChanges = changesOf(input);
@@ -979,7 +1001,11 @@ export const askFields = (
   if (isProblem(batchKey)) return batchKey;
   const to = input.to?.trim() || "owner";
   if (to !== "owner" && to !== "evaluator") {
-    return invalid(`an ask goes to "owner" (the default) or "evaluator" (got "${to}")`);
+    return invalid(
+      `an ask goes to "owner" (the default) or "evaluator" (got "${to}")`,
+      "bad_enum",
+      "to",
+    );
   }
 
   const blocks = input.blocks ?? [];
@@ -991,7 +1017,8 @@ export const askFields = (
   let expiresAt: string | undefined;
   if (input.expiresAt !== undefined && input.expiresAt.trim() !== "") {
     const time = DateTime.make(input.expiresAt);
-    if (Option.isNone(time)) return invalid("expiresAt is not a time (use ISO 8601)");
+    if (Option.isNone(time))
+      return invalid("expiresAt is not a time (use ISO 8601)", "bad_time", "expiresAt");
     expiresAt = DateTime.formatIso(time.value);
   }
 
@@ -999,7 +1026,11 @@ export const askFields = (
   const raw =
     kind === "rank" && givenFields(input.respond).length === 0 ? [] : (input.options ?? []);
   if (raw.length > ASK_LIMITS.options) {
-    return invalid(`an ask takes at most ${ASK_LIMITS.options} options (got ${raw.length})`);
+    return invalid(
+      `an ask takes at most ${ASK_LIMITS.options} options (got ${raw.length})`,
+      "too_many",
+      "options",
+    );
   }
   const options: Array<KanbanAskOption> = [];
   for (const entry of raw) {
@@ -1030,12 +1061,30 @@ export const askFields = (
     if (options.some((existing) => existing.id === id)) {
       return invalid(`option id "${id}" is used twice`);
     }
+    const approves = option.approves?.map((sid) => sid.trim());
+    if (
+      approves !== undefined &&
+      optionApprovalIds(rules.card ?? { subtasks: [] }, { label, approves }) === undefined
+    ) {
+      return invalid(`option ${id} is a hold or no option and can't carry approves`);
+    }
+    if (approves?.some((sid) => sid === "")) {
+      return invalid(`option ${id} approves needs non-empty subtask ids`);
+    }
+    for (const sid of approves ?? []) {
+      if (rules.card && !rules.card.subtasks.some((subtask) => subtask.id === sid)) {
+        return invalid(
+          `option ${id} approves ${sid}, which isn't a subtask on card #${rules.card.number}`,
+        );
+      }
+    }
     options.push(
       compact<KanbanAskOption>({
         id: id as KanbanAskOption["id"],
         label: label as KanbanAskOption["label"],
         detail,
         recommended: option.recommended === true ? true : undefined,
+        approves: approves as KanbanAskOption["approves"],
         consequence,
         block: option.block as KanbanAskOption["block"],
       }),
@@ -1193,6 +1242,7 @@ export const reviseAsk = (
   ask: KanbanOwnerAsk,
   edit: AskEdit,
   at: string,
+  card?: AskFieldsContext["card"],
 ): KanbanOwnerAsk | AskProblem => {
   const merged: AskFieldsInput = { ...fieldsInput(ask) };
   const change: AskFieldsInput =
@@ -1217,7 +1267,7 @@ export const reviseAsk = (
   // Stored blocks may be stubs: only new ones are checked, and kept ones stay as they are.
   const fields = askFields(
     { ...merged, blocks: edit.blocks },
-    { blocking: ask.blocking, keptBlockTags: (ask.blocks ?? []).map((block) => block._tag) },
+    { blocking: ask.blocking, card, keptBlockTags: (ask.blocks ?? []).map((block) => block._tag) },
   );
   if (isProblem(fields)) return fields;
   const question = edit.question === undefined ? ask.text : edit.question.trim();
@@ -2182,6 +2232,37 @@ export const handText = (card: KanbanCard, ask: KanbanOwnerAsk, fromOwner = true
 /** The first line of the message that shows an edited ask in its discussion. */
 export const revisedLine = (ask: KanbanOwnerAsk) =>
   `Updated ${ask.id} (revision ${kanbanAskRevision(ask)})${ask.revisionNote ? `: ${ask.revisionNote}` : ""}`;
+
+export const approvalWarning = (
+  card: Pick<KanbanCard, "subtasks">,
+  ask: KanbanOwnerAsk,
+  guessedGates?: KanbanBoard["guessedGates"],
+): string | undefined => {
+  if (
+    (ask.to ?? "owner") !== "owner" ||
+    ask.draft ||
+    kanbanAskIsNotice(ask) ||
+    !ask.options?.some((option) => !isNegativeOption(option.label)) ||
+    ask.options.some((option) => optionApprovalIds(card, option) !== undefined)
+  )
+    return undefined;
+  const wording = `${ask.text} ${ask.title ?? ""} ${ask.action?.summary ?? ""}`;
+  if (/\bs\d+\b/.test(wording)) return undefined;
+  const gated = card.subtasks.filter(
+    (subtask) =>
+      subtask.state !== "done" &&
+      subtask.state !== "skipped" &&
+      gateOf(subtask, guessedGates) !== undefined,
+  );
+  if (
+    gated.length === 0 ||
+    gated.some((subtask) => gateOf(subtask, guessedGates) === inferGate(wording))
+  )
+    return undefined;
+  const ids = gated.map((subtask) => subtask.id).join(", ");
+  const gates = [...new Set(gated.map((subtask) => gateOf(subtask, guessedGates)))].join(", ");
+  return `This ask won't approve ${ids} (${gates} steps) when he picks a go option: name the id in the question or set approves: [${ids}] on the go option.`;
+};
 
 /** What a tool call on an ask returns: never the card, never the prompt. */
 export const askSummary = (card: KanbanCard, askId: string) => {

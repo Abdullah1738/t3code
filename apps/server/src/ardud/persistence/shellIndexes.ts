@@ -2,20 +2,97 @@ import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { Switches } from "../perf/speedups.ts";
+import { threadReadIndexes } from "./threadReadIndexes.ts";
 
 // Lives outside Migrations: the fork forbids new numbered upstream migrations.
 // Idempotent, so it runs on every open, after runMigrations, for fresh and upgraded databases.
 // Predicate must match the authored subqueries in ProjectionStore (INDEXED BY).
 export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(function* () {
   const sql = yield* SqlClient.SqlClient;
+  for (const statement of threadReadIndexes("main", "orchestration_v2_projection_turn_items")) {
+    yield* sql.unsafe(statement);
+  }
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_v2_messages_latest_user_authored_idx
     ON orchestration_v2_projection_messages(thread_id, updated_at DESC, message_id DESC)
     WHERE role = 'user' AND json_extract(payload_json, '$.createdBy') = 'user'
   `;
   yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_active_threads_idx
+    ON orchestration_v2_projection_threads(thread_id)
+    WHERE deleted_at IS NULL AND json_extract(payload_json, '$.archivedAt') IS NULL
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_live_threads_idx
+    ON orchestration_v2_projection_runs(thread_id, ordinal DESC)
+    WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_pending_requests_idx
+    ON orchestration_v2_projection_runtime_requests(thread_id, created_at, runtime_request_id)
+    WHERE status = 'pending'
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_child_subagents_idx
+    ON orchestration_v2_projection_subagents(thread_id, COALESCE(started_at, ''), subagent_id)
+    WHERE child_thread_id IS NOT NULL
+  `;
+  // Periodic session maintenance starts from loaded native IDs or nonempty rosters,
+  // never every provider thread accumulated by a long-lived application thread.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_threads_native_idx
+    ON orchestration_v2_projection_provider_threads(
+      provider_session_id, json_extract(payload_json, '$.nativeThreadRef.nativeId')
+    )
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_threads_background_idx
+    ON orchestration_v2_projection_provider_threads(provider_session_id)
+    WHERE json_array_length(payload_json, '$.pendingBackgroundTasks') > 0
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_thread_subagent_owner_idx
+    ON orchestration_v2_projection_subagents(provider_thread_id, thread_id)
+  `;
+  // Discovery order is internal. Stable keys avoid rewriting these two indexes
+  // every time streaming output advances a candidate's updated_at.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_pr_sync_candidates_idx
+    ON orchestration_v2_projection_threads(thread_id)
+    WHERE deleted_at IS NULL AND json_extract(payload_json, '$.archivedAt') IS NULL
+      AND (json_extract(payload_json, '$.branch') IS NOT NULL OR json_extract(payload_json, '$.branchPullRequest') IS NOT NULL)
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_pr_sync_unsettled_idx
+    ON orchestration_v2_projection_threads(thread_id)
+    WHERE deleted_at IS NULL AND json_extract(payload_json, '$.archivedAt') IS NULL
+      AND (json_extract(payload_json, '$.branch') IS NOT NULL OR json_extract(payload_json, '$.branchPullRequest') IS NOT NULL)
+      AND json_extract(payload_json, '$.settledAt') IS NULL
+      AND json_extract(payload_json, '$.settledOverride') IS NOT 'settled'
+  `;
+  // Cross-thread control polling ranges over epoch milliseconds, including imported
+  // ISO timestamps with equivalent offsets or fractional-second spellings.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_control_user_messages_since_idx
+    ON orchestration_v2_projection_messages(
+      CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER),
+      message_id, thread_id
+    ) WHERE role = 'user'
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_control_messages_since_idx
+    ON orchestration_v2_projection_messages(
+      CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER),
+      message_id, thread_id, role
+    )
+  `;
+  yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_provider_turns_completed_idx
     ON orchestration_v2_projection_provider_turns(completed_at)
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_provider_turns_attempt_idx
+    ON orchestration_v2_projection_provider_turns(thread_id, run_attempt_id, provider_thread_id, ordinal)
   `;
   // Control listings by updatedSince read the changed range newest first instead of
   // building every thread's shell (a 145 s reader stall on 9 Nov). Not partial on

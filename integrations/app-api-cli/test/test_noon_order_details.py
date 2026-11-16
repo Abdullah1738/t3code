@@ -143,7 +143,8 @@ class MoneyOrderCoverageTests(unittest.TestCase):
         with patch.object(core, 'verified_session', return_value={}), patch.object(core, 'request', request), \
                 patch.object(vertical, '_headers', return_value={}), \
                 patch.object(vertical, '_read', return_value={'status': 'success', 'data': {'orders': []}}):
-            result = mc.charges.order_lookup.native('noon', str(Path(__file__).resolve().parents[1]))
+            result = mc.charges.order_lookup.native('noon', str(Path(__file__).resolve().parents[1]),
+                snapshot={'version': 1, 'complete': True, 'walked_at': '2026-10-24T10:00:00+04:00', 'orders': {}})
         self.assertFalse(result['complete'])
         self.assertEqual(result['orders'], [])
         with tempfile.TemporaryDirectory() as tmp, patch.object(mc, 'DATA', Path(tmp)), \

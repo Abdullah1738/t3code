@@ -11,7 +11,7 @@ then install.
 | `libexec/mail/` | `~/.local/libexec/mail/` | `himalaya-heal`, `mailsearch`, otp watchers, message-archive (`MAIL_LIBEXEC`) |
 | `libexec/card-preview/` | `~/.local/libexec/card-preview/` | ride cards (`RIDE_CARD_PREVIEW_LIB`), coordinated-project daily cards |
 | `libexec/qcard/` | `~/.local/libexec/qcard/` | `qcard` |
-| `bin/vp`, `libexec/vp/` | `~/.local/bin/vp`, `~/.local/libexec/vp/` | current checkout’s pinned `vp`; dependencyless worktrees use main’s `fmt`/`lint` with worktree paths, ignores and overrides, refusing config drift; other commands give an offbox hint |
+| `bin/vp`, `libexec/vp/` | `~/.local/bin/vp`, `~/.local/libexec/vp/` | current checkout’s pinned `vp`; dependencyless worktrees try `vp.toolchain`, then main, for `fmt`/`lint` using the worktree’s Vite config, imported helpers and local JS plugins with borrowed packages; compares toolchain/plugin versions, lockfile snapshots and package type; preserves worktree paths, ignores and overrides; other commands give an offbox hint |
 | `juno-proxy/` | `~/.local/share/juno-proxy/` | `com.abdullah.juno-proxy`: HTTP/CONNECT proxy and `/proxy.pac` on the Tailscale IP, port 8118, so tailnet devices reach Juno hosts through this Mac's VPN |
 | `lydia-ticks/` | `~/.local/share/lydia-ticks/` | `com.ardud.lydia-ticks-server` (Bun, 127.0.0.1:18820: saves each tick on Lydia's checklist and serves the per-day history page) and `com.ardud.lydia-ticks-tunnel` (Cloudflare tunnel for https://lydia.abdullah.fund). `tunnel.json` (tunnel credentials), `history-token` (the private history link) and `ticks.db*` (Lydia's data) stay live-only, never in the repo |
 | `bin/` | `~/.local/bin/` | agents and skills; `power-unplug-telegram.sh` and `battery-low-telegram.sh` for the power agents; `cards-tunnel`, `cards-health` and `cards-tunnel-setup` for the card links; `opencode-web` for the emergency OpenCode web UI; `rclaude` for an interactive Claude Code launched like Robob's claudeAgent threads (pinned harness binary, `~/.robob/harness-homes/claude`, 9router env and model/effort from `~/.robob/userdata/settings.json`; `rclaude --rclaude-print` shows the resolved command) |
@@ -251,3 +251,17 @@ When an error tag has no IDs, its `sampleId` gives the day file, timestamp and
 one-based physical line number so the original record can still be found.
 The Python logger has one source in `libexec/toollog/`; the other integrations'
 source symlinks are materialized beside their entry points by their installers.
+
+## vp toolchain
+
+The optional fmt/lint copy is managed from any repo worktree with
+`~/.local/libexec/vp/toolchain init [dir]`, `sync [--install]`, or `status`.
+It is a detached worktree configured in `git config vp.toolchain`; unset that
+key to return to main-only fallback. The shim updates it from the local
+`origin/main` ref without fetching or installing. After a toolchain version
+bump, run `toolchain sync --install`. The frozen install selects only the root
+and `oxlint-plugin-t3code` importers, whose runtime dependencies lint loads.
+
+To try an uninstalled branch, run its absolute `integrations/local-helpers/bin/vp`
+path from the target worktree. Config snapshots and Vite’s cache stay in a
+private temporary directory; the borrowed install is read-only.

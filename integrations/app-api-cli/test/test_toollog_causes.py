@@ -50,7 +50,8 @@ class CauseLogs(unittest.TestCase):
                         details.details('FTEST', 'food')
                 opener.open.assert_called_once()
                 row = self.rows()[-1]
-                self.assertEqual(row['props'], {'merchant': 'noon', 'lane': 'food'})
+                self.assertEqual(row['props'], {'merchant': 'noon', 'lane': 'food',
+                                                'caller': 'other', 'trigger': 'other'})
                 self.assertEqual(row['error']['cause'], {
                     'httpStatus': status, 'endpoint': '/_svc/mp-food-api-mpnoon/order/details',
                     'attempt': 1, 'retryable': status != 401, 'upstreamCode': None,
@@ -227,7 +228,8 @@ class CauseLogs(unittest.TestCase):
                 self.assertEqual(live.call_count, int(live_path))
                 self.assertEqual(fallback.call_count, int(not live_path))
                 self.assertEqual(bool(state['last_result'].get('live_source_ok')), live_path and not errors)
-                rows = self.rows()[start:]
+                rows = [row for row in self.rows()[start:]
+                        if row['name'] in {'provider.track', 'track.error', 'track.poll'}]
                 self.assertTrue({'track.error', 'track.poll'} <= {r['name'] for r in rows})
                 for row in rows:
                     self.assertEqual(row['props']['merchant'], 'careem')
@@ -427,9 +429,11 @@ class CauseLogs(unittest.TestCase):
         result = amazon.track(OID, runner=runner, accounts=['gmail'], now=NOW)
         self.assertTrue(result['errors'])
         runner.assert_called_once()
-        self.assertEqual(self.rows()[-1]['error']['cause'], {
-            'httpStatus': None, 'endpoint': None, 'attempt': 1, 'retryable': True,
-            'upstreamCode': None, 'exceptionClass': 'TimeoutExpired'})
+        cause = self.rows()[-1]['error']['cause']
+        self.assertGreaterEqual(cause.pop('phaseElapsedMs'), 0)
+        self.assertEqual(cause, {
+            'httpStatus': None, 'endpoint': '/amazon/mail/search', 'attempt': 1, 'retryable': True,
+            'upstreamCode': None, 'exceptionClass': 'TimeoutExpired', 'phase': 'order_list'})
         self.assertNotIn(secret, self.lines())
 
     def test_structured_source_error_uses_safe_code_as_message(self):

@@ -1,8 +1,14 @@
+import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
+import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
+import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
+import * as ThreadReadDeadline from "./ThreadReadDeadline.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
+import { delegationIdShape } from "./delegationTaskIdentity.ts";
+import * as CardNextMetrics from "../ardud/analytics/CardNextMetrics.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { analyticsErrorTag, recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
@@ -43,7 +49,7 @@ import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as LargeReplyLog from "../observability/LargeReplyLog.ts";
 import * as McpReplySize from "../observability/McpReplySize.ts";
 import {
-  jsonExceedsBudget,
+  jsonBytesUpToLimit,
   MAX_REPLY_BYTES,
   REPLY_TOO_LARGE,
   ReplyTooLarge,
@@ -61,6 +67,7 @@ import {
 } from "../telemetry/ProviderDimensions.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
+import * as McpDeadline from "./McpDeadline.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import * as PreviewControlsHandlers from "./toolkits/previewControls/handlers.ts";
@@ -72,6 +79,7 @@ import { AttachmentToolkit } from "./toolkits/attachment/tools.ts";
 import * as AttachmentHandlers from "./toolkits/attachment/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import * as ThreadHandlers from "./toolkits/thread/handlers.ts";
+import * as BackgroundTerminals from "../ardud/exec-sessions/BackgroundTerminals.ts";
 import * as ThreadMetadataMcpService from "./ThreadMetadataMcpService.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
@@ -98,7 +106,7 @@ import * as ControlStore from "../ardud/control/ControlStore.ts";
 // ardud schedules: retry a scheduled task's blocked runs.
 import * as ScheduledTaskBlockRetry from "../ardud/schedules/blockRetryTools.ts";
 import * as KanbanHandlers from "../ardud/kanban/tools/handlers.ts";
-import { KanbanToolkit } from "../ardud/kanban/tools/tools.ts";
+import { KanbanToolkit, KanbanArgumentKeys, argumentFailure } from "../ardud/kanban/tools/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -179,9 +187,14 @@ type McpAuthMiddleware = (
   HttpServerRequest.HttpServerRequest
 >;
 
-class McpReplyCapture extends Context.Service<McpReplyCapture, McpReplySize.McpReplyCapture>()(
-  "t3/mcp/McpHttpServer/McpReplyCapture",
-) {}
+class McpReplyCapture extends Context.Service<
+  McpReplyCapture,
+  McpReplySize.McpReplyCapture & {
+    readonly arrivedAt: bigint;
+    readonly authenticatedAt: bigint;
+    readonly sessionId: string | undefined;
+  }
+>()("t3/mcp/McpHttpServer/McpReplyCapture") {}
 
 export const normalizeMcpHttpResponse = (
   response: HttpServerResponse.HttpServerResponse,
@@ -217,11 +230,12 @@ const BOARD_READ_TOOLS = new Set([
   "card_search",
 ]);
 
-const makeMcpAuthMiddleware = Effect.gen(function* () {
+export const makeMcpAuthMiddleware = Effect.gen(function* () {
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
   const largeReplies = yield* Effect.serviceOption(LargeReplyLog.LargeReplyLog);
   return Effect.fn("McpHttpServer.authenticateRequest")(function* (httpEffect) {
+    const arrivedAt = yield* Clock.monotonicTimeNanos;
     const request = yield* HttpServerRequest.HttpServerRequest;
     const authorization = request.headers.authorization;
     const token =
@@ -233,6 +247,7 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
       (Option.isSome(clients) && token.length > 0
         ? yield* clients.value.authenticate(request)
         : undefined);
+    const authenticatedAt = yield* Clock.monotonicTimeNanos;
     if (!invocation) {
       yield* Effect.logWarning("rejected MCP request with an unusable credential", {
         reason: token.length === 0 ? "missing_bearer_token" : "unknown_or_expired_token",
@@ -244,11 +259,18 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
         providerToken: looksLikeProviderToken(token),
       });
     }
-    const capture: McpReplySize.McpReplyCapture = {
+    const capture: McpReplyCapture["Service"] = {
+      arrivedAt,
+      authenticatedAt,
+      sessionId: request.headers["mcp-session-id"],
       name: undefined,
       threadId: invocation.thread?.threadId,
     };
+    const delivery = McpResponseDelivery.forRequest(request.source);
     return yield* httpEffect.pipe(
+      delivery === undefined
+        ? (effect) => effect
+        : Effect.provideService(McpResponseDelivery.McpResponseDelivery, delivery),
       Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
       Effect.provideService(McpReplyCapture, capture),
       Effect.map(normalizeMcpHttpResponse),
@@ -488,7 +510,15 @@ const decodeAsAdvertised = <Tools extends Record<string, Tool.Any>>(
   // The clones keep each tool's id, name and decoded parameter type, so handlers still match.
   Toolkit.make(
     ...Object.values(toolkit.tools).map((tool) =>
-      tool.setParameters(Schema.toCodecJson(tool.parametersSchema)),
+      tool.setParameters(
+        Schema.toCodecJson(tool.parametersSchema).pipe(
+          // @effect-diagnostics-next-line anyUnknownInErrorContext:off - Tool.Any erases each codec's requirements at registration.
+          Schema.middlewareDecoding((decode) =>
+            // @effect-diagnostics-next-line anyUnknownInErrorContext:off - Preserve the erased requirements while observing failures.
+            decode.pipe(Effect.tapError(McpCallAnalytics.parameterFailure)),
+          ),
+        ),
+      ),
     ),
   ) as unknown as Toolkit.Toolkit<Tools>;
 
@@ -895,6 +925,39 @@ const handoffTargetIds = (
   return typeof threadId === "string" ? [threadId] : [];
 };
 
+export const withFailureStructuredContent = (
+  result: McpSchema.CallToolResult | McpSchema.InputRequired,
+) => {
+  if (
+    result instanceof McpSchema.InputRequired ||
+    result.isError !== true ||
+    result.structuredContent !== undefined
+  )
+    return result;
+  const part = result.content.find((part) => part.type === "text");
+  if (part?.type !== "text" || part.text.length > 8192) return result;
+  try {
+    const failure = JSON.parse(part.text) as Schema.Json;
+    if (failure !== null && typeof failure === "object" && !Array.isArray(failure)) {
+      // Effect drops structuredContent on failures, but scripted callers read it.
+      return new McpSchema.CallToolResult({ ...result, structuredContent: failure });
+    }
+  } catch {
+    /* Plain-text failures stay unchanged. */
+  }
+  return result;
+};
+
+const inputKeyCache = new WeakMap<object, ReadonlySet<string>>();
+const inputKeysOf = (tool: McpSchema.Tool): ReadonlySet<string> => {
+  let keys = inputKeyCache.get(tool);
+  if (keys === undefined) {
+    keys = new Set(Object.keys(tool.inputSchema.properties ?? {}));
+    inputKeyCache.set(tool, keys);
+  }
+  return keys;
+};
+
 /**
  * Runs a tool registration against a server that records one anonymous
  * `mcp.tool.invoked` event per call: the tool, the calling agent's provider,
@@ -908,6 +971,7 @@ const withToolAnalytics =
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const ledger = yield* McpCallLedger.McpCallLedger;
+    const kanbanContext = yield* Effect.serviceOption(KanbanService);
     const startup = yield* Effect.serviceOption(StartupPhaseLog.StartupPhaseLog);
     const callBootId = Option.isSome(startup) ? startup.value.snapshot().bootId : bootId;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
@@ -1022,6 +1086,13 @@ const withToolAnalytics =
       addTool: (options) =>
         server.addTool({
           ...options,
+          tool:
+            Context.getOrUndefined(options.annotations, KanbanArgumentKeys) === undefined
+              ? options.tool
+              : new McpSchema.Tool({
+                  ...options.tool,
+                  inputSchema: { ...options.tool.inputSchema, additionalProperties: false },
+                }),
           handle:
             /* Request instrumentation already owns the span; keep this helper in that context. */
             Effect.fnUntraced(function* (payload) {
@@ -1030,254 +1101,654 @@ const withToolAnalytics =
               const invocation = Option.getOrUndefined(
                 yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
               );
-              // The shared tools/call span otherwise cannot be matched to a
-              // reporter after concurrent requests enter different service fibers.
-              yield* Effect.annotateCurrentSpan({
-                "mcp.tool.name": options.tool.name,
-                "mcp.caller.thread_id": invocation?.thread?.threadId ?? null,
-                "mcp.request.namespace": invocation?.requestNamespace ?? null,
-              });
-              const startedAt = yield* Clock.currentTimeMillis;
-              const started = yield* Clock.monotonicTimeNanos;
-              const callState: McpCallAnalytics.McpCall["Service"] = {
-                callerResolved: false,
-                callerResolveMs: 0,
-                readerLane: yield* NodeSqliteClient.ReaderLane,
-                phase: "handler",
-                saved: "unknown",
-              };
-              const parentSaved = yield* SavedWrite.observer;
-              const parentCommitting = yield* SavedWrite.commitObserver;
-              const identifiers = McpCallAnalytics.callIdentifiers(
-                payload,
-                invocation?.thread?.threadId ?? invocation?.requestNamespace,
-              );
-              // The request span already covers ledger capture on this hot path.
-              const row = Effect.fnUntraced(function* (
-                outcome: ReturnType<typeof McpCallAnalytics.callOutcome>,
-              ) {
-                const ended = yield* Clock.monotonicTimeNanos;
-                const interrupted =
-                  outcome.outcome === "interrupted" ||
-                  outcome.outcome === "interrupted_by_shutdown";
-                // Reserve most of the shutdown budget for recording and flushing all rows.
-                const observedCommit =
-                  interrupted && options.tool.name === "delegate_task"
-                    ? callState.delegation === undefined
-                      ? false
-                      : yield* callState.delegation.readCommitted.pipe(
-                          Effect.interruptible,
-                          Effect.timeout("250 millis"),
-                          Effect.orElseSucceed(() => "unknown" as const),
-                        )
-                    : undefined;
-                // HTTP teardown follows this snapshot, so admitted handlers can still commit.
-                const committed =
-                  outcome.outcome === "interrupted_by_shutdown" && observedCommit === false
-                    ? "unknown"
-                    : observedCommit;
-                return {
-                  ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
-                  kind: "mcp.call" as const,
-                  startedAt: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
-                  bootId: callBootId,
-                  surface: "server" as const,
-                  route: "mcp",
-                  tool: options.tool.name,
-                  build,
-                  ...identifiers,
-                  ...(callState.boardId ? { boardId: callState.boardId } : {}),
-                  ...(callState.cardId ? { cardId: callState.cardId } : {}),
-                  ...(invocation?.thread ? { callerThreadId: invocation.thread.threadId } : {}),
-                  callerResolved: callState.callerResolved,
-                  callerResolveMs:
-                    callState.callerResolveMs +
-                    (callState.callerStarted === undefined
-                      ? 0
-                      : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
-                  readerLane: callState.readerLane,
-                  durationMs: Math.max(0, Number(ended - started) / 1e6),
-                  ...outcome,
-                  props: {
-                    ...outcome.props,
-                    ...(callState.boardId ? { boardId: callState.boardId } : {}),
-                    ...(callState.cardNumber === undefined
-                      ? {}
-                      : { cardNumber: callState.cardNumber }),
-                    saved: outcome.saved ?? "unknown",
-                  },
-                  ...(committed === undefined
-                    ? {}
-                    : {
-                        committed,
-                        ...(committed === true && callState.delegation !== undefined
-                          ? { taskId: callState.delegation.taskId }
-                          : {}),
-                      }),
-                };
-              });
-              const complete = yield* ledger.begin(() =>
-                row({
-                  outcome: "interrupted_by_shutdown",
-                  props: { code: "unknown", cause: "shutdown" },
-                  saved: callState.saved,
-                  errorPhase: callState.phase,
-                }),
-              );
-              if (Option.isNone(complete))
-                return new McpSchema.CallToolResult({
-                  isError: true,
-                  content: [
-                    { type: "text", text: "Robob is restarting; retry after reconnecting." },
-                  ],
-                  structuredContent: { reason: "server_shutting_down", bootId: callBootId },
-                });
-              if (options.tool.name === "card_next")
-                yield* Effect.logInfo("MCP card_next started", {
-                  threadId: invocation?.thread?.threadId ?? "unknown",
-                  startedAt,
-                });
-              const rejection = { exceeded: false };
-              const readiness = BOARD_READ_TOOLS.has(options.tool.name)
-                ? boardReplyReady
-                : options.tool.name === "list_scheduled_tasks"
-                  ? controlReplyReady
-                  : Effect.void;
-              const result = readiness
-                .pipe(Effect.andThen(options.handle(payload)))
-                .pipe(Effect.provideService(ReplyRejection, rejection));
-              // Large reads run on their own "mcp" lane (whole call, so at most
-              // PERMITS.mcp large results are built at once). They queue only behind
-              // each other, never behind control polls, lists or snapshots (10 Nov
-              // 2026: t3_thread_read held the shared agent lane up to 153 s).
-              const check = <A>(built: A): A | McpSchema.CallToolResult => {
-                // MCP repeats the result as text and structuredContent; leave envelope headroom.
-                if (!rejection.exceeded && !jsonExceedsBudget(built, MAX_REPLY_BYTES - 4096))
-                  return built;
-                if (Option.isSome(largeRepliesForTools))
-                  largeRepliesForTools.value.record({
-                    kind: "mcp",
-                    name: options.tool.name,
-                    bytes: MAX_REPLY_BYTES + 1,
-                    rejected: true,
-                  });
-                return new McpSchema.CallToolResult({
-                  isError: true,
-                  content: [{ type: "text", text: REPLY_TOO_LARGE }],
-                });
-              };
-              const completed = result.pipe(
-                (call) =>
-                  LARGE_READ_TOOLS.has(options.tool.name)
-                    ? ReplyBuilders.bounded(Effect.map(call, check), "mcp")
-                    : Effect.map(call, check),
-                Effect.catchCauseIf(
-                  (cause) =>
-                    cause.reasons.some(
-                      (reason) =>
-                        Cause.isDieReason(reason) && reason.defect instanceof ReplyTooLarge,
-                    ),
-                  () => {
-                    if (Option.isSome(largeRepliesForTools))
-                      largeRepliesForTools.value.record({
-                        kind: "mcp",
-                        name: options.tool.name,
-                        bytes: MAX_REPLY_BYTES + 1,
-                        rejected: true,
+              return yield* Effect.acquireUseRelease(
+                ledger.enter(
+                  encodeJsonText([
+                    invocation?.requestNamespace,
+                    Option.isSome(capture) ? capture.value.sessionId : undefined,
+                  ]),
+                ),
+                (activity) =>
+                  Effect.gen(function* () {
+                    // The shared tools/call span otherwise cannot be matched to a
+                    // reporter after concurrent requests enter different service fibers.
+                    yield* Effect.annotateCurrentSpan({
+                      "mcp.tool.name": options.tool.name,
+                      "mcp.caller.thread_id": invocation?.thread?.threadId ?? null,
+                      "mcp.request.namespace": invocation?.requestNamespace ?? null,
+                    });
+                    const startedAt = yield* Clock.currentTimeMillis;
+                    const started = yield* Clock.monotonicTimeNanos;
+                    const delivery = yield* Effect.serviceOption(
+                      McpResponseDelivery.McpResponseDelivery,
+                    );
+                    if (Option.isSome(delivery)) {
+                      delivery.value.tool = options.tool.name;
+                      if (invocation?.thread)
+                        delivery.value.callerThreadId = invocation.thread.threadId;
+                    }
+                    const initialReaderLane = yield* NodeSqliteClient.ReaderLane;
+                    const readOnly = Context.get(options.annotations, Tool.Readonly);
+                    const boardWrite =
+                      Object.hasOwn(KanbanToolkit.tools, options.tool.name) && !readOnly;
+                    const callState: McpCallAnalytics.McpCall["Service"] = {
+                      readOnly,
+                      boardWrite,
+                      inputKeys: inputKeysOf(options.tool),
+                      detachedAnalytics: {
+                        tool: options.tool.name,
+                        callerIdentity:
+                          invocation?.thread?.threadId ?? invocation?.requestNamespace,
+                        callerThreadId: invocation?.thread?.threadId,
+                        startedAt: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
+                        build,
+                        bootId: callBootId,
+                      },
+                      ...(options.tool.name === "task_status" || options.tool.name === "task_cancel"
+                        ? {
+                            taskLookup: {
+                              idShape: delegationIdShape(
+                                typeof payload === "object" &&
+                                  payload !== null &&
+                                  "taskId" in payload
+                                  ? payload.taskId
+                                  : undefined,
+                              ),
+                            },
+                          }
+                        : {}),
+                      ...(options.tool.name === "t3_thread_read"
+                        ? {
+                            threadRead: {
+                              readerWaitMs: 0,
+                              queryMs: 0,
+                              renderMs: 0,
+                              threadReadStages: [],
+                            },
+                          }
+                        : {}),
+                      ...(Option.isSome(capture)
+                        ? {
+                            requestTiming: {
+                              authMs:
+                                Number(capture.value.authenticatedAt - capture.value.arrivedAt) /
+                                1e6,
+                              dispatchMs: Number(started - capture.value.authenticatedAt) / 1e6,
+                              preHandlerMs: Number(started - capture.value.arrivedAt) / 1e6,
+                            },
+                          }
+                        : {}),
+                      callerResolved: false,
+                      callerResolveMs: 0,
+                      callerReaderLane: initialReaderLane,
+                      readerLane: initialReaderLane,
+                      phase: "handler",
+                      saved: boardWrite ? false : "unknown",
+                    };
+                    if (callState.requestTiming !== undefined)
+                      yield* Effect.annotateCurrentSpan({
+                        "mcp.auth_ms": callState.requestTiming.authMs,
+                        "mcp.dispatch_ms": callState.requestTiming.dispatchMs,
+                        "mcp.pre_handler_ms": callState.requestTiming.preHandlerMs,
                       });
-                    return Effect.succeed(
-                      new McpSchema.CallToolResult({
-                        isError: true,
-                        content: [{ type: "text", text: REPLY_TOO_LARGE }],
+                    let handlerEnded: bigint | undefined;
+                    let threadReadAtExit: ReturnType<typeof ThreadReadMetrics.snapshot> | undefined;
+                    let cardNextAtExit:
+                      | (ReturnType<typeof CardNextMetrics.snapshot> &
+                          Pick<
+                            McpCallAnalytics.McpCall["Service"],
+                            "readerLane" | "callerResolved" | "callerResolveMs"
+                          >)
+                      | undefined;
+                    const parentSaved = yield* SavedWrite.observer;
+                    const parentCommitting = yield* SavedWrite.commitObserver;
+                    const identifiers = McpCallAnalytics.callIdentifiers(
+                      payload,
+                      invocation?.thread?.threadId ?? invocation?.requestNamespace,
+                    );
+                    const isKanbanTool = Object.hasOwn(KanbanToolkit.tools, options.tool.name);
+                    callState.callerRole = "none";
+                    callState.callerKind =
+                      invocation === undefined || invocation.thread ? "unknown" : "cli";
+                    callState.resolveCallerContext = (parentThreadId) => {
+                      if (callState.callerCardNumber !== undefined) return;
+                      const id = parentThreadId ?? invocation?.thread?.threadId;
+                      const context =
+                        id && Option.isSome(kanbanContext)
+                          ? kanbanContext.value.callerAnalytics?.(id)
+                          : undefined;
+                      const delegated =
+                        parentThreadId !== undefined || context?.callerKind === "delegated_child";
+                      callState.callerRole = context?.callerRole ?? "none";
+                      callState.callerKind = delegated
+                        ? "delegated_child"
+                        : (context?.callerKind ?? (context?.boardId ? "board_thread" : "unknown"));
+                      if (context) {
+                        if (
+                          (!isKanbanTool || identifiers.boardId === undefined) &&
+                          context.boardId !== undefined
+                        )
+                          callState.boardId = context.boardId;
+                        if (!isKanbanTool) {
+                          if (context.cardId !== undefined) callState.cardId = context.cardId;
+                          if (context.cardNumber !== undefined)
+                            callState.cardNumber = context.cardNumber;
+                          if (context.cardStage !== undefined)
+                            callState.cardStage = context.cardStage;
+                        }
+                        if (context.cardNumber !== undefined)
+                          callState.callerCardNumber = context.cardNumber;
+                        if (context.cardStage !== undefined)
+                          callState.callerCardStage = context.cardStage;
+                      }
+                    };
+                    if (invocation?.thread) callState.resolveCallerContext();
+                    // The request span already covers ledger capture on this hot path.
+                    const row = Effect.fnUntraced(function* (
+                      outcome: ReturnType<typeof McpCallAnalytics.callOutcome>,
+                    ) {
+                      if (outcome.outcome !== "ok") {
+                        callState.reasonClass ??= "other";
+                        if (boardWrite)
+                          callState.refusedAt =
+                            outcome.saved === true
+                              ? "post_write"
+                              : callState.boardAdmitted
+                                ? "in_write"
+                                : "pre_lock";
+                      }
+                      const ended = handlerEnded ?? (yield* Clock.monotonicTimeNanos);
+                      const interrupted =
+                        outcome.outcome === "interrupted" ||
+                        outcome.outcome === "interrupted_by_shutdown";
+                      // Reserve most of the shutdown budget for recording and flushing all rows.
+                      const observedCommit =
+                        interrupted && options.tool.name === "delegate_task"
+                          ? callState.delegation === undefined
+                            ? false
+                            : yield* callState.delegation.readCommitted.pipe(
+                                Effect.interruptible,
+                                Effect.timeout("250 millis"),
+                                Effect.orElseSucceed(() => "unknown" as const),
+                              )
+                          : undefined;
+                      // HTTP teardown follows this snapshot, so admitted handlers can still commit.
+                      const committed =
+                        outcome.outcome === "interrupted_by_shutdown" && observedCommit === false
+                          ? "unknown"
+                          : observedCommit;
+                      const durationMs = Math.max(0, Number(ended - started) / 1e6);
+                      const totalMs =
+                        callState.requestTiming === undefined
+                          ? undefined
+                          : callState.requestTiming.preHandlerMs + durationMs;
+                      if (totalMs !== undefined)
+                        yield* Effect.annotateCurrentSpan({ "mcp.total_ms": totalMs });
+                      const callerReaderLane = callState.callerReaderLane ?? initialReaderLane;
+                      return {
+                        ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
+                        kind: "mcp.call" as const,
+                        startedAt: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
+                        bootId: callBootId,
+                        surface: "server" as const,
+                        route: "mcp",
+                        tool: options.tool.name,
+                        build,
+                        ...identifiers,
+                        ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                        ...(callState.cardId ? { cardId: callState.cardId } : {}),
+                        ...(invocation?.thread
+                          ? { callerThreadId: invocation.thread.threadId }
+                          : {}),
+                        callerRole: callState.callerRole ?? "none",
+                        callerKind: callState.callerKind ?? "unknown",
+                        ...(callState.cardNumber === undefined
+                          ? {}
+                          : { cardNumber: callState.cardNumber }),
+                        ...(callState.callerCardNumber === undefined
+                          ? {}
+                          : { callerCardNumber: callState.callerCardNumber }),
+                        ...(callState.callerCardStage === undefined
+                          ? {}
+                          : { callerCardStage: callState.callerCardStage }),
+                        ...(callState.writePhases === undefined
+                          ? {}
+                          : { writePhases: callState.writePhases }),
+                        ...(callState.cardStage === undefined
+                          ? {}
+                          : { cardStage: callState.cardStage }),
+                        ...(callState.denyReason === undefined
+                          ? {}
+                          : { denyReason: callState.denyReason }),
+                        ...(callState.reasonClass === undefined
+                          ? {}
+                          : { reasonClass: callState.reasonClass }),
+                        ...(callState.invalidField === undefined ||
+                        !callState.inputKeys?.has(callState.invalidField)
+                          ? {}
+                          : { invalidField: callState.invalidField }),
+                        ...(outcome.outcome === "ok" || callState.refusedAt === undefined
+                          ? {}
+                          : { refusedAt: callState.refusedAt }),
+                        ...(callState.replyStage === undefined
+                          ? {}
+                          : { replyStage: callState.replyStage }),
+                        ...(callState.replyPhases === undefined
+                          ? {}
+                          : { replyPhases: callState.replyPhases }),
+                        ...(callState.requestTiming === undefined
+                          ? {}
+                          : { requestTiming: callState.requestTiming }),
+                        callerResolved: callState.callerResolved,
+                        callerResolveMs:
+                          callState.callerResolveMs +
+                          (callState.callerStarted === undefined
+                            ? 0
+                            : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
+                        callerReaderLane,
+                        readerLane: callerReaderLane,
+                        ...(callState.cardNext === undefined
+                          ? {}
+                          : (cardNextAtExit ??
+                            CardNextMetrics.snapshot(callState.cardNext, ended))),
+                        ...(callState.waitStage === undefined
+                          ? {}
+                          : { waitStage: callState.waitStage }),
+                        ...(callState.waitLookupMs === undefined
+                          ? {}
+                          : { waitLookupMs: callState.waitLookupMs }),
+                        durationMs,
+                        ...(callState.threadRead === undefined
+                          ? {}
+                          : {
+                              ...(threadReadAtExit ??
+                                ThreadReadMetrics.snapshot(callState.threadRead, ended)),
+                              inFlightAtStart: activity.inFlightAtStart,
+                            }),
+                        ...callState.requestTiming,
+                        ...(totalMs === undefined ? {} : { totalMs }),
+                        ...outcome,
+                        ...(Option.isSome(delivery) ? delivery.value.snapshot() : {}),
+                        props: {
+                          ...outcome.props,
+                          ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                          ...(callState.cardNumber === undefined
+                            ? {}
+                            : { cardNumber: callState.cardNumber }),
+                          ...(readOnly && callState.taskLookup === undefined
+                            ? {}
+                            : { saved: outcome.saved ?? "unknown" }),
+                        },
+                        ...(committed === undefined
+                          ? {}
+                          : {
+                              committed,
+                              ...(committed === true && callState.delegation !== undefined
+                                ? { taskId: callState.delegation.taskId }
+                                : {}),
+                            }),
+                      };
+                    });
+                    const complete = yield* ledger.begin(() =>
+                      row({
+                        outcome: "interrupted_by_shutdown",
+                        props: {
+                          code: "unknown",
+                          cause: "shutdown",
+                          ...(callState.taskLookup?.foundBy === undefined
+                            ? {}
+                            : { foundBy: callState.taskLookup.foundBy }),
+                          ...(callState.taskLookup?.idCanonical === undefined
+                            ? {}
+                            : { idCanonical: callState.taskLookup.idCanonical }),
+                          ...(callState.taskLookup?.idShape === undefined
+                            ? {}
+                            : { idShape: callState.taskLookup.idShape }),
+                        },
+                        ...(readOnly && callState.taskLookup === undefined
+                          ? {}
+                          : {
+                              saved:
+                                boardWrite && callState.saved === false
+                                  ? ("unknown" as const)
+                                  : callState.saved,
+                            }),
+                        errorPhase: callState.phase,
                       }),
                     );
-                  },
-                ),
-              );
-              const protectedCall = SavedBoardReply.TOOLS.has(options.tool.name)
-                ? SavedBoardReply.protect(completed, options.tool.name)
-                : completed;
-              return yield* protectedCall.pipe(
-                Effect.provideService(McpCallAnalytics.McpCall, callState),
-                Effect.provideService(SavedWrite.observer, (receipt) => {
-                  callState.saved = true;
-                  if (receipt.kind === "card" && callState.cardId === undefined) {
-                    callState.boardId = receipt.card.boardId;
-                    callState.cardId = receipt.card.id;
-                    callState.cardNumber = receipt.card.number;
-                  }
-                  parentSaved(receipt);
-                }),
-                Effect.provideService(SavedWrite.commitObserver, () => {
-                  if (callState.saved !== true) callState.saved = "unknown";
-                  parentCommitting();
-                }),
-                Effect.onExit((exit) => {
-                  const result = exit._tag === "Success" ? exit.value : undefined;
-                  // Handoff tools look up threads to record; the response must not wait on them.
-                  return Effect.gen(function* () {
-                    const endedAt = yield* Clock.currentTimeMillis;
-                    const resolved = {
-                      ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
-                      ...(callState.boardId ? { boardId: callState.boardId } : {}),
-                      ...(callState.cardId ? { cardId: callState.cardId } : {}),
-                    };
-                    const outcome = McpCallAnalytics.callOutcome(exit, callState);
-                    if (options.tool.name === "card_next")
-                      yield* Effect.logInfo("MCP card_next finished", {
-                        threadId: invocation?.thread?.threadId ?? "unknown",
-                        durationMs: Math.max(0, endedAt - startedAt),
-                        outcome: outcome.outcome,
+                    if (Option.isNone(complete))
+                      return new McpSchema.CallToolResult({
+                        isError: true,
+                        content: [
+                          { type: "text", text: "Robob is restarting; retry after reconnecting." },
+                        ],
+                        structuredContent: { reason: "server_shutting_down", bootId: callBootId },
                       });
-                    yield* complete
-                      .value(row(outcome))
-                      .pipe(Effect.interruptible, Effect.timeout("1 second"), Effect.ignoreCause);
-                    yield* Effect.gen(function* () {
-                      // The anonymous analytics event counts the completed input retry only.
-                      if (result instanceof McpSchema.InputRequired) return;
-                      if (Option.isSome(ownerAnalytics) && options.tool.name !== "analytics_read") {
-                        const failed =
-                          exit._tag === "Failure" ||
-                          (result !== undefined && "isError" in result && result.isError === true);
-                        yield* recordServerAnalytics(ownerAnalytics.value, {
-                          ts: DateTime.formatIso(DateTime.makeUnsafe(endedAt)),
-                          kind: failed ? "server.mcp.error" : "server.mcp",
-                          surface: "server",
-                          route: "mcp",
-                          ...resolved,
-                          ...(invocation?.thread === undefined
-                            ? {}
-                            : { threadId: invocation.thread.threadId }),
-                          durationMs: Math.max(0, endedAt - startedAt),
-                          props: {
-                            ...outcome.props,
-                            saved: outcome.saved ?? "unknown",
-                            ...(callState.boardId
-                              ? { boardId: callState.boardId }
-                              : identifiers.boardId
-                                ? { boardId: identifiers.boardId }
-                                : {}),
-                            ...(callState.cardNumber === undefined
-                              ? {}
-                              : { cardNumber: callState.cardNumber }),
-                            method: options.tool.name,
-                            span: "mcp.tools.call",
-                            originKind: invocation?.thread === undefined ? "mcp-client" : "agent",
-                            ...(failed
-                              ? {
-                                  errorTag:
-                                    exit._tag === "Failure"
-                                      ? analyticsErrorTag(exit.cause)
-                                      : "McpToolError",
-                                }
-                              : {}),
-                          },
-                        });
+                    if (options.tool.name === "card_next")
+                      yield* Effect.logInfo("MCP card_next started", {
+                        threadId: invocation?.thread?.threadId ?? "unknown",
+                        startedAt,
+                      });
+                    const rejection = { exceeded: false };
+                    const readiness = BOARD_READ_TOOLS.has(options.tool.name)
+                      ? boardReplyReady
+                      : options.tool.name === "list_scheduled_tasks"
+                        ? controlReplyReady
+                        : Effect.void;
+                    const largeRead = LARGE_READ_TOOLS.has(options.tool.name);
+                    let phase: "lane" | "readiness" | "handler" = "lane";
+                    let phaseStarted = yield* Clock.monotonicTimeNanos;
+                    const readStarted = phaseStarted;
+                    const timings = { readinessWaitMs: 0, laneWaitMs: 0, handlerMs: 0 };
+                    const phaseKey = {
+                      lane: "laneWaitMs",
+                      readiness: "readinessWaitMs",
+                      handler: "handlerMs",
+                    } as const;
+                    // The tools/call span owns these timings, including an interrupted wait.
+                    const advance = Effect.fnUntraced(function* (next: typeof phase) {
+                      const now = yield* Clock.monotonicTimeNanos;
+                      timings[phaseKey[phase]] += Number(now - phaseStarted) / 1e6;
+                      phase = next;
+                      phaseStarted = now;
+                    });
+                    const result = readiness
+                      .pipe(Effect.andThen(largeRead ? advance("handler") : Effect.void))
+                      .pipe(
+                        Effect.andThen(
+                          options.tool.name === "t3_thread_read"
+                            ? ThreadReadMetrics.enterPhase("query")
+                            : Effect.void,
+                        ),
+                      )
+                      .pipe(
+                        Effect.andThen(() => {
+                          const allowed = Context.getOrUndefined(
+                            options.annotations,
+                            KanbanArgumentKeys,
+                          );
+                          const failure =
+                            allowed === undefined
+                              ? undefined
+                              : argumentFailure(options.tool.name, allowed, payload);
+                          return failure === undefined
+                            ? options.handle(payload)
+                            : Effect.succeed(
+                                new McpSchema.CallToolResult({
+                                  isError: true,
+                                  content: [{ type: "text", text: encodeJsonText(failure) }],
+                                }),
+                              );
+                        }),
+                      )
+                      .pipe(
+                        Effect.tap(() =>
+                          options.tool.name === "t3_thread_read"
+                            ? ThreadReadMetrics.enterPhase("render")
+                            : Effect.void,
+                        ),
+                      )
+                      .pipe(Effect.map(withFailureStructuredContent))
+                      .pipe(Effect.provideService(ReplyRejection, rejection));
+                    // Large reads run on their own "mcp" lane (whole call, so at most
+                    // PERMITS.mcp large results are built at once). They queue only behind
+                    // each other, never behind control polls, lists or snapshots (10 Nov
+                    // 2026: t3_thread_read held the shared agent lane up to 153 s).
+                    let measuredResult: unknown;
+                    let replyBytes = 0;
+                    const check = <A>(built: A): A | McpSchema.CallToolResult => {
+                      // MCP repeats the result as text and structuredContent; leave envelope headroom.
+                      if (!rejection.exceeded) {
+                        replyBytes = jsonBytesUpToLimit(built, MAX_REPLY_BYTES - 4096);
+                        measuredResult = built;
+                        if (replyBytes <= MAX_REPLY_BYTES - 4096) return built;
                       }
-                      yield* record(options.tool.name, payload, result, endedAt - startedAt);
-                    }).pipe(Effect.ignoreCause, Effect.forkDetach);
-                  }).pipe(Effect.asVoid);
-                }),
+                      if (Option.isSome(largeRepliesForTools))
+                        largeRepliesForTools.value.record({
+                          kind: "mcp",
+                          name: options.tool.name,
+                          bytes: MAX_REPLY_BYTES + 1,
+                          rejected: true,
+                        });
+                      return new McpSchema.CallToolResult({
+                        isError: true,
+                        content: [{ type: "text", text: REPLY_TOO_LARGE }],
+                      });
+                    };
+                    const completed = result.pipe(
+                      (call) =>
+                        largeRead
+                          ? ReplyBuilders.bounded(
+                              advance("readiness").pipe(
+                                Effect.andThen(
+                                  options.tool.name === "t3_thread_read"
+                                    ? // Keep the permit outside the detached waiter so masked cleanup
+                                      // cannot retain admission after the read deadline or disconnect.
+                                      McpDeadline.awaitInterruptibly(Effect.map(call, check))
+                                    : Effect.map(call, check),
+                                ),
+                              ),
+                              "mcp",
+                            )
+                          : Effect.map(call, check),
+                      Effect.catchCauseIf(
+                        (cause) =>
+                          cause.reasons.some(
+                            (reason) =>
+                              Cause.isDieReason(reason) && reason.defect instanceof ReplyTooLarge,
+                          ),
+                        () => {
+                          if (Option.isSome(largeRepliesForTools))
+                            largeRepliesForTools.value.record({
+                              kind: "mcp",
+                              name: options.tool.name,
+                              bytes: MAX_REPLY_BYTES + 1,
+                              rejected: true,
+                            });
+                          return Effect.succeed(
+                            new McpSchema.CallToolResult({
+                              isError: true,
+                              content: [{ type: "text", text: REPLY_TOO_LARGE }],
+                            }),
+                          );
+                        },
+                      ),
+                    );
+                    // Reuse the bounded-read waiter so masked SQLite cleanup cannot hold the reply.
+                    const boundedRead =
+                      options.tool.name === "t3_thread_read"
+                        ? ThreadReadDeadline.withDeadline(completed)
+                        : options.tool.name === "list_scheduled_tasks"
+                          ? McpDeadline.awaitInterruptibly(completed).pipe(
+                              Effect.timeoutOrElse({
+                                duration: "20 seconds",
+                                orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(function* () {
+                                  const now = yield* Clock.monotonicTimeNanos;
+                                  return new McpSchema.CallToolResult({
+                                    isError: true,
+                                    content: [
+                                      {
+                                        type: "text",
+                                        text: "Robob is busy; nothing was read. Retry the same call.",
+                                      },
+                                    ],
+                                    structuredContent: {
+                                      reason: "server_busy",
+                                      phase,
+                                      waitedMs: Number(now - readStarted) / 1e6,
+                                    },
+                                  });
+                                }),
+                              }),
+                            )
+                          : completed;
+                    const protectedRead = SavedBoardReply.TIMED_TOOLS.has(options.tool.name)
+                      ? SavedBoardReply.protect(boundedRead, options.tool.name)
+                      : boundedRead;
+                    // Keep read timings on tools/call, outside the saved-reply child span.
+                    const measuredRead = largeRead
+                      ? protectedRead.pipe(
+                          Effect.onExit((exit) =>
+                            Effect.gen(function* () {
+                              const now = yield* Clock.monotonicTimeNanos;
+                              const elapsed = { ...timings };
+                              elapsed[phaseKey[phase]] += Number(now - phaseStarted) / 1e6;
+                              const result = exit._tag === "Success" ? exit.value : undefined;
+                              const content =
+                                result !== undefined && "structuredContent" in result
+                                  ? result.structuredContent
+                                  : undefined;
+                              yield* Effect.annotateCurrentSpan({
+                                ...elapsed,
+                                replyBytes:
+                                  result === undefined
+                                    ? 0
+                                    : result === measuredResult
+                                      ? replyBytes
+                                      : jsonBytesUpToLimit(result),
+                                ...(options.tool.name === "list_scheduled_tasks"
+                                  ? {
+                                      taskCount:
+                                        content !== null &&
+                                        typeof content === "object" &&
+                                        "tasks" in content &&
+                                        Array.isArray(content.tasks)
+                                          ? content.tasks.length
+                                          : 0,
+                                    }
+                                  : {}),
+                              });
+                            }),
+                          ),
+                        )
+                      : protectedRead;
+                    return yield* measuredRead.pipe(
+                      Effect.provideService(McpCallAnalytics.McpCall, callState),
+                      Effect.provideService(SavedWrite.observer, (receipt) => {
+                        if (!boardWrite) callState.saved = true;
+                        if (receipt.kind === "card" && callState.cardId === undefined) {
+                          callState.boardId = receipt.card.boardId;
+                          callState.cardId = receipt.card.id;
+                          callState.cardNumber = receipt.card.number;
+                          callState.cardStage = receipt.card.stage;
+                        }
+                        parentSaved(receipt);
+                      }),
+                      Effect.provideService(SavedWrite.commitObserver, () => {
+                        // Board writes scope commit evidence to the incoming request in SavedWrite.
+                        if (!boardWrite && callState.saved !== true) callState.saved = "unknown";
+                        parentCommitting();
+                      }),
+                      Effect.onExit((exit) => {
+                        const result = exit._tag === "Success" ? exit.value : undefined;
+                        // Handoff tools look up threads to record; the response must not wait on them.
+                        return Effect.gen(function* () {
+                          const endedAt = yield* Clock.currentTimeMillis;
+                          handlerEnded = yield* Clock.monotonicTimeNanos;
+                          // Detached cancellation cleanup can finish before response delivery.
+                          if (callState.threadRead !== undefined)
+                            threadReadAtExit = ThreadReadMetrics.snapshot(
+                              callState.threadRead,
+                              handlerEnded,
+                            );
+                          if (callState.cardNext !== undefined) {
+                            const timings = CardNextMetrics.snapshot(
+                              callState.cardNext,
+                              handlerEnded,
+                            );
+                            cardNextAtExit = {
+                              ...timings,
+                              readerLane: callState.readerLane,
+                              callerResolved: callState.callerResolved,
+                              callerResolveMs:
+                                timings.cardNextStages.find((part) => part.stage === "caller")
+                                  ?.durationMs ?? 0,
+                            };
+                          }
+                          const resolved = {
+                            ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
+                            ...(callState.boardId ? { boardId: callState.boardId } : {}),
+                            ...(callState.cardId ? { cardId: callState.cardId } : {}),
+                          };
+                          const outcome = McpCallAnalytics.callOutcome(exit, callState);
+                          if (options.tool.name === "card_next")
+                            yield* Effect.logInfo("MCP card_next finished", {
+                              threadId: invocation?.thread?.threadId ?? "unknown",
+                              durationMs: Math.max(0, endedAt - startedAt),
+                              outcome: outcome.outcome,
+                            });
+                          // Waiting here would prevent the response from being written. Keep the
+                          // ledger entry pending until Node finishes or loses the response instead.
+                          const writeRow = complete
+                            .value(row(outcome))
+                            .pipe(
+                              Effect.interruptible,
+                              Effect.timeout("1 second"),
+                              Effect.ignoreCause,
+                            );
+                          if (Option.isSome(delivery))
+                            yield* delivery.value.settled.pipe(
+                              Effect.andThen(writeRow),
+                              Effect.forkDetach,
+                            );
+                          else yield* writeRow;
+                          yield* Effect.gen(function* () {
+                            // The anonymous analytics event counts the completed input retry only.
+                            if (result instanceof McpSchema.InputRequired) return;
+                            if (
+                              Option.isSome(ownerAnalytics) &&
+                              options.tool.name !== "analytics_read"
+                            ) {
+                              const failed =
+                                exit._tag === "Failure" ||
+                                (result !== undefined &&
+                                  "isError" in result &&
+                                  result.isError === true);
+                              yield* recordServerAnalytics(ownerAnalytics.value, {
+                                ts: DateTime.formatIso(DateTime.makeUnsafe(endedAt)),
+                                kind: failed ? "server.mcp.error" : "server.mcp",
+                                surface: "server",
+                                route: "mcp",
+                                ...resolved,
+                                ...(invocation?.thread === undefined
+                                  ? {}
+                                  : { threadId: invocation.thread.threadId }),
+                                durationMs: Math.max(0, endedAt - startedAt),
+                                props: {
+                                  ...outcome.props,
+                                  ...(readOnly && callState.taskLookup === undefined
+                                    ? {}
+                                    : { saved: outcome.saved ?? "unknown" }),
+                                  ...(callState.boardId
+                                    ? { boardId: callState.boardId }
+                                    : identifiers.boardId
+                                      ? { boardId: identifiers.boardId }
+                                      : {}),
+                                  ...(callState.cardNumber === undefined
+                                    ? {}
+                                    : { cardNumber: callState.cardNumber }),
+                                  method: options.tool.name,
+                                  span: "mcp.tools.call",
+                                  originKind:
+                                    invocation?.thread === undefined ? "mcp-client" : "agent",
+                                  ...(failed
+                                    ? {
+                                        errorTag:
+                                          exit._tag === "Failure"
+                                            ? analyticsErrorTag(exit.cause)
+                                            : "McpToolError",
+                                      }
+                                    : {}),
+                                },
+                              });
+                            }
+                            yield* record(options.tool.name, payload, result, endedAt - startedAt);
+                          }).pipe(Effect.ignoreCause, Effect.forkDetach);
+                        }).pipe(Effect.asVoid);
+                      }),
+                    );
+                  }),
+                (activity) => activity.release,
               );
             }),
         }),
@@ -1339,7 +1810,11 @@ export const layerPreviewToolkit = Layer.mergeAll(
 export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorToolkit,
   OrchestratorHandlers.layer,
-).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
+).pipe(
+  Layer.provide(OrchestratorMcpService.layer),
+  Layer.provide(ThreadMetadataMcpService.layer),
+  Layer.provide(BackgroundTerminals.layer),
+);
 
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 

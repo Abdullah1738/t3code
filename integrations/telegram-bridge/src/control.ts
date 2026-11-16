@@ -6,7 +6,7 @@ import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PermissionRequest, QuestionRequest } from "./openchamber.ts";
-import { errorCause, toolError, type ErrorCause } from "./toollog.ts";
+import { errorInfo, toolError, type ErrorCause, type ErrorInfo } from "./toollog.ts";
 
 const COMPONENT = "telegram-bridge";
 const PREFIX = "/api/ardud/control";
@@ -94,7 +94,7 @@ export interface ControlEventFrame {
 }
 
 export class ControlError extends Error {
-  constructor(readonly status: number, readonly code = "", readonly causeClass: ErrorCause = status || "unknown") {
+  constructor(readonly status: number, readonly code = "", readonly causeClass: ErrorCause = status || "unclassified", readonly diagnostic?: ErrorInfo) {
     // Never carry response bodies, URLs or tokens into errors.
     super(`Robob control request failed (HTTP ${status})`);
     this.name = "ControlError";
@@ -162,19 +162,21 @@ export class ControlClient {
       });
     } catch (error) {
       toolError("telegram", "tg.control.request", undefined, signal.aborted ? signal.reason : error);
-      throw new ControlError(0, "", errorCause(signal.aborted ? signal.reason : error));
+      const diagnostic = errorInfo(signal.aborted ? signal.reason : error);
+      throw new ControlError(0, "", diagnostic.cause, diagnostic);
     }
     let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
     } catch (error) {
-      const causeClass = signal.aborted ? errorCause(signal.reason) : !response.ok ? response.status : errorCause(error);
-      const failure = new ControlError(response.status, "", causeClass);
+      const diagnostic = errorInfo(signal.aborted ? signal.reason : !response.ok ? { status: response.status } : error);
+      const failure = new ControlError(response.status, "", diagnostic.cause, diagnostic);
       toolError("telegram", "tg.control.responseJson", undefined, failure);
       throw failure;
     }
     if (!response.ok || (!options.kanban && data?.ok !== true)) {
-      throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "", response.ok ? "decode" : response.status);
+      throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "", response.ok ? "decode" : response.status,
+        response.ok ? { cause: "decode", detail: "SchemaError" } : undefined);
     }
     return data as T;
   }
@@ -241,7 +243,8 @@ export class ControlClient {
       });
     } catch (error) {
       toolError("telegram", "tg.control.upload", undefined, error);
-      throw new ControlError(0, "upload_failed", errorCause(error));
+      const diagnostic = errorInfo(error);
+      throw new ControlError(0, "upload_failed", diagnostic.cause, diagnostic);
     }
     await response.body?.cancel().catch(error => { toolError("telegram", "tg.control.uploadBodyCancel", undefined, error); });
     if (!response.ok) throw new ControlError(response.status, "upload_failed");
@@ -270,7 +273,8 @@ export class ControlClient {
       });
     } catch (error) {
       toolError("telegram", "tg.control.events", undefined, error);
-      throw new ControlError(0, "", errorCause(options.signal.aborted ? options.signal.reason : error));
+      const diagnostic = errorInfo(options.signal.aborted ? options.signal.reason : error);
+      throw new ControlError(0, "", diagnostic.cause, diagnostic);
     }
     if (!response.ok || !response.body || response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "text/event-stream") {
       await response.body?.cancel().catch(error => { toolError("telegram", "tg.control.eventBodyCancel", undefined, error); });

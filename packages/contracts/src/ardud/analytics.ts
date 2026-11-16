@@ -1,5 +1,8 @@
+import { McpReasonClass, McpInvalidField, McpRefusedAt } from "./mcpReasonClass.ts";
+import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
+import { OrchestrationV2CancelReason } from "../orchestrationV2.ts";
 
 const Timestamp = Schema.String.check(
   Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
@@ -24,9 +27,33 @@ const DerivedId = Schema.String.check(
   Schema.isMaxLength(8192),
   Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+!~'()*-]*$/),
 );
+const McpCallerRole = Schema.Literals([
+  "work",
+  "review",
+  "evaluator",
+  "discussion",
+  "owner",
+  "unattached",
+  "none",
+]);
+const McpCallerKind = Schema.Literals([
+  "board_thread",
+  "plain_thread",
+  "delegated_child",
+  "cli",
+  "unknown",
+]);
 const Measurement = Schema.Number.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 );
+const McpReplyPhases = Schema.Struct({
+  caller: Schema.optionalKey(Measurement),
+  admission: Schema.optionalKey(Measurement),
+  read: Schema.optionalKey(Measurement),
+  mutate: Schema.optionalKey(Measurement),
+  commit: Schema.optionalKey(Measurement),
+  ack: Schema.optionalKey(Measurement),
+});
 // Mergeable, bounded duration distribution; bucket upper bounds have at most 2% error.
 export const LONG_TASK_HISTOGRAM_RATIO = 1.02;
 export const LONG_TASK_HISTOGRAM_BUCKETS = 1024;
@@ -41,7 +68,78 @@ const McpOutcome = Schema.Literals([
   "interrupted",
   "interrupted_by_shutdown",
 ]);
-const McpPhase = Schema.Literals(["caller", "dispatch", "result", "handler"]);
+const McpPhase = Schema.Literals([
+  "caller",
+  "dispatch",
+  "result",
+  "handler",
+  "lane_wait",
+  "query",
+  "render",
+]);
+export const EvaluatorTrigger = Schema.Literals([
+  "owner_answer",
+  "card_ask",
+  "discussion_post",
+  "step_transition",
+  "step_reminder",
+  "stall_run_failure",
+  "system_stall",
+  "review_verdict",
+  "wait_ended",
+  "wait_expired",
+  "wait_failing",
+  "report_bug",
+  "evaluator_start",
+  "tick_check",
+  "tick_stalled",
+  "tick_completed",
+  "tick_deployed",
+  "tick_packets",
+  "nightly",
+  "setup",
+  "discussion_nudge",
+  "thread_send",
+  "legacy_queue",
+]);
+export type EvaluatorTrigger = typeof EvaluatorTrigger.Type;
+export const EvaluatorOutcome = Schema.Literals([
+  "started",
+  "reused",
+  "merged",
+  "queued_spawn_cap",
+]);
+export type EvaluatorOutcome = typeof EvaluatorOutcome.Type;
+export const EvaluatorReuseMissReason = Schema.Literals([
+  "duplicate",
+  "stale_reminder",
+  "no_card_reuse_scope",
+  "no_candidates",
+  "all_candidates_rejected",
+  "idle_expired",
+  "archived",
+  "failed",
+  "missing",
+  "different_purpose",
+  "forced_new",
+  "not_attempted",
+  "legacy_queue",
+]);
+export type EvaluatorReuseMissReason = typeof EvaluatorReuseMissReason.Type;
+const DetachedOutcome = Schema.Literals(["committed", "failed", "capped"]);
+const EventOutcome = Schema.Union([McpOutcome, EvaluatorOutcome, DetachedOutcome]);
+export const EvaluatorPurposeKind = Schema.Literals([
+  "discussion",
+  "nightly",
+  "stalled",
+  "completed",
+  "deployed",
+  "check",
+  "packets",
+  "setup",
+  "request",
+  "unknown",
+]);
 const GeneralEvent = Schema.Struct({
   ts: Timestamp,
   kind: Label.check(Schema.makeFilter((kind) => kind !== "run.usage")),
@@ -52,6 +150,8 @@ const GeneralEvent = Schema.Struct({
   discussionId: Schema.optionalKey(Id),
   threadId: Schema.optionalKey(DerivedId),
   durationMs: Schema.optionalKey(Measurement),
+  lateMs: Schema.optionalKey(Measurement),
+  afterCap: Schema.optionalKey(Schema.Boolean),
   tool: Schema.optionalKey(Label),
   build: Schema.optionalKey(Label),
   bootId: Schema.optionalKey(Id),
@@ -59,31 +159,121 @@ const GeneralEvent = Schema.Struct({
   committed: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
   taskId: Schema.optionalKey(DerivedId),
   callerThreadId: Schema.optionalKey(DerivedId),
+  callerRole: Schema.optionalKey(McpCallerRole),
+  callerKind: Schema.optionalKey(McpCallerKind),
+  cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+  callerCardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+  callerCardStage: Schema.optionalKey(Label),
+  writePhases: Schema.optionalKey(
+    Schema.Struct({
+      lockWait: Measurement,
+      read: Measurement,
+      write: Measurement,
+      replyWait: Measurement,
+    }),
+  ),
+  cardStage: Schema.optionalKey(Label),
+  denyReason: Schema.optionalKey(McpDenyReason),
+  reasonClass: Schema.optionalKey(McpReasonClass),
+  invalidField: Schema.optionalKey(McpInvalidField),
+  refusedAt: Schema.optionalKey(McpRefusedAt),
+  replyStage: Schema.optionalKey(Label),
+  replyPhases: Schema.optionalKey(McpReplyPhases),
+  requestTiming: Schema.optionalKey(
+    Schema.Struct({ authMs: Measurement, dispatchMs: Measurement, preHandlerMs: Measurement }),
+  ),
   callerResolved: Schema.optionalKey(Schema.Boolean),
   callerResolveMs: Schema.optionalKey(Measurement),
+  authMs: Schema.optionalKey(Measurement),
+  dispatchMs: Schema.optionalKey(Measurement),
+  preHandlerMs: Schema.optionalKey(Measurement),
+  totalMs: Schema.optionalKey(Measurement),
   clientRequestId: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
-  outcome: Schema.optionalKey(McpOutcome),
+  outcome: Schema.optionalKey(EventOutcome),
+  purposeKind: Schema.optionalKey(EvaluatorPurposeKind),
+  trigger: Schema.optionalKey(EvaluatorTrigger),
+  reuseMissReason: Schema.optionalKey(EvaluatorReuseMissReason),
   errorTag: Schema.optionalKey(Label),
   errorPhase: Schema.optionalKey(McpPhase),
   saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+  responseDelivery: Schema.optionalKey(Schema.Literals(["pending", "finished", "closed"])),
+  responseElapsedMs: Schema.optionalKey(Measurement),
+  responseCloseReason: Schema.optionalKey(
+    Schema.Literals(["idle_timeout", "client_error", "peer_end", "socket_error", "unknown"]),
+  ),
+  callerReaderLane: Schema.optionalKey(Label),
+  /** Legacy caller-lookup lane; new rows emit this alias for one release. */
   readerLane: Schema.optionalKey(Label),
+  waitStage: Schema.optionalKey(Schema.Literals(["lookup.caller", "lookup.target", "waiting"])),
+  waitLookupMs: Schema.optionalKey(Measurement),
   writerWaitMs: Schema.optionalKey(Measurement),
+  readerWaitMs: Schema.optionalKey(Measurement),
+  cardNextStages: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        stage: Schema.Literals(["caller", "occupancy", "cards", "ranking", "rules"]),
+        durationMs: Measurement,
+        readerWaitMs: Measurement,
+        queryMs: Measurement,
+        completed: Schema.Boolean,
+      }),
+    ).check(Schema.isMaxLength(5)),
+  ),
+  queryMs: Schema.optionalKey(Measurement),
+  renderMs: Schema.optionalKey(Measurement),
+  inFlightAtStart: Schema.optionalKey(
+    Schema.Struct({
+      session: Measurement,
+      overall: Measurement,
+    }),
+  ),
+  threadReadStages: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        stage: Schema.Literals([
+          "caller",
+          "shell",
+          "records",
+          "timeline",
+          "messages",
+          "acknowledgement",
+        ]),
+        durationMs: Measurement,
+        completed: Schema.Boolean,
+        readerWaitMs: Measurement,
+        queryMs: Measurement,
+      }),
+    ).check(Schema.isMaxLength(6)),
+  ),
   props: Schema.optionalKey(
     Schema.Struct({
+      on: Schema.optionalKey(Label),
+      until: Schema.optionalKey(Timestamp),
+      script: Schema.optionalKey(Label),
       number: Schema.optionalKey(Measurement),
       from: Schema.optionalKey(Label),
       to: Schema.optionalKey(Label),
       actor: Schema.optionalKey(
         Schema.Literals(["owner", "thread", "evaluator", "script", "system"]),
       ),
+      seq: Schema.optionalKey(Measurement),
+      target: Schema.optionalKey(Schema.Literals(["live_thread", "steer", "start", "none"])),
       msInPrevStage: Schema.optionalKey(Measurement),
       round: Schema.optionalKey(Measurement),
       chain: Schema.optionalKey(Label),
       verdict: Schema.optionalKey(Schema.Literals(["clear", "feedback"])),
       head: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[0-9a-f]{7,40}$/))),
-      action: Schema.optionalKey(Schema.Literals(["set", "clear"])),
+      action: Schema.optionalKey(
+        Schema.Literals(["set", "clear", "resumed", "restarted", "failed"]),
+      ),
+      effort: Schema.optionalKey(Label),
+      lastProgressKind: Schema.optionalKey(Label),
+      lastProgressTool: Schema.optionalKey(Label),
+      silentSeconds: Schema.optionalKey(Measurement),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
+      cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
+      runId: Schema.optionalKey(DerivedId),
       model: Schema.optionalKey(Label),
       provider: Schema.optionalKey(Label),
       operation: Schema.optionalKey(Label),
@@ -94,12 +284,73 @@ const GeneralEvent = Schema.Struct({
       slots: Schema.optionalKey(Measurement),
       waiting: Schema.optionalKey(Measurement),
       method: Schema.optionalKey(Label),
+      httpMethod: Schema.optionalKey(Label),
+      httpRoute: Schema.optionalKey(Label),
+      queryShape: Schema.optionalKey(Label),
+      controlClient: Schema.optionalKey(Label),
+      userAgent: Schema.optionalKey(Label),
+      readerLane: Schema.optionalKey(Label),
+      readerAcquireMs: Schema.optionalKey(Measurement),
+      readerQueryMs: Schema.optionalKey(Measurement),
+      readerStatements: Schema.optionalKey(Measurement),
+      serializationMs: Schema.optionalKey(Measurement),
+      readerHolders: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            holder: Label,
+            holdMs: Measurement,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
+      readerTimings: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            waitMs: Measurement,
+            queryMs: Measurement,
+            statements: Measurement,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
+      replyAdmissions: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            waitMs: Measurement,
+            runMs: Measurement,
+            acquired: Schema.Boolean,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
       span: Schema.optionalKey(Label),
       errorTag: Schema.optionalKey(Label),
       code: Schema.optionalKey(Label),
       boardId: Schema.optionalKey(Id),
       cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
       saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+      foundBy: Schema.optionalKey(
+        Schema.Literals(["subagents", "receipt", "request_key_recovery", "none"]),
+      ),
+      notFoundReason: Schema.optionalKey(
+        Schema.Literals([
+          "non_canonical_id",
+          "never_saved",
+          "not_a_delegation_id",
+          "other_thread",
+          "not_a_delegation_command",
+          "accepted",
+          "rejected",
+          "pending",
+          "abandoned",
+          "missing_child_thread",
+        ]),
+      ),
+      idCanonical: Schema.optionalKey(Schema.Boolean),
+      dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
+      idShape: Schema.optionalKey(
+        Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
+      ),
       cause: Schema.optionalKey(
         Schema.Literals(["client_disconnect", "shutdown", "deadline", "stop", "unknown"]),
       ),
@@ -108,7 +359,22 @@ const GeneralEvent = Schema.Struct({
       poolKey: Schema.optionalKey(Label),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
+      effectId: Schema.optionalKey(DerivedId),
+      effectType: Schema.optionalKey(Label),
+      commandType: Schema.optionalKey(Label),
+      failedRunId: Schema.optionalKey(DerivedId),
+      startedRunId: Schema.optionalKey(DerivedId),
+      failureCode: Schema.optionalKey(Label),
+      headRunId: Schema.optionalKey(DerivedId),
+      headOrdinal: Schema.optionalKey(Measurement),
+      queuedCount: Schema.optionalKey(Measurement),
+      heldCount: Schema.optionalKey(Measurement),
       phase: Schema.optionalKey(Label),
+      subSteps: Schema.optionalKey(
+        Schema.Array(Schema.Struct({ subStep: Label, ms: Measurement })).check(
+          Schema.isMaxLength(3),
+        ),
+      ),
       tickId: Schema.optionalKey(Id),
       activeTickId: Schema.optionalKey(Id),
       cardsScanned: Schema.optionalKey(Measurement),
@@ -192,6 +458,7 @@ export const RunUsageEvent = Schema.Struct({
   wallMs: Schema.NullOr(Measurement),
   turnCount: Measurement,
   endReason: Schema.Literals(["completed", "failed", "interrupted", "cancelled"]),
+  cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
   usageStatus: Schema.Literals(["complete", "partial", "unavailable"]),
   reviewRound: TokenCount,
 });
@@ -215,14 +482,25 @@ export class AnalyticsError extends Schema.TaggedError<AnalyticsError>()("Analyt
     return `Analytics ${this.operation} failed.`;
   }
 }
+export const AnalyticsReadSection = Schema.suspend(() =>
+  Schema.Literals([
+    ...(Object.keys(AnalyticsRollup.fields) as Array<keyof typeof AnalyticsRollup.fields>),
+    "samples",
+  ]),
+);
+export type AnalyticsReadSection = typeof AnalyticsReadSection.Type;
 export const AnalyticsReadInput = Schema.Struct({
   day: Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/)),
   kind: Schema.optionalKey(Label),
   boardId: Schema.optionalKey(Id),
   cardId: Schema.optionalKey(Id),
+  cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
   tool: Schema.optionalKey(Label),
-  outcome: Schema.optionalKey(McpOutcome),
+  outcome: Schema.optionalKey(EventOutcome),
+  section: Schema.optionalKey(AnalyticsReadSection),
+  cursor: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(160))),
   limit: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 500 }))),
+  responseDelivery: Schema.optionalKey(Schema.Literals(["pending", "finished", "closed"])),
 });
 export type AnalyticsReadInput = typeof AnalyticsReadInput.Type;
 const LatencyFields = {
@@ -265,7 +543,7 @@ export const AskLatencyRollup = Schema.Struct({
   byKind: Schema.Record(Label, AskLatencySplit),
 });
 export const AnalyticsRollup = Schema.Struct({
-  day: AnalyticsReadInput.fields.day,
+  day: Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/)),
   generatedAt: Timestamp,
   scope: Schema.Literal("retained-events"),
   total: Measurement,
@@ -286,6 +564,19 @@ export const AnalyticsRollup = Schema.Struct({
     ),
   ),
   errorCounts: Schema.Record(Label, Measurement),
+  controlRoutes: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        route: Label,
+        method: Label,
+        hour: Label,
+        statuses: Schema.Record(Label, Measurement),
+        totalWaitMs: Measurement,
+        deadlineExceeded: Measurement,
+        ...LatencyFields,
+      }),
+    ),
+  ),
   errorsByRoute: Schema.Array(
     Schema.Struct({
       route: Label,
@@ -296,6 +587,46 @@ export const AnalyticsRollup = Schema.Struct({
     }),
   ),
   mcpErrorsByCode: Schema.Array(Schema.Struct({ tool: Label, code: Label, ...LatencyFields })),
+  mcpFailureBreakdown: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        tool: Label,
+        code: Label,
+        ...LatencyFields,
+        byReason: Schema.Record(Label, Measurement),
+        byRole: Schema.Record(Label, Measurement),
+        byCallerReaderLane: Schema.Record(Label, Measurement),
+      }),
+    ),
+  ),
+  mcpFailureContexts: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        tool: Label,
+        code: Label,
+        errorTag: Label,
+        denyReason: Label,
+        callerRole: Label,
+        cardStage: Label,
+        ...LatencyFields,
+      }),
+    ),
+  ),
+  mcpReplyTimeouts: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        tool: Label,
+        code: Schema.Literal("reply_timeout"),
+        errorTag: Label,
+        denyReason: Label,
+        callerRole: Label,
+        cardStage: Label,
+        ...LatencyFields,
+        replyPhases: Schema.Record(Label, Schema.Struct(LatencyFields)),
+        writePhases: Schema.Record(Label, Schema.Struct(LatencyFields)),
+      }),
+    ),
+  ),
   dbSlowBySpan: Schema.Array(
     Schema.Struct({
       span: Label,
@@ -390,6 +721,27 @@ export const AnalyticsRollup = Schema.Struct({
   tickPhases: Schema.optionalKey(
     Schema.Array(Schema.Struct({ boardId: Id, phase: Label, ...LatencyFields })),
   ),
+  evaluatorOutcomes: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        boardId: Id,
+        trigger: Label,
+        purposeKind: Label,
+        outcome: Label,
+        reuseMissReason: Schema.NullOr(Label),
+        count: Measurement,
+      }),
+    ),
+  ),
+  evaluatorStartsByTrigger: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        boardId: Id,
+        trigger: Label,
+        count: Measurement,
+      }),
+    ),
+  ),
   mcpCalls: Schema.Array(
     Schema.Struct({
       tool: Label,
@@ -397,22 +749,68 @@ export const AnalyticsRollup = Schema.Struct({
       build: Label,
       bootId: Id,
       ...LatencyFields,
+      preHandler: Schema.optionalKey(Schema.Struct(LatencyFields)),
       failures: Measurement,
       failureRate: Measurement,
       outcomes: Schema.Record(Label, Measurement),
       savedCounts: Schema.Record(Label, Measurement),
+      reasonClasses: Schema.Record(Label, Measurement),
+      invalidFields: Schema.Record(Label, Measurement),
+      notFoundReasons: Schema.optionalKey(Schema.Record(Label, Measurement)),
+      foundByCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
+      idShapeCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
       errors: Schema.Array(
         Schema.Struct({ errorTag: Label, errorPhase: McpPhase, count: Measurement }),
       ),
       failedThenRetried: Measurement,
       retrySucceeded: Measurement,
+      dispatchTimeouts: Schema.optionalKey(
+        Schema.Struct({
+          committed: Measurement,
+          failed: Measurement,
+          capped: Measurement,
+          noOutcome: Measurement,
+        }),
+      ),
     }),
   ),
-  mcpOverflow: Schema.Struct({ groups: Measurement, retryAttempts: Measurement }),
+  mcpOverflow: Schema.Struct({
+    groups: Measurement,
+    retryAttempts: Measurement,
+    detachedOutcomes: Schema.optionalKey(Measurement),
+  }),
 });
 export type AnalyticsRollup = typeof AnalyticsRollup.Type;
 export const AnalyticsReadResult = Schema.Struct({
   rollup: AnalyticsRollup,
   samples: Schema.Array(AnalyticsEvent),
+  summary: Schema.Struct({
+    events: Measurement,
+    errors: Measurement,
+    mcpCalls: Measurement,
+    mcpFailures: Measurement,
+    boardMoves: Measurement,
+    reviewRounds: Measurement,
+    stalls: Measurement,
+    openAsks: Measurement,
+    runs: Measurement,
+  }),
+  sections: Schema.Array(
+    Schema.Struct({ name: AnalyticsReadSection, rows: Measurement, chars: Measurement }),
+  ),
+  section: Schema.optionalKey(AnalyticsReadSection),
+  rows: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        path: Schema.Array(Schema.Union([Schema.String, Schema.Int])),
+        value: Schema.Json,
+        truncated: Schema.optionalKey(Schema.Boolean),
+      }),
+    ),
+  ),
+  hasMore: Schema.Boolean,
+  cursor: Schema.optionalKey(Schema.String),
+  truncated: Schema.optionalKey(Schema.Boolean),
+  next: Schema.optionalKey(Schema.String),
 });
 export type AnalyticsReadResult = typeof AnalyticsReadResult.Type;

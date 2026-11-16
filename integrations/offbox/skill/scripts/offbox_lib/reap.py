@@ -7,11 +7,12 @@ from __future__ import annotations
 import time
 import sqlite3
 import re
+import contextlib
 
 from . import api, bases, capacity, lease, prune
 from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
-                     iso_ts, kv_set, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner, write)
+                     iso_ts, kv_set, log, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner, write)
 from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
@@ -176,6 +177,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if rid in recovered or rid in unowned:
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost")
+        with contextlib.suppress(Exception):
+            log(f"reaper no-box run {rid} client_pid=None check=no_pid_age_limit age_s={now() - start_at:.3f} dry={dry}")
         if not dry:
             _mark_lost(con, rid, "client ended before it got a box", no_box=True, expected_client=(None, start_at))
     # A no-box run whose own `offbox run` client is gone never got a box: mark it lost now, not after 2 h.
@@ -186,7 +189,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     for rid, pid, start_at in orphan:
         if rid in recovered or rid in unowned:
             continue
-        if _client_alive(pid, start_at):
+        if _client_alive(pid, start_at, reaper_run=rid):
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost (client {pid} gone)")
         if not dry:
@@ -470,7 +473,7 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
         con.commit()
         lease._release_locked(con, bid)
     if not dry:
-        reconcile_lost(con, bid, state=state)
+        reconcile_lost(con, bid, state=state, foreign=True)
     from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND (status IN ('starting','running') OR "
                            "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
@@ -502,7 +505,8 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 # Legacy wrappers cannot be fenced; receipts are still authoritative.
                 if modern or result.code is not None:
                     start_check.settle(con, run, result, run['error'] or 'client ended before the command started',
-                                       until=None if api.left() is None else now() + max(0, api.left()))
+                                       until=None if api.left() is None else now() + max(0, api.left()),
+                                       foreign=True)
                     actions.append(f"settled run {run['run_id']} on {bid}: {result.verdict} exit={result.code}")
                     continue
             if state in api.LIVE_STATES and not pid:
@@ -518,6 +522,14 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                     code = st.get('exitCode') if st else None
                 except OffboxError:
                     continue
+                if st:
+                    if not dry:
+                        from .runs import remember_interruption
+                        remember_interruption(run['run_id'], st)
+                    if st.get('running') is True:
+                        continue
+                    if st.get('status') == 'interrupted':
+                        status, code = 'interrupted', EXIT_INTERRUPTED
         elif state not in api.LIVE_STATES:
             continue
         elif pid:
@@ -528,8 +540,11 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
             if st is None:
                 # Missing/unavailable status is not proof a process stopped.
                 continue
-            elif not st.get("running") and st.get('status') == 'interrupted':
-                # Our server restarted under the run and did not run it again (runs.Interrupted).
+            if not dry:
+                from .runs import remember_interruption
+                remember_interruption(run['run_id'], st)
+            if not st.get("running") and st.get('status') == 'interrupted':
+                # The server settled the interruption without retrying the command.
                 status, code = 'interrupted', EXIT_INTERRUPTED
             elif not st.get("running") and st.get('status') in ('exited','lost'):
                 if st.get('status') == 'lost':
@@ -564,13 +579,33 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                     if wedged:
                         actions.append(wedged_message(bid, *wedged))
                         continue
-                if run['mode'] == 'bg' and status in ('done','failed') and run['pulls']:
+                from .runs import killed_result
+                killed = killed_result(run['run_id'], wait=True, row=run, known_code=code) if code in (None, 137, 143) else None
+                if killed is not None and killed['process_id']:
+                    status, code = 'killed', killed['exit_code']
+                if run['mode'] == 'bg' and status in ('done','failed','killed') and run['pulls']:
                     import json
                     from .runs import do_pulls
-                    do_pulls(bid, dict(run), json.loads(run['pulls']))
+                    try:
+                        do_pulls(bid, dict(run), json.loads(run['pulls']), foreign=True)
+                    except (OffboxError, OSError, sqlite3.Error) as error:
+                        if killed is None:
+                            raise
+                        say(f"warning: {run['run_id']}: artifact pull after offbox kill failed ({error})")
                 from .runs import planned_steps
                 code = finish(run['run_id'], code, status, run=run, bookkeeping=False, report=True)
-                if planned_steps(run):
+                try:
+                    settled = con.execute('SELECT * FROM runs WHERE run_id=?', (run['run_id'],)).fetchone()
+                except sqlite3.Error as error:
+                    from .runs import state_warning
+                    state_warning(run['run_id'], code, error)
+                    settled = run
+                if settled['status'] == 'killed':
+                    from .runs import report_killed
+                    report_killed(settled)
+                    status = 'killed'
+                    actions[-1] = f"mark run {run['run_id']} killed by offbox kill exit={code}"
+                elif planned_steps(run):
                     status = 'infra' if code is None else ('done' if code == 0 else 'failed')
                 try:
                     from .misc import _catch_up_finished

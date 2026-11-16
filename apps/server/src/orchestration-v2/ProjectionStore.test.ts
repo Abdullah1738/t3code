@@ -32,12 +32,14 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import { projectThreadAwarenessV2 } from "@t3tools/shared/agentAwareness";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { liveColumns } from "../ardud/persistence/historyArchiveSql.ts";
@@ -46,6 +48,7 @@ import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import { startState } from "../ardud/orchestration/ProviderStartProgress.ts";
 import {
   buildBoundedThreadProjection,
   decodeThreadHistoryCursor,
@@ -695,6 +698,103 @@ it.effect("memory activates a null-ref codex seed but not an ordinary queued pla
       targetRow,
     );
   }).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect.each([
+  ["memory", ProjectionStore.layerMemory],
+  ["SQL", layerTest],
+] as const)(
+  "%s native-start reads select only the active attempt without scanning provider history",
+  ([kind, layer]) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("native-start-filter");
+      const now = yield* DateTime.now;
+      const older = RunAttemptId.make("native-start-older");
+      const replacement = RunAttemptId.make("native-start-replacement");
+      const run = {
+        ...(yield* store.getThreadProjection(threadId)).runs[0]!,
+        status: "running" as const,
+        activeAttemptId: replacement,
+      };
+      yield* store.apply({
+        id: EventId.make("native-start:run"),
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: run,
+      });
+      const turns: OrchestrationV2ProviderTurn[] = [older, replacement].map((attemptId, i) => ({
+        id: ProviderTurnId.make(`native-start-turn-${i}`),
+        providerThreadId: ProviderThreadId.make("native-start-provider-thread"),
+        nodeId: run.rootNodeId!,
+        runAttemptId: attemptId,
+        nativeTurnRef: null,
+        ordinal: i + 1,
+        status: "running",
+        startedAt: now,
+        completedAt: null,
+        ...(attemptId === older ? { promptAcceptedAt: now } : {}),
+      }));
+      for (const turn of turns)
+        yield* store.apply({
+          id: EventId.make(`native-start:${turn.id}`),
+          type: "provider-turn.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: turn,
+        });
+      const selected = yield* store.getThreadRecords(threadId, ["providerTurns"], {
+        providerTurnAttemptId: replacement,
+      });
+      assert.deepEqual(
+        selected.providerTurns.map((turn) => turn.runAttemptId),
+        [replacement],
+      );
+      assert.isTrue(startState(run, selected.providerTurns, null).startPending);
+      const old = yield* store.getThreadRecords(threadId, ["providerTurns"], {
+        providerTurnAttemptId: older,
+      });
+      assert.deepEqual(
+        old.providerTurns.map((turn) => turn.runAttemptId),
+        [older],
+      );
+      assert.isTrue(startState(run, old.providerTurns, null).startPending);
+      assert.isEmpty(
+        (yield* store.getThreadRecords(threadId, ["providerTurns"], {
+          providerTurnAttemptId: RunAttemptId.make("absent"),
+        })).providerTurns,
+      );
+      yield* store.apply({
+        id: EventId.make("native-start:accepted"),
+        type: "provider-turn.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...turns[1]!, promptAcceptedAt: now },
+      });
+      const accepted = yield* store.getThreadRecords(threadId, ["providerTurns"], {
+        providerTurnAttemptId: replacement,
+      });
+      assert.isFalse(startState(run, accepted.providerTurns, null).startPending);
+      if (kind === "SQL") {
+        const sql = Option.getOrThrow(yield* Effect.serviceOption(SqlClient.SqlClient));
+        const plan = yield* sql<{ detail: string }>`EXPLAIN QUERY PLAN
+        SELECT payload_json FROM orchestration_v2_projection_provider_turns
+        WHERE thread_id = ${threadId} AND run_attempt_id = ${replacement}
+        ORDER BY provider_thread_id ASC, ordinal ASC`;
+        assert.isTrue(
+          plan.some((row) =>
+            /SEARCH.*ardud_provider_turns_attempt_idx.*thread_id=\?.*run_attempt_id=\?/.test(
+              row.detail,
+            ),
+          ),
+        );
+        assert.isFalse(plan.some((row) => /SCAN|TEMP B-TREE/.test(row.detail)));
+      }
+    }).pipe(Effect.provide(layer)),
 );
 
 it.effect.each([
@@ -2244,6 +2344,28 @@ it.effect("one shared session update carrier survives SQL rebuild and memory rep
 });
 
 it.layer(layerTest)("ProjectionStoreV2", (it) => {
+  it.effect("metadata-only record reads do not open a writer transaction", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("metadata-only");
+      let commits = 0;
+      const read = yield* store.getThreadRecords(threadId, []).pipe(
+        Effect.provideService(NodeSqliteClient.TransactionCommitObserver, () => {
+          commits++;
+        }),
+      );
+      assert.deepEqual(read, { thread: yield* store.getThread(threadId) });
+      assert.equal(commits, 0);
+      const records = yield* store.getThreadRecords(threadId, ["runs"]).pipe(
+        Effect.provideService(NodeSqliteClient.TransactionCommitObserver, () => {
+          commits++;
+        }),
+      );
+      assert.isNotEmpty(records.runs);
+      assert.equal(commits, 1);
+    }),
+  );
+
   it.effect("returns a typed read error for malformed stored plan JSON", () =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
@@ -2316,6 +2438,256 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       assert.deepEqual(recovery?.restartCancelledBackgroundWork, work);
     }),
   );
+  it.effect("keeps cancellation provenance through stale lifecycle updates in SQL and memory", () =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("cancel-reason");
+      const initial = yield* store.getThreadProjection(threadId);
+      const run = initial.runs[0]!;
+      assert.isUndefined(run.cancelReason);
+      const now = yield* DateTime.now;
+      let memory = initial;
+      for (const [index, payload] of [
+        {
+          ...run,
+          status: "cancelled" as const,
+          cancelReason: "server_shutdown" as const,
+          cancelDetail: "Server shut down.",
+        },
+        { ...run, status: "cancelled" as const },
+        { ...run, status: "cancelled" as const, cancelReason: "provider_cancelled" as const },
+      ].entries()) {
+        const event = {
+          id: EventId.make(`event:cancel-reason:${index}`),
+          type: "run.updated" as const,
+          threadId,
+          runId: run.id,
+          providerInstanceId,
+          occurredAt: now,
+          payload,
+        };
+        yield* store.apply(event);
+        memory = ProjectionStore.applyToProjection(memory, event);
+        const stored = (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!;
+        assert.equal(stored.cancelReason, "server_shutdown");
+        assert.equal(stored.cancelDetail, "Server shut down.");
+        assert.equal(memory.runs[0]?.cancelReason, stored.cancelReason);
+        assert.equal(memory.runs[0]?.cancelDetail, stored.cancelDetail);
+      }
+    }),
+  );
+  it.effect.each(["post_tool", "first_event"] as const)(
+    "keeps the %s recovery cap through stale SQL and memory updates",
+    (phase) =>
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const threadId = yield* addRolledBackRecoveryCandidate(`stall-recovery:${phase}`);
+        let memory = yield* store.getThreadProjection(threadId);
+        const run = memory.runs[0]!;
+        const now = yield* DateTime.now;
+        const recovery = {
+          phase,
+          lastProgressAt: DateTime.formatIso(now),
+          attemptId: run.activeAttemptId,
+        };
+        for (const [index, payload] of [
+          { ...run, delegatedTaskStallRecovery: recovery },
+          { ...run, status: "running" as const },
+          { ...run, status: "interrupted" as const },
+        ].entries()) {
+          const event = {
+            id: EventId.make(`event:stall-recovery:${phase}:${index}`),
+            type: "run.updated" as const,
+            threadId,
+            runId: run.id,
+            providerInstanceId,
+            occurredAt: now,
+            payload,
+          };
+          yield* store.apply(event);
+          memory = ProjectionStore.applyToProjection(memory, event);
+          assert.deepEqual(memory.runs[0]!.delegatedTaskStallRecovery, recovery);
+          assert.deepEqual(
+            (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!.delegatedTaskStallRecovery,
+            recovery,
+          );
+        }
+      }),
+  );
+  it.effect.each(
+    (["interrupted", "cancelled"] as const).flatMap((status) =>
+      (
+        [undefined, "provider_cancelled", "provider_interrupted", "server_shutdown"] as const
+      ).flatMap((previous) =>
+        (
+          [
+            "user_stop",
+            "task_cancel",
+            "thread_reset",
+            "card_stop",
+            "delegated_parent_cancelled",
+            "superseded",
+            "task_stalled",
+          ] as const
+        ).map((cancelReason) => ({ status, previous, cancelReason })),
+      ),
+    ),
+  )(
+    "late Stop provenance patches only metadata in SQL and memory ($status / $previous / $cancelReason)",
+    ({ status, previous, cancelReason }) =>
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const threadId = yield* addRolledBackRecoveryCandidate(
+          `late-stop:${status}:${previous ?? "missing"}:${cancelReason}`,
+        );
+        let memory = yield* store.getThreadProjection(threadId);
+        const run = memory.runs[0]!;
+        const now = yield* DateTime.now;
+        const terminal = {
+          id: EventId.make(`${threadId}:terminal`),
+          type: "run.updated" as const,
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            ...run,
+            status,
+            cancelReason: previous,
+            cancelDetail: previous === "server_shutdown" ? "Server shut down." : undefined,
+            completedAt: now,
+          },
+        };
+        yield* store.apply(terminal);
+        memory = ProjectionStore.applyToProjection(memory, terminal);
+        const request = {
+          id: EventId.make(`${threadId}:stop`),
+          type: "turn-item.updated" as const,
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`${threadId}:request`),
+            threadId,
+            runId: run.id,
+            nodeId: run.rootNodeId,
+            providerThreadId: run.providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 2,
+            status: "completed" as const,
+            title: "Interrupt requested",
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "run_interrupt_request" as const,
+            cancelReason,
+            message: "Stop before provider start.",
+          },
+        };
+        yield* store.apply(request);
+        memory = ProjectionStore.applyToProjection(memory, request);
+        const stale = { ...terminal, id: EventId.make(`${threadId}:stale-terminal`) };
+        yield* store.apply(stale);
+        memory = ProjectionStore.applyToProjection(memory, stale);
+        const stored = (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!;
+        const expectedReason = previous === "server_shutdown" ? previous : cancelReason;
+        const expectedDetail =
+          previous === "server_shutdown" ? "Server shut down." : "Stop before provider start.";
+        assert.equal(stored.status, status);
+        assert.equal(stored.cancelReason, expectedReason);
+        assert.equal(stored.cancelDetail, expectedDetail);
+        assert.equal(memory.runs[0]?.status, status);
+        assert.equal(memory.runs[0]?.cancelReason, expectedReason);
+        assert.equal(memory.runs[0]?.cancelDetail, expectedDetail);
+      }),
+  );
+  it.effect.each(
+    (
+      [
+        "thread_archive",
+        "thread_settle",
+        "thread_reset",
+        "workspace_change",
+        "runtime_mode_change",
+        "superseded",
+        "session_detach",
+      ] as const
+    ).flatMap((cancelReason) =>
+      (["running", "completed"] as const).flatMap((status) =>
+        [true, false].map((matches) => ({ cancelReason, status, matches })),
+      ),
+    ),
+  )(
+    "detach preserves lifecycle and stamps only bound active runs ($cancelReason / $status / $matches)",
+    ({ cancelReason, status, matches }) =>
+      Effect.gen(function* () {
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const suffix = `detach:${cancelReason}:${status}:${matches}`;
+        const threadId = yield* addRolledBackRecoveryCandidate(suffix);
+        let memory = yield* store.getThreadProjection(threadId);
+        const at = yield* DateTime.now;
+        const sessionId = ProviderSessionId.make(`${suffix}:session`);
+        const providerThreadId = ProviderThreadId.make(`${suffix}:provider-thread`);
+        const providerEvent = {
+          id: EventId.make(`${suffix}:provider`),
+          type: "provider-thread.updated" as const,
+          threadId,
+          occurredAt: at,
+          payload: {
+            id: providerThreadId,
+            driver,
+            providerInstanceId,
+            providerSessionId: sessionId,
+            appThreadId: threadId,
+            ownerNodeId: null,
+            nativeThreadRef: null,
+            nativeConversationHeadRef: null,
+            status: "idle" as const,
+            firstRunOrdinal: null,
+            lastRunOrdinal: null,
+            handoffIds: [],
+            contextUsage: null,
+            forkedFrom: null,
+            createdAt: at,
+            updatedAt: at,
+          },
+        };
+        yield* store.apply(providerEvent);
+        memory = ProjectionStore.applyToProjection(memory, providerEvent);
+        const runEvent = {
+          id: EventId.make(`${suffix}:run`),
+          type: "run.updated" as const,
+          threadId,
+          occurredAt: at,
+          payload: { ...memory.runs[0]!, status, providerThreadId },
+        };
+        yield* store.apply(runEvent);
+        memory = ProjectionStore.applyToProjection(memory, runEvent);
+        const detached = {
+          id: EventId.make(`${suffix}:detach`),
+          type: "provider-session.detached" as const,
+          threadId,
+          occurredAt: at,
+          payload: {
+            providerSessionId: matches ? sessionId : ProviderSessionId.make(`${suffix}:other`),
+            detachedAt: at,
+            cancelReason,
+            reason: "D".repeat(501),
+          },
+        };
+        yield* store.apply(detached);
+        memory = ProjectionStore.applyToProjection(memory, detached);
+        const stored = (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!;
+        const stamps = matches && status === "running";
+        assert.equal(stored.status, status);
+        assert.equal(stored.cancelReason, stamps ? cancelReason : undefined);
+        assert.equal(stored.cancelDetail, stamps ? "D".repeat(500) : undefined);
+        assert.equal(memory.runs[0]?.status, stored.status);
+        assert.equal(memory.runs[0]?.cancelReason, stored.cancelReason);
+        assert.equal(memory.runs[0]?.cancelDetail, stored.cancelDetail);
+      }),
+  );
   it.effect("recentRunLimit keeps unfinished runs plus the newest N", () =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
@@ -2351,6 +2723,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       // The unfinished first run stays; of the finished ones only the newest two.
       assert.deepEqual(yield* ordinals({ recentRunLimit: 2 }), [1, 4, 5]);
       assert.deepEqual(yield* ordinals({ recentRunLimit: 10 }), [1, 2, 3, 4, 5]);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true }), [5]);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true, runIds: [first.id] }), []);
+      assert.deepEqual(yield* ordinals({ latestRunOnly: true, runIds: [] }), []);
+      assert.deepEqual(
+        yield* ordinals({ latestRunOnly: true, runIds: [RunId.make("run:recent-run-limit:5")] }),
+        [5],
+      );
       assert.deepEqual(yield* ordinals({}), [1, 2, 3, 4, 5]);
     }),
   );
@@ -5195,11 +5574,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       const recoveryPlan = yield* sql.unsafe<{ readonly detail: string }>(
         `EXPLAIN QUERY PLAN ${recoveryStatement}`,
       );
-      assert.include(
-        recoveryPlan.map((row) => row.detail).join("\n"),
-        "orchestration_v2_projection_nodes_live_idx",
-      );
-      assert.notMatch(recoveryPlan.map((row) => row.detail).join("\n"), /ardud_|SCAN cold/);
+      const recoveryDetails = recoveryPlan.map((row) => row.detail).join("\n");
+      assert.include(recoveryDetails, "orchestration_v2_projection_nodes_live_idx");
+      assert.include(recoveryDetails, "orchestration_v2_projection_subagents_provider_thread_idx");
+      assert.notMatch(recoveryDetails, /ardud_|SCAN cold/, recoveryDetails);
       assert.include(recoveryThreadIds, runningThreadId);
       assert.include(recoveryThreadIds, orphanedThreadId);
       assert.include(recoveryThreadIds, memberThreadId);
@@ -5216,7 +5594,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         `EXPLAIN QUERY PLAN ${pendingStatement}`,
       );
       const pendingDetails = pendingPlan.map((row) => row.detail).join("\n");
-      assert.notMatch(pendingDetails, /ardud_|SCAN cold/);
+      assert.notMatch(pendingDetails, /ardud_|SCAN cold/, pendingDetails);
       assert.include(pendingDetails, "orchestration_v2_projection_turn_items_shell_pending_idx");
       const memberRecovery = yield* projectionStore.getRuntimeRecoveryProjection(memberThreadId);
       const childRecovery = yield* projectionStore.getRuntimeRecoveryProjection(childThreadId);
@@ -7103,6 +7481,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         sourceMessages,
         (yield* projectionStore.getThreadProjection(sourceThreadId)).messages,
       );
+      const sourceAfterRollback = yield* projectionStore.getThreadProjection(sourceThreadId);
+      const sourceForward = yield* projectionStore.getTimelinePage(sourceThreadId, {
+        view: "activity",
+        limit: 1,
+      });
+      assert.deepEqual(sourceForward.items, sourceAfterRollback.visibleTurnItems.slice(0, 1));
+      assert.equal(sourceForward.totalItems, sourceAfterRollback.visibleTurnItems.length);
       const targetAfterRollback = yield* projectionStore.getThreadProjection(targetThreadId);
       const shellSnapshot = yield* projectionStore.getShellSnapshot();
       for (const shell of [

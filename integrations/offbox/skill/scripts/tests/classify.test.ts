@@ -43,6 +43,8 @@ test("gate refusal names the glob or file count and says nothing ran", async () 
   const root = mkdtempSync(join(tmpdir(), "offbox-denial-"))
   try {
     mkdirSync(join(root, "plugin"))
+    mkdirSync(join(root, "lib"))
+    copyFileSync(join(import.meta.dir, "../../../lib/toollog.ts"), join(root, "lib/toollog.ts"))
     mkdirSync(join(root, "skills/remote-compute/scripts"), { recursive: true })
     copyFileSync(join(import.meta.dir, "../../../plugin/offbox-gate.ts"), join(root, "plugin/offbox-gate.ts"))
     copyFileSync(join(import.meta.dir, "../toollog.ts"), join(root, "skills/remote-compute/scripts/toollog.ts"))

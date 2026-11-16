@@ -1,0 +1,343 @@
+"""Source-bound reader grant and lifecycle evidence; no provisioning occurs here."""
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable, Mapping, Sequence
+from types import MappingProxyType
+from typing import Literal
+
+from .contract import ArtifactRef, CompletionRecord, Milliseconds, SHA256, Text, canonical_bytes, record_digest
+from .observer_source import ReaderGrantReceipt as ObserverGrantReceipt, reader_scope_digest as _reader_scope_digest
+from .environment_lease import LeaseSet, validate_lease
+
+
+_CH_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+_CH_TABLE = rf"{_CH_NAME}\.{_CH_NAME}"
+_CH_COLUMN = rf"{_CH_TABLE}\.{_CH_NAME}"
+_CH_PHYSICAL = r"clickhouse:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+
+
+# Aurora PostgreSQL §4.5: changing this budget requires a contract change first.
+AUDIT_ROLE = "crpko_harness_qa_audit"
+AUDIT_DB_NAME = "crpko"
+AUDIT_COLUMNS = (
+    "audit_id", "actor_user_id", "method", "path_template", "resource_scope",
+    "resource_id", "result", "status_code", "error_code", "duration_ms", "created_at_ms",
+)
+AUTH_EVENT_VIEW = "harness_qa.owned_auth_events"
+OWNED_AUTH_EVENT_COLUMNS = (
+    "outbox_id", "status", "created_at_ms", "published_at_ms", "event_id", "occurred_at_ms",
+    "action", "outcome", "failure_reason", "actor_user_id", "session_sha256", "trace_id",
+    "correlation_id", "path",
+)
+OWNED_AUTH_EVENT_RESOURCES = tuple(f"{AUTH_EVENT_VIEW}.{c}" for c in OWNED_AUTH_EVENT_COLUMNS)
+OWNED_AUTH_EVENT_VIEWDEF_SHA256 = "755457286211a3d3557000ac156fec07dd9928acc18dcd886c05b949096ab72c"
+AUDIT_PRINCIPAL_BUDGET = frozenset({
+    f"database:{AUDIT_DB_NAME}:CONNECT", "schema:backoffice:USAGE",
+    *(f"column:{c}:SELECT" for c in AUDIT_COLUMNS),
+    "schema:harness_qa:USAGE", f"relation:{AUTH_EVENT_VIEW}:SELECT",
+})
+PRINCIPAL_BUDGETS: Mapping[str, frozenset[str]] = MappingProxyType({AUDIT_ROLE: AUDIT_PRINCIPAL_BUDGET})
+
+
+def reader_scope_digest(kind: Literal["kafka", "database", "projection", "clickhouse"], resources: Iterable[str]) -> str:
+    """Use the shared canonical digest, with a distinct ClickHouse grant kind."""
+    return _reader_scope_digest(kind, resources)
+
+
+class ReaderGrantSpec(CompletionRecord):
+    """Cluster and incarnation identify the lease's environment authority."""
+    source_id: Text
+    principal: Text
+    principal_incarnation: Text
+    allowed: tuple[Text, ...]
+    denied: tuple[Text, ...]
+    cluster: Text
+    incarnation: Text
+    physical_source: Text
+    scope_digest: SHA256
+
+
+class ReaderOwnership(CompletionRecord):
+    """Cluster and incarnation identify the lease's environment authority."""
+    source_id: Text
+    cluster: Text
+    incarnation: Text
+    physical_source: Text
+    principal: Text
+    principal_incarnation: Text
+    operation_id: Text
+    owner_operation_id: Text
+    lease_ref: Text
+    origin: Literal["created", "borrowed"]
+    resource_ref: Text
+    proof: ArtifactRef
+
+
+def may_teardown_reader(ownership: ReaderOwnership, active_leases: Sequence[LeaseSet]) -> bool:
+    """Require the creator's current exclusive, physical reader lease.
+
+    This is a precondition, not authority to delete: exact resource identity,
+    journaled intent and an independent readback confirming the live principal's
+    incarnation matches principal_incarnation are still required by the caller.
+    """
+    if (ownership.origin != "created" or ownership.operation_id != ownership.owner_operation_id
+            or len(active_leases) != 1
+            or not re.fullmatch(r"pgsys:\d+|kafka:[A-Za-z0-9_-]+|" + _CH_PHYSICAL, ownership.physical_source)):
+        return False
+    lease = active_leases[0]
+    try:
+        if not isinstance(lease, LeaseSet):
+            return False
+        validate_lease(lease, lease.authority, lease.backend.now_ms())
+        return (lease.operation.id == ownership.operation_id
+                and lease.operation.holder_id == ownership.lease_ref
+                and lease.authority.incarnation == ownership.incarnation
+                and lease.authority.cluster == ownership.cluster
+                and ownership.resource_ref == f"principal:{ownership.physical_source}:{ownership.principal}"
+                and any(s.kind == "reader" and s.resource == ownership.resource_ref and s.mode == "exclusive"
+                        for s in lease.scopes))
+    except Exception:
+        return False
+
+
+class ReaderControl(CompletionRecord):
+    """Cluster/incarnation bind the lease environment/bootstrap, not physical identity."""
+    source_id: Text
+    cluster: Text
+    incarnation: Text
+    physical_source: Text
+    principal: Text
+    principal_incarnation: Text
+    scope_digest: SHA256
+    kind: Literal["permitted_read", "forbidden_access"]
+    capability: Text
+    resource: Text
+    api: Text
+    expected: Literal["ALLOWED", "DENIED"]
+    send_ref: Text
+    evidence: ArtifactRef
+    outcome: Literal["observed_pass", "observed_violation", "unobserved"]
+    observed_at_ms: Milliseconds
+    proof: ArtifactRef
+
+
+class EffectiveGrantSnapshot(CompletionRecord):
+    """Cluster and incarnation identify the lease's environment authority."""
+    source_id: Text
+    cluster: Text
+    incarnation: Text
+    physical_source: Text
+    principal: Text
+    principal_incarnation: Text
+    scope_digest: SHA256
+    permissions: tuple[Text, ...]
+    unknown: tuple[Text, ...]
+    observed_at_ms: Milliseconds
+    expires_at_ms: Milliseconds
+    proof: ArtifactRef
+    controls: tuple[ReaderControl, ...]
+
+
+class ReaderGrantReceipt(CompletionRecord):
+    spec: ReaderGrantSpec
+    effective: EffectiveGrantSnapshot
+    ownership: ReaderOwnership
+
+    @property
+    def issues(self) -> tuple[str, ...]:
+        return _issues(self.spec, self.effective, self.ownership)
+
+    @property
+    def qualified(self) -> bool:
+        return not self.issues
+
+    def observer_grant(self) -> ObserverGrantReceipt:
+        """Project only an actually qualified grant onto the observer ABI."""
+        s, e = self.spec, self.effective
+        digest = record_digest(self)
+        return ObserverGrantReceipt(
+            physical_source=self.spec.physical_source,
+            schema_version="completion-v1", source_id=s.source_id, incarnation=s.incarnation,
+            scope_digest=s.scope_digest, principal=s.principal,
+            # Only a qualified, scope-bound inventory can authorize an observer.
+            effective_permissions=tuple(sorted({"read"} | ({"describe"} if any(
+                re.fullmatch(r"kafka-topic:[A-Za-z0-9._-]+:DESCRIBE", p)
+                for p in e.permissions) else set()))) if self.qualified else (),
+            observed_at_ms=max((c.observed_at_ms for c in e.controls), default=e.observed_at_ms),
+            expires_at_ms=e.expires_at_ms,
+            proof=ArtifactRef(schema_version="completion-v1", ref="reader-grant:" + digest,
+                              sha256=digest, size_bytes=len(canonical_bytes(self))),
+        )
+
+
+def _read_only_permission(permission: str) -> bool:
+    """Never allow a caller's allowlist to authorize write or administrative access."""
+    return bool(re.fullmatch(
+        r"(?:database:[^:]+:CONNECT|schema:[^:]+:USAGE|column:[^:]+:SELECT|"
+        r"relation:harness_qa\.owned_auth_events:SELECT|"
+        rf"clickhouse-table:{_CH_TABLE}:SELECT|clickhouse-column:{_CH_COLUMN}:SELECT|"
+        r"kafka-topic:[A-Za-z0-9._-]+:(?:READ|DESCRIBE)|"
+        r"kafka-group:(?:literal|prefixed):[A-Za-z0-9._-]+:(?:READ|DESCRIBE))", permission))
+
+
+def scope_resources(allowed: Iterable[str]) -> tuple[Literal["kafka", "database", "clickhouse"], tuple[str, ...]]:
+    """Return one kind of data-read resources; absent or mixed scopes are invalid."""
+    found: dict[str, set[str]] = {"kafka": set(), "database": set(), "clickhouse": set()}
+    allowed = tuple(allowed)
+    relation = f"relation:{AUTH_EVENT_VIEW}:SELECT" in allowed
+    if relation and any(p.startswith("column:") for p in allowed):
+        raise ValueError("database scope mixes relation and column reads")
+    if relation:
+        found["database"].update(OWNED_AUTH_EVENT_RESOURCES)
+    for permission in allowed:
+        if match := re.fullmatch(r"kafka-topic:([A-Za-z0-9._-]+):READ", permission):
+            found["kafka"].add(match.group(1))
+        elif match := re.fullmatch(r"column:([^:]+):SELECT", permission):
+            found["database"].add(match.group(1))
+        elif match := re.fullmatch(rf"clickhouse-table:({_CH_TABLE}):SELECT", permission):
+            found["clickhouse"].add(match.group(1) + ".*")
+        elif match := re.fullmatch(rf"clickhouse-column:({_CH_COLUMN}):SELECT", permission):
+            found["clickhouse"].add(match.group(1))
+    if sum(bool(resources) for resources in found.values()) > 1:
+        raise ValueError("allowed scope mixes source kinds")
+    if any(r.rsplit(".", 1)[0] + ".*" in found["clickhouse"] for r in found["clickhouse"] if not r.endswith(".*")):
+        raise ValueError("table-wide read overlaps column scope")
+    if found["kafka"]:
+        return "kafka", tuple(sorted(found["kafka"]))
+    if found["database"]:
+        return "database", OWNED_AUTH_EVENT_RESOURCES if relation else tuple(sorted(found["database"]))
+    if found["clickhouse"]:
+        return "clickhouse", tuple(sorted(found["clickhouse"]))
+    raise ValueError("allowed scope contains no supported data read")
+
+
+def _control_api_matches(control: ReaderControl, physical_source: str) -> bool:
+    patterns = {
+        "SELECT column": rf"(?:column:[^:]+:SELECT|clickhouse-column:{_CH_COLUMN}:SELECT)",
+        "SELECT relation": r"relation:harness_qa\.owned_auth_events:SELECT",
+        "SELECT table": rf"clickhouse-table:{_CH_TABLE}:SELECT",
+        "Fetch": r"kafka-topic:[A-Za-z0-9._-]+:READ",
+        "Metadata": r"kafka-topic:[A-Za-z0-9._-]+:DESCRIBE",
+        "ListOffsets": r"kafka-topic:[A-Za-z0-9._-]+:DESCRIBE",
+        "MetadataAndListOffsets": r"kafka-topic:[A-Za-z0-9._-]+:DESCRIBE",
+        "CreateTopics(validateOnly)": "kafka-cluster:" + re.escape(physical_source.removeprefix("kafka:")) + ":CREATE",
+    }
+    return bool(re.fullmatch(patterns.get(control.api, r"(?!)"), control.capability))
+
+
+def _issues(spec: ReaderGrantSpec, effective: EffectiveGrantSnapshot,
+            ownership: ReaderOwnership) -> tuple[str, ...]:
+    issues = []
+    identity = (spec.source_id, spec.cluster, spec.incarnation, spec.physical_source,
+                spec.principal, spec.principal_incarnation)
+    if identity != (effective.source_id, effective.cluster, effective.incarnation, effective.physical_source,
+                    effective.principal, effective.principal_incarnation):
+        issues.append("effective source, cluster, incarnation or principal differs")
+    if identity != (ownership.source_id, ownership.cluster, ownership.incarnation, ownership.physical_source,
+                    ownership.principal, ownership.principal_incarnation):
+        issues.append("reader ownership source, cluster, incarnation or principal differs")
+    if spec.scope_digest != effective.scope_digest:
+        issues.append("effective grant scope differs")
+    if not spec.allowed or not spec.denied or len(set(spec.allowed)) != len(spec.allowed) or len(set(spec.denied)) != len(spec.denied):
+        issues.append("allowed and forbidden capabilities must be explicit and unique")
+    if set(spec.allowed) & set(spec.denied):
+        issues.append("allowed and forbidden capabilities overlap")
+    if ownership.origin == "created" and ownership.operation_id != ownership.owner_operation_id:
+        issues.append("created principal owner differs from the current operation")
+    if ownership.origin == "borrowed" and ownership.operation_id == ownership.owner_operation_id:
+        issues.append("borrowed principal cannot be claimed as operation-owned")
+    if any(not _read_only_permission(p) for p in effective.permissions):
+        issues.append("effective capability is not a supported read-only permission")
+    if any(p.startswith("kafka-group:") and not re.fullmatch(
+            r"kafka-group:(?:literal|prefixed):crpko-harness-qa-[A-Za-z0-9._-]*:(?:READ|DESCRIBE)", p)
+            for p in effective.permissions):
+        issues.append("consumer group lacks a dedicated harness namespace")
+    resources: tuple[str, ...] = ()
+    scope_kind = None
+    try:
+        scope_kind, resources = scope_resources(spec.allowed)
+        if spec.scope_digest != reader_scope_digest(scope_kind, resources):
+            issues.append("scope digest does not match the allowed read resources")
+        physical_pattern = {"kafka": r"kafka:[A-Za-z0-9_-]+", "database": r"pgsys:\d+|rds:cluster-[A-Za-z0-9]+",
+                            "clickhouse": _CH_PHYSICAL}[scope_kind]
+        if not re.fullmatch(physical_pattern, spec.physical_source):
+            issues.append("physical source does not match the allowed read kind")
+        prefixes = {"kafka": ("kafka-",), "database": ("database:", "schema:", "column:", "relation:"),
+                    "clickhouse": ("clickhouse-table:", "clickhouse-column:")}
+        if any(not p.startswith(prefixes[scope_kind]) for p in spec.allowed):
+            issues.append("allowed permissions mix source kinds")
+    except ValueError as exc:
+        issues.append(str(exc))
+    # The audit allowlist is PostgreSQL-only; ClickHouse columns use exact scope equality.
+    if any(p.startswith("column:") and p.removeprefix("column:").removesuffix(":SELECT") not in {
+                "audit_id", "actor_user_id", "method", "path_template", "resource_scope",
+                "resource_id", "result", "status_code", "error_code", "duration_ms", "created_at_ms"
+            } for p in spec.allowed):
+        issues.append("audit column is outside the supported non-sensitive projection")
+    if effective.unknown:
+        issues.extend(effective.unknown)
+    if len(set(effective.permissions)) != len(effective.permissions):
+        issues.append("effective permission inventory contains duplicates")
+    if (budget := PRINCIPAL_BUDGETS.get(spec.principal)) is not None:
+        if not set(spec.allowed) <= set(effective.permissions):
+            issues.append("effective permissions lack the source's allowed scope")
+        if not set(effective.permissions) <= budget:
+            issues.append("effective permission is outside the principal budget")
+        if not set(spec.allowed) <= budget:
+            issues.append("allowed scope is outside the principal budget")
+        if set(spec.denied) & budget:
+            issues.append("forbidden capability is inside the principal budget")
+    elif set(effective.permissions) != set(spec.allowed):
+        issues.append("effective permissions differ from the exact allowed scope")
+    if set(effective.permissions) & set(spec.denied):
+        issues.append("forbidden capability is effective")
+    if effective.expires_at_ms <= effective.observed_at_ms:
+        issues.append("grant validity interval is invalid")
+    if len({c.kind for c in effective.controls}) != len(effective.controls):
+        issues.append("duplicate reader control kinds")
+    for c in effective.controls:
+        if not _control_api_matches(c, spec.physical_source):
+            issues.append("reader control API does not test its native capability")
+        if c.evidence.sha256 == effective.proof.sha256:
+            issues.append("reader control evidence is not independent of the inventory")
+        if c.kind == "permitted_read":
+            match = re.fullmatch(r"(?:column:([^:]+):SELECT|kafka-topic:([A-Za-z0-9._-]+):READ|"
+                                 rf"clickhouse-column:({_CH_COLUMN}):SELECT|relation:(harness_qa\.owned_auth_events):SELECT)", c.capability)
+            column = match.group(3) if match else None
+            allowed = c.capability in spec.allowed or (scope_kind == "clickhouse" and column is not None
+                and column.rsplit(".", 1)[0] + ".*" in resources)
+            if (not allowed or not match or c.expected != "ALLOWED"
+                    or c.resource != next((g for g in match.groups() if g), None)):
+                issues.append("permitted read control does not bind an allowed data read")
+        else:
+            parts = c.capability.split(":")
+            named_resource = (parts[2] if len(parts) == 4 and parts[:2] in
+                              (["kafka-group", "literal"], ["kafka-group", "prefixed"]) else
+                              parts[1] if len(parts) == 3 else None)
+            wrong_kind = (not c.capability.startswith("kafka-") if resources and scope_kind == "kafka"
+                          else not c.capability.startswith(("database:", "schema:", "column:")))
+            if scope_kind == "clickhouse":
+                wrong_kind = not re.fullmatch(rf"clickhouse-table:{_CH_TABLE}:SELECT", c.capability)
+                wrong_kind = wrong_kind or any(r.rsplit(".", 1)[0] == c.resource for r in resources)
+            if (c.capability not in spec.denied or c.expected != "DENIED" or c.resource in resources
+                    or named_resource != c.resource or wrong_kind):
+                issues.append("forbidden access control does not bind a denied capability outside the read scope")
+    for kind in ("permitted_read", "forbidden_access"):
+        controls = [c for c in effective.controls if c.kind == kind]
+        if len(controls) != 1 or any(
+            (c.source_id, c.cluster, c.incarnation, c.physical_source, c.principal,
+             c.principal_incarnation, c.scope_digest)
+            != (*identity, spec.scope_digest) or c.outcome != "observed_pass"
+            or not effective.observed_at_ms <= c.observed_at_ms < effective.expires_at_ms
+            for c in controls
+        ):
+            issues.append(f"qualified {kind} control is missing, failed or foreign")
+    return tuple(issues)
+
+
+def qualify_reader_grants(spec: ReaderGrantSpec, effective: EffectiveGrantSnapshot,
+                          ownership: ReaderOwnership) -> ReaderGrantReceipt:
+    """Require complete inventory, the pinned permission policy and both controls."""
+    return ReaderGrantReceipt(schema_version="completion-v1", spec=spec, effective=effective,
+                              ownership=ownership)

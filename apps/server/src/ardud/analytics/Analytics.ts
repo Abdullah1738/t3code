@@ -23,6 +23,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../../config.ts";
+import { makeReadPager } from "./readPages.ts";
 import { sampleMix } from "./samples.ts";
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -100,6 +101,7 @@ class AnalyticsValidationError extends Schema.TaggedError<AnalyticsValidationErr
       "batch-size",
       "queue-full",
       "invalid-day",
+      "invalid-cursor",
     ]),
   },
 ) {}
@@ -159,6 +161,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   const options = boundedOptions(input);
   const directory = path.join(config.logsDir, "analytics");
   const disk = yield* Semaphore.make(1);
+  const readPager = makeReadPager();
   const wakeups = yield* Queue.dropping<void, Cause.Done>(1);
   const retries = yield* Queue.dropping<void, Cause.Done>(1);
   const encoder = new TextEncoder();
@@ -167,15 +170,14 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
   let lastMaintenanceDay: string | undefined;
   let retryAt = 0;
   const dirtyDays = new Set<string>();
-  // Only recently read views are resident. Each owns bounded groups and 500 samples, never the day log.
+  // Only recently read views are resident. Each owns bounded per-kind samples, never the day log.
   const views = new Map<
     string,
     {
       day: string;
       filter: AnalyticsReadInput | undefined;
       accumulator: ReturnType<typeof makeAccumulator>;
-      samples: ReturnType<ReturnType<typeof sampleMix>["entries"]>;
-      kinds: string[];
+      samples: ReturnType<typeof sampleMix>;
       signature: string;
     }
   >();
@@ -184,16 +186,27 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     (filter?.kind === undefined || filter.kind === event.kind) &&
     (filter?.boardId === undefined || filter.boardId === event.boardId) &&
     (filter?.cardId === undefined || filter.cardId === event.cardId) &&
+    (filter?.cardNumber === undefined ||
+      filter.cardNumber === event.cardNumber ||
+      filter.cardNumber === event.callerCardNumber ||
+      filter.cardNumber === event.props?.cardNumber) &&
     (filter?.tool === undefined || filter.tool === event.tool) &&
-    (filter?.outcome === undefined || filter.outcome === event.outcome);
+    (filter?.outcome === undefined || filter.outcome === event.outcome) &&
+    (filter?.responseDelivery === undefined || filter.responseDelivery === event.responseDelivery);
+  const relatedDetached = (event: AnalyticsEvent, filter?: AnalyticsReadInput) =>
+    event.kind === "mcp.detached" &&
+    (filter?.kind === undefined || filter.kind === "mcp.call") &&
+    (filter?.tool === undefined || filter.tool === event.tool);
   const viewKey = (day: string, filter?: AnalyticsReadInput) =>
     JSON.stringify([
       day,
       filter?.kind,
       filter?.boardId,
       filter?.cardId,
+      filter?.cardNumber,
       filter?.tool,
       filter?.outcome,
+      filter?.responseDelivery,
     ]);
   const invalidate = (day: string) => {
     for (const [key, view] of views) if (view.day === day) views.delete(key);
@@ -262,7 +275,10 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         accumulator.invalidLines++;
         return;
       }
-      if (!matches(event, filter)) return;
+      if (!matches(event, filter)) {
+        if (relatedDetached(event, filter)) accumulate(accumulator, event, true);
+        return;
+      }
       accumulate(accumulator, event);
       samples.add(event);
     });
@@ -277,8 +293,7 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     }
     return {
       accumulator,
-      samples: samples.entries(),
-      kinds: samples.kinds(),
+      samples,
     };
   });
 
@@ -299,7 +314,6 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
       filter,
       accumulator: scan.accumulator,
       samples: scan.samples,
-      kinds: scan.kinds,
       signature: fingerprint,
     };
     // FIFO bounds cardinality across days and arbitrary filter combinations.
@@ -476,15 +490,15 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         const fingerprint = yield* signature(first.day, yield* listFiles());
         for (const view of views.values()) {
           if (view.day !== first.day) continue;
-          const samples = sampleMix(500, view.filter?.kind, view.kinds);
-          for (const sample of view.samples) samples.add(sample.event, sample.order);
           for (const entry of attempted) {
-            if (!matches(entry.event, view.filter)) continue;
+            if (!matches(entry.event, view.filter)) {
+              if (relatedDetached(entry.event, view.filter))
+                accumulate(view.accumulator, entry.event, true);
+              continue;
+            }
             accumulate(view.accumulator, entry.event);
-            samples.add(entry.event);
+            view.samples.add(entry.event);
           }
-          view.samples = samples.entries();
-          view.kinds = samples.kinds();
           view.signature = fingerprint;
         }
         // Held entries remain in pending (and consume capacity) until append succeeds.
@@ -588,9 +602,13 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
     yield* boards.value.ready;
     const sql = boards.value.sql;
     const rows = yield* sql<
-      Omit<AskTimingRow, "kind"> & { kind: string | null; askJson: string | null }
+      Omit<AskTimingRow, "kind"> & {
+        cardNumber: number;
+        kind: string | null;
+        askJson: string | null;
+      }
     >`
-      SELECT c.board_id AS boardId, c.id AS cardId,
+      SELECT c.board_id AS boardId, c.id AS cardId, c.number AS cardNumber,
         json_extract(a.value, '$.id') AS askId,
         json_extract(a.value, '$.at') AS createdAt,
         json_extract(a.value, '$.closedAt') AS closedAt,
@@ -628,6 +646,14 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
         cause: new AnalyticsValidationError({ reason: "invalid-day" }),
       });
     }
+    if (input.cursor !== undefined) {
+      const page = readPager.resume(input);
+      if (page) return page;
+      return yield* new AnalyticsError({
+        operation: "read",
+        cause: new AnalyticsValidationError({ reason: "invalid-cursor" }),
+      });
+    }
     const storedRows = yield* readAskRows(input.day).pipe(
       Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })),
     );
@@ -649,7 +675,8 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
                     storedRows.filter(
                       (row) =>
                         (filter?.boardId === undefined || row.boardId === filter.boardId) &&
-                        (filter?.cardId === undefined || row.cardId === filter.cardId),
+                        (filter?.cardId === undefined || row.cardId === filter.cardId) &&
+                        (filter?.cardNumber === undefined || row.cardNumber === filter.cardNumber),
                     ),
                     input.day,
                     generatedAt,
@@ -659,13 +686,11 @@ const make = Effect.fnUntraced(function* (input: Partial<AnalyticsOptions>) {
             yield* persistRollup(
               withAskLatency(finishRollup(full.accumulator, input.day, generatedAt)),
             );
-          return {
-            rollup: withAskLatency(
-              finishRollup(view.accumulator, input.day, generatedAt),
-              input,
-            ),
-            samples: view.samples.slice(0, input.limit ?? 100).map((sample) => sample.event),
-          };
+          return readPager.read(
+            input,
+            withAskLatency(finishRollup(view.accumulator, input.day, generatedAt), input),
+            view.samples.entries().map((sample) => sample.event),
+          );
         }),
       )
       .pipe(Effect.mapError((cause) => new AnalyticsError({ operation: "read", cause })));

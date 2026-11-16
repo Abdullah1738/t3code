@@ -31,6 +31,24 @@ export function latestRootProviderFailure(
   return latest?.failure ?? null;
 }
 
+/** Runtime reconciliation cancels a run, while recording why it was cut. User Stops have no such marker. */
+export function rootRuntimeLoss(
+  run: OrchestrationV2Run | null,
+  turnItems: ReadonlyArray<OrchestrationV2TurnItem>,
+): OrchestrationV2ProviderFailure | null {
+  if (run?.status !== "cancelled") return null;
+  const item = turnItems.find(
+    (candidate) =>
+      candidate.type === "error" &&
+      candidate.status === "failed" &&
+      candidate.runId === run.id &&
+      candidate.nodeId === run.rootNodeId &&
+      // A classified outage keeps its original code/class in the startup marker.
+      candidate.id === `turn-item:runtime-lost:${run.id}`,
+  );
+  return item?.type === "error" ? item.failure : null;
+}
+
 export function threadErrorSummary(
   failure: OrchestrationV2ProviderFailure | null,
   sessionError: string | null,

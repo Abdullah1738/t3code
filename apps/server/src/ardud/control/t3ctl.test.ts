@@ -1,5 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - the CLI under test is plain Node.
-// @effect-diagnostics globalTimers:off - CLI timeout tests measure real wall-clock budgets outside the Effect runtime.
+// @effect-diagnostics nodeBuiltinImport:off globalTimers:off - the CLI under test is plain Node and uses real timers.
 import * as NodeAssert from "node:assert/strict";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
@@ -10,7 +9,75 @@ import * as NodeURL from "node:url";
 import { test } from "@effect/vitest";
 
 // @ts-expect-error plain ESM module without declarations
-import { checkLive, ignoreMacosTypeOfServiceEinval } from "./t3ctl.mjs";
+import { checkLive, ignoreMacosTypeOfServiceEinval, readUsage } from "./t3ctl.mjs";
+
+test.each(["AbortError", "TimeoutError"])(
+  "usage names the failed page and resume cursor on %s",
+  async (name) => {
+    let calls = 0;
+    const client = {
+      usage: async () => {
+        if (++calls === 1) return { items: [{ id: 1 }, { id: 2 }], nextCursor: "next/+=" };
+        throw new DOMException("deadline", name);
+      },
+    };
+    await NodeAssert.rejects(
+      readUsage(client, { since: "0" }, { allPages: true, timeoutMs: 1234 }),
+      {
+        message:
+          "usage page 2 timed out after 1234 ms; cursor next/+=; 2 items read; resume with --cursor 'next/+='",
+      },
+    );
+    NodeAssert.equal(calls, 2);
+  },
+);
+
+test("usage resumes at the supplied cursor and follows the remaining pages", async () => {
+  const cursors: string[] = [];
+  const client = {
+    usage: async (filters: { cursor: string }) => {
+      cursors.push(filters.cursor);
+      return filters.cursor === "resume"
+        ? { items: [{ id: 2 }], nextCursor: "last" }
+        : { items: [{ id: 3 }], nextCursor: null };
+    },
+  };
+  NodeAssert.deepEqual(
+    await readUsage(client, { since: "0", cursor: "resume" }, { allPages: true }),
+    { items: [{ id: 2 }, { id: 3 }], nextCursor: null },
+  );
+  NodeAssert.deepEqual(cursors, ["resume", "last"]);
+});
+
+test("usage reports a first-page failure without inventing a cursor", async () => {
+  await NodeAssert.rejects(
+    readUsage(
+      {
+        usage: async () => {
+          throw new Error("offline");
+        },
+      },
+      { since: "0" },
+    ),
+    {
+      message: "usage page 1 failed: offline; cursor <start>; 0 items read; retry without --cursor",
+    },
+  );
+});
+
+test("usage includes page context when pagination repeats a cursor", async () => {
+  let calls = 0;
+  const client = {
+    usage: async () => {
+      if (++calls > 2) throw new Error("unexpected extra page");
+      return { items: [1], nextCursor: "repeat" };
+    },
+  };
+  await NodeAssert.rejects(readUsage(client, { since: "0" }, { allPages: true }), {
+    message:
+      "usage page 2 failed: usage pagination returned a repeated cursor; cursor repeat; 1 items read; resume with --cursor 'repeat'",
+  });
+});
 
 test("live bounds health even when it ignores abort", async () => {
   const start = performance.now();

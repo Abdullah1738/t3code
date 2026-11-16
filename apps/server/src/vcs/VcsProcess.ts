@@ -328,7 +328,12 @@ export const make = Effect.gen(function* () {
         }),
       );
     }
-    return yield* input.command === "gh" ? githubProcesses.withPermits(1)(bounded) : bounded;
+    const executable = ProcessRunner.commandName(input.command);
+    const isGitHub =
+      hostPlatform === "win32"
+        ? /^gh(?:\.(?:exe|cmd|bat))?$/i.test(executable)
+        : executable === "gh";
+    return yield* isGitHub ? githubProcesses.withPermits(1)(bounded) : bounded;
   });
 
   return VcsProcess.of({ run });

@@ -13,6 +13,7 @@ import {
   ThreadId,
   TurnItemId,
   type ModelSelection,
+  type AnalyticsEvent,
   type OrchestrationV2DomainEvent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -49,6 +50,7 @@ import * as ServerConfig from "../config.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import { layer as providerRegistryLayer } from "../provider/testUtils/providerRegistryMock.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as KanbanService from "../ardud/kanban/engine/KanbanService.ts";
 import * as KanbanModels from "../ardud/kanban/engine/models.ts";
 import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
@@ -1579,24 +1581,25 @@ it.effect.each(
               createdBy: "system",
               creationSource: "server",
             });
+          const before = yield* kanban.card(card.id);
           const result = yield* Effect.result(
             kanban.cardThread(card.id, action, text, { _tag: "owner" }),
           );
-          assert.equal(Result.isFailure(result), rejected);
+          const refused = rejected || !text.trim();
+          assert.equal(Result.isFailure(result), refused);
+          if (!text.trim()) {
+            assert(Result.isFailure(result));
+            assert.equal(result.failure.code, "invalid");
+            assert.deepEqual(yield* kanban.card(card.id), before);
+          }
           yield* worker.drain();
-          assert.deepEqual(
-            steered,
-            rejected ? [] : [...queuedText, text.trim() ? text : "latest snapshot"],
-          );
-          if (rejected) {
+          assert.deepEqual(steered, refused ? [] : [...queuedText, text]);
+          if (refused) {
             assert.lengthOf(yield* threads.queuedRuns(threadId), 1);
           }
-          yield* kanban.cardThread(card.id, "wake", "", { _tag: "owner" });
+          yield* orchestrator.promoteQueuedMessages(threadId, "wake");
           yield* worker.drain();
-          assert.deepEqual(steered, [
-            ...queuedText,
-            !rejected && text.trim() ? text : "latest snapshot",
-          ]);
+          assert.deepEqual(steered, [...queuedText, refused ? "latest snapshot" : text]);
           assert.lengthOf(yield* threads.queuedRuns(threadId), 0);
           const records = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
           assert.equal(records.runs.find((run) => run.id === queuedId)!.status, "cancelled");
@@ -2068,6 +2071,237 @@ it.effect("queues a plain send behind the stopped queue and releases its hold", 
         // The user sent it, so the queue they stopped runs again once the provider stops.
         assert.isFalse(queued.some((run) => run.queueHeld === true));
       }).pipe(Effect.provide(layer));
+    }),
+  ),
+);
+
+it.effect.each(["auto", "steer"] as const)(
+  "#1574 assignment stays queued after unrelated live input ($mode)",
+  (mode) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { steered, layer, db, startFirstTurn } = yield* nextTurnSelectionHarness(
+          `assignment-${mode}`,
+        );
+        const management = ThreadManagementService.layer.pipe(
+          Layer.provideMerge(layer),
+          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(db))),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provideMerge(db),
+        );
+        const lifecycle = KanbanThreads.layer.pipe(
+          Layer.provide(management),
+          Layer.provide(db),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        );
+        yield* Effect.gen(function* () {
+          const threadId = yield* startFirstTurn;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threads = yield* KanbanThreads.KanbanThreads;
+          const before = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!;
+          const reminder = yield* threads.send({
+            threadId,
+            text: "Old reminder",
+            coalesce: "step:other",
+            mode: "queue",
+          });
+          const assignment = yield* threads.send({
+            threadId,
+            text: "New assigned card",
+            key: "assignment",
+            coalesce: "assignment:card",
+            mode: "queue",
+          });
+          if (typeof assignment !== "string") return yield* Effect.die("Assignment did not queue");
+          yield* threads.send({
+            threadId,
+            text: "Unrelated live input",
+            ...(mode === "steer" ? { mode: "steer" as const } : {}),
+          });
+          yield* worker.drain();
+          const after = yield* orchestrator.getThreadRecords(threadId, ["runs", "turnItems"]);
+          assert.equal(after.runs.find((run) => run.id === assignment)?.status, "queued");
+          assert.equal(after.runs.find((run) => run.id === before.id)?.status, "running");
+          assert.equal(
+            after.runs.find((run) => run.id === before.id)?.activeAttemptId,
+            before.activeAttemptId,
+          );
+          assert.deepEqual(steered, ["Unrelated live input"]);
+          assert.isTrue(
+            after.turnItems.some(
+              (item) =>
+                item.type === "user_message" &&
+                item.text === "Unrelated live input" &&
+                item.inputIntent === "steer",
+            ),
+          );
+          assert.equal(after.runs.find((run) => run.id === reminder)?.status, "cancelled");
+          assert.isTrue(yield* threads.cancelQueued(threadId, assignment));
+          assert.equal(
+            (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+              (run) => run.id === assignment,
+            )?.status,
+            "cancelled",
+          );
+        }).pipe(Effect.provide(Layer.merge(layer, lifecycle)));
+      }),
+    ),
+);
+
+it.effect("#1561 intake survives provider completion after steer acceptance", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = "kanban-intake-steer-completion";
+      const { events, started, steered, layer, db, startFirstTurn } =
+        yield* nextTurnSelectionHarness(name);
+      const measurements: AnalyticsEvent[] = [];
+      const management = ThreadManagementService.layer.pipe(
+        Layer.provideMerge(layer),
+        Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(db))),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provideMerge(db),
+      );
+      const lifecycle = KanbanThreads.layer.pipe(
+        Layer.provide(management),
+        Layer.provide(db),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+      );
+      let requestThread: ThreadId | undefined;
+      let evaluatorStarts = 0;
+      const existingThread = Layer.effect(
+        KanbanThreads.KanbanThreads,
+        Effect.map(KanbanThreads.KanbanThreads, (real) =>
+          KanbanThreads.KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.gen(function* () {
+                if (!requestThread)
+                  return yield* Effect.die("Initial provider turn must be running");
+                const threadId = requestThread;
+                evaluatorStarts += 1;
+                yield* input.onStarted?.(threadId) ?? Effect.void;
+                return threadId;
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(lifecycle));
+      const boardLayer = KanbanService.layer.pipe(
+        Layer.provideMerge(existingThread),
+        Layer.provideMerge(KanbanModels.layerTest(null)),
+        Layer.provideMerge(KanbanStore.layer.pipe(Layer.provide(db))),
+        Layer.provideMerge(db),
+        Layer.provide(Layer.mock(TextGeneration.TextGeneration)({})),
+        Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+        Layer.provide(providerRegistryLayer([opencodeTestProvider()])),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                measurements.push(event);
+              }),
+          }),
+        ),
+        Layer.provide(
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-intake-race-" }).pipe(
+            Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(ServerSettings.layerTest()),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        requestThread = yield* startFirstTurn;
+        const kanban = yield* KanbanService.KanbanService;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const board = yield* kanban.ensureBoard({
+          slug: "intake-race",
+          name: "Intake race",
+          defaultProjectId: ProjectId.make(`project:${name}`),
+        });
+        const options = { callerThreadId: ThreadId.make("reporter") };
+        const first = yield* kanban.submitEvaluator(
+          board.id,
+          { kind: "request", text: "First intake request" },
+          options,
+        );
+        const second = yield* kanban.submitEvaluator(
+          board.id,
+          { kind: "request", text: "Second intake request" },
+          options,
+        );
+        assert.deepEqual(second, first);
+        assert.equal(evaluatorStarts, 1);
+        assert.deepEqual(
+          measurements
+            .filter((event) => event.kind === "kanban.evaluator")
+            .map((event) => event.outcome),
+          ["started", "merged"],
+        );
+        // Dispatch accepted the intake, but its provider effect has not executed.
+        const nativeFirst = started[0]!;
+        const settled = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.id === nativeFirst.runId &&
+              event.payload.status === "waiting",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        const turn = (yield* orchestrator.getThreadProjection(requestThread)).providerTurns[0]!;
+        yield* Queue.offer(events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: { ...turn, status: "completed", completedAt: yield* DateTime.now },
+        });
+        yield* Queue.offer(events, {
+          type: "turn.terminal",
+          driver,
+          providerThreadId: turn.providerThreadId,
+          providerTurnId: turn.id,
+          runOrdinal: nativeFirst.runOrdinal,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        yield* Fiber.join(settled);
+        yield* worker.drain();
+        yield* orchestrator.resumeQueuedRuns;
+        yield* worker.drain();
+        assert.deepEqual(steered, []);
+        assert.equal(started.length, 2);
+        assert.include(started[1]!.message.text, "Second intake request");
+        assert.include(started[1]!.message.text, "t3-thread://v1/reporter");
+        assert.deepEqual(started[1]!.modelSelection, nativeFirst.modelSelection);
+        const projection = yield* orchestrator.getThreadProjection(requestThread);
+        assert.lengthOf(
+          projection.messages.filter((message) => message.text.includes("Second intake request")),
+          1,
+        );
+        const accepted = projection.messages.find((message) =>
+          message.text.includes("Second intake request"),
+        )!;
+        const port = yield* KanbanThreads.KanbanThreads;
+        assert.equal(yield* port.acceptedSend!(accepted.id.slice("kanban:".length)), requestThread);
+        assert.deepEqual(
+          yield* kanban.submitEvaluator(
+            board.id,
+            { kind: "request", text: "Second intake request" },
+            options,
+          ),
+          second,
+        );
+        yield* worker.drain();
+        assert.equal(evaluatorStarts, 1);
+        assert.equal(started.length, 2);
+        assert.equal(
+          measurements.filter((event) => event.kind === "kanban.evaluator").at(-1)!.reuseMissReason,
+          "duplicate",
+        );
+      }).pipe(Effect.provide(Layer.merge(layer, boardLayer)));
     }),
   ),
 );

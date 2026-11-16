@@ -62,12 +62,23 @@ export const wrap = (
     cardsByThread: (id) => thread(id, store.cardsByThread(id)),
     nextCardNumber: (id) => locks.access(id, store.nextCardNumber(id)),
     putCard: (row) => locks.access(row.boardId, store.putCard(row), true, `card:${row.id}`),
-    addCardEvent: (row, applicationId) =>
-      card(row.cardId, store.addCardEvent(row, applicationId), true),
+    updateCard: (row, before) =>
+      locks.access(before.boardId, store.updateCard(row, before), true, `card:${row.id}`),
+    addCardEvent: (row, applicationId, snapshot) =>
+      snapshot?.id === row.cardId
+        ? locks.access(
+            snapshot.boardId,
+            store.addCardEvent(row, applicationId, snapshot),
+            true,
+            `card:${row.cardId}`,
+          )
+        : card(row.cardId, store.addCardEvent(row, applicationId), true),
     pendingInstructionApplications: (cardId, boardId, field, askId) =>
       card(cardId, store.pendingInstructionApplications(cardId, boardId, field, askId)),
     cardEvents: (id) => card(id, store.cardEvents(id)),
     boardEvents: (id, since, until) => locks.access(id, store.boardEvents(id, since, until)),
+    activityHistory: (id, window) => locks.access(id, store.activityHistory(id, window)),
+    slotHistory: (filter) => locks.access(filter.boardId, store.slotHistory(filter)),
     lastTransitions: (id, cardIds, beforeId) =>
       locks.access(id, store.lastTransitions(id, cardIds, beforeId)),
     goals: (id) => locks.access(id, store.goals(id)),
@@ -90,7 +101,8 @@ export const wrap = (
     putDiscussion: (row) =>
       locks.access(row.boardId, store.putDiscussion(row), true, `discussion:${row.id}`),
     messages: (id, options) => discussion(id, store.messages(id, options)),
-    ownerWait: (id) => discussion(id, store.ownerWait(id)),
+    ownerWait: (id, includeScripts, atSeq) =>
+      discussion(id, store.ownerWait(id, includeScripts, atSeq)),
     allMessages: (id) => discussion(id, store.allMessages(id)),
     message: (id, seq) => discussion(id, store.message(id, seq)),
     putMessage: (row) => discussion(row.discussionId, store.putMessage(row), true),

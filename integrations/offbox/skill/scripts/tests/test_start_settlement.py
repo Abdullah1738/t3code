@@ -234,6 +234,27 @@ class StartPaths(Isolated):
             self.assertGreater(lease.active_runs(self.con, 'bx'), 0)
             self.assertIn(row['run_id'], row['error'])
 
+    def test_disk_refusal_releases_foreground_and_background_without_ssh_and_allows_failover(self):
+        from offbox_lib import home, disk_pressure
+        for bg in (False, True):
+            with self.subTest(bg=bg), contextlib.ExitStack() as stack:
+                self.con.execute('DELETE FROM runs')
+                stack.enter_context(patch.object(api, 'BACKEND', 'server'))
+                stack.enter_context(patch.object(disk_pressure, 'remember'))
+                stack.enter_context(patch.object(home, 'before_run'))
+                stack.enter_context(patch.object(home, 'active', return_value=True))
+                stack.enter_context(patch.object(home, 'may_fail_over', return_value=True))
+                failover = stack.enter_context(patch.object(home, 'fail_over', return_value=False))
+                code, row, output, send = self.run_cli(
+                    api.ApiError(503, 'server_disk_low', 'offbox 1 GiB free'), start_check.Result(), bg)
+                self.assertEqual(self.check_calls, 0, output)
+                self.assertEqual(code, 90)
+                self.assertEqual(lease.active_runs(self.con, 'bx'), 0)
+                self.assertNotIn('start unknown', output)
+                self.assertNotIn('may have started', output)
+                self.assertEqual(send.call_count, 1)
+                failover.assert_called_once()
+
     def test_refused_and_cf_do_not_ssh_check(self):
         for status in (409, *api.CF_NOT_DELIVERED):
             with patch.object(start_check, 'check') as check:

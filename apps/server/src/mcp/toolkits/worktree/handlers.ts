@@ -16,6 +16,7 @@ const handlers = {
       const context = yield* McpInvocationContext.McpInvocationContext;
       if (!context.capabilities.has("worktree"))
         return yield* new OrchestratorMcpFailure({
+          reason: "capability_missing",
           code: "capability_denied",
           message: "This credential cannot inspect worktrees.",
         });
@@ -27,6 +28,7 @@ const handlers = {
       const project = yield* projects.getById(thread.projectId).pipe(Effect.mapError(unavailable));
       if (Option.isNone(project))
         return yield* new OrchestratorMcpFailure({
+          reason: "invalid_args",
           code: "invalid_request",
           message: "The project was not found.",
         });

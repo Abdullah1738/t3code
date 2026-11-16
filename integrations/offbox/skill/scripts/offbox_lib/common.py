@@ -67,7 +67,7 @@ def home_state() -> dict:
         s = json.loads(BACKEND_STATE.read_text())
     except (OSError, ValueError):
         return {"state": "home_up"}
-    return s if isinstance(s, dict) and s.get("state") in ("home_up", "home_down") else {"state": "home_up"}
+    return s if isinstance(s, dict) and s.get("state") in ("home_up", "home_down", "home_starting", "home_slow") else {"state": "home_up"}
 
 
 def person() -> str | None:
@@ -236,9 +236,12 @@ def entry_backend(argv: list[str]) -> str:
             on_home = any(r["name"] == full for r in base_catalog.rows("server"))
             if on_home and not on_boat:
                 return "server"
-            if first == "server" and on_boat and not on_home:
+            if on_boat and not on_home:
                 _BACKEND_REASON = "boat-only-base"
                 return "boat"
+    if sub == "run":
+        # Routing waits for a live preflight; alert hysteresis can lag behind recovery.
+        return "server"
     if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec"):
         named = [x for x in argv if x.startswith(("run-", "bx_"))]
         if sub == "exec":
@@ -308,7 +311,7 @@ EXIT_INFRA = 90
 EXIT_CAP = 91
 EXIT_BUSY = 92                 # every pool box stayed busy for the whole queue wait; nothing ran, retry
 EXIT_HOME_DOWN = 93            # person-box work while the home server is down: it waits, it never goes to Boat
-EXIT_INTERRUPTED = 94          # the home server restarted under the run and the run was not run again
+EXIT_INTERRUPTED = 94          # the home command was interrupted and was not run again
 EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
 EXIT_LOCAL = 96                # local state failure; never automatic local fallback
 EXIT_TOOLCHAIN = 99            # repo Node/pnpm could not be provisioned; user command never started
@@ -386,7 +389,12 @@ def log(msg: str) -> None:
     ensure_dirs()
     stamp = dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_PATH, "a") as f:
-        f.write(f"{stamp} [{os.getpid()}] {msg}\n")
+        run_id = os.environ.get('OFFBOX_BACKGROUND_RUN')
+        if run_id:
+            for line in msg.splitlines():
+                f.write(f"{stamp} [{os.getpid()}] run={run_id} {line}\n")
+        else:
+            f.write(f"{stamp} [{os.getpid()}] {msg}\n")
 
 
 def is_silenced(stream) -> bool:
@@ -478,7 +486,7 @@ def die(msg: str, code: int = 2):
 
 
 def new_id(prefix: str) -> str:
-    return f"{prefix}-{dt.datetime.now(TZ).strftime('%m%d-%H%M%S')}-{secrets.token_hex(2)}"
+    return f"{prefix}-{dt.datetime.now(TZ).strftime('%m%d-%H%M%S')}-{secrets.token_hex(4)}"
 
 
 SCHEMA = """
@@ -714,10 +722,12 @@ def _owner_columns(con) -> None:
         log(f"token owner backfill skipped: {e}")
 
 
-def event(con, box_id: str | None, kind: str, detail: str = "") -> None:
-    con.execute("INSERT INTO events VALUES (?,?,?,?)", (now(), box_id, kind, detail[:2000]))
+def event(con, box_id: str | None, kind: str, detail: str = "", *, limit: int | None = 2000) -> None:
+    # Fetch summaries are bounded JSON; truncating them makes analytics unreadable.
+    payload = detail if kind == 'logs_fetch' or limit is None else detail[:limit]
+    con.execute("INSERT INTO events VALUES (?,?,?,?)", (now(), box_id, kind, payload))
     con.commit()
-    log(f"{kind} {box_id or '-'} {detail[:300]}")
+    log(f"{kind} {box_id or '-'} {detail if kind == 'logs_fetch' else detail[:300]}")
 
 
 def kv_get(con, k: str, max_age: float | None = None):

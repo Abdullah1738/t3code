@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
@@ -77,6 +78,26 @@ describe("DesktopQuit", () => {
         ["/logs/desktop-quits.ndjson", "/logs/desktop-quits.ndjson.1"],
       ]);
     }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect(
+    "retains receipt time through later quit callbacks and clears it after a failed quit",
+    () =>
+      Effect.gen(function* () {
+        const state = yield* DesktopState.DesktopState;
+        yield* DesktopQuit.prepare({ trigger: "quitAndInstall" });
+        const first = yield* Ref.get(state.quitTrigger);
+        yield* TestClock.adjust("2 seconds");
+        yield* DesktopQuit.record({ trigger: "before-quit" });
+        assert.deepEqual(yield* Ref.get(state.quitTrigger), first);
+        assert.equal(first?.trigger, "quitAndInstall");
+        assert.isTrue(Number.isFinite(Date.parse(first!.at)));
+        yield* DesktopQuit.reset;
+        assert.isUndefined(yield* Ref.get(state.quitTrigger));
+        yield* DesktopQuit.prepare({ trigger: "before-quit" });
+        const next = yield* Ref.get(state.quitTrigger);
+        assert.equal(Date.parse(next!.at) - Date.parse(first!.at), 2000);
+      }).pipe(Effect.provide(Layer.provideMerge(layer, TestClock.layer()))),
   );
 
   it.effect("does not block shutdown when the log is unwritable", () =>

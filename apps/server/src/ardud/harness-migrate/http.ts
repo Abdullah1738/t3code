@@ -11,6 +11,7 @@ import * as Input from "./CutoverInput.ts";
 import * as Readiness from "./CutoverReadiness.ts";
 import * as Projections from "../../orchestration-v2/ProjectionStore.ts";
 import * as Job from "./CutoverJob.ts";
+import * as ControlRequestAnalytics from "../control/ControlRequestAnalytics.ts";
 
 const prefix = "/api/ardud/control/harness-cutover";
 const json = (body: unknown, status = 200) =>
@@ -215,7 +216,7 @@ export const routes = HttpRouter.addAll(
       HttpRouter.route("POST", `${prefix}/run`, handle("run")),
       HttpRouter.route("GET", `${prefix}/status`, handle("status")),
     ];
-  }),
+  }).pipe(Effect.flatMap(ControlRequestAnalytics.observeRoutes)),
 );
 
 export const harnessCutoverRouteLayer = routes.pipe(

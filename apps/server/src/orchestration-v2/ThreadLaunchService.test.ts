@@ -1,4 +1,5 @@
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as EvaluatorAnalytics from "../ardud/kanban/engine/evaluatorAnalytics.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
@@ -64,6 +65,7 @@ import * as ThreadLaunch from "./ThreadLaunchService.ts";
 import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadTitleRegeneration from "./ThreadTitleRegenerationService.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -117,6 +119,7 @@ const claudeAdapter = {
 } as ProviderAdapter.ProviderAdapterV2["Service"];
 
 interface HarnessOptions {
+  readonly failFirstLaunchProjection?: boolean;
   readonly closeTerminal?: TerminalManager.TerminalManager["Service"]["close"];
   readonly adapters?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>;
   readonly managedFolders?: Layer.Layer<ManagedProjectFolders.ManagedProjectFolders>;
@@ -143,11 +146,28 @@ function makeHarness(options: HarnessOptions = {}) {
   );
   const layerServerSettings = ServerSettings.layerTest(options.serverSettings);
   const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
-  const layerThreadManagement = ThreadManagement.layer.pipe(
+  const layerBaseThreadManagement = ThreadManagement.layer.pipe(
     Layer.provide(layerOrchestrator),
     Layer.provide(layerServerSettings),
     Layer.provide(layerReceipts),
   );
+  const layerThreadManagement = options.failFirstLaunchProjection
+    ? Layer.effect(
+        ThreadManagement.ThreadManagementService,
+        Effect.map(ThreadManagement.ThreadManagementService, (real) => {
+          let fail = true;
+          return ThreadManagement.ThreadManagementService.of({
+            ...real,
+            getThreadProjection: (threadId) =>
+              Effect.suspend(() => {
+                if (!fail) return real.getThreadProjection(threadId);
+                fail = false;
+                return Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId }));
+              }),
+          });
+        }),
+      ).pipe(Layer.provide(layerBaseThreadManagement))
+    : layerBaseThreadManagement;
   const layerOutbox = EffectOutbox.layer.pipe(Layer.provide(layerDatabase));
   const createWorktree = vi.fn(
     options.createWorktree ??
@@ -3584,12 +3604,18 @@ it.effect.each(
           createdBy: "user",
           creationSource: "web",
         });
+        const parentAtAdmission = yield* threads.getThreadProjection(parentThreadId);
+        const parentRun = ThreadManagement.latestActiveRun(parentAtAdmission);
+        assert.isDefined(parentRun);
+        const parentSessionId = parentAtAdmission.providerThreads.find(
+          (thread) => thread.id === parentRun!.providerThreadId,
+        )!.providerSessionId!;
         const scope = {
           environmentId: EnvironmentId.make("delegated-worktree-test"),
           requestNamespace: "parent-session",
           thread: {
             threadId: parentThreadId,
-            providerSessionId: "parent-session",
+            providerSessionId: parentSessionId,
             providerInstanceId: modelSelection.instanceId,
           },
           client: undefined,
@@ -3687,4 +3713,33 @@ it.effect.each(
         }
       }).pipe(Effect.provide(Layer.merge(harness.layer, layerService)));
     }),
+);
+
+it.effect(
+  "#1490 observes an admitted launch before projection failure and not its resumed replay",
+  () => {
+    const harness = makeHarness({ failFirstLaunchProjection: true });
+    const observed: string[] = [];
+    return Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const input = launchInput({
+        command: "measure:partial-launch",
+        thread: "thread:measure:partial-launch",
+        message: "Measured launch",
+      });
+      const first = yield* Effect.result(launches.launch(input));
+      assert.equal(first._tag, "Failure");
+      assert.deepEqual(observed, [input.threadId]);
+      const resumed = yield* launches.launch(input);
+      assert.isTrue(resumed.resumed);
+      assert.deepEqual(observed, [resumed.threadId]);
+    }).pipe(
+      Effect.provide(harness.layer),
+      Effect.provideService(EvaluatorAnalytics.startObserver, (id) =>
+        Effect.sync(() => {
+          observed.push(id);
+        }),
+      ),
+    );
+  },
 );

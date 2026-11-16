@@ -21,6 +21,7 @@ import { ArchiveSnapshotGate } from "./archiveSnapshotGate.ts";
 import * as NodeURL from "node:url";
 import { initializeShellItemCounts } from "./shellItemCounts.ts";
 import { withStartupPhase } from "../observability/StartupPhaseLog.ts";
+import { threadReadIndexes } from "./threadReadIndexes.ts";
 
 class HistoryArchiveMissing extends Schema.TaggedError<HistoryArchiveMissing>()(
   "HistoryArchiveMissing",
@@ -65,6 +66,9 @@ export const initializeHistoryArchive = Effect.fn("HistoryArchive.initialize")(f
   }
   yield* sql`ATTACH DATABASE ${archivePath} AS ardud_archive`;
   yield* sql`PRAGMA ardud_archive.journal_mode = WAL`;
+  // PASSIVE barriers leave a high-water file. Cap reuse as well as the worker's
+  // scheduled TRUNCATE; a pinned reader can defer either without losing rows.
+  yield* sql`PRAGMA ardud_archive.journal_size_limit = 33554432`;
   // Copy and commit before deleting from main. FULL makes the archive copy
   // durable even when the OS loses main's later NORMAL-synchronous commit.
   yield* sql`PRAGMA ardud_archive.synchronous = FULL`;
@@ -114,6 +118,9 @@ export const initializeHistoryArchive = Effect.fn("HistoryArchive.initialize")(f
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_sequence_idx ON ardud_events(sequence)`;
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_identity_idx ON ardud_events(event_id)`;
         } else {
+          for (const statement of threadReadIndexes("ardud_archive", "ardud_turn_items")) {
+            yield* sql.unsafe(statement);
+          }
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_run_idx ON ardud_turn_items(run_id, ordinal)`;
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_node_idx ON ardud_turn_items(node_id, ordinal)`;
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_provider_turn_idx ON ardud_turn_items(provider_turn_id)`;
@@ -176,8 +183,8 @@ const envInteger = (
  * Pacing for the archive loop, read once at startup. Overrides (restart, no rebuild):
  *
  * - `ROBOB_HISTORY_ARCHIVE_PAUSED=1`: no passes at all.
- * - `ROBOB_HISTORY_ARCHIVE_MIN_INTERVAL_MS` (default 250): the least idle time between
- *   two passes. The gap is also at least as long as the pass that just ran.
+ * - `ROBOB_HISTORY_ARCHIVE_MIN_INTERVAL_MS` (default 5000): the least idle time between
+ *   two passes. The gap is also at least nine times the pass duration.
  * - `ROBOB_HISTORY_ARCHIVE_CONTENTION_MS` (default 1000): a pass that waits this long
  *   for a reader slot, the writer, a durability barrier or the snapshot gate stops and
  *   reports contention.
@@ -202,8 +209,8 @@ export const historyArchivePacing = (
   const minIntervalMs = envInteger(
     env,
     "ROBOB_HISTORY_ARCHIVE_MIN_INTERVAL_MS",
-    250,
-    25,
+    5_000,
+    1_000,
     3_600_000,
   );
   const backoffMs = envInteger(env, "ROBOB_HISTORY_ARCHIVE_BACKOFF_MS", 10_000, 100, 3_600_000);
@@ -221,7 +228,7 @@ export const historyArchivePacing = (
 
 /**
  * Idle time after a pass. Passes never run back to back: the gap is at least the pass's
- * own duration (so archiving uses at most half the wall clock) and the minimum interval.
+ * own duration times nine (at most 10% of wall time) and the minimum interval.
  * A contended pass (or a run of them) waits the doubling backoff instead, so the loop
  * stays off the writer and the background reader while they are congested.
  */
@@ -229,7 +236,7 @@ export const nextHistoryArchiveDelayMs = (
   pacing: HistoryArchivePacing,
   pass: { readonly durationMs: number; readonly contendedStreak: number },
 ): number => {
-  const paced = Math.max(pacing.minIntervalMs, Math.ceil(pass.durationMs));
+  const paced = Math.max(pacing.minIntervalMs, Math.ceil(pass.durationMs * 9));
   if (pass.contendedStreak <= 0) return paced;
   const backoff = pacing.backoffMs * 2 ** Math.min(pass.contendedStreak - 1, 30);
   return Math.max(paced, Math.min(pacing.maxBackoffMs, backoff));
@@ -243,7 +250,7 @@ export interface HistoryArchivePassResult {
 
 // One row per commit is intentional: a single tool payload can own thousands of
 // overflow pages. A row count alone cannot promise a disk-latency deadline.
-const MAX_ROWS_PER_PASS = 16;
+const MAX_ROWS_PER_PASS = 4;
 // Large overflow chains cannot be deleted within an interactive writer budget.
 // Leave those rows hot for the coordinator's offline maintenance pass.
 const MAX_ROW_BYTES = 64 * 1024;

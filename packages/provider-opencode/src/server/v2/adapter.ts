@@ -1560,7 +1560,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       if (subagent === undefined || child.active !== undefined) return;
       subagent.turns += 1;
       const startedAt = yield* DateTime.now;
-      const nativeTurnId = `${child.sessionId}:turn:${subagent.turns}`;
+      // A resumed child keeps its native session ID while this counter resets.
+      const startId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+      const nativeTurnId = `${child.sessionId}:turn:${subagent.turns}:${startId}`;
       const rootNodeId = idAllocator.derive.nodeFromProviderItem({
         driver,
         nativeItemId: `${nativeTurnId}:root`,
@@ -2305,10 +2307,13 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 event.data.error.type === "provider.rate-limit"
                   ? "usage_limit"
                   : "provider_error",
+              // OpenCode uses provider.no-route for missing models and invalid variants alike.
               ...(event.data.error.type === "provider.quota" ||
               event.data.error.type === "provider.rate-limit"
                 ? { category: "quota" as const }
-                : {}),
+                : event.data.error.message.startsWith("Model unavailable: ")
+                  ? { category: "transient" as const }
+                  : {}),
             }),
           });
         default:
@@ -4471,10 +4476,18 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             return yield* lock.withPermit(finishTurn(state, { status: "interrupted" }));
           }
           if (!reply.value.interrupted && state.active === turn) {
-            turn.interrupted = false;
-            return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            yield* lock.withPermit(
+              Effect.gen(function* () {
+                if (state.active !== turn) return;
+                // Its native end may still be queued; the next turn must skip that late event.
+                markUnsettled(state);
+                yield* finishTurn(state, { status: "interrupted" });
+              }),
+            );
+            return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
               driver: OPENCODE_PROVIDER,
-              detail: `OpenCode session ${sessionId} had nothing running to stop`,
+              providerThreadId: interruptInput.providerThread.id,
+              providerTurnId: interruptInput.providerTurnId,
             });
           }
         },
