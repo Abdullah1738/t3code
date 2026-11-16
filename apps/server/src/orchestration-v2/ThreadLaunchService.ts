@@ -225,10 +225,17 @@ const make = Effect.gen(function* () {
         cause,
       });
 
-  const readReceipt = (input: ThreadLaunchInput, commandId: CommandId) =>
+  const readReceipt = (
+    input: ThreadLaunchInput,
+    commandId: CommandId,
+    phase: "create" | "message",
+  ) =>
     receipts
       .getByCommandId(commandId)
-      .pipe(Effect.mapError(mapError(input, "read-receipt", input.threadId)));
+      .pipe(
+        Effect.mapError(mapError(input, "read-receipt", input.threadId)),
+        Effect.withSpan(`ThreadLaunchService.${phase}Receipt`),
+      );
 
   const validateReusableThread = Effect.fn("ThreadLaunchService.validateReusableThread")(function* (
     input: ThreadLaunchInput,
@@ -837,7 +844,7 @@ const make = Effect.gen(function* () {
         )("Reusing an existing thread requires a thread id.");
       }
 
-      const launchReceipt = yield* readReceipt(input, input.commandId);
+      const launchReceipt = yield* readReceipt(input, input.commandId, "create");
       yield* threads
         .assertProviderInstanceEnabled({
           projectId: input.projectId,
@@ -935,6 +942,7 @@ const make = Effect.gen(function* () {
                 creationSource: input.creationSource,
               });
         const claimed = yield* claimDispatch.pipe(
+          Effect.withSpan("ThreadLaunchService.threadCreate"),
           Effect.mapError(
             mapError(
               input,
@@ -954,7 +962,7 @@ const make = Effect.gen(function* () {
         let messageWasAlreadyAccepted = false;
         if (input.initialMessage !== undefined) {
           const messageCommandId = CommandId.make(`${input.commandId}:initial-message`);
-          const messageReceipt = yield* readReceipt(input, messageCommandId);
+          const messageReceipt = yield* readReceipt(input, messageCommandId, "message");
           messageWasAlreadyAccepted = Option.isSome(messageReceipt);
           const messageId =
             input.initialMessage.messageId ??
@@ -982,7 +990,10 @@ const make = Effect.gen(function* () {
               createdBy: input.createdBy,
               creationSource: input.creationSource,
             })
-            .pipe(Effect.mapError(mapError(input, "dispatch-message", threadId)));
+            .pipe(
+              Effect.mapError(mapError(input, "dispatch-message", threadId)),
+              Effect.withSpan("ThreadLaunchService.turnDispatch"),
+            );
           const runCreated = dispatched.storedEvents.find(
             (stored) => stored.event.type === "run.created",
           );

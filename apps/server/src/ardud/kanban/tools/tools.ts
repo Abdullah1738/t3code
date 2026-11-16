@@ -1113,6 +1113,25 @@ const EvaluatorStart = tool(
   { readonly: false },
 );
 
+const EvaluatorStatus = tool(
+  "evaluator_status",
+  "Look up an evaluator request",
+  "Read back an evaluator_start or report_bug using exactly one returned queueId or threadId. Returns its queue state, evaluator thread and cards it filed or updated, including retitled or settled cards and duplicates recorded on existing cards.",
+  {
+    boardId: BoardRef,
+    queueId: Schema.optional(PositiveInt),
+    threadId: Schema.optional(TrimmedNonEmptyString),
+  },
+  {
+    saved: Schema.Boolean,
+    queued: Schema.Boolean,
+    queueId: Schema.optional(Schema.Number),
+    threadId: Schema.optional(TrimmedNonEmptyString),
+    cards: Records,
+  },
+  { readonly: true },
+);
+
 const SetupDone = tool(
   "setup_done",
   "End board setup",
@@ -1186,5 +1205,6 @@ export const KanbanToolkit = Toolkit.make(
   WikiWrite,
   BoardOpen,
   EvaluatorStart,
+  EvaluatorStatus,
   ReportBug,
 );

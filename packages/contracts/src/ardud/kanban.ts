@@ -1919,6 +1919,8 @@ export const KanbanCardEvent = Schema.Struct({
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),
+  /** Caller of a system-authored evaluator admission sighting. */
+  sourceThreadId: Schema.optionalKey(ThreadId),
   /** Original delivery to reconcile when assignment inputs have since changed. */
   assignmentWake: Schema.optionalKey(
     Schema.Struct({ threadId: ThreadId, key: TrimmedNonEmptyString }),
