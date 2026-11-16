@@ -11,7 +11,7 @@ export type LogEntry = {
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
 const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "meantFor"]);
-const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays"]);
+const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap"]);
 const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
@@ -27,6 +27,7 @@ const values: Record<string, readonly string[]> = {
   route: ["person", "owner", "group", "creator", "other", "thread", "unverified", "refused"],
   via: ["wake", "thread", "imessage-send", "telegram", "none", "wake:owner-fallback", "native:pending"],
   confirmed: ["pending", "n/a"],
+  operation: ["check", "pending"],
 };
 let testRoot: string | undefined;
 export const logDirectory = () => {
@@ -41,21 +42,32 @@ export const logDirectory = () => {
 const initialized = new Set<string>();
 const CAP = 50 * 1024 * 1024;
 
+function logId(key: string, value: string | number): string {
+  const text = String(value);
+  // Names are needed for nightly attribution; arbitrary correlation IDs may contain private text.
+  return (key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(text) && !/\d{5}/.test(text)
+    ? text : createHash("sha256").update(text).digest("hex").slice(0, 24);
+}
+
 function fields(entry: LogEntry, at: Date) {
   if (!token.test(entry.component) || !token.test(entry.name) || !["event", "perf", "error"].includes(entry.kind)) return undefined;
   const marker = entry.name === "deploy.marker" ? markerProps(entry.props) : undefined;
   if (entry.name === "deploy.marker" && (!marker || entry.kind !== "event")) return undefined;
   const ids: Record<string, string> = {};
   for (const [key, value] of Object.entries(marker ? {} : entry.ids ?? {})) {
-    if (!idKeys.has(key) || !["string", "number"].includes(typeof value)) continue;
-    const text = String(value);
-    // Names are needed for nightly attribution; arbitrary correlation IDs may contain private text.
-    ids[key] = (key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(text) && !/\d{5}/.test(text)
-      ? text : createHash("sha256").update(text).digest("hex").slice(0, 24);
+    if (!idKeys.has(key) || (typeof value !== "string" && typeof value !== "number")) continue;
+    ids[key] = logId(key, value);
   }
-  const props: Record<string, string | number | boolean | null> = {};
+  const props: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
-    if ((key === "exitCode" || key === "signal") && value === null) props[key] = null;
+    if (key === "holders" && (entry.name === "slot.wait" || entry.name === "slot.backlog") && Array.isArray(value)) {
+      props[key] = value.slice(0, 100).flatMap(value => {
+        const holder = record(value);
+        return (typeof holder.watcher === "string" || typeof holder.watcher === "number") && milliseconds(holder.elapsedMs)
+          ? [{ watcher: logId("watcher", holder.watcher), elapsedMs: holder.elapsedMs }] : [];
+      });
+    }
+    else if ((key === "exitCode" || key === "signal") && value === null) props[key] = null;
     else if (key === "stderrLines" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) props[key] = value;
     else if (key === "missingForS" && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if ((key === "stderrHash" || key === "triggerPathHash") && typeof value === "string" && /^[a-f0-9]{16}$/.test(value)) props[key] = value;
@@ -157,7 +169,7 @@ function percentiles(samples: number[]) {
   return { p50: samples[Math.ceil(samples.length * .5) - 1] ?? null, p95: samples[Math.ceil(samples.length * .95) - 1] ?? null, max: samples.at(-1) ?? null };
 }
 function watcherStats() {
-  return { runs: 0, fires: 0, outcomes: outcomes(), durations: [] as number[], queued: [] as number[], failStreak: 0, longestFailStreak: 0, lastFailureTag: null as string | null };
+  return { runs: 0, fires: 0, outcomes: outcomes(), durations: [] as number[], queued: [] as number[], slotWaits: [] as number[], lateRuns: 0, failStreak: 0, longestFailStreak: 0, lastFailureTag: null as string | null };
 }
 function helperStats() {
   return { runs: 0, failures: 0, exitCodes: Object.create(null) as Record<string, number>, durations: [] as number[] };
@@ -209,6 +221,8 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
     const markers: { ts: string; service: string; sha: string; step: string }[] = [];
     const errorTimes: number[] = [];
     const wake = { sent: 0, failed: 0, attempts: 0, replyGuard: { total: 0, blocked: 0, accepted: 0 } };
+    let allSlotsBusyMs = 0;
+    const slotHolders = new Map<string, number>();
     let total = 0, ok = 0, failed = 0, withOk = 0;
     // Read the halo too so marker comparisons retain their full 30 minutes across UTC midnight.
     let files: string[];
@@ -231,6 +245,15 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
         if (row.tool !== "watchers" || typeof row.name !== "string" || !token.test(row.name) || typeof row.kind !== "string" || !["event", "perf", "error"].includes(row.kind)) continue;
         const ts = isoTime(row.ts);
         if (ts !== undefined && ts >= since - HALF_HOUR && ts < until + HALF_HOUR && row.kind === "error") errorTimes.push(ts);
+        // Usage is flushed at least once a minute, including while a check spans midnight.
+        if (ts !== undefined && milliseconds(row.durationMs) && (row.name === "slot.busy" || row.name === "slot.hold")) {
+          const overlap = Math.max(0, Math.min(ts, until) - Math.max(ts - row.durationMs, since));
+          if (row.name === "slot.busy") allSlotsBusyMs += overlap;
+          else {
+            const id = record(row.ids).watcher;
+            if (safeId("watcher", id)) slotHolders.set(id, (slotHolders.get(id) ?? 0) + overlap);
+          }
+        }
         // Legacy day fixtures without timestamps still contribute to daily totals only.
         if (window ? ts === undefined || ts < since || ts >= until : file !== `${day}.ndjson`) continue;
         let hour;
@@ -278,6 +301,12 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
             stats.longestFailStreak = Math.max(stats.longestFailStreak, ++stats.failStreak);
             stats.lastFailureTag = tag ?? null;
           } else if (outcome === "no_change" || outcome === "fire" || row.ok === true) stats.failStreak = 0;
+        }
+        if (row.name === "slot.start" && watcher) {
+          const stats = watchers.get(watcher) ?? watcherStats();
+          watchers.set(watcher, stats);
+          if (milliseconds(props.slotWaitMs)) stats.slotWaits.push(props.slotWaitMs);
+          if (milliseconds(props.startLateMs) && milliseconds(props.intervalMs) && props.intervalMs > 0 && props.startLateMs > props.intervalMs) stats.lateRuns++;
         }
         if (row.name === "helper.run") {
           const id = helper ?? "unknown", stats = helpers.get(id) ?? helperStats();
@@ -329,6 +358,7 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
     const byWatcher = Object.fromEntries([...watchers].sort(byRuns).slice(0, 40).map(([id, stats]) => [id, {
       runs: stats.runs, outcomes: stats.outcomes, fires: stats.fires, durationMs: percentiles(stats.durations), queuedMs: { p95: percentiles(stats.queued).p95 },
       longestFailStreak: stats.longestFailStreak, lastFailureTag: stats.lastFailureTag,
+      slotWaitMs: { count: stats.slotWaits.length, total: stats.slotWaits.reduce((sum, ms) => sum + ms, 0), p95: percentiles(stats.slotWaits).p95 }, lateRuns: stats.lateRuns,
     }]));
     const byHelper = Object.fromEntries([...helpers].sort(byRuns).slice(0, 40).map(([id, stats]) => [id, {
       runs: stats.runs, failures: stats.failures, exitCodes: stats.exitCodes, durationMs: { p95: percentiles(stats.durations).p95 },
@@ -356,7 +386,8 @@ export async function rollup(selection: string | LogWindow, dir = logDirectory()
       errors: Object.entries(errors).sort((a, b) => b[1] - a[1]).slice(0, 20).map(([tag, count]) => ({ tag, count,
         topSources: [...sourceErrors.values()].filter(source => source.tag === tag).sort(byErrors).slice(0, 3).map(({ source, id, count }) => ({ source, id, count })),
       })),
-      byWatcher, watcherTotals, byHelper, helperTotals, errorsByTagAndSource, wake, hourly, markers: deployMarkers };
+      byWatcher, watcherTotals, byHelper, helperTotals, errorsByTagAndSource, wake, hourly, markers: deployMarkers,
+      slots: { allSlotsBusyMinutes: allSlotsBusyMs / 60_000, topHolders: [...slotHolders].filter(([, ms]) => ms > 0).sort(([a, x], [b, y]) => y - x || a.localeCompare(b)).slice(0, 20).map(([watcher, ms]) => ({ watcher, slotSeconds: ms / 1000 })) } };
     const target = out ?? (day ? join(dir, `rollup-${day}.json`) : undefined);
     if (target) {
       mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
