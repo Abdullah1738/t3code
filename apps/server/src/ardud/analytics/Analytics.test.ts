@@ -84,6 +84,79 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect("reads slot and claim decisions in defaults and by kind", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const decisions = [
+        event({
+          kind: "kanban.slot",
+          surface: "server",
+          boardId: "a",
+          cardId: "c",
+          threadId: "t",
+          props: { poolKey: "sol", slot: "take", why: "start", held: false },
+        }),
+        event({
+          kind: "kanban.slot",
+          surface: "server",
+          boardId: "a",
+          threadId: "t",
+          props: { poolKey: "sol", slot: "release", why: "hold_end", held: false },
+        }),
+        event({
+          kind: "kanban.claim_denied",
+          surface: "server",
+          boardId: "a",
+          cardId: "c",
+          threadId: "t",
+          props: {
+            poolKey: "sol",
+            reason: "pool_full",
+            holdsSlot: false,
+            carried: 0,
+            used: 1,
+            slots: 1,
+          },
+        }),
+        event({
+          kind: "kanban.claim",
+          surface: "server",
+          boardId: "a",
+          cardId: "c",
+          threadId: "t",
+          props: {
+            poolKey: "sol",
+            reason: "taken",
+            holdsSlot: true,
+            carried: 0,
+            used: 1,
+            slots: 1,
+          },
+        }),
+        event({
+          kind: "kanban.next",
+          surface: "server",
+          boardId: "a",
+          threadId: "t",
+          props: { holdsSlot: true, candidateCount: 1 },
+        }),
+      ];
+      for (const row of decisions) yield* analytics.record(row);
+      yield* analytics.flush;
+      const cold = yield* open(setup);
+      for (const reader of [analytics, cold]) {
+        assert.sameDeepMembers([...(yield* reader.read({ day, boardId: "a" })).samples], decisions);
+        for (const kind of new Set(decisions.map((row) => row.kind))) {
+          assert.sameDeepMembers(
+            [...(yield* reader.read({ day, kind })).samples],
+            decisions.filter((row) => row.kind === kind),
+          );
+        }
+      }
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("reads silent child stall decisions with their phase and recovery action", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;

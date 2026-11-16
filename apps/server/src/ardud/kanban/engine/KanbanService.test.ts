@@ -41016,6 +41016,20 @@ it.effect("a later start cannot erase an earlier window's pool queue", () =>
   }),
 );
 
+const slotAnalytics = (events: AnalyticsEvent[]) =>
+  Layer.mock(Analytics.Analytics)({
+    record: (event) =>
+      decodeAnalyticsEvent(event).pipe(
+        Effect.orDie,
+        Effect.tap((decoded) =>
+          Effect.sync(() => {
+            events.push(decoded);
+          }),
+        ),
+        Effect.asVoid,
+      ),
+  });
+
 const slotRows = (boardId: string) =>
   Effect.flatMap(KanbanStore.KanbanStore, (store) =>
     store.slotEvents({ boardId, from: "", to: "9999" }),
@@ -41047,6 +41061,7 @@ it.effect.each(["held", "review", "needs-input", "waiting", "queued", "late-turn
   (mode) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
       let target: ThreadId | undefined;
       let state: KanbanThreadView["state"] | undefined;
       const states = Layer.effect(
@@ -41122,13 +41137,32 @@ it.effect.each(["held", "review", "needs-input", "waiting", "queued", "late-turn
         const claimed = yield* kanban.claimCard(threadId, related.id);
         assert.equal(claimed.card.activeThreadId, threadId);
         assert.equal(claimed.card.stage, "working");
+        const claims = events.filter((event) => event.kind === "kanban.claim");
+        assert.lengthOf(claims, 1);
+        assert.deepInclude(claims[0], { boardId: board.id, cardId: related.id, threadId });
+        assert.deepStrictEqual(claims[0]!.props, {
+          poolKey: Rules.poolKey(board.defaultCardModel),
+          reason: "taken",
+          holdsSlot: true,
+          carried: 0,
+          used: mode === "held" ? 1 : 2,
+          slots: 1,
+        });
+        const offers = events.filter((event) => event.kind === "kanban.next");
+        assert.isTrue(offers.length > 0);
+        assert.isTrue(
+          offers.every(
+            (event) => event.props?.holdsSlot === true && event.props.candidateCount === 1,
+          ),
+        );
+
         assert.notInclude(
           (yield* slotRows(board.id))
             .filter((row) => row.threadId === threadId)
             .map((row) => row.kind),
           "release",
         );
-      }).pipe(Effect.provide(testLayer(states)));
+      }).pipe(Effect.provide(testLayer(states).pipe(Layer.provide(slotAnalytics(events)))));
     }),
 );
 
@@ -41137,6 +41171,7 @@ it.effect.each(["turn-end", "idle-tick", "timeout"] as const)(
   (mode) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
       yield* Effect.gen(function* () {
         const { kanban, board } = yield* toyBoard;
         yield* kanban.updateBoard(board.id, {
@@ -41177,6 +41212,21 @@ it.effect.each(["turn-end", "idle-tick", "timeout"] as const)(
         const refused = yield* kanban.claimCard(threadId, related.id).pipe(Effect.flip);
         assert.equal(refused.code, "denied");
         assert.equal(refused.reason, "pool_full");
+        const denials = events.filter((event) => event.kind === "kanban.claim_denied");
+        assert.lengthOf(denials, 1);
+        assert.deepInclude(denials[0], { boardId: board.id, cardId: related.id, threadId });
+        assert.deepStrictEqual(denials[0]!.props, {
+          poolKey: Rules.poolKey(board.defaultCardModel),
+          reason: "pool_full",
+          holdsSlot: false,
+          carried: 0,
+          used: 1,
+          slots: 1,
+        });
+        assert.isFalse(
+          events.some((event) => event.kind === "kanban.claim" || event.kind === "kanban.next"),
+        );
+
         assert.equal((yield* kanban.card(related.id)).card.stage, "todo");
         assert.deepStrictEqual(
           (yield* slotRows(board.id))
@@ -41187,7 +41237,7 @@ it.effect.each(["turn-end", "idle-tick", "timeout"] as const)(
             ["release", "hold_end"],
           ],
         );
-      }).pipe(Effect.provide(testLayer(fake.layer)));
+      }).pipe(Effect.provide(testLayer(fake.layer).pipe(Layer.provide(slotAnalytics(events)))));
     }),
 );
 
@@ -41254,6 +41304,7 @@ it.effect("#1732 an expired hold check cannot release a replacement hold", () =>
 it.effect("slot ledger counts shared cards once and retains a hold until turn end", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
+    const events: AnalyticsEvent[] = [];
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       const card = yield* kanban.createCard(board.id, { title: "A", prompt: "A" }, owner);
@@ -41296,7 +41347,86 @@ it.effect("slot ledger counts shared cards once and retains a hold until turn en
       );
       assert.isNull((yield* slotRows(board.id))[1]!.cardId);
       yield* assertSlotReplay(board.id);
-    }).pipe(Effect.provide(testLayer(fake.layer)));
+
+      const slots = events.filter((event) => event.kind === "kanban.slot");
+      assert.deepStrictEqual(
+        slots.map((event) => ({
+          boardId: event.boardId,
+          threadId: event.threadId,
+          cardId: event.cardId ?? null,
+          ts: event.ts,
+          ...event.props,
+        })),
+        (yield* slotRows(board.id)).map((row) => ({
+          boardId: row.boardId,
+          threadId: row.threadId,
+          cardId: row.cardId,
+          ts: row.at,
+          poolKey: row.poolKey,
+          slot: row.kind,
+          why: row.why,
+          held: false,
+        })),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer).pipe(Layer.provide(slotAnalytics(events)))));
+  }),
+);
+
+it.effect("slot analytics failure preserves slot writes and claim outcomes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const attempted: string[] = [];
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const first = yield* kanban.createCard(board.id, { title: "First", prompt: "First" }, owner);
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(first.id)).card.activeThreadId!;
+      const related = yield* kanban.createCard(
+        board.id,
+        { title: "Related", prompt: "Related" },
+        owner,
+      );
+      yield* kanban.setGroups(board.id, [
+        { id: "related", name: "Related", summary: "", cardIds: [first.id, related.id] },
+      ]);
+      assert.equal((yield* kanban.claimCard(threadId, related.id)).card.activeThreadId, threadId);
+      const error = yield* kanban.claimCard(threadId, related.id).pipe(Effect.flip);
+      assert.equal(error.code, "denied");
+      yield* kanban.moveCard(first.id, "needs_review", "cardThread", { _tag: "thread", threadId });
+      yield* kanban.moveCard(related.id, "needs_review", "cardThread", {
+        _tag: "thread",
+        threadId,
+      });
+      yield* setRunning(fake, threadId, false);
+      yield* kanban.turnEnded(threadId);
+      yield* kanban.turnEnded(threadId);
+      assert.deepStrictEqual(
+        (yield* slotRows(board.id)).map((row) => row.kind),
+        ["take", "release"],
+      );
+      assert.sameMembers(attempted, [
+        "kanban.slot",
+        "kanban.claim",
+        "kanban.claim_denied",
+        "kanban.slot",
+      ]);
+      yield* assertSlotReplay(board.id);
+    }).pipe(
+      Effect.provide(
+        testLayer(fake.layer).pipe(
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) => {
+                if (!["kanban.slot", "kanban.claim", "kanban.claim_denied"].includes(event.kind))
+                  return Effect.void;
+                attempted.push(event.kind);
+                return Effect.die("analytics unavailable");
+              },
+            }),
+          ),
+        ),
+      ),
+    );
   }),
 );
 
