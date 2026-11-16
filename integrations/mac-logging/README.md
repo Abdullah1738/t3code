@@ -209,33 +209,43 @@ These events never alert or launch extra scans.
 
 `com.abdullah.mac-tailnet` invokes `collector.py --tailnet` every 60 seconds,
 independently of the hourly collector's slow disk scans. `tailnet.py` calls only
-`/Applications/Tailscale.app/Contents/MacOS/Tailscale status --json` (five-second
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale status --json` (15-second
 timeout, no socket override). It never changes Tailscale preferences or reconnects.
 `THRESHOLD_CHECKS` (3) and `PROBE_HOST` (`100.75.104.72`) are its configuration
-values. Up requires `BackendState=Running` and `Self.Online=true`; existing IPs
-and extension PIDs do not prove connectivity. Starting and CLI failures count
-as not up. The third consecutive not-up check queues one Telegram alert. A
-healthy check resets the streak and queues one recovery line for alerted outages.
-Brief outages produce no notification. Three minute checks are a sampling
-threshold, not a guarantee of three full elapsed minutes after the first failure.
+values. A valid Running/online response is up; explicit Stopped, NeedsLogin,
+NeedsMachineAuth, NoState, Starting or Running/offline is down. Missing or invalid
+CLI data is unknown. Unknown CLI checks probe home SSH (100.75.104.72:22) and the
+remote Mullvad de-dus-wg-102 DNS listener (100.64.1.71:53), using ordinary TCP
+connections through the Mac's Tailscale interface. Either success proves up;
+both failures confirm down. An unavailable probe tool leaves the outcome unknown.
+Only consecutive confirmed-down checks count: at least three checks AND 180
+elapsed seconds are required to alert. Up resets the streak; unknown breaks it
+without claiming recovery. Recovery is sent only for an alerted outage.
 
 `state/tailnet.json` and a separate nonblocking lock preserve streaks and queued
 notification payloads across invocations. Keys and text remain identical on retry,
 including after a timeout that may have followed durable Telegram queueing.
-Recovery uses a distinct key. Unix timestamps measure outages across processes;
-monotonic time measures only one invocation's probe duration.
+Recovery uses a distinct key. The first run drops legacy unproven counters and
+pending timeout alerts, while preserving already alerted explicit-state outages.
+Unix timestamps measure outages across processes; monotonic time measures CLI
+and probe duration. The CLI timeout is 15 s, pgrep 3 s, each of two probes 6 s
+(`nc -z -G 5`), and at most one Telegram send is attempted per invocation (10 s).
+The subprocess budget is at most 40 s per run.
 
-`tailnet.sample` records backend state, online flag, IP count, CLI exit/timeout,
-extension PIDs and the result of `nc -z -G 3 <PROBE_HOST> 22` (four-second outer
-timeout, only for Running). A failed home probe never triggers a tailnet alert.
+`tailnet.sample` adds `outcome`, `cliOutcome`, `confirmedDown`, `cliMs` and, when
+CLI evidence is unknown, `confirmProbes` (host to port/ok/error/ms). Backend state,
+online flag, IP count, CLI exit/timeout and extension PIDs remain available.
+Running samples retain a home SSH probe; its failure alone never overrides a
+healthy CLI. `tailnet.cli_slow` records unknown CLI evidence resolved up by peers,
+at most once per 900 seconds, with `suppressed` counting intervening occurrences.
 `tailnet.state` and `tailnet.extension` record initial observations and changes;
 a PID change alone is not a crash. `tailnet.alert` / `tailnet.recovery` record
 notification queue acceptance or failure. Failed sends retry next minute.
-Raw CLI output, addresses, peers, identity and notification text never enter
-these events. `mac-log-status` and daily rollups flag a missing sample after
-three minutes. The app CLI's “Skip a start command” and “Peer connection was
-rejected” logs are known harmless noise; check for `EditPrefs` and backend changes
-when verifying read-only behavior.
+Only configured probe addresses enter these events; raw CLI output, identity,
+other peers and notification text are discarded. `mac-log-status` and daily
+rollups flag a missing sample after three minutes. The app CLI's “Skip a start
+command” and “Peer connection was rejected” logs are known harmless noise;
+check for `EditPrefs` and backend changes when verifying read-only behavior.
 
 After review and merge/push, run `zsh integrations/mac-logging/install.zsh`
 (`--dry-run` first, `--check` after). The installer copies but never loads agents.
