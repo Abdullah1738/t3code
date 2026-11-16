@@ -3758,6 +3758,7 @@ const make = Effect.gen(function* () {
   const upgradeFindings = Effect.fn("KanbanService.upgradeFindings")(function* (
     cards: ReadonlyArray<KanbanCard>,
     persist = true,
+    cardEvents: typeof rawStore.cardEvents = store.cardEvents,
   ) {
     return yield* Effect.forEach(cards, (card) =>
       Effect.gen(function* () {
@@ -3771,7 +3772,7 @@ const make = Effect.gen(function* () {
           return card;
         // Older workers consumed their only findings marker. Read the actual
         // verdict once: a historical findings round alone is not a pending bounce.
-        const verdict = (yield* store.cardEvents(card.id)).findLast((e) => e.kind === "review");
+        const verdict = (yield* cardEvents(card.id)).findLast((e) => e.kind === "review");
         const next = {
           ...card,
           reviewFindingsPending: verdict?.toStage === "todo" && verdict.body !== "clear",
@@ -10952,38 +10953,90 @@ const make = Effect.gen(function* () {
     yield* kick;
   });
 
+  const recoveringBoards = new Set<string>();
   const wakeRecovered = Effect.fn("KanbanService.wakeRecovered")(function* (board: KanbanBoard) {
-    const recovered = yield* Ref.get(recoveredThreads);
-    if (recovered.size === 0) return;
-    for (const { link } of yield* pausedLinks) {
-      if (link.boardId !== board.id || link.paused === null || !recovered.has(link.threadId))
-        continue;
-      const carried = yield* upgradeFindings(yield* store.cardsByThread(link.threadId));
-      if (carried.length === 0 || (link.role === "work" && !carried.some(kanbanWorkStep))) {
-        yield* store.putThreadLink({ ...link, paused: null });
-        yield* Ref.update(recoveredThreads, (map) => {
-          const next = new Map(map);
-          next.delete(link.threadId);
-          return next;
-        });
-        continue;
-      }
-      if (board.pause && carried.some((card) => !board.pause!.keep.includes(card.id))) continue;
-      if ((yield* Ref.get(down)).has(linkKey(link, board))) continue;
-      const found = yield* Effect.result(threads.find(link.threadId));
-      if (Result.isFailure(found)) continue;
-      const view = found.success;
-      if (view !== null && !view.archived && view.state === "idle") {
-        const sent = yield* threads
-          .send({ threadId: link.threadId, text: Briefs.providerBackText(link.paused.message) })
-          .pipe(
-            Effect.as(true),
-            Effect.catchCause(() => Effect.succeed(false)),
-          );
-        if (!sent) continue;
-      }
-      yield* store.putThreadLink({ ...link, paused: null });
-    }
+    // Reserve before any read: unpause and overlapping ticks share one recovery pass.
+    if (recoveringBoards.has(board.id)) return;
+    recoveringBoards.add(board.id);
+    yield* Effect.gen(function* () {
+      const recovered = yield* Ref.get(recoveredThreads);
+      if (recovered.size === 0) return;
+      // A global pausedLinks scan makes every board's tick queue on every other
+      // board. Select only this board's recovered links before taking any gate.
+      const candidates = (yield* locks.outside(
+        rawStore.threadLinksByIds([...recovered.keys()]),
+        undefined,
+        true,
+      )).filter((link) => link.boardId === board.id && link.paused !== null);
+      if (candidates.length === 0) return;
+      yield* tickStep(
+        board.id,
+        "wakeRecovered",
+        locks.access(
+          board.id,
+          Effect.gen(function* () {
+            for (const candidate of candidates) {
+              // #1656's helper checks the board generation before consuming the
+              // snapshot, including legacy findings reads, after reader admission.
+              const { currentBoard, link, carried } = yield* locks.outside(
+                Effect.gen(function* () {
+                  const currentBoard = yield* rawStore.board(board.id);
+                  const link = yield* rawStore.threadLink(candidate.threadId);
+                  const carried = yield* upgradeFindings(
+                    yield* rawStore.cardsByThread(candidate.threadId),
+                    false,
+                    rawStore.cardEvents,
+                  );
+                  return { currentBoard, link, carried };
+                }),
+                undefined,
+                true,
+              );
+              if (
+                currentBoard === null ||
+                currentBoard.archivedAt !== null ||
+                link?.boardId !== board.id ||
+                link.paused === null ||
+                !(yield* Ref.get(recoveredThreads)).has(link.threadId)
+              )
+                continue;
+              if (carried.length === 0 || (link.role === "work" && !carried.some(kanbanWorkStep))) {
+                yield* store.putThreadLink({ ...link, paused: null });
+                yield* Ref.update(recoveredThreads, (map) => {
+                  const next = new Map(map);
+                  next.delete(link.threadId);
+                  return next;
+                });
+                continue;
+              }
+              if (
+                currentBoard.pause &&
+                carried.some((card) => !currentBoard.pause!.keep.includes(card.id))
+              )
+                continue;
+              if ((yield* Ref.get(down)).has(linkKey(link, currentBoard))) continue;
+              const found = yield* Effect.result(threads.find(link.threadId));
+              if (Result.isFailure(found)) continue;
+              const view = found.success;
+              if (view !== null && !view.archived && view.state === "idle") {
+                const sent = yield* threads
+                  .send({
+                    threadId: link.threadId,
+                    text: Briefs.providerBackText(link.paused.message),
+                    key: wakeKey(link.threadId, link.paused.at),
+                  })
+                  .pipe(
+                    Effect.as(true),
+                    Effect.catchCause(() => Effect.succeed(false)),
+                  );
+                if (!sent) continue;
+              }
+              yield* store.putThreadLink({ ...link, paused: null });
+            }
+          }),
+        ),
+      );
+    }).pipe(Effect.ensuring(Effect.sync(() => recoveringBoards.delete(board.id))));
   });
 
   const nudgeThread = Effect.fn("KanbanService.nudgeThread")(function* (
@@ -11524,13 +11577,23 @@ const make = Effect.gen(function* () {
     yield* kick;
   });
 
+  const boardNudgeThreads = Effect.fn("KanbanService.boardNudgeThreads")(function* (
+    boardId: string,
+  ) {
+    const deferred = yield* Ref.get(deferredNudges);
+    if (deferred.size === 0) return [];
+    return (yield* locks.outside(rawStore.threadLinksByIds([...deferred]), undefined, true))
+      .filter((link) => link.boardId === boardId)
+      .map((link) => link.threadId);
+  });
+
   const wakeBoardNudges = Effect.fn("KanbanService.wakeBoardNudges")(function* (
     board: KanbanBoard,
     discussionWakes: ReadonlySet<ThreadId>,
+    candidates?: ReadonlyArray<ThreadId>,
   ) {
-    const deferred = yield* Ref.get(deferredNudges);
-    if (deferred.size === 0) return;
-    for (const threadId of deferred) {
+    for (const threadId of candidates ?? (yield* boardNudgeThreads(board.id))) {
+      if (!(yield* Ref.get(deferredNudges)).has(threadId)) continue;
       const cards = yield* store.openCards(board.id);
       const carried = cards.filter((card) => card.activeThreadId === threadId);
       if (carried.length === 0) {
@@ -13199,10 +13262,7 @@ const make = Effect.gen(function* () {
                 }),
                 cardId,
               );
-            yield* step(
-              "wakeRecovered",
-              Effect.suspend(() => wakeRecovered(board)),
-            );
+            yield* wakeRecovered(board);
             yield* step(
               "reconcileHeldDiscussions",
               Effect.suspend(() => reconcileHeldDiscussions(board)),
@@ -13213,10 +13273,12 @@ const make = Effect.gen(function* () {
               "wakeDiscussionNudges",
               Effect.suspend(() => wakeDiscussionNudges(board, discussionWakes)),
             );
-            yield* step(
-              "wakeBoardNudges",
-              Effect.suspend(() => wakeBoardNudges(board, discussionWakes)),
-            );
+            const deferredBoardThreads = yield* boardNudgeThreads(board.id);
+            if (deferredBoardThreads.length > 0)
+              yield* step(
+                "wakeBoardNudges",
+                Effect.suspend(() => wakeBoardNudges(board, discussionWakes, deferredBoardThreads)),
+              );
             views.clear();
             let boardCards: ReadonlyArray<KanbanCard> | undefined;
             const cardsForPlan = Effect.suspend(() =>
@@ -14810,11 +14872,12 @@ const make = Effect.gen(function* () {
   ) {
     const boardId = board.id;
     yield* Effect.annotateCurrentSpan("kanban.board_id", boardId);
-    const previous = runningTicks.get(boardId);
-    const busy = previous !== undefined;
     const tickId = NodeCrypto.randomUUID();
     yield* Effect.annotateCurrentSpan("kanban.tick_id", tickId);
     const timing = yield* TickTimings.create;
+    // No yield between testing and reserving the board, even during a burst.
+    const previous = runningTicks.get(boardId);
+    const busy = previous !== undefined;
     if (!busy) runningTicks.set(boardId, { tickId, timing });
     else {
       previous.timing.overlappingTicks++;

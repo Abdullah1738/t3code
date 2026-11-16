@@ -19706,13 +19706,17 @@ const probe: {
   block?: { reached: Deferred.Deferred<void>; release: Deferred.Deferred<void> };
 } = { ok: false, calls: 0 };
 /** Everything but the service, so a test can start a second service on the same store. */
-const probeDeps = (fake: Layer.Layer<KanbanThreads>, failPosts = false) =>
+const probeDeps = (
+  fake: Layer.Layer<KanbanThreads>,
+  failPosts = false,
+  storeLayer = KanbanStore.layer,
+) =>
   fake.pipe(
     Layer.provideMerge(KanbanModels.layerTest(null)),
     Layer.provideMerge(
       failPosts
-        ? failingPostStore.pipe(Layer.provide(KanbanStore.layer))
-        : failingRekeyStore.pipe(Layer.provide(KanbanStore.layer)),
+        ? failingPostStore.pipe(Layer.provide(storeLayer))
+        : failingRekeyStore.pipe(Layer.provide(storeLayer)),
     ),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(
@@ -21672,7 +21676,10 @@ it.effect("the scribe groups a board's open cards when they change, at most ever
 
       yield* TestClock.adjust("10 minutes");
       const secondRun = yield* (yield* grouped).pipe(Effect.forkScoped);
-      yield* kanban.tick;
+      // The scribe's commit can invalidate a tick step; drive its retry backoff.
+      const tick = yield* kanban.tick.pipe(Effect.forkScoped);
+      yield* TestClock.adjust(100);
+      yield* Fiber.join(tick);
       assert.isTrue(Option.isSome(yield* Fiber.join(secondRun)));
       assert.lengthOf(groupAsks(asked), 2);
     }).pipe(Effect.scoped, Effect.provide(scribeLayer(fake.layer, asked)));
@@ -46505,6 +46512,251 @@ it.effect("#1712 retaining the worker slot reuses the outside-gate cards snapsho
           testLayer(fake.layer, undefined, undefined, observed),
           Logger.layer([logger], { mergeWithExisting: false }),
         ),
+      ),
+    );
+  }),
+);
+
+const recovered1710 = Effect.fn("test.recovered1710")(function* (
+  fake: Effect.Success<typeof makeFake>,
+) {
+  probe.ok = true;
+  const { kanban, board } = yield* toyBoard;
+  yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+  const card = yield* kanban.createCard(
+    board.id,
+    {
+      title: "Recover",
+      prompt: "Work",
+      subtasks: [{ text: "Save", owner: "work" }],
+    },
+    owner,
+  );
+  const other = yield* kanban.createCard(
+    board.id,
+    {
+      title: "Foreground",
+      prompt: "Work",
+      subtasks: [{ text: "Save", owner: "work" }],
+    },
+    owner,
+  );
+  yield* kanban.dispatchNow;
+  const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
+  fake.failures.set(worker, outage);
+  yield* kanban.turnEnded(worker);
+  yield* kanban.pauseBoard(board.id, { reason: "Hold recovery", keep: [] }, owner);
+  yield* TestClock.adjust("5 minutes");
+  yield* kanban.probeOutages;
+  fake.failures.delete(worker);
+  const store = yield* KanbanStore.KanbanStore;
+  const link = (yield* store.threadLink(worker))!;
+  assert.isNotNull(link.paused);
+  // Leave the recovered wake to tick, rather than the unpause entry point.
+  yield* store.putBoard({ ...(yield* store.board(board.id))!, pause: null });
+  return { kanban, board, card, other, worker, store, link };
+});
+
+it.effect("#1710 empty recovery and board nudges take no wake gate", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban } = yield* toyBoard;
+      const span = yield* Effect.makeSpan("test.emptyRecovery");
+      const labels: unknown[] = [];
+      yield* kanban.tick.pipe(
+        Effect.provideService(SavedWrite.traceObserver, {
+          span,
+          enter: () => () => {},
+          mark: () => {},
+          observeLocks: (snapshot) => {
+            labels.push(snapshot(0)["board.waiter"]);
+            return () => {};
+          },
+        }),
+      );
+      assert.notInclude(labels, "KanbanService.tickStep:wakeRecovered");
+      assert.notInclude(labels, "KanbanService.tickStep:wakeBoardNudges");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("#1710 held board gate admits at most one pending tick from a burst", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let target: KanbanCard["id"] | undefined;
+    const gated = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) => ({
+        ...real,
+        putCard: (row: KanbanCard) =>
+          Effect.gen(function* () {
+            if (row.id === target) {
+              target = undefined;
+              yield* Deferred.succeed(held, undefined);
+              yield* Deferred.await(release);
+            }
+            yield* real.putCard(row);
+          }),
+      })),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board, other } = yield* recovered1710(fake);
+      for (let i = 0; i < 13; i++)
+        yield* kanban.ensureBoard({
+          slug: `foreign-${i}`,
+          name: `Foreign ${i}`,
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+      target = other.id;
+      const holder = yield* Effect.forkChild(
+        kanban.editCard(other.id, { description: "Hold" }, owner),
+      );
+      yield* Deferred.await(held);
+      const snapshots = new Set<(now: number) => Readonly<Record<string, unknown>>>();
+      const span = yield* Effect.makeSpan("test.tickBurst");
+      const ticks = yield* Effect.forkChild(
+        Effect.forEach(Array.from({ length: 16 }), () => kanban.tick, {
+          concurrency: "unbounded",
+          discard: true,
+        }).pipe(
+          Effect.provideService(SavedWrite.traceObserver, {
+            span,
+            enter: () => () => {},
+            mark: () => {},
+            observeLocks: (snapshot) => {
+              snapshots.add(snapshot);
+              return () => {
+                snapshots.delete(snapshot);
+              };
+            },
+          }),
+        ),
+      );
+      yield* TestClock.adjust(0);
+      const waiting = [...snapshots]
+        .map((snapshot) => snapshot(0))
+        .filter((row) => row["board.id"] === board.id && row["board.waiting_on"] === "gate");
+      assert.isAtLeast(waiting.length, 1);
+      const wakeWaiters = waiting.filter(
+        (row) => row["board.waiter"] === "KanbanService.tickStep:wakeRecovered",
+      );
+      assert.isAtMost(wakeWaiters.length, 1);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      yield* Fiber.join(ticks);
+    }).pipe(
+      Effect.provide(
+        KanbanService.layer.pipe(Layer.provideMerge(probeDeps(fake.layer, false, gated))),
+      ),
+    );
+  }),
+);
+
+it.effect("#1710 slow recovered send releases the gate for subtask_done and coalesces wakes", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let block = false;
+    const delayed = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          send: (input) =>
+            Effect.gen(function* () {
+              if (block && input.text.includes("model answers again now")) {
+                block = false;
+                yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+              }
+              return yield* real.send(input);
+            }),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board, other } = yield* recovered1710(fake);
+      const otherWorker = (yield* kanban.card(other.id)).card.activeThreadId!;
+      block = true;
+      const waking = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(entered);
+      yield* kanban.markSubtask(
+        other.id,
+        "s1",
+        "done",
+        "Saved during send",
+        {
+          _tag: "thread",
+          threadId: otherWorker,
+        },
+        "work",
+      );
+      assert.equal((yield* kanban.card(other.id)).card.subtasks[0]!.state, "done");
+      yield* kanban.reportBug({
+        boardId: board.id,
+        threadId: ThreadId.make("orders-reporter"),
+        title: "Report during recovery",
+        evidence: "Bug intake saves while the provider send is blocked",
+        cardHint: `#${other.number}`,
+      });
+      assert.isTrue(
+        (yield* kanban.card(other.id)).events.some((event) =>
+          event.body?.includes("Bug intake saves while the provider send is blocked"),
+        ),
+      );
+      // The reverse entry point shares recovery's per-board reservation.
+      yield* kanban.pauseBoard(board.id, { reason: "Hold again", keep: [] }, owner);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(waking);
+      assert.equal((yield* kanban.snapshot(board.id)).board.pause?.reason, "Hold again");
+    }).pipe(Effect.provide(probeLayer(delayed)));
+  }),
+);
+
+it.effect("#1710 stale recovered snapshot is rejected before a provider send or link write", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let target: ThreadId | undefined;
+    const delayed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) => ({
+        ...real,
+        cardsByThread: (id: string) =>
+          Effect.gen(function* () {
+            const rows = yield* real.cardsByThread(id);
+            if (id === target) {
+              target = undefined;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+            }
+            return rows;
+          }),
+      })),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      const { kanban, board, worker, store, link } = yield* recovered1710(fake);
+      target = worker;
+      const before = fake.sends.length;
+      const waking = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(entered);
+      yield* kanban.pauseBoard(board.id, { reason: "New hold", keep: [] }, owner);
+      yield* Deferred.succeed(release, undefined);
+      // Generation conflicts retry after the lock helper's virtual backoff.
+      yield* TestClock.adjust(100);
+      yield* Fiber.join(waking);
+      assert.deepEqual((yield* store.threadLink(worker))!.paused, link.paused);
+      assert.isFalse(
+        fake.sends.slice(before).some((send) => send.text.includes("model answers again now")),
+      );
+    }).pipe(
+      Effect.provide(
+        KanbanService.layer.pipe(Layer.provideMerge(probeDeps(fake.layer, false, delayed))),
       ),
     );
   }),
