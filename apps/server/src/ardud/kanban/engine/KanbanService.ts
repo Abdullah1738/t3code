@@ -18161,6 +18161,8 @@ const make = Effect.gen(function* () {
     savedCardGuard(
       "card.thread",
       Effect.gen(function* () {
+        if ((action === "steer" || action === "wake") && !text.trim())
+          return yield* failWith("invalid", `${action} needs text: pass the message as text`);
         yield* checkText([["note", text]]);
         const card = (yield* upgradeFindings([yield* cardOf(cardId)]))[0]!;
         if (action !== "stop" && (yield* boardOf(card.boardId)).archivedAt !== null)

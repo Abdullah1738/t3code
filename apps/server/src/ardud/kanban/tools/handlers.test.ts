@@ -9742,3 +9742,146 @@ it.effect.each([
     }).pipe(Effect.provide(layer));
   },
 );
+
+it.effect.each(
+  (["steer", "wake"] as const).flatMap((action) =>
+    [
+      {},
+      { text: "" },
+      { text: " \n\t" },
+      { message: " " },
+      { text: "", message: "" },
+      { typo: "lost" },
+    ].map((fields) => ({ action, fields })),
+  ),
+)("card_thread rejects missing or blank text (%j)", ({ action, fields }) => {
+  const sent: Array<string> = [];
+  const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+    findExisting: true,
+    send: (input) =>
+      Effect.sync(() => {
+        sent.push(input.text);
+      }),
+  });
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "thread-text",
+      name: "Thread text",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    const before = yield* kanban.card(card.id);
+    const result = yield* call(ThreadId.make("thread-evaluator"), "card_thread", {
+      boardId: board.id,
+      card: card.id,
+      action,
+      ...fields,
+    });
+    assert.isTrue(result.isError);
+    assert.include(result.text, `${action} needs text: pass the message as text`);
+    assert.deepStrictEqual(sent, []);
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect.each([
+  { message: "  Exact steer\nsecond line  " },
+  { text: "  Exact steer\nsecond line  " },
+  { text: "  Exact steer\nsecond line  ", message: "  Exact steer\nsecond line  " },
+])("card_thread delivers and logs text from %j", (fields) => {
+  const sent: Array<string> = [];
+  const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+    findExisting: true,
+    send: (input) =>
+      Effect.sync(() => {
+        sent.push(input.text);
+      }),
+  });
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "thread-alias",
+      name: "Thread alias",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const result = yield* call(ThreadId.make("thread-evaluator"), "card_thread", {
+      boardId: board.id,
+      card: card.id,
+      action: "steer",
+      ...fields,
+    });
+    assert.isFalse(result.isError, result.text);
+    assert.deepStrictEqual(sent, ["  Exact steer\nsecond line  "]);
+    assert.strictEqual(
+      (yield* kanban.card(card.id)).events.at(-1)?.body,
+      "Steered:   Exact steer\nsecond line  ",
+    );
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect.each([
+  { text: "First", message: "Second" },
+  { text: "", message: "Second" },
+  { text: "First", message: "" },
+  { text: " \n\t", message: "Second" },
+  { text: "First", message: " \n\t" },
+])("card_thread refuses conflicting text and message without sending or logging (%j)", (fields) => {
+  const sent: Array<string> = [];
+  const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+    findExisting: true,
+    send: (input) =>
+      Effect.sync(() => {
+        sent.push(input.text);
+      }),
+  });
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "thread-conflict",
+      name: "Thread conflict",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    const before = yield* kanban.card(card.id);
+    const result = yield* call(ThreadId.make("thread-evaluator"), "card_thread", {
+      boardId: board.id,
+      card: card.id,
+      action: "steer",
+      ...fields,
+    });
+    assert.isTrue(result.isError);
+    assert.include(result.text, "text and message must match");
+    assert.deepStrictEqual(sent, []);
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect.each(["stop", "reset"] as const)("card_thread %s accepts omitted text", (action) => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "thread-optional-text",
+      name: "Thread optional text",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+    yield* kanban.dispatchNow;
+    const result = yield* call(ThreadId.make("thread-evaluator"), "card_thread", {
+      boardId: board.id,
+      card: card.id,
+      action,
+    });
+    assert.isFalse(result.isError, result.text);
+    const changed = (yield* kanban.card(card.id)).card;
+    assert.strictEqual(changed.activeThreadId, null);
+    assert.strictEqual(changed.stage, "todo");
+    if (action === "stop") assert.strictEqual(changed.stalled?.reason, "Stopped");
+    else assert.strictEqual(changed.workThreadId, null);
+  }).pipe(Effect.provide(fake.layer));
+});
