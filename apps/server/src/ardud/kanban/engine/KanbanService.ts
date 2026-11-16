@@ -11182,6 +11182,8 @@ const make = Effect.gen(function* () {
     const sink: EffectSink = { effects: [], closed: false };
     const publications: Array<BoardPublication> = [];
     const measurements: AnalyticsEvent[] = [];
+    const observer = yield* SavedWrite.observer;
+    const receipts: SavedWrite.Saved[] = [];
     let lanes = new Set<string>();
     const saved = yield* turnAdmission.withLock(
       threadId,
@@ -11202,40 +11204,53 @@ const make = Effect.gen(function* () {
         const ageMs = BoardAnalytics.elapsed(at, card.analyticsStageEnteredAt ?? card.movedAt);
         // Turn-end and tick have no write-effect sink. Save the handoff and its
         // evaluator obligation together so a rejected notification can replay.
-        lanes = yield* boardTransaction(
-          card.boardId,
-          Effect.gen(function* () {
-            yield* logEvent(next, actor, "moved", {
-              fromStage: card.stage,
-              toStage: next.stage,
-              body: `Auto-advanced: ${reason}; ${ageMs} ms in Working`,
-            });
-            yield* saveCard(next, actor);
-            yield* recordAnalytics({
-              kind: "kanban.card.autoAdvanced",
-              boardId: card.boardId,
-              cardId: card.id,
-              threadId,
-              props: {
-                number: card.number,
-                from: card.stage,
-                to: next.stage,
-                actor: "system",
-                reasonClass: reason,
-                msInPrevStage: ageMs,
-              },
-            });
-            yield* laterEvaluatorTurn(card, next, actor);
-            return yield* saveEffectRows(sink.effects);
-          }).pipe(
-            Effect.provideService(effectSink, sink),
-            Effect.provideService(publicationSink, publications),
-            Effect.provideService(analyticsSink, measurements),
-            Effect.ensuring(
+        lanes = yield* Effect.uninterruptible(
+          boardTransaction(
+            card.boardId,
+            Effect.gen(function* () {
+              yield* logEvent(next, actor, "moved", {
+                fromStage: card.stage,
+                toStage: next.stage,
+                body: `Auto-advanced: ${reason}; ${ageMs} ms in Working`,
+              });
+              yield* saveCard(next, actor, false, false);
+              yield* recordAnalytics({
+                kind: "kanban.card.autoAdvanced",
+                boardId: card.boardId,
+                cardId: card.id,
+                threadId,
+                props: {
+                  number: card.number,
+                  from: card.stage,
+                  to: next.stage,
+                  actor: "system",
+                  reasonClass: reason,
+                  msInPrevStage: ageMs,
+                },
+              });
+              yield* laterEvaluatorTurn(card, next, actor);
+              return yield* saveEffectRows(sink.effects);
+            }).pipe(
+              Effect.provideService(SavedWrite.observer, (receipt) => {
+                receipts.push(receipt);
+              }),
+              Effect.provideService(effectSink, sink),
+              Effect.provideService(publicationSink, publications),
+              Effect.provideService(analyticsSink, measurements),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  sink.closed = true;
+                }),
+              ),
+            ),
+          ).pipe(
+            Effect.tap(() =>
               Effect.sync(() => {
-                sink.closed = true;
+                for (const receipt of receipts) observer(receipt);
               }),
             ),
+            // The slot cache and returned receipts must only reflect committed state.
+            Effect.tap(() => syncSlot(card.boardId, threadId, "card_left", card.id)),
           ),
         );
         return true;

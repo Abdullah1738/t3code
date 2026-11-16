@@ -422,31 +422,63 @@ it.effect.each(["turn end", "tick", "idle mark"] as const)(
     }),
 );
 
-it.effect("an unsaved evaluator obligation rolls back the handoff and its event", () =>
-  Effect.gen(function* () {
-    const f = yield* fixture;
-    yield* Effect.gen(function* () {
-      const { kanban, card, threadId, worker } = yield* f.start("evaluator");
-      yield* kanban.markSubtask(card.id, "s1", "done", null, worker, "work");
-      const sql = yield* BoardsDatabase.client;
-      yield* sql`CREATE TRIGGER reject_handoff BEFORE INSERT ON ardud_kanban_owner_routes
-        WHEN json_extract(NEW.json, '$.effect.kind') = 'evaluatorTurn'
-        BEGIN SELECT RAISE(ABORT, 'handoff write failed'); END`;
-      f.control.state = "idle";
-      yield* kanban.turnEnded(threadId).pipe(Effect.exit);
-      const held = yield* kanban.card(card.id);
-      assert.equal(held.card.stage, "working");
-      assert.equal(held.card.activeThreadId, threadId);
-      assert.equal(advanced(f.events).length, 0);
-      assert.equal(
-        held.events.filter((event) => event.body?.startsWith("Auto-advanced:")).length,
-        0,
-      );
-      yield* sql`DROP TRIGGER reject_handoff`;
-      yield* kanban.turnEnded(threadId);
-      yield* Deferred.await(f.notified);
-      assert.equal((yield* kanban.card(card.id)).card.stage, "todo");
-      assert.equal(advanced(f.events).length, 1);
-    }).pipe(Effect.provide(f.provided));
-  }),
+it.effect.each(["turn end", "tick", "idle mark"] as const)(
+  "an unsaved evaluator obligation from %s rolls back receipts and slot release",
+  (entry) =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, threadId, worker } = yield* f.start("evaluator");
+        if (entry !== "idle mark")
+          yield* kanban.markSubtask(card.id, "s1", "done", null, worker, "work");
+        const sql = yield* BoardsDatabase.client;
+        const store = yield* KanbanStore.KanbanStore;
+        const slotKinds = store
+          .slotEvents({ boardId: board.id, from: "", to: "9999" })
+          .pipe(
+            Effect.map((rows) =>
+              rows.filter((row) => row.threadId === threadId).map((row) => row.kind),
+            ),
+          );
+        assert.deepEqual(yield* slotKinds, ["take"]);
+        yield* sql`CREATE TRIGGER reject_handoff BEFORE INSERT ON ardud_kanban_owner_routes
+          WHEN json_extract(NEW.json, '$.effect.kind') = 'evaluatorTurn'
+          BEGIN SELECT RAISE(ABORT, 'handoff write failed'); END`;
+        f.control.state = "idle";
+        if (entry === "idle mark") {
+          const returned = yield* kanban.markSubtask(
+            card.id,
+            "s1",
+            "done",
+            null,
+            evaluator,
+            "evaluator",
+          );
+          assert.equal(returned.stage, "working");
+          assert.deepEqual(returned, (yield* store.card(card.id))!);
+        } else {
+          yield* (entry === "tick" ? kanban.tick : kanban.turnEnded(threadId)).pipe(Effect.exit);
+        }
+        const held = yield* kanban.card(card.id);
+        assert.equal(held.card.stage, "working");
+        assert.equal(held.card.activeThreadId, threadId);
+        assert.equal(held.card.subtasks[0]!.state, "done");
+        assert.equal(advanced(f.events).length, 0);
+        assert.equal(
+          held.events.filter((event) => event.body?.startsWith("Auto-advanced:")).length,
+          0,
+        );
+        assert.deepEqual(yield* slotKinds, ["take"]);
+        assert.isTrue((yield* store.openSlots()).some((row) => row.threadId === threadId));
+        yield* sql`DROP TRIGGER reject_handoff`;
+        yield* kanban.turnEnded(threadId);
+        yield* Deferred.await(f.notified);
+        assert.equal((yield* kanban.card(card.id)).card.stage, "todo");
+        assert.equal(advanced(f.events).length, 1);
+        assert.deepEqual(yield* slotKinds, ["take", "release"]);
+        assert.isFalse((yield* store.openSlots()).some((row) => row.threadId === threadId));
+        yield* kanban.turnEnded(threadId);
+        assert.deepEqual(yield* slotKinds, ["take", "release"]);
+      }).pipe(Effect.provide(f.provided));
+    }),
 );
