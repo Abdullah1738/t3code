@@ -7,11 +7,12 @@ from __future__ import annotations
 import time
 import sqlite3
 import re
+import contextlib
 
 from . import api, bases, capacity, lease, prune
 from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
-                     iso_ts, kv_set, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner, write)
+                     iso_ts, kv_set, log, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner, write)
 from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
@@ -176,6 +177,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if rid in recovered or rid in unowned:
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost")
+        with contextlib.suppress(Exception):
+            log(f"reaper no-box run {rid} client_pid=None check=no_pid_age_limit age_s={now() - start_at:.3f} dry={dry}")
         if not dry:
             _mark_lost(con, rid, "client ended before it got a box", no_box=True, expected_client=(None, start_at))
     # A no-box run whose own `offbox run` client is gone never got a box: mark it lost now, not after 2 h.
@@ -186,7 +189,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     for rid, pid, start_at in orphan:
         if rid in recovered or rid in unowned:
             continue
-        if _client_alive(pid, start_at):
+        if _client_alive(pid, start_at, reaper_run=rid):
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost (client {pid} gone)")
         if not dry:
@@ -213,7 +216,15 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                         actions[-1] += ' (busy; skipped)'
                         return
                     current = con.execute('SELECT * FROM leases WHERE box_id=?', (box_id,)).fetchone()
-                    if current and (current['note'] or '').startswith(BOX_WEDGED_NOTE):
+                    if current and (current['note'] or '').startswith((BOX_WEDGED_NOTE, 'disk-full:')):
+                        from . import box_disk
+                        if (current['note'] or '').startswith(box_disk.NOTE) and what == 'refresh':
+                            fn()
+                            return
+                        if ((current['note'] or '').startswith(box_disk.NOTE) and not box_disk.safe_to_stop(box_id)):
+                            box_disk.keep_running(con, box_id)
+                            actions[-1] += ' (disk_full; live holders or unknown activity; kept)'
+                            return
                         if what == 'stop':
                             lease.stop_box(con, box_id, 'reap: box-wedged', images=False, locked=True)
                         actions[-1] += ' (set aside; stale action skipped)'
@@ -242,6 +253,15 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         bid = r["box_id"]
         b = live.get(bid)
         if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{bid}",)).fetchone():
+            if not dry and (r['note'] or '').startswith('disk-full:'):
+                if api.left() is not None and api.left() <= 0.05:
+                    actions.append('defer retired resumes: maintenance budget exhausted')
+                    return actions
+                try:
+                    with file_lock('box-' + bid, timeout=0):
+                        lease.reconcile_retired_resume(con, bid)
+                except OffboxError as error:
+                    event(con, bid, 'resume_reconcile_deferred', str(error))
             actions.append(f"defer {bid}: unanswered resume needs reconciliation")
             continue
         if bid in protected:
@@ -291,7 +311,14 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 continue
         # A failed stop is retried without asking Docker; never refresh or automatically delete a wedged box.
         note = con.execute('SELECT note FROM leases WHERE box_id=?', (bid,)).fetchone()[0] or ''
-        if note.startswith(BOX_WEDGED_NOTE):
+        if note.startswith('disk-full:'):
+            stopped = iso_ts(b.get('stoppedAt'))
+            if ((r['pinned_until'] or 0) > now() and state in api.STOPPED_STATES and stopped and
+                    now() - stopped > KEEPALIVE_S and refreshes < 2):
+                refreshes += 1
+                act(bid, 'refresh', 'disk_full pinned disk retention',
+                    lambda bid=bid: lease.refresh_box(con, bid), expected=r)
+        if note.startswith((BOX_WEDGED_NOTE, 'disk-full:')):
             if not running_runs and state in api.LIVE_STATES:
                 act(bid, 'stop', 'set aside: box-wedged',
                     lambda bid=bid: lease.stop_box(con, bid, 'reap: box-wedged', images=False, locked=True))

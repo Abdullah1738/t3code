@@ -1,0 +1,5 @@
+{
+  "extends": "../spectrum-bridge/tsconfig.json",
+  "compilerOptions": { "typeRoots": ["../spectrum-bridge/node_modules/@types"] },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

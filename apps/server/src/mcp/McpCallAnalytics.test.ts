@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import { expect, it } from "@effect/vitest";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- isolated loopback MCP integration.
@@ -16,6 +17,7 @@ import {
   type OrchestrationV2Subagent,
   EnvironmentId,
   OrchestratorMcpFailure,
+  PullRequestUnavailableError,
   ProviderInstanceId,
   ThreadId,
   PreviewAutomationError,
@@ -61,6 +63,7 @@ import * as McpToolAccess from "./McpToolAccess.ts";
 import {
   PullRequestToolTimeoutError,
   PullRequestWatchTimeoutError,
+  PullRequestWatchUnavailableError,
 } from "./toolkits/pullRequests/tools.ts";
 import * as Testkit from "./McpToolAccess.testkit.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -80,6 +83,9 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { BoardsDatabase } from "../ardud/persistence/BoardsDatabase.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as WikiReadTiming from "../ardud/analytics/WikiReadTiming.ts";
 
 it("hashes retry ids deterministically within their caller identity", () => {
   const first = callIdentifiers(
@@ -119,6 +125,7 @@ const client = McpSchema.McpServerClient.of({
 const ProbeFailure = Schema.Union([
   OrchestratorMcpFailure,
   PullRequestWatchTimeoutError,
+  PullRequestWatchUnavailableError,
   PullRequestToolTimeoutError,
   KanbanError,
   PreviewAutomationError,
@@ -148,6 +155,7 @@ const probe = (name: string) =>
     }),
   );
 const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent);
+const decodeAnalyticsEventSync = Schema.decodeUnknownSync(AnalyticsEvent);
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
 const isAnalyticsEvent = Schema.is(AnalyticsEvent);
 
@@ -186,6 +194,15 @@ const lookupCases = [
     saved: true,
   },
   { name: "pending", state: "pending", reason: "pending" },
+  {
+    name: "legacy pending without owner evidence",
+    id: IdAllocator.derive.delegatedTaskNode({
+      commandId: CommandId.make("command:mcp:credential:delegate-task:private"),
+    }),
+    state: "pending",
+    reason: "non_canonical_id",
+    canonical: false,
+  },
   { name: "abandoned", state: "abandoned", reason: "abandoned" },
   { name: "copied miss", id: copiedLookupId, reason: "non_canonical_id", canonical: false },
   {
@@ -232,6 +249,18 @@ const lookupCases = [
     foundBy: "subagents",
     saved: true,
   },
+  ...(["pending", "accepted"] as const).map(
+    (state) =>
+      ({
+        name: `missing child with ${state} receipt`,
+        hit: true,
+        noChild: true,
+        state,
+        reason: "missing_child_thread",
+        foundBy: "subagents",
+        saved: true,
+      }) as const,
+  ),
   ...[
     "thread:project:private:uuid",
     `thread:delegated-task:${lookupId.slice(20)}`,
@@ -422,6 +451,7 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
         }).pipe(Effect.tap(() => Deferred.succeed(acknowledged, undefined))),
     });
     const service = OrchestratorMcpService.layer.pipe(
+      Layer.provide(McpProviderSessions.layer),
       Layer.provide(
         Layer.mergeAll(
           NodeServices.layer,
@@ -486,6 +516,10 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
             ? ["task_status", "task_cancel"]
             : ["task_status"];
       for (const name of names) {
+        const creating =
+          name === "task_status" &&
+          "reason" in testCase &&
+          (testCase.reason === "pending" || testCase.reason === "accepted");
         const call = server
           .callTool({ name, arguments: { taskId: "id" in testCase ? testCase.id : lookupId } })
           .pipe(Effect.provideService(McpSchema.McpServerClient, client));
@@ -524,7 +558,9 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
         });
         expect(row.errorTag).toBe(
           "reason" in testCase
-            ? "task_not_found"
+            ? creating
+              ? "task_creating"
+              : "task_not_found"
             : "error" in testCase
               ? testCase.error
               : "invalid" in testCase
@@ -556,6 +592,8 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
               : "Expected the taskId returned by delegate_task.",
           );
           expect(text).not.toContain("id" in testCase ? testCase.id : lookupId);
+          expect(text.includes("No delegated task has this id.")).toBe(!creating);
+          if (creating) expect(row.props?.code).toBe("task_creating");
         }
       }
       if ("ack" in testCase) {
@@ -1174,6 +1212,13 @@ const typedFailures = [
     outcome: "timeout",
   })),
   { error: new PullRequestWatchTimeoutError({ saved: "unknown" }), outcome: "timeout" },
+  {
+    error: new PullRequestWatchUnavailableError({
+      host: "github.com",
+      cause: new PullRequestUnavailableError({ reason: "cli-missing" }),
+    }),
+    outcome: "refused",
+  },
   { error: new PreviewAutomationTimeoutError(browserRequest), outcome: "timeout" },
   {
     error: new PreviewAutomationRecordingDeadlineExpiredError({
@@ -1354,6 +1399,87 @@ it.effect.each(outcomeCases)(
         );
         expect(yield* decodeEvent(row)).toEqual(row);
       }).pipe(Effect.provide(registration));
+    }),
+);
+
+const wikiLaneCases = (["caller", "body"] as const).flatMap((stage) =>
+  (["foreground", "background", "writer"] as const).flatMap((routedLane) =>
+    (["success", "timeout"] as const).map((ending) => ({ stage, routedLane, ending })),
+  ),
+);
+it.effect.each(wikiLaneCases)(
+  "wiki_read emits routed $stage lane $routedLane on $ending",
+  ({ stage, routedLane, ending }) =>
+    Effect.gen(function* () {
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const toolkit = probe("wiki_read");
+      const handler = Effect.gen(function* () {
+        expect(yield* NodeSqliteClient.ReaderLane).toBe("foreground");
+        const start = yield* NodeSqliteClient.ReaderWaitStartedObserver;
+        const acquired = yield* NodeSqliteClient.ReaderWaitObserver;
+        const read = (phase: "caller" | "body") =>
+          WikiReadTiming.step(
+            phase,
+            Effect.gen(function* () {
+              const lane = phase === stage ? routedLane : "foreground";
+              const finish = start?.("foreground");
+              finish?.(lane, false);
+              if (phase === "caller") yield* TestClock.adjust("5 millis");
+              if (phase === stage) {
+                yield* Deferred.succeed(entered, undefined);
+                if (ending === "timeout") yield* Deferred.await(release);
+              }
+              if (lane !== "writer") acquired?.(phase === "caller" ? 5 : 0, lane);
+              finish?.(lane, true);
+              return { boardId: "board-robob" };
+            }),
+          );
+        yield* read("caller");
+        yield* read("body");
+        return { pages: [] };
+      });
+      const registration = McpHttpServer.toolkitRegistration(
+        toolkit,
+        McpToolAccess.toLayer(toolkit, {
+          wiki_read: McpToolAccess.reads(() => handler),
+        }),
+      ).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(BoardsDatabase)({ ready: Effect.void, path: "/synthetic/boards.sqlite" }),
+        ),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const pending = yield* server
+          .callTool({ name: "wiki_read", arguments: args })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.forkChild);
+        yield* Deferred.await(entered);
+        if (ending === "timeout") yield* TestClock.adjust("20 seconds");
+        yield* Fiber.join(pending);
+        const row = yield* Deferred.await(recorded);
+        expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+          tool: "wiki_read",
+          outcome: ending === "timeout" ? "timeout" : "ok",
+          callerResolved: !(stage === "caller" && ending === "timeout"),
+          callerResolveMs: stage === "caller" && ending === "timeout" ? 20000 : 5,
+          callerReaderLane: stage === "caller" ? routedLane : "foreground",
+          readerLane: ending === "timeout" || stage === "body" ? routedLane : "foreground",
+          ...(ending === "timeout" ? { props: { phase: stage } } : {}),
+        });
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(registration));
     }),
 );
 
@@ -2134,6 +2260,48 @@ it.effect("the canonical target replaces caller attribution and survives depende
   }),
 );
 
+it.effect.each([false, true])(
+  "records the final outcome after a recovered dispatch fence (waitTimedOut=%s)",
+  (waitTimedOut) =>
+    Effect.gen(function* () {
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: "unknown",
+      };
+      yield* McpCall.failedPhase("dispatch").pipe(Effect.provideService(McpCall.McpCall, state));
+      yield* McpCall.dispatchFenceRecovered.pipe(Effect.provideService(McpCall.McpCall, state));
+      yield* McpCall.setSaved(true).pipe(Effect.provideService(McpCall.McpCall, state));
+      const result = McpCall.callOutcome(
+        Exit.succeed(
+          new McpSchema.CallToolResult({
+            content: [],
+            structuredContent: { taskId: "task", waitTimedOut },
+          }),
+        ),
+        state,
+      );
+      expect(result).toMatchObject({
+        outcome: waitTimedOut ? "timeout" : "ok",
+        saved: true,
+        props: { dispatchFenceRecovered: true },
+      });
+      expect(result.errorTag).toBe(waitTimedOut ? "wait_timeout" : undefined);
+      expect(result.errorPhase).toBe(waitTimedOut ? "result" : undefined);
+      expect(() =>
+        decodeAnalyticsEventSync({
+          ts: "2026-11-16T00:00:00.000Z",
+          kind: "mcp.call",
+          surface: "server",
+          route: "mcp",
+          ...result,
+        }),
+      ).not.toThrow();
+    }),
+);
+
 it("does not take refusal metadata from a successful result body", () => {
   const state: McpCall.McpCall["Service"] = {
     callerResolved: true,
@@ -2184,6 +2352,199 @@ it.each([
     callerCardStage: "working",
   });
 });
+
+it.effect.each([
+  {
+    name: "mixed union",
+    input: { title: "ok", stage: "todo", choice: 42 },
+    reasonClass: "bad_type",
+    invalidField: "choice",
+  },
+  {
+    name: "nullable enum",
+    input: { title: "ok", stage: "todo", nullableStage: "invalid" },
+    reasonClass: "bad_enum",
+    invalidField: "nullableStage",
+  },
+  {
+    name: "nullable type",
+    input: { title: "ok", stage: "todo", optionalText: 42 },
+    reasonClass: "bad_type",
+    invalidField: "optionalText",
+  },
+  {
+    name: "union missing key",
+    input: { title: "ok", stage: "todo", objectChoice: {} },
+    reasonClass: "missing_required",
+    invalidField: "objectChoice",
+  },
+  { name: "missing", input: {}, reasonClass: "missing_required", invalidField: "title" },
+  {
+    name: "enum",
+    input: { title: "private", stage: "private stage" },
+    reasonClass: "bad_enum",
+    invalidField: "stage",
+  },
+  {
+    name: "type",
+    input: { title: 42, stage: "todo" },
+    reasonClass: "bad_type",
+    invalidField: "title",
+  },
+  {
+    name: "length",
+    input: { title: "private text too long", stage: "todo" },
+    reasonClass: "too_long",
+    invalidField: "title",
+  },
+  {
+    name: "items",
+    input: { title: "ok", stage: "todo", subtasks: ["private a", "private b"] },
+    reasonClass: "too_many",
+    invalidField: "subtasks",
+  },
+])("schema refusal $name retains only the declared field and issue class", (scenario) =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = Toolkit.make(
+      Tool.make("card_create", {
+        parameters: Schema.Struct({
+          title: Schema.String.check(Schema.isMaxLength(8)),
+          stage: Schema.Literals(["todo", "working"]),
+          choice: Schema.optionalKey(
+            Schema.Union([Schema.String, Schema.Struct({ label: Schema.String })]),
+          ),
+          nullableStage: Schema.optionalKey(Schema.NullOr(Schema.Literals(["todo", "working"]))),
+          optionalText: Schema.optionalKey(Schema.NullOr(Schema.String)),
+          objectChoice: Schema.optionalKey(
+            Schema.Union([Schema.Struct({ label: Schema.String }), Schema.String]),
+          ),
+          subtasks: Schema.optionalKey(Schema.Array(Schema.String).check(Schema.isMaxLength(1))),
+        }),
+        success: Schema.Unknown,
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        card_create: McpToolAccess.reads(() =>
+          Effect.die("schema validation must precede handler"),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+      Layer.provide(Testkit.liveThreadsLayer),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      yield* server
+        .callTool({ name: "card_create", arguments: scenario.input })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.exit);
+      const row = yield* Deferred.await(recorded);
+      expect(row).toMatchObject({
+        reasonClass: scenario.reasonClass,
+        invalidField: scenario.invalidField,
+        saved: false,
+      });
+      expect(JSON.stringify(row)).not.toContain("private");
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect(
+  "a refused write after a commit retains saved true and drops undeclared field names",
+  () =>
+    Effect.gen(function* () {
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        boardWrite: true,
+        saved: false,
+        inputKeys: new Set(["title"]),
+      };
+      yield* Effect.gen(function* () {
+        yield* SavedWrite.committing;
+        yield* SavedWrite.committed();
+        const error = new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "private",
+          reasonClass: "conflict",
+          invalidField: "private_value",
+        });
+        yield* McpCall.handlerFailure(Cause.fail(error));
+        const row = McpCall.callOutcome(Exit.fail(error), state);
+        expect(row.saved).toBe(true);
+        expect(state.refusedAt).toBe("post_write");
+        expect(state.reasonClass).toBe("conflict");
+        expect(state.invalidField).toBeUndefined();
+      }).pipe(Effect.provideService(McpCall.McpCall, state));
+    }),
+);
+
+it.each([true, false, null] as const)(
+  "board-write reply timeout keeps receipt saved=%s",
+  (saved) => {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "result",
+      boardWrite: true,
+      saved: false,
+      replyFailure: "reply_timeout",
+      refusedAt: "pre_lock",
+    };
+    const row = McpCall.callOutcome(
+      Exit.succeed(
+        new McpSchema.CallToolResult({
+          isError: true,
+          content: [],
+          structuredContent: { saved },
+        }),
+      ),
+      state,
+    );
+    expect(row.saved).toBe(saved === null ? "unknown" : saved);
+    expect(state.reasonClass).toBe("reply_timeout");
+    expect(state.refusedAt).toBe(saved === true ? "post_write" : "pre_lock");
+  },
+);
+
+it.effect("a recovered admission clears its refusal stage before a later committed timeout", () =>
+  Effect.gen(function* () {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+      boardWrite: true,
+      saved: false,
+      refusedAt: "pre_lock",
+    };
+    yield* McpCall.writeAdmitted().pipe(Effect.provideService(McpCall.McpCall, state));
+    expect(state.refusedAt).toBeUndefined();
+    yield* SavedWrite.committed().pipe(Effect.provideService(McpCall.McpCall, state));
+    state.replyFailure = "reply_timeout";
+    McpCall.callOutcome(
+      Exit.fail(new OrchestratorMcpFailure({ code: "invalid_request", message: "private" })),
+      state,
+    );
+    expect(state.refusedAt).toBe("post_write");
+  }),
+);
 
 it.effect("records a late detached create with the original HTTP call's correlation metadata", () =>
   Effect.gen(function* () {

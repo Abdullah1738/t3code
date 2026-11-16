@@ -297,6 +297,7 @@ class ResumeQueueTests(Isolated):
                 patch.object(lease, '_bring_up'), patch.object(lease, 'ensure_ttl'), \
                 patch.object(lease.ssh_sync, 'close_master'), patch.object(self.clock.time, 'sleep', sleep), \
                 patch.object(runs.Runner, 'start', start), patch.object(fallback, 'run_local') as local, \
+                patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stdout(io.StringIO()):
             thread = threading.Thread(target=grower)
             thread.start()

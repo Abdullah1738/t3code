@@ -558,6 +558,15 @@ const OrchestrationV2DelegatedTaskStall = Schema.Struct({
   idleTimeoutMs: Schema.Finite,
   lastProgressAt: Schema.DateTimeUtc,
   lastProgressKind: Schema.String,
+  phase: Schema.optional(Schema.Literals(["post_tool", "first_event", "mid_turn"])),
+  lastProgressTool: Schema.optional(Schema.String),
+  silentSeconds: Schema.optional(Schema.Finite),
+});
+
+const DelegatedTaskStallRecovery = Schema.Struct({
+  phase: Schema.Literals(["post_tool", "first_event"]),
+  lastProgressAt: IsoDateTime,
+  attemptId: Schema.NullOr(RunAttemptId),
 });
 
 export const OrchestrationV2CancelReason = Schema.Literals([
@@ -609,6 +618,7 @@ export const OrchestrationV2Run = Schema.Struct({
   restartContinuationOfRunId: Schema.optional(RunId),
   delegatedTaskId: Schema.optional(NodeId),
   delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
+  delegatedTaskStallRecovery: Schema.optional(DelegatedTaskStallRecovery),
   providerStartDeadlineAt: Schema.optional(Schema.DateTimeUtc),
   providerRestartCleanup: Schema.optional(
     Schema.Struct({
@@ -799,6 +809,9 @@ export const OrchestrationV2Subagent = Schema.Struct({
   completionWake: Schema.optional(Schema.Literals(["always", "settled_only"])),
   selectionRouting: Schema.optional(ModelSelectionRouting),
   completionDelivery: Schema.optional(OrchestrationV2DelegatedCompletionTaskDelivery),
+  lastAnnouncedStatus: Schema.optional(
+    Schema.Literals(["completed", "failed", "cancelled", "interrupted"]),
+  ),
   status: Schema.Literals([
     "idle",
     "pending",
@@ -3048,6 +3061,7 @@ export const OrchestrationV2Command = Schema.Union([
     manualContinuationOfRunId: Schema.optional(RunId),
     usageLimitRecoveryRequestId: Schema.optional(CommandId),
     deliveryIntent: Schema.optional(Schema.Literals(["auto", "steer", "restart"])),
+    delegatedTaskStallRecovery: Schema.optional(DelegatedTaskStallRecovery),
     /** ardud: start this message on a fresh provider thread, with the message as its only context. */
     contextReset: Schema.optional(Schema.Boolean),
     delegatedCompletion: Schema.optional(
@@ -3218,6 +3232,8 @@ export const OrchestrationV2Command = Schema.Union([
     parentRunId: RunId,
     parentNodeId: NodeId,
     task: TrimmedNonEmptyString,
+    parentAdmittedAt: Schema.optional(Schema.DateTimeUtc),
+    parentProviderSessionId: Schema.optional(ProviderSessionId),
     idleTimeoutMs: Schema.optional(Schema.Finite),
     title: Schema.optional(TrimmedNonEmptyString),
     modelSelection: ModelSelection,

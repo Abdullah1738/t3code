@@ -1,3 +1,4 @@
+import { McpReasonClass, McpInvalidField } from "./mcpReasonClass.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 /**
  * Missions board (code name kanban): cards move through fixed stages, a
@@ -164,6 +165,8 @@ export const KanbanSubtask = Schema.Struct({
   createdAt: Schema.optional(IsoDateTime),
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   script: Schema.optional(Schema.String),
+  /** True: a Completed card's dependents on other threads wait until this subtask is done or skipped; false: never holds; absent: guessed from the text. */
+  holdsDependents: Schema.optional(Schema.Boolean),
   state: Schema.Literals(["open", "done", "skipped"]),
   /** What was done, or why it was skipped. */
   note: Schema.NullOr(Schema.String),
@@ -496,6 +499,7 @@ export const KANBAN_ASK_VERDICTS = [
   "acknowledged",
   "handed",
   "dropped",
+  "auto_closed",
 ] as const;
 export const KanbanAskVerdict = Schema.String;
 export type KanbanAskVerdict = string;
@@ -555,6 +559,7 @@ export const KanbanOwnerAsk = Schema.Struct({
         Schema.Literals(["approve", "pick", "draft", "action", "input", "notice"]),
       ),
       openAsksAtCreation: Schema.optional(NonNegativeInt),
+      openNoticesAtCreation: Schema.optional(NonNegativeInt),
       notified: Schema.optional(
         Schema.Struct({
           in_app: Schema.optional(IsoDateTime),
@@ -597,6 +602,8 @@ export const KanbanOwnerAsk = Schema.Struct({
   expiresAt: Schema.optional(IsoDateTime),
   /** Asks with the same key on a board are the same shape and can be answered together. */
   batchKey: Schema.optional(Schema.String),
+  /** The subtask a gate-cleared notice belongs to. Older notices use their title. */
+  subtaskId: Schema.optional(Schema.String),
   /** Bumped every time the agent edits the open ask. Absent means 0. */
   revision: Schema.optional(NonNegativeInt),
   revisedAt: Schema.optional(IsoDateTime),
@@ -1393,19 +1400,19 @@ const isOpenCard = (card: Pick<KanbanCard, "stage" | "settledAt">) =>
   !KANBAN_DONE_STAGES.has(card.stage) && card.settledAt === null;
 
 /**
- * A completed card whose evaluator merge subtask is still open: review has
- * passed, but its work isn't on ardud/main yet. Completed means review-passed;
- * the merge is a later evaluator subtask.
+ * A completed card whose landing step is still open. Completed means review
+ * passed, but dependents on other threads may still need its work to land.
  */
 export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">): boolean =>
   card.stage === "completed" &&
   card.subtasks.some(
     (subtask) =>
       subtask.state === "open" &&
-      (subtask.owner === "evaluator" || subtask.owner === "script") &&
-      // A merge action starts a clause ("merge router.ts into ...", "...; merge; deploy ...");
-      // a check that only mentions a merge ("blocker's merge subtask") doesn't.
-      /(?:^|[;:,.]\s*|\b(?:and|then)\s+)merge\b/i.test(subtask.text),
+      (subtask.holdsDependents === true ||
+        (subtask.holdsDependents === undefined &&
+          (subtask.owner === "evaluator" || subtask.owner === "script") &&
+          // The action must start a clause, not just be mentioned in a check.
+          /(?:^|[;:,.]\s*|\b(?:and|then)\s+)(?:merge|land|fast[- ]forward)\b/i.test(subtask.text))),
   );
 
 /**
@@ -1414,7 +1421,7 @@ export const kanbanAwaitsMerge = (card: Pick<KanbanCard, "stage" | "subtasks">):
  * in order unless stalled, in the backlog, waiting on the evaluator, or held
  * up in turn. Once the blocker leaves for review, the thread's branch is
  * unreviewed and rework can come back. A completed blocker still holds while
- * its merge subtask is open; deployed and verified blockers never do.
+ * its landing step is open; deployed and verified blockers never do.
  */
 export function kanbanHeldUpBy(
   card: KanbanCard,
@@ -2250,6 +2257,8 @@ export const KanbanParticipant = Schema.Struct({
   typingUntil: Schema.NullOr(IsoDateTime),
   /** Agent was asked to reply here; "nudged" after one reminder at turn end. */
   owes: Schema.NullOr(Schema.Literals(["asked", "nudged"])),
+  /** The delivered ask stays fixed when reading later messages advances lastReadSeq. */
+  askedSeq: Schema.optional(NonNegativeInt),
   /** A turn-end reminder held by the board pause, to be retried after release. */
   deferred: Schema.optional(Schema.Boolean),
   /** Stable ID for retrying one deferred reminder after an ambiguous send. */
@@ -2423,6 +2432,8 @@ export type KanbanDeniedReason = typeof KanbanDeniedReason.Type;
 
 export class KanbanError extends Schema.TaggedError<KanbanError>()("KanbanError", {
   code: KanbanErrorCode,
+  reasonClass: Schema.optionalKey(McpReasonClass),
+  invalidField: Schema.optionalKey(McpInvalidField),
   detail: Schema.String,
   reason: Schema.optionalKey(KanbanDeniedReason),
   /**
@@ -2511,6 +2522,8 @@ export type KanbanBoardSummary = typeof KanbanBoardSummary.Type;
  * resends neither board pictures nor every thread id.
  */
 export const KanbanBoardListEntry = Schema.Struct({
+  // A content-free entry keeps failed thread deletions hidden until cleanup commits.
+  purged: Schema.optional(Schema.Boolean),
   boardId: KanbanBoardId,
   board: Schema.NullOr(KanbanBoard),
   needsOwner: NonNegativeInt,
@@ -2523,6 +2536,11 @@ export type KanbanBoardListEntry = typeof KanbanBoardListEntry.Type;
 export const KanbanChange = Schema.Union([
   // `by`: who saved the card, when the save came from a move. Script listeners need it to skip a script's own moves.
   Schema.TaggedStruct("card", { card: KanbanCard, by: Schema.optional(KanbanActor) }),
+  Schema.TaggedStruct("purgeThreads", {
+    boardId: KanbanBoardId,
+    threadIds: Schema.Array(ThreadId),
+  }),
+  Schema.TaggedStruct("boardRemoved", { boardId: KanbanBoardId }),
   Schema.TaggedStruct("cardRemoved", { cardId: KanbanCardId }),
   Schema.TaggedStruct("goal", { goal: KanbanGoal }),
   Schema.TaggedStruct("pools", { pools: Schema.Array(KanbanPool) }),

@@ -19,6 +19,13 @@ afterEach(() => dirs.splice(0).forEach(root => {
   rmSync(root, { recursive: true, force: true });
 }));
 
+test("notice suppression reasons survive structured-log redaction", () => {
+  const { log, lines } = setup();
+  const reasons = ["grace", "not-waiting", "already-sent", "rate-limited"];
+  for (const reason of reasons) log.write({ component: "remote-box", kind: "event", name: "moni-notice-suppressed", props: { reason } });
+  expect(lines().map(line => line.props?.reason)).toEqual(reasons);
+});
+
 test("shared format, UTC milliseconds, append-only and private modes", () => {
   const { root, log, lines } = setup();
   chmodSync(root, 0o755);
@@ -148,8 +155,34 @@ test("empty days roll up once, and a broken clock cannot reject any logger opera
   expect(await log.rollup(day)).toMatchObject({ total: 0, day, topErrorTags: [] });
   const broken = createToolLog({ now: () => { throw new Error("clock unavailable"); } });
   expect(() => broken.write(entry)).not.toThrow();
+  expect(broken.flush()).toBe(false);
+  expect(broken.flush()).toBe(true);
   await expect(broken.rollup()).resolves.toBeUndefined();
   await expect(broken.tick()).resolves.toBeUndefined();
+});
+
+test("rejected renders and failed capture cannot pass the next flush acknowledgement", () => {
+  const { log, lines } = setup();
+  log.write({ ...entry, component: "invalid component", name: "card.render" });
+  expect(log.flush()).toBe(false);
+  expect(() => log.capture(() => { throw new Error("PRIVATE capture failure"); })).not.toThrow();
+  expect(log.flush()).toBe(false);
+  log.write(entry);
+  expect(log.flush()).toBe(true);
+  expect(lines()).toHaveLength(1);
+  expect(JSON.stringify(lines())).not.toContain("PRIVATE");
+});
+
+test.each([
+  { field: "component", component: "invalid component" },
+  { field: "name", name: "invalid name" },
+  { field: "kind", kind: "invalid" as "perf" },
+])("dropping a diagnostic with an invalid $field does not fail the next flush", invalid => {
+  const { log, lines } = setup();
+  log.write({ ...entry, ...invalid });
+  log.write(entry);
+  expect(log.flush()).toBe(true);
+  expect(lines()).toHaveLength(1);
 });
 
 // Process and recovery records share the same schema without any payload content.

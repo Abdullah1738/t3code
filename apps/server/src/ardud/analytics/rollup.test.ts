@@ -15,6 +15,54 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("sums statement work and actual process bytes without counting unavailable intervals as idle", () => {
+    const target = makeAccumulator();
+    for (const connection of ["reader", "reader", "export"])
+      accumulate(
+        target,
+        event({
+          kind: "db.statement.summary",
+          props: {
+            database: "statev2.sqlite",
+            connection,
+            lane: "background",
+            sqlFingerprint: "abc",
+            key: "SELECT:threads",
+            count: 12,
+            totalMs: 20,
+            maxMs: 5,
+            resultCount: 6,
+            failures: 1,
+          },
+        }),
+      );
+    accumulate(
+      target,
+      event({ kind: "db.process.disk_read", props: { readBytes: 1000, sampleMs: 60000 } }),
+    );
+    accumulate(
+      target,
+      event({ kind: "db.process.disk_read", props: { readBytes: 0, sampleMs: 60000 } }),
+    );
+    accumulate(target, event({ kind: "db.process.disk_read", props: { reason: "unavailable" } }));
+    const result = finishRollup(target, "2026-11-13", ts);
+    assert.deepInclude(result.dbStatementFamilies?.[0], {
+      connection: "reader",
+      calls: 24,
+      totalMs: 40,
+      maxMs: 5,
+      returnedRows: 12,
+      failures: 2,
+    });
+    assert.strictEqual(result.dbStatementFamilies?.length, 2);
+    assert.deepEqual(result.processDiskRead, {
+      readBytes: 1000,
+      sampleMs: 120000,
+      samples: 2,
+      unavailableSamples: 1,
+    });
+  });
+
   it("groups control routes by UTC hour and method, retaining statuses and deadline counts", () => {
     const target = makeAccumulator();
     const sample = (durationMs: number, status: number, hour = "12", method = "GET") =>
@@ -998,6 +1046,44 @@ it("#1490 counts evaluator starts by origin without treating steers and queued i
   assert.deepEqual(result.errorCounts, {});
 });
 
+it("counts and bounds refusal classes and fields per tool and hour", () => {
+  const target = makeAccumulator();
+  for (let i = 0; i < 160; i++)
+    accumulate(
+      target,
+      event({
+        kind: "mcp.call",
+        tool: "card_create",
+        outcome: "error",
+        saved: false,
+        reasonClass: i % 2 === 0 ? "duplicate_title" : "missing_required",
+        invalidField: `field${i}`,
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "mcp.call",
+      tool: "wiki_read",
+      outcome: "error",
+      reasonClass: "not_found",
+      invalidField: "slug",
+    }),
+  );
+  const rows = finishRollup(target, "2026-11-13", ts).mcpCalls;
+  const write = rows.find((row) => row.tool === "card_create")!;
+  assert.deepEqual(write.reasonClasses, { duplicate_title: 80, missing_required: 80 });
+  assert.equal(Object.keys(write.invalidFields).length, 129);
+  assert.equal(
+    Object.values(write.invalidFields).reduce((sum, count) => sum + count, 0),
+    160,
+  );
+  assert.deepEqual(write.savedCounts, { false: 160 });
+  const read = rows.find((row) => row.tool === "wiki_read")!;
+  assert.deepEqual(read.reasonClasses, { not_found: 1 });
+  assert.deepEqual(read.invalidFields, { slug: 1 });
+  assert.deepEqual(read.savedCounts, { "n/a": 1 });
+});
 const timeoutCall = (input: Partial<AnalyticsEvent> = {}) =>
   event({
     kind: "mcp.call",

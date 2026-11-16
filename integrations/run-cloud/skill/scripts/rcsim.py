@@ -293,31 +293,108 @@ def caller_native() -> tuple[str | None, str | None]:
     return None, None
 
 
-def identity_for(native: str, driver: str) -> dict:
-    """C1's resolution for one native id: {resolution, robobThreadId, parentThreadId, executionKind, ...}.
+def identity_detail(data: dict, status: int) -> str:
+    error = data.get("error")
+    detail = str(error.get("message") if isinstance(error, dict) else error or f"HTTP {status}")
+    # Control errors are untrusted; diagnostics must not echo credentials or request URLs.
+    for cfg_file in CTL_CFGS:
+        try:
+            token = json.loads(cfg_file.read_text()).get("token")
+            if token:
+                detail = detail.replace(token, "<redacted>")
+        except Exception:
+            pass
+    detail = re.sub(r"https?://\S+", "<redacted-url>", detail, flags=re.IGNORECASE)
+    detail = re.sub(r"\bBearer\s+\S+", "Bearer <redacted>", detail, flags=re.IGNORECASE)
+    return " ".join(detail.split())[:300]
 
-    Every failure (control API down, bad token, unreadable config) comes back as "unavailable", never as
-    an unowned caller. Rcsim refuses to create or claim on anything but "resolved".
-    """
-    st, d = ctl("GET", f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}")
-    if st == 200 and isinstance(d, dict) and isinstance(d.get("identity"), dict):
-        ident = dict(d["identity"])
+
+def _identity_lookup(native: str, driver: str, route: str, command: str, attempt: int) -> dict:
+    started = time.perf_counter()
+    path = "/threads/by-native/" + q(native) if route == "by-native" else \
+        f"/identity/resolve?nativeId={q(native)}&driver={q(driver)}"
+    st, data = ctl("GET", path, timeout=8)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    data = data if isinstance(data, dict) else {}
+    if st == 200 and route == "by-native":
+        t = data.get("thread") or {}
+        ident = {"resolution": "resolved", "robobThreadId": t.get("threadId"), "_thread": t}
+    elif st == 200 and isinstance(data.get("identity"), dict):
+        ident = dict(data["identity"])
+        ident.pop("detail", None)
     else:
-        ident = {"resolution": "unavailable", "robobThreadId": None, "parentThreadId": None,
-                 "executionKind": None, "acceptsMessages": False, "candidates": []}
-    ident.update(driver=driver, nativeId=native)
+        ident = {"resolution": "unresolved" if st == 404 else "unavailable"}
+    if st == 0 or 500 <= st < 600:
+        ident.update(reason="control-api-unreachable", detail=identity_detail(data, st))
+    elif st == 404:
+        ident["reason"] = "not-mapped"
+    elif st == 200 and ident.get("resolution") in ("unavailable", "pending"):
+        ident["reason"] = "identity-pending"
+    else:
+        resolution = ident.get("resolution")
+        ident["reason"] = (None if resolution == "resolved" else "not-mapped" if resolution == "unresolved"
+                           else "ambiguous" if resolution == "ambiguous" else "control-api-http-error")
+    ident.update(driver=driver, nativeId=native, _status=st, _ms=elapsed_ms)
+    ok = ident.get("resolution") == "resolved"
+    try:
+        toollog.emit("rcsim", "perf" if ok else "error", "identity.resolve", ok=ok,
+                     duration_ms=elapsed_ms, ids={"sessionId": native},
+                     props={"driver": driver, "route": route, "httpStatus": st,
+                            "resolution": ident.get("resolution"), "reason": ident.get("reason"),
+                            "attempt": attempt, "command": command}, error_tag=ident.get("reason"))
+    except Exception:
+        pass
     return ident
 
 
-def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env: bool = False) -> dict:
+def _resolve_identity(native: str, driver: str, route: str, command: str, retry_unavailable: bool) -> dict:
+    waited_ms = 0
+    waits = (5, 10, 20)
+    for attempt in range(1, 5):
+        ident = _identity_lookup(native, driver, route, command, attempt)
+        ident.update(_attempts=attempt, _waited_ms=waited_ms)
+        if (not retry_unavailable or attempt == 4 or ident.get("resolution") not in ("unavailable", "pending")
+                or ident.get("reason") not in ("control-api-unreachable", "identity-pending")):
+            return ident
+        wait = waits[attempt - 1]
+        message = (f"{command}: identity {ident['resolution']} ({ident['reason']}); "
+                   f"retrying in {wait} s (attempt {attempt + 1}/4)")
+        log(message)
+        print(f"rcsim: {message}", file=sys.stderr)
+        time.sleep(wait)
+        waited_ms += wait * 1000
+    return ident
+
+
+def identity_for(native: str, driver: str, *, retry_unavailable: bool = False, command: str = "monitor") -> dict:
+    """C1's resolution for one native id: {resolution, robobThreadId, parentThreadId, executionKind, ...}.
+
+    Failed lookups never establish an owner. Only transient failures may be retried; a missing mapping,
+    ambiguous answer or rejected request remains an immediate refusal.
+    """
+    return _resolve_identity(native, driver, "identity", command, retry_unavailable)
+
+
+def resolved_owner(ident: dict) -> dict:
+    thread = ident.get("robobThreadId")
+    parent = ident.get("parentThreadId")
+    _, t = thread_get(thread) if thread else (None, None)
+    return {"resolution": "resolved", "executionKind": ident.get("executionKind"),
+            "thread": thread, "title": (t or {}).get("title"), "manager": parent,
+            "relationship": "subagent" if parent else None}
+
+
+def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env: bool = False,
+           retry_unavailable: bool = False, command: str = "whoami") -> dict:
     """The execution rcsim acts for: owner thread, its title, and its manager (parent) thread.
 
     The owner is the resolved execution (a Claude or Codex thread, a Claude child with its parent), not the
     shared native session. `resolution` says whether that is known. Anything but "resolved" has no owner.
     """
     native, driver = caller_native()
-    me = {"ses": native, "driver": driver, "resolution": None, "executionKind": None,
+    me = {"ses": native, "driver": driver, "resolution": None, "reason": None, "executionKind": None,
           "thread": None, "title": None, "manager": None, "relationship": None}
+    ident = None
     if driver == "claudeAgent":
         # A Claude shell carries only its session id, which its native children share. No --thread, RCSIM_THREAD
         # or C1 answer can name this one execution, so the check comes before every explicit and env branch. An
@@ -332,24 +409,19 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
     env_thread = None if ignore_env else (os.environ.get("RCSIM_THREAD") or None)
     explicit = thread or env_thread
     if native is not None and driver == "opencode" and explicit is None:
-        # OpenCode path, unchanged: the session names the thread through the control API.
-        st, d = ctl("GET", "/threads/by-native/" + q(native))
-        if st == 200:
-            t = d.get("thread") or {}
+        ident = _resolve_identity(native, driver, "by-native", command, retry_unavailable)
+        me["resolution"] = ident.get("resolution")
+        if ident.get("resolution") == "resolved":
+            t = ident["_thread"]
             me.update(thread=t.get("threadId"), title=t.get("title"), resolution="resolved")
             if t.get("relationshipToParent") == "subagent" and t.get("parentThreadId"):
                 me.update(manager=t["parentThreadId"], relationship="subagent")
     elif native is not None and explicit is None:
-        ident = identity_for(native, driver)
+        ident = identity_for(native, driver, retry_unavailable=retry_unavailable, command=command)
         me["resolution"] = ident.get("resolution")
         me["executionKind"] = ident.get("executionKind")
         if ident.get("resolution") == "resolved":
-            me["thread"] = ident.get("robobThreadId")
-            me["manager"] = ident.get("parentThreadId")
-            if me["thread"]:
-                state, t = thread_get(me["thread"])
-                me["title"] = (t or {}).get("title")
-            me["relationship"] = "subagent" if me["manager"] else None
+            me.update(resolved_owner(ident))
     elif explicit is not None:
         # An explicit --thread names the owner the operator chose. It counts only when it is this execution or
         # one of its ancestors. RCSIM_THREAD is inherited shell state: it can never replace a resolved owner,
@@ -357,22 +429,27 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
         state, t = thread_get(explicit)
         if state == "gone":
             die(f"thread {explicit} not found or archived")
-        ident = identity_for(native, driver) if native is not None else None
+        ident = identity_for(native, driver, retry_unavailable=retry_unavailable, command=command) if native is not None else None
         if thread is None and ident is not None and ident.get("resolution") == "resolved":
             # Inherited RCSIM_THREAD: keep the resolved execution as the owner and drop the env value.
-            # An ancestor value is only informational here, so it is logged and ignored.
+            # Reuse this answer so ignoring the env value cannot restart the retry budget.
             if explicit != ident.get("robobThreadId"):
                 log(f"RCSIM_THREAD ignored: the resolved execution owns this call, not the inherited {explicit}")
-            return whoami(None, manager, ignore_env=True)
-        if ident is not None and ident.get("resolution") == "resolved":
-            allowed = {ident.get("robobThreadId"), ident.get("parentThreadId")} - {None}
-            if explicit not in allowed:
-                die(f"--thread {explicit} is not this session's thread or its parent")
-        me.update(thread=explicit, title=(t or {}).get("title"),
-                  resolution="resolved" if (ident is None or ident.get("resolution") == "resolved") else
-                  ident.get("resolution"))
-        if t and t.get("relationshipToParent") == "subagent" and t.get("parentThreadId"):
-            me.update(manager=t["parentThreadId"], relationship="subagent")
+            me.update(resolved_owner(ident))
+        else:
+            if ident is not None and ident.get("resolution") == "resolved":
+                allowed = {ident.get("robobThreadId"), ident.get("parentThreadId")} - {None}
+                if explicit not in allowed:
+                    die(f"--thread {explicit} is not this session's thread or its parent")
+            me.update(thread=explicit, title=(t or {}).get("title"),
+                      resolution="resolved" if (ident is None or ident.get("resolution") == "resolved") else
+                      ident.get("resolution"))
+            if t and t.get("relationshipToParent") == "subagent" and t.get("parentThreadId"):
+                me.update(manager=t["parentThreadId"], relationship="subagent")
+    if ident is not None:
+        for key in ("reason", "detail", "_attempts", "_waited_ms"):
+            if key in ident:
+                me[key] = ident[key]
     if manager:
         me["manager"] = None if manager == "none" else manager
     return me
@@ -381,13 +458,41 @@ def whoami(thread: str | None = None, manager: str | None = None, *, ignore_env:
 def refuse_unresolved(me: dict, action: str) -> None:
     """Rcsim only acts for a resolved execution. Pending, ambiguous and unavailable never fall back to an
     unowned or shared-session owner."""
-    if me.get("reason") == "claude-shared-session":
-        die(f"{action} refused: a Claude shell shares its session id with its native children, so it can't be "
+    reason = me.get("reason")
+    if reason != "claude-shared-session" and me.get("resolution") == "resolved" and me.get("thread"):
+        return
+    code = 2
+    if reason == "claude-shared-session":
+        message = (f"{action} refused: a Claude shell shares its session id with its native children, so it can't be "
             f"told apart from them. Claude callers can't own simulators; use a Codex or OpenCode thread, or an "
             f"iMessage-driven one. Nothing was changed.")
-    if me.get("resolution") != "resolved" or not me.get("thread"):
-        die(f"{action} refused: this caller is not resolved to a Robob thread yet "
+    elif reason == "control-api-unreachable":
+        code = 3
+        message = (f"{action} refused: the Robob control API (127.0.0.1:3773) isn't answering "
+                   f"({me.get('detail') or 'unreachable'}), so rcsim can't confirm this caller's thread. "
+                   "This is a Robob server problem, not your session mapping. Wait a minute and retry; "
+                   "don't use a raw Run Cloud call. Nothing was changed.")
+    elif reason == "identity-pending":
+        code = 3
+        message = (f"{action} refused: Robob hasn't mapped this caller to its thread yet "
+                   f"(resolution={me.get('resolution')}) after ~35 s of retries (identity-pending). Retry in a minute; "
+                   "if it persists it's a Robob server problem, not your session. Nothing was changed.")
+    elif reason == "not-mapped":
+        message = (f"{action} refused: this session isn't mapped to a Robob thread "
+                   "(reason=not-mapped). Nothing was changed.")
+    else:
+        message = (f"{action} refused: this caller is not resolved to a Robob thread yet "
             f"(resolution={me.get('resolution') or 'none'}). Retry in a few seconds; nothing was created.")
+    if action.split()[0] in ("release", "heartbeat"):
+        message += " The simulator keeps billing until a retry succeeds or the rcsim monitor reaps it."
+    try:
+        toollog.emit("rcsim", "error", "identity.refused", ok=False, ids={"sessionId": me.get("ses")},
+                     props={"command": action.split()[0], "resolution": me.get("resolution"), "reason": reason,
+                            "attempts": me.get("_attempts", 0), "exitCode": code,
+                            "waitedMs": me.get("_waited_ms", 0)}, error_tag=reason)
+    except Exception:
+        pass
+    die(message, code)
 
 
 def refuse_native_unproven(me: dict, action: str) -> None:
@@ -494,7 +599,7 @@ def logged_sim(name):
 
 @logged_sim('sim.create')
 def cmd_create(a) -> None:
-    me = whoami(a.thread, a.manager)
+    me = whoami(a.thread, a.manager, retry_unavailable=True, command="create")
     refuse_unresolved(me, "create")
     con = db()
     hard = check_hard(a.hard_timeout)
@@ -524,7 +629,7 @@ def cmd_create(a) -> None:
 def cmd_launch(a) -> None:
     if bool(a.build) == bool(a.asset):
         die("pass exactly one of --build BUILD_ID or --asset ASSET_ID")
-    me = whoami(a.thread, a.manager)
+    me = whoami(a.thread, a.manager, retry_unavailable=True, command="launch")
     refuse_unresolved(me, "launch")
     con = db()
     hard = check_hard(a.hard_timeout)
@@ -582,9 +687,11 @@ def _log_session(name, row, started, *, ok=True, error_tag=None, observed_at=Non
 @logged_sim('sim.heartbeat')
 def cmd_heartbeat(a) -> None:
     con = db()
-    me = whoami(a.thread)
+    me = whoami(a.thread, retry_unavailable=True, command="heartbeat")
     if a.ids:
         refuse_native_unproven(me, "heartbeat")
+    else:
+        refuse_unresolved(me, "heartbeat")
     ids = [resolve_id(con, i) for i in a.ids] if a.ids else [r["id"] for r in my_active(con, me)]
     if not ids:
         die("no active simulators registered to this thread (pass ids explicitly)", 1)
@@ -630,7 +737,7 @@ def release(con, row, reason: str) -> tuple[bool, str]:
 
 def cmd_release(a) -> None:
     con = db()
-    me = whoami(a.thread)
+    me = whoami(a.thread, retry_unavailable=True, command="release")
     if a.mine:
         # "Nothing to release" from an unresolved caller would hide its simulators behind a pending mapping.
         refuse_unresolved(me, "release --mine")
@@ -677,7 +784,7 @@ def cmd_release(a) -> None:
 
 def cmd_claim(a) -> None:
     con = db()
-    me = whoami(a.thread, a.manager)
+    me = whoami(a.thread, a.manager, retry_unavailable=True, command="claim")
     # Before any discovery or write: a pending, ambiguous or unavailable caller must not overwrite an owner or
     # register a simulator under a shared or missing identity.
     refuse_unresolved(me, "claim")
@@ -709,7 +816,7 @@ def cmd_claim(a) -> None:
 
 def cmd_handoff(a) -> None:
     con = db()
-    me = whoami(a.thread)
+    me = whoami(a.thread, retry_unavailable=True, command="handoff")
     refuse_native_unproven(me, "handoff")
     sid = resolve_id(con, a.id)
     row = get_row(con, sid)
@@ -775,7 +882,7 @@ def cmd_list(a) -> None:
 
 
 def cmd_whoami(a) -> None:
-    print(json.dumps(whoami(a.thread), indent=1))
+    print(json.dumps({k: v for k, v in whoami(a.thread).items() if not k.startswith("_")}, indent=1))
 
 
 # ---------------------------------------------------------------- monitor

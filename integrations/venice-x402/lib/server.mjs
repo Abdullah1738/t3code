@@ -6,6 +6,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { CapError, actualCost, estimateAndClamp } from './caps.mjs';
 import { FALLBACK_MODELS } from './config.mjs';
+import { builtinEgressCheck } from './egress.mjs';
 
 const MAX_BODY = 32 * 1024 * 1024;
 // Cloudflare/origin hiccups worth another try; anything else goes back to the client as-is.
@@ -282,11 +283,18 @@ export function createProxy({ cfg, venice, ledger, clientToken, log = () => {}, 
 // Async (no event-loop stall for streams in flight); concurrent callers share one run.
 // Failures are logged with the check's own reason (VENICE_EGRESS_VERBOSE=1).
 // reset() drops a cached success, e.g. after an upstream connection failure.
-export function defaultEgressCheck(cfg, log = () => {}) {
+// cfg.egressCheck 'builtin' runs the checks in this process (no spawn); any
+// other value is a shell command that must exit 0.
+export function defaultEgressCheck(cfg, log = () => {}, { builtin = builtinEgressCheck({ statePath: cfg.mullvadState }) } = {}) {
   let okUntil = 0;
   let running = null;
+  const runBuiltin = async () => {
+    const r = await builtin();
+    if (!r.ok) log({ event: 'egress_failed', reason: r.reason });
+    return r.ok;
+  };
   const run = () =>
-    new Promise((resolve) => {
+    cfg.egressCheck === 'builtin' ? runBuiltin() : new Promise((resolve) => {
       const p = spawn('/bin/zsh', ['-c', cfg.egressCheck], {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, VENICE_EGRESS_VERBOSE: '1' },

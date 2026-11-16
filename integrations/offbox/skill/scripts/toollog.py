@@ -22,13 +22,18 @@ NUMBERS.add("waited_s")
 NUMBERS.add("sample")
 NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
 NUMBERS.update({'outageS', 'waitedMs', 'placeBefore', 'placeAfter'})
+NUMBERS.update({'ageSeconds', 'runCount', 'waitSeconds', 'serving', 'held', 'pending', 'cap'})
+NUMBERS.update({'deficit', 'members_before'})
+NUMBERS.update({'created_at', 'since', 'total', 'headNeedBytes', 'freeBytes', 'running'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
                for field in ('free_bytes', 'size_bytes'))
 BOOLEANS = {"peer_online"} | set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
 BOOLEANS.add("ok")
 BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
 BOOLEANS.add('deadlineKept')
+BOOLEANS.add('queueExpired')
 ENUMS = {
+    'signalName': {'SIGINT', 'SIGTERM', 'SIGHUP', 'SIGALRM', 'SIGPIPE', 'SIGQUIT'},
     "jdk_phase": {"check", "install", "result"},
     "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
     "jdk_trigger": {"command", "repo-marker", "harness"},
@@ -50,7 +55,11 @@ ENUMS = {
     "stage": {"ssh_setup", "ssh_drop", "readiness", "put_file", "sync", "pull", "command", "install_mid_run", "request", "reaper"},
     "infra_failure": {"enospc", "native_crash", "disk_probe"},
     "infra_reason": {"low_space_gate", "disk_exhausted", "toolchain_unpack_crash", "probe_crashed"},
+    "stateBefore": {"running", "stopped"},
+    "result": {"detached", "stop_failed", "created"},
 }
+ENUMS['reason'].update({'killed', 'kill_file', 'unit_inactive', 'unit_failed', 'unit_unknown',
+                        'memory', 'fifo', 'cpu', 'cpu_config', 'cpu_unknown', 'cpu_settle', 'admitted_alone'})
 ENUMS['reason'].update({'history_empty', 'history_timeout', 'history_no_progress', 'history_unavailable'})
 ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
               for fs in ('tmp', 'var_tmp', 'home', 'workspace')})
@@ -76,7 +85,7 @@ def _atom(value):
 
 def _ids(values):
     return {k: v for k, v in (values or {}).items()
-            if k in {"run", "box", "thread", "card", "chat", "order", "owner"} and isinstance(v, str)
+            if k in {"run", "box", "newBox", "thread", "card", "chat", "order", "owner"} and isinstance(v, str)
             and len(v) <= 200 and re.fullmatch(r"[A-Za-z0-9_:%.\-/]+", v)
             and not re.search(r"\d{13,}", v)}
 
@@ -101,15 +110,19 @@ def _props(values, *, name=None):
             out[k] = v
         elif k in ("boot_id", "last_good_boot_id") and isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", v):
             out[k] = v
+        elif k == 'head' and isinstance(v, str) and re.fullmatch(r'bx_[A-Za-z0-9]+/[0-9]+', v):
+            out[k] = v
         elif k == "day" and isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
             out[k] = v
         elif k == "repo" and isinstance(v, str) and re.fullmatch(r"[a-f0-9]{16}", v):
             out[k] = v
         elif k == "size" and v in ("small", "default", "large", "xlarge"):
             out[k] = v
-        elif k == "errorClass" and _atom(v):
+        elif k == "errorClass" and isinstance(v, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]{0,79}', v):
             out[k] = v
         elif k == 'base' and (v is None or isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', v)):
+            out[k] = v
+        elif k in ('source', 'fromSource') and isinstance(v, str) and re.fullmatch(r'(?:template|recipe|base):[A-Za-z0-9_.:-]{1,200}|fresh', v):
             out[k] = v
         elif k == "exitRelay" and isinstance(v, str) and re.fullmatch(r"[a-z]{2}-[a-z]{3}-wg-\d{3}", v):
             out[k] = v

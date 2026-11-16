@@ -2,12 +2,16 @@ import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { Switches } from "../perf/speedups.ts";
+import { threadReadIndexes } from "./threadReadIndexes.ts";
 
 // Lives outside Migrations: the fork forbids new numbered upstream migrations.
 // Idempotent, so it runs on every open, after runMigrations, for fresh and upgraded databases.
 // Predicate must match the authored subqueries in ProjectionStore (INDEXED BY).
 export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(function* () {
   const sql = yield* SqlClient.SqlClient;
+  for (const statement of threadReadIndexes("main", "orchestration_v2_projection_turn_items")) {
+    yield* sql.unsafe(statement);
+  }
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_v2_messages_latest_user_authored_idx
     ON orchestration_v2_projection_messages(thread_id, updated_at DESC, message_id DESC)
@@ -97,6 +101,13 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_v2_threads_updated_idx
     ON orchestration_v2_projection_threads(updated_at DESC, thread_id ASC)
+  `;
+  // MCP lists seek within a project and stop before decoding unrelated histories.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_mcp_project_recency_idx
+    ON orchestration_v2_projection_threads(project_id,
+      CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) DESC, thread_id DESC)
+    WHERE deleted_at IS NULL AND archived_at IS NULL
   `;
   // Control pages/counts must not fetch each thread's payload to inspect lineage.
   // Keep the narrow recency index above for other queries; only control opts into this one.

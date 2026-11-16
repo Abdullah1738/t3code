@@ -1,3 +1,4 @@
+import { McpReasonClass, McpInvalidField } from "./ardud/mcpReasonClass.ts";
 import { McpDenyReason } from "./ardud/mcpDenyReason.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -465,10 +466,13 @@ export type OrchestratorMcpThreadListItem = typeof OrchestratorMcpThreadListItem
 
 export const OrchestratorMcpThreadListResult = Schema.Struct({
   projectId: ProjectId,
+  projectTitle: Schema.optional(Schema.String),
   currentThreadId: Schema.NullOr(ThreadId),
   threads: Schema.Array(OrchestratorMcpThreadListItem),
   nextCursor: Schema.NullOr(NonNegativeInt),
+  /** Lower bound when totalIsExact is false; older servers always returned an exact total. */
   total: NonNegativeInt,
+  totalIsExact: Schema.optional(Schema.Boolean),
 });
 export type OrchestratorMcpThreadListResult = typeof OrchestratorMcpThreadListResult.Type;
 
@@ -802,6 +806,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     code: Schema.Literals([
       "capability_denied",
       "parent_not_active",
+      "run_starting",
       "caller_unresolved",
       "delegation_timeout",
       "ambiguous_replay",
@@ -810,6 +815,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "runtime_mode_escalation_denied",
       "interaction_mode_escalation_denied",
       "task_not_found",
+      "task_creating",
       "task_not_cancellable",
       "thread_not_found",
       "run_not_found",
@@ -821,8 +827,12 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "orchestration_error",
       "thread_credential_required",
       "target_required",
+      "not_supported",
     ]),
     message: Schema.String,
     reason: Schema.optional(McpDenyReason),
+    reasonClass: Schema.optionalKey(McpReasonClass),
+    invalidField: Schema.optionalKey(McpInvalidField),
+    saved: Schema.optional(Schema.Boolean),
   },
 ) {}

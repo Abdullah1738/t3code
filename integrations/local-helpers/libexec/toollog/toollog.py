@@ -33,7 +33,8 @@ _FIELDS = {'harness', 'guard', 'decision', 'rule', 'firstWord', 'commandLength',
            'exitCode', 'failingStep', 'count', 'dryRun', 'toolCount', 'operation', 'status',
            'cwdClass', 'matchedRoot', 'argv0Class', 'repeatCount', 'threadIdSource',
            'method', 'toolName', 'load1', 'load5', 'load15', 'sampleRate',
-           'httpMethod', 'ttfbMs', 'reason', 'identity_source'}
+           'httpMethod', 'ttfbMs', 'reason', 'identity_source', 'driver', 'route', 'httpStatus',
+           'resolution', 'attempt', 'command', 'attempts', 'waitedMs'}
 _IDS = {'sessionId', 'threadId', 'nativeAgentId', 'cardNumber', 'serverId', 'home', 'sampleId'}
 _WORDS = set('git rg grep find ls cat cp mv rm python python3 node bun npm pnpm yarn vp go cargo rustc make docker offbox bash sh zsh curl sqlite3 terraform aws rcsim runcloud printf echo env sudo'.split())
 
@@ -555,6 +556,7 @@ def rollup(board, day, top_n=20):
     component_totals, component_errors = Counter(), defaultdict(Counter)
     component_samples, component_durations = defaultdict(dict), defaultdict(list)
     order_failures, poll_counts = defaultdict(Counter), {}
+    can_report_outcomes = {'success': 0, 'refused': 0}
     threads_by_rule, attempts = defaultdict(Counter), defaultdict(list)
     thread_decisions, unattributed = defaultdict(Counter), defaultdict(Counter)
     sampled_threads, sampled_attempts, sampled_unknown = set(), set(), set()
@@ -659,10 +661,12 @@ def rollup(board, day, top_n=20):
         if board == 'orders':
             component = row.get('component')
             if not isinstance(component, str) or component not in {
-                    'commerce', 'order-watch', 'card_status', 'noon', 'careem',
+                    'commerce', 'order-watch', 'card_status', 'card-vault-fill', 'noon', 'careem',
                     'amazon', 'uber', 'toollog', 'money-cases'}:
                 component = 'unknown'
             component_totals[component] += weight
+            if component == 'order-watch' and name == 'order_watch.can_report' and type(row.get('ok')) is bool:
+                can_report_outcomes['success' if row['ok'] else 'refused'] += weight
             if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0:
                 component_durations[f'{component}:{name}'].append((duration, weight))
             merchant = (row.get('props') or {}).get('merchant')
@@ -767,6 +771,7 @@ def rollup(board, day, top_n=20):
         result['unrecognizedThreadIds'] = unrecognized
         result['unrecognizedThreadIdsSampled'] = unrecognized_sampled
     if board == 'orders':
+        result['canReportByOutcome'] = can_report_outcomes
         result['durationsMs'] = {name: dict(values) for name, values in result['durationMsByName'].items()}
         if order_polls:
             result['durationsMs']['track.poll']['byMerchant'] = {

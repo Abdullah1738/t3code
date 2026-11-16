@@ -100,7 +100,7 @@ describe("ask latency", () => {
       kind: "private kind",
       options: [{ id: "o1", label: "private option" }],
       batchKey: "private batch",
-      timing: { openAsksAtCreation: 4 },
+      timing: { openAsksAtCreation: 4, openNoticesAtCreation: 2 },
     };
     const web = markAskTiming(ask, "seen", "web", "2026-11-13T01:00:00.000Z");
     expect(markAskTiming(web, "seen", "web", "2026-11-13T01:01:00.000Z")).toBe(web);
@@ -111,10 +111,14 @@ describe("ask latency", () => {
       askKind: "pick",
       hasBatchKey: true,
       openAsksAtCreation: 4,
+      openNoticesAtCreation: 2,
       firstSeenAt: "2026-11-13T01:00:00.000Z",
       firstSeenBySurface: { web: "2026-11-13T01:00:00.000Z", mobile: "2026-11-13T01:30:00.000Z" },
     });
     expect(JSON.stringify(props)).not.toContain("private");
+    expect(askTimingProps({ ...ask, timing: undefined })).not.toHaveProperty(
+      "openNoticesAtCreation",
+    );
     expect(
       markAskTiming({ ...mobile, closedAt: done }, "seen", "desktop", done).timing?.firstSeen
         ?.desktop,

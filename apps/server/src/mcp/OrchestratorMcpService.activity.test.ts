@@ -1,4 +1,5 @@
 import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import {
   EnvironmentId,
   MessageId,
@@ -8,6 +9,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   RunId,
   ScheduledTaskId,
   ThreadId,
@@ -110,6 +112,7 @@ it.effect.each(["caller row", "caller records", "idle target", "dispatch"] as co
 );
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -948,6 +951,9 @@ it("readThread and sendToThread reach threads in other projects", async () => {
             if (threadId === foreignThreadId) return Effect.succeed(foreignProjection(threadId));
             return Effect.die(`unexpected thread ${threadId}`);
           },
+          hasReceipt: () => Effect.succeed(false),
+          getCommandReceipt: () => Effect.succeed(Option.none()),
+          getDelegationCommandState: () => Effect.succeed({ status: "never_saved" }),
           getCallerRow: (threadId) =>
             Effect.succeed(
               threadId === foreignThreadId
@@ -1159,6 +1165,85 @@ it("readThread and sendToThread reach threads in other projects", async () => {
       .pipe(Effect.flip);
     expect(stopped.code).toBe("parent_not_active");
   }).pipe(Effect.provide(layer), Effect.runPromise);
+});
+
+it.effect("wake tools that need a run return run_starting until admission", () => {
+  const instanceId = ProviderInstanceId.make("claudeAgent");
+  let archived = false;
+  const scope = {
+    ...makeScope(),
+    thread: { ...makeScope().thread!, providerInstanceId: instanceId },
+  };
+  const shell = {
+    ...liveThreadShell(parentThreadId, { activeRunId: null }),
+    providerInstanceId: instanceId,
+    modelSelection: { instanceId, model: "claude-opus-5-5" },
+    get archivedAt() {
+      return archived ? now : null;
+    },
+  };
+  const projection = idleThreadProjection(shell);
+  const dependencies = Layer.mergeAll(
+    McpProviderSessions.layer,
+    Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getCallerRow: () => Effect.succeed(shell),
+      getThreadShell: () => Effect.succeed(shell),
+      getThreadRecords: () => Effect.succeed(projection),
+      hasReceipt: () => Effect.succeed(false),
+      getCommandReceipt: () => Effect.succeed(Option.none()),
+      getDelegationCommandState: () => Effect.succeed({ status: "never_saved" }),
+    }),
+    ServerSettings.layerTest(),
+    Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+    Layer.mock(ProjectService.ProjectService)({}),
+    Layer.mock(SecretRequests.SecretRequests)({}),
+    Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+    Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+    NodeCrypto.layer,
+  );
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const sessions = yield* McpProviderSessions.McpProviderSessions;
+      const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+      const caller = scope.thread;
+      const credential = {
+        ...caller,
+        runtimeProviderSessionId: ProviderSessionId.make("runtime:wake-activity"),
+        environmentId,
+        endpoint: "http://localhost/mcp",
+        authorizationHeader: "Bearer test",
+        browserToolsAvailable: false,
+      };
+      yield* sessions.set(credential);
+      let state: McpProviderSessions.WakeCallerState = "starting";
+      yield* sessions.registerWakeCaller(credential, () => state);
+      const calls = [
+        service
+          .delegateTask(scope, { task: "requires a run", clientRequestId: "wake-delegate" })
+          .pipe(Effect.asVoid),
+        service
+          .createThreads(scope, { threads: [{ prompt: "requires a run" }] })
+          .pipe(Effect.asVoid),
+        service
+          .requestSecret(scope, { label: "Secret", reason: "requires a run" })
+          .pipe(Effect.asVoid),
+      ];
+      for (const phase of ["starting", "live", "inactive"] as const) {
+        state = phase;
+        for (const call of calls) {
+          const error = yield* call.pipe(Effect.flip);
+          expect(error.code).toBe(phase === "inactive" ? "parent_not_active" : "run_starting");
+          if (phase !== "inactive") expect(error.saved).toBe(false);
+        }
+      }
+      state = "live";
+      archived = true;
+      for (const call of calls) {
+        const error = yield* call.pipe(Effect.flip);
+        expect(error.code).toBe("parent_not_active");
+      }
+    }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provideMerge(dependencies)))),
+  );
 });
 
 it.each(["missing-session", "capability", "replay"] as const)(

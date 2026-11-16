@@ -426,6 +426,16 @@ class Failover(HomeFiles):
         with patch("urllib.request.urlopen", side_effect=OSError("timed out")):
             self.assertIn("no answer", home.probe())
 
+    def test_loop_degradation_runs_at_home_without_failover(self):
+        for ok in (True, False):
+            body = {"ok": ok, "degraded": True, "reasons": ["sampler has not completed a pass for 200 s (disk)"]}
+            with self.subTest(ok=ok), patch.object(home, "_health", return_value=body), \
+                    patch.object(runs, "run_remote", return_value=0):
+                rc, _ = self.run_cmd("--", "make", "test")
+                self.assertEqual(rc, 0)
+                self.assertEqual(self.execs, [])
+                self.assertEqual(self.failures(), [])
+
     def test_unreachable_fails_over_but_starting_waits_at_home(self):
         gone = api.NetworkError("offbox server API unreachable (POST /sandboxes): timed out")
         with patch.object(home, "probe", return_value=None), patch.object(runs, "run_remote", side_effect=gone):

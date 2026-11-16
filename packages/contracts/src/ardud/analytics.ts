@@ -1,3 +1,4 @@
+import { McpReasonClass, McpInvalidField, McpRefusedAt } from "./mcpReasonClass.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -157,6 +158,25 @@ const GeneralEvent = Schema.Struct({
   startedAt: Schema.optionalKey(Timestamp),
   committed: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
   taskId: Schema.optionalKey(DerivedId),
+  parentThreadId: Schema.optionalKey(DerivedId),
+  parentRunId: Schema.optionalKey(DerivedId),
+  noticeMessageId: Schema.optionalKey(DerivedId),
+  noticeKind: Schema.optionalKey(
+    Schema.Literals(["finished", "failed", "stopped", "mixed", "unknown"]),
+  ),
+  children: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        childTaskId: DerivedId,
+        status: Label,
+        terminalAt: Schema.NullOr(Timestamp),
+        delayMs: Schema.NullOr(Measurement),
+      }),
+    ),
+  ),
+  oldStatus: Schema.optionalKey(Label),
+  newStatus: Schema.optionalKey(Label),
+  reason: Schema.optionalKey(Label),
   callerThreadId: Schema.optionalKey(DerivedId),
   callerRole: Schema.optionalKey(McpCallerRole),
   callerKind: Schema.optionalKey(McpCallerKind),
@@ -173,6 +193,9 @@ const GeneralEvent = Schema.Struct({
   ),
   cardStage: Schema.optionalKey(Label),
   denyReason: Schema.optionalKey(McpDenyReason),
+  reasonClass: Schema.optionalKey(McpReasonClass),
+  invalidField: Schema.optionalKey(McpInvalidField),
+  refusedAt: Schema.optionalKey(McpRefusedAt),
   replyStage: Schema.optionalKey(Label),
   replyPhases: Schema.optionalKey(McpReplyPhases),
   requestTiming: Schema.optionalKey(
@@ -243,22 +266,42 @@ const GeneralEvent = Schema.Struct({
   ),
   props: Schema.optionalKey(
     Schema.Struct({
+      on: Schema.optionalKey(Label),
+      until: Schema.optionalKey(Timestamp),
+      script: Schema.optionalKey(Label),
       number: Schema.optionalKey(Measurement),
       from: Schema.optionalKey(Label),
       to: Schema.optionalKey(Label),
       actor: Schema.optionalKey(
         Schema.Literals(["owner", "thread", "evaluator", "script", "system"]),
       ),
+      seq: Schema.optionalKey(Measurement),
+      target: Schema.optionalKey(Schema.Literals(["live_thread", "steer", "start", "none"])),
       msInPrevStage: Schema.optionalKey(Measurement),
       round: Schema.optionalKey(Measurement),
       chain: Schema.optionalKey(Label),
       verdict: Schema.optionalKey(Schema.Literals(["clear", "feedback"])),
       head: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[0-9a-f]{7,40}$/))),
-      action: Schema.optionalKey(Schema.Literals(["set", "clear"])),
+      action: Schema.optionalKey(
+        Schema.Literals(["set", "clear", "resumed", "restarted", "failed"]),
+      ),
+      effort: Schema.optionalKey(Label),
+      lastProgressKind: Schema.optionalKey(Label),
+      lastProgressTool: Schema.optionalKey(Label),
+      silentSeconds: Schema.optionalKey(Measurement),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
       cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
       runId: Schema.optionalKey(DerivedId),
+      attemptId: Schema.optionalKey(DerivedId),
+      stage: Schema.optionalKey(Label),
+      outcome: Schema.optionalKey(Label),
+      retryCount: Schema.optionalKey(Measurement),
+      discoveryMs: Schema.optionalKey(Schema.NullOr(Measurement)),
+      attachmentsMs: Schema.optionalKey(Schema.NullOr(Measurement)),
+      sdkOpenMs: Schema.optionalKey(Schema.NullOr(Measurement)),
+      mcpRegistrationMs: Schema.optionalKey(Schema.NullOr(Measurement)),
+      sdkAcceptMs: Schema.optionalKey(Schema.NullOr(Measurement)),
       model: Schema.optionalKey(Label),
       provider: Schema.optionalKey(Label),
       operation: Schema.optionalKey(Label),
@@ -278,6 +321,36 @@ const GeneralEvent = Schema.Struct({
       readerAcquireMs: Schema.optionalKey(Measurement),
       readerQueryMs: Schema.optionalKey(Measurement),
       readerStatements: Schema.optionalKey(Measurement),
+      serializationMs: Schema.optionalKey(Measurement),
+      readerHolders: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            holder: Label,
+            holdMs: Measurement,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
+      readerTimings: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            waitMs: Measurement,
+            queryMs: Measurement,
+            statements: Measurement,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
+      replyAdmissions: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            waitMs: Measurement,
+            runMs: Measurement,
+            acquired: Schema.Boolean,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
       span: Schema.optionalKey(Label),
       errorTag: Schema.optionalKey(Label),
       code: Schema.optionalKey(Label),
@@ -302,6 +375,7 @@ const GeneralEvent = Schema.Struct({
         ]),
       ),
       idCanonical: Schema.optionalKey(Schema.Boolean),
+      dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
       idShape: Schema.optionalKey(
         Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
       ),
@@ -313,11 +387,27 @@ const GeneralEvent = Schema.Struct({
       poolKey: Schema.optionalKey(Label),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
+      effectId: Schema.optionalKey(DerivedId),
+      effectType: Schema.optionalKey(Label),
+      commandType: Schema.optionalKey(Label),
+      failedRunId: Schema.optionalKey(DerivedId),
+      startedRunId: Schema.optionalKey(DerivedId),
+      failureCode: Schema.optionalKey(Label),
       headRunId: Schema.optionalKey(DerivedId),
       headOrdinal: Schema.optionalKey(Measurement),
       queuedCount: Schema.optionalKey(Measurement),
       heldCount: Schema.optionalKey(Measurement),
       phase: Schema.optionalKey(Label),
+      threadList: Schema.optionalKey(
+        Schema.Struct({
+          phase: Schema.Literals(["caller", "project", "candidates", "shell", "render"]),
+          batchCount: Measurement,
+          candidateRows: Measurement,
+          elapsedMs: Measurement,
+          readerWaitMs: Measurement,
+          queryMs: Measurement,
+        }),
+      ),
       subSteps: Schema.optionalKey(
         Schema.Array(Schema.Struct({ subStep: Label, ms: Measurement })).check(
           Schema.isMaxLength(3),
@@ -359,9 +449,17 @@ const GeneralEvent = Schema.Struct({
       ),
       hasBatchKey: Schema.optionalKey(Schema.Boolean),
       openAsksAtCreation: Schema.optionalKey(Measurement),
+      openNoticesAtCreation: Schema.optionalKey(Measurement),
       answeredVia: Schema.optionalKey(Schema.Literals(["single", "batch", "free_text"])),
       status: Schema.optionalKey(Measurement),
       count: Schema.optionalKey(Measurement),
+      database: Schema.optionalKey(Label),
+      connection: Schema.optionalKey(Label),
+      lane: Schema.optionalKey(Label),
+      sqlFingerprint: Schema.optionalKey(Label),
+      failures: Schema.optionalKey(Measurement),
+      readBytes: Schema.optionalKey(Measurement),
+      sampleMs: Schema.optionalKey(Measurement),
       bytes: Schema.optionalKey(Measurement),
       p50Ms: Schema.optionalKey(Measurement),
       p95Ms: Schema.optionalKey(Measurement),
@@ -584,6 +682,30 @@ export const AnalyticsRollup = Schema.Struct({
       ...LatencyFields,
     }),
   ),
+  dbStatementFamilies: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        database: Label,
+        connection: Label,
+        lane: Label,
+        fingerprint: Label,
+        family: Label,
+        calls: Measurement,
+        totalMs: Measurement,
+        maxMs: Measurement,
+        returnedRows: Measurement,
+        failures: Measurement,
+      }),
+    ),
+  ),
+  processDiskRead: Schema.optionalKey(
+    Schema.Struct({
+      readBytes: Measurement,
+      sampleMs: Measurement,
+      samples: Measurement,
+      unavailableSamples: Measurement,
+    }),
+  ),
   longTasksByRoute: Schema.Array(
     Schema.Struct({
       route: Label,
@@ -702,6 +824,8 @@ export const AnalyticsRollup = Schema.Struct({
       failureRate: Measurement,
       outcomes: Schema.Record(Label, Measurement),
       savedCounts: Schema.Record(Label, Measurement),
+      reasonClasses: Schema.Record(Label, Measurement),
+      invalidFields: Schema.Record(Label, Measurement),
       notFoundReasons: Schema.optionalKey(Schema.Record(Label, Measurement)),
       foundByCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
       idShapeCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),

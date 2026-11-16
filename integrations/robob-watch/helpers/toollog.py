@@ -16,7 +16,7 @@ _DATED = re.compile(r'(?:rollup-)?(\d{4}-\d{2}-\d{2})(?:\.ndjson|\.json|\.cap)')
 _IDS = frozenset(('watcher', 'run', 'thread', 'chat', 'key', 'operation', 'reminder', 'update', 'item', 'helper'))
 _NUMERIC = frozenset(('exitCode', 'attempt', 'count', 'bytes', 'queuedMs', 'failedSources', 'totalSources'))
 _BOOLEAN = frozenset(('deduped', 'accepted', 'timedOut'))
-_ERRNO = frozenset(errno.errorcode.values()) | {'UNKNOWN'}
+_ERRNO = frozenset(name for name in dir(errno) if name.startswith('E') and type(getattr(errno, name)) is int) | {'UNKNOWN'}
 _SIGNALS = frozenset(s.name for s in signal.Signals)
 _VALUES = {
     'severity': ('info', 'attention', 'error'),
@@ -190,7 +190,15 @@ def _fields(entry, at):
         for key, value in entry['props'].items():
             if type(key) is not str:
                 continue
-            if key in ('exitCode', 'signal') and value is None:
+            file_event = entry['name'] in ('data_read.retried', 'data_read.failed', 'data_write.retried',
+                                           'data_write.failed', 'runs_log.write_failed')
+            if file_event and key == 'path' and type(value) is str and len(value) <= 1024 and value.startswith('/') and not any(ord(c) < 32 for c in value):
+                props[key] = value
+            elif file_event and key in ('attempts', 'ms') and _finite(value) and value >= 0:
+                props[key] = value
+            elif file_event and key == 'dataless' and type(value) is bool:
+                props[key] = value
+            elif key in ('exitCode', 'signal') and value is None:
                 props[key] = None
             elif key == 'stderrLines' and type(value) is int and 0 <= value <= 2 ** 53 - 1:
                 props[key] = value

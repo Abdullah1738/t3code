@@ -491,6 +491,7 @@ it.effect.each([
         service.sendToThread({ ...input, commandId: CommandId.make(`fresh:${mode}`) }),
       );
       expect(fresh).toBeInstanceOf(ThreadManagementService.ThreadManagementNoSteerableRunError);
+      expect(fresh).toMatchObject({ holder: { threadId, runId, status: "completed" } });
       archived = true;
       const archivedRetry = yield* service.sendToThread(input);
       expect(archivedRetry.message).toEqual(first.message);

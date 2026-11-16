@@ -233,12 +233,8 @@ const CodexBackgroundTerminalTerminateResponse = Schema.Struct({
   terminated: Schema.Boolean,
 });
 const CodexBackgroundTerminalsListResponse = Schema.Struct({
-  data: Schema.Array(
-    Schema.Struct({
-      processId: Schema.String,
-    }),
-  ),
-  nextCursor: Schema.NullOr(Schema.String),
+  data: Schema.Array(ProviderAdapter.ProviderBackgroundTerminal),
+  nextCursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 type CodexBackgroundTerminalsListPage = typeof CodexBackgroundTerminalsListResponse.Type;
 const decodeCodexBackgroundTerminalTerminateResponse = Schema.decodeUnknownEffect(
@@ -446,15 +442,20 @@ export function codexSkillMentionText(text: string): string {
 const BACKGROUND_COMMAND_DETAIL_COMMAND_MAX_LENGTH = 200;
 const BACKGROUND_COMMAND_DETAIL_OUTPUT_TAIL_MAX_LENGTH = 1_000;
 
-export function codexBackgroundCommandDetail(item: {
-  readonly command: string;
-  readonly exitCode?: number | null | undefined;
-  readonly aggregatedOutput?: string | null | undefined;
-}): string {
+export function codexBackgroundCommandDetail(
+  item: {
+    readonly command: string;
+    readonly exitCode?: number | null | undefined;
+    readonly aggregatedOutput?: string | null | undefined;
+  },
+  outcome: "completed" | "interrupted" = "completed",
+): string {
   const command =
     item.command.length > BACKGROUND_COMMAND_DETAIL_COMMAND_MAX_LENGTH
       ? `${item.command.slice(0, BACKGROUND_COMMAND_DETAIL_COMMAND_MAX_LENGTH)}...`
       : item.command;
+  if (outcome === "interrupted")
+    return `Background command interrupted (Codex thread closed): ${command}`;
   const exit =
     item.exitCode === null || item.exitCode === undefined ? "" : ` (exit ${item.exitCode})`;
   const output = (item.aggregatedOutput ?? "").trimEnd();
@@ -1961,7 +1962,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   }),
                 )
               : Effect.succeed(undefined)
-            : mcpSessions.read(threadId);
+            : McpProviderSessions.readForRuntime(
+                mcpSessions,
+                threadId,
+                input.providerSessionId,
+                CODEX_PROVIDER,
+              );
         const recallForThread = (threadId: ThreadId | null) =>
           recallUrl && threadId !== null ? { url: recallUrl, threadId } : undefined;
         const client = yield* clientFactory.open({
@@ -2390,10 +2396,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           function* (
             context: ActiveCodexTurnContext,
             nativeTurnId: string,
-            item: Extract<
-              CodexSchema.V2ItemCompletedNotification__ThreadItem,
-              { type: "commandExecution" }
-            >,
+            item: {
+              readonly id: string;
+              readonly command: string;
+              readonly exitCode?: number | null | undefined;
+              readonly aggregatedOutput?: string | null | undefined;
+            },
+            outcome: "completed" | "interrupted" = "completed",
           ) {
             if (
               context.subagent === null &&
@@ -2423,18 +2432,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   driver: CODEX_PROVIDER,
                   // Codex starts a new turn from this text, so nothing is buffered.
                   delivery: "message_text",
-                  detail: codexBackgroundCommandDetail(item),
+                  detail: codexBackgroundCommandDetail(item, outcome),
                   notification: {
                     ...backgroundWorkNotification([
                       {
                         kind: "command",
                         label: item.command,
                         outcome:
-                          item.exitCode === 0
-                            ? "completed"
-                            : item.exitCode == null
-                              ? "unknown"
-                              : "failed",
+                          outcome === "interrupted"
+                            ? "cancelled"
+                            : item.exitCode === 0
+                              ? "completed"
+                              : item.exitCode == null
+                                ? "unknown"
+                                : "failed",
                         exitCode: item.exitCode ?? undefined,
                       },
                     ]),
@@ -2681,6 +2692,42 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }
         });
 
+        const listBackgroundTerminals = Effect.fn("CodexAdapterV2.listBackgroundTerminals")(
+          function* (nativeThreadId: string) {
+            const terminals: Array<ProviderAdapter.ProviderBackgroundTerminal> = [];
+            const cursors = new Set<string>();
+            let cursor: string | undefined;
+            do {
+              const response = yield* client.raw
+                .request("thread/backgroundTerminals/list", {
+                  threadId: nativeThreadId,
+                  ...(cursor === undefined ? {} : { cursor }),
+                })
+                .pipe(
+                  Effect.catchTags({
+                    CodexAppServerProcessExitedError: () => Effect.succeed({ data: [] }),
+                    CodexAppServerInputStreamEndedError: () => Effect.succeed({ data: [] }),
+                    CodexAppServerRequestError: (error) =>
+                      error.code === -32600 && error.errorMessage.startsWith("thread not found:")
+                        ? Effect.succeed({ data: [] })
+                        : Effect.fail(error),
+                  }),
+                );
+              const page = yield* decodeCodexBackgroundTerminalsListResponse(response);
+              terminals.push(...page.data);
+              cursor = page.nextCursor ?? undefined;
+              if (cursor !== undefined && cursors.has(cursor)) {
+                return yield* toProtocolError(
+                  "Codex background terminal listing repeated a cursor.",
+                );
+              }
+              if (cursor !== undefined) cursors.add(cursor);
+            } while (cursor !== undefined);
+            return terminals;
+          },
+          Effect.timeout("10 seconds"),
+        );
+
         const terminateBackgroundTerminal = Effect.fn("CodexAdapterV2.terminateBackgroundTerminal")(
           function* (nativeThreadId: string, processId: string) {
             const response = yield* client.raw
@@ -2689,20 +2736,24 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 processId,
               })
               .pipe(
+                Effect.map((response) => ({ response, alreadyGone: false })),
                 Effect.catchTags({
-                  CodexAppServerProcessExitedError: () => Effect.succeed({ terminated: true }),
-                  CodexAppServerInputStreamEndedError: () => Effect.succeed({ terminated: true }),
+                  CodexAppServerProcessExitedError: () =>
+                    Effect.succeed({ response: { terminated: true }, alreadyGone: true }),
+                  CodexAppServerInputStreamEndedError: () =>
+                    Effect.succeed({ response: { terminated: true }, alreadyGone: true }),
                   // The thread is unloaded, as Codex does a minute after a
                   // settle or archive unsubscribes it. Unloading kills the
                   // thread's terminals, so nothing is left to stop.
                   CodexAppServerRequestError: (error) =>
                     error.code === -32600 && error.errorMessage.startsWith("thread not found:")
-                      ? Effect.succeed({ terminated: true })
+                      ? Effect.succeed({ response: { terminated: true }, alreadyGone: true })
                       : Effect.fail(error),
                 }),
               );
-            const result = yield* decodeCodexBackgroundTerminalTerminateResponse(response);
-            if (result.terminated) return;
+            const result = yield* decodeCodexBackgroundTerminalTerminateResponse(response.response);
+            if (result.terminated)
+              return { terminated: true, alreadyGone: response.alreadyGone } as const;
             let cursor: string | null = null;
             while (true) {
               const response: unknown = yield* client.raw.request(
@@ -2719,7 +2770,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   `Codex background terminal ${processId} remained active after termination.`,
                 );
               }
-              if (page.nextCursor === null) return;
+              if (page.nextCursor == null) return { terminated: true, alreadyGone: true } as const;
               cursor = page.nextCursor;
             }
           },
@@ -5064,6 +5115,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 "interrupted",
                 completedAt,
               );
+              for (const command of commands?.values() ?? []) {
+                yield* offerBackgroundCommand(
+                  context,
+                  context.nativeTurnId,
+                  command,
+                  "interrupted",
+                );
+              }
               yield* Ref.update(runningCommandItemsByTurn, (current) => {
                 const updated = new Map(current);
                 updated.delete(context.nativeTurnId);
@@ -6902,7 +6961,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
           ) {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
-            const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+            const mcpSession = yield* readMcpSession(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
               codexInput,
@@ -7372,7 +7431,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }
                 const preflight = Effect.gen(function* () {
                   const mcpSession = yield* ensureInitialized.pipe(
-                    Effect.andThen(mcpSessions.read(threadInput.threadId)),
+                    Effect.andThen(readMcpSession(threadInput.threadId)),
                   );
                   const response = yield* client
                     .request(
@@ -7686,6 +7745,39 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               ),
+          ),
+          listBackgroundTerminals: Effect.fn("CodexAdapterV2.listThreadBackgroundTerminals")(
+            function* ({ providerThread }) {
+              return yield* listBackgroundTerminals(yield* getNativeThreadId(providerThread));
+            },
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail: "Failed to list Codex background terminals.",
+                  cause: normalizeCodexCause(cause),
+                }),
+            ),
+          ),
+          terminateBackgroundTerminal: Effect.fn(
+            "CodexAdapterV2.terminateThreadBackgroundTerminal",
+          )(
+            function* ({ providerThread, processId }) {
+              const nativeThreadId = yield* getNativeThreadId(providerThread);
+              const terminals = yield* listBackgroundTerminals(nativeThreadId);
+              if (!terminals.some((terminal) => terminal.processId === processId)) {
+                return { terminated: true, alreadyGone: true } as const;
+              }
+              return yield* terminateBackgroundTerminal(nativeThreadId, processId);
+            },
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail: "Failed to stop Codex background terminal.",
+                  cause: normalizeCodexCause(cause),
+                }),
+            ),
           ),
           listLoadedNativeThreads: Effect.fn("CodexAdapterV2.listLoadedNativeThreads")(
             function* () {
@@ -8393,7 +8485,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                             ? {}
                             : { lastTurnId: boundary.lastTurnId }),
                           ...codexThreadRuntimeParams({
-                            mcpSession: yield* mcpSessions.read(threadInput.targetThreadId),
+                            mcpSession: yield* readMcpSession(threadInput.targetThreadId),
                             recall: recallForThread(threadInput.targetThreadId),
                             ...(threadInput.modelSelection === undefined
                               ? {}

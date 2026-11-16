@@ -22,7 +22,7 @@ import * as DelegatedTaskQuestionReactor from "./orchestration-v2/DelegatedTaskQ
 import * as NodeHttp from "node:http";
 
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
-import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as ServerProcessRuntime from "./serverProcessRuntime.ts";
 import { EnvironmentHttpApi, type RepositoryIdentity } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
@@ -359,8 +359,6 @@ const layerHttpServer = Layer.unwrap(
     );
   }),
 ).pipe(StartupPhaseLog.withStartupLayer("http.listen"));
-
-const layerPlatformServices = NodeServices.layer;
 
 const layerPersistence = BoardsDatabase.layerConfig.pipe(
   Layer.provideMerge(layerSqlitePersistence),
@@ -853,7 +851,10 @@ const layerMakeServer = Layer.unwrap(
     const routesReady = yield* Deferred.make<void>();
     const layerLauncher = ServiceLauncherClient.layer;
 
-    yield* fixPath({ shellEnvironmentPrepared: config.shellEnvironmentPrepared });
+    yield* fixPath({
+      shellEnvironmentPrepared: config.shellEnvironmentPrepared,
+      shellPathHydration: config.shellPathHydration,
+    });
 
     const layerHttpListening = Layer.effectDiscard(
       Effect.gen(function* () {
@@ -1187,6 +1188,7 @@ const layerMakeServer = Layer.unwrap(
         Layer.provide(McpCallLedger.layer),
         Layer.provide(McpAvailability.layer),
         Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
+        Layer.provide(AnalyticsDatabase.layerStatementStats),
         Layer.provide(LargeReplyLog.layer),
         Layer.provide(ReplyBuilders.layer),
         Layer.provideMerge(FetchHttpClient.layer),
@@ -1195,11 +1197,10 @@ const layerMakeServer = Layer.unwrap(
         Layer.provideMerge(ProviderProcessRegistry.layer),
       )
       .pipe(
-        Layer.provideMerge(layerPlatformServices),
         StartupPhaseLog.withStartupLayer("boot"),
         Layer.provide(StartupPhaseLog.layer(config.logsDir)),
       );
   }),
-).pipe(Layer.provide(ProcessRunner.layer));
+).pipe(ServerProcessRuntime.provide);
 
 export const runServer = Layer.launch(layerMakeServer);

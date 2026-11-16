@@ -79,6 +79,7 @@ const testLayer = () => {
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: () => Effect.succeed(null),
       view: (threadId) =>
@@ -748,7 +749,8 @@ it("the card_ask description says what he can give back, and stays short", () =>
   ]) {
     assert.include(description, word);
   }
-  assert.isBelow(description.length, 2_000);
+  assert.include(description, "card accepts an id or #number; omit it for your own card.");
+  assert.isBelow(description.length, 2_100);
   // The tool and any page that shows it read the same constant.
   assert.strictEqual(description, CARD_ASK_TOOL_DESCRIPTION);
   assert.include(CARD_ASK_TOOL_DESCRIPTION, "and then for what you do after it");

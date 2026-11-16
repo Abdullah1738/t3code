@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -214,6 +215,7 @@ it.effect.each([
           Layer.provideMerge(ThreadCommandExecutor.layer),
         );
         const layer = OrchestratorMcpService.layer.pipe(
+          Layer.provide(McpProviderSessions.layer),
           Layer.provideMerge(database),
           Layer.provideMerge(threads),
           Layer.provide(

@@ -1,4 +1,7 @@
 import { normalizeSql, sqlFingerprint } from "./sqlDiagnostics.ts";
+import { StatementStats, recordStatementCompletion } from "./nodeSqliteStatementStats.ts";
+export { StatementStats, makeStatementStats } from "./nodeSqliteStatementStats.ts";
+export type { StatementCompletion } from "./nodeSqliteStatementStats.ts";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeUtil from "node:util";
 import * as NodeWorkerThreads from "node:worker_threads";
@@ -46,7 +49,11 @@ import {
   readerBusy,
 } from "./nodeSqliteReaderLanes.ts";
 
-export { ReaderLane, readerLaneFailure } from "./nodeSqliteReaderLanes.ts";
+export {
+  ReaderLane,
+  readerLaneFailure,
+  ReaderContentionObserver,
+} from "./nodeSqliteReaderLanes.ts";
 export type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
 import type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
 
@@ -854,7 +861,8 @@ const endsReadTransaction = (sql: string) => /^\s*ROLLBACK\b|^\s*COMMIT\b/i.test
  * it. A lease whose worker stopped before running anything for it moves to the
  * replacement once; after any statement reached the worker it stays pinned.
  */
-const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
+const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig, lane: string) {
+  const statementStats = yield* StatementStats;
   const failed = (cause: unknown, message: string, operation: string) =>
     readerFailed(options, cause, message, operation);
   const snapshotLock = options.readerSnapshotLock ?? (yield* Semaphore.make(1));
@@ -1080,6 +1088,16 @@ const makeReader = Effect.fnUntraced(function* (options: SqliteClientConfig) {
             },
             resume: (reply) => {
               recordExecution(reply.executionMs);
+              if (statementStats !== undefined && reply.executionMs !== undefined)
+                recordStatementCompletion(statementStats, {
+                  database: options.filename,
+                  connection: "reader",
+                  lane,
+                  sql: input.sql,
+                  executionMs: reply.executionMs,
+                  rows: "rows" in reply && Array.isArray(reply.rows) ? reply.rows.length : 0,
+                  failed: "error" in reply,
+                });
               if ("rows" in reply) {
                 resume(Effect.succeed(reply.rows));
                 return;
@@ -2137,6 +2155,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
   statementMetrics: boolean,
   setup: ReturnType<typeof makeWriterSetup>,
 ) {
+  const statementStats = yield* StatementStats;
   const failed = (cause: unknown, message: string, operation: string) =>
     new SqlError({ reason: classifyError(cause, message, operation, options, "writer") });
   const cancelledBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
@@ -2315,6 +2334,20 @@ const makeWriterSession = Effect.fnUntraced(function* (
         pending.set(id, (reply) => {
           preBegin?.phase("effect_resume");
           acknowledge();
+          if (
+            statementStats !== undefined &&
+            input.sql !== undefined &&
+            reply.elapsedMs !== undefined
+          )
+            recordStatementCompletion(statementStats, {
+              database: options.filename,
+              connection: "writer",
+              lane: "default",
+              sql: input.sql,
+              executionMs: reply.elapsedMs,
+              rows: "rows" in reply && Array.isArray(reply.rows) ? reply.rows.length : 0,
+              failed: "error" in reply,
+            });
           onClassification?.(reply.write ?? false);
           const currentSpan = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
           try {
@@ -2620,6 +2653,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
   };
   options = { ...options, errorObserver: options.errorObserver ?? (yield* ErrorObserver) };
   const statementObserver = yield* StatementObserver;
+  const statementStats = yield* StatementStats;
   yield* checkNodeSqliteCompat();
   const statementMetrics =
     options.statementMetrics ??
@@ -2772,6 +2806,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
             ?.toLowerCase();
           const execute = () => {
             const executionStart = performance.now();
+            let returnedRows = 0;
+            let executionFailed = true;
             const controlStart = control === undefined ? undefined : performance.now();
             let arrays = false;
             let result: Exit.Exit<ReadonlyArray<unknown>, SqlError>;
@@ -2821,6 +2857,8 @@ const make = Effect.fn("makeWithDatabase")(function* (
                   /* Observing a committed write must never change its result. */
                 }
               }
+              returnedRows = Array.isArray(value) ? value.length : 0;
+              executionFailed = false;
               result = Exit.succeed(value);
             } catch (cause) {
               result = Exit.fail(
@@ -2829,6 +2867,16 @@ const make = Effect.fn("makeWithDatabase")(function* (
                 }),
               );
             } finally {
+              if (statementStats !== undefined)
+                recordStatementCompletion(statementStats, {
+                  database: options.filename,
+                  connection: "writer",
+                  lane: "default",
+                  sql: statement.sourceSQL,
+                  executionMs: performance.now() - executionStart,
+                  rows: returnedRows,
+                  failed: executionFailed,
+                });
               try {
                 const span = Context.getOrUndefined(fiber.context, Tracer.ParentSpan);
                 if (
@@ -2940,18 +2988,21 @@ const make = Effect.fn("makeWithDatabase")(function* (
       ? options.readerMaxResultBytes
       : (options.readerMaxResultBytes?.[lane] ?? 0);
   const laneReader = (lane: "foreground" | "background") =>
-    makeReader({
-      ...options,
-      readerSnapshotLock: snapshotLock,
-      readerMaxResultBytes: laneMaxResultBytes(lane),
-      readerInitializationSql:
-        lane === "foreground"
-          ? [
-              ...(options.readerInitializationSql ?? []),
-              ...(options.foregroundReaderInitializationSql ?? []),
-            ]
-          : options.readerInitializationSql,
-    });
+    makeReader(
+      {
+        ...options,
+        readerSnapshotLock: snapshotLock,
+        readerMaxResultBytes: laneMaxResultBytes(lane),
+        readerInitializationSql:
+          lane === "foreground"
+            ? [
+                ...(options.readerInitializationSql ?? []),
+                ...(options.foregroundReaderInitializationSql ?? []),
+              ]
+            : options.readerInitializationSql,
+      },
+      lane,
+    );
   // Only the explicit zero-foreground layout shares interactive reads with background.
   const background = readers
     ? yield* makeReaderPool({
@@ -2989,10 +3040,14 @@ const make = Effect.fn("makeWithDatabase")(function* (
     readers && options.authReaderProcess
       ? yield* makeReaderLanes(
           () =>
-            makeAuthReader({
-              ...options,
-              readerStatementLimit: reservedStatementLimit,
-            }),
+            makeAuthReader(
+              {
+                ...options,
+                readerStatementLimit: reservedStatementLimit,
+              },
+              undefined,
+              "auth",
+            ),
           reservedAdmissionLimit,
         )
       : undefined;
@@ -3001,10 +3056,14 @@ const make = Effect.fn("makeWithDatabase")(function* (
     readers && (options.identityReaderProcess ?? options.authReaderProcess)
       ? yield* makeReaderLanes(
           () =>
-            makeAuthReader({
-              ...options,
-              readerStatementLimit: reservedStatementLimit,
-            }),
+            makeAuthReader(
+              {
+                ...options,
+                readerStatementLimit: reservedStatementLimit,
+              },
+              undefined,
+              "identity",
+            ),
           reservedAdmissionLimit,
         )
       : undefined;

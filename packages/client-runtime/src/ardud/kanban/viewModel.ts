@@ -270,7 +270,7 @@ export function cardView(card: KanbanCard, state: KanbanBoardState, nowMs: numbe
         kind: "blocked",
         label:
           blocker.stage === "completed"
-            ? `Waits for #${blocker.number} to be merged`
+            ? `Waits for #${blocker.number} to land`
             : `After #${blocker.number}`,
       };
     } else if (kanbanWaitsOnEvaluator(card)) {

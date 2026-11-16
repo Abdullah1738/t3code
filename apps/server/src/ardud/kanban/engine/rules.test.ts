@@ -534,19 +534,19 @@ describe("planDispatch", () => {
     expect(planDispatch(board, [scriptStep], pools([[opus, 2]]))).toEqual([]);
   });
 
-  it("interleaves reviews and todos by priority", () => {
+  it("starts reviews before new todos, then keeps todo priority order", () => {
     const low = card({ priority: 3 });
     const high = card({ priority: 1 });
     const review = card({ stage: "needs_review" });
     const plan = planDispatch(board, [low, high, review], pools([[opus, 2]]));
     expect(plan.map((d) => [d.cardId, d.role])).toEqual([
-      [high.id, "work"],
       [review.id, "review"],
+      [high.id, "work"],
     ]);
   });
 
   it.each([
-    { todoPriority: 1, reviewPriority: 3, winner: "work" },
+    { todoPriority: 1, reviewPriority: 3, winner: "review" },
     { todoPriority: 2, reviewPriority: 2, winner: "review" },
     { todoPriority: 3, reviewPriority: 1, winner: "review" },
   ])(
@@ -563,6 +563,84 @@ describe("planDispatch", () => {
       ]);
     },
   );
+
+  it("fills both free slots with reviews before higher-priority new work", () => {
+    const older = card({ stage: "needs_review", priority: 3, movedAt: "2026-10-25T00:00:00Z" });
+    const newer = card({ stage: "needs_review", priority: 3, movedAt: "2026-10-25T01:00:00Z" });
+    const todos = [card({ priority: 1 }), card({ priority: 1 })];
+    expect(
+      planDispatch(board, [todos[0]!, newer, todos[1]!, older], pools([[opus, 2]])),
+    ).toMatchObject([
+      { cardId: older.id, role: "review" },
+      { cardId: newer.id, role: "review" },
+    ]);
+  });
+
+  it.each([
+    "existing thread",
+    "fresh thread after findings",
+    "work after a passed review",
+  ] as const)("keeps urgent follow-up work ahead of reviews (%s)", (kind) => {
+    const rework = card({
+      priority: 1,
+      reviewRound: kind === "work after a passed review" ? 0 : 1,
+      reviewThreadId: kind === "work after a passed review" ? ThreadId.make("reviewer") : null,
+      workThreadId: kind === "existing thread" ? ThreadId.make("worker") : null,
+    });
+    const review = card({ stage: "needs_review", priority: 3 });
+    const todo = card({ priority: 1 });
+    expect(planDispatch(board, [todo, review, rework], pools([[opus, 1]]))).toMatchObject([
+      { cardId: rework.id, role: "work" },
+    ]);
+  });
+
+  it("does not let review on a full pool stop new work on another pool", () => {
+    const review = card({ stage: "needs_review", reviewChain: "Critical", priority: 3 });
+    const todo = card({ priority: 1 });
+    const available = pools([
+      [sol, 1],
+      [opus, 1],
+    ]);
+    expect(
+      planDispatch(board, [review, todo], available, new Map([["held", poolKey(sol)]])),
+    ).toMatchObject([{ cardId: todo.id, role: "work", pool: poolKey(opus) }]);
+  });
+
+  it("#14 queues an Opus work card on its default Sol review-chain pool", () => {
+    const workModel: ModelSelection = {
+      instanceId: ProviderInstanceId.make("claudeAgent"),
+      model: "claude-opus-5-5",
+      options: [{ id: "effort", value: "high" }],
+    };
+    const reviewModel: ModelSelection = {
+      instanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-6.1-sol",
+      options: [{ id: "reasoningEffort", value: "xhigh" }],
+    };
+    const standard = {
+      ...board,
+      reviewChains: [{ name: "Standard", steps: [reviewModel] }],
+      defaultReviewChain: "Standard",
+    };
+    const review = card({
+      model: workModel,
+      stage: "needs_review",
+      workThreadId: ThreadId.make("unended-worker"),
+      subtasks: [reviewTask("open")],
+    });
+    const available = pools([
+      [workModel, 1],
+      [reviewModel, 1],
+    ]);
+    const held = new Map([["sol-worker", poolKey(reviewModel)]]);
+    expect(planDispatch(standard, [review], available, held)).toEqual([]);
+    expect(dispatchQueueStatus(standard, [review], available, held)).toMatchObject([
+      { card: review.number, role: "review", pool: poolKey(reviewModel), reason: "pool_full" },
+    ]);
+    expect(planDispatch(standard, [review], available)).toMatchObject([
+      { cardId: review.id, role: "review", pool: poolKey(reviewModel), model: reviewModel },
+    ]);
+  });
 
   it.each([
     {
@@ -671,7 +749,7 @@ describe("planDispatch", () => {
       planDispatch(board, [review, routine, blocker, urgent], pools([[opus, 3]])).map(
         (d) => d.cardId,
       ),
-    ).toEqual([blocker.id, review.id, routine.id]);
+    ).toEqual([review.id, blocker.id, routine.id]);
   });
 
   it("at the same priority takes the card holding up the most work first", () => {
@@ -1060,6 +1138,31 @@ describe("planDispatch", () => {
     expect(planDispatch(board, [merged, waiting], pools([[opus, 2]])).map((d) => d.cardId)).toEqual(
       [waiting.id],
     );
+  });
+
+  it("holds dispatch for a guessed or marked landing step until it closes", () => {
+    for (const input of [
+      { text: "Land: rebase, fast-forward and push master" },
+      { text: "Host release via #99, then live read-back", holdsDependents: true },
+    ]) {
+      const step = {
+        id: "s1",
+        step: 4,
+        ...input,
+        owner: "evaluator" as const,
+        state: "open" as const,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      };
+      const blocker = card({ stage: "completed", subtasks: [step] });
+      const waiter = card({ blockedBy: [blocker.id] });
+      expect(planDispatch(board, [blocker, waiter], pools([[opus, 2]]))).toEqual([]);
+      const landed = { ...blocker, subtasks: [{ ...step, state: "done" as const }] };
+      expect(
+        planDispatch(board, [landed, waiter], pools([[opus, 2]])).map((d) => d.cardId),
+      ).toEqual([waiter.id]);
+    }
   });
 
   it("counts running cards against their pool and never goes negative", () => {
@@ -1931,6 +2034,14 @@ describe("waitingOnBackground and reviewerQuietDue", () => {
     expect(waitingOnBackground(bg("running", 1), at(59))).toBe(false);
   });
 
+  it("uses the child's activity deadline, then releases a silent child at the ceiling", () => {
+    const active = { ...bg("idle", 1), backgroundWorkUntil: "2026-10-25T01:20:00.000Z" };
+    expect(waitingOnBackground(active, at(65))).toBe(true);
+    expect(waitingOnBackground(active, at(80))).toBe(false);
+    expect(waitingOnBackground({ ...active, backgroundWork: 0 }, at(65))).toBe(false);
+    expect(waitingOnBackground({ ...active, state: "running" }, at(65))).toBe(false);
+  });
+
   it("holds an idle thread with a PR watch for six hours only", () => {
     expect(PR_WATCH_GRACE_MS).toBe(6 * 60 * 60 * 1000);
     expect(waitingOnBackground(bg("idle", 0, 1), at(359))).toBe(true);
@@ -2072,6 +2183,21 @@ describe("isOutage category", () => {
         message: "Provider blocked the response",
       }),
     ).toBe(false);
+  });
+
+  it.each([
+    [undefined, true],
+    ["unknown", true],
+    ["model_invalid", false],
+  ] as const)("classifies Model unavailable with category %s as outage=%s", (category, outage) => {
+    expect(
+      isOutage({
+        class: "provider_error",
+        code: "provider.no-route",
+        message: "Model unavailable: sable/x",
+        category,
+      }),
+    ).toBe(outage);
   });
 });
 
@@ -2446,7 +2572,7 @@ describe("dispatch queue activity", () => {
     holds = new Map<string, string>(),
   ) => dispatchQueueStatus(board, cards, available, holds, now);
 
-  it("explains #42's lower rank behind todo work and a held work slot", () => {
+  it("explains a review ahead of higher-priority todo work on a full pool", () => {
     const holder = card({
       number: 44,
       priority: 2,
@@ -2459,7 +2585,7 @@ describe("dispatch queue activity", () => {
     const todo = card({ number: 47, priority: 3, movedAt });
     expect(status([review, holder, todo])).toMatchObject([
       {
-        card: 47,
+        card: 42,
         reason: "pool_full",
         pool: poolKey(opus),
         slots: 1,
@@ -2469,10 +2595,10 @@ describe("dispatch queue activity", () => {
         hours: 11,
       },
       {
-        card: 42,
+        card: 47,
         reason: "pool_full",
         rank: 2,
-        ahead: { count: 1, items: [47] },
+        ahead: { count: 1, items: [42] },
         held: [{ card: 44, role: "work" }],
         hours: 11,
       },
@@ -2490,6 +2616,75 @@ describe("dispatch queue activity", () => {
         rank: 2,
         ahead: { count: 1, items: [review.number] },
       },
+    ]);
+  });
+
+  it("#1755 excludes attempted reviews from simulated starts", () => {
+    const first = card({ stage: "needs_review" });
+    const second = card({ stage: "needs_review" });
+    const next = card({ priority: 3, stage: "needs_review" });
+    expect(
+      dispatchQueueStatus(
+        board,
+        [first, second, next],
+        one,
+        new Map(),
+        now,
+        new Map(),
+        new Map(),
+        new Map(),
+        new Set([first.id, second.id]),
+      ),
+    ).toMatchObject([
+      { card: first.number, reason: "attempted" },
+      { card: second.number, reason: "attempted" },
+      { card: next.number, reason: "would_start" },
+    ]);
+  });
+
+  it("#1755 keeps attempted cards as dependency blockers", () => {
+    const blocker = card();
+    const dependent = card({ blockedBy: [blocker.id] });
+    expect(
+      dispatchQueueStatus(
+        board,
+        [blocker, dependent],
+        one,
+        new Map(),
+        now,
+        new Map(),
+        new Map(),
+        new Map(),
+        new Set([blocker.id]),
+      ),
+    ).toMatchObject([
+      { card: blocker.number, reason: "attempted" },
+      { card: dependent.number, reason: "blocked", blockedBy: [blocker.number] },
+    ]);
+  });
+
+  it("#1755 retains slots held by attempted cards", () => {
+    const holder = card({
+      activeRole: "work",
+      activePool: poolKey(opus),
+      activeThreadId: ThreadId.make("attempted-holder"),
+    });
+    const next = card({ priority: 3 });
+    expect(
+      dispatchQueueStatus(
+        board,
+        [holder, next],
+        one,
+        new Map(),
+        now,
+        new Map(),
+        new Map(),
+        new Map(),
+        new Set([holder.id]),
+      ),
+    ).toMatchObject([
+      { card: holder.number, reason: "attempted" },
+      { card: next.number, reason: "pool_full", held: [{ card: holder.number, role: "work" }] },
     ]);
   });
 
@@ -2551,7 +2746,7 @@ describe("dispatch queue activity", () => {
     const stalled = card({ stalled: { reason: "Stopped", at: movedAt, by: { _tag: "owner" } } });
     const backlog = card({ priority: 5 });
     const result = dispatchQueue(board, [review, urgent, blocker, stalled, backlog], now);
-    expect(result.queue.map(({ card }) => card.id)).toEqual([blocker.id, review.id]);
+    expect(result.queue.map(({ card }) => card.id)).toEqual([review.id, blocker.id]);
     expect(result.ineligible.map(({ reason }) => reason)).toEqual([
       "blocked",
       "stalled:flagged",

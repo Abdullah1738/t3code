@@ -33,7 +33,7 @@
     <key>VENICE_X402_AUTO_TOPUP</key>
     <string>1</string>
     <key>VENICE_X402_EGRESS_CHECK</key>
-    <string>/Users/ardud/.local/share/venice-x402/bin/egress-check</string>
+    <string>builtin</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -42,7 +42,7 @@
   <key>ThrottleInterval</key>
   <integer>30</integer>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
   <key>StandardOutPath</key>
   <string>/Users/ardud/Library/Logs/venice-x402.log</string>
   <key>StandardErrorPath</key>

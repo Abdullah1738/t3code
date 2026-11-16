@@ -18,6 +18,7 @@ import * as SqlitePersistence from "../../persistence/Sqlite.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ThreadManagementService from "../ThreadManagementService.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import type * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as McpSessionRegistryTestkit from "../../mcp/McpSessionRegistry.testkit.ts";
 import * as VcsDriverRegistry from "../../vcs/VcsDriverRegistry.ts";
 import * as GitVcsDriver from "../../vcs/GitVcsDriver.ts";
@@ -247,9 +248,13 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
   | EffectWorker.OrchestrationEffectWorkerV2
+  | EffectOutbox.EffectOutboxV2
+  | ProviderEventIngestor.ProviderEventIngestorV2
+  | ThreadManagementService.ThreadManagementService
   | EventSink.EventSinkV2
   | CommandOutputRecorder.CommandOutputRecorder
-  | ProviderSessionManager.ProviderSessionManagerV2,
+  | ProviderSessionManager.ProviderSessionManagerV2
+  | McpProviderSessions.McpProviderSessions,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
   const layerRegistry = harness.makeProviderAdapterRegistryLayer(
@@ -272,18 +277,27 @@ export function layerWithRegistry<Error>(
       MigrationError | PlatformError.PlatformError | SqlError
     >;
     readonly afterProviderEvent?: Effect.Effect<void>;
+    readonly beforeEventWrite?: (
+      input: Parameters<EventSink.EventSinkV2Shape["write"]>[0],
+    ) => Effect.Effect<void>;
     readonly runEffectWorker?: boolean;
     readonly runContinuationWorker?: boolean;
     readonly recoverOnStartup?: boolean;
     readonly continueThreadsAfterServerUpdate?: boolean;
     readonly ardudHarnessMigration?: import("@t3tools/contracts").ArdudHarnessMigrationSettings;
+    readonly configureMcp?: boolean;
+    readonly mcpRegistryLayer?: Layer.Layer<McpSessionRegistry.McpSessionRegistry>;
   } = {},
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
   | EffectWorker.OrchestrationEffectWorkerV2
+  | EffectOutbox.EffectOutboxV2
+  | ProviderEventIngestor.ProviderEventIngestorV2
+  | ThreadManagementService.ThreadManagementService
   | EventSink.EventSinkV2
   | ProviderSessionManager.ProviderSessionManagerV2
-  | CommandOutputRecorder.CommandOutputRecorder,
+  | CommandOutputRecorder.CommandOutputRecorder
+  | McpProviderSessions.McpProviderSessions,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
   const layerServerConfig = Layer.effect(
@@ -321,9 +335,23 @@ export function layerWithRegistry<Error>(
     EffectOutbox.layer,
     TurnItemPositionStore.layer,
   ).pipe(Layer.provide(layerDatabase));
-  const layerEventSinkProvided = EventSink.layerFromStores.pipe(
+  const layerEventSinkBase = EventSink.layerFromStores.pipe(
     Layer.provide(Layer.mergeAll(layerStores, layerDatabase)),
   );
+  const layerEventSinkProvided =
+    options.beforeEventWrite === undefined
+      ? layerEventSinkBase
+      : Layer.effect(
+          EventSink.EventSinkV2,
+          Effect.gen(function* () {
+            const sink = yield* EventSink.EventSinkV2;
+            return {
+              ...sink,
+              write: (input: Parameters<EventSink.EventSinkV2Shape["write"]>[0]) =>
+                options.beforeEventWrite!(input).pipe(Effect.andThen(sink.write(input))),
+            };
+          }),
+        ).pipe(Layer.provide(layerEventSinkBase));
   const layerCommandReceiptStoreProvided = CommandReceiptStore.layer.pipe(
     Layer.provide(layerDatabase),
   );
@@ -384,7 +412,7 @@ export function layerWithRegistry<Error>(
     Layer.provide(Layer.merge(layerEventSinkProvided, layerStores)),
   );
   const layerProviderSessionManagerProvided = ProviderSessionManager.layerWithOptions({
-    configureMcp: false,
+    configureMcp: options.configureMcp ?? false,
   }).pipe(
     Layer.provide(
       Layer.mergeAll(
@@ -393,7 +421,7 @@ export function layerWithRegistry<Error>(
         layerEventSinkProvided,
         IdAllocator.layer,
         McpProviderSessions.layer,
-        McpSessionRegistryTestkit.layer,
+        options.mcpRegistryLayer ?? McpSessionRegistryTestkit.layer,
         layerProviderEventIngestorProvided,
         layerStores,
       ),
@@ -525,7 +553,7 @@ export function layerWithRegistry<Error>(
         layerStores,
         layerEventSinkProvided,
         layerRunFinalizationServiceProvided,
-        McpSessionRegistryTestkit.layer,
+        options.mcpRegistryLayer ?? McpSessionRegistryTestkit.layer,
         layerCheckpointRollbackServiceProvided,
         layerProviderSessionManagerProvided,
         layerProviderTurnControlServiceProvided,
@@ -541,12 +569,16 @@ export function layerWithRegistry<Error>(
     Layer.provide(Layer.merge(layerStores, layerEffectExecutorProvided)),
   );
   const layerReplayRuntime = Layer.mergeAll(
+    McpProviderSessions.layer,
     layerOrchestratorProvided,
     layerProviderSessionManagerProvided,
     layerEffectWorkerProvided,
     layerEventSinkProvided,
     layerContinuationWorkerProvided,
     layerCommandOutputHubProvided,
+    EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
+    layerProviderEventIngestorProvided,
+    layerThreadManagementProvided,
   ).pipe(Layer.provide(ProviderTurnStartServiceTestkit.layer), Layer.provide(NodeServices.layer));
 
   if (options.runEffectWorker === false) {
