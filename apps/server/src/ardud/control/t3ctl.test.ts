@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off - the CLI under test is plain Node.
+// @effect-diagnostics globalTimers:off - CLI timeout tests measure real wall-clock budgets outside the Effect runtime.
 import * as NodeAssert from "node:assert/strict";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";

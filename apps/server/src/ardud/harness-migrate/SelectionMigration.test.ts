@@ -54,6 +54,7 @@ const emptyOwners = Layer.mergeAll(
 const inertThreads = Layer.succeed(
   KanbanThreads.KanbanThreads,
   KanbanThreads.KanbanThreads.of({
+    remove: () => Effect.void,
     pendingUserInputs: () => Effect.succeed([]),
     claimContext: () => Effect.succeed(null),
     view: () => Effect.succeed(null),

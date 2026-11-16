@@ -35,6 +35,7 @@ import {
   KANBAN_WS_METHODS,
   KANBAN_RETRY_BACKOFF_MS,
   KanbanBoard,
+  KanbanBoardId,
   KanbanDiscussionId,
   KanbanCardId,
   kanbanOpenStep,
@@ -74,6 +75,7 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -233,6 +235,7 @@ const makeFake = Effect.gen(function* () {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: (threadId) =>
         Effect.suspend(() =>
           failQuestionReads.has(threadId)
@@ -34611,5 +34614,301 @@ it.effect.each([
         const read = yield* kanban.agentCall(thread, kanban.card(card.id));
         assert.isNull(read.card.activeThreadId);
       }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, observed)));
+    }),
+);
+
+it.effect(
+  "#1264 purge refuses live boards and every non-owner actor, including unknown boards",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const live = yield* Effect.result(kanban.purgeBoard(board.id, owner));
+        assert.equal(live._tag, "Failure");
+        if (live._tag === "Failure")
+          assert.include(live.failure.detail.toLowerCase(), "delete the board first");
+        const actors: KanbanActor[] = [
+          { _tag: "thread", threadId: ThreadId.make("work") },
+          { _tag: "thread", threadId: ThreadId.make("review") },
+          { _tag: "thread", threadId: ThreadId.make("child") },
+          { _tag: "evaluator", threadId: ThreadId.make("evaluator") },
+          { _tag: "system", component: "test" },
+          { _tag: "script", scriptId: KanbanScriptId.make("script") },
+        ];
+        for (const actor of actors) {
+          const result = yield* Effect.result(kanban.purgeBoard(board.id, actor));
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") assert.equal(result.failure.code, "denied");
+        }
+        for (const session of [
+          { sessionId: "agent", subject: "thread" },
+          {
+            sessionId: "component",
+            subject: "component:cli",
+            origin: { _tag: "component" as const, component: "cli" },
+          },
+          { sessionId: "unknown", subject: "one-time-token" },
+        ]) {
+          const handlers = makeKanbanWsHandlers(kanban, {} as KanbanScriptsShape, session);
+          const result = yield* Effect.result(handlers[M.boardPurge]({ boardId: board.id }));
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure") assert.equal(result.failure.code, "denied");
+        }
+        assert.deepStrictEqual(clientRpcRequiredScopes(M.boardPurge, {}), [
+          AuthOrchestrationOperateScope,
+        ]);
+        assert.deepStrictEqual(RPC_REQUIRED_SCOPES[M.boardPurge], AuthOrchestrationOperateScope);
+        yield* kanban.purgeBoard(KanbanBoardId.make("unknown"), owner);
+        assert.isNotNull(yield* (yield* KanbanStore.KanbanStore).board(board.id));
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect(
+  "#1264 purge commits content before thread deletion and retains failures across reruns",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const removed: string[] = [];
+      let first = true;
+      let purging: KanbanBoardId;
+      const layer = Layer.effect(
+        KanbanThreads,
+        Effect.gen(function* () {
+          const real = yield* KanbanThreads;
+          const store = yield* KanbanStore.KanbanStore;
+          return KanbanThreads.of({
+            ...real,
+            remove: (id) =>
+              Effect.gen(function* () {
+                assert.isNull(yield* store.board(purging).pipe(Effect.orDie));
+                removed.push(id);
+                if (id === "purge-fail" && first) {
+                  first = false;
+                  return yield* new KanbanThreadError({
+                    operation: "delete",
+                    detail: "temporary failure",
+                  });
+                }
+              }),
+          });
+        }),
+      ).pipe(
+        Layer.provide(fake.layer),
+        Layer.provide(KanbanStore.layer),
+        Layer.provide(Sqlite.layerMemory),
+        Layer.orDie,
+      );
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        purging = board.id;
+        // Store an already-deleted board, as #1261 would have left it.
+        yield* store.putBoard({ ...board, archivedAt: board.createdAt });
+        const sql = yield* SqlClient.SqlClient;
+        for (const id of ["purge-fail", "purge-ok"])
+          yield* sql`INSERT INTO ardud_kanban_threads (thread_id, board_id, json) VALUES (${id}, ${board.id}, '{}')`;
+        yield* kanban.purgeBoard(board.id, owner);
+        assert.deepStrictEqual(removed, ["purge-fail", "purge-ok"]);
+        assert.deepStrictEqual(
+          (yield* store.pendingBoardPurges).map((row) => row.threadId),
+          ["purge-fail"],
+        );
+        yield* kanban.purgeBoard(board.id, owner);
+        assert.deepStrictEqual(removed, ["purge-fail", "purge-ok", "purge-fail"]);
+        assert.deepStrictEqual(yield* store.pendingBoardPurges, []);
+        yield* kanban.purgeBoard(board.id, owner);
+        assert.lengthOf(removed, 3);
+      }).pipe(Effect.provide(testLayer(layer)));
+    }),
+);
+
+it.effect(
+  "#1264 purge requests the existing stop path and refuses to erase while a stop is pending",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let busy = true;
+      const stops: string[] = [];
+      const layer = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            interrupt: (id, _reason, cancelQueued) =>
+              Effect.sync(() => {
+                assert.isTrue(cancelQueued);
+                stops.push(id);
+              }),
+            find: (id) =>
+              real
+                .find(id)
+                .pipe(
+                  Effect.map((view) =>
+                    view === null
+                      ? null
+                      : { ...view, state: busy ? ("running" as const) : ("idle" as const) },
+                  ),
+                ),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(board.id, { prompt: "work" }, owner);
+        yield* kanban.dispatchNow;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* store.putBoard({ ...board, archivedAt: board.createdAt });
+        const result = yield* Effect.result(kanban.purgeBoard(board.id, owner));
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.equal(result.failure.code, "conflict");
+        assert.isNotNull(yield* store.board(board.id));
+        assert.isNotNull(yield* store.card(card.id));
+        assert.isNotEmpty(stops);
+        busy = false;
+        yield* kanban.purgeBoard(board.id, owner);
+        assert.isNull(yield* store.board(board.id));
+      }).pipe(Effect.provide(testLayer(layer)));
+    }),
+);
+
+it.effect(
+  "#1264 purge deletes real orchestration threads after commit and drains their effects",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const lifecycle = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+      const fake = yield* makeFake;
+      const erased: ThreadId[] = [];
+      const lifecycleLayer = Layer.effect(
+        KanbanThreads,
+        Effect.gen(function* () {
+          const real = yield* KanbanThreads;
+          const store = yield* KanbanStore.KanbanStore;
+          return KanbanThreads.of({
+            ...real,
+            interrupt: lifecycle.interrupt,
+            find: lifecycle.find,
+            remove: (id) =>
+              Effect.gen(function* () {
+                assert.isNull(yield* store.threadLink(id).pipe(Effect.orDie));
+                erased.push(id);
+                yield* lifecycle.remove(id);
+              }),
+          });
+        }),
+      ).pipe(
+        Layer.provide(fake.layer),
+        Layer.provide(KanbanStore.layer),
+        Layer.provide(Sqlite.layerMemory),
+        Layer.orDie,
+      );
+      const ids = ["work", "review", "evaluator", "discussion", "unrelated"].map((id) =>
+        ThreadId.make(`purge-real-${id}`),
+      );
+      const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" };
+      for (const id of ids)
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${id}`),
+          threadId: id,
+          projectId: ProjectId.make("project-1"),
+          title: id,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "system",
+          creationSource: "server",
+        });
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* store.putBoard({ ...board, archivedAt: board.createdAt });
+        const sql = yield* SqlClient.SqlClient;
+        for (const id of ids.slice(0, -1))
+          yield* sql`INSERT INTO ardud_kanban_threads (thread_id, board_id, json) VALUES (${id}, ${board.id}, '{}')`;
+        yield* kanban.purgeBoard(board.id, owner);
+        assert.sameMembers(erased, ids.slice(0, -1));
+        yield* worker.drain();
+        for (const id of ids.slice(0, -1))
+          assert.isNotNull((yield* orchestrator.getThreadShell(id))?.deletedAt);
+        assert.isNull((yield* orchestrator.getThreadShell(ids.at(-1)!))?.deletedAt);
+        yield* kanban.purgeBoard(board.id, owner);
+        assert.lengthOf(erased, 4);
+        // The lifecycle operation itself also skips an already-deleted thread.
+        yield* lifecycle.remove(ids[0]!);
+        assert.deepStrictEqual(yield* store.pendingBoardPurges, []);
+      }).pipe(Effect.provide(testLayer(lifecycleLayer)));
+    }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect.each(["work", "review", "evaluator", "discussion"] as const)(
+  "#1264 purge waits for an in-flight %s launch before erasing its links",
+  (kind) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const started = yield* Deferred.make<ThreadId>();
+      const resume = yield* Deferred.make<void>();
+      const removed: ThreadId[] = [];
+      const lifecycle = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              real.launch(input).pipe(
+                Effect.tap((id) => Deferred.succeed(started, id)),
+                Effect.tap(() => Deferred.await(resume)),
+              ),
+            remove: (id) =>
+              Effect.sync(() => {
+                removed.push(id);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(board.id, { prompt: "work" }, owner);
+        if (kind === "review") yield* store.putCard({ ...card, stage: "needs_review" });
+        const discussion =
+          kind === "discussion" ? yield* kanban.createDiscussion(board.id, "Discuss", owner) : null;
+        const launching = yield* (
+          kind === "evaluator" || kind === "discussion"
+            ? kanban.startEvaluator(
+                board.id,
+                discussion === null
+                  ? { kind: "request", text: "Evaluate" }
+                  : {
+                      kind: "discussion",
+                      discussionId: discussion.id,
+                      title: discussion.title,
+                      cardNumber: null,
+                    },
+              )
+            : kanban.dispatchNow
+        ).pipe(Effect.exit, Effect.forkChild);
+        const id = yield* Deferred.await(started);
+        yield* kanban.updateBoard(board.id, { archived: true }, owner);
+        const refused = yield* Effect.result(kanban.purgeBoard(board.id, owner));
+        assert.equal(refused._tag, "Failure");
+        if (refused._tag === "Failure") assert.equal(refused.failure.code, "conflict");
+        assert.isNotNull(yield* store.board(board.id));
+        yield* Deferred.succeed(resume, undefined);
+        yield* Fiber.join(launching);
+        const linked = yield* store.threadLink(id);
+        assert.equal(linked?.boardId, board.id);
+        yield* kanban.purgeBoard(board.id, owner);
+        assert.include(removed, id);
+        assert.isNull(yield* store.threadLink(id));
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(resume, undefined)),
+        Effect.provide(testLayer(lifecycle)),
+      );
     }),
 );

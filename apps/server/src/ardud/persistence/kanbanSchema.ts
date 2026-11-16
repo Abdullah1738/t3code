@@ -25,6 +25,10 @@ export const initializeKanbanSchema = Effect.fn("initializeKanbanSchema")(functi
 });
 
 export const kanbanDDL = [
+  // Survives the content transaction until orchestration accepts every thread deletion.
+  `CREATE TABLE IF NOT EXISTS ardud_kanban_board_purges (
+    board_id TEXT NOT NULL, thread_id TEXT NOT NULL, PRIMARY KEY (board_id, thread_id)
+  )`,
   `CREATE TABLE IF NOT EXISTS ardud_kanban_evaluator_spawns (
     launch_key TEXT PRIMARY KEY, board_id TEXT NOT NULL, card_id TEXT, at TEXT NOT NULL
   )`,

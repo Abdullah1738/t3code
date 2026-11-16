@@ -2363,3 +2363,137 @@ it.effect.each([
     if (kind === "urgency") assert.equal(actual[0], blocker.id);
   }).pipe(Effect.provide(TestLayer)),
 );
+
+const seedPurgeBoard = Effect.fn("test.seedPurgeBoard")(function* (id: string) {
+  const store = yield* KanbanStore.KanbanStore;
+  const sql = yield* SqlClient.SqlClient;
+  yield* store.putBoard({ ...board, id: KanbanBoardId.make(id), slug: id, archivedAt: at });
+  yield* sql`INSERT INTO ardud_kanban_cards (id, board_id, number, stage, json) VALUES (${`c-${id}`}, ${id}, 1, 'todo', '{}')`;
+  yield* sql`INSERT INTO ardud_kanban_card_events (card_id, json) VALUES (${`c-${id}`}, '{}')`;
+  yield* sql`INSERT INTO ardud_kanban_discussions (id, board_id, json) VALUES (${`d-${id}`}, ${id}, '{}')`;
+  yield* sql`INSERT INTO ardud_kanban_messages (discussion_id, seq, json) VALUES (${`d-${id}`}, 1, '{}')`;
+  yield* sql`INSERT INTO ardud_kanban_scripts (id, board_id, json) VALUES (${`s-${id}`}, ${id}, '{}')`;
+  yield* sql`INSERT INTO ardud_kanban_script_runs (script_id, json) VALUES (${`s-${id}`}, '{}')`;
+  yield* sql`INSERT INTO ardud_kanban_threads (thread_id, board_id, json) VALUES (${`t-${id}`}, ${id}, '{}')`;
+  yield* sql`INSERT INTO ardud_kanban_thread_cards (thread_id, card_id, joined_at) VALUES (${`t-${id}`}, ${`c-${id}`}, ${at})`;
+  yield* sql`INSERT INTO ardud_kanban_owner_routes (route_key, board_id, discussion_id, json, created_at) VALUES (${`r-${id}`}, ${id}, ${`d-${id}`}, '{}', ${at})`;
+  yield* sql`INSERT INTO ardud_kanban_evaluator_queue (job_key, board_id, json, created_at) VALUES (${`q-${id}`}, ${id}, '{}', ${at})`;
+  yield* sql`INSERT INTO ardud_kanban_evaluator_spawns (launch_key, board_id, at) VALUES (${`e-${id}`}, ${id}, ${at})`;
+  yield* sql`INSERT INTO ardud_kanban_instruction_applications (id, board_id, card_id, field, ask_id, json) VALUES (${`i-${id}`}, ${id}, ${`c-${id}`}, 'modelRouting', 'ask', '{}')`;
+  yield* sql`INSERT INTO ardud_kanban_groups (board_id, json) VALUES (${id}, '[]')`;
+  yield* sql`INSERT INTO ardud_kanban_pools (board_id, key, json) VALUES (${id}, 'pool', '{}')`;
+  yield* sql`INSERT INTO ardud_kanban_wiki (board_id, slug, json) VALUES (${id}, 'wiki', '{}')`;
+  for (const table of ["ardud_kanban_goals", "ardud_kanban_automations"])
+    yield* sql`INSERT INTO ${sql(table)} (id, board_id, json) VALUES (${`${table}-${id}`}, ${id}, '{}')`;
+});
+
+const purgeContentTables = kanbanDDL.flatMap((ddl) => {
+  const match = /^CREATE TABLE IF NOT EXISTS (\w+)/.exec(ddl);
+  return match && match[1] !== "ardud_kanban_board_purges" ? [match[1]!] : [];
+});
+
+it.effect("purgeBoard erases every content table atomically and preserves a second board", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    yield* seedPurgeBoard("keep");
+    const before = yield* Effect.forEach(
+      purgeContentTables,
+      (table) => sql`SELECT * FROM ${sql(table)}`,
+    );
+    yield* seedPurgeBoard("erase");
+    // Prime the board decoder to also prove deletion invalidates cached reads.
+    assert.isNotNull(yield* store.board(KanbanBoardId.make("erase")));
+    assert.deepStrictEqual(yield* store.purgeBoard(KanbanBoardId.make("erase")), [
+      ThreadId.make("t-erase"),
+    ]);
+    assert.isNull(yield* store.board(KanbanBoardId.make("erase")));
+    const after = yield* Effect.forEach(
+      purgeContentTables,
+      (table) => sql`SELECT * FROM ${sql(table)}`,
+    );
+    assert.deepStrictEqual(after, before);
+    assert.deepStrictEqual(yield* store.purgeBoard(KanbanBoardId.make("erase")), [
+      ThreadId.make("t-erase"),
+    ]);
+    yield* store.finishBoardPurgeThread(KanbanBoardId.make("erase"), ThreadId.make("t-erase"));
+    assert.deepStrictEqual(yield* store.purgeBoard(KanbanBoardId.make("erase")), []);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect(
+  "purgeBoard rolls back all content and cleanup obligations when its final delete fails",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      yield* seedPurgeBoard("erase");
+      const before = yield* Effect.forEach(
+        purgeContentTables,
+        (table) => sql`SELECT * FROM ${sql(table)}`,
+      );
+      yield* sql.unsafe(
+        "CREATE TRIGGER reject_purge BEFORE DELETE ON ardud_kanban_boards BEGIN SELECT RAISE(ABORT, 'injected failure'); END",
+      );
+      const result = yield* Effect.result(store.purgeBoard(KanbanBoardId.make("erase")));
+      assert.equal(result._tag, "Failure");
+      assert.deepStrictEqual(
+        yield* Effect.forEach(purgeContentTables, (table) => sql`SELECT * FROM ${sql(table)}`),
+        before,
+      );
+      assert.deepStrictEqual(yield* store.pendingBoardPurges, []);
+      yield* sql.unsafe("DROP TRIGGER reject_purge");
+      yield* store.purgeBoard(KanbanBoardId.make("erase"));
+      assert.isNull(yield* store.board(KanbanBoardId.make("erase")));
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect(
+  "purge discovers ended, detached, card-only and evaluator threads without deleting a foreign board thread",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      yield* seedPurgeBoard("erase");
+      yield* seedPurgeBoard("keep");
+      yield* sql`UPDATE ardud_kanban_threads SET ended = 1 WHERE board_id = 'erase'`;
+      yield* sql`UPDATE ardud_kanban_cards SET active_thread_id = 'active-only', json = '{"workThreadId":"work-only","reviewThreadId":"review-only"}' WHERE board_id = 'erase'`;
+      yield* sql`UPDATE ardud_kanban_discussions SET evaluator_thread_id = 'discussion-only' WHERE board_id = 'erase'`;
+      yield* sql`UPDATE ardud_kanban_evaluator_queue SET thread_id = 'evaluator-only' WHERE board_id = 'erase'`;
+      yield* sql`INSERT INTO ardud_kanban_thread_cards (thread_id, card_id, joined_at) VALUES ('detached-only', 'c-erase', ${at})`;
+      yield* sql`INSERT INTO ardud_kanban_thread_cards (thread_id, card_id, joined_at) VALUES ('t-keep', 'c-erase', ${at})`;
+      yield* sql`INSERT INTO ardud_kanban_thread_cards (thread_id, card_id, joined_at) VALUES ('t-erase', 'missing-card', ${at})`;
+      assert.sameMembers(
+        [...(yield* store.boardThreadIds(KanbanBoardId.make("erase")))],
+        [
+          "active-only",
+          "work-only",
+          "review-only",
+          "discussion-only",
+          "evaluator-only",
+          "detached-only",
+          "t-erase",
+        ],
+      );
+      yield* store.purgeBoard(KanbanBoardId.make("erase"));
+      const links = yield* sql<{
+        thread_id: string;
+        card_id: string;
+      }>`SELECT thread_id, card_id FROM ardud_kanban_thread_cards`;
+      assert.deepStrictEqual(links, [{ thread_id: "t-keep", card_id: "c-keep" }]);
+      assert.deepStrictEqual(
+        (yield* store.pendingBoardPurges).map((row) => row.threadId).sort(),
+        [
+          "active-only",
+          "work-only",
+          "review-only",
+          "discussion-only",
+          "evaluator-only",
+          "detached-only",
+          "t-erase",
+        ].sort(),
+      );
+      const threads = yield* sql<{ thread_id: string }>`SELECT thread_id FROM ardud_kanban_threads`;
+      assert.deepStrictEqual(threads, [{ thread_id: "t-keep" }]);
+    }).pipe(Effect.provide(TestLayer)),
+);
