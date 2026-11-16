@@ -3877,6 +3877,64 @@ const make = Effect.gen(function* () {
     return next;
   });
 
+  const reviewPlanClear = (card: KanbanCard) =>
+    card.reviewFindingsPending !== true &&
+    !card.subtasks.some(
+      (subtask) =>
+        subtask.state === "open" && (subtask.owner === "work" || subtask.owner === "review"),
+    ) &&
+    !kanbanOpenAsks(card).some((ask) => ask.blocking);
+
+  const trackedPrs = (card: KanbanCard) =>
+    card.links.filter((link) => link.kind === "pr" && link.state !== null);
+
+  const logStageSync = Effect.fn("KanbanService.logStageSync")(function* (card: KanbanCard) {
+    yield* Effect.logInfo("kanban.stage_sync", {
+      card: card.id,
+      boardId: card.boardId,
+      from: "in_review",
+      to: "completed",
+      reason: "review clear and PRs merged",
+      prStates: trackedPrs(card).map((pr) => pr.state),
+    });
+  });
+
+  const syncReviewedStage = Effect.fn("KanbanService.syncReviewedStage")(function* (
+    card: KanbanCard,
+  ) {
+    if (
+      card.stage !== "in_review" ||
+      card.activeThreadId !== null ||
+      card.settledAt !== null ||
+      card.stalled !== null ||
+      !reviewPlanClear(card) ||
+      trackedPrs(card).length === 0 ||
+      !Rules.prsLanded(card)
+    )
+      return card;
+    const board = yield* boardOf(card.boardId);
+    if (!Rules.reviewFinished(card, Rules.chainFor(board, card)?.steps.length ?? 1)) return card;
+    const at = yield* nowIso;
+    if (Waits.decidingHolds(card, Date.parse(at))) return card;
+    const actor: KanbanActor = { _tag: "system", component: "dispatcher" };
+    // A wait belongs to the remaining evaluator/script plan, not the finished review.
+    const next: KanbanCard = {
+      ...(yield* moveWait(card, "completed", at, actor, true)),
+      stage: "completed",
+      movedAt: at,
+      updatedAt: at,
+    };
+    yield* logEvent(next, actor, "moved", {
+      fromStage: card.stage,
+      toStage: next.stage,
+      body: "review clear and PRs merged",
+    });
+    yield* saveCard(next);
+    yield* logStageSync(next);
+    yield* laterEvaluatorTurn(card, next, actor);
+    return next;
+  });
+
   /**
    * Copies the work thread's tracked PRs (same source as the sidebar) onto the
    * card. A thread that carried several cards attaches PRs per card itself, so
@@ -3896,7 +3954,10 @@ const make = Effect.gen(function* () {
     // A dispatch tolerates concurrent PR metadata writes, but their newer result wins this read.
     if ((yield* locks.resourceVersion(card.boardId, `card:${card.id}`)) !== revision)
       return current;
-    if (!view || view.prs.length === 0) return current;
+    if (!view || view.prs.length === 0) {
+      if (canSave && !(yield* canSave())) return current;
+      return yield* syncReviewedStage(current);
+    }
     const at = yield* nowIso;
     const solo = (yield* store.threadCards(card.workThreadId)).every((id) => id === card.id);
     let changed = false;
@@ -3913,11 +3974,12 @@ const make = Effect.gen(function* () {
       changed = true;
       return { ...link, kind: "pr" as const, state: pr.state, checkedAt: at };
     });
-    if (!changed) return card;
     if (canSave && !(yield* canSave())) return card;
+    // Reconcile unchanged metadata too: older releases left already-merged cards in review.
+    if (!changed) return yield* syncReviewedStage(card);
     const next = { ...card, links, updatedAt: at };
     yield* saveCard(next, undefined, links.length === card.links.length);
-    return next;
+    return yield* syncReviewedStage(next);
   });
 
   const writeTitle = Effect.fn("KanbanService.writeTitle")(function* (
@@ -12959,8 +13021,12 @@ const make = Effect.gen(function* () {
                   if (!card) return;
 
                   if (card.stage !== "in_review" || card.activeThreadId !== null) return;
+                  // PR completion can finish the review while an evaluator's wait stays parked.
+                  const refreshed = yield* syncPrs(card);
+                  invalidateCards();
+                  if (refreshed.stage !== "in_review") return;
                   // Parked on a wait: it stays in review until the wait pass above ends it.
-                  if (Waits.WAITS_ENGINE_WIRED && Waits.waitHoldsDispatch(card)) return;
+                  if (Waits.WAITS_ENGINE_WIRED && Waits.waitHoldsDispatch(refreshed)) return;
                   const chain = Rules.chainFor(board, card);
                   if (!Rules.reviewFinished(card, chain?.steps.length ?? 1)) return;
                   const current = yield* store.card(card.id);
@@ -12979,7 +13045,7 @@ const make = Effect.gen(function* () {
                   if (Waits.decidingHolds(current, now)) return;
                   views.clear();
                   invalidateCards();
-                  const synced = yield* syncPrs(current);
+                  const synced = current;
                   if (!Rules.prsLanded(synced)) return;
                   // The plan's next step decides where it goes: the worker's sends it
                   // back to work, a review-only one to review, else it's completed.
@@ -12989,6 +13055,7 @@ const make = Effect.gen(function* () {
                       : kanbanStepSubtasks(synced, "review").length > 0
                         ? "needs_review"
                         : "completed";
+                  if (to === "completed" && !reviewPlanClear(synced)) return;
                   const at = yield* nowIso;
                   const dispatcher: KanbanActor = { _tag: "system", component: "dispatcher" };
                   const landed: KanbanCard = {
@@ -17085,6 +17152,7 @@ const make = Effect.gen(function* () {
   const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings, head) =>
     Effect.suspend(() => {
       let attempted: KanbanCard | undefined;
+      let savingVerdict = false;
       return SavedWrite.recover(
         guardDeferred(
           "card.reviewResult",
@@ -17098,7 +17166,7 @@ const make = Effect.gen(function* () {
                 "role_not_allowed",
               );
             }
-            const card = yield* cardOf(link.cardId);
+            let card = yield* cardOf(link.cardId);
             attempted = card;
             const live = card.activeThreadId === threadId && card.stage === "in_review";
             const late = !live && (yield* lateReviewer(card, threadId));
@@ -17164,6 +17232,7 @@ const make = Effect.gen(function* () {
                 "head is the commit you reviewed: 7 to 40 hex characters",
               );
             }
+            card = yield* syncPrs(card);
             const board = yield* boardOf(card.boardId);
             const chain = Rules.chainFor(board, card);
             const outcome = Rules.applyReviewResult(card, chain?.steps.length ?? 1, verdict);
@@ -17193,23 +17262,27 @@ const make = Effect.gen(function* () {
               reviewPlanStep !== undefined &&
               moreWork &&
               unfinishedWork.some((work) => work.step < reviewPlanStep);
+            const to = moreWork
+              ? "todo"
+              : outcome.continueReview
+                ? "needs_review"
+                : outcome.stage === "completed" &&
+                    !reviewPlanClear({ ...card, subtasks, reviewFindingsPending: false })
+                  ? "in_review"
+                  : outcome.stage;
+            const prCompletion = to === "completed" && trackedPrs(card).length > 0;
             const next: KanbanCard = {
               // A verdict is a review that ended normally: its retry record goes.
               ...Retries.withoutRetries(
                 release(
-                  yield* moveWait(
-                    card,
-                    moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
-                    at,
-                    { _tag: "thread", threadId },
-                  ),
+                  yield* moveWait(card, to, at, { _tag: "thread", threadId }, prCompletion),
                 ),
               ),
               // The dispatcher's no-verdict flag is answered by the verdict; a
               // reviewer's own flag stays for the evaluator.
               stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
               subtasks,
-              stage: moreWork ? "todo" : outcome.continueReview ? "needs_review" : outcome.stage,
+              stage: to,
               reviewStep: moreWork && !earlierWork ? 0 : outcome.reviewStep,
               reviewRound: outcome.reviewRound,
               reviewFindingsPending: verdict === "findings",
@@ -17235,7 +17308,16 @@ const make = Effect.gen(function* () {
               body,
               head: sha,
             });
+            savingVerdict = true;
             yield* saveCard(next);
+            if (prCompletion) {
+              // Keep the verdict body intact for review evidence and replay detection.
+              yield* logEvent(next, { _tag: "thread", threadId }, "comment", {
+                at,
+                body: "review clear and PRs merged",
+              });
+              yield* logStageSync(next);
+            }
             const reviewStartedAt = live
               ? card.movedAt
               : ((yield* store.cardEvents(card.id)).findLast(
@@ -17286,7 +17368,11 @@ const make = Effect.gen(function* () {
             return { card: next, recorded: true };
           }),
         ),
-        (saved) => (saved.kind === "card" ? { card: saved.card, recorded: true } : undefined),
+        (saved) =>
+          // A PR metadata save does not acknowledge the subsequent verdict.
+          savingVerdict && saved.kind === "card" && saved.card.id === attempted?.id
+            ? { card: saved.card, recorded: true }
+            : undefined,
       ).pipe(
         Effect.tapError((error) => {
           const initial = attempted;
