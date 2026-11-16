@@ -2,6 +2,7 @@
 import datetime as dt
 import fcntl
 import json
+import ipaddress
 import math
 import os
 from pathlib import Path
@@ -281,10 +282,33 @@ def safe_fields(values, event=None):
                 result[key] = value
             elif key in ('statusError', 'extensionError', 'homeProbeError') and value in (None, 'timeout', 'exit', 'parse', 'unavailable'):
                 result[key] = value
-            elif key in ('up', 'selfOnline', 'timedOut', 'homeReachable') and (value is None or type(value) is bool):
+            elif key in ('up', 'selfOnline', 'timedOut', 'homeReachable', 'confirmedDown') and (value is None or type(value) is bool):
                 result[key] = value
-            elif key in ('tailscaleIPsCount', 'exitCode', 'extensionPid', 'notUpChecks', 'outageStart') and (value is None or type(value) is int):
+            elif key in ('tailscaleIPsCount', 'exitCode', 'extensionPid', 'notUpChecks') and (value is None or type(value) is int):
                 result[key] = value
+            elif key in ('outcome', 'cliOutcome') and value in ('up', 'down', 'unknown'):
+                result[key] = value
+            elif key in ('cliMs', 'outageStart') and (value is None or finite_number(value) and value >= 0):
+                result[key] = value
+            elif key == 'suppressed' and type(value) is int and value >= 0:
+                result[key] = value
+            elif key == 'confirmProbes' and isinstance(value, dict):
+                result[key] = {}
+                for host, probe in list(value.items())[:2]:
+                    if not isinstance(host, str):
+                        continue
+                    try:
+                        address = ipaddress.ip_address(host)
+                    except ValueError:
+                        continue
+                    if address not in ipaddress.ip_network('100.64.0.0/10'):
+                        continue
+                    if (not isinstance(probe, dict) or type(probe.get('ok')) is not bool
+                            or probe.get('error') not in (None, 'timeout', 'exit', 'unavailable')
+                            or not finite_number(probe.get('ms')) or probe['ms'] < 0
+                            or type(probe.get('port')) is not int or not 1 <= probe['port'] <= 65535):
+                        continue
+                    result[key][host] = {k: probe[k] for k in ('port', 'ok', 'error', 'ms')}
             elif key == 'extensionPids' and (value is None or isinstance(value, str) and re.fullmatch(r'[0-9 ]{1,180}', value)):
                 result[key] = value
         return result
