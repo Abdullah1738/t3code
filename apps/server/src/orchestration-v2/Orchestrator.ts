@@ -10443,8 +10443,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: { ...providerThread, status: "idle", updatedAt: input.now },
       });
     }
+    const preserveBackgroundWork =
+      input.command.type === "thread.background-work.settle" &&
+      input.command.preserveBackgroundWork === true;
+    const delegatedNodeIds = new Set(
+      input.projection.subagents
+        .filter((subagent) => subagent.origin === "app_owned" || preserveBackgroundWork)
+        .map((subagent) => subagent.id),
+    );
+    // Remote tasks can outlive the released wrapper, including their child nodes.
+    let previousSize = -1;
+    while (preserveBackgroundWork && previousSize !== delegatedNodeIds.size) {
+      previousSize = delegatedNodeIds.size;
+      for (const node of input.projection.nodes) {
+        if (node.parentNodeId !== null && delegatedNodeIds.has(node.parentNodeId))
+          delegatedNodeIds.add(node.id);
+      }
+    }
     for (const message of input.projection.messages) {
       if (message.runId !== run.id || !message.streaming) continue;
+      if (preserveBackgroundWork && message.nodeId !== null && delegatedNodeIds.has(message.nodeId))
+        continue;
       yield* emitEvent({
         ...base,
         ...(message.nodeId === null ? {} : { nodeId: message.nodeId }),
@@ -10452,11 +10471,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: { ...message, streaming: false, updatedAt: input.now },
       });
     }
-    const delegatedNodeIds = new Set(
-      input.projection.subagents
-        .filter((subagent) => subagent.origin === "app_owned")
-        .map((subagent) => subagent.id),
-    );
     const cascaded = yield* RunExecutionService.cascadeTerminalizeRunOwnedSubagents({
       run,
       status: "interrupted",
@@ -10469,7 +10483,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       open: {
         subagents: new Map(
           input.projection.subagents
-            .filter((task) => task.runId === run.id && task.origin !== "app_owned")
+            .filter((task) => task.runId === run.id && !delegatedNodeIds.has(task.id))
             .map((task) => [task.id, task]),
         ),
         nodes: new Map(
@@ -10483,6 +10497,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             .filter(
               (item) =>
                 item.runId === run.id &&
+                (!preserveBackgroundWork ||
+                  item.nodeId === null ||
+                  !delegatedNodeIds.has(item.nodeId)) &&
                 (item.type === "assistant_message" || item.type === "reasoning"),
             )
             .map((item) => [item.id, item]),
@@ -10494,6 +10511,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     for (const request of input.projection.runtimeRequests) {
       if (
         request.status !== "pending" ||
+        (preserveBackgroundWork && delegatedNodeIds.has(request.nodeId)) ||
         !input.projection.nodes.some((node) => node.id === request.nodeId && node.runId === run.id)
       )
         continue;

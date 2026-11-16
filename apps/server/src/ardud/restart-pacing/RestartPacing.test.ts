@@ -1483,6 +1483,9 @@ it.effect(
             Layer.provide(
               Layer.mergeAll(
                 Layer.mock(RunFinalizationService.RunFinalizationService)({}),
+                Layer.mock(EffectOutbox.EffectOutboxV2)({
+                  get: () => Effect.succeed(Option.none()),
+                }),
                 Layer.mock(CheckpointRollbackService.CheckpointRollbackServiceV2)({}),
                 Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
                 Layer.mock(ProviderTurnControlService.ProviderTurnControlServiceV2)({}),

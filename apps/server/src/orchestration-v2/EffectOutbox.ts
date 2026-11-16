@@ -36,6 +36,7 @@ const StoppedRunAttempts = Schema.Array(
 export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-session.reconcile-turn"),
+    preserveBackgroundWork: Schema.optional(Schema.Boolean),
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
   }),

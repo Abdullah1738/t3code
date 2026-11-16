@@ -3352,6 +3352,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("thread.background-work.settle"),
     runOnly: Schema.optional(Schema.Boolean),
+    preserveBackgroundWork: Schema.optional(Schema.Boolean),
     commandId: CommandId,
     threadId: ThreadId,
     providerThreadId: ProviderThreadId,

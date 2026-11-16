@@ -250,6 +250,7 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
+        Layer.mock(EffectOutbox.EffectOutboxV2)({ get: () => Effect.succeed(Option.none()) }),
         Layer.mock(EventSink.EventSinkV2)({
           writeIfRunCurrent: (input) =>
             Effect.sync(() => {

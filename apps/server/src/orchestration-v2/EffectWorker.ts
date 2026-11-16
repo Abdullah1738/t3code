@@ -47,6 +47,7 @@ export class OrchestrationEffectExecutionError extends Schema.TaggedError<Orches
 ) {}
 
 export const isOrchestrationEffectExecutionError = Schema.is(OrchestrationEffectExecutionError);
+const isProviderSessionEndedError = Schema.is(ProviderSessionManager.ProviderSessionEndedError);
 
 /**
  * Do not apply this to `provider-turn.restart`: that compound effect also runs
@@ -96,6 +97,7 @@ export const layerExecutor: Layer.Layer<
   | McpSessionRegistry.McpSessionRegistry
   | EventSink.EventSinkV2
   | ProjectionStore.ProjectionStoreV2
+  | EffectOutbox.EffectOutboxV2
   | RestartPacing.RestartPacing
 > = Layer.effect(
   OrchestrationEffectExecutorV2,
@@ -114,6 +116,7 @@ export const layerExecutor: Layer.Layer<
     const mcpRegistry = yield* McpSessionRegistry.McpSessionRegistry;
     const eventSink = yield* EventSink.EventSinkV2;
     const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
     const pacing = yield* RestartPacing.RestartPacing;
     return OrchestrationEffectExecutorV2.of({
       execute: (effect, options) => {
@@ -124,7 +127,9 @@ export const layerExecutor: Layer.Layer<
               .dispatch({
                 type: "thread.background-work.settle",
                 runOnly: true,
-                commandId: CommandId.make(`${effect.id}:settle`),
+                preserveBackgroundWork: effect.request.preserveBackgroundWork === true,
+                // Rejected planning has a durable receipt; a new attempt must plan again.
+                commandId: CommandId.make(`${effect.id}:settle:${effect.attemptCount}`),
                 threadId: effect.threadId,
                 providerThreadId: effect.request.providerThreadId,
                 providerTurnId: effect.request.providerTurnId,
@@ -483,9 +488,14 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.catch((error) =>
                   Effect.gen(function* () {
+                    if (providerAccepted) return yield* error;
+                    const sessionEnded =
+                      ("cause" in error && isProviderSessionEndedError(error.cause)) ||
+                      Option.isSome(
+                        yield* outbox.get(`effect:session-ended:${request.providerTurnId}`),
+                      );
                     if (
-                      !("turnCompleted" in error) ||
-                      !error.turnCompleted ||
+                      ((!("turnCompleted" in error) || !error.turnCompleted) && !sessionEnded) ||
                       effect.request.type !== "provider-turn.steer"
                     ) {
                       return yield* error;
@@ -501,12 +511,14 @@ export const layerExecutor: Layer.Layer<
                     const message = projection.messages.find((item) => item.id === messageId);
                     const run = projection.runs.find((item) => item.id === message?.runId);
                     if (message === undefined || run === undefined) return yield* error;
-                    // Reuse the message identity and a stable command receipt so an outbox
-                    // retry cannot append a duplicate message or start a second follow-up.
+                    // A prior attempt may have queued this message before its outbox ack failed.
+                    if (sessionEnded && run.userMessageId === message.id) return;
                     yield* threads
                       .dispatch({
                         type: "message.dispatch",
-                        commandId: CommandId.make(`command:steer-follow-up:${effect.id}`),
+                        commandId: CommandId.make(
+                          `command:steer-follow-up:${effect.id}${sessionEnded ? `:${effect.attemptCount}` : ""}`,
+                        ),
                         threadId: effect.threadId,
                         messageId: message.id,
                         text: message.text,
@@ -517,6 +529,7 @@ export const layerExecutor: Layer.Layer<
                           : { modelSelection: run.modelSelection }),
                         dispatchMode: {
                           type:
+                            !sessionEnded &&
                             message.delegatedCompletion === undefined &&
                             message.notification === undefined
                               ? "start_immediately"

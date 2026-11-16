@@ -407,6 +407,7 @@ const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
     Layer.mergeAll(
       layerEventSinkProvided,
       ProjectionStore.layer,
+      EffectOutbox.layer,
       layerRestartPacingProvided,
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,

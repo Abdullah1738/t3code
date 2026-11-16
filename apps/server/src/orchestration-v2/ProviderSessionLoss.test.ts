@@ -3,6 +3,7 @@ import {
   CommandId,
   EventId,
   MessageId,
+  NodeId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -19,9 +20,11 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
+import { vi } from "vite-plus/test";
 import * as Sqlite from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -29,6 +32,501 @@ import * as Registry from "./ProviderAdapterRegistry.ts";
 import * as Sessions from "./ProviderSessionManager.ts";
 import * as Harness from "./testkit/ProviderReplayHarness.ts";
 import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
+
+const sessionLoss = ({
+  instance,
+  reason,
+  replace = false,
+  promotion = false,
+  accepted,
+  faultRead = false,
+  activeTurnOnly = false,
+  delivered = false,
+}: {
+  instance: "codex" | "codex-cu" | "opencode";
+  reason: Sessions.ProviderSessionReleaseReason;
+  replace?: boolean;
+  promotion?: boolean;
+  accepted?: "before recovery" | "after recovery" | "replacement session";
+  faultRead?: boolean;
+  activeTurnOnly?: boolean;
+  delivered?: boolean;
+}) =>
+  Effect.gen(function* () {
+    const closing = yield* Deferred.make<void>();
+    const finishClose = yield* Deferred.make<void>();
+    const instanceId = ProviderInstanceId.make(instance);
+    const driver = ProviderDriverKind.make(instance === "opencode" ? "opencode" : "codex");
+    const modelSelection = { instanceId, model: "test" };
+    const sessionId = ProviderSessionId.make(
+      `provider-session:provider-instance:${instance}:shared`,
+    );
+    const adapter = {
+      instanceId,
+      driver,
+      getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+      planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+      openSession: () =>
+        Effect.gen(function* () {
+          const now = yield* DateTime.now;
+          yield* Effect.addFinalizer(() =>
+            Deferred.succeed(closing, undefined).pipe(Effect.andThen(Deferred.await(finishClose))),
+          );
+          return {
+            instanceId,
+            driver,
+            providerSessionId: sessionId,
+            providerSession: {
+              id: sessionId,
+              driver,
+              providerInstanceId: instanceId,
+              status: "ready",
+              cwd: process.cwd(),
+              model: "test",
+              capabilities: CodexProviderCapabilitiesV2,
+              createdAt: now,
+              updatedAt: now,
+              lastError: null,
+            },
+            events: Stream.never,
+            backgroundTasksEndWithProcess: instance !== "opencode",
+          } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+        }),
+    } as ProviderAdapter.ProviderAdapterV2["Service"];
+    const database = Sqlite.layerMemory;
+    const layer = Layer.mergeAll(
+      ProjectionStore.layer.pipe(Layer.provide(database)),
+      EffectOutbox.layer.pipe(Layer.provide(database)),
+      Harness.layerWithRegistry(
+        { name: `session-loss-${instance}` },
+        Registry.layerFromAdapters([adapter]),
+        {
+          databaseLayer: database,
+          runEffectWorker: false,
+        },
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const sessions = yield* Sessions.ProviderSessionManagerV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threads = [ThreadId.make("session-loss-a"), ThreadId.make("session-loss-b")];
+      const targets = [];
+      for (const threadId of threads) {
+        yield* engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${threadId}`),
+          threadId,
+          projectId: ProjectId.make("project:session-loss"),
+          title: "Session loss",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* engine.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`initial:${threadId}`),
+          threadId,
+          messageId: MessageId.make(`initial:${threadId}`),
+          text: "initial",
+          attachments: [],
+          dispatchMode: { type: "defer_start" },
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        yield* sessions.open({
+          threadId,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy: {
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          },
+        });
+        const before = yield* projections.getThreadProjection(threadId);
+        const run = before.runs[0]!;
+        const attempt = before.attempts[0]!;
+        const root = before.nodes.find((node) => node.id === run.rootNodeId)!;
+        const providerThread = before.providerThreads[0]!;
+        const now = yield* DateTime.now;
+        const turn = {
+          id: ProviderTurnId.make(`turn:${threadId}`),
+          providerThreadId: providerThread.id,
+          nodeId: root.id,
+          runAttemptId: attempt.id,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "running" as const,
+          startedAt: now,
+          completedAt: null,
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`bind:${threadId}`),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...providerThread,
+                providerSessionId: sessionId,
+                status: "active",
+                lastRunOrdinal: run.ordinal,
+                pendingBackgroundTasks:
+                  instance === "opencode" ? [{ taskId: "remote-work", kind: "subagent" }] : [],
+              },
+            },
+            {
+              id: EventId.make(`run:${threadId}`),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...run, status: "running", startedAt: now },
+            },
+            {
+              id: EventId.make(`attempt:${threadId}`),
+              type: "run-attempt.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...attempt, status: "running", providerTurnId: turn.id },
+            },
+            {
+              id: EventId.make(`node:${threadId}`),
+              type: "node.updated",
+              threadId,
+              occurredAt: now,
+              payload: { ...root, status: "running", checkpointScopeId: null },
+            },
+            {
+              id: EventId.make(`turn:${threadId}`),
+              type: "provider-turn.updated",
+              threadId,
+              occurredAt: now,
+              payload: turn,
+            },
+          ],
+        });
+        if (instance === "opencode" || instance === "codex") {
+          const childId = NodeId.make(`remote:${threadId}`);
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make(`remote-node:${threadId}`),
+                type: "node.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  ...root,
+                  id: childId,
+                  kind: "subagent",
+                  parentNodeId: root.id,
+                  status: "running",
+                  checkpointScopeId: null,
+                },
+              },
+              {
+                id: EventId.make(`remote-task:${threadId}`),
+                type: "subagent.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  id: childId,
+                  threadId,
+                  runId: run.id,
+                  parentNodeId: root.id,
+                  origin: "provider_native",
+                  createdBy: "agent",
+                  driver,
+                  providerInstanceId: instanceId,
+                  providerThreadId: providerThread.id,
+                  childThreadId: null,
+                  nativeTaskRef: { driver, nativeId: "remote-work", strength: "strong" },
+                  prompt: "remote task",
+                  title: null,
+                  model: null,
+                  status: "running",
+                  result: null,
+                  startedAt: now,
+                  completedAt: null,
+                  updatedAt: now,
+                },
+              },
+            ],
+          });
+        }
+        targets.push({ threadId, run, attempt, root, providerThread, turn });
+      }
+      const target = targets[0]!;
+      const acceptedCommand = {
+        type: "message.dispatch" as const,
+        commandId: CommandId.make("accepted-steer"),
+        threadId: target.threadId,
+        messageId: MessageId.make("accepted-steer"),
+        text: "accepted correction",
+        attachments: [],
+        dispatchMode: {
+          type: "steer_active" as const,
+          targetRunId: target.run.id,
+          ...(activeTurnOnly ? { activeTurnOnly: true } : {}),
+        },
+        createdBy: "agent" as const,
+        creationSource: "mcp" as const,
+      };
+      if (accepted !== undefined) yield* engine.dispatch(acceptedCommand);
+      const releasing = yield* sessions
+        .release({ providerSessionId: sessionId, reason })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(closing);
+      assert.isTrue(Option.isNone(yield* sessions.get(sessionId)));
+      const steer = {
+        type: "message.dispatch" as const,
+        commandId: CommandId.make("lost-session-steer"),
+        threadId: target.threadId,
+        messageId: MessageId.make("lost-session-steer"),
+        text: "correction",
+        attachments: [],
+        dispatchMode: { type: "steer_active" as const, targetRunId: target.run.id },
+        createdBy: "agent" as const,
+        creationSource: "mcp" as const,
+      };
+      const command = promotion
+        ? yield* Effect.gen(function* () {
+            yield* engine.dispatch({
+              ...steer,
+              commandId: CommandId.make("queued-correction"),
+              dispatchMode: { type: "queue_after_active" },
+            });
+            const queued = (yield* projections.getThreadProjection(target.threadId)).runs.find(
+              (run) => run.status === "queued",
+            )!;
+            return {
+              type: "queued-message.promote-to-steer" as const,
+              threadId: target.threadId,
+              commandId: CommandId.make("lost-session-promotion"),
+              queuedRunId: queued.id,
+              targetRunId: target.run.id,
+            };
+          })
+        : steer;
+      const rejected = yield* engine.dispatch(command).pipe(Effect.flip);
+      assert.equal(rejected._tag, "OrchestratorDispatchError");
+      if (rejected._tag === "OrchestratorDispatchError") {
+        assert.instanceOf(rejected.cause, Sessions.ProviderSessionEndedError);
+      }
+      assert.include(
+        userFacingDispatchErrorMessage(rejected),
+        promotion ? "remains queued" : "mode=queue",
+      );
+      assert.notInclude(userFacingDispatchErrorMessage(rejected), "is not active");
+      const replayed = yield* engine.dispatch(command).pipe(Effect.flip);
+      assert.equal(replayed._tag, "OrchestratorCommandPreviouslyRejectedError");
+      assert.include(
+        userFacingDispatchErrorMessage(replayed),
+        promotion ? "remains queued" : "new clientRequestId",
+      );
+      const refused = yield* projections.getThreadProjection(target.threadId);
+      assert.lengthOf(refused.messages, (promotion ? 2 : 1) + (accepted === undefined ? 0 : 1));
+      if (promotion)
+        assert.lengthOf(
+          refused.runs.filter((run) => run.status === "queued"),
+          1,
+        );
+      if (replace) {
+        yield* sessions.open({
+          threadId: target.threadId,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy: {
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          },
+        });
+        const now = yield* DateTime.now;
+        const replacementAttempt = RunAttemptId.make("replacement-attempt");
+        const replacementTurn = ProviderTurnId.make("replacement-turn");
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("replace-run"),
+              type: "run.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: { ...target.run, status: "running", activeAttemptId: replacementAttempt },
+            },
+            {
+              id: EventId.make("replace-attempt"),
+              type: "run-attempt.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: {
+                ...target.attempt,
+                id: replacementAttempt,
+                attemptOrdinal: target.attempt.attemptOrdinal + 1,
+                status: "running",
+                providerTurnId: replacementTurn,
+              },
+            },
+            {
+              id: EventId.make("replace-turn"),
+              type: "provider-turn.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: {
+                ...target.turn,
+                id: replacementTurn,
+                runAttemptId: replacementAttempt,
+                startedAt: now,
+              },
+            },
+          ],
+        });
+      }
+      yield* Deferred.succeed(finishClose, undefined);
+      yield* Fiber.join(releasing);
+      const recordedSteerEffect =
+        accepted === undefined
+          ? undefined
+          : (yield* outbox.listByCommandId(acceptedCommand.commandId)).find(
+              (effect) => effect.request.type === "provider-turn.steer",
+            )!;
+      const steerEffect =
+        delivered && recordedSteerEffect?.request.type === "provider-turn.steer"
+          ? {
+              ...recordedSteerEffect,
+              request: { ...recordedSteerEffect.request, providerAccepted: true },
+            }
+          : recordedSteerEffect;
+      if (accepted === "before recovery") yield* executor.execute(steerEffect!);
+      if (faultRead) {
+        const effect = Option.getOrThrow(
+          yield* outbox.get(`effect:session-ended:${target.turn.id}`),
+        );
+        const read = vi.spyOn(projections, "getThreadRecords").mockImplementationOnce(() =>
+          Effect.fail(
+            new ProjectionStore.ProjectionStoreReadError({
+              threadId: target.threadId,
+              cause: new Error("transient read failure"),
+            }),
+          ),
+        );
+        yield* executor
+          .execute({ ...effect, attemptCount: 1 })
+          .pipe(Effect.flip, Effect.ensuring(Effect.sync(() => read.mockRestore())));
+        assert.equal(
+          (yield* projections.getThreadProjection(target.threadId)).runs[0]?.status,
+          "running",
+        );
+        yield* executor.execute({ ...effect, attemptCount: 2 });
+        yield* executor.execute({ ...effect, attemptCount: 2 });
+      }
+      if (accepted !== undefined || faultRead) {
+        for (const item of targets) {
+          const effect = Option.getOrThrow(
+            yield* outbox.get(`effect:session-ended:${item.turn.id}`),
+          );
+          yield* executor.execute({
+            ...effect,
+            attemptCount: faultRead && item === target ? 2 : 1,
+          });
+        }
+      } else yield* worker.drain();
+      if (accepted === "replacement session") {
+        yield* sessions.open({
+          threadId: target.threadId,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy: {
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          },
+        });
+      }
+      if (accepted !== undefined) {
+        yield* executor.execute({ ...steerEffect!, attemptCount: 2 });
+        yield* executor.execute({ ...steerEffect!, attemptCount: 3 });
+        const current = yield* projections.getThreadProjection(target.threadId);
+        assert.lengthOf(
+          current.messages.filter((message) => message.id === acceptedCommand.messageId),
+          1,
+        );
+        assert.lengthOf(
+          current.runs.filter((run) => run.userMessageId === acceptedCommand.messageId),
+          activeTurnOnly || delivered ? 0 : 1,
+        );
+      }
+      for (const [index, target] of targets.entries()) {
+        const current = yield* projections.getThreadProjection(target.threadId);
+        assert.equal(
+          current.providerTurns.find((turn) => turn.id === target.turn.id)?.status,
+          "interrupted",
+        );
+        assert.equal(
+          current.runs.find((run) => run.id === target.run.id)?.status,
+          replace && index === 0 ? "running" : "interrupted",
+        );
+        if (replace && index === 0) {
+          assert.equal(
+            current.providerTurns.find((turn) => turn.id === "replacement-turn")?.status,
+            "running",
+          );
+        }
+        if (instance === "opencode") {
+          assert.deepEqual(
+            current.providerThreads.find((thread) => thread.id === target.providerThread.id)
+              ?.pendingBackgroundTasks,
+            [{ taskId: "remote-work", kind: "subagent" }],
+          );
+          assert.equal(current.subagents[0]?.status, "running");
+          assert.equal(
+            current.nodes.find((node) => node.id === `remote:${target.threadId}`)?.status,
+            "running",
+          );
+        }
+        if (instance === "codex") {
+          assert.equal(current.subagents[0]?.status, "interrupted");
+          assert.equal(
+            current.nodes.find((node) => node.id === `remote:${target.threadId}`)?.status,
+            "interrupted",
+          );
+        }
+        if (!replace || index !== 0) {
+          assert.equal(
+            current.attempts.find((attempt) => attempt.id === target.attempt.id)?.status,
+            "interrupted",
+          );
+          assert.equal(
+            current.nodes.find((node) => node.id === target.root.id)?.status,
+            "interrupted",
+          );
+        }
+      }
+      if (!replace && !promotion && accepted === undefined) {
+        yield* engine.dispatch({
+          ...steer,
+          commandId: CommandId.make("queued-correction"),
+          messageId: MessageId.make("queued-correction"),
+          dispatchMode: { type: "queue_after_active" },
+        });
+        const current = yield* projections.getThreadProjection(target.threadId);
+        assert.lengthOf(
+          current.messages.filter((message) => message.text === "correction"),
+          1,
+        );
+        assert.lengthOf(current.runs, 2);
+      }
+    }).pipe(Effect.ensuring(Deferred.succeed(finishClose, undefined)), Effect.provide(layer));
+  });
 
 it.effect.each([
   { instance: "codex", reason: "idle_timeout", replace: false, promotion: false },
@@ -39,332 +537,29 @@ it.effect.each([
   { instance: "codex-cu", reason: "idle_timeout", replace: false, promotion: true },
 ] as const)(
   "settles shared session loss ($instance, $reason, replacement=$replace, promotion=$promotion)",
-  ({ instance, reason, replace, promotion }) =>
-    Effect.gen(function* () {
-      const closing = yield* Deferred.make<void>();
-      const finishClose = yield* Deferred.make<void>();
-      const instanceId = ProviderInstanceId.make(instance);
-      const driver = ProviderDriverKind.make(instance === "opencode" ? "opencode" : "codex");
-      const modelSelection = { instanceId, model: "test" };
-      const sessionId = ProviderSessionId.make(
-        `provider-session:provider-instance:${instance}:shared`,
-      );
-      const adapter = {
-        instanceId,
-        driver,
-        getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
-        planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
-        openSession: () =>
-          Effect.gen(function* () {
-            const now = yield* DateTime.now;
-            yield* Effect.addFinalizer(() =>
-              Deferred.succeed(closing, undefined).pipe(
-                Effect.andThen(Deferred.await(finishClose)),
-              ),
-            );
-            return {
-              instanceId,
-              driver,
-              providerSessionId: sessionId,
-              providerSession: {
-                id: sessionId,
-                driver,
-                providerInstanceId: instanceId,
-                status: "ready",
-                cwd: process.cwd(),
-                model: "test",
-                capabilities: CodexProviderCapabilitiesV2,
-                createdAt: now,
-                updatedAt: now,
-                lastError: null,
-              },
-              events: Stream.never,
-              backgroundTasksEndWithProcess: instance !== "opencode",
-            } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
-          }),
-      } as ProviderAdapter.ProviderAdapterV2["Service"];
-      const database = Sqlite.layerMemory;
-      const layer = Layer.mergeAll(
-        ProjectionStore.layer.pipe(Layer.provide(database)),
-        Harness.layerWithRegistry(
-          { name: `session-loss-${instance}` },
-          Registry.layerFromAdapters([adapter]),
-          {
-            databaseLayer: database,
-            runEffectWorker: false,
-          },
-        ),
-      );
-      yield* Effect.gen(function* () {
-        const engine = yield* Orchestrator.OrchestratorV2;
-        const projections = yield* ProjectionStore.ProjectionStoreV2;
-        const sink = yield* EventSink.EventSinkV2;
-        const sessions = yield* Sessions.ProviderSessionManagerV2;
-        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
-        const threads = [ThreadId.make("session-loss-a"), ThreadId.make("session-loss-b")];
-        const targets = [];
-        for (const threadId of threads) {
-          yield* engine.dispatch({
-            type: "thread.create",
-            commandId: CommandId.make(`create:${threadId}`),
-            threadId,
-            projectId: ProjectId.make("project:session-loss"),
-            title: "Session loss",
-            modelSelection,
-            runtimeMode: "full-access",
-            interactionMode: "default",
-            branch: null,
-            worktreePath: null,
-            createdBy: "user",
-            creationSource: "web",
-          });
-          yield* engine.dispatch({
-            type: "message.dispatch",
-            commandId: CommandId.make(`initial:${threadId}`),
-            threadId,
-            messageId: MessageId.make(`initial:${threadId}`),
-            text: "initial",
-            attachments: [],
-            dispatchMode: { type: "defer_start" },
-            createdBy: "agent",
-            creationSource: "mcp",
-          });
-          yield* sessions.open({
-            threadId,
-            providerSessionId: sessionId,
-            modelSelection,
-            runtimePolicy: {
-              runtimeMode: "full-access",
-              interactionMode: "default",
-              cwd: process.cwd(),
-            },
-          });
-          const before = yield* projections.getThreadProjection(threadId);
-          const run = before.runs[0]!;
-          const attempt = before.attempts[0]!;
-          const root = before.nodes.find((node) => node.id === run.rootNodeId)!;
-          const providerThread = before.providerThreads[0]!;
-          const now = yield* DateTime.now;
-          const turn = {
-            id: ProviderTurnId.make(`turn:${threadId}`),
-            providerThreadId: providerThread.id,
-            nodeId: root.id,
-            runAttemptId: attempt.id,
-            nativeTurnRef: null,
-            ordinal: 1,
-            status: "running" as const,
-            startedAt: now,
-            completedAt: null,
-          };
-          yield* sink.write({
-            events: [
-              {
-                id: EventId.make(`bind:${threadId}`),
-                type: "provider-thread.updated",
-                threadId,
-                occurredAt: now,
-                payload: {
-                  ...providerThread,
-                  providerSessionId: sessionId,
-                  status: "active",
-                  lastRunOrdinal: run.ordinal,
-                  pendingBackgroundTasks:
-                    instance === "opencode" ? [{ taskId: "remote-work", kind: "command" }] : [],
-                },
-              },
-              {
-                id: EventId.make(`run:${threadId}`),
-                type: "run.updated",
-                threadId,
-                occurredAt: now,
-                payload: { ...run, status: "running", startedAt: now },
-              },
-              {
-                id: EventId.make(`attempt:${threadId}`),
-                type: "run-attempt.updated",
-                threadId,
-                occurredAt: now,
-                payload: { ...attempt, status: "running", providerTurnId: turn.id },
-              },
-              {
-                id: EventId.make(`node:${threadId}`),
-                type: "node.updated",
-                threadId,
-                occurredAt: now,
-                payload: { ...root, status: "running", checkpointScopeId: null },
-              },
-              {
-                id: EventId.make(`turn:${threadId}`),
-                type: "provider-turn.updated",
-                threadId,
-                occurredAt: now,
-                payload: turn,
-              },
-            ],
-          });
-          targets.push({ threadId, run, attempt, root, providerThread, turn });
-        }
-        const releasing = yield* sessions
-          .release({ providerSessionId: sessionId, reason })
-          .pipe(Effect.forkScoped);
-        yield* Deferred.await(closing);
-        assert.isTrue(Option.isNone(yield* sessions.get(sessionId)));
-        const target = targets[0]!;
-        const steer = {
-          type: "message.dispatch" as const,
-          commandId: CommandId.make("lost-session-steer"),
-          threadId: target.threadId,
-          messageId: MessageId.make("lost-session-steer"),
-          text: "correction",
-          attachments: [],
-          dispatchMode: { type: "steer_active" as const, targetRunId: target.run.id },
-          createdBy: "agent" as const,
-          creationSource: "mcp" as const,
-        };
-        const command = promotion
-          ? yield* Effect.gen(function* () {
-              yield* engine.dispatch({
-                ...steer,
-                commandId: CommandId.make("queued-correction"),
-                dispatchMode: { type: "queue_after_active" },
-              });
-              const queued = (yield* projections.getThreadProjection(target.threadId)).runs.find(
-                (run) => run.status === "queued",
-              )!;
-              return {
-                type: "queued-message.promote-to-steer" as const,
-                threadId: target.threadId,
-                commandId: CommandId.make("lost-session-promotion"),
-                queuedRunId: queued.id,
-                targetRunId: target.run.id,
-              };
-            })
-          : steer;
-        const rejected = yield* engine.dispatch(command).pipe(Effect.flip);
-        assert.equal(rejected._tag, "OrchestratorDispatchError");
-        if (rejected._tag === "OrchestratorDispatchError") {
-          assert.instanceOf(rejected.cause, Sessions.ProviderSessionEndedError);
-        }
-        assert.include(
-          userFacingDispatchErrorMessage(rejected),
-          promotion ? "remains queued" : "mode=queue",
-        );
-        assert.notInclude(userFacingDispatchErrorMessage(rejected), "is not active");
-        const replayed = yield* engine.dispatch(command).pipe(Effect.flip);
-        assert.equal(replayed._tag, "OrchestratorCommandPreviouslyRejectedError");
-        assert.include(
-          userFacingDispatchErrorMessage(replayed),
-          promotion ? "remains queued" : "new clientRequestId",
-        );
-        const refused = yield* projections.getThreadProjection(target.threadId);
-        assert.lengthOf(refused.messages, promotion ? 2 : 1);
-        if (promotion)
-          assert.lengthOf(
-            refused.runs.filter((run) => run.status === "queued"),
-            1,
-          );
-        if (replace) {
-          yield* sessions.open({
-            threadId: target.threadId,
-            providerSessionId: sessionId,
-            modelSelection,
-            runtimePolicy: {
-              runtimeMode: "full-access",
-              interactionMode: "default",
-              cwd: process.cwd(),
-            },
-          });
-          const now = yield* DateTime.now;
-          const replacementAttempt = RunAttemptId.make("replacement-attempt");
-          const replacementTurn = ProviderTurnId.make("replacement-turn");
-          yield* sink.write({
-            events: [
-              {
-                id: EventId.make("replace-run"),
-                type: "run.updated",
-                threadId: target.threadId,
-                occurredAt: now,
-                payload: { ...target.run, status: "running", activeAttemptId: replacementAttempt },
-              },
-              {
-                id: EventId.make("replace-attempt"),
-                type: "run-attempt.updated",
-                threadId: target.threadId,
-                occurredAt: now,
-                payload: {
-                  ...target.attempt,
-                  id: replacementAttempt,
-                  attemptOrdinal: target.attempt.attemptOrdinal + 1,
-                  status: "running",
-                  providerTurnId: replacementTurn,
-                },
-              },
-              {
-                id: EventId.make("replace-turn"),
-                type: "provider-turn.updated",
-                threadId: target.threadId,
-                occurredAt: now,
-                payload: {
-                  ...target.turn,
-                  id: replacementTurn,
-                  runAttemptId: replacementAttempt,
-                  startedAt: now,
-                },
-              },
-            ],
-          });
-        }
-        yield* Deferred.succeed(finishClose, undefined);
-        yield* Fiber.join(releasing);
-        yield* worker.drain();
-        for (const [index, target] of targets.entries()) {
-          const current = yield* projections.getThreadProjection(target.threadId);
-          assert.equal(
-            current.providerTurns.find((turn) => turn.id === target.turn.id)?.status,
-            "interrupted",
-          );
-          assert.equal(
-            current.runs.find((run) => run.id === target.run.id)?.status,
-            replace && index === 0 ? "running" : "interrupted",
-          );
-          if (replace && index === 0) {
-            assert.equal(
-              current.providerTurns.find((turn) => turn.id === "replacement-turn")?.status,
-              "running",
-            );
-          }
-          if (instance === "opencode") {
-            assert.deepEqual(
-              current.providerThreads.find((thread) => thread.id === target.providerThread.id)
-                ?.pendingBackgroundTasks,
-              [{ taskId: "remote-work", kind: "command" }],
-            );
-          }
-          if (!replace || index !== 0) {
-            assert.equal(
-              current.attempts.find((attempt) => attempt.id === target.attempt.id)?.status,
-              "interrupted",
-            );
-            assert.equal(
-              current.nodes.find((node) => node.id === target.root.id)?.status,
-              "interrupted",
-            );
-          }
-        }
-        if (!replace && !promotion) {
-          yield* engine.dispatch({
-            ...steer,
-            commandId: CommandId.make("queued-correction"),
-            messageId: MessageId.make("queued-correction"),
-            dispatchMode: { type: "queue_after_active" },
-          });
-          const current = yield* projections.getThreadProjection(target.threadId);
-          assert.lengthOf(
-            current.messages.filter((message) => message.text === "correction"),
-            1,
-          );
-          assert.lengthOf(current.runs, 2);
-        }
-      }).pipe(Effect.ensuring(Deferred.succeed(finishClose, undefined)), Effect.provide(layer));
-    }),
+  sessionLoss,
+);
+
+it.effect.each(["before recovery", "after recovery", "replacement session"] as const)(
+  "queues an accepted steer after session loss (%s)",
+  (accepted) => sessionLoss({ instance: "codex-cu", reason: "runtime_error", accepted }),
+);
+it.effect("retries session-loss settlement after a transient planning rejection", () =>
+  sessionLoss({ instance: "codex-cu", reason: "runtime_error", faultRead: true }),
+);
+it.effect("session loss does not turn active-turn-only input into a new run", () =>
+  sessionLoss({
+    instance: "codex-cu",
+    reason: "runtime_error",
+    accepted: "after recovery",
+    activeTurnOnly: true,
+  }),
+);
+it.effect("session loss does not requeue input already accepted by the provider", () =>
+  sessionLoss({
+    instance: "codex-cu",
+    reason: "runtime_error",
+    accepted: "after recovery",
+    delivered: true,
+  }),
 );

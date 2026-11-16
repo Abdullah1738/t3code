@@ -137,6 +137,19 @@ export const layer: Layer.Layer<
       const interruptProviderThread = targetsRecordedSession
         ? providerThread
         : { ...providerThread, providerSessionId: input.providerSessionId };
+      const steerSession =
+        input.operation === "steer" ? yield* sessions.get(input.providerSessionId) : undefined;
+      if (steerSession !== undefined && Option.isNone(steerSession)) {
+        return yield* new ProviderTurnControlError({
+          threadId: input.threadId,
+          operation: "steer",
+          providerTurnId: input.providerTurnId,
+          cause: new ProviderSessionManager.ProviderSessionEndedError({
+            providerSessionId: input.providerSessionId,
+            ...(context.run === undefined ? {} : { runId: context.run.id }),
+          }),
+        });
+      }
       if (providerTurn.status !== "running") {
         if (input.operation === "steer") {
           return yield* new ProviderTurnControlError({
@@ -154,7 +167,7 @@ export const layer: Layer.Layer<
           session: Option.none(),
         };
       }
-      const session = yield* sessions.get(input.providerSessionId);
+      const session = steerSession ?? (yield* sessions.get(input.providerSessionId));
       if (Option.isNone(session)) {
         // Interrupt/restart against a already-released session must not fail
         // the durable effect (and retry 5x). The turn may still look running

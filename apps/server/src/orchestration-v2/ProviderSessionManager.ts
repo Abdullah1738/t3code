@@ -1015,6 +1015,8 @@ export const layerWithOptions = (
                 threadId,
                 request: {
                   type: "provider-session.reconcile-turn",
+                  preserveBackgroundWork:
+                    input.entry.runtime.backgroundTasksEndWithProcess !== true,
                   providerThreadId: turn.providerThreadId,
                   providerTurnId: turn.id,
                 },
