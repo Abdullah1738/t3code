@@ -33,7 +33,7 @@ _NAMES = {
     'step.auth', 'step.cart_build', 'step.checkout', 'step.payment_submit',
     'step.bank_approval_wait', 'step.confirmation', 'flow.recover_payment',
     'flow.release', 'flow.abandon', 'track.add', 'track.poll', 'track.transition',
-    'track.eta_elapsed', 'track.delivered', 'track.error', 'card.assert',
+    'track.eta_elapsed', 'track.delivered', 'track.error', 'card.assert', 'card.fill',
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
@@ -41,6 +41,9 @@ _NAMES = {
     'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared',
 }
 _ENUMS = {
+    'route': {'cdp', 'phone', 'unspecified'},
+    'field': {'card_name', 'card_number', 'card_expiry', 'card_cvc'},
+    'cardNickname': {'Marriott', 'MashreqNoon', 'Skywards', 'Mashreq'},
     'reason': DELEGATION_REASONS,
     'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
@@ -193,6 +196,7 @@ INVALID_DELIVERY_OPTION_ACTION INVALID_DELIVERY_OPTION_TYPE INVALID_DELIVERY_OPT
 ACTIVE_ORDER_PRESENT ACTIVE_ORDER_SCHEMA_CHANGED ADDRESS ADDRESS_BINDING_MISMATCH
 ADDRESS_OWNER_MISMATCH ADDRESS_SCHEMA_CHANGED ASYNC_SAVED_CARD_INSTRUMENT_REQUIRED CARD
 CARDS_SCHEMA_CHANGED CARD_ASSERT_FINAL_REFUSED CARD_CANCELLED CARD_CHANGED CARD_FILL_FAILED
+CARD_FILL_TARGET_REQUIRED CARD_FILL_NO_FOCUS
 CARD_MISMATCH CARD_QUOTE_BODY_DENIED CARD_QUOTE_CONTEXT_UNSUPPORTED
 CARD_QUOTE_EXACT_SAVED_CARD_NOT_UNIQUE CARD_QUOTE_INTENT_ALREADY_CONSUMED
 CARD_QUOTE_PAYMENT_SCHEMA_CHANGED CARD_RECENTLY_DECLINED CARD_RECORD_REQUIRED CARD_REQUIRED
@@ -517,7 +521,9 @@ def _phases(scope, start, end):
 def _fields(props):
     result = {}
     for key, value in (props or {}).items():
-        if key == 'app' and type(value) is str:
+        if key == 'cdpPort' and type(value) is int and 1 <= value <= 65535:
+            result[key] = value
+        elif key == 'app' and type(value) is str:
             result[key] = value if value in _ENUMS['merchant'] else 'other'
         elif key in _ENUMS and type(value) is str and value in _ENUMS[key]:
             result[key] = value
@@ -604,7 +610,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher', 'vendorId', 'cardId'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
@@ -617,7 +623,7 @@ def _noon_lane(order):
 
 def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, props=None, error=None, cause=None):
     try:
-        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
+        if component not in {'commerce', 'order-watch', 'card_status', 'card-vault-fill', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
             return
         if kind not in {'event', 'perf', 'error'} or name not in _NAMES:
             return
@@ -845,7 +851,7 @@ def rollup(day=None):
                     error_lines += kind == 'error'
                     component = row.get('component')
                     if not isinstance(component, str) or component not in {
-                            'commerce', 'order-watch', 'card_status', 'noon', 'careem',
+                            'commerce', 'order-watch', 'card_status', 'card-vault-fill', 'noon', 'careem',
                             'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
                         component = 'unknown'
                     component_totals[component] = component_totals.get(component, 0) + 1
