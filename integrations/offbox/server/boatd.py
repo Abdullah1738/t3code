@@ -1292,6 +1292,28 @@ def read_result(box_id: str, pid: int, attempt: int) -> dict | None:
     return d if isinstance(d, dict) and d.get("attempt") == (attempt or 1) else None
 
 
+@contextmanager
+def runner_dispatch(*, blocking=True):
+    # A queued row is published before systemd-run, including during restart reconciliation.
+    # Admission may inspect unit absence only while nobody can be between those two steps.
+    with open(VAR / "dispatch.lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def dispatching(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with runner_dispatch():
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+@dispatching
 def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
     r = box_row(con, box_id, owner)
     if r["state"] not in LIVE:
@@ -1366,7 +1388,14 @@ def cmd_status_json(con, box_id: str, pid: int, tail_bytes: int = 4096) -> dict:
             "metrics": json.loads(r["metrics"]) if r["metrics"] else None,
             "interruption": json.loads(r['metrics'] or '{}').get('interruption'),
             "cleanup": json.loads(r['metrics'] or '{}').get('kill'),
-            "reason": json.loads(r['metrics'] or '{}').get('start_failure')}
+            "reason": json.loads(r['metrics'] or '{}').get('start_failure'),
+            **queue_loss_json(r)}
+
+
+def queue_loss_json(row):
+    reason = json.loads(row['metrics'] or '{}').get('queue_lost_reason')
+    return {'notAdmitted': row['status'] == 'lost' and row['started_at'] is None and bool(reason),
+            'queueLostReason': reason}
 
 
 def _cg_pids(box_id: str, pid: int) -> list[int]:
@@ -1679,6 +1708,10 @@ def terminal_result(res) -> bool:
 
 def _write_command_result(con, c, result, metrics, changes=None):
     updates = {k: result.get(k, c[k]) for k in ('status', 'started_at', 'ended_at', 'boot_id')}
+    metrics = dict(metrics)
+    metrics.pop('queue_lost_reason', None)
+    if updates['status'] == 'lost' and updates['started_at'] is None and result.get('queue_lost_reason'):
+        metrics['queue_lost_reason'] = result['queue_lost_reason']
     updates.update(exit_code=result.get('exit_code'), signal=result.get('signal'), metrics=json.dumps(metrics))
     updates.update(changes or {})
     columns = ', '.join(f'{k}=?' for k in updates)
@@ -1739,6 +1772,7 @@ def _kill_result_locked(con, c, observed, cleanup, *, lost=False, metrics=None):
     if recognized_interruption:
         emit_interruption(c, saved['interruption'])
     m['kill'] = cleanup
+    changes = {'killed': 1} if 'killed' in c.keys() else {}
     if cleanup['cleanup'] == 'unknown':
         result = dict(current if not terminal_result(current) else {})
         result.update(attempt=c['attempt'] or 1, status='running', exit_code=None, signal=None,
@@ -1746,7 +1780,7 @@ def _kill_result_locked(con, c, observed, cleanup, *, lost=False, metrics=None):
         if saved:
             result['held_result'] = saved
             result['started_at'] = saved.get('started_at', c['started_at'])
-        _write_command_result(con, c, result, m, {'killed': 1})
+        _write_command_result(con, c, result, m, changes)
         return 'following'
     result = saved or dict(attempt=c['attempt'] or 1, status='lost' if lost else 'exited', exit_code=143,
                            signal='SIGTERM', started_at=c['started_at'], ended_at=now(), boot_id=c['boot_id'], synthetic_kill=True)
@@ -1755,7 +1789,7 @@ def _kill_result_locked(con, c, observed, cleanup, *, lost=False, metrics=None):
         m['interruption'] = result['interruption']
     m.pop('kill_request', None)
     m['kill_synthetic'] = bool(result.get('synthetic_kill'))
-    _write_command_result(con, c, result, m, {'killed': 1})
+    _write_command_result(con, c, result, m, changes)
     return 'killed'
 
 
@@ -1766,7 +1800,9 @@ def restore_kill_result(con, c, res, cleanup=None, *, lost=False):
             return 'following', cleanup
         if cleanup is None:
             request = json.loads(latest['metrics'] or '{}').get('kill_request') or {}
-            before_spawn = request.get('before_spawn') if request else latest['status'] == 'queued' and latest['started_at'] is None
+            queue_loss = res.get('status') == 'lost' and res.get('started_at') is None and bool(res.get('queue_lost_reason'))
+            before_spawn = queue_loss or (request.get('before_spawn') if request else
+                                         latest['status'] == 'queued' and latest['started_at'] is None and not res)
             cleanup = dict(cleanup='clean', leftover_killed=0, remaining=0) if before_spawn else cleanup_run(latest)
         return _kill_result_locked(con, latest, res, cleanup, lost=lost), cleanup
 
@@ -1774,14 +1810,14 @@ def restore_kill_result(con, c, res, cleanup=None, *, lost=False):
 def record_command_result(con, c, result, metrics, action, *, changes=None,
                           terminal_evidence=True, before_spawn=False, repair_legacy=False):
     with result_lock(c['box_id'], c['pid']):
-        latest = cmd_row(con, c['box_id'], c['pid'])
+        latest = dict(cmd_row(con, c['box_id'], c['pid']))
         if (latest['attempt'] or 1) != (result.get('attempt') or c['attempt'] or 1):
             return 'following'
         prior = read_result(c['box_id'], c['pid'], latest['attempt'] or 1) or {}
         kf = cmd_dir(c['box_id']) / f"{c['pid']}.kill"
         current_metrics = json.loads(latest['metrics'] or '{}')
         request = current_metrics.get('kill_request') or {}
-        if kf.exists() or request or prior.get('kill_pending') or latest['killed'] or (current_metrics.get('kill') or {}).get('cleanup') == 'unknown':
+        if kf.exists() or request or prior.get('kill_pending') or latest.get('killed') or (current_metrics.get('kill') or {}).get('cleanup') == 'unknown':
             cleanup = dict(cleanup='clean', leftover_killed=0, remaining=0) if before_spawn or request.get('before_spawn') else cleanup_run(latest)
             lost = kf.exists() and kf.read_text().strip() == 'lost'
             return _kill_result_locked(con, latest, result if terminal_evidence else {}, cleanup,
@@ -1817,13 +1853,15 @@ def stage_kill(con, box_id, pid, lost):
             try:
                 output = False
                 if attempt == 1:
-                    with open(cmd_dir(box_id) / f'{pid}.err', 'rb') as f:
-                        err = f.read(8193)
                     marker = (offbox_disk_space.MARKER + json.dumps(dict(phase='attempt', attempt=attempt))).encode()
                     queue_lines = (marker, b'offbox-server: waiting for earlier runs in the queue')
-                    output = (cmd_dir(box_id) / f'{pid}.out').stat().st_size > 0 or len(err) > 8192 or any(
-                        line.strip() and line not in queue_lines and not line.startswith(b'offbox-server: waiting for memory (')
-                        for line in err.splitlines())
+                    with open(cmd_dir(box_id) / f'{pid}.err', 'rb') as f:
+                        # Queue refreshes can exceed the old 8 KiB total limit without a command starting.
+                        output = (cmd_dir(box_id) / f'{pid}.out').stat().st_size > 0 or any(
+                            len(line) > 8192 or (line.strip() and line.rstrip(b'\r\n') not in queue_lines and
+                            not line.startswith((b'offbox-server: waiting for memory (',
+                                                 b'offbox-server: waiting; position ')))
+                            for line in iter(lambda: f.readline(8193), b''))
             except OSError:
                 output = True
             request = m.get('kill_request') or dict(lost=lost, before_spawn=r['status'] == 'queued' and
@@ -1891,9 +1929,14 @@ def mem_available() -> int:
     return 0
 
 
+def async_filter(con) -> str:
+    # Old runners can see the pre-batch schema; all persisted commands there were detached.
+    return "sync=0 AND " if "sync" in _cols(con, "commands") else ""
+
+
 def predicted_peak(con, kind: str) -> int:
     rows = [json.loads(r[0]).get("box_mem_peak") or 0 for r in con.execute(
-        "SELECT metrics FROM commands WHERE sync=0 AND kind=? AND metrics IS NOT NULL ORDER BY ended_at DESC LIMIT 50", (kind,))]
+        f"SELECT metrics FROM commands WHERE {async_filter(con)}kind=? AND metrics IS NOT NULL ORDER BY ended_at DESC LIMIT 50", (kind,))]
     rows = sorted(x for x in rows if x)
     if len(rows) < 3:
         return int(CFG["default_peak_gb"] * 2**30)
@@ -1904,7 +1947,7 @@ def predicted_peak(con, kind: str) -> int:
 def admitted_bytes(con) -> int:
     """Memory promised to runs that started in the last 60 s and may not have grown yet."""
     total = 0
-    for r in con.execute("SELECT kind FROM commands WHERE sync=0 AND status='running' AND started_at > ?", (now() - 60,)):
+    for r in con.execute(f"SELECT kind FROM commands WHERE {async_filter(con)}status='running' AND started_at > ?", (now() - 60,)):
         total += predicted_peak(con, r["kind"])
     return total
 
@@ -1913,7 +1956,12 @@ ADMIT_LOCK = VAR / "admit.lock"
 
 
 def last_admission(con) -> float | None:
-    return con.execute("SELECT MAX(started_at) FROM commands WHERE sync=0").fetchone()[0]
+    try:
+        return con.execute("SELECT MAX(started_at) FROM commands WHERE sync=0").fetchone()[0]
+    except sqlite3.OperationalError as error:
+        if str(error) != 'no such column: sync':
+            raise
+        return con.execute("SELECT MAX(started_at) FROM commands").fetchone()[0]
 
 
 def admission_cpu_limit() -> float | None:
@@ -1938,25 +1986,75 @@ def admit(con, box_id: str, pid: int, kind: str, errf) -> float:
         return queued
 
 
+def queue_head(con, box_id, pid):
+    while True:
+        head = con.execute(f"SELECT * FROM commands WHERE {async_filter(con)}status='queued' "
+                           "ORDER BY created_at, box_id, pid LIMIT 1").fetchone()
+        if head is None or (head['box_id'], head['pid']) == (box_id, pid):
+            return head
+        with runner_dispatch(blocking=False) as inspecting:
+            if not inspecting:
+                return head
+            with result_lock(head['box_id'], head['pid']):
+                current = dict(cmd_row(con, head['box_id'], head['pid']))
+                if current['status'] != 'queued' or current.get('attempt') != head['attempt']:
+                    continue
+                if current.get('killed'):
+                    reason = 'killed'
+                elif (CMDS / head['box_id'] / f"{head['pid']}.kill").exists():
+                    reason = 'kill_file'
+                else:
+                    rc, state = _sh(['systemctl', 'is-active', unit_name(
+                        head['box_id'], head['pid'], head['attempt'] or 1)], timeout=2)
+                    # A timeout, unavailable bus or unexpected response is unknown, not dead.
+                    reason = 'unit_' + state if rc in (3, 4) and state in ('inactive', 'failed', 'unknown') else None
+                if not reason:
+                    return head
+                if read_result(head['box_id'], head['pid'], head['attempt'] or 1):
+                    # Receipts survive a crash before the matching DB commit. Recover that outcome first.
+                    action = settle_cmd(con, current)
+                    recovered = cmd_row(con, head['box_id'], head['pid'])
+                    if action in ('requeue', 'retry'):
+                        error = spawn_runner(head['box_id'], head['pid'], recovered['attempt'] or 1)
+                        if error:
+                            drop_cmd(con, head['box_id'], head['pid'], f'could not recover queued receipt: {error}')
+                        recovered = cmd_row(con, head['box_id'], head['pid'])
+                    if recovered['status'] == 'queued':
+                        return recovered
+                    continue
+                metrics = json.loads(current['metrics'] or '{}')
+                result = dict(attempt=current['attempt'] or 1, status='lost', exit_code=None,
+                              started_at=current['started_at'], ended_at=now(), boot_id=current['boot_id'],
+                              queue_lost_reason=reason)
+                _write_command_result(con, current, result, metrics)
+                _note(head['box_id'], head['pid'], f"queued runner lost ({reason}); command was not admitted")
+                toollog.emit('boatd', 'run.queue.dead_head', ids={'box': head['box_id'], 'run': current['run_id']},
+                             props={'pid': head['pid'], 'created_at': head['created_at'], 'reason': reason})
+
+
 def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
-    """Wait until the host has room for this run's predicted peak. Returns seconds queued."""
+    """Wait for this run's FIFO turn and host capacity. Returns seconds queued."""
     need = predicted_peak(con, kind)
     reserve = int(CFG["mem_reserve_gb"] * 2**30)
     t0 = now()
-    said = False
+    last_reason, last_said = None, None
     while True:
-        current = cmd_row(con, box_id, pid)
-        if current['killed'] or current['status'] != 'queued' or (cmd_dir(box_id) / f"{pid}.kill").exists() or json.loads(current['metrics'] or '{}').get('kill_request'):
+        current = dict(cmd_row(con, box_id, pid))
+        if current.get('killed') or current['status'] != 'queued' or (CMDS / box_id / f"{pid}.kill").exists() or json.loads(current['metrics'] or '{}').get('kill_request'):
             return now() - t0
         with open(ADMIT_LOCK, "w") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
+            head = queue_head(con, box_id, pid)
+            # Recheck after the lock: cancellation/another waiter may have settled this row.
+            current = dict(cmd_row(con, box_id, pid))
+            if current.get('killed') or current['status'] != 'queued' or (CMDS / box_id / f"{pid}.kill").exists() or json.loads(current['metrics'] or '{}').get('kill_request'):
+                return now() - t0
             free = mem_available() - reserve - admitted_bytes(con)
-            # Oldest first, so a run queued again after a restart goes before runs submitted after it.
-            head = con.execute("SELECT box_id, pid FROM commands WHERE sync=0 AND status='queued' ORDER BY created_at, box_id, pid "
-                               "LIMIT 1").fetchone()
-            mine = head is None or (head["box_id"] == box_id and head["pid"] == pid)
+            mine = head is None or (head['box_id'], head['pid']) == (box_id, pid)
+            head_need = need if mine else predicted_peak(con, head['kind'])
             cap = int(CFG.get("max_running") or 0)
-            room = not cap or con.execute("SELECT COUNT(*) FROM commands WHERE sync=0 AND status='running'").fetchone()[0] < cap
+            running = con.execute(f"SELECT COUNT(*) FROM commands WHERE {async_filter(con)}status='running'").fetchone()[0]
+            room = not cap or running < cap
             cpu_limit = admission_cpu_limit()
             cpu = psi("cpu") if cpu_limit is not None and cpu_limit > 0 else None
             cpu_known = cpu is not None and math.isfinite(cpu) and 0 <= cpu <= 100
@@ -1964,34 +2062,53 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             # PSI is a moving average: let a new run show up before admitting its neighbour.
             cpu_room = cpu_limit == 0 or (cpu_limit is not None and cpu_known and cpu < cpu_limit and
                                         (last_start is None or now() - last_start >= 10))
-            # Keep the escape while CPU admission is off; #219 replaces it.
-            if (mine and room and free >= need and cpu_room) or (cpu_limit == 0 and now() - t0 > 3600):
-                con.execute("UPDATE commands SET status='running', started_at=?, queued_s=?, boot_id=? "
-                            "WHERE box_id=? AND pid=? AND status='queued' AND killed=0", (now(), now() - t0, boot_id(), box_id, pid))
+            # The estimate can exceed this host's capacity. An empty host must still make FIFO progress.
+            alone = running == 0
+            if mine and room and ((free >= need and cpu_room) or alone):
+                guard = " AND killed=0" if 'killed' in current else ""
+                updated = con.execute("UPDATE commands SET status='running', started_at=?, queued_s=?, boot_id=? "
+                            "WHERE box_id=? AND pid=? AND status='queued'" + guard,
+                            (now(), now() - t0, boot_id(), box_id, pid))
+                if updated.rowcount and alone and (free < need or not cpu_room):
+                    errf.write(f"offbox-server: admitted alone: needs {need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free\n".encode())
+                    errf.flush()
+                    toollog.emit('boatd', 'run.queue', ids={'box': box_id, 'run': current['run_id']},
+                                 props={'backend': 'home', 'reason': 'admitted_alone', 'position': 1,
+                                        'headNeedBytes': need, 'freeBytes': free, 'running': 0,
+                                        'waitMs': (now() - t0) * 1000})
                 return now() - t0
-        if not said:
-            try:
-                position = con.execute("SELECT COUNT(*) FROM commands WHERE sync=0 AND status='queued' AND created_at <= (SELECT created_at FROM commands WHERE box_id=? AND pid=?)", (box_id, pid)).fetchone()[0]
-            except Exception:
-                position = None
-            toollog.emit("boatd", "run.queue", ids={"box": box_id}, props={"backend": "home", "queued": True,
-                         "waitMs": (now()-t0)*1000, "position": position})
-            if not (mine and room):
-                why = "for earlier runs in the queue"
-            elif free < need:
-                why = (f"for memory (this kind peaks ~{need / 2**30:.1f} GB, {max(0, free) / 2**30:.1f} GB free "
-                       "after reserve)")
+            queue = con.execute(f"SELECT box_id,pid FROM commands WHERE {async_filter(con)}status='queued' "
+                                "ORDER BY created_at,box_id,pid").fetchall()
+            position = next(i for i, row in enumerate(queue, 1) if (row['box_id'], row['pid']) == (box_id, pid))
+            head_id = f"{head['box_id']}/{head['pid']}" if head else f"{box_id}/{pid}"
+            if not room:
+                reason, why = 'cap', f"max_running cap {running}/{cap}"
+            elif free < head_need:
+                reason = 'memory'
+                why = f"head {head_id} needs {head_need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free above reserve and recent admissions"
             elif cpu_limit is None:
-                why = "for a valid CPU admission setting"
+                reason, why = 'cpu_config', "a valid CPU admission setting"
             elif not cpu_known and cpu_limit > 0:
-                why = "for a host CPU pressure reading"
+                reason, why = 'cpu_unknown', "a host CPU pressure reading"
             elif cpu_limit > 0 and cpu >= cpu_limit:
-                why = f"for host CPU pressure ({cpu:.1f}%, limit {cpu_limit:g}%)"
+                reason, why = 'cpu', f"host CPU pressure ({cpu:.1f}%, limit {cpu_limit:g}%)"
+            elif not cpu_room:
+                reason, why = 'cpu_settle', "the previous run's CPU pressure to settle"
             else:
-                why = "for the previous run's CPU pressure to settle"
-            errf.write(f"offbox-server: waiting {why}\n".encode())
-            errf.flush()
-            said = True
+                reason, why = 'fifo', "the head's runner to admit"
+            if not mine:
+                why = f"behind {head_id} queued {max(0, now() - head['created_at']):.0f} s; " + why
+            state = (reason, position, len(queue), head_id, head_need, cap, running if reason == 'cap' else None)
+            waited = now() - t0
+            if state != last_reason or last_said is None or now() - last_said >= 60:
+                errf.write(f"offbox-server: waiting; position {position} of {len(queue)}; {why}; waited {waited:.0f} s\n".encode())
+                errf.flush()
+                toollog.emit('boatd', 'run.queue', ids={'box': box_id, 'run': current['run_id']},
+                             props={'backend': 'home', 'queued': True, 'waitMs': waited * 1000,
+                                    'reason': reason, 'position': position, 'total': len(queue),
+                                    'head': head_id, 'headNeedBytes': head_need, 'freeBytes': free,
+                                    'running': running, 'cap': cap})
+                last_reason, last_said = state, now()
         time.sleep(2)
 
 
@@ -2229,12 +2346,13 @@ def run_cmd(box_id: str, pid: int) -> int:
                             'cgroupProcessCount': len(view['pids']) if view.get('pids') is not None else None})
         # The earlier invocation might still be alive even though its replacement failed to dispatch.
         # Both paths inspect that command before deciding; neither removes a possibly live cgroup.
-        act = settle_transport(con, c, res, view=view)
-        if act == 'retry':
-            cur = cmd_row(con, box_id, pid)
-            err = spawn_runner(box_id, pid, cur['attempt'])
-            if err:
-                drop_cmd(con, box_id, pid, f'could not retry interrupted command: {err}')
+        with runner_dispatch():
+            act = settle_transport(con, c, res, view=view)
+            if act == 'retry':
+                cur = cmd_row(con, box_id, pid)
+                err = spawn_runner(box_id, pid, cur['attempt'])
+                if err:
+                    drop_cmd(con, box_id, pid, f'could not retry interrupted command: {err}')
         outf.close()
         errf.close()
         return 0
@@ -2410,6 +2528,7 @@ def sync_snaps(con, box_id: str) -> tuple[int, int]:
     return adopted, dropped
 
 
+@dispatching
 def reconcile(con) -> dict:
     """Run at every boatd start, before the API answers. Brings database, systemd units and containers back in
     line after a boatd restart or a host crash. Safe to run twice."""
@@ -2608,21 +2727,22 @@ def reap_once(con) -> None:
     # Commands whose runner went away without recording an exit: same rules as at start-up.
     for c in [*con.execute("SELECT * FROM commands WHERE status IN ('queued','running') AND created_at < ? AND "
                           "COALESCE(interrupted_at, 0) < ?", (t - 30, t - 30)).fetchall(), *pending_kill_rows(con)]:
-        act = settle_cmd(con, c)
-        if act in ("requeue", "retry"):
-            b = con.execute("SELECT state FROM boxes WHERE id=? AND deleted_at IS NULL", (c["box_id"],)).fetchone()
-            cur = cmd_row(con, c["box_id"], c["pid"])
-            if not b or b["state"] not in LIVE:
-                drop_cmd(con, c["box_id"], c["pid"], "its box is not running; the run was dropped")
-                continue
-            if act == "requeue":
-                # A queued run without a runner: mark the respawn so it is not repeated every 15 s.
-                con.execute("UPDATE commands SET interrupted_at=? WHERE box_id=? AND pid=?", (t, c["box_id"], c["pid"]))
-            err = spawn_runner(c["box_id"], c["pid"], cur["attempt"] or 1)
-            if err:
-                drop_cmd(con, c["box_id"], c["pid"], f"could not be started again: {err}")
-        if act != "following":
-            log(f"run {c['box_id']}/{c['pid']}: {act}")
+        with runner_dispatch():
+            act = settle_cmd(con, c)
+            if act in ("requeue", "retry"):
+                b = con.execute("SELECT state FROM boxes WHERE id=? AND deleted_at IS NULL", (c["box_id"],)).fetchone()
+                cur = cmd_row(con, c["box_id"], c["pid"])
+                if not b or b["state"] not in LIVE:
+                    drop_cmd(con, c["box_id"], c["pid"], "its box is not running; the run was dropped")
+                    continue
+                if act == "requeue":
+                    # A queued run without a runner: mark the respawn so it is not repeated every 15 s.
+                    con.execute("UPDATE commands SET interrupted_at=? WHERE box_id=? AND pid=?", (t, c["box_id"], c["pid"]))
+                err = spawn_runner(c["box_id"], c["pid"], cur["attempt"] or 1)
+                if err:
+                    drop_cmd(con, c["box_id"], c["pid"], f"could not be started again: {err}")
+            if act != "following":
+                log(f"run {c['box_id']}/{c['pid']}: {act}")
     con.execute("DELETE FROM samples WHERE ts < ?", (t - CFG["keep_samples_days"] * 86400,))
     con.execute("DELETE FROM host_samples WHERE ts < ?", (t - CFG["keep_samples_days"] * 86400,))
     con.execute("DELETE FROM idem WHERE ts < ?", (t - 86400,))
@@ -3071,6 +3191,7 @@ class Handler(BaseHTTPRequestHandler):
                 return {"ok": True, "data": data, "nextOffset": nxt, "size": size,
                         "done": r["status"] not in ("queued", "running") and nxt >= size,
                         "commandId": r['command_id'], "status": r['status'],
+                        "attempt": r['attempt'] or 1,
                         "metrics": host_box_metrics(r['metrics']),
                         "interruption": json.loads(r['metrics'] or '{}').get('interruption')}
             return {"ok": True, "command": cmd_status_json(con, bid, r["pid"], 0)}
@@ -3180,7 +3301,7 @@ class Handler(BaseHTTPRequestHandler):
         offs = {"out": out_off, "err": err_off}
         started = last_beat = now()
         attempt = cmd_row(con, bid, pid)["attempt"] or 1
-        emit({"type": "hello", "attempt": attempt, "bootId": boot_id(), "serverStartedAt": iso(STARTED)})
+        emit({"type": "hello", "status": cmd_row(con, bid, pid)["status"], "attempt": attempt, "bootId": boot_id(), "serverStartedAt": iso(STARTED)})
         try:
             while True:
                 sent = False
@@ -3194,14 +3315,14 @@ class Handler(BaseHTTPRequestHandler):
                             offs[which] = nxt
                             emit({"type": typ, "data": text, "nextOffset": nxt})
                             sent = True
-                if sent:
-                    continue
                 r = con.execute("SELECT status, exit_code, signal, attempt, command_id, started_at, ended_at, metrics FROM commands WHERE box_id=? AND pid=?",
                                 (bid, pid)).fetchone()
                 if (r["attempt"] or 1) != attempt:
                     attempt = r["attempt"] or 1
-                    emit({"type": "attempt", "attempt": attempt})
+                    emit({"type": "attempt", "status": r["status"], "attempt": attempt})
                 if r["status"] not in ("queued", "running"):
+                    if sent:
+                        continue  # Drain bounded chunks before handling a final incomplete UTF-8 tail.
                     sizes = {w: (d / f"{pid}.{w}").stat().st_size for w in ("out", "err")}
                     for which, typ in (("out", "stdout"), ("err", "stderr")):
                         if offs[which] < sizes[which]:  # an incomplete UTF-8 tail: the run is over, send it as is
@@ -3215,16 +3336,18 @@ class Handler(BaseHTTPRequestHandler):
                               "status": r["status"], "attempt": attempt, "commandId": r["command_id"],
                               "startedAt": iso(r["started_at"]), "endedAt": iso(r["ended_at"]),
                               "metrics": host_box_metrics(r['metrics']),
-                              "interruption": json.loads(r['metrics'] or '{}').get('interruption')})
+                              "interruption": json.loads(r['metrics'] or '{}').get('interruption'),
+                              **queue_loss_json(r)})
                         break
                     continue
                 if now() - started > 600:
                     emit({"type": "reconnect", "stdoutOffset": offs["out"], "stderrOffset": offs["err"]})
                     break
                 if now() - last_beat > 15:
-                    emit({"type": "heartbeat", 'interruption': json.loads(r['metrics'] or '{}').get('interruption')})
+                    emit({"type": "heartbeat", "status": r["status"], 'interruption': json.loads(r['metrics'] or '{}').get('interruption')})
                     last_beat = now()
-                time.sleep(0.2)
+                if not sent:
+                    time.sleep(0.2)
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
