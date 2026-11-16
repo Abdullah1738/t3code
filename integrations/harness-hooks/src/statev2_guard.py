@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import glob
 import hashlib
 import json
@@ -13,6 +14,7 @@ import shutil
 import stat
 import unicodedata
 import warnings
+from urllib.parse import unquote
 
 
 REPLICA = re.compile(r"(?<![\w.-])\.robob/userdata/readonly/state\.sqlite(?:-(?:wal|shm))?(?![\w./-])")
@@ -2805,7 +2807,7 @@ def _concurrent_group(tokens, index):
     return False
 
 
-def _quoted_punctuation(source, script_literals=False):
+def _quoted_punctuation(source, script_literals=False, single_quotes_only=False):
     # shlex strips quotes, making a filename like '&' indistinguishable from
     # a background operator. Keep quoted punctuation opaque until command data
     # is inspected, including adjacent quoted pieces of a single word.
@@ -2880,13 +2882,20 @@ def _quoted_punctuation(source, script_literals=False):
         if char in "\"'":
             end = index + 1
             while end < len(source):
-                if source[end] == "\\" and char == '"':
+                if source[end] == "\\" and (char == '"' or single_quotes_only and index > 0 and source[index - 1] == '$'):
                     end += 2
                     continue
                 if source[end] == char:
                     break
                 end += 1
             value = source[index + 1:end]
+            if single_quotes_only:
+                if char == "'" and (index == 0 or source[index - 1] != '$'):
+                    output.append(' ' + ''.join('\n' if c == '\n' else ' ' for c in value) + ' ')
+                else:
+                    output.append(source[index:end + 1])
+                index = end + 1
+                continue
             literal = script_literals and (char == "'" or '\\$' in value or '\\`' in value)
             double = script_literals and char == '"' and not literal
             if end < len(source) and (re.fullmatch(r"[;&|(){}\n<>]+", value) or literal or double):
@@ -2903,7 +2912,13 @@ def _quoted_punctuation(source, script_literals=False):
             continue
         output.append(char)
         index += 1
-    return "".join(output), quoted
+    result = "".join(output)
+    if single_quotes_only:
+        # Keep substitutions, parameter expansions and backticks live. Only
+        # ordinary single quotes are inert for the binding preflight.
+        for key, value in reversed(quoted.items()):
+            result = result.replace(key, value)
+    return result, quoted
 
 
 def _offbox_payload(words, *, known_only=True):
@@ -2952,7 +2967,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
     written = {}
-    invalidated_written = set()
+    invalidated_written = {}
     write_history = {}
     variable_written = set()
     tool_changes = set()
@@ -2982,8 +2997,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     invocation_reader_literals = set()
     invocation_quoted = set()
     uncertain_write = 0
-    unsafe_bindings = inherited_unsafe
-    unsafe_binding_cause = None
+    unsafe_bindings = bool(inherited_unsafe)
+    unsafe_binding_cause = inherited_unsafe or None
     # Opaque paths need a fresh, unmodified root; existing files cannot be
     # assumed replaced when a write fails or is skipped.
     fresh_variables = set()
@@ -2996,6 +3011,26 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     current_line = 1
     copied_opaque = set()
     noclobber = False
+    proof_failure = 'opaque binary'
+    execution_site = 'script operand'
+    execution_binary = 'script'
+
+    def binary_label(words):
+        binary = os.path.basename(words[0]) if words else ''
+        # Executable names are caller-controlled too. Only emit vocabulary
+        # owned by the guard, never a path or an arbitrary command token.
+        if re.fullmatch(r'python[\d.]*', binary):
+            return 'python3' if binary.startswith('python3') else 'python'
+        return binary if binary in {'node', 'bun', 'deno', 'bash', 'sh', 'zsh', 'dash', 'ksh',
+                                    'cat', 'tee', 'sed', 'chmod', 'mkdir', 'ls', 'test', 'echo',
+                                    'cp', 'mv', 'rsync', 'ditto', 'install', 'git', 'offbox',
+                                    'perl', 'truncate', 'true', 'printf'} else 'opaque binary'
+
+    def invalidate(paths, site, words=(), reason=None, destination=None):
+        target = invalidated_written if destination is None else destination
+        detail = f'{site}: {binary_label(words)} at line {current_line}; {reason or proof_failure}'
+        for path in paths:
+            target.setdefault(path, detail)
 
     def source_identity(path):
         # The same call may run on a case-insensitive, normalization-insensitive
@@ -3057,12 +3092,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if value not in invocation_quoted and value not in inherited_quoted:
                 reason = 'unquoted script path; quote the directory variable (IFS/glob expansion is unproved)'
             elif unsafe_bindings:
-                reason = unsafe_binding_cause or 'unsafe shell/startup bindings invalidate the script proof'
+                reason = unsafe_binding_cause
             elif key in writer_causes:
                 reason = writer_causes[key]
             else:
                 reason = next((binding_causes[a or b] for a, b in names if (a or b) in binding_causes), None)
-                reason = reason or invocation_invalidation or 'no readable same-call heredoc writer for this script'
+                reason = reason or ('no readable same-call heredoc writer for this script; ' + invocation_invalidation
+                                    if invocation_invalidation else 'no readable same-call heredoc writer for this script')
         extension = '.py' if binary.startswith('python') else '.sh' if binary in {'bash','sh','zsh','dash','ksh'} else '.ts' if binary == 'bun' else '.js'
         runner = f'bun test --preload "$d/x{extension}"' if binary == 'bun' else f'{binary} "$d/x{extension}"'
         return (f'{reason}: {_token(value)} ({binary})\n'
@@ -3125,11 +3161,49 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return True
 
     def python_preserves_sources(source, directory):
+        nonlocal proof_failure
+        proof_failure = 'python: operation proof failed'
         try:
             tree = ast.parse(source)
         except (SyntaxError, ValueError):
+            proof_failure = 'python: source not parseable'
             return False
         bindings, strings = {}, set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if node.func.attr in {'glob', 'rglob', 'walk', 'scandir', 'listdir', 'iterdir'}:
+                    proof_failure = 'python: glob or traversal targets unproved'
+                    return False
+                elif node.func.attr in {'touch', 'rename', 'replace', 'unlink', 'extractall', 'urlretrieve'}:
+                    proof_failure = 'python: mutation method outside write proof'
+
+        def writer_parts(call):
+            if isinstance(call.func, ast.Attribute) and call.func.attr in {'write', 'write_text', 'write_bytes'}:
+                return call.func.value, [*call.args, *(k.value for k in call.keywords)]
+            if _name(call.func) == 'json.dump' and len(call.args) == 2 and all(
+                    k.arg in {'indent', 'sort_keys', 'ensure_ascii'} for k in call.keywords):
+                return call.args[1], [call.args[0], *(k.value for k in call.keywords)]
+            return None, []
+
+        # Normalize one bounded context-manager writer into the same operation
+        # proof as open(...).write/json.dump. Do not trust arbitrary handle use.
+        statements = []
+        for statement in tree.body:
+            if isinstance(statement, ast.With) and len(statement.items) == 1 and len(statement.body) == 1:
+                item = statement.items[0]
+                body = statement.body[0]
+                if (isinstance(item.optional_vars, ast.Name) and isinstance(body, ast.Expr) and
+                        isinstance(body.value, ast.Call) and _name(body.value.func) == 'json.dump' and
+                        len(body.value.args) == 2 and isinstance(body.value.args[1], ast.Name) and
+                        body.value.args[1].id == item.optional_vars.id and
+                        sum(isinstance(n, ast.Name) and n.id == item.optional_vars.id for n in ast.walk(tree)) == 2 and
+                        item.optional_vars.id not in {'json', 'Path', 'pathlib', 'open', 'compile', 'ast'} and
+                        not any(isinstance(n, ast.Name) and n.id == item.optional_vars.id for n in ast.walk(body.value.args[0]))):
+                    body.value.args[1] = item.context_expr
+                    statements.append(body)
+                    continue
+            statements.append(statement)
+        tree.body = statements
 
         def string_value(node):
             return (isinstance(node, ast.Constant) and isinstance(node.value, str) or
@@ -3187,23 +3261,27 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             # in the AST so their side effects still face the read-only check.
             if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
                 call = statement.value
-                if isinstance(call.func, ast.Attribute) and call.func.attr in {'write', 'write_text', 'write_bytes'}:
-                    receiver = call.func.value
-                    if call.func.attr == 'write' and isinstance(receiver, ast.Call) and _name(receiver.func) == 'open':
+                receiver, data = writer_parts(call)
+                if receiver is not None:
+                    if isinstance(receiver, ast.Call) and _name(receiver.func) == 'open':
                         mode = receiver.args[1] if len(receiver.args) > 1 else next((k.value for k in receiver.keywords if k.arg == 'mode'), None)
-                        if not isinstance(mode, ast.Constant) or mode.value not in {'w', 'a', 'wb', 'ab'} or not receiver.args:
+                        if (not isinstance(mode, ast.Constant) or mode.value not in {'w', 'a', 'wb', 'ab'} or
+                                not receiver.args or len(receiver.args) > 2 or
+                                any(k.arg not in {'mode', 'encoding', 'errors'} for k in receiver.keywords)):
                             return False
                         destination = _path_expression(receiver.args[0], bindings, {})
                         values = [*receiver.args, *(k.value for k in receiver.keywords)]
-                    elif call.func.attr in {'write_text', 'write_bytes'}:
+                    elif isinstance(call.func, ast.Attribute) and call.func.attr in {'write_text', 'write_bytes'}:
                         destination = _path_expression(receiver, bindings, {})
                         values = [receiver]
                     else:
                         return False
                     path = _literal_path(destination, directory) if destination is not None else None
-                    if path is None or affected_sources(path):
+                    if path is None or affected_sources(path, descendants=True):
+                        proof_failure = ('python: write target not literal' if path is None else
+                                         'python: write target aliases checked source')
                         return False
-                    statement.value = ast.Tuple(elts=[*values, *call.args, *(k.value for k in call.keywords)], ctx=ast.Load())
+                    statement.value = ast.Tuple(elts=[*values, *data], ctx=ast.Load())
             literal = None
             is_string = False
             if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
@@ -3227,12 +3305,31 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                        shell_values, written, script)
 
     def may_change_scripts(words, directory, stdin_sources=()):
+        nonlocal proof_failure
+        proof_failure = 'opaque binary'
         words = list(words)
         while words and (words[0] in {'do', 'then', 'else', 'if', '!'} or re.match(r'^[A-Za-z_]\w*=', words[0])):
             words.pop(0)
         if not words or words[0] in {'for', 'while', 'until', 'done', 'fi'}:
             return False
         binary = os.path.basename(words[0])
+        if binary in {'node', 'bun', 'deno'}:
+            proof_failure = 'node: source or operation proof failed'
+        elif re.fullmatch(r'python[\d.]*', binary):
+            proof_failure = 'python: source proof failed'
+        if binary == 'sed':
+            args = words[1:]
+            if args[:1] == ['-i']:
+                args = args[1:]
+                if args[:1] == ['']:
+                    args = args[1:]
+                # sed can execute commands or write additional files from its
+                # expression. Only a plain substitution has bounded outputs.
+                if (len(args) >= 2 and re.fullmatch(r's/(?:\\.|[^/\\])*/(?:\\.|[^/\\])*/[gIp0-9]*', args[0]) and
+                        all(not arg.startswith('-') and (path := _literal_path(arg, directory)) is not None and
+                            not affected_sources(path, descendants=True) for arg in args[1:])):
+                    return False
+            proof_failure = 'sed: output targets or expression unproved'
         # These writers have explicit destinations, handled by affected_sources
         # below. Treating them as arbitrary programs also invalidated siblings.
         if binary == 'cp' and len(words) == 3 and not any(arg.startswith('-') for arg in words[1:]):
@@ -3325,6 +3422,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                    for source in sources):
                     return False
             elif binary in {'node', 'bun'}:
+                inline = node_inline_sources(words, stdin_sources)
+                if inline:
+                    return not all(node_inline_preserves_sources(source, directory) for source in inline)
                 args = _interpreter_args(binary, words[1:])
                 test_mode = False
                 if binary == 'node':
@@ -3355,6 +3455,47 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if binary == 'print':
             return not output_only_print(words)
         return binary not in {'cat', 'tee', 'mkdir', 'chmod', 'set', 'head', 'tail', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'ls', 'stat', 'wc', 'pwd'}
+
+    def node_inline_sources(words, stdin_sources):
+        if not words or os.path.basename(words[0]) != 'node':
+            return []
+        args, inputs, _, _ = _node_arguments(words[1:])
+        if inputs:
+            return []
+        if len(args) >= 2 and args[0] in {'-e', '--eval', '-p', '--print'}:
+            source = args[1]
+            return [source] if source in invocation_literals or not re.search(r'[$`]', source) else []
+        return list(stdin_sources) if not args or args[0] == '-' else []
+
+    def node_inline_preserves_sources(source, directory, depth=0):
+        nonlocal proof_failure
+        proof_failure = 'node: inline operation or import proof failed'
+        if depth > MAX_SHELL_DEPTH or len(source) > MAX_SOURCE_BYTES:
+            return False
+        # Reuse the retained-source grammar for the program around imports.
+        # Each accepted data module is decoded and faces the same proof; local
+        # and computed specifiers cannot justify ignoring remembered scripts.
+        literal = r'''(?:"[^"\\\n]*"|'[^'\\\n]*')'''
+        pattern = r'\b(?:await\s+)?import\s*(?:\(\s*(' + literal + r')\s*\)|(' + literal + r'))\s*;?'
+        for match in list(re.finditer(pattern, source)):
+            specifier = (match[1] or match[2])[1:-1]
+            if not specifier.startswith('data:text/javascript,') and not specifier.startswith('data:text/javascript;base64,'):
+                proof_failure = 'node: local or unsupported inline import'
+                return False
+            header, _, payload = specifier.partition(',')
+            try:
+                decoded = (base64.b64decode(payload, validate=True).decode('utf-8') if header.endswith(';base64') else unquote(payload))
+            except (ValueError, UnicodeError):
+                proof_failure = 'node: data import decoding failed'
+                return False
+            check_source(decoded, directory, False, 'live-database-read')
+            if not node_inline_preserves_sources(decoded, directory, depth + 1):
+                return False
+        remaining = re.sub(pattern, '', source)
+        if re.search(r'\b(?:import|require)\b', remaining):
+            proof_failure = 'node: computed or unsupported inline import'
+            return False
+        return heredoc_preserves_sources(remaining, directory, False)
 
     def heredoc_preserves_sources(source, directory, python, script_args=None):
         # This proof is only for bodies retained from this batch. Arbitrary
@@ -3517,11 +3658,12 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     yield [expand(word, {name: value}) for word in words]
 
     def remember_assignment(word, directory, track_scripts=True, transient=False):
-        nonlocal unsafe_bindings
+        nonlocal unsafe_bindings, unsafe_binding_cause
         name, _, value = word.partition("=")
         if track_scripts:
             if name in {'PATH', 'IFS', 'ENV', 'BASH_ENV', 'BASHOPTS', 'SHELLOPTS', 'ZDOTDIR'}:
                 unsafe_bindings = True
+                unsafe_binding_cause = f'{name} assignment at line {current_line}'
             previous = name in script_values
             invalidate_variable(name)
             resolved_path = None
@@ -3804,7 +3946,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                 check_source(source.decode('utf-8', errors='replace'), directory, path.suffix == '.py')
             except OSError:
                 pass
-            raise AmbiguousScript("script source changed after its heredoc write " + _token(value))
+            # Audit rows retain 240 characters. Put both proof sites before a
+            # potentially long script path so truncation keeps the diagnosis.
+            raise AmbiguousScript("script source changed after its heredoc write; " + invalidated_written[path] +
+                                  f'; execution {execution_site}: {execution_binary} at line {current_line}; ' + _token(value))
         if path not in paths:
             paths.append(path)
         try:
@@ -3895,7 +4040,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if inherit_environment:
             environment = ({name: value for name, value in shell_values.items()
                             if STARTUP_ENV.fullmatch(name) or name in {'ZDOTDIR', 'PATH', 'IFS'}},
-                           unsafe_bindings, caller_command if caller_command is not None else command)
+                           unsafe_binding_cause if unsafe_bindings else False, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
                                   _sources=(written, invalidated_written, write_history, variable_written, tool_changes),
                                   _stdin=(input_words, input_bodies or {}), _environment=environment, _opaque=opaque)
@@ -3905,6 +4050,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
 
     def inspect(words, directory, depth, bodies, quoted, changed_sources, cwd_only=False, binding_preflight=False):
         nonlocal unknown_cause, invocation_written, invocation_fresh, invocation_literals, invocation_reader_literals, invocation_quoted, unsafe_bindings, unsafe_binding_cause, noclobber, last_invalidation, invocation_invalidation
+        nonlocal execution_site, execution_binary
         invocation_invalidation = last_invalidation
         words = list(words)
         if stdin_words and not any(word in {'<<', '<<<', '<'} for word in words):
@@ -4033,7 +4179,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 if len(arguments) > MAX_SCRIPTS:
                     raise AmbiguousScript('too many caller-expanded remote argument combinations')
             return arguments
-        if not cwd_only and any(re.match(r'^[A-Za-z_]\w*(?:\+|\[)', word) for word in words):
+        if not cwd_only and any(re.match(r'^[A-Za-z_]\w*(?:\+=|\[[^=]*=)', word) for word in words):
             script_values.clear()
             opaque_written.clear()
         caller_directory = directory
@@ -4150,7 +4296,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                     opaque=(trusted, empty, reasons) if len(words) > 1 else None)
                     if may_change_scripts(words, directory, documents):
                         tool_changes.add(None)
-                        changed_sources.update(written)
+                        invalidate(written, 'offbox payload', words, destination=changed_sources)
                         fresh_variables.clear()
                     if pulls:
                         # Pulls occur after the payload, and may replace any
@@ -4158,7 +4304,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         last_invalidation = f'invalidated by offbox --pull at line {current_line}'
                         opaque_written.clear()
                         fresh_variables.clear()
-                        changed_sources.update(written)
+                        invalidate(written, 'offbox pull', ['offbox'], 'output pull may replace source', changed_sources)
                         tool_changes.add(None)
                 # Local output redirects still need the normal invalidation
                 # pass after the remote command has been checked.
@@ -4169,6 +4315,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if not words:
             return caller_directory if child_directory else directory
         binary, args = os.path.basename(words[0]), words[1:]
+        execution_binary = binary_label(words)
+        execution_site = 'interpreter operand' if binary in {'node', 'bun', 'deno'} or re.fullmatch(r'python[\d.]*', binary) else 'script operand'
         if binary in {'set', 'bash', 'sh', 'zsh', 'dash', 'ksh'}:
             for arg in args:
                 for option in script_variants(arg):
@@ -4176,13 +4324,16 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         noclobber = True
         if binary in {'trap', 'alias', 'unalias', 'enable', 'builtin', 'shopt', 'setopt'}:
             unsafe_bindings = True
+            unsafe_binding_cause = f'{binary} shell binding builtin at line {current_line}'
         after = caller_directory if child_directory else directory
         if binary in {"export", "readonly", "declare", "typeset", "local"}:
             if not cwd_only:
                 if binary in {'declare', 'typeset', 'local'} and any(re.fullmatch(r'-[A-Za-z]*[naiA][A-Za-z]*', arg) for arg in args):
                     unsafe_bindings = True
+                    unsafe_binding_cause = f'non-scalar declaration at line {current_line}'
                 if any(arg.partition('=')[0] in {'PATH', 'IFS', 'ENV', 'BASH_ENV', 'BASHOPTS', 'SHELLOPTS', 'ZDOTDIR'} for arg in args):
                     unsafe_bindings = True
+                    unsafe_binding_cause = f'startup binding declaration at line {current_line}'
                 script_values.clear()
                 opaque_written.clear()
             for arg in args:
@@ -4205,6 +4356,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if binary == 'unset' and all(re.fullmatch(r'[A-Za-z_]\w*', arg) for arg in args):
             if 'PATH' in args:
                 unsafe_bindings = True
+                unsafe_binding_cause = f'PATH unset at line {current_line}'
             for name in args:
                 invalidate_variable(name)
                 script_values.pop(name, None)
@@ -4218,21 +4370,21 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         invocation_written = dict(opaque_written)
         invocation_fresh = set(fresh_variables)
         stdin_sources = documents if exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) else []
+        if written or opaque_written:
+            inline_sources = node_inline_sources(words, stdin_sources)
+            if inline_sources and not all(node_inline_preserves_sources(source, directory) for source in inline_sources):
+                raise AmbiguousScript(f'{proof_failure}; execution inline source: node at line {current_line}')
         changes_scripts = may_change_scripts(words, directory, stdin_sources)
         if changes_scripts:
             if opaque_written or fresh_variables:
-                last_invalidation = f'invalidated by {binary} command at line {current_line}'
+                last_invalidation = f'invalidated by {binary_label(words)} command at line {current_line}; intervening command; {proof_failure}'
             tool_changes.add(None)
-            changed_sources.update(written)
+            invalidate(written, 'intervening command', words, destination=changed_sources)
             opaque_written.clear()
             fresh_variables.clear()
         if binary == 'chmod':
             tool_changes.update(_literal_path(candidate, directory) for arg in args if not arg.startswith('-')
                                 for candidate in script_variants(arg))
-            if not (not unsafe_bindings and len(args) == 2 and re.fullmatch(r'[0-7]+|[ugoa]*[+=-][rwx]+', args[0]) and
-                    opaque_key(args[1], directory) and args[1] in invocation_quoted):
-                opaque_written.clear()
-                fresh_variables.clear()
         if words[0].startswith(('/', './', '../')) and re.search(r'\.(?:py|mjs|cjs|js|ts|sh)$', words[0]):
             fresh_variables.clear()
         if binary in {'cp', 'mv', 'rsync', 'ditto', 'install', 'tee', 'sed', 'perl', 'truncate'}:
@@ -4241,7 +4393,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 for candidate in script_variants(arg):
                     target = _literal_path(candidate, directory)
                     if target is not None:
-                        invalidated_written.update(affected_sources(target, descendants=True))
+                        invalidate(affected_sources(target, descendants=True), 'writer operand', words, 'destination overlaps checked source')
             if binary == 'cp' and len(args) == 2:
                 root = re.fullmatch(r'\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/([^$`*?\[\]{}]*)', args[-1])
                 source = _literal_path(args[0], directory)
@@ -4358,7 +4510,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 affected = affected_sources(path)
                 if documents and binary in {'cat', 'tee'}:
                     affected.discard(path)
-                invalidated_written.update(affected)
+                invalidate(affected, 'output redirect', words, 'redirect target overlaps or is unproved')
         tee_options = binary == 'tee' and all(arg and (not arg.startswith('-') or arg in {'-a', '--append', '--'}) for arg in args)
         writer = not noclobber and exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) and (binary == 'cat' and args in ([], ['-'], ['--']) or tee_options)
         if not (writer and documents) and binary == 'tee':
@@ -4372,7 +4524,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     for candidate in script_variants(target):
                         path = _literal_path(candidate, directory)
                         if path is not None:
-                            invalidated_written.add(path)
+                            invalidate([path], 'unreadable heredoc writer', words, 'heredoc writer proof failed')
         if documents:
             for body in documents:
                 if binary in shells and stdin_code:
@@ -4391,7 +4543,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         path = _literal_path(candidate, directory)
                         if path is not None:
                             if not append and not conditional and len(candidates) == 1 and '$' not in target:
-                                invalidated_written.discard(path)
+                                invalidated_written.pop(path, None)
                             prior, replaced = written.get(path, ("", False))
                             if not append and not conditional and len(candidates) == 1 and '$' not in target:
                                 write_history[path] = []
@@ -4553,7 +4705,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return after
 
     def scan(source, directory, depth=0, cwd_only=False, inherited_bodies=None):
-        nonlocal unsafe_bindings
+        nonlocal unsafe_bindings, unsafe_binding_cause
         if depth > MAX_SHELL_DEPTH:
             if SCRIPT.search(source) or DIRECT.search(source) or READER.search(source):
                 raise AmbiguousScript(f"shell nesting deeper than MAX_SHELL_DEPTH ({MAX_SHELL_DEPTH})")
@@ -4572,10 +4724,17 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             return directory
         # Definitions and arithmetic can mutate bindings outside the simple
         # assignment grammar. Keep variable execution opaque in those shells.
-        if (re.search(r'\(\(|(?:^|[;&|()\n])\s*(?:function\s+[A-Za-z_]\w*|[A-Za-z_]\w*\s*\(\s*\)\s*\{)', source) or
-                any(not re.fullmatch(r'\$\{[A-Za-z_]\w*\}', match[0]) for match in re.finditer(r'\$\{[^}]*\}', source))):
-            unsafe_bindings = True
-            opaque_written.clear()
+        binding_source, _ = _quoted_punctuation(source, single_quotes_only=True)
+        checks = [('(( arithmetic', re.search(r'\(\(', binding_source)),
+                  ('function definition', re.search(r'(?:^|[;&|()\n])\s*(?:function\s+[A-Za-z_]\w*|[A-Za-z_]\w*\s*\(\s*\)\s*\{)', binding_source)),
+                  ('non-simple ${} expansion', next((m for m in re.finditer(r'\$\{[^}]*\}', binding_source)
+                                                    if not re.fullmatch(r'\$\{[A-Za-z_]\w*\}', m[0])), None))]
+        for reason, match in checks:
+            if match:
+                unsafe_bindings = True
+                unsafe_binding_cause = f'{reason} at line {binding_source.count(chr(10), 0, match.start()) + 1}'
+                opaque_written.clear()
+                break
         source, quoted = _quoted_punctuation(source, script_literals=True)
         lexer = shlex.shlex(source, posix=True, punctuation_chars=";&|(){}\n<>")
         lexer.whitespace = " \t\r"
@@ -4615,7 +4774,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 uncertain = bool(branches) or guarded or concurrent
                 conditional += uncertain
                 uncertain_write += bool(branches) or concurrent or guarded and not safe_chain
-                changed_sources = set()
+                changed_sources = {}
                 try:
                     current = inspect(words, current, depth, bodies, quoted, changed_sources,
                                       cwd_only=probe, binding_preflight=binding_preflight) if words else current
@@ -4682,7 +4841,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     # The next iteration may inherit any assignment from the
                     # body, including one after an earlier script invocation.
                     segment = [decode_word(word, current, depth, quoted, set(), True, bodies) for word in tokens[index + 1:end]]
-                    if any(word in {'read', 'readarray', 'mapfile', 'unset', 'printf', 'let', 'getopts', 'eval', 'source', '.', 'wait', 'local', 'declare', 'typeset', 'export', 'readonly', 'trap', 'alias', 'unalias', 'enable', 'builtin', 'shopt', 'setopt'} or re.match(r'^[A-Za-z_]\w*(?:\+|\[)', word) for word in segment):
+                    if any(word in {'read', 'readarray', 'mapfile', 'unset', 'printf', 'let', 'getopts', 'eval', 'source', '.', 'wait', 'local', 'declare', 'typeset', 'export', 'readonly', 'trap', 'alias', 'unalias', 'enable', 'builtin', 'shopt', 'setopt'} or re.match(r'^[A-Za-z_]\w*(?:\+=|\[[^=]*=)', word) for word in segment):
                         script_values.clear()
                         opaque_written.clear()
                     for offset, decoded in enumerate(segment):
@@ -4701,13 +4860,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         targets = [group[i + 1] for i, token in enumerate(group[:-1]) if token in {'>', '>>'}]
                         if may_change_scripts(group, current):
                             tool_changes.add(None)
-                            invalidated_written.update(written)
+                            invalidate(written, 'loop command', group)
                         if group and os.path.basename(group[0]) in {'cp', 'mv', 'rsync', 'ditto', 'tee', 'sed', 'perl', 'truncate'}:
                             targets += group[1:]
                         for target in targets:
                             for candidate in script_variants(target):
                                 path = _literal_path(candidate, current)
-                                invalidated_written.update(affected_sources(path, descendants=True))
+                                invalidate(affected_sources(path, descendants=True), 'loop writer', group, 'destination overlaps or is unproved')
                         if targets:
                             opaque_written.clear()
                         group = []

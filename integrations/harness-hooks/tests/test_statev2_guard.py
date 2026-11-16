@@ -192,8 +192,8 @@ class GuardTests(unittest.TestCase):
         path.write_text(source)
         return path
 
-    def heredoc(self, target, body):
-        return 'cat > ' + target + " <<'GUARD_BODY'\n" + body.rstrip() + '\nGUARD_BODY\n'
+    def heredoc(self, target, body, append=False):
+        return ('cat >> ' if append else 'cat > ') + target + " <<'GUARD_BODY'\n" + body.rstrip() + '\nGUARD_BODY\n'
 
     @contextmanager
     def trusted_node_environment(self):
@@ -551,6 +551,142 @@ class GuardTests(unittest.TestCase):
                     self.assertEqual(json.loads(output.getvalue())['hookSpecificOutput']['permissionDecision'], 'deny')
                 else:
                     self.assertEqual(output.getvalue(), '')
+
+    def test_same_call_literal_sibling_edits(self):
+        self.write('config/shards.json', '{}')
+        edits = [
+            "from pathlib import Path\ns=open('config/shards.json').read()\nPath('config/shards.json').write_text(s)",
+            "import json\ns=json.load(open('config/shards.json'))\njson.dump(s, open('config/shards.json', 'w'))",
+            "import json\nwith open('config/shards.json', 'w') as f:\n json.dump({}, f)",
+        ]
+        for body in edits:
+            command = self.heredoc('scripts/a.mjs', 'console.log(1)', append=True)
+            command += "python3 -I - <<'PY'\n" + body + '\nPY\nnode --test scripts/a.mjs'
+            with self.subTest(body=body):
+                self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+                self.adapters(command)
+
+    def test_same_call_inline_node_does_not_run_sibling(self):
+        prefix = 'W=$(mktemp -d)\n' + self.heredoc('"$W/prep.py"', 'print(1)')
+        prefix += self.heredoc('scripts/a.mjs', 'console.log(1)', append=True)
+        for code, expected in [
+            ('await import("data:text/javascript,export default 1")', None),
+            ('import "data:text/javascript,export default 1"', None),
+            ('await import("./scripts/a.mjs")', UNRESOLVED),
+            ('import "./scripts/a.mjs"', UNRESOLVED),
+            ('await import(process.argv[1])', UNRESOLVED),
+        ]:
+            for run in ['node --input-type=module -e ' + shlex.quote(code),
+                        "node --input-type=module - <<'JS'\n" + code + '\nJS\n']:
+                with self.subTest(run=run):
+                    self.assertEqual(self.classify(prefix + run), expected)
+                    self.adapters(prefix + run, expected)
+
+    def test_same_call_single_quoted_binding_punctuation(self):
+        code = 's="(( ${t.name}"; print(s)'
+        prefix = 'd=$(mktemp -d)\npython3 -I -c ' + shlex.quote(code) + '\n'
+        command = prefix + self.heredoc('"$d/x.mjs"', 'console.log(1)')
+        command += 'node --test --test-name-pattern foo "$d/x.mjs"'
+        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        self.adapters(command)
+        writer = 'import sys; open(sys.argv[1], "w").write("(( ${t.name}")'
+        command = 'd=$(mktemp -d)\npython3 -I -c ' + shlex.quote(writer) + ' "$d/x.mjs"\nnode --test "$d/x.mjs"'
+        rule, cause = guard.classify_detail(command, str(self.root))
+        self.assertEqual(rule, UNRESOLVED)
+        self.assertIn('no readable same-call heredoc writer', cause)
+
+    def test_same_call_binding_causes(self):
+        rows = {
+            '((i++))': '(( arithmetic',
+            'f(){ :; }': 'function definition',
+            'function f { :; }': 'function definition',
+            'echo "${d:-/tmp}"': 'non-simple ${} expansion',
+            "echo $'(( ${x:-y}'": '(( arithmetic',
+            'echo `echo "${x:-y}"`': 'non-simple ${} expansion',
+            'PATH=/bin': 'PATH assignment',
+            'IFS=,': 'IFS assignment',
+            "trap ':' EXIT": 'shell binding builtin',
+            'declare -n other=d': 'non-scalar declaration',
+            'export PATH': 'startup binding declaration',
+            'unset PATH': 'PATH unset',
+        }
+        for binding, expected in rows.items():
+            command = 'd=$(mktemp -d)\n' + binding + '\n'
+            command += self.heredoc('"$d/x.mjs"', 'console.log(1)') + 'node "$d/x.mjs"'
+            with self.subTest(binding=binding):
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED)
+                self.assertIn(expected, cause)
+                self.assertRegex(cause, r'at line \d+')
+
+    def test_same_call_nonwriters_and_sed_sibling(self):
+        for command in ['chmod +x "$d/x.sh"', 'chmod -R u+x "$d"', 'mkdir "$d/other"', 'ls', 'cat config/shards.json',
+                        'test -f "$d/x.sh"', 'echo hello', "sed -i 's/a/b/' config/shards.json"]:
+            prefix = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.sh"', 'echo ok')
+            with self.subTest(command=command):
+                self.assertEqual(guard.classify_detail(prefix + command + '\nbash "$d/x.sh"', str(self.root)), (None, None))
+        command = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.sh"', 'echo ok')
+        self.assertEqual(self.classify(command + 'chmod +x "$d/x.sh"\n"$d/x.sh"'), None)
+
+    def test_same_call_mutation_causes_and_aliases(self):
+        self.write('scripts/a.mjs', 'console.log(1)')
+        (self.root / 'alias.mjs').symlink_to(self.root / 'scripts/a.mjs')
+        os.link(self.root / 'scripts/a.mjs', self.root / 'hardlink.mjs')
+        rows = [
+            "python3 -I -c \"open('scripts/a.mjs','w').write('SECRET_BODY')\"",
+            "python3 -I -c \"open('scripts/' + input(), 'w').write('SECRET_BODY')\"",
+            "python3 -I -c \"import glob; [open(p,'w').write('SECRET_BODY') for p in glob.glob('scripts/*')]\"",
+            "python3 -I -c \"from pathlib import Path; Path('alias.mjs').write_text('SECRET_BODY')\"",
+            "python3 -I -c \"from pathlib import Path; Path('hardlink.mjs').write_text('SECRET_BODY')\"",
+            "sed -i 's/a/SECRET_BODY/' scripts/a.mjs", 'cp other.mjs scripts/a.mjs',
+            'mv other scripts', 'rsync -a other/ scripts/', 'git restore scripts/a.mjs',
+            'git checkout -- scripts/a.mjs', 'git stash pop',
+        ]
+        for edit in rows:
+            command = self.heredoc('scripts/a.mjs', 'console.log(1)') + edit + '\nnode --test scripts/a.mjs'
+            with self.subTest(edit=edit):
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED)
+                self.assertIn('at line', cause)
+                self.assertIn('execution interpreter operand: node', cause)
+                self.assertNotIn('SECRET_BODY', cause)
+                self.assertNotIn(edit, cause)
+
+    def test_same_call_audit_retains_proof_sites_without_command_text(self):
+        target = 'scripts/' + 'a' * 120 + '.mjs'
+        command = self.heredoc(target, 'console.log(1)') + 'SECRET_BINARY SECRET_BODY\nnode --test ' + target
+        state = self.root / 'audit'
+        for harness, tool, field in [('claude', 'Bash', 'command'), ('codex', 'exec_command', 'cmd')]:
+            event = {'hook_event_name': 'PreToolUse', 'cwd': str(self.root), 'tool_name': tool,
+                     'tool_input': {field: command}}
+            with self.subTest(harness=harness), patch.dict(os.environ, {'HARNESS_HOOKS_STATE_DIR': str(state)}), \
+                    patch.object(engine, '_command_identity_key', return_value=b'fixture-key'), patch.object(engine, '_tool_log'):
+                self.assertEqual(engine.decide(event, harness)['decision'], 'deny')
+                row = json.loads((state / 'decisions.jsonl').read_text().splitlines()[-1])
+                self.assertIn('intervening command: opaque binary', row['cause'])
+                self.assertIn('execution interpreter operand: node', row['cause'])
+                self.assertNotIn('SECRET', json.dumps(row))
+                self.assertIsNone(row['cmd'])
+
+    def test_same_call_additional_write_proof_negatives(self):
+        prefix = self.heredoc('scripts/a.mjs', 'console.log(1)')
+        edits = [
+            "python3 -I -c \"import json; json.dump({}, open('scripts/a.mjs', 'w'))\"",
+            "python3 -I -c \"import json; from pathlib import Path; json.dump({}, open('config/x', 'w'), default=Path('scripts/a.mjs').touch)\"",
+            "python3 -I -c \"import json; from pathlib import Path; [Path(p).write_text('x') for p in Path('.').rglob('*.mjs')]\"",
+            "sed -i 's/a/b/w scripts/a.mjs' config/shards.json",
+            "sed -i 's/a/b/e' config/shards.json",
+            "sed -i 's/a/b/' config/*.json",
+            "sed -i 's/a/b/' alias.mjs",
+            "sed -i 's/a/b/' hardlink.mjs",
+            'cp other scripts', 'cp other alias.mjs',
+        ]
+        self.write('scripts/a.mjs', 'console.log(1)')
+        (self.root / 'alias.mjs').symlink_to(self.root / 'scripts/a.mjs')
+        os.link(self.root / 'scripts/a.mjs', self.root / 'hardlink.mjs')
+        for edit in edits:
+            with self.subTest(edit=edit):
+                self.assertEqual(self.classify(prefix + edit + '\nnode --test scripts/a.mjs'), UNRESOLVED)
 
     def test_same_call_unproved_python_operations(self):
         rows = {
