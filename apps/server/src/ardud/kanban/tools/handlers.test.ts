@@ -6478,6 +6478,8 @@ it.effect.each(["card_move", "card_review_result"] as const)(
         yield* kanban.postToCard(card.id, owner, [{ _tag: "md", text: "Prepare the handoff" }]);
         yield* kanban.dispatchNow;
         const worker = (yield* kanban.card(card.id)).card.workThreadId!;
+        // Keep the worker active so completing its last subtask does not auto-advance it.
+        if (tool === "card_move") fake.running.add(worker);
         yield* kanban.markSubtask(
           card.id,
           "s1",
@@ -6513,6 +6515,8 @@ it.effect.each(["card_move", "card_review_result"] as const)(
             yield* Deferred.await(resume);
           });
         warnings.length = 0;
+        if (tool === "card_move")
+          assert.strictEqual((yield* kanban.card(card.id)).card.stage, "working");
         const request = yield* call(
           caller,
           tool,
@@ -6520,7 +6524,14 @@ it.effect.each(["card_move", "card_review_result"] as const)(
             ? { card: card.id, to: "needs_review", note: "Saved race" }
             : { verdict: "clear", head: "27a1b1e0" },
         ).pipe(Effect.forkChild);
-        yield* Deferred.await(held);
+        yield* Deferred.await(held).pipe(
+          Effect.timeout("5 seconds"),
+          Effect.catchTags({
+            TimeoutError: () =>
+              Effect.die(new Error(`${tool}: missing saved event or no post-commit thread read`)),
+          }),
+          TestClock.withLive,
+        );
         yield* kanban.updateBoard(board.id, { name: "Changed concurrently" });
         yield* Deferred.succeed(resume, undefined);
         const result = yield* Fiber.join(request);
