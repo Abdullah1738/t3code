@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,225 @@ class GuardTests(unittest.TestCase):
 
     def reporter_body(self, name):
         return (Path(__file__).with_name('fixtures') / 'heredoc-rerun' / name).read_text()
+
+    def test_checked_intervening_reporters(self):
+        fixtures = Path(__file__).with_name('fixtures') / 'checked-intervening'
+        sources = json.loads((fixtures / 'sources.json').read_text())
+        for row in json.loads((fixtures / 'cases.json').read_text()):
+            directory = self.root / row['fixture']
+            directory.mkdir()
+            for group, entries in sources.items():
+                if row['fixture'].startswith(group):
+                    for entry in entries:
+                        target = directory / entry['path']
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text((fixtures / entry['snapshot']).read_text())
+            command = (fixtures / row['fixture']).read_text().replace(row['cwd'], str(directory))
+            with self.subTest(reporter=row['fixture'], shape=row['label']):
+                rule, cause = guard.classify_detail(command, str(directory))
+                if row['expected'] == 'allow':
+                    self.assertIsNone(rule, cause)
+                else:
+                    self.assertIsNotNone(rule)
+                if row.get('script'):
+                    self.assertEqual(rule, UNRESOLVED)
+                    self.assertIn(row['script'], cause)
+                    reason = guard.refusal_reason(rule, cause, str(directory))
+                    self.assertIn('Split source preparation and execution into separate calls', reason)
+                    self.assertNotIn('literal absolute', reason)
+
+    def test_checked_intervening_writers(self):
+        target = 'tmp/checked.py'
+        prefix = self.heredoc(target, 'print(1)')
+        run = 'python3 -I ' + target
+        bodies = [
+            f"from pathlib import Path\np=Path({target!r});p.write_text('print(2)')",
+            f"open({target!r}, 'w').write('print(2)')",
+            f"import os\nos.replace('replacement.py', {target!r})",
+            "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('print(2)')",
+            "import ast\nast.parse(open('other.py').read());open('tmp/checked.py', 'w').write('print(2)')",
+            "from pathlib import Path\np=Path('tmp/sibling.py')\nif flag: p=Path('tmp/checked.py')\np.write_text('print(2)')",
+        ]
+        commands = ["python3 -I - <<'EDIT'\n" + body + '\nEDIT\n' for body in bodies]
+        commands += [f'cat other.py > {target}\n', f'cat other.py >> {target}\n',
+                     f'cp other.py {target}\n', f'mv other.py {target}\n',
+                     f'sed -i s/1/2/ {target}\n', f'git checkout HEAD -- {target}\n']
+        for change in commands:
+            with self.subTest(change=change):
+                command = prefix + change + run
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                reason = guard.refusal_reason(rule, cause, str(self.root))
+                self.assertIn('Split source preparation and execution into separate calls', reason)
+                self.assertNotIn('literal absolute', reason)
+                self.adapters(command, UNRESOLVED)
+
+    def test_checked_intervening_parsing_and_sibling_edits(self):
+        target = 'tmp/checked.py'
+        changes = [
+            "from pathlib import Path\nimport ast\nfor p in ['tmp/checked.py']: ast.parse(Path(p).read_text())",
+            "from pathlib import Path\np=Path('tmp/sibling.py');s=p.read_text();s=s[:s.index('x')]+s;s=s.replace('a','b');compile(s,str(p),'exec');p.write_text(s)",
+            "from pathlib import Path\np=Path('tmp/sibling.py');p.write_text(p.read_text().replace('a','b'))",
+        ]
+        for body in changes:
+            with self.subTest(body=body):
+                command = self.heredoc(target, 'print(1)') + "python3 -I - <<'EDIT'\n" + body + '\nEDIT\npython3 -I ' + target
+                self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+                self.adapters(command)
+
+    def test_checked_intervening_syntax_checks(self):
+        for flag in ['--check', '-c']:
+            prefix = self.heredoc('tmp/checked.mjs', 'console.log(1)')
+            run = 'node tmp/checked.mjs'
+            command = prefix + f'node {flag} tmp/checked.mjs\n' + run
+            with self.subTest(flag=flag):
+                self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+                self.adapters(command)
+            for check in [f'node --require tmp/hook.cjs {flag} tmp/checked.mjs',
+                          f'node --import tmp/hook.mjs {flag} tmp/checked.mjs',
+                          f'NODE_OPTIONS=--require=./tmp/hook.cjs node {flag} tmp/checked.mjs']:
+                with self.subTest(check=check):
+                    self.assertEqual(self.classify(prefix + check + '\n' + run), UNRESOLVED)
+        startup = self.write('startup.sh', "echo replacement > tmp/checked.py")
+        prefix = self.heredoc('tmp/checked.py', 'print(1)')
+        with patch.dict(os.environ, {'BASH_ENV': str(startup)}):
+            command = prefix + 'bash -n tmp/checked.py\npython3 -I tmp/checked.py'
+            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        with patch.dict(os.environ, {'BASH_FUNC_node%%': "() { printf 'print(2)\\n' > tmp/checked.py; }"}):
+            command = prefix + self.heredoc('tmp/checked.mjs', 'console.log(1)')
+            command += 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py'
+            self.assertEqual(self.classify('bash -c ' + shlex.quote(command)), UNRESOLVED)
+
+    def test_checked_intervening_node_identity(self):
+        prefix = self.heredoc('tmp/checked.py', 'print(1)')
+        prefix += self.heredoc('tmp/checked.mjs', 'console.log(1)')
+        writer = "#!/bin/sh\nprintf '%s\\n' 'print(2)' > tmp/checked.py"
+        for executable in ['./tmp/node', str(self.root / 'tmp/node')]:
+            command = prefix + self.heredoc('tmp/node', writer) + 'chmod +x tmp/node\n'
+            command += executable + ' --check tmp/checked.mjs\npython3 -I tmp/checked.py'
+            with self.subTest(executable=executable):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+        shadow = self.write('bin/node', writer)
+        shadow.chmod(0o755)
+        with patch.dict(os.environ, {'PATH': str(shadow.parent) + os.pathsep + os.environ['PATH']}):
+            self.assertEqual(self.classify(prefix + 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py'), UNRESOLVED)
+        startup = self.write('untrusted-startup.sh', 'echo startup')
+        shell = self.write('bin/bash', writer)
+        shell.chmod(0o755)
+        with patch.dict(os.environ, {'BASH_ENV': str(startup)}):
+            for executable in ['./bin/bash', str(shell)]:
+                with self.subTest(executable=executable):
+                    self.assertEqual(self.classify(prefix + executable + ' -n tmp/checked.py\npython3 -I tmp/checked.py'), UNRESOLVED)
+            with patch.dict(os.environ, {'PATH': str(shell.parent) + os.pathsep + os.environ['PATH']}):
+                self.assertEqual(self.classify(prefix + 'bash -n tmp/checked.py\npython3 -I tmp/checked.py'), UNRESOLVED)
+
+    def test_checked_intervening_system_tool_ownership(self):
+        node = Path('/usr/local/bin/node')
+        chain = (node, *node.parents)
+        actual_stat, realpath = os.stat, os.path.realpath
+        command = self.heredoc('tmp/checked.mjs', 'console.log(1)')
+        command += '/usr/local/bin/node --check tmp/checked.mjs\nnode tmp/checked.mjs'
+        cases = [('root-owned chain', None, 0, 0o755, None)]
+        cases += [(str(part) + label, part, uid, mode, None) for part in chain
+                  for label, uid, mode in [(' user-owned', 501, 0o755), (' group-writable', 0, 0o775), (' world-writable', 0, 0o757)]]
+        cases += [('stat error', node, 0, 0o755, PermissionError('unavailable'))]
+        for label, unsafe, uid, mode, error in cases:
+            def metadata(path, *args, **kwargs):
+                part = Path(path)
+                if part in chain:
+                    if part == unsafe and error:
+                        raise error
+                    owner, permissions = (uid, mode) if part == unsafe else (0, 0o755)
+                    kind = stat.S_IFREG if part == node else stat.S_IFDIR
+                    return os.stat_result((kind | permissions, 0, 0, 1, owner, 0, 0, 0, 0, 0))
+                return actual_stat(path, *args, **kwargs)
+            with self.subTest(ownership=label), patch.object(os, 'stat', side_effect=metadata), patch.object(os.path, 'realpath', side_effect=lambda path, *a, **k: str(node) if str(path) == str(node) else realpath(path, *a, **k)):
+                self.assertEqual(self.classify(command), None if unsafe is None else UNRESOLVED)
+
+    def test_checked_intervening_constructor_shadowing(self):
+        bindings = {
+            'match': 'match pick:\n case Path: pass',
+            'match sequence': 'match [pick]:\n case [Path]: pass',
+            'assignment': 'Path=pick',
+            'loop': 'for Path in [pick]: pass',
+            'function': "def Path(p): return pathlib.Path('tmp/checked.py')",
+            'import alias': 'from pathlib import PurePath as Path',
+        }
+        for label, binding in bindings.items():
+            body = "compile('pass', 'x', 'exec')\nimport pathlib\ndef pick(p): return pathlib.Path('tmp/checked.py')\n"
+            body += binding + "\nPath('tmp/sibling.py').write_text('print(2)')"
+            command = self.heredoc('tmp/checked.py', 'print(1)')
+            command += "python3 -I - <<'EDIT'\n" + body + '\nEDIT\npython3 -I tmp/checked.py'
+            with self.subTest(binding=label):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+                self.adapters(command, UNRESOLVED)
+
+    def test_checked_intervening_parser_shadowing(self):
+        bodies = [
+            "from pathlib import Path\ncompile=Path('tmp/checked.py').write_text\ncompile('print(2)')",
+            "from pathlib import Path\ndef edit(compile): compile('print(2)')\nedit(Path('tmp/checked.py').write_text)",
+            "from pathlib import Path\nimport ast\nast.parse(Path('tmp/checked.py').write_text('print(2)'))",
+            "from pathlib import Path\ncompile(Path('tmp/checked.py').write_text('print(2)'), 'x', 'exec')",
+            "match open:\n case compile: compile('tmp/checked.py', 'w')",
+            "match [open]:\n case [compile]: compile('tmp/checked.py', 'w')",
+            "match {'x': open}:\n case {'x': compile}: compile('tmp/checked.py', 'w')",
+            "match [open]:\n case [*compile]: compile[0]('tmp/checked.py', 'w')",
+            "match {'x': open}:\n case {**compile}: compile['x']('tmp/checked.py', 'w')",
+            "from builtins import open as compile\ncompile('tmp/checked.py', 'w')",
+        ]
+        for body in bodies:
+            command = self.heredoc('tmp/checked.py', 'print(1)') + "python3 -I - <<'EDIT'\n" + body + '\nEDIT\npython3 -I tmp/checked.py'
+            with self.subTest(body=body):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+
+        for builtin in ('len', 'str', 'int', 'set', 'dict', 'list', 'tuple', 'print', 'sorted', 'range', 'all', 'any', 'min', 'max'):
+            body = "compile('pass','x','exec')\nmatch open:\n case " + builtin + ": pass\n" + builtin + "('tmp/checked.py','w')"
+            command = self.heredoc('tmp/checked.py', 'print(1)') + "python3 -I - <<'EDIT'\n" + body + '\nEDIT\npython3 -I tmp/checked.py'
+            with self.subTest(captured_builtin=builtin):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+                self.adapters(command, UNRESOLVED)
+
+    def test_checked_intervening_retained_writers(self):
+        prefix = self.heredoc('tmp/checked.py', 'print(1)')
+        prefix += "python3 -I - <<'CHECK'\nimport ast\nast.parse(open('tmp/checked.py').read())\nCHECK\n"
+        prefix += self.heredoc('tmp/editor.py', "match open:\n case len: pass\nlen('tmp/checked.py', 'w')")
+        for invoke in ('python3 -I tmp/editor.py', 'python3 -I ' + str(self.root / 'tmp/editor.py'),
+                       'python3 -I -m unittest discover -s tmp -p editor.py'):
+            command = prefix + invoke + '\npython3 -I tmp/checked.py'
+            with self.subTest(invoke=invoke):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+                self.adapters(command, UNRESOLVED)
+
+    def test_checked_intervening_rebinding_scopes(self):
+        replacements = {
+            'for': "for s in [Path('tmp/replacement.py')]:\n s.replace('tmp/checked.py')",
+            'while': "while flag:\n s=Path('tmp/replacement.py')\n s.replace('tmp/checked.py')",
+            'if': "if flag:\n s=Path('tmp/replacement.py')\n s.replace('tmp/checked.py')",
+            'with': "with Path('tmp/replacement.py') as s:\n s.replace('tmp/checked.py')",
+            'try': "try:\n s=Path('tmp/replacement.py')\n s.replace('tmp/checked.py')\nexcept Exception: pass",
+            'except target': "try: pass\nexcept Exception as s:\n s.replace('tmp/checked.py')",
+            'match': "match other:\n case s: s.replace('tmp/checked.py')",
+            'parameter': "def edit(s):\n s.replace('tmp/checked.py')\nedit(Path('tmp/replacement.py'))",
+            'function name': "def s(): pass\ns.replace('tmp/checked.py')",
+            'class name': "class s: pass\ns.replace('tmp/checked.py')",
+            'annotated': "s: object=Path('tmp/replacement.py')\ns.replace('tmp/checked.py')",
+            'unpacked': "s, = [Path('tmp/replacement.py')]\ns.replace('tmp/checked.py')",
+            'chained': "s=other=Path('tmp/replacement.py')\ns.replace('tmp/checked.py')",
+            'walrus': "(s:=Path('tmp/replacement.py')).replace('tmp/checked.py')",
+            'comprehension': "[s.replace('tmp/checked.py') for s in [Path('tmp/replacement.py')]]",
+            'assigned comprehension': "out=[s.replace('tmp/checked.py') for s in [Path('tmp/replacement.py')]]",
+            'import alias': "import os as s\ns.replace('tmp/replacement.py', 'tmp/checked.py')",
+            'from import alias': "from pathlib import os as s\ns.replace('tmp/replacement.py', 'tmp/checked.py')",
+            'match mapping rest': "match {'x': Path('tmp/replacement.py')}:\n case {**s}: s['x'].replace('tmp/checked.py')",
+        }
+        prefix = self.heredoc('tmp/checked.py', 'print(1)')
+        prefix += self.heredoc('tmp/replacement.py', f'open({LIVE!r}).read()')
+        for label, replacement in replacements.items():
+            body = "from pathlib import Path\ns=Path('tmp/checked.py').read_text()\n" + replacement
+            command = prefix + "python3 -I - <<'EDIT'\n" + body + '\nEDIT\npython3 -I tmp/checked.py'
+            with self.subTest(binding=label):
+                self.assertEqual(self.classify(command), UNRESOLVED)
+                self.adapters(command, UNRESOLVED)
 
     def adapters(self, command, expected=None):
         for harness, adapter, tool, field in [('claude', claude, 'Bash', 'command'), ('codex', codex, 'exec_command', 'cmd')]:
@@ -1530,7 +1750,7 @@ class GuardTests(unittest.TestCase):
         self.assertIsNone(self.classify(prefix + 'bash -n tmp/writer.sh' + invoke))
         self.assertEqual(self.classify(prefix + 'bash -nc "echo hi"' + invoke), UNRESOLVED)
         with patch.dict(os.environ, {'BASH_ENV': '/tmp/guard841-shell-env.sh'}):
-            self.assertEqual(self.classify(prefix + 'bash -n tmp/writer.sh' + invoke), UNRESOLVED)
+            self.assertIsNone(self.classify(prefix + 'bash -n tmp/writer.sh' + invoke))
         other_edit = "python3 - <<'PY'\nfrom pathlib import Path\np=Path('tmp/report.txt')\np.write_text('report')\nPY"
         self.assertIsNone(self.classify(prefix + other_edit + invoke))
         other_edit_live_read = other_edit.replace("'report'", 'open(' + repr(LIVE) + ').read()')
