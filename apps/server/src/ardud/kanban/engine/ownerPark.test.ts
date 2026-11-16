@@ -27,6 +27,144 @@ import * as Rules from "./rules.ts";
 
 const decodeAnalytics = Schema.decodeUnknownEffect(AnalyticsEvent);
 
+it.effect.each(
+  (["await", "deferred", "inline"] as const).flatMap((mode) =>
+    (["post", "pick", "answer", "drop", "wake"] as const).flatMap((reply) =>
+      (["delivered", "stop", "reset", "pause"] as const).map((outcome) => ({
+        mode,
+        reply,
+        outcome,
+      })),
+    ),
+  ),
+)(
+  "a restored $reply has one guarded delivery in $mode mode ($outcome)",
+  ({ mode, reply, outcome }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const finished = yield* Deferred.make<void>();
+      const transitioned = yield* Deferred.make<void>();
+      const observed: Array<{ guarded: boolean; stale: boolean }> = [];
+      let notification: string | undefined;
+      let target: ThreadId | undefined;
+      let revoking = false;
+      const storeLayer = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            putCard: (card) =>
+              real
+                .putCard(card)
+                .pipe(
+                  Effect.tap(() =>
+                    revoking && card.activeThreadId === null
+                      ? Deferred.succeed(transitioned, undefined)
+                      : Effect.void,
+                  ),
+                ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      const gated = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            send: (input) =>
+              Effect.gen(function* () {
+                if (
+                  input.threadId !== target ||
+                  notification === undefined ||
+                  !input.text.includes(notification)
+                )
+                  return yield* real.send(input);
+                const guarded = input.coalesce?.startsWith("owner:") === true;
+                if (guarded) yield* Deferred.succeed(entered, undefined);
+                yield* Deferred.await(release);
+                const stale = input.isStale?.() === true;
+                observed.push({ guarded, stale });
+                if (!stale) yield* real.send(input);
+                if (guarded) yield* Deferred.succeed(finished, undefined);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, threadId, worker } = yield* workingCard();
+        target = threadId;
+        const marker = "Owner route matrix 1615";
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "Continue?",
+            blocking: true,
+            ...(reply === "pick" ? { options: [marker, "No"] } : {}),
+          },
+          worker,
+          "cardThread",
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const ask = askOf((yield* kanban.card(card.id)).card);
+        notification = reply === "drop" ? `Abdullah dropped ${ask.id}.` : marker;
+        const close =
+          reply === "post"
+            ? Effect.asVoid(kanban.post(discussion.id, owner, [{ _tag: "md", text: marker }]))
+            : reply === "pick"
+              ? Effect.asVoid(
+                  kanban.answer(discussion.id, ask.seq!, ask.id, [ask.options![0]!.id], owner),
+                )
+              : reply === "answer"
+                ? Effect.asVoid(
+                    kanban.answerAsk(
+                      card.id,
+                      ask.id,
+                      { verdict: "answered", text: marker, revision: 0 },
+                      owner,
+                    ),
+                  )
+                : reply === "drop"
+                  ? Effect.asVoid(kanban.changeAsk(card.id, ask.id, "drop", owner, "owner"))
+                  : Effect.asVoid(kanban.cardThread(card.id, "wake", marker, owner));
+        const request = yield* Effect.forkChild(close);
+        yield* Deferred.await(entered);
+        assert.equal((yield* kanban.card(card.id)).card.stage, "working");
+        revoking = outcome === "stop" || outcome === "reset";
+        const revocation =
+          outcome === "stop" || outcome === "reset"
+            ? yield* Effect.forkChild(
+                kanban.cardThread(card.id, outcome, "Discard pending reply", owner),
+              )
+            : undefined;
+        if (outcome === "pause")
+          yield* kanban.pauseBoard(board.id, { reason: "Discard pending reply", keep: [] }, owner);
+        if (revocation !== undefined) {
+          // Await mode waits for the lane drain after committing Stop/Reset.
+          yield* Deferred.await(transitioned);
+        }
+        yield* Deferred.succeed(release, undefined);
+        if (revocation !== undefined) yield* Fiber.join(revocation);
+        yield* Fiber.join(request);
+        yield* Deferred.await(finished);
+        yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Delivery drain barrier" }]);
+        yield* kanban.dispatchNow;
+        assert.deepEqual(observed, [{ guarded: true, stale: outcome !== "delivered" }]);
+        assert.equal(
+          (yield* fake.heard(threadId)).filter((text) => text.includes(notification!)).length,
+          outcome === "delivered" ? 1 : 0,
+        );
+      }).pipe(
+        Effect.provide(
+          testLayer(gated, storeLayer).pipe(
+            Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, mode)),
+          ),
+        ),
+      );
+    }),
+);
+
 it.effect.each([
   { reply: "post", failure: "reply write" } as const,
   ...(["pick", "answer", "drop", "wake"] as const).map((reply) => ({

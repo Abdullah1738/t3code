@@ -6578,6 +6578,8 @@ const make = Effect.gen(function* () {
       current = heard.discussion;
       for (const id of heard.told) told.add(id);
     }
+    // The saved notice owns this delivery; inline routing must not send an unguarded copy.
+    if (notificationSaved && resume !== undefined) told.add(resume.threadId);
     if (unblock) yield* kick;
     return { told, discussion: current, card: next };
   }, Effect.scoped);
