@@ -1,6 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { AnalyticsEvent, AuthSessionId, CommandId, ThreadId } from "@t3tools/contracts";
+import {
+  AnalyticsEvent,
+  AuthSessionId,
+  CommandId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -16,10 +22,12 @@ import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../config.ts";
 import { liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
+import * as CommandPolicy from "../../orchestration-v2/CommandPolicy.ts";
 import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as ThreadLaunchService from "../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
+import { userFacingDispatchErrorMessage } from "../../orchestration-v2/UserFacingErrors.ts";
 import * as OrchestrationEventStore from "../../persistence/OrchestrationEventStore.ts";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
@@ -173,6 +181,42 @@ const rejection = (logs: readonly unknown[]) => {
   return rows[0]![1];
 };
 
+const invariantRefusals = [
+  [
+    "Context compaction must run as a separate turn. Queue it or wait for the active turn to finish.",
+    "compaction_requires_separate_turn",
+  ],
+  [
+    "Signing out must run as a separate turn. Queue it or wait for the active turn to finish.",
+    "sign_out_requires_separate_turn",
+  ],
+  [
+    "Goal commands must run as a separate turn. Queue it or wait for the active turn to finish.",
+    "goal_requires_separate_turn",
+  ],
+  [
+    "Wait for context compaction to finish before steering the thread.",
+    "context_compaction_in_progress",
+  ],
+  ["Wait for sign-out to finish before steering the thread.", "sign_out_in_progress"],
+  ["Active-turn-only steering cannot restart the turn.", "active_turn_only_restart_forbidden"],
+  ["Silent child recovery is no longer safe or was already attempted.", "silent_recovery_not_safe"],
+  ["The active ACP session does not expose a model-switch capability.", "model_switch_unsupported"],
+] as const;
+
+const capabilityRefusals = [
+  ["queued_messages", "unsupported_queued_messages"],
+  ["active_steering", "unsupported_active_steering"],
+  ["interrupt", "unsupported_interrupt"],
+  ["interrupt_restart_steering", "unsupported_interrupt_restart_steering"],
+  ["native_fork", "unsupported_native_fork"],
+  ["fork_from_turn", "unsupported_fork_from_turn"],
+  ["rollback", "unsupported_rollback"],
+  ["rollback_snapshot", "unsupported_rollback_snapshot"],
+  ["context_handoff", "unsupported_context_handoff"],
+  ["strong_terminal_status", "unsupported_strong_terminal_status"],
+] as const satisfies ReadonlyArray<readonly [CommandPolicy.CommandPolicyCapability, string]>;
+
 describe("control send refusal logging", () => {
   it.effect("records the typed no-steerable-run reason once with request correlation", () =>
     withHarness({}, ({ post, logs, samples, sent }) =>
@@ -202,6 +246,148 @@ describe("control send refusal logging", () => {
           reason: "no_steerable_run",
         });
         assert.equal(samples[0]!.durationMs, rejection(logs).durationMs);
+      }),
+    ),
+  );
+
+  it.effect.each([
+    ...invariantRefusals.flatMap(([detail, reason]) => [
+      {
+        cause: new Orchestrator.OrchestratorDispatchError({
+          commandId,
+          commandType: "message.dispatch",
+          cause: detail,
+        }),
+        errorTag: "OrchestratorDispatchError",
+        reason,
+      },
+      {
+        cause: new Orchestrator.OrchestratorCommandPreviouslyRejectedError({
+          commandId,
+          commandType: "message.dispatch",
+          detail,
+        }),
+        errorTag: "OrchestratorCommandPreviouslyRejectedError",
+        reason,
+      },
+    ]),
+    ...capabilityRefusals.map(([capability, reason]) => ({
+      cause: new Orchestrator.OrchestratorCommandPreviouslyRejectedError({
+        commandId,
+        commandType: "message.dispatch",
+        detail:
+          userFacingDispatchErrorMessage(
+            new CommandPolicy.CommandPolicyCapabilityUnsupportedError({
+              commandId,
+              threadId,
+              providerInstanceId: ProviderInstanceId.make(privateAttachment),
+              capability,
+              detail: privateGuidance,
+            }),
+          ) ?? privateText,
+      }),
+      errorTag: "OrchestratorCommandPreviouslyRejectedError",
+      reason,
+    })),
+    {
+      cause: new Orchestrator.OrchestratorCommandPreviouslyRejectedError({
+        commandId,
+        commandType: "message.dispatch",
+        detail: `${privateAttachment} cannot deliver a message that way right now.`,
+      }),
+      errorTag: "OrchestratorCommandPreviouslyRejectedError",
+      reason: "dispatch_mode_unsupported",
+    },
+    ...[
+      ...capabilityRefusals.map(([capability, reason]) => ({
+        cause: new CommandPolicy.CommandPolicyCapabilityUnsupportedError({
+          commandId,
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          capability,
+          detail: privateGuidance,
+        }),
+        errorTag: "CommandPolicyCapabilityUnsupportedError",
+        reason,
+      })),
+      ...(
+        [
+          ["steer_active", "steer_target_not_active"],
+          ["restart_active", "restart_target_not_active"],
+          [privateText, "dispatch_mode_unsupported"],
+        ] as const
+      ).map(([requestedMode, reason]) => ({
+        cause: new CommandPolicy.CommandPolicyUnsupportedError({
+          commandId,
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          requestedMode,
+        }),
+        errorTag: "CommandPolicyUnsupportedError",
+        reason,
+      })),
+      {
+        cause: { _tag: "CommandPolicyCapabilityUnsupportedError", capability: privateText },
+        errorTag: "CommandPolicyCapabilityUnsupportedError",
+        reason: "capability_unsupported",
+      },
+    ].flatMap(({ cause, ...expected }) => [
+      {
+        cause: new Orchestrator.OrchestratorDispatchError({
+          commandId,
+          commandType: "message.dispatch",
+          cause,
+        }),
+        ...expected,
+      },
+      {
+        cause: new Orchestrator.OrchestratorCommandRejectedError({
+          commandId,
+          commandType: "message.dispatch",
+          cause: new CommandPolicy.CommandPolicyMessageDispatchError({
+            commandId,
+            threadId,
+            cause,
+          }),
+        }),
+        ...expected,
+      },
+    ]),
+    ...(
+      [
+        ["No running provider turn found for active run old-run.", "no_running_provider_turn"],
+        [
+          "No running providerInstanceId turn found for active run old-run.",
+          "no_running_provider_turn",
+        ],
+        [privateText, "message_dispatch_failed"],
+      ] as const
+    ).map(([cause, reason]) => ({
+      cause: new Orchestrator.OrchestratorCommandRejectedError({
+        commandId,
+        commandType: "message.dispatch",
+        cause: new CommandPolicy.CommandPolicyMessageDispatchError({ commandId, threadId, cause }),
+      }),
+      errorTag: "CommandPolicyMessageDispatchError",
+      reason,
+    })),
+  ])("records $errorTag / $reason through the send route", ({ cause, errorTag, reason }) =>
+    withHarness({ send: Effect.fail(cause) }, ({ post, logs, samples }) =>
+      Effect.gen(function* () {
+        assert.equal((yield* post(body)).status, 409);
+        assert.deepInclude(rejection(logs), {
+          httpRoute: route,
+          threadId,
+          mode: "steer",
+          clientRequestId,
+          status: 409,
+          code: "conflict",
+          errorTag,
+          reason,
+        });
+        assert.lengthOf(samples, 1);
+        assert.deepEqual(decodeAnalyticsEvent(samples[0]), samples[0]);
+        assert.deepInclude(samples[0]!.props, { errorTag, reason });
       }),
     ),
   );

@@ -37,6 +37,24 @@ const RequestContext = Context.Reference<RequestDetails | undefined>(
 // text (including previously persisted rejection details) stay out of logs.
 const dispatchReason = (cause: unknown): string | undefined => {
   if (typeof cause !== "string" || cause.length > 8192) return;
+  switch (cause) {
+    case "Context compaction must run as a separate turn. Queue it or wait for the active turn to finish.":
+      return "compaction_requires_separate_turn";
+    case "Signing out must run as a separate turn. Queue it or wait for the active turn to finish.":
+      return "sign_out_requires_separate_turn";
+    case "Goal commands must run as a separate turn. Queue it or wait for the active turn to finish.":
+      return "goal_requires_separate_turn";
+    case "Wait for context compaction to finish before steering the thread.":
+      return "context_compaction_in_progress";
+    case "Wait for sign-out to finish before steering the thread.":
+      return "sign_out_in_progress";
+    case "Active-turn-only steering cannot restart the turn.":
+      return "active_turn_only_restart_forbidden";
+    case "Silent child recovery is no longer safe or was already attempted.":
+      return "silent_recovery_not_safe";
+    case "The active ACP session does not expose a model-switch capability.":
+      return "model_switch_unsupported";
+  }
   if (/^Target run \S+ is stopping and cannot be steered\.$/.test(cause)) return "run_stopping";
   if (/^Target run \S+ was not found\.$/.test(cause)) return "target_run_not_found";
   if (/^Target run \S+ has no root node\.$/.test(cause)) return "target_run_missing_root";
@@ -49,12 +67,45 @@ const dispatchReason = (cause: unknown): string | undefined => {
   if (/^Target run \S+ does not belong to thread \S+\.$/.test(cause)) return "run_thread_mismatch";
   if (/^Run \S+ is not running in this thread\.$/.test(cause)) return "run_thread_mismatch";
   if (/^Thread \S+ was stopped\.$/.test(cause)) return "thread_stopped";
-  if (/^No running provider turn found for active run \S+\.$/.test(cause))
+  if (/^No running provider(?:InstanceId)? turn found for active run \S+\.$/.test(cause))
     return "no_running_provider_turn";
   if (/^Provider thread \S+ has no active provider session for steering\.$/.test(cause))
     return "no_active_provider_session";
   if (/^Provider session \S+ is not active\.$/.test(cause)) return "provider_session_inactive";
   if (cause === "Delivery was revoked before dispatch.") return "delivery_revoked";
+  // Rejected receipts retain the friendly policy message, without its typed cause.
+  if (/^.+ cannot queue messages behind an active run\.$/.test(cause))
+    return "unsupported_queued_messages";
+  if (/^.+ cannot redirect an active run\. Stop it first, then send the message\.$/.test(cause))
+    return "unsupported_active_steering";
+  if (
+    /^.+ cannot restart an active run\. Use t3_thread_interrupt, then send the message\.$/.test(
+      cause,
+    )
+  )
+    return "unsupported_interrupt_restart_steering";
+  if (/^.+ cannot stop a run once it has started\.$/.test(cause)) return "unsupported_interrupt";
+  if (/^.+ cannot fork this thread natively\.$/.test(cause)) return "unsupported_native_fork";
+  if (/^.+ cannot fork from an earlier point in this thread\.$/.test(cause))
+    return "unsupported_fork_from_turn";
+  if (
+    /^.+ cannot rewind its conversation, so this checkpoint cannot be restored on this thread\.$/.test(
+      cause,
+    )
+  )
+    return "unsupported_rollback";
+  if (
+    /^.+ did not report its rewound conversation state, so the checkpoint was not restored\.$/.test(
+      cause,
+    )
+  )
+    return "unsupported_rollback_snapshot";
+  if (/^.+ cannot receive the context handoff needed for this switch\.$/.test(cause))
+    return "unsupported_context_handoff";
+  if (/^.+ cannot confirm when its runs finish reliably enough for this\.$/.test(cause))
+    return "unsupported_strong_terminal_status";
+  if (/^.+ cannot deliver a message that way right now\.$/.test(cause))
+    return "dispatch_mode_unsupported";
 };
 
 // Error tags are an allowlist, never a copy of an arbitrary defect's tag/message.
@@ -106,6 +157,36 @@ export const failureDetails = (cause: unknown, depth = 0): FailureDetails => {
       };
     case "ServerRuntimeStartupError":
       return { errorTag, reason: "startup_unavailable" };
+    case "CommandPolicyCapabilityUnsupportedError": {
+      const capability = "capability" in cause ? cause.capability : undefined;
+      switch (capability) {
+        case "queued_messages":
+        case "active_steering":
+        case "interrupt":
+        case "interrupt_restart_steering":
+        case "native_fork":
+        case "fork_from_turn":
+        case "rollback":
+        case "rollback_snapshot":
+        case "context_handoff":
+        case "strong_terminal_status":
+          return { errorTag, reason: `unsupported_${capability}` };
+        default:
+          return { errorTag, reason: "capability_unsupported" };
+      }
+    }
+    case "CommandPolicyUnsupportedError": {
+      const mode = "requestedMode" in cause ? cause.requestedMode : undefined;
+      return {
+        errorTag,
+        reason:
+          mode === "steer_active"
+            ? "steer_target_not_active"
+            : mode === "restart_active"
+              ? "restart_target_not_active"
+              : "dispatch_mode_unsupported",
+      };
+    }
     case "OrchestratorCommandPreviouslyRejectedError":
       return {
         errorTag,
@@ -116,7 +197,8 @@ export const failureDetails = (cause: unknown, depth = 0): FailureDetails => {
     case "OrchestratorCommandRejectedError":
     case "OrchestratorProjectionError":
     case "OrchestratorProviderAdapterError":
-    case "ThreadManagementProjectionLoadError": {
+    case "ThreadManagementProjectionLoadError":
+    case "CommandPolicyMessageDispatchError": {
       const underlying = "cause" in cause ? cause.cause : undefined;
       const reason = dispatchReason(underlying);
       if (reason !== undefined) return { errorTag, reason };
@@ -131,7 +213,9 @@ export const failureDetails = (cause: unknown, depth = 0): FailureDetails => {
               ? "dispatch_failed"
               : errorTag === "OrchestratorProviderAdapterError"
                 ? "provider_adapter_failed"
-                : "projection_failed",
+                : errorTag === "CommandPolicyMessageDispatchError"
+                  ? "message_dispatch_failed"
+                  : "projection_failed",
       };
     }
     default:
