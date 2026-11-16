@@ -27,7 +27,7 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount"]);
 const ENUMS: Record<string, readonly string[]> = {
   replyMode: ["final", "tool"], reason: ["background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal"],
   source: ["live", "backfill"], outcome: ["replied", "failed", "refused", "no_reply", "ok", "fallback"],
@@ -53,7 +53,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
-    if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1 || value > 100)) continue;
+    if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if (NUMBERS.has(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (["queued", "inboundKnown", "bytesKnown", "pendingOrders"].includes(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && ENUMS[key]?.includes(value)) props[key] = value;
@@ -73,7 +73,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       name, ...entry.error, status: entry.error?.status ?? (status ? Number(status) : typeof props.status === "number" ? props.status : undefined),
       code: entry.error?.code ?? (status ? safeLineFailureCode(tag) : undefined),
     }) };
-    if (["Error", "UnknownError"].includes(line.error.name)) line.error.causeKey = causeKey(line.error, line.error.tag);
+    if (["Error", "UnknownError", "TimeoutError"].includes(line.error.name)) line.error.causeKey = causeKey(line.error, line.error.tag);
     const site = cleanSite(entry.site);
     if (site) line.site = site;
   }
@@ -394,9 +394,9 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
 export const toolLog = createToolLog({ defer: true });
 /** Cooperative read yielding is expected control flow, not a backend failure. */
 export const completionReady = Symbol("completionReady");
-export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"]): void {
+export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"], props?: LogLine["props"]): void {
   if (cause === completionReady) return;
-  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids, error: { tag, cause } });
+  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids, props, error: { tag, cause } });
 }
 export function cardKind(value: string): string {
   // Generator names only; captions, query values and health data never enter the log.

@@ -665,11 +665,11 @@ Secure forms and the other commands are in the imessage skill.`;
 
 // Existing client methods do not accept cancellation signals. Bound the wait, but
 // treat timed-out mutations as ambiguous: their underlying request can finish later.
-async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
+export async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Router request timed out")), timeout);
+      timer = setTimeout(() => reject(Object.assign(new Error("Router request timed out"), { name: "TimeoutError", code: "timeout" })), timeout);
     })]);
   } finally {
     clearTimeout(timer);
@@ -867,6 +867,7 @@ export class Router {
 
   private checkingLatency?: Promise<void>;
   private latencyScanAt = -Infinity;
+  private replayProbeBackoff = new Map<string, { delay: number; nextAt: number }>();
   private latencyParents = new Map<string, string>();
   private latencyParentsAt = -Infinity;
 
@@ -922,7 +923,7 @@ export class Router {
         && (wake || typed) && Number.isSafeInteger(input.receivedAt)
         && now - input.receivedAt! >= (wake ? 15 * 60_000 : 120_000);
     });
-    if (!rows.length) return;
+    if (!rows.length) { this.replayProbeBackoff.clear(); return; }
     // Sealed membership changes on a seal, not on the one-second delivery clock.
     if (now - this.latencyParentsAt >= 60_000) {
       this.latencyParents = new Map(this.store.db.query<{ member: string; leader: string }, []>(
@@ -934,21 +935,23 @@ export class Router {
     const parents = this.latencyParents;
     // Protect every candidate before the first backend await; an earlier slow read
     // must not let the normal timer discard a later batch's membership.
-    const snapshots = new Map<string, { original: Turn | null | undefined; members: string[]; batch: NormalizedInbound | null | undefined }>();
+    const snapshots = new Map<string, { original: Turn | null | undefined; members: string[]; batch: NormalizedInbound | null | undefined; received?: number }>();
     for (const row of rows) {
       const leader = parents.get(row.id) ?? row.id;
       if (snapshots.has(leader)) continue;
       const original = this.store.get<Turn | null>(`failed-delivery:${leader}`);
       const batch = this.store.get<NormalizedInbound | null>(`batch:${leader}`);
       const members = batch?.batchIds ?? [leader];
-      snapshots.set(leader, { original, members, batch });
       const received = this.store.db.query<{ at: number }, [string]>("SELECT json_extract(payload, '$.receivedAt') AS at FROM inbound WHERE id = ?").get(leader)?.at;
+      snapshots.set(leader, { original, members, batch, received });
       if (!original || !this.current(original) || received === undefined || now - received > FAILED_INBOUND_REPLAY_MAX_AGE_MS) continue;
       this.store.set(`latency-route:${leader}`, original);
       const until = received + FAILED_INBOUND_REPLAY_MAX_AGE_MS;
       this.store.set(`failed-replay-until:${leader}`, Math.min(this.store.get<number>(`failed-replay-until:${leader}`) ?? until, until));
     }
+    for (const leader of this.replayProbeBackoff.keys()) if (!snapshots.has(leader)) this.replayProbeBackoff.delete(leader);
     const checked = new Set<string>();
+    const timedOut = new Set<string>();
     let due = false;
     for (const row of rows) {
       const input = JSON.parse(row.payload) as NormalizedInbound;
@@ -973,34 +976,58 @@ export class Router {
         for (const id of ids) if (id.startsWith("wake:") && this.store.get(`stuck-wake-retry:${id}`) === undefined) this.store.set(`stuck-wake-retry:${id}`, now);
       }
       if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS && retryAt === undefined) continue;
-      const { original, members, batch } = snapshots.get(leader)!;
+      const { original, members, batch, received } = snapshots.get(leader)!;
       let absent = true;
       if (original) {
-        for (const id of [original.messageId, ...original.earlier ?? []]) {
-          try {
-            if (await bounded(this.backend.promptAccepted(original.id, original.directory, id))) {
-              this.store.db.transaction(() => {
-                // A normal tick may have admitted and already failed this turn during the read.
-                if (this.store.get(`inbound-delivered:${leader}`) !== undefined) {
-                  for (const member of members) if (this.store.get(`inbound-delivered:${member}`) === undefined) this.delivered(member, [member]);
-                  return;
-                }
-                const attempt = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
-                if (attempt) this.consumeSteer(leader, attempt);
-                else {
-                  const active = this.store.get<Turn | null>("activeTurn");
-                  if (this.current(original) && (!active || active.phase === "failed" || active.inboundId === leader)) {
-                    const admitted: Turn = { ...original, phase: "running" };
-                    this.setTurn(admitted);
-                    this.landed(admitted);
+        const backoff = this.replayProbeBackoff.get(leader);
+        const deadline = (received ?? input.receivedAt!) + FAILED_INBOUND_REPLAY_MAX_AGE_MS;
+        const maxDelay = 10 * 60_000;
+        // Leave the final ten minutes of the replay horizon unthrottled. Alerts
+        // below still run for every row, including members of a cooling batch.
+        const nearDeadline = Date.now() >= deadline - maxDelay && Date.now() <= deadline;
+        const cooling = backoff && Date.now() < backoff.nextAt && !nearDeadline;
+        if (cooling || timedOut.has(leader)) absent = false;
+        else {
+          let uncertain = false;
+          const ids = [original.messageId, ...original.earlier ?? []];
+          for (const [probeIndex, id] of ids.entries()) {
+            try {
+              if (await bounded(this.backend.promptAccepted(original.id, original.directory, id))) {
+                this.store.db.transaction(() => {
+                  // A normal tick may have admitted and already failed this turn during the read.
+                  if (this.store.get(`inbound-delivered:${leader}`) !== undefined) {
+                    for (const member of members) if (this.store.get(`inbound-delivered:${member}`) === undefined) this.delivered(member, [member]);
+                    return;
                   }
-                }
-                this.delivered(leader, members);
-              }).immediate();
+                  const attempt = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
+                  if (attempt) this.consumeSteer(leader, attempt);
+                  else {
+                    const active = this.store.get<Turn | null>("activeTurn");
+                    if (this.current(original) && (!active || active.phase === "failed" || active.inboundId === leader)) {
+                      const admitted: Turn = { ...original, phase: "running" };
+                      this.setTurn(admitted);
+                      this.landed(admitted);
+                    }
+                  }
+                  this.delivered(leader, members);
+                }).immediate();
+                absent = false;
+                break;
+              }
+            } catch (caughtError) {
+              toolError("router", "router.catch1", caughtError, { inboundId: `row_${hash(leader).slice(0, 16)}` }, { probeIndex, probeCount: ids.length });
               absent = false;
-              break;
+              uncertain = true;
+              if (caughtError instanceof Error && "code" in caughtError && caughtError.code === "timeout") {
+                timedOut.add(leader);
+                const delay = Math.min((backoff?.delay ?? 30_000) * 2, maxDelay);
+                const at = Date.now();
+                this.replayProbeBackoff.set(leader, { delay, nextAt: at < deadline - maxDelay ? Math.min(at + delay, deadline - maxDelay) : at + delay });
+                break;
+              }
             }
-          } catch (caughtError) { toolError("router", "router.catch1", caughtError); absent = false; }
+          }
+          if (!uncertain || this.store.get(`inbound-delivered:${leader}`) !== undefined) this.replayProbeBackoff.delete(leader);
         }
         const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (live?.state === "done" || this.store.get(`inbound-delivered:${leader}`) !== undefined) continue;
