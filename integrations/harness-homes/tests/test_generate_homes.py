@@ -724,7 +724,8 @@ class GenerateTests(HarnessTestCase):
             return out
 
         claude_hooks, codex_hooks = split(all_claude, False), split(all_codex, False)
-        self.assertEqual(set(claude_hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart"})
+        self.assertEqual(set(claude_hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure", "SessionStart",
+                                             "Stop", "SubagentStop", "SessionEnd"})
         # Codex has no PostToolUseFailure; turn-end hooks close desktop calls that failed without PostToolUse.
         self.assertEqual(set(codex_hooks), {"PreToolUse", "PostToolUse", "Stop", "SubagentStop", "SessionEnd"})
         claude_recall, codex_recall = split(all_claude, True), split(all_codex, True)
