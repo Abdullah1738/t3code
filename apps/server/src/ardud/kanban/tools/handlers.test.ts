@@ -3277,7 +3277,7 @@ it.effect(
           assert.isTrue(result.isError, result.text);
           assert.match(
             result.text,
-            /Board busy: not written \(waited 120s behind [01]; most time: selectionMigration 120s\). Safe to retry once\./,
+            /Board busy: not written \(held 120000ms by selectionMigration; waited 120000ms behind [01]; most time: selectionMigration 120s\). Safe to retry once\./,
           );
         }
         assert.isUndefined(holder.pollUnsafe());
@@ -6763,7 +6763,7 @@ it.effect.each(["card", "discussion"] as const)(
         const result = yield* Fiber.join(request);
         assert.isTrue(result.isError, result.text);
         assert.strictEqual(result.structured.saved, false);
-        assert.include(result.text, "Not saved (board busy). Safe to retry.");
+        assert.include(result.text, "Not saved (reply timed out before a save; stage:");
         assert.lengthOf(yield* kanban.messages(discussion.id), 0);
       }).pipe(Effect.provide(fake.layer));
     }),

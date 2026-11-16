@@ -2253,6 +2253,8 @@ export const KanbanParticipant = Schema.Struct({
   typingUntil: Schema.NullOr(IsoDateTime),
   /** Agent was asked to reply here; "nudged" after one reminder at turn end. */
   owes: Schema.NullOr(Schema.Literals(["asked", "nudged"])),
+  /** The delivered ask stays fixed when reading later messages advances lastReadSeq. */
+  askedSeq: Schema.optional(NonNegativeInt),
   /** A turn-end reminder held by the board pause, to be retried after release. */
   deferred: Schema.optional(Schema.Boolean),
   /** Stable ID for retrying one deferred reminder after an ambiguous send. */

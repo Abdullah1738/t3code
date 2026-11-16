@@ -442,15 +442,20 @@ export function codexSkillMentionText(text: string): string {
 const BACKGROUND_COMMAND_DETAIL_COMMAND_MAX_LENGTH = 200;
 const BACKGROUND_COMMAND_DETAIL_OUTPUT_TAIL_MAX_LENGTH = 1_000;
 
-export function codexBackgroundCommandDetail(item: {
-  readonly command: string;
-  readonly exitCode?: number | null | undefined;
-  readonly aggregatedOutput?: string | null | undefined;
-}): string {
+export function codexBackgroundCommandDetail(
+  item: {
+    readonly command: string;
+    readonly exitCode?: number | null | undefined;
+    readonly aggregatedOutput?: string | null | undefined;
+  },
+  outcome: "completed" | "interrupted" = "completed",
+): string {
   const command =
     item.command.length > BACKGROUND_COMMAND_DETAIL_COMMAND_MAX_LENGTH
       ? `${item.command.slice(0, BACKGROUND_COMMAND_DETAIL_COMMAND_MAX_LENGTH)}...`
       : item.command;
+  if (outcome === "interrupted")
+    return `Background command interrupted (Codex thread closed): ${command}`;
   const exit =
     item.exitCode === null || item.exitCode === undefined ? "" : ` (exit ${item.exitCode})`;
   const output = (item.aggregatedOutput ?? "").trimEnd();
@@ -2386,10 +2391,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           function* (
             context: ActiveCodexTurnContext,
             nativeTurnId: string,
-            item: Extract<
-              CodexSchema.V2ItemCompletedNotification__ThreadItem,
-              { type: "commandExecution" }
-            >,
+            item: {
+              readonly id: string;
+              readonly command: string;
+              readonly exitCode?: number | null | undefined;
+              readonly aggregatedOutput?: string | null | undefined;
+            },
+            outcome: "completed" | "interrupted" = "completed",
           ) {
             if (
               context.subagent === null &&
@@ -2419,18 +2427,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   driver: CODEX_PROVIDER,
                   // Codex starts a new turn from this text, so nothing is buffered.
                   delivery: "message_text",
-                  detail: codexBackgroundCommandDetail(item),
+                  detail: codexBackgroundCommandDetail(item, outcome),
                   notification: {
                     ...backgroundWorkNotification([
                       {
                         kind: "command",
                         label: item.command,
                         outcome:
-                          item.exitCode === 0
-                            ? "completed"
-                            : item.exitCode == null
-                              ? "unknown"
-                              : "failed",
+                          outcome === "interrupted"
+                            ? "cancelled"
+                            : item.exitCode === 0
+                              ? "completed"
+                              : item.exitCode == null
+                                ? "unknown"
+                                : "failed",
                         exitCode: item.exitCode ?? undefined,
                       },
                     ]),
@@ -5100,6 +5110,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 "interrupted",
                 completedAt,
               );
+              for (const command of commands?.values() ?? []) {
+                yield* offerBackgroundCommand(
+                  context,
+                  context.nativeTurnId,
+                  command,
+                  "interrupted",
+                );
+              }
               yield* Ref.update(runningCommandItemsByTurn, (current) => {
                 const updated = new Map(current);
                 updated.delete(context.nativeTurnId);
