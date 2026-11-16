@@ -10,7 +10,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from zoneinfo import ZoneInfo
 
@@ -95,18 +94,17 @@ def read(app, deadline=None, since=None, cache_path=None):
         cache = load_cache(cache_path) if app == 'noon' else []
         from marketplace import load
         snapshot, snapshot_reason = load(cache_path.parent) if app == 'noon' else (None, None)
-        # Readers log by default. Their diagnostics are disposable: only our sanitized
-        # lane metrics leave this sandbox. They never write the live app state/logs.
-        with tempfile.TemporaryDirectory(prefix='money-orders-') as scratch:
-            env = {**os.environ, 'ROBOB_TOOL_LOG_DIR': scratch}
-            remaining = end - time.monotonic()
-            if remaining < 1:
-                raise OutOfTime('order lookup out of time')
-            result = subprocess.run([str(python), '-I', '-B', str(Path(__file__).resolve()), app, str(root),
-                                     str(time.time() + remaining - 0.5)],
-                                    input=json.dumps({'since': since.isoformat() if since else None, 'cache': cache,
-                                                      'snapshot': snapshot, 'snapshot_reason': snapshot_reason}),
-                                    capture_output=True, text=True, timeout=remaining, env=env)
+        # Keep the caller's log destination: provider metadata must reach the same
+        # rollup as check.run. The shared logger allowlists every field.
+        env = dict(os.environ)
+        remaining = end - time.monotonic()
+        if remaining < 1:
+            raise OutOfTime('order lookup out of time')
+        result = subprocess.run([str(python), '-I', '-B', str(Path(__file__).resolve()), app, str(root),
+                                 str(time.time() + remaining - 0.5)],
+                                input=json.dumps({'since': since.isoformat() if since else None, 'cache': cache,
+                                                  'snapshot': snapshot, 'snapshot_reason': snapshot_reason}),
+                                capture_output=True, text=True, timeout=remaining, env=env)
         if result.returncode:
             raise ValueError('order lookup unavailable')
         result = json.loads(result.stdout)
@@ -437,9 +435,15 @@ if __name__ == '__main__':
             args = parser.parse_args()
             if not 0 < args.budget <= 180:
                 parser.error('budget must be between 0 and 180')
-            print(json.dumps(refresh(args.data, args.root, args.budget)))
+            sys.path.insert(0, str(args.root))
+            import toollog
+            with toollog.caller_context('money-cases', command='refresh-marketplace', run_id=os.environ.get('WATCH_RUN')):
+                print(json.dumps(refresh(args.data, args.root, args.budget)))
         else:
             payload = json.load(sys.stdin)
-            print(json.dumps(native(sys.argv[1], sys.argv[2], float(sys.argv[3]), **payload)))
+            sys.path.insert(0, sys.argv[2])
+            import toollog
+            with toollog.caller_context('money-cases', command='order-lookup', run_id=os.environ.get('WATCH_RUN')):
+                print(json.dumps(native(sys.argv[1], sys.argv[2], float(sys.argv[3]), **payload)))
     except Exception:
         sys.exit(1)
