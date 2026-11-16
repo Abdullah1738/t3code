@@ -20389,6 +20389,145 @@ it.effect("an evaluator that fails twice is replaced in its discussion", () =>
   }),
 );
 
+it.effect.each(["discussion", "request", "card", "replaced discussion"] as const)(
+  "a safeguard refusal replaces a $0 evaluator on fresh Sol xhigh without a same-model retry",
+  (kind) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const opus = modelSelectionOf({
+          instanceId: "claudeAgent",
+          model: "claude-opus-5-5",
+          variant: "high",
+        });
+        yield* kanban.updateBoard(board.id, { evaluatorModel: opus });
+        const card =
+          kind === "card"
+            ? yield* kanban.createCard(board.id, { title: "Audit", prompt: "Audit" }, owner)
+            : null;
+        const channel =
+          kind === "request"
+            ? null
+            : card
+              ? yield* kanban.cardDiscussion(card.id)
+              : yield* kanban.createDiscussion(board.id, "Audit", owner);
+        if (channel)
+          yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Read the audit" }]);
+        let before = channel
+          ? (yield* kanban.discussion(channel.id)).evaluatorThreadId!
+          : yield* kanban.startEvaluator(board.id, { kind: "request", text: "Read the audit" });
+        if (kind === "replaced discussion") {
+          fake.failures.set(before, stopping);
+          yield* kanban.turnEnded(before);
+          yield* TestClock.adjust("2 minutes");
+          yield* kanban.tick;
+          fake.failures.set(before, { ...(stopping as object) } as never);
+          yield* kanban.turnEnded(before);
+          before = (yield* kanban.discussion(channel!.id)).evaluatorThreadId!;
+        }
+        fake.failures.set(before, {
+          class: "provider_error",
+          code: "model_refusal",
+          category: "content_filter",
+          message:
+            "claude-opus-5-5 safeguards flagged this session [cyber]; the fallback model claude-opus-4-8 failed (HTTP 404).",
+        } as never);
+        yield* kanban.turnEnded(before);
+        yield* kanban.turnEnded(before);
+        yield* TestClock.adjust("3 minutes");
+        yield* kanban.tick;
+        if (card) {
+          assert.isFalse(
+            [...(yield* Ref.get(fake.threads)).values()].some(
+              (thread) => thread.model.model === "gpt-6.1-sol",
+            ),
+          );
+          yield* TestClock.adjust("8 minutes");
+          yield* kanban.tick;
+        }
+        const all = yield* Ref.get(fake.threads);
+        const replacements = [...all.entries()].filter(
+          ([id, t]) => id !== before && t.model.model === "gpt-6.1-sol",
+        );
+        assert.lengthOf(replacements, 1);
+        const [after, replacement] = replacements[0]!;
+        assert.notEqual(after, before);
+        assert.equal(replacement.model.instanceId, "codex");
+        assert.deepEqual(replacement.model.options, [
+          { id: "reasoningEffort", value: "xhigh" },
+          { id: "serviceTier", value: "default" },
+        ]);
+        assert.include(replacement.messages.join("\n"), before);
+        assert.isFalse(
+          all.get(before)!.messages.some((text) => text.includes("one automatic retry")),
+        );
+        assert.deepEqual(
+          (yield* kanban.boards).find((b) => b.id === board.id)!.evaluatorModel,
+          opus,
+        );
+        if (channel) assert.equal((yield* kanban.discussion(channel.id)).evaluatorThreadId, after);
+        else {
+          const errors = (yield* kanban.discussions(board.id)).find(
+            (d) => d.title === "Evaluator errors",
+          )!;
+          const notice = lastText(yield* kanban.messages(errors.id));
+          assert.include(notice, "safeguard refusal [cyber] on claude-opus-5-5");
+          assert.notInclude(notice, "one retry didn't help");
+        }
+        fake.failures.set(after, {
+          class: "provider_error",
+          code: "model_refusal",
+          category: "content_filter",
+          message: "Sol safeguards refused the request [cyber]",
+        } as never);
+        yield* kanban.turnEnded(ThreadId.make(after));
+        yield* TestClock.adjust("11 minutes");
+        yield* kanban.tick;
+        assert.lengthOf(
+          [...(yield* Ref.get(fake.threads)).values()].filter(
+            (thread) => thread.model.model === "gpt-6.1-sol",
+          ),
+          1,
+        );
+        assert.isFalse(
+          (yield* Ref.get(fake.threads))
+            .get(after)!
+            .messages.some((text) => text.includes("one automatic retry")),
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["Provider turn failed.", "HTTP 503 upstream unavailable"])(
+  "an ordinary evaluator failure still gets one automatic retry: %s",
+  (message) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const threadId = yield* kanban.startEvaluator(board.id, {
+          kind: "request",
+          text: "Read it",
+        });
+        fake.failures.set(threadId, {
+          class: "provider_error",
+          code: null,
+          category: "unknown",
+          message,
+        } as never);
+        yield* kanban.turnEnded(threadId);
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.tick;
+        const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+        assert.lengthOf(
+          messages.filter((text) => text.includes("one automatic retry")),
+          1,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("a full context replaces the evaluator without a retry", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
