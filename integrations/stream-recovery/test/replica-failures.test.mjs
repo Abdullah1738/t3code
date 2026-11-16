@@ -94,7 +94,7 @@ test('a not-ready export reopened mid-scan tags both lanes and leaves recovery p
   const state = { handled:{}, servers:[], lastScan:new Date(NOW - 60_000).toISOString() };
   const before = structuredClone(state);
   const io = { PATHS:{db:path}, openDb, assertReplicaFresh,
-    serverRuntime:() => null, openCodeRuntime:() => null,
+    loadStallState: () => ({ stalls: {} }), serverRuntime:() => null, openCodeRuntime:() => null,
     cancelledSubagentsSince:() => { set('ready', '0'); return []; },
     cancelledDelegatedTasksSince:() => assert.fail('must defer before next query'),
     sendToThread:() => assert.fail('must not send'), telegram:() => assert.fail('must not notify'),
@@ -123,14 +123,13 @@ for (const [lane, stage] of [['stream','gather'], ['stream','act'], ['restart','
   const incident = { id, startMs:at, endMs:at, failAllMs:at, subagents:[],
     runs:['t','healthy'].map(thread_id => ({thread_id,run_id:'run:1',ordinal:1,completed_at:new Date(at).toISOString()})) };
   const state = { handled:{[id]:{incident, attempts:1, threads:{t:{failures:1}}}}, servers:[] };
-  state.lastStallScan = new Date(NOW).toISOString();
   const sent = [];
   const notifications = [];
   const noMutation = () => assert.fail('replica deferral must not mutate or notify');
   const io = {
     PATHS:{db:path}, openDb, assertReplicaFresh, assertThreadInReplica,
     harnessCutoverStatus:async () => ({active:false,completed:false,claimedThreadIds:[],claimedRunIds:[]}),
-    serverRuntime:() => null, openCodeRuntime:() => null,
+    loadStallState: () => ({ stalls: {} }), serverRuntime:() => null, openCodeRuntime:() => null,
     cancelledSubagentsSince:() => [], cancelledDelegatedTasksSince:() => [], restartRunsSince:() => [],
     failedRunsSince:() => [], failedSubagentsSince:() => [], laterRuns:() => [], queuedRuns:() => [],
     activeSessions:async () => new Set(), getThread:async id => id === 't' ? thread : healthy,

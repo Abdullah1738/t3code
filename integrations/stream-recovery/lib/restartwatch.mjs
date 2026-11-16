@@ -324,12 +324,17 @@ async function restartScanImpl({ db, refreshDb, state, now, sinceIso, floorMs, d
   state.servers = trackServer(state.servers, io.openCodeRuntime(), now);
   freshBatch();
   const nativeSubs = io.cancelledSubagentsSince(db, sinceIso)
-    .filter((s) => !stallInterrupted(state, sessionFromProviderThread(s.provider_thread_id), toMs(s.completed_at)));
+    .filter((s) => !stallInterrupted(io.loadStallState(), sessionFromProviderThread(s.provider_thread_id), toMs(s.completed_at)));
   freshBatch();
   const delegatedCandidates = io.cancelledDelegatedTasksSince(db, sinceIso);
   freshBatch();
   const delegatedSubs = delegatedCandidates
-    .filter((s) => !stallInterrupted(state, io.childNativeSession(db, s.childThreadId), toMs(s.completed_at), s.childThreadId));
+    .filter((s) => {
+      const ses = io.childNativeSession(db, s.childThreadId);
+      // Read after the replica query: the independent stall job may have
+      // interrupted this session while discovery was blocked.
+      return !stallInterrupted(io.loadStallState(), ses, toMs(s.completed_at), s.childThreadId);
+    });
   const subs = [...nativeSubs, ...delegatedSubs];
   for (const s of subs) {
     freshBatch();
