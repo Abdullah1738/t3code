@@ -1,3 +1,5 @@
+import * as McpCall from "../../analytics/McpCall.ts";
+import * as SavedWrite from "../engine/savedWrite.ts";
 // @effect-diagnostics nodeBuiltinImport:off - random fixture text prevents string interning in retention measurements.
 import * as NodeCrypto from "node:crypto";
 import * as NodeV8 from "node:v8";
@@ -2737,6 +2739,294 @@ it.effect.each([
   }).pipe(Effect.provide(TestLayer)),
 );
 
+it.effect("caller analytics is a memory lookup and follows card and link writes", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const current = card(4336, "working");
+    const id = ThreadId.make("worker-4336");
+    yield* store.putCard(current);
+    yield* store.putThreadLink({
+      threadId: id,
+      boardId,
+      cardId: current.id,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model,
+      startedAt: at,
+      endedAt: null,
+      paused: null,
+    });
+    const queries: string[] = [];
+    const observe: Statement.Transformer = (statement) => {
+      queries.push(statement.compile()[0]);
+      return Effect.succeed(statement);
+    };
+    const context = yield* Effect.sync(() => store.callerAnalytics!(id)).pipe(
+      Effect.provideService(Statement.CurrentTransformer, observe),
+    );
+    assert.deepEqual(context, {
+      boardId,
+      cardId: current.id,
+      cardNumber: 4336,
+      cardStage: "working",
+      callerRole: "work",
+    });
+    assert.deepEqual(queries, []);
+    store.registerCallerParent!("plain-child", "plain-parent");
+    assert.deepEqual(store.callerAnalytics!("plain-child"), {
+      callerRole: "none",
+      callerKind: "delegated_child",
+    });
+    store.registerCallerParent!("child", id);
+    assert.deepEqual(store.callerAnalytics!("child"), {
+      ...context,
+      callerRole: "work",
+      callerKind: "delegated_child",
+    });
+    const sql = yield* SqlClient.SqlClient;
+    yield* store
+      .observeCallerWrites(
+        sql.withTransaction(
+          store
+            .putCard({ ...current, stage: "needs_review" })
+            .pipe(Effect.andThen(Effect.fail("rollback"))),
+        ),
+      )
+      .pipe(Effect.exit);
+    assert.equal(store.callerAnalytics!(id)?.cardStage, "working");
+    yield* store.observeCallerWrites(
+      sql.withTransaction(store.putCard({ ...current, stage: "needs_review" })),
+    );
+    assert.equal(store.callerAnalytics!(id)?.cardStage, "needs_review");
+    const reopened = Context.get(
+      yield* Layer.build(
+        Layer.fresh(KanbanStore.layer).pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
+      ),
+      KanbanStore.KanbanStore,
+    );
+    assert.equal(reopened.callerAnalytics!(id)?.cardStage, "needs_review");
+    assert.deepEqual(reopened.callerAnalytics!("plain"), {
+      callerRole: "none",
+      callerKind: "plain_thread",
+    });
+    const cold = Context.get(
+      yield* Layer.build(
+        Layer.fresh(KanbanStore.layer).pipe(
+          Layer.provide(
+            Layer.succeed(BoardsDatabase.BoardsDatabase, {
+              sql,
+              path: "cold-test",
+              ready: Effect.never,
+            }),
+          ),
+        ),
+      ),
+      KanbanStore.KanbanStore,
+    );
+    assert.deepEqual(cold.callerAnalytics!("not-loaded-yet"), {
+      callerRole: "none",
+      callerKind: "unknown",
+    });
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each(["work", "review", "evaluator", "discussion"] as const)(
+  "delegated children inherit the resolved %s role without queries",
+  (role) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const current = card(4336, "working");
+      yield* store.putCard(current);
+      yield* store.putThreadLink({
+        threadId: ThreadId.make("parent"),
+        boardId,
+        cardId: current.id,
+        role: role === "discussion" ? "evaluator" : role,
+        purpose: null,
+        discussionId: role === "discussion" ? KanbanDiscussionId.make("card-discussion") : null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      });
+      store.registerCallerParent!("child", "parent");
+      store.registerCallerParent!("grandchild", "child");
+      const queries: string[] = [];
+      const observe: Statement.Transformer = (statement) => {
+        queries.push(statement.compile()[0]);
+        return Effect.succeed(statement);
+      };
+      yield* Effect.sync(() => {
+        for (const id of ["child", "grandchild"])
+          assert.deepEqual(store.callerAnalytics!(id), {
+            boardId,
+            cardId: current.id,
+            cardNumber: current.number,
+            cardStage: current.stage,
+            callerRole: role,
+            callerKind: "delegated_child",
+          });
+      }).pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+      assert.deepEqual(queries, []);
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("reopened caller attribution follows nested subagents and stops at forks", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    for (const [id, number] of [
+      ["worker", 4336],
+      ["own-fork", 4339],
+    ] as const) {
+      const current = card(number, "working");
+      yield* store.putCard(current);
+      yield* store.putThreadLink({
+        threadId: ThreadId.make(id),
+        boardId,
+        cardId: current.id,
+        role: "work",
+        purpose: null,
+        discussionId: null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      });
+    }
+    for (const [id, parent, relationship, deleted] of [
+      ["child", "worker", "subagent", false],
+      ["grandchild", "child", "subagent", false],
+      ["plain-fork", "worker", "fork", false],
+      ["fork-child", "plain-fork", "subagent", false],
+      ["fork-grandchild", "fork-child", "subagent", false],
+      ["own-fork", "worker", "fork", false],
+      ["own-child", "own-fork", "subagent", false],
+      ["own-grandchild", "own-child", "subagent", false],
+      ["legacy", "worker", "legacy", false],
+      ["legacy-grandchild", "legacy", "subagent", false],
+      ["explicit-root", "worker", "root", false],
+      ["root-grandchild", "explicit-root", "subagent", false],
+      ["cycle-a", "cycle-b", "subagent", false],
+      ["cycle-b", "cycle-a", "subagent", false],
+      ["deleted-parent", "worker", "subagent", true],
+      ["deleted-grandchild", "deleted-parent", "subagent", false],
+    ] as const) {
+      const payload = {
+        ...(relationship === "legacy"
+          ? {}
+          : {
+              lineage: {
+                parentThreadId: relationship === "root" ? null : parent,
+                relationshipToParent: relationship === "root" ? null : relationship,
+                rootThreadId: "worker",
+              },
+            }),
+        forkedFrom: { type: "run", threadId: parent },
+      };
+      yield* sql`INSERT INTO orchestration_v2_projection_threads (
+        thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+        created_at, updated_at, payload_json, deleted_at
+      ) VALUES (${id}, 'project', ${id}, 'codex', 'full-access', 'default',
+        ${at}, ${at}, ${JSON.stringify(payload)}, ${deleted ? "2026-11-14T00:00:00.000Z" : null})`;
+    }
+    const reopened = Context.get(
+      yield* Layer.build(
+        Layer.fresh(KanbanStore.layer).pipe(Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))),
+      ),
+      KanbanStore.KanbanStore,
+    );
+    const queries: string[] = [];
+    const observe: Statement.Transformer = (statement) => {
+      queries.push(statement.compile()[0]);
+      return Effect.succeed(statement);
+    };
+    yield* Effect.sync(() => {
+      for (const [id, number] of [
+        ["grandchild", 4336],
+        ["fork-grandchild", undefined],
+        ["own-grandchild", 4339],
+        ["legacy-grandchild", 4336],
+        ["root-grandchild", undefined],
+        ["cycle-a", undefined],
+        ["deleted-grandchild", undefined],
+      ] as const) {
+        const context = reopened.callerAnalytics!(id);
+        assert.equal(context?.callerRole, number === undefined ? "none" : "work", id);
+        assert.equal(context?.callerKind, "delegated_child", id);
+        assert.equal(context?.cardNumber, number, id);
+        assert.equal(context?.cardStage, number === undefined ? undefined : "working", id);
+      }
+      assert.equal(reopened.callerAnalytics!("plain-fork")?.callerRole, "none");
+      assert.equal(reopened.callerAnalytics!("own-fork")?.callerRole, "work");
+    }).pipe(Effect.provideService(Statement.CurrentTransformer, observe));
+    assert.deepEqual(queries, []);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each(["rekey", "selection"] as const)(
+  "%s caller metadata waits for the enclosing commit",
+  (mode) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const current = card(4336, "working");
+      const id = ThreadId.make("bulk-worker");
+      const link = {
+        threadId: id,
+        boardId,
+        cardId: current.id,
+        role: "work" as const,
+        purpose: null,
+        discussionId: null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      };
+      yield* store.putCard(current);
+      yield* store.putThreadLink(link);
+      const before = store.callerAnalytics!(id);
+      const watched = yield* store.watchCardWrites(boardId);
+      const changed = card(4336, "needs_review");
+      const bulk =
+        mode === "rekey"
+          ? store.rekeyBoard(boardId, [], [changed])
+          : store.migrateBoardSelections({
+              board,
+              pools: [],
+              oldPoolKeys: [],
+              cards: [changed],
+              threadLinks: [{ ...link, role: "review" }],
+            });
+      const rolledBack = yield* store
+        .observeCallerWrites(
+          sql.withTransaction(
+            bulk.pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  assert.deepEqual(store.callerAnalytics!(id), before);
+                  assert.deepEqual([...watched], [current.id]);
+                }),
+              ),
+              Effect.andThen(Effect.fail("rollback")),
+            ),
+          ),
+        )
+        .pipe(Effect.exit);
+      assert.equal(rolledBack._tag, "Failure");
+      assert.deepEqual(store.callerAnalytics!(id), before);
+      assert.equal((yield* store.card(current.id))?.stage, "working");
+      assert.equal((yield* store.threadLink(id))?.role, "work");
+      if (mode === "selection") {
+        yield* store.observeCallerWrites(sql.withTransaction(bulk));
+        assert.equal(store.callerAnalytics!(id)?.cardStage, "needs_review");
+        assert.equal(store.callerAnalytics!(id)?.callerRole, "review");
+      }
+    }).pipe(Effect.scoped, Effect.provide(TestLayer)),
+);
+
 it.effect("#1569 owner choices use their answer time, and a later evaluator clears them", () =>
   Effect.gen(function* () {
     const store = yield* KanbanStore.KanbanStore;
@@ -2782,4 +3072,35 @@ it.effect("#1569 owner choices use their answer time, and a later evaluator clea
     });
     assert.strictEqual((yield* store.ownerReply(talk.id, evaluator, true))?.answered, false);
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each([false, true])(
+  "saved analytics publishes after an outer transaction commits (rollback=%s)",
+  (rollback) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        boardWrite: true,
+        saved: false,
+      };
+      yield* sql`CREATE TABLE saved_probe (value INTEGER)`;
+      const write = Effect.gen(function* () {
+        yield* SavedWrite.committing;
+        yield* sql`INSERT INTO saved_probe VALUES (1)`;
+        yield* SavedWrite.committed();
+        assert.strictEqual(state.saved, "unknown");
+        if (rollback) return yield* Effect.fail("rollback");
+      });
+      yield* store
+        .observeCallerWrites(sql.withTransaction(write))
+        .pipe(Effect.provideService(McpCall.McpCall, state), Effect.exit);
+      const rows = yield* sql`SELECT * FROM saved_probe`;
+      assert.lengthOf(rows, rollback ? 0 : 1);
+      assert.strictEqual(state.saved, rollback ? "unknown" : true);
+    }).pipe(Effect.provide(TestLayer)),
 );

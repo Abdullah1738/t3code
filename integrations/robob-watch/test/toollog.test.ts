@@ -21,13 +21,63 @@ test("test default stays outside the home log tree when the override is absent",
 const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
 const emptyBreakdown = {
-  byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0 }, fires: 0 },
+  byDependency: {}, dependencyTotals: { dependencies: 0, busyRuns: 0 },
+  slots: { allSlotsBusyMinutes: 0, topHolders: [] },
+  byWatcher: {}, watcherTotals: { watchers: 0, runs: 0, outcomes: { no_change: 0, fire: 0, fail: 0, timeout: 0, busy: 0 }, fires: 0 },
   byHelper: {}, helperTotals: { helpers: 0, runs: 0, failures: 0, exitCodes: {} }, errorsByTagAndSource: [], hourly: [], markers: [],
   wake: { attempts: 0, sent: 0, failed: 0, replyGuard: { total: 0, blocked: 0, accepted: 0 } },
 };
 const day = () => new Date().toISOString().slice(0, 10);
 const rows = (dir: string) => readFileSync(join(dir, `${day()}.ndjson`), "utf8").trim().split("\n").map(line => JSON.parse(line));
 afterEach(() => { if (before === undefined) delete process.env.TOOLLOG_DIR; else process.env.TOOLLOG_DIR = before; for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+test.each([
+  ["msgs", true], ["9router", true], ["mail.archive-v2", true], ["a".repeat(64), true],
+  ["a".repeat(65), false], ["", false], ["private text", false], ["/private/path", false],
+  ["private12345", false], [12345, false], [null, false], [{ name: "msgs" }, false],
+] as const)("dependency labels are validated by the writer and rollup: %s", async (dependency, valid) => {
+  const dir = fixture();
+  toolLog({ component: "runner", kind: "error", name: "watch.run", ids: { watcher: "fixture" },
+    props: { outcome: "busy", stderrClass: "dependency_busy", dependency } });
+  expect(rows(dir)[0].props.dependency).toBe(valid ? dependency : undefined);
+  // An imported or older writer's row must pass the same validation at read time.
+  writeFileSync(join(dir, `${day()}.ndjson`), JSON.stringify({ ts: new Date().toISOString(), tool: "watchers",
+    component: "runner", kind: "error", name: "watch.run", ids: { watcher: "fixture" }, props: { outcome: "busy", dependency } }) + "\n");
+  const result = await rollup(day(), dir);
+  expect(result?.byWatcher.fixture?.outcomes.busy).toBe(1);
+  expect(Object.keys(result!.byDependency)).toEqual(valid ? [dependency as string] : []);
+});
+
+test("slot snapshots retain only sanitized holder ids and valid elapsed times", () => {
+  const dir = fixture();
+  toolLog({ component: "runner", kind: "perf", name: "slot.backlog", props: { depth: 2, active: 2, cap: 2, oldestWaitMs: 60_000,
+    holders: [{ watcher: "flighty-bookings", elapsedMs: 60_000, secret: "private" }, { watcher: null, elapsedMs: 1 },
+      { watcher: {}, elapsedMs: 1 }, { watcher: "valid", elapsedMs: -1 }, { watcher: "valid", elapsedMs: Infinity }, null], request: { secret: "private" } } });
+  expect(rows(dir)[0].props).toEqual({ depth: 2, active: 2, cap: 2, oldestWaitMs: 60_000, holders: [{ watcher: "flighty-bookings", elapsedMs: 60_000 }] });
+});
+
+test.each([
+  ["named", "flighty-bookings", true],
+  ["hexadecimal", "abcdefabcdefabcdefabcdef", true],
+  ["24 digits", "123456789012345678901234", false],
+  ["embedded digits", "watcher-12345", false],
+  ["phone", "+971500000000", false],
+  ["spaces", "private text", false],
+  ["path", "/Users/private", false],
+  ["empty", "", false],
+  ["long", "a".repeat(81), false],
+  ["unicode", "watcher-é", false],
+  ["number", 1234567890, false],
+] as const)("slot holder ids use the writer's watcher sanitizer: %s", (_shape, watcher, readable) => {
+  const dir = fixture();
+  for (const name of ["slot.wait", "slot.backlog"]) toolLog({ component: "runner", kind: "perf", name,
+    ids: { watcher }, props: { holders: [{ watcher, elapsedMs: 30_000 }] } });
+  const expected = readable ? String(watcher) : new Bun.CryptoHasher("sha256").update(String(watcher)).digest("hex").slice(0, 24);
+  for (const row of rows(dir)) {
+    expect(row.ids.watcher).toBe(expected);
+    expect(row.props.holders).toEqual([{ watcher: expected, elapsedMs: 30_000 }]);
+  }
+});
 
 test("watcher and Telegram loggers share the same private, allowlisted format", async () => {
   const dir = fixture();

@@ -1,5 +1,6 @@
 import type { NotificationEvent } from "./notification-events.ts";
-import { toolError } from "./toollog.ts";
+import { toolError, toolLog } from "./toollog.ts";
+import { countStreamError, streamErrorCode, type StreamEndKind } from "./stream-telemetry.ts";
 import {
   BOARD_EVENT_KEY_LIMIT, boardEventKey, IMESSAGE_ORIGIN, type AlertBackend, type BoardEntry, type BoardSnapshot, type BoardTelemetry, type PermissionRequest,
   type QuestionRequest, type RequestReader, type SessionRecord,
@@ -17,7 +18,11 @@ export interface ReviewBoard {
   markDirty?(reason?: "hard" | "soft", eventType?: string): void;
   status?(): BoardTelemetry;
   applyStatus?(threadId: string, state: ThreadState, runId?: string): void;
+  created?(threadId: string): void;
   recordLocal?(eventType: string): void;
+  streamConnected?(): void;
+  streamError?(code: unknown): string;
+  streamEnded?(kind: StreamEndKind, connectedMs: number | null): void;
 }
 
 const BOARD_MAX_AGE = 30_000;
@@ -69,10 +74,12 @@ export class ActiveThreadsBoard implements ReviewBoard {
   private cache?: BoardSnapshot;
   private readonly states = new Map<string, ThreadState>();
   private readonly runIds = new Map<string, string | null | undefined>();
-  private readonly reconciling = new Map<string, { version: number; promise: Promise<void> }>();
+  private readonly reconciling = new Map<string, { version: number; handled: boolean; promise: Promise<void> }>();
   private readonly threadReadAt = new Map<string, number>();
   private readonly deferredReads = new Set<string>();
   private readonly offboard = new Set<string>();
+  private readonly subagents = new Set<string>();
+  private readonly pendingCreated = new Set<string>();
   private readonly pendingStatuses = new Map<string, { state: ThreadState; thread?: ThreadSummary }>();
   private fetchedAt = 0;
   private dirty: "hard" | "soft" | undefined = "hard";
@@ -84,7 +91,10 @@ export class ActiveThreadsBoard implements ReviewBoard {
   private readonly telemetry: BoardTelemetry = {
     boardFetches: 0, boardCacheHits: 0, boardFetchErrors: 0, boardBackoffMs: 0, lastFetchDurationMs: null, lastFetchReason: null,
     fetchesByReason: { cold: 0, age: 0, hard: 0, soft: 0 }, dirtyEventsByType: {}, windowStartedAt: "",
-    threadReads: 0, threadReadErrors: 0, threadReadsByReason: { run: 0, state: 0, followup: 0 },
+    threadReads: 0, threadReadErrors: 0, threadReadsByReason: { run: 0, state: 0, followup: 0, created: 0 },
+    streamConnects: 0, streamEndsByKind: { errorFrame: 0, clean: 0, thrown: 0, aborted: 0 },
+    streamLastConnectedMs: null, streamMinConnectedMs: null, streamMaxConnectedMs: null,
+    streamErrorCodes: {}, lastStreamEndAt: null, lastStreamEndKind: null,
   };
 
   constructor(
@@ -103,6 +113,23 @@ export class ActiveThreadsBoard implements ReviewBoard {
 
   recordLocal(eventType: string): void { this.countEvent("local", eventType); }
 
+  streamConnected(): void { this.telemetry.streamConnects++; }
+
+  streamError(code: unknown): string { return countStreamError(this.telemetry.streamErrorCodes, code); }
+
+  streamEnded(kind: StreamEndKind, connectedMs: number | null): void {
+    const stats = this.telemetry;
+    stats.streamEndsByKind[kind]++;
+    stats.lastStreamEndAt = new Date(this.now()).toISOString();
+    stats.lastStreamEndKind = kind;
+    // Failed attempts without a frame have no connected lifetime.
+    if (connectedMs !== null) {
+      stats.streamLastConnectedMs = connectedMs;
+      stats.streamMinConnectedMs = Math.min(stats.streamMinConnectedMs ?? connectedMs, connectedMs);
+      stats.streamMaxConnectedMs = Math.max(stats.streamMaxConnectedMs ?? connectedMs, connectedMs);
+    }
+  }
+
   private countEvent(reason: "hard" | "soft" | "local", eventType: string): void {
     const events = this.telemetry.dirtyEventsByType;
     const key = Object.hasOwn(events, eventType) || (eventType !== "other" && Object.keys(events).filter(key => key !== "other").length < BOARD_EVENT_KEY_LIMIT)
@@ -114,19 +141,31 @@ export class ActiveThreadsBoard implements ReviewBoard {
   applyStatus(threadId: string, state: ThreadState, runId?: string): void {
     const entry = this.cache?.entries.find(entry => entry.sessionId === threadId);
     const kind = entry ? (state === "idle" ? "leave" : this.states.get(threadId) === state ? "same" : "move")
-      : state === "idle" || this.offboard.has(threadId) ? "offboard" : "join";
+      : state === "idle" || this.offboard.has(threadId) || this.subagents.has(threadId) ? "offboard" : "join";
     const key = `thread.status:${kind}`;
+    if (this.cache && !this.fetching && kind === "join" && this.client.thread) {
+      this.reconcileStatus(threadId, "state");
+      this.recordLocal(key);
+      return;
+    }
     // Alerts bypass the board. Known rows can be patched locally; the 30 s
     // age refresh backs up missed roster changes. Run events need extra care:
     // their state describes one run, which may not be the thread's active run.
-    const ambiguous = this.reconciling.has(threadId) || (runId !== undefined && (entry || this.fetching || !this.cache)
-      && (runId !== this.runIds.get(threadId) || state !== this.states.get(threadId)));
+    const ambiguous = !this.subagents.has(threadId) && (this.reconciling.has(threadId) || (runId !== undefined && (entry || this.fetching || !this.cache)
+      && (runId !== this.runIds.get(threadId) || state !== this.states.get(threadId))));
     if (ambiguous && this.client.thread) this.reconcileStatus(threadId, runId !== this.runIds.get(threadId) ? "run" : "state");
     else if (ambiguous) this.markDirty("soft");
     else this.applyCachedStatus(threadId, state);
     if (!this.cache || this.fetching) this.markDirty("hard", key);
     else if (kind === "join") this.markDirty("soft", key);
     else this.countEvent("local", key);
+  }
+
+  created(threadId: string): void {
+    if (!this.client.thread) { this.markDirty("hard", "thread.created"); return; }
+    this.recordLocal("thread.created");
+    this.pendingCreated.add(threadId);
+    this.reconcileStatus(threadId, "created");
   }
 
   private applyCachedStatus(threadId: string, state: ThreadState, thread?: ThreadSummary): void {
@@ -144,7 +183,7 @@ export class ActiveThreadsBoard implements ReviewBoard {
     const entry = snapshot.entries.find(entry => entry.sessionId === thread.threadId);
     if (entry || this.states.has(thread.threadId)) this.runIds.set(thread.threadId, thread.activeRunId ?? thread.latestRunId);
     if (thread.origin === IMESSAGE_ORIGIN || thread.relationshipToParent === "subagent") {
-      this.offboard.add(thread.threadId);
+      if (thread.origin === IMESSAGE_ORIGIN) this.offboard.add(thread.threadId);
       this.patchStatus(snapshot, thread.threadId, "idle");
     } else {
       this.offboard.delete(thread.threadId);
@@ -154,7 +193,13 @@ export class ActiveThreadsBoard implements ReviewBoard {
 
   private reconcileStatus(threadId: string, reason: keyof BoardTelemetry["threadReadsByReason"]): void {
     const pending = this.reconciling.get(threadId);
-    if (pending) { pending.version++; return; }
+    if (pending) {
+      // A newer event can arrive after the result was applied but before
+      // promise cleanup removes the task; it still needs a cooldown read.
+      if (pending.handled) this.deferredReads.add(threadId);
+      else if (reason !== "created") pending.version++;
+      return;
+    }
     const lastRead = this.threadReadAt.get(threadId);
     if (lastRead !== undefined && this.now() - lastRead < BOARD_MIN_GAP) {
       this.deferredReads.add(threadId);
@@ -169,19 +214,27 @@ export class ActiveThreadsBoard implements ReviewBoard {
         if (this.now() - at >= BOARD_MIN_GAP && !this.reconciling.has(id) && !this.deferredReads.has(id)) this.threadReadAt.delete(id);
       }
     }
-    const task = { version: 0, promise: Promise.resolve() };
+    const task = { version: 0, handled: false, promise: Promise.resolve() };
     this.reconciling.set(threadId, task);
     this.telemetry.threadReads++;
     this.telemetry.threadReadsByReason[reason]++;
     task.promise = (async () => {
       const { thread } = await this.client.thread!(threadId);
-      if (task.version !== 0) { this.deferredReads.add(threadId); return; }
+      task.handled = true;
+      if (thread.relationshipToParent === "subagent") {
+        // Lineage is permanent; list refreshes omit subagents entirely.
+        this.subagents.add(threadId);
+        if (this.subagents.size > 2_000) this.subagents.delete(this.subagents.values().next().value!);
+      }
+      if (task.version !== 0 && thread.relationshipToParent !== "subagent") { this.deferredReads.add(threadId); return; }
+      const created = this.pendingCreated.delete(threadId);
       this.applyCachedStatus(threadId, thread.state, thread);
-      if (!this.cache?.entries.some(entry => entry.sessionId === threadId) && thread.state !== "idle"
-        && thread.origin !== IMESSAGE_ORIGIN && thread.relationshipToParent !== "subagent") this.markDirty("soft");
+      if (thread.state !== "idle" && thread.origin !== IMESSAGE_ORIGIN && thread.relationshipToParent !== "subagent"
+        && (created || !this.cache?.entries.some(entry => entry.sessionId === threadId))) this.markDirty(created ? "hard" : "soft");
     })().catch(error => {
+      task.handled = true;
       this.telemetry.threadReadErrors++;
-      this.markDirty("soft");
+      this.markDirty(this.pendingCreated.delete(threadId) ? "hard" : "soft");
       toolError("telegram", "tg.robob.statusRead", undefined, error);
     }).finally(() => { this.reconciling.delete(threadId); });
   }
@@ -204,13 +257,14 @@ export class ActiveThreadsBoard implements ReviewBoard {
 
   status(): BoardTelemetry {
     return { ...this.telemetry, fetchesByReason: { ...this.telemetry.fetchesByReason },
+      streamEndsByKind: { ...this.telemetry.streamEndsByKind }, streamErrorCodes: { ...this.telemetry.streamErrorCodes },
       threadReadsByReason: { ...this.telemetry.threadReadsByReason },
       dirtyEventsByType: Object.fromEntries(Object.entries(this.telemetry.dirtyEventsByType).map(([key, counts]) => [key, { ...counts }])) };
   }
 
   snapshot(): Promise<BoardSnapshot> {
     for (const threadId of this.deferredReads) {
-      if (this.now() - this.threadReadAt.get(threadId)! >= BOARD_MIN_GAP) this.reconcileStatus(threadId, "followup");
+      if (this.now() - this.threadReadAt.get(threadId)! >= BOARD_MIN_GAP) this.reconcileStatus(threadId, this.pendingCreated.has(threadId) ? "created" : "followup");
     }
     if (this.fetching) {
       this.telemetry.boardCacheHits++;
@@ -299,6 +353,7 @@ export class RobobAlertBackend implements AlertBackend {
   readonly client: ControlClient;
   readonly directories: ThreadDirectories;
   private readonly board: ReviewBoard;
+  private readonly now: () => number;
   /** Thread id to directory; a thread's folder does not change. */
   private readonly threadDirectories = new Map<string, string>();
   private readonly native = new Map<string, string>();
@@ -307,6 +362,7 @@ export class RobobAlertBackend implements AlertBackend {
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
     this.board = options.board ?? new ActiveThreadsBoard(this.client, this.directories, options);
+    this.now = options.now ?? Date.now;
   }
 
   private async resolve(id: string): Promise<string> {
@@ -430,6 +486,8 @@ export class RobobAlertBackend implements AlertBackend {
       this.board.recordLocal?.("message.completed:assistant");
     } else if (type === "thread.status" && threadId && BOARD_STATES.has(data.state) && this.board.applyStatus) {
       this.board.applyStatus(threadId, data.state as ThreadState, typeof data.runId === "string" ? data.runId : undefined);
+    } else if (type === "thread.created" && threadId && this.board.created) {
+      this.board.created(threadId);
     } else this.markDirty(hard ? "hard" : "soft", boardEventKey(type, data.change));
     if (type === "ready") return { type: "invalidate" };
     if (!threadId) return { type: "wake" };
@@ -464,8 +522,17 @@ export class RobobAlertBackend implements AlertBackend {
     let after: number | undefined;
     let backoff = 1_000;
     while (!signal.aborted) {
+      let connectedAt: number | undefined;
+      let lastErrorCode: string | undefined;
+      let kind: StreamEndKind = "clean";
       try {
         for await (const frame of this.client.events({ signal, ...(after === undefined ? {} : { after }) })) {
+          if (connectedAt === undefined) {
+            connectedAt = this.now();
+            this.board.streamConnected?.();
+          }
+          lastErrorCode = frame.data.type === "error"
+            ? this.board.streamError?.(frame.data.code) ?? streamErrorCode(frame.data.code) : undefined;
           backoff = 1_000;
           onConnected?.();
           if (frame.id !== undefined && /^\d+$/.test(frame.id)) after = Number(frame.id);
@@ -473,9 +540,16 @@ export class RobobAlertBackend implements AlertBackend {
           if (event) yield event;
         }
       } catch (error) {
+        kind = "thrown";
         toolError("telegram", "tg.robob.notifications", undefined, error);
         if (signal.aborted) return;
         if (error instanceof ControlError && (error.status === 401 || error.status === 403)) throw error;
+      } finally {
+        const endKind = signal.aborted ? "aborted" : kind === "thrown" ? "thrown" : lastErrorCode !== undefined ? "errorFrame" : "clean";
+        const connectedMs = connectedAt === undefined ? null : Math.max(0, this.now() - connectedAt);
+        this.board.streamEnded?.(endKind, connectedMs);
+        toolLog({ component: "telegram", kind: "event", name: "tg.robob.streamEnd",
+          props: { kind: endKind, connectedMs, code: lastErrorCode ?? "none" } });
       }
       await new Promise(resolve => setTimeout(resolve, backoff));
       backoff = Math.min(backoff * 2, 30_000);

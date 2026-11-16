@@ -78,3 +78,6 @@ export * from "./clientRpcPermissions.ts";
 export * from "./ardud/threadRedaction.ts";
 
 export * from "./ardud/analytics.ts";
+
+export { McpReasonClass, McpInvalidField, McpRefusedAt } from "./ardud/mcpReasonClass.ts";
+export { McpDenyReason } from "./ardud/mcpDenyReason.ts";

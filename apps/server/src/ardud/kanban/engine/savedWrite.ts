@@ -1,3 +1,4 @@
+import { McpCall, writeCommitting, writeRefused } from "../../analytics/McpCall.ts";
 import type { KanbanCard, KanbanMessage, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -6,6 +7,11 @@ import * as Clock from "effect/Clock";
 import * as Fiber from "effect/Fiber";
 
 export const LONG_HOLD_MS = 5_000;
+export type UnverifiedReporterReason = "caller_unresolved" | "parent_not_active";
+export const reporterUnverified = Context.Reference<(reason: UnverifiedReporterReason) => void>(
+  "KanbanSavedWriteReporterUnverified",
+  { defaultValue: () => () => {} },
+);
 export type SubStep = { readonly subStep: string; readonly ms: number };
 
 export const subStepReporter = Context.Reference<(steps: ReadonlyArray<SubStep>) => void>(
@@ -22,10 +28,12 @@ export const subStepObserver = Context.Reference<
 >("KanbanSavedWriteSubSteps", { defaultValue: () => undefined });
 
 // Reuse existing operation spans, including interrupted SQL admission. No extra
-// spans or detail rows on fast calls; count only time while a board permit is held.
+// spans or detail rows on fast calls. Evaluator calls also count launch I/O
+// outside the board permit, where command-receipt reads can wait on a reader.
 export const subSteps = Effect.fnUntraced(function* <A, E, R>(
   name: string,
   effect: Effect.Effect<A, E, R>,
+  includeOutsideLocks = false,
 ) {
   const delegate = yield* Tracer.Tracer;
   const parent = yield* subStepObserver;
@@ -73,41 +81,84 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
     },
     ...(delegate.context ? { context: delegate.context } : {}),
   });
+  const hold = (fiberId: number) => {
+    const held = { fiberId, since: now(), totals: new Map<string, number>() };
+    holds.add(held);
+    return (long: boolean) => {
+      account(fiberId);
+      holds.delete(held);
+      if (!long) return undefined;
+      return [...held.totals]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([subStep, ms]) => ({
+          subStep:
+            subStep.length <= 160 && /^[a-zA-Z0-9_.:/#@%+-]+$/.test(subStep) ? subStep : "unknown",
+          ms,
+        }));
+    };
+  };
+  const finish = includeOutsideLocks ? hold(yield* Effect.fiberId) : undefined;
+  const report = yield* subStepReporter;
   return yield* effect.pipe(
+    // Lock collectors still return their diagnostics, but only the enclosing
+    // whole-call collector publishes to the reply ledger.
+    (effect) =>
+      includeOutsideLocks ? effect.pipe(Effect.provideService(subStepReporter, () => {})) : effect,
     Effect.withTracer(tracer),
     Effect.provideService(subStepObserver, {
       tracer: parent?.tracer ?? delegate,
-      hold(fiberId) {
-        const started = now();
-        const hold = { fiberId, since: started, totals: new Map<string, number>() };
-        holds.add(hold);
-        return (long) => {
-          account(fiberId);
-          holds.delete(hold);
-          if (!long) return undefined;
-          return [...hold.totals]
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 3)
-            .map(([subStep, ms]) => ({
-              subStep:
-                subStep.length <= 160 && /^[a-zA-Z0-9_.:/#@%+-]+$/.test(subStep)
-                  ? subStep
-                  : "unknown",
-              ms,
-            }));
-        };
-      },
+      hold,
     }),
+    Effect.ensuring(
+      Effect.sync(() => {
+        const steps = finish?.(now() >= LONG_HOLD_MS);
+        if (steps !== undefined) report(steps);
+      }),
+    ),
   );
 });
 
-export type Stage = "caller" | "admission" | "read" | "mutate" | "commit";
+// The store defers this callback when SQL is inside an enclosing transaction.
+export const afterCommit = Context.Reference<(confirm: () => void) => void>(
+  "KanbanSavedWriteAfterCommit",
+  {
+    defaultValue: () => (confirm) => confirm(),
+  },
+);
+const requestCommitEvidence = Context.Reference<boolean>("KanbanSavedWriteRequestCommitEvidence", {
+  defaultValue: () => true,
+});
+
+// Setup may persist a discussion while the incoming request is still unsaved.
+export const preparatory = Effect.fn("KanbanSavedWrite.preparatory")(function* <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) {
+  return yield* effect.pipe(
+    Effect.provideService(observer, () => {}),
+    Effect.provideService(requestCommitEvidence, false),
+  );
+});
+
+export const committed = Effect.fnUntraced(function* () {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some" && call.value.boardWrite && (yield* requestCommitEvidence))
+    (yield* afterCommit)(() => {
+      call.value.saved = true;
+      delete call.value.refusedAt;
+    });
+});
+
+export type Stage = "caller" | "admission" | "read" | "mutate" | "commit" | "ack";
 
 export const traceObserver = Context.Reference<
   | {
       readonly span: Tracer.Span;
       readonly enter: (stage: Stage, fiberId: number) => () => void;
       readonly mark: (stage: Stage, fiberId: number) => void;
+      readonly observeLocks?: (
+        snapshot: (now: number) => Readonly<Record<string, unknown>>,
+      ) => () => void;
     }
   | undefined
 >("KanbanSavedWriteTrace", { defaultValue: () => undefined });
@@ -117,6 +168,11 @@ export const stage = Effect.fnUntraced(function* <A, E, R>(
   effect: Effect.Effect<A, E, R>,
   name: Stage,
 ) {
+  effect = effect.pipe(
+    Effect.onError(() =>
+      writeRefused(name === "admission" || name === "caller" ? "pre_lock" : "in_write"),
+    ),
+  );
   const trace = yield* traceObserver;
   if (trace === undefined) return yield* effect;
   const fiberId = yield* Effect.fiberId;
@@ -162,7 +218,35 @@ export const linkReply = Effect.fnUntraced(function* () {
 export type Saved =
   | { readonly kind: "card"; readonly card: KanbanCard }
   | { readonly kind: "message"; readonly message: KanbanMessage }
-  | { readonly kind: "evaluator"; readonly threadId: ThreadId };
+  | { readonly kind: "evaluator"; readonly threadId: ThreadId; readonly key?: string | undefined }
+  | { readonly kind: "evaluatorQueue"; readonly key: string; readonly queueId: number };
+
+export type ReportLookup =
+  | {
+      readonly kind: "card";
+      readonly boardId: KanbanCard["boardId"];
+      readonly cardId: KanbanCard["id"];
+      readonly number: number;
+    }
+  | {
+      readonly kind: "evaluator";
+      readonly boardId: KanbanCard["boardId"];
+      readonly keyPrefix: string;
+    };
+
+// Published before a report can write; unlike a receipt, this does not prove a save.
+export const reportLookupObserver = Context.Reference<(lookup: ReportLookup) => void>(
+  "KanbanReportLookup",
+  {
+    defaultValue: () => () => {},
+  },
+);
+
+export const locateReport = Effect.fn("KanbanSavedWrite.locateReport")(function* (
+  lookup: ReportLookup,
+) {
+  (yield* reportLookupObserver)(lookup);
+});
 
 export const observer = Context.Reference<(saved: Saved) => void>("KanbanSavedWrite", {
   defaultValue: () => () => {},
@@ -175,12 +259,16 @@ export const commitObserver = Context.Reference<() => void>("KanbanSavedWriteCom
 
 // Runs at every store write; the enclosing lock operation already supplies its span.
 export const committing = Effect.gen(function* () {
+  if (yield* requestCommitEvidence) yield* writeCommitting();
   const trace = yield* traceObserver;
   trace?.mark("commit", yield* Effect.fiberId);
   (yield* commitObserver)();
 });
 
 export const record = Effect.fn("KanbanSavedWrite.record")(function* (saved: Saved) {
+  yield* committed();
+  const trace = yield* traceObserver;
+  trace?.mark("ack", yield* Effect.fiberId);
   (yield* observer)(saved);
 });
 

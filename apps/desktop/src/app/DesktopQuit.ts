@@ -15,6 +15,8 @@ export type QuitTrigger =
   | { readonly trigger: "signal"; readonly signal: "SIGINT" | "SIGTERM" | "SIGHUP" }
   | { readonly trigger: "ipc-relaunch"; readonly reason: string };
 
+export type QuitRequest = QuitTrigger & { readonly at: string };
+
 const { logError } = makeComponentLogger("desktop-lifecycle");
 const encodeQuitRecord = Schema.encodeEffect(
   Schema.fromJsonString(
@@ -30,7 +32,8 @@ const encodeQuitRecord = Schema.encodeEffect(
 
 export const prepare = Effect.fn("desktop.lifecycle.prepareQuit")(function* (trigger: QuitTrigger) {
   const state = yield* DesktopState.DesktopState;
-  yield* Ref.update(state.quitTrigger, (current) => current ?? trigger);
+  const at = DateTime.formatIso(yield* DateTime.now);
+  yield* Ref.update(state.quitTrigger, (current) => current ?? { ...trigger, at });
 });
 
 export const reset = Effect.gen(function* () {
@@ -42,16 +45,17 @@ export const reset = Effect.gen(function* () {
 export const record = Effect.fn("desktop.lifecycle.recordQuit")(function* (fallback: QuitTrigger) {
   const state = yield* DesktopState.DesktopState;
   if (yield* Ref.getAndSet(state.quitRecorded, true)) return;
-  const trigger = (yield* Ref.get(state.quitTrigger)) ?? fallback;
+  yield* prepare(fallback);
+  const trigger = (yield* Ref.get(state.quitTrigger))!;
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const at = DateTime.formatIso(yield* DateTime.now);
   yield* Effect.annotateCurrentSpan({ ...trigger, pid: process.pid });
   // Updater quits can bypass Effect's scope finalizers and its buffered trace
   // writer. Persist this one event synchronously before Electron can exit.
   yield* encodeQuitRecord({
-    at,
     pid: process.pid,
     ...trigger,
+    at,
   }).pipe(
     Effect.flatMap((line) =>
       Effect.try(() => {

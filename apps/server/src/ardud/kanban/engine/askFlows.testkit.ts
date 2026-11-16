@@ -124,6 +124,7 @@ export const makeFake = Effect.gen(function* () {
                 };
           }),
         ),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       model: (threadId) =>

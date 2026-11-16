@@ -1,3 +1,4 @@
+import { writeAdmitted } from "../../analytics/McpCall.ts";
 import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Metric from "effect/Metric";
@@ -34,6 +35,8 @@ interface Holder {
   readonly acquiredAtMs: number;
 }
 
+type WaitingOn = Pick<Holder, "boardId" | "lock" | "cardId">;
+
 interface BoardLock {
   waiters: number;
   readonly holders: Map<symbol, Holder>;
@@ -64,6 +67,8 @@ interface Operation {
   readonly fiberId: number;
   readonly cardId: string | undefined;
   held: Held | undefined;
+  boardId: string | undefined;
+  waiting: { readonly target: WaitingOn; readonly started: number } | undefined;
   stale: boolean;
   committed: boolean;
   sideEffect: boolean;
@@ -196,7 +201,6 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     lock,
     cardId,
   });
-  type WaitingOn = ReturnType<typeof waitingOn>;
   const blockersAt = (target: WaitingOn, now: number) =>
     (target.lock === "migration"
       ? [...migrationHolders.values()]
@@ -388,6 +392,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             return yield* Effect.die(
               new KanbanError({
                 code: "conflict",
+                reasonClass: "board_busy",
                 saved: op.committed ? null : false,
                 detail: op.committed
                   ? MAY_HAVE_APPLIED
@@ -419,6 +424,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         if (target.lock === "migration") migrationWaiters += 1;
         return Effect.gen(function* () {
           const started = yield* Clock.currentTimeMillis;
+          op.waiting = { target, started };
           while (!(yield* semaphore.takeIfAvailable(permits))) {
             // withPermits owns cancellation cleanup while waiting. The actual transfer
             // happens masked, so an interrupt cannot land between take and ownership.
@@ -478,6 +484,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         }).pipe(
           Effect.ensuring(
             Effect.sync(() => {
+              op.waiting = undefined;
               board.waiters -= 1;
               if (target.lock === "migration") migrationWaiters -= 1;
             }),
@@ -513,6 +520,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         yield* check(op);
         if (op.held?.boardId === boardId) return;
         yield* release(op);
+        op.boardId = boardId;
         const board = boardOf(boardId);
         const cardId = op.cardId;
         let mutex: Semaphore.Semaphore | undefined;
@@ -544,6 +552,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           acquiredAtMs: yield* Clock.currentTimeMillis,
         };
         op.held = held;
+        yield* writeAdmitted();
         const seen = versions.get(op)!;
         const expected = seen.get(boardId);
         const scoped = op.scopes.get(boardId);
@@ -584,6 +593,8 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           cardId,
           diagnosticCardId: cardId,
           held: undefined,
+          boardId: undefined,
+          waiting: undefined,
           stale: false,
           committed: false,
           sideEffect: false,
@@ -596,6 +607,18 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           replayed: 0,
         };
         versions.set(op, new Map());
+        const stopObserving = (yield* SavedWrite.traceObserver)?.observeLocks?.((now) => ({
+          "board.waiter": op.label,
+          ...(op.boardId === undefined ? {} : { "board.id": op.boardId }),
+          ...(op.diagnosticCardId === undefined ? {} : { "board.card_id": op.diagnosticCardId }),
+          "board.waiter_fiber_id": op.fiberId,
+          "board.waiting_on": op.waiting?.target.lock ?? null,
+          ...(op.waiting ? { "board.waited_ms": Math.max(0, now - op.waiting.started) } : {}),
+          "board.holders": holdersAt(now).filter(
+            (holder) => holder.boardId === op.boardId || holder.boardId === "*",
+          ),
+          "board.blockers": op.waiting ? blockersAt(op.waiting.target, now) : [],
+        }));
         if (attempt > 0) yield* Effect.annotateCurrentSpan("board.rerun_attempt", attempt);
         return yield* restore(effect).pipe(
           Effect.ensuring(
@@ -632,6 +655,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
                 ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy, op.label)))
               : Effect.failCause(cause);
           }),
+          Effect.ensuring(Effect.sync(() => stopObserving?.())),
         );
       }),
     );
@@ -671,6 +695,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           ? SavedWrite.stage(SavedWrite.committing.pipe(Effect.andThen(effect)), "commit")
           : restore(dispatchRead(effect));
         if (write) {
+          yield* SavedWrite.committed();
           op.committed = true;
           const held = op.held!;
           const parents: Array<readonly [Operation, boolean]> = [];
@@ -732,6 +757,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     abandoned?: (value: A) => Effect.Effect<void>,
     readOnly = false,
     reconcile?: Effect.Effect<boolean, E2, R2>,
+    options: { readonly writesTrackedInside?: boolean } = {},
   ) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -750,7 +776,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         const external = restore(Effect.interruptible(effect));
         const result = yield* Effect.exit(
           SavedWrite.stage(
-            readOnly ? external : SavedWrite.committing.pipe(Effect.andThen(external)),
+            // Serial lanes keep the retry guard above; their nested writes own commit evidence.
+            readOnly || options.writesTrackedInside
+              ? external
+              : SavedWrite.committing.pipe(Effect.andThen(external)),
             readOnly ? "read" : "commit",
           ),
         );

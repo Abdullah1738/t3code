@@ -1,15 +1,18 @@
 // @effect-diagnostics nodeBuiltinImport:off - command ids only need a random UUID.
 import * as NodeCrypto from "node:crypto";
 import * as EvaluatorAnalytics from "./evaluatorAnalytics.ts";
+import { BACKGROUND_GRACE_MS } from "./rules.ts";
 
 import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
   MessageId,
+  type NodeId,
   RunId,
   type OrchestrationV2UserInputQuestion,
   type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
   type RuntimeRequestId,
   type ModelSelection,
   type ProjectId,
@@ -28,7 +31,6 @@ import type {
   OrchestrationV2ThreadShell,
 } from "@t3tools/contracts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
-import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import {
   latestExecutedRun,
   latestRootProviderFailure,
@@ -89,8 +91,10 @@ export interface KanbanThreadView {
   readonly runRequestedAt?: string | null;
   readonly runMessageId?: string | null;
   readonly runStatus?: string | null;
-  /** Its own subagents and background tasks still running after its turn ended. Pull-request watches are counted in prWatches instead. */
+  /** Its own subagents, commands and background tasks still running after its turn ended. Pull-request watches are counted in prWatches instead. */
   readonly backgroundWork: number;
+  readonly backgroundWorkUntil?: string;
+  readonly backgroundJobs?: OrchestrationV2ThreadShell["pendingBackgroundTasks"];
   /** Pull requests this thread watches (watch_pull_request) that are still open or draft. The watch wakes it on CI and review changes. */
   readonly prWatches: number;
   readonly prs: ReadonlyArray<KanbanThreadPr>;
@@ -110,6 +114,8 @@ export interface KanbanLaunchInput {
 export interface KanbanSendInput {
   /** Observes a newly accepted delivery, excluding receipt replays and coalesced no-ops. */
   readonly onAccepted?: (identity: string) => Effect.Effect<void>;
+  /** Called at the durable acceptance boundary, before any projection or board revalidation. */
+  readonly onCommitted?: () => void;
   readonly flushQueued?: "wake" | "steer";
   readonly threadId: ThreadId;
   readonly text: string;
@@ -175,6 +181,8 @@ export interface KanbanThreadsShape {
     {
       readonly runId: string;
       readonly status: string;
+      readonly cancelReason?: OrchestrationV2Run["cancelReason"];
+      readonly cancelDetail?: string | undefined;
       readonly message: string | null;
       readonly model?: ModelSelection | null;
     } | null,
@@ -184,12 +192,18 @@ export interface KanbanThreadsShape {
     threadId: ThreadId,
     runId: string,
   ) => Effect.Effect<boolean, KanbanThreadError>;
+  readonly backgroundStoppedSince: (
+    threadId: ThreadId,
+    since: string,
+  ) => Effect.Effect<boolean, KanbanThreadError>;
   readonly compactRun: (
     threadId: ThreadId,
     runId: string,
   ) => Effect.Effect<
     {
       readonly status: string;
+      readonly cancelReason?: OrchestrationV2Run["cancelReason"];
+      readonly cancelDetail?: string | undefined;
       readonly message: string | null;
       readonly messageId?: string;
       readonly model?: ModelSelection | null;
@@ -206,6 +220,8 @@ export interface KanbanThreadsShape {
   >;
   readonly launch: (input: KanbanLaunchInput) => Effect.Effect<ThreadId, KanbanThreadError>;
   readonly send: (input: KanbanSendInput) => Effect.Effect<string | void, KanbanThreadError>;
+  /** Recovers the durable recipient of a keyed send, including across service restarts. */
+  readonly acceptedSend?: (key: string) => Effect.Effect<ThreadId | null, KanbanThreadError>;
   readonly withdraw: (input: {
     readonly threadId: ThreadId;
     readonly key: string;
@@ -227,6 +243,7 @@ export interface KanbanThreadsShape {
   readonly cancelQueued: (
     threadId: ThreadId,
     runId: string,
+    cancelReason?: OrchestrationV2Run["cancelReason"],
   ) => Effect.Effect<boolean, KanbanThreadError>;
   /** A thread that no longer exists counts as stopped; a failed read or stop fails. */
   readonly interrupt: (
@@ -235,6 +252,7 @@ export interface KanbanThreadsShape {
     cancelQueued?: boolean,
     runId?: string,
     messageId?: string,
+    cancelReason?: OrchestrationV2Run["cancelReason"],
   ) => Effect.Effect<KanbanInterruptResult | void, KanbanThreadError>;
 }
 
@@ -328,11 +346,49 @@ export const viewStateOf = (
 /** Background work that still runs for the thread once its turn ended. */
 export const backgroundWorkOf = (
   shell: Pick<OrchestrationV2ThreadShell, "pendingBackgroundTasks">,
+  completions: ReadonlyArray<OrchestrationV2Subagent> = [],
+  descendants: ReadonlySet<NodeId> = new Set(),
 ): number =>
   (shell.pendingBackgroundTasks ?? []).filter(
-    (task) =>
-      !task.taskId.startsWith("pull-request-watch:") && backgroundWorkHoldsCompletion([task]),
-  ).length;
+    // Commands may finish the turn, but their completion still wakes an idle worker.
+    (task) => !task.taskId.startsWith("pull-request-watch:"),
+  ).length +
+  completions.filter((task) => completionPending(task) || descendants.has(task.id)).length;
+
+const completionPending = (task: OrchestrationV2Subagent) =>
+  task.origin === "app_owned" &&
+  ["completed", "failed", "cancelled", "interrupted"].includes(task.status) &&
+  (task.completionDelivery?.state === "pending" || task.completionDelivery?.state === "claimed");
+
+const backgroundWorkUntil = (
+  quietSince: DateTime.Utc,
+  tasks: ReadonlyArray<OrchestrationV2Subagent>,
+  activity: ReadonlyMap<ThreadId, DateTime.Utc>,
+  otherBackgroundUntil?: number,
+): string | undefined => {
+  if (tasks.length === 0 && otherBackgroundUntil === undefined) return undefined;
+  const quiet = DateTime.toEpochMillis(quietSince);
+  return DateTime.formatIso(
+    DateTime.makeUnsafe(
+      Math.max(
+        ...(otherBackgroundUntil === undefined ? [] : [otherBackgroundUntil]),
+        ...tasks.map((task) => {
+          const progress =
+            task.childThreadId === null ? undefined : activity.get(task.childThreadId);
+          const since = completionPending(task)
+            ? task.updatedAt
+            : (progress ?? task.startedAt ?? task.updatedAt);
+          const timeout = completionPending(task)
+            ? BACKGROUND_GRACE_MS
+            : task.idleTimeoutMs && Number.isFinite(task.idleTimeoutMs)
+              ? Math.min(2 * BACKGROUND_GRACE_MS, Math.max(60_000, task.idleTimeoutMs))
+              : BACKGROUND_GRACE_MS;
+          return Math.max(quiet, DateTime.toEpochMillis(since)) + timeout;
+        }),
+      ),
+    ),
+  );
+};
 
 export const prWatchesOf = (shell: Pick<OrchestrationV2ThreadShell, "pullRequests">): number =>
   (shell.pullRequests ?? []).filter(
@@ -357,6 +413,104 @@ const make = Effect.gen(function* () {
           ? null
           : yield* threads.getThreadRecords(threadId, ["runs"], { runIds: [runId] });
       const run = records?.runs[0];
+      // The shell drops terminal items before their completion wake is accepted.
+      const pending =
+        runId === null
+          ? (yield* threads.getThreadRecords(
+              threadId,
+              ["subagents"],
+              { pendingBackgroundTasksOnly: true },
+              { projectionOnly: true },
+            )).subagents
+          : [];
+      const activityByChild = new Map<ThreadId, DateTime.Utc>();
+      const pendingTree = [...pending];
+      const visited = new Set<ThreadId>([threadId]);
+      const descendants = new Set<NodeId>();
+      const threadsWithBackground = new Set<ThreadId>();
+      let otherBackgroundUntil =
+        backgroundWorkOf(shell) >
+        pending.filter((task) => ["pending", "running", "waiting"].includes(task.status)).length
+          ? DateTime.toEpochMillis(viewStateOf(shell).quietSince) + BACKGROUND_GRACE_MS
+          : undefined;
+      // Each descendant keeps its own silence timeout or completion-delivery grace.
+      for (const task of pendingTree) {
+        if (task.childThreadId === null) continue;
+        if (visited.has(task.childThreadId)) continue;
+        visited.add(task.childThreadId);
+        const childShell = yield* threads.getThreadShell(task.childThreadId);
+        if (childShell === null || childShell.deletedAt !== null) continue;
+        const child = yield* threads.getThreadRecords(
+          task.childThreadId,
+          ["runs", "subagents"],
+          {
+            ...(childShell.activeRunId === null
+              ? { latestRunOnly: true }
+              : { runIds: [childShell.activeRunId] }),
+            pendingBackgroundTasksOnly: true,
+          },
+          { projectionOnly: true },
+        );
+        const latest = child.runs[0];
+        if (latest)
+          activityByChild.set(
+            task.childThreadId,
+            latest.lastActivityAt ?? latest.startedAt ?? latest.requestedAt,
+          );
+        const background = backgroundWorkOf(childShell, child.subagents);
+        // A completion wake hides pending shell work while its run is active.
+        const activeDelegates =
+          childShell.activeRunId !== null &&
+          child.subagents.some((nested) =>
+            ["pending", "running", "waiting"].includes(nested.status),
+          );
+        if (background > 0 || activeDelegates) {
+          threadsWithBackground.add(task.childThreadId);
+          if (
+            backgroundWorkOf(childShell) >
+            child.subagents.filter((nested) =>
+              ["pending", "running", "waiting"].includes(nested.status),
+            ).length
+          ) {
+            const quiet = DateTime.toEpochMillis(viewStateOf(childShell).quietSince);
+            const activity = latest?.lastActivityAt
+              ? DateTime.toEpochMillis(latest.lastActivityAt)
+              : quiet;
+            otherBackgroundUntil = Math.max(
+              otherBackgroundUntil ?? 0,
+              Math.max(quiet, activity) + BACKGROUND_GRACE_MS,
+            );
+          }
+        }
+        pendingTree.push(...child.subagents);
+      }
+      const terminalParents = new Map<ThreadId, OrchestrationV2Subagent[]>();
+      for (const task of pendingTree) {
+        if (
+          task.childThreadId !== null &&
+          ["completed", "failed", "cancelled", "interrupted"].includes(task.status)
+        ) {
+          const parents = terminalParents.get(task.childThreadId) ?? [];
+          parents.push(task);
+          terminalParents.set(task.childThreadId, parents);
+        }
+      }
+      // Propagate validated work through terminal ancestors, including shared subtrees.
+      for (const childId of threadsWithBackground) {
+        for (const task of terminalParents.get(childId) ?? []) {
+          descendants.add(task.id);
+          threadsWithBackground.add(task.threadId);
+        }
+      }
+      const until = backgroundWorkUntil(
+        viewStateOf(shell).quietSince,
+        pendingTree.filter(
+          (task) =>
+            ["pending", "running", "waiting"].includes(task.status) || completionPending(task),
+        ),
+        activityByChild,
+        otherBackgroundUntil,
+      );
       const started = shell.activityRunStartedAt;
       const activity = run?.lastActivityAt;
       return {
@@ -380,7 +534,11 @@ const make = Effect.gen(function* () {
         runRequestedAt: run ? DateTime.formatIso(run.requestedAt) : null,
         runMessageId: run?.userMessageId ?? null,
         runStatus: run?.status ?? null,
-        backgroundWork: backgroundWorkOf(shell),
+        backgroundWork: backgroundWorkOf(shell, pending, descendants),
+        ...(until === undefined ? {} : { backgroundWorkUntil: until }),
+        backgroundJobs: (shell.pendingBackgroundTasks ?? []).filter(
+          (task) => !task.taskId.startsWith("pull-request-watch:"),
+        ),
         prWatches: prWatchesOf(shell),
         archived: shell.archivedAt !== null,
         prs: (shell.pullRequests ?? []).map((pr) => ({
@@ -512,6 +670,8 @@ const make = Effect.gen(function* () {
             Effect.map((messages) => ({
               runId: run.id,
               status: run.status,
+              cancelReason: run.cancelReason,
+              cancelDetail: run.cancelDetail,
               model: run.modelSelection,
               message: messages.messages[0]?.text ?? null,
             })),
@@ -539,6 +699,29 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const backgroundStoppedSince = Effect.fn("KanbanThreads.backgroundStoppedSince")(
+    function* (threadId: ThreadId, since: string) {
+      // Stop can interrupt retained work without changing the finished run's timestamp.
+      const records = yield* Effect.all([
+        threads.getThreadRecords(threadId, ["turnItems"], {
+          turnItemTypes: ["run_interrupt_request"],
+          recentTurnItemLimit: 1,
+        }),
+        threads.getThreadRecords(threadId, ["turnItems"], {
+          turnItemTypes: ["command_execution", "dynamic_tool", "subagent"],
+          turnItemStatuses: ["interrupted", "cancelled"],
+        }),
+      ]);
+      return records.some(({ turnItems }) =>
+        turnItems.some((item) => DateTime.toEpochMillis(item.updatedAt) >= Date.parse(since)),
+      );
+    },
+    Effect.mapError(
+      (error) =>
+        new KanbanThreadError({ operation: "backgroundStoppedSince", detail: detailOf(error) }),
+    ),
+  );
+
   const compactRun: KanbanThreadsShape["compactRun"] = (threadId, runId) =>
     threads.getThreadRecords(threadId, ["runs"]).pipe(
       Effect.flatMap((records) => {
@@ -551,6 +734,8 @@ const make = Effect.gen(function* () {
           .pipe(
             Effect.map((messages) => ({
               status: run.status,
+              cancelReason: run.cancelReason,
+              cancelDetail: run.cancelDetail,
               messageId: run.userMessageId,
               model: run.modelSelection,
               message: messages.messages[0]?.text ?? null,
@@ -590,6 +775,7 @@ const make = Effect.gen(function* () {
       threadId: ThreadId,
       id: string,
       reason = "Board withdrawal could not steer its original run",
+      interruptRunning = true,
     ) {
       const messageId = MessageId.make(`kanban:${id}`);
       // A queued withdrawal can start while cancellation is committing; reconcile that race once.
@@ -627,13 +813,17 @@ const make = Effect.gen(function* () {
           run.status === "queued"
             ? {
                 type: "queued-run.cancel" as const,
+                reason: "superseded" as const,
+                detail: "Board send withdrawn before it started.",
                 commandId: CommandId.make(`kanban:send:${id}:cancel`),
                 threadId,
                 runId: run.id,
               }
-            : ["preparing", "starting", "running", "waiting"].includes(run.status)
+            : interruptRunning &&
+                ["preparing", "starting", "running", "waiting"].includes(run.status)
               ? {
                   type: "run.interrupt" as const,
+                  cancelReason: "superseded" as const,
                   commandId: CommandId.make(`kanban:send:${id}:interrupt`),
                   threadId,
                   runId: run.id,
@@ -646,16 +836,15 @@ const make = Effect.gen(function* () {
                   reason,
                 }
               : null;
-        if (command === null) return true;
+        if (command === null)
+          return !["preparing", "starting", "running", "waiting"].includes(run.status);
         const stopped = yield* Effect.result(threads.dispatch(command));
         if (Result.isSuccess(stopped)) return true;
         if (attempt === 1) return yield* stopped.failure;
       }
     },
     Effect.catchCause((cause) =>
-      Effect.logWarning("kanban withdrawal cleanup failed", {
-        errorTag: analyticsErrorTag(cause),
-      }).pipe(Effect.as(true)),
+      Effect.logWarning("kanban withdrawal cleanup failed", { cause }).pipe(Effect.as(true)),
     ),
   );
 
@@ -731,12 +920,12 @@ const make = Effect.gen(function* () {
       // Native steering can share a run whose root message belongs to another card.
       // Its delivery is already stopped if that shared run finished before cleanup.
       if (yield* terminal) return true;
-      const stopped = yield* discardWithdrawal(projectId, threadId, id, text);
+      const stopped = yield* discardWithdrawal(projectId, threadId, id, text, false);
       if (!stopped && text !== undefined) {
         const steered = yield* Effect.result(
           send({ threadId, key: `${id}:state-changed`, text, mode: "steer" }),
         );
-        if (Result.isSuccess(steered)) return true;
+        if (Result.isSuccess(steered)) return yield* terminal;
         if (yield* terminal) return true;
         return yield* Effect.fail(steered.failure);
       }
@@ -754,6 +943,7 @@ const make = Effect.gen(function* () {
       | "retryWithdrawn"
       | "withdrawalText"
       | "withdrawalBefore"
+      | "onCommitted"
     >,
     onReplay?: (threadId: ThreadId, messageId: string) => ReturnType<typeof pruneMessageWakes>,
   ) {
@@ -851,6 +1041,7 @@ const make = Effect.gen(function* () {
           }
         }
         if (receipt.value.status !== "rejected") {
+          if (receipt.value.status === "accepted") input.onCommitted?.();
           if (input.keyAcrossThreads && input.coalesce === undefined && onReplay !== undefined)
             yield* onReplay(ThreadId.make(receipt.value.aggregateId), `kanban:${id}`);
           if (
@@ -866,10 +1057,37 @@ const make = Effect.gen(function* () {
     return id;
   });
 
+  const acceptedSend = Effect.fn("KanbanThreads.acceptedSend")(
+    function* (key: string) {
+      for (let attempt = 0; ; attempt += 1) {
+        const identity = attempt === 0 ? key : `${key}:retry:${attempt}`;
+        const receipt = yield* readSendReceipt(CommandId.make(`kanban:send:${identity}`), false);
+        if (Option.isNone(receipt)) return null;
+        if (
+          receipt.value.aggregateKind !== "thread" ||
+          receipt.value.commandType !== "message.dispatch"
+        )
+          return yield* new KanbanThreadError({
+            operation: "send",
+            detail: "keyed send receipt belongs to another command",
+          });
+        if (receipt.value.status === "accepted") return ThreadId.make(receipt.value.aggregateId);
+      }
+    },
+    Effect.mapError((error) => sendError(error)),
+  );
+
   const send: KanbanThreadsShape["send"] = Effect.fn("KanbanThreads.send")(
     function* (input) {
       let acceptedMessageId: string | undefined;
       let acceptedRunId: string | undefined;
+      let deliveryCommandId: CommandId | undefined;
+      let acknowledged = false;
+      const accept = () => {
+        if (acknowledged) return;
+        acknowledged = true;
+        input.onCommitted?.();
+      };
       return yield* Effect.gen(function* () {
         const scope =
           input.mode === "steer" || input.model !== undefined ? undefined : input.coalesce;
@@ -879,7 +1097,7 @@ const make = Effect.gen(function* () {
           return yield* new KanbanThreadError({ operation: "send", detail: "thread not found" });
         }
         if (scope === "nudge" && (yield* nudgeBlocked(input.threadId))) return;
-        let id = yield* sendId(input, pruneMessageWakes);
+        let id = yield* sendId({ ...input, onCommitted: accept }, pruneMessageWakes);
         if (id === undefined) return;
         // Queue edits cannot change a run's model selection or steer a live turn.
         if (input.flushQueued !== undefined) {
@@ -915,6 +1133,7 @@ const make = Effect.gen(function* () {
             );
             if (Result.isSuccess(edited)) {
               acceptedRunId = target.id;
+              accept();
               if (
                 scope === "nudge" &&
                 (yield* nudgeBlocked(input.threadId, {
@@ -940,7 +1159,7 @@ const make = Effect.gen(function* () {
               return yield* sendError(edited.failure, target.userMessageId);
             }
             // The rejected edit owns its command id. Walk its receipt before sending once.
-            id = yield* sendId({ ...input, key: input.key ?? id });
+            id = yield* sendId({ ...input, key: input.key ?? id, onCommitted: accept });
             if (id === undefined) return;
           }
         }
@@ -952,6 +1171,7 @@ const make = Effect.gen(function* () {
           );
           acceptedMessageId = messageId;
           acceptedRunId = undefined;
+          deliveryCommandId = CommandId.make(`kanban:send:${id}`);
           const result = yield* Effect.result(
             threads.sendToThread({
               projectId: shell.projectId,
@@ -960,6 +1180,7 @@ const make = Effect.gen(function* () {
               threadId: input.threadId,
               text: input.text,
               attachments: [],
+              onAccepted: accept,
               ...(input.model ? { modelSelection: input.model } : {}),
               mode: input.mode ?? "auto",
               ...(input.mode === "steer" ? { activeTurnOnly: true } : {}),
@@ -969,6 +1190,10 @@ const make = Effect.gen(function* () {
             }),
           );
           if (Result.isFailure(result)) {
+            const receipt = yield* receipts.getByCommandId({
+              commandId: CommandId.make(`kanban:send:${id}`),
+            });
+            if (Option.isSome(receipt) && receipt.value.status === "accepted") accept();
             if (isCommandRejected(result.failure) && result.failure.revoked) {
               // No enqueue occurred; a future retry must not inherit cleanup for this id.
               acceptedMessageId = undefined;
@@ -994,6 +1219,7 @@ const make = Effect.gen(function* () {
           }
           const sent = result.success;
           acceptedRunId = sent.run.id;
+          accept();
           if (input.mode === "steer" && sent.delivery !== "steered") {
             return yield* new KanbanThreadError({
               operation: "send",
@@ -1026,6 +1252,18 @@ const make = Effect.gen(function* () {
             ? undefined
             : (commandId) => input.onAccepted!(commandId.replace(/^kanban:send:/, "")),
         ),
+        Effect.onError(() =>
+          deliveryCommandId === undefined || input.onCommitted === undefined
+            ? Effect.void
+            : receipts.getByCommandId({ commandId: deliveryCommandId }).pipe(
+                Effect.tap((receipt) =>
+                  Effect.sync(() => {
+                    if (Option.isSome(receipt) && receipt.value.status === "accepted") accept();
+                  }),
+                ),
+                Effect.ignore,
+              ),
+        ),
         Effect.mapError((error) => sendError(error, acceptedMessageId, acceptedRunId)),
       );
     },
@@ -1048,26 +1286,23 @@ const make = Effect.gen(function* () {
         Date.parse(receipt.value.acceptedAt) > Date.parse(input.withdrawalBefore)
       )
         return;
+      const commandId = CommandId.make(`kanban:send:${id}:withdrawn`);
       if (input.retryWithdrawn) {
-        // Intent precedes external cleanup, so a crash or an asynchronous stop
-        // cannot turn the next keyed retry into an old accepted-command replay.
-        const commandId = CommandId.make(`kanban:send:${id}:withdrawn`);
+        // Persist intent before cleanup so a crash cannot replay the old accepted command.
         yield* receipts.insertIfAbsent({
           ...receipt.value,
           commandId,
           commandType: "kanban.assignment.withdrawal_requested",
         });
-        if (!(yield* finishAssignmentWithdrawal(shell.projectId, input.threadId, id, input.text)))
-          return "pending" as const;
+      }
+      if (!(yield* finishAssignmentWithdrawal(shell.projectId, input.threadId, id, input.text)))
+        return "pending" as const;
+      if (input.retryWithdrawn)
         yield* receipts.upsert({
           ...receipt.value,
           commandId,
           commandType: "kanban.assignment.withdrawn",
         });
-      } else {
-        const stopped = yield* discardWithdrawal(shell.projectId, input.threadId, id, input.text);
-        if (!stopped) yield* send({ ...input, key: `${input.key}:state-changed`, mode: "steer" });
-      }
     },
     Effect.catchCause((cause) =>
       Effect.logWarning("kanban assignment withdrawal failed", {
@@ -1116,7 +1351,7 @@ const make = Effect.gen(function* () {
   const cancelQueuedRun: KanbanThreadsShape["cancelQueued"] = Effect.fn(
     "KanbanThreads.cancelQueued",
   )(
-    function* (threadId, runId) {
+    function* (threadId, runId, cancelReason = "superseded") {
       const run = (yield* threads.getThreadRecords(threadId, ["runs"])).runs.find(
         (row) => row.id === runId,
       );
@@ -1124,6 +1359,8 @@ const make = Effect.gen(function* () {
       const cancelled = yield* Effect.result(
         threads.dispatch({
           type: "queued-run.cancel",
+          reason: cancelReason,
+          detail: "Board withdrew queued work before it started.",
           commandId: commandId("cancel"),
           threadId,
           runId: run.id,
@@ -1157,7 +1394,14 @@ const make = Effect.gen(function* () {
   const cancelQueued = cancelQueuedRun;
 
   const interrupt: KanbanThreadsShape["interrupt"] = Effect.fn("KanbanThreads.interrupt")(
-    function* (threadId, reason, cancelQueued = false, runId, messageId) {
+    function* (
+      threadId,
+      reason,
+      cancelQueued = false,
+      runId,
+      messageId,
+      cancelReason = "card_stop",
+    ) {
       const shell = yield* threads.getThreadShell(threadId);
       if (shell === null) return { outcome: "noop" } as const;
       if (messageId !== undefined) {
@@ -1165,8 +1409,8 @@ const make = Effect.gen(function* () {
           (run) => run.userMessageId === messageId,
         );
         if (target === undefined) return { outcome: "noop" } as const;
-        yield* cancelQueuedRun(threadId, target.id);
-        return yield* interrupt(threadId, reason, false, target.id);
+        yield* cancelQueuedRun(threadId, target.id, cancelReason);
+        return yield* interrupt(threadId, reason, false, target.id, undefined, cancelReason);
       }
       if (!cancelQueued) {
         const result = yield* threads
@@ -1174,6 +1418,7 @@ const make = Effect.gen(function* () {
             projectId: shell.projectId,
             commandId: commandId("stop"),
             threadId,
+            cancelReason,
             reason,
             ...(runId === undefined ? {} : { runId: RunId.make(runId) }),
           })
@@ -1191,6 +1436,7 @@ const make = Effect.gen(function* () {
       // ignores queued runs, allowing an abandoned launch to start afterwards.
       const result = yield* threads.dispatch({
         type: "thread.stop",
+        cancelReason,
         commandId: commandId("stop"),
         threadId,
         reason,
@@ -1200,6 +1446,7 @@ const make = Effect.gen(function* () {
         if (run.status !== "queued") continue;
         yield* threads.dispatch({
           type: "queued-run.cancel",
+          reason: cancelReason,
           commandId: commandId("cancel"),
           threadId,
           runId: run.id,
@@ -1258,8 +1505,10 @@ const make = Effect.gen(function* () {
     latestRun,
     compactRun,
     runSettled,
+    backgroundStoppedSince,
     launch,
     send,
+    acceptedSend,
     withdraw,
     setModel,
     queuedRuns,

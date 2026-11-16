@@ -7,7 +7,7 @@
 #   3. the IP Cloudflare sees for venice.ai (cdn-cgi/trace) equals that exit IP.
 # -v prints the reason. Used by the proxy before any Venice call (cached 5 min).
 set -u
-verbose=0; [[ "${1:-}" == -v ]] && verbose=1
+verbose=0; [[ "${1:-}" == -v || -n "${VENICE_EGRESS_VERBOSE:-}" ]] && verbose=1
 say() { (( verbose )) && print -r -- "$*"; return 0 }
 state=${VENICE_MULLVAD_STATE:-/usr/local/var/venice-mullvad/state.json}
 

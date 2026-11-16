@@ -123,6 +123,7 @@ export type CallerRow = Pick<
   | "worktreePath"
 >;
 export type CallerActiveRow = CallerRow & {
+  readonly lineage?: OrchestrationV2AppThread["lineage"];
   readonly activeRunId: RunId | null;
   // Absent when exact liveness needs fork history or exceeds the bounded caller read.
   readonly pendingBackgroundTasks?: OrchestrationV2ThreadShell["pendingBackgroundTasks"];
@@ -360,6 +361,10 @@ export interface ProjectionRuntimeResponseContext {
 
 export interface ProjectionRecordFilter {
   readonly unfinishedRunsOnly?: boolean;
+  /** Newest unfinished run, falling back to the newest terminal run. */
+  readonly currentRunOnly?: boolean;
+  readonly pendingRuntimeRequestsOnly?: boolean;
+  readonly subagentsWithChildThreadOnly?: boolean;
   readonly providerSessionId?: ProviderSessionId;
   readonly providerThreadIds?: ReadonlyArray<string>;
   readonly pendingBackgroundTasksOnly?: boolean;
@@ -616,6 +621,10 @@ export interface ProjectionStoreV2Shape {
   readonly apply: (
     event: OrchestrationV2DomainEvent,
   ) => Effect.Effect<void, ProjectionStoreV2Error>;
+  readonly pageActiveThreadIds: (
+    cursor: string | null,
+    limit: number,
+  ) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
   readonly listActiveThreadIds: () => Effect.Effect<
     ReadonlyArray<ThreadId>,
     ProjectionStoreV2Error
@@ -981,6 +990,12 @@ function preserveRunRecordedFields(
   if (current === undefined) return next;
   return {
     ...next,
+    ...((next.cancelReason === undefined ||
+      next.cancelReason === "provider_cancelled" ||
+      next.cancelReason === "provider_interrupted") &&
+    current.cancelReason !== undefined
+      ? { cancelReason: current.cancelReason, cancelDetail: current.cancelDetail }
+      : {}),
     ...(current.lastActivityAt !== undefined &&
     (next.lastActivityAt === undefined ||
       DateTime.toEpochMillis(current.lastActivityAt) > DateTime.toEpochMillis(next.lastActivityAt))
@@ -1170,6 +1185,23 @@ export function applyToProjection(
     case "provider-session.detached":
       return {
         ...base,
+        runs:
+          event.payload.cancelReason === undefined
+            ? base.runs
+            : base.runs.map((run) =>
+                ["preparing", "starting", "running", "waiting"].includes(run.status) &&
+                base.providerThreads.some(
+                  (thread) =>
+                    thread.id === run.providerThreadId &&
+                    thread.providerSessionId === event.payload.providerSessionId,
+                )
+                  ? {
+                      ...run,
+                      cancelReason: event.payload.cancelReason,
+                      cancelDetail: event.payload.reason?.slice(0, 500),
+                    }
+                  : run,
+              ),
         providerSessions: base.providerSessions.filter(
           (session) => session.id !== event.payload.providerSessionId,
         ),
@@ -1210,14 +1242,31 @@ export function applyToProjection(
     case "turn-item.updated":
       return withLocalVisibleTurnItems({
         ...base,
-        runs: base.runs.map((run) =>
-          run.id === event.payload.runId &&
-          (run.lastActivityAt === undefined ||
-            DateTime.toEpochMillis(run.lastActivityAt) <
-              DateTime.toEpochMillis(event.payload.updatedAt))
-            ? { ...run, lastActivityAt: event.payload.updatedAt }
-            : run,
-        ),
+        runs: base.runs.map((run) => {
+          if (run.id !== event.payload.runId) return run;
+          const request = event.payload;
+          const recorded =
+            request.type === "run_interrupt_request" &&
+            request.cancelReason !== undefined &&
+            (!(run.status === "cancelled" || run.status === "interrupted") ||
+              run.cancelReason === undefined ||
+              run.cancelReason === "provider_cancelled" ||
+              run.cancelReason === "provider_interrupted")
+              ? {
+                  ...run,
+                  cancelReason: request.cancelReason,
+                  cancelDetail:
+                    request.message === "Interrupt requested"
+                      ? undefined
+                      : request.message.slice(0, 500),
+                }
+              : run;
+          return recorded.lastActivityAt === undefined ||
+            DateTime.toEpochMillis(recorded.lastActivityAt) <
+              DateTime.toEpochMillis(request.updatedAt)
+            ? { ...recorded, lastActivityAt: request.updatedAt }
+            : recorded;
+        }),
         turnItems: upsertById(base.turnItems, event.payload),
       });
     case "plan.updated":
@@ -2406,7 +2455,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 status = excluded.status,
                 requested_at = excluded.requested_at,
                 completed_at = excluded.completed_at,
-                payload_json = ${keepRecordedRunField(
+                payload_json = json_patch(${keepRecordedRunField(
                   keepRecordedRunField(
                     keepRecordedRunField(
                       keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
@@ -2415,7 +2464,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     "$.restartCancelledBackgroundWork",
                   ),
                   "$.lastActivityAt",
-                )}
+                )}, CASE
+                  WHEN json_type(orchestration_v2_projection_runs.payload_json, '$.cancelReason') IS NOT NULL
+                    AND (json_type(excluded.payload_json, '$.cancelReason') IS NULL
+                      OR json_extract(excluded.payload_json, '$.cancelReason') IN ('provider_cancelled', 'provider_interrupted'))
+                  THEN json_object(
+                    'cancelReason', json_extract(orchestration_v2_projection_runs.payload_json, '$.cancelReason'),
+                    'cancelDetail', json_extract(orchestration_v2_projection_runs.payload_json, '$.cancelDetail')
+                  )
+                  ELSE '{}'
+                END)
             `;
               break;
             }
@@ -2653,6 +2711,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               break;
             }
             case "provider-session.detached": {
+              if (event.payload.cancelReason !== undefined) {
+                yield* sql`UPDATE orchestration_v2_projection_runs
+                  SET payload_json = json_patch(payload_json, json_object(
+                    'cancelReason', ${event.payload.cancelReason},
+                    'cancelDetail', ${event.payload.reason?.slice(0, 500) ?? null}))
+                  WHERE thread_id = ${event.threadId}
+                    AND status IN ('preparing', 'starting', 'running', 'waiting')
+                    AND provider_thread_id IN (
+                      SELECT provider_thread_id FROM orchestration_v2_projection_provider_threads
+                      WHERE provider_session_id = ${event.payload.providerSessionId})`;
+              }
               yield* sql`
               DELETE FROM orchestration_v2_projection_provider_session_bindings
               WHERE provider_session_id = ${event.payload.providerSessionId}
@@ -2975,6 +3044,21 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 updated_at = excluded.updated_at,
                 payload_json = excluded.payload_json
             `;
+              if (
+                event.payload.type === "run_interrupt_request" &&
+                event.payload.cancelReason !== undefined &&
+                event.payload.runId !== null
+              ) {
+                const request = event.payload;
+                yield* sql`UPDATE orchestration_v2_projection_runs
+                  SET payload_json = json_patch(payload_json, json_object(
+                    'cancelReason', ${request.cancelReason},
+                    'cancelDetail', ${request.message === "Interrupt requested" ? null : request.message.slice(0, 500)}))
+                  WHERE run_id = ${request.runId}
+                    AND (status NOT IN ('cancelled', 'interrupted')
+                      OR json_extract(payload_json, '$.cancelReason') IS NULL
+                      OR json_extract(payload_json, '$.cancelReason') IN ('provider_cancelled', 'provider_interrupted'))`;
+              }
               // One run-row update keeps the board sweep independent of transcript size.
               if (event.payload.runId !== null) {
                 yield* sql`UPDATE orchestration_v2_projection_runs
@@ -3625,6 +3709,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.runIds)}))`
               }
               ${
+                filter?.currentRunOnly
+                  ? sql`AND run_id = COALESCE(
+                (SELECT run_id FROM orchestration_v2_projection_runs INDEXED BY ardud_recovery_live_threads_idx
+                 WHERE thread_id = ${threadId} AND status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                 ORDER BY ordinal DESC LIMIT 1),
+                (SELECT run_id FROM orchestration_v2_projection_runs
+                 WHERE thread_id = ${threadId} ORDER BY ordinal DESC LIMIT 1)
+              )`
+                  : sql``
+              }
+              ${
                 filter?.latestRunOnly
                   ? sql`AND run_id = (
                 SELECT run_id FROM orchestration_v2_projection_runs
@@ -3710,8 +3805,46 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             : window === undefined
               ? sql<PayloadRow>`
             SELECT payload_json
-            FROM orchestration_v2_projection_subagents
+            FROM orchestration_v2_projection_subagents ${filter?.subagentsWithChildThreadOnly ? sql`INDEXED BY ardud_recovery_child_subagents_idx` : sql``}
             WHERE thread_id = ${threadId}
+              ${
+                filter?.pendingBackgroundTasksOnly
+                  ? sql`AND json_extract(payload_json, '$.origin') = 'app_owned'
+                AND (status IN ('pending', 'running', 'waiting')
+                  OR (status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                    AND json_extract(payload_json, '$.completionDelivery.state') IN ('pending', 'claimed'))
+                  OR (status IN ('completed', 'failed', 'cancelled', 'interrupted') AND EXISTS (
+                    WITH RECURSIVE descendants(thread_id) AS (
+                      SELECT orchestration_v2_projection_subagents.child_thread_id
+                      UNION
+                      SELECT child.child_thread_id
+                      FROM descendants
+                      JOIN orchestration_v2_projection_subagents AS child
+                        ON child.thread_id = descendants.thread_id
+                      WHERE json_extract(child.payload_json, '$.origin') = 'app_owned'
+                        AND child.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                        AND child.child_thread_id IS NOT NULL
+                    )
+                    SELECT 1 FROM descendants WHERE EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_subagents AS child
+                    WHERE child.thread_id = descendants.thread_id
+                      AND (child.status IN ('pending', 'running', 'waiting')
+                        OR json_extract(child.payload_json, '$.completionDelivery.state') IN ('pending', 'claimed'))
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_turn_items AS item
+                    WHERE item.thread_id = descendants.thread_id
+                      AND item.type IN ('command_execution', 'dynamic_tool', 'subagent')
+                      AND item.status IN ('pending', 'running', 'waiting')
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM orchestration_v2_projection_provider_threads AS provider
+                    WHERE provider.thread_id = descendants.thread_id
+                      AND json_array_length(provider.payload_json, '$.pendingBackgroundTasks') > 0
+                  ))))`
+                  : sql``
+              }
+              ${filter?.subagentsWithChildThreadOnly ? sql`AND child_thread_id IS NOT NULL` : sql``}
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `
               : sql<PayloadRow>`
@@ -3781,7 +3914,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                ))
               `
               }
-            ORDER BY COALESCE(first_run_ordinal, 0), provider_thread_id ASC
+            ${filter?.providerThreadIds !== undefined && filter.providerThreadIds.length <= 1 ? sql`` : sql`ORDER BY COALESCE(first_run_ordinal, 0), provider_thread_id ASC`}
           `
               : sql<PayloadRow>`
             SELECT payload_json FROM orchestration_v2_projection_provider_threads
@@ -3814,8 +3947,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             : window === undefined
               ? sql<PayloadRow>`
             SELECT payload_json
-            FROM orchestration_v2_projection_runtime_requests
+            FROM orchestration_v2_projection_runtime_requests ${filter?.pendingRuntimeRequestsOnly ? sql`INDEXED BY ardud_recovery_pending_requests_idx` : sql``}
             WHERE thread_id = ${threadId}
+              ${filter?.pendingRuntimeRequestsOnly ? sql`AND status = 'pending'` : sql``}
             ORDER BY created_at ASC, runtime_request_id ASC
           `
               : sql<PayloadRow>`
@@ -7286,6 +7420,20 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.map(decodeShellSnapshot),
       );
 
+    const pageActiveThreadIds = Effect.fn("ProjectionStore.pageActiveThreadIds")(function* (
+      cursor: string | null,
+      limit: number,
+    ) {
+      const rows = yield* sql<{ readonly thread_id: string }>`
+        SELECT thread_id FROM orchestration_v2_projection_threads
+          INDEXED BY ardud_recovery_active_threads_idx
+        WHERE deleted_at IS NULL AND json_extract(payload_json, '$.archivedAt') IS NULL
+          AND thread_id > ${cursor ?? ""}
+        ORDER BY thread_id ASC LIMIT ${limit}
+      `;
+      return rows.map((row) => ThreadId.make(row.thread_id));
+    }, Effect.mapError(shellSnapshotReadError));
+
     const listActiveThreadIds = Effect.fn("ProjectionStore.listActiveThreadIds")(function* () {
       // Match the unpaged active shell's payload predicate and ordering, including legacy rows.
       const rows = yield* sql<{ readonly thread_id: string }>`
@@ -7534,6 +7682,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     return {
       apply,
       listActiveThreadIds,
+      pageActiveThreadIds,
       getShellSnapshot,
       readShellSnapshot,
       getCallerRow,
@@ -7616,6 +7765,20 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
           }
           yield* Ref.update(sequence, (current) => current + 1);
         }),
+      pageActiveThreadIds: Effect.fn("ProjectionStore.pageActiveThreadIds")(
+        function* (cursor, limit) {
+          return [...(yield* Ref.get(replayState)).projections.entries()]
+            .filter(
+              ([id, projection]) =>
+                (cursor === null || id > cursor) &&
+                projection.thread.deletedAt === null &&
+                projection.thread.archivedAt === null,
+            )
+            .map(([id]) => id)
+            .toSorted((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+            .slice(0, limit);
+        },
+      ),
       listActiveThreadIds: Effect.fn("ProjectionStore.listActiveThreadIds")(function* () {
         const existing = (yield* Ref.get(replayState)).projections;
         return [...existing.entries()]
@@ -8038,11 +8201,18 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
       ),
       getThreadRecords: Effect.fn("ProjectionStore.getThreadRecords")(
         function* (threadId, fields, filter) {
-          const projection = (yield* Ref.get(replayState)).projections.get(threadId);
+          const state = yield* Ref.get(replayState);
+          const projection = state.projections.get(threadId);
           if (projection === undefined)
             return yield* new ProjectionStoreThreadNotFoundError({ threadId });
           const newest = filter?.latestRunOnly
             ? projection.runs.toSorted((a, b) => b.ordinal - a.ordinal)[0]
+            : undefined;
+          const current = filter?.currentRunOnly
+            ? (() => {
+                const ordered = projection.runs.toSorted((a, b) => b.ordinal - a.ordinal);
+                return ordered.find((run) => UNFINISHED_RUN_STATUSES.has(run.status)) ?? ordered[0];
+              })()
             : undefined;
           const selected = {
             ...projection,
@@ -8066,7 +8236,11 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
             ).filter(
               (row) =>
                 (!filter?.latestRunOnly || row.id === newest?.id) &&
+                (!filter?.currentRunOnly || row.id === current?.id) &&
                 (!filter?.unfinishedRunsOnly || UNFINISHED_RUN_STATUSES.has(row.status)),
+            ),
+            runtimeRequests: projection.runtimeRequests.filter(
+              (row) => !filter?.pendingRuntimeRequestsOnly || row.status === "pending",
             ),
             turnItems: projection.turnItems
               .filter(
@@ -8084,6 +8258,51 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                   ? 0
                   : -Math.max(1, Math.min(200, Math.floor(filter.recentTurnItemLimit))),
               ),
+            subagents: projection.subagents.filter((task) => {
+              if (filter?.subagentsWithChildThreadOnly && task.childThreadId === null) return false;
+              if (!filter?.pendingBackgroundTasksOnly) return true;
+              if (task.origin !== "app_owned") return false;
+              if (
+                ["pending", "running", "waiting"].includes(task.status) ||
+                (["completed", "failed", "cancelled", "interrupted"].includes(task.status) &&
+                  (task.completionDelivery?.state === "pending" ||
+                    task.completionDelivery?.state === "claimed"))
+              )
+                return true;
+              if (!["completed", "failed", "cancelled", "interrupted"].includes(task.status))
+                return false;
+              const descendants = new Set(task.childThreadId === null ? [] : [task.childThreadId]);
+              for (const childId of descendants) {
+                const child = state.projections.get(childId);
+                if (child === undefined) continue;
+                if (
+                  child.subagents.some(
+                    (nested) =>
+                      ["pending", "running", "waiting"].includes(nested.status) ||
+                      nested.completionDelivery?.state === "pending" ||
+                      nested.completionDelivery?.state === "claimed",
+                  ) ||
+                  child.turnItems.some(
+                    (item) =>
+                      ["command_execution", "dynamic_tool", "subagent"].includes(item.type) &&
+                      ["pending", "running", "waiting"].includes(item.status),
+                  ) ||
+                  child.providerThreads.some(
+                    (provider) => (provider.pendingBackgroundTasks?.length ?? 0) > 0,
+                  )
+                )
+                  return true;
+                for (const nested of child.subagents) {
+                  if (
+                    nested.origin === "app_owned" &&
+                    nested.childThreadId !== null &&
+                    ["completed", "failed", "cancelled", "interrupted"].includes(nested.status)
+                  )
+                    descendants.add(nested.childThreadId);
+                }
+              }
+              return false;
+            }),
             providerThreads:
               filter?.providerSessionId === undefined &&
               filter?.providerThreadIds === undefined &&

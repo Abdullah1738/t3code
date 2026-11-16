@@ -1,5 +1,6 @@
+import type { McpDenyReason } from "@t3tools/contracts";
 /**
- * Card waits: a card with no running thread says, as data, what it is waiting
+ * Card waits: a card says, as data, what it is waiting
  * on. Everything here is pure. The tick gathers the facts (PR states, the
  * other cards, the clock), calls `resolveWait` per waiting card and applies
  * what comes back; the tool validates with `checkWait` and builds with
@@ -1160,10 +1161,20 @@ export function scriptCheckEveryMs(cards: ReadonlyArray<Pick<KanbanCard, "wait">
 
 export type WaitCheck =
   | { readonly ok: true; readonly deferredUntilTurnEnds?: true }
-  | { readonly ok: false; readonly code: "invalid" | "denied"; readonly reason: string };
+  | {
+      readonly ok: false;
+      readonly code: "invalid" | "denied";
+      readonly reason: string;
+      readonly denyReason?: McpDenyReason;
+    };
 
 const bad = (reason: string): WaitCheck => ({ ok: false, code: "invalid", reason });
-const denied = (reason: string): WaitCheck => ({ ok: false, code: "denied", reason });
+const denied = (reason: string, denyReason: McpDenyReason): WaitCheck => ({
+  ok: false,
+  code: "denied",
+  reason,
+  denyReason,
+});
 
 /** A thread clears only its own stalled flag; the owner, evaluators and the board clear any. */
 export const mayClearFlag = (card: Pick<KanbanCard, "stalled">, actor: KanbanActor): boolean => {
@@ -1206,8 +1217,9 @@ export function checkWait(
   activeThreadRunning = true,
 ): WaitCheck {
   const n = `card #${card.number}`;
-  if (card.settledAt !== null) return denied(`${n} is settled`);
-  if (card.stage === "verified") return denied(`${n} is verified: nothing left to wait for`);
+  if (card.settledAt !== null) return denied(`${n} is settled`, "card_settled");
+  if (card.stage === "verified")
+    return denied(`${n} is verified: nothing left to wait for`, "card_verified");
   const ownWorker =
     card.stage === "working" &&
     actor._tag === "thread" &&
@@ -1215,25 +1227,36 @@ export function checkWait(
     actor.threadId === card.workThreadId &&
     card.activeRole === "work";
   if (card.activeThreadId !== null) {
-    if (ownWorker && request.on === "ci" && request.pr) {
+    if (ownWorker && ["ci", "push", "merge"].includes(request.on)) {
       return denied(
         "This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you.",
+        "active_worker_cannot_wait",
       );
     }
     if (!ownWorker && activeThreadRunning) {
       return denied(
         `${n} has a running thread, so it isn't waiting. Set the wait once the thread has handed the card on`,
+        "card_has_active_thread",
       );
     }
   }
+  if (ownWorker && request.on === "owner_go")
+    return denied(
+      "Ask the owner with card_ask; use blocking true when you cannot go on without the answer.",
+      "active_worker_cannot_wait",
+    );
   const accepted: WaitCheck = ownWorker ? { ok: true, deferredUntilTurnEnds: true } : { ok: true };
   // A wait takes over a stalled flag, but only one its setter could clear (the card_flag rule).
   if (!mayClearFlag(card, actor)) {
-    return denied(`${n} was flagged stalled by someone else; only they can change or clear it`);
+    return denied(
+      `${n} was flagged stalled by someone else; only they can change or clear it`,
+      "flag_owner_mismatch",
+    );
   }
   if (!wired && !QUIET_STAGES.has(card.stage)) {
     return denied(
       `${n} is in ${card.stage}, where the dispatcher would start it anyway: waits there are not honoured yet. For To-Do use blockedBy (card_edit); for the rest use card_flag with the reason`,
+      "wait_stage_unsupported",
     );
   }
   if (!request.note.trim()) return bad("a wait needs a one-line note: what exactly is awaited");
@@ -1242,6 +1265,8 @@ export function checkWait(
     until = Date.parse(request.until);
     if (!Number.isFinite(until)) return bad(`until is not a time: ${request.until}`);
     if (until <= nowMs) return bad("until is in the past");
+    if (ownWorker && request.on === "time" && until - nowMs > 24 * 60 * 60 * 1000)
+      return bad("a worker's time wait must be at most 24 hours ahead");
     if (until - nowMs > WAIT_MAX_AHEAD_MS) return bad("until is more than 30 days ahead");
   }
   switch (request.on) {

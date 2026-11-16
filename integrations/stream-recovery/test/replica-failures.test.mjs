@@ -10,6 +10,7 @@ import { timedScan } from '../lib/logging.mjs';
 import { act, recoveryScan, scan } from '../cli.mjs';
 import { restartScan } from '../lib/restartwatch.mjs';
 import { fixture } from '../../router-logging/test/support.mjs';
+import { assertScanProps } from './scan-props.mjs';
 
 const NOW = Date.parse('2026-11-15T10:00:00Z');
 const invalid = [
@@ -93,7 +94,7 @@ test('a not-ready export reopened mid-scan tags both lanes and leaves recovery p
   const state = { handled:{}, servers:[], lastScan:new Date(NOW - 60_000).toISOString() };
   const before = structuredClone(state);
   const io = { PATHS:{db:path}, openDb, assertReplicaFresh,
-    serverRuntime:() => null, openCodeRuntime:() => null,
+    loadStallState: () => ({ stalls: {} }), serverRuntime:() => null, openCodeRuntime:() => null,
     cancelledSubagentsSince:() => { set('ready', '0'); return []; },
     cancelledDelegatedTasksSince:() => assert.fail('must defer before next query'),
     sendToThread:() => assert.fail('must not send'), telegram:() => assert.fail('must not notify'),
@@ -104,7 +105,7 @@ test('a not-ready export reopened mid-scan tags both lanes and leaves recovery p
   for (const lane of ['stream', 'restart']) {
     const row = rows().find(row => row.name === `${lane}.scan`);
     assert.equal(row.error.tag, 'REPLICA_NOT_READY');
-    assert.deepEqual(row.props, {replicaGeneration:42,replicaAgeMs:1_000,deferredThreads:0,maxThreadAheadMs:'unknown',phase:'openDb'});
+    assertScanProps(row.props, {replicaGeneration:42,replicaAgeMs:1_000,deferredThreads:0,maxThreadAheadMs:'unknown',phase:'openDb'});
   }
   assert.deepEqual(state, before);
 });
@@ -122,14 +123,13 @@ for (const [lane, stage] of [['stream','gather'], ['stream','act'], ['restart','
   const incident = { id, startMs:at, endMs:at, failAllMs:at, subagents:[],
     runs:['t','healthy'].map(thread_id => ({thread_id,run_id:'run:1',ordinal:1,completed_at:new Date(at).toISOString()})) };
   const state = { handled:{[id]:{incident, attempts:1, threads:{t:{failures:1}}}}, servers:[] };
-  state.lastStallScan = new Date(NOW).toISOString();
   const sent = [];
   const notifications = [];
   const noMutation = () => assert.fail('replica deferral must not mutate or notify');
   const io = {
     PATHS:{db:path}, openDb, assertReplicaFresh, assertThreadInReplica,
     harnessCutoverStatus:async () => ({active:false,completed:false,claimedThreadIds:[],claimedRunIds:[]}),
-    serverRuntime:() => null, openCodeRuntime:() => null,
+    loadStallState: () => ({ stalls: {} }), serverRuntime:() => null, openCodeRuntime:() => null,
     cancelledSubagentsSince:() => [], cancelledDelegatedTasksSince:() => [], restartRunsSince:() => [],
     failedRunsSince:() => [], failedSubagentsSince:() => [], laterRuns:() => [], queuedRuns:() => [],
     activeSessions:async () => new Set(), getThread:async id => id === 't' ? thread : healthy,
@@ -154,7 +154,7 @@ for (const [lane, stage] of [['stream','gather'], ['stream','act'], ['restart','
     const row = rows().filter(row => row.name === `${lane}.scan`).at(-1);
     assert.equal(row.ok, true);
     assert.equal(row.error, undefined);
-    assert.deepEqual(row.props, {deferredThreads:1,maxThreadAheadMs:ahead});
+    assertScanProps(row.props, {deferredThreads:1,maxThreadAheadMs:ahead});
     const deferral = rows().filter(row => row.name === 'thread.deferred').at(-1);
     assert.deepEqual(deferral.error, {tag:'REPLICA_BEHIND_THREAD',message:'thread is newer than Robob replica; recovery deferred'});
     assert.deepEqual(deferral.props, {replicaGeneration:42,replicaAgeMs:1_000,threadAheadMs:ahead});
@@ -170,7 +170,7 @@ for (const [lane, stage] of [['stream','gather'], ['stream','act'], ['restart','
   assert.deepEqual(sent, ['healthy','t']);
   assert.equal(state.handled[id].done, true);
   assert.equal(notifications.length, 1);
-  assert.deepEqual(rows().filter(row => row.name === `${lane}.scan`).at(-1).props,
+  assertScanProps(rows().filter(row => row.name === `${lane}.scan`).at(-1).props,
     {deferredThreads:0,maxThreadAheadMs:'unknown'});
 });
 

@@ -105,6 +105,7 @@ const refuseReadOnlyClient = McpInvocationContext.McpInvocationContext.pipe(
     scope.client?.access === "read-only"
       ? Effect.fail(
           new OrchestratorMcpFailure({
+            reason: "read_only_client",
             code: "capability_denied",
             message:
               "This tool changes the environment, and this MCP client was approved for read-only access.",
@@ -140,6 +141,33 @@ export const actsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A,
       Effect.flatMap(() => writingCaller),
       Effect.flatMap(() => handle(params)),
     ),
+  );
+
+/** Bug intake retains token attribution when the live caller check is unavailable. */
+export const reportsBug = <P, A, E, R>(
+  handle: (
+    params: P,
+    reporter: {
+      readonly threadId: ThreadId;
+      readonly unverifiedReason?: "caller_unresolved" | "parent_not_active" | undefined;
+    },
+  ) => Effect.Effect<A, E, R>,
+) =>
+  declare((params: P) =>
+    Effect.gen(function* () {
+      const scope = yield* requireThreadCaller;
+      yield* refuseReadOnlyClient;
+      const unverifiedReason = yield* writingCaller.pipe(
+        Effect.as(undefined),
+        Effect.catchTags({
+          OrchestratorMcpFailure: (error) =>
+            error.code === "caller_unresolved" || error.code === "parent_not_active"
+              ? Effect.succeed(error.code)
+              : Effect.fail(error),
+        }),
+      );
+      return yield* handle(params, { threadId: scope.thread.threadId, unverifiedReason });
+    }),
   );
 
 export const writes = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
@@ -211,6 +239,7 @@ export const boundedThreadSend = <
 
 const escalationDenied = (refusal: DispatchModeRefusal) =>
   new OrchestratorMcpFailure({
+    reason: refusal.mode === "runtime" ? "runtime_mode_escalation" : "interaction_mode_escalation",
     code:
       refusal.mode === "runtime"
         ? "runtime_mode_escalation_denied"

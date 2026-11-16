@@ -1,0 +1,440 @@
+{
+  "source": "87 watcher definitions captured 2026-11-16; slow-run maxima from 02:00\u201304:36Z clamped to 40\u201390s; unlogged checks assumed 0.5s. All definitions treated as due, including currently paused/done watchers (stress test).",
+  "watchers": [
+    {
+      "watcher": "watcher-000",
+      "intervalMs": 60000,
+      "checkMs": 67100
+    },
+    {
+      "watcher": "watcher-001",
+      "intervalMs": 600000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-002",
+      "intervalMs": 180000,
+      "checkMs": 61000
+    },
+    {
+      "watcher": "watcher-003",
+      "intervalMs": 900000,
+      "checkMs": 90000
+    },
+    {
+      "watcher": "watcher-004",
+      "intervalMs": 120000,
+      "checkMs": 90000
+    },
+    {
+      "watcher": "watcher-005",
+      "intervalMs": 60000,
+      "checkMs": 44800
+    },
+    {
+      "watcher": "watcher-006",
+      "intervalMs": 300000,
+      "checkMs": 90000
+    },
+    {
+      "watcher": "watcher-007",
+      "intervalMs": 30000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-008",
+      "intervalMs": 30000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-009",
+      "intervalMs": 300000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-010",
+      "intervalMs": 60000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-011",
+      "intervalMs": 600000,
+      "checkMs": 51800
+    },
+    {
+      "watcher": "watcher-012",
+      "intervalMs": 300000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-013",
+      "intervalMs": 300000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-014",
+      "intervalMs": 1800000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-015",
+      "intervalMs": 60000,
+      "checkMs": 76700
+    },
+    {
+      "watcher": "watcher-016",
+      "intervalMs": 300000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-017",
+      "intervalMs": 60000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-018",
+      "intervalMs": 3600000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-019",
+      "intervalMs": 900000,
+      "checkMs": 59400
+    },
+    {
+      "watcher": "watcher-020",
+      "intervalMs": 1800000,
+      "checkMs": 62300
+    },
+    {
+      "watcher": "watcher-021",
+      "intervalMs": 120000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-022",
+      "intervalMs": 120000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "flighty-bookings",
+      "intervalMs": 180000,
+      "checkMs": 88500
+    },
+    {
+      "watcher": "watcher-024",
+      "intervalMs": 60000,
+      "checkMs": 81000
+    },
+    {
+      "watcher": "watcher-025",
+      "intervalMs": 300000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-026",
+      "intervalMs": 600000,
+      "checkMs": 40700
+    },
+    {
+      "watcher": "watcher-027",
+      "intervalMs": 120000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-028",
+      "intervalMs": 30000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-029",
+      "intervalMs": 15000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-030",
+      "intervalMs": 300000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-031",
+      "intervalMs": 15000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-032",
+      "intervalMs": 15000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-033",
+      "intervalMs": 600000,
+      "checkMs": 62600
+    },
+    {
+      "watcher": "watcher-034",
+      "intervalMs": 300000,
+      "checkMs": 82700
+    },
+    {
+      "watcher": "watcher-035",
+      "intervalMs": 15000,
+      "checkMs": 48700
+    },
+    {
+      "watcher": "watcher-036",
+      "intervalMs": 60000,
+      "checkMs": 45800
+    },
+    {
+      "watcher": "watcher-037",
+      "intervalMs": 60000,
+      "checkMs": 90000
+    },
+    {
+      "watcher": "watcher-038",
+      "intervalMs": 450000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-039",
+      "intervalMs": 10800000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-040",
+      "intervalMs": 600000,
+      "checkMs": 61300
+    },
+    {
+      "watcher": "watcher-041",
+      "intervalMs": 300000,
+      "checkMs": 47500
+    },
+    {
+      "watcher": "watcher-042",
+      "intervalMs": 900000,
+      "checkMs": 80800
+    },
+    {
+      "watcher": "watcher-043",
+      "intervalMs": 900000,
+      "checkMs": 58600
+    },
+    {
+      "watcher": "watcher-044",
+      "intervalMs": 900000,
+      "checkMs": 60800
+    },
+    {
+      "watcher": "watcher-045",
+      "intervalMs": 30000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-046",
+      "intervalMs": 30000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-047",
+      "intervalMs": 30000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-048",
+      "intervalMs": 30000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-049",
+      "intervalMs": 300000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-050",
+      "intervalMs": 180000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-051",
+      "intervalMs": 180000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-052",
+      "intervalMs": 120000,
+      "checkMs": 90000
+    },
+    {
+      "watcher": "watcher-053",
+      "intervalMs": 60000,
+      "checkMs": 90000
+    },
+    {
+      "watcher": "watcher-054",
+      "intervalMs": 60000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-055",
+      "intervalMs": 300000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-056",
+      "intervalMs": 300000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-057",
+      "intervalMs": 60000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-058",
+      "intervalMs": 15000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-059",
+      "intervalMs": 600000,
+      "checkMs": 70300
+    },
+    {
+      "watcher": "watcher-060",
+      "intervalMs": 600000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-061",
+      "intervalMs": 60000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-062",
+      "intervalMs": 60000,
+      "checkMs": 90000
+    },
+    {
+      "watcher": "watcher-063",
+      "intervalMs": 15000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-064",
+      "intervalMs": 120000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-065",
+      "intervalMs": 60000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-066",
+      "intervalMs": 120000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-067",
+      "intervalMs": 900000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-068",
+      "intervalMs": 60000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-069",
+      "intervalMs": 60000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-070",
+      "intervalMs": 300000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-071",
+      "intervalMs": 30000,
+      "checkMs": 66000
+    },
+    {
+      "watcher": "watcher-072",
+      "intervalMs": 120000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-073",
+      "intervalMs": 15000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-074",
+      "intervalMs": 300000,
+      "checkMs": 61700
+    },
+    {
+      "watcher": "watcher-075",
+      "intervalMs": 60000,
+      "checkMs": 49000
+    },
+    {
+      "watcher": "watcher-076",
+      "intervalMs": 60000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-077",
+      "intervalMs": 15000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-078",
+      "intervalMs": 300000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-079",
+      "intervalMs": 20000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-080",
+      "intervalMs": 120000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-081",
+      "intervalMs": 300000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-082",
+      "intervalMs": 15000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-083",
+      "intervalMs": 600000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-084",
+      "intervalMs": 3600000,
+      "checkMs": 40000
+    },
+    {
+      "watcher": "watcher-085",
+      "intervalMs": 15000,
+      "checkMs": 500
+    },
+    {
+      "watcher": "watcher-086",
+      "intervalMs": 15000,
+      "checkMs": 500
+    }
+  ]
+}

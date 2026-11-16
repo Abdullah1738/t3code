@@ -1,8 +1,11 @@
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import type * as Statement from "effect/sql/Statement";
 import {
@@ -15,10 +18,14 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderThreadId,
+  ProviderTurnId,
   RunId,
   RuntimeRequestId,
   NodeId,
   type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
+  type OrchestrationV2ThreadShell,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2ServerCommand,
   type OrchestrationV2TurnItem,
@@ -29,12 +36,17 @@ import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+
 import * as Sqlite from "../../../persistence/Sqlite.ts";
 import * as CommandReceipts from "../../../persistence/OrchestrationCommandReceipts.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
+import * as EventSink from "../../../orchestration-v2/EventSink.ts";
+import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../../../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderReplayHarness from "../../../orchestration-v2/testkit/ProviderReplayHarness.ts";
@@ -51,10 +63,11 @@ import {
   viewStateOf,
 } from "./threads.ts";
 
-import { liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
+import { idleThreadProjection, liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
 import * as Analytics from "../../analytics/Analytics.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import * as EvaluatorAnalytics from "./evaluatorAnalytics.ts";
+import { waitingOnBackground } from "./rules.ts";
 
 const at = (iso: string) => DateTime.makeUnsafe(iso);
 const QUESTION_AT = "2026-10-25T00:10:00.000Z";
@@ -125,18 +138,61 @@ describe("viewStateOf", () => {
 });
 
 describe("backgroundWorkOf", () => {
-  it("counts subagents and background tasks, not commands or pull-request watches", () => {
+  it("counts commands alongside subagents and tasks, with PR watches counted separately", () => {
     expect(
       backgroundWorkOf({
         pendingBackgroundTasks: [
           { taskId: "a", kind: "subagent" },
           { taskId: "b", kind: "background_task" },
           { taskId: "c", kind: "command" },
+          { taskId: "d", kind: "monitor" },
           { taskId: "pull-request-watch:github.com/x/y#1", kind: "monitor" },
         ],
       }),
-    ).toBe(2);
+    ).toBe(4);
   });
+
+  it.each([
+    "pending",
+    "running",
+    "waiting",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+  ] as const)("counts a Codex shell item only while active: %s", (status) => {
+    const pendingBackgroundTasks = derivePendingBackgroundWork({
+      latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+      providerThreads: [],
+      turnItems: [{ id: "shell", type: "command_execution", title: "Check", status }],
+    });
+    expect(backgroundWorkOf({ pendingBackgroundTasks })).toBe(
+      status === "pending" || status === "running" || status === "waiting" ? 1 : 0,
+    );
+  });
+
+  it.each(["command", "background_task", "monitor"] as const)(
+    "counts a Claude %s until the provider removes it from its roster",
+    (kind) => {
+      const pendingBackgroundTasks = derivePendingBackgroundWork({
+        latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+        providerThreads: [
+          {
+            id: ProviderThreadId.make("claude"),
+            pendingBackgroundTasks: [{ taskId: "bash-or-task", kind }],
+          },
+        ],
+        turnItems: [],
+      });
+      expect(backgroundWorkOf({ pendingBackgroundTasks })).toBe(1);
+      const ended = derivePendingBackgroundWork({
+        latestRun: { id: RunId.make("parent"), ordinal: 1, status: "completed" },
+        providerThreads: [{ id: ProviderThreadId.make("claude"), pendingBackgroundTasks: [] }],
+        turnItems: [],
+      });
+      expect(backgroundWorkOf({ pendingBackgroundTasks: ended })).toBe(0);
+    },
+  );
 
   it("is zero for an empty roster", () => {
     expect(backgroundWorkOf({ pendingBackgroundTasks: [] })).toBe(0);
@@ -145,6 +201,41 @@ describe("backgroundWorkOf", () => {
   it("is zero when the roster is missing (older shells)", () => {
     expect(backgroundWorkOf({})).toBe(0);
   });
+});
+
+it.effect.each([
+  { type: "run_interrupt_request", status: "completed", time: "before", expected: false },
+  { type: "run_interrupt_request", status: "completed", time: "after", expected: true },
+  { type: "command_execution", status: "interrupted", time: "after", expected: true },
+  { type: "dynamic_tool", status: "cancelled", time: "after", expected: true },
+  { type: "subagent", status: "cancelled", time: "after", expected: true },
+  { type: "command_execution", status: "completed", time: "after", expected: false },
+  { type: "command_execution", status: "failed", time: "after", expected: false },
+] as const)("background recovery respects $type $status $time the worker stopped", (row) => {
+  const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: (_, __, filter) =>
+      Effect.succeed({
+        turnItems:
+          filter?.turnItemTypes?.includes(row.type) &&
+          (filter.turnItemStatuses === undefined || filter.turnItemStatuses.includes(row.status))
+            ? [{ updatedAt: at(row.time === "before" ? QUESTION_AT : SHARED_UPDATED) }]
+            : [],
+      } as never),
+  });
+  return Effect.gen(function* () {
+    const threads = yield* KanbanThreads;
+    expect(
+      yield* threads.backgroundStoppedSince(ThreadId.make("stopped-background"), FINISHED_AT),
+    ).toBe(row.expected);
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(management),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  );
 });
 
 describe("prWatchesOf", () => {
@@ -232,6 +323,7 @@ describe("prWatchesOf", () => {
           ...(state === "current" ? { observedHeadSha: observed } : {}),
         };
         const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getThreadRecords: () => Effect.succeed({ subagents: [] } as never),
           getThreadShell: () =>
             Effect.succeed({
               ...shell({}),
@@ -362,6 +454,7 @@ it.effect.each(
     Effect.gen(function* () {
       const threadId = ThreadId.make("restored-thread");
       const stopped: Array<string | undefined> = [];
+      const sources: Array<string | undefined> = [];
       const cancelled: Array<string> = [];
       let restoredRunning = true;
       let oldCancelled = false;
@@ -392,6 +485,7 @@ it.effect.each(
         interruptThread: (input) =>
           Effect.sync(() => {
             stopped.push(input.runId);
+            sources.push(input.cancelReason);
             if (input.runId === undefined || input.runId === "restored-run")
               restoredRunning = false;
           }).pipe(
@@ -411,6 +505,7 @@ it.effect.each(
             if (input.type === "thread.stop") restoredRunning = false;
             if (input.type === "queued-run.cancel") {
               cancelled.push(input.runId);
+              sources.push(input.reason);
               if (input.runId === "old-run") oldCancelled = true;
             }
             return { storedEvents: [] } as never;
@@ -420,10 +515,25 @@ it.effect.each(
         const threads = yield* KanbanThreads;
         if (mode === "run") {
           yield* threads.cancelQueued(threadId, "old-run");
-          yield* threads.interrupt(threadId, "Late archived send", false, "old-run");
+          yield* threads.interrupt(
+            threadId,
+            "Late archived send",
+            false,
+            "old-run",
+            undefined,
+            "superseded",
+          );
         } else
-          yield* threads.interrupt(threadId, "Late archived send", false, undefined, messageId);
+          yield* threads.interrupt(
+            threadId,
+            "Late archived send",
+            false,
+            undefined,
+            messageId,
+            "superseded",
+          );
         expect(restoredRunning).toBe(true);
+        expect(sources.every((source) => source === "superseded")).toBe(true);
         expect(stopped).toEqual(status === "missing" && mode !== "run" ? [] : ["old-run"]);
         expect(cancelled).toEqual(status === "queued" ? ["old-run"] : []);
       }).pipe(
@@ -991,6 +1101,7 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const recorded: Array<ThreadManagementService.ThreadManagementSendInput> = [];
   let failBeforeDispatch = false;
   let failAfterDispatch = false;
+  let receiptFailureAfterCommit = false;
   let queueWithdrawal = false;
   let startWithdrawal = false;
   let restartBeforeCleanup = false;
@@ -1007,6 +1118,7 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
   const dependencies = Layer.mergeAll(
     management,
     receipts,
+    CommandReceipts.layer.pipe(Layer.provide(db)),
     ProjectionStore.layer.pipe(Layer.provide(db)),
     Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
   );
@@ -1177,7 +1289,34 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         true,
       );
       failAfterDispatch = true;
-      expect(Result.isFailure(yield* Effect.result(threads.send(wake)))).toBe(true);
+      let acknowledged = false;
+      const repository = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+      const originalRead = repository.getByCommandId;
+      const reads = vi
+        .spyOn(repository, "getByCommandId")
+        .mockImplementation((input) =>
+          receiptFailureAfterCommit
+            ? Effect.die("receipt read unavailable after accepted commit")
+            : originalRead(input),
+        );
+      let failed = false;
+      try {
+        const result = yield* Effect.exit(
+          threads.send({
+            ...wake,
+            onCommitted: () => {
+              acknowledged = true;
+              receiptFailureAfterCommit = true;
+            },
+          }),
+        );
+        failed = result._tag === "Failure";
+      } finally {
+        receiptFailureAfterCommit = false;
+        reads.mockRestore();
+      }
+      expect(failed).toBe(true);
+      expect(acknowledged).toBe(true);
       expect(recorded.at(-1)?.commandId).toBe("kanban:send:wake:real-receipt:retry:2");
       const accepted = yield* receiptStore.getByCommandId(recorded.at(-1)!.commandId);
       expect(Option.isSome(accepted) && accepted.value.status).toBe("accepted");
@@ -1200,14 +1339,12 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         text: "The board changed while assigning this review",
       });
       const revoked = yield* orchestrator.getThreadRecords(threadId, ["runs", "messages"]);
-      expect(["interrupted", "cancelled"]).toContain(
-        revoked.runs.find((run) => run.id === acceptedWake.id)?.status,
+      expect(revoked.runs.find((run) => run.id === acceptedWake.id)?.status).toBe(
+        acceptedWake.status,
       );
-      expect(
-        revoked.messages.some(
-          (message) => message.text === "The board changed while assigning this review",
-        ),
-      ).toBe(false);
+      expect(revoked.runs.filter((run) => run.status === "queued")).toHaveLength(0);
+      // Finish this preserved turn explicitly before exercising the next withdrawal scenario.
+      yield* threads.interrupt(threadId, "Finish preserved turn", true);
       yield* threads.send({ threadId, key: "wake:next-worker", text: "Next valid work" });
       const original = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.at(-1)!;
       const records = yield* orchestrator.getThreadRecords(threadId, [
@@ -1340,7 +1477,8 @@ it.effect("a rejected keyed wake can retry with real orchestrator receipts", () 
         text: "Stop only the original card",
       });
       nativeSteering = null;
-      expect(siblingBeforeInterrupt).toBe(false);
+      expect(siblingBeforeInterrupt).toBe(true);
+      siblingBeforeInterrupt = false;
       const lateShared = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
       const latePreserved = lateShared.runs.find((run) => run.id === lateRoot.id)!;
       expect(latePreserved.status).toBe(lateRoot.status);
@@ -1363,7 +1501,7 @@ it.effect("#1490 observes accepted deliveries once and does not block on boards 
     Layer.mock(Analytics.Analytics)({
       record: (event) =>
         Effect.sync(() => {
-          measured.push(event);
+          if (event.kind === "kanban.evaluator") measured.push(event);
         }),
     }),
     Layer.effect(
@@ -1698,17 +1836,26 @@ it.effect("#1490 observes accepted deliveries once and does not block on boards 
   }).pipe(Effect.provide(dependencies));
 });
 
-it.effect.each([
-  "preparing",
-  "queued",
-  "shared queued",
-  "shared active",
-  "shared completed",
-  "shared failed",
-  "shared interrupted",
-] as const)(
-  "#566 stopping an abandoned %s launch prevents its pending turn from starting",
-  (state) => {
+it.effect.each(
+  (
+    [
+      "preparing",
+      "queued",
+      "shared queued",
+      "shared active",
+      "shared completed",
+      "shared failed",
+      "shared interrupted",
+    ] as const
+  ).flatMap((state) =>
+    ([undefined, "task_stalled", "superseded"] as const).map((cancelReason) => ({
+      state,
+      cancelReason,
+    })),
+  ),
+)(
+  "#566 stopping an abandoned $state launch prevents its pending turn from starting ($cancelReason)",
+  ({ state, cancelReason }) => {
     const db = Sqlite.layerMemory;
     const instanceId = ProviderInstanceId.make("codex");
     const projectId = ProjectId.make("project:abandoned");
@@ -1785,9 +1932,19 @@ it.effect.each([
         expect(after.at(-1)?.status).toBe(state === "shared queued" ? "cancelled" : "queued");
         return;
       }
-      yield* threads.interrupt(threadId, "Abandoned launch", true);
+      yield* threads.interrupt(
+        threadId,
+        "Abandoned launch",
+        true,
+        undefined,
+        undefined,
+        cancelReason,
+      );
       const after = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs;
       expect(after.every((run) => ["cancelled", "interrupted"].includes(run.status))).toBe(true);
+      expect(after.map((run) => run.cancelReason)).toEqual(
+        after.map(() => cancelReason ?? "card_stop"),
+      );
       yield* orchestrator.dispatch({
         type: "queue.resume",
         commandId: CommandId.make("abandon:resume"),
@@ -2611,3 +2768,933 @@ it.effect("#1574 assignment queue preserves a busy run and replays once", () => 
     ),
   );
 });
+
+it.effect.each(["sql", "memory"] as const)(
+  "find holds live child progress and pending final-summary delivery (%s)",
+  (storage) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const parentId = ThreadId.make("background-parent");
+      const childId = ThreadId.make("background-child");
+      const quiet = at("2026-11-15T00:00:00.000Z");
+      const progress = at("2026-11-15T01:10:00.000Z");
+      const finished = at("2026-11-15T01:12:00.000Z");
+      const parent = {
+        ...liveThreadShell(parentId, { activeRunId: null }),
+        status: "idle" as const,
+        activityRunStatus: null,
+        latestRunCompletedAt: quiet,
+        pendingBackgroundTasks: [
+          { taskId: "child-task", kind: "subagent" as const, childThreadId: childId },
+        ] as OrchestrationV2ThreadShell["pendingBackgroundTasks"],
+      };
+      for (const id of [parentId, childId])
+        yield* projections.apply({
+          id: EventId.make(`create:${id}`),
+          type: "thread.created",
+          threadId: id,
+          occurredAt: quiet,
+          payload: idleThreadProjection(liveThreadShell(id)).thread,
+        });
+      const childRun = {
+        id: RunId.make("child-run"),
+        threadId: childId,
+        ordinal: 1,
+        providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        modelSelection: {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-sonnet-5-5",
+        },
+        providerThreadId: null,
+        userMessageId: MessageId.make("child-input"),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "running" as const,
+        requestedAt: quiet,
+        startedAt: quiet,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+        lastActivityAt: progress,
+      } satisfies OrchestrationV2Run;
+      yield* projections.apply({
+        id: EventId.make("child-start"),
+        type: "run.updated",
+        threadId: childId,
+        runId: childRun.id,
+        occurredAt: quiet,
+        payload: { ...childRun, lastActivityAt: quiet },
+      });
+      const task = {
+        id: NodeId.make("child-task"),
+        threadId: parentId,
+        runId: null,
+        parentNodeId: NodeId.make("parent-root"),
+        origin: "app_owned" as const,
+        createdBy: "agent" as const,
+        driver: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: childRun.providerInstanceId,
+        providerThreadId: null,
+        childThreadId: childId,
+        nativeTaskRef: null,
+        prompt: "Watch the proof",
+        title: null,
+        model: "claude-sonnet-5-5",
+        status: "running" as const,
+        idleTimeoutMs: 15 * 60_000,
+        completionDelivery: { state: "pending" as const, observedByRunId: null },
+        result: null,
+        startedAt: quiet,
+        completedAt: null,
+        updatedAt: quiet,
+      } satisfies OrchestrationV2Subagent;
+      yield* projections.apply({
+        id: EventId.make("task-start"),
+        type: "subagent.updated",
+        threadId: parentId,
+        occurredAt: quiet,
+        payload: task,
+      });
+      const childShells = new Map<ThreadId, OrchestrationV2ThreadShell>([
+        [
+          childId,
+          {
+            ...parent,
+            id: childId,
+            activeRunId: childRun.id,
+            pendingBackgroundTasks: [],
+          },
+        ],
+      ]);
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: (id) =>
+          Effect.succeed(id === parentId ? parent : (childShells.get(id) ?? null)),
+        getThreadRecords: (id, fields, filter) =>
+          projections.getThreadRecords(id, fields, filter).pipe(Effect.orDie),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        parent.pendingBackgroundTasks = [
+          ...parent.pendingBackgroundTasks!,
+          { taskId: "native-command", kind: "command" },
+        ];
+        const nativeHold = yield* threads.find(parentId);
+        expect(nativeHold?.backgroundWork).toBe(2);
+        expect(nativeHold?.backgroundWorkUntil).toBe("2026-11-15T01:00:00.000Z");
+        expect(waitingOnBackground(nativeHold!, Date.parse("2026-11-15T00:59:00Z"))).toBe(true);
+        expect(waitingOnBackground(nativeHold!, Date.parse("2026-11-15T01:00:00Z"))).toBe(false);
+        parent.pendingBackgroundTasks = parent.pendingBackgroundTasks?.filter(
+          (job) => job.taskId !== "native-command",
+        );
+        yield* projections.apply({
+          id: EventId.make("child-progress"),
+          type: "run.updated",
+          threadId: childId,
+          occurredAt: progress,
+          payload: childRun,
+        });
+        const live = yield* threads.find(parentId);
+        expect(live?.backgroundWork).toBe(1);
+        expect(live?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
+        expect(waitingOnBackground(live!, Date.parse("2026-11-15T01:15:00Z"))).toBe(true);
+        expect(waitingOnBackground(live!, Date.parse("2026-11-15T01:25:00Z"))).toBe(false);
+        parent.pendingBackgroundTasks = [
+          ...parent.pendingBackgroundTasks!,
+          { taskId: "native-command", kind: "command" },
+        ];
+        const mixed = yield* threads.find(parentId);
+        expect(mixed?.backgroundWork).toBe(2);
+        expect(mixed?.backgroundJobs?.map((job) => job.taskId)).toEqual([
+          "child-task",
+          "native-command",
+        ]);
+        expect(mixed?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
+        parent.pendingBackgroundTasks = parent.pendingBackgroundTasks?.filter(
+          (job) => job.taskId !== "native-command",
+        );
+        for (const [index, idleTimeoutMs, expected] of [
+          [0, undefined, "2026-11-15T02:10:00.000Z"],
+          [1, 0, "2026-11-15T02:10:00.000Z"],
+          [2, 1, "2026-11-15T01:11:00.000Z"],
+          [3, 3 * 60 * 60_000, "2026-11-15T03:10:00.000Z"],
+        ] as const) {
+          yield* projections.apply({
+            id: EventId.make(`timeout:${index}`),
+            type: "subagent.updated",
+            threadId: parentId,
+            occurredAt: quiet,
+            payload: { ...task, idleTimeoutMs },
+          });
+          expect((yield* threads.find(parentId))?.backgroundWorkUntil).toBe(expected);
+        }
+        yield* projections.apply({
+          id: EventId.make("task:queued-followup-timeout"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: quiet,
+          payload: task,
+        });
+        for (const ordinal of [2, 3]) {
+          const queuedAt = at(`2026-11-15T00:0${ordinal - 1}:00Z`);
+          yield* projections.apply({
+            id: EventId.make(`child:queue:${ordinal}`),
+            type: "run.updated",
+            threadId: childId,
+            occurredAt: queuedAt,
+            payload: {
+              ...childRun,
+              id: RunId.make(`child-queued:${ordinal}`),
+              ordinal,
+              status: "queued",
+              requestedAt: queuedAt,
+              startedAt: null,
+              lastActivityAt: undefined,
+            },
+          });
+          const queued = yield* threads.find(parentId);
+          expect(queued?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
+          expect(waitingOnBackground(queued!, Date.parse("2026-11-15T01:20:00Z"))).toBe(true);
+        }
+        yield* projections.apply({
+          id: EventId.make("child:active-progress-with-queue"),
+          type: "run.updated",
+          threadId: childId,
+          occurredAt: at("2026-11-15T01:19:00Z"),
+          payload: { ...childRun, lastActivityAt: at("2026-11-15T01:19:00Z") },
+        });
+        const activeWithQueue = yield* threads.find(parentId);
+        expect(activeWithQueue?.backgroundWorkUntil).toBe("2026-11-15T01:34:00.000Z");
+        expect(waitingOnBackground(activeWithQueue!, Date.parse("2026-11-15T01:26:00Z"))).toBe(
+          true,
+        );
+        expect(waitingOnBackground(activeWithQueue!, Date.parse("2026-11-15T01:34:00Z"))).toBe(
+          false,
+        );
+        const idleChildId = ThreadId.make("idle-child-waiting-for-watcher");
+        task.childThreadId = idleChildId;
+        const idleChildShell = {
+          ...parent,
+          id: idleChildId,
+          pendingBackgroundTasks: [] as OrchestrationV2ThreadShell["pendingBackgroundTasks"],
+        };
+        childShells.set(idleChildId, idleChildShell);
+        yield* projections.apply({
+          id: EventId.make("idle-child:create"),
+          type: "thread.created",
+          threadId: idleChildId,
+          occurredAt: quiet,
+          payload: idleThreadProjection(liveThreadShell(idleChildId)).thread,
+        });
+        const watcherId = ThreadId.make("background-watcher-grandchild");
+        childShells.set(watcherId, { ...parent, id: watcherId, pendingBackgroundTasks: [] });
+        yield* projections.apply({
+          id: EventId.make("watcher:create"),
+          type: "thread.created",
+          threadId: watcherId,
+          occurredAt: quiet,
+          payload: idleThreadProjection(liveThreadShell(watcherId)).thread,
+        });
+        yield* projections.apply({
+          id: EventId.make("child:waiting-for-watcher"),
+          type: "run.updated",
+          threadId: idleChildId,
+          runId: RunId.make("idle-child-run"),
+          occurredAt: quiet,
+          payload: {
+            ...childRun,
+            id: RunId.make("idle-child-run"),
+            threadId: idleChildId,
+            status: "completed",
+            completedAt: quiet,
+            lastActivityAt: quiet,
+          },
+        });
+        yield* projections.apply({
+          id: EventId.make("task:waiting-for-watcher"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: quiet,
+          payload: { ...task, status: "waiting" },
+        });
+        const watcherTask = {
+          ...task,
+          id: NodeId.make("watcher-task"),
+          threadId: idleChildId,
+          childThreadId: watcherId,
+        };
+        yield* projections.apply({
+          id: EventId.make("watcher:task"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: quiet,
+          payload: watcherTask,
+        });
+        const watcherRun = { ...childRun, id: RunId.make("watcher-run"), threadId: watcherId };
+        yield* projections.apply({
+          id: EventId.make("watcher:progress"),
+          type: "run.updated",
+          threadId: watcherId,
+          runId: watcherRun.id,
+          occurredAt: progress,
+          payload: watcherRun,
+        });
+        const nested = yield* threads.find(parentId);
+        expect(nested?.backgroundWorkUntil).toBe("2026-11-15T01:25:00.000Z");
+        expect(waitingOnBackground(nested!, Date.parse("2026-11-15T01:15:00Z"))).toBe(true);
+        expect(waitingOnBackground(nested!, Date.parse("2026-11-15T01:25:00Z"))).toBe(false);
+        yield* projections.apply({
+          id: EventId.make("watcher:more-progress"),
+          type: "run.updated",
+          threadId: watcherId,
+          runId: watcherRun.id,
+          occurredAt: at("2026-11-15T01:20:00Z"),
+          payload: { ...watcherRun, lastActivityAt: at("2026-11-15T01:20:00Z") },
+        });
+        const renewed = yield* threads.find(parentId);
+        expect(renewed?.backgroundWorkUntil).toBe("2026-11-15T01:35:00.000Z");
+        expect(waitingOnBackground(renewed!, Date.parse("2026-11-15T01:26:00Z"))).toBe(true);
+        expect(waitingOnBackground(renewed!, Date.parse("2026-11-15T01:35:00Z"))).toBe(false);
+        for (const [index, ancestorMinutes, descendantMinutes, expected] of [
+          [0, 15, 120, "2026-11-15T03:20:00.000Z"],
+          [1, 120, 15, "2026-11-15T02:00:00.000Z"],
+          [2, 1, undefined, "2026-11-15T02:20:00.000Z"],
+          [3, undefined, 1, "2026-11-15T01:21:00.000Z"],
+        ] as const) {
+          yield* projections.apply({
+            id: EventId.make(`ancestor-timeout:${index}`),
+            type: "subagent.updated",
+            threadId: parentId,
+            occurredAt: quiet,
+            payload: {
+              ...task,
+              status: "waiting",
+              idleTimeoutMs: ancestorMinutes === undefined ? undefined : ancestorMinutes * 60_000,
+            },
+          });
+          yield* projections.apply({
+            id: EventId.make(`descendant-timeout:${index}`),
+            type: "subagent.updated",
+            threadId: idleChildId,
+            occurredAt: quiet,
+            payload: {
+              ...watcherTask,
+              idleTimeoutMs:
+                descendantMinutes === undefined ? undefined : descendantMinutes * 60_000,
+            },
+          });
+          const bounded = yield* threads.find(parentId);
+          expect(bounded?.backgroundWorkUntil).toBe(expected);
+          expect(waitingOnBackground(bounded!, Date.parse(expected) - 1)).toBe(true);
+          expect(waitingOnBackground(bounded!, Date.parse(expected))).toBe(false);
+        }
+        for (const state of [
+          "pending",
+          "claimed",
+          "acknowledged",
+          "delivered",
+          "disposed",
+        ] as const) {
+          yield* projections.apply({
+            id: EventId.make(`watcher-delivery:${state}`),
+            type: "subagent.updated",
+            threadId: idleChildId,
+            occurredAt: finished,
+            payload: {
+              ...watcherTask,
+              status: "completed",
+              result: "FINAL watcher proof passed: exit 0",
+              completedAt: finished,
+              updatedAt: finished,
+              completionDelivery: { state, observedByRunId: null },
+            },
+          });
+          const delivery = yield* threads.find(parentId);
+          expect(delivery?.backgroundWorkUntil).toBe(
+            state === "pending" || state === "claimed"
+              ? "2026-11-15T02:12:00.000Z"
+              : "2026-11-15T01:00:00.000Z",
+          );
+          expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T01:30:00Z"))).toBe(
+            state === "pending" || state === "claimed",
+          );
+          expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T02:12:00Z"))).toBe(false);
+        }
+        // The shell no longer has a live item; the persisted delivery is now the hold.
+        parent.pendingBackgroundTasks = [];
+        const final = {
+          ...task,
+          status: "completed" as const,
+          result: "FINAL proof passed: exit 0",
+          updatedAt: finished,
+          completedAt: finished,
+          completionDelivery: { state: "pending" as const, observedByRunId: null },
+        };
+        yield* projections.apply({
+          id: EventId.make("task-final"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: final,
+        });
+        const pending = yield* threads.find(parentId);
+        expect(pending?.backgroundWork).toBe(1);
+        expect(pending?.backgroundWorkUntil).toBe("2026-11-15T02:12:00.000Z");
+        expect(waitingOnBackground(pending!, Date.parse("2026-11-15T01:30:00Z"))).toBe(true);
+        expect(waitingOnBackground(pending!, Date.parse("2026-11-15T02:12:00Z"))).toBe(false);
+        const records = yield* projections.getThreadRecords(parentId, ["subagents"], {
+          pendingBackgroundTasksOnly: true,
+        });
+        expect(records.subagents[0]?.result).toBe("FINAL proof passed: exit 0");
+        yield* projections.apply({
+          id: EventId.make("task:without-child-thread"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: { ...final, childThreadId: null },
+        });
+        expect(
+          (yield* projections.getThreadRecords(parentId, ["subagents"], {
+            pendingBackgroundTasksOnly: true,
+          })).subagents,
+        ).toHaveLength(1);
+        expect(
+          (yield* projections.getThreadRecords(parentId, ["subagents"], {
+            pendingBackgroundTasksOnly: true,
+            subagentsWithChildThreadOnly: true,
+          })).subagents,
+        ).toEqual([]);
+        yield* projections.apply({
+          id: EventId.make("task:restore-child-thread"),
+          type: "subagent.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: final,
+        });
+        for (const state of ["claimed", "acknowledged", "delivered", "disposed"] as const) {
+          yield* projections.apply({
+            id: EventId.make(`task:${state}`),
+            type: "subagent.updated",
+            threadId: parentId,
+            occurredAt: finished,
+            payload: { ...final, completionDelivery: { state, observedByRunId: null } },
+          });
+          const delivery = yield* threads.find(parentId);
+          expect(delivery?.backgroundWork).toBe(state === "claimed" ? 1 : 0);
+          expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T02:12:00Z"))).toBe(false);
+        }
+        yield* projections.apply({
+          id: EventId.make("watcher:still-running"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: watcherTask,
+        });
+        idleChildShell.pendingBackgroundTasks = [
+          { taskId: "watcher-task", kind: "subagent", childThreadId: watcherId },
+        ];
+        for (const status of ["completed", "failed", "cancelled", "interrupted"] as const) {
+          for (const state of ["acknowledged", "delivered"] as const) {
+            yield* projections.apply({
+              id: EventId.make(`terminal-with-watcher:${status}:${state}`),
+              type: "subagent.updated",
+              threadId: parentId,
+              occurredAt: finished,
+              payload: { ...final, status, completionDelivery: { state, observedByRunId: null } },
+            });
+            const inherited = yield* threads.find(parentId);
+            expect(inherited?.backgroundWork).toBe(1);
+            expect(inherited?.backgroundWorkUntil).toBe("2026-11-15T01:35:00.000Z");
+            expect(waitingOnBackground(inherited!, Date.parse("2026-11-15T01:30:00Z"))).toBe(true);
+            expect(waitingOnBackground(inherited!, Date.parse("2026-11-15T01:35:00Z"))).toBe(false);
+          }
+        }
+        const resumedRun = {
+          ...childRun,
+          id: RunId.make("completion-wake-with-live-sibling"),
+          threadId: idleChildId,
+          ordinal: 2,
+          lastActivityAt: quiet,
+        };
+        yield* projections.apply({
+          id: EventId.make("child:completion-wake-with-live-sibling"),
+          type: "run.updated",
+          threadId: idleChildId,
+          occurredAt: quiet,
+          payload: resumedRun,
+        });
+        childShells.set(idleChildId, {
+          ...idleChildShell,
+          activeRunId: resumedRun.id,
+          status: "running",
+          activityRunStatus: "running",
+          pendingBackgroundTasks: [],
+        });
+        for (const state of ["acknowledged", "delivered", "disposed"] as const) {
+          yield* projections.apply({
+            id: EventId.make(`finished-sibling:${state}`),
+            type: "subagent.updated",
+            threadId: idleChildId,
+            occurredAt: finished,
+            payload: {
+              ...watcherTask,
+              id: NodeId.make("finished-sibling"),
+              childThreadId: null,
+              status: "completed",
+              completedAt: finished,
+              completionDelivery: { state, observedByRunId: resumedRun.id },
+              result: "FINAL sibling passed",
+            },
+          });
+          for (const status of ["pending", "running", "waiting"] as const) {
+            yield* projections.apply({
+              id: EventId.make(`resumed-child:${state}:watcher:${status}`),
+              type: "subagent.updated",
+              threadId: idleChildId,
+              occurredAt: finished,
+              payload: { ...watcherTask, status },
+            });
+            const resumed = yield* threads.find(parentId);
+            expect(resumed?.backgroundWork).toBe(1);
+            expect(resumed?.backgroundWorkUntil).toBe("2026-11-15T01:35:00.000Z");
+            expect(waitingOnBackground(resumed!, Date.parse("2026-11-15T01:30:00Z"))).toBe(true);
+            expect(waitingOnBackground(resumed!, Date.parse("2026-11-15T01:35:00Z"))).toBe(false);
+          }
+        }
+        yield* projections.apply({
+          id: EventId.make("watcher:before-terminal-chain"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: {
+            ...watcherTask,
+            status: "completed",
+            completedAt: finished,
+            completionDelivery: { state: "acknowledged", observedByRunId: null },
+          },
+        });
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+        childShells.set(idleChildId, idleChildShell);
+        idleChildShell.pendingBackgroundTasks = [];
+        for (const depth of [2, 3]) {
+          const ancestorIds = [idleChildId];
+          for (let level = 1; level < depth; level++) {
+            const id = ThreadId.make(`terminal-chain:${depth}:${level}`);
+            ancestorIds.push(id);
+            childShells.set(id, { ...parent, id, pendingBackgroundTasks: [] });
+            yield* projections.apply({
+              id: EventId.make(`create:${id}`),
+              type: "thread.created",
+              threadId: id,
+              occurredAt: quiet,
+              payload: idleThreadProjection(liveThreadShell(id)).thread,
+            });
+          }
+          const links = ancestorIds.map((id, level) => ({
+            ...watcherTask,
+            id: NodeId.make(`chain-task:${depth}:${level}`),
+            threadId: id,
+            childThreadId: ancestorIds[level + 1] ?? watcherId,
+          }));
+          const leaf = links.at(-1)!;
+          childShells.set(leaf.threadId, {
+            ...childShells.get(leaf.threadId)!,
+            pendingBackgroundTasks: [
+              { taskId: leaf.id, kind: "subagent", childThreadId: watcherId },
+            ],
+          });
+          yield* projections.apply({
+            id: EventId.make(`chain:${depth}:watcher`),
+            type: "subagent.updated",
+            threadId: leaf.threadId,
+            occurredAt: quiet,
+            payload: leaf,
+          });
+          for (const status of ["completed", "failed", "cancelled", "interrupted"] as const) {
+            for (const state of ["acknowledged", "delivered", "disposed"] as const) {
+              for (const link of links.slice(0, -1))
+                yield* projections.apply({
+                  id: EventId.make(`chain:${link.id}:${status}:${state}`),
+                  type: "subagent.updated",
+                  threadId: link.threadId,
+                  occurredAt: finished,
+                  payload: {
+                    ...link,
+                    status,
+                    completedAt: finished,
+                    completionDelivery: { state, observedByRunId: null },
+                  },
+                });
+              const inherited = yield* threads.find(parentId);
+              expect(inherited?.backgroundWork).toBe(1);
+              expect(inherited?.backgroundWorkUntil).toBe("2026-11-15T01:35:00.000Z");
+              expect(waitingOnBackground(inherited!, Date.parse("2026-11-15T01:30:00Z"))).toBe(
+                true,
+              );
+              expect(waitingOnBackground(inherited!, Date.parse("2026-11-15T01:35:00Z"))).toBe(
+                false,
+              );
+            }
+          }
+          childShells.set(leaf.threadId, {
+            ...childShells.get(leaf.threadId)!,
+            pendingBackgroundTasks: [],
+          });
+          for (const state of [
+            "pending",
+            "claimed",
+            "acknowledged",
+            "delivered",
+            "disposed",
+          ] as const) {
+            yield* projections.apply({
+              id: EventId.make(`chain:${depth}:delivery:${state}`),
+              type: "subagent.updated",
+              threadId: leaf.threadId,
+              occurredAt: finished,
+              payload: {
+                ...leaf,
+                status: "completed",
+                completedAt: finished,
+                updatedAt: finished,
+                completionDelivery: { state, observedByRunId: null },
+              },
+            });
+            const delivery = yield* threads.find(parentId);
+            const owed = state === "pending" || state === "claimed";
+            expect(delivery?.backgroundWork).toBe(owed ? 1 : 0);
+            expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T01:30:00Z"))).toBe(owed);
+            expect(waitingOnBackground(delivery!, Date.parse("2026-11-15T02:12:00Z"))).toBe(false);
+          }
+        }
+        yield* projections.apply({
+          id: EventId.make("terminal-cycle"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: {
+            ...final,
+            id: NodeId.make("terminal-cycle"),
+            threadId: idleChildId,
+            childThreadId: idleChildId,
+            completionDelivery: { state: "acknowledged", observedByRunId: null },
+          },
+        });
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+        yield* projections.apply({
+          id: EventId.make("watcher:after-terminal-chain"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: watcherTask,
+        });
+        idleChildShell.pendingBackgroundTasks = [
+          { taskId: "pull-request-watch:only", kind: "monitor" },
+        ];
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+        yield* projections.apply({
+          id: EventId.make("watcher:finally-delivered"),
+          type: "subagent.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: {
+            ...watcherTask,
+            status: "completed",
+            result: "FINAL proof passed",
+            completedAt: finished,
+            completionDelivery: { state: "delivered", observedByRunId: null },
+          },
+        });
+        idleChildShell.pendingBackgroundTasks = [];
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+        const backgroundTool = {
+          id: TurnItemId.make("child-background-shell"),
+          threadId: idleChildId,
+          runId: resumedRun.id,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: 1,
+          type: "dynamic_tool" as const,
+          status: "running" as const,
+          title: null,
+          startedAt: progress,
+          completedAt: null,
+          updatedAt: progress,
+          toolName: "background-shell",
+          input: { persistent: true },
+        };
+        yield* projections.apply({
+          id: EventId.make("child:background-shell"),
+          type: "turn-item.updated",
+          threadId: idleChildId,
+          occurredAt: progress,
+          payload: backgroundTool,
+        });
+        yield* projections.apply({
+          id: EventId.make("child:shell-progress"),
+          type: "run.updated",
+          threadId: idleChildId,
+          runId: resumedRun.id,
+          occurredAt: progress,
+          payload: {
+            ...resumedRun,
+            status: "completed",
+            completedAt: quiet,
+            lastActivityAt: progress,
+          },
+        });
+        idleChildShell.pendingBackgroundTasks = [
+          { taskId: "child-background-shell", kind: "background_task" },
+        ];
+        const shellWait = yield* threads.find(parentId);
+        expect(shellWait?.backgroundWork).toBe(1);
+        expect(shellWait?.backgroundWorkUntil).toBe("2026-11-15T02:10:00.000Z");
+        expect(waitingOnBackground(shellWait!, Date.parse("2026-11-15T01:30:00Z"))).toBe(true);
+        expect(waitingOnBackground(shellWait!, Date.parse("2026-11-15T02:10:00Z"))).toBe(false);
+        yield* projections.apply({
+          id: EventId.make("child:shell-finished"),
+          type: "turn-item.updated",
+          threadId: idleChildId,
+          occurredAt: finished,
+          payload: { ...backgroundTool, status: "completed", completedAt: finished },
+        });
+        idleChildShell.pendingBackgroundTasks = [];
+        expect((yield* threads.find(parentId))?.backgroundWork).toBe(0);
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }).pipe(
+      Effect.provide(
+        storage === "sql"
+          ? ProjectionStore.layer.pipe(Layer.provide(Sqlite.layerMemory))
+          : ProjectionStore.layerMemory,
+      ),
+    ),
+);
+
+it.effect.each([
+  "missing",
+  "rejected",
+  "accepted",
+  "accepted retry",
+  "wrong command",
+  "wrong aggregate",
+] as const)("#1561 durable send lookup reconciles $0 receipts without a live thread", (form) =>
+  Effect.gen(function* () {
+    const receipts = yield* CommandReceipts.OrchestrationCommandReceiptRepository;
+    if (form !== "missing") {
+      const status =
+        form === "rejected" || form === "accepted retry"
+          ? ("rejected" as const)
+          : ("accepted" as const);
+      const receipt = {
+        commandId: CommandId.make("kanban:send:durable-key"),
+        aggregateKind: form === "wrong aggregate" ? ("project" as const) : ("thread" as const),
+        aggregateId:
+          form === "wrong aggregate"
+            ? ProjectId.make("original-recipient")
+            : ThreadId.make("original-recipient"),
+        commandType: form === "wrong command" ? "run.interrupt" : "message.dispatch",
+        acceptedAt: QUESTION_AT,
+        resultSequence: 1,
+        status,
+        error: status === "rejected" ? "rejected" : null,
+      };
+      yield* receipts.insertIfAbsent(receipt);
+      if (form === "accepted retry")
+        yield* receipts.insertIfAbsent({
+          ...receipt,
+          commandId: CommandId.make("kanban:send:durable-key:retry:1"),
+          status: "accepted",
+          error: null,
+        });
+    }
+    const threads = yield* KanbanThreads;
+    const found = yield* Effect.result(threads.acceptedSend!("durable-key"));
+    expect(Result.isSuccess(found)).toBe(!form.startsWith("wrong"));
+    if (Result.isSuccess(found))
+      expect(found.success).toBe(form.startsWith("accepted") ? "original-recipient" : null);
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(Layer.mock(ThreadManagementService.ThreadManagementService)({})),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provideMerge(CommandReceipts.layer),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  ),
+);
+
+it.effect.each([false, true])(
+  "card_thread delivery persists exact text on an idle or running thread (running=%s)",
+  (running) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const db = Sqlite.layerMemory;
+        const instanceId = ProviderInstanceId.make("codex");
+        const driver = ProviderDriverKind.make("codex");
+        const projectId = ProjectId.make("project:card-thread-text");
+        const threadId = ThreadId.make("thread:card-thread-text");
+        const model = { instanceId, model: "gpt-5.1-codex" };
+        const cwd = yield* checkpointWorkspace("kanban-card-thread-text");
+        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        const received: string[] = [];
+        const adapter: ProviderAdapter.ProviderAdapterV2["Service"] = {
+          instanceId,
+          driver,
+          getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+          planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+          openSession: (input) =>
+            Effect.gen(function* () {
+              const now = yield* DateTime.now;
+              return {
+                instanceId,
+                driver,
+                providerSessionId: input.providerSessionId,
+                providerSession: {
+                  id: input.providerSessionId,
+                  driver,
+                  providerInstanceId: instanceId,
+                  status: "ready",
+                  cwd,
+                  model: model.model,
+                  capabilities: CodexProviderCapabilitiesV2,
+                  createdAt: now,
+                  updatedAt: now,
+                  lastError: null,
+                },
+                events: Stream.fromQueue(events),
+                ensureThread: ({ threadId }) =>
+                  Effect.succeed({
+                    id: ProviderThreadId.make(`provider-thread:${threadId}`),
+                    driver,
+                    providerInstanceId: instanceId,
+                    providerSessionId: input.providerSessionId,
+                    appThreadId: threadId,
+                    ownerNodeId: null,
+                    nativeThreadRef: { driver, nativeId: "native-thread", strength: "strong" },
+                    nativeConversationHeadRef: null,
+                    status: "idle",
+                    firstRunOrdinal: null,
+                    lastRunOrdinal: null,
+                    handoffIds: [],
+                    forkedFrom: null,
+                    createdAt: now,
+                    updatedAt: now,
+                  }),
+                resumeThread: ({ providerThread }) => Effect.succeed(providerThread),
+                startTurn: (turn) =>
+                  Effect.gen(function* () {
+                    received.push(turn.message.text);
+                    yield* Queue.offer(events, {
+                      type: "provider_turn.updated",
+                      driver,
+                      providerTurn: {
+                        id: ProviderTurnId.make(`provider-turn:${turn.attemptId}`),
+                        providerThreadId: turn.providerThread.id,
+                        nodeId: turn.rootNodeId,
+                        runAttemptId: turn.attemptId,
+                        nativeTurnRef: { driver, nativeId: "native-turn", strength: "strong" },
+                        ordinal: turn.providerTurnOrdinal,
+                        status: "running",
+                        startedAt: now,
+                        completedAt: null,
+                      },
+                    });
+                  }),
+                steerTurn: (input) =>
+                  Effect.sync(() => {
+                    received.push(input.message.text);
+                  }),
+                interruptTurn: () => Effect.void,
+                respondToRuntimeRequest: () => Effect.die("unused"),
+                readThreadSnapshot: () => Effect.die("unused"),
+                rollbackThread: () => Effect.die("unused"),
+                forkThread: () => Effect.die("unused"),
+              };
+            }),
+        };
+        const runtime = ProviderReplayHarness.layerWithRegistry(
+          { name: "kanban-card-thread-text" },
+          ProviderAdapterRegistry.layerFromAdapters([adapter]),
+          { databaseLayer: db, runEffectWorker: false },
+        );
+        const receipts = CommandReceiptStore.layer.pipe(Layer.provide(db));
+        const management = ThreadManagementService.layer.pipe(
+          Layer.provideMerge(Layer.mergeAll(runtime, receipts, ServerSettings.layerTest(), db)),
+        );
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sink = yield* EventSink.EventSinkV2;
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("card-thread-text:create"),
+            threadId,
+            projectId,
+            title: "Card thread delivery",
+            modelSelection: model,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: cwd,
+            createdBy: "system",
+            creationSource: "server",
+          });
+          yield* Effect.gen(function* () {
+            const threads = yield* KanbanThreads;
+            if (running) {
+              const afterSequence = yield* sink.latestSequence({ threadId });
+              yield* threads.send({ threadId, text: "Initial turn", model });
+              yield* worker.drain();
+              yield* sink.stream({ threadId, afterSequence }).pipe(
+                Stream.filter(
+                  (stored) =>
+                    stored.event.type === "provider-turn.updated" &&
+                    stored.event.payload.status === "running",
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+              );
+            }
+            const text = "  Keep the exact spacing.\nUse juno.  ";
+            const runId = yield* threads.send({ threadId, text, model, flushQueued: "steer" });
+            const records = yield* orchestrator.getThreadRecords(threadId, [
+              "runs",
+              "messages",
+              "turnItems",
+            ]);
+            const message = records.messages.find((entry) => entry.text === text);
+            expect(message?.text).toBe(text);
+            expect(message?.runId).toBe(runId);
+            expect(
+              records.turnItems.some(
+                (item) => item.type === "user_message" && item.messageId === message?.id,
+              ),
+            ).toBe(true);
+            expect(records.runs.find((run) => run.id === runId)?.status).not.toBe("queued");
+            expect(records.messages.filter((entry) => entry.text === text)).toHaveLength(1);
+            yield* worker.drain();
+            expect(received).toEqual(running ? ["Initial turn", text] : [text]);
+          }).pipe(Effect.provide(layer));
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              management,
+              receipts,
+              Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+            ),
+          ),
+        );
+      }),
+    ),
+);

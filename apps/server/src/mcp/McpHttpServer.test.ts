@@ -34,6 +34,7 @@ import {
 
 import * as ProjectService from "../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
+import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as PullRequestReviewGuideService from "../pullRequest/PullRequestReviewGuideService.ts";
 import * as ServerConfig from "../config.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
@@ -98,6 +99,7 @@ const layerPullRequestsTest = McpHttpServer.layerPullRequestsToolkit.pipe(
         resolve: () => Effect.succeed(null),
       }),
       Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
+      Layer.mock(PullRequestService.PullRequestService)({}),
       Layer.mock(Orchestrator.OrchestratorV2)({}),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
       NodeServices.layer,
@@ -310,6 +312,7 @@ it.effect("mirrors encoded typed handler failures without changing text or analy
 
 it.each([
   '{ "code": "delegation_timeout", "taskId": "task-1567", "retryHint": "same key" }',
+  '{ "_tag": "OrchestratorMcpFailure", "code": "parent_not_active", "saved": false, "message": "Delegated task was not created; safe to retry with the same clientRequestId. Parent run ended." }',
   "{}",
   JSON.stringify({ message: "x".repeat(8178) }),
 ])("mirrors JSON object failures and preserves their original text: %.80s", (text) => {
@@ -666,6 +669,12 @@ it.effect.each([
       expect(span?.attributes.get("readinessWaitMs")).toBe(0);
       expect(span?.attributes.get("replyBytes")).toBe(Buffer.byteLength(JSON.stringify(result)));
       expect(span?.attributes.has("taskCount")).toBe(false);
+      if (name === "wiki_read") {
+        const savedReply = spans.find((span) => span.name === "KanbanTools.savedReply");
+        expect(savedReply?.attributes.get("kanban.reply.elapsed_ms")).toBe(25000);
+        expect(savedReply?.attributes.get("kanban.reply.timed_out")).toBe(false);
+        expect(savedReply?.parent).toMatchObject({ value: { spanId: span?.spanId } });
+      }
     }).pipe(Effect.provide(layer), Effect.withTracer(tracer));
   }),
 );

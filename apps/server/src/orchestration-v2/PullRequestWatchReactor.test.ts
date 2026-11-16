@@ -17,6 +17,7 @@ import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
 import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
 
+import { pullRequestWatchStopMessage } from "./pullRequestWatch.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import { makeSweepFixture } from "../pullRequest/testkit/sweepFixture.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -404,6 +405,7 @@ it.effect.each([
     assert.isNull(commands[0]!.watch);
     assert.include(commands[0]!.wake?.text ?? "", reason);
     assert.notInclude(commands[0]!.wake?.text ?? "", "8 times");
+    assert.notInclude(commands[0]!.wake?.text ?? "", "watch_pull_request");
     yield* reactor.sweep;
     assert.strictEqual(commands.length, 1);
   }),
@@ -725,3 +727,35 @@ it.effect("measures project listing and identity spawns across watch sweeps", ()
     assert.strictEqual(commands.length, 40);
   }),
 );
+
+it.each(["cli-missing", "cli-unauthenticated", "provider-unsupported"] as const)(
+  "unavailable stop text does not invite re-watching: %s",
+  (reason) => {
+    const error = new PullRequestUnavailableError({
+      reason,
+      provider: SourceControlProviderKind.make("forgejo"),
+    });
+    const text = pullRequestWatchStopMessage(
+      { host: "forgejo.example", number: 9, url: "https://forgejo.example/o/r/pulls/9" },
+      1,
+      error,
+    );
+    assert.include(text, `The server can't read pull requests on forgejo.example (${reason}).`);
+    assert.include(text, error.message);
+    assert.include(text, "Watching again won't help until server access is fixed.");
+    assert.include(text, "Check the PR with your own tools instead.");
+    assert.notInclude(text, "watch_pull_request");
+  },
+);
+
+it("transient stop text keeps the eight-read retry advice", () => {
+  assert.strictEqual(
+    pullRequestWatchStopMessage(
+      { host: "github.com", number: 9, url: "https://github.com/o/r/pull/9" },
+      8,
+      new PullRequestOperationError({ operation: "detail", detail: "Rate limited" }),
+      "Still delayed.",
+    ),
+    "T3 Code stopped watching pull request #9 (https://github.com/o/r/pull/9) after 8 consecutive unsuccessful reads. Still delayed. Last error: Pull request operation detail failed: Rate limited Check it yourself, and call watch_pull_request to watch it again.",
+  );
+});

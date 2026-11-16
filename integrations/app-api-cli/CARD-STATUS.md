@@ -6,7 +6,8 @@ lives beside `CARD_STATUS_FILE` (default `~/.local/state/card-status.merchants.j
 lock and atomic writes as card status.
 
 `--role primary` replaces the previous primary; explicitly add the old card with `--role backup`
-if it is still saved. `merchant remove MERCHANT LAST4` removes one saved card, and
+if it is still saved. Both roles stay listed as saved cards; a backup observation does not require
+checkout's `--fallback` flag. `merchant remove MERCHANT LAST4` removes one saved card, and
 `merchant set MERCHANT none` clears all saved cards for that merchant. `merchant list --json`
 lists observations; `merchant dead --json` lists merchants with any cancelled or declined saved card.
 A decline stays visible here until cleared, even after the checkout's 12-hour decline block expires.
@@ -19,5 +20,10 @@ Immediately before paying, read the last four on the final screen and run
 `card-status assert-final MERCHANT LAST4`. Exit 0 means it matches `card_routes.json`; exit 3 refuses
 an incorrect, cancelled, recently declined, or other person's card (or unreadable status/routes).
 Noon defaults to 9546; 2342 needs `--fallback` after a failure/decline and safe reconciliation.
-Uber/Amazon use 2342; boat.dev/ChatGPT use 7572 per card-vault. Other merchants default to 2342.
+Uber/Amazon use 2342; boat.dev uses 7572. Other merchants default to 2342.
 The flag records an explicit fallback choice; it does not prove the previous attempt failed or authorize a payment.
+
+Routes live in the fork at `integrations/app-api-cli/card_routes.json`, deployed beside `card_status.py`.
+`expected` pins a card; `fallback` selects the alternative only with `--fallback`.
+OpenAI uses `any: true`, so no `expected` or `fallback` is needed; owner-go approval picks the card.
+Forbidden cards, other owners' cards, cancellations and recent declines still refuse every route.

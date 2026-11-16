@@ -146,7 +146,7 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['errorRate'], .01)
         self.assertEqual(result['durationMs']['cli.run'], {'p50': 50, 'p95': 95, 'max': 100})
         self.assertEqual(result['topErrors'], [{'tag': 'io_error', 'count': 1, 'sampleId': 'a' * 32,
-                                              'exceptionClass': None, 'exitCode': None}])
+                                              'exceptionClass': None, 'exitCode': None, 'reason': None}])
         self.assertEqual(result['malformedCount'], 1)
         self.assertEqual(stat.S_IMODE(next(self.root.glob('rollup-*.json')).stat().st_mode), 0o600)
 
@@ -413,6 +413,50 @@ class IsolationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'tool failure'):
                 with log.run('food'):
                     raise ValueError('tool failure')
+
+
+class ReasonRollupTests(unittest.TestCase):
+    setUp = ToolLogTests.setUp
+    tearDown = ToolLogTests.tearDown
+    rows = ToolLogTests.rows
+    def test_reason_allowlist_and_types(self):
+        for reason in log.FOOD_EXIT_REASONS:
+            log.emit('food', 'cli.run', props={'reason': reason, 'candidateCount': 2, 'queryLen': 9})
+            self.assertEqual(self.rows()[-1]['props'], {'reason': reason, 'candidateCount': 2, 'queryLen': 9})
+        for value in ('PrivateValueToken', True, [], {'private': 'text'}):
+            log.emit('food', 'cli.run', props={'reason': value, 'candidateCount': value, 'queryLen': value})
+            self.assertNotIn('props', self.rows()[-1])
+        self.assertNotIn('PrivateValueToken', json.dumps(self.rows()))
+
+    def test_rollup_groups_reason_and_includes_legacy_null(self):
+        for reason in ('food_not_found', 'food_ambiguous', 'PrivateValueToken'):
+            with self.assertRaises(SystemExit):
+                with log.run('food', ['log']) as span:
+                    span.props['reason'] = reason
+                    raise SystemExit(2)
+        result = log.rollup(log.utcnow().date().isoformat())
+        self.assertEqual({r['reason'] for r in result['topErrors']}, {'food_not_found', 'food_ambiguous', None})
+        self.assertNotIn('PrivateValueToken', json.dumps(result))
+
+    def test_delivery_unmarked_exact_definition(self):
+        log.emit('cards', 'card.render', props={'kind': 'nutrition'}, run_id='a' * 32, ok=True)
+        log.emit('cards', 'card.render', props={'kind': 'nutrition'}, run_id='b' * 32, ok=False)
+        log.emit('food', 'food.warning', props={'warning': 'unverified', 'count': 5}, run_id='a' * 32)
+        log.emit('food', 'food.warning', props={'warning': 'no_time', 'count': 1}, run_id='a' * 32)
+        log.emit('meds-nag', 'nag.sent', props={'count': 3}, run_id='c' * 32)
+        for _ in range(2):
+            log.emit('cards', 'card.render', props={'kind': 'nutrition'})
+        log.delivery('card', 'a' * 32)
+        log.delivery('nag', 'c' * 32, ok=False)
+        log.delivery('nag', 'c' * 32, ok=True)
+        log.delivery('warning', 'd' * 32, ok=False)
+        delivery = log.rollup(log.utcnow().date().isoformat())['delivery']
+        self.assertEqual({k: v for k, v in delivery.items() if k != 'unmarkedMeaning'},
+                         {'sent': 2, 'failed': 1, 'unmarked': 4, 'autoReceipts': 0, 'manualReceipts': 3})
+        self.assertEqual(delivery['unmarkedMeaning'], log.UNMARKED_MEANING)
+        self.assertIn('including failed renders', delivery['unmarkedMeaning'])
+        self.assertIn('UTC day file', delivery['unmarkedMeaning'])
+
 
 
 if __name__ == '__main__':

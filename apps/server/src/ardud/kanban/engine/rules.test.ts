@@ -34,6 +34,8 @@ import {
   modelOnPool,
   nextProbeDelay,
   planDispatch,
+  dispatchQueue,
+  dispatchQueueStatus,
   aliasPool,
   poolFor,
   poolKey,
@@ -498,6 +500,7 @@ describe("planDispatch", () => {
     expect(checkClaim(paused, held, ctx)).toEqual({
       ok: false,
       reason: "the board is paused: Ship the fix",
+      denyReason: "board_paused",
     });
     const reviewKept = { ...paused, pause: { ...paused.pause!, keep: [review.id] } };
     expect(
@@ -1380,6 +1383,7 @@ describe("thread batching", () => {
     expect(checkClaim(setupRunning, card(), ctx)).toEqual({
       ok: false,
       reason: "Setup is running",
+      denyReason: "board_setup_running",
     });
     expect(
       checkClaim(
@@ -1412,6 +1416,7 @@ describe("thread batching", () => {
       }),
     ).toEqual({
       ok: false,
+      denyReason: "dependency_blocked",
       reason: `card #${waiting.number} waits on #${blocker.number} (needs_review)`,
     });
   });
@@ -1926,6 +1931,14 @@ describe("waitingOnBackground and reviewerQuietDue", () => {
     expect(waitingOnBackground(bg("running", 1), at(59))).toBe(false);
   });
 
+  it("uses the child's activity deadline, then releases a silent child at the ceiling", () => {
+    const active = { ...bg("idle", 1), backgroundWorkUntil: "2026-10-25T01:20:00.000Z" };
+    expect(waitingOnBackground(active, at(65))).toBe(true);
+    expect(waitingOnBackground(active, at(80))).toBe(false);
+    expect(waitingOnBackground({ ...active, backgroundWork: 0 }, at(65))).toBe(false);
+    expect(waitingOnBackground({ ...active, state: "running" }, at(65))).toBe(false);
+  });
+
   it("holds an idle thread with a PR watch for six hours only", () => {
     expect(PR_WATCH_GRACE_MS).toBe(6 * 60 * 60 * 1000);
     expect(waitingOnBackground(bg("idle", 0, 1), at(359))).toBe(true);
@@ -2407,3 +2420,267 @@ describe("failedTurnResumeDue", () => {
     },
   );
 });
+
+it("#1553 assignment retry gates use the supplied clock and reset on a manual move", () => {
+  const waiting = card({ id: KanbanCardId.make("wake-retry"), stage: "todo", movedAt: iso(1000) });
+  const retries = new Map([
+    [waiting.id, { movedAt: waiting.movedAt, attempts: 1, retryAt: 31_000 }],
+  ]);
+  const plan = (row: KanbanCard, now: number) =>
+    planDispatch(
+      board,
+      [row],
+      pools([[opus, 1]]),
+      new Map(),
+      undefined,
+      now,
+      new Set(),
+      new Map(),
+      new Map(),
+      retries,
+    );
+  expect(plan(waiting, 30_999)).toHaveLength(0);
+  expect(plan(waiting, 31_000)).toHaveLength(1);
+  expect(plan({ ...waiting, movedAt: iso(2000) }, 2000)).toHaveLength(1);
+});
+
+describe("dispatch queue activity", () => {
+  const now = Date.parse("2026-11-15T20:00:00Z");
+  const movedAt = "2026-11-15T09:00:00Z";
+  const one = pools([[opus, 1]]);
+  const status = (
+    cards: ReadonlyArray<KanbanCard>,
+    available = one,
+    holds = new Map<string, string>(),
+  ) => dispatchQueueStatus(board, cards, available, holds, now);
+
+  it("explains #42's lower rank behind todo work and a held work slot", () => {
+    const holder = card({
+      number: 44,
+      priority: 2,
+      stage: "working",
+      activeRole: "work",
+      activePool: poolKey(opus),
+      activeThreadId: ThreadId.make("held"),
+    });
+    const review = card({ number: 42, priority: 4, stage: "needs_review", movedAt });
+    const todo = card({ number: 47, priority: 3, movedAt });
+    expect(status([review, holder, todo])).toMatchObject([
+      {
+        card: 47,
+        reason: "pool_full",
+        pool: poolKey(opus),
+        slots: 1,
+        rank: 1,
+        ahead: { count: 0, items: [] },
+        held: [{ card: 44, role: "work" }],
+        hours: 11,
+      },
+      {
+        card: 42,
+        reason: "pool_full",
+        rank: 2,
+        ahead: { count: 1, items: [47] },
+        held: [{ card: 44, role: "work" }],
+        hours: 11,
+      },
+    ]);
+  });
+
+  it("takes reviews before work at equal rank, consuming simulated room", () => {
+    const todo = card({ priority: 3, movedAt });
+    const review = card({ priority: 3, stage: "needs_review", movedAt });
+    expect(status([todo, review])).toMatchObject([
+      { card: review.number, reason: "would_start", rank: 1 },
+      {
+        card: todo.number,
+        reason: "pool_full",
+        rank: 2,
+        ahead: { count: 1, items: [review.number] },
+      },
+    ]);
+  });
+
+  it("reports blockers only for work and reuses card_wait kinds", () => {
+    const blocker = card({ stage: "working" });
+    const blocked = card({ blockedBy: [blocker.id] });
+    const review = card({ stage: "needs_review", blockedBy: [blocker.id] });
+    const waiting = card({
+      movedAt,
+      wait: newWait(
+        { on: "ci", pr: "https://example.com/pr/1", note: "CI" },
+        { _tag: "owner" },
+        movedAt,
+      ),
+    });
+    expect(status([blocker, blocked, review, waiting])).toMatchObject([
+      { card: blocked.number, reason: "blocked", blockedBy: [blocker.number] },
+      { card: waiting.number, reason: "wait:ci" },
+      { card: review.number, reason: "would_start" },
+    ]);
+  });
+
+  it.each([0, -1])("reports no_pool for a pool with %s slots", (slots) => {
+    expect(status([card()], pools([[opus, slots]]))[0]).toMatchObject({ reason: "no_pool", slots });
+  });
+  it("reports missing pools and held reservations without an active card", () => {
+    expect(status([card()], [])[0]).toMatchObject({
+      reason: "no_pool",
+      slots: 0,
+      pool: poolKey(opus),
+    });
+    expect(status([card()], one, new Map([["reserved", poolKey(opus)]]))[0]).toMatchObject({
+      reason: "pool_full",
+      held: [{ card: null, role: "work" }],
+    });
+  });
+
+  it("joins an already-held work thread and respects MAX_BATCH", () => {
+    const thread = ThreadId.make("batch");
+    const holder = card({
+      stage: "working",
+      activeRole: "work",
+      activeThreadId: thread,
+      workThreadId: thread,
+      activePool: poolKey(opus),
+    });
+    const join = card({ workThreadId: thread });
+    expect(status([holder, join])).toMatchObject([{ card: join.number, reason: "joins_thread" }]);
+    const full = Array.from({ length: MAX_BATCH }, () =>
+      card({ ...holder, id: KanbanCardId.make(`held-${n}`) }),
+    );
+    expect(status([...full, join])[0]?.reason).toBe("batch_full");
+  });
+
+  it("inherits blocking urgency and excludes waiting/stalled/backlog cards", () => {
+    const blocker = card({ priority: 4, movedAt });
+    const urgent = card({ priority: 1, blockedBy: [blocker.id], movedAt });
+    const review = card({ priority: 2, stage: "needs_review", movedAt });
+    const stalled = card({ stalled: { reason: "Stopped", at: movedAt, by: { _tag: "owner" } } });
+    const backlog = card({ priority: 5 });
+    const result = dispatchQueue(board, [review, urgent, blocker, stalled, backlog], now);
+    expect(result.queue.map(({ card }) => card.id)).toEqual([blocker.id, review.id]);
+    expect(result.ineligible.map(({ reason }) => reason)).toEqual([
+      "blocked",
+      "stalled:flagged",
+      "backlog",
+    ]);
+  });
+
+  it("caps cards ahead without losing the count or the stage age", () => {
+    const cards = Array.from({ length: 15 }, () =>
+      card({ movedAt, analyticsStageEnteredAt: "2026-11-15T10:00:00Z" }),
+    );
+    const rows = status(cards, one, new Map([["held", poolKey(opus)]]));
+    expect(rows.at(-1)).toMatchObject({
+      rank: 15,
+      hours: 10,
+      ahead: { count: 14, items: cards.slice(0, 10).map((c) => c.number) },
+    });
+  });
+
+  it("uses the highest-weight free pool and preserves tie selection in dispatch", () => {
+    const multi = card({
+      models: [
+        { model: opus, weight: 90 },
+        { model: haiku, weight: 10 },
+      ],
+    });
+    const available = pools([
+      [opus, 1],
+      [haiku, 1],
+    ]);
+    const held = new Map([["held", poolKey(opus)]]);
+    expect(status([multi], available, held)[0]).toMatchObject({
+      pool: poolKey(haiku),
+      reason: "would_start",
+    });
+    const tied = card({
+      models: [
+        { model: opus, weight: 50 },
+        { model: haiku, weight: 50 },
+      ],
+    });
+    expect(planDispatch(board, [tied], available, new Map(), (n) => n - 1)[0]?.model).toEqual(
+      haiku,
+    );
+  });
+});
+
+it("queue diagnostics preserve exact pool matching even for a stale stored key", () => {
+  const waiting = card({ model: opus });
+  const available = [{ key: poolKey(opus), model: haiku, slots: 1 }];
+  expect(planDispatch(board, [waiting], available)).toEqual([]);
+  expect(dispatchQueueStatus(board, [waiting], available)[0]?.reason).toBe("no_pool");
+});
+
+it("queue exclusions explain board gates, retries, completed reviews and active threads", () => {
+  const now = Date.parse("2026-11-15T20:00:00Z");
+  const movedAt = iso(now - 1000);
+  const task = {
+    id: "s1",
+    step: 1,
+    text: "Do it",
+    state: "open" as const,
+    createdAt: movedAt,
+    note: null,
+    doneBy: null,
+    doneAt: null,
+  };
+  const evaluator = card({ movedAt, subtasks: [{ ...task, owner: "evaluator" }] });
+  const reviewed = card({
+    stage: "needs_review",
+    subtasks: [{ ...task, owner: "review", state: "done" }],
+  });
+  const active = card({ activeThreadId: ThreadId.make("active") });
+  const deciding = card({ movedAt, deciding: { since: movedAt, why: "Wait ended", toldAt: null } });
+  const retry = card({ movedAt });
+  const attempted = card();
+  const result = dispatchQueue(
+    board,
+    [evaluator, reviewed, active, deciding, retry, attempted],
+    now,
+    new Set([attempted.id]),
+    new Map(),
+    new Map([[retry.id, { movedAt, attempts: 1, retryAt: now + 1000 }]]),
+  );
+  expect(result.queue).toEqual([]);
+  expect(result.ineligible.map(({ reason }) => reason)).toEqual([
+    "evaluator_step",
+    "review_done",
+    "has_thread",
+    "deciding",
+    "retry_backoff",
+    "attempted",
+  ]);
+  const pause = { ...board, pause: { keep: [], reason: "Hold", by: "owner", at: movedAt } };
+  expect(dispatchQueue(pause, [retry], now).ineligible[0]?.reason).toBe("paused");
+  expect(
+    dispatchQueue({ ...pause, pause: { ...pause.pause, keep: [retry.id] } }, [retry], now).queue,
+  ).toHaveLength(1);
+  const setup = {
+    ...board,
+    setup: {
+      status: "running" as const,
+      discussionId: KanbanDiscussionId.make("setup"),
+      threadId: ThreadId.make("setup"),
+      startedAt: movedAt,
+      finishedAt: null,
+    },
+  };
+  expect(dispatchQueue(setup, [retry], now).ineligible[0]?.reason).toBe("setup_running");
+});
+
+it.each(["todo", "needs_review"] as const)(
+  "archived boards explain %s without changing legacy plans",
+  (stage) => {
+    const candidate = card({ stage });
+    const archived = { ...board, archivedAt: candidate.movedAt };
+    expect(dispatchQueueStatus(archived, [candidate], pools([[opus, 1]]))).toMatchObject([
+      { card: candidate.number, reason: "archived" },
+    ]);
+    expect(planDispatch(archived, [candidate], pools([[opus, 1]]))).toEqual(
+      planDispatch(board, [candidate], pools([[opus, 1]])),
+    );
+  },
+);

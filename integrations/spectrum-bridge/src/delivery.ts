@@ -1,3 +1,4 @@
+import { flushHealthReceipts, healthFailureTag, rememberHealthReceipt } from "./health-receipts.ts";
 import { cardKind, toolError, toolLog } from "./toollog.ts";
 import { createHash } from "node:crypto";
 import { IMessageError } from "@photon-ai/advanced-imessage/grpc";
@@ -149,6 +150,12 @@ export class Delivery {
   }
 
   private error(code: string, item: OutboxRecord): void {
+    if (item.healthReceipt) {
+      this.store.db.transaction(() => {
+        this.store.set(`health-receipt-error:${item.id}`, healthFailureTag(code));
+        rememberHealthReceipt(this.store, item.id, this.store.getOperation(item.id)?.state ?? "");
+      }).immediate();
+    }
     toolLog.capture(() => toolLog.write({ component: "delivery", kind: "error", name: "reply.failed", ok: false, ids: this.logIds(item.id, item), error: { tag: code, message: "" } }));
     this.lastError = code;
     this.options.log?.("outbound-failed", code);
@@ -189,6 +196,7 @@ export class Delivery {
     }
     let newOptOut = false;
     this.store.db.transaction(() => {
+      if (item.healthReceipt) this.store.set(`health-receipt-error:${item.id}`, healthFailureTag(failure.code));
       const ambiguous = wasAmbiguous || failure.uncertain;
       this.store.set(`sendAmbiguous:${item.id}`, ambiguous);
       const attempts = this.store.getOperation(item.id)!.attempts;
@@ -381,6 +389,7 @@ export class Delivery {
   private async run(): Promise<void> {
     await this.send();
     await this.checkLanded();
+    flushHealthReceipts(this.store);
     await this.housekeeping();
   }
 

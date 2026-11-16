@@ -298,12 +298,23 @@ export interface AskFieldsInput {
 }
 
 export type AskProblem = {
+  readonly reasonClass?: KanbanError["reasonClass"];
+  readonly invalidField?: string;
   readonly code: KanbanError["code"];
   readonly detail: string;
   /** The revision the ask is at, when the answer was refused for giving none or an older one. */
   readonly revision?: number;
 };
-const invalid = (detail: string): AskProblem => ({ code: "invalid", detail });
+const invalid = (
+  detail: string,
+  reasonClass: NonNullable<KanbanError["reasonClass"]> = "other",
+  invalidField?: string,
+): AskProblem => ({
+  code: "invalid",
+  detail,
+  reasonClass,
+  ...(invalidField === undefined ? {} : { invalidField }),
+});
 const isProblem = (value: unknown): value is AskProblem =>
   typeof value === "object" && value !== null && "code" in value && "detail" in value;
 
@@ -371,7 +382,11 @@ const respondTextFields = (
 
 const tooLong = (name: string, value: string, max: number) =>
   value.length > max
-    ? invalid(`${name} is at most ${max} characters (got ${value.length})`)
+    ? invalid(
+        `${name} is at most ${max} characters (got ${value.length})`,
+        "too_long",
+        /^[A-Za-z_][A-Za-z0-9_]{0,79}$/.test(name) ? name : undefined,
+      )
     : undefined;
 
 /** A trimmed optional line: absent when empty. */
@@ -954,7 +969,11 @@ export const askFields = (
 ): AskFields | AskProblem => {
   const named = input.kind?.trim();
   if (named !== undefined && named.length > ASK_LIMITS.kind) {
-    return invalid(`kind is a short label, at most ${ASK_LIMITS.kind} characters`);
+    return invalid(
+      `kind is a short label, at most ${ASK_LIMITS.kind} characters`,
+      "too_long",
+      "kind",
+    );
   }
   const kind = named || inferKind(input);
   const rawChanges = changesOf(input);
@@ -982,7 +1001,11 @@ export const askFields = (
   if (isProblem(batchKey)) return batchKey;
   const to = input.to?.trim() || "owner";
   if (to !== "owner" && to !== "evaluator") {
-    return invalid(`an ask goes to "owner" (the default) or "evaluator" (got "${to}")`);
+    return invalid(
+      `an ask goes to "owner" (the default) or "evaluator" (got "${to}")`,
+      "bad_enum",
+      "to",
+    );
   }
 
   const blocks = input.blocks ?? [];
@@ -994,7 +1017,8 @@ export const askFields = (
   let expiresAt: string | undefined;
   if (input.expiresAt !== undefined && input.expiresAt.trim() !== "") {
     const time = DateTime.make(input.expiresAt);
-    if (Option.isNone(time)) return invalid("expiresAt is not a time (use ISO 8601)");
+    if (Option.isNone(time))
+      return invalid("expiresAt is not a time (use ISO 8601)", "bad_time", "expiresAt");
     expiresAt = DateTime.formatIso(time.value);
   }
 
@@ -1002,7 +1026,11 @@ export const askFields = (
   const raw =
     kind === "rank" && givenFields(input.respond).length === 0 ? [] : (input.options ?? []);
   if (raw.length > ASK_LIMITS.options) {
-    return invalid(`an ask takes at most ${ASK_LIMITS.options} options (got ${raw.length})`);
+    return invalid(
+      `an ask takes at most ${ASK_LIMITS.options} options (got ${raw.length})`,
+      "too_many",
+      "options",
+    );
   }
   const options: Array<KanbanAskOption> = [];
   for (const entry of raw) {

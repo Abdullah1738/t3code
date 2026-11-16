@@ -601,7 +601,7 @@ it.effect.each(
         command === "command:mcp:delegate-task:environment:caller:retry" ||
         (command.startsWith("command:mcp:old") &&
           (testCase.state === "never_saved" || testCase.state === "pending"))
-          ? "No delegated task has this id. Check the id; copy it exactly from delegate_task."
+          ? "No delegated task has this id. Expected the taskId returned by delegate_task."
           : testCase.message,
     })),
   ),

@@ -1,7 +1,7 @@
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import * as C from '../lib/coord.mjs';
-import { deliver, pump, HEAL } from '../lib/pump.mjs';
+import { deliver, pump, HEAL, queueApi } from '../lib/pump.mjs';
 import { fresh, advance, stubControl, resetHooks } from './helpers.mjs';
 
 let stub;
@@ -20,6 +20,28 @@ afterEach(async () => { await stub.close(); C.close(); });
 const post = (key, to = 'master') => C.post('ops', { as: 'crw', kind: 'status', key, summary: key, to: [to] }).seq;
 const run = (o = {}) => deliver({ cfg: stub.cfg, queue: stub.queue, ...o });
 const status = (seq, as = 'master') => C.inbox({ as }).events.find(e => e.seq === seq).delivery;
+
+test('the real queue transport stamps coordination supersession', async (t) => {
+  const sent = [];
+  const original = globalThis.WebSocket;
+  t.after(() => { globalThis.WebSocket = original; });
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ ticket: 'fixture' }));
+  globalThis.WebSocket = class {
+    constructor() { queueMicrotask(() => this.onopen()); }
+    send(raw) {
+      const request = JSON.parse(raw);
+      sent.push(request);
+      queueMicrotask(() => this.onmessage({ data: JSON.stringify({ _tag: 'Exit', requestId: request.id, exit: { _tag: 'Success', value: {} } }) }));
+    }
+    close() {}
+  };
+  await queueApi.cancel({ url: 'http://fixture', token: 'fixture' }, 'thread', 'run');
+  assert.equal(sent[0].tag, 'orchestration.dispatchCommand');
+  assert.deepEqual(sent[0].payload, {
+    type: 'queued-run.cancel', commandId: `coord:supersede:run:${C.clock.now()}`,
+    threadId: 'thread', runId: 'run', reason: 'superseded', detail: 'Coordination wake superseded.',
+  });
+});
 
 // Rings `key` for master while the thread is running, so the wake stays queued; then a restart holds it.
 async function heldWake(key) {

@@ -94,7 +94,9 @@ class WorkerTests(JanitorTestCase):
 
     def test_worker_keeps_liveness_and_report_only_findings_in_audit(self):
         processes = {"candidates": [{"pid": 42}], "problems": ["control api timed out"],
-                     "checked": 8, "skipped": 1, "budget_skipped": 2}
+                     "checked": 8, "skipped": 1, "budget_skipped": 2,
+                     "owner_calls": {"by_native": {"count": 3, "p50_ms": 10, "p95_ms": 20,
+                                                   "max_ms": 20, "failures": {"404": 1}}}}
         report = {"ts": 123, "resources": [], "candidates": [], "processes": processes,
                   "liveness_unavailable": "control api projects: timed out"}
         with (self.state_dir / "lock").open("a+") as lock, \
@@ -103,6 +105,7 @@ class WorkerTests(JanitorTestCase):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(janitor_watch.worker(lock.fileno()), 0)
         self.assertEqual(out.getvalue(), "")
+        self.assertEqual(janitor_watch.read_state()['processes'], processes)
         entry = json.loads((self.root / "audit.jsonl").read_text())
         self.assertEqual(entry, {"ts": 123, "event": "report", "processes": processes,
                                  "liveness_unavailable": report["liveness_unavailable"]})

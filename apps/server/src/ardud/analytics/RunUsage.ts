@@ -22,7 +22,7 @@ type Attribution = {
 export interface RunUsageInput {
   readonly run: Pick<
     OrchestrationV2Run,
-    "id" | "threadId" | "startedAt" | "providerInstanceId" | "delegatedTaskId"
+    "id" | "threadId" | "startedAt" | "providerInstanceId" | "delegatedTaskId" | "cancelReason"
   >;
   readonly attempt: Pick<OrchestrationV2RunAttempt, "id">;
   readonly appThread: Pick<OrchestrationV2AppThread, "lineage">;
@@ -32,6 +32,7 @@ export interface RunUsageInput {
 export const makeRunUsageState = () => ({
   turns: new Map<string, OrchestrationV2ProviderTurn>(),
   finished: false,
+  cancelReason: undefined as OrchestrationV2Run["cancelReason"],
   attribution: undefined as Effect.Effect<Attribution> | undefined,
   model: undefined as string | undefined,
   mixedModels: false,
@@ -45,6 +46,10 @@ export const makeRunUsageObserver = Effect.fn("RunUsage.observeRun")(function* (
   if (state.startedAt === undefined) state.startedAt = input.run.startedAt;
   const analytics = yield* Effect.serviceOption(Analytics.Analytics);
   const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
+  if (Option.isSome(kanban) && input.appThread.lineage?.relationshipToParent === "subagent") {
+    const parent = input.appThread.lineage.parentThreadId ?? input.appThread.lineage.rootThreadId;
+    kanban.value.registerCallerParent?.(input.run.threadId, parent);
+  }
   // Snapshot attribution before a worker hands its card off or a review round advances.
   const attribution: Effect.Effect<Attribution> =
     state.attribution ??
@@ -135,6 +140,14 @@ export const makeRunUsageObserver = Effect.fn("RunUsage.observeRun")(function* (
       // Provider turns, including retry attempts, rather than inferred model response counts.
       turnCount: turns.length,
       endReason: status,
+      ...(status === "cancelled" || status === "interrupted"
+        ? {
+            cancelReason:
+              state.cancelReason ??
+              input.run.cancelReason ??
+              (status === "cancelled" ? "provider_cancelled" : "provider_interrupted"),
+          }
+        : {}),
       usageStatus:
         usage.length > 0 && usage.every((row) => row?.usageStatus === "complete")
           ? "complete"
