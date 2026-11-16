@@ -194,6 +194,41 @@ describe("backgroundWorkOf", () => {
   });
 });
 
+it.effect.each([
+  { type: "run_interrupt_request", status: "completed", time: "before", expected: false },
+  { type: "run_interrupt_request", status: "completed", time: "after", expected: true },
+  { type: "command_execution", status: "interrupted", time: "after", expected: true },
+  { type: "dynamic_tool", status: "cancelled", time: "after", expected: true },
+  { type: "subagent", status: "cancelled", time: "after", expected: true },
+  { type: "command_execution", status: "completed", time: "after", expected: false },
+  { type: "command_execution", status: "failed", time: "after", expected: false },
+] as const)("background recovery respects $type $status $time the worker stopped", (row) => {
+  const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadRecords: (_, __, filter) =>
+      Effect.succeed({
+        turnItems:
+          filter?.turnItemTypes?.includes(row.type) &&
+          (filter.turnItemStatuses === undefined || filter.turnItemStatuses.includes(row.status))
+            ? [{ updatedAt: at(row.time === "before" ? QUESTION_AT : SHARED_UPDATED) }]
+            : [],
+      } as never),
+  });
+  return Effect.gen(function* () {
+    const threads = yield* KanbanThreads;
+    expect(
+      yield* threads.backgroundStoppedSince(ThreadId.make("stopped-background"), FINISHED_AT),
+    ).toBe(row.expected);
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(management),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provide(Sqlite.layerMemory),
+      ),
+    ),
+  );
+});
+
 describe("prWatchesOf", () => {
   const watchedPr = (overrides: Partial<ThreadPullRequestLink> = {}): ThreadPullRequestLink => ({
     host: "github.com",

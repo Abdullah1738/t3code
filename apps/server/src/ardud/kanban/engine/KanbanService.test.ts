@@ -146,6 +146,8 @@ interface FakeThread {
   stuck?: boolean;
   quietSince?: string;
   background?: number;
+  backgroundJobs?: KanbanThreadView["backgroundJobs"];
+  backgroundStopped?: boolean;
   prWatches?: number;
   archived: boolean;
 }
@@ -253,6 +255,7 @@ const makeFake = Effect.gen(function* () {
             runId: thread.runId ?? null,
             runRequestedAt: thread.runRequestedAt ?? null,
             backgroundWork: thread.background ?? 0,
+            backgroundJobs: thread.backgroundJobs,
             prWatches: thread.prWatches ?? 0,
             prs: prs.get(threadId) ?? [],
             archived: thread.archived,
@@ -277,6 +280,8 @@ const makeFake = Effect.gen(function* () {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      backgroundStoppedSince: (threadId) =>
+        Ref.get(threads).pipe(Effect.map((all) => all.get(threadId)?.backgroundStopped ?? false)),
       pendingUserInputs: (threadId) =>
         Effect.suspend(() =>
           failQuestionReads.has(threadId)
@@ -43473,4 +43478,139 @@ it.effect.each(
         assert.strictEqual((yield* Ref.get(fake.threads)).size, 2);
       }).pipe(Effect.provide(evaluatorAnalyticsLayer(fake.layer, events)));
     }),
+);
+
+it.effect.each([
+  "missing wake",
+  "provider running",
+  "provider finished",
+  "flagged",
+  "sibling wait",
+  "sibling ask",
+  "sibling pause",
+  "stopped",
+  "retired",
+] as const)("background completion backstop: %s", (mode) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-16T00:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(
+        board.id,
+        { prompt: "build", title: "build" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const threadId = (yield* kanban.card(created.id)).card.activeThreadId!;
+      const job = {
+        taskId: "exec-background-build",
+        description: "sleep 60 && echo X",
+        kind: "command" as const,
+      };
+      yield* Ref.update(fake.threads, (all) => {
+        const thread = all.get(threadId)!;
+        thread.quietSince = "2026-11-16T00:00:00.000Z";
+        thread.background = 1;
+        thread.backgroundJobs = [job];
+        return all;
+      });
+      yield* kanban.turnEnded(threadId);
+      assert.equal(yield* nudgesTo(fake, threadId), 0);
+      if (mode.startsWith("sibling")) {
+        const store = yield* KanbanStore.KanbanStore;
+        const current = (yield* kanban.card(created.id)).card;
+        yield* store.putCard({
+          ...current,
+          id: KanbanCardId.make("background-held-sibling"),
+          number: 200,
+          ...(mode === "sibling wait"
+            ? {
+                wait: yield* decodeWait({
+                  on: "time",
+                  until: "2026-11-17T00:00:00.000Z",
+                  at: current.movedAt,
+                  by: owner,
+                  note: "External dependency",
+                  wakeRole: "work",
+                }),
+              }
+            : {}),
+          ...(mode === "sibling ask"
+            ? {
+                asks: [
+                  {
+                    id: "background-sibling-ask",
+                    text: "Decision",
+                    blocking: true,
+                    by: owner,
+                    at: current.movedAt,
+                    closedAt: null,
+                    seq: null,
+                  },
+                ],
+              }
+            : {}),
+        });
+        if (mode === "sibling pause")
+          yield* store.putBoard({
+            ...board,
+            pause: {
+              reason: "Hold sibling",
+              at: current.movedAt,
+              by: "owner",
+              keep: [created.id],
+            },
+          });
+      }
+      if (mode === "flagged")
+        yield* kanban.flagCard(created.id, "Waiting on the background build", {
+          _tag: "thread",
+          threadId,
+        });
+      if (mode === "retired") {
+        const store = yield* KanbanStore.KanbanStore;
+        const current = (yield* kanban.card(created.id)).card;
+        yield* store.putCard({
+          ...current,
+          stage: "needs_review",
+          activeThreadId: null,
+          activeRole: null,
+        });
+        yield* kanban.tick;
+        yield* store.putCard(current);
+      }
+      yield* TestClock.adjust("60 seconds");
+      yield* Ref.update(fake.threads, (all) => {
+        const thread = all.get(threadId)!;
+        thread.background = 0;
+        thread.backgroundJobs = [];
+        thread.backgroundStopped = mode === "stopped";
+        return all;
+      });
+      yield* kanban.tick;
+      const wakes = () => fake.sends.filter((send) => send.key?.startsWith("background-command:"));
+      assert.lengthOf(wakes(), 0);
+      if (mode === "missing wake") {
+        yield* kanban.turnEnded(threadId);
+        assert.equal(yield* nudgesTo(fake, threadId), 0);
+      }
+      if (mode === "provider running") yield* setRunning(fake, threadId, true);
+      if (mode === "provider finished")
+        yield* Ref.update(fake.threads, (all) => {
+          all.get(threadId)!.quietSince = "2026-11-16T00:01:01.000Z";
+          return all;
+        });
+      yield* TestClock.adjust("119 seconds");
+      yield* kanban.tick;
+      assert.lengthOf(wakes(), 0);
+      yield* TestClock.adjust("1 second");
+      yield* kanban.tick;
+      const expected = mode === "missing wake" || mode === "flagged" ? 1 : 0;
+      assert.lengthOf(wakes(), expected);
+      if (expected) assert.equal(wakes()[0]?.text, "Background work finished: sleep 60 && echo X");
+      yield* kanban.tick;
+      assert.lengthOf(wakes(), expected);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );

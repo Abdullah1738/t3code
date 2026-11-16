@@ -275,6 +275,7 @@ const makeWorld = (
         Effect.sync(() =>
           statuses.has(id) ? { runId: "run-1", status: statuses.get(id)!, message: null } : null,
         ),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
