@@ -853,6 +853,7 @@ export function dispatchQueueStatus(
   reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
   workThreadHomes: ReadonlyMap<string, KanbanCard | null> = new Map(),
   assignmentWakeRetries: ReadonlyMap<string, AssignmentWakeRetry> = new Map(),
+  attempted: ReadonlySet<string> = new Set(),
 ): ReadonlyArray<QueuedCard> {
   // Archiving is gated outside planDispatch; leave its legacy planning behavior intact.
   if (board.archivedAt !== null) {
@@ -875,7 +876,7 @@ export function dispatchQueueStatus(
     holds,
     () => 0,
     nowMs,
-    new Set(),
+    attempted,
     reviews,
     workThreadHomes,
     assignmentWakeRetries,

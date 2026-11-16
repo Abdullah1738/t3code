@@ -2541,6 +2541,75 @@ describe("dispatch queue activity", () => {
     ]);
   });
 
+  it("#1755 excludes attempted reviews from simulated starts", () => {
+    const first = card({ stage: "needs_review" });
+    const second = card({ stage: "needs_review" });
+    const next = card({ priority: 3, stage: "needs_review" });
+    expect(
+      dispatchQueueStatus(
+        board,
+        [first, second, next],
+        one,
+        new Map(),
+        now,
+        new Map(),
+        new Map(),
+        new Map(),
+        new Set([first.id, second.id]),
+      ),
+    ).toMatchObject([
+      { card: first.number, reason: "attempted" },
+      { card: second.number, reason: "attempted" },
+      { card: next.number, reason: "would_start" },
+    ]);
+  });
+
+  it("#1755 keeps attempted cards as dependency blockers", () => {
+    const blocker = card();
+    const dependent = card({ blockedBy: [blocker.id] });
+    expect(
+      dispatchQueueStatus(
+        board,
+        [blocker, dependent],
+        one,
+        new Map(),
+        now,
+        new Map(),
+        new Map(),
+        new Map(),
+        new Set([blocker.id]),
+      ),
+    ).toMatchObject([
+      { card: blocker.number, reason: "attempted" },
+      { card: dependent.number, reason: "blocked", blockedBy: [blocker.number] },
+    ]);
+  });
+
+  it("#1755 retains slots held by attempted cards", () => {
+    const holder = card({
+      activeRole: "work",
+      activePool: poolKey(opus),
+      activeThreadId: ThreadId.make("attempted-holder"),
+    });
+    const next = card({ priority: 3 });
+    expect(
+      dispatchQueueStatus(
+        board,
+        [holder, next],
+        one,
+        new Map(),
+        now,
+        new Map(),
+        new Map(),
+        new Map(),
+        new Set([holder.id]),
+      ),
+    ).toMatchObject([
+      { card: holder.number, reason: "attempted" },
+      { card: next.number, reason: "pool_full", held: [{ card: holder.number, role: "work" }] },
+    ]);
+  });
+
   it("reports blockers only for work and reuses card_wait kinds", () => {
     const blocker = card({ stage: "working" });
     const blocked = card({ blockedBy: [blocker.id] });
