@@ -1,4 +1,6 @@
-"""Shared phone claims. Priority holds never expire by age; expired leases are free.
+"""Shared phone claims. Holds free themselves after holder exit or 30m without refresh.
+
+Holders refresh automatically on every ph call; expired leases are free.
 
 Lease holders refresh their TTL so a crashed background job cannot wedge the phone.
 The metadata flock serializes compare/replace/unlink, not device operations.
@@ -7,6 +9,9 @@ import contextlib
 import datetime as dt
 import fcntl
 import json
+import hashlib
+import subprocess
+import stat
 import os
 from pathlib import Path
 import re
@@ -19,6 +24,7 @@ LEASE = LOCK_DIR / 'lease.json'
 HOLD_REASON = 'owner request holds the phone; if it is yours, export PHONE_HOLD_OWNER=<your exact hold token>'
 DEFAULT_TTL = 20 * 60
 MAX_TTL = 120 * 60
+HOLD_STALE_AFTER = 30 * 60
 event_hook = lambda kind: None
 
 
@@ -47,15 +53,215 @@ def ttl_seconds(ttl):
     return float(ttl)
 
 
-def hold_state():
+def hold_stale_after():
+    value = os.environ.get('PH_HOLD_STALE_AFTER', str(HOLD_STALE_AFTER))
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)([smh]?)', value)
+    if not match:
+        raise ValueError('invalid hold staleness')
+    seconds = float(match[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600}[match[2]]
+    if not 0 < seconds < float('inf'):
+        raise ValueError('invalid hold staleness')
+    return seconds
+
+
+def token_sha(token):
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def process_started(pid):
     try:
-        held = HOLD.read_text().strip()
-        return True, bool(held) and os.environ.get('PHONE_HOLD_OWNER') == held
-    except FileNotFoundError:
-        return os.path.lexists(HOLD), False
+        result = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)],
+                                capture_output=True, text=True, timeout=1)
+        if result.returncode == 1 and not result.stdout.strip():
+            return False
+        return result.stdout.rstrip('\n') if result.returncode == 0 and result.stdout.strip() else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def holder_metadata(token):
+    # Import lazily so Jev shares ph's executable-name-only ancestor walk too.
+    from ph import caller_chain
+    agent = next((row for row in caller_chain() if row['comm'] in ('claude', 'codex', 'opencode')), {})
+    pid = agent.get('pid') if agent.get('comm') in ('claude', 'codex') else None
+    started = process_started(pid) if pid else None
+    return dict(token_sha=token_sha(token), agent_pid=pid if started else None,
+                agent_comm=agent.get('comm'), agent_started=started or None, recorded_at=now().isoformat())
+
+
+def read_holder(token):
+    try:
+        owner = json.loads(HOLD.with_name('priority-hold.owner.json').read_text())
+        if isinstance(owner, dict) and owner.get('token_sha') == token_sha(token):
+            return owner
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return {}
+
+
+def write_holder(token):
+    path = write_temp(holder_metadata(token))
+    try:
+        os.replace(path, HOLD.with_name('priority-hold.owner.json'))
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def remove_holder(token):
+    if read_holder(token):
+        HOLD.with_name('priority-hold.owner.json').unlink(missing_ok=True)
+
+
+def hold_snapshot(path=None):
+    path = HOLD if path is None else path
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError('hold is not a regular file')
+    contents = path.read_text()
+    after = path.lstat()
+    if (before.st_ino, before.st_mtime_ns) != (after.st_ino, after.st_mtime_ns):
+        raise OSError('hold changed')
+    return after, contents
+
+
+def same_hold(left, right):
+    return (left[0].st_ino, left[0].st_mtime_ns, left[1]) == (right[0].st_ino, right[0].st_mtime_ns, right[1])
+
+
+def archive_hold(snapshot):
+    name = 'priority-hold.stale-' + now().strftime('%Y%m%dT%H%M%SZ') + '-' + str(os.getpid())
+    archived = LOCK_DIR / name
+    # Several stale holds can be swept by one process in the same second.
+    if os.path.lexists(archived):
+        archived = LOCK_DIR / (name + '-' + uuid.uuid4().hex)
+    os.rename(HOLD, archived)
+    try:
+        unchanged = same_hold(snapshot, hold_snapshot(archived))
     except (OSError, UnicodeError):
-        # A disappeared hold is free; unreadable or partially written holds are busy.
-        return os.path.lexists(HOLD), False
+        unchanged = False
+    if not unchanged:
+        try:
+            os.link(archived, HOLD)
+        except FileExistsError:
+            pass
+        else:
+            archived.unlink()
+        return False
+    remove_holder(snapshot[1].strip())
+    return True
+
+
+def _hold_status(*, refresh_own=True):
+    state = dict(present=False, own_hold=False, age_s=None, stale_in_s=None,
+                 holder_alive=None, agent_comm=None)
+    try:
+        snapshot = hold_snapshot()
+        held = snapshot[1].strip()
+        state['present'] = True
+        if not held:
+            return state
+        age = max(0, now().timestamp() - snapshot[0].st_mtime)
+        stale_after = hold_stale_after()
+        state.update(age_s=age, stale_in_s=max(0, stale_after-age))
+        owner = read_holder(held)
+        comm = owner.get('agent_comm')
+        state['agent_comm'] = comm if comm in ('claude', 'codex', 'opencode') else None
+        pid, started = owner.get('agent_pid'), owner.get('agent_started')
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(started, str) and started:
+            current = process_started(pid)
+            state['holder_alive'] = None if current is None else current == started
+        reason = ('holder_exited' if state['holder_alive'] is False else
+                  'not_refreshed' if age > stale_after else None)
+        if reason:
+            if archive_hold(snapshot):
+                hold_archive_event(reason, age, state['agent_comm'], token_sha(held))
+                state.update(present=os.path.lexists(HOLD), archived=reason)
+            # A replaced or refreshed hold is busy even when we restored it.
+            return state
+        state['own_hold'] = os.environ.get('PHONE_HOLD_OWNER') == held
+        if state['own_hold'] and refresh_own:
+            if not same_hold(snapshot, hold_snapshot()):
+                state['own_hold'] = False
+                return state
+            if not owner:
+                write_holder(held)
+            if age >= 60:
+                # Touch the opened inode, never a successor at the same pathname.
+                with HOLD.open() as handle:
+                    if same_hold(snapshot, (os.fstat(handle.fileno()), handle.read())):
+                        os.utime(handle.fileno(), None)
+                        state.update(age_s=0, stale_in_s=stale_after)
+    except (OSError, UnicodeError):
+        state.update(present=os.path.lexists(HOLD), own_hold=False)
+    return state
+
+
+def hold_archive_event(reason, age_s, agent_comm, digest):
+    from ph import event, caller_chain
+    event('hold_archived', device=False, reason=reason, age_s=age_s,
+          agent_comm=agent_comm, token_sha=digest, caller_chain=caller_chain())
+
+
+def hold_status():
+    with metadata_lock():
+        return _hold_status()
+
+
+def hold_state():
+    state = hold_status()
+    return state['present'], state['own_hold']
+
+
+def hold_acquire(token):
+    if not token or token != token.strip():
+        raise ValueError('hold token must be nonempty without surrounding whitespace')
+    with metadata_lock():
+        if _hold_status()['present']:
+            raise Busy(HOLD_REASON)
+        fd, name = tempfile.mkstemp(prefix='.hold-', dir=LOCK_DIR)
+        path = Path(name)
+        try:
+            with os.fdopen(fd, 'w') as out:
+                out.write(token)
+                out.flush()
+                os.fsync(out.fileno())
+            try:
+                os.link(path, HOLD)
+            except FileExistsError:
+                raise Busy(HOLD_REASON) from None
+            write_holder(token)
+        finally:
+            path.unlink(missing_ok=True)
+
+
+def hold_refresh():
+    with metadata_lock():
+        state = _hold_status()
+        if not state['own_hold']:
+            raise Busy('hold is not yours')
+        snapshot = hold_snapshot()
+        with HOLD.open() as handle:
+            if not same_hold(snapshot, (os.fstat(handle.fileno()), handle.read())) or snapshot[1].strip() != os.environ.get('PHONE_HOLD_OWNER'):
+                raise Busy('hold changed; yield')
+            os.utime(handle.fileno(), None)
+
+
+def hold_release():
+    with metadata_lock():
+        try:
+            snapshot = hold_snapshot()
+        except FileNotFoundError:
+            return
+        token = os.environ.get('PHONE_HOLD_OWNER')
+        if not token or snapshot[1].strip() != token:
+            raise Busy('hold is not yours')
+        if not same_hold(snapshot, hold_snapshot()):
+            raise Busy('hold changed; yield')
+        HOLD.unlink()
+        remove_holder(token)
+        # A successor can take over immediately; never remove it during readback.
+        if os.path.lexists(HOLD):
+            hold_snapshot()
 
 
 @contextlib.contextmanager
@@ -134,7 +340,7 @@ def acquire(owner, purpose, ttl=DEFAULT_TTL, *, exclusive=False):
     purpose = safe_purpose(purpose)
     expired = False
     with metadata_lock():
-        if hold_state()[0]:
+        if _hold_status()['present']:
             raise Busy(HOLD_REASON)
         old, raw = read_lease()
         if live(old) and (exclusive or old['owner'] != owner):
@@ -164,7 +370,8 @@ def acquire(owner, purpose, ttl=DEFAULT_TTL, *, exclusive=False):
 def refresh(owner, *, lease_id=None):
     owner_token(owner)
     with metadata_lock():
-        present, own = hold_state()
+        state = _hold_status()
+        present, own = state['present'], state['own_hold']
         if present and not own:
             raise Busy(HOLD_REASON)
         lease, raw = read_lease()
@@ -191,12 +398,14 @@ def release(owner, *, lease_id=None):
 
 
 def status():
-    present, own_hold = hold_state()
+    hold = hold_status()
+    present, own_hold = hold['present'], hold['own_hold']
     with metadata_lock():
         lease, _ = read_lease()
     seconds = max(0, (dt.datetime.fromisoformat(lease['expires_at']) - now()).total_seconds()) if lease else 0
     own = bool(lease and lease['owner'] in (os.environ.get('PH_LEASE_OWNER'), os.environ.get('PHONE_HOLD_OWNER')))
     return dict(hold_present=present, own_hold=own_hold, lease=lease, seconds_left=seconds,
+                **({'archived': hold['archived']} if 'archived' in hold else {}),
                 lease_owner=lease['owner'] if lease else 'none',
                 lease_state=('own' if own else 'foreign') if seconds else 'none')
 

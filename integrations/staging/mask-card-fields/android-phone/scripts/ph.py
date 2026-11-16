@@ -370,6 +370,7 @@ sh CMD...                  raw adb shell (treated as an action; never auto-repea
 log [n]                    last n events (default 20), counts by event/source over 7 days
 note-drop --source NAME --cmd VERB --exc TYPE [--msg TEXT] [--phase read|action]
                            log a direct-u2 drop without connecting or resetting u2
+hold acquire --token T | hold refresh|release | hold status [--json]
 lease acquire|run --owner T --purpose P [--ttl 20m] [-- CMD...]
 lease refresh|release --owner T | lease status [--json]
 Exit codes: 0 success, 1 not found/timeout, 2 usage, 3 failed twice, 4 MAYBE_SENT (check ph ui before repeating), 5 PHONE_BUSY (yield)
@@ -497,6 +498,39 @@ def guard_phone(action):
         raise PhoneBusy()
 
 
+class HoldParser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse otherwise echoes arbitrary arguments, including the hold token.
+        raise ValueError('invalid hold request')
+
+
+def hold_cli(args):
+    parser = HoldParser(prog="ph hold")
+    subs = parser.add_subparsers(dest="command", required=True)
+    for name in ("acquire", "refresh", "release", "status"):
+        sub = subs.add_parser(name)
+        if name == "acquire": sub.add_argument("--token", required=True)
+        if name == "status": sub.add_argument("--json", action="store_true")
+    try:
+        opts = parser.parse_args(args)
+        if opts.command == "acquire": phonelock.hold_acquire(opts.token)
+        elif opts.command == "refresh": phonelock.hold_refresh()
+        elif opts.command == "release": phonelock.hold_release()
+        else:
+            state = phonelock.hold_status()
+            state.pop("own_hold")
+            print(json.dumps(state) if opts.json else " ".join(f"{k}={v}" for k, v in state.items()))
+        return 0
+    except phonelock.Busy as exc:
+        refuse(str(exc))
+        return 5
+    except (ValueError, OSError, UnicodeError):
+        print("hold: invalid request or unavailable metadata")
+        return 2
+    except SystemExit as exc:
+        return exc.code
+
+
 def lease_cli(args):
     parser = argparse.ArgumentParser(prog="ph lease")
     subs = parser.add_subparsers(dest="command", required=True)
@@ -521,7 +555,9 @@ def lease_cli(args):
             state.pop("own_hold")
             print(json.dumps(state) if opts.json else
                   f"hold_present={state['hold_present']} lease={state['lease']} seconds_left={state['seconds_left']:.0f}")
-        elif opts.command == "release": phonelock.release(opts.owner)
+        elif opts.command == "release":
+            phonelock.hold_state()
+            phonelock.release(opts.owner)
         elif opts.command == "refresh": phonelock.refresh(opts.owner)
         elif opts.command == "acquire": phonelock.acquire(opts.owner, opts.purpose, opts.ttl)
         else:
@@ -659,9 +695,12 @@ def run(argv):
                             [base64.b64encode(v.encode()).decode() for v in values])
     maintain_logs()
     # These local diagnostics have their own bounded adb calls and must never reset u2.
+    if cmd == "hold":
+        return hold_cli(argv[1:])
     if cmd == "lease":
         return lease_cli(argv[1:])
     if cmd in ("log", "note-drop", "help") or argv[0] == "-h":
+        phonelock.hold_state()
         main(argv)
         return 0
     previous = signal.signal(signal.SIGALRM, _alarm)
