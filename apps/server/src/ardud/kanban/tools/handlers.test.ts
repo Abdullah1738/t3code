@@ -5552,6 +5552,54 @@ const ownedWaitFixture = Effect.gen(function* () {
   return { ...fixture, owned, worker: owned.workThreadId! };
 });
 
+it.effect.each(["ci", "push", "merge", "owner_go"] as const)(
+  "a Working worker cannot self-park on %s",
+  (on) => {
+    const fake = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, store, owned, worker, card } = yield* ownedWaitFixture;
+      fake.running.add(worker);
+      yield* store.putCard({ ...owned, links: card.links });
+      const result = yield* call(worker, "card_wait", {
+        on,
+        pr: card.links[0]!.url,
+        head: "abcdef123",
+        ask: "q1",
+        note: "hold",
+      });
+      assert.isTrue(result.isError, result.text);
+      assert.include(result.text, on === "owner_go" ? "card_ask" : "watch_pull_request");
+      assert.isUndefined((yield* kanban.card(owned.id)).card.wait);
+    }).pipe(Effect.provide(fake.layer));
+  },
+);
+
+it.effect.each(["time", "card", "script"] as const)(
+  "a Working worker sets and clears its own %s wait through MCP",
+  (on) => {
+    const fake = fakeThreads();
+    return Effect.gen(function* () {
+      const { kanban, store, board, owned, worker, card } = yield* ownedWaitFixture;
+      fake.running.add(worker);
+      if (on === "script") yield* store.putScript(boardScript(board.id, "offbox-results"));
+      const set = yield* call(worker, "card_wait", {
+        on,
+        until: "1970-01-02T00:00:00.000Z",
+        waitsOn: card.id,
+        ...(on === "script" ? { script: "offbox-results" } : {}),
+        note: "offbox results",
+      });
+      assert.isFalse(set.isError, set.text);
+      const pending = (yield* kanban.card(owned.id)).card;
+      assert.strictEqual(pending.wait?.on, on);
+      assert.strictEqual(pending.activeThreadId, worker);
+      const cleared = yield* call(worker, "card_wait", { clear: true });
+      assert.isFalse(cleared.isError, cleared.text);
+      assert.isUndefined((yield* store.card(owned.id))?.wait);
+    }).pipe(Effect.provide(fake.layer));
+  },
+);
+
 it.effect("a worker's deferred wait is parked under turn admission", () => {
   const fake = fakeThreads();
   return Effect.gen(function* () {

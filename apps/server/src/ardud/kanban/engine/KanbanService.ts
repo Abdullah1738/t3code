@@ -11058,9 +11058,7 @@ const make = Effect.gen(function* () {
     return;
   });
 
-  const turnEndCard = Effect.fn("KanbanService.turnEndCard")(function* (
-    id: KanbanCard["id"],
-  ) {
+  const turnEndCard = Effect.fn("KanbanService.turnEndCard")(function* (id: KanbanCard["id"]) {
     // Reader admission can take minutes. The enclosing operation revalidates
     // its board generation before using this snapshot after reacquiring the gate.
     return yield* locks.outside(rawStore.card(id), undefined, true);
@@ -17247,6 +17245,21 @@ const make = Effect.gen(function* () {
               (card.stalled !== null ? ` (replaces the stalled flag: ${card.stalled.reason})` : ""),
           });
           yield* saveCard(next);
+          if (check.deferredUntilTurnEnds && actor._tag === "thread")
+            yield* recordAnalytics({
+              kind: "wait_set",
+              boardId: card.boardId,
+              cardId: card.id,
+              threadId: actor.threadId,
+              callerRole: "work",
+              props: {
+                on: wait.on,
+                ...(wait.until === null
+                  ? {}
+                  : { until: DateTime.formatIso(DateTime.makeUnsafe(wait.until)) }),
+                ...(wait.script === null ? {} : { script: BoardAnalytics.label(wait.script) }),
+              },
+            });
         });
         // The board gate alone cannot order this write against new turns.
         yield* card.activeThreadId === null
@@ -18002,9 +18015,7 @@ const make = Effect.gen(function* () {
             const next: KanbanCard = {
               // A verdict is a review that ended normally: its retry record goes.
               ...Retries.withoutRetries(
-                release(
-                  yield* moveWait(card, to, at, { _tag: "thread", threadId }, prCompletion),
-                ),
+                release(yield* moveWait(card, to, at, { _tag: "thread", threadId }, prCompletion)),
               ),
               // The dispatcher's no-verdict flag is answered by the verdict; a
               // reviewer's own flag stays for the evaluator.
@@ -18225,10 +18236,14 @@ const make = Effect.gen(function* () {
             Effect.succeed(true),
           );
           const current = yield* cardOf(cardId);
-          // A detached steer can start a run; its old holds must not hide that run.
+          // A worker owns its explicit wait even when another signal starts a run.
           let next = current;
           if (current.activeThreadId === null && current.workThreadId === threadId) {
-            if (card.wait !== undefined && NodeUtil.isDeepStrictEqual(current.wait, card.wait))
+            if (
+              card.wait !== undefined &&
+              !(card.wait.by._tag === "thread" && card.wait.by.threadId === threadId) &&
+              NodeUtil.isDeepStrictEqual(current.wait, card.wait)
+            )
               next = kanbanWithoutWait(next);
             if (
               card.retries !== undefined &&

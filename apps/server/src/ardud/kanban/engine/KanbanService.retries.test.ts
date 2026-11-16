@@ -583,6 +583,107 @@ it.effect("the silent-run backstop still stops a retry after its backoff ends", 
   }),
 );
 
+it.effect("a worker self-parks through turn end and its deadline wakes it exactly once", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, card, thread, now } = yield* workingCard;
+      yield* fake.start(thread);
+      const actor = { _tag: "thread", threadId: thread } as const;
+      const sent = fake.messages(thread).length;
+      yield* kanban.waitCard(
+        card.id,
+        {
+          on: "time",
+          until: DateTime.formatIso(DateTime.makeUnsafe(START + 60_000)),
+          note: "offbox watcher fallback",
+        },
+        actor,
+      );
+      const pending = yield* now;
+      assert.strictEqual(pending.card.stage, "working");
+      assert.strictEqual(pending.card.activeThreadId, thread);
+      const events = pending.events.filter((event) => Waits.waitEventOf(event) === "set");
+      assert.lengthOf(events, 1);
+      assert.deepStrictEqual(events[0]?.actor, actor);
+      assert.include(events[0]?.body ?? "", "2026-11-10T10:01:00.000Z");
+      const store = yield* KanbanStore.KanbanStore;
+      assert.strictEqual((yield* store.threadLink(thread))?.role, "work");
+      fake.finish(thread);
+      yield* kanban.turnEnded(thread);
+      yield* kanban.turnEnded(thread);
+      const parked = (yield* now).card;
+      assert.strictEqual(parked.stage, "todo");
+      assert.isNull(parked.activeThreadId);
+      assert.strictEqual(parked.wait?.on, "time");
+      yield* kanban.dispatchNow;
+      assert.lengthOf(fake.messages(thread), sent);
+      yield* TestClock.adjust("1 minute");
+      yield* kanban.tick;
+      yield* kanban.dispatchNow;
+      assert.isUndefined((yield* now).card.wait);
+      assert.strictEqual((yield* now).card.activeThreadId, thread);
+      assert.lengthOf(fake.messages(thread), sent + 1);
+      assert.include(fake.messages(thread).at(-1) ?? "", "offbox watcher fallback");
+      yield* fake.start(thread);
+      yield* kanban.tick;
+      assert.lengthOf(fake.messages(thread), sent + 1);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a steer preserves a worker wait until it clears it, then normal nudges resume", () =>
+  Effect.gen(function* () {
+    const fake = makeFake();
+    yield* Effect.gen(function* () {
+      const { kanban, card, thread, now } = yield* workingCard;
+      yield* fake.start(thread);
+      const actor = { _tag: "thread", threadId: thread } as const;
+      yield* kanban.waitCard(
+        card.id,
+        {
+          on: "time",
+          until: DateTime.formatIso(DateTime.makeUnsafe(START + 60_000)),
+          note: "offbox watcher fallback",
+        },
+        actor,
+      );
+      fake.finish(thread);
+      yield* kanban.turnEnded(thread);
+      const wait = (yield* now).card.wait;
+      yield* kanban.cardThread(card.id, "steer", "A partial result arrived", owner);
+      yield* TestClock.adjust(1);
+      yield* fake.start(thread);
+      assert.deepStrictEqual((yield* now).card.wait, wait);
+      fake.finish(thread);
+      const sent = fake.messages(thread).length;
+      yield* kanban.turnEnded(thread);
+      assert.lengthOf(fake.messages(thread), sent);
+      yield* TestClock.adjust(1);
+      yield* fake.start(thread);
+      yield* kanban.waitCard(card.id, null, actor);
+      assert.isUndefined((yield* now).card.wait);
+      yield* kanban.dispatchNow;
+      assert.strictEqual((yield* now).card.activeThreadId, thread);
+      // A late script answer cannot wake a wait the worker already cleared.
+      const late = yield* kanban
+        .answerWait(
+          card.id,
+          { result: "wake", note: "late result" },
+          { script: null },
+          { _tag: "system", component: "test" },
+          true,
+        )
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(late));
+      fake.finish(thread);
+      yield* kanban.turnEnded(thread);
+      assert.lengthOf(fake.messages(thread), sent + 1);
+      assert.include(fake.messages(thread).at(-1) ?? "", "still in Working");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("the silent-run backstop still stops a worker after its parked wait ends", () =>
   Effect.gen(function* () {
     const fake = makeFake();
