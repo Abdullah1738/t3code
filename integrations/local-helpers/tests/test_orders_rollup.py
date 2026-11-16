@@ -235,6 +235,21 @@ class OrdersRollupTests(unittest.TestCase):
         self.assertEqual((ROOT / 'app-api-cli/toollog.py').read_bytes(),
                          (ROOT / 'robob-watch/checks/money-cases/toollog.py').read_bytes())
 
+    def test_card_fill_component_and_errors_survive_every_reader(self):
+        rows = [dict(ts=DAY + 'T12:00:00Z', tool='orders', component='card-vault-fill',
+                     name='card.fill', kind='error', ok=False, durationMs=12,
+                     error={'tag': code}, props={'route': 'phone', 'field': 'card_cvc', 'outcome': 'failure'})
+                for code in ('CARD_FILL_TARGET_REQUIRED', 'CARD_FILL_NO_FOCUS', 'CARD_FILL_FAILED')]
+        self.write(rows)
+        for reader in READERS:
+            with self.subTest(reader=reader.__name__):
+                result = self.rollup(reader)
+                self.assertEqual(result['errorsByComponent']['card-vault-fill'],
+                                 {row['error']['tag']: 1 for row in rows})
+                self.assertEqual(result['failureShare']['card-vault-fill'], 1)
+                self.assertEqual(result['durationsMs']['card-vault-fill:card.fill'],
+                                 {'p50': 12, 'p95': 12, 'max': 12, 'count': 3})
+
 
 if __name__ == '__main__':
     unittest.main()
