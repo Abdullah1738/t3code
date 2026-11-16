@@ -61,7 +61,9 @@ describe("EventLoopMonitor", () => {
     "logs memory to the logger and a root trace every sixty seconds and stops with scope",
     () => {
       // TestClock advances the heartbeat while the process may still be in its first half-second.
-      const uptime = vi.spyOn(NodeProcess.getBuiltinModule("process"), "uptime").mockReturnValue(0.1);
+      const uptime = vi
+        .spyOn(NodeProcess.getBuiltinModule("process"), "uptime")
+        .mockReturnValue(0.1);
       const spans: Array<Tracer.NativeSpan> = [];
       const messages: Array<unknown> = [];
       const tracer = Tracer.make({
