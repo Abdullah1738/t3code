@@ -116,7 +116,14 @@ export class SpawnClient {
           resolveSpawn(event.pid);
           break;
         case "error":
-          fail(Object.assign(new Error(event.message), { code: event.code }));
+          fail(
+            Object.assign(new Error(event.message), {
+              code: event.code,
+              errno: event.errno,
+              syscall: event.syscall,
+              path: event.path,
+            }),
+          );
           break;
         case "exit":
           exited = true;
