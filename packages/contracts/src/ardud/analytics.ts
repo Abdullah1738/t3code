@@ -102,6 +102,8 @@ export const EvaluatorOutcome = Schema.Literals([
 ]);
 export type EvaluatorOutcome = typeof EvaluatorOutcome.Type;
 export const EvaluatorReuseMissReason = Schema.Literals([
+  "duplicate",
+  "stale_reminder",
   "no_card_reuse_scope",
   "no_candidates",
   "all_candidates_rejected",
