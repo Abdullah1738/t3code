@@ -169,6 +169,7 @@ import {
   type ProjectionCheckpointContext,
   type ShellSnapshotOptions,
   type ThreadListCandidate,
+  type ThreadListPageOptions,
 } from "./ProjectionStore.ts";
 import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -504,6 +505,7 @@ export interface OrchestratorV2Shape {
   >;
   readonly getThreadListCandidates: (
     projectId: ProjectId,
+    options?: ThreadListPageOptions,
   ) => Effect.Effect<ReadonlyArray<ThreadListCandidate>, OrchestratorV2Error>;
   readonly getCallerRow: (
     threadId: ThreadId,
@@ -14815,9 +14817,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           Effect.mapError(shellProjectionError),
           Effect.map(Effect.mapError(shellProjectionError)),
         ),
-    getThreadListCandidates: (projectId) =>
+    getThreadListCandidates: (projectId, options) =>
       projectionStore
-        .getThreadListCandidates(projectId)
+        .getThreadListCandidates(projectId, options)
         .pipe(NodeSqliteClient.readOnly, Effect.mapError(shellProjectionError)),
     getCallerRow: (threadId) =>
       projectionStore.getCallerRow(threadId).pipe(
