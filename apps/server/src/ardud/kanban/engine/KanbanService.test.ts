@@ -7636,18 +7636,35 @@ it.effect.each(reviewHandbacks)(
 );
 
 it.effect.each([
-  { state: "done", late: false },
-  { state: "skipped", late: false },
-  { state: "open", late: false },
-  { state: "done", late: true },
+  { state: "done", late: false, steps: 1, tick: "first" },
+  { state: "skipped", late: false, steps: 1, tick: "first" },
+  { state: "open", late: false, steps: 1, tick: "first" },
+  { state: "done", late: true, steps: 1, tick: "first" },
+  { state: "done", late: false, steps: 2, tick: "first" },
+  { state: "skipped", late: false, steps: 2, tick: "first" },
+  { state: "done", late: false, steps: 2, tick: "between" },
+  { state: "done", late: false, steps: 2, tick: "last" },
+  { state: "done", late: true, steps: 2, tick: "first" },
+  { state: "done", late: false, steps: 3, tick: "first" },
 ] as const)(
-  "#1729 a clear verdict leaves the notes review open after bump merge is $state (late: $late)",
-  ({ state, late }) =>
+  "#1729 $steps-step chain leaves notes review open: merge $state at $tick, late $late",
+  ({ state, late, steps, tick }) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
       yield* Effect.gen(function* () {
         const { kanban, board } = yield* toyBoard;
         yield* kanban.setPool(board.id, board.defaultCardModel, 3);
+        yield* kanban.updateBoard(board.id, {
+          reviewChains: [
+            {
+              name: "Round",
+              steps: Array.from({ length: steps }, (_, index) =>
+                index === 0 ? board.evaluatorModel : board.defaultCardModel,
+              ),
+            },
+          ],
+          defaultReviewChain: "Round",
+        });
         const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
         const card = yield* kanban.createCard(
           board.id,
@@ -7671,36 +7688,87 @@ it.effect.each([
         yield* TestClock.adjust("1 second");
         yield* kanban.moveCard(card.id, "needs_review", "cardThread", worker);
         yield* kanban.dispatchNow;
-        const reviewing = (yield* kanban.card(card.id)).card;
+        let reviewing = (yield* kanban.card(card.id)).card;
         assert.strictEqual(reviewing.activeRole, "review");
         assert.strictEqual(kanbanOpenStep(reviewing), 2);
-        yield* TestClock.adjust("1 second");
-        if (state !== "open")
-          yield* kanban.markSubtask(card.id, "s2", state, "Handled bump", evaluator, "evaluator");
-        if (late) {
+        for (let step = 1; step <= steps; step++) {
           yield* TestClock.adjust("1 second");
-          yield* kanban.flagCard(card.id, "Need context", {
-            _tag: "thread",
-            threadId: reviewing.activeThreadId!,
-          });
+          if (
+            state !== "open" &&
+            ((tick === "first" && step === 1) || (tick === "last" && step === steps))
+          )
+            yield* kanban.markSubtask(card.id, "s2", state, "Handled bump", evaluator, "evaluator");
+          if (late && step === steps) {
+            yield* TestClock.adjust("1 second");
+            yield* kanban.flagCard(card.id, "Need context", {
+              _tag: "thread",
+              threadId: reviewing.activeThreadId!,
+            });
+          }
+          const result = yield* kanban.reviewResult(
+            reviewing.activeThreadId!,
+            "clear",
+            [],
+            "e80a290e",
+          );
+          assert.strictEqual(result.card.subtasks[3]?.state, "open");
+          if (step < steps) {
+            assert.strictEqual(result.card.stage, "needs_review");
+            if (tick === "between" && step === 1) {
+              yield* TestClock.adjust("1 second");
+              yield* kanban.markSubtask(
+                card.id,
+                "s2",
+                "done",
+                "Handled bump",
+                evaluator,
+                "evaluator",
+              );
+              const back = (yield* kanban.card(card.id)).card;
+              assert.strictEqual(back.stage, "todo");
+              assert.strictEqual(back.reviewStep, 0);
+              assert.strictEqual(back.subtasks[3]?.state, "open");
+              yield* kanban.dispatchNow;
+              assert.strictEqual((yield* kanban.card(card.id)).card.activeRole, "work");
+              break;
+            }
+            yield* TestClock.adjust("1 second");
+            yield* kanban.dispatchNow;
+            reviewing = (yield* kanban.card(card.id)).card;
+            assert.strictEqual(reviewing.reviewStep, step);
+          } else {
+            assert.deepStrictEqual(
+              result.card.subtasks.map((subtask) => subtask.state),
+              ["done", state, "open", "open", "open"],
+            );
+            assert.strictEqual(result.card.stage, state === "open" ? "in_review" : "todo");
+            assert.notInclude(result.card.wakeNote ?? "", "Don't change code");
+          }
         }
-        const result = yield* kanban.reviewResult(
-          reviewing.activeThreadId!,
-          "clear",
-          [],
-          "e80a290e",
-        );
-        assert.deepStrictEqual(
-          result.card.subtasks.map((subtask) => subtask.state),
-          ["done", state, "open", "open", "open"],
-        );
-        assert.strictEqual(result.card.stage, state === "open" ? "in_review" : "todo");
-        assert.notInclude(result.card.wakeNote ?? "", "Don't change code");
         assert.isTrue(
           (yield* kanban.card(card.id)).events.some(
             (event) => event.kind === "review" && event.body === "clear",
           ),
         );
+        if (steps === 2 && tick === "first" && state === "done" && !late) {
+          yield* kanban.dispatchNow;
+          const nextWorker: KanbanActor = {
+            _tag: "thread",
+            threadId: (yield* kanban.card(card.id)).card.activeThreadId!,
+          };
+          yield* TestClock.adjust("1 second");
+          yield* kanban.markSubtask(card.id, "s3", "done", "Notes ready", nextWorker, "work");
+          yield* TestClock.adjust("1 second");
+          yield* kanban.moveCard(card.id, "needs_review", "cardThread", nextWorker);
+          for (let step = 0; step < steps; step++) {
+            yield* kanban.dispatchNow;
+            const reviewer = (yield* kanban.card(card.id)).card.activeThreadId!;
+            yield* kanban.reviewResult(reviewer, "clear", [], "abcdef12");
+          }
+          const finished = (yield* kanban.card(card.id)).card;
+          assert.strictEqual(finished.subtasks[3]?.state, "done");
+          assert.strictEqual(finished.stage, "completed");
+        }
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
 );

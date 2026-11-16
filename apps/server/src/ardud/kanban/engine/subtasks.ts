@@ -12,6 +12,7 @@ import {
   type KanbanAskOption,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanCardEvent,
   type KanbanOwnerAsk,
   type KanbanSubtask,
   type KanbanStandingApproval,
@@ -1516,6 +1517,26 @@ export const markSubtask = (
           doneAt: at,
         };
   });
+
+export function reviewRoundStartedAt(events: ReadonlyArray<KanbanCardEvent>, reviewStep: number) {
+  let remaining = reviewStep;
+  let startedAt: string | undefined;
+  // Dispatch retries and later reviewers belong to the same round until its
+  // passed chain steps are exhausted; a final verdict or return to work ends it.
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]!;
+    if (event.kind === "review") {
+      if (remaining === 0 || event.body !== "clear" || event.toStage !== "needs_review") break;
+      remaining--;
+    } else if (event.kind === "moved" && event.toStage === "in_review") {
+      startedAt = event.at;
+    } else if (event.toStage === "todo" || event.toStage === "working") {
+      break;
+    }
+  }
+  // Incomplete legacy history cannot establish a whole-round cutoff.
+  return remaining === 0 ? startedAt : undefined;
+}
 
 export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">, roundStartedAt?: string) {
   // Without a known start, older callers keep judging the plan as it stands.
