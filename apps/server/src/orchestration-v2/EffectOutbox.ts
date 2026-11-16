@@ -263,6 +263,9 @@ export interface EffectOutboxV2Shape {
   readonly get: (
     effectId: string,
   ) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
+  readonly pendingRunContinuation: (
+    threadId: ThreadId,
+  ) => Effect.Effect<string | null, EffectOutboxError>;
   readonly hasPendingRunContinuation: (
     threadId: ThreadId,
   ) => Effect.Effect<boolean, EffectOutboxError>;
@@ -462,6 +465,21 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         Effect.mapError((cause) => new EffectOutboxError({ operation, cause })),
       );
 
+    const pendingRunContinuation = Effect.fn("EffectOutbox.pendingRunContinuation")(
+      function* (threadId: ThreadId) {
+        const rows = yield* sql<{ effect_id: string }>`
+          SELECT effect_id FROM orchestration_v2_effect_outbox
+          WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+            AND effect_type = 'provider-runtime.continue'
+            AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
+          LIMIT 1
+        `;
+        return rows[0]?.effect_id ?? null;
+      },
+      NodeSqliteClient.readOnly,
+      Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+    );
+
     const service: EffectOutboxV2Shape = {
       enqueue: Effect.fn("EffectOutbox.enqueue")(
         function* (effects) {
@@ -521,18 +539,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       awaitControlAvailable: Queue.take(controlAvailable),
       awaitStartAvailable: Queue.take(startAvailable),
       notifyAvailable,
-      hasPendingRunContinuation: Effect.fn("EffectOutbox.hasPendingRunContinuation")(
-        function* (threadId) {
-          const rows = yield* sql`
-          SELECT 1 FROM orchestration_v2_effect_outbox
-          WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
-            AND effect_type = 'provider-runtime.continue'
-            AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
-          LIMIT 1
-        `;
-          return rows.length > 0;
-        },
-        Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+      pendingRunContinuation,
+      hasPendingRunContinuation: Effect.fn("EffectOutbox.hasPendingRunContinuation")((threadId) =>
+        pendingRunContinuation(threadId).pipe(Effect.map((id) => id !== null)),
       ),
       hasRunContinuationAt: Effect.fn("EffectOutbox.hasRunContinuationAt")(
         function* ({ threadId, requestedAt, startupAt }) {

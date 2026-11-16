@@ -39,6 +39,7 @@ import {
 
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
+import * as EffectOutbox from "../../../orchestration-v2/EffectOutbox.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as OrchestrationCommandReceipts from "../../../persistence/OrchestrationCommandReceipts.ts";
 import { analyticsErrorTag } from "../../../observability/RpcInstrumentation.ts";
@@ -91,6 +92,7 @@ export interface KanbanThreadView {
   readonly runRequestedAt?: string | null;
   readonly runMessageId?: string | null;
   readonly runStatus?: string | null;
+  readonly restartRecovery?: { readonly effectId?: string; readonly runId?: string } | undefined;
   /** Its own subagents, commands and background tasks still running after its turn ended. Pull-request watches are counted in prWatches instead. */
   readonly backgroundWork: number;
   readonly backgroundWorkUntil?: string;
@@ -403,27 +405,35 @@ const make = Effect.gen(function* () {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const launcher = yield* ThreadLaunchService.ThreadLaunchService;
   const receipts = yield* OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository;
+  const outbox = yield* EffectOutbox.EffectOutboxV2;
 
   const find: KanbanThreadsShape["find"] = Effect.fn("KanbanThreads.find")(
     function* (threadId) {
       const shell = yield* threads.getThreadShell(threadId);
       if (shell === null || shell.deletedAt !== null) return null;
       const runId = shell.activeRunId;
-      const records =
-        runId === null
-          ? null
-          : yield* threads.getThreadRecords(threadId, ["runs"], { runIds: [runId] });
-      const run = records?.runs[0];
+      const records = yield* threads.getThreadRecords(
+        threadId,
+        runId === null ? ["runs", "subagents"] : ["runs"],
+        {
+          ...(runId === null ? { latestRunOnly: true } : { runIds: [runId] }),
+          pendingBackgroundTasksOnly: true,
+        },
+        { projectionOnly: true },
+      );
+      const latest = records.runs[0];
+      const run = runId === null ? undefined : latest;
+      const effectId = yield* outbox.pendingRunContinuation(threadId);
+      const restartRecovery =
+        effectId !== null
+          ? { effectId }
+          : latest?.restartContinuationOfRunId !== undefined &&
+              latest.startedAt === null &&
+              (latest.status === "queued" || latest.status === "starting")
+            ? { runId: latest.id }
+            : undefined;
       // The shell drops terminal items before their completion wake is accepted.
-      const pending =
-        runId === null
-          ? (yield* threads.getThreadRecords(
-              threadId,
-              ["subagents"],
-              { pendingBackgroundTasksOnly: true },
-              { projectionOnly: true },
-            )).subagents
-          : [];
+      const pending = runId === null ? records.subagents : [];
       const activityByChild = new Map<ThreadId, DateTime.Utc>();
       const pendingTree = [...pending];
       const visited = new Set<ThreadId>([threadId]);
@@ -535,6 +545,7 @@ const make = Effect.gen(function* () {
         runRequestedAt: run ? DateTime.formatIso(run.requestedAt) : null,
         runMessageId: run?.userMessageId ?? null,
         runStatus: run?.status ?? null,
+        restartRecovery,
         backgroundWork: backgroundWorkOf(shell, pending, descendants),
         ...(until === undefined ? {} : { backgroundWorkUntil: until }),
         backgroundJobs: (shell.pendingBackgroundTasks ?? []).filter(
@@ -1522,7 +1533,9 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layerFromApplicationReceipts = Layer.effect(KanbanThreads, make);
+export const layerFromApplicationReceipts = Layer.effect(KanbanThreads, make).pipe(
+  Layer.provide(EffectOutbox.layer),
+);
 export const layer = layerFromApplicationReceipts.pipe(
   Layer.provide(OrchestrationCommandReceipts.layer),
 );

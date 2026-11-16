@@ -44,6 +44,7 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as EffectOutbox from "../../../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
 import * as EventSink from "../../../orchestration-v2/EventSink.ts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
@@ -324,7 +325,7 @@ describe("prWatchesOf", () => {
           ...(state === "current" ? { observedHeadSha: observed } : {}),
         };
         const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getThreadRecords: () => Effect.succeed({ subagents: [] } as never),
+          getThreadRecords: () => Effect.succeed({ subagents: [], runs: [] } as never),
           getThreadShell: () =>
             Effect.succeed({
               ...shell({}),
@@ -3770,3 +3771,94 @@ it.effect.each([false, true])(
       }),
     ),
 );
+
+it.effect.each([
+  { effect: "pending", expected: "effect" },
+  { effect: "running", expected: "effect" },
+  { effect: "succeeded", expected: null },
+  { effect: "failed", expected: null },
+  { effect: "cancelled", expected: null },
+  { effect: "pending", queued: true, expected: null },
+  { status: "starting", recovery: true, expected: "run" },
+  { status: "starting", recovery: true, active: true, expected: "run" },
+  { status: "running", recovery: false, active: true, started: true, expected: null },
+  { status: "queued", recovery: true, expected: "run" },
+  { status: "running", recovery: true, started: true, expected: null },
+  { status: "completed", recovery: true, expected: null },
+  { status: "failed", recovery: true, expected: null },
+  { status: "cancelled", recovery: true, expected: null },
+  { status: "starting", recovery: false, expected: null },
+] as const)("thread recovery ownership: %j", (row) => {
+  const threadId = ThreadId.make("thread-restart-recovery");
+  const runId = RunId.make("run-restart-recovery");
+  const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadShell: () =>
+      Effect.succeed({
+        ...shell({}),
+        id: threadId,
+        projectId: ProjectId.make("project-1"),
+        deletedAt: null,
+        activeRunId: "active" in row ? runId : null,
+        activityRunStartedAt: null,
+        archivedAt: null,
+        title: "Restart recovery",
+        pullRequests: [],
+      } as never),
+    getThreadRecords: (_, fields) => {
+      expect(fields).toEqual("active" in row ? ["runs"] : ["runs", "subagents"]);
+      return Effect.succeed({
+        subagents: [],
+        runs:
+          "status" in row
+            ? [
+                {
+                  id: runId,
+                  status: row.status,
+                  requestedAt: at(QUESTION_AT),
+                  startedAt: "started" in row ? at(FINISHED_AT) : null,
+                  ...(row.recovery ? { restartContinuationOfRunId: RunId.make("cut-run") } : {}),
+                },
+              ]
+            : [],
+      } as never);
+    },
+  });
+  return Effect.gen(function* () {
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    if ("effect" in row) {
+      yield* outbox.enqueue([
+        {
+          id: "effect:restart-continuation:cut-run",
+          threadId,
+          commandId: CommandId.make("restart"),
+          request: {
+            type: "provider-runtime.continue",
+            sourceRunId: RunId.make("cut-run"),
+            ...("queued" in row ? { queued: row.queued } : {}),
+          },
+        },
+      ]);
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET status = ${row.effect}`;
+      expect(yield* outbox.hasPendingRunContinuation(threadId)).toBe(row.expected === "effect");
+    }
+    const threads = yield* KanbanThreads;
+    const view = yield* threads.find(threadId);
+    expect(view?.restartRecovery).toEqual(
+      row.expected === "effect"
+        ? { effectId: "effect:restart-continuation:cut-run" }
+        : row.expected === "run"
+          ? { runId }
+          : undefined,
+    );
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(management),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provideMerge(EffectOutbox.layer),
+        Layer.provideMerge(Sqlite.layerMemory),
+      ),
+    ),
+  );
+});
