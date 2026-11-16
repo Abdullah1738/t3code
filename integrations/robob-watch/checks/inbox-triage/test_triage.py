@@ -495,7 +495,7 @@ class ChargeTests(unittest.TestCase):
         self.now = 1_800_000_000.0
         self.rows = []
 
-        def search(query, since, until=None, source=None, n=20, deadline=None):
+        def search(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None, all_copies=False):
             # Terms are AND'ed; "a OR b" is one term, as in msgs search.
             groups, prev = [], 'OR'
             for tok in query.split(' '):
@@ -511,8 +511,9 @@ class ChargeTests(unittest.TestCase):
         self.patches = [patch.object(self.mc, 'DATA', self.tmp / 'money'),
                         patch.object(t, 'chat_down', return_value=(False, '')),
                         patch.object(self.mc.charges, 'search', search),
-                        patch.object(self.mc.charges, 'show', lambda row, deadline=None: row['text']),
-                        patch.object(self.mc.charges, 'owner_texts', lambda since, until, deadline=None: []),
+                        patch.object(self.mc.charges, 'show', lambda row, deadline=None, memo=None, stats=None: row['text']),
+                        patch.object(self.mc.charges, 'owner_texts',
+                                     lambda since, until, deadline=None, stats=None, cache_path=None, cache_reset=None: []),
                         patch.object(t, 'load_module', return_value=self.mc)]
         for p in self.patches:
             p.start()

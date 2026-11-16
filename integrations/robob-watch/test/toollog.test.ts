@@ -20,6 +20,17 @@ test("test default stays outside the home log tree when the override is absent",
 });
 const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
+
+test.each(["data_read.retried", "data_read.failed", "data_write.retried", "data_write.failed", "runs_log.write_failed"])("%s retains only file fault metadata", name => {
+  const dir = fixture();
+  const props = { path: "/home/fixture/settings.json", errnoCode: "EDEADLK", attempts: 4, ms: 1750, dataless: true };
+  toolLog({ component: "triage", kind: "error", name, props: { ...props, body: "private" } });
+  expect(rows(dir)[0].props).toEqual(props);
+  for (const path of ["private body", "/file\nprivate", "/" + "x".repeat(1024)]) {
+    toolLog({ component: "triage", kind: "error", name, props: { path } });
+  }
+  expect(rows(dir).slice(1).every(row => row.props === undefined)).toBe(true);
+});
 const emptyBreakdown = {
   byDependency: {}, dependencyTotals: { dependencies: 0, busyRuns: 0 },
   slots: { allSlotsBusyMinutes: 0, topHolders: [] },
