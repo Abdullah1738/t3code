@@ -194,6 +194,15 @@ const lookupCases = [
     saved: true,
   },
   { name: "pending", state: "pending", reason: "pending" },
+  {
+    name: "legacy pending without owner evidence",
+    id: IdAllocator.derive.delegatedTaskNode({
+      commandId: CommandId.make("command:mcp:credential:delegate-task:private"),
+    }),
+    state: "pending",
+    reason: "non_canonical_id",
+    canonical: false,
+  },
   { name: "abandoned", state: "abandoned", reason: "abandoned" },
   { name: "copied miss", id: copiedLookupId, reason: "non_canonical_id", canonical: false },
   {
@@ -240,6 +249,18 @@ const lookupCases = [
     foundBy: "subagents",
     saved: true,
   },
+  ...(["pending", "accepted"] as const).map(
+    (state) =>
+      ({
+        name: `missing child with ${state} receipt`,
+        hit: true,
+        noChild: true,
+        state,
+        reason: "missing_child_thread",
+        foundBy: "subagents",
+        saved: true,
+      }) as const,
+  ),
   ...[
     "thread:project:private:uuid",
     `thread:delegated-task:${lookupId.slice(20)}`,
@@ -495,6 +516,10 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
             ? ["task_status", "task_cancel"]
             : ["task_status"];
       for (const name of names) {
+        const creating =
+          name === "task_status" &&
+          "reason" in testCase &&
+          (testCase.reason === "pending" || testCase.reason === "accepted");
         const call = server
           .callTool({ name, arguments: { taskId: "id" in testCase ? testCase.id : lookupId } })
           .pipe(Effect.provideService(McpSchema.McpServerClient, client));
@@ -533,7 +558,9 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
         });
         expect(row.errorTag).toBe(
           "reason" in testCase
-            ? "task_not_found"
+            ? creating
+              ? "task_creating"
+              : "task_not_found"
             : "error" in testCase
               ? testCase.error
               : "invalid" in testCase
@@ -565,6 +592,8 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
               : "Expected the taskId returned by delegate_task.",
           );
           expect(text).not.toContain("id" in testCase ? testCase.id : lookupId);
+          expect(text.includes("No delegated task has this id.")).toBe(!creating);
+          if (creating) expect(row.props?.code).toBe("task_creating");
         }
       }
       if ("ack" in testCase) {
