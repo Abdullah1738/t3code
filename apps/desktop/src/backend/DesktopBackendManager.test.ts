@@ -506,7 +506,7 @@ describe("DesktopBackendManager", () => {
           if (trigger?.trigger === "ipc-relaunch")
             assert.equal(logged.annotations?.appQuitReason, trigger.reason);
         }),
-      ).pipe(Effect.provide(DesktopState.layer), Effect.provide(TestClock.layer())),
+      ).pipe(Effect.provide(Layer.provideMerge(DesktopState.layer, TestClock.layer()))),
   );
 
   it.effect.each(["before-exit", "during-drain"] as const)(
@@ -577,7 +577,7 @@ describe("DesktopBackendManager", () => {
             timing === "before-exit" ? "1970-01-01T00:00:02.000Z" : "1970-01-01T00:00:00.000Z",
           );
         }),
-      ).pipe(Effect.provide(DesktopState.layer), Effect.provide(TestClock.layer())),
+      ).pipe(Effect.provide(Layer.provideMerge(DesktopState.layer, TestClock.layer()))),
   );
 
   it.effect("reports output stream failures with process and stream context", () =>

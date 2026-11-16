@@ -97,7 +97,7 @@ describe("DesktopQuit", () => {
         yield* DesktopQuit.prepare({ trigger: "before-quit" });
         const next = yield* Ref.get(state.quitTrigger);
         assert.equal(Date.parse(next!.at) - Date.parse(first!.at), 2000);
-      }).pipe(Effect.provide(layer), Effect.provide(TestClock.layer())),
+      }).pipe(Effect.provide(Layer.provideMerge(layer, TestClock.layer()))),
   );
 
   it.effect("does not block shutdown when the log is unwritable", () =>
