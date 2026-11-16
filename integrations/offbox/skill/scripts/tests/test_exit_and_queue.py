@@ -171,7 +171,7 @@ class RemoteWrapperTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / 'w/repo/sub').mkdir(parents=True)
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', 'sub', argv, None, 'run-test')
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True,
@@ -256,7 +256,7 @@ class RemoteWrapperTests(unittest.TestCase):
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             cases = [(['false'], 1), (['exit 3'], 3), (['true'], 0), (['sh', '-c', 'kill -KILL $$'], 137)]
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                    patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                    patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 for i, (argv, code) in enumerate(cases):
                     run_id = f"run-test-{i}"
                     with self.subTest(argv=argv):

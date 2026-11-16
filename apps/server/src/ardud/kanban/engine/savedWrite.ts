@@ -6,6 +6,11 @@ import * as Clock from "effect/Clock";
 import * as Fiber from "effect/Fiber";
 
 export const LONG_HOLD_MS = 5_000;
+export type UnverifiedReporterReason = "caller_unresolved" | "parent_not_active";
+export const reporterUnverified = Context.Reference<(reason: UnverifiedReporterReason) => void>(
+  "KanbanSavedWriteReporterUnverified",
+  { defaultValue: () => () => {} },
+);
 export type SubStep = { readonly subStep: string; readonly ms: number };
 
 export const subStepReporter = Context.Reference<(steps: ReadonlyArray<SubStep>) => void>(
@@ -22,10 +27,12 @@ export const subStepObserver = Context.Reference<
 >("KanbanSavedWriteSubSteps", { defaultValue: () => undefined });
 
 // Reuse existing operation spans, including interrupted SQL admission. No extra
-// spans or detail rows on fast calls; count only time while a board permit is held.
+// spans or detail rows on fast calls. Evaluator calls also count launch I/O
+// outside the board permit, where command-receipt reads can wait on a reader.
 export const subSteps = Effect.fnUntraced(function* <A, E, R>(
   name: string,
   effect: Effect.Effect<A, E, R>,
+  includeOutsideLocks = false,
 ) {
   const delegate = yield* Tracer.Tracer;
   const parent = yield* subStepObserver;
@@ -73,31 +80,41 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
     },
     ...(delegate.context ? { context: delegate.context } : {}),
   });
+  const hold = (fiberId: number) => {
+    const held = { fiberId, since: now(), totals: new Map<string, number>() };
+    holds.add(held);
+    return (long: boolean) => {
+      account(fiberId);
+      holds.delete(held);
+      if (!long) return undefined;
+      return [...held.totals]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([subStep, ms]) => ({
+          subStep:
+            subStep.length <= 160 && /^[a-zA-Z0-9_.:/#@%+-]+$/.test(subStep) ? subStep : "unknown",
+          ms,
+        }));
+    };
+  };
+  const finish = includeOutsideLocks ? hold(yield* Effect.fiberId) : undefined;
+  const report = yield* subStepReporter;
   return yield* effect.pipe(
+    // Lock collectors still return their diagnostics, but only the enclosing
+    // whole-call collector publishes to the reply ledger.
+    (effect) =>
+      includeOutsideLocks ? effect.pipe(Effect.provideService(subStepReporter, () => {})) : effect,
     Effect.withTracer(tracer),
     Effect.provideService(subStepObserver, {
       tracer: parent?.tracer ?? delegate,
-      hold(fiberId) {
-        const started = now();
-        const hold = { fiberId, since: started, totals: new Map<string, number>() };
-        holds.add(hold);
-        return (long) => {
-          account(fiberId);
-          holds.delete(hold);
-          if (!long) return undefined;
-          return [...hold.totals]
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 3)
-            .map(([subStep, ms]) => ({
-              subStep:
-                subStep.length <= 160 && /^[a-zA-Z0-9_.:/#@%+-]+$/.test(subStep)
-                  ? subStep
-                  : "unknown",
-              ms,
-            }));
-        };
-      },
+      hold,
     }),
+    Effect.ensuring(
+      Effect.sync(() => {
+        const steps = finish?.(now() >= LONG_HOLD_MS);
+        if (steps !== undefined) report(steps);
+      }),
+    ),
   );
 });
 
@@ -108,6 +125,9 @@ export const traceObserver = Context.Reference<
       readonly span: Tracer.Span;
       readonly enter: (stage: Stage, fiberId: number) => () => void;
       readonly mark: (stage: Stage, fiberId: number) => void;
+      readonly observeLocks?: (
+        snapshot: (now: number) => Readonly<Record<string, unknown>>,
+      ) => () => void;
     }
   | undefined
 >("KanbanSavedWriteTrace", { defaultValue: () => undefined });

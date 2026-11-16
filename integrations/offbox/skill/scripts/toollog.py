@@ -19,6 +19,7 @@ NUMBERS = set("bytes files skipped exitCode waitMs queueMs runMs position ttlSec
 NUMBERS.update("ms slow_ms last_good_boatd_uptime_s snapshot_age_s boatd_uptime_s uptime_s slow slow_max_s slow_total_s starting starting_max_s down".split())
 NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'client_started_at', 'disk_probe_module_mtime'})
 NUMBERS.add("waited_s")
+NUMBERS.add("sample")
 NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
 NUMBERS.update({'outageS', 'waitedMs', 'placeBefore', 'placeAfter'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
@@ -211,6 +212,7 @@ def rollup(day=None):
     root = directory()
     counts, kinds, errors, samples, durations = Counter(), Counter(), Counter(), {}, {}
     total = ok = checked = bad = malformed = 0
+    sampled = False
     path = root / (day + ".ndjson")
     if path.exists():
         with path.open() as source:
@@ -220,26 +222,30 @@ def rollup(day=None):
                     if not isinstance(row, dict) or row.get("tool") != "offbox" or not _atom(row.get("name")) or row.get("kind") not in ("event", "perf", "error"):
                         raise ValueError()
                     name, kind = row["name"], row["kind"]
-                    total += 1
-                    counts[name] += 1
-                    kinds[kind] += 1
+                    weight = (row.get("props") or {}).get("sample", 1)
+                    if type(weight) is not int or weight < 1:
+                        weight = 1
+                    sampled |= weight > 1
+                    total += weight
+                    counts[name] += weight
+                    kinds[kind] += weight
                     if type(row.get("ok")) is bool:
-                        checked += 1
-                        ok += row["ok"]
-                    bad += kind == "error" or row.get("ok") is False
+                        checked += weight
+                        ok += weight * row["ok"]
+                    bad += weight * (kind == "error" or row.get("ok") is False)
                     ms = row.get("durationMs")
                     if type(ms) in (int, float) and math.isfinite(ms) and ms >= 0:
                         durations.setdefault(name, []).append(ms)
                     tag = (row.get("error") or {}).get("tag")
                     if _atom(tag):
-                        errors[tag] += 1
+                        errors[tag] += weight
                         samples.setdefault(tag, _ids(row.get("ids")))
                 except (ValueError, TypeError, AttributeError):
                     malformed += 1
     def stats(xs):
         xs.sort()
         return {"p50": xs[max(0, math.ceil(len(xs)*.50)-1)], "p95": xs[math.ceil(len(xs)*.95)-1], "max": xs[-1]}
-    result = {"day": day, "total": total, "countsByName": dict(counts), "countsByKind": dict(kinds),
+    result = {"day": day, "total": total, "sampled": sampled, "countsByName": dict(counts), "countsByKind": dict(kinds),
               "okRate": ok/checked if checked else None, "errorRate": bad/total if total else None,
               "durationMs": {name: stats(xs) for name, xs in durations.items()}, "malformedLines": malformed,
               "topErrors": [{"tag": tag, "count": count, "sampleIds": samples[tag]} for tag, count in errors.most_common(20)]}

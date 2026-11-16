@@ -665,8 +665,40 @@ def _require_my_run(r) -> None:
 LOG_READ_WAIT_S = 10
 
 
+def _checkpoint_bytes(path):
+    try:
+        size = path.stat().st_size
+        keep = (checkpoint(path) or {}).get('logBytes', 0)
+        return keep if 0 <= keep <= size else 0
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
 def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live: bool = False,
                   lock_wait: float = 0) -> str:
+    stats = dict(run=r['run_id'], live=live, result='error', seconds=0, pages=[0, 0], bytes=0,
+                 slowest_ms=0, lock_wait_ms=0, budget=budget, page_ms=[[], []], page_ms_omitted=[0, 0])
+    started = monotonic()
+    try:
+        result = _fetch_log(r, budget, locked=locked, live=live, lock_wait=lock_wait, stats=stats)
+        stats['result'] = result
+        return result
+    finally:
+        stats['seconds'] = round(monotonic() - started, 3)
+        detail = json.dumps(stats, separators=(',', ':'))
+        # Diagnostics must not wait on a writer, migrate the DB, or backfill owners after a fetch deadline.
+        try:
+            from . import common
+            with contextlib.closing(sqlite3.connect(common.DB_PATH, timeout=0, isolation_level=None)) as con:
+                event(con, r['box_id'], 'logs_fetch', detail)
+        except sqlite3.Error:
+            with contextlib.suppress(OSError):
+                log(f"logs_fetch {r['box_id'] or '-'} {detail}")
+        except OSError:
+            pass
+
+
+def _fetch_log(r, budget, *, locked, live, lock_wait, stats) -> str:
     """Settled history reads need only the run lock; live recovery still takes box then run."""
     from .runs import log_lock
     if (r['status'] in ('starting', 'running') and not live) or not r['box_id']:
@@ -680,11 +712,16 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
     try:
         if live and not locked:
             guard.enter_context(file_lock('box-' + r['box_id'], timeout=0))
-        waited = guard.enter_context(log_lock(r['run_id'], timeout=0 if locked or live else
-                                             min(lock_wait, lock_wait if budget is None else max(0, budget))))
+        lock_started = monotonic()
+        try:
+            waited = guard.enter_context(log_lock(r['run_id'], timeout=0 if locked or live else
+                                                 min(lock_wait, lock_wait if budget is None else max(0, budget))))
+        finally:
+            stats['lock_wait_ms'] = round((monotonic() - lock_started) * 1000, 3)
     except OffboxError:
         guard.close()
         return 'n/a'
+    published_before = _checkpoint_bytes(path)
     try:
         ck = read_json(offsets_path(path), {})
         # Reuse a completed check published by the holder we just waited for. Sequential reads still check history,
@@ -703,7 +740,7 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
         boat_bg = not live and api.BACKEND == 'boat' and r['mode'] == 'bg'
         if boat_bg and remaining is not None:
             history_budget = remaining / 2
-        result = _catch_up_log_locked(r, path, history_budget, live=live) if r['command_id'] else 'n/a'
+        result = _catch_up_log_locked(r, path, history_budget, live=live, stats=stats) if r['command_id'] else 'n/a'
         if locked and not live and r['mode'] == 'bg' and api.BACKEND == 'boat':
             event(db(), r['box_id'], 'log_catchup_result', f"{r['run_id']} {result}")
         if not live and result in ('complete', 'caught_up'):
@@ -721,6 +758,7 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
     except OSError as e:
         return 'incomplete:' + str(e)
     finally:
+        stats['bytes'] = max(0, _checkpoint_bytes(path) - published_before)
         guard.close()
 
 
@@ -977,7 +1015,7 @@ def _preamble_first(dst, stdout_bytes, run_id):
     dst.seek(end)
 
 
-def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
+def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
     from .runs import remember_interruption
     started = time.time()
     deadline = started + (30 if budget is None else budget)
@@ -1022,7 +1060,19 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                 while True:
                     if time.time() >= deadline:
                         return 'incomplete:timeout'
-                    page = api.history_logs(r['box_id'], r['command_id'], which, offsets[i], deadline=deadline)
+                    page_started = monotonic()
+                    try:
+                        page = api.history_logs(r['box_id'], r['command_id'], which, offsets[i], deadline=deadline)
+                    finally:
+                        if stats is not None:
+                            elapsed_ms = round((monotonic() - page_started) * 1000, 3)
+                            stats['pages'][i] += 1
+                            stats['slowest_ms'] = max(stats['slowest_ms'], elapsed_ms)
+                            # Keep the summary bounded even when retained history has thousands of pages.
+                            if len(stats['page_ms'][i]) < 8:
+                                stats['page_ms'][i].append(elapsed_ms)
+                            else:
+                                stats['page_ms_omitted'][i] += 1
                     if time.time() >= deadline:
                         return 'incomplete:timeout'
                     remember_interruption(r['run_id'], page)
@@ -1147,12 +1197,38 @@ def _catch_up_finished(con, run_id, budget: float = 10, *, row=None) -> str | No
         return 'incomplete:' + str(e)
 
 
-def _incomplete_log(r, result) -> None:
+def _live_log_notice(r, path, result, seconds) -> bool:
+    queued = r['status'] == 'queued'
+    try:
+        if path.stat().st_size <= 256:
+            queued |= path.read_bytes().strip() == b'offbox-server: waiting for earlier runs in the queue'
+    except OSError:
+        pass
+    if queued:
+        since = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(r['start_at'])) if r['start_at'] else 'unknown'
+        elapsed = f", {max(0, now() - r['start_at']):.0f}s" if r['start_at'] else ''
+        say(f"{r['run_id']} is queued on the server behind earlier runs (since {since}{elapsed}); nothing has run yet. "
+            f"Keep reading: offbox logs {r['run_id']} --follow, or offbox wait {r['run_id']} --timeout 570")
+        return True
+    if not result.startswith('incomplete:'):
+        return False
+    size = path.stat().st_size if path.exists() else 0
+    reason = ' '.join(result.split(':', 1)[1].splitlines())
+    duration = f' after {seconds:.1f}s' if seconds is not None else ''
+    say(f"{r['run_id']} is still running; fetched {size} bytes so far ({reason}{duration}); "
+        f"more output is on the server. Keep reading: offbox logs {r['run_id']} --follow, "
+        f"or offbox wait {r['run_id']} --timeout 570")
+    return True
+
+
+def _incomplete_log(r, result, *, seconds=None) -> bool:
     if r['status'] == 'source_gone':
-        return
-    settled = r['status'] not in ('starting', 'running')
+        return False
+    settled = r['status'] not in ('starting', 'running', 'queued')
     p = LOGS_DIR / f"{r['run_id']}.log"
     p = _shown_log(p)
+    if not settled:
+        return _live_log_notice(r, p, result, seconds)
     size = p.stat().st_size if p.exists() else 0
     if result == 'n/a' and settled and r['mode'] != 'local':
         reason = ("another reader is fetching this run's log" if r['box_id'] and r['command_id']
@@ -1163,9 +1239,10 @@ def _incomplete_log(r, result) -> None:
         say(f"{r['run_id']} local log stops at {size} bytes and the rest couldn't be fetched "
             f"({result.split(':', 1)[1]}); this output is incomplete")
     else:
-        return
+        return False
     if settled:
         say(f"{r['run_id']} run ended {r['status']} exit={r['exit_code']}")
+    return True
 
 
 def _refresh_running_ttl(r, until=None) -> None:
@@ -1263,14 +1340,15 @@ def logs(run_id: str, do_follow: bool) -> int:
     from . import start_check
     if do_follow and r['status'] == 'infra' and start_check.recovery_marked(db(), r):
         return _wait_locked(r, echo=True)
-    if r['status'] in ('starting', 'running'):
+    if r['status'] in ('starting', 'running', 'queued'):
         if do_follow:
             return _wait_locked(r, echo=True)
         _refresh_running_ttl(r)
+        started = monotonic()
         result = _catch_up_log(r, budget=10, live=True) if r['status'] == 'running' else 'n/a'
         _tail(_shown_log(p), 0, True)
-        _incomplete_log(r, result)
-        if r['mode'] != 'local':
+        notified = _incomplete_log(r, result, seconds=monotonic() - started)
+        if r['mode'] != 'local' and not notified:
             if not r['box_id'] or not r['process_id']:
                 from .start_check import hint
                 check = ('; check: ' + hint(r['box_id'], r['run_id'])) if r['box_id'] else ''

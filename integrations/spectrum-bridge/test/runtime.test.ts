@@ -640,6 +640,72 @@ describe("Sendblue socket API", () => {
     }
   });
 
+  test.each(["roster", "seen-senders", "blank-roster", "unknown"])("group bus audience uses %s from that group's store", async source => {
+    const { post, chats, moniChat, line, ownerStore } = api();
+    const key = chatKey.group("GRP-Allowed-123");
+    const family = chats.open(key, "Family Trip");
+    const sink = chats.sink(async () => {});
+    const deps = { line, owner, ownerStore, access: async () => access, sink };
+    if (source !== "unknown") {
+      for (const [handle, from] of [["first", owner], ["second", "moni@example.com"], ["third", moni]] as const) {
+        await handleInbound(deps, message({ handle, chat: key, from,
+          participants: source === "roster" ? [owner, moni, "silent@example.com"] : source === "blank-roster" ? [" "] : [] }));
+      }
+    }
+    const other = chats.open(chatKey.group("other"));
+    other.store.acceptInbound("unrelated", { sender: "OTHER_GROUP_SECRET" });
+    family.store.set("route", { id: "ses_group", generation: 1 });
+    expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "question", dedupeKey: "audience" })).status).toBe(202);
+    const wake = moniChat.store.pendingInbound().find(row => row.id.startsWith("wake:agent-bus:"))!.payload as { text: string };
+    expect(wake.text).toContain('This answer will be posted in the group "Family Trip"');
+    if (source === "unknown") expect(wake.text).toContain("members: unknown");
+    else {
+      expect(wake.text).toContain("Abdullah");
+      expect(wake.text.match(/Moni/g)).toHaveLength(1);
+      expect(wake.text.includes("silent@example.com")).toBe(source === "roster");
+    }
+    expect(wake.text).not.toContain("OTHER_GROUP_SECRET");
+  });
+
+  const audienceUpdates = [
+    { label: "omitted participants", participants: undefined, refreshed: false },
+    { label: "empty participants", participants: [], refreshed: false },
+    ...[0x9, 0xa, 0xb, 0xc, 0xd, 0x20, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005,
+      0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff].map(code => ({
+      label: `blank participants U+${code.toString(16).toUpperCase().padStart(4, "0")}`, participants: ["", String.fromCodePoint(code)], refreshed: false,
+    })),
+    { label: "new roster", participants: [owner, moni, "new-silent@example.com"], refreshed: true },
+  ];
+  test.each(audienceUpdates)("group bus reconciles newer senders after a roster: $label", async ({ participants, refreshed }) => {
+    const { post, chats, moniChat, line, ownerStore } = api();
+    const key = chatKey.group("GRP-Allowed-123");
+    const family = chats.open(key, "Family Trip");
+    const sam = "+15555550222";
+    access.people.push({ name: "Sam", role: "person", addresses: [sam] });
+    const deps = { line, owner, ownerStore, access: async () => access, sink: chats.sink(async () => {}) };
+    await handleInbound(deps, message({ handle: "before-roster", chat: key, from: "old@example.com" }));
+    await handleInbound(deps, message({ handle: "roster", chat: key, from: owner, participants: [owner, moni, "silent@example.com"] }));
+    await handleInbound(deps, message({ handle: "new-member", chat: key, from: sam, participants: [] }));
+    await handleInbound(deps, message({ handle: "alias", chat: key, from: "moni@example.com", ...(participants ? { participants } : {}) }));
+    family.store.acceptInbound("machine-wake", { text: "not a participant" });
+    family.store.acceptInbound("blank-sender", { sender: "\t\n\u00a0" });
+    const expected = refreshed ? [owner, moni, "new-silent@example.com", "moni@example.com"]
+      : [owner, moni, "silent@example.com", sam, "moni@example.com"];
+    for (let read = 0; read < 3; read++) expect(family.store.groupAudience().sort()).toEqual(expected.sort());
+    family.store.set("route", { id: "ses_group", generation: 1 });
+    for (let request = 0; request < 2; request++) {
+      expect((await post("/agent-ask", { sessionId: "ses_group", to: "moni", text: "question", dedupeKey: `updated-audience-${request}` })).status).toBe(202);
+      const wakes = moniChat.store.pendingInbound().filter(row => row.id.startsWith("wake:agent-bus:"));
+      expect(wakes).toHaveLength(request + 1);
+      const wake = wakes[request]!.payload as { text: string };
+      expect(wake.text).toContain('This answer will be posted in the group "Family Trip"');
+      expect(wake.text.match(/\(members: ([^)]+)\)\./)?.[1]?.split(", ").sort()).toEqual(
+        (refreshed ? ["Abdullah", "Moni", "new-silent@example.com"] : ["Abdullah", "Moni", "Sam", "silent@example.com"]).sort());
+      expect(wake.text).not.toContain("old@example.com");
+      expect(wake.text).toContain("Share only what is fine for everyone there to read.");
+    }
+  });
+
   test("agent routes validate bodies, reject missing/stale sessions, and respect readiness", async () => {
     const { post } = api(); const disabled = api(false).post;
     const request = `areq_${"a".repeat(64)}`;

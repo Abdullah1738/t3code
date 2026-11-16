@@ -71,6 +71,10 @@ ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "S
 # Read from this checkout's skill root, not common.TEMPLATES_DIR: the live copy lacks the file until install.zsh runs.
 DOCKER_HOOK_B64 = base64.b64encode(
     (Path(__file__).resolve().parents[2] / "templates" / "boat-sync-docker-firewall").read_bytes()).decode()
+SQLITE_SETUP = ("bash -c " + shlex.quote(
+    (Path(__file__).resolve().parents[2] / "templates/tools/fetch.sh").read_text() + "\n" +
+    (Path(__file__).resolve().parents[2] / "templates/tools/sqlite.sh").read_text()) +
+    ' || { echo "offbox: sqlite3 setup failed" >&2; exit 97; }')
 
 # Recipes travel with this runner so an uninstalled checkout can prove the exact change.
 REPO_RECIPES_DIR = Path(__file__).resolve().parents[2] / "templates" / "repos"
@@ -101,18 +105,19 @@ from pathlib import Path
 Path(sys.argv[1]).write_bytes(base64.b64decode('@RECIPE@'))
 OFFBOX_REPO_RECIPE
   _offbox_needs_setup=false
+  _offbox_recipe_mode=
   @CHECK@
   if $_offbox_needs_setup || [ "$(cat "$_offbox_base.stamp" 2>/dev/null || true)" != "$_offbox_stamp" ] ||
      [ ! -f "$HOME/.offbox/repo-env/@KEY@.sh" ]; then
-    echo 'offbox: setting up @KEY@ toolchain on this box (first run here, a few minutes)' >&3
+    @ANNOUNCE@
     rm -f "$_offbox_base.stamp"
     _offbox_t0=$SECONDS
-    bash "$_offbox_base.sh"
+    bash "$_offbox_base.sh" ${_offbox_recipe_mode:+"$_offbox_recipe_mode"}
     # A successful recipe must publish the environment before we trust its stamp.
     test -f "$HOME/.offbox/repo-env/@KEY@.sh"
     printf '%s\n' "$_offbox_stamp" > "$_offbox_base.stamp.tmp"
     mv -f "$_offbox_base.stamp.tmp" "$_offbox_base.stamp"
-    echo "offbox: @KEY@ toolchain ready ($((SECONDS - _offbox_t0))s)" >&3
+    @READY@
   fi
 ) 3>&2 >>"$HOME/.offbox/repo-setup-@KEY@.log" 2>&1
 _offbox_repo_rc=$?
@@ -141,12 +146,24 @@ def repo_setup_block(repo_key: str, rdir: str) -> str:
     if repo_key == "crpko-devops":
         body = (REPO_RECIPES_DIR.parent / "tools/crpko.sh").read_bytes() + b"\n" + body
     body = (REPO_RECIPES_DIR.parent / "tools/fetch.sh").read_bytes() + b"\n" + body
-    check = 'bash "$_offbox_base.sh" --check || _offbox_needs_setup=true' if repo_key == "crpko-devops" else ':'
+    announce = "echo 'offbox: setting up @KEY@ toolchain on this box (first run here, a few minutes)' >&3"
+    ready = 'echo "offbox: @KEY@ toolchain ready ($((SECONDS - _offbox_t0))s)" >&3'
+    check = ':'
+    if repo_key == "crpko-devops":
+        # One invocation shares the parsed pin between readiness and setup. Status bypasses the retained log.
+        check = '''export OFFBOX_REPO_STATUS_FD=3
+  if [ "$(cat "$_offbox_base.stamp" 2>/dev/null || true)" = "$_offbox_stamp" ] &&
+     [ -f "$HOME/.offbox/repo-env/crpko-devops.sh" ]; then
+    _offbox_recipe_mode=--ensure
+  fi
+  _offbox_needs_setup=true'''
+        announce = ready = ':'
     # The log redirection opens before the subshell can create its directories.
     return ('mkdir -p "$HOME/.offbox" || { '
             f'echo "offbox: {repo_key} toolchain setup failed on this box; nothing ran" >&2; '
             'echo offbox-repo-setup-failed >&2; exit 98; }\n'
-            + REPO_SETUP.replace('@KEY@', repo_key).replace('@ROOT@', shlex.quote(rdir))
+            + REPO_SETUP.replace('@ANNOUNCE@', announce).replace('@READY@', ready)
+            .replace('@KEY@', repo_key).replace('@ROOT@', shlex.quote(rdir))
             .replace('@CHECK@', check)
             .replace('@RECIPE@', base64.b64encode(body).decode()))
 
@@ -1529,6 +1546,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               probe + ' start "$__obsw" || { __obprobe_rc=$?; [ "$__obprobe_rc" != 90 ] || exit 90; '
               'echo "offbox: disk-space probe failed (exit $__obprobe_rc); the command runs without disk evidence" >&2; }',
               userns.setup(api.BACKEND, box_id),
+              SQLITE_SETUP,
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
               CACHE_OWNER_REPAIR.replace('__OFFBOX_BOX__', shlex.quote(box_id)),
@@ -1544,6 +1562,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
                                                        repo_key=repo_key, template=template)),
               ('''for _offbox_tool in terraform aws ruby vector gh; do
+  if [ "$_offbox_tool" = terraform ] && [ "${OFFBOX_TERRAFORM_STATE:-}" = skipped ]; then continue; fi
   command -v "$_offbox_tool" >/dev/null || {
     echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
     echo offbox-repo-setup-failed >&2

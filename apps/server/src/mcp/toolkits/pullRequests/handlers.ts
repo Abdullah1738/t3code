@@ -28,6 +28,7 @@ import * as Option from "effect/Option";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
+import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import { pullRequestSyncKey } from "../../../pullRequest/pullRequestSyncKey.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
@@ -45,6 +46,7 @@ import {
   PullRequestNotOpenError,
   type PullRequestTargetInput,
   PullRequestWatchFailedError,
+  PullRequestWatchUnavailableError,
   PullRequestWatchTimeoutError,
   PullRequestToolTimeoutError,
   PullRequestWatchFromSubagentError,
@@ -240,6 +242,7 @@ function projectForPullRequest(
 
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
+  const pullRequests = yield* PullRequestService.PullRequestService;
   const reviewGuides = yield* PullRequestReviewGuideService.PullRequestReviewGuideService;
 
   const projects = yield* ProjectService.ProjectService;
@@ -331,6 +334,47 @@ const make = Effect.gen(function* () {
         wasWatching,
         ...(watching ? { alreadyWatching: true } : { alreadyUnwatched: true }),
       };
+    }
+    if (watching) {
+      const preflight = yield* pullRequests
+        .detail({
+          projectId: thread.projectId,
+          host: target.host,
+          repository: target.repository,
+          number: target.number,
+          allowStale: false,
+        })
+        .pipe(
+          McpDeadline.awaitInterruptibly,
+          // Leave most of the ten-second operation budget for saving and reading back the watch.
+          Effect.timeout("3 seconds"),
+          Effect.match({
+            onSuccess: () => ({ outcome: "ok" as const }),
+            onFailure: (error) =>
+              error._tag === "PullRequestUnavailableError"
+                ? { outcome: "unavailable" as const, error }
+                : {
+                    outcome:
+                      error._tag === "TimeoutError"
+                        ? ("timeout" as const)
+                        : ("skipped-error" as const),
+                  },
+          }),
+        );
+      yield* Effect.annotateCurrentSpan("pullRequest.watch.preflight", preflight.outcome);
+      if (preflight.outcome === "unavailable") {
+        yield* Effect.logWarning("pull request watch preflight refused", {
+          host: target.host,
+          repository: target.repository,
+          number: target.number,
+          reason: preflight.error.reason,
+          threadId: thread.id,
+        });
+        return yield* new PullRequestWatchUnavailableError({
+          host: target.host,
+          cause: preflight.error,
+        });
+      }
     }
     const id = yield* commandId("mcp-pr-watch", thread.id);
     state.phase = "dispatch";

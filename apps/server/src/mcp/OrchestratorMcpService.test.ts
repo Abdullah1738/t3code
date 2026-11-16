@@ -9,10 +9,11 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
   EnvironmentId,
+  EventId,
   GitCommandError,
   MessageId,
   type ModelSelection,
-  type OrchestratorMcpFailure,
+  OrchestratorMcpFailure,
   NodeId,
   OrchestratorMcpTarget,
   OrchestratorMcpDelegateTaskResult,
@@ -58,6 +59,8 @@ import {
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as LegacyV1ThreadImporter from "../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import { DELEGATED_COMPLETION_HOLD } from "../orchestration-v2/ProviderContinuationService.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import {
@@ -85,6 +88,10 @@ import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { McpCall } from "../ardud/analytics/McpCall.ts";
 
+const decodeMcpFailureJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestratorMcpFailure),
+);
+const encodeMcpFailureJson = Schema.encodeEffect(Schema.fromJsonString(OrchestratorMcpFailure));
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
 const decodeDelegateTaskResult = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskResult);
 const encodeDelegateTaskResult = Schema.encodeSync(
@@ -1962,6 +1969,219 @@ describe("OrchestratorMcpService provider resolution", () => {
     turnItems: [],
   } as unknown as OrchestrationV2ThreadProjection;
 
+  it.effect.each([
+    "direct rejection",
+    "rejected receipt at timeout",
+    "no active run",
+    "previously rejected receipt",
+    "idle previously rejected receipt",
+  ] as const)("delegateTask gives a definite not-created reply for %s", (path) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const finished = yield* Deferred.make<void>();
+      const commandId = CommandId.make(
+        `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(parentThreadId)}:parent-ended`,
+      );
+      const receipt = {
+        commandId,
+        threadId: parentThreadId,
+        commandType: "delegated_task.request",
+        acceptedAt: DateTime.makeUnsafe("2026-11-16T00:00:00Z"),
+        resultSequence: 0,
+        status: "rejected" as const,
+        error: `Parent run ${parentRunId} is not active.`,
+      };
+      const state: McpCall["Service"] = {
+        callerResolved: false,
+        callerResolveMs: 0,
+        readerLane: "background",
+        phase: "handler",
+        saved: "unknown",
+      };
+      const previousCall = path.includes("previously rejected");
+      const idle = path === "no active run" || path === "idle previously rejected receipt";
+      let rejected = previousCall;
+      let dispatches = 0;
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
+          getThreadRecords: () => {
+            const projection = parentProjection([]);
+            return Effect.succeed(idle ? { ...projection, runs: [] } : projection);
+          },
+          hasReceipt: () => Effect.succeed(false),
+          getCommandReceipt: () => Effect.succeed(rejected ? Option.some(receipt) : Option.none()),
+          getDelegationCommandState: () =>
+            Effect.succeed(rejected ? receipt : { status: "never_saved" as const }),
+          dispatch: (command) =>
+            Effect.gen(function* () {
+              assert.equal(command.commandId, commandId);
+              dispatches++;
+              rejected = true;
+              yield* Deferred.succeed(entered, undefined);
+              if (path === "rejected receipt at timeout") yield* Deferred.await(release);
+              if (previousCall)
+                return yield* new Orchestrator.OrchestratorCommandPreviouslyRejectedError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  detail: receipt.error,
+                });
+              return yield* new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: receipt.error,
+              });
+            }).pipe(Effect.ensuring(Deferred.succeed(finished, undefined))),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([
+          providerSnapshot({
+            instanceId: codexInstanceId,
+            driver: ProviderDriverKind.make("codex"),
+            model: "gpt-5.4",
+          }),
+        ]),
+        adapterRegistryLayer([codexInstanceId]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const pending = yield* service
+          .delegateTask(scope, { task: "Review", mode: "async", clientRequestId: "parent-ended" })
+          .pipe(Effect.flip, Effect.forkChild);
+        if (!idle) yield* Deferred.await(entered);
+        if (path === "rejected receipt at timeout") yield* TestClock.adjust("10 seconds");
+        const error = yield* Fiber.join(pending);
+        yield* Deferred.succeed(release, undefined);
+        if (!idle) yield* Deferred.await(finished);
+        assert.equal(error.code, "parent_not_active");
+        assert.isTrue("saved" in error);
+        assert.equal(error.saved, false);
+        assert.equal(
+          (yield* decodeMcpFailureJson(yield* encodeMcpFailureJson(error))).saved,
+          false,
+        );
+        assert.match(error.message, /not created; safe to retry/i);
+        if (path !== "no active run") assert.include(error.message, receipt.error);
+        if (previousCall) {
+          assert.include(error.message, "An earlier call with this clientRequestId was rejected");
+          assert.include(error.message, "safe to retry with a new clientRequestId");
+        }
+        assert.equal(dispatches, idle ? 0 : 1);
+        assert.notInclude(error.message, "may still be created");
+        assert.equal(state.saved, false);
+      }).pipe(
+        Effect.provideService(McpCall, state),
+        Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
+      );
+    }),
+  );
+
+  it.effect.each(
+    (
+      ["pending", "accepted", "rejected", "abandoned", "never_saved", "read_error"] as const
+    ).flatMap((state) =>
+      (["dispatch error", "idle retry"] as const).map((path) => ({ state, path })),
+    ),
+  )("delegation creation proof: $state at $path", ({ state, path }) =>
+    Effect.gen(function* () {
+      const receipt = {
+        commandId: CommandId.make("proof"),
+        threadId: parentThreadId,
+        commandType: "delegated_task.request",
+        acceptedAt: DateTime.makeUnsafe("2026-11-16T00:00:00Z"),
+        resultSequence: 1,
+        status: state === "accepted" ? ("accepted" as const) : ("rejected" as const),
+        error: `Parent run ${parentRunId} is not active.`,
+      };
+      const analytics: McpCall["Service"] = {
+        callerResolved: false,
+        callerResolveMs: 0,
+        readerLane: "background",
+        phase: "handler",
+        saved: "unknown",
+      };
+      const dependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          getCallerRow: (id) =>
+            Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
+          getThreadRecords: () =>
+            Effect.succeed({
+              ...parentProjection([]),
+              ...(path === "idle retry" ? { runs: [] } : {}),
+            }),
+          hasReceipt: () => Effect.succeed(state === "accepted"),
+          getCommandReceipt: () =>
+            Effect.succeed(
+              state === "accepted" || state === "rejected" ? Option.some(receipt) : Option.none(),
+            ),
+          getDelegationCommandState: () =>
+            state === "read_error"
+              ? Effect.fail(
+                  new CommandReceiptStore.CommandReceiptStoreReadError({
+                    commandId: receipt.commandId,
+                  }),
+                )
+              : Effect.succeed(
+                  state === "accepted" || state === "rejected"
+                    ? receipt
+                    : state === "abandoned"
+                      ? {
+                          status: "abandoned" as const,
+                          reason: "dispatch failed",
+                          elapsedSeconds: 1,
+                          at: receipt.acceptedAt,
+                        }
+                      : { status: state },
+                ),
+          dispatch: (command) =>
+            Effect.fail(
+              new Orchestrator.OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: receipt.error,
+              }),
+            ),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([
+          providerSnapshot({
+            instanceId: codexInstanceId,
+            driver: ProviderDriverKind.make("codex"),
+            model: "gpt-5.4",
+          }),
+        ]),
+        adapterRegistryLayer([codexInstanceId]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const error = yield* service
+          .delegateTask(scope, { task: "Review", mode: "async", clientRequestId: "proof" })
+          .pipe(Effect.flip);
+        const definite = state === "rejected" || state === "abandoned" || state === "never_saved";
+        assert.equal(error.saved, state === "accepted" ? true : definite ? false : undefined);
+        if (definite) assert.include(error.message, "not created; safe to retry");
+        else assert.notInclude(error.message, "not created");
+        if (state === "accepted") {
+          assert.include(error.message, "was created");
+          assert.equal(analytics.saved, true);
+        }
+      }).pipe(
+        Effect.provideService(McpCall, analytics),
+        Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))),
+      );
+    }),
+  );
+
   it.effect.each(["node:delegated-task:unknown", "unknown"])(
     "taskStatus traces an unknown id %s",
     (id) =>
@@ -2604,7 +2824,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           assert.isDefined(state.delegation);
           assert.equal(
             yield* state.delegation!.readCommitted,
-            receipt === "read_error" ? "unknown" : receipt === "rejected",
+            receipt === "read_error" ? "unknown" : false,
           );
         }).pipe(
           Effect.provideService(McpCall, state),
@@ -3625,6 +3845,10 @@ describe("OrchestratorMcpService provider resolution", () => {
 
   it.effect.each([
     { mode: "async", legacy: false },
+    { mode: "async", legacy: false, rejectBeforeAdmission: true },
+    { mode: "async", legacy: false, replayReadFailure: true },
+    { mode: "async", legacy: false, dispatchTimeout: "before commit", parentEnds: true },
+    { mode: "wait", legacy: false, dispatchTimeout: "before commit", parentEnds: true },
     { mode: "async", legacy: false, parentRestart: true },
     { mode: "wait", legacy: false },
     { mode: "wait", legacy: false, stillRunning: true },
@@ -3697,7 +3921,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     },
     { mode: "wait", legacy: true, dispatchTimeout: "before commit", noRetry: true },
   ] as const)(
-    "replays the same delegation across any namespace rebind ($mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease, expireCreate=$expireCreate, failCreate=$failCreate)",
+    "replays the same delegation across any namespace rebind (parentEnds=$parentEnds, rejectBeforeAdmission=$rejectBeforeAdmission, replayReadFailure=$replayReadFailure, $mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease, expireCreate=$expireCreate, failCreate=$failCreate)",
     (testCase) => {
       const { mode, legacy } = testCase;
       const stillRunning = "stillRunning" in testCase;
@@ -3718,10 +3942,15 @@ describe("OrchestratorMcpService provider resolution", () => {
             },
           ]);
           const database = SqlitePersistence.layerMemory;
+          const storeLayer = ProjectionStore.layer.pipe(Layer.provide(database));
           const orchestratorLayer = ProviderReplayHarness.layerWithRegistry(
             { name: `mcp-delegate-retry-${mode}` },
             layerRegistry,
-            { databaseLayer: database, runEffectWorker: false },
+            {
+              databaseLayer: database,
+              runEffectWorker: false,
+              runContinuationWorker: "parentEnds" in testCase,
+            },
           );
           const settings = ServerSettings.layerTest();
           const firstWatch = yield* Deferred.make<void>();
@@ -3736,6 +3965,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           const wakeUpgraded = yield* Deferred.make<void>();
           const prepared = yield* Deferred.make<void>();
           let blockDispatch = dispatchTimeout !== undefined;
+          let failReplayRead = false;
           let blockRecovery = false;
           const heldOrchestrator = Layer.effect(
             Orchestrator.OrchestratorV2,
@@ -3745,6 +3975,12 @@ describe("OrchestratorMcpService provider resolution", () => {
                 ...real,
                 dispatch: (command) =>
                   Effect.gen(function* () {
+                    if (command.type === "delegated_task.request" && failReplayRead)
+                      return yield* new Orchestrator.OrchestratorDispatchError({
+                        commandId: command.commandId,
+                        commandType: command.type,
+                        cause: "Accepted receipt event replay read failed",
+                      });
                     if (command.type !== "delegated_task.request" || !blockDispatch)
                       return yield* real.dispatch(command);
                     blockDispatch = false;
@@ -3827,6 +4063,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           ).pipe(Layer.provideMerge(threads));
           const layerTest = OrchestratorMcpService.layer.pipe(
             Layer.provideMerge(threadsWithWatchSignal),
+            Layer.provideMerge(storeLayer),
             Layer.provide(
               Layer.mergeAll(
                 NodeServices.layer,
@@ -3908,6 +4145,14 @@ describe("OrchestratorMcpService provider resolution", () => {
               attachments: [],
               dispatchMode: { type: "start_immediately" },
             });
+            const parentAtAdmission = yield* orchestrator.getThreadProjection(parentThreadId);
+            const callerSession = parentAtAdmission.providerThreads.find(
+              (thread) => thread.id === parentAtAdmission.runs[0]!.providerThreadId,
+            )!.providerSessionId!;
+            let boundScope = {
+              ...scope,
+              thread: { ...scope.thread!, providerSessionId: callerSession },
+            };
             const request = {
               task: "Review.",
               mode,
@@ -3915,6 +4160,49 @@ describe("OrchestratorMcpService provider resolution", () => {
               clientRequestId: `delegate-replay-${mode}`,
               ...("worktree" in testCase ? { isolation: "worktree" as const } : {}),
             } as const;
+            if ("rejectBeforeAdmission" in testCase) {
+              const store = yield* ProjectionStore.ProjectionStoreV2;
+              const run = parentAtAdmission.runs[0]!;
+              const now = yield* DateTime.now;
+              yield* store.apply({
+                type: "run.updated",
+                id: EventId.make("parent:ended-before-admission"),
+                threadId: parentThreadId,
+                runId: run.id,
+                occurredAt: now,
+                payload: { ...run, status: "completed", completedAt: now },
+              });
+              const error = yield* service.delegateTask(boundScope, request).pipe(Effect.flip);
+              assert.equal(error.code, "parent_not_active");
+              assert.equal(error.saved, false);
+              assert.include(error.message, "not created; safe to retry");
+              assert.lengthOf(
+                (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+                0,
+              );
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make("parent:retry-after-rejection"),
+                threadId: parentThreadId,
+                messageId: MessageId.make("parent:retry-after-rejection"),
+                text: "Retry delegate with the same key",
+                attachments: [],
+                dispatchMode: { type: "start_immediately" },
+                createdBy: "user",
+                creationSource: "web",
+              });
+              const resumed = yield* orchestrator.getThreadProjection(parentThreadId);
+              const runNow = resumed.runs.at(-1)!;
+              boundScope = {
+                ...boundScope,
+                thread: {
+                  ...boundScope.thread,
+                  providerSessionId: resumed.providerThreads.find(
+                    (thread) => thread.id === runNow.providerThreadId,
+                  )!.providerSessionId!,
+                },
+              };
+            }
             if (legacy) {
               const parent = yield* orchestrator.getThreadProjection(parentThreadId);
               const run = parent.runs[0]!;
@@ -3937,14 +4225,14 @@ describe("OrchestratorMcpService provider resolution", () => {
             let timeoutTaskId: string | undefined;
             if (dispatchTimeout !== undefined) {
               const timedCall = yield* service
-                .delegateTask(scope, request)
+                .delegateTask(boundScope, request)
                 .pipe(Effect.flip, Effect.forkScoped);
               yield* Deferred.await(dispatchEntered);
               yield* TestClock.adjust("10 seconds");
               const error = yield* Fiber.join(timedCall);
               assert.equal(error.code, "delegation_timeout");
               timeoutTaskId =
-                /Task (\S+) may still be created; use task_status to check whether it was saved\./.exec(
+                /Task (\S+) (?:may still be created|was created); use task_status/.exec(
                   error.message,
                 )?.[1];
               assert.isDefined(timeoutTaskId);
@@ -3966,7 +4254,7 @@ describe("OrchestratorMcpService provider resolution", () => {
               }
               const concurrent =
                 "concurrentRetry" in testCase
-                  ? yield* service.delegateTask(scope, request).pipe(Effect.forkScoped)
+                  ? yield* service.delegateTask(boundScope, request).pipe(Effect.forkScoped)
                   : undefined;
               if ("expireCreate" in testCase) {
                 const threads = yield* ThreadManagementService.ThreadManagementService;
@@ -4017,6 +4305,27 @@ describe("OrchestratorMcpService provider resolution", () => {
                 });
                 yield* orchestrator.recoverDelegatedTasks;
               }
+              if ("parentEnds" in testCase) {
+                const store = yield* ProjectionStore.ProjectionStoreV2;
+                const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+                const run = parent.runs[0]!;
+                const now = yield* DateTime.now;
+                yield* store.apply({
+                  type: "run.updated",
+                  id: EventId.make("parent:normal-end"),
+                  threadId: parentThreadId,
+                  runId: run.id,
+                  occurredAt: now,
+                  payload: { ...run, status: "completed", completedAt: now },
+                });
+                const pendingRetry = yield* service
+                  .delegateTask(boundScope, request)
+                  .pipe(Effect.flip);
+                assert.equal(pendingRetry.code, "delegation_timeout");
+                assert.isUndefined(pendingRetry.saved);
+                assert.include(pendingRetry.message, "may still be created");
+                assert.notInclude(pendingRetry.message, "not created");
+              }
               yield* Deferred.succeed(dispatchRelease, undefined);
               yield* Deferred.await(dispatchFinished);
               if ("worktree" in testCase) yield* Deferred.await(prepared);
@@ -4030,6 +4339,58 @@ describe("OrchestratorMcpService provider resolution", () => {
                   assert.notEqual(child.runs[0]!.status, "preparing");
                 }
               }
+            }
+            if ("parentEnds" in testCase) {
+              if (mode === "wait") yield* Deferred.await(wakeUpgraded);
+              const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+              assert.equal(parent.runs[0]!.status, "completed");
+              assert.lengthOf(parent.subagents, 1);
+              const task = parent.subagents[0]!;
+              assert.equal(task.runId, parent.runs[0]!.id);
+              assert.equal(task.completionWake, "always");
+              // A replay while the parent is idle must recover the accepted task.
+              const replay = yield* service.delegateTask(boundScope, { ...request, mode: "async" });
+              assert.equal(replay.taskId, timeoutTaskId);
+              assert.equal(replay.childThreadId, task.childThreadId);
+              const store = yield* ProjectionStore.ProjectionStoreV2;
+              const child = yield* orchestrator.getThreadProjection(task.childThreadId!);
+              const childRun = child.runs[0]!;
+              const now = yield* DateTime.now;
+              yield* store.apply({
+                type: "run.updated",
+                id: EventId.make("late:finish-child"),
+                threadId: task.childThreadId!,
+                runId: childRun.id,
+                occurredAt: now,
+                payload: { ...childRun, status: "completed", completedAt: now },
+              });
+              const wake = yield* orchestrator.streamDomainEvents.pipe(
+                Stream.filter(
+                  (event) =>
+                    event.type === "message.updated" &&
+                    event.threadId === parentThreadId &&
+                    event.payload.delegatedCompletion !== undefined,
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+                Effect.forkScoped,
+              );
+              yield* orchestrator.recoverDelegatedTasks;
+              yield* TestClock.adjust(DELEGATED_COMPLETION_HOLD);
+              yield* Fiber.join(wake);
+              yield* orchestrator.recoverDelegatedTasks;
+              const after = yield* orchestrator.getThreadProjection(parentThreadId);
+              assert.lengthOf(after.subagents, 1);
+              assert.lengthOf(
+                after.messages.filter((message) => message.delegatedCompletion !== undefined),
+                1,
+              );
+              assert.lengthOf(
+                after.runs.filter((run) => run.id !== parent.runs[0]!.id),
+                1,
+              );
+              assert.equal(after.subagents[0]!.completionDelivery?.state, "claimed");
+              return;
             }
             if ("noRetry" in testCase && timeoutTaskId !== undefined) {
               if (mode === "wait") yield* Deferred.await(wakeUpgraded);
@@ -4054,7 +4415,9 @@ describe("OrchestratorMcpService provider resolution", () => {
               assert.equal(finished.completionDelivery?.state, "claimed");
               return;
             }
-            const firstCall = yield* service.delegateTask(scope, request).pipe(Effect.forkScoped);
+            const firstCall = yield* service
+              .delegateTask(boundScope, request)
+              .pipe(Effect.forkScoped);
             if (mode === "wait") {
               yield* Deferred.await(firstWatch);
               yield* TestClock.adjust(1_000);
@@ -4070,6 +4433,23 @@ describe("OrchestratorMcpService provider resolution", () => {
               );
             }
             assert.equal(first.waitTimedOut, mode === "wait");
+            if ("replayReadFailure" in testCase) {
+              failReplayRead = true;
+              const error = yield* service.delegateTask(boundScope, request).pipe(Effect.flip);
+              assert.equal(error.saved, true);
+              assert.include(error.message, "was created");
+              assert.notInclude(error.message, "not created");
+              assert.lengthOf(
+                (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+                1,
+              );
+              assert.lengthOf(
+                (yield* orchestrator.getThreadProjection(first.childThreadId)).runs,
+                1,
+              );
+              return;
+            }
+
             if ("parentRestart" in testCase) {
               const parent = yield* orchestrator.getThreadProjection(parentThreadId);
               yield* orchestrator.dispatch({

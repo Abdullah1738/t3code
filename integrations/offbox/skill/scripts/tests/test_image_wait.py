@@ -203,7 +203,7 @@ class ImageWaitTests(unittest.TestCase):
             fx.tool('docker', '#!/bin/bash\necho docker >> "$CALLS"\nexit 1\n')
             fx.tool('systemctl', '#!/bin/bash\necho systemctl >> "$CALLS"\nexit 0\n')
             fx.env['HOME'] = d
-            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
+            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), \
                  patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('missing-dir', '.', ['echo USER_COMMAND'], None, 'r', wait_images=True)
             script = script.replace(runs.IMAGE_WAIT, fx.script())

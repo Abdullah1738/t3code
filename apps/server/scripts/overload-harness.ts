@@ -323,6 +323,7 @@ const threads = Layer.effect(
           status: views.get(threadId) === false ? "completed" : "running",
           message: null,
         }),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: Effect.fn("OverloadProvider.launch")(function* () {

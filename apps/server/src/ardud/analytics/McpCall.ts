@@ -37,6 +37,14 @@ export class McpCall extends Context.Service<
       readonly taskId: string;
       readonly readCommitted: Effect.Effect<boolean | "unknown">;
     };
+    detachedAnalytics?: {
+      readonly tool: string;
+      readonly callerIdentity: string | undefined;
+      readonly callerThreadId: string | undefined;
+      readonly startedAt: string;
+      readonly build: string;
+      readonly bootId: string;
+    };
     threadRead?: {
       readerWaitMs: number;
       queryMs: number;
@@ -106,6 +114,7 @@ const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
   ThreadReadTimeoutError: "timeout",
   PullRequestWatchTimeoutError: "timeout",
+  PullRequestWatchUnavailableError: "refused",
   PullRequestToolTimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
   PreviewAutomationRecordingDeadlineExpiredError: "timeout",
@@ -139,6 +148,12 @@ function classifyFailure(error: Record<string, unknown>) {
   return undefined;
 }
 
+export function hashClientRequestId(clientRequestId: string, callerIdentity: string | undefined) {
+  return NodeCrypto.createHash("sha256")
+    .update(JSON.stringify([callerIdentity ?? "", clientRequestId]))
+    .digest("hex");
+}
+
 export function callIdentifiers(payload: unknown, callerIdentity: string | undefined) {
   const input = fields(payload);
   return {
@@ -148,9 +163,7 @@ export function callIdentifiers(payload: unknown, callerIdentity: string | undef
       : {}),
     ...(typeof input.clientRequestId === "string"
       ? {
-          clientRequestId: NodeCrypto.createHash("sha256")
-            .update(JSON.stringify([callerIdentity ?? "", input.clientRequestId]))
-            .digest("hex"),
+          clientRequestId: hashClientRequestId(input.clientRequestId, callerIdentity),
         }
       : {}),
   };

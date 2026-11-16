@@ -223,6 +223,7 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
     const other = chat.kind === "owner" ? " (add `--chat moni` for Moni's)" : "";
     lines.push(`Location, only for pickups, "where am I/is she", nearby results, ETAs and live location: run \`location --session CURRENT_SESSION_ID\`${other} for the latest share. If nothing is shared, run \`location-request --session CURRENT_SESSION_ID --key UNIQUE_KEY\`${other ? " (same `--chat`)" : ""}, say you've asked, and wait for the [Shared location] message. Never use Find My.`);
   }
+  if (chat.kind === "group") lines.push("Group requests: you have no private tools. If you don't know the answer or can't do it yourself (Abdullah's plans, flights, calendar, orders, or Moni's things), ask quietly with `agent-ask --to owner` or `--to moni`, choosing whose it is; include `--text \"...\" --session CURRENT_SESSION_ID --key UNIQUE_KEY`. Answer in the group yourself once the answer arrives. Don't say you're asking another assistant. Never post private details unless the person they belong to asked for them here.");
   // Turns nobody typed (wakes) carry no attachments and don't open Robob asks; guest wakes bring their own commands.
   if (!background) {
     const other = chat.kind === "owner" ? " Add `--chat <slug>` for another chat."
@@ -236,7 +237,7 @@ export function sendblueContextPrompt(context: ChatContext, eyes: boolean, sende
   if (chat.kind === "owner") lines.push((tool ? "Other chats: `chats --session CURRENT_SESSION_ID` lists them; `imessage_send` with `to` set to the slug (or `send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...`) messages one;" : "Other chats: `chats --session CURRENT_SESSION_ID` lists them; `send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` messages one;") + " `wake --chat <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...` passes the owner's decision to that chat's assistant. `allow --address A --name N [--admin]` and `allow-group --id G [--name N]` add people or groups when the owner asks.");
   else if (chat.kind === "dm" && context.roleOf(chatKey.target(chat.key)).role === "admin") lines.push(`Groups: \`chats --session CURRENT_SESSION_ID\` lists the group chats ${chat.title} has written in; \`send --to <slug> --session CURRENT_SESSION_ID --key UNIQUE_KEY --text ...\` posts in one of them when ${chat.title} asks. For work on the Mac (orders, rides, payments, the owner's Dia, Android phone, Keychain, calendar, mail, health or money), use agent-ask --to owner. For her own accounts, keep using offbox-person.`);
   if (chat.kind === "owner" || (chat.kind === "dm" && context.roleOf(chatKey.target(chat.key)).role === "admin")) {
-    lines.push('Agent bus: `agent-ask --to <slug> --text "..." --session CURRENT_SESSION_ID --key UNIQUE_KEY` asks another assistant; add `--parent areq_...` while handling a request. Reply with `agent-answer --request areq_... --text "..." --session CURRENT_SESSION_ID [--status done|declined|pending]`. `agent-requests --session CURRENT_SESSION_ID` lists requests.');
+    lines.push('Agent bus: `agent-ask --to <slug> --text "..." --session CURRENT_SESSION_ID --key UNIQUE_KEY` asks another assistant; add `--parent areq_...` while handling a request. Reply with `agent-answer --request areq_... --text "..." --session CURRENT_SESSION_ID [--status done|declined|pending]`. `agent-requests --session CURRENT_SESSION_ID` lists requests. Requests from a group include its members; answer for that audience.');
     lines.push("owner = Abdullah's assistant on his Mac: orders (noon/Careem/Amazon), Uber rides, payments and cards, Dia browser, his Android phone, his calendar, mail, health and money.");
     lines.push("moni = Moni's assistant: her accounts, WhatsApp, files, preferences and browser on her own box.");
     lines.push("groups = no private data.");
@@ -665,11 +666,11 @@ Secure forms and the other commands are in the imessage skill.`;
 
 // Existing client methods do not accept cancellation signals. Bound the wait, but
 // treat timed-out mutations as ambiguous: their underlying request can finish later.
-async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
+export async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Router request timed out")), timeout);
+      timer = setTimeout(() => reject(Object.assign(new Error("Router request timed out"), { name: "TimeoutError", code: "timeout" })), timeout);
     })]);
   } finally {
     clearTimeout(timer);
@@ -867,6 +868,7 @@ export class Router {
 
   private checkingLatency?: Promise<void>;
   private latencyScanAt = -Infinity;
+  private replayProbeBackoff = new Map<string, { delay: number; nextAt: number }>();
   private latencyParents = new Map<string, string>();
   private latencyParentsAt = -Infinity;
 
@@ -922,7 +924,7 @@ export class Router {
         && (wake || typed) && Number.isSafeInteger(input.receivedAt)
         && now - input.receivedAt! >= (wake ? 15 * 60_000 : 120_000);
     });
-    if (!rows.length) return;
+    if (!rows.length) { this.replayProbeBackoff.clear(); return; }
     // Sealed membership changes on a seal, not on the one-second delivery clock.
     if (now - this.latencyParentsAt >= 60_000) {
       this.latencyParents = new Map(this.store.db.query<{ member: string; leader: string }, []>(
@@ -934,21 +936,23 @@ export class Router {
     const parents = this.latencyParents;
     // Protect every candidate before the first backend await; an earlier slow read
     // must not let the normal timer discard a later batch's membership.
-    const snapshots = new Map<string, { original: Turn | null | undefined; members: string[]; batch: NormalizedInbound | null | undefined }>();
+    const snapshots = new Map<string, { original: Turn | null | undefined; members: string[]; batch: NormalizedInbound | null | undefined; received?: number }>();
     for (const row of rows) {
       const leader = parents.get(row.id) ?? row.id;
       if (snapshots.has(leader)) continue;
       const original = this.store.get<Turn | null>(`failed-delivery:${leader}`);
       const batch = this.store.get<NormalizedInbound | null>(`batch:${leader}`);
       const members = batch?.batchIds ?? [leader];
-      snapshots.set(leader, { original, members, batch });
       const received = this.store.db.query<{ at: number }, [string]>("SELECT json_extract(payload, '$.receivedAt') AS at FROM inbound WHERE id = ?").get(leader)?.at;
+      snapshots.set(leader, { original, members, batch, received });
       if (!original || !this.current(original) || received === undefined || now - received > FAILED_INBOUND_REPLAY_MAX_AGE_MS) continue;
       this.store.set(`latency-route:${leader}`, original);
       const until = received + FAILED_INBOUND_REPLAY_MAX_AGE_MS;
       this.store.set(`failed-replay-until:${leader}`, Math.min(this.store.get<number>(`failed-replay-until:${leader}`) ?? until, until));
     }
+    for (const leader of this.replayProbeBackoff.keys()) if (!snapshots.has(leader)) this.replayProbeBackoff.delete(leader);
     const checked = new Set<string>();
+    const timedOut = new Set<string>();
     let due = false;
     for (const row of rows) {
       const input = JSON.parse(row.payload) as NormalizedInbound;
@@ -973,34 +977,58 @@ export class Router {
         for (const id of ids) if (id.startsWith("wake:") && this.store.get(`stuck-wake-retry:${id}`) === undefined) this.store.set(`stuck-wake-retry:${id}`, now);
       }
       if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS && retryAt === undefined) continue;
-      const { original, members, batch } = snapshots.get(leader)!;
+      const { original, members, batch, received } = snapshots.get(leader)!;
       let absent = true;
       if (original) {
-        for (const id of [original.messageId, ...original.earlier ?? []]) {
-          try {
-            if (await bounded(this.backend.promptAccepted(original.id, original.directory, id))) {
-              this.store.db.transaction(() => {
-                // A normal tick may have admitted and already failed this turn during the read.
-                if (this.store.get(`inbound-delivered:${leader}`) !== undefined) {
-                  for (const member of members) if (this.store.get(`inbound-delivered:${member}`) === undefined) this.delivered(member, [member]);
-                  return;
-                }
-                const attempt = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
-                if (attempt) this.consumeSteer(leader, attempt);
-                else {
-                  const active = this.store.get<Turn | null>("activeTurn");
-                  if (this.current(original) && (!active || active.phase === "failed" || active.inboundId === leader)) {
-                    const admitted: Turn = { ...original, phase: "running" };
-                    this.setTurn(admitted);
-                    this.landed(admitted);
+        const backoff = this.replayProbeBackoff.get(leader);
+        const deadline = (received ?? input.receivedAt!) + FAILED_INBOUND_REPLAY_MAX_AGE_MS;
+        const maxDelay = 10 * 60_000;
+        // Leave the final ten minutes of the replay horizon unthrottled. Alerts
+        // below still run for every row, including members of a cooling batch.
+        const nearDeadline = Date.now() >= deadline - maxDelay && Date.now() <= deadline;
+        const cooling = backoff && Date.now() < backoff.nextAt && !nearDeadline;
+        if (cooling || timedOut.has(leader)) absent = false;
+        else {
+          let uncertain = false;
+          const ids = [original.messageId, ...original.earlier ?? []];
+          for (const [probeIndex, id] of ids.entries()) {
+            try {
+              if (await bounded(this.backend.promptAccepted(original.id, original.directory, id))) {
+                this.store.db.transaction(() => {
+                  // A normal tick may have admitted and already failed this turn during the read.
+                  if (this.store.get(`inbound-delivered:${leader}`) !== undefined) {
+                    for (const member of members) if (this.store.get(`inbound-delivered:${member}`) === undefined) this.delivered(member, [member]);
+                    return;
                   }
-                }
-                this.delivered(leader, members);
-              }).immediate();
+                  const attempt = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
+                  if (attempt) this.consumeSteer(leader, attempt);
+                  else {
+                    const active = this.store.get<Turn | null>("activeTurn");
+                    if (this.current(original) && (!active || active.phase === "failed" || active.inboundId === leader)) {
+                      const admitted: Turn = { ...original, phase: "running" };
+                      this.setTurn(admitted);
+                      this.landed(admitted);
+                    }
+                  }
+                  this.delivered(leader, members);
+                }).immediate();
+                absent = false;
+                break;
+              }
+            } catch (caughtError) {
+              toolError("router", "router.catch1", caughtError, { inboundId: `row_${hash(leader).slice(0, 16)}` }, { probeIndex, probeCount: ids.length });
               absent = false;
-              break;
+              uncertain = true;
+              if (caughtError instanceof Error && "code" in caughtError && caughtError.code === "timeout") {
+                timedOut.add(leader);
+                const delay = Math.min((backoff?.delay ?? 30_000) * 2, maxDelay);
+                const at = Date.now();
+                this.replayProbeBackoff.set(leader, { delay, nextAt: at < deadline - maxDelay ? Math.min(at + delay, deadline - maxDelay) : at + delay });
+                break;
+              }
             }
-          } catch (caughtError) { toolError("router", "router.catch1", caughtError); absent = false; }
+          }
+          if (!uncertain || this.store.get(`inbound-delivered:${leader}`) !== undefined) this.replayProbeBackoff.delete(leader);
         }
         const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (live?.state === "done" || this.store.get(`inbound-delivered:${leader}`) !== undefined) continue;
@@ -4170,21 +4198,74 @@ export class Router {
     return found;
   }
 
+  private logNoticeReply(turn: Pick<Turn, "id" | "generation"> & Partial<Pick<Turn, "messageId" | "earlySent" | "earlyOutbox">>, scope: MessageRecord[], record: MessageRecord,
+    source: "watch" | "settle_preceding", sealedWake = false,
+    outcome?: "incomplete" | "failed" | "owner_typed"): void {
+    toolLog.capture(() => {
+      const pendingKey = turn.messageId ? `log-notice-pending:${turn.id}:${turn.messageId}` : undefined;
+      let pending = pendingKey
+        ? this.store.get<{ noticeId: string; ownerTyped: boolean; sealedWake: boolean; runId?: string; replyIds?: string[]; precedingIdleIds?: string[] } | null>(pendingKey) : undefined;
+      const observe = (run: MessageRecord[], boundary: MessageRecord, override?: typeof outcome) => {
+        const notice = run.find(m => (m.type === "user" || m.type === "synthetic")
+          && typeof m.text === "string" && isCompletionNoticeText(m.text));
+        const carried = pending?.precedingIdleIds?.includes(boundary.id) ? undefined : pending;
+        if (carried) pending = undefined;
+        const noticeId = carried?.noticeId ?? notice?.id;
+        if (!noticeId) return;
+        const key = `${turn.id}:${noticeId}`;
+        // Incomplete runs leave the watermark unchanged, including across a bridge restart.
+        const logged = this.store.get<string[]>("log-notice-replies") ?? [];
+        if (logged.includes(key)) { if (carried && pendingKey) this.store.set(pendingKey, null); return; }
+        const steps = run.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
+        const final = steps.at(-1);
+        const runId = carried?.runId ?? steps.find(m => typeof m.runId === "string")?.runId;
+        // Early replies are already in the outbox when terminal processing excludes them from outgoing.
+        const replies = this.toolMode ? 0 : new Set([
+          ...(carried?.replyIds ?? []),
+          ...steps.filter(m => this.store.getOperation(`reply:${turn.generation}:${m.id}`)
+            || m.id === turn.earlySent && turn.earlyOutbox && this.store.getOperation(turn.earlyOutbox)).map(m => m.id),
+        ]).size;
+        toolLog.write({ component: "router", kind: "event", name: "notice.reply",
+          ids: { chat: this.options.context?.chat.slug ?? "owner", runId: runId ?? boundary.id },
+          props: { source: carried ? "settle_preceding" : source, outcome: carried?.ownerTyped || run.some(ownerPrompt) ? "owner_typed" : override
+            ?? (boundary.type === "idle" && (boundary.outcome !== "succeeded" || boundary.modelError) || final?.error ? "failed"
+              : boundary.type === "idle" && final && (final.time.completed === undefined || final.finish === "tool-calls") ? "incomplete"
+              : this.toolMode ? "quiet" : replies ? "forwarded" : "no_reply"), replies, sealedWake: carried?.sealedWake ?? sealedWake } });
+        this.store.set("log-notice-replies", [...logged.slice(-255), key]);
+        if (carried && pendingKey) this.store.set(pendingKey, null);
+      };
+      // Foreground steering can collect several completed runs before its final idle.
+      let run: MessageRecord[] = [];
+      for (const item of scope) {
+        if (item.type !== "idle") { run.push(item); continue; }
+        // Earlier replies stay held until the final steered run reaches the outbox transaction.
+        if (outcome === "incomplete") pending = undefined;
+        else observe(run, item);
+        run = [];
+      }
+      observe(run, record, outcome);
+    });
+  }
+
   /** Completed notice runs retain their own outcome even when a sealed wake overtakes them. */
   private settlePrecedingCompletions(turn: Turn, records: MessageRecord[]): void {
     const replies: Extract<MessageRecord, { type: "assistant" }>[] = [];
+    const observations: { scope: MessageRecord[]; record: MessageRecord; outcome?: "incomplete" | "failed" }[] = [];
     let scope: MessageRecord[] = [];
     let settled: string | undefined;
     for (const record of records) {
       if (record.type !== "idle") { scope.push(record); continue; }
+      const observation: typeof observations[number] = { scope, record };
+      observations.push(observation);
       if (!scope.some(backgroundCompletion) || scope.some(ownerPrompt)) { scope = []; continue; }
       const steps = withoutProgressReplies(scope).filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
       const final = steps.at(-1);
       if (record.outcome === "succeeded" && !record.modelError && !final?.error) {
-        if (final && (final.time.completed === undefined || final.finish === "tool-calls")) break;
+        if (final && (final.time.completed === undefined || final.finish === "tool-calls")) { observation.outcome = "incomplete"; break; }
         const quiet = quietMessages(scope);
         replies.push(...steps.filter(m => !quiet.has(m.id) && !m.error && (m.answer === true || (m === final && m.answer !== false))));
       }
+      else observation.outcome = "failed";
       settled = record.id;
       scope = [];
     }
@@ -4197,7 +4278,25 @@ export class Router {
       replies.push(...answered);
       settled = answered.at(-1)?.id ?? settled;
     }
-    if (!settled) return;
+    const log = () => {
+      for (const observation of observations) this.logNoticeReply(turn, observation.scope, observation.record, "settle_preceding",
+        !!turn.inboundId?.startsWith("wake:"), observation.outcome);
+      if (scope.length && !observations.some(observation => observation.scope === scope)) toolLog.capture(() => {
+        const notice = scope.find(m => (m.type === "user" || m.type === "synthetic")
+          && typeof m.text === "string" && isCompletionNoticeText(m.text));
+        const steps = scope.filter((m): m is Extract<MessageRecord, { type: "assistant" }> => m.type === "assistant");
+        // A completed answer can precede more answers or a failed idle in this same run.
+        // Retain its identity and committed reply IDs when admission moves the watermark past them.
+        if (notice) this.store.set(`log-notice-pending:${turn.id}:${turn.messageId}`, {
+          noticeId: notice.id, ownerTyped: scope.some(ownerPrompt), sealedWake: !!turn.inboundId?.startsWith("wake:"),
+          runId: steps.find(m => typeof m.runId === "string")?.runId,
+          replyIds: steps.filter(m => this.store.getOperation(`reply:${turn.generation}:${m.id}`)).map(m => m.id),
+          // With no new answer to advance the watermark, earlier idles can be read again.
+          precedingIdleIds: observations.map(observation => observation.record.id),
+        });
+      });
+    };
+    if (!settled) { log(); return; }
     let enqueued = false;
     this.store.db.transaction(() => {
       for (const reply of this.toolMode ? [] : replies) {
@@ -4210,6 +4309,7 @@ export class Router {
       }
       this.store.set("watermark", { sessionId: turn.id, id: settled! } satisfies Watermark);
     }).immediate();
+    log();
     if (enqueued) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
   }
 
@@ -4504,6 +4604,7 @@ export class Router {
             this.fail(turn!, text, idle.id, reason, immediate);
             for (const id of completed) this.store.updateInbound(id, "done");
           }).immediate();
+          this.logNoticeReply(turn!, scope, idle, "watch", false, "failed");
           if (!this.toolMode && completedEarlier.length) this.stage("reply-enqueued", turn!.inboundId ?? turn!.messageId);
         };
         const providerError = [...replies].reverse().find(reply => reply.error)?.error;
@@ -4572,10 +4673,16 @@ export class Router {
       const tools = replies.flatMap(m => Array.isArray(m.content) ? m.content.filter(p => p?.type === "tool") : []);
       const runningTools = tools.some(p => !["completed", "error"].includes((p as { state?: { status?: string } }).state?.status ?? ""));
       if (turn.phase !== "running") return;
-      if (runningTools || !idle) return;
+      if (runningTools || !idle) {
+        if (idle) this.logNoticeReply(turn, scope, idle, "watch", false, "incomplete");
+        return;
+      }
       // An unsent final that has not completed, or that stopped to call tools, keeps the turn open. Narration
       // is the last word only when nothing follows it, so it closes here once the run is idle.
-      if (final && final.id !== turn.earlySent && (final.time.completed === undefined || final.finish === "tool-calls")) return;
+      if (final && final.id !== turn.earlySent && (final.time.completed === undefined || final.finish === "tool-calls")) {
+        this.logNoticeReply(turn, scope, idle, "watch", false, "incomplete");
+        return;
+      }
       // Unsent narration (text before a tool call, `answer` false) stays quiet. A final whose phase
       // is unknown still does, as before: the owner chose to keep forwarding unknown finals.
       const early = replies.find(reply => reply.id === turn!.earlySent);
@@ -4655,6 +4762,7 @@ export class Router {
       // Tool mode safety net: a typed message whose turn texted nothing gets one reminder.
       if (sent && !sent.length && !silent && !waiting.length) this.nudgeReply(turn);
     }).immediate();
+    this.logNoticeReply(turn, scope, idle, "watch");
     if (!this.toolMode && (text || earlier.length)) this.stage("reply-enqueued", turn.inboundId ?? turn.messageId);
   }
 
@@ -4725,6 +4833,14 @@ export class Router {
         }
       }
       if (!after.length && statuses[route.id] === undefined) return;
+      if (statuses[route.id] === undefined && (after.some(ownerPrompt) || !after.some(m => m.type === "assistant"))) {
+        let scope: MessageRecord[] = [];
+        for (const record of after) {
+          if (record.type !== "idle") { scope.push(record); continue; }
+          this.logNoticeReply(route, scope, record, "watch", false, after.some(ownerPrompt) ? "owner_typed" : undefined);
+          scope = [];
+        }
+      }
       if (after.some(ownerPrompt)) {
         // Desktop owner replies stay there even if a completion also arrived.
         const idle = [...after].reverse().find(m => m.type === "idle");

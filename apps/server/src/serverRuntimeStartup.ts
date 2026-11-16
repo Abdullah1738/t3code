@@ -32,6 +32,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "./config.ts";
+import * as ProviderProcessRegistry from "./ardud/providers/ProviderProcessRegistry.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import { flushCompileCache } from "./compileCache.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -452,11 +453,13 @@ export const runOrderedV2StartupPhases = Effect.fn(
   WorkerContext,
   BootstrapContext,
 >(input: {
+  readonly reapProviderProcesses: Effect.Effect<void>;
   readonly importLegacyShells: Effect.Effect<Import, ImportError, ImportContext>;
   readonly recover: Effect.Effect<Recovery, RecoveryError, RecoveryContext>;
   readonly startEffectWorker: Effect.Effect<void, WorkerError, WorkerContext>;
   readonly autoBootstrap: Effect.Effect<Bootstrap, BootstrapError, BootstrapContext>;
 }) {
+  yield* input.reapProviderProcesses;
   const recovery = yield* input.recover;
   yield* input.importLegacyShells;
   yield* input.startEffectWorker;
@@ -466,6 +469,8 @@ export const runOrderedV2StartupPhases = Effect.fn(
 
 const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: StartupOptions) {
   const serverConfig = yield* ServerConfig.ServerConfig;
+  const processRegistry = yield* ProviderProcessRegistry.ProviderProcessRegistry;
+  const analytics = yield* AnalyticsService.AnalyticsService;
   const keybindings = yield* Keybindings.Keybindings;
   const legacyV1ThreadImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
   const providerRuntimeRecovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
@@ -588,6 +593,25 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
     yield* Deferred.await(httpListening);
     yield* Effect.yieldNow;
     const { recovery, bootstrap: bootstrapTargets } = yield* runOrderedV2StartupPhases({
+      reapProviderProcesses: processRegistry.reap.pipe(
+        Effect.flatMap((records) =>
+          Effect.forEach(
+            records,
+            (record) =>
+              Effect.gen(function* () {
+                const now = yield* DateTime.now;
+                yield* analytics.record("provider.previous_boot_process_reaped", {
+                  threadId: record.threadId,
+                  provider: record.provider,
+                  pid: record.pid,
+                  bootId: record.bootId,
+                  ageMs: Math.max(0, DateTime.toEpochMillis(now) - record.recordedAt),
+                });
+              }),
+            { discard: true },
+          ),
+        ),
+      ),
       importLegacyShells: runStartupPhase(
         "orchestration-v2.legacy-v1.import-shells",
         legacyV1ThreadImporter.reconcileShells.pipe(

@@ -48,7 +48,7 @@ class StepScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             (Path(home) / 'w/repo/sub').mkdir(parents=True)
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', 'sub', [], None, 'run-test', steps=steps)
             env = {'HOME': home, 'PATH': os.environ.get('PATH', '/usr/bin:/bin')}
             p = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True)
@@ -56,7 +56,7 @@ class StepScriptTests(unittest.TestCase):
 
     def test_script_has_one_marker_per_step_and_pipefail(self):
         with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['true', 'false | cat'])
         self.assertEqual(script.count('offbox step '), 2)
         self.assertEqual(script.count('set -o pipefail'), 2)
@@ -865,7 +865,7 @@ class MissingDepsTests(unittest.TestCase):
                     elif state == 'symlink':
                         (root / 'node_modules').symlink_to(root / 'sub', target_is_directory=True)
                     with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                            patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                            patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                         script = runs.remote_script('w/repo', 'sub', [f'node -e \"process.exit({code})\"; cd /; exit {code}'], None, 'r', repo_root=root)
                     p = subprocess.run(['bash', '-c', script], env=clean_env(HOME=home),
                                        capture_output=True, text=True, timeout=10)
@@ -879,7 +879,7 @@ class MissingDepsTests(unittest.TestCase):
             root.mkdir(parents=True)
             (root / 'package.json').write_text('{"devDependencies":{"vitest":"1"}}')
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                    patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                    patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', '.', [], None, 'r', steps=['node -e \"process.exit(127)\"', 'true'], repo_root=root)
             p = subprocess.run(['bash', '-c', script], env=clean_env(HOME=home),
                                capture_output=True, text=True, timeout=10)
