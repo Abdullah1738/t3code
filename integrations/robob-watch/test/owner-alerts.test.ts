@@ -3,9 +3,17 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createApi } from "../../spectrum-bridge/src/api.ts";
+import { Delivery } from "../../spectrum-bridge/src/delivery.ts";
+import { Store } from "../../spectrum-bridge/src/store.ts";
+import { TransportError, type Photon } from "../../spectrum-bridge/src/photon.ts";
 
 const sandboxes: string[] = [];
-afterAll(() => { for (const path of sandboxes) rmSync(path, { recursive: true, force: true }); });
+const cleanups: (() => void)[] = [];
+afterAll(() => {
+  for (const cleanup of cleanups) cleanup();
+  for (const path of sandboxes) rmSync(path, { recursive: true, force: true });
+});
 const source = join(import.meta.dir, "../src");
 function fixture(opted = true, extra: Record<string, unknown> = {}) {
   const root = mkdtempSync(join(tmpdir(), "watcher-owner-alert-"));
@@ -19,6 +27,7 @@ function fixture(opted = true, extra: Record<string, unknown> = {}) {
   const bridgeDB = join(root, "bridge.sqlite");
   const db = new Database(bridgeDB);
   db.exec("create table kv(key text primary key,value text)");
+  db.exec("create table outbox(id text primary key,payload text not null,state text not null,attempts integer not null default 0,providerId text unique)");
   db.query("insert into kv values ('route',?)").run(JSON.stringify({ id: "ses_owner" })); db.close();
   const bridge = join(root, "bridge.ts");
   writeFileSync(bridge, `import {Database} from "bun:sqlite";
@@ -29,19 +38,25 @@ function fixture(opted = true, extra: Record<string, unknown> = {}) {
     if(existsSync(root+"/fail-"+args[0])) {console.error("stub refusal");process.exit(1);}
     if(args[0]==="send") {
       const opt=n=>args.find(a=>a.startsWith("--"+n+"="))?.slice(n.length+3);
+      if(existsSync(root+"/bridge-url")) {
+        const response=await fetch(readFileSync(root+"/bridge-url","utf8")+"/send",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({text:opt("text"),sessionId:opt("session"),dedupeKey:opt("key")})});
+        console.log(await response.text());process.exit(response.ok?0:1);
+      }
       const db=new Database(${JSON.stringify(bridgeDB)});
       const route=JSON.parse(db.query("select value from kv where key='route'").get().value);
       const key="api:send:send:"+createHash("sha256").update(opt("key")).digest("hex");
       const spec=JSON.stringify({kind:"conversation",text:opt("text"),sessionId:opt("session"),generation:route.generation});
       const prior=db.query("select value from kv where key=?").get(key);
       if(prior&&JSON.parse(prior.value).spec!==spec){console.error("409 route changed");process.exit(1);}
-      db.query("insert or replace into kv values (?,?)").run(key,JSON.stringify({spec}));db.close();
+      db.query("insert or replace into kv values (?,?)").run(key,JSON.stringify({spec}));
+      db.query("insert or ignore into outbox values (?,?,'sent',1,?)").run(key.slice(9),spec,key);db.close();
       const saved=existsSync(root+"/accepted")?JSON.parse(readFileSync(root+"/accepted","utf8")):{};
       if(saved[opt("key")] && saved[opt("key")]!==opt("text")) {console.error("409 changed payload");process.exit(1);}
       saved[opt("key")]=opt("text");writeFileSync(root+"/accepted",JSON.stringify(saved));
     }
     console.log('{"created":true}');`);
-  const environment = { ...process.env, ROBOB_TEST: "1", BUN_INSPECT: "", ROBOB_WATCH_ROOT: root,
+  const environment: Record<string, string | undefined> = { ...process.env, ROBOB_TEST: "1", BUN_INSPECT: "", ROBOB_WATCH_ROOT: root,
     ROBOB_WATCH_LOAD_OVERRIDE: "0.1", TOOLLOG_DIR: join(root, "logs"), ROBOB_WATCH_BRIDGE_DB: bridgeDB,
     ROBOB_WATCH_SPECTRUM_CLI: bridge, ROBOB_WATCH_TELEGRAM_CLI: bridge };
   const state = () => JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
@@ -75,8 +90,148 @@ function fixture(opted = true, extra: Record<string, unknown> = {}) {
     const db = new Database(bridgeDB);
     db.query("update kv set value=? where key='route'").run(JSON.stringify({ id, generation })); db.close();
   };
-  return { root, state, define, tick, resume, execute, calls, accepted, events, rotate };
+  return { root, bridgeDB, state, define, tick, resume, execute, calls, accepted, events, rotate };
 }
+
+function realBridgeFixture(maxFailures = 1) {
+  const f = fixture(true, { max_consecutive_failures: maxFailures });
+  const store = new Store(f.bridgeDB);
+  store.set("route", { id: "ses_owner", generation: 1 });
+  const texts: string[] = [];
+  const transport: Pick<Photon, "sendText"> = { async sendText(input) {
+    texts.push(input.text); return { providerId: `test-${texts.length}` };
+  } };
+  const delivery = new Delivery(store, transport, { projectScope: "owner-alert-test", enabled: () => true,
+    chatGuid: () => "iMessage;-;+15555550123", sleep: async () => {} });
+  const api = createApi({ store, photon: { async react() {} }, router: () => undefined,
+    chatGuid: () => "iMessage;-;+15555550123", enabled: () => true, health: () => ({ ok: true }) });
+  const responses: number[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const response = await api(request); responses.push(response.status); return response;
+  } });
+  writeFileSync(join(f.root, "bridge-url"), server.url.origin);
+  cleanups.push(() => { server.stop(true); store.close(); });
+  const operations = () => store.db.query<{ id: string; state: string; attempts: number }, []>(
+    "select id,state,attempts from outbox order by rowid").all();
+  const post = (path: string, body: unknown) => api(new Request(`http://test${path}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }));
+  return { ...f, store, texts, transport, delivery, responses, operations, post };
+}
+
+const routeChanges = [
+  { name: "thread", route: { id: "ses_new_owner", generation: 1 } },
+  { name: "generation", route: { id: "ses_owner", generation: 2 } },
+  { name: "missing route", route: null },
+];
+test.each(["pause", "failing", "recovered"].flatMap(kind => routeChanges.map(change => ({ kind, ...change }))))(
+  "real bridge requeues an unsent $kind after $name cancellation and restart", async ({ kind, route }) => {
+  const f = realBridgeFixture(kind === "failing" ? 0 : 1);
+  await f.tick(0); if (kind === "failing") await f.tick(15);
+  expect(f.state().owner_imessage_episodes[0].sent).toBeUndefined();
+  expect(f.events().filter(row => row.name === "alert.imessage.sent")).toHaveLength(0);
+  if (kind === "recovered") {
+    await f.delivery.tick(); await f.tick(16);
+    f.define({ check: "true" }); f.resume(); await f.tick(17);
+  }
+  expect(f.responses.at(-1)).toBe(202);
+  const cancelledId = f.operations().at(-1)!.id;
+  f.store.set("route", route); await f.delivery.tick();
+  expect(f.store.getOperation(cancelledId)).toMatchObject({ state: "cancelled", attempts: 0 });
+  expect(f.texts).toHaveLength(kind === "recovered" ? 1 : 0);
+  // Lose the requeue result once too: restarts must derive the identical successor.
+  await f.tick(19, false); await f.tick(21);
+  if (!route) f.rotate("ses_returned_owner", 3);
+  await f.tick(23);
+  // An acceptance receipt alone must never retire the notice or its recovery.
+  expect(f.state().owner_imessage_episodes).toHaveLength(1);
+  expect(f.operations().at(-1)!.state).toBe("pending");
+  expect(f.operations().at(-1)!.id).not.toBe(cancelledId);
+  await f.delivery.tick(); await f.tick(25); await f.tick(27);
+  expect(f.texts).toHaveLength(kind === "recovered" ? 2 : 1);
+  if (kind !== "recovered") expect(f.state().owner_imessage_episodes[0].sent).toBe(true);
+  else expect(f.state().owner_imessage_episodes).toBeUndefined();
+}, 20_000);
+
+test.each(["sent", "pending", "sending", "uncertain", "failed", "missing", "manual cancellation", "aliased sent"])(
+  "real bridge preserves the original key for %s receipts across a route rotation", async state => {
+  const f = realBridgeFixture(); await f.tick(0);
+  const id = f.operations()[0]!.id;
+  if (state === "sent" || state === "aliased sent") await f.delivery.tick();
+  else if (state === "sending" || state === "uncertain" || state === "failed") {
+    f.store.outboxState(id, "sending");
+    if (state !== "sending") f.store.outboxState(id, state);
+  } else if (state === "missing") f.store.db.query("delete from outbox where id=?").run(id);
+  else if (state === "manual cancellation") {
+    const key = f.calls().find(args => args[0] === "send")!.find(arg => arg.startsWith("--key="))!.slice(6);
+    expect((await f.post("/cancel-send", { dedupeKey: key, sessionId: "ses_owner" })).status).toBe(200);
+  }
+  if (state === "aliased sent") {
+    const saved = f.store.get<{ spec: string }>(`api:send:${id}`)!;
+    f.store.set(`api:send:${id}`, { ...saved, operationId: "early-reply" });
+    f.store.db.query("update outbox set id='early-reply' where id=?").run(id);
+  }
+  f.rotate("ses_new_owner", 2); await f.tick(2); await f.tick(4);
+  expect(f.calls().filter(args => args[0] === "send")).toHaveLength(1);
+  expect(f.state().owner_imessage_episodes[0].sent).toBe(state.includes("sent") ? true : undefined);
+  expect(f.state().owner_imessage_episodes[0].delivery_key).toBeUndefined();
+}, 10_000);
+
+test.each(["accepted", "ambiguous"])("real bridge cancellation after an %s transport attempt never resends", async outcome => {
+  const f = realBridgeFixture(); await f.tick(0);
+  const send = f.transport.sendText;
+  f.transport.sendText = async input => {
+    const result = await send(input);
+    f.rotate("ses_new_owner", 2);
+    if (outcome === "ambiguous") throw new TransportError("timeout", true, true);
+    return result;
+  };
+  await f.delivery.tick();
+  expect(f.operations()[0]).toMatchObject({ state: "cancelled", attempts: 1 });
+  await f.tick(2); await f.tick(4);
+  expect(f.texts).toHaveLength(1);
+  expect(f.calls().filter(args => args[0] === "send")).toHaveLength(1);
+  expect(f.state().owner_imessage_episodes[0].sent).toBeUndefined();
+  expect(f.state().owner_imessage_episodes[0].delivery_key).toBeUndefined();
+}, 10_000);
+
+test("real bridge repeated route cancellations advance a durable key without duplicate delivery", async () => {
+  const f = realBridgeFixture(); await f.tick(0);
+  for (let i = 0; i < 3; i++) {
+    f.rotate(`ses_owner_${i}`, i + 2); await f.delivery.tick();
+    await f.tick(i * 4 + 2); await f.tick(i * 4 + 4);
+  }
+  expect(f.operations().map(op => op.state)).toEqual(["cancelled", "cancelled", "cancelled", "pending"]);
+  await f.delivery.tick(); await f.tick(16); await f.tick(18);
+  expect(f.texts).toHaveLength(1);
+  expect(f.state().owner_imessage_episodes[0].sent).toBe(true);
+}, 15_000);
+
+test.each(["failed", "post-attempt cancelled", "failed recovery"])(
+  "real bridge %s receipt does not block resume and a later failure episode", async terminal => {
+  const f = realBridgeFixture(); await f.tick(0);
+  if (terminal === "failed recovery") {
+    await f.delivery.tick(); await f.tick(2);
+    f.define({ check: "true" }); f.resume(); await f.tick(4);
+  }
+  const oldKey = f.state().owner_imessage_episodes[0].key;
+  const oldOperation = f.operations().at(-1)!.id;
+  f.store.outboxState(oldOperation, "sending");
+  f.store.outboxState(oldOperation, terminal === "post-attempt cancelled" ? "cancelled" : "failed");
+  await f.tick(6);
+  f.define({ check: "true" }); f.resume(); await f.tick(8);
+  f.define({ check: "exit 1" }); await f.tick(10);
+  expect(f.operations()).toHaveLength(terminal === "failed recovery" ? 3 : 2);
+  expect(f.operations().at(-1)!.state).toBe("pending");
+  await f.delivery.tick(); await f.tick(12); await f.tick(14);
+  const episodes = f.state().owner_imessage_episodes;
+  expect(episodes).toHaveLength(2);
+  expect(episodes[0].key).toBe(oldKey);
+  expect(episodes[1].sent).toBe(true);
+  expect(f.store.getOperation(oldOperation)?.state).toBe(terminal === "post-attempt cancelled" ? "cancelled" : "failed");
+  expect(f.texts).toHaveLength(terminal === "failed recovery" ? 2 : 1);
+  expect(f.texts.at(-1)).toContain("paused after 1 failed runs");
+}, 15_000);
 
 test("opted-in auto-pause texts once across two runner restarts and resume texts once", async () => {
   const f = fixture();

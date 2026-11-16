@@ -11,6 +11,7 @@ export type OwnerAlertEpisode = {
   sent?: boolean;
   recovery?: string;
   retry_at?: number;
+  delivery_key?: string;
 };
 
 const enabled = (watcher: Watcher) => watcher.owner_imessage_alerts === true && !watcher.chat;
@@ -49,7 +50,7 @@ export function queueOwnerRecovery(watcher: Watcher, state: State): void {
 }
 
 const sending = new Map<string, Promise<void>>();
-const completed = new Map<string, { instance?: string; key: string; kind: "pause" | "failing" | "recovered" }>();
+const completed = new Map<string, { instance?: string; key: string; kind: "pause" | "failing" | "recovered"; retryKey?: string }>();
 
 // Apply between checks: an async send must never race a check's state.json snapshot.
 export function applyOwnerAlertResults(id: string): void {
@@ -60,12 +61,16 @@ export function applyOwnerAlertResults(id: string): void {
     const state = loadState(id);
     const episode = state.owner_imessage_episodes?.find(episode => episode.key === result.key);
     if (!episode) return;
-    if (result.kind === "recovered") {
+    if (result.retryKey) {
+      episode.delivery_key = result.retryKey;
+      delete episode.retry_at;
+    } else if (result.kind === "recovered") {
       state.owner_imessage_episodes = state.owner_imessage_episodes!.filter(entry => entry.key !== result.key);
       if (!state.owner_imessage_episodes.length) delete state.owner_imessage_episodes;
     } else {
       episode.sent = true;
       delete episode.retry_at;
+      delete episode.delivery_key;
     }
     saveState(id, state);
   });
@@ -78,29 +83,37 @@ async function flush(id: string): Promise<void> {
     const watcher = loadWatcher(id);
     if (!watcher || !enabled(watcher) || watcherInstance(id) !== instance) return;
     const state = loadState(id);
-    const episode = state.owner_imessage_episodes?.[0];
-    if (!episode || (episode.retry_at ?? 0) > now() || (episode.sent && !episode.recovery)) return;
+    // Old unresolved deliveries retain their keys without starving newer episodes.
+    const episode = state.owner_imessage_episodes?.filter(entry => (entry.retry_at ?? 0) <= now() && !(entry.sent && !entry.recovery))
+      .sort((a, b) => (a.retry_at ?? 0) - (b.retry_at ?? 0))[0];
+    if (!episode) return;
     // Persist a retry delay before I/O. A crash retries the identical bridge key and payload.
     episode.retry_at = now() + 60_000;
     saveState(id, state);
-    return { key: episode.key, kind: episode.sent ? "recovered" as const : episode.kind,
+    return { key: episode.key, deliveryKey: episode.delivery_key, kind: episode.sent ? "recovered" as const : episode.kind,
       text: episode.sent ? episode.recovery! : episode.text };
   });
   if (!pending) return;
   const started = performance.now();
   let ok = false;
-  try { ok = (await imessage(pending.text, `${pending.key}:${pending.kind}`, { reconcile: true })).ok; }
+  let retryKey: string | undefined;
+  try {
+    const result = await imessage(pending.text, pending.deliveryKey ?? `${pending.key}:${pending.kind}`, { reconcile: true });
+    if (result.pending) return;
+    ok = result.ok;
+    retryKey = result.retryKey;
+  }
   catch { /* The persisted entry retries; bridge keys reconcile ambiguous acceptance. */ }
   toolLog({ component: "runner", kind: ok ? "event" : "error", name: `alert.imessage.${ok ? "sent" : "failed"}`,
     ok, durationMs: Math.max(0, performance.now() - started), ids: { watcher: id }, props: { alertKind: pending.kind },
     ...(ok ? {} : { error: { tag: "alert.imessage.send_failed" } }),
   });
   // A restart before this result is persisted replays the same key at the bridge.
-  if (ok) completed.set(id, { instance, key: pending.key, kind: pending.kind });
+  if (ok || retryKey) completed.set(id, { instance, key: pending.key, kind: pending.kind, retryKey });
   return;
 }
 
-/** Separate from checks and Telegram: the receipt/route lookups and send have 10s/10s/20s deadlines. */
+/** Separate from checks and Telegram: each receipt/route lookup is bounded to 10s, the send to 20s. */
 export function dispatchOwnerAlerts(id: string): void {
   if (sending.has(id) || completed.has(id)) return;
   const job = flush(id).catch(() => toolError("runner", "alert.imessage.dispatch_failed", { watcher: id }))

@@ -966,29 +966,65 @@ export async function wakeChat(chat: string, source: string, text: string, key: 
   return run([BUN, cli, "wake", `--chat=${chat}`, `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
 }
 
-export async function imessage(text: string, key: string, options: { reconcile?: boolean } = {}): Promise<{ ok: boolean; out: string }> {
+type ImessageResult = { ok: boolean; out: string; pending?: boolean; retryKey?: string };
+
+async function imessageReceipt(text: string, key: string): Promise<ImessageResult | undefined> {
+  const id = `send:${hash(key)}`;
+  // Read acceptance, its actual operation (including early-reply aliases), and
+  // transport evidence in one snapshot. /send's 202 only means queued.
+  const receipt = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, `
+    with acceptance as (select value from kv where key='api:send:${id}'),
+    identity as (select coalesce((select json_extract(value,'$.operationId') from acceptance),'${id}') as id)
+    select json_object('saved',(select value from acceptance),
+      'payload',outbox.payload,'state',outbox.state,'attempts',outbox.attempts,'providerId',outbox.providerId,
+      'route',(select value from kv where key='route'),
+      'fenced',exists(select 1 from kv where key in ('cancelledSend:${id}','cancelledSend:'||identity.id)),
+      'attempted',exists(select 1 from kv where key in ('firstAttempt:'||identity.id,'sendAmbiguous:'||identity.id,'sent-at:'||identity.id))
+        or exists(select 1 from kv where key >= 'chunk:'||identity.id||':' and key < 'chunk:'||identity.id||';'))
+      from identity left join outbox on outbox.id=identity.id`], 10_000, 100_000);
+  if (!receipt.ok) return { ok: false, out: "bridge delivery lookup failed" };
+  try {
+    const row = JSON.parse(receipt.out) as { saved: string | null;
+      payload: string | null; state: string | null; attempts: number | null; providerId: string | null;
+      route: string | null; fenced: number; attempted: number };
+    if (!row.saved) return;
+    const saved = JSON.parse(row.saved) as { spec?: string };
+    const spec = JSON.parse(saved.spec ?? "null") as { kind?: string; text?: string; sessionId?: string; generation?: number } | null;
+    if (spec?.kind !== "conversation" || spec.text !== clip(text, MAX_WAKE)) {
+      return { ok: false, out: "bridge acceptance content mismatch" };
+    }
+    if (!row.payload) return { ok: false, out: "bridge accepted operation missing" };
+    const payload = JSON.parse(row.payload) as { kind?: string; sessionId?: string; generation?: number };
+    if (payload.kind !== "conversation" || payload.sessionId !== spec.sessionId || payload.generation !== spec.generation) {
+      return { ok: false, out: "bridge accepted operation mismatch" };
+    }
+    if (row.state === "sent") return { ok: true, out: "bridge delivery confirmed" };
+    const route = row.route ? JSON.parse(row.route) as { id?: string; generation?: number } | null : null;
+    if (row.state === "cancelled" && row.attempts === 0 && row.providerId === null && !row.fenced && !row.attempted
+      && typeof payload.generation === "number" && typeof payload.sessionId === "string"
+      && (route?.id !== payload.sessionId || route?.generation !== payload.generation)) {
+      // The cancelled operation is terminal and conclusively unsent. A deterministic
+      // successor survives a crash before the watcher's new key is persisted.
+      return { ok: false, out: "bridge cancelled an unattempted stale route", retryKey: `robob-watch:owner-alert:retry:${hash(key)}` };
+    }
+    return { ok: false, out: `bridge delivery ${row.state}`,
+      ...(["pending", "sending", "uncertain"].includes(row.state ?? "") ? { pending: true } : {}) };
+  } catch { return { ok: false, out: "bridge delivery receipt unreadable" }; }
+}
+
+export async function imessage(text: string, key: string, options: { reconcile?: boolean } = {}): Promise<ImessageResult> {
   // Decide the CLI before the await: an override removed while liveSession() is pending must not reopen the live path.
   const cli = spectrumCli();
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
   if (options.reconcile) {
-    // The bridge binds a send's dedupe spec to a session generation. After /new, an
-    // accepted send must be recognised by its original key before resolving the new route.
-    const receipt = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB,
-      `select coalesce((select value from kv where key='api:send:send:${hash(key)}'),'null')`], 10_000, 100_000);
-    if (!receipt.ok) return { ok: false, out: "bridge acceptance lookup failed" };
-    try {
-      const saved = JSON.parse(receipt.out) as { spec?: string } | null;
-      if (saved) {
-        const operation = JSON.parse(saved.spec ?? "null") as { kind?: string; text?: string } | null;
-        return operation?.kind === "conversation" && operation.text === clip(text, MAX_WAKE)
-          ? { ok: true, out: "bridge already accepted this key" }
-          : { ok: false, out: "bridge acceptance content mismatch" };
-      }
-    } catch { return { ok: false, out: "bridge acceptance unreadable" }; }
+    const receipt = await imessageReceipt(text, key);
+    if (receipt) return receipt;
   }
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
+  const sent = await run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
+  if (!options.reconcile || !sent.ok) return sent;
+  return await imessageReceipt(text, key) ?? { ok: false, pending: true, out: "bridge acceptance awaiting receipt" };
 }
 
 export function telegram(source: string, text: string, key: string, severity = "info", burstKey?: string): Promise<{ ok: boolean; out: string }> {
