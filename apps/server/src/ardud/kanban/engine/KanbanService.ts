@@ -1121,6 +1121,10 @@ interface Hold {
 // A held slot is meant to last to the end of the thread's turn; past this a
 // stuck thread gives it back.
 const HOLD_MAX_MS = 30 * 60_000;
+const holdIsLive = (held: Hold, view: KanbanThreadView | null, now: number) =>
+  view !== null &&
+  view.state !== "idle" &&
+  (held.preservedTurn === true || now - held.at <= HOLD_MAX_MS);
 /** Thread views the wait pass reads at once, in its one read outside the gate. */
 const WAIT_VIEW_READS = 8;
 const waitingToRun = (card: KanbanCard, now: number) =>
@@ -3050,14 +3054,17 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     why: SlotEventWhy = "hold_end",
     cardId: string | null = null,
+    expected?: Hold,
   ) {
-    const held = (yield* Ref.get(holds)).get(threadId);
-    if (held === undefined) return;
-    yield* Ref.update(holds, (all) => {
+    const held = yield* Ref.modify(holds, (all) => {
+      const current = all.get(threadId);
+      if (current === undefined || (expected !== undefined && current !== expected))
+        return [undefined, all] as const;
       const next = new Map(all);
       next.delete(threadId);
-      return next;
+      return [current, next] as const;
     });
+    if (held === undefined) return;
     yield* syncSlot(held.boardId, threadId, why, cardId);
   }, Effect.uninterruptible);
 
@@ -12673,12 +12680,14 @@ const make = Effect.gen(function* () {
     }
     const system: KanbanActor = { _tag: "system", component: "dispatcher" };
     const held = (yield* Ref.get(holds)).get(threadId);
-    if (
-      held !== undefined &&
-      (!held.preservedTurn || (yield* freshThreads.find(threadId))?.state === "idle")
-    ) {
-      yield* dropHold(threadId);
-      yield* kick;
+    if (held !== undefined) {
+      // A terminal event may belong to a cancelled queued wake or an older run.
+      // Confirm the current turn ended before giving its between-card slot away.
+      const current = yield* freshThreads.find(threadId);
+      if (!holdIsLive(held, current, yield* nowMillis)) {
+        yield* dropHold(threadId, "hold_end", null, held);
+        yield* kick;
+      }
     }
     if (link.role === "work") {
       const carried = yield* Effect.forEach(yield* store.cardsByThread(threadId), (entry) =>
@@ -13445,20 +13454,13 @@ const make = Effect.gen(function* () {
     for (const [threadId, held] of yield* Ref.get(holds)) {
       if (held.boardId !== boardId) continue;
       const view = yield* planView(threadId);
-      const keep = held.preservedTurn
-        ? view !== null && view.state !== "idle"
-        : view?.state === "running" && now - held.at <= HOLD_MAX_MS;
+      const keep = holdIsLive(held, view, now);
       if (!keep) {
         const current = yield* freshFind(threadId);
         if (Option.isNone(current)) continue;
-        if (
-          held.preservedTurn
-            ? current.value !== null && current.value.state !== "idle"
-            : current.value?.state === "running" && now - held.at <= HOLD_MAX_MS
-        )
-          continue;
+        if (holdIsLive(held, current.value, now)) continue;
         views.delete(threadId);
-        yield* dropHold(threadId);
+        yield* dropHold(threadId, "hold_end", null, held);
         yield* kick;
       }
     }
@@ -16726,8 +16728,34 @@ const make = Effect.gen(function* () {
       carried,
       origin,
       pool,
-      holdsSlot: carried.length > 0 || held !== undefined,
     };
+  });
+
+  const takeCapacity = Effect.fn("KanbanService.takeCapacity")(function* (
+    threadId: ThreadId,
+    thread: {
+      readonly board: KanbanBoard;
+      readonly pool: string;
+      readonly carried: ReadonlyArray<KanbanCard>;
+    },
+  ) {
+    const pools = yield* store.pools(thread.board.id);
+    const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
+    const held = (yield* Ref.get(holds)).get(threadId);
+    const holdsSlot =
+      thread.carried.length > 0 || (held?.boardId === thread.board.id && held.pool === thread.pool);
+    const carrying =
+      thread.carried.length +
+      [...starting.values()].filter((pending) => pending.threadId === threadId).length;
+    let eligible = slots > 0 && carrying < Rules.MAX_BATCH;
+    if (eligible && !holdsSlot) {
+      const occupied = new Set(yield* store.poolThreadIds(thread.board.id, thread.pool));
+      for (const [id, pool] of yield* boardHolds(thread.board.id)) {
+        if (pool === thread.pool) occupied.add(id);
+      }
+      eligible = occupied.size < slots;
+    }
+    return { pools, slots, carrying, holdsSlot, eligible };
   });
 
   /** Every card a thread has carried, owned now or not. */
@@ -16812,7 +16840,6 @@ const make = Effect.gen(function* () {
       readonly pool: string;
       readonly projectId: ProjectId;
       readonly carried: ReadonlyArray<KanbanCard>;
-      readonly holdsSlot: boolean;
     },
     threadId: ThreadId,
     card: KanbanCard,
@@ -16831,18 +16858,15 @@ const make = Effect.gen(function* () {
       return yield* failWith("denied", `card #${card.number} is on another board`, "cross_board");
     }
     const cards = yield* store.openCards(card.boardId);
-    const pools = yield* store.pools(card.boardId);
-    const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
+    const capacity = yield* takeCapacity(threadId, thread);
     const check = Rules.checkClaim(thread.board, card, {
       threadId,
       pool: thread.pool,
       projectId: thread.projectId,
       byId: new Map(cards.map((entry) => [entry.id as string, entry])),
-      carrying:
-        thread.carried.length +
-        [...starting.values()].filter((pending) => pending.threadId === threadId).length,
-      slots,
-      pools,
+      carrying: capacity.carrying,
+      slots: capacity.slots,
+      pools: capacity.pools,
       nowMs: yield* nowMillis,
     });
     if (!check.ok)
@@ -16851,16 +16875,12 @@ const make = Effect.gen(function* () {
         check.reason,
         ("denyReason" in check ? check.denyReason : undefined) ?? "role_not_allowed",
       );
-    if (!thread.holdsSlot) {
-      const used =
-        Rules.poolThreads(cards, yield* boardHolds(card.boardId)).get(thread.pool)?.size ?? 0;
-      if (used >= slots) {
-        return yield* failWith(
-          "denied",
-          `no free slot on ${thread.pool}; leave it in todo`,
-          "pool_full",
-        );
-      }
+    if (!capacity.eligible) {
+      return yield* failWith(
+        "denied",
+        `no free slot on ${thread.pool}; leave it in todo`,
+        "pool_full",
+      );
     }
   });
 
@@ -17070,26 +17090,14 @@ const make = Effect.gen(function* () {
       return yield* readDb(
         Effect.gen(function* () {
           const thread = yield* CardNextMetrics.stage("caller", workThreadOf(threadId, true));
-          const { pools, slots, eligible } = yield* CardNextMetrics.stage(
+          const { pools, slots, carrying, holdsSlot, eligible } = yield* CardNextMetrics.stage(
             "occupancy",
-            Effect.gen(function* () {
-              const pools = yield* store.pools(thread.board.id);
-              const slots = pools.find((pool) => pool.key === thread.pool)?.slots ?? 0;
-              let eligible = slots > 0 && thread.carried.length < Rules.MAX_BATCH;
-              if (eligible && !thread.holdsSlot) {
-                const occupied = new Set(yield* store.poolThreadIds(thread.board.id, thread.pool));
-                for (const [id, pool] of yield* boardHolds(thread.board.id)) {
-                  if (pool === thread.pool) occupied.add(id);
-                }
-                eligible = occupied.size < slots;
-              }
-              return { pools, slots, eligible };
-            }),
+            takeCapacity(threadId, thread),
           );
           const empty = {
             carrying: thread.carried,
             candidates: [],
-            holdsSlot: thread.holdsSlot,
+            holdsSlot,
           } satisfies NextCards;
           if (!eligible) return empty;
           const { cards, seeds, groups } = yield* CardNextMetrics.stage(
@@ -17116,7 +17124,7 @@ const make = Effect.gen(function* () {
             threadId,
             pool: thread.pool,
             projectId: thread.projectId,
-            carrying: thread.carried.length,
+            carrying,
             slots,
             pools,
           };

@@ -25,6 +25,7 @@ fixture or real day file and writes a private `rollup-YYYY-MM-DD.json` with name
 and kind counts, rates, duration percentiles and top error tags. The poller makes
 yesterday's rollup on its first successful run after 00:05 UTC. Invalid lines
 are counted and skipped.
+`complete` means `generatedAt` is on or after the next UTC midnight; incomplete rollups are regenerated after 00:05Z, and lock `distinct` counts dedupe account/provider/model/deadline-minute while `count` keeps raw lines.
 
 `account.lock` and `account.unlock` carry hashed account IDs, scope, classifier
 cause, deadline and the source request ID when known. DB expiry is recorded on

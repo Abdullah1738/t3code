@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import { expect, it } from "@effect/vitest";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- isolated loopback MCP integration.
@@ -426,6 +427,7 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
         }).pipe(Effect.tap(() => Deferred.succeed(acknowledged, undefined))),
     });
     const service = OrchestratorMcpService.layer.pipe(
+      Layer.provide(McpProviderSessions.layer),
       Layer.provide(
         Layer.mergeAll(
           NodeServices.layer,

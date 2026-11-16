@@ -1,3 +1,6 @@
+import * as McpSessionRegistryTestkit from "../mcp/McpSessionRegistry.testkit.ts";
+import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as EvaluatorAnalytics from "../ardud/kanban/engine/evaluatorAnalytics.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
@@ -282,6 +285,7 @@ function makeHarness(options: HarnessOptions = {}) {
   );
   return {
     layer: Layer.mergeAll(
+      McpProviderSessions.layer,
       layerLaunch,
       layerRegistry,
       layerThreadManagement,
@@ -3569,6 +3573,7 @@ it.effect.each(
               ),
       });
       const layerService = OrchestratorMcpService.layer.pipe(
+        Layer.provideMerge(McpSessionRegistryTestkit.layer),
         Layer.provide(NodeCrypto.layer),
         Layer.provide(harness.layer),
         Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({ resolveCommit })),
@@ -3607,15 +3612,23 @@ it.effect.each(
         const parentAtAdmission = yield* threads.getThreadProjection(parentThreadId);
         const parentRun = ThreadManagement.latestActiveRun(parentAtAdmission);
         assert.isDefined(parentRun);
-        const parentSessionId = parentAtAdmission.providerThreads.find(
-          (thread) => thread.id === parentRun!.providerThreadId,
-        )!.providerSessionId!;
+        const issued = yield* (yield* McpSessionRegistry.McpSessionRegistry).issue({
+          threadId: parentThreadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const credential = issued.config;
+        yield* (yield* McpProviderSessions.McpProviderSessions).set({
+          ...credential,
+          runtimeProviderSessionId: parentAtAdmission.providerThreads.find(
+            (thread) => thread.id === parentRun!.providerThreadId,
+          )!.providerSessionId!,
+        });
         const scope = {
           environmentId: EnvironmentId.make("delegated-worktree-test"),
           requestNamespace: "parent-session",
           thread: {
             threadId: parentThreadId,
-            providerSessionId: parentSessionId,
+            providerSessionId: credential.providerSessionId,
             providerInstanceId: modelSelection.instanceId,
           },
           client: undefined,

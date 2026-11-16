@@ -1962,7 +1962,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   }),
                 )
               : Effect.succeed(undefined)
-            : mcpSessions.read(threadId);
+            : McpProviderSessions.readForRuntime(
+                mcpSessions,
+                threadId,
+                input.providerSessionId,
+                CODEX_PROVIDER,
+              );
         const recallForThread = (threadId: ThreadId | null) =>
           recallUrl && threadId !== null ? { url: recallUrl, threadId } : undefined;
         const client = yield* clientFactory.open({
@@ -6956,7 +6961,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
           ) {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
-            const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+            const mcpSession = yield* readMcpSession(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
               codexInput,
@@ -7426,7 +7431,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }
                 const preflight = Effect.gen(function* () {
                   const mcpSession = yield* ensureInitialized.pipe(
-                    Effect.andThen(mcpSessions.read(threadInput.threadId)),
+                    Effect.andThen(readMcpSession(threadInput.threadId)),
                   );
                   const response = yield* client
                     .request(
@@ -8480,7 +8485,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                             ? {}
                             : { lastTurnId: boundary.lastTurnId }),
                           ...codexThreadRuntimeParams({
-                            mcpSession: yield* mcpSessions.read(threadInput.targetThreadId),
+                            mcpSession: yield* readMcpSession(threadInput.targetThreadId),
                             recall: recallForThread(threadInput.targetThreadId),
                             ...(threadInput.modelSelection === undefined
                               ? {}

@@ -8,6 +8,7 @@ import {
   OrchestratorMcpThreadSendResult,
   ProviderInstanceId,
   ProviderInteractionMode,
+  ProviderSessionId,
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
@@ -485,6 +486,7 @@ it.effect.each(["card_update", "card_move", "link_pull_request"] as const)(
         };
         const config = {
           ...caller,
+          runtimeProviderSessionId: ProviderSessionId.make("runtime:wake-access"),
           environmentId: EnvironmentId.make("test"),
           endpoint: "http://localhost/mcp",
           authorizationHeader: "Bearer test",
@@ -528,7 +530,7 @@ it.effect.each(["card_update", "card_move", "link_pull_request"] as const)(
           );
         yield* Effect.scoped(
           Effect.gen(function* () {
-            yield* sessions.registerWakeCaller(caller, () => state);
+            yield* sessions.registerWakeCaller(config, () => state);
             yield* check("run_starting");
             state = "live";
             yield* check("ran");
@@ -555,9 +557,9 @@ it.effect.each(["card_update", "card_move", "link_pull_request"] as const)(
         const outerScope = yield* Effect.scope;
         yield* Effect.scoped(
           Effect.gen(function* () {
-            yield* sessions.registerWakeCaller(caller, () => "inactive");
+            yield* sessions.registerWakeCaller(config, () => "inactive");
             yield* sessions
-              .registerWakeCaller(caller, () => "live")
+              .registerWakeCaller(config, () => "live")
               .pipe(Effect.provideService(Scope.Scope, outerScope));
           }),
         );
