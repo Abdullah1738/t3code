@@ -34,6 +34,9 @@ interface McpGroup {
   failures: number;
   outcomes: Map<string, number>;
   savedCounts: Map<string, number>;
+  notFoundReasons: Map<string, number>;
+  foundByCounts: Map<string, number>;
+  idShapeCounts: Map<string, number>;
   errors: Map<
     string,
     { errorTag: string; errorPhase: NonNullable<AnalyticsEvent["errorPhase"]>; count: number }
@@ -761,6 +764,9 @@ export function accumulate(
         failures: 0,
         outcomes: new Map(),
         savedCounts: new Map(),
+        notFoundReasons: new Map(),
+        foundByCounts: new Map(),
+        idShapeCounts: new Map(),
         errors: new Map(),
       };
       target.mcp.set(key, group);
@@ -769,6 +775,10 @@ export function accumulate(
     if (event.preHandlerMs !== undefined) addDuration(group.preHandler, event.preHandlerMs);
     increment(group.outcomes, event.outcome);
     increment(group.savedCounts, String(event.saved ?? "unknown"));
+    if (event.props?.notFoundReason !== undefined)
+      increment(group.notFoundReasons, event.props.notFoundReason);
+    if (event.props?.foundBy !== undefined) increment(group.foundByCounts, event.props.foundBy);
+    if (event.props?.idShape !== undefined) increment(group.idShapeCounts, event.props.idShape);
     if (event.outcome !== "ok") {
       group.failures++;
       const errorTag = event.errorTag ?? "unknown";
@@ -1076,6 +1086,9 @@ export function finishRollup(
         failureRate: group.failures / group.durations.count,
         outcomes: Object.fromEntries(group.outcomes),
         savedCounts: Object.fromEntries(group.savedCounts),
+        notFoundReasons: Object.fromEntries(group.notFoundReasons),
+        foundByCounts: Object.fromEntries(group.foundByCounts),
+        idShapeCounts: Object.fromEntries(group.idShapeCounts),
         errors: [...group.errors.values()],
         ...(retries.get(key) ?? { failedThenRetried: 0, retrySucceeded: 0 }),
       }))

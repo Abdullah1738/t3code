@@ -2096,7 +2096,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           ]) {
             const error = yield* operation.pipe(Effect.flip);
             assert.equal(error.code, "task_not_found");
-            assert.include(error.message, "Check the id; copy it exactly from delegate_task.");
+            assert.include(error.message, "Expected the taskId returned by delegate_task.");
             assert.notInclude(error.message, "never saved");
           }
           yield* Effect.yieldNow;
@@ -2221,7 +2221,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           if (Exit.isFailure(outcome)) {
             const error = Cause.squash(outcome.cause) as OrchestratorMcpFailure;
             assert.equal(error.code, "task_not_found");
-            assert.include(error.message, "Check the id; copy it exactly from delegate_task.");
+            assert.include(error.message, "Expected the taskId returned by delegate_task.");
             assert.notInclude(error.message, "never saved");
           }
         }
@@ -2250,25 +2250,25 @@ describe("OrchestratorMcpService provider resolution", () => {
         name,
         id: NodeId.make(change(encodedTaskId())),
         state: "never_saved",
-        expected: "Check the id; copy it exactly from delegate_task.",
+        expected: "Expected the taskId returned by delegate_task.",
       })),
     {
       name: "foreign caller",
       id: encodedTaskId(ThreadId.make("thread:other")),
       state: "never_saved",
-      expected: "Check the id; copy it exactly from delegate_task.",
+      expected: "Expected the taskId returned by delegate_task.",
     },
     {
       name: "unknown",
       id: NodeId.make("unknown"),
       state: "never_saved",
-      expected: "Check the id; copy it exactly from delegate_task.",
+      expected: "Expected the taskId returned by delegate_task.",
     },
     {
       name: "invalid escape",
       id: NodeId.make("node:delegated-task:%ZZ"),
       state: "never_saved",
-      expected: "Check the id; copy it exactly from delegate_task.",
+      expected: "Expected the taskId returned by delegate_task.",
     },
     {
       name: "legacy without owner evidence",
@@ -2276,7 +2276,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         `node:delegated-task:${encodeURIComponent("command:mcp:credential:delegate-task:review")}`,
       ),
       state: "never_saved",
-      expected: "Check the id; copy it exactly from delegate_task.",
+      expected: "Expected the taskId returned by delegate_task.",
     },
   ] as const)("missing task diagnosis: $name", ({ id, state, expected }) =>
     Effect.gen(function* () {
@@ -2309,7 +2309,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         const error = yield* service.taskStatus(scope, id).pipe(Effect.flip);
         assert.equal(error.code, "task_not_found");
         assert.include(error.message, expected);
-        if (expected.startsWith("Check")) {
+        if (expected.startsWith("Expected")) {
           assert.notInclude(error.message, "never saved");
           assert.notInclude(error.message, "Retry delegate_task");
         }
@@ -2520,7 +2520,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         ]) {
           const error = yield* read.pipe(Effect.flip);
           assert.equal(error.code, "task_not_found");
-          assert.include(error.message, "Check the id; copy it exactly from delegate_task.");
+          assert.include(error.message, "Expected the taskId returned by delegate_task.");
           assert.notInclude(error.message, "does not belong");
           assert.notInclude(error.message, "about 30 seconds after the timeout");
           assert.notInclude(error.message, "same clientRequestId");
@@ -3953,7 +3953,9 @@ describe("OrchestratorMcpService provider resolution", () => {
               if (!legacy && dispatchTimeout === "before commit") {
                 const missing = yield* service.taskStatus(scope, recoveringId).pipe(Effect.flip);
                 assert.equal(missing.code, "task_not_found");
-                assert.include(missing.message, "was not found for thread");
+                assert.include(missing.message, "Expected the taskId returned by delegate_task.");
+                assert.notInclude(missing.message, recoveringId);
+                assert.notInclude(missing.message, parentThreadId);
                 assert.notInclude(missing.message, "does not belong");
                 assert.include(missing.message, "This delegation is still being created");
                 assert.include(missing.message, "retry task_status with this task id");

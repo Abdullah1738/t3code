@@ -679,6 +679,104 @@ describe("Analytics", () => {
         assert.deepEqual((yield* cold.read(filter)).samples, dropped.samples);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
+  it.effect("rolls up task lookup reasons and recovery paths through analytics_read", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const lookups = [
+        {
+          foundBy: "none",
+          notFoundReason: "non_canonical_id",
+          idCanonical: false,
+          saved: "unknown",
+        },
+        {
+          foundBy: "none",
+          notFoundReason: "non_canonical_id",
+          idCanonical: false,
+          saved: "unknown",
+        },
+        { foundBy: "none", notFoundReason: "never_saved", idCanonical: true, saved: false },
+        { foundBy: "receipt", notFoundReason: "accepted", idCanonical: true, saved: true },
+        { foundBy: "request_key_recovery", idCanonical: false, saved: true },
+        { foundBy: "subagents", idCanonical: true, saved: true },
+      ] as const;
+      for (const { saved, ...props } of lookups)
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "task_status",
+            saved,
+            outcome: "notFoundReason" in props ? "error" : "ok",
+            ...("notFoundReason" in props ? { errorTag: "task_not_found" } : {}),
+            props: { ...props, idShape: "task_id" },
+          }),
+        );
+      // Older rows have no lookup metadata and must not acquire an invented reason.
+      for (const idShape of ["thread_id", "child_thread_id", "empty", "other"] as const)
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "task_status",
+            saved: "unknown",
+            outcome: "error",
+            errorTag: idShape === "empty" ? "invalid_request" : "task_not_found",
+            props: {
+              idShape,
+              ...(idShape === "empty"
+                ? {}
+                : {
+                    foundBy: "none",
+                    notFoundReason: "not_a_delegation_id",
+                    idCanonical: false,
+                  }),
+            },
+          }),
+        );
+      yield* analytics.record(
+        event({ kind: "mcp.call", surface: "server", tool: "task_status", outcome: "ok" }),
+      );
+      const input = { day, kind: "mcp.call", tool: "task_status" };
+      const result = yield* analytics.read(input);
+      assert.deepInclude(result.rollup.mcpCalls[0], {
+        count: 11,
+        savedCounts: { unknown: 7, false: 1, true: 3 },
+        notFoundReasons: {
+          non_canonical_id: 2,
+          never_saved: 1,
+          accepted: 1,
+          not_a_delegation_id: 3,
+        },
+        foundByCounts: { none: 6, receipt: 1, request_key_recovery: 1, subagents: 1 },
+        idShapeCounts: { task_id: 6, thread_id: 1, child_thread_id: 1, empty: 1, other: 1 },
+      });
+      const filtered = yield* analytics.read({ ...input, outcome: "error" });
+      assert.deepInclude(filtered.rollup.mcpCalls[0], {
+        count: 8,
+        notFoundReasons: {
+          non_canonical_id: 2,
+          never_saved: 1,
+          accepted: 1,
+          not_a_delegation_id: 3,
+        },
+        foundByCounts: { none: 6, receipt: 1 },
+        idShapeCounts: { task_id: 4, thread_id: 1, child_thread_id: 1, empty: 1, other: 1 },
+      });
+      const section = yield* analytics.read({ ...input, section: "mcpCalls" });
+      assert.include(JSON.stringify(section.rows), '"request_key_recovery":1');
+      const cold = yield* open(setup);
+      assert.deepEqual((yield* cold.read(input)).rollup.mcpCalls, result.rollup.mcpCalls);
+      const persisted = JSON.parse(
+        yield* setup.fs.readFileString(`${setup.directory}/rollup-${day}.json`),
+      );
+      assert.deepEqual(
+        persisted.mcpCalls[0].notFoundReasons,
+        result.rollup.mcpCalls[0]!.notFoundReasons,
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
   it.effect("flushes before reads, filters samples, and atomically saves the full rollup", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;
