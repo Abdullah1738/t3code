@@ -282,6 +282,13 @@ function failure(
   });
 }
 
+// Cancellation keeps its missing-task contract until it can cancel in-flight creates.
+function cancelLookupFailure(error: OrchestratorMcpFailure) {
+  return error.code === "task_creating"
+    ? failure("task_not_found", `No delegated task has this id. ${error.message}`)
+    : error;
+}
+
 /**
  * A caller's thread is live while it is not archived, runs on the caller's
  * provider instance, and has an active run or a background subagent that
@@ -2220,9 +2227,12 @@ const make = Effect.gen(function* () {
           notFoundReason = "missing_child_thread";
         }
         yield* McpCallAnalytics.setTaskLookup({ foundBy, notFoundReason, idCanonical });
+        const creating = notFoundReason === "pending" || notFoundReason === "accepted";
         return yield* failure(
-          "task_not_found",
-          `No delegated task has this id.${detail}${idHint()}`,
+          creating ? "task_creating" : "task_not_found",
+          creating
+            ? `${detail.trimStart()}${idHint()}`
+            : `No delegated task has this id.${detail}${idHint()}`,
         );
       }
     }
@@ -3830,7 +3840,9 @@ const make = Effect.gen(function* () {
     }, traceUntilShutdown("t3.task")),
     cancelTask: Effect.fn("OrchestratorMcpService.cancelTask")(function* (callerScope, input) {
       const scope = yield* requireThreadScope(callerScope, "task_cancel");
-      const current = yield* readTask(scope, input.taskId);
+      const current = yield* readTask(scope, input.taskId).pipe(
+        Effect.mapError(cancelLookupFailure),
+      );
       const taskId = current.taskId;
       const key = yield* requestKey(input.clientRequestId);
       const parentProjection = yield* loadProjection(scope.thread.threadId, ["subagents"]);
@@ -3989,7 +4001,7 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
-      const stopped = yield* readTask(scope, taskId);
+      const stopped = yield* readTask(scope, taskId).pipe(Effect.mapError(cancelLookupFailure));
       return {
         taskId,
         status: isTerminalTaskStatus(stopped.status) ? stopped.status : "cancel_requested",

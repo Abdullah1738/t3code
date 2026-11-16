@@ -486,7 +486,9 @@ export function callOutcome(
     props: {
       ...taskLookup,
       ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
-      ...(code === "task_not_found" && notFoundReason !== undefined ? { notFoundReason } : {}),
+      ...((code === "task_not_found" || code === "task_creating") && notFoundReason !== undefined
+        ? { notFoundReason }
+        : {}),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
       ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
       code:

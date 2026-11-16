@@ -614,13 +614,19 @@ it.effect.each(
       const commandId = CommandId.make(command);
       const taskId = IdAllocator.derive.delegatedTaskNode({ commandId });
       const service = yield* OrchestratorMcp.OrchestratorMcpService;
-      for (const operation of [
-        service.taskStatus(scope, taskId).pipe(Effect.asVoid),
-        service.cancelTask(scope, { taskId }).pipe(Effect.asVoid),
-      ]) {
+      for (const [name, operation] of [
+        ["status", service.taskStatus(scope, taskId).pipe(Effect.asVoid)],
+        ["cancel", service.cancelTask(scope, { taskId }).pipe(Effect.asVoid)],
+      ] as const) {
         const error = yield* operation.pipe(Effect.flip);
-        assert.equal(error.code, "task_not_found");
+        const creating =
+          name === "status" &&
+          (state === "pending" || state === "accepted") &&
+          !message.startsWith("No delegated");
+        assert.equal(error.code, creating ? "task_creating" : "task_not_found");
         assert.include(error.message, message);
+        if (creating) assert.notInclude(error.message, "No delegated task has this id.");
+        else assert.isTrue(error.message.startsWith("No delegated task has this id."));
       }
     }).pipe(
       Effect.provide(

@@ -2540,6 +2540,21 @@ describe("OrchestratorMcpService provider resolution", () => {
     },
     { name: "pending", id: encodedTaskId(), state: "pending", expected: "still being created" },
     { name: "rejected", id: encodedTaskId(), state: "rejected", expected: "was rejected" },
+    {
+      name: "abandoned",
+      id: encodedTaskId(),
+      state: "abandoned",
+      expected:
+        "This delegation was not created: the create stopped after 10 s waiting at dispatch/threadManagement.dispatch (interrupt). Nothing ran. Retry delegate_task with the same clientRequestId.",
+    },
+    {
+      name: "pending without owner evidence",
+      id: NodeId.make(
+        `node:delegated-task:${encodeURIComponent("command:mcp:credential:delegate-task:review")}`,
+      ),
+      state: "pending",
+      expected: "Expected the taskId returned by delegate_task.",
+    },
     ...taskIdForms
       .filter((row) => !("late" in row) && row.name !== "exact")
       .map(({ name, change }) => ({
@@ -2590,7 +2605,14 @@ describe("OrchestratorMcpService provider resolution", () => {
                     commandType: "delegated_task.request",
                     error: null,
                   } as never)
-                : ({ status: state } as never),
+                : state === "abandoned"
+                  ? {
+                      status: state,
+                      elapsedSeconds: 10,
+                      reason: "interrupt",
+                      at: DateTime.makeUnsafe(0),
+                    }
+                  : ({ status: state } as never),
             ),
         }),
         ServerSettings.layerTest(),
@@ -2603,8 +2625,14 @@ describe("OrchestratorMcpService provider resolution", () => {
       yield* Effect.gen(function* () {
         const service = yield* OrchestratorMcpService.OrchestratorMcpService;
         const error = yield* service.taskStatus(scope, id).pipe(Effect.flip);
-        assert.equal(error.code, "task_not_found");
+        const creating =
+          (state === "pending" || state === "accepted") && !expected.startsWith("Expected");
+        assert.equal(error.code, creating ? "task_creating" : "task_not_found");
         assert.include(error.message, expected);
+        if (creating) {
+          assert.isFalse(error.message.startsWith(" "));
+          assert.notInclude(error.message, "No delegated task has this id.");
+        } else assert.isTrue(error.message.startsWith("No delegated task has this id."));
         if (expected.startsWith("Expected")) {
           assert.notInclude(error.message, "never saved");
           assert.notInclude(error.message, "Retry delegate_task");
@@ -5112,7 +5140,7 @@ describe("OrchestratorMcpService provider resolution", () => {
               const recoveringId = NodeId.make(timeoutTaskId!);
               if (!legacy && dispatchTimeout === "before commit" && !savedAsync) {
                 const missing = yield* service.taskStatus(scope, recoveringId).pipe(Effect.flip);
-                assert.equal(missing.code, "task_not_found");
+                assert.equal(missing.code, "task_creating");
                 assert.include(missing.message, "Expected the taskId returned by delegate_task.");
                 assert.notInclude(missing.message, recoveringId);
                 assert.notInclude(missing.message, parentThreadId);
