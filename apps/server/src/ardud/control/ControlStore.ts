@@ -83,6 +83,10 @@ export interface ControlStoreShape {
     },
     ControlStoreError
   >;
+  readonly hasCompactedEvents: (
+    afterSequence: number,
+    throughSequence: number,
+  ) => Effect.Effect<boolean, ControlStoreError>;
   readonly getOrigin: (threadId: string) => Effect.Effect<string | null, ControlStoreError>;
   readonly getOrigins: (
     threadIds: ReadonlyArray<string>,
@@ -220,6 +224,19 @@ export const make = Effect.gen(function* () {
     )
   `.pipe(Effect.mapError(fail("ensure-opencode-import")));
     }),
+  );
+
+  const hasCompactedEvents = Effect.fn("ControlStore.hasCompactedEvents")(
+    function* (afterSequence: number, throughSequence: number) {
+      const table =
+        yield* sql`SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_compacted_events' AND type = 'table'`;
+      if (table.length === 0) return false;
+      const rows = yield* sql`SELECT 1 FROM ardud_history_compacted_events
+      WHERE sequence > ${afterSequence} AND sequence <= ${throughSequence} LIMIT 1`;
+      return rows.length > 0;
+    },
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-compacted-events")),
   );
 
   const getOrigins: ControlStoreShape["getOrigins"] = (threadIds) =>
@@ -773,6 +790,7 @@ export const make = Effect.gen(function* () {
   );
 
   return ControlStore.of({
+    hasCompactedEvents,
     userMessagesSince,
     lastAssistant,
     changeMarkers,
