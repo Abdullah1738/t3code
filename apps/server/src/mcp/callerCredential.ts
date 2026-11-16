@@ -22,13 +22,16 @@ export const resolveCallerRuntime = Effect.fn("mcp.resolveCallerRuntime")(functi
     records.thread.deletedAt !== null
   )
     return undefined;
-  return (
-    records.providerThreads.find(
-      (thread) =>
-        thread.id === records.thread.activeProviderThreadId &&
-        thread.appThreadId === caller.threadId &&
-        thread.providerInstanceId === caller.providerInstanceId &&
-        thread.providerSessionId === current.runtimeProviderSessionId,
-    )?.providerSessionId ?? undefined
-  );
+  // A current credential can outlive its runtime attachment. Keep that distinct
+  // from an invalid caller so reset can refuse before queuing any work.
+  return {
+    runtimeProviderSessionId:
+      records.providerThreads.find(
+        (thread) =>
+          thread.id === records.thread.activeProviderThreadId &&
+          thread.appThreadId === caller.threadId &&
+          thread.providerInstanceId === caller.providerInstanceId &&
+          thread.providerSessionId === current.runtimeProviderSessionId,
+      )?.providerSessionId ?? undefined,
+  };
 });

@@ -3179,10 +3179,11 @@ const make = Effect.gen(function* () {
           ? new OrchestratorMcpFailure({ code: "parent_not_active", saved: false, message })
           : new OrchestratorMcpFailure({ code: "orchestration_error", saved: false, message });
       });
-      const callerRuntime = yield* bounded(
+      const callerIdentity = yield* bounded(
         "caller_credential",
         resolveCallerRuntime(credentials, scope.thread, parentRecords),
       );
+      const callerRuntime = callerIdentity?.runtimeProviderSessionId;
       const parentRun =
         parentRecords.runs
           .filter(
