@@ -47,6 +47,9 @@ import {
  */
 const SWEEP_MINUTES = 2;
 const READ_FAILURE_LIMIT = 8;
+// Three sweeps tolerate a missing-tool race without retaining an unusable watch
+// indefinitely. Transient spawn/credential failures keep the normal eight-read budget.
+const TOOL_FAILURE_LIMIT = 3;
 /**
  * Without a host fingerprint, a pull request with nothing in flight is read again only when its
  * sync snapshot moves, or after this long, for news the snapshot cannot show, such as a bot
@@ -476,7 +479,12 @@ export const make = Effect.gen(function* () {
       });
     }
     const unavailable = Option.isSome(error) && error.value._tag === "PullRequestUnavailableError";
-    if (!unavailable && failures < READ_FAILURE_LIMIT) return false;
+    const toolFailure =
+      Option.isSome(error) &&
+      error.value._tag === "PullRequestUnavailableError" &&
+      error.value.reason === "cli-missing";
+    if (toolFailure ? failures < TOOL_FAILURE_LIMIT : !unavailable && failures < READ_FAILURE_LIMIT)
+      return false;
     if (yield* eachTarget(group, (target) => giveUp(target, failures, error, reason))) {
       readFailures.delete(group.key);
     }
