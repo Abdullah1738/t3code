@@ -29,6 +29,10 @@ const decodeAnalytics = Schema.decodeUnknownEffect(AnalyticsEvent);
 
 it.effect.each([
   { reply: "post", failure: "reply write" } as const,
+  ...(["pick", "answer", "drop", "wake"] as const).map((reply) => ({
+    reply,
+    failure: "notification write" as const,
+  })),
   ...(["post", "pick", "answer", "drop", "wake"] as const).flatMap((reply) =>
     (["slot write", "cancellation"] as const).map((failure) => ({ reply, failure })),
   ),
@@ -59,6 +63,16 @@ it.effect.each([
                       fiber.interruptUnsafe();
                       return Effect.void;
                     });
+                  } else if (failure === "notification write") {
+                    armed = false;
+                    injected++;
+                    yield* sql.unsafe(`
+                  CREATE TEMP TRIGGER restored_notification_failure
+                  BEFORE INSERT ON ardud_kanban_owner_routes
+                  WHEN json_extract(NEW.json, '$.kind') = 'effect'
+                    AND json_extract(NEW.json, '$.effect.kind') IN ('tellAnswered', 'ownerWake')
+                  BEGIN SELECT RAISE(FAIL, 'injected restored notification failure'); END
+                `);
                   } else if (failure === "slot write") {
                     armed = false;
                     injected++;
@@ -154,7 +168,7 @@ it.effect.each([
                 ? Effect.asVoid(kanban.changeAsk(card.id, ask.id, "drop", owner, "owner"))
                 : Effect.asVoid(kanban.cardThread(card.id, "wake", "Owner rollback 1615", owner));
       const first = yield* close.pipe(Effect.forkChild, Effect.flatMap(Fiber.await));
-      if (reply !== "post" && failure === "slot write") {
+      if (reply !== "post" && failure !== "cancellation") {
         assert.equal(first._tag, "Failure");
         assert.equal((yield* kanban.card(card.id)).card.stage, "needs_owner");
         assert.equal(
@@ -173,6 +187,12 @@ it.effect.each([
         1,
       );
       assert.equal(restoreAttempts, failure === "cancellation" ? 1 : 2);
+      yield* kanban.dispatchNow;
+      const notification = reply === "drop" ? `Abdullah dropped ${ask.id}.` : "Owner rollback 1615";
+      assert.equal(
+        (yield* fake.heard(threadId)).filter((text) => text.includes(notification)).length,
+        1,
+      );
       yield* kanban.cardThread(card.id, "stop", "Release restored slot", owner);
       assert.equal(
         (yield* store.openSlots(board.id)).filter((row) => row.threadId === threadId).length,

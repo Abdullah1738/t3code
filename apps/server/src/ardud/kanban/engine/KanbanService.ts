@@ -1386,7 +1386,8 @@ const ownerRestoredReply = Context.Reference<{ notice: AnsweredNotice | undefine
  * - `await`: the same durable route row and drain, but the reply waits for the
  *   first delivery attempt (the default, so tests observe delivery synchronously).
  * - `inline`: the pre-durable path with no route row (rollback:
- *   `ROBOB_KANBAN_INLINE_OWNER_ROUTES=1`).
+ *   `ROBOB_KANBAN_INLINE_OWNER_ROUTES=1`). Restored attachments retain a durable
+ *   notification in every mode so cancellation cannot strand an idle worker.
  */
 export type OwnerRouteMode = "deferred" | "await" | "inline";
 /** A route still failing after this long is closed as undeliverable, with a notice. */
@@ -1554,6 +1555,7 @@ interface AnsweredNotice {
  * forked must not add to a list nobody saves).
  */
 interface EffectSink {
+  readonly committedLanes?: Set<string>;
   readonly effects: Array<{
     readonly boardId: string;
     readonly lane: string;
@@ -3319,16 +3321,26 @@ const make = Effect.gen(function* () {
     A,
     E,
     R,
-  >(card: KanbanCard, write: Effect.Effect<A, E, R>, afterCommit?: () => void) {
+  >(
+    card: KanbanCard,
+    write: Effect.Effect<A, E, R>,
+    afterCommit?: () => void,
+    notification?: EffectSink["effects"][number],
+  ) {
     const slots = new Map<string, Map<string, Set<string>>>();
     const publications: BoardPublication[] = [];
     const measurements: AnalyticsEvent[] = [];
     const receipts: SavedWrite.Saved[] = [];
     const observer = yield* SavedWrite.observer;
+    const sink = yield* effectSink;
+    let lanes = new Set<string>();
     // The durable reply, attachment and slot commit together. Process-local state
     // and saved-write receipts must not escape a transaction that rolls back.
     yield* tickTransaction(
-      write.pipe(
+      Effect.gen(function* () {
+        yield* write;
+        if (notification !== undefined) lanes = yield* saveEffectRows([notification]);
+      }).pipe(
         Effect.provideService(pendingSlotState, slots),
         Effect.provideService(publicationSink, publications),
         Effect.provideService(analyticsSink, measurements),
@@ -3346,10 +3358,16 @@ const make = Effect.gen(function* () {
             slotState.set(boardId, board);
           }
           afterCommit?.();
+          for (const lane of lanes) sink?.committedLanes?.add(lane);
           for (const receipt of receipts) observer(receipt);
         }),
       ),
       Effect.tap(() => dropHold(card.activeThreadId!, "join", card.id)),
+      Effect.tap(() =>
+        notification === undefined || sink?.committedLanes !== undefined
+          ? Effect.void
+          : forkPostCommit(Effect.forEach(lanes, afterOwnerCommit, { discard: true })),
+      ),
       Effect.uninterruptible,
     );
     for (const measurement of measurements) yield* recordAnalytics(measurement);
@@ -6489,6 +6507,7 @@ const make = Effect.gen(function* () {
       unblockEvaluator,
       ...(resume === undefined ? {} : { resume }),
     };
+    let notificationSaved = false;
     // Saved before anyone is told: the card's new state never waits on a thread.
     if (next !== card) {
       analyticsActors.set(next, answeredBy);
@@ -6509,9 +6528,25 @@ const make = Effect.gen(function* () {
       const reply = yield* ownerRestoredReply;
       if (!restored) yield* write;
       else {
-        yield* commitOwnerRestoration(next, write, () => {
-          if (reply !== undefined) reply.notice = notice;
-        });
+        yield* commitOwnerRestoration(
+          next,
+          write,
+          () => {
+            if (reply !== undefined) reply.notice = notice;
+            notificationSaved = rowId === undefined;
+          },
+          rowId === undefined
+            ? {
+                boardId: next.boardId,
+                lane: current.id,
+                effect: {
+                  kind: "tellAnswered",
+                  ...notice,
+                  evaluatorTrigger: answeredBy._tag === "owner" ? "owner_answer" : "card_ask",
+                },
+              }
+            : undefined,
+        );
       }
     }
     yield* releaseModel;
@@ -6527,7 +6562,7 @@ const make = Effect.gen(function* () {
         });
       }
     const deferred = yield* effectSink;
-    if (deferred !== undefined && !deferred.closed) {
+    if (!notificationSaved && deferred !== undefined && !deferred.closed) {
       if (answered.length > 0 || unblockEvaluator !== null)
         deferred.effects.push({
           boardId: next.boardId,
@@ -6538,7 +6573,7 @@ const make = Effect.gen(function* () {
             evaluatorTrigger: answeredBy._tag === "owner" ? "owner_answer" : "card_ask",
           },
         });
-    } else {
+    } else if (!notificationSaved) {
       const heard = yield* tellAnswered(notice, current, next);
       current = heard.discussion;
       for (const id of heard.told) told.add(id);
@@ -13614,7 +13649,7 @@ const make = Effect.gen(function* () {
   ) =>
     deferWrites
       ? Effect.suspend(() => {
-          const sink: EffectSink = { effects: [], closed: false };
+          const sink: EffectSink = { effects: [], committedLanes: new Set(), closed: false };
           let lanes = new Set<string>();
           const attempt = Effect.suspend(() => {
             // A stale rerun starts over; it keeps only its own follow-ons.
@@ -13638,7 +13673,11 @@ const make = Effect.gen(function* () {
             Effect.onExit((exit) =>
               Effect.suspend(() => {
                 sink.closed = true;
-                const started = Effect.forEach(lanes, afterOwnerCommit, { discard: true });
+                const started = Effect.forEach(
+                  new Set([...lanes, ...(sink.committedLanes ?? [])]),
+                  afterOwnerCommit,
+                  { discard: true },
+                );
                 if (sink.effects.length === 0) return started;
                 const saving = saveEffects([...sink.effects]);
                 // A failed write's follow-ons are saved too, but never replace its error.
@@ -17708,21 +17747,26 @@ const make = Effect.gen(function* () {
           toStage: next.stage,
           body: "Woken",
         });
-        yield* next.stage === "working" && next.activeThreadId !== null
-          ? commitOwnerRestoration(next, saveCard(next, undefined, false, "restore"))
-          : saveCard(next);
-        yield* releaseModel;
         if (next.stage === "working" && next.activeThreadId !== null) {
-          const wake: Extract<BoardEffect, { readonly kind: "ownerWake" }> = {
-            kind: "ownerWake",
-            cardId: next.id,
-            threadId: next.activeThreadId,
-            moveId: moved.id,
-            startedAt: card.ownerPark?.startedAt ?? null,
-            text: wakeNote ?? "Continue after the owner wait",
-          };
-          yield* later(next.boardId, cardLane(next), wake, sendOwnerWake(wake));
-        }
+          yield* commitOwnerRestoration(
+            next,
+            saveCard(next, undefined, false, "restore"),
+            undefined,
+            {
+              boardId: next.boardId,
+              lane: cardLane(next),
+              effect: {
+                kind: "ownerWake",
+                cardId: next.id,
+                threadId: next.activeThreadId,
+                moveId: moved.id,
+                startedAt: card.ownerPark?.startedAt ?? null,
+                text: wakeNote ?? "Continue after the owner wait",
+              },
+            },
+          );
+        } else yield* saveCard(next);
+        yield* releaseModel;
         assignmentFailures.delete(card.id);
         if (card.settledAt !== null && card.discussionId !== null) {
           const discussion = yield* store.discussion(card.discussionId);
