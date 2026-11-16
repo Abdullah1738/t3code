@@ -29,6 +29,117 @@ const decodeAnalytics = Schema.decodeUnknownEffect(AnalyticsEvent);
 
 it.effect.each(
   (["await", "deferred", "inline"] as const).flatMap((mode) =>
+    (["post text", "post choice", "pick"] as const).flatMap((reply) =>
+      (reply === "pick"
+        ? (["none", "worker"] as const)
+        : (["none", "worker", "evaluator"] as const)
+      ).map((failure) => ({ mode, reply, failure })),
+    ),
+  ),
+)(
+  "a restored multi-ask $reply has one notification owner in $mode mode ($failure failure)",
+  ({ mode, reply, failure }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const workerSent = yield* Deferred.make<void>();
+      const evaluatorSent = yield* Deferred.make<void>();
+      const marker = "Owner multi-ask retry 1615";
+      let workerId: ThreadId | undefined;
+      let evaluatorId: ThreadId | undefined;
+      let injected = 0;
+      const external = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            send: (input) =>
+              Effect.gen(function* () {
+                const relevant = input.text.includes(marker);
+                if (
+                  injected === 0 &&
+                  relevant &&
+                  ((failure === "worker" && input.threadId === workerId) ||
+                    (failure === "evaluator" && input.threadId === evaluatorId))
+                ) {
+                  injected++;
+                  return yield* new KanbanThreadError({
+                    operation: "send",
+                    detail: "Retry a multi-ask recipient once",
+                  });
+                }
+                if (!input.isStale?.()) yield* real.send(input);
+                if (!relevant) return;
+                if (input.threadId === workerId) yield* Deferred.succeed(workerSent, undefined);
+                if (input.threadId === evaluatorId)
+                  yield* Deferred.succeed(evaluatorSent, undefined);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, threadId, worker } = yield* workingCard();
+        workerId = threadId;
+        evaluatorId = yield* kanban.startEvaluator(board.id, {
+          kind: "request",
+          text: `Review card #${card.number}`,
+        });
+        yield* Ref.update(fake.threads, (all) =>
+          new Map(all).set(evaluatorId!, { ...all.get(evaluatorId!)!, state: "running" }),
+        );
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "Also tell the evaluator?",
+            blocking: false,
+            ...(reply === "post choice" ? { options: ["First", "Second"] } : {}),
+          },
+          { _tag: "evaluator", threadId: evaluatorId },
+          "evaluator",
+        );
+        yield* kanban.askOwner(
+          card.id,
+          {
+            question: "Continue worker?",
+            blocking: true,
+            ...(reply === "pick" ? { options: [marker, "No"] } : {}),
+          },
+          worker,
+          "cardThread",
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        const ask = askOf((yield* kanban.card(card.id)).card, "q2");
+        if (reply === "pick")
+          yield* kanban.answer(discussion.id, ask.seq!, ask.id, [ask.options![0]!.id], owner);
+        else yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: marker }]);
+        yield* Deferred.await(workerSent);
+        if (reply !== "pick") yield* Deferred.await(evaluatorSent);
+        yield* kanban.dispatchNow;
+        const restored = (yield* kanban.card(card.id)).card;
+        assert.equal(restored.stage, "working");
+        assert.equal(restored.activeThreadId, threadId);
+        assert.isNotNull(askOf(restored, "q2").closedAt);
+        assert.equal(askOf(restored, "q1").closedAt === null, reply !== "post text");
+        assert.equal(injected, failure === "none" ? 0 : 1);
+        assert.equal(
+          (yield* fake.heard(threadId)).filter((text) => text.includes(marker)).length,
+          1,
+        );
+        assert.equal(
+          (yield* fake.heard(evaluatorId)).filter((text) => text.includes(marker)).length,
+          reply === "pick" ? 0 : 1,
+        );
+      }).pipe(
+        Effect.provide(
+          testLayer(external).pipe(
+            Layer.provide(Layer.succeed(KanbanService.OwnerRouteMode, mode)),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect.each(
+  (["await", "deferred", "inline"] as const).flatMap((mode) =>
     (["post", "pick", "answer", "drop", "wake"] as const).flatMap((reply) =>
       (["delivered", "stop", "reset", "pause"] as const).map((outcome) => ({
         mode,

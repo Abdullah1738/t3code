@@ -1374,10 +1374,14 @@ const ownerDelivered = Context.Reference<Set<string> | undefined>("KanbanOwnerDe
 const ownerRouteRow = Context.Reference<number | undefined>("KanbanOwnerRouteRow", {
   defaultValue: () => undefined,
 });
-const ownerRestoredReply = Context.Reference<{ notice: AnsweredNotice | undefined } | undefined>(
-  "KanbanOwnerRestoredReply",
-  { defaultValue: () => undefined },
-);
+const ownerRestoredReply = Context.Reference<
+  | {
+      notice: AnsweredNotice | undefined;
+      notificationSaved: boolean;
+      readonly askers: ReadonlyArray<KanbanOwnerAsk>;
+    }
+  | undefined
+>("KanbanOwnerRestoredReply", { defaultValue: () => undefined });
 
 /**
  * How owner answers and posts reach their agents.
@@ -1537,6 +1541,8 @@ interface AnsweredNotice {
   readonly note: boolean;
   readonly answeredBy: KanbanActor;
   readonly answered: ReadonlyArray<KanbanOwnerAsk>;
+  /** Open choice asks still hear discussion text without being answered by it. */
+  readonly retained?: ReadonlyArray<KanbanOwnerAsk>;
   /** Threads already told by the write itself (a woken worker gets it as its wake note). */
   readonly told: ReadonlyArray<string>;
   /** The evaluator whose blocking ask held the card, told first. */
@@ -6495,6 +6501,9 @@ const make = Effect.gen(function* () {
       };
     if (answeredBy._tag === "owner" && answered.length > 0)
       next = yield* recheckReviewGate(next, yield* boardOf(next.boardId), true);
+    const reply = yield* ownerRestoredReply;
+    const retained =
+      resume === undefined ? [] : (reply?.askers ?? []).filter((ask) => !answeredIds.has(ask.id));
     const notice: AnsweredNotice = {
       singleEvaluator: yield* collapseEvaluatorReplies,
       discussionId: current.id,
@@ -6503,6 +6512,7 @@ const make = Effect.gen(function* () {
       note,
       answeredBy,
       answered,
+      ...(retained.length === 0 ? {} : { retained }),
       told: [...told],
       unblockEvaluator,
       ...(resume === undefined ? {} : { resume }),
@@ -6525,15 +6535,17 @@ const make = Effect.gen(function* () {
           `;
         }
       });
-      const reply = yield* ownerRestoredReply;
       if (!restored) yield* write;
       else {
         yield* commitOwnerRestoration(
           next,
           write,
           () => {
-            if (reply !== undefined) reply.notice = notice;
             notificationSaved = rowId === undefined;
+            if (reply !== undefined) {
+              reply.notice = notice;
+              reply.notificationSaved = notificationSaved;
+            }
           },
           rowId === undefined
             ? {
@@ -6596,9 +6608,10 @@ const make = Effect.gen(function* () {
       const { text, note, answeredBy } = notice;
       let current = discussion;
       const told = new Set<string>(notice.told);
+      const askers = [...notice.answered, ...(notice.retained ?? [])];
       const evaluatorAskers = new Set<ThreadId>();
       if (notice.singleEvaluator)
-        for (const ask of notice.answered)
+        for (const ask of askers)
           if (
             ask.by._tag === "evaluator" &&
             (yield* isBoardEvaluator(ask.by.threadId, card.boardId))
@@ -6641,7 +6654,7 @@ const make = Effect.gen(function* () {
         // Obsolete restoration notices must not fall through to an unguarded asker send.
         told.add(notice.resume.threadId);
       }
-      for (const ask of notice.answered) {
+      for (const ask of askers) {
         const collapse = ask.by._tag === "evaluator" && evaluatorAskers.has(ask.by.threadId);
         if (collapse && !evaluatorOwner) continue;
         const by =
@@ -6892,14 +6905,15 @@ const make = Effect.gen(function* () {
     key: string,
     route: Effect.Effect<unknown, E>,
     row?: SavedOwnerRow,
-    asks?: ReadonlySet<string>,
+    asks: ReadonlyArray<KanbanOwnerAsk> = [],
   ) => {
     let delivered = ownerDeliveries.get(key);
     if (!delivered) ownerDeliveries.set(key, (delivered = new Set()));
     // Evaluators this route already started carried the text in their first message.
     for (const id of row?.launched ?? []) delivered.add(id);
-    const reply = { notice: row?.restoredReply };
+    const reply = { notice: row?.restoredReply, notificationSaved: false, askers: asks };
     const resume = Effect.gen(function* () {
+      if (reply.notificationSaved) return;
       const notice = reply.notice;
       if (notice === undefined) return yield* route;
       return yield* tellAnswered(
@@ -6925,7 +6939,10 @@ const make = Effect.gen(function* () {
         Effect.provideService(ownerDelivered, delivered),
         Effect.provideService(ownerRouteRow, row?.id),
         Effect.provideService(ownerRestoredReply, reply),
-        Effect.provideService(ownerRouteAsks, row === undefined ? undefined : asks),
+        Effect.provideService(
+          ownerRouteAsks,
+          row === undefined ? undefined : new Set(asks.map((ask) => ask.id)),
+        ),
       );
     if (row !== undefined) return attempt.pipe(Effect.asVoid);
     const retry = (remaining: number): Effect.Effect<void> =>
@@ -7070,7 +7087,10 @@ const make = Effect.gen(function* () {
       discussionId,
       key,
       Effect.gen(function* () {
+        const reply = yield* ownerRestoredReply;
         yield* route;
+        // Restoration saves all frozen recipients, including asks left open by the reply.
+        if (reply?.notificationSaved) return;
         for (const ask of asks) {
           const by = ask.by;
           if (
@@ -7119,7 +7139,7 @@ const make = Effect.gen(function* () {
         }
       }),
       row,
-      new Set(asks.map((ask) => ask.id)),
+      asks,
     );
   }, Effect.mapError(toKanbanError));
   const ownerPostRoute = Effect.fn("KanbanService.ownerPostRoute")(
