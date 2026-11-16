@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import tempfile
 import time
 import unittest
@@ -49,6 +50,78 @@ class HistoryTests(unittest.TestCase):
             self.assertTrue(history.append(self.wd, self.row))
         for text in ('I paid', 'test-secret', '4111', '123456', 'private'):
             self.assertNotIn(text, self.path.read_text())
+
+    def test_case_error_normalization(self):
+        timeout = str(subprocess.TimeoutExpired(
+            ['/Users/ardud/.local/bin/msgs', 'search', '("Logic Utilities" OR "Acme Merchant")'], 2))
+        numeric_timeout = str(subprocess.TimeoutExpired(
+            ['/Users/ardud/.local/bin/msgs', 'search', '"4111111111111111" OR "Acme Merchant"'], 0.5))
+        forms = [
+            ('refund mail logic-utilities-nov: msgs: ' + timeout, 'refund mail: msgs: timed out'),
+            ('msgs: ' + timeout, 'msgs: timed out'),
+            ('refund mail some-case: out of time', 'refund mail: out of time'),
+            ('receipt abc-1: out of time', 'receipt: out of time'),
+            ('merchant history some-case: out of time', 'merchant history: out of time'),
+            ('refund mail x: hello <body text>', 'unclassified error (details omitted)'),
+            ('refund mail x: msgs: ' + numeric_timeout, 'refund mail: msgs: timed out'),
+            ('msgs: ' + numeric_timeout, 'msgs: timed out'),
+            ('q-ab12: receipt abc-1: out of time', 'receipt: out of time'),
+            ('receipt 0: out of time', 'receipt: out of time'),
+            ('refund mail ' + 'a' * 81 + ': out of time', 'refund mail: out of time'),
+            ('refund mail: out of time; the rest next check', 'refund mail: out of time; the rest next check'),
+            ('msgs: unreadable search output', 'msgs: unreadable search output'),
+        ]
+        forms += [(prefix + 'msgs: ' + timeout, prefix + 'msgs: timed out') for prefix in (
+            'refund mail: ', 'receipt: ', 'merchant history: ', 'his threads: ', 'orders: ',
+            'noon orders: ', 'careem orders: ', 'his threads: receipt: ')]
+        for raw, expected in forms:
+            with self.subTest(raw=raw):
+                self.assertEqual(history.safe_error(raw), expected)
+                self.assertEqual(history.safe_error(expected), expected)
+                self.row['question_errors'] = [raw]
+                self.assertTrue(history.append(self.wd, self.row))
+        rows = [json.loads(line) for line in self.path.read_text().splitlines()]
+        self.assertEqual([row['question_errors'] for row in rows], [[expected] for _, expected in forms])
+        for private in ('Logic Utilities', 'Acme Merchant', '4111111111111111', 'body text', '/Users/',
+                        'logic-utilities-nov', 'some-case', 'abc-1'):
+            self.assertNotIn(private, self.path.read_text())
+
+    def test_case_error_normalization_rejects_unknown_shapes(self):
+        timeout = "msgs: Command '['msgs', 'search', 'private query']' timed out after 2 seconds"
+        forms = [
+            'refund mail Upper: out of time',
+            'receipt under_score: out of time',
+            'merchant history -leading: out of time',
+            'refund mail ' + 'a' * 82 + ': out of time',
+            'refund mail : out of time',
+            'refund mail x:out of time',
+            'unknown x: out of time',
+            'receipt x: private message',
+            'merchant history x: private message',
+            'refund mail x: out of time\nprivate message',
+            timeout + ' private message',
+            'private message ' + timeout,
+            'unknown: ' + timeout,
+            "msgs: Command 'private message' timed out after 2 seconds",
+        ]
+        for raw in forms:
+            with self.subTest(raw=raw):
+                self.assertEqual(history.safe_error(raw), 'unclassified error (details omitted)')
+
+    def test_summary_groups_normalized_case_errors(self):
+        timeout = "msgs: Command '['msgs', 'search', 'private query']' timed out after 2 seconds"
+        self.row['question_errors'] = ['refund mail first-case: ' + timeout,
+                                       'refund mail second-case: ' + timeout,
+                                       'refund mail first-case: out of time',
+                                       'refund mail second-case: out of time']
+        self.assertTrue(history.append(self.wd, self.row))
+        now = dt.datetime(2026, 11, 16, 12, tzinfo=dt.timezone.utc)
+        result = history.summary(self.wd, now=now)
+        self.assertEqual(result['question_errors'], {'refund mail: msgs: timed out': 2,
+                                                    'refund mail: out of time': 2})
+        text = history.format_summary(result)
+        self.assertIn('2x refund mail: msgs: timed out', text)
+        self.assertIn('2x refund mail: out of time', text)
 
     def test_rotation_at_boundary_keeps_one_previous_file(self):
         size = len((json.dumps({**history.run_row(self.row), 'history_append_errors': history.APPEND_ERRORS},
