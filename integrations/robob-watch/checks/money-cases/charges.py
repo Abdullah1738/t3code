@@ -216,6 +216,8 @@ def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None, stats=
                     options = {'since': (memo or {}).get(('orders_since', app), at - SAME_TIME)}
                     if memo is not None and ('orders_cache',) in memo:
                         options['cache_path'] = memo[('orders_cache',)]
+                    if memo is not None and not memo.get(('write_cache',), True):
+                        options['write_cache'] = False
                 with step_timing(stats, 'lookups', deadline):
                     result = (lookup or order_lookup.read)(app, deadline=deadline, **options)
             except (ValueError, OSError) as exc:
@@ -463,7 +465,7 @@ class SearchRows(list):
         self.raw_count = raw_count
 
 
-def search(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None, all_copies=False):
+def search(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None, all_copies=False, *, write_cache=True):
     """Rows from the message archive (the msgs CLI), newest first, without bodies."""
     # Deduplication happens after msgs limits raw rows, hiding truncated searches.
     # Keep the raw count, then fold Message-ID copies before any body reads.
@@ -506,7 +508,7 @@ def search(query, since, until=None, source=None, n=20, deadline=None, memo=None
     rows = SearchRows(unique, raw_count)
     # A capped result is incomplete. Do not freeze it (or any failed search)
     # into a negative screen; open windows always go back to the archive.
-    if key is not None and raw_count < n:
+    if write_cache and (memo or {}).get(('write_cache',), True) and key is not None and raw_count < n:
         cache[key] = {'saved': time.time(), 'rows': [
             {field: row[field] for field in SEARCH_ROW_FIELDS if field in row} for row in rows]}
         cache = dict(sorted(cache.items(), key=lambda item: item[1]['saved'])[-SEARCH_CACHE_LIMIT:])
@@ -692,7 +694,7 @@ def save_owner_cache(path, cache, since, until):
         raise Lookup('Robob control: owner cache save failed') from None
 
 
-def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None):
+def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None, *, write_cache=True):
     """His app/iMessage typing, fetched once per check within its own total cap."""
     if stats is not None:
         for key in OWNER_TIMING_KEYS:
@@ -707,7 +709,7 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
     with within(stop, error):
         # Stop network work early enough to persist completed threads. The outer
         # deadline also bounds cache reads, fsync, pruning and result assembly.
-        rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25)
+        rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25, write_cache=write_cache)
         if time.time() >= stop:
             raise error
         if stats is not None:
@@ -715,7 +717,7 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
         return rows
 
 
-def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
+def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_cache=True):
     with within(stop, Lookup('Robob control: incomplete thread list')):
         config = control_config()
         # The API's since filter is strict on updatedAt; include messages created exactly at since.
@@ -867,7 +869,7 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
                 stats['owner_threads_fetched'] += 1
         except Lookup as exc:
             errors.append(exc)
-    size = save_owner_cache(path, cache, since, until)
+    size = save_owner_cache(path, cache, since, until) if write_cache else len(cache)
     if stats is not None:
         stats['owner_cache_size'] = size
     if len(covered) != len(selected):
