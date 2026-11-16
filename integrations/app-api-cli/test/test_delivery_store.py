@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
@@ -142,6 +143,11 @@ class DeliveryHoldTests(unittest.TestCase):
 
     def remember(self, path):
         self.snapshots[path] = (path.read_bytes(), path.stat().st_mtime_ns)
+
+    def dead_pid(self):
+        with subprocess.Popen([sys.executable, '-I', '-c', 'pass']) as child:
+            self.assertEqual(child.wait(timeout=5), 0)
+        return child.pid
 
     def health(self):
         with s.connect() as db:
@@ -329,31 +335,44 @@ class DeliveryHoldTests(unittest.TestCase):
         self.assertEqual(s.rows('amazon', 0, self.now)[1], [])
         self.adb.assert_not_called()
 
-    def test_dead_holder_is_stale_before_lease_expiry(self):
-        self.hold()
-        self.lease()
-        with patch.object(s.os, 'kill', side_effect=ProcessLookupError):
-            s.collect()
-            with self.assertRaisesRegex(RuntimeError, 'holder_pid_dead'):
-                s.health_check()
-        self.assertEqual((self.health()['ok'], self.health()['detail']), (0, 'priority_hold_stale'))
-        self.assertEqual(self.errors(), ['notifications_priority_hold_stale'])
+    def test_dead_lease_pid_is_live_before_lease_expiry(self):
+        self.hold(age=10)
+        pid = self.dead_pid()
+        self.lease(pid=pid)
+        state = s.hold_state()
+        self.assertEqual((state['state'], state['reason'], state['pid']),
+                         ('live', 'lease_live', pid))
+        s.collect()
+        self.check_deferred('lease_live')
+        self.assertEqual((self.health()['ok'], self.health()['detail']), (1, 'deferred_priority_hold'))
+        self.assertEqual(self.errors(), [])
         self.adb.assert_not_called()
 
     def test_expired_lease_precedes_dead_pid(self):
-        self.hold()
-        self.lease(expiry=-1)
+        self.hold(age=10)
+        self.lease(expiry=-1, pid=self.dead_pid())
         with patch.object(s.os, 'kill') as kill:
             s.collect()
+            self.assertEqual(s.hold_state()['reason'], 'lease_expired')
             with self.assertRaisesRegex(RuntimeError, 'lease_expired'):
                 s.health_check()
             kill.assert_not_called()
         self.adb.assert_not_called()
 
-    def test_permission_error_counts_as_alive(self):
+    def test_age_limit_precedes_unexpired_lease_with_dead_pid(self):
+        self.hold(age=61 * 60)
+        self.lease(pid=self.dead_pid())
+        s.collect()
+        self.assertEqual(s.hold_state()['reason'], 'hold_older_than_60m')
+        with self.assertRaisesRegex(RuntimeError, 'hold_older_than_60m'):
+            s.health_check()
+        self.assertEqual(self.errors(), ['notifications_priority_hold_stale'])
+        self.adb.assert_not_called()
+
+    def test_live_lease_never_probes_pid(self):
         self.hold()
         self.lease()
-        with patch.object(s.os, 'kill', side_effect=PermissionError):
+        with patch.object(s.os, 'kill', side_effect=AssertionError('lease pid is not a liveness probe')):
             s.collect()
             self.check_deferred('lease_live')
         self.adb.assert_not_called()
@@ -525,13 +544,16 @@ class DeliveryHoldTests(unittest.TestCase):
         self.lease(expiry=-1, owner='x' * 120)
         self.assertEqual(s.hold_state()['reason'], 'no_matching_lease_within_bound')
 
-    def test_health_recomputes_deferred_row_when_holder_dies(self):
-        self.hold()
-        self.lease()
-        s.collect()
-        with patch.object(s.os, 'kill', side_effect=ProcessLookupError):
-            with self.assertRaisesRegex(RuntimeError, 'holder_pid_dead'):
-                s.health_check()
+    def test_health_keeps_deferred_row_healthy_after_lease_process_exits(self):
+        self.hold(age=10)
+        with subprocess.Popen([sys.executable, '-I', '-c', 'import sys; sys.stdin.read()'],
+                              stdin=subprocess.PIPE) as child:
+            self.lease(pid=child.pid)
+            s.collect()
+            child.communicate(timeout=5)
+            self.assertEqual(child.returncode, 0)
+        self.check_deferred('lease_live')
+        self.assertEqual(s.hold_state()['pid'], child.pid)
         self.adb.assert_not_called()
 
     def test_health_recomputes_when_lease_expires_or_age_exceeds_bound(self):
