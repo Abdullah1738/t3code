@@ -1,5 +1,6 @@
 import {
   CommandId,
+  MessageId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type ThreadId,
@@ -8,9 +9,11 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { forkParked } from "../serverActivation.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import {
@@ -19,6 +22,9 @@ import {
   progressBlockers,
   latestQualifyingProgress,
   stalledSummary,
+  stallPhase,
+  silentRecoveryStillSafe,
+  supportsSilentRecovery,
 } from "./delegatedTaskProgress.ts";
 
 type Progress = {
@@ -52,6 +58,7 @@ export class DelegatedTaskProgressGuard extends Context.Service<
 const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
   const threads = yield* ThreadManagementService.ThreadManagementService;
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
   const children = new Map<ThreadId, Child>();
   const limits = new Map<ThreadId, number>();
   const boot = yield* DateTime.now;
@@ -216,7 +223,7 @@ const make = Effect.gen(function* () {
           continue;
         const snapshot = yield* engine.getThreadRecords(
           threadId,
-          ["runs", "turnItems", "runtimeRequests", "messages"],
+          ["runs", "turnItems", "runtimeRequests", "messages", "providerThreads"],
           {
             turnItemRunId: child.run.id,
             messageRunIds: [child.run.id],
@@ -238,11 +245,146 @@ const make = Effect.gen(function* () {
           child.thinkingSince = null;
           continue;
         }
+        const phase = stallPhase(
+          child.lastProgressKind,
+          child.thinkingSince !== null ||
+            snapshot.turnItems.some(
+              (item) =>
+                item.runId === run.id &&
+                item.type === "reasoning" &&
+                DateTime.toEpochMillis(item.updatedAt) >=
+                  DateTime.toEpochMillis(child.lastProgressAt),
+            ),
+        );
+        const lastTool = snapshot.turnItems
+          .filter(
+            (item) =>
+              item.runId === run.id &&
+              isProgressActivity(item) &&
+              item.status !== "running" &&
+              item.status !== "pending" &&
+              item.status !== "waiting",
+          )
+          .toSorted(
+            (a, b) =>
+              DateTime.toEpochMillis(b.updatedAt) - DateTime.toEpochMillis(a.updatedAt) ||
+              b.ordinal - a.ordinal,
+          )[0];
+        const tool =
+          lastTool?.type === "dynamic_tool"
+            ? (lastTool.toolName ?? "dynamic_tool")
+            : lastTool?.type;
         const stall = {
           idleTimeoutMs: child.idleTimeoutMs,
           lastProgressAt: child.lastProgressAt,
           lastProgressKind: child.lastProgressKind,
+          phase,
+          ...(tool === undefined ? {} : { lastProgressTool: tool }),
+          silentSeconds:
+            (DateTime.toEpochMillis(now) - DateTime.toEpochMillis(child.lastProgressAt)) / 1000,
         };
+        const record = Effect.fn("DelegatedTaskProgressGuard.recordStall")(function* (
+          action: "resumed" | "restarted" | "failed",
+        ) {
+          yield* Effect.logWarning("delegated child stalled", {
+            threadId,
+            runId: run.id,
+            ...stall,
+            action,
+          });
+          if (Option.isNone(analytics)) return;
+          const effort = run.modelSelection?.options?.find((o) =>
+            ["reasoningEffort", "effort", "variant"].includes(o.id),
+          )?.value;
+          yield* analytics.value.record({
+            ts: DateTime.formatIso(now),
+            kind: "delegated_task.stall",
+            surface: "server",
+            route: "provider",
+            threadId,
+            ...(run.delegatedTaskId === undefined ? {} : { taskId: run.delegatedTaskId }),
+            props: {
+              runId: run.id,
+              provider: run.providerInstanceId,
+              ...(run.modelSelection === undefined ? {} : { model: run.modelSelection.model }),
+              ...(typeof effort === "string" ? { effort } : {}),
+              phase,
+              action,
+              lastProgressKind: stall.lastProgressKind,
+              ...(tool === undefined
+                ? {}
+                : { lastProgressTool: tool.replace(/[^a-zA-Z0-9_.:/#@%+-]/g, "_").slice(0, 160) }),
+              silentSeconds: stall.silentSeconds,
+              reasonClass:
+                phase === "mid_turn"
+                  ? "mid_turn"
+                  : run.delegatedTaskStallRecovery === undefined
+                    ? "silent_model"
+                    : "recovery_exhausted",
+            },
+          });
+        });
+        const recovery =
+          phase === "mid_turn"
+            ? undefined
+            : {
+                phase,
+                lastProgressAt: DateTime.formatIso(child.lastProgressAt),
+                attemptId: run.activeAttemptId,
+              };
+        if (
+          recovery !== undefined &&
+          snapshot.providerThreads.some(
+            (p) =>
+              p.id === run.providerThreadId && supportsSilentRecovery(p.driver, recovery.phase),
+          ) &&
+          silentRecoveryStillSafe(snapshot, run, recovery)
+        ) {
+          const original =
+            recovery.phase === "first_event"
+              ? yield* engine.getThreadRecords(threadId, ["messages"], {
+                  messageIds: [run.userMessageId],
+                })
+              : undefined;
+          const prompt = original?.messages.find((message) => message.id === run.userMessageId);
+          if (recovery.phase === "post_tool" || prompt !== undefined) {
+            child.stopping = true;
+            const resumed = yield* threads
+              .sendToThread({
+                threadId,
+                projectId: snapshot.thread.projectId,
+                commandId: CommandId.make(`server:delegated-stall-recovery:${run.id}`),
+                messageId: MessageId.make(`server:delegated-stall-recovery:${run.id}`),
+                mode: "restart",
+                createdBy: "system",
+                creationSource: "server",
+                modelSelection: run.modelSelection,
+                text:
+                  recovery.phase === "post_tool"
+                    ? "Your last model request got no reply. Write your final report now from what you have."
+                    : prompt!.text,
+                attachments: prompt?.attachments ?? [],
+                ...(prompt?.context === undefined ? {} : { context: prompt.context }),
+                delegatedTaskStallRecovery: recovery,
+              })
+              .pipe(Effect.result);
+            if (resumed._tag === "Success") {
+              child.run = resumed.success.run;
+              child.lastProgressAt = now;
+              child.lastProgressKind = "run_started";
+              child.thinkingSince = null;
+              child.stopping = false;
+              yield* record(recovery.phase === "post_tool" ? "resumed" : "restarted");
+              continue;
+            }
+            // The interrupt also rechecks progress and the attempt before committing.
+            child.stopping = false;
+            yield* Effect.logWarning("delegated child recovery rejected", {
+              threadId,
+              cause: resumed.failure,
+            });
+          }
+        }
         child.stopping = true;
         const result = yield* threads
           .interruptThread({
@@ -274,6 +416,7 @@ const make = Effect.gen(function* () {
           )
         )
           child.stopping = false;
+        else if (result?.type === "interrupt_requested") yield* record("failed");
       }
     },
     (effect) =>

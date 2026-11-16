@@ -2342,11 +2342,16 @@ const make = Effect.gen(function* () {
         ? subagentResultForRun(childProjection, summaryRun)
         : null;
     const derivedResult =
-      task.result !== null
-        ? task.result
-        : taskResultRun !== undefined && isTerminalTaskStatus(status)
-          ? resultText(taskResultRun)
-          : null;
+      stall !== undefined && resultRun !== undefined
+        ? resultText(resultRun)
+        : task.result !== null
+          ? task.result
+          : taskResultRun !== undefined && isTerminalTaskStatus(status)
+            ? resultText(taskResultRun)
+            : null;
+    const incompleteReason =
+      projectedResult?.incomplete ??
+      (stall === undefined ? null : "The child stalled without a final report.");
     const resultTransfers = parentProjection.contextTransfers.filter(
       (transfer) =>
         transfer.type === "subagent_result" &&
@@ -2468,10 +2473,8 @@ const make = Effect.gen(function* () {
         ? {}
         : { failureReason: "stalled" as const }),
       summary: derivedResult,
-      resultLooksIncomplete: projectedResult?.incomplete != null,
-      ...(projectedResult?.incomplete == null
-        ? {}
-        : { incompleteReason: projectedResult.incomplete }),
+      resultLooksIncomplete: incompleteReason !== null,
+      ...(incompleteReason === null ? {} : { incompleteReason }),
       resultContextTransferId,
       latestTerminalRunId: terminalRun?.id ?? null,
       latestTerminalStatus:

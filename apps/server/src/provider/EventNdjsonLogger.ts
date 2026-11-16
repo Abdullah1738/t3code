@@ -4,6 +4,7 @@
  * they cannot race while appending to the same thread-scoped file.
  */
 import * as NodeFS from "node:fs";
+import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
 
 import type { ThreadId } from "@t3tools/contracts";
@@ -175,7 +176,11 @@ function logWarning(message: string, context: Record<string, unknown>): Effect.E
 
 function resolveThreadSegment(raw: string | null | undefined): string {
   const normalized = typeof raw === "string" ? toSafeThreadAttachmentSegment(raw) : null;
-  return normalized ?? GLOBAL_THREAD_SEGMENT;
+  if (normalized === null || normalized === undefined) return GLOBAL_THREAD_SEGMENT;
+  // Long delegated IDs differ beyond the attachment segment's truncation point.
+  return raw!.length <= 80
+    ? normalized
+    : `${normalized}-${NodeCrypto.createHash("sha256").update(raw!).digest("hex").slice(0, 12)}`;
 }
 
 function resolveStreamLabel(stream: EventNdjsonStream): string {

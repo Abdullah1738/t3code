@@ -355,124 +355,137 @@ describe("OrchestratorMcpService", () => {
       }),
   );
 
-  it.effect("a terminal stalled run is reported correctly before parent finalization", () =>
-    Effect.gen(function* () {
-      const parentThreadId = ThreadId.make("stall-race-parent");
-      const childThreadId = ThreadId.make("stall-race-child");
-      const taskId = NodeId.make("stall-race-task");
-      const runId = RunId.make("stall-race-run");
-      const at = DateTime.makeUnsafe("2026-11-12T01:00:00Z");
-      const acknowledgements: Array<string> = [];
-      const acknowledged = yield* Deferred.make<void>();
-      const parent = {
-        thread: { id: parentThreadId },
-        runs: [],
-        contextTransfers: [],
-        subagents: [
-          {
-            id: taskId,
-            threadId: parentThreadId,
-            origin: "app_owned",
-            childThreadId,
-            driver: "codex",
-            model: "test",
-            result: null,
-            status: "running",
-            completionDelivery: { state: "pending" },
-          },
-        ],
-      } as unknown as OrchestrationV2ThreadProjection;
-      const child = {
-        thread: { id: childThreadId },
-        contextTransfers: [],
-        runtimeRequests: [],
-        providerThreads: [],
-        providerTurns: [],
-        subagents: [],
-        turnItems: [],
-        runs: [
-          {
-            id: runId,
-            ordinal: 1,
-            delegatedTaskId: taskId,
-            status: "interrupted",
-            startedAt: at,
-            completedAt: at,
-            delegatedTaskStall: {
-              idleTimeoutMs: 60_000,
-              lastProgressAt: at,
-              lastProgressKind: "assistant_text",
-            },
-          },
-        ],
-        messages: [
-          {
-            id: MessageId.make("partial"),
-            runId,
-            role: "assistant",
-            text: "Partial work",
-            createdAt: at,
-            updatedAt: at,
-          },
-        ],
-      } as unknown as OrchestrationV2ThreadProjection;
-      const dependencies = Layer.mergeAll(
-        NodeServices.layer,
-        Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
-          getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
-          getThreadRecords: (id) => Effect.succeed(id === parentThreadId ? parent : child),
-          delegatedTaskResultPending: () => Effect.succeed(false),
-          dispatch: (command) =>
-            Effect.sync(() => {
-              acknowledgements.push(command.type);
-            }).pipe(
-              Effect.andThen(Deferred.succeed(acknowledged, undefined)),
-              Effect.as({} as never),
-            ),
-        }),
-        ServerSettings.layerTest(),
-        Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
-        Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
-          list: () => Effect.succeed([]),
-        }),
-        Layer.mock(ProjectService.ProjectService)({}),
-        Layer.mock(SecretRequests.SecretRequests)({}),
-        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
-      );
-      yield* Effect.gen(function* () {
-        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const result = yield* service.taskStatus(
-          {
-            environmentId: EnvironmentId.make("stall-race-env"),
-            requestNamespace: "stall-race",
-            thread: {
+  it.effect.each(["post_tool", "first_event"] as const)(
+    "%s stall replaces a saved progress summary",
+    (phase) =>
+      Effect.gen(function* () {
+        const parentThreadId = ThreadId.make("stall-race-parent");
+        const childThreadId = ThreadId.make("stall-race-child");
+        const taskId = NodeId.make("stall-race-task");
+        const runId = RunId.make("stall-race-run");
+        const at = DateTime.makeUnsafe("2026-11-12T01:00:00Z");
+        const acknowledgements: Array<string> = [];
+        const acknowledged = yield* Deferred.make<void>();
+        const parent = {
+          thread: { id: parentThreadId },
+          runs: [],
+          contextTransfers: [],
+          subagents: [
+            {
+              id: taskId,
               threadId: parentThreadId,
-              providerSessionId: "stall-race",
-              providerInstanceId: ProviderInstanceId.make("codex"),
+              origin: "app_owned",
+              childThreadId,
+              driver: "codex",
+              model: "test",
+              result: "I am still reviewing files",
+              status: "running",
+              completionDelivery: { state: "pending" },
             },
-            client: undefined,
-            capabilities: new Set(["orchestration"]),
-            issuedAt: 1,
-          },
-          taskId,
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const child = {
+          thread: { id: childThreadId },
+          contextTransfers: [],
+          runtimeRequests: [],
+          providerThreads: [],
+          providerTurns: [],
+          subagents: [],
+          turnItems: [],
+          runs: [
+            {
+              id: runId,
+              ordinal: 1,
+              delegatedTaskId: taskId,
+              status: "interrupted",
+              startedAt: at,
+              completedAt: at,
+              delegatedTaskStall: {
+                idleTimeoutMs: 60_000,
+                lastProgressAt: at,
+                lastProgressKind: phase === "post_tool" ? "dynamic_tool_finished" : "run_started",
+                phase,
+                lastProgressTool: "t3-code.list_thread_pull_requests",
+              },
+            },
+          ],
+          messages: [
+            {
+              id: MessageId.make("partial"),
+              runId,
+              role: "assistant",
+              text: "Partial work",
+              createdAt: at,
+              updatedAt: at,
+            },
+          ],
+        } as unknown as OrchestrationV2ThreadProjection;
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getCallerRow: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadShell: (threadId) => Effect.succeed(liveThreadShell(threadId)),
+            getThreadRecords: (id) => Effect.succeed(id === parentThreadId ? parent : child),
+            delegatedTaskResultPending: () => Effect.succeed(false),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                acknowledgements.push(command.type);
+              }).pipe(
+                Effect.andThen(Deferred.succeed(acknowledged, undefined)),
+                Effect.as({} as never),
+              ),
+          }),
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+            list: () => Effect.succeed([]),
+          }),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
         );
-        assert.equal(result.status, "failed");
-        assert.equal(result.failureReason, "stalled");
-        assert.deepEqual(result.failure, {
-          category: "unknown",
-          code: null,
-          message: stalledSummary(child.runs[0]!.delegatedTaskStall!, null),
-          retryable: null,
-        });
-        assert.equal(result.latestTerminalStatus, "failed");
-        assert.match(result.summary!, /^Stalled:/);
-        assert.include(result.summary!, "Partial work");
-        assert.equal(result.lastProgressAt, DateTime.formatIso(at));
-        yield* Deferred.await(acknowledged);
-        assert.deepEqual(acknowledgements, ["delegated_task.completion-delivery.acknowledge"]);
-      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
-    }),
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const result = yield* service.taskStatus(
+            {
+              environmentId: EnvironmentId.make("stall-race-env"),
+              requestNamespace: "stall-race",
+              thread: {
+                threadId: parentThreadId,
+                providerSessionId: "stall-race",
+                providerInstanceId: ProviderInstanceId.make("codex"),
+              },
+              client: undefined,
+              capabilities: new Set(["orchestration"]),
+              issuedAt: 1,
+            },
+            taskId,
+          );
+          assert.equal(result.status, "failed");
+          assert.equal(result.failureReason, "stalled");
+          assert.deepEqual(result.failure, {
+            category: "unknown",
+            code: null,
+            message: stalledSummary(child.runs[0]!.delegatedTaskStall!, null),
+            retryable: null,
+          });
+          assert.equal(result.latestTerminalStatus, "failed");
+          assert.match(result.summary!, /^stalled:/);
+          assert.include(result.summary!, "Partial work");
+          assert.include(
+            result.summary!,
+            phase === "post_tool"
+              ? "after tool t3-code.list_thread_pull_requests"
+              : "after run start",
+          );
+          assert.include(result.summary!, "; no final report");
+          assert.notInclude(result.summary!, "I am still reviewing files");
+          assert.equal(result.latestTerminalSummary ?? result.summary, result.summary);
+          assert.equal(result.lastProgressAt, DateTime.formatIso(at));
+          yield* Deferred.await(acknowledged);
+          assert.deepEqual(acknowledgements, ["delegated_task.completion-delivery.acknowledge"]);
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(dependencies))));
+      }),
   );
 
   it.effect.each([

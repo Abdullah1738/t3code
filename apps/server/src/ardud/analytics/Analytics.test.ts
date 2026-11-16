@@ -84,6 +84,48 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect("reads silent child stall decisions with their phase and recovery action", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      for (const [phase, action] of [
+        ["post_tool", "resumed"],
+        ["first_event", "restarted"],
+        ["mid_turn", "failed"],
+      ] as const) {
+        yield* analytics.record(
+          event({
+            kind: "delegated_task.stall",
+            surface: "server",
+            route: "provider",
+            threadId: "thread:delegated:child",
+            taskId: "task:child",
+            props: {
+              runId: "run:child",
+              provider: "codex",
+              model: "gpt-6.1-sol",
+              effort: "max",
+              phase,
+              action,
+              lastProgressKind: "run_started",
+              silentSeconds: 900,
+            },
+          }),
+        );
+      }
+      const result = yield* analytics.read({ day, kind: "delegated_task.stall", limit: 10 });
+      assert.lengthOf(result.samples, 3);
+      assert.sameMembers(
+        result.samples.map((row) => row.props?.action),
+        ["resumed", "restarted", "failed"],
+      );
+      assert.sameMembers(
+        result.samples.map((row) => row.props?.phase),
+        ["post_tool", "first_event", "mid_turn"],
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("prioritises board kinds and ignores board long tasks in samples and rollup", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;
