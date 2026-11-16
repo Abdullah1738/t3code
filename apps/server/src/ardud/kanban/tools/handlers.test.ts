@@ -612,6 +612,99 @@ it.effect.each(["subtask_done", "report_bug"] as const)(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.effect.each([
+  { prompt: "Replacement" },
+  { subtasks: [] },
+  { prompt: "Replacement", basedOn: " " },
+])("card_edit requires basedOn for replacements: %j", (patch) => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "required-base",
+      name: "Required base",
+      defaultProjectId: null,
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      { prompt: "Original", title: "Original", description: "Explicit" },
+      owner,
+    );
+    const before = yield* kanban.card(card.id);
+    const result = yield* call(ThreadId.make("evaluator"), "card_edit", {
+      card: card.id,
+      ...patch,
+    });
+    assert.isTrue(result.isError, result.text);
+    const failure = yield* decodeToolFailure(result.text);
+    assert.strictEqual(failure.code, "invalid_request");
+    assert.strictEqual(failure.reason, "invalid_args");
+    assert.include(failure.message, "requires basedOn from the updatedAt");
+    assert.deepStrictEqual(yield* kanban.card(card.id), before);
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect(
+  "card_edit maps stale bases to conflicts and permits additive edits without basedOn",
+  () => {
+    const { layer } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "base-conflict",
+        name: "Base conflict",
+        defaultProjectId: null,
+      });
+      const card = yield* kanban.createCard(
+        board.id,
+        { prompt: "Original", title: "Original", description: "Explicit" },
+        owner,
+      );
+      const a = ThreadId.make("evaluator-a");
+      const b = ThreadId.make("evaluator-b");
+      const first = yield* call(a, "card_edit", {
+        card: card.id,
+        prompt: "A's prompt",
+        basedOn: card.updatedAt,
+      });
+      assert.isFalse(first.isError, first.text);
+      const current = yield* decodeKanbanCard(first.structured.card);
+      const conflict = yield* call(b, "card_edit", {
+        card: card.id,
+        prompt: "B's prompt",
+        basedOn: card.updatedAt,
+      });
+      assert.isTrue(conflict.isError, conflict.text);
+      const failure = yield* decodeToolFailure(conflict.text);
+      assert.strictEqual(failure.code, "invalid_request");
+      assert.strictEqual(failure.reason, "conflict");
+      assert.include(failure.message, `by evaluator thread ${a}`);
+      assert.include(failure.message, current.updatedAt);
+      const merged = yield* call(b, "card_edit", {
+        card: card.id,
+        prompt: "A plus B",
+        basedOn: current.updatedAt,
+      });
+      assert.isFalse(merged.isError, merged.text);
+      const additive = yield* call(a, "card_edit", {
+        card: card.id,
+        links: [{ url: "https://example.com/evidence" }],
+        comment: "More evidence",
+      });
+      assert.isFalse(additive.isError, additive.text);
+      const before = yield* kanban.card(card.id);
+      const repeated = yield* call(a, "card_edit", {
+        card: card.id,
+        links: [{ url: "https://example.com/evidence" }],
+        comment: "More evidence",
+        basedOn: card.updatedAt,
+      });
+      assert.isFalse(repeated.isError, repeated.text);
+      assert.deepStrictEqual(yield* kanban.card(card.id), before);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
 it.effect("card_edit reports control characters to an evaluator", () => {
   const { layer } = fakeThreads();
   return Effect.gen(function* () {
@@ -729,6 +822,7 @@ it.effect("MCP rejects controls in raw trimmed fields before any write", () => {
     const before = yield* kanban.card(card.id);
     const edit = yield* call(evaluator, "card_edit", {
       card: card.id,
+      basedOn: (yield* kanban.card(card.id)).card.updatedAt,
       subtasks: [{ text: "\u000bSubtask\u000c", owner: "work" }],
     });
     assert.isTrue(edit.isError, edit.text);
@@ -4814,6 +4908,7 @@ it.effect("card_edit analytics separates invalid subtask plans from approval ref
       pending = yield* Deferred.make<AnalyticsEvent>();
       const result = yield* call(ThreadId.make("plan-evaluator"), "card_edit", {
         card: card.id,
+        basedOn: (yield* kanban.card(card.id)).card.updatedAt,
         subtasks: row.subtasks,
       }).pipe(Effect.result);
       if (Result.isFailure(result)) {
@@ -4882,6 +4977,7 @@ it.effect(
       assert.include(JSON.stringify(Schema.toJsonSchemaDocument(parameters)), '"maxLength":500');
       const kept = yield* call(evaluator, "card_edit", {
         card: card.id,
+        basedOn: (yield* kanban.card(card.id)).card.updatedAt,
         subtasks: [{ id: "s1" }, { id: "s2" }],
       });
       assert.isFalse(kept.isError, kept.text);
@@ -4889,6 +4985,7 @@ it.effect(
       for (const input of [{ text: "New" }, { owner: "work" }]) {
         const refused = yield* call(evaluator, "card_edit", {
           card: card.id,
+          basedOn: (yield* kanban.card(card.id)).card.updatedAt,
           subtasks: [{ id: "s1" }, { id: "s2" }, input],
         });
         assert.isTrue(refused.isError);
@@ -6961,6 +7058,7 @@ it.effect("card_create and card_edit report guessed gates and expose clearGate",
     const card = yield* decodeKanbanCard(created.structured.card);
     const edited = yield* call(evaluator, "card_edit", {
       card: card.id,
+      basedOn: (yield* kanban.card(card.id)).card.updatedAt,
       subtasks: [{ id: "s1", gate: null }, { id: "s2", gate: "money" }, { id: "s3" }, { id: "s4" }],
     });
     assert.isFalse(edited.isError, edited.text);
@@ -6970,6 +7068,7 @@ it.effect("card_create and card_edit report guessed gates and expose clearGate",
     assert.strictEqual((yield* kanban.card(card.id)).card.subtasks[0]!.gate, "deploy");
     const cleared = yield* call(evaluator, "card_edit", {
       card: card.id,
+      basedOn: (yield* kanban.card(card.id)).card.updatedAt,
       subtasks: [
         { id: "s1", clearGate: "This is a report, nothing goes live" },
         { id: "s2" },
@@ -6982,6 +7081,7 @@ it.effect("card_create and card_edit report guessed gates and expose clearGate",
     assert.lengthOf((yield* kanban.card(card.id)).card.asks, 1);
     const reworded = yield* call(evaluator, "card_edit", {
       card: card.id,
+      basedOn: (yield* kanban.card(card.id)).card.updatedAt,
       subtasks: [
         { id: "s1", text: "Tell both reporters once installed" },
         { id: "s2" },
@@ -7035,6 +7135,7 @@ it.effect(
       assert.include(refused.text, "clearGate");
       const patch = {
         card: card.id,
+        basedOn: (yield* kanban.card(card.id)).card.updatedAt,
         subtasks: finished.map(({ id }) => ({
           id,
           clearGate: "This only reports the result; nothing goes live",
@@ -7089,6 +7190,7 @@ it.effect.each(["open", "done", "skipped"] as const)(
       });
       const reply = yield* call(ThreadId.make("no-gate-evaluator"), "card_edit", {
         card: card.id,
+        basedOn: (yield* kanban.card(card.id)).card.updatedAt,
         subtasks: [{ id: "s1", clearGate: "This only reads the result" }],
       });
       assert.isTrue(reply.isError, reply.text);
@@ -7119,6 +7221,7 @@ it.effect("guessed gate results follow allocated ids even when plan steps are ou
     yield* kanban.markSubtask(card.id, "s1", "done", "Read", owner, "evaluator");
     const edited = yield* call(ThreadId.make("gate-evaluator"), "card_edit", {
       card: card.id,
+      basedOn: (yield* kanban.card(card.id)).card.updatedAt,
       subtasks: [
         { text: "Restart Robob", owner: "evaluator", step: 5 },
         { text: "Pay the invoice", owner: "evaluator", step: 2, gate: null },
@@ -7179,6 +7282,7 @@ it.effect("tool results respect disabled board guesses after create and edit", (
     const card = yield* decodeKanbanCard(made.structured.card);
     const edited = yield* call(evaluator, "card_edit", {
       card: card.id,
+      basedOn: (yield* kanban.card(card.id)).card.updatedAt,
       subtasks: [{ id: "s1", gate: null }],
     });
     assert.isFalse(edited.isError, edited.text);
@@ -7268,7 +7372,10 @@ it.effect.each(
       const refused = yield* call(child, row.tool, {
         card: card.id,
         ...(row.tool === "card_edit"
-          ? { subtasks: [{ id: "s1", clearGate: "This gate was guessed incorrectly" }] }
+          ? {
+              basedOn: card.updatedAt,
+              subtasks: [{ id: "s1", clearGate: "This gate was guessed incorrectly" }],
+            }
           : { subtask: "s1", state: "skipped", note: "This gate was filed incorrectly" }),
       });
       assert.isTrue(refused.isError, refused.text);
@@ -7307,6 +7414,7 @@ it.effect.each(["outside orchestrator", "board evaluator"] as const)(
       );
       const cleared = yield* call(root, "card_edit", {
         card: card.id,
+        basedOn: (yield* kanban.card(card.id)).card.updatedAt,
         subtasks: [{ id: "s1", clearGate: "This is only a test invoice fixture" }],
       });
       assert.isFalse(cleared.isError, cleared.text);
@@ -8497,6 +8605,7 @@ it.effect("only evaluators can set or clear service via create and edit", () =>
     }
     const cleared = yield* call(evaluator, "card_edit", {
       card: card.id,
+      basedOn: (yield* kanban.card(card.id)).card.updatedAt,
       subtasks: [{ id: "s1", service: null }],
     });
     assert.isFalse(cleared.isError, cleared.text);
@@ -9424,6 +9533,7 @@ it.effect("card_edit exact edits reject the whole patch on any invalid field", (
     for (const { patch, error } of cases) {
       const result = yield* call(ThreadId.make("thread-evaluator"), "card_edit", {
         card: card.id,
+        basedOn: (yield* kanban.card(card.id)).card.updatedAt,
         comment: "Must not save",
         ...patch,
       });
@@ -9589,6 +9699,7 @@ it.effect("card_edit subtaskEdits use the same gate checks as plan replacements"
     assert.strictEqual(gated.gate, "deploy");
     const normal = yield* call(evaluator, "card_edit", {
       card: card.id,
+      basedOn: (yield* kanban.card(card.id)).card.updatedAt,
       subtasks: [{ id: "s1", text: "Tell the reporter once installed" }],
     });
     assert.isFalse(normal.isError, normal.text);
@@ -9600,6 +9711,7 @@ it.effect("card_edit subtaskEdits use the same gate checks as plan replacements"
     });
     const rewordedPlan = yield* call(evaluator, "card_edit", {
       card: card.id,
+      basedOn: (yield* kanban.card(card.id)).card.updatedAt,
       subtasks: [{ id: "s1", text: "Tell the reporter" }],
     });
     assert.isFalse(rewordedExact.isError, rewordedExact.text);
