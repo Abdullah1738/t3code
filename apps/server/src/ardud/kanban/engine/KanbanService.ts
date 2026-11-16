@@ -2016,13 +2016,17 @@ const make = Effect.gen(function* () {
         const committed =
           carried.find((card) => card.activeRole === "work") ??
           (source?.workThreadId === threadId ? source : undefined);
-        if (committed === undefined) return;
+        if (committed === undefined) return false;
         yield* touching(threadId, threadIo.setModel(threadId, committed.model));
+        const restored = yield* threadIo.model(threadId);
+        return restored !== null && modelSelectionsEqual(restored, committed.model);
       });
-      yield* locked ? restoring : withThreadModel(threadId, restoring);
+      return yield* locked ? restoring : withThreadModel(threadId, restoring);
     },
     Effect.catchCause((cause) =>
-      Effect.logWarning("kanban thread model reconciliation failed", { cause }),
+      Effect.logWarning("kanban thread model reconciliation failed", { cause }).pipe(
+        Effect.as(false),
+      ),
     ),
   );
   const ensureWorkModel = Effect.fn("KanbanService.ensureWorkModel")(function* (
@@ -2032,7 +2036,8 @@ const make = Effect.gen(function* () {
     locked = false,
   ) {
     let current: ModelSelection | null = null;
-    const read = yield* locks.outside(Effect.exit(threadIo.model(threadId)), undefined, true);
+    const reading = Effect.exit(threadIo.model(threadId));
+    const read = yield* locked ? reading : locks.outside(reading, undefined, true);
     if (read._tag === "Success") {
       current = read.value;
       if (current !== null && modelSelectionsEqual(current, model)) return null;
@@ -2050,9 +2055,11 @@ const make = Effect.gen(function* () {
     const checked =
       read._tag === "Failure"
         ? read
-        : yield* locks.outside(locked ? checking : withThreadModel(threadId, checking), () =>
-            locked ? Effect.void : restoreWorkModel(threadId, cardId),
-          );
+        : locked
+          ? yield* checking
+          : yield* locks.outside(withThreadModel(threadId, checking), () =>
+              restoreWorkModel(threadId, cardId).pipe(Effect.asVoid),
+            );
     if (checked._tag === "Success" && checked.value === true) return null;
     const reason = `Thread model differs from card model: thread runs ${current === null ? "unknown" : Rules.poolKey(current)}, card runs ${Rules.poolKey(model)}`;
     return checked._tag === "Failure" ? `${reason}; ${String(checked.cause)}` : reason;
@@ -2621,6 +2628,33 @@ const make = Effect.gen(function* () {
         yield* touching(threadId, threadIo.setModel(ThreadId.make(threadId), working.model));
       }),
     );
+  const switchPoolModel = Effect.fn("KanbanService.switchPoolModel")(function* (
+    boardId: KanbanBoard["id"],
+    threadId: ThreadId,
+    cardId?: KanbanCard["id"],
+  ) {
+    yield* locks.outside(
+      withThreadModel(
+        threadId,
+        Effect.gen(function* () {
+          // A card edit can commit while this pool move waits for the model lock.
+          // Resolve the saved selection now; the pool move's captured model may be obsolete.
+          const cards = yield* rawStore.cardsByThread(threadId);
+          const source = cardId === undefined ? null : yield* rawStore.card(cardId);
+          const card =
+            cards.find((entry) => entry.activeRole === "work") ??
+            (source?.workThreadId === threadId ? source : undefined);
+          const held = (yield* Ref.get(holds)).get(threadId);
+          const model =
+            card?.model ??
+            (held?.boardId === boardId
+              ? (yield* rawStore.pools(boardId)).find((pool) => pool.key === held.pool)?.model
+              : undefined);
+          if (model !== undefined) yield* touching(threadId, threadIo.setModel(threadId, model));
+        }),
+      ),
+    );
+  });
   /**
    * A write's thread follow-on. While `guardDeferred` runs the write (durable
    * route modes) it is saved after the write and run by its lane's drain;
@@ -17094,6 +17128,12 @@ const make = Effect.gen(function* () {
     let lockedWork: ThreadId | null = null;
     let releaseModel: Effect.Effect<void> = Effect.void;
     let confirmingModel = false;
+    let confirmedModel: { model: ModelSelection; reason: string | null } | undefined;
+    let restored = false;
+    let switchFrom: string | undefined;
+    let switchTo: string | undefined;
+    let reruns = 0;
+    let staleFences: ReadonlyArray<string> = [];
     const editing = savedCardGuard(
       "card.update",
       Effect.gen(function* () {
@@ -17347,7 +17387,25 @@ const make = Effect.gen(function* () {
           (next.activeRole === "work" ? next.activeThreadId : null) ?? next.workThreadId;
         if ((patch.model || patch.models) && workThread !== null) {
           confirmingModel = true;
-          const reason = yield* ensureWorkModel(workThread, next.model, card.id, true);
+          switchFrom ??= Rules.poolKey(card.model);
+          switchTo = Rules.poolKey(next.model);
+          if (
+            confirmedModel === undefined ||
+            !modelSelectionsEqual(confirmedModel.model, next.model)
+          ) {
+            // The model lock and final restore compensate this switch. Cache its result before
+            // re-entry: a stale board snapshot may retry, but must not repeat slow thread I/O.
+            yield* locks.outside(
+              ensureWorkModel(workThread, next.model, card.id, true).pipe(
+                Effect.tap((reason) =>
+                  Effect.sync(() => (confirmedModel = { model: next.model, reason })),
+                ),
+              ),
+              undefined,
+              true,
+            );
+          }
+          const reason = confirmedModel!.reason;
           if (reason !== null) {
             return yield* failWith(
               "invalid",
@@ -17516,7 +17574,7 @@ const make = Effect.gen(function* () {
       const card = yield* read(rawStore.card(cardId));
       lockedWork =
         (card?.activeRole === "work" ? card.activeThreadId : null) ?? card?.workThreadId ?? null;
-      if (lockedWork === null) return yield* editing;
+      if (card === null || lockedWork === null) return yield* editing;
       const threadId = lockedWork;
       const lock = threadModelLock(threadId);
       return yield* Effect.acquireUseRelease(
@@ -17531,13 +17589,48 @@ const make = Effect.gen(function* () {
           return Effect.uninterruptible(
             Effect.suspend(() =>
               held && confirmingModel
-                ? restoreWorkModel(threadId, cardId, true).pipe(Effect.ensuring(releaseModel))
+                ? restoreWorkModel(threadId, cardId, true).pipe(
+                    Effect.tap((success) => Effect.sync(() => (restored = success))),
+                    Effect.asVoid,
+                    Effect.ensuring(releaseModel),
+                  )
                 : releaseModel,
             ),
           );
         }),
-        () => editing,
+        () =>
+          editing.pipe(
+            Effect.provideService(BoardLocks.staleObserver, (detail) => {
+              reruns = detail.reruns;
+              staleFences = detail.fences;
+            }),
+          ),
         (finish) => finish,
+      ).pipe(
+        Effect.mapError((error) =>
+          confirmingModel
+            ? new KanbanError({
+                ...error,
+                saved: false,
+                reasonClass: error.reasonClass ?? kanbanReasonClass(error.code, error.reason),
+                detail: `Not saved. ${error.detail === BoardLocks.MAY_HAVE_APPLIED ? "Board changed during the model edit." : error.detail} ${restored ? "Thread restored to the saved card model." : "Thread restoration could not be confirmed; check the thread model before retrying."}`,
+              })
+            : error,
+        ),
+        Effect.onExit((exit) =>
+          confirmingModel
+            ? Effect.logInfo("kanban card model switch", {
+                boardId: card.boardId,
+                cardId,
+                threadId,
+                fromPool: switchFrom,
+                toPool: switchTo,
+                reruns,
+                outcome: Exit.isSuccess(exit) ? "saved" : restored ? "restored" : "conflict",
+                staleFences,
+              })
+            : Effect.void,
+        ),
       );
     });
   };
@@ -20274,13 +20367,11 @@ const make = Effect.gen(function* () {
         (card.activeRole === "work" ? card.activeThreadId : null) ?? card.workThreadId;
       if (work && workThread !== null && !switched.has(workThread)) {
         switched.add(workThread);
-        yield* threads
-          .setModel(workThread, to.model)
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("kanban thread model switch failed", { cardId: card.id, cause }),
-            ),
-          );
+        yield* switchPoolModel(board.id, workThread, card.id).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban thread model switch failed", { cardId: card.id, cause }),
+          ),
+        );
       }
     }
     // A held slot (a work thread between cards) moves with its pool and keeps its start time.
@@ -20291,13 +20382,11 @@ const make = Effect.gen(function* () {
       if (hold.boardId !== board.id || !movedThreads.has(threadId)) continue;
       if (!switched.has(threadId)) {
         switched.add(threadId);
-        yield* threads
-          .setModel(threadId, to.model)
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("kanban thread model switch failed", { threadId, cause }),
-            ),
-          );
+        yield* switchPoolModel(board.id, ThreadId.make(threadId)).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban thread model switch failed", { threadId, cause }),
+          ),
+        );
       }
     }
   });
