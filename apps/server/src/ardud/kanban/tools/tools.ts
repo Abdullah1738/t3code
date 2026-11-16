@@ -23,6 +23,7 @@ import {
 import { ExactEdits } from "../engine/exactEdits.ts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
+import * as Context from "effect/Context";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
@@ -104,7 +105,7 @@ const SubtasksInput = describe(
       id: Schema.optional(
         describe(
           TrimmedNonEmptyString,
-          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is; omit id for a new subtask.",
+          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is. An s<N> id the card does not have yet creates a new subtask with that id (text and owner required); omit id to let the board number a new subtask.",
         ),
       ),
       step: Schema.optional(
@@ -156,9 +157,15 @@ const SubtasksInput = describe(
           "For a script's subtask: the name of the board script that does it. Left out on a new or edited entry, any script on the board can. An id alone keeps its stored binding; done and skipped subtasks keep theirs.",
         ),
       ),
+      holdsDependents: Schema.optional(
+        describe(
+          Schema.Boolean,
+          "true on the step that lands the work where dependents need it (merge, land, fast-forward, push): a Completed card's dependents wait until it's done. false: never holds. Left out: guessed from the text (merge/land/fast-forward).",
+        ),
+      ),
     }),
   ),
-  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id; open ones left out go, done ones stay.`,
+  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id or with a new s<N> id; open ones left out go, done ones stay.`,
 );
 
 const LinkInput = Schema.Struct({
@@ -174,6 +181,29 @@ const BlocksInput = {
       'Rich blocks, each with _tag: md {text}, collapse {title, text}, html {html, title, height}, choice {id, style "poll"|"pick", question, options [{id,label}], multi}, card {cardId}, image {url, alt}, attachment {attachment: {type image|file, id, name, mimeType, sizeBytes}} (the id comes from t3_attachment_prepare_upload).',
     ),
   ),
+};
+
+// MCP supplies its own decode options and strips excess keys before handlers run.
+// Keep the declared keys at registration so the raw payload can be checked first.
+export class KanbanArgumentKeys extends Context.Service<
+  KanbanArgumentKeys,
+  ReadonlyArray<string>
+>()("t3/ardud/kanban/tools/tools/KanbanArgumentKeys") {}
+
+export const argumentFailure = (name: string, allowed: ReadonlyArray<string>, input: unknown) => {
+  if (typeof input !== "object" || input === null) return;
+  const unknown = Object.keys(input).filter((key) => !allowed.includes(key));
+  if (unknown.length === 0) return;
+  const hint =
+    allowed.includes("card") &&
+    unknown.some((key) => ["id", "cardId", "card_id", "number", "cardNumber"].includes(key))
+      ? ' Did you mean "card"? Pass card: "<card id>" or "#4421".'
+      : "";
+  return new OrchestratorMcpFailure({
+    code: "invalid_request",
+    reason: "invalid_args",
+    message: `${name} has no argument${unknown.length === 1 ? "" : "s"} ${unknown.map((key) => JSON.stringify(key)).join(", ")}. Allowed: ${allowed.join(", ") || "(none)"}.${hint}`,
+  });
 };
 
 const tool = <
@@ -198,6 +228,7 @@ const tool = <
     failureMode: "return",
     dependencies,
   })
+    .annotate(KanbanArgumentKeys, Object.keys(parameters))
     .annotate(Tool.Title, title)
     .annotate(Tool.Readonly, flags.readonly)
     .annotate(Tool.Destructive, flags.destructive ?? false)
@@ -266,7 +297,7 @@ const CardSearch = tool(
 const CardGet = tool(
   "card_get",
   "Read a card",
-  'One card with its latest 20 events (moves, edits, comments, review verdicts), eventsTotal, a cursor for older ones (olderEvents) and every thread it has had. Pass events {before: olderEvents, limit} to page back, or "all" for every event (it can be more than your client accepts). With before, the reply carries only the card\'s id, number, title, stage and boardId, without the full card or threads. Pages leave out oldest events to fit 60,000 characters; a full card and threads can exceed this on the first read. A single oversized event is skipped with a note; "all" returns it. Follow olderEvents until null, even after an empty page.',
+  'One card with its latest 20 events (moves, edits, comments, review verdicts), eventsTotal, a cursor for older ones (olderEvents) and every thread it has had. Pass events {before: olderEvents, limit} to page back, or "all" for every event (it can be more than your client accepts). With before, the reply carries only the card\'s id, number, title, stage and boardId, without the full card or threads. Pages leave out oldest events to fit 60,000 characters; a full card and threads can exceed this on the first read. A single oversized event is skipped with a note; "all" returns it. Follow olderEvents until null, even after an empty page. card accepts an id or #number; omit it for your own card.',
   {
     card: Schema.optional(CardRef),
     boardId: BoardRef,
@@ -299,7 +330,7 @@ const CardGet = tool(
 const CardUpdate = tool(
   "card_update",
   "Update your card",
-  "Work threads may update only their assigned cards; evaluators use card_edit. Change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
+  "Work threads may update only their assigned cards; evaluators use card_edit. Change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -314,7 +345,7 @@ const CardUpdate = tool(
 const CardMove = tool(
   "card_move",
   "Move a card",
-  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed. A move clears its wait unless keepWait is true or it moves to completed/deployed with open evaluator/script subtasks; the result reports keep/clear.",
+  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed. A move clears its wait unless keepWait is true or it moves to completed/deployed with open evaluator/script subtasks; the result reports keep/clear. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -524,7 +555,7 @@ const CardAsk = tool(
 const CardAskChange = tool(
   "card_ask_change",
   "Change an open ask",
-  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may block or drop asks in todo (blocking moves the card to Needs Owner) and needs_owner.',
+  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may block or drop asks in todo (blocking moves the card to Needs Owner) and needs_owner. card accepts an id or #number; omit it for your own card.',
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -555,7 +586,7 @@ const CardAskChange = tool(
 const CardAskAnswer = tool(
   "card_ask_answer",
   "Decide a handed ask",
-  'Evaluators only: decide an ask that is with you (the owner handed it over, or it was asked to you; you are told either way). Whoever asked hears it as the answer, marked as decided by you for him. If only he can decide, give it to him with card_ask_change action "return" instead.',
+  'Evaluators only: decide an ask that is with you (the owner handed it over, or it was asked to you; you are told either way). Whoever asked hears it as the answer, marked as decided by you for him. If only he can decide, give it to him with card_ask_change action "return" instead. card accepts an id or #number; omit it for your own card.',
   {
     card: Schema.optional(CardRef),
     ask: Schema.String,
@@ -589,7 +620,7 @@ const CardAskAnswer = tool(
 const CardFlag = tool(
   "card_flag",
   "Flag a card stalled",
-  "Mark a card stalled with the reason (missing access, broken environment, waiting on something outside the board), or clear the flag with stalled false. A stalled card gives up its slot and returns from work or review to its queue.",
+  "Mark a card stalled with the reason (missing access, broken environment, waiting on something outside the board), or clear the flag with stalled false. A stalled card gives up its slot and returns from work or review to its queue. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -603,7 +634,7 @@ const CardFlag = tool(
 const BoardStandingApproval = tool(
   "board_standing_approval",
   "Standing deploy approval",
-  "Evaluators only: grant a board standing deploy approval from a closed owner-approved ask naming every requested board slug. The ask may be on any board (use its card id). Quote the owner's words and source thread/time. Replaces active records, retaining history. Any evaluator can revoke with a reason. Returns open release asks to drop with card_ask_change; never answers them. Money, secret and ownerOnly steps still need on-card approval.",
+  "Evaluators only: grant a board standing deploy approval from a closed owner-approved ask naming every requested board slug. The ask may be on any board (use its card id). Quote the owner's words and source thread/time. Replaces active records, retaining history. Any evaluator can revoke with a reason. Returns open release asks to drop with card_ask_change; never answers them. Money, secret and ownerOnly steps still need on-card approval. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     action: Schema.Literals(["grant", "revoke"]),
@@ -623,10 +654,11 @@ const BoardStandingApproval = tool(
 const CardWait = tool(
   "card_wait",
   "Say what a card waits on",
-  "Set the one thing a card waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only. A worker can set a wait on its own card while running; it takes effect when the turn ends, so end the turn right after. For a PR's CI, call watch_pull_request and end the turn instead." +
+  "Set the one thing a card waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only. A worker in Working can park its own card while running with on: time (until required, at most 24 hours ahead), script, or card. Set it as your last act and end the turn; it survives turn end. Clear it if a durable watcher, offbox result or another wake reaches you first. Workers cannot use push, merge, ci or owner_go while Working: use watch_pull_request for PR waits, or card_ask for the owner's answer." +
     (WAITS_ENGINE_WIRED
       ? ""
-      : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner."),
+      : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner.") +
+    " card accepts an id or #number; omit it for your own card.",
   {
     card: Schema.optional(CardRef),
     on: Schema.optional(describe(KanbanWaitKind, "What it waits on. Required unless clear.")),
@@ -649,7 +681,7 @@ const CardWait = tool(
     until: Schema.optional(
       describe(
         TrimmedNonEmptyString,
-        "time: when it ends (ISO 8601, at most 30 days ahead). Other kinds: your own deadline, after which the card shows as stuck.",
+        "time: when it ends (ISO 8601, at most 24 hours ahead for a Working worker parking itself, otherwise 30 days). Other kinds: your own deadline, after which the card shows as stuck.",
       ),
     ),
     head: Schema.optional(
@@ -703,7 +735,7 @@ const CardReviewResult = tool(
 const DiscussionPost = tool(
   "discussion_post",
   "Post in a discussion",
-  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. With ask (q1...), the message is a reply on that open ask of the card: the ask stays open and it is the owner's turn again. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
+  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. With ask (q1...), the message is a reply on that open ask of the card: the ask stays open and it is the owner's turn again. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice. card accepts an id or #number; omit it for your own card.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     boardId: BoardRef,
@@ -723,7 +755,7 @@ const DiscussionPost = tool(
 const DiscussionRead = tool(
   "discussion_read",
   "Read a discussion",
-  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB, or with limit up to that many and about 50,000 characters. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post.",
+  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB, or with limit up to that many and about 50,000 characters. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post. card accepts an id or #number; omit it for your own card.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     boardId: BoardRef,
@@ -890,7 +922,7 @@ const CardEdit = tool(
 const SubtaskDone = tool(
   "subtask_done",
   "Mark a subtask",
-  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. Unless standing deploy approval covers it, a gated subtask needs the owner's answer on an ask naming its id; a refusal says which ask is missing. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate. Evaluators may skip a deploy-, money- or secret-gated evaluator or script step without the owner's answer when the note gives the reason (10–300 characters); Abdullah gets a notice, and marking it done still needs his OK.",
+  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. Unless standing deploy approval covers it, a gated subtask needs the owner's answer on an ask naming its id; a refusal says which ask is missing. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate. Evaluators may skip a deploy-, money- or secret-gated evaluator or script step without the owner's answer when the note gives the reason (10–300 characters); Abdullah gets a notice, and marking it done still needs his OK. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -914,7 +946,7 @@ const SubtaskDone = tool(
 const CardThread = tool(
   "card_thread",
   "Steer, stop, wake or reset a card thread",
-  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it. Steer and wake require non-blank text. message is an alias for text; if both are supplied, they must match.",
+  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it. Steer and wake require non-blank text and an open worker step or pending review findings, unless a reviewer is attached. message is an alias for text; if both are supplied, they must match.",
   {
     boardId: BoardRef,
     card: CardRef,
@@ -1076,6 +1108,11 @@ const ReportBug = tool(
   },
   {
     appendedTo: Schema.optional(TrimmedNonEmptyString),
+    callerVerified: Schema.optional(Schema.Boolean),
+    callerUnverifiedReason: Schema.optional(
+      Schema.Literals(["caller_unresolved", "parent_not_active"]),
+    ),
+    message: Schema.optional(Schema.String),
     deduped: Schema.optional(Schema.Boolean),
     candidates: Schema.optional(Records),
     threadId: Schema.optional(TrimmedNonEmptyString),

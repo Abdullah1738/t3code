@@ -12,7 +12,8 @@ import * as Stream from "effect/Stream";
 import * as Schema from "effect/Schema";
 import * as Analytics from "../analytics/Analytics.ts";
 import { accumulate, finishRollup, makeAccumulator } from "../analytics/rollup.ts";
-import { observe, sendMode } from "./ControlRequestAnalytics.ts";
+import * as ReplyBuilders from "../http/ReplyBuilders.ts";
+import { encoding, observe, sendMode, thread } from "./ControlRequestAnalytics.ts";
 
 const decodeAnalyticsEvent = Schema.decodeUnknownSync(AnalyticsEvent, {
   onExcessProperty: "error",
@@ -190,4 +191,139 @@ it.effect("records interruption and preserves the request exit when analytics de
     );
     assert.equal(response.status, 200);
   }),
+);
+
+it.effect("separates admission, reader lanes and encoding while preserving parent observers", () =>
+  Effect.gen(function* () {
+    const samples: AnalyticsEvent[] = [];
+    const parentWaits: number[] = [];
+    const parentStatements: number[] = [];
+    const parentAdmissions: string[] = [];
+    yield* observe(
+      "control.messages",
+      Effect.gen(function* () {
+        yield* thread("thread:messages-test");
+        yield* ReplyBuilders.bounded(
+          Effect.gen(function* () {
+            (yield* NodeSqliteClient.ReaderWaitObserver)?.(25, "foreground");
+            (yield* NodeSqliteClient.ReaderWaitObserver)?.(5, "auth");
+            const contention = yield* NodeSqliteClient.ReaderContentionObserver;
+            contention?.({ lane: "foreground", slot: 0, holder: "KanbanThreads.find", holdMs: 20 });
+            contention?.({ lane: "foreground", slot: 0, holder: "KanbanThreads.find", holdMs: 5 });
+            const statement = yield* NodeSqliteClient.StatementTimingObserver;
+            statement?.({
+              connection: "reader",
+              lane: "foreground",
+              operation: "read",
+              durationMs: 7,
+              outcome: "success",
+            });
+            statement?.({
+              connection: "writer",
+              operation: "write",
+              durationMs: 3,
+              outcome: "success",
+            });
+            yield* TestClock.adjust("40 millis");
+          }),
+          "controlRead",
+        );
+        return yield* ReplyBuilders.bounded(
+          encoding(TestClock.adjust("2 millis").pipe(Effect.as(HttpServerResponse.empty()))),
+          "agent",
+        );
+      }),
+    ).pipe(
+      Effect.provide(ReplyBuilders.layer),
+      Effect.provideService(NodeSqliteClient.ReaderWaitObserver, (ms) => {
+        parentWaits.push(ms);
+      }),
+      Effect.provideService(NodeSqliteClient.StatementTimingObserver, (sample) => {
+        parentStatements.push(sample.durationMs);
+      }),
+      Effect.provideService(ReplyBuilders.AdmissionObserver, (sample) => {
+        parentAdmissions.push(sample.lane);
+      }),
+      Effect.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (event) =>
+            Effect.sync(() => {
+              samples.push(event);
+            }),
+        }),
+      ),
+    );
+    const event = samples[0]!;
+    assert.deepEqual(decodeAnalyticsEvent(event), event);
+    assert.equal(event.threadId, "thread:messages-test");
+    assert.equal(event.durationMs, 42);
+    assert.equal(event.props?.waitMs, 30);
+    assert.equal(event.props?.serializationMs, 2);
+    assert.deepEqual(event.props?.readerHolders, [
+      { lane: "foreground", holder: "KanbanThreads.find", holdMs: 25 },
+    ]);
+    assert.deepEqual(event.props?.readerTimings, [
+      { lane: "foreground", waitMs: 25, queryMs: 7, statements: 1 },
+      { lane: "auth", waitMs: 5, queryMs: 0, statements: 0 },
+      { lane: "writer", waitMs: 0, queryMs: 3, statements: 1 },
+    ]);
+    assert.deepEqual(event.props?.replyAdmissions, [
+      { lane: "controlRead", waitMs: 0, runMs: 40, acquired: true },
+      { lane: "agent", waitMs: 0, runMs: 2, acquired: true },
+    ]);
+    assert.deepEqual(parentWaits, [25, 5]);
+    assert.deepEqual(parentStatements, [7, 3]);
+    assert.deepEqual(parentAdmissions, ["controlRead", "agent"]);
+  }),
+);
+
+it.effect("records a cancelled admission without pretending the read acquired a permit", () =>
+  Effect.gen(function* () {
+    const samples: AnalyticsEvent[] = [];
+    const held = yield* Deferred.make<void>();
+    const queued = yield* Deferred.make<void>();
+    const holder = yield* Effect.forkChild(
+      ReplyBuilders.bounded(
+        Deferred.succeed(held, undefined).pipe(Effect.andThen(Effect.never)),
+        "controlRead",
+      ),
+    );
+    yield* Deferred.await(held);
+    const waiter = yield* Effect.forkChild(
+      observe(
+        "control.messages",
+        Effect.gen(function* () {
+          yield* Deferred.succeed(queued, undefined);
+          return yield* ReplyBuilders.bounded(
+            Effect.succeed(HttpServerResponse.empty()),
+            "controlRead",
+          );
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                samples.push(event);
+              }),
+          }),
+        ),
+      ),
+    );
+    yield* Deferred.await(queued);
+    yield* TestClock.adjust("50 millis");
+    yield* Fiber.interrupt(waiter);
+    const event = samples[0]!;
+    assert.deepEqual(decodeAnalyticsEvent(event), event);
+    assert.equal(event.outcome, "interrupted");
+    assert.deepEqual(event.props?.replyAdmissions, [
+      { lane: "controlRead", waitMs: 50, runMs: 0, acquired: false },
+    ]);
+    yield* Fiber.interrupt(holder);
+    assert.equal(
+      (yield* ReplyBuilders.bounded(Effect.succeed(HttpServerResponse.empty()), "controlRead"))
+        .status,
+      204,
+    );
+  }).pipe(Effect.provide(ReplyBuilders.layer)),
 );

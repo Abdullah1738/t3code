@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
 from . import command_usage, common, containers, java_version, prune, prepare, userns
-from . import resources, box_disk
+from . import resources, box_disk, queue_lifecycle
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
                      is_silenced, offsets_path, person, read_json, record_delivery, say, silence, write)
@@ -105,18 +105,19 @@ from pathlib import Path
 Path(sys.argv[1]).write_bytes(base64.b64decode('@RECIPE@'))
 OFFBOX_REPO_RECIPE
   _offbox_needs_setup=false
+  _offbox_recipe_mode=
   @CHECK@
   if $_offbox_needs_setup || [ "$(cat "$_offbox_base.stamp" 2>/dev/null || true)" != "$_offbox_stamp" ] ||
      [ ! -f "$HOME/.offbox/repo-env/@KEY@.sh" ]; then
-    echo 'offbox: setting up @KEY@ toolchain on this box (first run here, a few minutes)' >&3
+    @ANNOUNCE@
     rm -f "$_offbox_base.stamp"
     _offbox_t0=$SECONDS
-    bash "$_offbox_base.sh"
+    bash "$_offbox_base.sh" ${_offbox_recipe_mode:+"$_offbox_recipe_mode"}
     # A successful recipe must publish the environment before we trust its stamp.
     test -f "$HOME/.offbox/repo-env/@KEY@.sh"
     printf '%s\n' "$_offbox_stamp" > "$_offbox_base.stamp.tmp"
     mv -f "$_offbox_base.stamp.tmp" "$_offbox_base.stamp"
-    echo "offbox: @KEY@ toolchain ready ($((SECONDS - _offbox_t0))s)" >&3
+    @READY@
   fi
 ) 3>&2 >>"$HOME/.offbox/repo-setup-@KEY@.log" 2>&1
 _offbox_repo_rc=$?
@@ -145,12 +146,24 @@ def repo_setup_block(repo_key: str, rdir: str) -> str:
     if repo_key == "crpko-devops":
         body = (REPO_RECIPES_DIR.parent / "tools/crpko.sh").read_bytes() + b"\n" + body
     body = (REPO_RECIPES_DIR.parent / "tools/fetch.sh").read_bytes() + b"\n" + body
-    check = 'bash "$_offbox_base.sh" --check || _offbox_needs_setup=true' if repo_key == "crpko-devops" else ':'
+    announce = "echo 'offbox: setting up @KEY@ toolchain on this box (first run here, a few minutes)' >&3"
+    ready = 'echo "offbox: @KEY@ toolchain ready ($((SECONDS - _offbox_t0))s)" >&3'
+    check = ':'
+    if repo_key == "crpko-devops":
+        # One invocation shares the parsed pin between readiness and setup. Status bypasses the retained log.
+        check = '''export OFFBOX_REPO_STATUS_FD=3
+  if [ "$(cat "$_offbox_base.stamp" 2>/dev/null || true)" = "$_offbox_stamp" ] &&
+     [ -f "$HOME/.offbox/repo-env/crpko-devops.sh" ]; then
+    _offbox_recipe_mode=--ensure
+  fi
+  _offbox_needs_setup=true'''
+        announce = ready = ':'
     # The log redirection opens before the subshell can create its directories.
     return ('mkdir -p "$HOME/.offbox" || { '
             f'echo "offbox: {repo_key} toolchain setup failed on this box; nothing ran" >&2; '
             'echo offbox-repo-setup-failed >&2; exit 98; }\n'
-            + REPO_SETUP.replace('@KEY@', repo_key).replace('@ROOT@', shlex.quote(rdir))
+            + REPO_SETUP.replace('@ANNOUNCE@', announce).replace('@READY@', ready)
+            .replace('@KEY@', repo_key).replace('@ROOT@', shlex.quote(rdir))
             .replace('@CHECK@', check)
             .replace('@RECIPE@', base64.b64encode(body).decode()))
 
@@ -1549,6 +1562,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
                                                        repo_key=repo_key, template=template)),
               ('''for _offbox_tool in terraform aws ruby vector gh; do
+  if [ "$_offbox_tool" = terraform ] && [ "${OFFBOX_TERRAFORM_STATE:-}" = skipped ]; then continue; fi
   command -v "$_offbox_tool" >/dev/null || {
     echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
     echo offbox-repo-setup-failed >&2
@@ -1935,6 +1949,9 @@ class Runner:
     def require_pending(self, con) -> None:
         row = con.execute('SELECT status FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
         if not row or row['status'] != 'starting':
+            if os.environ.get(BACKGROUND_RUN_ENV):
+                queue_lifecycle.note(self.run_id, 'settled', 'row_no_longer_pending',
+                                     status=row['status'] if row else None)
             raise OffboxError(f'{self.run_id}: settled before the command started; nothing ran', code=130)
 
     def _prepare_box(self, con, a, rdir, env_file, body) -> dict | None:
@@ -3055,6 +3072,12 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         if prior['status'] == 'killed':
             code, st = prior['exit_code'] or (143 if prior['process_id'] else 130), 'killed'
             return
+        if status == 'busy' and incoming == EXIT_BUSY and not any(
+                prior[k] for k in ('box_id', 'command_id', 'process_id')):
+            from . import start_check
+            with contextlib.closing(db()) as con:
+                if not start_check.recovery_marked(con, prior):
+                    return  # A pre-box queue refusal has no step results to validate.
         if incoming in (None, 137, 143):
             killed = killed_result(run_id, wait=True, until=until, row=prior, known_code=incoming)
             if killed is not None:
@@ -3265,6 +3288,13 @@ def background_wait_hint(run_id: str) -> None:
 
 
 def background_queue(run_id: str, payload: dict) -> int:
+    with queue_lifecycle.client(run_id) as result:
+        code = _background_queue(run_id, payload)
+        result['exit_code'] = code
+        return code
+
+
+def _background_queue(run_id: str, payload: dict) -> int:
     a, me = SimpleNamespace(**payload['args']), payload['me']
     source_failure = None
     con = db()
@@ -3274,6 +3304,7 @@ def background_queue(run_id: str, payload: dict) -> int:
             if (not row or row['mode'] != 'bg' or row['status'] != 'starting' or row['box_id'] or row['process_id']
                     or row['client_pid'] != os.getpid() or row['owner'] != me['owner']
                     or row['repo_root'] != me['repo_root'] or payload['backend'] != common.backend()):
+                queue_lifecycle.note(run_id, 'settled', 'adoption_rejected', status=row['status'] if row else None)
                 raise OffboxError(f'{run_id}: queued run cannot be adopted', code=EXIT_LOCAL)
             con.execute('UPDATE runs SET client_pid=?,start_at=? WHERE run_id=?', (os.getpid(), now(), run_id))
         cwd = Path(row['local_cwd'] or row['cwd'])
@@ -3298,6 +3329,7 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
     from . import cli
     rid = os.environ[BACKGROUND_RUN_ENV]
     def interrupted(signum, frame):
+        queue_lifecycle.received(rid, signum)
         raise _ClientSignal
     old = {s: signal.signal(s, interrupted) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     code = EXIT_LOCAL
@@ -3317,6 +3349,7 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
             finally:
                 os.close(accept)
             if accepted not in (b'1', b''):
+                queue_lifecycle.note(rid, 'settled', 'handoff_rejected')
                 finish(rid, EXIT_LOCAL, 'local_error')
                 return EXIT_LOCAL
         rn = Runner(a, me)
@@ -3329,6 +3362,7 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
             error, queue_s = source_failure
             rn.queue_s = queue_s
             rn.source_gone(error)
+            queue_lifecycle.note(rid, 'settled', 'source_gone', message=str(error))
             say(str(error))
             code = 2
             return code
@@ -3358,9 +3392,11 @@ def forward_background(env: dict, *, backend="boat") -> None:
     if _background_context is None:
         raise OffboxError('background failover has no queued run context', code=EXIT_LOCAL)
     # Reuse the stdin protocol on failover too: an exec of the original argv would expose --env values.
+    rid = os.environ.get(BACKGROUND_RUN_ENV)
     common.select_backend(backend)
     os.environ.clear()
     os.environ.update(env)
+    queue_lifecycle.note(rid, 'handoff', 'forwarded', backend=backend)
     raise SystemExit(_background(*_background_context))
 
 
@@ -3669,6 +3705,8 @@ def _run_remote(a, rn) -> int:
     def on_sig(signum, _frame):
         if interrupted['sig'] is None:
             interrupted["sig"] = signum
+            if os.environ.get(BACKGROUND_RUN_ENV):
+                queue_lifecycle.received(rn.run_id, signum)
             raise _ClientSignal
 
     # Installed before rn.start(): a tool-call timeout's SIGTERM during the pool wait or the lease must reach
@@ -3692,7 +3730,10 @@ def _run_remote(a, rn) -> int:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
                 elif not os.environ.get(BACKGROUND_RUN_ENV) and not (
                         os.environ.get(home.RETURNED_HOME_ENV) and home.unreachable(e)):
-                    finish(rn.run_id, None, "busy" if e.code == EXIT_BUSY else "infra")
+                    # Preserve a pre-box refusal's exit without assigning an exit to an uncertain command start.
+                    code = e.code if not rn.box and (e.code == EXIT_BUSY or (
+                        e.code in (2, EXIT_INFRA) and 'nothing ran' in str(e).lower())) else None
+                    finish(rn.run_id, code, "busy" if e.code == EXIT_BUSY else "infra")
             if not isinstance(e, common.SourceGone):
                 rn.record(error=str(e)[:500])
             raise e
@@ -3712,6 +3753,8 @@ def _run_remote(a, rn) -> int:
             finish(rn.run_id, rn.recovered_code)
             print(rn.run_id)
             background_wait_hint(rn.run_id)
+            if os.environ.get(BACKGROUND_RUN_ENV):
+                queue_lifecycle.note(rn.run_id, 'handoff', 'handoff', box_id=rn.box, recovered_code=rn.recovered_code)
             return 0
         if a.bg and rn.recovered_code is None:
             # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
@@ -3724,6 +3767,8 @@ def _run_remote(a, rn) -> int:
                 print(rn.run_id)
                 background_wait_hint(rn.run_id)
                 say(f"started in background on {rn.box}")
+                if os.environ.get(BACKGROUND_RUN_ENV):
+                    queue_lifecycle.note(rn.run_id, 'handoff', 'handoff', box_id=rn.box, process_id=rn.pid)
                 return 0
             rn.recovered_code = admission
         kill_hint = dict(run_id=rn.run_id, status='running', exit_code=None, process_id=getattr(rn, 'pid', None), box_id=rn.box,

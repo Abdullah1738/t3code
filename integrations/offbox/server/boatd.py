@@ -57,6 +57,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boatd_disk as disk
+import boatd_tmp
 
 try:
     import offbox_disk_space
@@ -101,6 +102,7 @@ DEFAULTS = {
     "default_peak_gb": 4,             # admission: predicted peak for a kind with no history
     "retention": dict(RETENTION),
     "zpool": "offbox",
+    "scratch_disk": True,             # new boxes only; keep lifecycle handling enabled on rollback
     "state_dataset": "",              # e.g. offbox/boatd: boatd refuses to keep state anywhere else (set by install-host.sh)
     "owners": ["ardud", "moni"], "default_owner": "ardud",
     "person_owners": ["moni"],        # their boxes get hourly/daily/weekly snapshots
@@ -193,6 +195,8 @@ def migrate(con) -> None:
     con.executescript(SCHEMA_V2)
     if "mgmt_ssh_port" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN mgmt_ssh_port INTEGER")
+    if "provision_identity" not in _cols(con, "boxes"):
+        con.execute("ALTER TABLE boxes ADD COLUMN provision_identity INTEGER NOT NULL DEFAULT 0")
     owner = CFG.get("default_owner") or "ardud"
     if "owner" not in _cols(con, "boxes"):
         con.execute("ALTER TABLE boxes ADD COLUMN owner TEXT")
@@ -380,7 +384,7 @@ def vpn_problem() -> str | None:
 
 
 READY = threading.Event()          # set once the state is there and the start-up reconcile has finished
-STATE = {"problem": "starting", "reconcile": None, "boot": None, "phases": {}}
+STATE = {"problem": "starting", "reconcile": None, "boot": None, "phases": {}, "loops": {}}
 
 
 def startup_status():
@@ -438,6 +442,7 @@ def health_stage(stage, read):
 
 def refresh_health(fresh: bool = False) -> dict:
     """Only refreshers serialize; request threads read the published snapshot without this lock."""
+    loops = loop_health()
     with _HEALTH_LOCK:
         cached = _HEALTH["v"]
         if not fresh and cached and now() - _HEALTH["ts"] < 5:
@@ -485,6 +490,10 @@ def refresh_health(fresh: bool = False) -> dict:
                "boot_id": boot_id(), "uptime_s": int(host_uptime()), "boatd_uptime_s": int(now() - STARTED),
                "restartPending": restart_pending(),
                "version": VERSION, **status, "boot": STATE.get("boot"), "startupPhases": STATE.get("phases", {})}
+        problems = [v["problem"] for v in loops.values() if v["stalled"]]
+        out.update(loops=loops, degraded=bool(problems), problem="; ".join(problems) or None)
+        if problems:
+            out.update(mode="degraded", reasons=list(out.get("reasons", [])) + problems)
         _HEALTH.update(ts=now(), v=out)
         _HEALTH_REFRESH.update(stage="idle", since=None)
         return out
@@ -699,7 +708,7 @@ def health(fresh: bool = False) -> dict:
                           "pool": {"name": CFG["zpool"], "state": "UNKNOWN"}, "mdraid": {"state": "unknown", "arrays": {}},
                           "queue": None, "running": None, "version": VERSION,
                           "restartPending": {"count": 0, "since": None}, "boot": STATE.get("boot"),
-                          "startupPhases": STATE.get("phases", {})})
+                          "startupPhases": STATE.get("phases", {}), "loops": {}, "degraded": False, "problem": None})
     if not READY.is_set():
         reason = STATE["problem"] or "starting"
         out.update(ok=False, mode="degraded", reasons=[reason] + [r for r in out.get("reasons", []) if r != reason])
@@ -764,6 +773,32 @@ def ct_exec(box_id: str, cmd: str, input: bytes | None = None, timeout: float = 
     if user:
         args += ["--user", str(user), "--group", str(user), "--env", "HOME=/home/user"]
     return incus(*args, "--", "bash", "-c", cmd, input=input, timeout=timeout, check=check)
+
+
+def scratch():
+    return boatd_tmp.Scratch(CFG, incus)
+
+
+def check_instance_identity(box_id: str) -> None:
+    p = incus('query', f'/1.0/instances/{ct(box_id)}', check=False, timeout=30)
+    if p.returncode and not instance_missing(p):
+        raise Fail(500, 'incus_failed', 'cannot confirm interrupted instance identity')
+    if not p.returncode and json.loads(p.stdout).get('config', {}).get('user.offbox.provision') != box_id:
+        raise Fail(500, 'instance_identity', 'refusing cleanup of an unlabelled interrupted instance')
+
+
+def delete_instance(box_id: str, owner: str, require_identity: bool = False) -> None:
+    with boatd_tmp.lock(box_id):
+        if require_identity:
+            check_instance_identity(box_id)
+        deleted = incus('delete', ct(box_id), '--force', timeout=300, check=False)
+        if deleted.returncode and not instance_missing(deleted):
+            raise Fail(500, 'incus_failed', 'Incus did not confirm instance deletion')
+        scratch().delete(box_id, owner)
+
+
+def cleanup_provision(box_id: str, owner: str) -> None:
+    delete_instance(box_id, owner, require_identity=True)
 
 
 # ---------------------------------------------------------------- boxes
@@ -922,26 +957,37 @@ def provision(box_id: str, source: tuple[str, str | None], t: str) -> None:
     """source: ("image", alias) | ("saved", instance) | ("box", box_id). Runs in a thread."""
     con = db()
     try:
+        # Keep the identity requirement after failed creation, later resumes and reaping.
+        set_box(con, box_id, provision_identity=1)
         kind, ref = source
         name = ct(box_id)
+        marker = ('-c', f'user.offbox.provision={box_id}')
         if kind == "image":
-            incus("init", ref, name, "-p", "default", "-p", "offbox", timeout=900)
+            incus("init", ref, name, "-p", "default", "-p", "offbox", *marker, timeout=900)
         elif kind == "saved":
-            incus("copy", ref, name, "--instance-only", "-p", "default", "-p", "offbox", timeout=900)
+            incus("copy", ref, name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
         else:
-            incus("copy", ct(ref), name, "--instance-only", "-p", "default", "-p", "offbox", timeout=900)
+            incus("copy", ct(ref), name, "--instance-only", "-p", "default", "-p", "offbox", *marker, timeout=900)
+        r = box_row(con, box_id)
+        scratch().create(box_id, r['owner'])
         apply_size(box_id, t)
         r = box_row(con, box_id)
         _ensure_proxy(box_id, r["ssh_port"])
         _ensure_mgmt_proxy(con, box_id)
-        incus("start", name, timeout=300)
+        scratch().start(box_id)
         _wait_boot(box_id, ssh=False)
+        scratch().verify(box_id)
         _fresh_identity(box_id)
         _wait_boot(box_id)
         set_box(con, box_id, state="ready", last_active=now(), error=None)
         log(f"box {box_id} ready ({kind} {ref} {t})")
     except Exception as e:  # noqa: BLE001
         log(f"provision {box_id} failed: {e}")
+        try:
+            cleanup_provision(box_id, box_row(con, box_id)['owner'])
+        except Exception as cleanup:
+            log(f'provision cleanup deferred for {box_id}: {cleanup}')
+            e = RuntimeError(f'{e}; cleanup deferred: {cleanup}')
         set_box(con, box_id, state="error", error=str(e)[:500])
     finally:
         con.close()
@@ -972,7 +1018,7 @@ def create_box(con, body: dict, idem: str | None, owner: str, src_box: str | Non
     t0 = now()
     con.execute("BEGIN IMMEDIATE")
     con.execute("INSERT INTO boxes (id, name, type, state, ttl, last_active, created_at, updated_at, ssh_port, source, "
-                "owner) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (bid, (body.get("name") or bid)[:120], t, "provisioning",
+                "owner, provision_identity) VALUES (?,?,?,?,?,?,?,?,?,?,?,1)", (bid, (body.get("name") or bid)[:120], t, "provisioning",
                                                           int(body.get("ttlSeconds") or 1200), t0, t0, t0,
                                                           next_ssh_port(con), src_label, owner))
     if idem:
@@ -1094,8 +1140,9 @@ def resume_box(con, box_id: str, body: dict) -> None:
             _ensure_proxy(box_id, box_row(c2, box_id)["ssh_port"])
             _ensure_mgmt_proxy(c2, box_id)
             if not ct_running(box_id):
-                incus("start", ct(box_id), timeout=300)
+                scratch().start(box_id)
             _wait_boot(box_id)
+            scratch().verify(box_id)
             set_box(c2, box_id, state="ready", last_active=now())
             log(f"box {box_id} resumed")
         except Exception as e:  # noqa: BLE001
@@ -1110,11 +1157,12 @@ def delete_box(con, box_id: str) -> None:
     r = box_row(con, box_id)
     if r["pinned"]:
         raise Fail(409, "sandbox_pinned", f"{box_id} is pinned; unpin it first")
-    for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)):
-        kill_cmd(con, box_id, c["pid"], lost=True)
-    deleted = incus("delete", ct(box_id), "--force", timeout=300, check=False)
-    if deleted.returncode and not instance_missing(deleted):
-        raise Fail(500, 'incus_failed', 'Incus did not confirm instance deletion')
+    with boatd_tmp.lock(box_id):
+        if r['provision_identity']:
+            check_instance_identity(box_id)
+        for c in con.execute("SELECT pid FROM commands WHERE box_id=? AND status IN ('queued','running')", (box_id,)):
+            kill_cmd(con, box_id, c["pid"], lost=True)
+        delete_instance(box_id, r['owner'], require_identity=bool(r['provision_identity']))
     con.execute("DELETE FROM snaps WHERE box_id=?", (box_id,))
     set_box(con, box_id, state="deleted", deleted_at=now())
     log(f"box {box_id} deleted")
@@ -1146,6 +1194,7 @@ def save_box(con, box_id: str, name: str, owner: str) -> dict:
         c2 = db()
         try:
             incus("copy", ct(box_id), inst, "--instance-only", "--stateless", timeout=900)
+            scratch().detach_copy(inst)
             size = _instance_bytes(inst)
             prev = c2.execute("SELECT instance FROM saved WHERE owner=? AND name=?", key).fetchone()
             c2.execute("UPDATE saved SET instance=?, source=?, type=?, status='ready', error=NULL, size_bytes=?, "
@@ -2323,8 +2372,9 @@ def start_container(box_id: str) -> str | None:
             apply_size(box_id, r["type"])
             _ensure_proxy(box_id, r["ssh_port"])
             _ensure_mgmt_proxy(c2, box_id)
-            incus("start", ct(box_id), timeout=300)
+            scratch().start(box_id)
         _wait_boot(box_id)
+        scratch().verify(box_id)
         set_box(c2, box_id, state="ready", last_active=now(), error=None)
         return None
     except Exception as e:  # noqa: BLE001
@@ -2370,9 +2420,15 @@ def reconcile(con) -> dict:
     # stays as an error so the client that asked for it gets a clear answer.
     for bid, r in boxes.items():
         if r["state"] == "provisioning":
-            incus("delete", ct(bid), "--force", timeout=300, check=False)
-            set_box(con, bid, state="error", error="creation was interrupted by a server restart; create it again")
-            out["cleaned"].append(f"half-created box {bid}")
+            set_box(con, bid, provision_identity=1)
+            try:
+                cleanup_provision(bid, r['owner'])
+                set_box(con, bid, state="error", error="creation was interrupted by a server restart; create it again")
+                out["cleaned"].append(f"half-created box {bid}")
+            except Exception as e:
+                # An unsafe backing must not be erased, or block recovery of unrelated boxes.
+                set_box(con, bid, state="error", error=f"creation interrupted; cleanup deferred: {e}"[:500])
+                log(f'creation cleanup deferred for {bid}: {e}')
     # 2. Saved states whose copy was cut short: remove exactly that copy, keep the previous one.
     for sv in con.execute("SELECT * FROM saved WHERE status='pending'").fetchall():
         if sv["pending_instance"]:
@@ -2640,23 +2696,120 @@ def sample_once(con) -> None:
                  live, st.f_bavail * st.f_frsize))
 
 
-def loop(fn, every: float, name: str) -> None:
+LOOP_LOCK = threading.RLock()
+LOOP_THREADS = {}
+LOOP_SPECS = {}
+
+
+def loop_log(event, name, **fields):
+    # Logging must survive the same disk failure as SQLite.
+    try:
+        log(json.dumps({"event": event, "loop": name, **fields}, sort_keys=True))
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException:
+        pass
+
+
+def loop_state(name, every, stamp):
+    return STATE["loops"].setdefault(name, {
+        "every": every, "started_at": stamp, "last_ok": None, "last_error": None,
+        "last_error_at": None, "consecutive_failures": 0, "passes": 0, "failure_since": None})
+
+
+def loop(fn, every: float, name: str, *, clock=None, sleep=None) -> None:
+    clock, sleep = clock or now, sleep or time.sleep
+    error_key, reported_at, repeats = None, 0, 0
     while True:
-        con = None
+        delay = every
         try:
+            con = None
             try:
-                con = db()
-            except sqlite3.Error as e:
-                if name == 'sampler':
-                    disk_maintenance(None, error=e)
-                raise
-            fn(con)
-        except Exception:  # noqa: BLE001
-            log(f"{name}: {traceback.format_exc()[-800:]}")
-        finally:
-            if con is not None:
-                con.close()
-        time.sleep(every)
+                try:
+                    con = db()
+                except sqlite3.Error as e:
+                    if name == 'sampler':
+                        disk_maintenance(None, error=e)
+                    raise
+                fn(con)
+            finally:
+                if con is not None:
+                    con.close()
+            stamp = clock()
+            with LOOP_LOCK:
+                state = loop_state(name, every, stamp)
+                failures = state["consecutive_failures"]
+                since = state["failure_since"]
+                state.update(last_ok=stamp, consecutive_failures=0, passes=state["passes"] + 1, failure_since=None)
+            if failures:
+                duration = stamp - (since if since is not None else stamp)
+                loop_log("loop.recovered", name, message=f"{name} recovered after {failures} failures, {duration:.1f} s",
+                         failures=failures, duration_s=duration)
+            error_key, repeats = None, 0
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as error:
+            stamp = clock()
+            text = f"{type(error).__name__}: {error}"
+            with LOOP_LOCK:
+                state = loop_state(name, every, stamp)
+                failures = state["consecutive_failures"] + 1
+                if state["failure_since"] is None:
+                    state["failure_since"] = stamp
+                state.update(last_error=text[:240], last_error_at=stamp, consecutive_failures=failures)
+            delay = min(every * 2 ** min(failures, 16), 300)
+            if text != error_key:
+                loop_log("loop.failed", name, error=text[:240], traceback=traceback.format_exc(), failures=failures)
+                error_key, reported_at, repeats = text, stamp, 0
+            else:
+                repeats += 1
+                if stamp - reported_at >= 300:
+                    loop_log("loop.failure_repeat", name, error=text[:240], repeats=repeats, failures=failures)
+                    reported_at, repeats = stamp, 0
+        try:
+            sleep(delay)
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as error:
+            loop_log("loop.sleep_failed", name, error=f"{type(error).__name__}: {error}"[:240])
+
+
+def start_loop(fn, every, name):
+    with LOOP_LOCK:
+        LOOP_SPECS[name] = (fn, every)
+        loop_state(name, every, now())
+        thread = LOOP_THREADS.get(name)
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(target=loop, args=(fn, every, name), name=f"boatd-{name}", daemon=True)
+            LOOP_THREADS[name] = thread
+            thread.start()
+
+
+def loop_health():
+    result = {}
+    with LOOP_LOCK:
+        for name, (fn, every) in LOOP_SPECS.items():
+            state = loop_state(name, every, now())
+            thread = LOOP_THREADS.get(name)
+            alive = thread is not None and thread.is_alive()
+            age = max(0, now() - (state["last_ok"] if state["last_ok"] is not None else state["started_at"]))
+            stalled = not alive or age > max(4 * every, 120)
+            problem = f"{name} has not completed a pass for {int(age)} s ({state['last_error'] or ('thread dead' if not alive else 'no error recorded')})"
+            if stalled and not state.get("stalled"):
+                loop_log("loop.stalled", name, problem=problem, alive=alive, age_s=age)
+            elif not stalled and state.get("stalled"):
+                loop_log("loop.healthy", name, passes=state["passes"])
+            state["stalled"] = stalled
+            result[name] = dict(state, alive=alive, age_s=age, problem=problem if stalled else None)
+            if not alive and READY.is_set():
+                loop_log("loop.respawn", name)
+                try:
+                    start_loop(fn, every, name)
+                except (SystemExit, KeyboardInterrupt):
+                    raise
+                except BaseException as error:
+                    loop_log("loop.respawn_failed", name, error=f"{type(error).__name__}: {error}"[:240])
+    return result
 
 
 # ---------------------------------------------------------------- stats
@@ -3167,8 +3320,8 @@ def startup() -> None:
     log(f"reconciled in {time.monotonic() - began:.3f} s phases={json.dumps(STATE['phases'])}")
     STATE["problem"] = None
     READY.set()
-    threading.Thread(target=loop, args=(reap_once, 15, "reaper"), daemon=True).start()
-    threading.Thread(target=loop, args=(sample_once, CFG["sample_s"], "sampler"), daemon=True).start()
+    start_loop(reap_once, 15, "reaper")
+    start_loop(sample_once, CFG["sample_s"], "sampler")
 
 
 def serve() -> None:
@@ -3274,7 +3427,8 @@ def main() -> int:
             if owner not in CFG["owners"]:
                 print(f"boatd: owner must be one of {', '.join(CFG['owners'])}", file=sys.stderr)
                 return 2
-            box_row(con, a[2])
+            r = box_row(con, a[2])
+            scratch().chown(a[2], r['owner'], owner)
             set_box(con, a[2], owner=owner)
             print(f"{a[2]} now belongs to {owner}")
             return 0

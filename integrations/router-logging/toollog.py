@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import re
 
-CAP = 50 * 1024 * 1024
+CAP = 200 * 1024 * 1024
 _seen = set()
 PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted', 'provider', 'scope', 'cause', 'lockMs', 'until', 'previousBackoffLevel', 'backoffLevel', 'source'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session'}

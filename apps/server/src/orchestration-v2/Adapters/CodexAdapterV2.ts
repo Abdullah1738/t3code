@@ -233,12 +233,8 @@ const CodexBackgroundTerminalTerminateResponse = Schema.Struct({
   terminated: Schema.Boolean,
 });
 const CodexBackgroundTerminalsListResponse = Schema.Struct({
-  data: Schema.Array(
-    Schema.Struct({
-      processId: Schema.String,
-    }),
-  ),
-  nextCursor: Schema.NullOr(Schema.String),
+  data: Schema.Array(ProviderAdapter.ProviderBackgroundTerminal),
+  nextCursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
 type CodexBackgroundTerminalsListPage = typeof CodexBackgroundTerminalsListResponse.Type;
 const decodeCodexBackgroundTerminalTerminateResponse = Schema.decodeUnknownEffect(
@@ -2681,6 +2677,42 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }
         });
 
+        const listBackgroundTerminals = Effect.fn("CodexAdapterV2.listBackgroundTerminals")(
+          function* (nativeThreadId: string) {
+            const terminals: Array<ProviderAdapter.ProviderBackgroundTerminal> = [];
+            const cursors = new Set<string>();
+            let cursor: string | undefined;
+            do {
+              const response = yield* client.raw
+                .request("thread/backgroundTerminals/list", {
+                  threadId: nativeThreadId,
+                  ...(cursor === undefined ? {} : { cursor }),
+                })
+                .pipe(
+                  Effect.catchTags({
+                    CodexAppServerProcessExitedError: () => Effect.succeed({ data: [] }),
+                    CodexAppServerInputStreamEndedError: () => Effect.succeed({ data: [] }),
+                    CodexAppServerRequestError: (error) =>
+                      error.code === -32600 && error.errorMessage.startsWith("thread not found:")
+                        ? Effect.succeed({ data: [] })
+                        : Effect.fail(error),
+                  }),
+                );
+              const page = yield* decodeCodexBackgroundTerminalsListResponse(response);
+              terminals.push(...page.data);
+              cursor = page.nextCursor ?? undefined;
+              if (cursor !== undefined && cursors.has(cursor)) {
+                return yield* toProtocolError(
+                  "Codex background terminal listing repeated a cursor.",
+                );
+              }
+              if (cursor !== undefined) cursors.add(cursor);
+            } while (cursor !== undefined);
+            return terminals;
+          },
+          Effect.timeout("10 seconds"),
+        );
+
         const terminateBackgroundTerminal = Effect.fn("CodexAdapterV2.terminateBackgroundTerminal")(
           function* (nativeThreadId: string, processId: string) {
             const response = yield* client.raw
@@ -2689,20 +2721,24 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 processId,
               })
               .pipe(
+                Effect.map((response) => ({ response, alreadyGone: false })),
                 Effect.catchTags({
-                  CodexAppServerProcessExitedError: () => Effect.succeed({ terminated: true }),
-                  CodexAppServerInputStreamEndedError: () => Effect.succeed({ terminated: true }),
+                  CodexAppServerProcessExitedError: () =>
+                    Effect.succeed({ response: { terminated: true }, alreadyGone: true }),
+                  CodexAppServerInputStreamEndedError: () =>
+                    Effect.succeed({ response: { terminated: true }, alreadyGone: true }),
                   // The thread is unloaded, as Codex does a minute after a
                   // settle or archive unsubscribes it. Unloading kills the
                   // thread's terminals, so nothing is left to stop.
                   CodexAppServerRequestError: (error) =>
                     error.code === -32600 && error.errorMessage.startsWith("thread not found:")
-                      ? Effect.succeed({ terminated: true })
+                      ? Effect.succeed({ response: { terminated: true }, alreadyGone: true })
                       : Effect.fail(error),
                 }),
               );
-            const result = yield* decodeCodexBackgroundTerminalTerminateResponse(response);
-            if (result.terminated) return;
+            const result = yield* decodeCodexBackgroundTerminalTerminateResponse(response.response);
+            if (result.terminated)
+              return { terminated: true, alreadyGone: response.alreadyGone } as const;
             let cursor: string | null = null;
             while (true) {
               const response: unknown = yield* client.raw.request(
@@ -2719,7 +2755,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   `Codex background terminal ${processId} remained active after termination.`,
                 );
               }
-              if (page.nextCursor === null) return;
+              if (page.nextCursor == null) return { terminated: true, alreadyGone: true } as const;
               cursor = page.nextCursor;
             }
           },
@@ -7686,6 +7722,39 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     }),
                 ),
               ),
+          ),
+          listBackgroundTerminals: Effect.fn("CodexAdapterV2.listThreadBackgroundTerminals")(
+            function* ({ providerThread }) {
+              return yield* listBackgroundTerminals(yield* getNativeThreadId(providerThread));
+            },
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail: "Failed to list Codex background terminals.",
+                  cause: normalizeCodexCause(cause),
+                }),
+            ),
+          ),
+          terminateBackgroundTerminal: Effect.fn(
+            "CodexAdapterV2.terminateThreadBackgroundTerminal",
+          )(
+            function* ({ providerThread, processId }) {
+              const nativeThreadId = yield* getNativeThreadId(providerThread);
+              const terminals = yield* listBackgroundTerminals(nativeThreadId);
+              if (!terminals.some((terminal) => terminal.processId === processId)) {
+                return { terminated: true, alreadyGone: true } as const;
+              }
+              return yield* terminateBackgroundTerminal(nativeThreadId, processId);
+            },
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CODEX_PROVIDER,
+                  detail: "Failed to stop Codex background terminal.",
+                  cause: normalizeCodexCause(cause),
+                }),
+            ),
           ),
           listLoadedNativeThreads: Effect.fn("CodexAdapterV2.listLoadedNativeThreads")(
             function* () {

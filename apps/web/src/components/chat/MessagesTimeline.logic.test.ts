@@ -21,7 +21,8 @@ import {
 } from "../../session-logic";
 import { makeStreamingTimelineFixture } from "../../test-fixtures";
 import type { TurnDiffSummary } from "../../types";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
+import * as ToolOutput from "@t3tools/shared/toolOutput";
 import { EnvironmentId, MessageId, RunId } from "@t3tools/contracts";
 import { serializeAssistantCitation } from "@t3tools/shared/assistantCitations";
 import {
@@ -4373,6 +4374,110 @@ describe("v2 run and attempt history", () => {
 });
 
 describe("streaming v2 row projection", () => {
+  it("does not rescan unchanged tool output when another command streams", () => {
+    const source = makeStreamingTimelineFixture("Still working");
+    const output = "Unchanged successful command output\n".repeat(400);
+    const command = source.visibleTurnItems.find((row) => row.item.type === "command_execution");
+    if (command?.item.type !== "command_execution") throw new Error("Missing command fixture");
+    const entries = source.visibleTurnItems.filter((row) => row.item.runId === source.runId);
+    const liveItems = entries.map((row) =>
+      row.item.type === "dynamic_tool"
+        ? {
+            ...row,
+            item: {
+              ...command.item,
+              id: row.item.id,
+              runId: source.runId,
+              status: "completed" as const,
+              output,
+              exitCode: 0,
+            },
+          }
+        : row,
+    );
+    const streaming = {
+      ...command,
+      item: {
+        ...command.item,
+        id: TurnItemId.make("streaming-command"),
+        runId: source.runId,
+        status: "running" as const,
+        output: "First chunk",
+        exitCode: 0,
+      },
+    };
+    const input = {
+      isWorking: true,
+      runningRunId: source.runId,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+    };
+    const spy = vi.spyOn(ToolOutput, "toolOutputIndicatesFailure");
+    try {
+      const timelineInput = { visibleTurnItems: [...liveItems, streaming], optimisticMessages: [] };
+      const timeline = deriveTimelineEntriesFromVisibleTurnItemsWithState(timelineInput);
+      const previous = deriveMessagesTimelineRowsWithState({
+        ...input,
+        timelineEntries: timeline.entries,
+      });
+      expect(spy.mock.calls.some(([text]) => text === output)).toBe(true);
+      spy.mockClear();
+
+      const nextInput = {
+        ...timelineInput,
+        visibleTurnItems: [
+          ...liveItems,
+          { ...streaming, item: { ...streaming.item, output: "Next chunk" } },
+        ],
+      };
+      const nextTimeline = deriveTimelineEntriesFromVisibleTurnItemsWithState(nextInput, timeline);
+      const next = deriveMessagesTimelineRowsWithState(
+        { ...input, timelineEntries: nextTimeline.entries },
+        previous,
+      );
+      expect(spy.mock.calls.filter(([text]) => text === output)).toHaveLength(0);
+      expect(
+        next.rows.some(
+          (row) =>
+            row.kind === "work" &&
+            row.groupedEntries.some(
+              (entry) => entry.id === "live-work" && !workEntryDisplayIndicatesToolFailure(entry),
+            ),
+        ),
+      ).toBe(true);
+
+      spy.mockClear();
+      const failedInput = {
+        ...nextInput,
+        visibleTurnItems: nextInput.visibleTurnItems.map((row) =>
+          row.item.id === "live-work"
+            ? { ...row, item: { ...row.item, output: "command not found" } }
+            : row,
+        ),
+      };
+      const failedTimeline = deriveTimelineEntriesFromVisibleTurnItemsWithState(
+        failedInput,
+        nextTimeline,
+      );
+      const failed = deriveMessagesTimelineRowsWithState(
+        { ...input, timelineEntries: failedTimeline.entries },
+        next,
+      );
+      expect(spy.mock.calls.some(([text]) => text === "command not found")).toBe(true);
+      expect(
+        failed.rows.some(
+          (row) =>
+            row.kind === "work" &&
+            row.groupedEntries.some(
+              (entry) => entry.id === "live-work" && workEntryDisplayIndicatesToolFailure(entry),
+            ),
+        ),
+      ).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   function fixture(text = "") {
     const source = makeStreamingTimelineFixture(text);
     const timelineInput = { visibleTurnItems: source.visibleTurnItems, optimisticMessages: [] };

@@ -14,7 +14,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Analytics from "../../analytics/Analytics.ts";
-import type { AnalyticsEvent } from "@t3tools/contracts";
+import { AnalyticsEvent } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -593,25 +593,26 @@ const deferredWorker = Effect.gen(function* () {
   yield* kanban.dispatchNow;
   const worker = (yield* cardOf(card.id)).workThreadId!;
   const actor: KanbanActor = { _tag: "thread", threadId: worker };
+  const dependency = yield* placed(board, "Parent dependency", { stage: "needs_owner" });
   yield* kanban.waitCard(
     card.id,
     {
-      on: "merge",
-      pr: PR,
+      on: "card",
+      card: dependency.id,
       note: "finish after the parent lands",
       wakeRole: "work",
     },
     actor,
   );
-  return { kanban, store, board, card, worker, actor };
+  return { kanban, store, board, card, worker, actor, dependency };
 });
 
 it.effect.each(["completed", "failed", "interrupted"] as const)(
-  "a worker's deferred merge wait parks after a %s turn and wakes the same worker",
+  "a worker's deferred card wait parks after a %s turn and wakes the same worker",
   (status) =>
     inWorld((world) =>
       Effect.gen(function* () {
-        const { kanban, card, worker } = yield* deferredWorker;
+        const { kanban, store, card, worker, dependency } = yield* deferredWorker;
         world.threads.get(worker)!.running = true;
         const owned = yield* cardOf(card.id);
         assert.strictEqual(owned.activeThreadId, worker);
@@ -646,7 +647,7 @@ it.effect.each(["completed", "failed", "interrupted"] as const)(
         assert.isDefined(parked.wait);
         assert.strictEqual(world.said("still in Working"), 0);
         world.failures.delete(worker);
-        world.host.readings = [{ url: PR, state: "merged", at: iso(T0) }];
+        yield* store.putCard({ ...dependency, stage: "completed" });
         yield* kanban.tick;
         const woke = yield* cardOf(card.id);
         assert.isUndefined(woke.wait);
@@ -670,7 +671,7 @@ it.effect.each(
   ({ pending, failure }) =>
     inWorld((world) =>
       Effect.gen(function* () {
-        const { kanban, card, worker } = yield* deferredWorker;
+        const { kanban, store, card, worker, dependency } = yield* deferredWorker;
         const work = pending === "background" ? world.background : world.queued;
         work.add(worker);
         if (pending === "both") world.background.add(worker);
@@ -702,7 +703,7 @@ it.effect.each(
         assert.isNull(parked.stalled);
         assert.isDefined(parked.wait);
         world.failures.delete(worker);
-        world.host.readings = [{ url: PR, state: "merged", at: iso(T0) }];
+        yield* store.putCard({ ...dependency, stage: "completed" });
         yield* kanban.tick;
         const woke = yield* cardOf(card.id);
         assert.strictEqual(woke.activeThreadId, worker);
@@ -723,7 +724,7 @@ it.effect.each(
 )("a $category-paused worker parks its wait after $pending work drains", ({ category, pending }) =>
   inWorld((world) =>
     Effect.gen(function* () {
-      const { kanban, store, card, worker } = yield* deferredWorker;
+      const { kanban, store, card, worker, dependency } = yield* deferredWorker;
       if (pending !== "background") world.queued.add(worker);
       if (pending !== "queued") world.background.add(worker);
       world.failures.set(worker, {
@@ -740,7 +741,6 @@ it.effect.each(
       assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
       world.queued.delete(worker);
       world.background.delete(worker);
-      world.host.readings = [{ url: PR, state: "open", at: iso(T0) }];
       yield* kanban.tick;
       const parked = yield* cardOf(card.id);
       assert.strictEqual(parked.stage, "todo");
@@ -752,14 +752,14 @@ it.effect.each(
       assert.strictEqual(world.said("still in Working"), 0);
       assert.strictEqual(world.probe.calls, 0);
       yield* TestClock.adjust(3 * MINUTE);
-      world.host.readings = [{ url: PR, state: "merged", at: iso(T0 + 3 * MINUTE) }];
+      yield* store.putCard({ ...dependency, stage: "completed" });
       yield* kanban.tick;
       const ready = yield* cardOf(card.id);
       assert.isUndefined(ready.wait);
       assert.include(ready.wakeNote ?? "", "finish after the parent lands");
       assert.strictEqual(ready.stage, "todo");
       assert.strictEqual(world.probe.calls, 0);
-      // Parking and the merge answer do not declare the failed provider healthy.
+      // Parking and the dependency answer do not declare the failed provider healthy.
       world.probe.ready = true;
       yield* TestClock.adjust(2 * MINUTE);
       yield* kanban.probeOutages;
@@ -774,12 +774,12 @@ it.effect.each(
   ),
 );
 
-it.effect("a PR merged before turn end wakes its worker only after the park", () =>
+it.effect("a dependency completed before turn end wakes its worker only after the park", () =>
   inWorld((world) =>
     Effect.gen(function* () {
-      const { kanban, card, worker } = yield* deferredWorker;
+      const { kanban, store, card, worker, dependency } = yield* deferredWorker;
       world.threads.get(worker)!.running = true;
-      world.host.readings = [{ url: PR, state: "merged", at: iso(T0) }];
+      yield* store.putCard({ ...dependency, stage: "completed" });
       yield* kanban.tick;
       assert.strictEqual((yield* cardOf(card.id)).activeThreadId, worker);
       assert.isDefined((yield* cardOf(card.id)).wait);
@@ -831,7 +831,6 @@ it.effect("the existing idle-worker backstop parks a deferred wait after a misse
   inWorld((world) =>
     Effect.gen(function* () {
       const { kanban, card, worker } = yield* deferredWorker;
-      world.host.readings = [{ url: PR, state: "open", at: iso(T0) }];
       yield* TestClock.adjust(31 * MINUTE);
       yield* kanban.tick;
       const parked = yield* cardOf(card.id);
@@ -1041,6 +1040,49 @@ it.effect("card: the worker starts when the card it waited on is done", () =>
       assert.include(briefOf(world, woken), `Card #${first.number} is done`);
     }),
   ),
+);
+
+it.effect.each(["done", "skipped"] as const)(
+  "card: a Completed target holds through its marked release until %s",
+  (state) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const created = yield* placed(board, "Host release", { stage: "completed" });
+        const step: KanbanCard["subtasks"][number] = {
+          id: "s1",
+          step: 1,
+          owner: "evaluator",
+          state: "open",
+          text: "Host release via #99, then live read-back",
+          holdsDependents: true,
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        };
+        yield* store.putCard({ ...created, subtasks: [step] });
+        const dependent = yield* placed(board, "Resume after release");
+        yield* kanban.waitCard(
+          dependent.id,
+          {
+            on: "card",
+            card: created.id,
+            note: "Needs the host release",
+            wakeRole: "work",
+          },
+          owner,
+        );
+        yield* kanban.tick;
+        assert.isDefined((yield* cardOf(dependent.id)).wait);
+        assert.strictEqual(world.cardThreads(), 0);
+        yield* store.putCard({ ...(yield* cardOf(created.id)), subtasks: [{ ...step, state }] });
+        yield* kanban.tick;
+        const woken = yield* cardOf(dependent.id);
+        assert.isUndefined(woken.wait);
+        assert.strictEqual(woken.activeRole, "work");
+        assert.include(briefOf(world, woken), `Card #${created.number} is done`);
+      }),
+    ),
 );
 
 it.effect.each(["work", "review", "evaluator"] as const)(
@@ -2578,9 +2620,76 @@ const OldCardDetail = Schema.Struct({
 });
 const oldClientReads = Schema.decodeUnknownResult(OldCardDetail);
 const thisClientReads = Schema.decodeUnknownResult(KanbanCardDetail);
+const readAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent, { onExcessProperty: "error" });
 const encodeDetail = Schema.encodeUnknownSync(KanbanCardDetail);
 const onTheWire = (detail: KanbanCardDetail): unknown =>
   JSON.parse(JSON.stringify(encodeDetail(detail)));
+
+it.effect.each(["time", "script", "card"] as const)(
+  "a worker's %s self-park keeps legacy card reads compatible and records one analytics row",
+  (on) => {
+    const rows: AnalyticsEvent[] = [];
+    const world = makeWorld({ analytics: rows });
+    return Effect.gen(function* () {
+      const { kanban, board } = yield* setup;
+      const card = yield* placed(board, "Await validation");
+      yield* kanban.dispatchNow;
+      const worker = (yield* cardOf(card.id)).workThreadId!;
+      world.threads.get(worker)!.running = true;
+      const dependency = yield* placed(board, "Dependency", { stage: "needs_owner" });
+      if (on === "script") {
+        const scripts = yield* ScriptService.KanbanScripts;
+        yield* scripts.register(
+          { boardId: board.id, name: "offbox-results", path: prReady, trigger: { _tag: "manual" } },
+          owner,
+        );
+      }
+      yield* kanban.waitCard(
+        card.id,
+        {
+          on,
+          note: "validation results",
+          ...(on === "time" ? { until: iso(T0 + HOUR) } : {}),
+          ...(on === "script" ? { script: "offbox-results" } : {}),
+          ...(on === "card" ? { card: dependency.id } : {}),
+        },
+        { _tag: "thread", threadId: worker },
+      );
+      const waiting = yield* kanban.card(card.id);
+      world.threads.get(worker)!.running = false;
+      yield* kanban.turnEnded(worker);
+      const parked = yield* kanban.card(card.id);
+      assert.strictEqual(parked.card.stage, "todo");
+      for (const detail of [waiting, parked]) {
+        const old = Result.getOrThrow(oldClientReads(onTheWire(detail)));
+        assert.strictEqual(old.card.id, card.id);
+        assert.strictEqual(old.events.length, detail.events.length);
+        const set = detail.events.filter((event) => Waits.waitEventOf(event) === "set");
+        assert.lengthOf(set, 1);
+        assert.strictEqual(set[0]?.kind, "edited");
+        assert.deepStrictEqual(set[0]?.actor, { _tag: "thread", threadId: worker });
+      }
+      const parks = rows.filter((event) => event.kind === "wait_set");
+      assert.lengthOf(parks, 1);
+      const recorded = yield* readAnalyticsEvent(parks[0]);
+      assert.deepStrictEqual(recorded, {
+        kind: "wait_set",
+        ts: iso(T0),
+        surface: "server",
+        route: "kanban",
+        boardId: board.id,
+        cardId: card.id,
+        threadId: worker,
+        callerRole: "work",
+        props: {
+          on,
+          ...(on === "time" ? { until: iso(T0 + HOUR) } : {}),
+          ...(on === "script" ? { script: "offbox-results" } : {}),
+        },
+      });
+    }).pipe(Effect.provide(world.layer));
+  },
+);
 
 it.effect(
   "while the event-kind switch is off a wait's whole history is `edited` events an old client can read",

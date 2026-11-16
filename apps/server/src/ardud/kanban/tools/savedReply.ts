@@ -13,6 +13,12 @@ export const REPLY_BUDGET_MS = 25_000;
 export const ADMISSION_BUDGET_MS = REPLY_BUDGET_MS - 5_000;
 
 export const TOOLS = new Set([
+  "card_claim",
+  "card_create",
+  "card_wait",
+  "card_ask",
+  "card_ask_answer",
+  "card_thread",
   "card_move",
   "card_review_result",
   "subtask_done",
@@ -24,7 +30,7 @@ export const TOOLS = new Set([
   "report_bug",
   "discussion_post",
 ]);
-export const TIMED_TOOLS = new Set([...TOOLS, "card_create", "card_wait", "wiki_read"]);
+export const TIMED_TOOLS = new Set([...TOOLS, "wiki_read"]);
 
 /** Encloses encoding and the reply budget, not just the mutation handler. */
 export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
@@ -82,6 +88,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   let slowSubSteps: ReadonlyArray<SavedWrite.SubStep> = [];
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
+  let unverifiedReporter: SavedWrite.UnverifiedReporterReason | undefined;
   let reportLookup: SavedWrite.ReportLookup | undefined;
   // raceFirst joins cancellation before replying. Evaluator admissions and bug
   // sightings publish their receipt inside the masked write, including queue-only saves.
@@ -126,8 +133,11 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
               : tool === "report_bug" && reportLookup !== undefined
                 ? { lookup: reportLookup }
                 : {};
+    if (tool === "report_bug" && unverifiedReporter !== undefined) {
+      Object.assign(details, { callerVerified: false, callerUnverifiedReason: unverifiedReporter });
+    }
     const saved = savedState();
-    const message =
+    const savedMessage =
       saved === false
         ? tool === "evaluator_start"
           ? "Not saved; evaluator not started. Safe to retry with the same arguments."
@@ -161,6 +171,10 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
               : receipt === undefined
                 ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
                 : "Saved; card_get for details.";
+    const message =
+      tool === "report_bug" && saved === true && unverifiedReporter !== undefined
+        ? `${savedMessage} Saved with an unverified caller; reporter unverified (${unverifiedReporter}).`
+        : savedMessage;
     const fields = attributes();
     return Effect.annotateCurrentSpan(fields).pipe(
       Effect.andThen(
@@ -178,6 +192,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
                 ...timeoutLocks,
                 "board.reply_phase": stageAtTimeout,
                 "board.reply_elapsed_ms": timeoutElapsedMs,
+                subSteps: slowSubSteps,
               };
               return Effect.logWarning(
                 // Fixed diagnostic fields, as in the lock-admission refusal logger.
@@ -195,6 +210,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
           timedOut,
           saved,
           commitStarted,
+          subSteps: slowSubSteps,
           ...fields,
         }),
       ),
@@ -242,6 +258,9 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     Effect.provideService(SavedWrite.reportLookupObserver, (lookup) => {
       reportLookup = lookup;
       parentLookup(lookup);
+    }),
+    Effect.provideService(SavedWrite.reporterUnverified, (reason) => {
+      unverifiedReporter = reason;
     }),
     Effect.provideService(SavedWrite.commitObserver, () => {
       commitStarted = true;

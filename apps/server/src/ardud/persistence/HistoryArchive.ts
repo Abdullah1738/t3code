@@ -21,6 +21,7 @@ import { ArchiveSnapshotGate } from "./archiveSnapshotGate.ts";
 import * as NodeURL from "node:url";
 import { initializeShellItemCounts } from "./shellItemCounts.ts";
 import { withStartupPhase } from "../observability/StartupPhaseLog.ts";
+import { threadReadIndexes } from "./threadReadIndexes.ts";
 
 class HistoryArchiveMissing extends Schema.TaggedError<HistoryArchiveMissing>()(
   "HistoryArchiveMissing",
@@ -117,6 +118,9 @@ export const initializeHistoryArchive = Effect.fn("HistoryArchive.initialize")(f
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_sequence_idx ON ardud_events(sequence)`;
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_events_identity_idx ON ardud_events(event_id)`;
         } else {
+          for (const statement of threadReadIndexes("ardud_archive", "ardud_turn_items")) {
+            yield* sql.unsafe(statement);
+          }
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_run_idx ON ardud_turn_items(run_id, ordinal)`;
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_node_idx ON ardud_turn_items(node_id, ordinal)`;
           yield* sql`CREATE INDEX IF NOT EXISTS ardud_archive.ardud_turn_items_provider_turn_idx ON ardud_turn_items(provider_turn_id)`;

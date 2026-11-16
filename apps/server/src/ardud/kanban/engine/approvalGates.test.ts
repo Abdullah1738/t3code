@@ -4025,7 +4025,7 @@ it.effect.each([true, false])(
       const fake = yield* makeFake;
       yield* Effect.gen(function* () {
         const { kanban, card, worker } = yield* workingCard();
-        yield* kanban.editCard(
+        const edited = yield* kanban.editCard(
           card.id,
           {
             subtasks: [
@@ -4035,6 +4035,8 @@ it.effect.each([true, false])(
           },
           owner,
         );
+        // Packet edits can advance updatedAt beyond the frozen clock to distinguish writes.
+        yield* TestClock.setTime(Date.parse(edited.updatedAt));
         yield* kanban.askOwner(
           card.id,
           {

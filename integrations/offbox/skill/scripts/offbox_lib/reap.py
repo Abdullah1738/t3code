@@ -7,11 +7,12 @@ from __future__ import annotations
 import time
 import sqlite3
 import re
+import contextlib
 
 from . import api, bases, capacity, lease, prune
 from .common import (ARCHIVED_DELETE_S, BOX_WEDGED_NOTE, EXIT_INFRA, EXIT_INTERRUPTED, IDLE_STOP_S, KEEPALIVE_S, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, UNUSED_DELETE_S, OffboxError, db, event, file_lock,
-                     iso_ts, kv_set, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner, write)
+                     iso_ts, kv_set, log, mine, now, owner_of_root, owner_scoped, PERSON_PREFIX, require_mine, say, token_owner, write)
 from .identity import thread_get
 
 # The monitor kills a reap pass at 120 s; keep every boat call and wait inside this budget.
@@ -176,6 +177,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if rid in recovered or rid in unowned:
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost")
+        with contextlib.suppress(Exception):
+            log(f"reaper no-box run {rid} client_pid=None check=no_pid_age_limit age_s={now() - start_at:.3f} dry={dry}")
         if not dry:
             _mark_lost(con, rid, "client ended before it got a box", no_box=True, expected_client=(None, start_at))
     # A no-box run whose own `offbox run` client is gone never got a box: mark it lost now, not after 2 h.
@@ -186,7 +189,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     for rid, pid, start_at in orphan:
         if rid in recovered or rid in unowned:
             continue
-        if _client_alive(pid, start_at):
+        if _client_alive(pid, start_at, reaper_run=rid):
             continue
         actions.append(f"{'would mark' if dry else 'mark'} no-box run {rid} lost (client {pid} gone)")
         if not dry:

@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SERVER = Path(__file__).resolve().parents[1] / "server"
 spec = importlib.util.spec_from_file_location("boatd", SERVER / "boatd.py")
@@ -60,6 +60,9 @@ class Fakes:
         elif args[:1] == ("query",) and "/snapshots" in args[1]:
             name = args[1].split("/")[3]
             out = json.dumps(self.snapshots.get(name, [])).encode()
+        elif args[:1] == ('query',) and args[1].startswith('/1.0/instances/'):
+            bid = args[1].split('/')[3].replace('-', '_')
+            out = json.dumps({'config': {'user.offbox.provision': bid}}).encode()
         elif args[:2] == ("config", "device"):
             out = b"ssh\n"
         p = subprocess.CompletedProcess(args, rc, out, b"refused" if rc else b"")
@@ -104,8 +107,18 @@ class Base(unittest.TestCase):
         boatd.boot_id = lambda: "boot-2"
         boatd.log = lambda msg: None
         boatd.load_cfg()
+        # Host storage is faked alongside Incus; focused scratch tests exercise its actual lifecycle.
+        storage = Mock()
+        storage.start.side_effect = lambda bid: boatd.incus('start', boatd.ct(bid), timeout=300)
+        scratch_host = patch.object(boatd, 'scratch', return_value=storage)
+        scratch_host.start()
+        self.addCleanup(scratch_host.stop)
         # Resource inputs are explicit in admission tests, independent of the test runner's host.
         boatd.CFG["cpu_pressure_limit"] = 0
+        for target, values in ((boatd.STATE, {"loops": {}}), (boatd.LOOP_SPECS, {}), (boatd.LOOP_THREADS, {})):
+            fixture = patch.dict(target, values, clear=target is not boatd.STATE)
+            fixture.start()
+            self.addCleanup(fixture.stop)
         boatd.READY.clear()
         boatd._HEALTH.update(ts=0.0, v=None)
         boatd._HEALTH_REFRESH.update(stage="idle", since=None, timings={})
@@ -838,7 +851,7 @@ class Http(Base):
         boatd.health(fresh=True)
         st, d = self.call(None, "GET", "/health")
         self.assertEqual(st, 200)
-        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "disk", "disk_full", "disk_low", "host", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
+        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "degraded", "disk", "disk_full", "disk_low", "host", "loops", "mdraid", "mode", "ok", "phase", "pool", "problem", "queue", "reasons",
                                      "refresh_stage", "refresh_stage_ms", "refresh_timings_ms", "restartPending", "running", "snapshot_age_s",
                                      "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
         self.assertNotIn("moni", json.dumps(d))
@@ -1174,7 +1187,7 @@ unused devices: <none>
         started = []
 
         class NoThread:
-            def __init__(self, target=None, args=(), daemon=None):
+            def __init__(self, target=None, args=(), daemon=None, name=None):
                 self.target, self.args = target, args
 
             def start(self):

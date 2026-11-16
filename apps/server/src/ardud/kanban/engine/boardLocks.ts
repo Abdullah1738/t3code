@@ -1,3 +1,4 @@
+import { writeAdmitted } from "../../analytics/McpCall.ts";
 import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Metric from "effect/Metric";
@@ -391,6 +392,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             return yield* Effect.die(
               new KanbanError({
                 code: "conflict",
+                reasonClass: "board_busy",
                 saved: op.committed ? null : false,
                 detail: op.committed
                   ? MAY_HAVE_APPLIED
@@ -550,6 +552,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           acquiredAtMs: yield* Clock.currentTimeMillis,
         };
         op.held = held;
+        yield* writeAdmitted();
         const seen = versions.get(op)!;
         const expected = seen.get(boardId);
         const scoped = op.scopes.get(boardId);
@@ -692,6 +695,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           ? SavedWrite.stage(SavedWrite.committing.pipe(Effect.andThen(effect)), "commit")
           : restore(dispatchRead(effect));
         if (write) {
+          yield* SavedWrite.committed();
           op.committed = true;
           const held = op.held!;
           const parents: Array<readonly [Operation, boolean]> = [];
@@ -753,6 +757,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     abandoned?: (value: A) => Effect.Effect<void>,
     readOnly = false,
     reconcile?: Effect.Effect<boolean, E2, R2>,
+    options: { readonly writesTrackedInside?: boolean } = {},
   ) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -771,7 +776,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         const external = restore(Effect.interruptible(effect));
         const result = yield* Effect.exit(
           SavedWrite.stage(
-            readOnly ? external : SavedWrite.committing.pipe(Effect.andThen(external)),
+            // Serial lanes keep the retry guard above; their nested writes own commit evidence.
+            readOnly || options.writesTrackedInside
+              ? external
+              : SavedWrite.committing.pipe(Effect.andThen(external)),
             readOnly ? "read" : "commit",
           ),
         );

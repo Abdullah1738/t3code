@@ -1,4 +1,5 @@
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Semaphore from "effect/Semaphore";
@@ -43,6 +44,10 @@ export type Lane =
   | "controlRead"
   | "mcp";
 
+export const AdmissionObserver = Context.Reference<
+  ((sample: { lane: Lane; waitMs: number; runMs: number; acquired: boolean }) => void) | undefined
+>("t3/ardud/http/ReplyBuilders/AdmissionObserver", { defaultValue: () => undefined });
+
 export class ReplyBuilders extends Context.Service<
   ReplyBuilders,
   { readonly [K in Lane]: Semaphore.Semaphore }
@@ -82,15 +87,39 @@ export const bounded = <A, E, R>(effect: Effect.Effect<A, E, R>, lane: Lane = "a
   Effect.flatMap(Effect.serviceOption(ReplyBuilders), (builders) =>
     builders._tag === "Some"
       ? Effect.suspend(() => {
-          const started = performance.now();
-          return builders.value[lane].withPermits(1)(
-            Effect.suspend(() =>
-              Effect.annotateCurrentSpan({
-                "reply_builder.admission_wait_ms": performance.now() - started,
-                "reply_builder.lane": lane,
-              }).pipe(Effect.andThen(effect)),
-            ),
-          );
+          return Effect.gen(function* () {
+            const clock = yield* Clock.Clock;
+            const observer = yield* AdmissionObserver;
+            const started = clock.monotonicTimeNanosUnsafe();
+            let admitted: bigint | undefined;
+            return yield* builders.value[lane]
+              .withPermits(1)(
+                Effect.suspend(() => {
+                  admitted = clock.monotonicTimeNanosUnsafe();
+                  return Effect.annotateCurrentSpan({
+                    "reply_builder.admission_wait_ms": Number(admitted - started) / 1e6,
+                    "reply_builder.lane": lane,
+                  }).pipe(Effect.andThen(effect));
+                }),
+              )
+              .pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    const ended = clock.monotonicTimeNanosUnsafe();
+                    try {
+                      observer?.({
+                        lane,
+                        waitMs: Number((admitted ?? ended) - started) / 1e6,
+                        runMs: admitted === undefined ? 0 : Number(ended - admitted) / 1e6,
+                        acquired: admitted !== undefined,
+                      });
+                    } catch {
+                      // Instrumentation must not change the reply or leak its permit.
+                    }
+                  }),
+                ),
+              );
+          });
         })
       : effect,
   );

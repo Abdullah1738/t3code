@@ -1571,6 +1571,105 @@ describe("planSubtasks", () => {
     expect(plan.subtasks[0]?.createdAt).toBe(at);
   });
 
+  it("keeps, overrides and preserves absence of explicit holds across plan edits", () => {
+    const first = planSubtasks(
+      [],
+      [
+        { text: "Ship it", owner: "evaluator", holdsDependents: true },
+        { text: "Merge", owner: "evaluator", holdsDependents: false },
+        { text: "Land", owner: "script" },
+      ],
+    );
+    if (!first.ok) throw new Error(first.reason);
+    expect(first.subtasks[0]?.holdsDependents).toBe(true);
+    expect(first.subtasks[1]?.holdsDependents).toBe(false);
+    expect(first.subtasks[2]).not.toHaveProperty("holdsDependents");
+    const kept = planSubtasks(first.subtasks, [
+      { id: "s1", text: "Ship it", owner: "evaluator" },
+      { id: "s2", text: "Merge", owner: "evaluator" },
+      { id: "s3", text: "Land", owner: "script" },
+    ]);
+    if (!kept.ok) throw new Error(kept.reason);
+    expect(kept.subtasks.map((subtask) => subtask.holdsDependents)).toEqual([
+      true,
+      false,
+      undefined,
+    ]);
+    expect(kept.subtasks[2]).not.toHaveProperty("holdsDependents");
+    const overridden = planSubtasks(kept.subtasks, [
+      { id: "s1", text: "Ship it", owner: "evaluator", holdsDependents: false },
+      { id: "s2", text: "Merge", owner: "evaluator", holdsDependents: true },
+    ]);
+    if (!overridden.ok) throw new Error(overridden.reason);
+    expect(overridden.subtasks.map((subtask) => subtask.holdsDependents)).toEqual([false, true]);
+    expect(subtaskLines({ subtasks: first.subtasks })).toContain(
+      "evaluator [holds dependents] (now)",
+    );
+    expect(subtaskLines({ subtasks: first.subtasks })).not.toContain("script [holds dependents]");
+  });
+  it.each(["work", "review"] as const)(
+    "refuses a true hold on %s, including owner changes",
+    (owner) => {
+      const input = { text: "Ship it", owner, holdsDependents: true };
+      expect(planSubtasks([], [input])).toMatchObject({ ok: false, denyReason: "invalid_args" });
+      const first = planSubtasks([], [{ ...input, owner: "evaluator" }]);
+      if (!first.ok) throw new Error(first.reason);
+      expect(planSubtasks(first.subtasks, [{ id: "s1", owner }])).toMatchObject({ ok: false });
+      expect(
+        planSubtasks(first.subtasks, [{ id: "s1", owner, holdsDependents: false }]),
+      ).toMatchObject({ ok: true });
+    },
+  );
+
+  it.each(
+    (["evaluator", "named script", "unnamed script"] as const).flatMap((binding) =>
+      ([undefined, "deploy", "money", "secret"] as const).flatMap((gate) =>
+        ([undefined, false, true] as const).map((holdsDependents) => ({
+          binding,
+          gate,
+          holdsDependents,
+        })),
+      ),
+    ),
+  )(
+    "preserves $binding details on a hold-only patch ($gate, $holdsDependents)",
+    ({ binding, gate, holdsDependents }) => {
+      const known: KanbanSubtask = {
+        ...planned()[2]!,
+        owner: binding === "evaluator" ? "evaluator" : "script",
+        ...(binding === "named script" ? { script: "land" } : {}),
+        ...(gate === undefined ? {} : { gate, gateSource: "set" }),
+        createdAt: at,
+        holdsDependents: holdsDependents !== true,
+      };
+      const updated = planSubtasks(
+        [known],
+        [{ id: known.id, holdsDependents }],
+        3,
+        "2026-10-27T12:00:00.000Z",
+      );
+      expect(updated.ok && updated.subtasks).toEqual([
+        holdsDependents === undefined ? known : { ...known, holdsDependents },
+      ]);
+    },
+  );
+
+  it.each(["done", "skipped"] as const)("a hold-only patch preserves %s history", (state) => {
+    const known: KanbanSubtask = {
+      ...planned()[2]!,
+      owner: "script",
+      script: "land",
+      state,
+      holdsDependents: true,
+      createdAt: at,
+      doneAt: at,
+      doneBy: owner,
+      note: "Landed",
+    };
+    const updated = planSubtasks([known], [{ id: known.id, holdsDependents: false }]);
+    expect(updated.ok && updated.subtasks).toEqual([known]);
+  });
+
   it("numbers steps in order, and keeps a shared step for work in any order", () => {
     const subtasks = planned();
     expect(subtasks.map((subtask) => [subtask.id, subtask.step])).toEqual([
@@ -1602,8 +1701,13 @@ describe("planSubtasks", () => {
   it("refuses unknown or repeated ids and empty text", () => {
     expect(planSubtasks([], [{ id: "s9" }])).toMatchObject({
       ok: false,
-      denyReason: "subtask_not_found",
-      reason: "the card has no subtask s9. Existing subtask ids: none",
+      denyReason: "invalid_args",
+      reason: "a new subtask needs text and owner",
+    });
+    expect(planSubtasks([], [{ id: "s9", text: "x" }])).toMatchObject({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "a new subtask needs text and owner",
     });
     const subtasks = planned();
     expect(planSubtasks(subtasks, [{ id: "s1" }, { id: "s1" }])).toMatchObject({
@@ -1611,7 +1715,135 @@ describe("planSubtasks", () => {
       denyReason: "invalid_args",
       reason: "subtask s1 is listed twice",
     });
+    expect(
+      planSubtasks([], [
+        { id: "s5", text: "a", owner: "work" },
+        { id: "s5", text: "b", owner: "work" },
+      ]),
+    ).toMatchObject({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "subtask s5 is listed twice",
+    });
+    // A numbered entry and a later explicit one cannot both take the same id.
+    expect(
+      planSubtasks([], [
+        { text: "a", owner: "work" },
+        { id: "s1", text: "b", owner: "work" },
+      ]),
+    ).toMatchObject({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "subtask s1 is listed twice",
+    });
     expect(planSubtasks([], [{ text: "  ", owner: "work" }])).toMatchObject({ ok: false });
+  });
+
+  it.each(["foo", "S1", "s0", "s01", "s 1", "s", "1", "s1x"])(
+    "refuses %j as a subtask id",
+    (id) => {
+      expect(planSubtasks([], [{ id, text: "x", owner: "work" }])).toEqual({
+        ok: false,
+        denyReason: "invalid_args",
+        reason: `"${id}" is not a subtask id; use s1, s2, ...`,
+      });
+    },
+  );
+
+  it("takes an explicit s<N> id for a new subtask and moves the counter past it", () => {
+    expect(planSubtasks([], [{ id: "s9", text: "x", owner: "work" }], 0, at)).toEqual({
+      ok: true,
+      subtasks: [
+        {
+          id: "s9",
+          step: 1,
+          text: "x",
+          owner: "work",
+          createdAt: at,
+          state: "open",
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        },
+      ],
+      subtaskSeq: 9,
+    });
+    // The reported create call: an s1 the card does not have yet.
+    const first = planSubtasks([], [{ id: "s1", text: "one", owner: "work" }], 0, at);
+    if (!first.ok) throw new Error(first.reason);
+    expect(first.subtasks.map((subtask) => [subtask.id, subtask.step])).toEqual([["s1", 1]]);
+    expect(first.subtaskSeq).toBe(1);
+    // Later entries without an id take the numbers after the explicit one.
+    const mixed = planSubtasks(
+      [],
+      [
+        { id: "s3", text: "three", owner: "work" },
+        { text: "four", owner: "work" },
+      ],
+      0,
+      at,
+    );
+    if (!mixed.ok) throw new Error(mixed.reason);
+    expect(mixed.subtasks.map((subtask) => [subtask.id, subtask.step, subtask.text])).toEqual([
+      ["s3", 1, "three"],
+      ["s4", 2, "four"],
+    ]);
+    expect(mixed.subtaskSeq).toBe(4);
+    // A number below the card's counter keeps the counter where it is.
+    const low = planSubtasks([], [{ id: "s2", text: "two", owner: "work" }], 9, at);
+    if (!low.ok) throw new Error(low.reason);
+    expect(low.subtaskSeq).toBe(9);
+  });
+
+  it("keeps known ids' state, step and history while adding an explicit new one", () => {
+    const done = markSubtask(planned(), "s2", "done", "PR #4", owner, at);
+    const plan = planSubtasks(
+      done,
+      [
+        { id: "s1" },
+        { id: "s2", text: "Review" },
+        { id: "s3" },
+        { id: "s4" },
+        { id: "s5" },
+        { id: "s6" },
+        { id: "s9", text: "Extra check", owner: "evaluator" },
+      ],
+      done.length,
+      at,
+    );
+    if (!plan.ok) throw new Error(plan.reason);
+    expect(plan.subtasks.map((subtask) => [subtask.id, subtask.state, subtask.text])).toEqual([
+      ["s1", "open", "Write the PR"],
+      ["s2", "done", "Review"],
+      ["s3", "open", "Merge and deploy"],
+      ["s4", "open", "Tell the reporter"],
+      ["s5", "open", "Update linked tickets"],
+      ["s6", "open", "Read back"],
+      ["s9", "open", "Extra check"],
+    ]);
+    expect(plan.subtaskSeq).toBe(9);
+  });
+
+  it("still needs an existing id to clear a gate", () => {
+    expect(
+      planSubtasks(
+        [],
+        [
+          {
+            id: "s9",
+            text: "x",
+            owner: "evaluator",
+            clearGate: "the guessed gate is wrong here",
+          },
+        ],
+        0,
+        at,
+      ),
+    ).toEqual({
+      ok: false,
+      denyReason: "invalid_args",
+      reason: "clearGate needs an existing subtask id",
+    });
   });
 });
 
@@ -2185,7 +2417,7 @@ describe("withPacketStep", () => {
       [],
       withPacketStep([
         { text: "Fix it", owner: "work" },
-        { text: "Tell QA", owner: "evaluator", step: 2 },
+        { text: "Tell QA", owner: "evaluator", step: 2, holdsDependents: true },
         { text: "Ping the owner", owner: "evaluator", step: 2 },
       ]),
     );
@@ -2198,6 +2430,7 @@ describe("withPacketStep", () => {
       [3, "evaluator"],
     ]);
     expect(plan.subtasks[0]?.text).toBe(PACKET_SUBTASK);
+    expect(plan.subtasks[2]?.holdsDependents).toBe(true);
   });
 });
 

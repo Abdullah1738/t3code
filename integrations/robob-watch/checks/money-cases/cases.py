@@ -51,7 +51,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -60,6 +59,7 @@ import time
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import data_io  # noqa: E402
 import charges  # noqa: E402
 from state_json import write_json as atomic_write_json
 import payments  # noqa: E402
@@ -108,7 +108,8 @@ ORDER_RESERVE = 12
 ORDER_SCREEN_BUDGET = 1
 FOLLOW_STEPS = ('merchants', 'order_charges', 'payments', 'questions', 'refunds',
                 'owner_threads', 'msgs', 'history', 'receipt', 'lookups', 'order_screen', 'census', 'loads', 'writes', 'locks')
-TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms', 'writes_n')
+TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms', 'writes_n',
+    'edeadlk_retries', 'edeadlk_ms', 'dataless_files', 'edeadlk_skips_before')
 FOLLOW_EACH = 6  # at most this many of them per question, least recently checked first
 DONT_ASK = 3
 # The runner clips an event at 6,000 characters; cases past this limit wait for the next check.
@@ -165,6 +166,10 @@ LABELLED = re.compile(
     rf'\b{_LABEL}\b(?:\s*(?:[:=#-]|\b[a-z]+\b)){{0,3}}\s*\d(?:[ -]?\d){{2,11}}(?!\w)'
     rf'|\b{_LABEL}\b(?:\s*(?:code|number|no\.?|is|was|[:=#-])){{0,3}}\s*\S*\d\S*'
     r'|\b(?:password|passwd|passcode|pwd)\b\s*(?:(?:is|was)\s*)?[:=]\s*\S+', re.I)
+
+
+class CheckBusy(Exception):
+    pass
 
 
 class CaseError(Exception):
@@ -524,8 +529,15 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
     current = current or (dict(charge, at=stamp(at)) if at is not None else None)
     # Descriptor variants of one alert may have different question IDs. Only
     # different transactions, including settled ones, compete for a receipt.
+    # Hold estimates and converted totals can compete across different amounts;
+    # USD receipts also compete with the supported AED conversion on either side.
+    variant = charges.receipt_variant(charge)
     rivals = [q for q in questions if q['id'] != qid and q.get('kind') == 'charge'
-              and q['currency'] == charge['currency'] and Decimal(q['amount']) == Decimal(charge['amount'])
+              and (q['currency'] == charge['currency']
+                   or ({q['currency'], charge['currency']} == {'AED', 'USD'}
+                       and (variant == 'usd' or charges.receipt_variant(q) == 'usd')))
+              and (Decimal(q['amount']) == Decimal(charge['amount'])
+                   or variant or charges.receipt_variant(q))
               and (not current or not moment(q.get('at')) or not alert_alias(current, q))]
 
     def accepts(row, text):
@@ -536,6 +548,10 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
                 return False
             observed = moment(other.get('at'))
             if observed is None:
+                continue
+            if charges.alternate_receipt(other, observed, received, row, text):
+                return False
+            if not charges.amount_pattern(other).search(text):
                 continue
             named = any(re.search(r'\b' + re.escape(word) + r'\b', text, re.I)
                         for word in charges.words(other['merchant']))
@@ -699,7 +715,7 @@ def follow_timing(stats):
 def read_json(path, default):
     with charges.step_timing(None, 'loads'):
         try:
-            return json.loads(path.read_text())
+            return json.loads(data_io.read_text(path))
         except FileNotFoundError:
             return default
 
@@ -1025,12 +1041,13 @@ class Locked:
         self.data, self.name, self.wait = data, name, wait
 
     def __enter__(self):
-        self.data.mkdir(parents=True, exist_ok=True)
-        self.lock = (self.data / f'{self.name}.lock').open('a')
+        data_io.materialize_io(lambda: self.data.mkdir(parents=True, exist_ok=True), self.data)
+        path = self.data / f'{self.name}.lock'
+        self.lock = data_io.materialize_io(lambda: path.open('a'), path)
 
         try:
             with charges.step_timing(None, 'locks'), within(time.time() + self.wait, CheckTimeout(f'{self.name}.lock still held after {self.wait}s')):
-                fcntl.flock(self.lock, fcntl.LOCK_EX)
+                data_io.materialize_io(lambda: fcntl.flock(self.lock, fcntl.LOCK_EX), path)
             self.book = {'cases': load, 'questions': load_questions, 'cards': load_cards,
                          'subscriptions': load_subscriptions}[self.name](self.data)
         except BaseException:
@@ -3474,8 +3491,34 @@ def follow_order_charges(data, now, deadline, find=None, stats=None, end=None, r
 
 @log_scope
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
+    parent = data_io.current_scope()
+    stats = parent['stats'] if parent is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+    started = parent['deadline'] - CHECK_BUDGET if parent is not None else time.time()
+    with data_io.scope(started + CHECK_BUDGET, stats):
+        stats['dataless_files'] = data_io.dataless_files(data or DATA)
+        skip = read_json(wd / 'data-skips.json', {})
+        stats['edeadlk_skips_before'] = skip.get('skip_streak', 0)
+        # Discover an evicted dependency before any book or ping mutations.
+        for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json',
+                     'owner-texts.json', 'msgs-searches.json', 'order-details.json', 'marketplace-placements.json'):
+            try:
+                data_io.read_text((data or DATA) / name)
+            except FileNotFoundError:
+                pass
+        from marketplace import refresh_status
+        refresh = refresh_status(data or DATA)
+        result = _scoped_run_check(wd, run, data, root, now, find, said, stats, refresh, started)
+        try:
+            (wd / 'data-skips.json').unlink(missing_ok=True)
+        except OSError:
+            # A committed outbox must still reach stdout if local cleanup fails.
+            print('money-cases: could not clear data skip state', file=sys.stderr)
+        return result
+
+
+def _scoped_run_check(wd, run, data, root, now, find, said, stats, marketplace_refresh, started):
     diagnostic = {'budgetHit': False, 'openCases': 0, 'fired': 0, 'ok': False,
-                  'slowest': 'reconcile', 'started': time.time()}
+                  'slowest': 'reconcile', 'started': started, 'stats': stats}
     try:
         event = _run_check(wd, run, data, root, now, find, said, diagnostic=diagnostic)
         # ok means the pass completed and saved without errors, including source
@@ -3484,8 +3527,7 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
         diagnostic['ok'] = diagnostic.get('complete', True)
         return event
     finally:
-        from marketplace import refresh_status, launch_refresh
-        marketplace_refresh = refresh_status(data or DATA)
+        from marketplace import launch_refresh
         try:
             # The check owns the start and timing samples; logging adds no second timer.
             duration = diagnostic.get('total_s')
@@ -3508,7 +3550,7 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                                 'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
         except Exception:
             pass
-        if marketplace_refresh == 'started':
+        if diagnostic['ok'] and marketplace_refresh == 'started':
             try:
                 launch_refresh(data or DATA)
             except OSError:
@@ -3520,8 +3562,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
     end = started + CHECK_BUDGET
     # Reserve a second for the final save, which still has the whole-check deadline.
     work_end = end - 1
-    stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
-    diagnostic['stats'] = stats
+    stats = diagnostic['stats']
     phases = {}
     phase, phase_at = 'reconcile', started
     now = (now or now_dubai()).astimezone(TZ)
@@ -3875,6 +3916,51 @@ def table(cases):
     return redact('\n'.join(rows)) or 'No cases.'
 
 
+def record_data_skip(wd, error):
+    # This state lives beside pings.json, outside iCloud DATA. The runner has no
+    # skip exit code: quiet success avoids its pause, but a two-hour outage alerts.
+    path = wd / 'data-skips.json'
+    state = read_json(path, {})
+    now = time.time()
+    state.update(skip_streak=state.get('skip_streak', 0) + 1,
+                 first_skip_at=state.get('first_skip_at', now), last_skip_at=now,
+                 last_file=error.path.name,
+                 edeadlk_retries=error.stats.get('edeadlk_retries', 0),
+                 edeadlk_ms=error.stats.get('edeadlk_ms', 0))
+    write_json(path, state)
+    return int(now - state['first_skip_at'] >= 2 * 60 * 60)
+
+
+def check_command(wd, run, data):
+    stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+    wd.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    with data_io.scope(started + CHECK_BUDGET, stats):
+        if wd.resolve() != LIVE.resolve():
+            # Read all originals before publishing a private snapshot; retry a failed
+            # copy next run rather than accepting an incomplete scratch book set.
+            copied = wd / 'scratch-books'
+            if not copied.exists():
+                contents = {}
+                for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
+                    try:
+                        contents[name] = data_io.read_text(data / name)
+                    except FileNotFoundError:
+                        pass
+                copied.mkdir(mode=0o700)
+                for name, content in contents.items():
+                    data_io.materialize_io(lambda: (copied / name).write_text(content), copied / name)
+            data = copied
+        path = wd / 'check.lock'
+        with data_io.materialize_io(lambda: path.open('a'), path) as lock:
+            try:
+                data_io.materialize_io(lambda: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB), path)
+            except BlockingIOError:
+                print('money-cases check already running', file=sys.stderr)
+                raise CheckBusy()
+            return run_check(wd, run, data)
+
+
 @log_cli
 def main(argv=None):
     os.umask(0o077)
@@ -3884,6 +3970,7 @@ def main(argv=None):
     p.add_argument('--all', action='store_true')
     p.add_argument('--json', action='store_true')
     sub.add_parser('show').add_argument('id')
+    sub.add_parser('pin').add_argument('--check', action='store_true')
     for name in ('add', 'update'):
         p = sub.add_parser(name)
         p.add_argument('id')
@@ -4033,6 +4120,9 @@ def main(argv=None):
                                  f"{q.get('outcome') or q.get('why') or ''}"))
                 if not qs:
                     print('No charge questions.')
+        elif args.command == 'pin':
+            from pin_data import pin_data_dir, pin_status
+            print(pin_status(DATA) if args.check else pin_data_dir(DATA))
         elif args.command == 'check':
             if hasattr(sys.stderr, 'reconfigure'):
                 sys.stderr.reconfigure(line_buffering=True)
@@ -4041,24 +4131,7 @@ def main(argv=None):
                                              exit=True)
             _CLI_WATCHDOG.set(True)
             wd = Path(os.environ.get('WATCH_DIR', LIVE))
-            wd.mkdir(parents=True, exist_ok=True)
-            data = DATA
-            if wd.resolve() != LIVE.resolve():
-                # robob-watch test runs a copy of the watcher folder; it gets a copy of the books too.
-                data = wd / 'scratch-books'
-                if not data.exists():
-                    data.mkdir(mode=0o700)
-                    for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
-                        if (DATA / name).exists():
-                            shutil.copy2(DATA / name, data / name)
-            with (wd / 'check.lock').open('a') as lock:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    # Nonzero so the runner keeps its last .run-ok acknowledgement.
-                    print('money-cases check already running', file=sys.stderr)
-                    return 75
-                event = run_check(wd, os.environ.get('WATCH_RUN', ''), data)
+            event = check_command(wd, os.environ.get('WATCH_RUN', ''), DATA)
             if event:
                 print(event)
         elif args.command == 'brief':
@@ -4129,6 +4202,11 @@ def main(argv=None):
         elif args.command == 'reopen':
             reopen(DATA, args.id, args.deadline, args.note)
             print(table([find(load(), args.id)]))
+    except CheckBusy:
+        return 75
+    except data_io.DataUnavailable as e:
+        print(f'money-cases: {e}', file=sys.stderr)
+        return record_data_skip(wd, e) if args.command == 'check' else 75
     except (CaseError, charges.Lookup) as e:
         if isinstance(e, charges.Lookup):
             print(f"UNVERIFIED: source {str(e).split(':', 1)[0]} unreadable", file=sys.stderr)

@@ -7,6 +7,7 @@
 /** The `card_ask` tool's description. */
 export const CARD_ASK_TOOL_DESCRIPTION = [
   "Ask the owner on a card.",
+  "card accepts an id or #number; omit it for your own card.",
   "He answers from a list; the question must stand alone; his answer comes back.",
   "Async by default: work continues.",
   "Use blocking only when work can't go on without the answer: the card waits in Needs Owner, freeing its Working slot; an unattached own worker may ask async/blocking from todo or blocking from needs_owner, and revise/reply on open asks in either stage.",

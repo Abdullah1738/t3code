@@ -1,3 +1,4 @@
+import type { DesktopBackendBootstrap } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
@@ -83,6 +84,7 @@ export class ServerConfig extends Context.Service<
     readonly desktopBootstrapSecret?: string | undefined;
     readonly robobBuildCommit?: string | null | undefined;
     readonly shellEnvironmentPrepared?: boolean | undefined;
+    readonly shellPathHydration?: DesktopBackendBootstrap["shellPathHydration"] | undefined;
     readonly desktopTelemetryFd?: number | undefined;
     readonly desktopTelemetryControlFd?: number | undefined;
     readonly desktopBrowserFd?: number | undefined;

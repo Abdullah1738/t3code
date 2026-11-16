@@ -242,6 +242,7 @@ class BoxDiskTests(Isolated):
             path.write_text('offbox-command-started: run-disk-gate\n')
             return runs._COMMAND_RUNNING
         def cleanup(*args,**kw):
+            self.assertFalse([call for call in lifecycle.call_args_list if call.args[1] == 'handoff'])
             row=self.con.execute("SELECT * FROM runs WHERE run_id='run-disk-gate'").fetchone()
             self.assertEqual((row['status'],row['exit_code'],row['process_id']),('starting',None,None))
             with self.assertRaises(common.OffboxError) as timed_out:
@@ -249,6 +250,7 @@ class BoxDiskTests(Isolated):
             self.assertEqual(timed_out.exception.code,common.EXIT_WAIT_TIMEOUT)
             return space(tmp=4096)
         with patch.dict(os.environ,{runs.BACKGROUND_RUN_ENV:'run-disk-gate'}), \
+             patch.object(runs.queue_lifecycle,'note',wraps=runs.queue_lifecycle.note) as lifecycle, \
              patch.object(runs,'follow',side_effect=admission), \
              patch.object(api,'get',return_value={'state':'running'}),patch.object(lease,'ensure_ttl',return_value=True), \
              patch.object(box_disk,'safe_to_stop',return_value=True), \
@@ -263,6 +265,10 @@ class BoxDiskTests(Isolated):
         self.assertTrue(self.row('bxA')['note'].startswith(box_disk.NOTE))
         row=self.con.execute("SELECT * FROM runs WHERE run_id='run-disk-gate'").fetchone()
         self.assertEqual((row['box_id'],row['status']),('bxB','running'))
+        handoffs=[call for call in lifecycle.call_args_list if call.args[1] == 'handoff']
+        self.assertEqual(len(handoffs),1)
+        self.assertEqual(handoffs[0].args,('run-disk-gate','handoff','handoff'))
+        self.assertEqual(handoffs[0].kwargs,dict(box_id='bxB',process_id=7))
 
     def _recovered_gate_case(self, backend, bg):
         acquire,start=self.run_fixture();self.a.bg=bg

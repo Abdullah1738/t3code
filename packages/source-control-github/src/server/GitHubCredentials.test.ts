@@ -1,15 +1,21 @@
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as PlatformError from "effect/PlatformError";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Redacted from "effect/Redacted";
 import { ChildProcessSpawner } from "effect/process";
 
-import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+import { DEFAULT_SERVER_SETTINGS, VcsProcessSpawnError } from "@t3tools/contracts";
 import type * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
 import * as GitHubCredentials from "./GitHubCredentials.ts";
+import { gitHubProviderFailure } from "./GitHubPullRequestProvider.ts";
 
 const TOKEN_VARIABLES = [
   "GH_TOKEN",
@@ -61,7 +67,7 @@ function harness(
         process: { run },
       }),
     ),
-    Layer.provide(NodeCrypto.layer),
+    Layer.provide(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer)),
   );
   return { layer, calls };
 }
@@ -72,6 +78,100 @@ describe("GitHubCredentials", () => {
   });
   afterEach(() => {
     vi.unstubAllEnvs();
+  });
+
+  it.effect.each([
+    { cwd: "/", gh: undefined, expected: "GitHubCliMissingError" },
+    { cwd: "/missing-pr-watch-cwd", gh: "/tools/gh", expected: "GitHubCliFailedError" },
+    { cwd: "/missing-pr-watch-cwd", gh: undefined, expected: "GitHubCliFailedError" },
+    { cwd: "/", gh: "/tools/gh", expected: "GitHubCliFailedError" },
+  ])("classifies spawn NotFound with cwd=$cwd gh=$gh", ({ cwd, gh, expected }) => {
+    const messages: unknown[] = [];
+    let calls = 0;
+    const layer = GitHubCredentials.layer.pipe(
+      Layer.provide(
+        TestSourceControlHost.layer({
+          process: {
+            run: (input) => {
+              calls++;
+              if (calls > 1)
+                return Effect.succeed(TestSourceControlHost.processOutput("recovered-token"));
+              return Effect.fail(
+                new VcsProcessSpawnError({
+                  operation: input.operation,
+                  command: input.command,
+                  cwd: input.cwd,
+                  cause: PlatformError.systemError({
+                    _tag: "NotFound",
+                    module: "ChildProcess",
+                    method: "spawn",
+                    syscall: "spawn gh",
+                    cause: Object.assign(new Error("private-token-must-not-be-logged"), {
+                      errno: -2,
+                      code: "ENOENT",
+                      syscall: "spawn gh",
+                      path: "gh",
+                      stdout: "private-token-must-not-be-logged",
+                      stderr: "private-token-must-not-be-logged",
+                    }),
+                  }),
+                }),
+              );
+            },
+          },
+        }),
+      ),
+      Layer.provide(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer)),
+    );
+    return Effect.gen(function* () {
+      const credentials = yield* GitHubCredentials.GitHubCredentials;
+      const failure = yield* Effect.flip(credentials.get("github.com"));
+      expect(failure._tag).toBe(expected);
+      expect(gitHubProviderFailure(failure).reason).toBe(
+        expected === "GitHubCliMissingError" ? "missing-tool" : "failed",
+      );
+      if (expected === "GitHubCliFailedError") {
+        expect(Redacted.value((yield* credentials.get("github.com")).token)).toBe(
+          "recovered-token",
+        );
+      } else {
+        expect((yield* Effect.flip(credentials.get("github.com")))._tag).toBe(expected);
+      }
+      expect(calls).toBe(expected === "GitHubCliFailedError" ? 2 : 1);
+      const flat = messages.flatMap((message) => (Array.isArray(message) ? message : [message]));
+      expect(flat).toContain("GitHub credential CLI failed");
+      expect(flat).toContainEqual(
+        expect.objectContaining({
+          operation: "GitHubCredentials.get",
+          host: "github.com",
+          errno: -2,
+          code: "ENOENT",
+          syscall: "spawn gh",
+          path: "gh",
+          cwd,
+          cwdExists: cwd === "/",
+          resolvedGh: gh ?? null,
+          pathDirs: ["/private/bin", "/usr/bin"],
+          credentialErrorTag: expected,
+          command: gh ?? "gh",
+        }),
+      );
+      expect(JSON.stringify(flat)).not.toContain("private-token-must-not-be-logged");
+      expect(JSON.stringify(flat)).not.toContain("recovered-token");
+    }).pipe(
+      Effect.provide(layer),
+      Effect.provideService(HostProcess.Environment, { PATH: "/private/bin:/usr/bin" }),
+      Effect.provideService(HostProcess.WorkingDirectory, cwd),
+      Effect.provideService(HostProcess.Platform, "darwin"),
+      Effect.provideService(SpawnExecutableResolution, () => gh),
+      Effect.provide(
+        Logger.layer([
+          Logger.make(({ message }) => {
+            messages.push(message);
+          }),
+        ]),
+      ),
+    );
   });
 
   it.effect("asks gh for the active login when Settings pin nothing", () => {

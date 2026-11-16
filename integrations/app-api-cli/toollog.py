@@ -33,14 +33,17 @@ _NAMES = {
     'step.auth', 'step.cart_build', 'step.checkout', 'step.payment_submit',
     'step.bank_approval_wait', 'step.confirmation', 'flow.recover_payment',
     'flow.release', 'flow.abandon', 'track.add', 'track.poll', 'track.transition',
-    'track.eta_elapsed', 'track.delivered', 'track.error', 'card.assert',
+    'track.eta_elapsed', 'track.delivered', 'track.error', 'card.assert', 'card.fill',
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
     'order_watch.item_drop_check',
-    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared',
+    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared', 'collector.hold_alert_sent',
 }
 _ENUMS = {
+    'route': {'cdp', 'phone', 'unspecified'},
+    'field': {'card_name', 'card_number', 'card_expiry', 'card_cvc'},
+    'cardNickname': {'Marriott', 'MashreqNoon', 'Skywards', 'Mashreq'},
     'reason': DELEGATION_REASONS,
     'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
@@ -69,7 +72,7 @@ _NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exi
             'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
             'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms',
             'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
-            'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size'}
+            'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'dataless_files', 'edeadlk_skips_before'}
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
@@ -84,7 +87,7 @@ _MONEY_PROPS = {
                   'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
                   'owner_threads_ms', 'msgs_ms', 'msgs_max_ms', 'lookups_ms', 'census_ms', 'starved_by',
                   'owner_list_pages', 'owner_list_ms', 'owner_threads_selected', 'owner_threads_fresh',
-                  'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'owner_result'},
+                  'owner_threads_needed', 'owner_threads_fetched', 'owner_fetch_ms_max', 'owner_timeouts', 'owner_cache_size', 'edeadlk_retries', 'edeadlk_ms', 'dataless_files', 'edeadlk_skips_before', 'owner_result'},
 }
 _COMMANDS = {'test-talabat-shops', 'capabilities', 'restaurant-cart-contract', 'item-options', 'cart',
              'clear-cart', 'menu', 'choices', 'inspect', 'open-flows', 'recover-payment',
@@ -193,6 +196,7 @@ INVALID_DELIVERY_OPTION_ACTION INVALID_DELIVERY_OPTION_TYPE INVALID_DELIVERY_OPT
 ACTIVE_ORDER_PRESENT ACTIVE_ORDER_SCHEMA_CHANGED ADDRESS ADDRESS_BINDING_MISMATCH
 ADDRESS_OWNER_MISMATCH ADDRESS_SCHEMA_CHANGED ASYNC_SAVED_CARD_INSTRUMENT_REQUIRED CARD
 CARDS_SCHEMA_CHANGED CARD_ASSERT_FINAL_REFUSED CARD_CANCELLED CARD_CHANGED CARD_FILL_FAILED
+CARD_FILL_TARGET_REQUIRED CARD_FILL_NO_FOCUS
 CARD_MISMATCH CARD_QUOTE_BODY_DENIED CARD_QUOTE_CONTEXT_UNSUPPORTED
 CARD_QUOTE_EXACT_SAVED_CARD_NOT_UNIQUE CARD_QUOTE_INTENT_ALREADY_CONSUMED
 CARD_QUOTE_PAYMENT_SCHEMA_CHANGED CARD_RECENTLY_DECLINED CARD_RECORD_REQUIRED CARD_REQUIRED
@@ -517,7 +521,9 @@ def _phases(scope, start, end):
 def _fields(props):
     result = {}
     for key, value in (props or {}).items():
-        if key == 'app' and type(value) is str:
+        if key == 'cdpPort' and type(value) is int and 1 <= value <= 65535:
+            result[key] = value
+        elif key == 'app' and type(value) is str:
             result[key] = value if value in _ENUMS['merchant'] else 'other'
         elif key in _ENUMS and type(value) is str and value in _ENUMS[key]:
             result[key] = value
@@ -528,7 +534,7 @@ def _fields(props):
         elif key in _BOOLS and type(value) is bool:
             result[key] = value
         elif key in _NUMBERS and type(value) is int and abs(value) <= 10**12 \
-                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_')) or value >= 0):
+                and (not (key.endswith('_ms') or key.startswith('msgs_') or key == 'writes_n' or key.startswith('owner_') or key.startswith('edeadlk_') or key == 'dataless_files') or value >= 0):
             result[key] = value
         elif key == 'hours' and type(value) in (int, float) and math.isfinite(value) and 0 < value <= 24:
             result[key] = value
@@ -604,7 +610,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher', 'vendorId', 'cardId'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
@@ -617,7 +623,7 @@ def _noon_lane(order):
 
 def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, props=None, error=None, cause=None):
     try:
-        if component not in {'commerce', 'order-watch', 'card_status', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
+        if component not in {'commerce', 'order-watch', 'card_status', 'card-vault-fill', 'noon', 'careem', 'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
             return
         if kind not in {'event', 'perf', 'error'} or name not in _NAMES:
             return
@@ -845,7 +851,7 @@ def rollup(day=None):
                     error_lines += kind == 'error'
                     component = row.get('component')
                     if not isinstance(component, str) or component not in {
-                            'commerce', 'order-watch', 'card_status', 'noon', 'careem',
+                            'commerce', 'order-watch', 'card_status', 'card-vault-fill', 'noon', 'careem',
                             'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
                         component = 'unknown'
                     component_totals[component] = component_totals.get(component, 0) + 1

@@ -92,7 +92,7 @@ function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; g
 }
 
 const stores: Store[] = [];
-afterEach(() => { for (const store of stores.splice(0)) store.db.close(); });
+afterEach(() => { setSystemTime(); for (const store of stores.splice(0)) store.db.close(); });
 
 test.each(["owner", "dm", "group"] as const)("%s skips an oversized file without directing non-owner files to the Mac", async kind => {
   const h = setup(context(kind), { quietMs: 0 });
