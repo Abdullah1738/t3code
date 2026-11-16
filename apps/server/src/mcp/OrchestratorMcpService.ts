@@ -157,6 +157,8 @@ const remainingWaitMs = (startNanos: bigint, timeoutMs: number | undefined) =>
       ),
     ),
   );
+// Keep dispatch recovery within the MCP reply timer, including receipt reads.
+const ASYNC_DISPATCH_GRACE = "5 seconds";
 const TASK_WAKE_EVENTS = [
   { thread: "parent", eventType: "subagent.updated" },
   { thread: "child", eventType: "run.updated" },
@@ -3179,6 +3181,144 @@ const make = Effect.gen(function* () {
           ? new OrchestratorMcpFailure({ code: "parent_not_active", saved: false, message })
           : new OrchestratorMcpFailure({ code: "orchestration_error", saved: false, message });
       });
+      let savedTaskId: NodeId | undefined;
+      let deliveredTerminalResult = false;
+      // These continuations annotate the enclosing delegateTask span.
+      const continueDelegation = Effect.fnUntraced(function* (
+        taskId: NodeId,
+        result?: Effect.Success<ReturnType<typeof threadManagement.dispatch>>,
+        preparation?: Fiber.Fiber<void>,
+        options: ReadonlyArray<ProviderOptionSelection> = [],
+        recovered = false,
+      ) {
+        let initial: OrchestratorMcpDelegateTaskResult;
+        if (result === undefined) initial = yield* readTask(scope, taskId, false, false);
+        else {
+          const taskEvent = result.storedEvents.find(
+            (stored) =>
+              stored.event.type === "subagent.updated" &&
+              stored.event.payload.origin === "app_owned",
+          );
+          if (taskEvent?.event.type !== "subagent.updated") {
+            return yield* failure(
+              "orchestration_error",
+              "Delegated task command did not produce a task projection.",
+            );
+          }
+          // Receipt existence includes rejections; the persisted task proves this delegation was saved.
+          yield* McpCallAnalytics.setSaved(true);
+          taskId = taskEvent.event.payload.id;
+          savedTaskId = taskId;
+          yield* Effect.annotateCurrentSpan({
+            "t3.delegate.task_id": taskId,
+            "t3.delegate.provider_instance_id": taskEvent.event.payload.providerInstanceId,
+            "t3.delegate.model": taskEvent.event.payload.model,
+            "t3.delegate.outcome": "accepted",
+          });
+          const childThreadId = taskEvent.event.payload.childThreadId;
+          const childRunEvent = result.storedEvents.find(
+            (stored) =>
+              stored.event.type === "run.created" && stored.event.threadId === childThreadId,
+          );
+          if (childThreadId === null) {
+            return yield* failure(
+              "orchestration_error",
+              "Accepted delegation has no child thread.",
+            );
+          }
+          const childRun =
+            childRunEvent?.event.type === "run.created" ? childRunEvent.event.payload : undefined;
+          initial = {
+            taskId,
+            childThreadId,
+            childRunId: childRun?.id ?? null,
+            childNodeId: taskId,
+            status: "running",
+            startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
+            ...startState(childRun, []),
+            ...(childRun === undefined ? { startPending: true } : {}),
+            workState: "working",
+            hasPendingChildRuns: false,
+            providerInstanceId: taskEvent.event.payload.providerInstanceId,
+            model: taskEvent.event.payload.model,
+            options: childRun?.modelSelection?.options ?? options,
+            summary: null,
+            resultContextTransferId: null,
+            latestTerminalRunId: null,
+            latestTerminalStatus: null,
+            latestTerminalSummary: null,
+            latestTerminalResultContextTransferId: null,
+            hasPendingQuestion: false,
+            pendingApproval: null,
+            waitTimedOut: input.mode === "wait",
+          };
+        }
+        const snapshot = yield* Ref.make(initial);
+        const observe = (value: OrchestratorMcpDelegateTaskResult) => Ref.set(snapshot, value);
+        const continuation = yield* Effect.gen(function* () {
+          if (preparation !== undefined) yield* Fiber.join(preparation);
+          if (input.mode !== "wait")
+            return yield* readTask(scope, taskId, false, !recovered, undefined, undefined, observe);
+          const waited = yield* waitForTask(scope, taskId, observe);
+          if (Option.isSome(waited)) return waited.value;
+          return { ...(yield* Ref.get(snapshot)), waitTimedOut: true };
+        }).pipe(Effect.forkIn(serviceScope));
+        const response = yield* Fiber.join(continuation).pipe(
+          Effect.timeoutOption(
+            Duration.millis(
+              yield* remainingWaitMs(
+                waitStartedAt,
+                input.mode === "wait" ? input.timeoutMs : 10_000,
+              ),
+            ),
+          ),
+          (effect) => McpTaskTrace.stage(effect, "wait"),
+          // A disconnect must not leave an event subscription behind. Interrupt
+          // observation without joining a potentially blocked read or writer.
+          Effect.ensuring(
+            Fiber.interrupt(continuation).pipe(Effect.forkIn(serviceScope), Effect.asVoid),
+          ),
+        );
+        const answer = Option.isSome(response)
+          ? response.value
+          : {
+              ...(yield* Ref.get(snapshot)),
+              waitTimedOut: input.mode === "wait",
+            };
+        yield* Effect.annotateCurrentSpan({
+          "t3.delegate.outcome": answer.waitTimedOut
+            ? "timeout_wait"
+            : isTerminalTaskStatus(answer.status)
+              ? "completed"
+              : "accepted",
+        });
+        deliveredTerminalResult = !answer.waitTimedOut && isTerminalTaskStatus(answer.status);
+        return input.mode !== "wait" &&
+          answer.childRunId === null &&
+          !isTerminalTaskStatus(answer.status)
+          ? { ...answer, startPending: true }
+          : answer;
+      });
+      const recoverAsyncReceipt = Effect.fnUntraced(function* (
+        result?: Effect.Success<ReturnType<typeof threadManagement.dispatch>>,
+      ) {
+        savedTaskId = expectedTaskId;
+        yield* McpCallAnalytics.setSaved(true);
+        yield* McpCallAnalytics.dispatchFenceRecovered;
+        yield* Effect.annotateCurrentSpan({
+          "t3.delegate.dispatch_fence_recovered": true,
+        });
+        return yield* continueDelegation(expectedTaskId, result, undefined, [], true);
+      });
+      if (input.mode !== "wait" && isRetryOfAcceptedDelegation) {
+        const state = yield* creationState();
+        if (
+          state?.status === "accepted" &&
+          state.threadId === scope.thread.threadId &&
+          state.commandType === "delegated_task.request"
+        )
+          return yield* recoverAsyncReceipt();
+      }
       const callerRuntime = yield* bounded(
         "caller_credential",
         resolveCallerRuntime(credentials, scope.thread, parentRecords),
@@ -3209,6 +3349,7 @@ const make = Effect.gen(function* () {
       ) {
         const state = yield* creationState();
         if (state?.status === "accepted") {
+          if (input.mode !== "wait") return yield* recoverAsyncReceipt();
           yield* McpCallAnalytics.setSaved(true);
           return yield* uncertainCreation(true);
         }
@@ -3298,8 +3439,6 @@ const make = Effect.gen(function* () {
         Effect.Success<ReturnType<typeof threadManagement.dispatch>>,
         OrchestratorMcpFailure
       >();
-      let savedTaskId: NodeId | undefined;
-      let deliveredTerminalResult = false;
       const upgradeCompletionWake = Effect.fn("OrchestratorMcpService.upgradeCompletionWake")(
         (taskId: NodeId) =>
           threadManagement
@@ -3350,7 +3489,7 @@ const make = Effect.gen(function* () {
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.
-      const { result, preparation } = yield* threadManagement
+      const dispatched = yield* threadManagement
         .dispatch({
           type: "delegated_task.request",
           createdBy: "agent",
@@ -3432,6 +3571,20 @@ const make = Effect.gen(function* () {
                 (error.code !== "delegation_timeout" && error.code !== "orchestration_error")
               )
                 return yield* error;
+              if (input.mode !== "wait" && error.code === "delegation_timeout") {
+                const accepted = yield* Deferred.await(dispatchAccepted).pipe(
+                  Effect.exit,
+                  Effect.timeoutOption(ASYNC_DISPATCH_GRACE),
+                );
+                if (Option.isSome(accepted)) {
+                  if (Exit.isSuccess(accepted.value))
+                    return { receipt: yield* recoverAsyncReceipt(accepted.value.value) };
+                  const createError = accepted.value.cause.reasons.find(
+                    (reason) => reason._tag === "Fail",
+                  )?.error;
+                  if (createError?.saved === false) return yield* createError;
+                }
+              }
               const state = yield* creationState();
               if (
                 state?.status === "accepted" &&
@@ -3440,8 +3593,8 @@ const make = Effect.gen(function* () {
               ) {
                 yield* McpCallAnalytics.setSaved(true);
                 savedTaskId = expectedTaskId;
-                if (input.mode !== "wait" || error.code !== "delegation_timeout")
-                  return yield* uncertainCreation(true);
+                if (input.mode !== "wait") return { receipt: yield* recoverAsyncReceipt() };
+                if (error.code !== "delegation_timeout") return yield* uncertainCreation(true);
               }
               if (
                 state?.status === "rejected" &&
@@ -3511,96 +3664,14 @@ const make = Effect.gen(function* () {
             }),
           ),
         );
-      const taskEvent = result.storedEvents.find(
-        (stored) =>
-          stored.event.type === "subagent.updated" && stored.event.payload.origin === "app_owned",
+      if ("receipt" in dispatched) return dispatched.receipt;
+      const { result, preparation } = dispatched;
+      return yield* continueDelegation(
+        expectedTaskId,
+        result,
+        preparation,
+        target.modelSelection.options ?? [],
       );
-      if (taskEvent?.event.type !== "subagent.updated") {
-        return yield* failure(
-          "orchestration_error",
-          "Delegated task command did not produce a task projection.",
-        );
-      }
-      // Receipt existence includes rejections; the persisted task proves this delegation was saved.
-      yield* McpCallAnalytics.setSaved(true);
-      const taskId = taskEvent.event.payload.id;
-      savedTaskId = taskId;
-      yield* Effect.annotateCurrentSpan({
-        "t3.delegate.task_id": taskId,
-        "t3.delegate.provider_instance_id": taskEvent.event.payload.providerInstanceId,
-        "t3.delegate.model": taskEvent.event.payload.model,
-        "t3.delegate.outcome": "accepted",
-      });
-      const childThreadId = taskEvent.event.payload.childThreadId;
-      const childRunEvent = result.storedEvents.find(
-        (stored) => stored.event.type === "run.created" && stored.event.threadId === childThreadId,
-      );
-      if (childThreadId === null) {
-        return yield* failure("orchestration_error", "Accepted delegation has no child thread.");
-      }
-      const childRun =
-        childRunEvent?.event.type === "run.created" ? childRunEvent.event.payload : undefined;
-      const snapshot = yield* Ref.make<OrchestratorMcpDelegateTaskResult>({
-        taskId,
-        childThreadId,
-        childRunId: childRun?.id ?? null,
-        childNodeId: taskId,
-        status: "running",
-        startedAt: childRun?.startedAt == null ? null : DateTime.formatIso(childRun.startedAt),
-        ...startState(childRun, []),
-        ...(childRun === undefined ? { startPending: true } : {}),
-        workState: "working",
-        hasPendingChildRuns: false,
-        providerInstanceId: taskEvent.event.payload.providerInstanceId,
-        model: taskEvent.event.payload.model,
-        options: childRun?.modelSelection?.options ?? target.modelSelection.options ?? [],
-        summary: null,
-        resultContextTransferId: null,
-        latestTerminalRunId: null,
-        latestTerminalStatus: null,
-        latestTerminalSummary: null,
-        latestTerminalResultContextTransferId: null,
-        hasPendingQuestion: false,
-        pendingApproval: null,
-        waitTimedOut: input.mode === "wait",
-      });
-      const observe = (value: OrchestratorMcpDelegateTaskResult) => Ref.set(snapshot, value);
-      const continuation = yield* Effect.gen(function* () {
-        if (preparation !== undefined) yield* Fiber.join(preparation);
-        if (input.mode !== "wait")
-          return yield* readTask(scope, taskId, false, true, undefined, undefined, observe);
-        const waited = yield* waitForTask(scope, taskId, observe);
-        if (Option.isSome(waited)) return waited.value;
-        return { ...(yield* Ref.get(snapshot)), waitTimedOut: true };
-      }).pipe(Effect.forkIn(serviceScope));
-      const response = yield* Fiber.join(continuation).pipe(
-        Effect.timeoutOption(
-          Duration.millis(
-            yield* remainingWaitMs(waitStartedAt, input.mode === "wait" ? input.timeoutMs : 10_000),
-          ),
-        ),
-        (effect) => McpTaskTrace.stage(effect, "wait"),
-        // A disconnect must not leave an event subscription behind. Interrupt
-        // observation without joining a potentially blocked read or writer.
-        Effect.ensuring(
-          Fiber.interrupt(continuation).pipe(Effect.forkIn(serviceScope), Effect.asVoid),
-        ),
-      );
-      const answer = Option.isSome(response)
-        ? response.value
-        : {
-            ...(yield* Ref.get(snapshot)),
-            waitTimedOut: input.mode === "wait",
-          };
-      yield* Effect.annotateCurrentSpan({
-        "t3.delegate.outcome": answer.waitTimedOut
-          ? "timeout_wait"
-          : isTerminalTaskStatus(answer.status)
-            ? "completed"
-            : "accepted",
-      });
-      deliveredTerminalResult = !answer.waitTimedOut && isTerminalTaskStatus(answer.status);
-      return answer;
     }, withDelegationLifetime),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       yield* Effect.annotateCurrentSpan({
