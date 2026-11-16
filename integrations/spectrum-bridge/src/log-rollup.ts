@@ -13,6 +13,9 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const represented = new Set<string>();
   const individualCalls: LogLine[] = [];
   const chainAggregation = createChainAggregation();
+  const firstReplies = new Map<number, number>();
+  const alerts = new Set<string>();
+  let overdue = 0, requeued_by_watchdog = 0, answered_late = 0;
   let total = 0, ok = 0, failed = 0, recordedRows = 0, failedCalls = 0;
   function observeError(line: LogLine) {
     // Legacy request diagnostics are owned by control.catch1/2, including in mixed-version days.
@@ -64,6 +67,13 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   for await (const line of lines) {
     recordedRows++;
     chainAggregation.accept(line);
+    if (line.name === "inbound.overdue") overdue++;
+    if (line.name === "inbound.watchdog_requeued") requeued_by_watchdog++;
+    if (line.name === "inbound.unanswered_alert" && line.ids?.inboundId) alerts.add(`${line.ids.chat}:${line.ids.inboundId}`);
+    if (line.name === "inbound.answered_late") answered_late++;
+    if (line.name === "inbound.answered" && line.durationMs !== undefined && ["owner", "moni"].includes(line.ids?.chat ?? "")) {
+      const ms = Math.round(line.durationMs); firstReplies.set(ms, (firstReplies.get(ms) ?? 0) + 1);
+    }
     if (line.name === "card.renders" && line.renders) {
       consume({ ...line, name: "card.render", renders: undefined }, line.renders.count, line.renders.count, 0, line.renders.histogram);
     } else if (line.name === "turn.robob_calls" && line.calls) {
@@ -96,7 +106,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
       ...(stats.histogram.size ? { durationMs: percentiles(stats.histogram) } : {}),
     };
   }
-  return { total, recordedRows, countsByName, countsByKind, ok, failed,
+  return { overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: percentiles(firstReplies), total, recordedRows, countsByName, countsByKind, ok, failed,
     okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countsByKind.error + failedCalls) / total : 0,
     durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
     topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20), chains: chainAggregation.summary(),
