@@ -18,7 +18,7 @@ import tempfile
 from functools import lru_cache
 
 # Keep iMessage class names in sync with spectrum-bridge/src/log-error.ts.
-_IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError SyntaxError URIError EvalError AggregateError IMessageError APIError FetchError HTTPError NetworkError ZodError AbortError TimeoutError SystemError SQLiteError SqliteError DOMException JudgeError TransportError PublishError CliError SttError SecretError ShareError HttpError ApiError ControlError LineError SendblueError ValidationError UnknownError'.split())
+_IMESSAGE_ERROR_NAMES = frozenset('Error TypeError RangeError ReferenceError SyntaxError URIError EvalError AggregateError IMessageError APIError FetchError HTTPError NetworkError ZodError AbortError TimeoutError BoundedTimeout SystemError SQLiteError SqliteError DOMException JudgeError TransportError PublishError CliError SttError SecretError ShareError HttpError ApiError ControlError LineError SendblueError ValidationError UnknownError'.split())
 
 CAP_BYTES = 50 * 1024 * 1024
 HOOKS_CAP_BYTES = 35 * 1024 * 1024
@@ -544,10 +544,46 @@ def _imessage_rollup_records(board, day):
         yield 0, row
 
 
+def _imessage_probe_stats(row):
+    if row.get('component') != 'router' or row.get('name') != 'router.prompt_probes' or row.get('kind') != 'perf':
+        return None
+    value = row.get('promptProbe')
+    if not isinstance(value, dict):
+        return None
+    outcomes = ('accepted', 'notAcceptedYet', 'timeout', 'http', 'transport')
+    valid = lambda n: type(n) is int and 0 <= n <= 10_000_000
+    if not all(valid(value.get(k)) for k in ('calls',) + outcomes):
+        return None
+    if value['calls'] != sum(value[k] for k in outcomes):
+        return None
+    statuses = value.get('httpByStatus')
+    if not isinstance(statuses, dict) or any(not isinstance(k, str) or not re.fullmatch(r'[1-5]\d{2}', k) or not valid(v) for k, v in statuses.items()):
+        return None
+    if sum(statuses.values()) != value['http']:
+        return None
+    result = {k: value[k] for k in ('calls',) + outcomes}
+    result['httpByStatus'] = dict(statuses)
+    for field in ('elapsedMs', 'attempts', 'msUntilAccepted'):
+        bins = value.get(field)
+        if not isinstance(bins, list) or len(bins) > 100_000:
+            return None
+        if any(not isinstance(pair, list) or len(pair) != 2 or type(pair[0]) is not int or not 0 <= pair[0] <= 2**53 - 1 or not valid(pair[1]) or pair[1] < 1 for pair in bins):
+            return None
+        result[field] = [tuple(pair) for pair in bins]
+    samples = lambda field: sum(n for _, n in result[field])
+    if samples('elapsedMs') != result['calls'] or samples('attempts') > result['accepted'] or samples('attempts') != samples('msUntilAccepted'):
+        return None
+    return result
+
+
 def rollup(board, day, top_n=20):
     from collections import Counter, defaultdict
     counts_name, counts_kind, tags = Counter(), Counter(), Counter()
     causes, render_failures = Counter(), Counter()
+    cause_kinds = defaultdict(Counter)
+    probe_totals, probe_statuses = Counter(), Counter()
+    probe_bins = defaultdict(list)
+    probe_hours = {}
     samples, references, durations = {}, {}, defaultdict(list)
     order_errors, order_polls = {}, defaultdict(list)
     component_totals, component_errors = Counter(), defaultdict(Counter)
@@ -616,6 +652,18 @@ def rollup(board, day, top_n=20):
         if values:
             durations[name].extend(values)
         if board == 'imessage':
+            probe = _imessage_probe_stats(row)
+            if probe:
+                hour = str(row.get('ts', ''))[11:13]
+                hourly = probe_hours.setdefault(hour, {'counts': Counter(), 'statuses': Counter(), 'bins': defaultdict(list)})
+                for field in ('calls', 'accepted', 'notAcceptedYet', 'timeout', 'http', 'transport'):
+                    probe_totals[field] += probe[field]
+                    hourly['counts'][field] += probe[field]
+                probe_statuses.update(probe['httpByStatus'])
+                hourly['statuses'].update(probe['httpByStatus'])
+                for field in ('elapsedMs', 'attempts', 'msUntilAccepted'):
+                    probe_bins[field].extend(probe[field])
+                    hourly['bins'][field].extend(probe[field])
             component = row.get('component', 'unknown')
             call = row.get('_rollup_call') if aggregate else _imessage_call_name(row)
             for label in [name] + ([call] if name == 'turn.robob_call' and call else []):
@@ -677,6 +725,9 @@ def rollup(board, day, top_n=20):
                 if not isinstance(error_name, str) or error_name not in _IMESSAGE_ERROR_NAMES:
                     error_name = 'UnknownError'
                 key = (tag, error_name)
+                cause_kind = (row.get('props') or {}).get('causeKind')
+                if cause_kind in {'timeout', 'http', 'transport'}:
+                    cause_kinds[key][cause_kind] += weight
                 cause = _imessage_cause_key((row.get('error') or {}).get('causeKey'))
                 if cause:
                     causes[(tag, cause)] += weight
@@ -738,7 +789,8 @@ def rollup(board, day, top_n=20):
                                  for rule, threads in sorted(threads_by_rule.items())},
             'repeatLoops': loops,
             'topErrorTags': [{**({'tag': key[0], 'name': key[1]} if board == 'imessage' else {'tag': key}),
-                              'count': count, 'sampleId': samples.get(key, references[key])}
+                              'count': count, 'sampleId': samples.get(key, references[key]),
+                              **({'causeKinds': dict(cause_kinds[key])} if board == 'imessage' and cause_kinds[key] else {})}
                              for key, count in sorted(tags.items(), key=lambda x: (-x[1], x[0]))[:20]]}
     if board == 'agent-tools':
         result['unattributedByRule'] = {rule: [
@@ -782,6 +834,15 @@ def rollup(board, day, top_n=20):
             merchant: {**poll, 'failureShare': poll['failed'] / poll['count']}
             for merchant, poll in sorted(poll_counts.items())}
     if board == 'imessage':
+        def probe_summary(counts, statuses, bins):
+            summary = {field: counts[field] for field in ('calls', 'accepted', 'notAcceptedYet', 'timeout', 'http', 'transport')}
+            summary['httpByStatus'] = dict(statuses)
+            for field in ('elapsedMs', 'attempts', 'msUntilAccepted'):
+                values = bins[field]
+                summary[field] = {'count': sum(n for _, n in values), **(percentiles(values) if values else {'p50': 0, 'p95': 0, 'max': 0})}
+            return summary
+        result['promptProbe'] = {**probe_summary(probe_totals, probe_statuses, probe_bins),
+            'byHour': {hour: probe_summary(value['counts'], value['statuses'], value['bins']) for hour, value in sorted(probe_hours.items())}}
         result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count}
                                for (tag, cause), count in sorted(causes.items(), key=lambda x: (-x[1], x[0]))[:20]]
         result['cardRenderFailures'] = dict(sorted(render_failures.items()))

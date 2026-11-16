@@ -16,6 +16,43 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_prompt_probe_outcomes_keep_all_failures_in_error_rate(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        aggregate = {'component': 'router', 'name': 'router.prompt_probes', 'kind': 'perf',
+                     'ts': self.day + 'T12:00:00.000Z', 'promptProbe': {
+                         'calls': 5, 'accepted': 1, 'notAcceptedYet': 1, 'timeout': 1, 'http': 1, 'transport': 1,
+                         'httpByStatus': {'503': 1}, 'elapsedMs': [[0, 2], [5, 1], [15, 1], [10000, 1]],
+                         'attempts': [[2, 1]], 'msUntilAccepted': [[172800000, 1]]}}
+        rows = [aggregate]
+        for name, kind in [('BoundedTimeout', 'timeout'), ('ControlError', 'http'), ('ControlError', 'transport')]:
+            rows.append({'component': 'router', 'name': 'bridge.catch', 'kind': 'error', 'ok': False,
+                         'error': {'tag': 'router.catch1', 'name': name, 'causeKey': 'prompt_acceptance_probe'},
+                         'props': {'causeKind': kind}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        result = toollog.rollup('imessage', self.day)
+        probe = result['promptProbe']
+        self.assertEqual({k: probe[k] for k in ('calls', 'accepted', 'notAcceptedYet', 'timeout', 'http', 'transport')},
+                         {'calls': 5, 'accepted': 1, 'notAcceptedYet': 1, 'timeout': 1, 'http': 1, 'transport': 1})
+        self.assertEqual(probe['httpByStatus'], {'503': 1})
+        self.assertEqual(probe['attempts'], {'count': 1, 'p50': 2, 'p95': 2, 'max': 2})
+        self.assertEqual(probe['msUntilAccepted'], {'count': 1, 'p50': 172800000, 'p95': 172800000, 'max': 172800000})
+        self.assertEqual(probe['byHour']['12']['calls'], 5)
+        self.assertEqual(result['countsByKind']['error'], 3)
+        self.assertEqual(result['errorRate'], 3 / 4)
+        tags = {r['name']: r for r in result['topErrorTags']}
+        self.assertEqual(tags['BoundedTimeout']['causeKinds'], {'timeout': 1})
+        self.assertEqual(tags['ControlError']['causeKinds'], {'http': 1, 'transport': 1})
+        self.assertEqual(tags['ControlError']['count'], 2)
+        # A malformed aggregate cannot erase an independent failure or leak its fields.
+        aggregate['promptProbe']['calls'] = 999
+        aggregate['promptProbe']['httpByStatus']['PRIVATE_TOKEN'] = 1
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(r) + '\n' for r in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual(result['promptProbe']['calls'], 0)
+        self.assertEqual(result['errorRate'], 3 / 4)
+        self.assertNotIn('PRIVATE_TOKEN', json.dumps(result))
+
     def test_shared_render_root_path_shapes_with_and_without_counters(self):
         import sqlite3
         with tempfile.TemporaryDirectory() as temp:

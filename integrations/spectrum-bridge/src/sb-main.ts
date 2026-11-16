@@ -367,6 +367,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     await apps?.stop().catch((caughtError) => { toolError("sb-main", "sb-main.catch17", caughtError);});
     await shares.stopAll().catch((caughtError) => { toolError("sb-main", "sb-main.catch18", caughtError);});
     // In-flight rows are intentionally recovered on the next startup rather than marked successful.
+    toolLog.flush();
     process.exit(0);
   };
   process.once("SIGTERM", () => { void stop(); });

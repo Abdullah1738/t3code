@@ -7,7 +7,9 @@ import type { ChatContext } from "../src/chats.ts";
 import type { NormalizedInbound } from "../src/photon.ts";
 import { toolLog } from "../src/toollog.ts";
 import { captureReadTiming, completionChecked, includeReadTiming, startTickRead, tickRead, timeTick } from "../src/tick-timing.ts";
-import { ControlClient } from "../src/control.ts";
+import { ControlClient, ControlError } from "../src/control.ts";
+import { BoundedTimeout } from "../src/bounded.ts";
+import { captureLogs } from "./log-fixture.ts";
 
 const hash = (id: string) => `msg_${createHash("sha256").update(id).digest("hex")}`;
 const now = Date.parse("2026-11-13T10:00:00Z");
@@ -57,6 +59,57 @@ function setup(slug = "owner", overrides: Partial<ConstructorParameters<typeof R
   const states = () => store.db.query<{ state: string }, []>("SELECT state FROM inbound ORDER BY rowid").all().map(r => r.state);
   return { store, backend, router, input, states, logs, alerts, ctx };
 }
+
+test.each([
+  ["timeout", new BoundedTimeout(10_000)], ["http", new ControlError(503, "unavailable")],
+  ["transport", new ControlError(0, "ECONNRESET")],
+  ["http", Object.assign(new Error("OpenChamber request failed (HTTP 503)"), { status: 503 })],
+] as const)("probe %s remains inconclusive and a later accepted check delivers without another POST", async (kind, error) => {
+  const h = setup(); h.input("probe"); h.store.updateInbound("probe", "processing");
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 };
+  h.store.set("route", route);
+  h.store.set("failed-delivery:probe", { ...route, inboundId: "probe", messageId: hash("probe"), startedAt: now - 120_000, phase: "unknown" });
+  h.backend.promptAccepted = async () => { throw error; };
+  const rows = await captureLogs(async () => {
+    await h.router.checkInboundLatency();
+    expect(h.states()).toEqual(["processing"]);
+    expect(h.backend.prompts).toEqual([]);
+    h.backend.promptAccepted = async () => true;
+    setSystemTime(now + 1000); await h.router.checkInboundLatency();
+  });
+  expect(h.states()).toEqual(["done"]);
+  expect(h.backend.prompts).toEqual([]);
+  const catches = rows.filter(row => row.error?.tag === "router.catch1");
+  expect(catches).toHaveLength(1);
+  expect(catches[0].props).toMatchObject({ causeKind: kind, boundMs: 10_000, attempt: 1, route: "/prompt-acceptance" });
+  expect(catches[0].error?.causeKey).toBe("prompt_acceptance_probe");
+  const probes = rows.filter(row => row.name === "router.prompt_probes");
+  expect(probes).toHaveLength(1);
+  expect(probes[0].promptProbe).toMatchObject({ calls: 2, accepted: 1, [kind]: 1, attempts: [[2, 1]], msUntilAccepted: [[121_000, 1]] });
+});
+
+test.each([
+  { label: "root send", age: 120_000, attemptAge: undefined, steerAge: undefined, matches: true, expected: 120_000 },
+  { label: "retried root", age: 3_600_000, attemptAge: 120_000, steerAge: undefined, matches: true, expected: 120_000 },
+  { label: "earlier request id", age: 3_600_000, attemptAge: 120_000, steerAge: undefined, matches: true, expected: 3_600_000, earlier: true },
+  { label: "steered follow-up", age: 3_600_000, attemptAge: 3_600_000, steerAge: 120_000, matches: true, expected: 120_000 },
+  { label: "legacy root older than 24h", age: 108_000_000, attemptAge: undefined, steerAge: undefined, matches: true, expected: 108_000_000 },
+  { label: "steer for a different route", age: 3_600_000, attemptAge: undefined, steerAge: 120_000, matches: false, expected: 3_600_000 },
+])("probe latency uses the matching send timestamp: $label", async fixture => {
+  const { age, attemptAge, steerAge, matches, expected } = fixture;
+  const earlier = "earlier" in fixture && fixture.earlier;
+  const h = setup(); h.input("probe"); h.store.updateInbound("probe", "processing");
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 };
+  h.store.set("route", route);
+  h.store.set("failed-delivery:probe", { ...route, inboundId: "probe", messageId: hash("probe"), startedAt: now - age,
+    ...(attemptAge === undefined ? {} : { attemptAt: now - attemptAge }), ...(earlier ? { earlier: ["msg_earlier"] } : {}), phase: "unknown" });
+  if (steerAge !== undefined) h.store.set("steer-attempt:probe", { ...route, id: matches ? route.id : "ses_other", startedAt: now - steerAge });
+  h.backend.promptAccepted = async (_id, _directory, messageId) => !earlier || messageId === "msg_earlier";
+  const rows = await captureLogs(() => h.router.checkInboundLatency());
+  expect(rows.find(row => row.promptProbe)?.promptProbe).toMatchObject({ calls: earlier ? 2 : 1, accepted: 1, msUntilAccepted: [[expected, 1]] });
+  expect(h.states()).toEqual(["done"]);
+  expect(h.backend.prompts).toEqual([]);
+});
 
 test.each(["owner", "moni"])("inbound latency sweep wakes idle %s once using the row request id", async slug => {
   const h = setup(slug); h.input("idle");

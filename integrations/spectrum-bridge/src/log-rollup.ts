@@ -1,3 +1,4 @@
+import { emptyPromptProbe, cleanPromptProbe, mergePromptProbe, summarizePromptProbe, type PromptProbeStats } from "./log-prompt-probes.ts";
 import type { LogLine } from "./toollog.ts";
 import { callName, percentiles } from "./log-calls.ts";
 import { createChainAggregation } from "./log-chains.ts";
@@ -7,12 +8,14 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const countsByKind: Record<string, number> = { event: 0, perf: 0, error: 0 };
   const durations = new Map<string, Map<number, number>>();
   const components = new Map<string, Map<string, { count: number; ok: number; failed: number; histogram: Map<number, number> }>>();
-  const errors = new Map<string, { tag: string; name: string; count: number; sampleId?: string; site?: string }>();
+  const errors = new Map<string, { tag: string; name: string; count: number; sampleId?: string; site?: string; causeKinds?: Record<string, number> }>();
   const causes = new Map<string, { tag: string; causeKey: string; count: number }>();
   const renderFailures = new Map<string, number>();
   const represented = new Set<string>();
   const individualCalls: LogLine[] = [];
   const chainAggregation = createChainAggregation();
+  const promptProbe = emptyPromptProbe();
+  const probeHours = new Map<string, PromptProbeStats>();
   let total = 0, ok = 0, failed = 0, recordedRows = 0;
   function merge(target: Map<number, number>, values: Iterable<[number, number]>) {
     for (const [ms, count] of values) target.set(ms, (target.get(ms) ?? 0) + count);
@@ -24,6 +27,15 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     names.set(name, stats); components.set(component, names);
   }
   function consume(line: LogLine, count = 1, oks = Number(line.ok === true), failures = Number(line.ok === false), histogram?: Iterable<[number, number]>) {
+    if (line.name === "router.prompt_probes" && line.component === "router" && line.kind === "perf") {
+      const stats = cleanPromptProbe(line.promptProbe);
+      if (stats) {
+        mergePromptProbe(promptProbe, stats);
+        const hour = line.ts.slice(11, 13);
+        const hourly = probeHours.get(hour) ?? emptyPromptProbe();
+        mergePromptProbe(hourly, stats); probeHours.set(hour, hourly);
+      }
+    }
     total += count; ok += oks; failed += failures;
     countsByName[line.name] = (countsByName[line.name] ?? 0) + count;
     countsByKind[line.kind] += count;
@@ -49,9 +61,13 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     if (line.error) {
       const name = line.error.name;
       const key = `${line.error.tag}\0${name}`;
-      const item = errors.get(key) ?? { tag: line.error.tag, name, count: 0,
+      const item: { tag: string; name: string; count: number; sampleId?: string; site?: string; causeKinds?: Record<string, number> } = errors.get(key) ?? { tag: line.error.tag, name, count: 0,
         sampleId: line.ids?.messageId ?? line.ids?.operationId ?? line.ids?.threadId ?? line.ids?.formId ?? line.ids?.runId,
         ...(line.site ? { site: line.site } : {}) };
+      const kind = line.props?.causeKind;
+      if (typeof kind === "string" && ["timeout", "http", "transport"].includes(kind)) {
+        item.causeKinds ??= {}; item.causeKinds[kind] = (item.causeKinds[kind] ?? 0) + 1;
+      }
       item.count++; errors.set(key, item);
     }
   }
@@ -89,6 +105,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   }
   return { total, recordedRows, countsByName, countsByKind, ok, failed,
     okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? countsByKind.error / total : 0,
+    promptProbe: { ...summarizePromptProbe(promptProbe), byHour: Object.fromEntries([...probeHours].sort().map(([hour, stats]) => [hour, summarizePromptProbe(stats)])) },
     durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
     topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20), chains: chainAggregation.summary(),
     topErrorTags: [...errors.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.name.localeCompare(b.name)).slice(0, 20) };

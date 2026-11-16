@@ -1,3 +1,5 @@
+import { bounded } from "./bounded.ts";
+import { PromptProbeTracker } from "./prompt-probe.ts";
 import { toolLog as watcherLog } from "./watcherlog.ts";
 import { completionReady, toolError, toolLog } from "./toollog.ts";
 import { captureReadTiming, completionChecked, includeReadTiming, timeTick, type ReadTiming } from "./tick-timing.ts";
@@ -655,20 +657,8 @@ Bridge CLI: ${CLI} COMMAND ... --session CURRENT_SESSION_ID --key UNIQUE_KEY
 Secure forms and the other commands are in the imessage skill.`;
 }
 
-// Existing client methods do not accept cancellation signals. Bound the wait, but
-// treat timed-out mutations as ambiguous: their underlying request can finish later.
-async function bounded<T>(operation: Promise<T>, timeout = 10_000): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([operation, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("Router request timed out")), timeout);
-    })]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 export class Router {
+  private readonly promptProbes = new PromptProbeTracker(toolLog.write);
   private completionRead?: { key: string; result: Promise<MessageRecord[]>; timing: ReadTiming; records?: MessageRecord[]; at?: number };
   private completionTargetKey?: string;
   private completionWake = Promise.withResolvers<void>();
@@ -968,9 +958,17 @@ export class Router {
       const { original, members, batch } = snapshots.get(leader)!;
       let absent = true;
       if (original) {
+        const steer = this.store.get<SteerAttempt | null>(`steer-attempt:${leader}`);
         for (const id of [original.messageId, ...original.earlier ?? []]) {
+          const steeredAt = id === original.messageId && id === `msg_${hash(leader)}`
+            && steer?.id === original.id && steer.directory === original.directory && steer.generation === original.generation
+            ? steer.startedAt : undefined;
+          const sentAt = id === original.messageId ? steeredAt ?? original.attemptAt ?? original.startedAt : original.startedAt;
+          const probe = this.promptProbes.start(original.id, id, sentAt);
           try {
-            if (await bounded(this.backend.promptAccepted(original.id, original.directory, id))) {
+            const accepted = await bounded(this.backend.promptAccepted(original.id, original.directory, id));
+            probe.complete(accepted);
+            if (accepted) {
               this.store.db.transaction(() => {
                 // A normal tick may have admitted and already failed this turn during the read.
                 if (this.store.get(`inbound-delivered:${leader}`) !== undefined) {
@@ -992,7 +990,7 @@ export class Router {
               absent = false;
               break;
             }
-          } catch (caughtError) { toolError("router", "router.catch1", caughtError); absent = false; }
+          } catch (caughtError) { toolError("router", "router.catch1", caughtError, { threadId: original.id }, probe.failure(caughtError)); absent = false; }
         }
         const live = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id);
         if (live?.state === "done" || this.store.get(`inbound-delivered:${leader}`) !== undefined) continue;
