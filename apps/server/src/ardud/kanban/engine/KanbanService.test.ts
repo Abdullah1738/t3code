@@ -14036,8 +14036,8 @@ it.effect.each([
   { work: "open", to: "todo" },
   { work: "unplanned", to: "todo" },
   { work: "findings", to: "todo" },
-  { work: "later step", to: "todo" },
-] as const)("idle worker with $work work is nudged once then released to $to", ({ work, to }) =>
+  { work: "later step", to: "needs_review" },
+] as const)("idle worker with $work work is released to $to", ({ work, to }) =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -14065,6 +14065,7 @@ it.effect.each([
       yield* kanban.dispatchNow;
       const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
       const worker: KanbanActor = { _tag: "thread", threadId: thread };
+      yield* setRunning(fake, thread, true);
       if (work === "done" || work === "skipped" || work === "findings" || work === "later step") {
         yield* kanban.markSubtask(
           card.id,
@@ -14082,6 +14083,20 @@ it.effect.each([
         });
       // Keep the released row observable before the next assignment.
       yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+      yield* setRunning(fake, thread, false);
+      if (to === "needs_review") {
+        yield* kanban.turnEnded(thread);
+        const after = yield* kanban.card(card.id);
+        assert.equal(after.card.stage, "needs_review");
+        assert.isNull(after.card.activePool);
+        assert.isNull(after.card.activeThreadId);
+        assert.equal(after.card.workThreadId, thread);
+        assert.equal(yield* nudgesTo(fake, thread), 0);
+        assert.isTrue(
+          after.events.some((event) => event.body?.startsWith("Auto-advanced: review_step;")),
+        );
+        return;
+      }
       yield* TestClock.adjust("29 minutes");
       yield* kanban.tick;
       assert.strictEqual(yield* nudgesTo(fake, thread), 0);
@@ -14090,11 +14105,6 @@ it.effect.each([
       const nudged = (yield* kanban.card(card.id)).card;
       assert.strictEqual(yield* nudgesTo(fake, thread), 1);
       assert.isNotNull(nudged.nudgedAt);
-      if (to === "needs_review")
-        assert.include(
-          (yield* Ref.get(fake.threads)).get(thread)!.messages.at(-1)!,
-          "Your work subtasks are done; card_move needs_review now",
-        );
       // Duplicate end notifications cannot renew the nudge clock.
       yield* kanban.turnEnded(thread);
       assert.strictEqual((yield* kanban.card(card.id)).card.nudgedAt, nudged.nudgedAt);
@@ -14111,15 +14121,7 @@ it.effect.each([
       assert.isNull(after.card.nudgedAt);
       assert.strictEqual(after.card.workThreadId, thread);
       assert.strictEqual(yield* nudgesTo(fake, thread), 1);
-      assert.isTrue(
-        after.events.some(
-          (event) =>
-            event.body ===
-            (to === "needs_review"
-              ? "Work thread idle with work done; moved to review"
-              : "Work thread idle; slot freed"),
-        ),
-      );
+      assert.isTrue(after.events.some((event) => event.body === "Work thread idle; slot freed"));
       if (to === "todo") {
         assert.strictEqual(
           yield* evaluatorNotesFor(fake, `Card #${card.number}: Work thread idle; slot freed`),
@@ -14127,10 +14129,7 @@ it.effect.each([
         );
         yield* kanban.setPool(board.id, board.defaultCardModel, 1);
         yield* kanban.dispatchNow;
-        assert.strictEqual(
-          (yield* kanban.card(card.id)).card.activeThreadId,
-          work === "later step" ? null : thread,
-        );
+        assert.strictEqual((yield* kanban.card(card.id)).card.activeThreadId, thread);
       }
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
@@ -14222,7 +14221,7 @@ it.effect.each([
   }),
 );
 
-it.effect("a finished worker gets the handoff nudge and releases at its next overdue stop", () =>
+it.effect("a finished worker hands off at turn end without a nudge", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
     yield* Effect.gen(function* () {
@@ -14243,6 +14242,7 @@ it.effect("a finished worker gets the handoff nudge and releases at its next ove
       );
       yield* kanban.dispatchNow;
       const thread = (yield* kanban.card(created.id)).card.activeThreadId!;
+      yield* setRunning(fake, thread, true);
       yield* kanban.markSubtask(
         created.id,
         "s1",
@@ -14252,9 +14252,9 @@ it.effect("a finished worker gets the handoff nudge and releases at its next ove
         "work",
       );
       yield* store.putCard({ ...(yield* kanban.card(created.id)).card, reviewStep: 1 });
+      yield* setRunning(fake, thread, false);
       yield* kanban.turnEnded(thread);
-      assert.strictEqual(yield* nudgesTo(fake, thread), 1);
-      yield* TestClock.adjust("30 minutes");
+      assert.strictEqual(yield* nudgesTo(fake, thread), 0);
       yield* kanban.turnEnded(thread);
       const after = (yield* kanban.card(created.id)).card;
       assert.strictEqual(after.stage, "needs_review");
@@ -14354,11 +14354,14 @@ it.effect.each(
         });
       const expected = origin === "stuck question" || origin === "silent run" ? 1 : 0;
       yield* kanban.turnEnded(thread);
-      assert.strictEqual(yield* nudgesTo(fake, thread), expected);
-      assert.strictEqual((yield* kanban.card(card.id)).card.stage, "working");
+      assert.strictEqual(yield* nudgesTo(fake, thread), done ? 0 : expected);
+      assert.strictEqual(
+        (yield* kanban.card(card.id)).card.stage,
+        done ? "needs_review" : "working",
+      );
       // The interrupt and accepted reminder deliberately share a timestamp.
       yield* kanban.turnEnded(thread);
-      assert.strictEqual(yield* nudgesTo(fake, thread), expected);
+      assert.strictEqual(yield* nudgesTo(fake, thread), done ? 0 : expected);
       yield* TestClock.adjust("30 minutes");
       yield* kanban.turnEnded(thread);
       const after = (yield* kanban.card(card.id)).card;
@@ -14438,6 +14441,7 @@ it.effect.each(
         );
         yield* kanban.dispatchNow;
         thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        yield* setRunning(fake, thread, true);
         if (done)
           yield* kanban.markSubtask(
             card.id,
@@ -14447,10 +14451,14 @@ it.effect.each(
             { _tag: "thread", threadId: thread },
             "work",
           );
-        yield* kanban.turnEnded(thread);
+        if (!done) {
+          yield* setRunning(fake, thread, false);
+          yield* kanban.turnEnded(thread);
+        }
         const before = (yield* kanban.card(card.id)).card;
         yield* TestClock.adjust("31 minutes");
         armed = true;
+        yield* setRunning(fake, thread, false);
         yield* kanban.turnEnded(thread);
         assert.isTrue(accepted);
         assert.isAtLeast(reads, 3);
@@ -34068,9 +34076,8 @@ it.effect.each(["dispatch", "claim"] as const)(
         const before = (yield* Ref.get(fake.threads)).get(worker)!.messages.length;
         yield* kanban.turnEnded(worker);
         const messages = (yield* Ref.get(fake.threads)).get(worker)!.messages;
-        assert.lengthOf(messages, before + 1);
-        assert.include(messages.at(-1)!, "Your work subtasks are done; card_move needs_review now");
-        assert.notInclude(messages.at(-1)!, "old words");
+        assert.lengthOf(messages, before);
+        assert.equal((yield* kanban.card(card.id)).card.stage, "needs_review");
         assert.isFalse((yield* kanban.card(card.id)).card.reviewFindingsPending);
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
