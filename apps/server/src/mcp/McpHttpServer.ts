@@ -1,3 +1,4 @@
+import { withBoardInputHint } from "../ardud/kanban/tools/inputErrors.ts";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
@@ -1391,7 +1392,13 @@ const withToolAnalytics =
                             : Effect.void,
                         ),
                       )
-                      .pipe(Effect.andThen(options.handle(payload)))
+                      .pipe(
+                        Effect.andThen(
+                          options
+                            .handle(payload)
+                            .pipe(Effect.mapError(withBoardInputHint(options.tool.name, payload))),
+                        ),
+                      )
                       .pipe(
                         Effect.tap(() =>
                           options.tool.name === "t3_thread_read"

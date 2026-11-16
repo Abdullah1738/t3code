@@ -28,6 +28,7 @@ import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { KanbanService } from "../engine/KanbanService.ts";
+import { ASK_LIMITS } from "../engine/asks.ts";
 import { MAX_SUBTASKS, MAX_TEXT } from "../engine/subtasks.ts";
 import { MAX_BATCH } from "../engine/rules.ts";
 import { WAITS_ENGINE_WIRED } from "../engine/waits.ts";
@@ -166,12 +167,15 @@ const LinkInput = Schema.Struct({
   label: Schema.optional(Schema.String),
 });
 
+const BLOCKS_DESCRIPTION =
+  'Each block is an object whose `_tag` field names its kind (all shown keys are required, even where null is allowed): md {text}, collapse {title, text}, html {html, title: string|null, height: positive integer|null}, image {url, alt: string|null}, attachment {attachment: {type: "image"|"file", id, name, mimeType, sizeBytes}}, card {cardId}; attachment id comes from t3_attachment_prepare_upload. Example: [{"_tag":"md","text":"Line count went from 120 to 4"},{"_tag":"image","url":"https://example.com/proof.png","alt":"Result"}]';
+
 const BlocksInput = {
   text: Schema.optional(describe(Schema.String, "Markdown message (shortcut for one md block).")),
   blocks: Schema.optional(
     describe(
       Schema.Array(KanbanBlockInput),
-      'Rich blocks, each with _tag: md {text}, collapse {title, text}, html {html, title, height}, choice {id, style "poll"|"pick", question, options [{id,label}], multi}, card {cardId}, image {url, alt}, attachment {attachment: {type image|file, id, name, mimeType, sizeBytes}} (the id comes from t3_attachment_prepare_upload).',
+      `${BLOCKS_DESCRIPTION} Also accepts choice {id, style: "poll"|"pick", question, options: [{id, label}], multi}.`,
     ),
   ),
 };
@@ -362,43 +366,69 @@ const AskFieldInput = Schema.Struct({
   block: Schema.optional(Schema.Finite),
 });
 
-const AskRespondInput = Schema.Struct({
+export const AskRespondInput = Schema.Struct({
   verdict: Schema.optional(
-    Schema.Union([
-      Schema.Boolean,
-      Schema.Struct({
-        approve: Schema.optional(Schema.String),
-        reject: Schema.optional(Schema.String),
-      }),
-    ]),
+    describe(
+      Schema.Union([
+        Schema.Boolean,
+        Schema.Struct({
+          approve: Schema.optional(Schema.String),
+          reject: Schema.optional(Schema.String),
+        }),
+      ]),
+      'true or an object with optional approve/reject (string button labels); false removes verdict buttons. Example: {"approve":"Deploy","reject":"Don\'t deploy"}.',
+    ),
   ),
   choose: Schema.optional(
-    Schema.Union([
-      Schema.Boolean,
-      Schema.Struct({
-        multi: Schema.optional(Schema.Boolean),
-        min: Schema.optional(Schema.Finite),
-        max: Schema.optional(Schema.Finite),
-      }),
-    ]),
+    describe(
+      Schema.Union([
+        Schema.Boolean,
+        Schema.Struct({
+          multi: Schema.optional(Schema.Boolean),
+          min: Schema.optional(Schema.Finite),
+          max: Schema.optional(Schema.Finite),
+        }),
+      ]),
+      'true or an object with optional multi (boolean), min/max (numbers) for picks from options; false removes picks. Example: {"multi":true,"min":1,"max":2}.',
+    ),
   ),
-  fields: Schema.optional(Schema.Array(AskFieldInput)),
-  edit: Schema.optional(Schema.Union([Schema.Boolean, Schema.String])),
+  fields: Schema.optional(
+    describe(
+      Schema.Array(AskFieldInput),
+      `A list of at most ${ASK_LIMITS.fields} objects with label (string), optional id/hint/unit (strings), type (text, longtext, number, date, datetime, toggle, select, rank, file, custom or secret), required/multi (booleans), default (JSON), min/max/maxFiles/block (numbers), accepts (list of strings) and options (list of strings or {id?: string, label: string}); custom uses block as the html block index, secret returns a one-use secretRef (24h, this thread only), and file returns a path. Example: [{"id":"reason","label":"Reason","type":"text","required":true},{"id":"scope","label":"Scope","type":"select","options":["Dev",{"id":"prod","label":"Production"}]}].`,
+    ),
+  ),
+  edit: Schema.optional(
+    describe(
+      Schema.Union([Schema.Boolean, Schema.String]),
+      'true or "draft" to edit the draft; requires draft, and false removes editing. Example: "draft".',
+    ),
+  ),
   task: Schema.optional(
-    Schema.Struct({
-      steps: Schema.optional(
-        Schema.Array(
-          Schema.Union([
-            Schema.String,
-            Schema.Struct({ text: Schema.String, link: Schema.optional(Schema.String) }),
-          ]),
+    describe(
+      Schema.Struct({
+        steps: Schema.optional(
+          Schema.Array(
+            Schema.Union([
+              Schema.String,
+              Schema.Struct({ text: Schema.String, link: Schema.optional(Schema.String) }),
+            ]),
+          ),
         ),
-      ),
-      proof: Schema.optional(Schema.String),
-    }),
+        proof: Schema.optional(Schema.String),
+      }),
+      `An object with optional steps (at most ${ASK_LIMITS.taskSteps} strings or {text: string, link?: string}) and proof (id of a required response field); he answers done or couldn't. Example: {"steps":["Check CI",{"text":"Review","link":"https://example.com/pr"}],"proof":"reason"}.`,
+    ),
   ),
-  ack: Schema.optional(Schema.Boolean),
+  ack: Schema.optional(
+    describe(
+      Schema.Boolean,
+      "true makes a notice with no other response parts; it cannot block. Example: true.",
+    ),
+  ),
 });
+
+const ASK_ACTION_DESCRIPTION = `An object with summary (string), optional command/target/undo/then (strings), and evidence (a list of strings, at most ${ASK_LIMITS.evidence}, each at most ${ASK_LIMITS.evidenceLine} characters); then says what you do once it is done. Example: {"summary":"Merge PR #512","evidence":["CI green on abc123","review passed"]}.`;
 
 /** What an asker writes on an ask beyond the question; card_ask_change edits the same fields. */
 const AskFieldsInput = {
@@ -431,7 +461,7 @@ const AskFieldsInput = {
           }),
         ]),
       ),
-      "Answers to pick from: a label, or {label, detail: what it is, consequence: what happens once picked, recommended: true on yours, block: index in blocks of the picture or page that shows it}. With kind rank: the items he puts in order.",
+      `A list of at most ${ASK_LIMITS.options} strings or objects with label (string), optional id/detail/consequence (strings), recommended (boolean), approves (list of existing subtask ids), and block (index of an existing block); with kind rank these are the items to order. Example: [{"id":"merge","label":"Merge","detail":"CI passed","recommended":true,"consequence":"Ships next release"}].`,
     ),
   ),
   multi: Schema.optional(
@@ -444,7 +474,7 @@ const AskFieldsInput = {
         format: Schema.optional(AskFormat),
         target: Schema.optional(Schema.String),
       }),
-      'The exact text you will post or send, and where (target, e.g. "comment on PR #512").',
+      'An object with text (string), optional format ("markdown" or "text") and target (string) for the exact text to post or send. Example: {"text":"Ready to merge.","format":"markdown","target":"comment on PR #512"}.',
     ),
   ),
   action: Schema.optional(
@@ -457,25 +487,25 @@ const AskFieldsInput = {
         undo: Schema.optional(Schema.String),
         then: Schema.optional(Schema.String),
       }),
-      "What you will do, the command, where, the proof it is ready, how to undo it, and what you do once it is done (then).",
+      ASK_ACTION_DESCRIPTION,
     ),
   ),
   change: Schema.optional(
     describe(
       AskChangeInput,
-      "A text being replaced (a tool description, a rule): what it is, the full text before and after.",
+      'An object with label, before and after (strings) for a text being replaced, plus optional format ("markdown" or "text"). Example: {"label":"Tool description","before":"Old text","after":"New text","format":"text"}.',
     ),
   ),
   changes: Schema.optional(
     describe(
       Schema.Array(AskChangeInput),
-      "Several texts replaced together, one {label, before, after} each (at most 8), e.g. one per file.",
+      `A list of at most ${ASK_LIMITS.changes} change objects, each with label/before/after (strings) and optional format ("markdown" or "text"). Example: [{"label":"Tool description","before":"Old text","after":"New text"}].`,
     ),
   ),
   respond: Schema.optional(
     describe(
       AskRespondInput,
-      'What he gives back, when it is more than the ask already implies (a draft implies edit + verdict, an action or change a verdict, options a pick, a bare question free text). Parts combine; each adds to the implied ones, false drops one. verdict: true or {approve, reject} for your own button labels ("Deploy" / "Don\'t deploy"). choose: {min, max} picks from options. fields (at most 8): [{id, label, type, required, hint, default}] with type text | longtext | number {unit, min, max} | date | datetime | toggle | select {options, multi} | rank {options} | file {accepts: ["image/*", ".csv"], maxFiles} | custom {block: index of the html block whose page produces the JSON value}. A secret {type: "secret"} is typed in a private field of the app and never stored: its answer gives you a one-use secretRef (24h, this thread only) to pass where a tool takes one. edit: true lets him edit your draft. task: {steps: ["...", {text, link}], proof: a field id he must fill when done}; he answers done or couldn\'t. ack: true makes it a notice (nothing else, never blocking). His values come back to you as "label: value" lines; a file as its path.',
+      `An object adding response parts to those implied by the ask (draft: edit + verdict, action/change: verdict, options: choose, bare question: free text); verdict, choose and edit accept false to remove that part, choose needs options, and edit needs a draft. Shapes (combine only the parts you need): {"verdict":{"approve":"Deploy","reject":"Don't deploy"},"choose":{"multi":false,"min":1,"max":1},"fields":[{"id":"reason","label":"Reason","type":"text"}],"edit":true,"task":{"steps":["Check CI",{"text":"Review","link":"https://example.com/pr"}],"proof":"reason"},"ack":false}; verdict also accepts true; Example: {"verdict":true}.`,
     ),
   ),
   to: Schema.optional(
@@ -499,7 +529,7 @@ const AskFieldsInput = {
   blocks: Schema.optional(
     describe(
       Schema.Array(KanbanBlockInput),
-      "Evidence shown inside the ask, in order (at most 12, 8 of them images or files): md {text}, collapse {title, text}, html {html, title, height}, image {url, alt}, attachment {attachment: {type image|file, id, name, mimeType, sizeBytes}} (id from t3_attachment_prepare_upload), card {cardId}. No choice blocks: answers go in options.",
+      `Evidence shown inside the ask, in order (at most ${ASK_LIMITS.blocks}, ${ASK_LIMITS.attachments} of them images or files); each image needs non-empty alt text, and answers go in options rather than choice blocks. ${BLOCKS_DESCRIPTION}`,
     ),
   ),
 };
@@ -544,7 +574,7 @@ const CardAskChange = tool(
           Schema.Literals(["block", "drop", "return"]),
           ...AskActionInput.schema.members,
         ]),
-        'An operation ("block", "drop" or "return"), or the new action body of an action ask.',
+        `An operation ("block", "drop" or "return"), or a new action body. ${ASK_ACTION_DESCRIPTION}`,
       ),
     ),
   },
