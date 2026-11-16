@@ -6,6 +6,11 @@ import * as Clock from "effect/Clock";
 import * as Fiber from "effect/Fiber";
 
 export const LONG_HOLD_MS = 5_000;
+export type UnverifiedReporterReason = "caller_unresolved" | "parent_not_active";
+export const reporterUnverified = Context.Reference<(reason: UnverifiedReporterReason) => void>(
+  "KanbanSavedWriteReporterUnverified",
+  { defaultValue: () => () => {} },
+);
 export type SubStep = { readonly subStep: string; readonly ms: number };
 
 export const subStepReporter = Context.Reference<(steps: ReadonlyArray<SubStep>) => void>(
@@ -120,6 +125,9 @@ export const traceObserver = Context.Reference<
       readonly span: Tracer.Span;
       readonly enter: (stage: Stage, fiberId: number) => () => void;
       readonly mark: (stage: Stage, fiberId: number) => void;
+      readonly observeLocks?: (
+        snapshot: (now: number) => Readonly<Record<string, unknown>>,
+      ) => () => void;
     }
   | undefined
 >("KanbanSavedWriteTrace", { defaultValue: () => undefined });

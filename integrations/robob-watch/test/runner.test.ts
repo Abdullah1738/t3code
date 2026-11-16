@@ -2,6 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { CheckSlots, type SlotEvent, type SlotTiming } from "../src/host.ts";
 
 // Drives the real runner and CLI against a sandbox root with stub bridge CLIs; nothing is sent anywhere.
 const sandbox = mkdtempSync(join(tmpdir(), "robob-watch-test-"));
@@ -421,7 +422,149 @@ test("checks run with bounded concurrency; queue time does not count against the
     expect(state(`conc${i}`).consecutive_failures).toBe(0);
     expect(state(`conc${i}`).last_run_ms).toBeGreaterThanOrEqual(900);
   }
+  const rows = readFileSync(join(env.TOOLLOG_DIR, new Date().toISOString().slice(0, 10) + ".ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  const admitted = rows.filter(row => row.name === "slot.start" && /^conc[1-4]$/.test(row.ids?.watcher));
+  expect(admitted).toHaveLength(4);
+  expect(admitted.filter(row => row.props.slotWaitMs >= 900)).toHaveLength(2);
+  expect(admitted.map(row => row.props.slotQueueDepth).sort()).toEqual([0, 0, 0, 1]);
+  expect(admitted.map(row => row.props.slotActiveAtEnqueue).sort()).toEqual([0, 1, 2, 2]);
 }, 20_000);
+
+test("slot telemetry measures four sleeping checks, names holders after 30s, and summarizes only a live backlog each minute", async () => {
+  let clock = 0;
+  const events: SlotEvent[] = [], timings: SlotTiming[] = [], release: (() => void)[] = [];
+  const slots = new CheckSlots(() => 2, { now: () => clock, emit: event => events.push(event) });
+  const jobs = ["one", "two", "three", "four"].map((watcher, i) => slots.run(async timing => {
+    timings[i] = timing;
+    await new Promise<void>(resolve => { release[i] = resolve; });
+  }, { watcher, dueAt: 0, intervalMs: 60_000 }));
+  await Promise.resolve();
+  for (clock of [29_999, 30_000, 59_999, 60_000, 119_999, 120_000]) slots.drain();
+  const waits = events.filter(event => event.name === "slot.wait");
+  expect(waits).toEqual(["three", "four"].map(watcher => ({ name: "slot.wait", request: { watcher, dueAt: 0, intervalMs: 60_000 }, waitMs: 30_000,
+    holders: [{ watcher: "one", elapsedMs: 30_000 }, { watcher: "two", elapsedMs: 30_000 }] })));
+  expect(events.filter(event => event.name === "slot.backlog")).toEqual([60_000, 120_000].map(elapsedMs => ({ name: "slot.backlog", depth: 2, oldestWaitMs: elapsedMs, active: 2, cap: 2,
+    holders: [{ watcher: "one", elapsedMs }, { watcher: "two", elapsedMs }] })));
+  clock = 130_000;
+  release[0]!(); release[1]!();
+  await Promise.all(jobs.slice(0, 2));
+  expect(timings).toEqual([
+    { slotWaitMs: 0, slotQueueDepth: 0, slotActiveAtEnqueue: 0, startLateMs: 0 },
+    { slotWaitMs: 0, slotQueueDepth: 0, slotActiveAtEnqueue: 1, startLateMs: 0 },
+    { slotWaitMs: 130_000, slotQueueDepth: 0, slotActiveAtEnqueue: 2, startLateMs: 130_000 },
+    { slotWaitMs: 130_000, slotQueueDepth: 1, slotActiveAtEnqueue: 2, startLateMs: 130_000 },
+  ]);
+  clock = 131_000;
+  release[2]!(); release[3]!(); await Promise.all(jobs);
+  const before = events.length;
+  clock = 300_000; slots.drain(); slots.drain();
+  expect(events).toHaveLength(before);
+  expect(events.filter(event => event.name === "slot.hold").reduce((sum, event) => sum + event.durationMs, 0)).toBe(262_000);
+  expect(events.filter(event => event.name === "slot.busy").reduce((sum, event) => sum + event.durationMs, 0)).toBe(131_000);
+});
+
+test("runner logs holder snapshots and one backlog summary, then adds slot wait and depth to slow runs", async () => {
+  const root = mkdtempSync(join(sandbox, "slots-"));
+  const child = Bun.spawn([process.execPath, "-e", `
+    import {mkdirSync,writeFileSync} from "node:fs";
+    import {join} from "node:path";
+    let clock=Date.now(); Date.now=()=>clock;
+    const {CheckSlots}=await import(${JSON.stringify(join(import.meta.dir, "../src/host.ts"))});
+    const run=CheckSlots.prototype.run; let limiter, count=0, queued;
+    const ready=new Promise(resolve=>queued=resolve);
+    CheckSlots.prototype.run=function(fn,request){limiter=this;const job=run.call(this,fn,request);if(++count===4)queued();return job};
+    const lib=await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
+    const ids=["one","two","three","four"];
+    for(const id of ids){
+      const dir=lib.watcherDir(id);mkdirSync(dir,{recursive:true});
+      writeFileSync(join(dir,"watcher.json"),JSON.stringify(lib.normalize({id,title:id,check:"sleep 0.2",mode:"notify",interval_s:600,max_fires:0})));
+      lib.saveState(id,{status:"active",fires:0,consecutive_failures:0});
+    }
+    const {tickOne}=await import(${JSON.stringify(join(import.meta.dir, "../src/runner.ts"))});
+    const jobs=ids.map(tickOne);await ready;
+    clock+=30_000;limiter.drain();clock+=30_000;limiter.drain();limiter.drain();
+    await Promise.all(jobs);clock+=60_000;limiter.drain();
+  `], { env: { ...env, ROBOB_WATCH_ROOT: join(root, "root"), TOOLLOG_DIR: join(root, "logs"), ROBOB_WATCH_MAX_CONCURRENT: "2" }, stdout: "pipe", stderr: "pipe" });
+  const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect(error).toBe(""); expect(code).toBe(0);
+  expect(output.match(/slot backlog:/g)).toHaveLength(1);
+  expect(output).toContain("slot backlog: depth 2, oldest 60.0s, active 2/2, holders [one:60.0s,two:60.0s]");
+  for (const id of ["three", "four"]) {
+    const log = readFileSync(join(root, "root/watchers", id, "log"), "utf8");
+    expect(log).toContain("slot wait passed 30s: slot_wait 30.0s, holders [one:30.0s,two:30.0s]");
+    expect(log).toContain(`slot_wait 60.0s, depth ${id === "three" ? 0 : 1}, active 2`);
+  }
+}, 10_000);
+
+test.each([
+  ["unchanged", "original"],
+  ["paused", undefined],
+  ["removed", undefined],
+  ["replaced instance", undefined],
+  ["pending disabled", undefined],
+  ["pending replaced", "replacement"],
+  ["closing", undefined],
+  ["reply handoff", undefined],
+] as const)("pending slot starts reflect admission after the relay lock: %s", async (change, ran) => {
+  const root = mkdtempSync(join(sandbox, "pending-slots-"));
+  const child = Bun.spawn([process.execPath, "-e", `
+    import {mkdirSync,readFileSync,writeFileSync,renameSync,existsSync} from "node:fs";
+    import {join} from "node:path";
+    import {Database} from "bun:sqlite";
+    let clock=Date.now(); Date.now=()=>clock;
+    const lib=await import(${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))});
+    const dir=lib.watcherDir("pending-admission"), marker=join(dir,"pending-ran");
+    mkdirSync(dir,{recursive:true});
+    const file=join(dir,"watcher.json");
+    writeFileSync(file,JSON.stringify(lib.normalize({id:"pending-admission",title:"Pending",check:"true",
+      pending_check:"printf original > "+JSON.stringify(marker),mode:"notify",interval_s:60,max_fires:0})));
+    lib.saveState("pending-admission",{status:"active",fires:0,consecutive_failures:0});
+    let armed=false, intercepted=false;
+    const {CheckSlots}=await import(${JSON.stringify(join(import.meta.dir, "../src/host.ts"))});
+    const run=CheckSlots.prototype.run;
+    CheckSlots.prototype.run=function(fn,request){return run.call(this,async timing=>{
+      if(request.operation==="pending") armed=true;
+      return fn(timing);
+    },request)};
+    const exec=Database.prototype.exec;
+    Database.prototype.exec=function(sql){
+      if(armed && sql==="BEGIN IMMEDIATE"){
+        armed=false;intercepted=true;clock+=90_000;
+        const watcher=lib.loadWatcher("pending-admission"), state=lib.loadState("pending-admission");
+        switch(${JSON.stringify(change)}){
+          case "paused":watcher.paused=true;break;
+          case "removed":renameSync(dir,dir+"-removed");break;
+          case "replaced instance":renameSync(dir,dir+"-old");mkdirSync(dir);break;
+          case "pending disabled":delete watcher.pending_check;break;
+          case "pending replaced":watcher.pending_check="printf replacement > "+JSON.stringify(marker);break;
+          case "closing":state.status="closing";break;
+          case "reply handoff":state.reply_handoff={run:"old",watcher};break;
+        }
+        if(${JSON.stringify(change)}!=="removed"){
+          writeFileSync(file,JSON.stringify(watcher));lib.saveState("pending-admission",state);
+        }
+      }
+      return exec.call(this,sql);
+    };
+    const {tickOne}=await import(${JSON.stringify(join(import.meta.dir, "../src/runner.ts"))});
+    await tickOne("pending-admission");
+    const {rollup}=await import(${JSON.stringify(join(import.meta.dir, "../src/toollog.ts"))});
+    const day=new Date().toISOString().slice(0,10);
+    const rows=readFileSync(join(process.env.TOOLLOG_DIR,day+".ndjson"),"utf8").trim().split("\\n").map(JSON.parse);
+    console.log(JSON.stringify({intercepted,ran:existsSync(marker)?readFileSync(marker,"utf8"):null,
+      starts:rows.filter(row=>row.name==="slot.start" && row.props.operation==="pending"),
+      watcher:(await rollup(day,process.env.TOOLLOG_DIR)).byWatcher["pending-admission"]}));
+  `], { env: { ...env, ROBOB_WATCH_ROOT: join(root, "root"), TOOLLOG_DIR: join(root, "logs") }, stdout: "pipe", stderr: "pipe" });
+  const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect(error).toBe(""); expect(code).toBe(0);
+  const result = JSON.parse(output.trim().split("\n").at(-1)!);
+  expect(result.intercepted).toBe(true);
+  expect(result.ran).toBe(ran ?? null);
+  expect(result.starts).toHaveLength(ran ? 1 : 0);
+  if (ran) expect(result.starts[0].props).toMatchObject({ slotWaitMs: 0, startLateMs: 90_000, intervalMs: 60_000 });
+  expect(result.watcher.slotWaitMs.count).toBe(ran ? 2 : 1);
+  expect(result.watcher.lateRuns).toBe(ran ? 1 : 0);
+}, 10_000);
 
 test("relays: one stop reaches every watcher of the trip, and ETA updates to a person are throttled", () => {
   const pam = { to: "120363@g.us", name: "Pam group", quote: "Keep Pam's group posted", at: "2026-10-19T04:00:00Z" };

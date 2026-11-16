@@ -1428,9 +1428,16 @@ const handlers = {
   card_thread: McpToolAccess.actsAsCaller((input) =>
     asEvaluator((service, caller) =>
       Effect.gen(function* () {
+        if (input.text !== undefined && input.message !== undefined && input.text !== input.message)
+          return yield* invalid("text and message must match; pass only one", "invalid_args");
         const card = yield* cardFor(service, caller, input.card, input.boardId);
         return {
-          card: yield* service.cardThread(card.id, input.action, input.text ?? "", caller.actor),
+          card: yield* service.cardThread(
+            card.id,
+            input.action,
+            input.text ?? input.message ?? "",
+            caller.actor,
+          ),
         };
       }),
     ),
@@ -1626,16 +1633,38 @@ const handlers = {
     ),
   ),
 
-  report_bug: McpToolAccess.actsAsCaller((input) =>
-    withCaller((service, caller) =>
-      service.reportBug({
-        boardId: input.boardId,
-        title: input.title,
-        evidence: input.evidence,
-        cardHint: input.cardHint,
-        threadId: caller.threadId,
-      }),
-    ),
+  report_bug: McpToolAccess.reportsBug((input, reporter) =>
+    Effect.gen(function* () {
+      yield* SavedWrite.linkReply();
+      const service = yield* KanbanService;
+      if (reporter.unverifiedReason !== undefined) {
+        const observe = yield* SavedWrite.reporterUnverified;
+        observe(reporter.unverifiedReason);
+      }
+      const result = yield* service.agentCall(
+        reporter.threadId,
+        SavedWrite.mutating(
+          service.reportBug({
+            boardId: input.boardId,
+            title: input.title,
+            evidence: input.evidence,
+            cardHint: input.cardHint,
+            threadId: reporter.threadId,
+            callerUnverifiedReason: reporter.unverifiedReason,
+          }),
+        ),
+      );
+      return {
+        ...result,
+        callerVerified: reporter.unverifiedReason === undefined,
+        ...(reporter.unverifiedReason === undefined
+          ? {}
+          : {
+              callerUnverifiedReason: reporter.unverifiedReason,
+              message: `Saved with an unverified caller; reporter unverified (${reporter.unverifiedReason}).`,
+            }),
+      };
+    }).pipe(Effect.catchTags({ KanbanError: (error) => Effect.fail(toolFailure(error)) })),
   ),
 
   evaluator_status: McpToolAccess.readsAsCaller((input) =>

@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Clock from "effect/Clock";
 import * as Option from "effect/Option";
+import * as References from "effect/References";
 import { McpSchema } from "effect/ai";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
@@ -42,6 +43,10 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const totals = new Map<SavedWrite.Stage, number>();
   let stageAtTimeout: SavedWrite.Stage | null = null;
   let timerLatenessMs: number | null = null;
+  const lockSnapshots = new Map<symbol, (now: number) => Readonly<Record<string, unknown>>>();
+  let timeoutLocks: Readonly<Record<string, unknown>> = {};
+  let timeoutElapsedMs = 0;
+  let timeoutObservedAtMs = 0;
   let closed = false;
   const updateStage = () => {
     if (closed) return;
@@ -77,6 +82,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   let slowSubSteps: ReadonlyArray<SavedWrite.SubStep> = [];
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
+  let unverifiedReporter: SavedWrite.UnverifiedReporterReason | undefined;
   let reportLookup: SavedWrite.ReportLookup | undefined;
   // raceFirst joins cancellation before replying. Evaluator admissions and bug
   // sightings publish their receipt inside the masked write, including queue-only saves.
@@ -121,8 +127,11 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
               : tool === "report_bug" && reportLookup !== undefined
                 ? { lookup: reportLookup }
                 : {};
+    if (tool === "report_bug" && unverifiedReporter !== undefined) {
+      Object.assign(details, { callerVerified: false, callerUnverifiedReason: unverifiedReporter });
+    }
     const saved = savedState();
-    const message =
+    const savedMessage =
       saved === false
         ? tool === "evaluator_start"
           ? "Not saved; evaluator not started. Safe to retry with the same arguments."
@@ -156,8 +165,39 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
               : receipt === undefined
                 ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
                 : "Saved; card_get for details.";
+    const message =
+      tool === "report_bug" && saved === true && unverifiedReporter !== undefined
+        ? `${savedMessage} Saved with an unverified caller; reporter unverified (${unverifiedReporter}).`
+        : savedMessage;
     const fields = attributes();
     return Effect.annotateCurrentSpan(fields).pipe(
+      Effect.andThen(
+        timedOut && saved === false
+          ? Effect.suspend(() => {
+              const diagnostics = {
+                "board.observed_at_ms": timeoutObservedAtMs,
+                "board.waiter": tool,
+                "board.id": call._tag === "Some" ? (call.value.boardId ?? null) : null,
+                "board.card_id": call._tag === "Some" ? (call.value.cardId ?? null) : null,
+                "board.waiting_on": null,
+                "board.waited_ms": timeoutElapsedMs,
+                "board.holders": [],
+                "board.blockers": [],
+                ...timeoutLocks,
+                "board.reply_phase": stageAtTimeout,
+                "board.reply_elapsed_ms": timeoutElapsedMs,
+              };
+              return Effect.logWarning(
+                // Fixed diagnostic fields, as in the lock-admission refusal logger.
+                // @effect-diagnostics-next-line preferSchemaOverJson:off
+                JSON.stringify({ event: "kanban board write refused", ...diagnostics }),
+              ).pipe(
+                Effect.annotateLogs({ ...diagnostics, "board.lock_log": true }),
+                Effect.provideService(References.MinimumLogLevel, "Warn"),
+              );
+            })
+          : Effect.void,
+      ),
       Effect.andThen(
         Effect.logWarning("kanban saved write reply unavailable", {
           timedOut,
@@ -185,7 +225,19 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const work = effect.pipe(
     // Interactive pre-write reads must not queue behind tick and maintenance scans.
     (effect) => (timingOnly ? effect : NodeSqliteClient.foregroundReads(effect)),
-    Effect.provideService(SavedWrite.traceObserver, { span, enter, mark }),
+    Effect.provideService(SavedWrite.traceObserver, {
+      span,
+      enter,
+      mark,
+      // Cleared together with stage tracking by SavedWrite.background.
+      observeLocks: (snapshot) => {
+        const token = Symbol();
+        lockSnapshots.set(token, snapshot);
+        return () => {
+          lockSnapshots.delete(token);
+        };
+      },
+    }),
     Effect.provideService(SavedWrite.subStepReporter, (steps) => {
       slowSubSteps = [...slowSubSteps, ...steps].sort((a, b) => b.ms - a.ms).slice(0, 3);
       span.attribute("kanban.reply.sub_steps", slowSubSteps);
@@ -198,6 +250,9 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     Effect.provideService(SavedWrite.reportLookupObserver, (lookup) => {
       reportLookup = lookup;
       parentLookup(lookup);
+    }),
+    Effect.provideService(SavedWrite.reporterUnverified, (reason) => {
+      unverifiedReporter = reason;
     }),
     Effect.provideService(SavedWrite.commitObserver, () => {
       commitStarted = true;
@@ -255,6 +310,9 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     Effect.andThen(
       Effect.sync(() => {
         stageAtTimeout = stage;
+        timeoutElapsedMs = elapsed();
+        timeoutObservedAtMs = clock.currentTimeMillisUnsafe();
+        timeoutLocks = [...lockSnapshots.values()].at(-1)?.(timeoutObservedAtMs) ?? {};
         timerLatenessMs = Math.max(0, elapsed() - scheduledAt - REPLY_BUDGET_MS);
       }),
     ),

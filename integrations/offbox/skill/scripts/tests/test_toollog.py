@@ -135,8 +135,47 @@ class Logs(unittest.TestCase):
         self.assertEqual(len(result['topErrors']),20)
         self.assertEqual(result['topErrors'][0]['sampleIds'], {'run':'run-fixture'})
         self.assertEqual(result['malformedLines'],1)
+        self.assertFalse(result['sampled'])
         self.assertEqual(next(self.root.glob('rollup-*')).stat().st_mode & 0o777,0o600)
         with self.assertRaises(ValueError): toollog.rollup('../2026-01-01')
+
+    def test_rollup_weights_sampled_counts_and_rates_but_not_percentiles(self):
+        for ms, sampled, failed in ((1, True, False), (2, True, False), (3, True, True),
+                                    (4, False, False), (5, False, True)):
+            toollog.emit('gate', 'gate.decision', kind='error' if failed else 'perf',
+                         ok=not failed, duration_ms=ms, props={'sample': 20} if sampled else {},
+                         tag='gate_failed' if failed else None)
+        path = next(self.root.glob('*.ndjson'))
+        result = toollog.rollup(path.stem)
+        self.assertEqual(result['total'], 62)
+        self.assertEqual(result['countsByName'], {'gate.decision': 62})
+        self.assertEqual(result['countsByKind'], {'perf': 41, 'error': 21})
+        self.assertTrue(result['sampled'])
+        self.assertAlmostEqual(result['okRate'], 41/62)
+        self.assertAlmostEqual(result['errorRate'], 21/62)
+        self.assertEqual(result['topErrors'][0]['count'], 21)
+        self.assertEqual(result['durationMs']['gate.decision'], {'p50': 3, 'p95': 5, 'max': 5})
+        self.assertEqual(result['malformedLines'], 0)
+
+    def test_rollup_defaults_invalid_sample_weights_to_one(self):
+        weights = (None, True, False, 0, -20, 2.5, '20', [], {})
+        self.root.mkdir()
+        path = self.root / '2026-11-14.ndjson'
+        path.write_text(''.join(json.dumps({'tool': 'offbox', 'name': 'gate.decision', 'kind': 'perf',
+                                           'ok': True, 'props': {'sample': weight}}) + '\n' for weight in weights))
+        result = toollog.rollup(path.stem)
+        self.assertEqual(result['total'], len(weights))
+        self.assertFalse(result['sampled'])
+        self.assertEqual(result['okRate'], 1)
+        self.assertEqual(result['malformedLines'], 0)
+
+    def test_rollup_weights_only_explicit_ok_values_in_ok_rate(self):
+        toollog.emit('gate', 'gate.decision', kind='perf', props={'sample': 20})
+        toollog.emit('gate', 'gate.decision', kind='error', ok=False, tag='gate_failed')
+        result = toollog.rollup(next(self.root.glob('*.ndjson')).stem)
+        self.assertEqual(result['total'], 21)
+        self.assertEqual(result['okRate'], 0)
+        self.assertAlmostEqual(result['errorRate'], 1/21)
 
     def test_rollup_cli_and_first_recurring_tick_after_0005(self):
         toollog.emit('run','run.request',ok=True)

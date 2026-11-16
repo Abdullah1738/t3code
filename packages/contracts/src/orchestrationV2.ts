@@ -3218,6 +3218,8 @@ export const OrchestrationV2Command = Schema.Union([
     parentRunId: RunId,
     parentNodeId: NodeId,
     task: TrimmedNonEmptyString,
+    parentAdmittedAt: Schema.optional(Schema.DateTimeUtc),
+    parentProviderSessionId: Schema.optional(ProviderSessionId),
     idleTimeoutMs: Schema.optional(Schema.Finite),
     title: Schema.optional(TrimmedNonEmptyString),
     modelSelection: ModelSelection,

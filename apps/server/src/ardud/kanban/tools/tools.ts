@@ -623,7 +623,7 @@ const BoardStandingApproval = tool(
 const CardWait = tool(
   "card_wait",
   "Say what a card waits on",
-  "Set the one thing a card waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only. A worker can set a wait on its own card while running; it takes effect when the turn ends, so end the turn right after. For a PR's CI, call watch_pull_request and end the turn instead." +
+  "Set the one thing a card waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only. A worker in Working can park its own card while running with on: time (until required, at most 24 hours ahead), script, or card. Set it as your last act and end the turn; it survives turn end. Clear it if a durable watcher, offbox result or another wake reaches you first. Workers cannot use push, merge, ci or owner_go while Working: use watch_pull_request for PR waits, or card_ask for the owner's answer." +
     (WAITS_ENGINE_WIRED
       ? ""
       : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner."),
@@ -649,7 +649,7 @@ const CardWait = tool(
     until: Schema.optional(
       describe(
         TrimmedNonEmptyString,
-        "time: when it ends (ISO 8601, at most 30 days ahead). Other kinds: your own deadline, after which the card shows as stuck.",
+        "time: when it ends (ISO 8601, at most 24 hours ahead for a Working worker parking itself, otherwise 30 days). Other kinds: your own deadline, after which the card shows as stuck.",
       ),
     ),
     head: Schema.optional(
@@ -914,12 +914,15 @@ const SubtaskDone = tool(
 const CardThread = tool(
   "card_thread",
   "Steer, stop, wake or reset a card thread",
-  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it.",
+  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it. Steer and wake require non-blank text. message is an alias for text; if both are supplied, they must match.",
   {
     boardId: BoardRef,
     card: CardRef,
     action: Schema.Literals(["steer", "stop", "wake", "reset"]),
     text: Schema.optional(Schema.String),
+    message: Schema.optional(
+      describe(Schema.String, "Alias for text; if both are supplied, they must match."),
+    ),
   },
   { card: Record },
   { readonly: false, destructive: true },
@@ -1073,6 +1076,11 @@ const ReportBug = tool(
   },
   {
     appendedTo: Schema.optional(TrimmedNonEmptyString),
+    callerVerified: Schema.optional(Schema.Boolean),
+    callerUnverifiedReason: Schema.optional(
+      Schema.Literals(["caller_unresolved", "parent_not_active"]),
+    ),
+    message: Schema.optional(Schema.String),
     deduped: Schema.optional(Schema.Boolean),
     candidates: Schema.optional(Records),
     threadId: Schema.optional(TrimmedNonEmptyString),

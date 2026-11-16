@@ -92,7 +92,7 @@ function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; g
 }
 
 const stores: Store[] = [];
-afterEach(() => { for (const store of stores.splice(0)) store.db.close(); });
+afterEach(() => { setSystemTime(); for (const store of stores.splice(0)) store.db.close(); });
 
 test.each(["owner", "dm", "group"] as const)("%s skips an oversized file without directing non-owner files to the Mac", async kind => {
   const h = setup(context(kind), { quietMs: 0 });
@@ -205,6 +205,11 @@ test("group prompts say app cards are not available, owner and Moni keep the app
   const group = sendblueContextPrompt(context("group"), false, []);
   expect(group).toContain("app cards are not available in groups");
   expect(group).not.toContain("App cards still work");
+  expect(group).toContain("you have no private tools");
+  expect(group).toContain("ask quietly with `agent-ask --to owner` or `--to moni`");
+  expect(group).toContain("Answer in the group yourself once the answer arrives.");
+  expect(group).toContain("Don't say you're asking another assistant.");
+  expect(group).toContain("Never post private details unless the person they belong to asked for them here.");
   expect(sendblueContextPrompt(context("owner"), false, [])).toContain("App cards still work (`app`)");
   expect(sendblueContextPrompt(context("dm"), false, [])).toContain("App cards still work (`app`)");
 });
@@ -236,6 +241,7 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(admin).not.toContain("Other chats can't be reached from here");
   expect(admin).toContain("agent-answer --request");
   expect(admin).toContain("groups = no private data.");
+  expect(admin).toContain("Requests from a group include its members; answer for that audience.");
   const person = sendblueContextPrompt(context("dm", { roleOf: address => ({ name: address, role: "person" }) }), false, []);
   expect(person).not.toContain("send --to");
   expect(person).not.toContain("Agent bus:");
@@ -252,9 +258,21 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(owner).toContain("send --to <slug>");
   expect(owner).not.toContain("ask-owner");
   expect(owner).toContain("Agent bus:");
+  expect(owner).toContain("Requests from a group include its members; answer for that audience.");
   expect(owner).toContain("agent-requests --session CURRENT_SESSION_ID");
   expect(owner).toContain("owner = Abdullah's assistant on his Mac:");
   expect(owner).toContain("moni = Moni's assistant:");
+});
+
+test.each(["final", "tool"] as const)("group quiet asks remain available on background turns in %s mode", mode => {
+  const group = sendblueContextPrompt(context("group"), false, [], true, mode);
+  expect(group).toContain("ask quietly with `agent-ask --to owner` or `--to moni`");
+  expect(group).toContain("you have no private tools");
+  for (const kind of ["owner", "dm"] as const) {
+    const dm = sendblueContextPrompt(context(kind), false, [], true, mode);
+    expect(dm).not.toContain("Group requests:");
+    expect(dm).toContain("Requests from a group include its members; answer for that audience.");
+  }
 });
 
 test("other chats' prompts say who reads background replies and keep agent talk out of them", () => {

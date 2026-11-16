@@ -1,3 +1,4 @@
+import * as ProviderProcessRegistry from "./ardud/providers/ProviderProcessRegistry.ts";
 import { emptyDelegatedRecoveryCounts } from "./ardud/observability/StartupPhaseLog.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
@@ -104,6 +105,7 @@ it.effect.each([
       };
       const imports = { importedThreadCount: 0, importedMessageCount: 0 };
       const dependencies = Layer.mergeAll(
+        ProviderProcessRegistry.ProviderProcessRegistry.layerTest,
         NodeCrypto.layer,
         Path.layer,
         FileSystem.layerNoop({}),
@@ -365,13 +367,14 @@ it.effect("starts without scanning or rebuilding projection history", () =>
     const record = (label: string) => Ref.update(calls, (current) => [...current, label]);
 
     const result = yield* ServerRuntimeStartup.runOrderedV2StartupPhases({
+      reapProviderProcesses: record("reap"),
       importLegacyShells: record("import"),
       recover: record("recover").pipe(Effect.as({ closedRequests: 2 })),
       startEffectWorker: record("worker"),
       autoBootstrap: record("bootstrap").pipe(Effect.as({ projectId: "project-1" })),
     });
 
-    assert.deepEqual(yield* Ref.get(calls), ["recover", "import", "worker", "bootstrap"]);
+    assert.deepEqual(yield* Ref.get(calls), ["reap", "recover", "import", "worker", "bootstrap"]);
     assert.deepEqual(result, {
       recovery: { closedRequests: 2 },
       bootstrap: { projectId: "project-1" },
@@ -652,4 +655,25 @@ it.effect("closes admissions again after a ready server begins shutdown", () =>
       );
     }),
   ),
+);
+
+it.effect("does not recover or dispatch when orphan reaping fails", () =>
+  Effect.gen(function* () {
+    const calls: string[] = [];
+    const record = (label: string) =>
+      Effect.sync(() => {
+        calls.push(label);
+      });
+    const exit = yield* Effect.exit(
+      ServerRuntimeStartup.runOrderedV2StartupPhases({
+        reapProviderProcesses: Effect.die("cannot establish process identity"),
+        recover: record("recover"),
+        importLegacyShells: record("import"),
+        startEffectWorker: record("worker"),
+        autoBootstrap: record("bootstrap"),
+      }),
+    );
+    assert.equal(exit._tag, "Failure");
+    assert.deepEqual(calls, []);
+  }),
 );

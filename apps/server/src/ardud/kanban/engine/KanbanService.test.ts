@@ -10441,6 +10441,65 @@ it.effect.each(["todo", "needs_review"] as const)(
     }),
 );
 
+it.effect.each(
+  (["steer", "wake"] as const).flatMap((action) =>
+    ["", " ", "\n\t\u00a0"].map((text) => ({ action, text })),
+  ),
+)("card_thread refuses blank text without side effects (%j)", ({ action, text }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const created = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const before = yield* kanban.card(created.id);
+      const sends = fake.sends.length;
+      const error = yield* kanban.cardThread(created.id, action, text, owner).pipe(Effect.flip);
+      assert.strictEqual(error.code, "invalid");
+      assert.strictEqual(error.detail, `${action} needs text: pass the message as text`);
+      assert.strictEqual(fake.sends.length, sends);
+      assert.deepStrictEqual(yield* kanban.card(created.id), before);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each([false, true])(
+  "card_thread steer delivers exact text and logs it (running=%s)",
+  (running) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+        yield* kanban.dispatchNow;
+        const card = (yield* kanban.card(created.id)).card;
+        const thread = (yield* Ref.get(fake.threads)).get(card.activeThreadId!)!;
+        thread.running = running;
+        const before = [...thread.messages];
+        const text = "  Keep the exact spacing.\nUse juno.  ";
+        yield* kanban.cardThread(card.id, "steer", text, owner);
+        assert.deepStrictEqual(thread.messages, [...before, text]);
+        const events = (yield* kanban.card(card.id)).events;
+        assert.strictEqual(events.at(-1)?.body, `Steered: ${text}`);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("card_thread does not log a steer when delivery fails", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const card = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
+      yield* kanban.dispatchNow;
+      const before = yield* kanban.card(card.id);
+      fake.rejectSends.add(before.card.activeThreadId!);
+      yield* kanban.cardThread(card.id, "steer", "Do this", owner).pipe(Effect.flip);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).events, before.events);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
 it.effect("a card restarted on a new thread keeps what it was woken with", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;
@@ -20328,6 +20387,145 @@ it.effect("an evaluator that fails twice is replaced in its discussion", () =>
       assert.isNotNull((yield* kanban.discussion(channel.id)).evaluatorThreadId);
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
+);
+
+it.effect.each(["discussion", "request", "card", "replaced discussion"] as const)(
+  "a safeguard refusal replaces a $0 evaluator on fresh Sol xhigh without a same-model retry",
+  (kind) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const opus = modelSelectionOf({
+          instanceId: "claudeAgent",
+          model: "claude-opus-5-5",
+          variant: "high",
+        });
+        yield* kanban.updateBoard(board.id, { evaluatorModel: opus });
+        const card =
+          kind === "card"
+            ? yield* kanban.createCard(board.id, { title: "Audit", prompt: "Audit" }, owner)
+            : null;
+        const channel =
+          kind === "request"
+            ? null
+            : card
+              ? yield* kanban.cardDiscussion(card.id)
+              : yield* kanban.createDiscussion(board.id, "Audit", owner);
+        if (channel)
+          yield* kanban.post(channel.id, owner, [{ _tag: "md", text: "Read the audit" }]);
+        let before = channel
+          ? (yield* kanban.discussion(channel.id)).evaluatorThreadId!
+          : yield* kanban.startEvaluator(board.id, { kind: "request", text: "Read the audit" });
+        if (kind === "replaced discussion") {
+          fake.failures.set(before, stopping);
+          yield* kanban.turnEnded(before);
+          yield* TestClock.adjust("2 minutes");
+          yield* kanban.tick;
+          fake.failures.set(before, { ...(stopping as object) } as never);
+          yield* kanban.turnEnded(before);
+          before = (yield* kanban.discussion(channel!.id)).evaluatorThreadId!;
+        }
+        fake.failures.set(before, {
+          class: "provider_error",
+          code: "model_refusal",
+          category: "content_filter",
+          message:
+            "claude-opus-5-5 safeguards flagged this session [cyber]; the fallback model claude-opus-4-8 failed (HTTP 404).",
+        } as never);
+        yield* kanban.turnEnded(before);
+        yield* kanban.turnEnded(before);
+        yield* TestClock.adjust("3 minutes");
+        yield* kanban.tick;
+        if (card) {
+          assert.isFalse(
+            [...(yield* Ref.get(fake.threads)).values()].some(
+              (thread) => thread.model.model === "gpt-6.1-sol",
+            ),
+          );
+          yield* TestClock.adjust("8 minutes");
+          yield* kanban.tick;
+        }
+        const all = yield* Ref.get(fake.threads);
+        const replacements = [...all.entries()].filter(
+          ([id, t]) => id !== before && t.model.model === "gpt-6.1-sol",
+        );
+        assert.lengthOf(replacements, 1);
+        const [after, replacement] = replacements[0]!;
+        assert.notEqual(after, before);
+        assert.equal(replacement.model.instanceId, "codex");
+        assert.deepEqual(replacement.model.options, [
+          { id: "reasoningEffort", value: "xhigh" },
+          { id: "serviceTier", value: "default" },
+        ]);
+        assert.include(replacement.messages.join("\n"), before);
+        assert.isFalse(
+          all.get(before)!.messages.some((text) => text.includes("one automatic retry")),
+        );
+        assert.deepEqual(
+          (yield* kanban.boards).find((b) => b.id === board.id)!.evaluatorModel,
+          opus,
+        );
+        if (channel) assert.equal((yield* kanban.discussion(channel.id)).evaluatorThreadId, after);
+        else {
+          const errors = (yield* kanban.discussions(board.id)).find(
+            (d) => d.title === "Evaluator errors",
+          )!;
+          const notice = lastText(yield* kanban.messages(errors.id));
+          assert.include(notice, "safeguard refusal [cyber] on claude-opus-5-5");
+          assert.notInclude(notice, "one retry didn't help");
+        }
+        fake.failures.set(after, {
+          class: "provider_error",
+          code: "model_refusal",
+          category: "content_filter",
+          message: "Sol safeguards refused the request [cyber]",
+        } as never);
+        yield* kanban.turnEnded(ThreadId.make(after));
+        yield* TestClock.adjust("11 minutes");
+        yield* kanban.tick;
+        assert.lengthOf(
+          [...(yield* Ref.get(fake.threads)).values()].filter(
+            (thread) => thread.model.model === "gpt-6.1-sol",
+          ),
+          1,
+        );
+        assert.isFalse(
+          (yield* Ref.get(fake.threads))
+            .get(after)!
+            .messages.some((text) => text.includes("one automatic retry")),
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(["Provider turn failed.", "HTTP 503 upstream unavailable"])(
+  "an ordinary evaluator failure still gets one automatic retry: %s",
+  (message) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const threadId = yield* kanban.startEvaluator(board.id, {
+          kind: "request",
+          text: "Read it",
+        });
+        fake.failures.set(threadId, {
+          class: "provider_error",
+          code: null,
+          category: "unknown",
+          message,
+        } as never);
+        yield* kanban.turnEnded(threadId);
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.tick;
+        const messages = (yield* Ref.get(fake.threads)).get(threadId)!.messages;
+        assert.lengthOf(
+          messages.filter((text) => text.includes("one automatic retry")),
+          1,
+        );
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect("a full context replaces the evaluator without a retry", () =>
@@ -32360,7 +32558,12 @@ it.effect.each(pendingContextActions)(
         );
         yield* kanban.cardThread(card.id, "wake", "Owner says use 2%", owner);
         yield* kanban.markSubtask(card.id, "s1", "done", "QA replied", owner, "evaluator");
-        yield* kanban.cardThread(card.id, action, text, owner);
+        if (action === "wake" && !text.trim()) {
+          const before = yield* kanban.card(card.id);
+          const refused = yield* kanban.cardThread(card.id, action, text, owner).pipe(Effect.flip);
+          assert.strictEqual(refused.code, "invalid");
+          assert.deepStrictEqual(yield* kanban.card(card.id), before);
+        } else yield* kanban.cardThread(card.id, action, text, owner);
         yield* kanban.dispatchNow;
         const running = (yield* kanban.card(card.id)).card;
         assert.strictEqual(running.stage, "working");
@@ -32406,7 +32609,12 @@ it.effect.each(pendingContextActions)(
         yield* kanban.reviewResult(reviewer, "findings", ["Reject negative rates before saving"]);
         yield* setRunning(fake, worker, false);
         yield* TestClock.adjust(1);
-        yield* kanban.cardThread(card.id, action, text, owner);
+        if (action === "wake" && !text.trim()) {
+          const before = yield* kanban.card(card.id);
+          const refused = yield* kanban.cardThread(card.id, action, text, owner).pipe(Effect.flip);
+          assert.strictEqual(refused.code, "invalid");
+          assert.deepStrictEqual(yield* kanban.card(card.id), before);
+        } else yield* kanban.cardThread(card.id, action, text, owner);
         yield* kanban.dispatchNow;
         const running = (yield* kanban.card(card.id)).card;
         assert.strictEqual(running.stage, "working");

@@ -275,7 +275,12 @@ class CrpkoSetupTests(unittest.TestCase):
         self.state = dict(vector='0.50.0', aws='2.99.0', terraform='1.16.1', ruby='3.3.0', time='GNU', gh='2.45.0')
         for tool in ('curl','sudo','tar','unzip','uname','readlink','dpkg-query','timeout','sleep',*self.state):
             shutil.copy(self.fake, self.bin/tool)
-        (self.bin/'python3').symlink_to(sys.executable)
+        python = self.bin/'python3'
+        python.write_text('#!'+sys.executable+'\nimport os,sys\nfrom pathlib import Path\n'
+                          'if any(a.endswith("/terraform-dev.yml") for a in sys.argv[1:]):\n'
+                          '    with (Path.home()/"pin-reads").open("a") as stream: stream.write("parse\\n")\n'
+                          'os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n')
+        python.chmod(0o755)
         flock = self.bin/'flock'
         flock.write_text('#!'+sys.executable+'\nimport fcntl,sys\nfcntl.flock(int(sys.argv[-1]),fcntl.LOCK_EX)\n')
         flock.chmod(0o755)
@@ -824,18 +829,84 @@ class CrpkoSetupTests(unittest.TestCase):
         self.assertIn('terraform_1.17.2_linux_amd64.zip',self.calls())
 
     def test_ci_pin_forms_and_conflicts(self):
-        for value in ['1.16.1',"'1.16.1'",'"1.16.1" # current']:
+        for value in ['1.16.1',"'1.16.1'",'"1.16.1" # current',
+                      '1.16.1\nterraform_version: 1.16.1']:
             with self.subTest(value=value):
                 self.workflow.write_text('  terraform_version: '+value+'\n')
                 self.assert_ok(self.run_setup())
-        for value in ['', 'terraform_version: latest\n', 'terraform_version: '+chr(34)+'1.16.1'+chr(39)+'\n',
-                      'terraform_version: 1.16.1\nterraform_version: 1.17.0\n']:
+        for value,reason in [
+            ('', 'no literal terraform_version'),
+            ('terraform_version: latest\n', 'no literal terraform_version'),
+            ('terraform_version: "${{ inputs.version }}"\n', 'no literal terraform_version'),
+            ('terraform_version: '+chr(34)+'1.16.1'+chr(39)+'\n', 'no literal terraform_version'),
+            ('terraform_version: 1.17.0\nterraform_version: 1.16.1\n', 'several pins 1.16.1,1.17.0'),
+        ]:
             with self.subTest(value=value):
                 self.workflow.write_text(value)
+                before=self.calls()
                 result=self.run_setup()
-                self.assertEqual(result.returncode,98,result.stderr)
-                self.assertIn('unambiguous literal CI pin',result.stderr)
-                self.assertNotIn('USER_COMMAND',result.stdout)
+                self.assert_ok(result)
+                self.assert_terraform_skipped(result,reason)
+                self.assertEqual(self.calls(),before)
+
+    def assert_terraform_skipped(self, result, reason):
+        warning=('offbox: Terraform skipped: '+reason+' in .github/workflows/terraform-dev.yml; '
+                 'commands that need terraform will fail')
+        self.assertEqual(result.stderr.count(warning),1,result.stderr)
+        self.assertEqual(result.stderr.count('Terraform skipped:'),1,result.stderr)
+        self.assertNotIn('offbox-repo-setup-failed',result.stderr)
+        env=(self.home/'.offbox/repo-env/crpko-devops.sh').read_text()
+        self.assertIn('export OFFBOX_TERRAFORM_STATE=skipped\n',env)
+        self.assertIn('unset TERRAFORM_PROVIDER_MIRROR\n',env)
+
+    def test_missing_or_ambiguous_pin_skips_all_terraform_work_on_cold_and_warm_box(self):
+        cases=[('', 'no literal terraform_version'),
+               ('terraform_version: 1.16.1\nterraform_version: 1.17.0\n', 'several pins 1.16.1,1.17.0')]
+        for value,reason in cases:
+            with self.subTest(value=value):
+                self.workflow.write_text(value)
+                self.missing('terraform')
+                self.missing('ruby')
+                self.lock('dev',{'aws':'5.100.0'})
+                for _ in range(2):
+                    before=self.calls()
+                    reads=(self.home/'pin-reads').read_text().count('parse') if (self.home/'pin-reads').exists() else 0
+                    result=self.run_setup(command='echo USER_COMMAND; command -v aws ruby vector; '
+                        'test "$OFFBOX_TERRAFORM_STATE" = skipped; test -z "${TERRAFORM_PROVIDER_MIRROR:-}"')
+                    self.assert_ok(result)
+                    self.assert_terraform_skipped(result,reason)
+                    self.assertEqual((self.home/'pin-reads').read_text().count('parse'),reads+1)
+                    calls=self.calls()[len(before):]
+                    self.assertNotIn('terraform',calls)
+                    self.assertFalse((self.bin/'terraform').exists())
+                    self.assertFalse((self.home/'.offbox/tf-provider-mirror').exists())
+                    self.assertFalse((self.home/'.terraformrc').exists())
+                    self.assertEqual(self.run_check().returncode,0)
+                self.assertIn('apt-get install -y -qq ruby',self.calls())
+
+    def test_skipped_then_valid_pin_installs_and_mirrors_on_same_box(self):
+        self.workflow.write_text('steps:\n  - uses: hashicorp/setup-terraform@v3\n')
+        self.missing('terraform')
+        self.lock('dev',{'aws':'5.100.0'})
+        self.assert_ok(self.run_setup(command='echo USER_COMMAND'))
+        self.pin('1.16.1')
+        self.assertNotEqual(self.run_check().returncode,0)
+        reads=(self.home/'pin-reads').read_text().count('parse')
+        self.assert_ok(self.run_setup())
+        self.assertEqual((self.home/'pin-reads').read_text().count('parse'),reads+1)
+        self.assertIn('terraform_1.16.1_linux_amd64.zip',self.calls())
+        self.assertTrue(self.mirror_package('aws','5.100.0').exists())
+        self.assertIn('export OFFBOX_TERRAFORM_STATE=1.16.1\n',
+                      (self.home/'.offbox/repo-env/crpko-devops.sh').read_text())
+        self.assertEqual(self.run_check().returncode,0)
+
+    def test_missing_workflow_skips_and_preserves_command_exit(self):
+        self.workflow.unlink()
+        self.missing('terraform')
+        result=self.run_setup(command='echo USER_COMMAND; exit 7')
+        self.assertEqual(result.returncode,7,result.stderr)
+        self.assertIn('USER_COMMAND',result.stdout)
+        self.assert_terraform_skipped(result,'no literal terraform_version')
 
     def test_broken_installer_names_missing_tool(self):
         self.missing('aws')

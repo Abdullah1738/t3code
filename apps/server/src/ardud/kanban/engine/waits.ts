@@ -1,6 +1,6 @@
 import type { McpDenyReason } from "@t3tools/contracts";
 /**
- * Card waits: a card with no running thread says, as data, what it is waiting
+ * Card waits: a card says, as data, what it is waiting
  * on. Everything here is pure. The tick gathers the facts (PR states, the
  * other cards, the clock), calls `resolveWait` per waiting card and applies
  * what comes back; the tool validates with `checkWait` and builds with
@@ -1227,7 +1227,7 @@ export function checkWait(
     actor.threadId === card.workThreadId &&
     card.activeRole === "work";
   if (card.activeThreadId !== null) {
-    if (ownWorker && request.on === "ci" && request.pr) {
+    if (ownWorker && ["ci", "push", "merge"].includes(request.on)) {
       return denied(
         "This card is yours and you are running, so the board can't park it. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you.",
         "active_worker_cannot_wait",
@@ -1240,6 +1240,11 @@ export function checkWait(
       );
     }
   }
+  if (ownWorker && request.on === "owner_go")
+    return denied(
+      "Ask the owner with card_ask; use blocking true when you cannot go on without the answer.",
+      "active_worker_cannot_wait",
+    );
   const accepted: WaitCheck = ownWorker ? { ok: true, deferredUntilTurnEnds: true } : { ok: true };
   // A wait takes over a stalled flag, but only one its setter could clear (the card_flag rule).
   if (!mayClearFlag(card, actor)) {
@@ -1260,6 +1265,8 @@ export function checkWait(
     until = Date.parse(request.until);
     if (!Number.isFinite(until)) return bad(`until is not a time: ${request.until}`);
     if (until <= nowMs) return bad("until is in the past");
+    if (ownWorker && request.on === "time" && until - nowMs > 24 * 60 * 60 * 1000)
+      return bad("a worker's time wait must be at most 24 hours ahead");
     if (until - nowMs > WAIT_MAX_AHEAD_MS) return bad("until is more than 30 days ahead");
   }
   switch (request.on) {

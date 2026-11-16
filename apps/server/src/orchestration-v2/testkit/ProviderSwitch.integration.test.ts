@@ -423,6 +423,7 @@ describe("orchestration v2 provider switching", () => {
     "screenshot-eight-fallback",
     "screenshot-large-model-native",
     "screenshot-reported-capacity-native",
+    "screenshot-reported-capacity-fallback",
     "screenshot-model-change-native",
     "screenshot-option-change-native",
     "screenshot-model-change-retry-native",
@@ -877,7 +878,11 @@ describe("orchestration v2 provider switching", () => {
             }
             return;
           }
-          assert.equal(projection.runs.at(-1)?.status, "completed");
+          assert.equal(
+            projection.runs.at(-1)?.status,
+            "completed",
+            JSON.stringify(projection.turnItems.filter((item) => item.type === "error")),
+          );
           if (exhaustedTarget) {
             assert.equal(yield* Ref.get(generation), 2);
             const turns = (yield* Ref.get(capturedTurns)).filter(
