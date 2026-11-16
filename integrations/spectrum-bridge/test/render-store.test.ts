@@ -54,9 +54,8 @@ test("a failed counter commit cannot acknowledge a successful CLI log", () => {
   const lock = new Database(join(root, `renders-${day}.sqlite`));
   try {
     lock.exec("BEGIN EXCLUSIVE");
-    const { BUN_INSPECT, ...env } = process.env;
     const child = Bun.spawnSync([process.execPath, "src/cli.ts", "log-card-render", "--kind", "delivery", "--ms", "7", "--ok", "true"], {
-      cwd: resolve(import.meta.dir, ".."), env: { ...env, TOOLLOG_DIR: root, NODE_ENV: "test" }, stdout: "pipe", stderr: "pipe",
+      cwd: resolve(import.meta.dir, ".."), env: { PATH: process.env.PATH, HOME: root, TOOLLOG_DIR: root, NODE_ENV: "test" }, stdout: "pipe", stderr: "pipe",
     });
     expect(child.exitCode).toBe(1);
     expect(child.stdout.toString()).toBe("");
