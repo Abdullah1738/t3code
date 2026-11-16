@@ -354,7 +354,15 @@ export type OrchestratorMcpTaskCancelInput = typeof OrchestratorMcpTaskCancelInp
 
 export const OrchestratorMcpTaskCancelResult = Schema.Struct({
   taskId: NodeId,
-  status: Schema.Literals(["cancel_requested", "completed", "failed", "cancelled", "interrupted"]),
+  status: Schema.Literals([
+    "cancel_pending",
+    "cancel_requested",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+  ]),
+  detail: Schema.optional(Schema.String),
 });
 export type OrchestratorMcpTaskCancelResult = typeof OrchestratorMcpTaskCancelResult.Type;
 
