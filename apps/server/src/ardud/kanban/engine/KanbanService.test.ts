@@ -29210,7 +29210,7 @@ it.effect(
       const warned = yield* Deferred.make<void>();
       const logger = Logger.make(({ message }) => {
         warnings.push(message);
-        if (JSON.stringify(message).includes("post-commit work failed"))
+        if (JSON.stringify(message).includes("kanban PR facts unavailable"))
           Deferred.doneUnsafe(warned, Effect.void);
       });
       yield* Effect.gen(function* () {
@@ -29238,7 +29238,9 @@ it.effect(
         assert.strictEqual(saved.card.stage, "needs_review");
         assert.strictEqual(saved.events.at(-1)?.body, "Exact note");
         assert.isTrue(
-          warnings.some((message) => JSON.stringify(message).includes("post-commit work failed")),
+          warnings.some((message) =>
+            JSON.stringify(message).includes("kanban PR facts unavailable"),
+          ),
         );
         const retry = yield* kanban.moveCard(created.id, "needs_review", "cardThread", worker, {
           note: "Other note",
@@ -34630,6 +34632,16 @@ it.effect.each([true, false])(
                       : Effect.void,
                   ),
                 ),
+            updateCard: (card, before) =>
+              real
+                .updateCard(card, before)
+                .pipe(
+                  Effect.tap(() =>
+                    card.links.some((link) => link.url === "https://github.com/o/r/pull/882")
+                      ? Deferred.succeed(synced, undefined)
+                      : Effect.void,
+                  ),
+                ),
           }),
         ),
       ).pipe(Layer.provide(KanbanStore.layer));
@@ -39133,20 +39145,22 @@ it.effect("a syncPrs conflict on one reviewed card does not stop another card's 
     const conflicted = yield* Queue.unbounded<void>();
     const conflictingStore = Layer.effect(
       KanbanStore.KanbanStore,
-      Effect.map(KanbanStore.KanbanStore, (real) =>
-        KanbanStore.KanbanStore.of({
+      Effect.map(KanbanStore.KanbanStore, (real) => {
+        const write = (card: KanbanCard, persist: ReturnType<typeof real.putCard>) =>
+          card.id === blocked && card.links.some((link) => link.state === "merged")
+            ? Effect.sync(() => {
+                conflicts += 1;
+              }).pipe(
+                Effect.andThen(Queue.offer(conflicted, undefined)),
+                Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged())),
+              )
+            : persist;
+        return KanbanStore.KanbanStore.of({
           ...real,
-          putCard: (card) =>
-            card.id === blocked && card.links.some((link) => link.state === "merged")
-              ? Effect.sync(() => {
-                  conflicts += 1;
-                }).pipe(
-                  Effect.andThen(Queue.offer(conflicted, undefined)),
-                  Effect.andThen(Effect.die(new BoardLocks.BoardStateChanged())),
-                )
-              : real.putCard(card),
-        }),
-      ),
+          putCard: (card) => write(card, real.putCard(card)),
+          updateCard: (card, before) => write(card, real.updateCard(card, before)),
+        });
+      }),
     ).pipe(Layer.provide(KanbanStore.layer));
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
@@ -39172,12 +39186,8 @@ it.effect("a syncPrs conflict on one reviewed card does not stop another card's 
         fake.prs.set(work, [{ url, title, state: "merged" }]);
       const ticking = yield* Effect.forkChild(kanban.tick);
       yield* Queue.take(conflicted);
-      yield* TestClock.adjust(10);
-      yield* Queue.take(conflicted);
-      yield* TestClock.adjust(20);
-      yield* Queue.take(conflicted);
       yield* Fiber.join(ticking);
-      assert.strictEqual(conflicts, 3);
+      assert.strictEqual(conflicts, 1);
       assert.strictEqual((yield* kanban.card(reviewed[0]!.card.id)).card.stage, "in_review");
       assert.strictEqual((yield* kanban.card(reviewed[1]!.card.id)).card.stage, "completed");
       blocked = undefined;

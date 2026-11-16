@@ -1524,6 +1524,9 @@ export const DeferWriteEffects = Context.Reference<boolean>("KanbanDeferWriteEff
 export const OwnerRouteMode = Context.Reference<OwnerRouteMode>("KanbanOwnerRouteMode", {
   defaultValue: () => "await",
 });
+export const PrSyncFetchBudget = Context.Reference<number>("KanbanPrSyncFetchBudget", {
+  defaultValue: () => 2_000,
+});
 const effectRouteReads = Context.Reference("KanbanEffectRouteReads", {
   defaultValue: () => false,
 });
@@ -3475,7 +3478,6 @@ const make = Effect.gen(function* () {
     readonly events: ReadonlyArray<KanbanCardEvent>;
     readonly slots: ReadonlyMap<string, ReadonlyArray<KanbanCard>>;
     readonly waitTargets: ReadonlyMap<string, KanbanCard & { readonly boardName?: string }>;
-    readonly workCards: ReadonlyArray<KanbanCardId>;
   }
 
   // Callers hold the lock, and log a card's event before saving it: clients
@@ -4294,8 +4296,40 @@ const make = Effect.gen(function* () {
     });
   });
 
+  const prWriteSnapshot = Effect.fn("KanbanService.prWriteSnapshot")(function* (card: KanbanCard) {
+    const board = yield* rawStore.board(card.boardId);
+    if (!board) return yield* failWith("not-found", `board ${card.boardId}`);
+    const slots = new Map<string, ReadonlyArray<KanbanCard>>();
+    if (card.activeThreadId !== null)
+      slots.set(card.activeThreadId, yield* rawStore.cardsByThread(card.activeThreadId));
+    const waitTargets = new Map<string, KanbanCard & { readonly boardName?: string }>();
+    if (card.wait?.card != null) {
+      const target = yield* rawStore.card(KanbanCardId.make(card.wait.card));
+      if (target) {
+        const boardName =
+          target.boardId === card.boardId
+            ? undefined
+            : ((yield* rawStore.board(target.boardId))?.name ?? target.boardId);
+        waitTargets.set(target.id, {
+          ...target,
+          ...(boardName === undefined ? {} : { boardName }),
+        });
+      }
+    }
+    return {
+      before: card,
+      board,
+      slots,
+      waitTargets,
+      events: yield* rawStore.cardEvents(card.id),
+      reviewLink:
+        card.reviewThreadId === null ? null : yield* rawStore.threadLink(card.reviewThreadId),
+    } satisfies CardWriteSnapshot;
+  });
+
   const syncReviewedStage = Effect.fn("KanbanService.syncReviewedStage")(function* (
     card: KanbanCard,
+    snapshot: CardWriteSnapshot,
   ) {
     if (
       card.stage !== "in_review" ||
@@ -4307,14 +4341,14 @@ const make = Effect.gen(function* () {
       !Rules.prsLanded(card)
     )
       return card;
-    const board = yield* boardOf(card.boardId);
-    if (!Rules.reviewFinished(card, Rules.chainFor(board, card)?.steps.length ?? 1)) return card;
+    if (!Rules.reviewFinished(card, Rules.chainFor(snapshot.board, card)?.steps.length ?? 1))
+      return card;
     const at = yield* nowIso;
     if (Waits.decidingHolds(card, Date.parse(at))) return card;
     const actor: KanbanActor = { _tag: "system", component: "dispatcher" };
     // A wait belongs to the remaining evaluator/script plan, not the finished review.
     const next: KanbanCard = {
-      ...(yield* moveWait(card, "completed", at, actor, true)),
+      ...(yield* moveWait(card, "completed", at, actor, true, snapshot)),
       stage: "completed",
       movedAt: at,
       updatedAt: at,
@@ -4323,8 +4357,9 @@ const make = Effect.gen(function* () {
       fromStage: card.stage,
       toStage: next.stage,
       body: "review clear and PRs merged",
+      before: card,
     });
-    yield* saveCard(next);
+    yield* saveCard(next, undefined, false, undefined, undefined, snapshot);
     yield* logStageSync(next);
     yield* laterEvaluatorTurn(card, next, actor);
     return next;
@@ -4340,24 +4375,61 @@ const make = Effect.gen(function* () {
     canSave?: () => Effect.Effect<boolean>,
     snapshot?: CardWriteSnapshot,
   ) {
-    // Follow-up runs after releasing the original permit. Fence its own current row before I/O.
-    const card = snapshot?.before ?? (yield* cardOf(source.id));
-    if (card.workThreadId !== source.workThreadId) return card;
-    if (card.workThreadId === null) return card;
-    const revision = yield* locks.resourceVersion(card.boardId, `card:${card.id}`);
-    const view = yield* threads.view(card.workThreadId);
-    const current = snapshot?.before ?? (yield* cardOf(card.id));
-    // A dispatch tolerates concurrent PR metadata writes, but their newer result wins this read.
-    if ((yield* locks.resourceVersion(card.boardId, `card:${card.id}`)) !== revision)
-      return current;
-    if (!view || view.prs.length === 0) {
-      if (canSave && !(yield* canSave())) return current;
-      return yield* syncReviewedStage(current);
-    }
-    const at = yield* nowIso;
-    const solo = (snapshot?.workCards ?? (yield* store.threadCards(card.workThreadId))).every(
-      (id) => id === card.id,
+    const budget = yield* PrSyncFetchBudget;
+    yield* locks.access(source.boardId, Effect.void, false, `card:${source.id}`);
+    yield* locks.access(source.boardId, Effect.void, false, "board");
+    const revision = yield* locks.resourceVersion(source.boardId, `card:${source.id}`);
+    // Read the complete fact set without permits. #1656 revalidates the card's
+    // generation when taking them back; a stale landing is retried by the tick.
+    const fetched = yield* locks.outside(
+      Effect.gen(function* () {
+        const card =
+          snapshot?.before ?? (yield* rawStore.card(source.id).pipe(Effect.withSpan("read.card")));
+        if (card === null)
+          return { card: source, view: null, solo: false, current: source, snapshot: null };
+        if (card.workThreadId !== source.workThreadId || card.workThreadId === null)
+          return { card, view: null, solo: false, current: card, snapshot: null };
+        const view = yield* threadIo.view(card.workThreadId);
+        const solo = (yield* rawStore.threadCards(card.workThreadId)).every((id) => id === card.id);
+        const writeSnapshot = snapshot ?? (yield* prWriteSnapshot(card));
+        const current = snapshot?.before ?? (yield* rawStore.card(card.id));
+        return { card, view, solo, current, snapshot: writeSnapshot };
+      }).pipe(
+        Effect.interruptible,
+        Effect.timeoutOption(budget),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("kanban PR facts unavailable", { cardId: source.id, cause }).pipe(
+            Effect.as(Option.none()),
+          ),
+        ),
+        Effect.withSpan("syncPrs.fetch"),
+      ),
+      undefined,
+      true,
     );
+    if (Option.isNone(fetched)) {
+      yield* Effect.logWarning("kanban PR refresh skipped", {
+        boardId: source.boardId,
+        cardId: source.id,
+        budgetMs: budget,
+        subSteps: [{ subStep: "syncPrs.fetch", ms: budget }],
+      });
+      return source;
+    }
+    const { card, view, solo, snapshot: writeSnapshot } = fetched.value;
+    // Dispatch deliberately tolerates concurrent PR metadata writes. Keep that
+    // newer refresh even when the dispatch's older projection read finishes last.
+    if ((yield* locks.resourceVersion(card.boardId, `card:${card.id}`)) !== revision)
+      return fetched.value.current ?? card;
+    if (
+      card.workThreadId !== source.workThreadId ||
+      card.workThreadId === null ||
+      writeSnapshot === null
+    )
+      return card;
+    if (canSave && !(yield* canSave())) return card;
+    if (!view || view.prs.length === 0) return yield* syncReviewedStage(card, writeSnapshot);
+    const at = yield* nowIso;
     let changed = false;
     let links = mergeLinks(
       card.links,
@@ -4374,7 +4446,7 @@ const make = Effect.gen(function* () {
     });
     if (canSave && !(yield* canSave())) return card;
     // Reconcile unchanged metadata too: older releases left already-merged cards in review.
-    if (!changed) return yield* syncReviewedStage(card);
+    if (!changed) return yield* syncReviewedStage(card, writeSnapshot);
     const next = {
       ...card,
       links,
@@ -4387,9 +4459,9 @@ const make = Effect.gen(function* () {
       links.length === card.links.length,
       undefined,
       undefined,
-      snapshot,
-    );
-    return yield* syncReviewedStage(next);
+      writeSnapshot,
+    ).pipe(Effect.withSpan("syncPrs.write"));
+    return yield* syncReviewedStage(next, { ...writeSnapshot, before: next });
   });
 
   const writeTitle = Effect.fn("KanbanService.writeTitle")(function* (
@@ -8321,7 +8393,12 @@ const make = Effect.gen(function* () {
         });
       case "syncPrs":
         return Effect.gen(function* () {
-          yield* syncPrs(yield* cardOf(KanbanCardId.make(effect.cardId)));
+          const source = yield* locks.outside(
+            rawStore.card(KanbanCardId.make(effect.cardId)),
+            undefined,
+            true,
+          );
+          if (source) yield* syncPrs(source);
         });
     }
   };
@@ -13059,7 +13136,13 @@ const make = Effect.gen(function* () {
           : /wait|block|depend/i.test(step)
             ? "dependency_checks"
             : "card_evaluation",
-      locks.step(effect, cardId, `KanbanService.tickStep:${step}`).pipe(
+      (step === "landing"
+        ? SavedWrite.subSteps(
+            "tickStep:landing",
+            locks.step(effect, cardId, `KanbanService.tickStep:${step}`, 0),
+          )
+        : locks.step(effect, cardId, `KanbanService.tickStep:${step}`)
+      ).pipe(
         Effect.map(Option.some),
         Effect.catchDefect((defect) =>
           Effect.gen(function* () {
@@ -15038,7 +15121,11 @@ const make = Effect.gen(function* () {
               yield* step(
                 "landing",
                 Effect.gen(function* () {
-                  const card = yield* store.card(initial.id);
+                  const card = yield* locks.outside(
+                    rawStore.card(initial.id).pipe(Effect.withSpan("read.card")),
+                    undefined,
+                    true,
+                  );
                   if (!card) return;
 
                   if (card.stage !== "in_review" || card.activeThreadId !== null) return;
@@ -15050,7 +15137,17 @@ const make = Effect.gen(function* () {
                   if (Waits.WAITS_ENGINE_WIRED && Waits.waitHoldsDispatch(refreshed)) return;
                   const chain = Rules.chainFor(board, card);
                   if (!Rules.reviewFinished(card, chain?.steps.length ?? 1)) return;
-                  const current = yield* store.card(card.id);
+                  const snapshot = yield* locks.outside(
+                    Effect.gen(function* () {
+                      const current = yield* rawStore
+                        .card(card.id)
+                        .pipe(Effect.withSpan("read.card"));
+                      return current === null ? null : yield* prWriteSnapshot(current);
+                    }),
+                    undefined,
+                    true,
+                  );
+                  const current = snapshot?.before;
                   if (
                     !current ||
                     current.stage !== "in_review" ||
@@ -15066,6 +15163,7 @@ const make = Effect.gen(function* () {
                   if (Waits.decidingHolds(current, now)) return;
                   views.clear();
                   invalidateCards();
+                  if (snapshot === null) return;
                   const synced = current;
                   if (!Rules.prsLanded(synced)) return;
                   // The plan's next step decides where it goes: the worker's sends it
@@ -15080,7 +15178,7 @@ const make = Effect.gen(function* () {
                   const at = yield* nowIso;
                   const dispatcher: KanbanActor = { _tag: "system", component: "dispatcher" };
                   const landed: KanbanCard = {
-                    ...(yield* moveWait(synced, to, at, dispatcher)),
+                    ...(yield* moveWait(synced, to, at, dispatcher, false, snapshot)),
                     stage: to,
                     reviewStep: to === "completed" ? synced.reviewStep : 0,
                     wakeNote:
@@ -15096,11 +15194,12 @@ const make = Effect.gen(function* () {
                     fromStage: synced.stage,
                     toStage: to,
                     body: "PRs landed",
+                    before: synced,
                   });
-                  yield* saveCard(landed);
+                  yield* saveCard(landed, undefined, false, undefined, undefined, snapshot);
                   yield* evaluatorTurn(synced, landed, dispatcher);
                   views.clear();
-                }),
+                }).pipe(Effect.withSpan("apply")),
                 initial.id,
               );
             }
@@ -17602,12 +17701,6 @@ const make = Effect.gen(function* () {
               events: yield* rawStore
                 .cardEvents(card.id)
                 .pipe(Effect.withSpan("card.move.read.events")),
-              workCards:
-                card.workThreadId === null
-                  ? []
-                  : yield* rawStore
-                      .threadCards(card.workThreadId)
-                      .pipe(Effect.withSpan("card.move.read.workCards")),
               reviewLink:
                 card.reviewThreadId === null
                   ? null
@@ -19557,7 +19650,7 @@ const make = Effect.gen(function* () {
                 "role_not_allowed",
               );
             }
-            const initialCard = yield* turnEndCard(link.cardId);
+            const initialCard = yield* turnEndCard(link.cardId).pipe(Effect.withSpan("read.card"));
             if (!initialCard) return yield* failWith("not-found", `card ${link.cardId}`);
             let card = initialCard;
             attempted = card;
@@ -19662,10 +19755,6 @@ const make = Effect.gen(function* () {
                   events,
                   slots,
                   waitTargets,
-                  workCards:
-                    card.workThreadId === null
-                      ? []
-                      : yield* rawStore.threadCards(card.workThreadId),
                   reviewLink:
                     card.reviewThreadId === threadId
                       ? link
@@ -19677,7 +19766,11 @@ const make = Effect.gen(function* () {
               undefined,
               true,
             );
-            card = yield* syncPrs(card, undefined, snapshot);
+            card = yield* syncPrs(card, undefined, snapshot).pipe(
+              // PR freshness is optional for saving a verdict. Leave a slow read
+              // to the next tick rather than consuming the 25-second reply budget.
+              Effect.provideService(PrSyncFetchBudget, 100),
+            );
             snapshot = { ...snapshot, before: card };
             const chain = Rules.chainFor(board, card);
             const outcome = Rules.applyReviewResult(card, chain?.steps.length ?? 1, verdict);
@@ -19818,7 +19911,7 @@ const make = Effect.gen(function* () {
               );
             }
             return { card: next, recorded: true };
-          }),
+          }).pipe(Effect.withSpan("apply")),
         ),
         (saved) =>
           // A PR metadata save does not acknowledge the subsequent verdict.
@@ -19886,7 +19979,7 @@ const make = Effect.gen(function* () {
             ),
           );
         }),
-        (effect) => SavedWrite.subSteps("card.reviewResult", effect),
+        (effect) => SavedWrite.subSteps("card.reviewResult", effect, true),
       );
     });
 
