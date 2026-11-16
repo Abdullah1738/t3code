@@ -248,6 +248,7 @@ export interface KanbanThreadsShape {
     runId: string,
     cancelReason?: OrchestrationV2Run["cancelReason"],
   ) => Effect.Effect<boolean, KanbanThreadError>;
+  readonly remove: (threadId: ThreadId) => Effect.Effect<void, KanbanThreadError>;
   /** A thread that no longer exists counts as stopped; a failed read or stop fails. */
   readonly interrupt: (
     threadId: ThreadId,
@@ -1489,6 +1490,17 @@ const make = Effect.gen(function* () {
     ),
   );
 
+  const remove = Effect.fn("KanbanThreads.remove")(
+    function* (threadId: ThreadId) {
+      const shell = yield* threads.getThreadShell(threadId);
+      if (shell === null || shell.deletedAt !== null) return;
+      yield* threads.dispatch({ type: "thread.delete", commandId: commandId("delete"), threadId });
+    },
+    Effect.mapError(
+      (error) => new KanbanThreadError({ operation: "delete", detail: detailOf(error) }),
+    ),
+  );
+
   const pendingUserInputs: KanbanThreadsShape["pendingUserInputs"] = Effect.fn(
     "KanbanThreads.pendingUserInputs",
   )(
@@ -1531,6 +1543,7 @@ const make = Effect.gen(function* () {
     queuedRuns,
     cancelQueued,
     interrupt,
+    remove,
   });
 });
 

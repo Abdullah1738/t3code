@@ -233,6 +233,7 @@ const fakeThreads = (
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: (threadId) =>
         Effect.suspend(() => storeControl.beforeClaimContext?.() ?? Effect.void).pipe(

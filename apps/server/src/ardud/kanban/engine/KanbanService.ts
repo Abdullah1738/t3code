@@ -465,6 +465,10 @@ export interface KanbanServiceShape {
     readonly defaultProjectId: ProjectId | null;
     readonly icon?: string | null | undefined;
   }) => Effect.Effect<KanbanBoard, KanbanError>;
+  readonly purgeBoard: (
+    boardId: KanbanBoardId,
+    actor: KanbanActor,
+  ) => Effect.Effect<void, KanbanError>;
   readonly updateBoard: (
     boardId: KanbanBoard["id"],
     patch: BoardPatch,
@@ -1937,6 +1941,7 @@ const make = Effect.gen(function* () {
   const threadIo = yield* KanbanThreads;
   const turnAdmission = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const inFlightSends = new Map<ThreadId, number>();
+  const pendingLaunches = new Map<KanbanBoardId, number>();
   const delivering = new Map<
     KanbanCard["id"],
     {
@@ -2484,6 +2489,7 @@ const make = Effect.gen(function* () {
     );
   });
   const threads: typeof threadIo = {
+    remove: (id) => locks.outside(touching(id, threadIo.remove(id))),
     claimContext: (id) => threadRead("claimContext", id, threadIo.claimContext(id)),
     pendingUserInputs: (id) =>
       TickTimings.measure(
@@ -2514,8 +2520,33 @@ const make = Effect.gen(function* () {
         "thread_status",
         locks.outside(threadIo.runSettled(id, run), undefined, true),
       ),
-    launch: (input) =>
-      Effect.flatMap(launchReconcile, (reconcile) => {
+    launch: Effect.fn("KanbanService.launchThread")(function* (
+      input: Parameters<typeof threadIo.launch>[0],
+    ) {
+      const [source, role] = input.key.split(":");
+      const boardId =
+        role === "work" || role === "review"
+          ? (yield* store
+              .card(KanbanCardId.make(source!))
+              .pipe(
+                Effect.mapError(
+                  (error) => new KanbanThreadError({ operation: "launch", detail: String(error) }),
+                ),
+              ))?.boardId
+          : KanbanBoardId.make(source!);
+      if (boardId === undefined)
+        return yield* new KanbanThreadError({
+          operation: "launch",
+          detail: "The launch's card no longer exists.",
+        });
+      pendingLaunches.set(boardId, (pendingLaunches.get(boardId) ?? 0) + 1);
+      let retained = false;
+      const releasePending = Effect.sync(() => {
+        const left = (pendingLaunches.get(boardId) ?? 1) - 1;
+        if (left === 0) pendingLaunches.delete(boardId);
+        else pendingLaunches.set(boardId, left);
+      });
+      return yield* Effect.flatMap(launchReconcile, (reconcile) => {
         let launched: ThreadId | undefined;
         let launchFailure: KanbanThreadError | undefined;
         return locks
@@ -2579,9 +2610,23 @@ const make = Effect.gen(function* () {
                 ? Effect.succeed(result.success)
                 : Effect.fail(result.failure),
             ),
-            Effect.tap((id) => locks.launched(id, abandonLaunch(input, id))),
+            Effect.tap((id) =>
+              Effect.uninterruptible(
+                Effect.gen(function* () {
+                  yield* locks.launched(id, abandonLaunch(input, id));
+                  // Attachment may still release the gate. Keep purge blocked through
+                  // the owning operation, after its abandonment compensation finishes.
+                  yield* locks.launched(
+                    `pending-launch:${NodeCrypto.randomUUID()}`,
+                    releasePending,
+                  );
+                  retained = true;
+                }),
+              ),
+            ),
           );
-      }),
+      }).pipe(Effect.ensuring(Effect.suspend(() => (retained ? Effect.void : releasePending))));
+    }),
     send: sendThread,
     withdraw: (input) => locks.outside(touching(input.threadId, threadIo.withdraw(input))),
     setModel: (id, model) =>
@@ -15257,6 +15302,8 @@ const make = Effect.gen(function* () {
   });
   const tickUnlocked = Effect.fn("KanbanService.tickUnlocked")(function* () {
     // A failed board must not interrupt the other boards, but callers still see its error.
+    for (const boardId of new Set((yield* store.pendingBoardPurges).map((row) => row.boardId)))
+      yield* guardReady("board.purge.retry", finishPurge(boardId), undefined, boardId);
     const turnEndLinks = new Map(
       (yield* rawStore.threadLinksByIds([...(yield* Ref.get(unresolvedTurnEnds))])).map(
         (link) => [link.threadId, link] as const,
@@ -15874,6 +15921,68 @@ const make = Effect.gen(function* () {
         boardId,
       ).pipe(Effect.onExit(() => Effect.forEach(lanes, afterOwnerCommit, { discard: true })));
     });
+
+  const finishPurge = Effect.fn("KanbanService.finishPurge")(function* (boardId: KanbanBoardId) {
+    const pending = (yield* store.pendingBoardPurges).filter((row) => row.boardId === boardId);
+    for (const { threadId } of pending) {
+      yield* Effect.gen(function* () {
+        yield* threads.remove(threadId);
+        yield* store.finishBoardPurgeThread(boardId, threadId);
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Board thread deletion will retry", { boardId, threadId, cause }),
+        ),
+      );
+    }
+    yield* publish(boardId, {
+      _tag: "purgeThreads",
+      boardId,
+      threadIds: (yield* store.pendingBoardPurges)
+        .filter((row) => row.boardId === boardId)
+        .map((row) => row.threadId),
+    });
+  });
+
+  const purgeBoard = Effect.fn("KanbanService.purgeBoard")(function* (
+    boardId: KanbanBoardId,
+    actor: KanbanActor,
+  ) {
+    if (actor._tag !== "owner")
+      return yield* failWith("denied", "Only the owner can erase a board.", "role_not_allowed");
+    yield* guard(
+      "board.purge",
+      Effect.gen(function* () {
+        const board = yield* store.board(boardId);
+        if (board !== null) {
+          if (board.archivedAt === null)
+            return yield* failWith("invalid", "Delete the board first.");
+          if ((pendingLaunches.get(boardId) ?? 0) > 0)
+            return yield* failWith(
+              "conflict",
+              "The board's threads are starting. Try erasing it again.",
+            );
+          const ids = yield* store.boardThreadIds(boardId);
+          let stopping = false;
+          for (const threadId of ids) {
+            yield* threads.interrupt(threadId, `Board "${board.name}" is being erased`, true);
+            const view = yield* threads.find(threadId);
+            if (view !== null && (view.state !== "idle" || view.backgroundWork > 0))
+              stopping = true;
+          }
+          if (stopping)
+            return yield* failWith(
+              "conflict",
+              "The board's threads are stopping. Try erasing it again.",
+            );
+          yield* store.purgeBoard(boardId);
+        }
+        yield* finishPurge(boardId);
+        yield* publish(boardId, { _tag: "boardRemoved", boardId });
+      }),
+      undefined,
+      boardId,
+    );
+  });
 
   const applyApprovedInstructions: KanbanServiceShape["applyApprovedInstructions"] = Effect.fn(
     "KanbanService.applyApprovedInstructions",
@@ -21066,7 +21175,12 @@ const make = Effect.gen(function* () {
           ),
         ),
       );
-      return Summaries.follow(Summaries.tallyBoards(boards), Stream.fromSubscription(subscription));
+      return Summaries.follow(
+        Summaries.tallyBoards(boards),
+        Stream.fromSubscription(subscription),
+        Date.now,
+        yield* readDb(store.pendingBoardPurges),
+      );
     }),
   );
 
@@ -21162,6 +21276,13 @@ const make = Effect.gen(function* () {
         ),
       )
       .pipe(
+        Effect.andThen(
+          Effect.gen(function* () {
+            const pending = yield* store.pendingBoardPurges;
+            for (const boardId of new Set(pending.map((row) => row.boardId)))
+              yield* finishPurge(boardId);
+          }),
+        ),
         Effect.andThen(loadPendingStops()),
         Effect.tapError((cause) =>
           Effect.logWarning("Board startup recovery will retry", { cause }),
@@ -22053,6 +22174,7 @@ const make = Effect.gen(function* () {
     openBoard,
     createBoard,
     updateBoard,
+    purgeBoard,
     applyApprovedInstructions,
     applyApprovedSettings,
     standingApproval,

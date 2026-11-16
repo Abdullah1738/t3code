@@ -111,6 +111,7 @@ const makeFake = () => {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: (threadId) =>
         read(threadId).pipe(

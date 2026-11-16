@@ -2518,6 +2518,8 @@ export type KanbanBoardSummary = typeof KanbanBoardSummary.Type;
  * resends neither board pictures nor every thread id.
  */
 export const KanbanBoardListEntry = Schema.Struct({
+  // A content-free entry keeps failed thread deletions hidden until cleanup commits.
+  purged: Schema.optional(Schema.Boolean),
   boardId: KanbanBoardId,
   board: Schema.NullOr(KanbanBoard),
   needsOwner: NonNegativeInt,
@@ -2530,6 +2532,11 @@ export type KanbanBoardListEntry = typeof KanbanBoardListEntry.Type;
 export const KanbanChange = Schema.Union([
   // `by`: who saved the card, when the save came from a move. Script listeners need it to skip a script's own moves.
   Schema.TaggedStruct("card", { card: KanbanCard, by: Schema.optional(KanbanActor) }),
+  Schema.TaggedStruct("purgeThreads", {
+    boardId: KanbanBoardId,
+    threadIds: Schema.Array(ThreadId),
+  }),
+  Schema.TaggedStruct("boardRemoved", { boardId: KanbanBoardId }),
   Schema.TaggedStruct("cardRemoved", { cardId: KanbanCardId }),
   Schema.TaggedStruct("goal", { goal: KanbanGoal }),
   Schema.TaggedStruct("pools", { pools: Schema.Array(KanbanPool) }),
