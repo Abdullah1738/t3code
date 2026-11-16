@@ -22,7 +22,6 @@ import os
 from pathlib import Path
 import re
 import shlex
-import shutil
 import signal
 import sqlite3
 import subprocess
@@ -210,7 +209,7 @@ expected_auth = load_module('inbox_expected_auth', Path(__file__).with_name('exp
 
 def read_json(path, default=None):
     try:
-        return json.loads(path.read_text())
+        return json.loads(expected_auth.read_bytes(path))
     except FileNotFoundError:
         return copy.deepcopy(default)
 
@@ -225,14 +224,16 @@ else:
 
 @admitted_check
 def atomic(path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + '.tmp')
-    with tmp.open('w') as f:
-        json.dump(obj, f, ensure_ascii=False, separators=(',', ':'))
-        f.write('\n')
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    def write():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + '.tmp')
+        with tmp.open('w') as f:
+            json.dump(obj, f, ensure_ascii=False, separators=(',', ':'))
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    expected_auth.retry_file(path, write, event='data_write')
 
 
 def stamp(ts=None):
@@ -533,8 +534,11 @@ def money_books(wd, mc, dry=False):
     if not data.exists():
         data.mkdir(mode=0o700, parents=True)
         for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
-            if (mc.DATA / name).exists():
-                shutil.copy2(mc.DATA / name, data / name)
+            try:
+                contents = expected_auth.read_bytes(mc.DATA / name)
+            except FileNotFoundError:
+                continue
+            (data / name).write_bytes(contents)
     return data
 
 
@@ -1191,16 +1195,20 @@ def build_context(items, watchers, now):
     descriptions.sort(key=relevance, reverse=True)
     lines = []
     p = HOME / 'Documents/assistant/activity-log.md'
-    if p.exists():
+    try:
+        activity = expected_auth.read_bytes(p).decode('utf-8', errors='replace')
+    except FileNotFoundError:
+        activity = ''
+    if activity:
         cutoff = dt.datetime.fromtimestamp(now - 3 * 86400, UTC).date().isoformat()
-        for line in p.read_text(errors='replace').split('\n')[-1200:]:
+        for line in activity.split('\n')[-1200:]:
             date = re.search(r'\b(20\d\d-\d\d-\d\d)\b', line)
             if date and date[1] >= cutoff:
                 lines.append(clean(line, 220))
     # Newest relevant outcomes must outrank older problems (a later resolution matters).
     related = [line for line in lines if relevance(line) >= 2]
     recent = list(reversed((related or lines)[-5:]))
-    prefs = (DATA / 'prefs.md').read_text()
+    prefs = expected_auth.read_bytes(DATA / 'prefs.md').decode('utf-8')
     if len(prefs) > PREFS_LIMIT:
         prefs = prefs[:2000] + '\n[... older rules trimmed ...]\n' + prefs[-(PREFS_LIMIT - 2100):]
     return {'preferences': clean_lines(prefs, PREFS_LIMIT), 'active_watchers': '\n'.join(descriptions)[:1100],
@@ -1296,9 +1304,25 @@ def classify_batch(items, context, seconds=20):
 def log_run(wd, record):
     # scratch/test runs never mutate live logs or reports.
     root = DATA if wd.resolve() == LIVE.resolve() else wd / 'diagnostics'
-    root.mkdir(parents=True, exist_ok=True)
-    with (root / 'runs.jsonl').open('a') as f:
-        f.write(json.dumps({'at': stamp(), **record}, ensure_ascii=False, separators=(',', ':')) + '\n')
+    path = root / 'runs.jsonl'
+    payload = (json.dumps({'at': stamp(), **record}, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
+    offset = None
+    def append():
+        nonlocal offset
+        root.mkdir(parents=True, exist_ok=True)
+        # check.lock serializes each watcher's run log. Roll back a partial append on retry.
+        with path.open('a+b') as f:
+            if offset is None:
+                offset = f.tell()
+            f.seek(offset)
+            f.truncate()
+            f.write(payload)
+            f.flush()
+    try:
+        expected_auth.retry_file(path, append, event='data_write', failure_event='runs_log.write_failed')
+    except OSError:
+        # Classification and cursor/outbox commits have already happened.
+        pass
 
 
 def work_line(work):
@@ -1565,6 +1589,7 @@ def expect_auth(sender, account=None):
 
 @trace_run('triage.fastpath')
 def run_fast(args):
+    expected_auth.reset_retry_budget()
     now = time.time()
     wd = Path(os.environ.get('WATCH_DIR', Path(__file__).resolve().parent))
     dry = args.dry_run_hours is not None
@@ -2003,6 +2028,7 @@ def source_exit(results, errors, label='inbox-triage'):
 
 @trace_run('triage.run')
 def run(args):
+    expected_auth.reset_retry_budget()
     now = time.time()
     wd = Path(os.environ.get('WATCH_DIR', Path(__file__).resolve().parent))
     dry = args.dry_run_hours is not None
