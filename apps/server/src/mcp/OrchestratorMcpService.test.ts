@@ -3044,10 +3044,16 @@ describe("OrchestratorMcpService provider resolution", () => {
             [false, true].map((failRead) => ({ scenario, read, failRead })),
           ),
         ),
+        [false, true].map((failRead) => ({
+          scenario: "retry_between_reads",
+          read: "parent" as const,
+          failRead,
+        })),
       )
       .flatMap((testCase) =>
-        testCase.read === undefined &&
-        ["within_grace", "accepted_after_grace", "saved_retry"].includes(testCase.scenario)
+        testCase.scenario === "retry_between_reads" ||
+        (testCase.read === undefined &&
+          ["within_grace", "accepted_after_grace", "saved_retry"].includes(testCase.scenario))
           ? [
               { ...testCase, claude: false },
               { ...testCase, claude: true },
@@ -3075,7 +3081,8 @@ describe("OrchestratorMcpService provider resolution", () => {
           const slowState =
             scenario === "saved_retry_slow_state" || scenario === "idle_retry_slow_state";
           const idle = scenario === "idle_retry" || scenario === "idle_retry_slow_state";
-          const retry = scenario === "saved_retry" || slowState || idle;
+          const betweenReads = scenario === "retry_between_reads";
+          const retry = scenario === "saved_retry" || slowState || idle || betweenReads;
           const targetInstanceId = claude
             ? ProviderInstanceId.make("claudeAgent")
             : codexInstanceId;
@@ -3086,7 +3093,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           );
           let expectedTaskId = NodeId.make(`node:delegated-task:${encodeURIComponent(commandId)}`);
           const childThreadId = IdAllocator.derive.delegatedTaskThread({ commandId });
-          let saved = retry;
+          let saved = retry && !betweenReads;
           let failed = false;
           let creates = 0;
           let wakeUpgrades = 0;
@@ -3110,7 +3117,11 @@ describe("OrchestratorMcpService provider resolution", () => {
                 Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
               getThreadShell: (id) =>
                 Effect.succeed({ ...liveThreadShell(id), ...parentProjection([]).thread }),
-              hasReceipt: () => Effect.succeed(retry),
+              hasReceipt: () =>
+                Effect.sync(() => {
+                  if (betweenReads) saved = true;
+                  return retry;
+                }),
               getDelegationCommandState: () =>
                 Effect.gen(function* () {
                   if (slowState) {

@@ -3224,7 +3224,11 @@ const make = Effect.gen(function* () {
           taskEvent?.event.type === "subagent.updated" ? taskEvent.event.payload : recoveryTask;
         taskId = task?.id ?? taskId;
         savedTaskId = taskId;
-        const fallbackSelection = selection ?? parent.thread.modelSelection;
+        // Acceptance can become visible after the retry read its parent projection.
+        const fallbackSelection = selection ?? {
+          instanceId: input.target?.providerInstanceId ?? parent.thread.modelSelection.instanceId,
+          model: input.target?.model ?? parent.thread.modelSelection.model,
+        };
         yield* Effect.annotateCurrentSpan({
           "t3.delegate.task_id": taskId,
           "t3.delegate.provider_instance_id":
