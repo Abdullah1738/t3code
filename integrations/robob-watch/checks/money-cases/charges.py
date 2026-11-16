@@ -248,6 +248,13 @@ def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None, stats=
             raise ValueError('ambiguous orders')
         if app == 'noon' and isinstance(result, dict):
             lanes = result.get('lanes') or {}
+            marketplace = lanes.get('marketplace') or {}
+            walked = marketplace.get('walked_at')
+            if walked is None or order_lookup.moment(walked) < at + SAME_TIME:
+                raise SourceLimit('noon orders: Marketplace snapshot predates the match window (source limit)',
+                                  ['marketplace_stale'])
+            if any(abs(order_lookup.moment(t) - at) <= SAME_TIME for t in marketplace.get('hold_times', [])):
+                raise SourceLimit('noon orders: Marketplace placement near charge (source limit)', ['marketplace_hold'])
             short = []
             for name in order_lookup.LANES:
                 lane = lanes.get(name) or {}

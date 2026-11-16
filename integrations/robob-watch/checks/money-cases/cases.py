@@ -2723,6 +2723,7 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
         census = stats['charge_census'] = {app: dict.fromkeys(
             ('open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'), 0)
             for app in ('noon', 'careem')}
+        census['noon'].update(marketplace_hold=0, marketplace_stale=0)
         census_questions = {}
         for q in questions:
             app = charges.order_app(charge_of(q)) if q.get('kind') == 'charge' and active(q) else None
@@ -2970,6 +2971,9 @@ def follow(data, now, root=None, deadline=None, find=None, said=None, end=None, 
                                            for source, _ in peers)
                         counted(q['id'], 'error' if failed_alias else 'limited')
         prune_questions(book, now)
+    for kind in ('marketplace_hold', 'marketplace_stale'):
+        census['noon'][kind] = sum(census_outcomes.get(qid) == 'limited' and kind in limit['kinds']
+                                   for qid, limit in order_limits.items())
     return errors
 
 
@@ -3480,6 +3484,8 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
         diagnostic['ok'] = diagnostic.get('complete', True)
         return event
     finally:
+        from marketplace import refresh_status, launch_refresh
+        marketplace_refresh = refresh_status(data or DATA)
         try:
             # The check owns the start and timing samples; logging adds no second timer.
             duration = diagnostic.get('total_s')
@@ -3495,12 +3501,18 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
                                 'limitKinds': diagnostic.get('limitKinds', []),
                                 'orderCoverage': diagnostic.get('order_coverage', {}),
                                 'chargeCensus': diagnostic.get('charge_census', {}),
+                                'marketplace_refresh': marketplace_refresh,
                                 **{key: stats.get(key, 0) for key in (*TIMING_KEYS, *charges.OWNER_TIMING_KEYS)},
                                 'owner_result': stats.get('owner_result', 'ok'),
                                 **charges.receipt_timing(stats),
                                 'starved_by': stats.get('starved_by', diagnostic.get('starved_by', 'none'))})
         except Exception:
             pass
+        if marketplace_refresh == 'started':
+            try:
+                launch_refresh(data or DATA)
+            except OSError:
+                record_event('marketplace.refresh', kind='error', ok=False, props={'result': 'launch_error'})
 
 
 def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *, diagnostic):

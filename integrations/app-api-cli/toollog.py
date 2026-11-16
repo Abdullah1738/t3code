@@ -35,7 +35,7 @@ _NAMES = {
     'track.eta_elapsed', 'track.delivered', 'track.error', 'card.assert',
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
-    'question.ask', 'check.run', 'cache_reset',
+    'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
     'order_watch.item_drop_check',
     'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared',
 }
@@ -52,6 +52,9 @@ _ENUMS = {
     'starved_by': {'none', 'owner_threads', 'msgs', 'lookups', 'census', 'receipt', 'history',
                    'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order_charges',
                    'payments', 'questions', 'refunds', 'order_screen', 'loads', 'writes', 'locks'},
+    'marketplace_refresh': {'started', 'busy', 'fresh', 'skipped'},
+    'snapshot_error': {'none', 'snapshot_missing', 'snapshot_corrupt'},
+    'result': {'busy', 'budget', 'list_error', 'detail_error', 'invalid_paging', 'placement_unknown', 'end_of_history', 'launch_error', 'cache_busy', 'store_error'},
     'owner_result': {'ok', 'incomplete', 'list_failed'},
     'slowestPhase': {'reconcile', 'follow', 'attention', 'build_write'},
     'state': {'unknown', 'placed', 'ordered', 'shipped', 'preparing', 'picked up', 'out for delivery',
@@ -59,7 +62,7 @@ _ENUMS = {
 }
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
 _BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
-_NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
+_NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
             'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
             'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
@@ -69,11 +72,12 @@ _NUMBERS = {'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired',
 _CASE_FIELDS = {'merchant', 'amount', 'currency', 'reference', 'state', 'next', 'deadline',
                 'due', 'why', 'who', 'watchers', 'note', 'because', 'reply', 'source'}
 _MONEY_PROPS = {
+    'marketplace.refresh': {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'result', 'snapshot_error'},
     'case.open': {'kind', 'unmatched'},
     'case.update': {'fields', 'deadlineMoved', 'answered'},
     'case.close': {'kind', 'ageDays'},
     'question.ask': {'outcome'},
-    'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus',
+    'check.run': {'budgetHit', 'openCases', 'fired', 'slowestPhase', 'sourceLimits', 'limitKinds', 'orderCoverage', 'chargeCensus', 'marketplace_refresh',
                   'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms', 'msgs_by_kind', 'receipt_result',
                   'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
                   'order_screen_ms', 'history_ms', 'receipt_ms', 'loads_ms', 'writes_ms', 'writes_n', 'locks_ms', 'follow_ms', 'untimed_ms',
@@ -458,7 +462,7 @@ def _fields(props):
             result[key] = value
         elif key == 'limitKinds' and isinstance(value, list):
             result[key] = sorted({v for v in value if isinstance(v, str) and v in {
-                'ORDER_LIST_HOST_BINDING_UNVERIFIED', 'food_page_1', 'nownow_page_1', 'marketplace_page_1'}})
+                'ORDER_LIST_HOST_BINDING_UNVERIFIED', 'food_page_1', 'nownow_page_1', 'marketplace_page_1', 'marketplace_hold', 'marketplace_stale'}})
         elif key == 'receipt_result' and isinstance(value, dict):
             result[key] = {k: v for k, v in value.items() if k in {'found', 'none', 'out_of_time', 'error'}
                            and type(v) is int and 0 <= v <= 10**9}
@@ -469,7 +473,7 @@ def _fields(props):
                            and isinstance(bucket, dict)}
         elif key == 'chargeCensus' and isinstance(value, dict):
             result[key] = {app: {k: v for k, v in counts.items()
-                if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked'}
+                if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked', 'marketplace_hold', 'marketplace_stale'}
                 and type(v) is int and 0 <= v <= 10**9}
                 for app, counts in value.items() if app in {'noon', 'careem'} and isinstance(counts, dict)}
         elif key == 'orderCoverage' and isinstance(value, dict):
@@ -483,11 +487,11 @@ def _fields(props):
                     lane = lanes.get(name)
                     if not isinstance(lane, dict):
                         continue
-                    safe = {k: v for k, v in lane.items() if k in {'pages', 'fetched', 'cached', 'ms', 'coverage_cleared_rows'}
+                    safe = {k: v for k, v in lane.items() if k in {'pages', 'fetched', 'cached', 'ms', 'coverage_cleared_rows', 'hold_count', 'placements_known', 'placements_total', 'snapshot_age_s'}
                             and type(v) is int and 0 <= v <= 10**9}
                     if type(lane.get('stop_reason')) is str and lane['stop_reason'] in {'slice_out', 'detail_error', 'unknown_time_row',
                             'scoped_cancellation', 'scoped_conflict', 'unordered', 'repeated_page', 'invalid_detail',
-                            'invalid_paging', 'end_of_history', 'covered', 'unproven_paging', 'list_error', 'reader_error'}:
+                            'snapshot_missing', 'snapshot_incomplete', 'placement_unknown', 'snapshot_corrupt', 'invalid_paging', 'end_of_history', 'covered', 'unproven_paging', 'list_error', 'reader_error'}:
                         safe['stop_reason'] = lane['stop_reason']
                     covered = lane.get('covered_from')
                     if covered is None or (isinstance(covered, str) and re.fullmatch(

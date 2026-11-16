@@ -407,7 +407,10 @@ times already held in memory took 10,383 ms; a separate history-only traversal
 took 11,562 ms. The warm figure is an optimistic lower bound: no per-order
 validation, account re-verification, or production process startup is included.
 It already exceeds the money-cases lane's 8,000 ms maximum (7,800 ms for the
-child before startup costs). No budget is raised and no cross-run cursor is
-retained. Money-cases keeps `scoped_cancellation`, null Marketplace coverage,
-and its existing matching semantics. A proven cancellation rule would still
-leave the full-chain timing and mixed-order proof unresolved.
+child before startup costs). No in-check budget is raised and no cross-run cursor
+is retained. Money-cases instead refreshes a placement-date snapshot in a detached
+process. Each refresh starts a new full cursor walk; a completed walk dates the
+snapshot's proof. Checks use that snapshot and cached whole-delivered receipts,
+holding charges near every other placement and limiting charges whose match
+window ends after the walk began. This does not establish cancellation proof or
+a placement-ordered prefix.
