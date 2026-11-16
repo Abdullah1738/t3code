@@ -481,9 +481,9 @@ export function triggerSig(watcher: Watcher): string | undefined {
   return watcher.triggers.map(path => {
     try { const st = statSync(path); return `${st.mtimeMs}:${st.size}`; }
     catch (error) {
-      // SQLite removes a checkpointed WAL while the paired database remains a healthy trigger.
+      // SQLite removes a checkpointed WAL even when only that WAL is configured as a trigger.
       if ((error as NodeJS.ErrnoException).code === "ENOENT" && path.endsWith("-wal")
-        && watcher.triggers!.includes(path.slice(0, -4)) && existsSync(path.slice(0, -4))) return "missing";
+        && existsSync(path.slice(0, -4))) return "missing";
       throw new TriggerError(path, error);
     }
   }).join("|");

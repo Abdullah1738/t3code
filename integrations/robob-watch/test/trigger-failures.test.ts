@@ -199,28 +199,54 @@ test("a pending event still delivers when the trigger disappears", () => {
   expect(result.rows.filter((row: { name: string }) => row.name === "runner.error")).toHaveLength(0);
 });
 
-test("a paired SQLite database stays healthy while its WAL appears and disappears", () => {
-  const result = simulate(`
-    writeFileSync(trigger, "database"); add({interval_s: 600, triggers: [trigger + "-wal", trigger]});
-    await at(0); const absentWal = state();
-    writeFileSync(trigger + "-wal", "write"); await at(2); const appeared = runs();
-    rmSync(trigger + "-wal"); await at(4);
-    output({absentWal, appeared, runs: runs(), state: state(), rows: rows()});
-  `);
-  expect(result.absentWal.consecutive_failures).toBe(0);
-  expect(result.appeared).toBe(2);
-  expect(result.runs).toBe(3);
-  expect(result.state.consecutive_failures).toBe(0);
-  expect(result.rows.filter((row: { kind: string }) => row.kind === "error")).toHaveLength(0);
-});
+const walConfigurations = [
+  { label: "single WAL", paths: 'trigger + "-wal"', includesBase: false },
+  { label: "WAL then database", paths: 'trigger + "-wal", trigger', includesBase: true },
+  { label: "database then WAL", paths: 'trigger, trigger + "-wal"', includesBase: true },
+];
 
-test("a missing database and WAL pair still counts as a failure", () => {
-  const result = simulate(`
-    add({triggers: [trigger + "-wal", trigger]}); await at(0); output({state: state(), rows: rows()});
-  `);
-  expect(result.state.consecutive_failures).toBe(1);
-  expect(result.rows.filter((row: { name: string }) => row.name === "runner.error")).toHaveLength(1);
-});
+for (const configuration of walConfigurations) {
+  test(`${configuration.label} stays healthy as SQLite creates and removes its WAL`, () => {
+    const result = simulate(`
+      writeFileSync(trigger, "database"); add({interval_s: 600, triggers: [${configuration.paths}]});
+      await at(0); const absentWal = state();
+      writeFileSync(trigger + "-wal", "write"); await at(2); const appeared = runs();
+      rmSync(trigger + "-wal"); await at(4); const disappeared = runs();
+      writeFileSync(trigger + "-wal", "next write"); await at(6);
+      output({absentWal, appeared, disappeared, runs: runs(), state: state(), rows: rows(), calls: readCalls()});
+    `);
+    expect(result.absentWal.consecutive_failures).toBe(0);
+    expect(result.appeared).toBe(2);
+    expect(result.disappeared).toBe(3);
+    expect(result.runs).toBe(4);
+    expect(result.state.consecutive_failures).toBe(0);
+    expect(result.state.failure_paused_at).toBeUndefined();
+    expect(result.calls).toHaveLength(0);
+    expect(result.rows.filter((row: { kind: string }) => row.kind === "error")).toHaveLength(0);
+  });
+
+  for (const basePresent of [true, false]) for (const wal of ["absent", "present", "broken"] as const) {
+    const healthy = wal !== "broken" && (wal === "present" || basePresent)
+      && (basePresent || !configuration.includesBase);
+    test(`${configuration.label}: database ${basePresent ? "present" : "absent"}, WAL ${wal}`, () => {
+      const result = simulate(`
+        if (${basePresent}) writeFileSync(trigger, "database");
+        if (${JSON.stringify(wal)} === "present") writeFileSync(trigger + "-wal", "write");
+        if (${JSON.stringify(wal)} === "broken") symlinkSync(trigger + "-wal", trigger + "-wal");
+        add({triggers: [${configuration.paths}]});
+        for (let second = 0; second < 600; second++) await at(second);
+        output({state: state(), runs: runs(), rows: rows(), calls: readCalls()});
+      `);
+      expect(result.runs).toBe(healthy ? 120 : 0);
+      expect(result.state.consecutive_failures).toBe(healthy ? 0 : 5);
+      expect(!!result.state.failure_paused_at).toBe(!healthy);
+      expect(result.calls).toHaveLength(healthy ? 0 : 4);
+      const errors = result.rows.filter((row: { kind: string }) => row.kind === "error");
+      expect(errors).toHaveLength(healthy ? 0 : 1);
+      expect(JSON.stringify(errors)).not.toContain("PRIVATE");
+    });
+  }
+}
 
 test("trigger failures keep the fifteen-minute wake escalation and five-minute retry cap", () => {
   const result = simulate(`
