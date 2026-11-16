@@ -114,6 +114,7 @@ const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
   ThreadReadTimeoutError: "timeout",
   PullRequestWatchTimeoutError: "timeout",
+  PullRequestWatchUnavailableError: "refused",
   PullRequestToolTimeoutError: "timeout",
   PreviewAutomationTimeoutError: "timeout",
   PreviewAutomationRecordingDeadlineExpiredError: "timeout",

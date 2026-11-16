@@ -6,6 +6,9 @@ import {
   NodeId,
   type OrchestrationV2ServerCommand as OrchestrationCommand,
   PullRequestOperationError,
+  PullRequestUnavailableError,
+  SourceControlProviderKind,
+  type PullRequestDetail,
   type OrchestrationProjectShell,
   type PullRequestRef,
   type PullRequestReviewGuideResult,
@@ -20,6 +23,8 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as Tracer from "effect/Tracer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
@@ -36,6 +41,7 @@ import {
 } from "../../../orchestration-v2/testkit/pullRequestFixtures.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../../../project/RepositoryIdentityResolver.ts";
+import * as PullRequestService from "../../../pullRequest/PullRequestService.ts";
 import * as PullRequestReviewGuideService from "../../../pullRequest/PullRequestReviewGuideService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -77,7 +83,7 @@ function makeProject(
       remoteName: "origin",
       remoteUrl: "git@github.com:T3Tools/T3Code.git",
     },
-    provider: "github",
+    provider: SourceControlProviderKind.make("github"),
     displayName: "T3Tools/T3Code",
     owner: "T3Tools",
     name: "T3Code",
@@ -163,6 +169,7 @@ const watch = {
 };
 
 interface HarnessOptions {
+  readonly detail?: PullRequestService.PullRequestService["Service"]["detail"];
   readonly callerLayer?: Layer.Layer<ThreadManagement.ThreadManagementService>;
   readonly thread?: PullRequestTestThread | null;
   readonly project?: OrchestrationProjectShell | null;
@@ -180,12 +187,61 @@ interface HarnessOptions {
   >;
 }
 
+const READABLE_PR: PullRequestDetail = {
+  provider: SourceControlProviderKind.make("github"),
+  capabilities: {
+    diff: true,
+    comment: true,
+    actions: [],
+    mergeMethods: [],
+    search: false,
+    review: { inlineComment: false, reply: false, resolve: false, verdicts: [] },
+    reviewers: { request: false, listCandidates: false },
+  },
+  viewerPermissions: {
+    actions: [],
+    comment: true,
+    resolve: true,
+    verdicts: [],
+    requestReviewers: false,
+  },
+  projectId: ProjectId.make("forgejo-project"),
+  projectTitle: "Watch",
+  workspaceRoot: "/workspace/watch",
+  repository: "acme/web",
+  number: 9,
+  title: "Watched PR",
+  body: "",
+  url: "https://github.com/acme/web/pull/9",
+  author: null,
+  state: "open",
+  isDraft: false,
+  mergeability: "mergeable",
+  additions: 1,
+  deletions: 0,
+  changedFiles: 1,
+  headBranch: "feature",
+  headSha: "head-1",
+  headBranchSha: "head-1",
+  checksHeadSha: "head-1",
+  baseBranch: "main",
+  createdAt: "2026-11-12T00:00:00.000Z",
+  updatedAt: "2026-11-12T00:00:00.000Z",
+  mergedAt: null,
+  closedAt: null,
+  reviewers: [],
+  labels: [],
+  checks: [{ name: "lint", status: "success", required: true, description: null, url: null }],
+  mergeCapabilities: { merge: true, squash: true, rebase: true },
+};
+
 const NO_GUIDE: PullRequestReviewGuideResult = { guide: null, run: null, currentHeadSha: "head-1" };
 
 const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
   options: HarnessOptions = {},
 ) {
   const commands = yield* Ref.make<ReadonlyArray<OrchestrationCommand>>([]);
+  const detailRequests = yield* Ref.make<ReadonlyArray<PullRequestRef>>([]);
   const guideRequests = yield* Ref.make<ReadonlyArray<PullRequestRef>>([]);
   const thread = options.thread === undefined ? makeThread([]) : options.thread;
   const project = options.project === undefined ? makeProject() : options.project;
@@ -202,6 +258,12 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
       return { sequence: 1, storedEvents: [] };
     });
   const layerDependencies = Layer.mergeAll(
+    Layer.mock(PullRequestService.PullRequestService)({
+      detail: (input) =>
+        Ref.update(detailRequests, (recorded) => [...recorded, input]).pipe(
+          Effect.andThen(options.detail?.(input) ?? Effect.succeed(READABLE_PR)),
+        ),
+    }),
     Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({
       resolve: () => Effect.succeed(null),
     }),
@@ -258,7 +320,7 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
       Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
       Effect.provide(layerDependencies),
     );
-  return { commands, guideRequests, call };
+  return { commands, detailRequests, guideRequests, call };
 });
 
 describe("pull request toolkit handlers", () => {
@@ -371,6 +433,155 @@ describe("pull request toolkit handlers", () => {
         },
       ]);
     }),
+  );
+
+  it.effect.each(["cli-missing", "cli-unauthenticated", "provider-unsupported"] as const)(
+    "watch preflight refuses an unavailable host (%s) without dispatching",
+    (reason) =>
+      Effect.gen(function* () {
+        const thread = makeThread([makeLink(9)]);
+        const unavailable = new PullRequestUnavailableError({
+          reason,
+          provider: SourceControlProviderKind.make("github"),
+        });
+        const harness = yield* makeHarness({ thread, detail: () => Effect.fail(unavailable) });
+        const error = yield* harness
+          .call("watch_pull_request", {
+            url: "https://github.com/T3Tools/T3Code/pull/9/files",
+          })
+          .pipe(Effect.flip);
+        expect(error).toMatchObject({
+          _tag: "PullRequestWatchUnavailableError",
+          host: "github.com",
+          reason,
+        });
+        expect(error.message).toContain(unavailable.message);
+        expect(error.message).toContain(
+          "The watch was not started; check the PR with your own tools instead.",
+        );
+        expect(yield* Ref.get(harness.commands)).toEqual([]);
+        expect(thread.pullRequests?.[0]?.watch).toBeUndefined();
+        expect(yield* Ref.get(harness.detailRequests)).toEqual([
+          {
+            projectId: PROJECT_ID,
+            host: "github.com",
+            repository: "t3tools/t3code",
+            number: 9,
+            allowStale: false,
+          },
+        ]);
+      }),
+  );
+
+  it.effect("watch preflight registers despite a transient host read error", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        detail: () =>
+          Effect.fail(
+            new PullRequestOperationError({ operation: "detail", detail: "Rate limited" }),
+          ),
+      });
+      yield* harness.call("watch_pull_request", { repository: "t3tools/t3code", number: 9 });
+      expect(yield* Ref.get(harness.detailRequests)).toHaveLength(1);
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        { type: "thread.pull-request.watch", watching: true },
+      ]);
+    }),
+  );
+
+  it.effect("watch preflight times out and still dispatches before the operation deadline", () =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        detail: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      const pending = yield* harness
+        .call("watch_pull_request", {
+          repository: "t3tools/t3code",
+          number: 9,
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("3 seconds");
+      expect(yield* Fiber.join(pending)).toMatchObject({ wasWatching: false });
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        { type: "thread.pull-request.watch", watching: true },
+      ]);
+    }),
+  );
+
+  it.effect.each(["ok", "unavailable", "skipped-error", "timeout"] as const)(
+    "watch preflight records %s and logs only refusals",
+    (outcome) =>
+      Effect.gen(function* () {
+        const spans: Tracer.NativeSpan[] = [];
+        const logs: unknown[] = [];
+        const tracer = Tracer.make({
+          span: (options) => {
+            const span = new Tracer.NativeSpan(options);
+            spans.push(span);
+            return span;
+          },
+        });
+        const entered = yield* Deferred.make<void>();
+        const harness = yield* makeHarness({
+          detail: () =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined);
+              switch (outcome) {
+                case "unavailable":
+                  return yield* new PullRequestUnavailableError({ reason: "cli-missing" });
+                case "skipped-error":
+                  return yield* new PullRequestOperationError({
+                    operation: "detail",
+                    detail: "Rate limited",
+                  });
+                case "timeout":
+                  return yield* Effect.never;
+                case "ok":
+                  return READABLE_PR;
+              }
+            }),
+        });
+        const pending = yield* harness
+          .call("watch_pull_request", { repository: "t3tools/t3code", number: 9 })
+          .pipe(
+            Effect.result,
+            Effect.withTracer(tracer),
+            Effect.provide(
+              Logger.layer([
+                Logger.make(({ message }) => {
+                  logs.push(message);
+                }),
+              ]),
+            ),
+            Effect.forkChild,
+          );
+        yield* Deferred.await(entered);
+        if (outcome === "timeout") yield* TestClock.adjust("3 seconds");
+        yield* Fiber.join(pending);
+        expect(
+          spans
+            .find((span) => span.name === "PullRequestsToolkit.setWatching")
+            ?.attributes.get("pullRequest.watch.preflight"),
+        ).toBe(outcome);
+        expect(logs).toEqual(
+          outcome === "unavailable"
+            ? [
+                [
+                  "pull request watch preflight refused",
+                  {
+                    host: "github.com",
+                    repository: "t3tools/t3code",
+                    number: 9,
+                    reason: "cli-missing",
+                    threadId: THREAD_ID,
+                  },
+                ],
+              ]
+            : [],
+        );
+      }),
   );
 
   it.effect("watching an unlinked pull request links it first", () =>
@@ -662,6 +873,7 @@ describe("pull request toolkit handlers", () => {
       ).toMatchObject({ number: 9, watching: true, wasWatching: true, alreadyWatching: true });
       expect(yield* Ref.get(harness.commands)).toEqual([]);
       expect(reads).toBe(1);
+      expect(yield* Ref.get(harness.detailRequests)).toEqual([]);
     }),
   );
 
@@ -1292,7 +1504,7 @@ describe("pull request guide tools", () => {
               remoteName: "origin",
               remoteUrl: "git@github.com:acme/web.git",
             },
-            provider: "github",
+            provider: SourceControlProviderKind.make("github"),
             displayName: "acme/web",
             owner: "acme",
             name: "web",

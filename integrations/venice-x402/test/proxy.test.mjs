@@ -308,3 +308,48 @@ test('egress check logs the failing reason and reset() drops a cached success', 
   c.reset();
   assert.equal(await c(), false);
 });
+
+test('builtin egress check: DNS in tunnel range, fresh healthy state, Venice sees the exit IP', async () => {
+  const { builtinEgressCheck } = await import('../lib/egress.mjs');
+  const { writeFileSync } = await import('node:fs');
+  const dir = mkdtempSync(join(tmpdir(), 'vx402-state-'));
+  const statePath = join(dir, 'state.json');
+  const nowS = 1_800_000_000;
+  writeFileSync(statePath, JSON.stringify({ healthy: true, healthy_at: nowS - 60, exit_ip: '1.2.3.4' }));
+  const traced = [];
+  const base = {
+    statePath,
+    now: () => nowS * 1000,
+    lookup: async (h) => ({ address: h === 'venice.ai' ? '198.18.0.4' : '198.19.0.2' }),
+    fetchImpl: async (u) => (traced.push(u), new Response('fl=1\nip=1.2.3.4\nts=1\n')),
+  };
+  assert.deepEqual(await builtinEgressCheck(base)(), { ok: true });
+  // a name outside the tunnel range: refused before anything is sent to Venice
+  traced.length = 0;
+  const leak = await builtinEgressCheck({ ...base, lookup: async () => ({ address: '104.18.1.1' }) })();
+  assert.equal(leak.ok, false);
+  assert.match(leak.reason, /not the tunnel range/);
+  assert.equal(traced.length, 0);
+  // Venice sees another IP
+  const other = await builtinEgressCheck({ ...base, fetchImpl: async () => new Response('ip=9.9.9.9\n') })();
+  assert.match(other.reason, /Venice sees '9\.9\.9\.9'/);
+  // stale health
+  const stale = await builtinEgressCheck({ ...base, now: () => (nowS + 3600) * 1000 })();
+  assert.match(stale.reason, /not healthy/);
+  // missing state, hung DNS
+  assert.match((await builtinEgressCheck({ ...base, statePath: join(dir, 'nope.json') })()).reason, /no tunnel state/);
+  const hung = await builtinEgressCheck({ ...base, timeoutMs: 30, lookup: () => new Promise(() => {}) })();
+  assert.match(hung.reason, /DNS venice\.ai timed out/);
+  // wired through defaultEgressCheck: success cached, failure logged
+  const { defaultEgressCheck } = await import('../lib/server.mjs');
+  const events = [];
+  let n = 0;
+  const c = defaultEgressCheck({ egressCheck: 'builtin', egressCheckTtlMs: 60_000 }, (o) => events.push(o), {
+    builtin: async () => (++n === 1 ? { ok: false, reason: 'FAIL x' } : { ok: true }),
+  });
+  assert.equal(await c(), false);
+  assert.equal(await c(), true);
+  assert.equal(await c(), true);
+  assert.equal(n, 2);
+  assert.deepEqual(events, [{ event: 'egress_failed', reason: 'FAIL x' }]);
+});
