@@ -1,0 +1,170 @@
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { rowSetDigest } from "./kafka-acl-apply.mjs";
+import { shellQuote } from "./kafka-onbox-admin.mjs";
+
+const digest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const fail = message => { throw new Error(message); };
+
+export function parseScramUsers(text) {
+  const users = [];
+  for (const line of text.split(/\r?\n/).filter(l => l.trim())) {
+    const match = /^SCRAM credential configs for user-principal '([A-Za-z0-9._-]+)' are SCRAM-SHA-512=iterations=\d+$/.exec(line.trim());
+    if (!match || users.includes(match[1])) fail("unexpected SCRAM user listing");
+    users.push(match[1]);
+  }
+  if (!users.includes("broker")) fail("SCRAM user listing has no broker");
+  return users.sort();
+}
+
+// Reads every configured log directory, including a separately configured metadata log.
+export function formatFingerprintShell() {
+  const script = [
+    "import json,pathlib,sys",
+    "def props(path):",
+    " out={}",
+    " for line in pathlib.Path(path).read_text().splitlines():",
+    "  if line.strip() and not line.lstrip().startswith('#'):",
+    "   k,v=line.split('=',1)",
+    "   if k.strip() in out: raise ValueError('duplicate property')",
+    "   out[k.strip()]=v.strip()",
+    " return out",
+    "p=props('/opt/kafka/config/kraft.properties')",
+    "dirs=p['log.dirs'].split(',')",
+    "if p.get('metadata.log.dir'): dirs.append(p['metadata.log.dir'])",
+    "logs=[]",
+    "for d in sorted(set(dirs)):",
+    " if not pathlib.Path(d).is_absolute(): raise ValueError('absolute log path required')",
+    " m=props(pathlib.Path(d)/'meta.properties')",
+    " if m['node.id']!=p['node.id']: raise ValueError('node identity differs')",
+    " logs.append({'path':d,'directory_id':m['directory.id'],'cluster_id':m['cluster.id']})",
+    "print(json.dumps({'node_id':p['node.id'],'log_directories':logs}))"
+  ].join("\n");
+  return ["set -euo pipefail", `python3 -I -c ${shellQuote(script)}`].join("\n");
+}
+
+export function discoverBrokers({ awsJson, env, expectedNodeIds }) {
+  const response = awsJson(["ec2", "describe-instances", "--filters", `Name=tag:KafkaCluster,Values=crpko-${env}-kafka-primary`, "Name=instance-state-name,Values=running"]);
+  if (!Array.isArray(response.Reservations)) fail("broker inventory unavailable");
+  const brokers = response.Reservations.flatMap(r => r.Instances ?? []).map(i => ({ instance_id: i.InstanceId,
+    node_id: i.Tags?.find(t => t.Key === "KafkaNodeId")?.Value,
+    node_name: i.Tags?.find(t => t.Key === "KafkaNodeName")?.Value }));
+  if (brokers.length !== expectedNodeIds.length || new Set(brokers.map(b => b.instance_id)).size !== brokers.length
+    || brokers.some(b => !/^i-[0-9a-f]{8,17}$/.test(b.instance_id ?? "") || b.node_name !== `broker-${b.node_id}`)
+    || JSON.stringify(brokers.map(b => b.node_id).sort()) !== JSON.stringify([...expectedNodeIds].sort())) fail("broker inventory does not match capacity manifest");
+  return brokers.sort((a, b) => a.node_id.localeCompare(b.node_id));
+}
+
+export function collectFormats({ brokers, ssm, clusterId }) {
+  const formats = brokers.map(b => {
+    const result = JSON.parse(ssm(b.instance_id, formatFingerprintShell(), "Kafka format fingerprint"));
+    if (result.node_id !== b.node_id || !Array.isArray(result.log_directories) || !result.log_directories.length) fail("format node identity differs");
+    const dirs = result.log_directories;
+    if (new Set(dirs.map(d => d.path)).size !== dirs.length || dirs.some(d => !/^\//.test(d.path ?? "") || !/^[A-Za-z0-9_-]{22}$/.test(d.directory_id ?? "") || d.cluster_id !== clusterId)) fail("format cluster or directory identity differs");
+    return { instance_id: b.instance_id, node_id: b.node_id, log_directories: dirs.sort((a, c) => a.path.localeCompare(c.path)) };
+  });
+  if (new Set(formats.flatMap(f => f.log_directories.map(d => d.directory_id))).size !== formats.reduce((n, f) => n + f.log_directories.length, 0)) fail("duplicate format directory id");
+  return formats;
+}
+
+// Inspect all active tasks, including consumer-only and one-off families. Identify
+// Kafka clients from their deployed config and the principal binary inventory.
+export function requireIdleKafkaClients({ awsJson, env }) {
+  const binaries = [...new Set(JSON.parse(readFileSync(new URL("../../plan/kafka/acl-principals.v1.json", import.meta.url))).principals.map(p => p.binary))];
+  const definitions = new Map();
+  const isClient = arn => {
+    if (!definitions.has(arn)) {
+      const definition = awsJson(["ecs", "describe-task-definition", "--task-definition", arn]).taskDefinition;
+      if (definition?.taskDefinitionArn !== arn || typeof definition.family !== "string" || !Array.isArray(definition.containerDefinitions) || !definition.containerDefinitions.length) fail("Kafka client definition unreadable");
+      const knownFamily = binaries.some(b => definition.family === `crpko-${env}-${b}` || definition.family.startsWith(`crpko-${env}-${b}-`));
+      let configured = false;
+      for (const container of definition.containerDefinitions) {
+        for (const kind of ["environment", "secrets"]) {
+          const fields = container[kind] ?? [];
+          if (!Array.isArray(fields) || fields.some(f => typeof f?.name !== "string" || typeof f[kind === "secrets" ? "valueFrom" : "value"] !== "string")) fail("Kafka client definition config unreadable");
+          if (fields.some(f => /KAFKA/i.test(f.name) || /(?:^|[/:])kafka[/:]/i.test(f.valueFrom ?? ""))) configured = true;
+        }
+      }
+      definitions.set(arn, knownFamily || configured);
+    }
+    return definitions.get(arn);
+  };
+  for (const status of ["RUNNING", "STOPPED"]) {
+    let token;
+    const tokens = new Set(), arns = new Set();
+    do {
+      const page = awsJson(["ecs", "list-tasks", "--cluster", `crpko-${env}`, "--desired-status", status, "--no-paginate", ...(token ? ["--next-token", token] : [])]);
+      if (!Array.isArray(page.taskArns) || new Set(page.taskArns).size !== page.taskArns.length || page.taskArns.some(a => typeof a !== "string" || !a || arns.has(a))) fail("Kafka client task inventory unavailable");
+      for (const arn of page.taskArns) arns.add(arn);
+      token = page.nextToken;
+      if (token !== undefined && (typeof token !== "string" || !token || tokens.has(token))) fail("Kafka client task pagination invalid");
+      tokens.add(token);
+    } while (token);
+    const tasks = [...arns];
+    for (let i = 0; i < tasks.length; i += 100) {
+      const batch = tasks.slice(i, i + 100), result = awsJson(["ecs", "describe-tasks", "--cluster", `crpko-${env}`, "--tasks", ...batch]);
+      if (!Array.isArray(result.tasks) || !Array.isArray(result.failures) || result.failures.length || result.tasks.length !== batch.length
+        || new Set(result.tasks.map(t => t.taskArn)).size !== batch.length || result.tasks.some(t => !batch.includes(t.taskArn) || typeof t.lastStatus !== "string" || !t.lastStatus)) fail("Kafka client task state unreadable");
+      for (const task of result.tasks) {
+        if (task.lastStatus === "STOPPED") continue;
+        if (typeof task.taskDefinitionArn !== "string" || !task.taskDefinitionArn) fail("Kafka client task definition unavailable");
+        if (isClient(task.taskDefinitionArn)) fail("Kafka clients running, pending or draining; use --clients-running-ok only for later row additions");
+      }
+    }
+  }
+}
+
+export function buildAclEvidence({ latch, target, manifest, rows, users, formats, mode, now = new Date() }) {
+  if (!latch || latch.env !== target.env || latch.account_id !== target.account_id || latch.region !== target.region || !latch.installation_id) fail("installation latch required for ACL evidence");
+  if (!formats.length || manifest.environment !== target.env) fail("ACL evidence target unavailable");
+  return { schema: "crpko.kafka.authz-evidence.v1", installation_id: latch.installation_id,
+    environment: target.env, account_id: target.account_id, region: target.region, cluster_id: manifest.cluster_id,
+    format_fingerprint: formats, format_sha256: digest(formats), manifest_sha256: manifest.sha256,
+    listing_sha256: rowSetDigest(rows), user_list_sha256: digest([...users].sort()),
+    row_count: rows.length, principal_count: new Set(rows.map(r => r.principal)).size, user_count: users.length,
+    instance_ids: formats.map(f => f.instance_id), scram_users: users, mode, captured_at: now.toISOString() };
+}
+
+export function validateEvidenceUri(uri, env) {
+  const prefix = `s3://crpko-${env}-evidence/rebuild/`;
+  if (typeof uri !== "string" || !uri.startsWith(prefix) || !/^\d{4}-\d{2}-\d{2}\/kafka-authz\/[A-Za-z0-9._/-]+\.json$/.test(uri.slice(prefix.length)) || uri.includes("/../")) fail("--evidence-out must name an object in the environment rebuild/<date>/kafka-authz/ prefix");
+  return { bucket: `crpko-${env}-evidence`, key: uri.slice(`s3://crpko-${env}-evidence/`.length) };
+}
+
+export function writeAclEvidence({ awsJson, evidence, localPath, uri }) {
+  const { bucket, key } = validateEvidenceUri(uri, evidence.environment);
+  mkdirSync(dirname(localPath), { recursive: true });
+  writeFileSync(localPath, `${JSON.stringify(evidence, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  return awsJson(["s3api", "put-object", "--bucket", bucket, "--key", key,
+    "--body", localPath, "--content-type", "application/json", "--if-none-match", "*"]);
+}
+
+export function parseClientSnapshot({ env, clusterId, users, groupsText, offsetsText, now = new Date() }) {
+  const groups = new Map(), topics = new Map();
+  const normalGroup = g => g.replace(/-[a-f0-9]{32}$/, "-<ecs_task_id>").replace(/^(venue-router-adapters-registry)-.+-[a-z0-9]+$/, "$1-<host>-<boot>");
+  for (const line of groupsText.split(/\r?\n/).filter(l => l.trim())) {
+    const fields = line.trim().split(/\s+/);
+    if (fields[0] === "GROUP" && fields[1] === "TOPIC") continue;
+    // Kafka reports inactive groups on stderr; stdout still has the tabular header.
+    if (fields.length !== 9 || !/^\d+$/.test(fields[2])) fail("unexpected consumer group listing");
+    if (fields[6] === "-" && fields[8] === "-") continue;
+    const group = normalGroup(fields[0]);
+    if (!groups.has(group)) groups.set(group, { group, clients: new Set(), consumers: new Set(), topics: new Set() });
+    const row = groups.get(group);
+    row.clients.add(fields[8]); row.consumers.add(fields[6]); row.topics.add(fields[1]);
+  }
+  const partitions = new Set();
+  for (const line of offsetsText.split(/\r?\n/).filter(l => l.trim())) {
+    const m = /^([^:\s]+):(\d+):(\d+)$/.exec(line);
+    if (!m || partitions.has(`${m[1]}:${m[2]}`) || !Number.isSafeInteger(Number(m[3]))) fail("unexpected topic offset listing");
+    partitions.add(`${m[1]}:${m[2]}`);
+    const offset = (topics.get(m[1]) ?? 0) + Number(m[3]);
+    if (!Number.isSafeInteger(offset)) fail("topic offset exceeds safe integer");
+    topics.set(m[1], offset);
+  }
+  return { schema: "crpko.kafka.acl-live-snapshot.v1", environment: env, cluster_id: clusterId, captured_at: now.toISOString(),
+    source: "on-broker SCRAM admin readback", scram_users: users,
+    groups: [...groups.values()].map(g => ({ group: g.group, instances: g.consumers.size, client_ids: [...g.clients].sort(), topics: [...g.topics].sort() })).sort((a,b) => a.group.localeCompare(b.group)),
+    topics: [...topics].map(([topic, end_offset]) => ({ topic, end_offset })).sort((a,b) => a.topic.localeCompare(b.topic)) };
+}

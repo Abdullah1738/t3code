@@ -422,11 +422,27 @@ def _python_touches_live(source, directory, replica=False):
 
 def _trusted_fixture_tool(executable, name, directory):
     trusted = {f'/bin/{name}', f'/usr/bin/{name}'}
+    if name == 'node':
+        trusted.add('/usr/local/bin/node')
+    system_paths = set(trusted)
+    if name in {'node', 'bash'}:
+        def root_owned(path):
+            try:
+                path = Path(os.path.realpath(path))
+                return all((info := os.stat(part)).st_uid == 0 and not info.st_mode & 0o022 for part in (path, *path.parents))
+            except Exception:
+                return False
+        trusted = {path for path in trusted if root_owned(path)}
     # This Mac's default Bash is Homebrew's versioned package, not /bin/bash.
     if name == 'bash':
         brew = '/opt/homebrew/bin/bash'
         if re.fullmatch(r'/opt/homebrew/Cellar/bash/[^/]+/bin/bash', os.path.realpath(brew)):
             trusted.add(brew)
+    if name == 'node':
+        for candidate in (executable, shutil.which(name)):
+            if candidate and candidate not in system_paths and os.path.isabs(candidate) and (re.fullmatch(r'/opt/homebrew/Cellar/node(?:@\d+)?/[^/]+/bin/node', os.path.realpath(candidate)) or
+                              re.fullmatch(re.escape(str(Path.home() / '.nvm/versions/node')) + r'/v\d+\.\d+\.\d+/bin/node', os.path.realpath(candidate))):
+                trusted.add(candidate)
     if executable in trusted:
         return True
     if executable != name:
@@ -2368,13 +2384,15 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     invalidated_written = set()
     write_history = {}
     variable_written = set()
+    tool_changes = set()
     stdin_words, stdin_bodies = _stdin or ([], {})
     if _sources is not None:
-        prior_written, prior_invalidated, prior_history, prior_variable = _sources
+        prior_written, prior_invalidated, prior_history, prior_variable, prior_tool_changes = _sources
         written.update(prior_written)
         invalidated_written.update(prior_invalidated)
         write_history.update((path, list(history)) for path, history in prior_history.items())
         variable_written.update(prior_variable)
+        tool_changes.update(prior_tool_changes)
     unknown_cause = "directory changed in a conditional branch"
     conditional = 0
     inherited_values, inherited_unsafe, caller_command = _environment or ({}, False, None)
@@ -2400,6 +2418,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     noclobber = False
 
     def affected_sources(path, descendants=False):
+        # Executable trust must survive the whole call, even writes before a
+        # script is remembered. None records an unbounded mutation.
+        tool_changes.add(path)
         if path is None:
             return set(written)
         affected = {remembered for remembered in written
@@ -2422,6 +2443,33 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 affected.add(remembered)
         return affected
 
+    def unchanged_tool(executable, directory):
+        if None in tool_changes:
+            return False
+        candidates = set()
+        if '/' not in executable:
+            # Relative PATH entries depend on the shell's current directory.
+            if any(not os.path.isabs(entry) for entry in os.get_exec_path()):
+                return False
+            candidates.update(_literal_path(str(Path(entry) / executable), directory) for entry in os.get_exec_path())
+            executable = shutil.which(executable)
+        path = _literal_path(executable, directory) if executable else None
+        if path is None:
+            return False
+        candidates.add(path)
+        for changed in tool_changes:
+            if any(candidate is None or candidate == changed or candidate.is_relative_to(changed) for candidate in candidates):
+                return False
+            for candidate in candidates:
+                try:
+                    if os.path.samefile(candidate, changed):
+                        return False
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return False
+        return True
+
     def python_preserves_sources(source, directory):
         try:
             tree = ast.parse(source)
@@ -2432,19 +2480,54 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         def string_value(node):
             return (isinstance(node, ast.Constant) and isinstance(node.value, str) or
                     isinstance(node, ast.Name) and node.id in strings or
+                    isinstance(node, ast.Subscript) and string_value(node.value) or
+                    isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and string_value(node.left) and string_value(node.right) or
                     isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
                     (node.func.attr == 'read' and isinstance(node.func.value, ast.Call) and _name(node.func.value.func) == 'open' or
+                     node.func.attr in {'read_text', 'read_bytes'} or
                      node.func.attr == 'replace' and string_value(node.func.value)))
 
         class StringMethods(ast.NodeTransformer):
             def visit_Call(self, node):
-                string_replace = isinstance(node.func, ast.Attribute) and node.func.attr == 'replace' and string_value(node.func.value)
+                string_replace = isinstance(node.func, ast.Attribute) and node.func.attr in {'replace', 'index'} and string_value(node.func.value)
+                parse = (_name(node.func) == 'ast.parse' or _name(node.func) == 'compile')
                 self.generic_visit(node)
-                if string_replace:
-                    return ast.Tuple(elts=[node.func.value, *node.args, *(k.value for k in node.keywords)], ctx=ast.Load())
+                if string_replace or parse:
+                    return ast.Tuple(elts=[*([node.func.value] if string_replace else []), *node.args, *(k.value for k in node.keywords)], ctx=ast.Load())
                 return node
 
+        def bound_names(node):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                return [node.id]
+            if isinstance(node, ast.arg):
+                return [node.arg]
+            if isinstance(node, ast.alias):
+                return [node.asname or node.name.split('.')[0]]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+                return [node.name] if node.name else []
+            return []
+
         for statement in tree.body:
+            # Compound scopes can rebind a value before using it. Only a
+            # straight-line assignment may keep the preceding value for its
+            # RHS (s = s.replace(...)); nested rebinding needs another call.
+            assignment_target = (statement.targets[0] if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and
+                                 isinstance(statement.targets[0], ast.Name) else None)
+            for node in ast.walk(statement):
+                if isinstance(node, ast.NamedExpr) or type(node).__name__ == 'Match':
+                    return False
+                if node is not assignment_target and any(name in bindings or name in strings for name in bound_names(node)):
+                    return False
+            if isinstance(statement, ast.Import):
+                statement.names = [item for item in statement.names if item.name != 'ast' or item.asname]
+            # Shadowed parsers and path constructors cannot justify preserving
+            # source or selecting a sibling destination.
+            constructors = {id(item) for item in statement.names
+                            if (isinstance(statement, ast.Import) and item.name == 'pathlib' or
+                                isinstance(statement, ast.ImportFrom) and statement.module == 'pathlib' and item.name == 'Path') and item.asname is None} if isinstance(statement, (ast.Import, ast.ImportFrom)) else set()
+            if any(name in {'ast', 'compile', 'Path', 'pathlib'} and id(node) not in constructors
+                   for node in ast.walk(statement) for name in bound_names(node)):
+                return False
             # Only straight-line literal destinations can prove that a data
             # edit leaves remembered scripts alone. Keep all value expressions
             # in the AST so their side effects still face the read-only check.
@@ -2516,9 +2599,17 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if binary == 'unset' and all(re.fullmatch(r'[A-Za-z_]\w*', arg) for arg in words[1:]):
             return False
         if binary in {'bash', 'sh', 'zsh', 'dash', 'ksh', 'node', 'bun', 'deno'} or re.fullmatch(r'python[\d.]*', binary):
+            if (binary == 'node' and not unsafe_bindings and not os.environ.get('NODE_OPTIONS') and
+                    'NODE_OPTIONS' not in shell_values and len(words) == 3 and words[1] in {'--check', '-c'} and
+                    not words[2].startswith('-') and not any(name.startswith('BASH_FUNC_') for name in os.environ) and
+                    _trusted_fixture_tool(words[0], 'node', directory) and unchanged_tool(words[0], directory)):
+                return False
             if (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(words) == 3 and words[1] == '-n' and
-                    not words[2].startswith('-') and not unsafe_bindings and
-                    not any(name in shell_values or os.environ.get(name) and not inherited_startup_safe(name, directory) for name in {'BASH_ENV', 'ENV', 'ZDOTDIR'}) and
+                    not words[2].startswith('-') and not unsafe_bindings and unchanged_tool(words[0], directory) and
+                    # Bash's noexec mode also disables startup-file commands.
+                    # Other shells retain their existing startup proof.
+                    (binary == 'bash' and _trusted_fixture_tool(words[0], 'bash', directory) or
+                     not any(name in shell_values or os.environ.get(name) and not inherited_startup_safe(name, directory) for name in {'BASH_ENV', 'ENV', 'ZDOTDIR'})) and
                     not any(name.startswith('BASH_FUNC_') for name in os.environ)):
                 return False
             if re.fullmatch(r'python[\d.]*', binary):
@@ -2635,6 +2726,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         # The older proof already handles literal data edits and a restricted
         # read-only helper grammar. Add only the JSON/HTTP readback grammar
         # here, never a denylist of Python writers: unknown code can write too.
+        if any(type(node).__name__ == 'Match' for node in ast.walk(tree)):
+            return False
         modules = {'json', 'sys', 'pathlib', 'urllib.request', 'unittest', 'tempfile'}
         calls = {'print', 'len', 'dict', 'list', 'tuple', 'str', 'int', 'bool',
                  'json.load', 'json.loads', 'json.dumps', 'pathlib.Path', 'pathlib.Path.read_text',
@@ -2997,7 +3090,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             if STARTUP_ENV.fullmatch(name) or name in {'ZDOTDIR', 'PATH', 'IFS'}},
                            unsafe_bindings, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
-                                  _sources=(written, invalidated_written, write_history, variable_written),
+                                  _sources=(written, invalidated_written, write_history, variable_written, tool_changes),
                                   _stdin=(input_words, input_bodies or {}), _environment=environment)
         paths.extend(path for path in remote_paths if path not in paths)
         if len(paths) > MAX_SCRIPTS:
@@ -3205,6 +3298,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         scan_remote(argv[0] if len(argv) == 1 else shlex.join(argv), directory, depth + 1,
                                     remote_input, remote_bodies, inherit_environment=True)
                     if may_change_scripts(words, directory, documents):
+                        tool_changes.add(None)
                         changed_sources.update(written)
                         fresh_variables.clear()
                 # Local output redirects still need the normal invalidation
@@ -3248,6 +3342,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if cwd_only:
             return scan(" ".join(args), directory, depth + 1, cwd_only=True) if binary == "eval" else after
         if binary == 'unset' and all(re.fullmatch(r'[A-Za-z_]\w*', arg) for arg in args):
+            if 'PATH' in args:
+                unsafe_bindings = True
             for name in args:
                 invalidate_variable(name)
                 script_values.pop(name, None)
@@ -3262,10 +3358,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         stdin_sources = documents if exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) else []
         changes_scripts = may_change_scripts(words, directory, stdin_sources)
         if changes_scripts:
+            tool_changes.add(None)
             changed_sources.update(written)
             opaque_written.clear()
             fresh_variables.clear()
         if binary == 'chmod':
+            tool_changes.update(_literal_path(candidate, directory) for arg in args if not arg.startswith('-')
+                                for candidate in script_variants(arg))
             opaque_written.clear()
             fresh_variables.clear()
         if words[0].startswith(('/', './', '../')) and re.search(r'\.(?:py|mjs|cjs|js|ts|sh)$', words[0]):
@@ -3637,6 +3736,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             continue
                         targets = [group[i + 1] for i, token in enumerate(group[:-1]) if token in {'>', '>>'}]
                         if may_change_scripts(group, current):
+                            tool_changes.add(None)
                             invalidated_written.update(written)
                         if group and os.path.basename(group[0]) in {'cp', 'mv', 'rsync', 'ditto', 'tee', 'sed', 'perl', 'truncate'}:
                             targets += group[1:]
