@@ -1463,6 +1463,9 @@ export const DeferWriteEffects = Context.Reference<boolean>("KanbanDeferWriteEff
 export const OwnerRouteMode = Context.Reference<OwnerRouteMode>("KanbanOwnerRouteMode", {
   defaultValue: () => "await",
 });
+const effectRouteReads = Context.Reference("KanbanEffectRouteReads", {
+  defaultValue: () => false,
+});
 
 interface OwnerRoutePost {
   readonly kind: "post";
@@ -1752,8 +1755,28 @@ const make = Effect.gen(function* () {
       ? yield* failWith("invalid", result.reason)
       : result.selection;
   });
-  const rawStore = TickTimings.store(yield* KanbanStore);
   const boardSql = yield* BoardsDatabase.client;
+  const timedStore = TickTimings.store(yield* KanbanStore);
+  // Nested routing and posting helpers read these rows too. Keep their reader
+  // admission outside the gate; `outside` revalidates the operation on return.
+  // Transaction reads use the writer and must retain its board permits.
+  // The store read already owns the tracing boundary.
+  const readRouteRow = Effect.fnUntraced(function* <A, E, R>(read: Effect.Effect<A, E, R>) {
+    if (
+      (yield* effectRouteReads) &&
+      Option.isNone(yield* Effect.serviceOption(boardSql.transactionService))
+    )
+      return yield* locks.outside(read, undefined, true);
+    return yield* read;
+  });
+  const rawStore = new Proxy(timedStore, {
+    get(target, key, receiver) {
+      if (key === "card") return (id: KanbanCardId) => readRouteRow(target.card(id));
+      if (key === "discussion")
+        return (id: KanbanDiscussionId) => readRouteRow(target.discussion(id));
+      return Reflect.get(target, key, receiver);
+    },
+  });
   const tickSql = <A extends object = Record<string, unknown>>(
     strings: TemplateStringsArray,
     ...args: Array<unknown>
@@ -7682,6 +7705,7 @@ const make = Effect.gen(function* () {
       KanbanDiscussionId.make(record.discussion_id),
       record.route_key,
       runBoardEffect(effect, record.route_key).pipe(
+        Effect.provideService(effectRouteReads, true),
         Effect.provideService(
           EvaluatorAnalytics.attribution,
           effect.evaluatorCardId === undefined
