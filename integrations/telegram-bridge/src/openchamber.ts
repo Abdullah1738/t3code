@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { StreamTelemetry } from "./stream-telemetry.ts";
 import { errorInfo, toolError } from "./toollog.ts";
 
 // JSON.parse establishes this representation; notification consumers decode its
@@ -108,7 +109,7 @@ export interface BoardSnapshot {
   syncError?: string | null;
 }
 
-export interface BoardTelemetry {
+export interface BoardTelemetry extends StreamTelemetry {
   boardFetches: number;
   boardCacheHits: number;
   boardFetchErrors: number;

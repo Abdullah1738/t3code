@@ -5,6 +5,7 @@ import { enqueueNotice } from "./notification-policy.ts";
 import { BOARD_EVENT_KEY, BOARD_EVENT_KEY_LIMIT } from "./openchamber.ts";
 import type { ReminderRecord, Store } from "./store.ts";
 import { toolError, toolLog } from "./toollog.ts";
+import { countStreamError, STREAM_END_KINDS } from "./stream-telemetry.ts";
 
 type Options = {
   store: Store;
@@ -122,7 +123,24 @@ export function createApi({ store, enabled, chatId, timezone, health }: Options)
               counters.lastFetchReason = board.lastFetchReason;
             }
             const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-            for (const key of ["threadReads", "threadReadErrors"]) if (count(board[key])) counters[key] = board[key];
+            for (const key of ["threadReads", "threadReadErrors", "streamConnects"]) if (count(board[key])) counters[key] = board[key];
+            for (const key of ["streamLastConnectedMs", "streamMinConnectedMs", "streamMaxConnectedMs"]) {
+              const value = board[key];
+              if (value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0)) counters[key] = value;
+            }
+            if (board.lastStreamEndKind === null || STREAM_END_KINDS.includes(board.lastStreamEndKind as typeof STREAM_END_KINDS[number])) counters.lastStreamEndKind = board.lastStreamEndKind;
+            if (board.lastStreamEndAt === null) counters.lastStreamEndAt = null;
+            else if (typeof board.lastStreamEndAt === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(board.lastStreamEndAt)
+              && Number.isFinite(Date.parse(board.lastStreamEndAt))) counters.lastStreamEndAt = board.lastStreamEndAt;
+            if (board.streamEndsByKind && typeof board.streamEndsByKind === "object" && !Array.isArray(board.streamEndsByKind)) {
+              counters.streamEndsByKind = Object.fromEntries(Object.entries(board.streamEndsByKind)
+                .filter(([key, value]) => STREAM_END_KINDS.includes(key as typeof STREAM_END_KINDS[number]) && count(value)));
+            }
+            if (board.streamErrorCodes && typeof board.streamErrorCodes === "object" && !Array.isArray(board.streamErrorCodes)) {
+              const codes: Record<string, number> = {};
+              for (const [code, value] of Object.entries(board.streamErrorCodes)) if (count(value)) countStreamError(codes, code, value);
+              counters.streamErrorCodes = codes;
+            }
             if (board.fetchesByReason && typeof board.fetchesByReason === "object" && !Array.isArray(board.fetchesByReason)) {
               counters.fetchesByReason = Object.fromEntries(Object.entries(board.fetchesByReason)
                 .filter(([key, value]) => ["cold", "age", "hard", "soft"].includes(key) && count(value)));
