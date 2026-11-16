@@ -242,13 +242,13 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "run":
         # Routing waits for a live preflight; alert hysteresis can lag behind recovery.
         return "server"
-    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec", "box"):
+    if sub in ("logs", "wait", "kill", "status", "release", "ssh", "ports", "keep", "exec", "box"):
         named = [x for x in argv if x.startswith(("run-", "bx_"))]
         if sub == "exec":
             from .cli import parse_args
             a = parse_args(argv)
             named = a.cmd[:1] if a.cmd and a.cmd[0].startswith("bx_") else []
-        elif sub in ("logs", "wait", "kill"):
+        elif sub in ("logs", "wait", "kill", "status"):
             named = []
             args = iter(argv[argv.index(sub) + 1:])
             for arg in args:
@@ -442,6 +442,15 @@ def say(msg: str) -> None:
     _emit(f"offbox: {msg}")
 
 
+def size_summary(row) -> str:
+    requested = row['requested_size'] if 'requested_size' in row.keys() else None
+    effective = row['size'] if 'size' in row.keys() else None
+    if not requested or not effective or requested == effective:
+        return ""
+    hint = "; OFFBOX_ALLOW_XLARGE=1 keeps xlarge" if requested == 'xlarge' and effective == 'large' else ""
+    return f"size: {effective} (asked {requested}{hint})"
+
+
 def warn_loud(msg: str) -> None:
     bar = "!" * 78
     _emit(f"\n{bar}\noffbox WARNING: {msg}\n{bar}\n")
@@ -568,7 +577,7 @@ CAPACITY_SCHEMA = """
 """
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 DB_TIMEOUT = 30
 
 
@@ -644,7 +653,8 @@ def _migrate(con):
             con.execute(statement)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL", "cmd_bytes INTEGER", "cmd_via TEXT"):
+                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL", "cmd_bytes INTEGER", "cmd_via TEXT",
+                "requested_size TEXT", "size_note TEXT"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
     if 'wrapper_pid' not in have:

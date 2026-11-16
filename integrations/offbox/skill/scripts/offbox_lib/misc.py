@@ -25,7 +25,7 @@ import toollog
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_BUSY, EXIT_INFRA, EXIT_NOT_STARTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
                      OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, kv_get, log, month_key, now,
-                     delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence)
+                     delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence, size_summary)
 from .common import mine as token_mine  # release() has its own `mine` flag
 from .identity import require_proven
 
@@ -577,7 +577,14 @@ def _home_run_notices(me):
         pass
 
 
-def status(me: dict) -> None:
+def status(me: dict, run_id: str | None = None) -> None:
+    if run_id:
+        r = _run_row(run_id)
+        print(f"{r['run_id']}: {r['status']} box={r['box_id'] or '-'} exit={r['exit_code']} log={r['log_path']}")
+        line = size_summary(r)
+        if line:
+            print(line)
+        return
     from . import box_disk
     with db() as disk_con:
         for row in disk_con.execute("SELECT box_id FROM leases WHERE note LIKE 'disk-full:%'"):
@@ -1374,6 +1381,9 @@ def _report_never_started(r) -> int:
 def logs(run_id: str, do_follow: bool) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    line = size_summary(r)
+    if line:
+        say(line)
     from .home_run_observation import notice
     notice(r)
     if r['status'] == 'source_gone':
@@ -1455,6 +1465,9 @@ def logs(run_id: str, do_follow: bool) -> int:
 def wait(run_id: str, timeout: float | None, *, summary: bool = False) -> int:
     r = _run_row(run_id)
     _require_my_run(r)
+    line = size_summary(r)
+    if line:
+        say(line)
     from .home_run_observation import notice
     notice(r)
     path = LOGS_DIR / f"{run_id}.log"
@@ -1485,6 +1498,12 @@ def wait(run_id: str, timeout: float | None, *, summary: bool = False) -> int:
 def _wait_summary(run_id: str, code: int, delivered: int) -> None:
     path = LOGS_DIR / f"{run_id}.log"
     out(f"{run_id}: backend={api.BACKEND} exit={code} log={path}")
+    # This is optional context; a failed read must not replace the command's known exit code.
+    with contextlib.suppress(sqlite3.Error), contextlib.closing(db()) as con:
+        row = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        line = size_summary(row) if row else ""
+        if line:
+            out(line)
     # Keep the summary and preview within the harness's completion-notification tail. Already delivered output
     # stays quiet, including failures shown by an earlier logs/follow/wait invocation.
     try:
@@ -1565,6 +1584,9 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
         resources.display(r['run_id'])
     from .runs import report_interruption
     report_interruption(r)
+    line = size_summary(r)
+    if line:
+        out(line)
     out(f"{r['run_id']}: {status} exit={code}" + resources.failure_suffix(r['run_id'], code))
     if code is None:
         from .run_evidence import report
@@ -2174,6 +2196,9 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
     resources.finalize(r)
     if not echo and code == 0:
         resources.display(r['run_id'])
+    line = size_summary(r)
+    if line:
+        out(line)
     out(f"{r['run_id']}: {'failed ' if failure else ''}exit={code}" + resources.failure_suffix(r['run_id'], code))
     if code is None:
         from .run_evidence import report

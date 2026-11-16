@@ -107,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     po.add_argument("--reverse", action="store_true",
                     help="expose the Mac's 127.0.0.1:<--local> on the box at 127.0.0.1:<port> instead")
     sp.add_parser("whoami")
-    sp.add_parser("status")
+    sp.add_parser("status").add_argument("run_id", nargs="?")
 
     s = sp.add_parser("spend")
     s.add_argument("--json", action="store_true")
@@ -513,7 +513,7 @@ def _main(argv: list[str] | None = None) -> int:
         elif a.sub == "whoami":
             print(json.dumps(me, indent=1))
         elif a.sub == "status":
-            misc.status(me)
+            misc.status(me, a.run_id)
         elif a.sub == "spend":
             out = spend.check() if a.check else spend.compute()
             spend.print_report(out, a.json)
