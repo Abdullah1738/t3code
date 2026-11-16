@@ -626,7 +626,9 @@ def _run_row(run_id: str):
     if terminal_result(recovered) and (r['status'] in ('starting','running') or
                                      (r['exit_code'] is None and (r['status'] == 'lost' or
                                       (r['status'] == 'infra' and start_check.recovery_marked(con, r))))):
-        finish(r['run_id'], recovered['exit_code'], recovered['status'], catch_up=False)
+        from .pulls import TERMINAL
+        if not json.loads(r['pulls'] or '[]') or r['pull_state'] in TERMINAL:
+            finish(r['run_id'], recovered['exit_code'], recovered['status'], catch_up=False)
     return recovered
 
 
@@ -696,7 +698,12 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
     except OSError as e:
         return 'incomplete:' + str(e)
     finally:
-        guard.close()
+        try:
+            if not live:
+                from .pulls import footer
+                footer(r['run_id'])
+        finally:
+            guard.close()
 
 
 def _diagnostic_only(r, path):
@@ -960,6 +967,8 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
     try:
         ck = checkpoint(path)
         length = path.stat().st_size
+        if ck is None and not _has_data(path):
+            length = 0  # A journal-owned footer is reconstructible and has no remote stream offsets.
         remote = _remote_copy(path)
         if remote and ck is None:
             length = 0
@@ -1000,7 +1009,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False) -> str:
                     page = api.history_logs(r['box_id'], r['command_id'], which, offsets[i], deadline=deadline)
                     if time.time() >= deadline:
                         return 'incomplete:timeout'
-                    remember_interruption(r['run_id'], page)
+                    remember_interruption(r['run_id'], page, until=deadline)
                     if page.get('size') is not None:
                         sizes[i] = max(sizes[i], int(page['size']) - (0 if remote else ck[which + 'Offset']))
                         if snapshot is None:
@@ -1113,6 +1122,8 @@ def _catch_up_finished(con, run_id, budget: float = 10, *, row=None) -> str | No
         result = _catch_up_log(r, budget=min(10, budget), locked=True)
         from . import resources
         resources.finalize(r)
+        from .pulls import footer
+        footer(run_id)
         if result == 'n/a' or result.startswith('incomplete:'):
             reason = result.split(':', 1)[1] if ':' in result else 'run log lock held'
             event(con, r['box_id'], 'log_catchup_failed', f"{run_id} {reason}")
@@ -1258,6 +1269,8 @@ def logs(run_id: str, do_follow: bool) -> int:
                 "end your turn and do not poll logs.")
         return 0
     result = _catch_up_log(r, lock_wait=LOG_READ_WAIT_S)
+    from .pulls import footer
+    footer(r['run_id'])
     from . import resources
     resources.finalize(r)
     _tail(_shown_log(p), 0, True)
@@ -1311,6 +1324,9 @@ def wait(run_id: str, timeout: float | None, *, summary: bool = False) -> int:
             forwarded = r['status'] == 'forwarded'
         if not forwarded:
             _wait_summary(run_id, code, delivered)
+    if r['status'] != 'forwarded' and json.loads(dict(r).get('pulls') or '[]'):
+        from .pulls import report
+        report(run_id, until=None if timeout is None else now())
     return code
 
 
@@ -1343,6 +1359,15 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
                                  timeout=None if echo or until is None else until-now())
     if _never_started(r):
         return _report_never_started(r)
+    from . import pulls
+    if json.loads(dict(r).get('pulls') or '[]') and r['exit_code'] is not None and (r['status'] in ('done', 'failed', 'interrupted', 'killed')
+                                     or dict(r).get('pull_state') in ('pending', 'running')):
+        pulls.wait(r['run_id'], until=until)
+        with contextlib.closing(db()) as con:
+            current = con.execute('SELECT * FROM runs WHERE run_id=?', (r['run_id'],)).fetchone()
+        if current is not None and current['status'] in ('starting', 'running'):
+            from .runs import finish
+            finish(r['run_id'], r['exit_code'], r['status'], until=until, catch_up=False, bookkeeping=False)
     from .runs import repo_setup_failed, settled_steps_code, planned_steps
     budget = None if until is None else max(0, until-now())
     result = _catch_up_log(r, budget=budget, lock_wait=LOG_READ_WAIT_S)
@@ -1390,6 +1415,7 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
         say(r['error'] or f"exit unknown; check: {hint(r['box_id'], r['run_id'])}")
     from .runs import space_result
     effective = space_result(r['run_id'], code, report=True) if r['mode'] != 'local' else code
+    pulls.footer(r['run_id'])
     return effective if effective is not None else 90
 
 
@@ -1533,6 +1559,10 @@ def _wait_locked(r, echo, timeout=None, *, show_failure=False):
         if ck:
             pos = _tail(log_path, pos, echo, ck["logBytes"])
         cur = _run_row(r['run_id'])
+        if dict(cur).get('pull_state') == 'running':
+            from .pulls import wait
+            wait(cur['run_id'], until=deadline)
+            cur = _run_row(r['run_id'])
         if cur['status'] not in ('starting', 'running', 'lost') or (cur['status'] == 'lost' and (
                 cur['exit_code'] is not None or db().execute(
                     'SELECT 1 FROM kv WHERE k=?', (f"lost_confirmed:{cur['run_id']}",)).fetchone())):
@@ -1587,6 +1617,9 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
     if code is None:
         code, how = _recover_by(r, log_path, deadline)
     receipt_code = code
+    if json.loads(r['pulls'] or '[]'):
+        from .pulls import wait
+        wait(r['run_id'], until=deadline)
     code = settled_steps_code(r, code, log_path=log_path, until=deadline)
     from . import resources
     resources.finalize(r)
@@ -1628,6 +1661,9 @@ def _recover_by(r, log_path, deadline):
 
 
 def _wait_timeout(r) -> OffboxError:
+    if dict(r).get('pull_state') == 'running':
+        from .pulls import report
+        report(r['run_id'], until=now())
     if r['status'] not in ('starting', 'running'):
         return OffboxError(f"--timeout reached while reading {r['run_id']}'s log; run ended "
                            f"{r['status']} exit={r['exit_code']}. Retry: offbox wait {r['run_id']}",
@@ -1758,10 +1794,12 @@ def _wait_for_start(r, deadline):
 
 
 def _has_data(log_path) -> bool:
-    """True when the local log exists and holds bytes. Such a log may be legacy output with no checkpoint, which must
-    never be rewritten in place before the replay is confirmed."""
+    """Pull receipts alone aren't command output. Legacy command bytes still require confirmed replay."""
     try:
-        return os.path.getsize(log_path) > 0
+        with open(log_path, 'rb') as stream:
+            prefix = stream.read(256)
+        marker = f'\n[offbox {Path(log_path).stem} pulls]\n'.encode()
+        return bool(prefix) and not prefix.startswith(marker)
     except OSError:
         return False
 
@@ -1832,8 +1870,13 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
     except Interrupted as e:
         # Final on the server: the run will not go on. Recorded here so a later wait answers at once.
         from .runs import remember_interruption
-        remember_interruption(r['run_id'], {'interruption': e.interruption})
-        code = finish(r["run_id"], e.code, "interrupted")
+        remember_interruption(r['run_id'], {'interruption': e.interruption}, until=until)
+        if json.loads(r['pulls'] or '[]'):
+            from .runs import save_run_state
+            save_run_state(r['run_id'], until=until, status='interrupted', exit_code=e.code)
+            from .pulls import wait
+            wait(r['run_id'], until=until)
+        code = finish(r["run_id"], e.code, "interrupted", until=until)
         if code is None:
             raise OffboxError(f"{r['run_id']}: steps incomplete after the interruption; remote exit unknown",
                               code=EXIT_INFRA, started=True) from None
@@ -1858,7 +1901,7 @@ def _report_deps_hint(r, code, log_path) -> None:
 def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) -> int:
     """Record a known end: pulls, the settled row (finish), std-tree hint and the exit line. Only after the log that
     describes this run is in its final place, so a concurrent follower never sees 'settled' with an old log."""
-    from .runs import (do_pulls, finish, go_std_glitch, repo_setup_failed,
+    from .runs import (finish, go_std_glitch, repo_setup_failed,
                        settle_box_wedged, wedged_message, settled_steps_code)
     show_failure = show_failure and not echo and dict(r).get('mode') == 'bg'
     receipt_code = code
@@ -1889,12 +1932,9 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
                 _failure_tail(log_path)
             say(wedged_message(r['box_id'], *wedged))
             return EXIT_INFRA
-        pulls = json.loads(r["pulls"] or "[]")
-        if pulls:
-            con = db()
-            row = dict(con.execute("SELECT * FROM runs WHERE run_id=?",
-                                   (r["run_id"],)).fetchone())
-            do_pulls(r["box_id"], row, pulls, until=until)
+        if json.loads(r['pulls'] or '[]'):
+            from .pulls import wait
+            wait(r['run_id'], until=until)
         if until is not None and now() >= until:
             raise _wait_timeout(r)
         code = settled_steps_code(r, code, log_path=log_path, locked=True, until=until,
@@ -1936,6 +1976,8 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
         say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
     from .runs import space_result
     effective = space_result(r['run_id'], code, log_path, report=True)
+    from . import pulls
+    pulls.footer(r['run_id'])
     return 90 if effective is None else effective
 
 

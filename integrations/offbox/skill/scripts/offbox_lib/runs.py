@@ -1229,7 +1229,7 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
 
 
 def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = None,
-                   until: float | None = None, *, foreign: bool = False) -> None:
+                   until: float | None = None, *, foreign: bool = False, role: str = 'wait') -> None:
     """Under box-<id>: repair old lost rows before following or handing their box to another run."""
     rows = con.execute("SELECT * FROM runs WHERE box_id=? AND status='lost' AND exit_code IS NULL "
                        "AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)",
@@ -1278,7 +1278,12 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
                     say(wedged_message(box_id, *wedged))
                     continue
             if st and row['pulls']:
-                do_pulls(box_id, dict(row), json.loads(row['pulls']), until=until, foreign=foreign)
+                if foreign:
+                    if not settle_pulls(row['run_id'], role, until=until, foreign=True):
+                        continue
+                else:
+                    from .pulls import wait
+                    wait(row['run_id'], role, until=until)
             if until is not None and now() >= until:
                 raise OffboxError(f"lost reconciliation timed out on {box_id}", code=EXIT_WAIT_TIMEOUT, started=True)
             if st:
@@ -1881,7 +1886,7 @@ class Runner:
                         + start_check.hint(self.box, self.run_id))
                     return row
                 current = con.execute('SELECT * FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
-                start_check.settle(con, current, result, f'{e} on start')
+                start_check.settle(con, current, result, f'{e} on start', role='fg')
                 if result.verdict == 'fenced':
                     self.started = False
                     event(con, self.box, 'cmd_start_lost', f'{self.run_id}: {e}; fenced')
@@ -2008,8 +2013,13 @@ class Runner:
                 with prepare.phase("push", self.box):
                     candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
                     self.check_source('push')
+                    from .pulls import snapshot_baseline, record_baseline
+                    pull_paths = getattr(a, 'pull', None)
+                    baseline = snapshot_baseline(self.cwd, pull_paths) if pull_paths else None
                     st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
                                        seed_candidates=candidates, run_id=self.run_id)
+                    if pull_paths:
+                        record_baseline(self.run_id, self.cwd, pull_paths, baseline)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s; "
@@ -2241,7 +2251,7 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
         st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
     except OffboxError:
         return None
-    remember_interruption(run_id, st)
+    remember_interruption(run_id, st, until=until)
     if st and not st.get("running") and st.get("status") in ("exited", "lost", "interrupted"):
         if st.get('status') == 'lost' and run_id:
             try:
@@ -2264,12 +2274,12 @@ def interruption_info(status):
     return dict(info) if isinstance(info, dict) and info else None
 
 
-def remember_interruption(run_id, status):
+def remember_interruption(run_id, status, *, until=None):
     info = interruption_info(status)
     if (run_id and info is not None and
             read_json(LOGS_DIR / f'{run_id}.state.json', {}).get('interruption') != info):
         try:
-            save_run_state(run_id, interruption=info)
+            save_run_state(run_id, until=until, interruption=info)
         except OSError as error:
             say(f"warning: {run_id}: could not save interruption details ({error})")
     return info
@@ -2527,7 +2537,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
         # An answer that arrives past the caller's deadline is not accepted: the wait ends with --timeout (124).
         if until is not None and now() >= until:
             raise timed_out()
-        remember_interruption(run_id, st)
+        remember_interruption(run_id, st, until=until)
         if st is not None and st.get("status") == "interrupted":
             raise Interrupted(what, st)
         if st is None or ended_again() < 2:
@@ -2567,7 +2577,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     # Absolute: a frame that arrives after the deadline (even an exit) is not accepted.
                     if until is not None and now() >= until:
                         raise timed_out()
-                    remember_interruption(run_id, fr)
+                    remember_interruption(run_id, fr, until=until)
                     t = fr.get("type")
                     if t != "error" and run_id and (now() - last_home_read >= 5 or t == "exit"):
                         from .home_run_observation import observe
@@ -2673,7 +2683,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     pass
                 if until is not None and now() >= until:
                     raise timed_out()
-                remember_interruption(run_id, st)
+                remember_interruption(run_id, st, until=until)
                 down_from = (down_from or failed_at) if boat_down else None
                 if home_run and boat_down and not seen["lost"]:
                     # The run was accepted, so it is never sent anywhere else (it would run twice): wait for the
@@ -2725,45 +2735,9 @@ def new_checkout_hint(row: dict, root: Path, usage: command_usage.Usage) -> None
 
 
 def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None,
-             foreign: bool = False) -> None:
-    for p in pulls:
-        opts = {}
-        if until is not None:
-            remaining = until - now()
-            if remaining <= 0:
-                raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
-            opts['timeout'] = min(1800, remaining)
-        detail = f"{row.get('run_id', 'unknown')} {p} -> {row['local_cwd']}"
-        prefix = (f"settled background run {row['run_id']} (not this run): "
-                  f"pull {p} into {row['local_cwd']}" if foreign else f"pull {p}")
-        with contextlib.closing(db()) as con:
-            try:
-                st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]), **opts)
-            except Exception as error:
-                event(con, box_id, "run_pull_failed", f"{detail} error={error}")
-                if foreign:
-                    say(f"{prefix} failed: {error}")
-                if isinstance(error, subprocess.TimeoutExpired) and until is not None:
-                    raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True) from None
-                raise
-            if st.get("missing"):
-                event(con, box_id, "run_pull_failed", f"{detail} error=not created on the box: {st.get('error')}")
-            elif st.get("ok"):
-                event(con, box_id, "run_pulled", f"{detail} files={st.get('files', 0)}")
-            else:
-                event(con, box_id, "run_pull_failed", f"{detail} error={st.get('error')}")
-        if until is not None and now() >= until:
-            raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
-        if st.get("missing"):
-            say(f"{prefix}: not created on the box")
-        elif st.get("ok"):
-            if foreign:
-                say(f"settled background run {row['run_id']} (not this run) and pulled {p} "
-                    f"into {row['local_cwd']} ({st.get('files', 0)} files)")
-            else:
-                say(f"pulled {p} ({st.get('files', 0)} files)")
-        else:
-            say(f"{prefix} failed: {st.get('error')}")
+             foreign: bool = False):
+    from .pulls import transfer
+    return transfer(row, pulls, until=until, foreign=foreign)
 
 
 def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int | None) -> bool:
@@ -2785,15 +2759,33 @@ def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int
     return True
 
 
-def save_run_state(run_id, **values):
+def save_run_state(run_id, *, until=None, **values):
     path = LOGS_DIR / f"{run_id}.state.json"
-    previous = read_json(path, {})
-    atomic_write_json(path, {**previous, **values})
+    guard = file_lock('run-state-' + run_id, timeout=0) if until is not None else file_lock('run-state-' + run_id)
+    while True:
+        try:
+            guard.__enter__()
+            break
+        except OffboxError:
+            if until is None:
+                raise
+            left = until-now()
+            if left <= 0:
+                raise OffboxError(f'{run_id}: artifact bookkeeping deadline reached; wait again',
+                                  code=EXIT_WAIT_TIMEOUT, started=True, run_id=run_id) from None
+            time.sleep(min(.01, left))
+            guard = file_lock('run-state-' + run_id, timeout=0)
+    try:
+        previous = read_json(path, {})
+        atomic_write_json(path, {**previous, **values})
+    finally:
+        guard.__exit__(None, None, None)
 
 
 def restore_run_state(row):
     """A remote handle/result survives a failed SQLite write; wait and reap can repair the row."""
     saved = read_json(LOGS_DIR / f"{row['run_id']}.state.json", {})
+    saved.pop('pulls', None)  # The state-file pulls object is telemetry; the runs column holds path arguments.
     restored = {**dict(row), **saved}
     # A competing finisher can commit before a blocked writer saves its result to the file.
     # Keep recoverable handles, but a known terminal result already committed to SQLite wins.
@@ -2934,6 +2926,7 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
                 r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                 if r:
                     con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? "
+                                "AND (pull_state IS NULL OR pull_state!='running') "
                                 "AND (status IN ('starting','running') OR (status='lost' AND exit_code IS NULL AND ?='infra') OR "
                                 "(exit_code IS NULL AND ? IS NOT NULL AND (status='lost' OR "
                                 "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))))",
@@ -2986,7 +2979,15 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         if con:
             con.close()
     resources.finalize(r)
+    if catch_up:
+        from .pulls import footer
+        footer(run_id)
     return code
+
+
+def settle_pulls(run_id, role, *, until=None, foreign=False):
+    from .pulls import settle
+    return settle(run_id, role, until=until, foreign=foreign)
 
 
 def run_remote(a, me: dict) -> int:
@@ -3356,7 +3357,7 @@ def _run_remote(a, rn) -> int:
             con = db()
             row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
             start_check.settle(con, row, start_check.Result('started', rn.recovered_code),
-                               'start receipt recovered')
+                               'start receipt recovered', role='fg')
             finish(rn.run_id, rn.recovered_code)
             print(rn.run_id)
             background_wait_hint(rn.run_id)
@@ -3375,6 +3376,10 @@ def _run_remote(a, rn) -> int:
             rn.remote_code = None if getattr(a, 'steps', None) else code
         except Interrupted as error:
             remember_interruption(rn.run_id, {'interruption': error.interruption})
+            if a.pull:
+                save_run_state(rn.run_id, status='interrupted', exit_code=EXIT_INTERRUPTED)
+                from .pulls import wait
+                wait(rn.run_id, 'fg')
             code = finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
             if code is None:
                 raise OffboxError(f"{rn.run_id}: steps incomplete after the interruption; remote exit unknown",
@@ -3442,8 +3447,8 @@ def _run_remote(a, rn) -> int:
         finish(rn.run_id, None, "infra")
         raise OffboxError("box setup failed (exit 97), not your command", code=EXIT_INFRA)
     if a.pull:
-        con = db()
-        do_pulls(rn.box, dict(con.execute("SELECT * FROM runs WHERE run_id=?", (rn.run_id,)).fetchone()), a.pull)
+        from .pulls import wait
+        wait(rn.run_id, 'fg')
     steps = getattr(a, 'steps', None) or []
     if steps:
         con = db()

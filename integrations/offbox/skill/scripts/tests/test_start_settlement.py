@@ -433,7 +433,7 @@ class RecoveryPaths(ShellChecks):
         for route in ('wait','reap'):
             path = route + '.txt'
             self.con.execute("UPDATE runs SET status='starting',exit_code=NULL,end_at=NULL,remote_dir='w/r', "
-                             "rel_cwd='.',local_cwd=?,pulls=? WHERE run_id='run-dead'",
+                             "rel_cwd='.',local_cwd=?,pulls=?,pull_state=NULL,pull_owner=NULL,pull_summary=NULL WHERE run_id='run-dead'",
                              (self.tmp.name, '["' + path + '"]'))
             self.con.commit()
             def pull(box,remote,rel,path,dest,**opts):

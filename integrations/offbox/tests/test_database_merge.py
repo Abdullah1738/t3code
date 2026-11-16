@@ -20,8 +20,8 @@ else:
 class DatabaseMerge(Isolated):
     def test_step_wrapper_exit_is_not_authoritative_before_validation(self):
         rid = 'steps-pull-lock'
-        self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,step_count) "
-                         "VALUES (?,'box','running','fg',2)", (rid,))
+        self.con.execute("INSERT INTO runs(run_id,box_id,status,mode,step_count,pulls) "
+                         "VALUES (?,'box','running','fg',2,'[\"artifact\"]')", (rid,))
         log = runs.LOGS_DIR / (rid + '.log')
         log.write_text('offbox step 1 rc=0: first\n')
         runner = SimpleNamespace(run_id=rid, box='box', started=True, registered=True, remote_code=None,

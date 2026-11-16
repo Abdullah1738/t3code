@@ -1408,10 +1408,13 @@ def _claim(con, me, row, run_id, *, pending_token=None):
 def _refresh_background(con, key, pull_artifacts=True):
     """Detached runs have no lock holder; reclaim completed slots without waiting for the reaper."""
     from . import api, outage, runs, start_check
+    from .pulls import TERMINAL
     from .misc import _catch_up_finished
     rows = con.execute(f"""SELECT r.* FROM runs r JOIN leases l USING(box_id)
         WHERE l.repo_key=? AND {token_mine('l')} AND r.mode='bg' AND (r.status IN ('starting','running','lost') OR (r.status='infra' AND EXISTS
-        (SELECT 1 FROM kv WHERE k='start_unknown:' || r.run_id)))
+        (SELECT 1 FROM kv WHERE k='start_unknown:' || r.run_id)) OR
+        (r.exit_code IS NOT NULL AND r.pulls IS NOT NULL AND r.pulls!='[]' AND
+         (r.pull_state IS NULL OR r.pull_state IN ('pending','running'))))
         """, (key,)).fetchall()
     for row in rows:
         if api.left() is not None and api.left() <= 0:
@@ -1421,9 +1424,13 @@ def _refresh_background(con, key, pull_artifacts=True):
                 row = con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone()
                 row = runs.restore_run_state(row)
                 if runs.terminal_result(row):
+                    if not pull_artifacts and json.loads(row['pulls'] or '[]') and row['pull_state'] not in TERMINAL:
+                        continue
+                    if pull_artifacts and not runs.settle_pulls(row['run_id'], 'refresh', foreign=True):
+                        continue
                     runs.finish(row['run_id'], row['exit_code'], row['status'], run=row)
                     continue
-                runs.reconcile_lost(con, row['box_id'], foreign=True)
+                runs.reconcile_lost(con, row['box_id'], foreign=True, role='refresh')
                 row = runs.restore_run_state(con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone())
                 if row['status'] not in ('starting','running') and not (
                         row['status'] == 'infra' and start_check.recovery_marked(con, row)):
@@ -1443,7 +1450,7 @@ def _refresh_background(con, key, pull_artifacts=True):
                         if result.code is not None or result.verdict == 'fenced':
                             start_check.settle(con, row, result, 'pool checked an unattached start',
                                                until=None if api.left() is None else time.time() + api.left(),
-                                               foreign=True)
+                                               foreign=True, role='refresh')
                         else:
                             start_check.remember_wrapper(con, row, result.pid)
                             con.commit()
@@ -1451,7 +1458,9 @@ def _refresh_background(con, key, pull_artifacts=True):
                 left = api.left()
                 options = {} if left is None else {"deadline": time.time() + left, "retries": 0}
                 st = api.cmd_status(row['box_id'], pid, **options)
-                if st and not st.get('running') and st.get('status') in ('exited', 'lost'):
+                if st and not st.get('running') and st.get('status') in ('exited', 'lost', 'interrupted'):
+                    if st.get('status') == 'interrupted':
+                        runs.remember_interruption(row['run_id'], st)
                     if st.get('status') == 'lost':
                         confirmed = runs.confirmed_lost(row['box_id'], row['run_id'], timeout=min(20, api.left() or 20))
                         if confirmed is None:
@@ -1472,8 +1481,10 @@ def _refresh_background(con, key, pull_artifacts=True):
                     if pulls:
                         if not pull_artifacts:
                             continue  # pulls keep the slot reserved until the normal follower/reaper finishes
-                        runs.do_pulls(row['box_id'], dict(row), pulls, foreign=True)
-                    status, code = runs.completed_result(row, {**st, 'exitCode':code})
+                        if not runs.settle_pulls(row['run_id'], 'refresh', foreign=True):
+                            continue
+                    status, code = (('interrupted', runs.EXIT_INTERRUPTED) if st.get('status') == 'interrupted'
+                                    else runs.completed_result(row, {**st, 'exitCode':code}))
                     runs.finish(row['run_id'], code, status, run=row)
         except OffboxError as error:
             if isinstance(error, (api.ApiError, api.NetworkError, api.BudgetExpired)):

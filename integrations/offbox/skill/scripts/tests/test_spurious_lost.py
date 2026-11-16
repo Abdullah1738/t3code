@@ -297,7 +297,7 @@ class SpuriousLostTests(Isolated):
             self.assertLessEqual(kwargs['timeout'],1)
             clock.t+=kwargs['timeout']
             return {'ok':True}
-        with patch.object(runs,'now',clock.now), patch.object(misc,'now',clock.now), \
+        with patch.object(runs,'now',clock.now), patch.object(common,'now',clock.now), patch.object(misc,'now',clock.now), \
                 patch.object(runs,'recorded_exit',return_value=0),patch.object(runs.ssh_sync,'pull',side_effect=pull):
             with self.assertRaises(common.OffboxError) as caught:
                 misc.wait('run-t',1)
@@ -364,7 +364,7 @@ class SpuriousLostTests(Isolated):
             self.assertLessEqual(kwargs['timeout'],1)
             clock.t+=kwargs['timeout']
             return {'ok':True}
-        with patch.object(runs,'now',clock.now),patch.object(misc,'now',clock.now), \
+        with patch.object(runs,'now',clock.now),patch.object(common,'now',clock.now),patch.object(misc,'now',clock.now), \
                 patch.object(runs,'recorded_exit',return_value=None),patch.object(runs,'remote_alive',return_value='alive'), \
                 patch.object(runs,'follow',return_value=0),patch.object(runs.ssh_sync,'pull',side_effect=pull):
             with self.assertRaises(common.OffboxError) as caught:

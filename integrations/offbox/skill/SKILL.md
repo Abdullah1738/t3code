@@ -231,6 +231,9 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
 | `--step CMD` (repeatable) | run several checks with a real exit code each (see Fallback and exit codes) |
 | `--no-retry` | home server only: if the server restarts under this run, don't run it again (exit 94). For commands that are not safe to run twice (a deploy, a migration, anything that sends) |
 
+Pulls never overwrite a file changed locally after the push; the pulled copy goes to `<path>.offbox-pulled` instead.
+`offbox wait` returns only after pulls finish and prints their state.
+
 Runs longer than 10 minutes are fine (every run is a boat background command, reattached on network blips).
 For long gates, use `offbox run --bg …` and the harness route in **Waiting for a run**; end your turn instead of polling. Do not rely on setsid or detached tmux to protect a foreground client from interruption.
 If Robob restarts on the Mac during a foreground run (home box or Boat), the run detaches and keeps going; re-attach using **Waiting for a run** (client exit 95). The home server itself restarting is a separate case (exit 94, below).
