@@ -39,10 +39,7 @@ export class BoxRunner {
   active() { return this.now() < this.leaseUntil; }
   pause() { this.leaseUntil = 0; this.turnAbort?.abort(); }
   private async modelReady() {
-    let ready = false;
-    try { ready = !this.io.modelReady || await this.io.modelReady(); } catch { /* Remain paused on a failed readiness check. */ }
-    if (!ready) this.pause();
-    return ready;
+    try { return !this.io.modelReady || await this.io.modelReady(); } catch { return false; }
   }
   enqueue(id: string, payload: unknown): boolean {
     if (!validId(id)) throw new Error("Invalid event id");
@@ -186,7 +183,9 @@ export class BoxRunner {
             body: JSON.stringify({ epoch: this.config.epoch }), signal: AbortSignal.timeout(5_000) });
           const ack = await jsonBody(response as unknown as Request); return response.ok && ack.epoch === this.config.epoch;
         })(); } catch { /* A failed callback check cannot renew the previous lease. */ }
-        if (!ready) { this.pause(); return reply(503, { error: "Callback unavailable" }); }
+        // A failed renewal cannot invalidate a newer successful probe or a still-live lease.
+        // Explicit pause and the existing 20-second expiry remain authoritative.
+        if (!ready) return reply(503, { error: "Callback unavailable" });
         this.leaseUntil = this.now() + 20_000;
         return reply(200, { boxId: this.config.boxId, epoch: this.config.epoch });
       }

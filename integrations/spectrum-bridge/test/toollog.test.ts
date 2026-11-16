@@ -19,6 +19,13 @@ afterEach(() => dirs.splice(0).forEach(root => {
   rmSync(root, { recursive: true, force: true });
 }));
 
+test("notice suppression reasons survive structured-log redaction", () => {
+  const { log, lines } = setup();
+  const reasons = ["grace", "not-waiting", "already-sent", "rate-limited"];
+  for (const reason of reasons) log.write({ component: "remote-box", kind: "event", name: "moni-notice-suppressed", props: { reason } });
+  expect(lines().map(line => line.props?.reason)).toEqual(reasons);
+});
+
 test("shared format, UTC milliseconds, append-only and private modes", () => {
   const { root, log, lines } = setup();
   chmodSync(root, 0o755);
