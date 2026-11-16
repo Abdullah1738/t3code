@@ -106,16 +106,10 @@ def hold_state(now=None):
         state.update(state='stale', reason='hold_older_than_60m')
     elif expiry is not None and state['pid'] is not None:
         # Partial or malformed leases cannot establish holder liveness.
+        # ph records its short-lived CLI pid; the lease expiry governs liveness.
         state['reason'] = 'lease_live'
         if expiry <= now:
             state.update(state='stale', reason='lease_expired')
-        else:
-            try:
-                os.kill(state['pid'], 0)
-            except ProcessLookupError:
-                state.update(state='stale', reason='holder_pid_dead')
-            except PermissionError:
-                pass
     return state
 
 
@@ -256,7 +250,7 @@ def health_check():
         if not row or now - row['checked'] > 120:
             raise RuntimeError('notification collector is stale; restart com.ardud.delivery-notifications')
         if row['detail'] in HOLD_DETAILS:
-            # The collector row can lag behind lease expiry or holder exit.
+            # The collector row can lag behind lease expiry or the hold age limit.
             hold = hold_state(now)
             if hold is not None and hold['state'] == 'stale':
                 raise RuntimeError('notification collection blocked by stale phone priority-hold: '
