@@ -35,6 +35,10 @@ const StoppedRunAttempts = Schema.Array(
 
 export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
+    type: Schema.Literal("notification.delivery.accept"),
+    messageId: MessageId,
+  }),
+  Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
     sourceRunId: RunId,
     queued: Schema.optional(Schema.Boolean),
@@ -156,6 +160,7 @@ export const START_LANE_EFFECT_TYPES = ["provider-turn.start"] as const satisfie
 >;
 
 export const CONTROL_LANE_EFFECT_TYPES = [
+  "notification.delivery.accept",
   "provider-turn.interrupt",
   "provider-turn.steer",
   "runtime-request.respond",
@@ -171,6 +176,7 @@ export const CONTROL_LANE_EFFECT_TYPES = [
 ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
 
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
+  "notification.delivery.accept",
   "provider-runtime.continue",
   "provider-session.detach",
   "provider-session.stop-background-work",
@@ -234,6 +240,19 @@ export interface PendingOrchestrationEffectV2 {
   readonly request: OrchestrationEffectRequestV2;
   readonly availableAt?: DateTime.Utc;
 }
+
+export const nativeNoticeAcceptanceEffect = (
+  threadId: ThreadId,
+  messageId: MessageId,
+): PendingOrchestrationEffectV2 => {
+  const commandId = CommandId.make(`command:notice-native-accepted:${threadId}:${messageId}`);
+  return {
+    id: `effect:${commandId}`,
+    commandId,
+    threadId,
+    request: { type: "notification.delivery.accept", messageId },
+  };
+};
 
 export class EffectOutboxError extends Schema.TaggedError<EffectOutboxError>()(
   "EffectOutboxError",
@@ -426,6 +445,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           SELECT 1
           FROM orchestration_v2_effect_outbox AS active
           WHERE active.thread_id = candidate.thread_id
+            -- Native input already arrived; its bookkeeping cannot wait for a start or steer.
+            AND candidate.effect_type != 'notification.delivery.accept'
             AND (
               active.status = 'running'
               OR (

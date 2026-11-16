@@ -1,6 +1,8 @@
 import * as NodeUtil from "node:util";
 import * as MessageEditObservation from "./messageEditObservation.ts";
 import * as EvaluatorAnalytics from "../ardud/kanban/engine/evaluatorAnalytics.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
+import { recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
 import * as QueueDrainDiagnostics from "./QueueDrainDiagnostics.ts";
 import {
   PROVIDER_START_TIMEOUT_CODE,
@@ -773,7 +775,9 @@ function delegatedCompletionWakeDetail(
     .join("\n\n");
 }
 
-function isTerminalDelegatedTaskStatus(status: OrchestrationV2Subagent["status"]): boolean {
+function isTerminalDelegatedTaskStatus(
+  status: OrchestrationV2Subagent["status"],
+): status is "completed" | "failed" | "cancelled" | "interrupted" {
   return (
     status === "completed" ||
     status === "failed" ||
@@ -1011,6 +1015,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const eventSink = yield* EventSinkV2;
   const commandReceipts = yield* CommandReceiptStoreV2;
   const evaluatorAnalytics = yield* EvaluatorAnalytics.make;
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
   const { skipped: queueDrainSkipped, terminal: neverStartedTerminalDrain } =
     yield* QueueDrainDiagnostics.make;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
@@ -12643,6 +12648,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       const updatedTask: OrchestrationV2Subagent = {
         ...task,
+        ...(isTerminalDelegatedTaskStatus(task.status) &&
+        task.status !== terminalStatus &&
+        (task.completionDelivery?.state === "delivered" ||
+          task.completionDelivery?.state === "acknowledged")
+          ? {
+              lastAnnouncedStatus: task.lastAnnouncedStatus ?? task.status,
+              completionDelivery: { state: "pending" as const, observedByRunId: null },
+            }
+          : {}),
         providerThreadId: childRun.providerThreadId,
         status: terminalStatus,
         cancelReason: childRun.cancelReason,
@@ -12652,7 +12666,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? { model: childRun.modelSelection.model }
           : {}),
         result: claudeRecoveryResult({ ...childRun, status: outcome }, result.text).text,
-        completedAt: now,
+        completedAt: childRun.completedAt ?? now,
         updatedAt: now,
       };
       const completionPlan = yield* planDelegatedCompletionDelivery({
@@ -12781,6 +12795,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         },
       ];
       yield* writeSystemEvents(completionEvents, [], { updateDelegatedCompletionOnly: true });
+      if (
+        Option.isSome(analytics) &&
+        isTerminalDelegatedTaskStatus(task.status) &&
+        task.status !== terminalStatus
+      ) {
+        yield* recordServerAnalytics(analytics.value, {
+          ts: DateTime.formatIso(now),
+          surface: "server",
+          route: "delegated-tasks",
+          kind: "delegated.terminal-status-changed",
+          parentThreadId,
+          ...(task.runId === null ? {} : { parentRunId: task.runId }),
+          taskId: task.id,
+          oldStatus: task.status,
+          newStatus: terminalStatus,
+          reason:
+            childRun.delegatedTaskStall === undefined
+              ? "child_terminal_reconciled"
+              : "stalled_child_terminal_reconciled",
+        });
+      }
 
       if (completionPlan.offer && completionPlan.parentRun !== undefined) {
         yield* offerDelegatedCompletionDelivery(parentThreadId, completionPlan.parentRun.id);
@@ -12924,6 +12959,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
+    let accepted = deliveryRun.status === "completed";
+    if (!accepted && deliveryRun.activeAttemptId !== null) {
+      const { providerTurns } = yield* projectionStore.getThreadRecords(
+        threadId,
+        ["providerTurns"],
+        {
+          providerTurnAttemptId: deliveryRun.activeAttemptId,
+        },
+      );
+      accepted = providerStartAccepted(
+        deliveryRun,
+        providerTurns.filter((turn) => turn.nodeId === deliveryRun.rootNodeId),
+        [],
+      );
+    }
+    // Native acknowledgement may commit just before the consuming run ends or the server stops.
+    // Settle it before cancellation recovery can reserve another copy of the same input.
+    if (accepted) {
+      yield* dispatchWithReceiptEffect({
+        type: "notification.delivery.accept",
+        commandId: EffectOutbox.nativeNoticeAcceptanceEffect(threadId, message.id).commandId,
+        threadId,
+        messageId: message.id,
+      });
+      return;
+    }
+
     const now = yield* DateTime.now;
     const nextTaskStates = new Map<
       OrchestrationV2Subagent["id"],
@@ -12939,7 +13001,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         continue;
       }
       nextTaskStates.set(task.id, {
-        state: deliveryRun.status === "cancelled" ? "pending" : "delivered",
+        state: "pending",
         observedByRunId: null,
       });
     }
@@ -13103,7 +13165,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         driver: task.driver,
         providerInstanceId: task.providerInstanceId,
         occurredAt: now,
-        payload: { ...task, completionDelivery: { state, observedByRunId: null }, updatedAt: now },
+        payload: {
+          ...task,
+          completionDelivery: { state, observedByRunId: null },
+          ...(state === "delivered" && isTerminalDelegatedTaskStatus(task.status)
+            ? { lastAnnouncedStatus: task.status }
+            : {}),
+          updatedAt: now,
+        },
       });
     }
     yield* emitEvent({
@@ -13740,6 +13809,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       Effect.catch((cause) =>
         Effect.gen(function* () {
           if (cause._tag === "OrchestratorThreadAboveModeLimitError") return yield* cause;
+          // Native input already arrived. A failed bookkeeping read must not poison its retry id.
+          if (command.type === "notification.delivery.accept") return yield* cause;
           const rejectedAt = yield* DateTime.now;
           const receipt = yield* eventSink
             .commitRejectedCommand({
@@ -14005,6 +14076,56 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     }
     if (committed.committed) {
+      if (command.type === "notification.delivery.accept" && Option.isSome(analytics)) {
+        const children = committed.storedEvents.flatMap(({ event }) =>
+          event.type === "subagent.updated" &&
+          event.payload.completionDelivery?.state === "delivered"
+            ? [
+                {
+                  childTaskId: event.payload.id,
+                  status: event.payload.status,
+                  terminalAt:
+                    event.payload.completedAt === null
+                      ? null
+                      : DateTime.formatIso(event.payload.completedAt),
+                  delayMs:
+                    event.payload.completedAt === null
+                      ? null
+                      : Math.max(
+                          0,
+                          DateTime.toEpochMillis(event.occurredAt) -
+                            DateTime.toEpochMillis(event.payload.completedAt),
+                        ),
+                },
+              ]
+            : [],
+        );
+        if (children.length > 0) {
+          const source = committed.storedEvents.find(({ event }) => event.type === "run.updated");
+          const kinds = new Set(
+            children.map((child) =>
+              child.status === "completed"
+                ? "finished"
+                : child.status === "failed"
+                  ? "failed"
+                  : child.status === "cancelled" || child.status === "interrupted"
+                    ? "stopped"
+                    : "unknown",
+            ),
+          );
+          yield* recordServerAnalytics(analytics.value, {
+            ts: DateTime.formatIso(source!.event.occurredAt),
+            surface: "server",
+            route: "delegated-tasks",
+            kind: "delegated.notice",
+            parentThreadId: command.threadId,
+            parentRunId: source!.event.runId!,
+            noticeMessageId: command.messageId,
+            noticeKind: kinds.size > 1 ? "mixed" : [...kinds][0]!,
+            children,
+          });
+        }
+      }
       for (const delivery of incoming) {
         if (
           committed.storedEvents.some(

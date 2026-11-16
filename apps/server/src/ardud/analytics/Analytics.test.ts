@@ -126,6 +126,56 @@ describe("Analytics", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("reads delegated notice delays and terminal status corrections by kind", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const notice = event({
+        ts,
+        surface: "server",
+        route: "delegated-tasks",
+        kind: "delegated.notice",
+        parentThreadId: "thread:parent",
+        parentRunId: "run:parent",
+        noticeMessageId: "message:notice",
+        noticeKind: "mixed",
+        children: [
+          {
+            childTaskId: "node:baseline",
+            status: "completed",
+            terminalAt: `${day}T11:59:48.000Z`,
+            delayMs: 12000,
+          },
+          {
+            childTaskId: "node:review",
+            status: "failed",
+            terminalAt: `${day}T11:59:50.000Z`,
+            delayMs: 10000,
+          },
+        ],
+      });
+      const correction = event({
+        ts,
+        surface: "server",
+        route: "delegated-tasks",
+        kind: "delegated.terminal-status-changed",
+        parentThreadId: "thread:parent",
+        parentRunId: "run:parent",
+        taskId: "node:review",
+        oldStatus: "completed",
+        newStatus: "failed",
+        reason: "child_terminal_reconciled",
+      });
+      yield* analytics.record(notice);
+      yield* analytics.record(correction);
+      yield* analytics.flush;
+      assert.deepEqual(yield* readSamples(analytics, { day, kind: "delegated.notice" }), [notice]);
+      assert.deepEqual(
+        yield* readSamples(analytics, { day, kind: "delegated.terminal-status-changed" }),
+        [correction],
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
   it.effect("prioritises board kinds and ignores board long tasks in samples and rollup", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;

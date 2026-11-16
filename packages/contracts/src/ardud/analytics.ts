@@ -158,6 +158,25 @@ const GeneralEvent = Schema.Struct({
   startedAt: Schema.optionalKey(Timestamp),
   committed: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
   taskId: Schema.optionalKey(DerivedId),
+  parentThreadId: Schema.optionalKey(DerivedId),
+  parentRunId: Schema.optionalKey(DerivedId),
+  noticeMessageId: Schema.optionalKey(DerivedId),
+  noticeKind: Schema.optionalKey(
+    Schema.Literals(["finished", "failed", "stopped", "mixed", "unknown"]),
+  ),
+  children: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        childTaskId: DerivedId,
+        status: Label,
+        terminalAt: Schema.NullOr(Timestamp),
+        delayMs: Schema.NullOr(Measurement),
+      }),
+    ),
+  ),
+  oldStatus: Schema.optionalKey(Label),
+  newStatus: Schema.optionalKey(Label),
+  reason: Schema.optionalKey(Label),
   callerThreadId: Schema.optionalKey(DerivedId),
   callerRole: Schema.optionalKey(McpCallerRole),
   callerKind: Schema.optionalKey(McpCallerKind),
