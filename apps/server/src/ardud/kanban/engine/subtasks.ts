@@ -878,7 +878,7 @@ export const approvalProblem = (
       service === undefined
         ? `; set service on ${subtask.id} (card_edit) so only releases of the same service count`
         : "";
-    return `card #${card.number} ${subtask.id} (interrupting${service ? `, ${service}` : ""}) is inside the ${window.hours} h release window: last ${service ? `${service} ` : ""}release ${source}#${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override${guidance}`;
+    return `card #${card.number} ${subtask.id} (interrupting${service ? `, ${service}` : ""}) is inside the ${window.hours} h release window: last ${service ? `${service} ` : ""}release ${source}#${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override${guidance}; if this step records release #${window.last.cardNumber} that already happened, tick it with releasedAt: "${window.last.at}" (or the real restart time); it is recorded then and starts no new window`;
   }
   let reason: string;
   if (!latest || !answer) {
@@ -1394,6 +1394,7 @@ export function checkMark(
   role: SubtaskRole,
   note: string | null,
   scriptName: string | null = null,
+  correctingRelease = false,
 ): MarkCheck {
   const subtask = card.subtasks.find((candidate) => candidate.id === id);
   if (!subtask)
@@ -1402,7 +1403,10 @@ export function checkMark(
       denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (subtask.state === state)
+  if (
+    subtask.state === state &&
+    !(correctingRelease && role === "evaluator" && subtask.interrupting && state === "done")
+  )
     return {
       ok: false,
       denyReason: "subtask_state_unchanged",

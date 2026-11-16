@@ -935,7 +935,7 @@ const SubtaskDone = tool(
     releasedAt: Schema.optional(
       describe(
         IsoDateTime,
-        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window.",
+        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window; use it for any step that records a release that already happened, including a second card's step for the same release.",
       ),
     ),
   },

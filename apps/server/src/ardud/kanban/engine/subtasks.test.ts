@@ -1716,10 +1716,13 @@ describe("planSubtasks", () => {
       reason: "subtask s1 is listed twice",
     });
     expect(
-      planSubtasks([], [
-        { id: "s5", text: "a", owner: "work" },
-        { id: "s5", text: "b", owner: "work" },
-      ]),
+      planSubtasks(
+        [],
+        [
+          { id: "s5", text: "a", owner: "work" },
+          { id: "s5", text: "b", owner: "work" },
+        ],
+      ),
     ).toMatchObject({
       ok: false,
       denyReason: "invalid_args",
@@ -1727,10 +1730,13 @@ describe("planSubtasks", () => {
     });
     // A numbered entry and a later explicit one cannot both take the same id.
     expect(
-      planSubtasks([], [
-        { text: "a", owner: "work" },
-        { id: "s1", text: "b", owner: "work" },
-      ]),
+      planSubtasks(
+        [],
+        [
+          { text: "a", owner: "work" },
+          { id: "s1", text: "b", owner: "work" },
+        ],
+      ),
     ).toMatchObject({
       ok: false,
       denyReason: "invalid_args",
@@ -3479,6 +3485,10 @@ describe("interrupting release pacing", () => {
     else {
       expect(problem).toContain("card #2 s1 (interrupting) is inside the 4 h release window");
       expect(problem).toContain("last release #1 at 12:00Z, next window 16:00Z");
+      expect(problem).toContain('write "critical: <reason>" in the done note to override');
+      expect(problem).toContain(
+        '; if this step records release #1 that already happened, tick it with releasedAt: "2026-10-26T12:00:00.000Z" (or the real restart time); it is recorded then and starts no new window',
+      );
     }
   });
   it.each(["2026-10-26T16:00:00.000Z", "2026-10-26T16:01:00.000Z"])("opens at %s", (now) => {
@@ -3522,7 +3532,26 @@ describe("interrupting release pacing", () => {
       }),
     ).toBeNull();
     expect(approvalProblem(card, subtask, replay)).toContain("set service on s1 (card_edit)");
+    expect(approvalProblem(card, tagged, { ...replay, at: "2026-11-15T05:00:00.000Z" })).toContain(
+      'releasedAt: "2026-11-15T02:13:00.000Z"',
+    );
   });
+  it.each([
+    { role: "evaluator" as const, interrupting: true, correcting: true, allowed: true },
+    { role: "evaluator" as const, interrupting: true, correcting: false, allowed: false },
+    { role: "evaluator" as const, interrupting: false, correcting: true, allowed: false },
+    { role: "work" as const, interrupting: true, correcting: true, allowed: false },
+    { role: "review" as const, interrupting: true, correcting: true, allowed: false },
+    { role: "script" as const, interrupting: true, correcting: true, allowed: false },
+  ])(
+    "release correction role=$role interrupting=$interrupting correcting=$correcting",
+    ({ role, interrupting, correcting, allowed }) => {
+      const done = { ...subtask, state: "done" as const, interrupting };
+      expect(
+        checkMark({ ...card, subtasks: [done] }, done.id, "done", role, null, null, correcting).ok,
+      ).toBe(allowed);
+    },
+  );
   it("post-hoc timestamps skip only pacing, preserving owner-only and other approval gates", () => {
     const postHoc = { ...context, releasedAt: at };
     expect(approvalProblem(card, subtask, postHoc)).toBeNull();
