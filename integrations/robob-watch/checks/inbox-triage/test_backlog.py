@@ -3,10 +3,12 @@ import concurrent.futures
 import contextlib
 import copy
 import importlib.util
+import imaplib
 import json
 import os
 from pathlib import Path
 import signal
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -37,7 +39,9 @@ class BacklogTests(unittest.TestCase):
             response=lambda key: (key, [b'1' if key == 'UIDVALIDITY' else b'101']),
             uid=self.search, shutdown=lambda: None)
         self.mail = types.SimpleNamespace(connect=lambda *a: self.imap,
-                                           mail_oauth=types.SimpleNamespace())
+            mail_oauth=types.SimpleNamespace(imaplib=types.SimpleNamespace(
+                IMAP4=imaplib.IMAP4, IMAP4_SSL=lambda *a, **k: self.imap),
+                _PinnedIMAP=lambda *a: self.imap))
         self.fetches = []
 
     def search(self, command, *args):
@@ -96,7 +100,7 @@ class BacklogTests(unittest.TestCase):
     def test_fetch_timeout_uses_checkpoint_and_logs_stage(self):
         result = {'items': [{'id': 'x'}], 'cursor': {'validity': 1, 'uid': 8},
                   'drops': {}, 'scanned': 8}
-        def fetch(account, request):
+        def fetch(account, request, **kwargs):
             t.atomic(Path(request['progress_path']), {'cursor_before': self.request['cursor'],
                      'stage': 'fetch', 'connect_ms': 17, 'result': result})
             raise subprocess.TimeoutExpired(['worker'], 12)
@@ -123,7 +127,8 @@ class BacklogTests(unittest.TestCase):
     def test_fetch_worker_cannot_refresh_or_look_up_credentials(self):
         def connect(*args):
             self.assertEqual(self.mail.mail_oauth.get_token('gmail'), 'fixture-secret')
-            self.assertFalse(self.mail.mail_oauth.refresh('gmail', force=True))
+            with self.assertRaises(t.MailAuthRejected):
+                self.mail.mail_oauth.refresh('gmail', force=True)
             return self.imap
         self.mail.connect = connect
         self.worker(self.request)
@@ -299,6 +304,215 @@ class BacklogTests(unittest.TestCase):
                 self.assertEqual(t.prepare_mail_credentials('gmail', 8, info), 'fixture-secret')
                 self.assertEqual(info['credential_inflight_age_s'], 300)
             spawn.assert_not_called()
+
+    def test_auth_healing_never_reuses_rejected_cache_while_refresh_is_inflight(self):
+        path = t.credential_guard_path('gmail')
+        path.write_text('{"started_at":1000}')
+        with path.open() as guard:
+            t.fcntl.flock(guard, t.fcntl.LOCK_EX)
+            with patch.object(t, 'cached_mail_credential', return_value='rejected-fixture') as cache, \
+                 patch.object(t.subprocess, 'Popen') as spawn:
+                with self.assertRaisesRegex(RuntimeError, 'refresh_inflight'):
+                    t.prepare_mail_credentials('gmail', 8, refresh=True)
+            cache.assert_not_called()
+            spawn.assert_not_called()
+
+    def test_rejected_unexpired_oauth_credentials_refresh_outside_fetch_once(self):
+        # Google rejects on the first AUTH; Outlook first rotates frontends. All
+        # paths must signal the parent through the real helper's refresh call.
+        for account in ('gmail', 'fund', 'juno', 'outlook'):
+            for fast in (False, True):
+                with self.subTest(account=account, fast=fast):
+                    self.oauth_healing(account, fast)
+
+    def oauth_healing(self, account, fast, *, still_rejected=False, accept_frontend=None,
+                      transport_errors=(), reject_old=True, pinned=False, outer_retry=False):
+        helper_path = Path(t.__file__).resolve().parents[3] / 'local-helpers/libexec/mail/mail_oauth.py'
+        real_load = t.load_module
+        state = {'token': 'rejected-fixture', 'fetching': False, 'refreshes': 0,
+                 'auths': [], 'frontends': []}
+        def connection(host, ip=None, timeout=None):
+            imap = types.SimpleNamespace(**vars(self.imap))
+            imap.authenticate = lambda method, blob: authenticate(ip, method, blob)
+            return imap
+        def load(*_):
+            oauth = real_load('healing_test_oauth', helper_path)
+            oauth.STATE_DIR = str(self.root / 'oauth')
+            oauth.ORTIE, oauth.KC_READ = 'fixture-ortie', 'fixture-kc-read'
+            oauth._v4_addrs = lambda *a: ['frontend-1', 'frontend-2', 'frontend-3'] if pinned else []
+            oauth._PinnedIMAP = connection
+            oauth.log = lambda *a: None
+            oauth.imaplib = types.SimpleNamespace(IMAP4=imaplib.IMAP4,
+                                                  IMAP4_SSL=connection)
+            oauth.time = types.SimpleNamespace(**vars(oauth.time))
+            oauth.time.sleep = lambda *_: None
+            return types.SimpleNamespace(mail_oauth=oauth, connect=lambda acct, timeout:
+                oauth.xoauth2_connect(acct, 'host.invalid', 'user.invalid', timeout=timeout))
+        def authenticate(ip, method, blob):
+            auth = blob(None).decode()
+            state['auths'].append('new' if 'accepted-fixture' in auth else 'old')
+            state['frontends'].append(ip)
+            if len(state['auths']) <= len(transport_errors):
+                raise transport_errors[len(state['auths']) - 1]
+            if ((reject_old and 'accepted-fixture' not in auth) or still_rejected
+                    or (accept_frontend and ip != accept_frontend)):
+                raise imaplib.IMAP4.error('User is authenticated but not connected')
+        def ortie(command, **kwargs):
+            self.assertFalse(state['fetching'], 'a refresh-capable command ran inside the fetch')
+            if command[0] == 'fixture-kc-read':
+                return types.SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {'issued_at': t.time.time() - 600, 'expires_in': 3600}))
+            self.assertIsNone(kwargs['timeout'])
+            if command[-1] == 'refresh':
+                # Exercise the actual helper lock path while the watcher guard is held.
+                with (self.root / 'oauth' / f'{account}.lock').open() as helper_lock:
+                    with self.assertRaises(BlockingIOError):
+                        t.fcntl.flock(helper_lock, t.fcntl.LOCK_EX | t.fcntl.LOCK_NB)
+                state['refreshes'] += 1
+                state['token'] = 'accepted-fixture'
+            return types.SimpleNamespace(returncode=0, stdout=state['token'])
+        def spawn(command, **kwargs):
+            self.assertTrue(kwargs['start_new_session'])
+            self.assertTrue(kwargs['pass_fds'])
+            token = t.mail_credentials(account, refresh='--refresh-mail-credentials' in command)
+            return types.SimpleNamespace(returncode=0, communicate=lambda **kw: (token, None))
+        def fetch(name, command, **kwargs):
+            state['fetching'] = True
+            try:
+                result = t.mail_worker(account, json.loads(kwargs['input']))
+                return subprocess.CompletedProcess(command, 0, json.dumps(result), '')
+            except Exception as error:
+                return subprocess.CompletedProcess(command, 1, '', f'{type(error).__name__}: {error}')
+            finally:
+                state['fetching'] = False
+        request = {**self.request, 'fast': fast, 'since': 1000}
+        # HOME prevents the real helper from reading the owner's preferred Outlook IP.
+        with patch.dict(os.environ, {'HOME': str(self.root)}), \
+             patch.object(t, 'load_module', side_effect=load), \
+             patch.object(t.subprocess, 'Popen', side_effect=spawn) as processes, \
+             patch.object(t.subprocess, 'run', side_effect=ortie), \
+             patch.object(t, 'run_helper', side_effect=fetch) as workers, \
+             patch.object(t, 'fetch_verified', side_effect=self.fetch), \
+             patch.object(t, 'mail_record', side_effect=self.record):
+            # This rejection occurs with 50 minutes remaining on the access token.
+            self.assertGreater(load().mail_oauth.seconds_left(account), 2900)
+            if still_rejected:
+                with self.assertRaisesRegex(RuntimeError, 'IMAP auth failed') as caught:
+                    t.run_mail(account, request)
+                info = caught.exception.mail_progress
+                self.assertEqual(info['cursor_after'], request['cursor'])
+            else:
+                result = t.run_mail(account, request)
+                info = result['mail_progress']
+                self.assertEqual(result['cursor']['uid'], 100)
+            refreshed = reject_old or bool(accept_frontend)
+            self.assertEqual(state['refreshes'], int(refreshed))
+            self.assertEqual(workers.call_count, 2 if refreshed or outer_retry else 1)
+            self.assertEqual(processes.call_count, 2 if refreshed else 1)
+            self.assertEqual(info['credential_refresh_attempts'], int(refreshed))
+            if accept_frontend:
+                self.assertEqual(state['frontends'], ['frontend-1', 'frontend-2',
+                                                       'frontend-1', 'frontend-2', 'frontend-3'])
+            elif not transport_errors:
+                self.assertEqual(state['auths'], ['old'] * (2 if account == 'outlook' else 1)
+                                 + ['new'] * ((8 if account == 'outlook' else 2) if still_rejected else 1))
+            else:
+                self.assertEqual(state['auths'][-1], 'new' if refreshed else 'old')
+                if not refreshed:
+                    self.assertEqual(len(state['auths']), len(transport_errors) + 1)
+
+    def test_still_rejected_refreshed_token_does_not_start_another_refresh(self):
+        for account in ('gmail', 'outlook'):
+            with self.subTest(account=account):
+                self.oauth_healing(account, False, still_rejected=True)
+
+    def test_outlook_keeps_rotating_frontends_after_the_isolated_refresh(self):
+        for fast in (False, True):
+            with self.subTest(fast=fast):
+                self.oauth_healing('outlook', fast, accept_frontend='frontend-3', pinned=True)
+
+    def test_auth_transport_errors_rotate_without_refreshing_credentials(self):
+        # abort is an IMAP4.error subclass. Other transport failures already have
+        # their own branch in xoauth2_connect; exercise the entire transport class.
+        errors = (imaplib.IMAP4.abort('socket error: EOF'),
+                  imaplib.IMAP4.readonly('connection changed'),
+                  ConnectionResetError('connection reset'), TimeoutError('timed out'),
+                  ssl.SSLError('TLS connection dropped'))
+        for account in ('gmail', 'fund', 'juno', 'outlook'):
+            for fast in (False, True):
+                for pinned in (False, True):
+                    for error in errors:
+                        with self.subTest(account=account, fast=fast, pinned=pinned, error=type(error).__name__):
+                            self.oauth_healing(account, fast, pinned=pinned,
+                                               transport_errors=(error,), reject_old=False)
+
+    def test_transport_abort_does_not_consume_a_later_auth_healing_attempt(self):
+        for account in ('gmail', 'outlook'):
+            with self.subTest(account=account):
+                self.oauth_healing(account, False,
+                                   transport_errors=(imaplib.IMAP4.abort('socket error: EOF'),))
+
+    def test_repeated_auth_aborts_preserve_the_outer_transport_retry(self):
+        errors = (imaplib.IMAP4.abort('socket error: EOF'),
+                  imaplib.IMAP4.abort('connection dropped'),
+                  imaplib.IMAP4.readonly('connection changed'))
+        for account in ('gmail', 'fund', 'juno', 'outlook'):
+            for pinned in (False, True):
+                for error in errors:
+                    with self.subTest(account=account, pinned=pinned, error=str(error)):
+                        # Exhaust the real helper, then let the outer retry succeed
+                        # with the same token. Outlook has eight inner attempts.
+                        attempts = 8 if account == 'outlook' else 2
+                        self.oauth_healing(account, False, transport_errors=(error,) * attempts,
+                                           reject_old=False, pinned=pinned, outer_retry=True)
+
+    def test_auth_refresh_and_retry_share_original_account_budget(self):
+        for fast, limit in ((False, 22), (True, 14)):
+            with self.subTest(fast=fast):
+                now = [100.0]
+                def credentials(account, seconds, diagnostics, *, refresh=False):
+                    self.assertLessEqual(seconds, 100 + limit - now[0])
+                    now[0] += 1 if not refresh else seconds
+                    return 'fixture-secret'
+                def fetch(account, request, *, deadline):
+                    if now[0] == 101:
+                        now[0] += 7
+                        raise t.MailAuthRejected('fixture auth rejection')
+                    self.assertEqual(deadline, 100 + limit)
+                    now[0] = deadline
+                    raise TimeoutError('mail collector budget exceeded')
+                with patch.object(t.time, 'monotonic', side_effect=lambda: now[0]), \
+                     patch.object(t, 'prepare_mail_credentials', side_effect=credentials), \
+                     patch.object(t, 'run_mail_fetch', side_effect=fetch):
+                    with self.assertRaises(TimeoutError) as caught:
+                        t.run_mail('gmail', {**self.request, 'fast': fast})
+                self.assertEqual(now[0], 100 + limit)
+                self.assertEqual(caught.exception.mail_progress['credential_refresh_attempts'], 1)
+
+    def test_non_auth_fetch_failure_never_starts_a_healing_refresh(self):
+        for account in ('icloud', 'gmail', 'fund', 'juno', 'outlook'):
+            with self.subTest(account=account), \
+                 patch.object(t, 'prepare_mail_credentials', return_value='fixture-secret') as credentials, \
+                 patch.object(t, 'run_mail_fetch', side_effect=RuntimeError('connection reset')):
+                with self.assertRaises(RuntimeError):
+                    t.run_mail(account, self.request)
+                credentials.assert_called_once()
+                self.assertFalse(credentials.call_args.kwargs['refresh'])
+
+    def test_auth_refresh_timeout_logs_credential_stage_without_advancing_cursor(self):
+        with patch.object(t, 'prepare_mail_credentials', side_effect=[
+                'rejected-fixture', TimeoutError('refresh continues in isolated session')]) as credentials, \
+             patch.object(t, 'run_mail_fetch', side_effect=t.MailAuthRejected()) as fetch:
+            with self.assertRaises(TimeoutError) as caught:
+                t.run_mail('gmail', self.request)
+        self.assertEqual(credentials.call_count, 2)
+        self.assertTrue(credentials.call_args.kwargs['refresh'])
+        fetch.assert_called_once()
+        info = caught.exception.mail_progress
+        self.assertEqual(info['stage'], 'credential')
+        self.assertIn('isolated session', info['credential_error'])
+        self.assertEqual(info['credential_refresh_attempts'], 1)
+        self.assertEqual(info['cursor_after'], self.request['cursor'])
 
     def test_cache_read_is_bounded_read_only_and_rejects_expired_or_missing_token(self):
         mail = types.SimpleNamespace(mail_oauth=types.SimpleNamespace(KC_READ='fixture-kc-read'))

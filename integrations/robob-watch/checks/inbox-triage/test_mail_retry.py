@@ -86,6 +86,14 @@ class MailRetryTests(unittest.TestCase):
         self.assertEqual(self.run.call_count, 1)
         self.assertEqual(self.now, 112)
 
+    def test_auth_retry_fetch_is_capped_by_the_original_account_deadline(self):
+        self.steps = [(6, None)]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            t.run_mail_fetch('juno', self.request, deadline=103)
+        self.run.assert_called_once()
+        self.assertEqual(self.run.call_args.kwargs['timeout'], 3)
+        self.assertEqual(self.now, 103)
+
     def test_worker_alarm_retries_only_with_remaining_budget(self):
         self.steps = [(9, self.failure('TimeoutError: mail worker budget exceeded')), (30, None)]
         with self.assertRaises(subprocess.TimeoutExpired):

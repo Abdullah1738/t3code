@@ -17,6 +17,7 @@ import functools
 import hashlib
 import importlib.machinery
 import importlib.util
+import imaplib
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import time
 import threading
+import types
 import urllib.error
 import urllib.request
 
@@ -857,10 +859,28 @@ def mail_record(M, mail, account, validity, record, cutoff, now, request):
     return item, None if item.get('hard_alert') else prefilter(item, now, request['rules'])
 
 
-def mail_credentials(account):
+class MailAuthRejected(RuntimeError):
+    pass
+
+
+def mail_credentials(account, refresh=False):
     mail = load_module('triage_mail_credentials', HOME / '.local/bin/mailsearch')
     if account == 'icloud':
         return mail.secret([mail.KC_READ, 'himalaya-icloud', 'himalaya'], 15)
+    oauth = mail.mail_oauth
+    if refresh:
+        # The shared refresh() kills ortie after 30s. Keep its serialization here,
+        # but let the detached writer finish even after the watcher's wait expires.
+        state = Path(oauth.STATE_DIR)
+        state.mkdir(parents=True, exist_ok=True)
+        with (state / f'{account}.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            response = subprocess.run([oauth.ORTIE, '-a', account, 'token', 'refresh'],
+                                      capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                      timeout=None)
+            if response.returncode:
+                raise RuntimeError(f'credential refresh failed (rc={response.returncode})')
+            return oauth.get_token(account, timeout=None)
     # ortie may refresh during token show. The parent bounds its wait; no nested
     # subprocess timer may kill a refresh halfway through its credential write.
     return mail.mail_oauth.get_token(account, timeout=None)
@@ -890,10 +910,12 @@ def cached_mail_credential(account, seconds):
         return None
 
 
-def prepare_mail_credentials(account, seconds, diagnostics=None):
+def prepare_mail_credentials(account, seconds, diagnostics=None, *, refresh=False):
     # The runner kills its entire process group. A refresh must survive that too,
     # not just the narrower mail-worker timeout. Only the wait is bounded here.
     command = [sys.executable, str(Path(__file__).resolve()), '--mail-credentials', account]
+    if refresh:
+        command.append('--refresh-mail-credentials')
     path = credential_guard_path(account)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a+') as guard:
@@ -907,7 +929,9 @@ def prepare_mail_credentials(account, seconds, diagnostics=None):
                 started = path.stat().st_mtime
             if diagnostics is not None:
                 diagnostics['credential_inflight_age_s'] = max(0, round(time.time() - started))
-            cached = cached_mail_credential(account, seconds)
+            # A token already rejected by IMAP must not be reused just because it
+            # has time left. Wait for the in-flight writer on a later tick instead.
+            cached = cached_mail_credential(account, seconds) if not refresh else None
             if cached:
                 return cached
             raise RuntimeError('refresh_inflight') from None
@@ -931,6 +955,20 @@ def prepare_mail_credentials(account, seconds, diagnostics=None):
     return output.strip()
 
 
+def mail_auth_transport(factory, *args, **kwargs):
+    connection = factory(*args, **kwargs)
+    authenticate = connection.authenticate
+    def auth(*args, **kwargs):
+        try:
+            return authenticate(*args, **kwargs)
+        except imaplib.IMAP4.abort:
+            # abort subclasses IMAP4.error; the shared helper otherwise treats a
+            # dropped AUTH connection as a rejected token and asks for a refresh.
+            raise ConnectionAbortedError('IMAP connection aborted during AUTH') from None
+    connection.authenticate = auth
+    return connection
+
+
 def mail_worker(account, request):
     deadline = time.monotonic() + (7 if request.get('fast') else 10)
     mail = load_module('triage_mailsearch', HOME / '.local/bin/mailsearch')
@@ -938,8 +976,18 @@ def mail_worker(account, request):
     credential = request['credential']
     mail.secret = lambda *_: credential
     if account != 'icloud':
-        mail.mail_oauth.get_token = lambda *_: credential
-        mail.mail_oauth.refresh = lambda *_, **__: False
+        oauth = mail.mail_oauth
+        oauth.get_token = lambda *_: credential
+        def refresh_outside_fetch(*_, **__):
+            if request.get('credential_refreshed'):
+                # The parent already refreshed once. Let the helper continue its
+                # remaining frontend attempts without starting another refresh.
+                return False
+            raise MailAuthRejected('IMAP authentication rejected; isolated refresh required')
+        oauth.refresh = refresh_outside_fetch
+        oauth.imaplib = types.SimpleNamespace(**vars(oauth.imaplib))
+        oauth.imaplib.IMAP4_SSL = functools.partial(mail_auth_transport, oauth.imaplib.IMAP4_SSL)
+        oauth._PinnedIMAP = functools.partial(mail_auth_transport, oauth._PinnedIMAP)
     now, cursor = request['now'], request.get('cursor')
     since = request.get('since')
     progress = {'account': account, 'cursor_before': cursor, 'stage': 'connect', 'result': None}
@@ -1024,9 +1072,11 @@ def mail_worker(account, request):
 
 def run_mail(account, request):
     started = time.monotonic()
+    deadline = started + (14 if request.get('fast') else 22)
     info = {'account': account, 'fetched': 0, 'cursor_before': request.get('cursor'),
             'cursor_after': request.get('cursor'), 'elapsed_ms': 0, 'credential_ms': 0,
             'credential_error': None, 'credential_inflight_age_s': None,
+            'credential_refresh_attempts': 0,
             'timed_out': False, 'stage': 'credential', 'connect_ms': None}
     payload = dict(request)
     wd = Path(os.environ.get('WATCH_DIR', Path(__file__).resolve().parent))
@@ -1041,22 +1091,35 @@ def run_mail(account, request):
                     elapsed_ms=round((time.monotonic()-started)*1000))
         result['mail_progress'] = info
         return result
-    try:
-        old = saved()
-        if old.get('result'):
-            info.update(stage='recovered', credential_ms=0)
-            return complete(old['result'])
+    def credentials(refresh=False):
+        info['stage'] = 'credential'
         credential_start = time.monotonic()
         try:
-            payload['credential'] = prepare_mail_credentials(account, 5 if request.get('fast') else 8, info)
+            remaining = deadline - credential_start
+            if remaining <= 0:
+                raise TimeoutError('mail credential budget exceeded')
+            payload['credential'] = prepare_mail_credentials(
+                account, min(5 if request.get('fast') else 8, remaining), info, refresh=refresh)
         except Exception as error:
             info['credential_error'] = ('refresh_inflight' if str(error) == 'refresh_inflight' else
                                         f'{type(error).__name__}: {clean(str(error), 160)}')
             raise
         finally:
-            info['credential_ms'] = round((time.monotonic()-credential_start)*1000)
+            info['credential_ms'] += round((time.monotonic()-credential_start)*1000)
         info['stage'] = 'connect'
-        result = run_mail_fetch(account, payload)
+    try:
+        old = saved()
+        if old.get('result'):
+            info.update(stage='recovered', credential_ms=0)
+            return complete(old['result'])
+        credentials()
+        try:
+            result = run_mail_fetch(account, payload, deadline=deadline)
+        except MailAuthRejected:
+            info['credential_refresh_attempts'] = 1
+            credentials(refresh=True)
+            payload['credential_refreshed'] = True
+            result = run_mail_fetch(account, payload, deadline=deadline)
         record = saved()
         info.update(stage='fetch', connect_ms=record.get('connect_ms'), fetch_ms=record.get('stage_elapsed_ms'))
         info['timed_out'] = any(marker in (result.get('partial') or '').lower()
@@ -1079,9 +1142,10 @@ def run_mail(account, request):
         raise
 
 
-def run_mail_fetch(account, request):
+def run_mail_fetch(account, request, *, deadline=None):
     # Accounts run concurrently; a retry shares this budget, rather than adding 22s.
-    deadline = time.monotonic() + (9 if request.get('fast') else 14)
+    fetch_deadline = time.monotonic() + (9 if request.get('fast') else 14)
+    deadline = min(deadline, fetch_deadline) if deadline is not None else fetch_deadline
     command = [sys.executable, str(Path(__file__).resolve()), '--mail-worker', account]
     payload = json.dumps(request)
     for attempt in range(2):
@@ -1098,6 +1162,8 @@ def run_mail_fetch(account, request):
                 # A completed prefix is already useful; never discard it to retry.
                 return json.loads(p.stdout)
             message = p.stderr.strip()[-180:] or 'mail collector failed'
+            if message.startswith('MailAuthRejected:'):
+                raise MailAuthRejected('IMAP authentication rejected; isolated refresh required')
             error = RuntimeError(message)
             text = message.lower()
             error.timed_out = any(marker in text for marker in ('timeouterror:', 'timeout:', 'timed out'))
@@ -2483,6 +2549,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mail-worker', choices=ACCOUNTS)
     parser.add_argument('--mail-credentials', choices=ACCOUNTS)
+    parser.add_argument('--refresh-mail-credentials', action='store_true')
     parser.add_argument('--dry-run-hours', type=float)
     parser.add_argument('--report')
     parser.add_argument('--fast-only', action='store_true')
@@ -2496,7 +2563,7 @@ def main():
         if os.environ.get('ROBOB_TEST') == '1':
             return 75
         try:
-            print(mail_credentials(args.mail_credentials))
+            print(mail_credentials(args.mail_credentials, refresh=args.refresh_mail_credentials))
         except Exception:
             return 1
         return 0
