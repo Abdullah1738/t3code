@@ -41,6 +41,7 @@ const source = (id: number): RestartSource => ({
 const harness = <E = never>(
   options: { maxActive?: number; spacingMs?: number } = {},
   settingsLayer?: Layer.Layer<ServerSettings.ServerSettingsService, E>,
+  loadReader?: () => number,
 ) => {
   const resolvedSettings: Layer.Layer<
     ServerSettings.ServerSettingsService,
@@ -52,6 +53,8 @@ const harness = <E = never>(
   const protectedNotes = new Set<string>();
   const statusHooks = new Map<string, () => void>();
   const admissionBlocks = new Map<string, Effect.Effect<void>>();
+  const sourceBlocks = new Map<string, Effect.Effect<void>>();
+  const pendingHooks = new Map<string, Effect.Effect<void>>();
   const positions: Array<{ id: string; position: number | null }> = [];
   const reads = { settings: 0, sources: 0, descriptions: 0, active: 0 };
   const runSources = new Map<string, RestartSource>();
@@ -79,14 +82,22 @@ const harness = <E = never>(
           wake: (input) => Effect.suspend(() => wake(input)),
           hasSuccessor: () => Effect.succeed(false),
           pending: (input) =>
-            Effect.sync(
-              () => !cancelled.has(input.sourceRunId) && !cancelled.has(input.effectId ?? ""),
+            (pendingHooks.get(input.sourceRunId) ?? Effect.void).pipe(
+              Effect.andThen(
+                Effect.sync(
+                  () => !cancelled.has(input.sourceRunId) && !cancelled.has(input.effectId ?? ""),
+                ),
+              ),
             ),
           sourceForRun: (_, runId) =>
-            Effect.sync(() => {
-              reads.sources++;
-              return runSources.get(runId);
-            }),
+            (sourceBlocks.get(runId) ?? Effect.void).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  reads.sources++;
+                  return runSources.get(runId);
+                }),
+              ),
+            ),
           describe: (input) =>
             Effect.sync(() => {
               reads.descriptions++;
@@ -126,7 +137,7 @@ const harness = <E = never>(
               ),
             ),
         }),
-        Layer.succeed(RestartPacing.RestartLoad, () => load),
+        Layer.succeed(RestartPacing.RestartLoad, loadReader ?? (() => load)),
       ),
     ),
   );
@@ -150,6 +161,8 @@ const harness = <E = never>(
     protectedNotes,
     statusHooks,
     admissionBlocks,
+    sourceBlocks,
+    pendingHooks,
     setLoad: (value: number) => {
       load = value;
     },
@@ -361,6 +374,13 @@ it.effect("system CPU and event-loop interval counters ignore a busy load averag
       loadavg: 0,
     };
     assert.isAbove(load(), 1);
+    assert.deepEqual(load.snapshot(), {
+      cpuBusy: 0.9,
+      cpuBusyThreshold: 0.85,
+      eventLoopUtilization: 0.1,
+      eventLoopThreshold: 0.9,
+      sampleIntervalMs: 10_000,
+    });
     sample = {
       at: 30_000,
       idle: 15_700,
@@ -370,8 +390,38 @@ it.effect("system CPU and event-loop interval counters ignore a busy load averag
       loadavg: 0,
     };
     assert.isAbove(load(), 1);
+    assert.equal(load.snapshot().eventLoopUtilization, 0.95);
   }),
 );
+
+it.effect("a load-held waiting row records the raw interval inputs and thresholds", () => {
+  let sample = { at: 0, idle: 0, total: 0, loopIdle: 0, loopActive: 0 };
+  const load = makeRestartLoad(() => sample);
+  const h = harness({ spacingMs: 0 }, undefined, load);
+  const messages: string[] = [];
+  const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    sample = { at: 10_000, idle: 1_000, total: 10_000, loopIdle: 500, loopActive: 9_500 };
+    yield* TestClock.adjust(10_000);
+    assert.isAbove(yield* pacing.acquire(source(1)), 0);
+    const waiting = messages.findLast((row) => row.includes("restart-pacing.waiting"))!;
+    for (const field of [
+      '"loaded":true',
+      '"cpuBusy":0.9',
+      '"cpuBusyThreshold":0.85',
+      '"eventLoopUtilization":0.95',
+      '"eventLoopThreshold":0.9',
+      '"sampleIntervalMs":10000',
+      '"queuedAtMs":10000',
+      '"waitedMs":0',
+      '"lastAdmissionAgoMs":null',
+    ])
+      assert.include(waiting, field);
+  }).pipe(
+    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+  );
+});
 
 it.effect("ten continuations cap concurrent provider starts until confirmation", () => {
   const h = harness({ maxActive: 3, spacingMs: 0 });
@@ -929,6 +979,95 @@ it.effect("recovers a transient deferral write failure and refunds the claim att
   }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
 );
 
+it.effect.each(["pending", "status"] as const)(
+  "pruning blocked in %s cannot backdate position progress across an expired window",
+  (persistence) => {
+    const h = harness({ maxActive: 1, spacingMs: 0 });
+    h.setLoad(2);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const stale = source(1);
+      const waiter = source(2);
+      const newcomer = source(3);
+      yield* pacing.register(stale);
+      yield* pacing.register(waiter);
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+      yield* TestClock.adjust("25 minutes");
+      h.priorities.set(newcomer.sourceRunId, 0);
+      h.setLoad(0);
+      assert.equal(yield* pacing.acquire(newcomer), 0);
+      h.running.add(newcomer.sourceRunId);
+      yield* pacing.dispatched(newcomer);
+      yield* TestClock.adjust(299_000);
+      const entered = yield* Deferred.make<void>();
+      const proceed = yield* Deferred.make<void>();
+      const blocks = persistence === "pending" ? h.pendingHooks : h.admissionBlocks;
+      blocks.set(
+        stale.sourceRunId,
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(proceed))),
+      );
+      h.cancelled.add(stale.sourceRunId);
+      const acquiring = yield* pacing.acquire(waiter).pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(25_000);
+      yield* Deferred.succeed(proceed, undefined);
+      const failure = yield* Fiber.join(acquiring);
+      assert.instanceOf(failure, RestartPacing.RestartAdmissionTimeoutError);
+      assert.equal(DateTime.toEpochMillis(failure.deadline), 30 * 60_000);
+    }).pipe(Effect.provide(h.layer));
+  },
+);
+
+it.effect.each(["no improvement", "later real improvement"] as const)(
+  "replacement preserves the waiter's completed queue position: %s",
+  (progress) => {
+    const h = harness({ maxActive: 1, spacingMs: 0 });
+    h.setLoad(2);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const first = { ...source(1), sourceRunId: RunId.make("run:first:ordinal:1") };
+      const successor = { ...first, sourceRunId: RunId.make("run:first:ordinal:2") };
+      const waiter = source(2);
+      const newcomer = source(3);
+      yield* pacing.register(first);
+      yield* pacing.register(waiter);
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+      yield* TestClock.adjust("25 minutes");
+      h.priorities.set(newcomer.sourceRunId, 0);
+      h.setLoad(0);
+      assert.equal(yield* pacing.acquire(newcomer), 0);
+      h.running.add(newcomer.sourceRunId);
+      yield* pacing.dispatched(newcomer);
+      yield* TestClock.adjust("4 minutes");
+      yield* pacing.register(successor);
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+      assert.equal(h.positions.at(-1)?.position, 2);
+      if (progress === "no improvement") {
+        yield* TestClock.adjust("1 minute");
+        const failure = yield* pacing.acquire(waiter).pipe(Effect.flip);
+        assert.instanceOf(failure, RestartPacing.RestartAdmissionTimeoutError);
+        assert.equal(DateTime.toEpochMillis(failure.deadline), 30 * 60_000);
+        return;
+      }
+      yield* TestClock.adjust(30_000);
+      yield* pacing.release(newcomer);
+      assert.equal(yield* pacing.acquire(successor), 0);
+      yield* pacing.dispatched(successor);
+      yield* TestClock.adjust(25.5 * 60_000);
+      const later = source(4);
+      h.priorities.set(later.sourceRunId, 0);
+      assert.equal(yield* pacing.acquire(later), 0);
+      h.running.add(later.sourceRunId);
+      yield* pacing.dispatched(later);
+      yield* TestClock.adjust(4.25 * 60_000);
+      assert.equal(yield* Clock.currentTimeMillis, 59.25 * 60_000);
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+      yield* pacing.release(later);
+      assert.equal(yield* pacing.acquire(waiter), 0);
+    }).pipe(Effect.provide(h.layer));
+  },
+);
+
 it.effect.each([
   [null, false],
   ["", false],
@@ -982,6 +1121,285 @@ it.effect("a failed post-dispatch read cannot leave an in-flight reservation for
     h.failActive(false);
     assert.equal(yield* pacing.acquire(source(2)), 0);
   }).pipe(Effect.provide(h.layer));
+});
+
+it.effect("a deep load-held queue keeps a progressing source alive beyond 30 minutes", () => {
+  const h = harness({ maxActive: 4, spacingMs: 0 });
+  h.setLoad(2);
+  const messages: Array<{ at: number; row: string }> = [];
+  let at = 0;
+  const logger = Logger.make(({ message }) => messages.push({ at, row: JSON.stringify(message) }));
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const queued = Array.from({ length: 40 }, (_, id) => source(id + 1));
+    const waiter = queued[33]!;
+    const advanceTo = (at: number) =>
+      Clock.currentTimeMillis.pipe(Effect.flatMap((now) => TestClock.adjust(at - now)));
+    for (const entry of queued) yield* pacing.register(entry);
+    assert.isAbove(yield* pacing.acquire(waiter), 0);
+    assert.equal(h.positions.at(-1)?.position, 34);
+    for (let index = 0; index < 33; index++) {
+      yield* advanceTo((index + 1) * 90_000);
+      h.setLoad(0);
+      at = yield* Clock.currentTimeMillis;
+      assert.equal(yield* pacing.acquire(queued[index]!), 0);
+      yield* pacing.dispatched(queued[index]!);
+      if (index === 32) {
+        assert.equal(yield* pacing.acquire(waiter), 0);
+        break;
+      }
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+      if (index === 29) {
+        assert.equal(yield* Clock.currentTimeMillis, 45 * 60_000);
+      }
+      h.setLoad(2);
+      yield* TestClock.adjust(10_000);
+      at = yield* Clock.currentTimeMillis;
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+      if (index === 19) {
+        yield* advanceTo(31 * 60_000);
+        at = yield* Clock.currentTimeMillis;
+        assert.isAbove(yield* pacing.acquire(waiter), 0);
+      }
+    }
+    assert.equal(h.positions.at(-1)?.position, null);
+    assert.equal(yield* Clock.currentTimeMillis, 49.5 * 60_000);
+    const deferred = messages.filter(
+      ({ row }) =>
+        row.includes("restart-pacing.bound_deferred") &&
+        row.includes(`"sourceRunId":"${waiter.sourceRunId}"`),
+    );
+    assert.lengthOf(deferred, 2);
+    for (let index = 1; index < deferred.length; index++)
+      assert.isAtLeast(deferred[index]!.at - deferred[index - 1]!.at, 10 * 60_000);
+    assert.isFalse(messages.some(({ row }) => row.includes("restart-pacing.bound_failed")));
+    const waiting = messages.find(({ row }) => row.includes("restart-pacing.waiting"))!.row;
+    assert.include(waiting, '"lastAdmissionAgoMs":null');
+    assert.include(waiting, '"loadScore":2');
+    assert.include(waiting, '"loadThreshold":1');
+  }).pipe(
+    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+  );
+});
+
+it.effect("the absolute backstop expires a source even while both progress clocks advance", () => {
+  const h = harness({ maxActive: 4, spacingMs: 0 });
+  h.setLoad(2);
+  const messages: string[] = [];
+  const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const queued = Array.from({ length: 100 }, (_, id) => source(id + 1));
+    const waiter = queued[99]!;
+    for (const entry of queued) yield* pacing.register(entry);
+    assert.isAbove(yield* pacing.acquire(waiter), 0);
+    for (let index = 0; index < 79; index++) {
+      yield* TestClock.adjust(90_000);
+      h.setLoad(0);
+      assert.equal(yield* pacing.acquire(queued[index]!), 0);
+      yield* pacing.dispatched(queued[index]!);
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+    }
+    yield* TestClock.adjust(90_000);
+    assert.instanceOf(
+      yield* pacing.acquire(waiter).pipe(Effect.flip),
+      RestartPacing.RestartAdmissionTimeoutError,
+    );
+    const failed = messages.findLast((row) => row.includes("restart-pacing.bound_failed"));
+    assert.include(failed!, '"rule":"absolute_backstop"');
+    assert.include(failed!, '"waitedMs":7200000');
+  }).pipe(
+    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+  );
+});
+
+it.effect("admissions elsewhere do not extend a source whose position never improves", () => {
+  const h = harness({ maxActive: 4, spacingMs: 0 });
+  h.setLoad(2);
+  const messages: string[] = [];
+  const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const waiter = source(100);
+    yield* pacing.register(waiter);
+    assert.isAbove(yield* pacing.acquire(waiter), 0);
+    h.setLoad(0);
+    for (let index = 0; index < 19; index++) {
+      yield* TestClock.adjust(90_000);
+      const newcomer = source(index);
+      h.priorities.set(newcomer.sourceRunId, 0);
+      assert.equal(yield* pacing.acquire(newcomer), 0);
+      yield* pacing.dispatched(newcomer);
+    }
+    yield* TestClock.adjust(90_000);
+    assert.instanceOf(
+      yield* pacing.acquire(waiter).pipe(Effect.flip),
+      RestartPacing.RestartAdmissionTimeoutError,
+    );
+    assert.include(
+      messages.findLast((row) => row.includes("bound_failed"))!,
+      '"rule":"no_progress"',
+    );
+  }).pipe(
+    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+  );
+});
+
+it.effect("position changes and a late admission cannot revive a window with no admissions", () => {
+  const h = harness({ maxActive: 4, spacingMs: 0 });
+  h.setLoad(2);
+  const messages: string[] = [];
+  const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const queued = Array.from({ length: 40 }, (_, id) => source(id + 1));
+    const waiter = queued[39]!;
+    for (const entry of queued) yield* pacing.register(entry);
+    assert.isAbove(yield* pacing.acquire(waiter), 0);
+    for (let index = 0; index < 29; index++) {
+      yield* TestClock.adjust(60_000);
+      h.cancelled.add(queued[index]!.sourceRunId);
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+    }
+    yield* TestClock.adjust(60_000);
+    h.setLoad(0);
+    // A newly registered source can be admitted, but the old window has expired.
+    const newcomer = source(100);
+    h.priorities.set(newcomer.sourceRunId, 0);
+    assert.equal(yield* pacing.acquire(newcomer), 0);
+    yield* pacing.dispatched(newcomer);
+    assert.instanceOf(
+      yield* pacing.acquire(waiter).pipe(Effect.flip),
+      RestartPacing.RestartAdmissionTimeoutError,
+    );
+    assert.include(
+      messages.findLast((row) => row.includes("bound_failed"))!,
+      '"rule":"no_progress"',
+    );
+  }).pipe(
+    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+  );
+});
+
+it.effect("a pruned waiter retains admissions made before its replacement registers", () => {
+  const h = harness({ maxActive: 4, spacingMs: 0 });
+  h.setLoad(2);
+  const first = source(1);
+  const waiter = { ...source(2), effectId: "start:replacement-race" };
+  const later = source(3);
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    yield* pacing.register(first);
+    yield* pacing.register(waiter);
+    assert.isAbove(yield* pacing.acquire(waiter), 0);
+    yield* TestClock.adjust("15 minutes");
+    h.cancelled.add(first.sourceRunId);
+    assert.isAbove(yield* pacing.acquire(waiter), 0);
+    h.cancelled.add(waiter.effectId);
+    assert.isAbove(yield* pacing.acquire(later), 0);
+    h.cancelled.delete(waiter.effectId);
+    yield* TestClock.adjust("5 minutes");
+    h.setLoad(0);
+    assert.equal(yield* pacing.acquire(later), 0);
+    yield* pacing.dispatched(later);
+    yield* TestClock.adjust("11 minutes");
+    assert.equal(yield* pacing.acquire(waiter), 0);
+  }).pipe(Effect.provide(h.layer));
+});
+
+it.effect(
+  "background pruning credits a sleeping waiter's position before its window expires",
+  () => {
+    const h = harness({ maxActive: 1, spacingMs: 0 });
+    h.setLoad(2);
+    return Effect.gen(function* () {
+      const pacing = yield* RestartPacing.RestartPacing;
+      const stale = source(1);
+      const waiter = source(2);
+      const newcomer = source(3);
+      yield* pacing.register(stale);
+      yield* pacing.register(waiter);
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+      yield* TestClock.adjust("25 minutes");
+      h.priorities.set(newcomer.sourceRunId, 0);
+      h.setLoad(0);
+      assert.equal(yield* pacing.acquire(newcomer), 0);
+      h.running.add(newcomer.sourceRunId);
+      yield* pacing.dispatched(newcomer);
+      yield* TestClock.adjust(280_000);
+      const pruned = yield* Deferred.make<void>();
+      h.pendingHooks.set(
+        waiter.sourceRunId,
+        Deferred.succeed(pruned, undefined).pipe(Effect.asVoid),
+      );
+      h.cancelled.add(stale.sourceRunId);
+      yield* TestClock.adjust(10_000);
+      yield* Deferred.await(pruned);
+      yield* TestClock.adjust(70_000);
+      assert.equal(yield* Clock.currentTimeMillis, 31 * 60_000);
+      assert.isAbove(yield* pacing.acquire(waiter), 0);
+      yield* pacing.release(newcomer);
+      assert.equal(yield* pacing.acquire(waiter), 0);
+    }).pipe(Effect.provide(h.layer));
+  },
+);
+
+it.effect.each([
+  ["no_progress", "status"],
+  ["no_progress", "sourceForRun"],
+  ["absolute_backstop", "status"],
+  ["absolute_backstop", "sourceForRun"],
+] as const)("a %s deadline crossed during %s cannot admit the source", ([rule, persistence]) => {
+  const h = harness({ maxActive: 4, spacingMs: 0 });
+  h.setLoad(2);
+  const messages: string[] = [];
+  const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const count = rule === "absolute_backstop" ? 80 : 1;
+    const queued = Array.from({ length: count }, (_, id) => source(id + 1));
+    const waiter = queued.at(-1)!;
+    h.runSources.set(waiter.sourceRunId, waiter);
+    for (const entry of queued) yield* pacing.register(entry);
+    assert.isAbove(yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId), 0);
+    for (const entry of queued.slice(0, -1)) {
+      yield* TestClock.adjust(90_000);
+      h.setLoad(0);
+      assert.equal(yield* pacing.acquire(entry), 0);
+      yield* pacing.dispatched(entry);
+    }
+    const deadline = (rule === "absolute_backstop" ? 120 : 30) * 60_000;
+    yield* TestClock.adjust(deadline - 1000 - (yield* Clock.currentTimeMillis));
+    h.setLoad(0);
+    const entered = yield* Deferred.make<void>();
+    const proceed = yield* Deferred.make<void>();
+    const blocks = persistence === "status" ? h.admissionBlocks : h.sourceBlocks;
+    blocks.set(
+      waiter.sourceRunId,
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(proceed))),
+    );
+    const admitting = yield* pacing
+      .acquireRun(waiter.threadId, waiter.sourceRunId)
+      .pipe(Effect.flip, Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(25_000);
+    yield* Deferred.succeed(proceed, undefined);
+    const failure = yield* Fiber.join(admitting);
+    assert.instanceOf(failure, RestartPacing.RestartAdmissionTimeoutError);
+    assert.equal(DateTime.toEpochMillis(failure.deadline), deadline);
+    const failed = messages.findLast((row) => row.includes("restart-pacing.bound_failed"));
+    assert.include(failed!, `"rule":"${rule}"`);
+    assert.include(failed!, `"waitedMs":${deadline + 24_000}`);
+    assert.isFalse(
+      messages.some(
+        (row) =>
+          row.includes(`"sourceRunId":"${waiter.sourceRunId}"`) &&
+          row.includes("restart-pacing.admitted"),
+      ),
+    );
+  }).pipe(
+    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+  );
 });
 
 it.effect.each(["active capacity", "load"])(
