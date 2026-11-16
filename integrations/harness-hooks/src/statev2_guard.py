@@ -2269,6 +2269,10 @@ def _database_reference(source):
 
 def refusal_reason(rule, cause, cwd):
     if rule == "live-database-script-unresolved":
+        if cause and '\nAccepted: ' in cause:
+            detail, hint = cause.split('\nAccepted: ', 1)
+            return ("statev2 guard: this command was NOT run.\n"
+                    f"Could not check {detail}. Resolved workdir: {cwd}.\nAccepted: {hint}")
         fix = "Use a literal absolute script path."
         if cause and "unbalanced quote" in cause:
             fix = "Close the shell quote before running the command."
@@ -2901,7 +2905,49 @@ def _quoted_punctuation(source, script_literals=False):
     return "".join(output), quoted
 
 
-def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None) -> list[Path]:
+def _offbox_payload(words, *, known_only=True):
+    if len(words) < 3 or os.path.basename(words[0]) != 'offbox' or words[1] != 'run':
+        return None
+    index = 2
+    while index < len(words):
+        flag, equal, _ = words[index].partition('=')
+        if flag == '--':
+            return words[index + 1:]
+        if flag in {'--include', '--size', '--template', '--base', '--pull'}:
+            index += 1 if equal else 2
+        elif flag in {'--bg', '--remote', '--no-fallback', '--git', '--fresh', '--no-sync', '--no-retry'} and not equal:
+            index += 1
+        else:
+            # Preserve scanning of unknown wrappers, but do not transfer a
+            # caller proof through flags that may change execution bindings.
+            return words[words.index('--', index) + 1:] if not known_only and '--' in words[index:] else None
+    return None
+
+
+def _fresh_mktemp(value):
+    if not re.fullmatch(r'\$\(mktemp -d(?: [^;&|()`\n]*)?\)', value):
+        return False
+    if re.search(r'\.\.|\.robob/userdata|robob-data|\.t3/userdata|\.local/share/opencode|opencode-data', value):
+        return False
+    try:
+        args = shlex.split(value[2:-1])[2:]
+    except ValueError:
+        return False
+    # Only HOME/PWD are bounded template expansions. No option can turn this
+    # into a dry run, or redirect -t's generated name outside its temp root.
+    args = [re.sub(r'\$\{?(HOME|PWD)\}?', '/guard-root', arg) for arg in args]
+    if args[:1] == ['-t']:
+        return len(args) == 2 and '/' not in args[1] and not re.search(r'[$`*?\[\]{}~]', args[1])
+    return len(args) <= 1 and all(not arg.startswith('-') and not re.search(r'[$`*?\[\]{}]', arg) for arg in args)
+
+
+def _attached_script_operand(word, binary):
+    flag, equal, value = word.partition('=')
+    options = NODE_SCRIPT_OPTIONS | NODE_FILE_OPTIONS if binary == 'node' else {'--preload'} if binary == 'bun' else set()
+    return value if equal and flag in options else word
+
+
+def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
     written = {}
@@ -2926,7 +2972,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     # Script bindings keep unknown branch values, unlike the reader's lexical
     # expansion. A safe assignment in one branch cannot prove a script path.
     script_values = {}
-    opaque_written = {}
+    opaque_written, inherited_empty, inherited_reasons = _opaque or ({}, set(), {})
+    opaque_written = dict(opaque_written)
+    inherited_quoted = {value for _, value in opaque_written}
     invocation_written = {}
     invocation_fresh = set()
     invocation_literals = set()
@@ -2937,9 +2985,44 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     # Opaque paths need a fresh, unmodified root; existing files cannot be
     # assumed replaced when a write fails or is skipped.
     fresh_variables = set()
-    populated_variables = set()
+    marker_variables = set()
+    populated_paths = set()
+    binding_causes = {}
+    writer_causes = {}
+    last_invalidation = None
+    invocation_invalidation = None
+    current_line = 1
     copied_opaque = set()
     noclobber = False
+
+    def opaque_key(value, directory):
+        root = re.fullmatch(r'\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/([^$`*?\[\]{}]+)', value)
+        if root and not Path(root[3]).is_absolute() and '..' not in Path(root[3]).parts and Path(root[3]) != Path('.'):
+            return directory, root[1] or root[2], str(Path(root[3]))
+        return None
+
+    def path_refusal(value, directory, binary, reason=None):
+        if '$' not in value and '`' not in value:
+            return None
+        names = re.findall(r'\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)', value)
+        key = opaque_key(value, directory)
+        if reason is None:
+            if value in inherited_reasons:
+                return inherited_reasons[value]
+            if value not in invocation_quoted and value not in inherited_quoted:
+                reason = 'unquoted script path; quote the directory variable (IFS/glob expansion is unproved)'
+            elif unsafe_bindings:
+                reason = 'unsafe shell/startup bindings invalidate the script proof'
+            elif key in writer_causes:
+                reason = writer_causes[key]
+            else:
+                reason = next((binding_causes[a or b] for a, b in names if (a or b) in binding_causes), None)
+                reason = reason or invocation_invalidation or 'no readable same-call heredoc writer for this script'
+        extension = '.py' if binary.startswith('python') else '.sh' if binary in {'bash','sh','zsh','dash','ksh'} else '.ts' if binary == 'bun' else '.js'
+        runner = f'bun test --preload "$d/x{extension}"' if binary == 'bun' else f'{binary} "$d/x{extension}"'
+        return (f'{reason}: {_token(value)} ({binary})\n'
+                f'Accepted: d=$(mktemp -d); cat > "$d/x{extension}" <<\'EOF\' … EOF; {runner} '
+                '(quote "$d" and use a same-call heredoc), or create/write first and run its literal absolute script path in the next call.')
 
     def affected_sources(path, descendants=False):
         # Executable trust must survive the whole call, even writes before a
@@ -3110,12 +3193,17 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 return True
             source = _literal_path(words[1], directory)
             target = words[2]
+            if (words[1] in invocation_quoted and (directory, words[1]) in opaque_written and
+                    _literal_path(target, directory) is not None):
+                return False
             if source is not None and _literal_path(target, directory) is not None:
                 return False
             root = re.fullmatch(r'\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/([^$`*?\[\]{}]*)', target)
             if source is not None and root and (root[1] or root[2]) in fresh_variables:
-                # Only a copied data sibling is known not to populate a future
-                # script. A directory copy or script copy keeps invalidating.
+                # A named sibling preserves other paths. copied_opaque still
+                # prevents executing or replacing this unchecked copy itself.
+                if target in invocation_quoted and opaque_key(target, directory):
+                    return False
                 return not (source.suffix == '.ndjson' and root[3] in {'', source.name})
         if (not unsafe_bindings and binary == 'git' and len(words) == 3 and words[1] == 'show' and
                 not words[2].startswith('-') and re.fullmatch(r'[^$`\s:]+:[^$`\s]+', words[2])):
@@ -3217,7 +3305,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         # Search writes only to explicit output redirects, checked below.
         if binary == 'linctl' and words[1:3] == ['issue', 'search']:
             return False
-        return binary not in {'cat', 'tee', 'mkdir', 'chmod', 'set', 'head', 'tail', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'ls', 'stat', 'wc', 'pwd'}
+        return binary not in {'cat', 'tee', 'mkdir', 'chmod', 'set', 'head', 'tail', 'echo', 'printf', 'print', 'true', 'false', ':', 'test', '[', 'ls', 'stat', 'wc', 'pwd'}
 
     def heredoc_preserves_sources(source, directory, python, script_args=None):
         # This proof is only for bodies retained from this batch. Arbitrary
@@ -3358,7 +3446,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
 
     def invalidate_variable(name):
         fresh_variables.discard(name)
-        populated_variables.discard(name)
+        marker_variables.discard(name)
+        populated_paths.difference_update(key for key in tuple(populated_paths) if key[1] == name)
         copied_opaque.difference_update(item for item in tuple(copied_opaque) if item[1] == name)
         reference = re.compile(r"\$\{" + re.escape(name) + r"\}|\$" + re.escape(name) + r"(?!\w)")
         for key in list(opaque_written):
@@ -3384,12 +3473,53 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if track_scripts:
             if name in {'PATH', 'IFS', 'ENV', 'BASH_ENV', 'BASHOPTS', 'SHELLOPTS', 'ZDOTDIR'}:
                 unsafe_bindings = True
+            previous = name in script_values
             invalidate_variable(name)
-            candidates = {value} if word in invocation_literals else script_variants(value)
-            script_values[name] = candidates | script_values.get(name, {"$" + name}) if conditional or transient else candidates
-            if (not conditional and not transient and re.fullmatch(r'\$\(mktemp -d(?: [^;&|()`\n]*)?\)', value) and
-                    not re.search(r'\.robob|robob-data|\.t3/userdata|\.local/share/opencode|opencode-data', value)):
+            resolved_path = None
+            if not uncertain_write and not transient and word not in invocation_literals and value.startswith('$(cat ') and value.endswith(')'):
+                try:
+                    reader = shlex.split(value[2:-1])
+                    source_path = _literal_path(reader[1], directory) if len(reader) == 2 and reader[0] == 'cat' else None
+                    if source_path is not None and not re.search(r'\.robob/userdata|robob-data|\.t3/userdata|\.local/share/opencode|opencode-data', str(source_path)):
+                        # This is a bounded read of a path marker, never a DB.
+                        # A second filename mention, even in code or an alias
+                        # binding, or an earlier opaque writer voids the read.
+                        remainder = command.replace(value, '', 1)
+                        mentioned = source_path.name in remainder or None in tool_changes
+                        lexer = shlex.shlex(remainder, posix=True, punctuation_chars=';&|()<>')
+                        lexer.whitespace_split = True
+                        for token in lexer:
+                            alias = token.partition('=')[2] if re.match(r'^[A-Za-z_]\w*=', token) else token
+                            if _literal_path(expand(alias, {'PWD': str(directory)}), directory) == source_path:
+                                mentioned = True
+                        info = source_path.stat()
+                        # Multiple hard links give writers an unmentioned name
+                        # for this marker. Keep those files out of this proof.
+                        if not mentioned and stat.S_ISREG(info.st_mode) and info.st_size <= 8192 and info.st_nlink == 1:
+                            with source_path.open('rb') as handle:
+                                opened = os.fstat(handle.fileno())
+                                if not stat.S_ISREG(opened.st_mode) or opened.st_size > 8192 or opened.st_nlink != 1:
+                                    raise ValueError('unbounded or aliased path marker')
+                                raw = handle.read(8193)
+                            text = raw.decode('utf-8')
+                            if os.path.isabs(text) and not re.search(r'[$`*?\[~\r\n]', text) and not re.search(r'\.robob/userdata|robob-data|\.t3/userdata|\.local/share/opencode|opencode-data', text):
+                                resolved_path = text
+                except (OSError, ValueError, UnicodeError):
+                    pass
+            if resolved_path is not None:
+                marker_variables.add(name)
+            candidates = {resolved_path, ''} if resolved_path is not None else {value} if word in invocation_literals else script_variants(value)
+            script_values[name] = candidates | script_values.get(name, {"$" + name}) if uncertain_write or transient else candidates
+            if not uncertain_write and not transient and _fresh_mktemp(value):
                 fresh_variables.add(name)
+                binding_causes.pop(name, None)
+            else:
+                reason = ('conditional or transient binding' if uncertain_write or transient else
+                          'mktemp template under a protected directory or containing ..' if '$(mktemp' in value and re.search(r'\.\.|\.robob/userdata|robob-data|\.t3/userdata|\.local/share/opencode|opencode-data', value) else
+                          'unsupported mktemp options/template' if '$(mktemp' in value else
+                          'read the path first, then use it literally' if value.startswith('$(cat ') else
+                          'reassigned binding' if previous else 'unproved variable binding')
+                binding_causes[name] = f'{reason} at line {current_line}'
         candidates = [value] if word in invocation_reader_literals else [values[0] for values in variants([value])]
         shell_values[name] = value if word in invocation_reader_literals else expand(value)
         for candidate in candidates:
@@ -3559,23 +3689,36 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     def script_path(value, directory, binary):
         path = _literal_path(value, directory)
         if path is None:
-            cause = (f"relative script {_token(value)} after {unknown_cause}" if directory is None and not os.path.isabs(value)
+            cause = path_refusal(value, directory, binary) or (f"relative script {_token(value)} after {unknown_cause}" if directory is None and not os.path.isabs(value)
                      else f"non-literal script path {_token(value)} ({binary})")
             raise AmbiguousScript(cause)
         return path
 
     def add(value, directory, binary="script", migration_args=None, test_target=None):
+        if (value not in invocation_quoted and value not in inherited_quoted and
+                any((a or b) in marker_variables for a, b in re.findall(r'\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)', value))):
+            raise AmbiguousScript(path_refusal(value, directory, binary))
+        inline = re.fullmatch(r'(\$\(mktemp -d(?: [^;&|()`\n]*)?\))/([^$`*?\[\]{}]+)', value)
+        if (not unsafe_bindings and (value in invocation_quoted and value not in invocation_literals or value in inherited_empty) and
+                inline and _fresh_mktemp(inline[1]) and '..' not in Path(inline[2]).parts and not Path(inline[2]).is_absolute()):
+            # This substitution is in the invocation itself, so its directory
+            # is still empty. A variable expanded to the same text is not fresh.
+            add_literal('/' + inline[2], directory, binary)
+            return
         for candidate in script_variants(value):
             if candidate != value and (candidate.startswith(('-', '+', '~')) or
                                        any(char in candidate for char in '\\\r\n') or
                                        re.search(r'\s', candidate) and value not in invocation_quoted):
-                raise AmbiguousScript(f"non-literal script path {_token(value)} ({binary})")
+                raise AmbiguousScript(path_refusal(value, directory, binary) or f"non-literal script path {_token(value)} ({binary})")
             if _literal_path(candidate, directory) is None:
-                body = invocation_written.get((directory, value)) if value in invocation_quoted and not unsafe_bindings else None
+                body = invocation_written.get((directory, value)) if (value in invocation_quoted or value in inherited_quoted) and not unsafe_bindings else None
                 if body is None:
                     root = re.fullmatch(r'\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/([^$`*?\[\]{}]*)', value)
                     if root and (directory, root[1] or root[2], str(Path(root[3]))) in copied_opaque:
-                        raise AmbiguousScript('unchecked copy at script path ' + _token(value))
+                        raise AmbiguousScript(path_refusal(value, directory, binary, writer_causes.get(opaque_key(value, directory), 'unchecked copy at script path')))
+                    detail = path_refusal(value, directory, binary)
+                    if detail:
+                        raise AmbiguousScript(detail)
                     script_path(candidate, directory, binary)
                 # Repeated bindings in a combined AST must not hide a read
                 # that was visible in one of its appended source fragments.
@@ -3623,13 +3766,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 raise LiveRead('live-database-script')
             plain = proof_command[:redirect.start()] if redirect else proof_command
             invocation = shlex.split(plain, comments=True)
-            if invocation[:2] == ['offbox', 'run']:
-                if invocation[2:3] == ['--']:
-                    invocation = invocation[3:]
-                elif invocation[2:4] == ['--bg', '--']:
-                    invocation = invocation[4:]
-                elif invocation[2:5] == ['--remote', '--no-fallback', '--']:
-                    invocation = invocation[5:]
+            payload = _offbox_payload(invocation)
+            if payload is not None:
+                invocation = payload
         except ValueError:
             invocation = []
         shell = (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(invocation) == 2 and
@@ -3697,7 +3836,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             fresh_variables.update(previous_fresh)
             opaque_written.clear()
 
-    def scan_remote(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False):
+    def scan_remote(source, directory, depth, input_words=(), input_bodies=None, inherit_environment=False, opaque=None):
         # Synced source evidence may be read remotely, but remote writes,
         # bindings and cwd cannot prove anything about the caller's files.
         # offbox may fall back to running locally, so its payload keeps the
@@ -3710,13 +3849,14 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                            unsafe_bindings, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
                                   _sources=(written, invalidated_written, write_history, variable_written, tool_changes),
-                                  _stdin=(input_words, input_bodies or {}), _environment=environment)
+                                  _stdin=(input_words, input_bodies or {}), _environment=environment, _opaque=opaque)
         paths.extend(path for path in remote_paths if path not in paths)
         if len(paths) > MAX_SCRIPTS:
             raise AmbiguousScript(f"more than MAX_SCRIPTS ({MAX_SCRIPTS}) script invocations")
 
     def inspect(words, directory, depth, bodies, quoted, changed_sources, cwd_only=False):
-        nonlocal unknown_cause, invocation_written, invocation_fresh, invocation_literals, invocation_reader_literals, invocation_quoted, unsafe_bindings, noclobber
+        nonlocal unknown_cause, invocation_written, invocation_fresh, invocation_literals, invocation_reader_literals, invocation_quoted, unsafe_bindings, noclobber, last_invalidation, invocation_invalidation
+        invocation_invalidation = last_invalidation
         words = list(words)
         if stdin_words and not any(word in {'<<', '<<<', '<'} for word in words):
             words.extend(stdin_words)
@@ -3900,8 +4040,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         if flag == "--directory":
                             child_directory = True
                             directory = _literal_path(value, directory)
-            elif binary == "offbox" and words[1:2] == ["run"] and "--" in words[2:]:
-                words = words[words.index("--", 2) + 1:]
+            elif binary == "offbox" and (payload := _offbox_payload(words, known_only=False)) is not None:
+                trusted_flags = _offbox_payload(words) is not None
+                pulls = any(word == '--pull' or word.startswith('--pull=') for word in words[2:len(words) - len(payload)])
+                words = payload
                 remote_input, remote_bodies = [], {key: bodies[key] for key in document_keys}
                 for key in document_keys:
                     remote_input.extend(['<<', key])
@@ -3913,13 +4055,62 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     if op == '<':
                         remote_input.extend([op, target])
                 if words:
-                    for argv in caller_argv(len(words)):
+                    trusted, empty, reasons = {}, set(), {}
+                    payload_binary = next((os.path.basename(word) for word in words
+                                           if os.path.basename(word) in {'bash', 'sh', 'zsh', 'dash', 'ksh', 'node', 'bun', 'deno'} or
+                                           re.fullmatch(r'python[\d.]*', os.path.basename(word))), os.path.basename(words[0]))
+                    def caller_template(value):
+                        return expand(value, {'PWD': shell_values.get('PWD', str(directory))})
+                    # A single string is remote shell text. Only argv payloads
+                    # expand caller variables, and only the caller's quoted
+                    # words retain the exact same proof as a local invocation.
+                    if len(words) > 1 and not unsafe_bindings and trusted_flags:
+                        for argument in words:
+                            word = _attached_script_operand(argument, payload_binary)
+                            if argument in invocation_quoted:
+                                invocation_quoted.add(word)
+                            if argument in invocation_literals:
+                                invocation_literals.add(word)
+                            if (word not in invocation_quoted and any((a or b) in marker_variables for a, b in
+                                    re.findall(r'\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)', word))):
+                                raise AmbiguousScript(path_refusal(word, directory, payload_binary))
+                            if '$' in word and word not in invocation_literals:
+                                for candidate in script_variants(word):
+                                    detail = path_refusal(word, directory, payload_binary)
+                                    reasons[candidate] = detail
+                                    reasons[caller_template(candidate)] = detail
+                            if word in invocation_quoted and word not in invocation_literals:
+                                body = opaque_written.get((directory, word))
+                                if body is not None:
+                                    invocation_written = dict(opaque_written)
+                                    invocation_fresh = set(fresh_variables)
+                                    add(word, directory, payload_binary)
+                                    for candidate in script_variants(word):
+                                        trusted[directory, candidate] = body
+                                        trusted[directory, caller_template(candidate)] = body
+                                elif word.startswith('$(mktemp -d'):
+                                    empty.update({word, caller_template(word)})
+                    try:
+                        arguments = caller_argv(len(words))
+                    except AmbiguousScript as error:
+                        word = next((word for word in words if '$' in word and word not in invocation_literals), None)
+                        raise AmbiguousScript(path_refusal(word, directory, payload_binary, str(error)) if word else str(error)) from error
+                    for argv in arguments:
                         scan_remote(argv[0] if len(argv) == 1 else shlex.join(argv), directory, depth + 1,
-                                    remote_input, remote_bodies, inherit_environment=True)
+                                    remote_input, remote_bodies, inherit_environment=True,
+                                    opaque=(trusted, empty, reasons) if len(words) > 1 else None)
                     if may_change_scripts(words, directory, documents):
                         tool_changes.add(None)
                         changed_sources.update(written)
                         fresh_variables.clear()
+                    if pulls:
+                        # Pulls occur after the payload, and may replace any
+                        # local source before the next command in this call.
+                        last_invalidation = f'invalidated by offbox --pull at line {current_line}'
+                        opaque_written.clear()
+                        fresh_variables.clear()
+                        changed_sources.update(written)
+                        tool_changes.add(None)
                 # Local output redirects still need the normal invalidation
                 # pass after the remote command has been checked.
                 words = ['true']
@@ -3977,6 +4168,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         stdin_sources = documents if exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) else []
         changes_scripts = may_change_scripts(words, directory, stdin_sources)
         if changes_scripts:
+            if opaque_written or fresh_variables:
+                last_invalidation = f'invalidated by {binary} command at line {current_line}'
             tool_changes.add(None)
             changed_sources.update(written)
             opaque_written.clear()
@@ -3984,8 +4177,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         if binary == 'chmod':
             tool_changes.update(_literal_path(candidate, directory) for arg in args if not arg.startswith('-')
                                 for candidate in script_variants(arg))
-            opaque_written.clear()
-            fresh_variables.clear()
+            if not (not unsafe_bindings and len(args) == 2 and re.fullmatch(r'[0-7]+|[ugoa]*[+=-][rwx]+', args[0]) and
+                    opaque_key(args[1], directory) and args[1] in invocation_quoted):
+                opaque_written.clear()
+                fresh_variables.clear()
         if words[0].startswith(('/', './', '../')) and re.search(r'\.(?:py|mjs|cjs|js|ts|sh)$', words[0]):
             fresh_variables.clear()
         if binary in {'cp', 'mv', 'rsync', 'ditto', 'install', 'tee', 'sed', 'perl', 'truncate'}:
@@ -4001,6 +4196,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 if root and source is not None:
                     copied = (directory, root[1] or root[2], str(Path(root[3] or source.name)))
                     copied_opaque.add(copied)
+                    writer_causes[copied] = f'unchecked copy at script path at line {current_line}'
                     for key in list(opaque_written):
                         retained_root = re.fullmatch(r'\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/([^$`*?\[\]{}]*)', key[1])
                         if retained_root and (key[0], retained_root[1] or retained_root[2], str(Path(retained_root[3]))) == copied:
@@ -4028,12 +4224,41 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             raise AmbiguousScript("migrate-dev-db package command not found")
         shells = {"bash", "sh", "zsh", "dash", "ksh"}
         python = bool(re.fullmatch(r"python[\d.]*", binary))
+        if binary == 'bun':
+            remaining, index, options = [], 0, True
+            while index < len(args):
+                arg = args[index]
+                flag, equal, value = arg.partition('=')
+                if options and flag == '--preload':
+                    original = arg
+                    if not equal:
+                        index += 1
+                        value = args[index] if index < len(args) else ''
+                    if equal and original in invocation_quoted:
+                        invocation_quoted.add(value)
+                    if equal and original in invocation_literals:
+                        invocation_literals.add(value)
+                    if not value:
+                        raise AmbiguousScript('missing bun --preload operand')
+                    add(value, directory, 'bun')
+                else:
+                    remaining.append(arg)
+                    if arg == '--' or arg not in {'test', 'run'} and not arg.startswith('-') and args[:1] != ['test']:
+                        options = False
+                index += 1
+            args = remaining
         if python or binary in shells | {"bun", "deno"}:
             args = _interpreter_args(binary, args)
         node_test = False
         node_inputs = []
         node_runtime_options = False
         if binary == 'node':
+            for argument in args:
+                operand = _attached_script_operand(argument, binary)
+                if argument in invocation_quoted:
+                    invocation_quoted.add(operand)
+                if argument in invocation_literals:
+                    invocation_literals.add(operand)
             args, node_inputs, node_test, node_runtime_options = _node_arguments(args)
         if binary == 'bun' and args[:1] == ['test']:
             node_test, args = True, args[1:]
@@ -4050,24 +4275,44 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         stdin_code |= shell_stdin and not shell_command
         # Any redirect other than the recognized heredoc writer invalidates
         # that file's prior source proof, including append and fd redirects.
-        for op, target in redirects:
+        output_redirects = list(redirects)
+        if binary == 'tee':
+            output_redirects.extend(('>', arg) for arg in args if not arg.startswith('-'))
+        for op, target in output_redirects:
             if op not in {'>', '>>'}:
                 continue
-            # Opaque roots can alias through a second variable or spelling.
-            # No intervening output proves it left the remembered file alone.
-            opaque_written.clear()
+            key = opaque_key(target, directory)
+            # A quoted, contained sibling cannot replace the checked script.
+            # This matches literal-path source checking, which does not recurse
+            # through imports. Unknown aliases still invalidate every proof.
+            bounded = (not unsafe_bindings and not uncertain_write and
+                       (key and key[1] in fresh_variables and target in invocation_quoted or
+                        _literal_path(target, directory) is not None))
+            if bounded:
+                for retained in list(opaque_written):
+                    if opaque_key(retained[1], retained[0]) == key and key is not None:
+                        del opaque_written[retained]
+                if key is not None and not (documents and binary in {'cat', 'tee'}):
+                    populated_paths.add(key)
+                    writer_causes[key] = f'written by a non-heredoc writer ({binary}) at line {current_line}'
+            else:
+                if opaque_written or fresh_variables:
+                    last_invalidation = f'unbounded or unquoted write at line {current_line}'
+                opaque_written.clear()
+                fresh_variables.clear()
             for candidate in script_variants(target):
                 path = _literal_path(candidate, directory)
                 affected = affected_sources(path)
                 if documents and binary in {'cat', 'tee'}:
                     affected.discard(path)
                 invalidated_written.update(affected)
-        if binary == 'tee':
-            opaque_written.clear()
         tee_options = binary == 'tee' and all(arg and (not arg.startswith('-') or arg in {'-a', '--append', '--'}) for arg in args)
         writer = not noclobber and exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) and (binary == 'cat' and args in ([], ['-'], ['--']) or tee_options)
-        if not (writer and documents) and (any(op in {'>', '>>'} for op, _ in redirects) or binary == 'tee'):
-            fresh_variables.clear()
+        if not (writer and documents) and binary == 'tee':
+            last_invalidation = f'unreadable tee writer at line {current_line}'
+            if not tee_options:
+                opaque_written.clear()
+                fresh_variables.clear()
         if (documents or here_strings) and binary in {'cat', 'tee'} and not writer:
             for op, target in redirects:
                 if op in {'>', '>>'}:
@@ -4117,9 +4362,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             all(name in script_values and '$' + name not in script_values[name] for name in references) and
                             not any(char in target for char in '`*?[') and '$(' not in target):
                         prior = invocation_written.get((directory, target))
-                        if append and prior is not None or not append and not any(name in populated_variables for name in references):
+                        key = opaque_key(target, directory)
+                        if append and prior is not None or not append and key not in populated_paths:
                             opaque_written[(directory, target)] = (*prior, *documents) if append else tuple(documents)
-                            populated_variables.update(references)
+                            populated_paths.add(key)
                         else:
                             fresh_variables.difference_update(references)
                     else:
@@ -4292,17 +4538,26 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if SCRIPT.search(source) or DIRECT.search(source) or READER.search(source) or any(value.startswith("${") for value in quoted.values()):
                 raise AmbiguousScript(f"shell text could not be parsed (unbalanced quote near line {lexer.lineno})")
             return None
+        token_lines, line = [], 1
+        for token in tokens:
+            token_lines.append(line)
+            line += token.count('\n')
+            for marker, literal in quoted.items():
+                if marker in token:
+                    line += literal.count('\n')
 
         def walk(index, current, closing=None, probe=cwd_only, stop=None):
-            nonlocal unknown_cause, conditional, uncertain_write
+            nonlocal unknown_cause, conditional, uncertain_write, current_line
             words = []
+            words_line = 1
             branches = []
             guarded = False
             safe_chain = True
 
             def run(words, current, concurrent=False):
-                nonlocal conditional, uncertain_write
+                nonlocal conditional, uncertain_write, current_line
                 before = current
+                current_line = words_line
                 uncertain = bool(branches) or guarded or concurrent
                 conditional += uncertain
                 uncertain_write += bool(branches) or concurrent or guarded and not safe_chain
@@ -4462,6 +4717,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     current = branches[-1]["cwd"]
                     branches[-1]["pattern"] = False
                 else:
+                    if not words:
+                        words_line = token_lines[index]
                     words.append(token)
                 index += 1
             return run(words, current), index
