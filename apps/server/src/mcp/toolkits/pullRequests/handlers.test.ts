@@ -20,6 +20,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -31,6 +32,7 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as Statement from "effect/sql/Statement";
 import type { Tool } from "effect/ai";
 
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
@@ -324,74 +326,191 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
 });
 
 describe("pull request toolkit handlers", () => {
-  it.effect("links a delegated caller's PR while the background reader is pinned", () =>
-    Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "delegated-pr-caller-" });
-      yield* Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        yield* sql`PRAGMA journal_mode = WAL`;
-        yield* sql`CREATE TABLE entries(value INTEGER)`;
-        yield* sql`INSERT INTO entries VALUES (1)`;
-        const held = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const holder = yield* sql
-          .withTransaction(
-            Effect.gen(function* () {
-              yield* sql`SELECT * FROM entries`;
-              yield* Deferred.succeed(held, undefined);
-              yield* Deferred.await(release);
-            }),
-          )
-          .pipe(SqliteClient.readOnly, SqliteClient.backgroundReads, Effect.forkChild);
-        yield* Deferred.await(held);
-        let callerReads = 0;
-        const harness = yield* makeHarness({
-          callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
-            getCallerRow: (id) =>
-              Effect.gen(function* () {
-                expect(yield* SqliteClient.ReaderLane).toBe("identity");
-                yield* sql
-                  .withTransaction(sql`SELECT * FROM entries`)
-                  .pipe(SqliteClient.readOnly, Effect.orDie);
-                callerReads++;
-                return {
-                  ...McpToolAccessTestkit.liveThreadShell(id),
-                  forkedFrom: { type: "node" as const, nodeId: NodeId.make("delegated-task") },
-                };
-              }),
-            getThreadShell: () => Effect.die("live delegated caller must not load its full shell"),
-          }),
-        });
+  it.effect(
+    "links a delegated caller's PR through handler and dispatch reads while the background reader is pinned",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "delegated-pr-caller-" });
         yield* Effect.gen(function* () {
-          const result = yield* harness.call("link_pull_request", {
-            url: "https://github.com/t3tools/t3code/pull/123",
-          });
-          expect(result.alreadyLinked).toBe(false);
-          expect(yield* Ref.get(harness.commands)).toMatchObject([
-            {
-              type: "thread.pull-request.link",
-              threadId: THREAD_ID,
-              number: 123,
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`PRAGMA journal_mode = WAL`;
+          yield* sql`CREATE TABLE entries(value INTEGER)`;
+          yield* sql`INSERT INTO entries VALUES (1)`;
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const holder = yield* sql
+            .withTransaction(
+              Effect.gen(function* () {
+                yield* sql`SELECT * FROM entries`;
+                yield* Deferred.succeed(held, undefined);
+                yield* Deferred.await(release);
+              }),
+            )
+            .pipe(SqliteClient.readOnly, SqliteClient.backgroundReads, Effect.forkChild);
+          yield* Deferred.await(held);
+          const milestone = yield* Deferred.make<"linked" | "background-slot">();
+          const tracer = Tracer.make({
+            span(options) {
+              const span = new Tracer.NativeSpan(options);
+              const attribute = span.attribute.bind(span);
+              span.attribute = (key, value) => {
+                attribute(key, value);
+                if (
+                  key === "db.reader.acquire_stage" &&
+                  value === "slot" &&
+                  span.attributes.get("db.reader.requested_lane") === "background"
+                )
+                  Deferred.doneUnsafe(milestone, Effect.succeed("background-slot"));
+              };
+              return span;
             },
-          ]);
-          expect(callerReads).toBe(1);
-          expect(yield* Deferred.isDone(release)).toBe(false);
-        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
-        yield* Fiber.join(holder);
-      }).pipe(
-        Effect.provide(
-          SqliteClient.layer({
-            filename: path.join(directory, "state.sqlite"),
-            readerWorker: true,
-            identityReaderProcess: true,
-            foregroundReaderSlots: 1,
-            backgroundReaderSlots: 1,
-          }),
+          });
+          let callerReads = 0;
+          const stages: Array<string> = [];
+          const read = (stage: string) =>
+            Effect.gen(function* () {
+              yield* sql`SELECT * FROM entries`.pipe(SqliteClient.readOnly, Effect.orDie);
+              stages.push(stage);
+            });
+          const harness = yield* makeHarness({
+            getThreadShell: () =>
+              read("thread").pipe(Effect.as(v2PullRequestThread(makeThread([])))),
+            getProjectShell: () => read("project").pipe(Effect.as(Option.some(makeProject()))),
+            dispatch: (command) =>
+              Effect.gen(function* () {
+                yield* read("receipt");
+                yield* sql.withTransaction(sql`INSERT INTO entries VALUES (2)`).pipe(Effect.orDie);
+                expect(yield* Deferred.isDone(release)).toBe(false);
+                expect(command.type).toBe("thread.pull-request.link");
+                return { sequence: 1, storedEvents: [] };
+              }),
+            callerLayer: Layer.mock(ThreadManagement.ThreadManagementService)({
+              getCallerRow: (id) =>
+                Effect.gen(function* () {
+                  expect(yield* SqliteClient.ReaderLane).toBe("identity");
+                  yield* sql
+                    .withTransaction(sql`SELECT * FROM entries`)
+                    .pipe(SqliteClient.readOnly, Effect.orDie);
+                  callerReads++;
+                  return {
+                    ...McpToolAccessTestkit.liveThreadShell(id),
+                    forkedFrom: { type: "node" as const, nodeId: NodeId.make("delegated-task") },
+                  };
+                }),
+              getThreadShell: () =>
+                Effect.die("live delegated caller must not load its full shell"),
+            }),
+          });
+          const pending = yield* harness
+            .call("link_pull_request", {
+              url: "https://github.com/t3tools/t3code/pull/123",
+            })
+            .pipe(
+              Effect.tap(() => Deferred.succeed(milestone, "linked")),
+              Effect.provideService(Statement.SpanPropagationEnabled, true),
+              Effect.withTracer(tracer),
+              Effect.forkChild,
+            );
+          yield* Effect.gen(function* () {
+            expect(yield* Deferred.await(milestone)).toBe("linked");
+            const result = yield* Fiber.join(pending);
+            expect(result.alreadyLinked).toBe(false);
+            expect(stages).toEqual(["thread", "project", "receipt"]);
+            expect(callerReads).toBe(1);
+            expect(yield* Deferred.isDone(release)).toBe(false);
+          }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+          yield* Fiber.join(holder);
+        }).pipe(
+          Effect.provide(
+            SqliteClient.layer({
+              filename: path.join(directory, "state.sqlite"),
+              readerWorker: true,
+              identityReaderProcess: true,
+              foregroundReaderSlots: 1,
+              backgroundReaderSlots: 1,
+            }),
+          ),
+        );
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each([
+    "link_pull_request",
+    "unlink_pull_request",
+    "watch_pull_request",
+    "unwatch_pull_request",
+  ] as const)("%s records successful saved state and phase durations", (tool) =>
+    Effect.gen(function* () {
+      const readEntered = yield* Deferred.make<void>();
+      const readRelease = yield* Deferred.make<void>();
+      const dispatchEntered = yield* Deferred.make<void>();
+      const dispatchRelease = yield* Deferred.make<void>();
+      const resultEntered = yield* Deferred.make<void>();
+      const resultRelease = yield* Deferred.make<void>();
+      const watching = tool === "watch_pull_request" || tool === "unwatch_pull_request";
+      const shell = v2PullRequestThread(
+        makeThread(
+          tool === "unlink_pull_request"
+            ? [makeLink(9)]
+            : tool === "unwatch_pull_request"
+              ? [makeLink(9, { watch })]
+              : [],
         ),
       );
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+      let reads = 0;
+      const harness = yield* makeHarness({
+        getThreadShell: () =>
+          (++reads === 1
+            ? Deferred.succeed(readEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(readRelease)),
+              )
+            : Deferred.succeed(resultEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(resultRelease)),
+              )
+          ).pipe(Effect.as(shell)),
+        dispatch: () =>
+          Deferred.succeed(dispatchEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(dispatchRelease)),
+            Effect.as({ sequence: 1, storedEvents: [] }),
+          ),
+      });
+      const callState = McpCall.McpCall.of({
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: "unknown",
+      });
+      const pending = yield* harness
+        .call(tool, { repository: "t3tools/t3code", number: 9 })
+        .pipe(Effect.provideService(McpCall.McpCall, callState), Effect.forkChild);
+      yield* Deferred.await(readEntered);
+      yield* TestClock.adjust("100 millis");
+      yield* Deferred.succeed(readRelease, undefined);
+      yield* Deferred.await(dispatchEntered);
+      yield* TestClock.adjust("200 millis");
+      yield* Deferred.succeed(dispatchRelease, undefined);
+      if (watching) {
+        yield* Deferred.await(resultEntered);
+        yield* TestClock.adjust("300 millis");
+        yield* Deferred.succeed(resultRelease, undefined);
+      }
+      const result = yield* Fiber.join(pending);
+      expect(callState.replyPhases).toEqual({
+        admission: 0,
+        read: 100,
+        mutate: 200,
+        ack: watching ? 300 : 0,
+      });
+      expect(
+        McpCall.callOutcome(
+          Exit.succeed({ content: [{ type: "text" as const, text: JSON.stringify(result) }] }),
+          callState,
+        ),
+      ).toMatchObject({ outcome: "ok", saved: true });
+    }),
   );
 
   it.effect("refuses a credential without the pull-requests capability", () =>
@@ -653,8 +772,11 @@ describe("pull request toolkit handlers", () => {
             saved,
             phase: stage.includes("dispatch") ? "dispatch" : "handler",
           });
+          const replyPhases = { ...callState.replyPhases };
+          expect(replyPhases[stage.includes("dispatch") ? "mutate" : "read"]).toBe(10000);
           yield* Deferred.succeed(release, undefined);
           yield* Deferred.await(exited);
+          expect(callState.replyPhases).toEqual(replyPhases);
         }),
     );
 
