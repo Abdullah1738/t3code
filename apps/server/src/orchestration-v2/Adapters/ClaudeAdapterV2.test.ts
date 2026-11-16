@@ -8113,6 +8113,83 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect.each([
+    { status: 404, category: "cyber", success: false },
+    { status: 502, category: null, success: false },
+    { status: 404, category: "cyber", success: true },
+  ])(
+    "classifies a safeguard fallback only when it fails: $status/$category/$success",
+    ({ status, category, success }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("claude-refusal-fallback-attempt"),
+            text: "Continue the audit",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "system",
+            subtype: "model_refusal_fallback",
+            trigger: "refusal",
+            direction: "retry",
+            original_model: "claude-opus-5-5",
+            fallback_model: "claude-opus-4-8",
+            request_id: "request-refusal-fallback",
+            api_refusal_category: category,
+            api_refusal_explanation: null,
+            content:
+              "Opus 5.5's safeguards flagged this session. Opus 4.8 is answering instead. Details: `[cyber]`",
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "00000000-0000-4000-8000-000000000411",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          success
+            ? makeAssistantTextFrame({ uuid: "00000000-0000-4000-8000-000000000412", text: "ok" })
+            : makeAssistantErrorFrame({
+                uuid: "00000000-0000-4000-8000-000000000412",
+                error: "invalid_request",
+                text: "There's an issue with the selected model (claude-opus-4-8). It may not exist or you may not have access to it.",
+              }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000413",
+            result: success ? "ok" : "Claude gave up after repeated API errors.",
+            terminalReason: success ? "completed" : "api_error",
+            ...(success ? {} : { apiErrorStatus: status }),
+            isError: !success,
+          }),
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, success ? "completed" : "failed");
+        if (terminal.status === "failed") {
+          assert.equal(terminal.failure.code, "model_refusal");
+          assert.equal(terminal.failure.category, "content_filter");
+          assert.include(
+            terminal.failure.message,
+            "claude-opus-5-5 safeguards flagged this session [cyber]",
+          );
+          assert.include(terminal.failure.message, "fallback model claude-opus-4-8 failed");
+          assert.include(terminal.failure.message, `HTTP ${status}`);
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+        ),
+      ),
+  );
+
   it.effect("fails a refused Claude turn as a content filter, not a usage limit", () =>
     Effect.gen(function* () {
       const harness = yield* makeWakeHarness;

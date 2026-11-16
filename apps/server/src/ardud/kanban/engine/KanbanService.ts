@@ -70,6 +70,7 @@ import {
   type EvaluatorReuseMissReason,
   type ProviderOptionSelection,
   type ProjectId,
+  ProviderInstanceId,
   ThreadId,
 } from "@t3tools/contracts";
 import { effortOptionId } from "@t3tools/client-runtime/ardud/models/harnessRouting";
@@ -221,6 +222,7 @@ interface EvaluatorJob {
     readonly note?: boolean;
     readonly seq?: number;
     readonly answer?: EvaluatorAnswer;
+    readonly model?: ModelSelection;
   };
 }
 interface EvaluatorAnswer {
@@ -1075,6 +1077,15 @@ const withoutDetachedSteer = (card: KanbanCard) => {
 const STATUS_FIRST_MS = 45 * 60_000;
 const STATUS_EVERY_MS = 60 * 60_000;
 const EVALUATOR_ERRORS_TITLE = "Evaluator errors";
+// The approved legacy Sol xhigh route maps to native Codex. Keep the replacement in standard mode.
+const REFUSAL_EVALUATOR_MODEL: ModelSelection = {
+  instanceId: ProviderInstanceId.make("codex"),
+  model: "gpt-6.1-sol",
+  options: [
+    { id: "reasoningEffort", value: "xhigh" },
+    { id: "serviceTier", value: "default" },
+  ],
+};
 // A todo card whose step is only evaluator subtasks (its packet) nobody has done
 // gets its evaluator woken once: a card made by an evaluator wakes nobody else.
 const STEP_WAIT_P1_MS = 15 * 60_000;
@@ -4577,9 +4588,10 @@ const make = Effect.gen(function* () {
         ? yield* discussionOf(KanbanDiscussionId.make(purpose.discussionId))
         : null;
     const evaluatorModel =
-      purpose.kind === "nightly"
+      extra.model ??
+      (purpose.kind === "nightly"
         ? (board.nightlyReview?.model ?? DEFAULT_NIGHTLY_REVIEW.model)
-        : board.evaluatorModel;
+        : board.evaluatorModel);
     const brief = Briefs.evaluatorBrief(board, purpose);
     const title = Briefs.evaluatorTitle(purpose);
     const launchInput = (key: string) => ({
@@ -4951,6 +4963,7 @@ const make = Effect.gen(function* () {
     // A stall wake has its own eligibility and delivery key; never merge it into an owner job.
     if (
       purpose.kind === "discussion" &&
+      extra.model === undefined &&
       extra.answer === undefined &&
       !key.startsWith(STALL_WAKE_PREFIX)
     ) {
@@ -5187,12 +5200,18 @@ const make = Effect.gen(function* () {
       // its stable launch before treating an attached evaluator as another owner.
       if (job.purpose.kind === "discussion" && row.started_at === null) {
         let discussion = yield* discussionOf(KanbanDiscussionId.make(job.purpose.discussionId));
-        const owner = row.card_id
-          ? yield* reusableEvaluator(yield* cardOf(KanbanCardId.make(row.card_id)))
-          : discussion.evaluatorThreadId !== null &&
-              (yield* eligibleDiscussionEvaluator(discussion.evaluatorThreadId, discussion.boardId))
-            ? discussion.evaluatorThreadId
-            : null;
+        const owner =
+          job.extra.model !== undefined
+            ? null
+            : row.card_id
+              ? yield* reusableEvaluator(yield* cardOf(KanbanCardId.make(row.card_id)))
+              : discussion.evaluatorThreadId !== null &&
+                  (yield* eligibleDiscussionEvaluator(
+                    discussion.evaluatorThreadId,
+                    discussion.boardId,
+                  ))
+                ? discussion.evaluatorThreadId
+                : null;
         if (owner) {
           if (discussion.evaluatorThreadId !== owner)
             discussion = yield* saveDiscussion({ ...discussion, evaluatorThreadId: owner });
@@ -5435,7 +5454,7 @@ const make = Effect.gen(function* () {
             return link.threadId;
           }
         }
-        if (extra.cardId) {
+        if (extra.cardId && extra.model === undefined) {
           const now = yield* nowMillis;
           const latest = (yield* cardEvaluatorLinks(yield* cardOf(extra.cardId))).findLast(
             (link) =>
@@ -5694,6 +5713,7 @@ const make = Effect.gen(function* () {
       note = false,
       deliveryKey?: string,
       coalesce?: string,
+      model?: ModelSelection,
     ) {
       if ((yield* boardOf(discussion.boardId)).archivedAt !== null) return discussion;
       const actorOf = (threadId: ThreadId): KanbanActor => ({ _tag: "evaluator", threadId });
@@ -5761,7 +5781,12 @@ const make = Effect.gen(function* () {
       const reuse: EvaluatorAnalytics.ReuseObservation = {
         reason: owningCard ? "no_candidates" : "no_card_reuse_scope",
       };
-      const ownerId = owningCard ? yield* reusableEvaluator(owningCard, reuse) : originalOwner;
+      const ownerId =
+        model !== undefined
+          ? null
+          : owningCard
+            ? yield* reusableEvaluator(owningCard, reuse)
+            : originalOwner;
       if (ownerId !== null) {
         const view = yield* locks.outside(
           threadIo.find(ownerId),
@@ -5842,6 +5867,7 @@ const make = Effect.gen(function* () {
               cardId: discussion.cardId,
               trigger: (yield* EvaluatorAnalytics.origin) ?? "discussion_post",
               reuseMissReason: reuse.reason,
+              ...(model === undefined ? {} : { model }),
               note,
               seq,
             },
@@ -5936,6 +5962,7 @@ const make = Effect.gen(function* () {
     deliveryKey?: string,
     canRoute?: Effect.Effect<boolean, E>,
     coalesce?: string,
+    model?: ModelSelection,
   ) =>
     serial(
       routing,
@@ -5953,14 +5980,16 @@ const make = Effect.gen(function* () {
         ) {
           current = yield* saveDiscussion({ ...current, evaluatorThreadId: null });
         }
-        return yield* routeEvaluator(current, text, note, deliveryKey, coalesce);
+        return yield* routeEvaluator(current, text, note, deliveryKey, coalesce, model);
       }),
     );
 
   /** A board note to the card's discussion evaluator; a failed note never breaks the caller. */
-  const noteDiscussion = (card: KanbanCard, text: string) =>
+  const noteDiscussion = (card: KanbanCard, text: string, model?: ModelSelection) =>
     cardDiscussionUnlocked(card.id).pipe(
-      Effect.flatMap((discussion) => toEvaluator(discussion, text, true)),
+      Effect.flatMap((discussion) =>
+        toEvaluator(discussion, text, true, undefined, undefined, undefined, undefined, model),
+      ),
       Effect.asVoid,
     );
 
@@ -10309,8 +10338,13 @@ const make = Effect.gen(function* () {
   const evaluatorGiveUp = Effect.fn("KanbanService.evaluatorGiveUp")(function* (
     link: KanbanThreadLink,
     message: string,
+    refusal?: { readonly model: string },
   ) {
     const threadId = link.threadId;
+    const replacementModel =
+      refusal !== undefined && !["gpt-6.1-sol", "opus/cx/gpt-6.1-sol"].includes(refusal.model)
+        ? REFUSAL_EVALUATOR_MODEL
+        : undefined;
     yield* Ref.update(evaluatorFailures, (all) =>
       new Map(all).set(threadId, { dueAt: 0, message, state: "gone", runId: null }),
     );
@@ -10326,7 +10360,9 @@ const make = Effect.gen(function* () {
     );
     for (const home of homes) {
       yield* Effect.gen(function* () {
-        const fresh = !(yield* Ref.get(replaced)).has(home.id);
+        const fresh = refusal
+          ? replacementModel !== undefined
+          : !(yield* Ref.get(replaced)).has(home.id);
         yield* postUnlocked(
           home.id,
           actor,
@@ -10336,9 +10372,16 @@ const make = Effect.gen(function* () {
         const cleared = { ...(yield* discussionOf(home.id)), evaluatorThreadId: null };
         if (fresh) {
           yield* Ref.update(replaced, (all) => new Set(all).add(home.id));
-          yield* toEvaluator(cleared, Briefs.evaluatorTakeoverText(threadId, message)).pipe(
-            Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"),
-          );
+          yield* toEvaluator(
+            cleared,
+            Briefs.evaluatorTakeoverText(threadId, message),
+            false,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            replacementModel,
+          ).pipe(Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"));
         } else {
           yield* saveDiscussion(cleared);
         }
@@ -10352,9 +10395,20 @@ const make = Effect.gen(function* () {
     yield* Effect.gen(function* () {
       const card = link.cardId !== null ? yield* store.card(link.cardId) : null;
       if (card) {
-        yield* noteDiscussion(card, Briefs.evaluatorTakeoverText(threadId, message)).pipe(
-          Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"),
-        );
+        if (refusal && replacementModel === undefined) {
+          yield* postUnlocked(
+            (yield* cardDiscussionUnlocked(card.id)).id,
+            actor,
+            [{ _tag: "md", text: `${message} No replacement starts automatically.` }],
+            false,
+          );
+          return;
+        }
+        yield* noteDiscussion(
+          card,
+          Briefs.evaluatorTakeoverText(threadId, message),
+          replacementModel,
+        ).pipe(Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"));
         return;
       }
       const title = (yield* threads.view(threadId))?.title ?? link.purpose ?? "evaluator";
@@ -10369,9 +10423,35 @@ const make = Effect.gen(function* () {
       yield* postUnlocked(
         channel.id,
         actor,
-        [{ _tag: "md", text: Briefs.evaluatorLostText(title, threadId, message) }],
+        [
+          {
+            _tag: "md",
+            text: refusal
+              ? `Evaluator [${title}](t3-thread://v1/${threadId}) stopped: ${message}.${replacementModel === undefined ? " No replacement starts automatically." : " A fresh evaluator takes over on Sol xhigh."}`
+              : Briefs.evaluatorLostText(title, threadId, message),
+          },
+        ],
         false,
       );
+      if (replacementModel !== undefined) {
+        yield* startEvaluatorUnlocked(
+          yield* boardOf(link.boardId),
+          {
+            kind: "request",
+            text: Briefs.evaluatorTakeoverText(threadId, message),
+          },
+          {
+            key: `refusal:${threadId}`,
+            model: replacementModel,
+            trigger: "stall_run_failure",
+          },
+        ).pipe(
+          Effect.catchTags({
+            KanbanError: (error) =>
+              error.detail.startsWith("Evaluator queued (") ? Effect.void : Effect.fail(error),
+          }),
+        );
+      }
     }).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning("kanban evaluator give-up failed", { threadId, cause }),
@@ -10848,6 +10928,18 @@ const make = Effect.gen(function* () {
       }
       // The same executed run can be reported twice (a repeated turn-end or a metadata update).
       if (entry !== undefined && failure.runId != null && entry.runId === failure.runId) return;
+      if (failure.code === "model_refusal") {
+        const category = /\[([^\]]+)\]/.exec(failure.message)?.[1];
+        const model =
+          (failure.model ?? link.model ?? (yield* threads.model(threadId)))?.model ??
+          "unknown model";
+        yield* evaluatorGiveUp(
+          link,
+          `safeguard refusal${category === undefined ? "" : ` [${category}]`} on ${model}: ${failure.message}`,
+          { model },
+        );
+        return;
+      }
       if (entry !== undefined || Rules.isContextFull(failure)) {
         yield* evaluatorGiveUp(link, failure.message);
         return;

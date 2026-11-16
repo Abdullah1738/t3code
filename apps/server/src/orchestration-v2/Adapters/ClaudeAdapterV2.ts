@@ -3566,6 +3566,14 @@ interface ActiveClaudeTurnContext {
   latestApiFailureCategory: OrchestrationV2ProviderFailureCategory | undefined;
   /** The CLI refused this turn with no fallback model (model_refusal_no_fallback): a content filter, not a usage limit. */
   refusalMessage: string | undefined;
+  refusalFallback:
+    | {
+        readonly notice: string;
+        readonly originalModel: string;
+        readonly fallbackModel: string;
+        readonly category: string | null;
+      }
+    | undefined;
   readonly rejectedRateLimitTypes: Set<string>;
   readonly rateLimitResetTimes: Map<string, string | null>;
   latestAssistantRateLimit: {
@@ -8406,6 +8414,17 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             (message.subtype === "model_refusal_fallback" ||
               (message.subtype === "informational" && message.level !== "info"))
           ) {
+            if (message.subtype === "model_refusal_fallback") {
+              context.refusalFallback = {
+                notice: message.content,
+                originalModel: message.original_model,
+                fallbackModel: message.fallback_model,
+                category:
+                  message.api_refusal_category ??
+                  /Details:\s*`?\[([^\]]+)\]/i.exec(message.content)?.[1] ??
+                  null,
+              };
+            }
             const now = yield* DateTime.now;
             const nativeItemId = message.uuid;
             context.assistant.noticeTexts.add(message.content);
@@ -9335,7 +9354,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       code: "model_refusal",
                       category: "content_filter",
                     })
-                  : failureWithRetryCause;
+                  : context.refusalFallback !== undefined && turnFailure !== null
+                    ? makeProviderFailure({
+                        class: "provider_error",
+                        code: "model_refusal",
+                        category: "content_filter",
+                        message: `${context.refusalFallback.originalModel} safeguards flagged this session${context.refusalFallback.category === null ? "" : ` [${context.refusalFallback.category}]`}; the fallback model ${context.refusalFallback.fallbackModel} failed (${failureWithRetryCause?.message ?? turnFailure.message}).`,
+                      })
+                    : failureWithRetryCause;
             const currentStatus = message.subtype === "success" ? message.api_error_status : null;
             // SDK delivery can lag transcript writes. Conflicting channels cannot
             // establish which native error happened last, so they never authorize replay.
@@ -10445,6 +10471,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   : false),
               realApiStatus: undefined,
               refusalMessage: undefined,
+              refusalFallback: undefined,
               rejectedRateLimitTypes: new Set(),
               rateLimitResetTimes: new Map(),
               latestAssistantRateLimit: null,
