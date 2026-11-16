@@ -12,7 +12,7 @@ import * as Statement from "effect/sql/Statement";
 import * as NodeSqliteClient from "./nodeSqliteClient.ts";
 import { makeLocalFileTracer, makeTraceSink, type TraceRecord } from "./observability.ts";
 import { normalizeSql, sqlFingerprint } from "./sqlDiagnostics.ts";
-import { explainSql } from "../../../scripts/explain-sql.ts";
+import { explainSql } from "../../../apps/server/scripts/explain-sql.ts";
 
 it.live(
   "a real slow query records sanitized text, rows, lane, wait, and one offline plan",
