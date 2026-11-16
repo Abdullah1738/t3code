@@ -11,11 +11,33 @@ export type AnsweredInput = NormalizedInbound & { answeredAt?: number; unanswere
 } };
 export const humanInput = (input: NormalizedInbound) => input.source === "typed" || input.source === "composed" && input.isAudioMessage;
 export type ReplyTurn = { id: string; generation: number; messageId: string; inboundId?: string;
-  covered?: string[]; background?: boolean; phase: string };
+  covered?: string[]; steered?: string[]; startedAt?: number; outbox?: number; earlyOutbox?: string; background?: boolean; phase: string };
+
+function sealedBatch(store: Store, id: string): { leader: string; members: string[] } {
+  const batch = store.get<NormalizedInbound>(`batch:${id}`);
+  if (batch) return { leader: id, members: batch.batchIds ?? [id] };
+  const parent = store.db.query<{ key: string; value: string }, [string]>(
+    "SELECT kv.key, kv.value FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
+  ).get(id);
+  return parent ? { leader: parent.key.slice("batch:".length), members: (JSON.parse(parent.value) as NormalizedInbound).batchIds! }
+    : { leader: id, members: [id] };
+}
+
+// A steer snapshot keeps the original turn's start and outbox fence even after admission clears its attempt.
+function legacyTurnRows(store: Store, turn: ReplyTurn): ReplyTurn[] {
+  if (!Number.isSafeInteger(turn.startedAt) || !Number.isSafeInteger(turn.outbox)) return [];
+  return store.db.query<{ value: string }, [string, number, number, number]>(`SELECT value FROM kv
+    WHERE key GLOB 'failed-delivery:*' AND json_extract(value, '$.id') = ?
+      AND json_extract(value, '$.generation') = ? AND json_extract(value, '$.startedAt') = ?
+      AND json_extract(value, '$.outbox') = ?`).all(turn.id, turn.generation, turn.startedAt!, turn.outbox!)
+    .map(row => JSON.parse(row.value) as ReplyTurn);
+}
 
 export function turnMembers(store: Store, turn: ReplyTurn): string[] {
-  return [...new Set([...(turn.inboundId
-    ? store.get<NormalizedInbound | null>(`batch:${turn.inboundId}`)?.batchIds ?? [turn.inboundId] : []), ...turn.covered ?? []])];
+  const legacy = turn.covered === undefined && turn.steered?.length
+    ? legacyTurnRows(store, turn).filter(row => turn.steered!.includes(row.messageId))
+      .flatMap(row => row.inboundId ? sealedBatch(store, row.inboundId).members : []) : [];
+  return [...new Set([...(turn.inboundId ? sealedBatch(store, turn.inboundId).members : []), ...turn.covered ?? [], ...legacy])];
 }
 
 /** Capture membership at enqueue time: the turn may be gone when delivery finishes. */
@@ -30,17 +52,28 @@ export function captureReplyCoverage(store: Store, op: OutboxOperation): void {
 export function deliveredReplyCoverage(store: Store, op: OutboxOperation): string[] {
   const saved = store.get<string[]>(`reply-covered:${op.id}`);
   if (saved !== undefined) return saved;
-  const ids = [store.get<string>(`log-inbound-id:${op.id}`), op.replyTo].flatMap(id => {
-    if (!id) return [];
-    let batch = store.get<NormalizedInbound>(`batch:${id}`);
-    if (!batch) {
-      const parent = store.db.query<{ value: string }, [string]>(
-        "SELECT kv.value FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
-      ).get(id);
-      if (parent) batch = JSON.parse(parent.value) as NormalizedInbound;
+  const sources = [store.get<string>(`log-inbound-id:${op.id}`), op.replyTo]
+    .flatMap(id => id ? [sealedBatch(store, id)] : []);
+  const ids = sources.flatMap(source => source.members);
+  const queuedAt = store.get<number>(`log-queued:${op.id}`);
+  const position = store.db.query<{ rowid: number }, [string]>("SELECT rowid FROM outbox WHERE id = ?").get(op.id)?.rowid;
+  for (const { leader } of sources) {
+    const turn = store.get<ReplyTurn | null>(`failed-delivery:${leader}`);
+    // A late-adopted steer keeps its predecessor's fences. Only the original prompt's
+    // submitting snapshot proves that a reply attributed to this row covered that cohort.
+    if (!turn || turn.phase !== "submitting" || turn.id !== op.sessionId || turn.generation !== op.generation
+      || !Number.isSafeInteger(queuedAt) || queuedAt! < (turn.startedAt ?? Infinity)
+      || position === undefined || position <= (turn.outbox ?? Infinity)) continue;
+    for (const member of legacyTurnRows(store, turn)) {
+      if (!member.inboundId || store.get(`batch-phase:${member.inboundId}`) !== "accepted") continue;
+      const admittedAt = store.get<number>(`inbound-delivered:${member.inboundId}`);
+      if (!Number.isSafeInteger(admittedAt) || admittedAt! > queuedAt!) continue;
+      // An early reply already present when this steer was posted cannot have answered it.
+      const early = member.earlyOutbox && store.db.query<{ rowid: number }, [string]>("SELECT rowid FROM outbox WHERE id = ?").get(member.earlyOutbox);
+      if (early && position <= early.rowid) continue;
+      ids.push(...sealedBatch(store, member.inboundId).members);
     }
-    return batch?.batchIds ?? [id];
-  });
+  }
   const covered = [...new Set(ids.filter(humanRow))];
   store.set(`reply-covered:${op.id}`, covered);
   return covered;
@@ -49,7 +82,7 @@ export function deliveredReplyCoverage(store: Store, op: OutboxOperation): strin
 /** Reconcile upgrade history before overdue rows can be replayed. Session identity alone is not proof. */
 export function reconcileLegacyReplies(store: Store, since: number, now: number): void {
   const rows = store.db.query<{ id: string }, []>(`SELECT o.id FROM outbox o
-    WHERE o.state = 'sent' AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)`).all()
+    WHERE o.state IN ('pending', 'sending', 'uncertain', 'failed', 'sent') AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)`).all()
     .map(({ id }) => {
       const sentAt = store.get<number>(`sent-at:${id}`);
       const known = Number.isSafeInteger(sentAt) && sentAt! >= 0 && sentAt! <= now;
@@ -57,7 +90,10 @@ export function reconcileLegacyReplies(store: Store, since: number, now: number)
     }).sort((a, b) => a.at - b.at);
   store.db.transaction(() => {
     for (const { op, at, known } of rows) {
-      const covered = deliveredReplyCoverage(store, op).filter(id => {
+      // Capture queued sends before requeueHuman clears their legacy admission evidence.
+      const snapshot = deliveredReplyCoverage(store, op);
+      if (op.state !== "sent") continue;
+      const covered = snapshot.filter(id => {
         const row = store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
         const receivedAt = row ? (JSON.parse(row.payload) as AnsweredInput).receivedAt : undefined;
         return Number.isSafeInteger(receivedAt) && receivedAt! >= since && receivedAt! <= at;
@@ -70,12 +106,25 @@ export function reconcileLegacyReplies(store: Store, since: number, now: number)
 /** All successful text, card, file, poll and explicit reaction paths share this marker. */
 export function markAnswered(store: Store, ids: string[], now = Date.now(), opts: { recordLatency?: boolean } = {}): void {
   store.db.transaction(() => {
-    for (const id of new Set(ids.filter(humanRow))) {
+    const covered = new Set(ids.filter(humanRow));
+    const rows = [...covered].flatMap(id => {
       const row = store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(id);
-      if (!row) continue;
-      const input = JSON.parse(row.payload) as AnsweredInput;
-      if (!humanInput(input) || input.answeredAt !== undefined) continue;
-      store.updateInbound(id, row.state === "admitted" ? "done" : row.state, { ...input, answeredAt: now });
+      return row ? [{ id, state: row.state, input: JSON.parse(row.payload) as AnsweredInput }] : [];
+    });
+    // A late delivery can win before dispatch starts the watchdog retry. Retire only whole,
+    // still-pending batches; a retry already submitted to the backend keeps its lifecycle.
+    const queuedRetries = new Set(rows.filter(({ id, state, input }) => state === "pending"
+      && input.unanswered?.requeuedAt !== undefined && store.get(`human-own-turn:${id}`)
+      && sealedBatch(store, id).members.every(member => covered.has(member))).map(row => row.id));
+    for (const { id, state, input } of rows) {
+      if (!humanInput(input)) continue;
+      const retryAnswered = (state === "pending" || state === "batched") && queuedRetries.has(sealedBatch(store, id).leader);
+      const nextState = state === "admitted" || retryAnswered ? "done" : state;
+      if (input.answeredAt !== undefined) {
+        if (nextState !== state) store.updateInbound(id, nextState);
+        continue;
+      }
+      store.updateInbound(id, nextState, { ...input, answeredAt: now });
       const ageMs = Math.max(0, now - (input.receivedAt ?? now));
       const chat = store.get<string>("unanswered-chat") ?? "other";
       toolLog.capture(() => {

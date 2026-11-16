@@ -852,8 +852,11 @@ export class Router {
     new Intl.DateTimeFormat("en-US", { timeZone: options.timezone });
     const chat = options.context?.chat;
     this.store.set("unanswered-chat", !chat || chat.kind === "owner" ? "owner" : chat.kind === "dm" && chat.slug === "moni" ? "moni" : "other");
+    const restored = this.store.get<Turn | null>("activeTurn");
+    if (restored && restored.covered === undefined && restored.steered?.length) {
+      this.store.set("activeTurn", { ...restored, covered: turnMembers(this.store, restored) });
+    }
     toolLog.capture(() => {
-      const restored = this.store.get<Turn | null>("activeTurn");
       // A persisted running turn can poll without passing through setTurn again.
       if (restored && restored.phase !== "failed" && this.current(restored)) this.logTurnStart(restored);
     });
@@ -4980,7 +4983,7 @@ export class Router {
     const live = this.store.get<Turn | null>("activeTurn");
     // Backend reads can settle after another path admits a follow-up into this turn.
     if (turn && live?.messageId === turn.messageId && live.id === turn.id && live.generation === turn.generation) {
-      turn = { ...turn, covered: [...new Set([...live.covered ?? [], ...turn.covered ?? []])] };
+      turn = { ...turn, covered: [...new Set([...turnMembers(this.store, live), ...turnMembers(this.store, turn)])] };
     }
     this.store.set("activeTurn", turn);
     if (turn && turn.phase !== "failed") this.logTurnStart(turn);

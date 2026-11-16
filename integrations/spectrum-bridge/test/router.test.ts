@@ -25,6 +25,7 @@ import type { ControlMessage, ThreadDetail } from "../src/control.ts";
 import type { SttInput } from "../src/stt.ts";
 import { robobSubagentNotice, opencodeSubagentNotice } from "./fixtures/subagent-notices.ts";
 import { captureLogs } from "./log-fixture.ts";
+import { legacySteerStart, restoreLegacySteer } from "./fixtures/legacy-steer-upgrade.ts";
 import { toolLog } from "../src/toollog.ts";
 
 type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }; owner?: OwnerWords };
@@ -10609,4 +10610,103 @@ test("a sealed batch straddling the restart cutoff keeps its member batched thro
   for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
   expect(inbounds(h.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt !== undefined)).toBe(true);
   await h.router.checkUnanswered(); expect(alerts).toHaveLength(1);
+});
+
+test("upgrade of the real pre-watchdog final reply covers its separately batched steer without replay or alert", async () => {
+  setSystemTime(legacySteerStart + 420_000);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  restoreLegacySteer(h.store, "completed");
+  const upgraded = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await upgraded.checkUnanswered(); await upgraded.tick();
+  setSystemTime(legacySteerStart + 660_000); await upgraded.checkUnanswered();
+  expect(h.backend.prompts).toHaveLength(0); expect(alerts).toHaveLength(0);
+  for (const row of inbounds(h.store)) {
+    expect(row.state).toBe("done");
+    const input = row.payload as import("../src/unanswered.ts").AnsweredInput;
+    expect(input.answeredAt).toBe(legacySteerStart + 2_000); expect(input.unanswered).toBeUndefined();
+    expect(h.store.get(`human-own-turn:${row.id}`)).toBeUndefined();
+  }
+});
+
+test("upgrade of a real pre-watchdog running human turn protects its steered batch and marks it when the reply sends", async () => {
+  setSystemTime(legacySteerStart + 420_000);
+  const h = setup(); restoreLegacySteer(h.store, "running");
+  const upgraded = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  const active = h.store.get<{ messageId: string; covered: string[]; steered: string[] }>("activeTurn")!;
+  expect(active.covered).toEqual(["legacy-root", "legacy-followup", "legacy-member"]);
+  const logs = await captureLogs(async () => { await upgraded.checkUnanswered(); });
+  expect(logs.filter(line => line.name === "inbound.overdue").map(line => [line.ids?.inboundId, line.props?.action]))
+    .toEqual([["legacy-root", "in_turn"], ["legacy-followup", "in_turn"], ["legacy-member", "in_turn"]]);
+  expect(h.backend.prompts).toHaveLength(0);
+  for (const row of inbounds(h.store)) {
+    expect(row.state).toBe("done"); expect(h.store.get(`human-own-turn:${row.id}`)).toBeUndefined();
+    expect((row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt).toBeUndefined();
+  }
+  h.backend.records.push(
+    { id: active.messageId, type: "user", text: "First action", time: { created: legacySteerStart } },
+    { id: active.steered[0]!, type: "user", text: "Second action\nThird action", time: { created: legacySteerStart + 1_000 } },
+  );
+  h.backend.final("Both done"); await upgraded.tick();
+  for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).map(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt))
+    .toEqual([Date.now(), Date.now(), Date.now()]);
+});
+
+test("legacy late adoption answers its own batch while the original silent human row still retries and alerts", async () => {
+  setSystemTime(legacySteerStart + 420_000);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  restoreLegacySteer(h.store, "lateAdopted");
+  const upgraded = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await upgraded.checkUnanswered();
+  const rows = inbounds(h.store);
+  expect(rows.map(row => row.state)).toEqual(["pending", "done", "done"]);
+  expect((rows[0]!.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt).toBeUndefined();
+  for (const row of rows.slice(1)) {
+    expect((row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt).toBe(legacySteerStart + 120_000);
+    expect(h.store.get(`human-own-turn:${row.id}`)).toBeUndefined();
+  }
+  expect(h.store.get<boolean>("human-own-turn:late-root")).toBe(true);
+  expect(alerts).toHaveLength(0);
+  setSystemTime(legacySteerStart + 600_000); await upgraded.checkUnanswered(); await upgraded.checkUnanswered();
+  expect(alerts).toHaveLength(1); expect(alerts[0]![2]).toBe("imessage-unanswered:late-root");
+});
+
+test.each(["pending", "sending", "uncertain", "failed"])("upgrade snapshots legacy %s coverage before watchdog requeue, then late delivery retires the queued retries", async state => {
+  setSystemTime(legacySteerStart + 420_000);
+  const alerts: string[][] = [];
+  const h = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
+  restoreLegacySteer(h.store, "completed"); h.store.db.query("UPDATE outbox SET state = ?").run(state);
+  const upgraded = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await upgraded.checkUnanswered();
+  expect(h.store.get<string[]>("reply-covered:reply:1:msg_assistant_2")?.sort()).toEqual(["legacy-followup", "legacy-member", "legacy-root"]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["pending", "pending", "batched"]);
+  for (const row of inbounds(h.store)) expect((row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt).toBeUndefined();
+  h.store.outboxState("reply:1:msg_assistant_2", "sent");
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done", "done"]);
+  for (const row of inbounds(h.store)) expect((row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt).toBe(Date.now());
+  await upgraded.tick(); expect(h.backend.prompts).toHaveLength(0);
+  setSystemTime(legacySteerStart + 600_000); await upgraded.checkUnanswered(); expect(alerts).toHaveLength(0);
+});
+
+test("reaction before a queued legacy full reply preserves first answeredAt and retires every retry member", async () => {
+  setSystemTime(legacySteerStart + 420_000);
+  const h = setup(); restoreLegacySteer(h.store, "completed");
+  h.store.db.query("UPDATE outbox SET state = 'pending'").run();
+  const upgraded = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await upgraded.checkUnanswered();
+  const api = createApi({ store: h.store, router: () => upgraded, photon: { react: async () => {} },
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  const res = await api(new Request("http://localhost/react", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ target: "legacy-followup", kind: "like" }) }));
+  expect(res.status).toBe(200);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["pending", "pending", "batched"]);
+  setSystemTime(legacySteerStart + 421_000); h.store.outboxState("reply:1:msg_assistant_2", "sent");
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done", "done"]);
+  expect(inbounds(h.store).map(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt))
+    .toEqual([legacySteerStart + 421_000, legacySteerStart + 420_000, legacySteerStart + 421_000]);
+  await upgraded.tick(); expect(h.backend.prompts).toHaveLength(0);
+  h.input("new-request", "New request", { source: "typed" }); await upgraded.tick();
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["New request"]);
 });

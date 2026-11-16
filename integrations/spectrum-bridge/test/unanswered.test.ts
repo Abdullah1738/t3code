@@ -3,8 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, type InboundRecord, type OutboxOperation } from "../src/store.ts";
-import { findOverdue, markAnswered, markReactionAnswered, reconcileLegacyReplies, UNANSWERED_REQUEUE_MS, type AnsweredInput } from "../src/unanswered.ts";
+import { findOverdue, markAnswered, markReactionAnswered, reconcileLegacyReplies, turnMembers, UNANSWERED_REQUEUE_MS, type AnsweredInput } from "../src/unanswered.ts";
 import { captureLogs } from "./log-fixture.ts";
+import { legacySteerStart, restoreLegacySteer } from "./fixtures/legacy-steer-upgrade.ts";
 import { summarizeLog } from "../src/log-rollup.ts";
 import { createApi } from "../src/api.ts";
 import { acknowledgePhoton } from "../src/inbound-failure.ts";
@@ -159,4 +160,91 @@ test.each(["pending", "sending", "uncertain", "failed"])("pre-upgrade %s text re
   delivery.recover(); await delivery.tick();
   expect(sends).toBe(1); expect(s.getOperation("legacy")?.state).toBe("sent");
   expect(s.db.query<{ payload: string }, []>("SELECT payload FROM inbound").all().every(row => (JSON.parse(row.payload) as AnsweredInput).answeredAt !== undefined)).toBe(true);
+});
+
+test.each(["session", "generation", "startedAt", "outbox", "missing-fence", "before-admission", "early-reply", "missing-queued-at", "unaccepted", "uncertain", "explicit-empty"])(
+  "legacy steer coverage requires proof from the same original turn: %s", kind => {
+    const s = store(); restoreLegacySteer(s, "completed");
+    const key = "failed-delivery:legacy-followup";
+    const turn = s.get<import("../src/unanswered.ts").ReplyTurn>(key)!;
+    const op = s.pendingOutbox()[0] ?? s.getOperation("reply:1:msg_assistant_2")!;
+    if (kind === "session") turn.id = "different-session";
+    if (kind === "generation") turn.generation++;
+    if (kind === "startedAt") turn.startedAt!++;
+    if (kind === "outbox") turn.outbox!++;
+    if (kind === "missing-fence") delete turn.outbox;
+    if (kind === "early-reply") turn.earlyOutbox = op.id;
+    s.set(key, turn);
+    if (kind === "before-admission") s.set(`log-queued:${op.id}`, legacySteerStart);
+    if (kind === "missing-queued-at") s.db.query("DELETE FROM kv WHERE key = ?").run(`log-queued:${op.id}`);
+    if (kind === "unaccepted") s.set("batch-phase:legacy-followup", "queued-steer");
+    if (kind === "uncertain") s.db.query("DELETE FROM kv WHERE key = 'inbound-delivered:legacy-followup'").run();
+    if (kind === "explicit-empty") s.set(`reply-covered:${op.id}`, []);
+    reconcileLegacyReplies(s, legacySteerStart - 30 * 60_000, legacySteerStart + 420_000);
+    const inputs = s.db.query<{ id: string; payload: string }, []>("SELECT id, payload FROM inbound").all();
+    for (const row of inputs.filter(row => row.id !== "legacy-root")) expect((JSON.parse(row.payload) as AnsweredInput).answeredAt).toBeUndefined();
+    expect((JSON.parse(inputs[0]!.payload) as AnsweredInput).answeredAt).toBe(kind === "explicit-empty" ? undefined : legacySteerStart + 2_000);
+  },
+);
+
+test.each(["pending", "sending", "uncertain", "failed"])("legacy %s send recovered after restart answers the original turn's steered batch", async state => {
+  const d = mkdtempSync(join(tmpdir(), "unanswered-steer-upgrade-")); dirs.push(d);
+  const path = join(d, "test.sqlite"); let s = new Store(path);
+  restoreLegacySteer(s, "completed");
+  s.db.query("UPDATE outbox SET state = ?").run(state);
+  s.set("firstAttempt:reply:1:msg_assistant_2", Date.now());
+  s.close(); s = new Store(path); stores.push(s);
+  reconcileLegacyReplies(s, legacySteerStart - 30 * 60_000, Date.now());
+  let sends = 0;
+  const delivery = new Delivery(s, { sendText: async () => { sends++; return { providerId: "delivered" }; } }, {
+    projectScope: "test", chatGuid: () => "iMessage;-;+15555550123", enabled: () => true, sleep: async () => {},
+  });
+  delivery.recover(); await delivery.tick();
+  expect(sends).toBe(1);
+  expect(s.get<string[]>("reply-covered:reply:1:msg_assistant_2")?.sort()).toEqual(["legacy-followup", "legacy-member", "legacy-root"]);
+  expect(s.db.query<{ payload: string }, []>("SELECT payload FROM inbound").all().every(row => (JSON.parse(row.payload) as AnsweredInput).answeredAt !== undefined)).toBe(true);
+});
+
+test.each(["accepted", "uncertain", "session", "generation", "startedAt", "outbox", "unlisted-prompt", "explicit-empty"])(
+  "legacy running membership restores only listed steers of that turn: %s", kind => {
+    const s = store(); restoreLegacySteer(s, "running");
+    const turn = s.get<import("../src/unanswered.ts").ReplyTurn>("activeTurn")!;
+    if (kind === "session") turn.id = "different-session";
+    if (kind === "generation") turn.generation++;
+    if (kind === "startedAt") turn.startedAt!++;
+    if (kind === "outbox") turn.outbox!++;
+    if (kind === "unlisted-prompt") turn.steered = ["unrelated-prompt"];
+    if (kind === "explicit-empty") turn.covered = [];
+    if (kind === "uncertain") {
+      s.set("batch-phase:legacy-followup", "steering");
+      s.db.query("DELETE FROM kv WHERE key = 'inbound-delivered:legacy-followup'").run();
+    }
+    expect(turnMembers(s, turn)).toEqual(["accepted", "uncertain"].includes(kind)
+      ? ["legacy-root", "legacy-followup", "legacy-member"] : ["legacy-root"]);
+  },
+);
+
+test.each(["source-only", "quote-member"])("legacy steer reply attribution also follows %s", kind => {
+  const s = store(); restoreLegacySteer(s, "completed");
+  const op = s.getOperation("reply:1:msg_assistant_2")!;
+  if (kind === "source-only") delete op.replyTo;
+  if (kind === "quote-member") {
+    op.replyTo = "legacy-member";
+    s.db.query("DELETE FROM kv WHERE key = ?").run(`log-inbound-id:${op.id}`);
+  }
+  s.db.query("UPDATE outbox SET payload = ? WHERE id = ?").run(JSON.stringify(op), op.id);
+  reconcileLegacyReplies(s, legacySteerStart - 30 * 60_000, legacySteerStart + 420_000);
+  expect(s.db.query<{ payload: string }, []>("SELECT payload FROM inbound").all().map(row => (JSON.parse(row.payload) as AnsweredInput).answeredAt))
+    .toEqual([kind === "source-only" ? legacySteerStart + 2_000 : undefined, legacySteerStart + 2_000, legacySteerStart + 2_000]);
+});
+
+test.each(["processing", "partial", "no-watchdog"])("late coverage does not retire a retry outside a fully covered pending watchdog batch: %s", kind => {
+  const s = store();
+  for (const id of ["root", "member"]) s.acceptInbound(id, { ...input(id), ...(kind === "no-watchdog" ? {} : { unanswered: { requeuedAt: at + 300_000 } }) });
+  s.set("batch:root", { ...input("root"), batchIds: ["root", "member"] });
+  s.set("human-own-turn:root", true);
+  s.updateInbound("root", kind === "processing" ? "processing" : "pending"); s.updateInbound("member", "batched");
+  markAnswered(s, kind === "partial" ? ["member"] : ["root", "member"], at + 360_000);
+  expect(s.db.query<{ state: string }, []>("SELECT state FROM inbound ORDER BY rowid").all().map(row => row.state))
+    .toEqual([kind === "processing" ? "processing" : "pending", "batched"]);
 });
