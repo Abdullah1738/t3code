@@ -247,6 +247,9 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
   | EffectWorker.OrchestrationEffectWorkerV2
+  | EffectOutbox.EffectOutboxV2
+  | ProviderEventIngestor.ProviderEventIngestorV2
+  | ThreadManagementService.ThreadManagementService
   | EventSink.EventSinkV2
   | CommandOutputRecorder.CommandOutputRecorder
   | ProviderSessionManager.ProviderSessionManagerV2,
@@ -284,6 +287,9 @@ export function layerWithRegistry<Error>(
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
   | EffectWorker.OrchestrationEffectWorkerV2
+  | EffectOutbox.EffectOutboxV2
+  | ProviderEventIngestor.ProviderEventIngestorV2
+  | ThreadManagementService.ThreadManagementService
   | EventSink.EventSinkV2
   | ProviderSessionManager.ProviderSessionManagerV2
   | CommandOutputRecorder.CommandOutputRecorder,
@@ -564,6 +570,9 @@ export function layerWithRegistry<Error>(
     layerEventSinkProvided,
     layerContinuationWorkerProvided,
     layerCommandOutputHubProvided,
+    EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
+    layerProviderEventIngestorProvided,
+    layerThreadManagementProvided,
   ).pipe(Layer.provide(ProviderTurnStartServiceTestkit.layer), Layer.provide(NodeServices.layer));
 
   if (options.runEffectWorker === false) {
