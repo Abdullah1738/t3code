@@ -33686,78 +33686,154 @@ it.effect("current-step gate: a failed start is held until the evaluator clears 
   }),
 );
 
-it.effect.each(["wake", "steer"] as const)(
-  "current-step gate: direct %s and stopped-worker nudges wait for worker work",
-  (action) =>
-    Effect.gen(function* () {
-      const fake = yield* makeFake;
-      yield* Effect.gen(function* () {
-        const { kanban, board } = yield* toyBoard;
-        const card = yield* kanban.createCard(
-          board.id,
-          {
-            title: "Direct wake",
-            prompt: "Direct wake",
-            subtasks: [
-              { text: "Work", owner: "work" },
-              { text: "Wait", owner: "evaluator" },
-              { text: "Later work", owner: "work" },
-            ],
-          },
-          owner,
-        );
-        yield* kanban.dispatchNow;
-        const worker = (yield* kanban.card(card.id)).card.activeThreadId!;
-        yield* kanban.markSubtask(
-          card.id,
-          "s1",
-          "done",
-          null,
-          { _tag: "thread", threadId: worker },
-          "work",
-        );
-        const sends = fake.sends.length;
-        yield* kanban.cardThread(card.id, action, "Owner words for the next worker step", owner);
-        yield* kanban.turnEnded(worker);
-        assert.strictEqual(fake.sends.length, sends);
-        const queued = (yield* kanban.card(card.id)).card;
-        assert.strictEqual(queued.wakeNote, "Owner words for the next worker step");
-        yield* kanban.editCard(
-          card.id,
-          {
-            subtasks: [
-              { id: "s1", text: "Work", owner: "work", step: 1 },
-              { id: "s2", text: "Wait", owner: "evaluator", step: 2 },
-              { id: "s3", text: "Edited later work", owner: "work", step: 3 },
-            ],
-          },
-          owner,
-        );
-        assert.strictEqual(fake.sends.length, sends);
-        assert.strictEqual(
-          (yield* kanban.card(card.id)).card.wakeNote,
-          "Owner words for the next worker step",
-        );
-        yield* kanban.markSubtask(
-          card.id,
-          "s2",
-          "done",
-          "Ready",
-          { _tag: "evaluator", threadId: ThreadId.make("eval") },
-          "evaluator",
-        );
-        yield* kanban.turnEnded(worker);
-        assert.include(
-          (yield* Ref.get(fake.threads)).get(worker)!.messages.at(-1)!,
-          "Owner words for the next worker step",
-        );
-        assert.include(
-          (yield* Ref.get(fake.threads)).get(worker)!.messages.at(-1)!,
-          "worker (now): Edited later work",
-        );
-        assert.isNull((yield* kanban.card(card.id)).card.wakeNote);
-      }).pipe(Effect.provide(testLayer(fake.layer)));
-    }),
+it.effect.each(
+  (["wake", "steer"] as const).flatMap((action) =>
+    (["attached", "detached", "unstarted"] as const).flatMap((thread) =>
+      (["evaluator", "review", "script", "mixed", "finished"] as const).map((step) => ({
+        action,
+        thread,
+        step,
+      })),
+    ),
+  ),
+)("#1739 $action refuses a $step step ($thread) without saving", ({ action, thread, step }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Direct wake",
+          prompt: "Direct wake",
+          subtasks: [
+            { text: "Work", owner: "work", step: 1 },
+            { text: "Next", owner: step === "review" ? "review" : "evaluator", step: 2 },
+            ...(step === "mixed" || step === "script"
+              ? [{ text: "Script", owner: "script" as const, step: 2 }]
+              : []),
+            { text: "Later work", owner: "work", step: 3 },
+          ],
+        },
+        owner,
+      );
+      if (thread !== "unstarted") yield* kanban.dispatchNow;
+      const running = (yield* kanban.card(card.id)).card;
+      yield* store.putCard({
+        ...running,
+        stage: thread === "attached" ? "working" : "todo",
+        activeThreadId: thread === "attached" ? running.activeThreadId : null,
+        activeRole: thread === "attached" ? "work" : null,
+        activePool: thread === "attached" ? running.activePool : null,
+        // Exercise the non-pending legacy findings upgrade on review-owned steps too.
+        reviewRound: step === "review" ? 1 : 0,
+        subtasks: running.subtasks.map((subtask) =>
+          step === "finished" || subtask.step === 1 || (step === "script" && subtask.id === "s2")
+            ? { ...subtask, state: "done" as const }
+            : subtask,
+        ),
+      });
+      const before = yield* kanban.card(card.id);
+      const sends = fake.sends.length;
+      const error = yield* kanban
+        .cardThread(card.id, action, "Resume from your last commit; no restart.", owner)
+        .pipe(Effect.flip);
+      assert.strictEqual(error.code, "denied");
+      assert.strictEqual(error.reason, "work_step_missing");
+      assert.include(error.detail, `card #${card.number}: no worker step open.`);
+      if (step === "finished") {
+        assert.include(error.detail, "All subtasks are finished");
+      } else {
+        const ids = step === "mixed" ? "s2, s3" : step === "script" ? "s3" : "s2";
+        assert.include(error.detail, `Step 2 (${ids})`);
+        assert.include(error.detail, step === "mixed" ? "evaluator and script" : step);
+        if (step === "review") assert.include(error.detail, "card_move to needs_review");
+      }
+      assert.strictEqual(fake.sends.length, sends);
+      assert.deepStrictEqual(yield* kanban.card(card.id), before);
+      yield* kanban.dispatchNow;
+      assert.strictEqual(fake.sends.length, sends);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(
+  (["wake", "steer"] as const).flatMap((action) =>
+    (["worker", "findings", "reviewer", "unplanned"] as const).map((kind) => ({ action, kind })),
+  ),
+)("#1739 $action still reaches an attached $kind thread", ({ action, kind }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Eligible wake",
+          prompt: "Eligible wake",
+          ...(kind === "unplanned"
+            ? {}
+            : { subtasks: [{ text: "Work", owner: "work" as const, step: 1 }] }),
+        },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const running = (yield* kanban.card(card.id)).card;
+      if (kind === "findings" || kind === "reviewer")
+        yield* store.putCard({
+          ...running,
+          activeRole: kind === "reviewer" ? "review" : "work",
+          stage: kind === "reviewer" ? "in_review" : "working",
+          reviewFindingsPending: kind === "findings",
+          subtasks: running.subtasks.map((subtask) => ({ ...subtask, owner: "review" as const })),
+        });
+      const sends = fake.sends.length;
+      yield* kanban.cardThread(card.id, action, "Continue this step", owner);
+      assert.strictEqual(fake.sends.length, sends + 1);
+      assert.strictEqual(fake.sends.at(-1)?.threadId, running.activeThreadId);
+      assert.strictEqual(fake.sends.at(-1)?.text, "Continue this step");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("#1739 a leftover free-text wake note does not mute a todo evaluator step", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Stale note",
+          prompt: "Stale note",
+          subtasks: [
+            { text: "Work", owner: "work", step: 1 },
+            { text: "Tell the reporter", owner: "evaluator", step: 2 },
+          ],
+        },
+        owner,
+      );
+      yield* store.putCard({ ...card, wakeNote: "Resume from your last commit; no restart." });
+      yield* kanban.markSubtask(card.id, "s1", "done", "Already finished", owner, "evaluator");
+      const waiting = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(waiting.stage, "todo");
+      assert.isNotNull(waiting.wakeNote);
+      const told = [...(yield* Ref.get(fake.threads)).values()].filter((thread) =>
+        thread.messages.some((text) => text.includes("waiting on your subtasks: s2")),
+      );
+      assert.lengthOf(told, 1);
+      yield* kanban.dispatchNow;
+      assert.isNull((yield* kanban.card(card.id)).card.activeThreadId);
+      assert.isFalse(
+        [...(yield* Ref.get(fake.threads)).values()].some(
+          (thread) => thread.title === `#${card.number} ${card.title}`,
+        ),
+      );
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
 );
 
 it.effect.each(["immediate", "deferred"] as const)(
@@ -34271,7 +34347,14 @@ it.effect.each(pendingContextActions)(
           },
           owner,
         );
-        yield* kanban.cardThread(card.id, "wake", "Owner says use 2%", owner);
+        const store = yield* KanbanStore.KanbanStore;
+        yield* store.putCard({ ...card, wakeNote: "Owner says use 2%" });
+        const before = yield* kanban.card(card.id);
+        const refused = yield* kanban
+          .cardThread(card.id, "wake", "Resume this step", owner)
+          .pipe(Effect.flip);
+        assert.strictEqual(refused.reason, "work_step_missing");
+        assert.deepStrictEqual(yield* kanban.card(card.id), before);
         yield* kanban.markSubtask(card.id, "s1", "done", "QA replied", owner, "evaluator");
         if (action === "wake" && !text.trim()) {
           const before = yield* kanban.card(card.id);
