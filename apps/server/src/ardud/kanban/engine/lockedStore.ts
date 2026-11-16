@@ -41,6 +41,11 @@ export const wrap = (
   return {
     ...store,
     boards: locks.observe(store.boards),
+    boardThreadIds: (id) => locks.access(id, store.boardThreadIds(id)),
+    purgeBoard: (id) => locks.access(id, store.purgeBoard(id), true),
+    pendingBoardPurges: locks.observe(store.pendingBoardPurges),
+    finishBoardPurgeThread: (id, threadId) =>
+      locks.access(id, store.finishBoardPurgeThread(id, threadId), true),
     board: (id) => locks.access(id, store.board(id), false, "board"),
     putBoard: (row) => locks.access(row.id, store.putBoard(row), true, "board"),
     putBoardWithPools: (row, pools, application) =>

@@ -24,7 +24,7 @@ import toollog
 
 from . import api, capacity, lease, outage, pool, ssh_sync
 from .common import (BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXEMPTIONS, EXIT_BUSY, EXIT_INFRA, EXIT_NOT_STARTED, EXIT_WAIT_TIMEOUT, LOGS_DIR, RUN_TTL_S, TOO_BIG_NOTE,
-                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, log, month_key, now,
+                     OffboxError, ago, atomic_write_json, checkpoint, db, event, file_lock, iso, is_silenced, kv_get, log, month_key, now,
                      delivered_bytes, offsets_path, out, read_json, record_delivery, require_mine, say, silence)
 from .common import mine as token_mine  # release() has its own `mine` flag
 from .identity import require_proven
@@ -106,9 +106,12 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
                            "(SELECT box_id FROM pool_callers WHERE owner=?)) ORDER BY last_used_at DESC",
                            (me['owner'], me['owner'])).fetchall()
     out = []
+    from . import box_disk
     for r in rows:
         d = dict(r)
         d["active_runs"] = lease.active_runs(con, r["box_id"])
+        d['disk_full'] = (d.get('note') or '').startswith(box_disk.NOTE)
+        d['disk_space'] = (kv_get(con, 'disk_full:' + d['box_id']) or {}).get('space', {})
         out.append(d)
     if as_json:
         print(json.dumps(out, indent=1))
@@ -117,8 +120,8 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
         print("no leases" + ("" if show_all else " for this thread (use --all)"))
     for d in out:
         pin = " pinned" if (d.get("pinned_until") or 0) > now() else ""
-        note = f"  [{d['note']}]" if d['state'] == 'resume_stalled' or (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE, pool.RECYCLED_NOTE)) else ""
-        print(f"{d['box_id']:<12} {d['state']:<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
+        note = f"  [{d['note']}]" if d['state'] == 'resume_stalled' or (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE, 'disk-full:', pool.RECYCLED_NOTE)) else ""
+        print(f"{d['box_id']:<12} {('disk_full' if d['disk_full'] else d['state']):<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
               f"ago runs:{d['active_runs']}{pin}{note}  {d['source'] or ''}  {(d['thread_title'] or d['owner'])[:40]}")
 
 
@@ -575,6 +578,13 @@ def _home_run_notices(me):
 
 
 def status(me: dict) -> None:
+    from . import box_disk
+    with db() as disk_con:
+        for row in disk_con.execute("SELECT box_id FROM leases WHERE note LIKE 'disk-full:%'"):
+            info = kv_get(disk_con, 'disk_full:' + row['box_id']) or {}
+            print(f"{row['box_id']}: disk_full " + ', '.join(
+                f"{name} {value.get('free_bytes', '?')} bytes free"
+                for name, value in info.get('space', {}).items()))
     from . import common, home
     con = db()
     cap = read_json(CAP_PATH, {})
@@ -1330,8 +1340,10 @@ def _never_started(r) -> bool:
 
 
 def _report_never_started(r) -> int:
+    from . import queue_lifecycle
     if r['status'] == 'killed':
         say(f"{r['run_id']}: killed while queued; never started; nothing ran, safe to rerun")
+        say(queue_lifecycle.last_end(r['run_id']))
         return 130
     client_log = LOGS_DIR / f"{r['run_id']}.client.log"
     try:
@@ -1351,6 +1363,7 @@ def _report_never_started(r) -> int:
         guess = '' if client_log.exists() else ' (caller interrupted?)'
         say(f"{r['run_id']}: never started: the offbox client that queued it ended before it got a box"
             f"{guess}; nothing ran, safe to rerun")
+    say(queue_lifecycle.last_end(r['run_id']))
     if tail:
         say(f"client log: {client_log}")
         for line in tail:
@@ -1678,6 +1691,12 @@ def _wait_locked(r, echo, timeout=None, *, show_failure=False):
                 if deadline is not None and now() >= deadline:
                     raise _wait_timeout(r)
                 cur = _run_row(r['run_id'])
+                if cur['box_id'] != r['box_id']:
+                    # A background disk retry keeps the run id but changes its box. Drop the old box lock first.
+                    guard.__exit__(None, None, None)
+                    guard = contextlib.nullcontext()
+                    return _wait_locked(cur, echo, None if deadline is None else max(0,deadline-now()),
+                                        show_failure=show_failure)
                 if cur['status'] not in ('starting', 'running'):
                     # The holder wrote its last output, recorded the end and released the lock between two polls.
                     # Nothing will be replayed now, so drain the whole rest of the log.
@@ -1704,6 +1723,9 @@ def _wait_locked(r, echo, timeout=None, *, show_failure=False):
         if ck:
             pos = _tail(log_path, pos, echo, ck["logBytes"])
         cur = _run_row(r['run_id'])
+        if cur['box_id'] != r['box_id']:
+            return _wait_locked(cur, echo, None if deadline is None else max(0,deadline-now()),
+                                show_failure=show_failure)
         if cur['status'] not in ('starting', 'running', 'lost') or (cur['status'] == 'lost' and (
                 cur['exit_code'] is not None or db().execute(
                     'SELECT 1 FROM kv WHERE k=?', (f"lost_confirmed:{cur['run_id']}",)).fetchone())):
@@ -1850,19 +1872,31 @@ def _pid_started_at(pid: int) -> float | None:
         return None
 
 
-def _client_alive(pid: int | None, start_at: float | None) -> bool:
+def _client_alive(pid: int | None, start_at: float | None, *, reaper_run=None) -> bool:
     """Is the `offbox run` that inserted this row still running? Unknown (no pid recorded) counts as alive.
     A live pid that started after the run did is a reused pid, so the client is gone."""
+    alive, check, began = _client_check(pid, start_at)
+    if not alive and reaper_run:
+        with contextlib.suppress(Exception):
+            age = f'{now() - start_at:.3f}' if start_at is not None else 'unknown'
+            log(f"reaper no-box run {reaper_run} client_pid={pid} check={check} "
+                f"age_s={age} row_start_at={start_at} observed_start_at={began}")
+    return alive
+
+
+def _client_check(pid, start_at):
     if not pid:
-        return True
+        return True, 'no_pid', None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return False, 'pid_missing', None
     except PermissionError:
         pass
     began = _pid_started_at(pid)
-    return began is None or start_at is None or began <= start_at + 2
+    alive = began is None or start_at is None or began <= start_at + 2
+    check = 'identity_unavailable' if began is None or start_at is None else 'alive' if alive else 'pid_reused'
+    return alive, check, began
 
 
 def _wait_start_receipt(row, deadline, *, locked=False):

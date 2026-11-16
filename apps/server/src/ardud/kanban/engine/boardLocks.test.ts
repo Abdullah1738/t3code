@@ -1,5 +1,8 @@
 import { assert, it, vi } from "@effect/vitest";
 import * as Logger from "effect/Logger";
+import * as Layer from "effect/Layer";
+import { Analytics } from "../../analytics/Analytics.ts";
+import type { AnalyticsEvent } from "@t3tools/contracts";
 import * as Metric from "effect/Metric";
 import * as References from "effect/References";
 import * as Deferred from "effect/Deferred";
@@ -1086,7 +1089,7 @@ it.effect("saved-reply admission expires before the reply budget and never write
     const result = yield* Fiber.join(waiter);
     assert.isTrue(Exit.isFailure(result));
     if (Exit.isFailure(result)) {
-      assert.include(String(Cause.squash(result.cause)), "Board busy: not written (waited");
+      assert.include(String(Cause.squash(result.cause)), "Board busy: not written (held");
     }
     assert.isFalse(written);
     yield* Deferred.succeed(release, undefined);
@@ -1189,7 +1192,7 @@ it.effect.each(["migration", "gate", "card"] as const)(
         assert.strictEqual((error as KanbanError).saved, false);
         assert.include(
           String(error),
-          "Board busy: not written (waited 134s behind 0; most time: test.longHolder 134s). Safe to retry once.",
+          "Board busy: not written (held 134000ms by test.longHolder; waited 134000ms behind 0; most time: test.longHolder 134s). Safe to retry once.",
         );
       }
       const refusals = logs.filter((log) =>
@@ -1430,7 +1433,7 @@ it.effect("#1472 attributes a queued refusal to sequential gate holders", () => 
       const error = Cause.squash(result.cause) as KanbanError;
       assert.strictEqual(
         error.detail,
-        "Board busy: not written (waited 20s behind 2; most time: tick 8s, missingThread 7s, wakeBoardNudges 5s). Safe to retry once.",
+        "Board busy: not written (held 7000ms by KanbanService.tickStep:missingThread; waited 20000ms behind 2; most time: tick 8s, missingThread 7s, wakeBoardNudges 5s). Safe to retry once.",
       );
       assert.match(error.detail, boardBusyPrefix);
     }
@@ -1622,7 +1625,7 @@ it.effect("#1472 retains the holder fallback when the wait has no positive overl
       const error = Cause.squash(result.cause) as KanbanError;
       assert.strictEqual(
         error.detail,
-        "Board busy: not written (held 0m0s by KanbanService.tick). Safe to retry once.",
+        "Board busy: not written (held 0ms by KanbanService.tick; waited 0ms). Safe to retry once.",
       );
       assert.match(error.detail, boardBusyPrefix);
     }
@@ -1630,3 +1633,131 @@ it.effect("#1472 retains the holder fallback when the wait has no positive overl
     yield* Fiber.interrupt(holder);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect.each(["card_update", "discussion_post", "report_bug"] as const)(
+  "#1412 %s outer reply deadline names the active holder and actual admission wait",
+  (tool) =>
+    Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const beforeAdmission = yield* Deferred.make<void>();
+      const admit = yield* Deferred.make<void>();
+      const holder = yield* locks
+        .board("a", Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))))
+        .pipe(Effect.provideService(BoardLocks.operationName, "slow-holder"), Effect.forkChild);
+      yield* Deferred.await(held);
+      let written = false;
+      const waiter = yield* SavedReply.protect(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(beforeAdmission, undefined);
+          yield* Deferred.await(admit);
+          yield* locks.board(
+            "a",
+            locks.access(
+              "a",
+              Effect.sync(() => {
+                written = true;
+              }),
+              true,
+            ),
+          );
+          return new McpSchema.CallToolResult({ content: [] });
+        }),
+        tool,
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(beforeAdmission);
+      yield* TestClock.adjust(10_000);
+      yield* Deferred.succeed(admit, undefined);
+      yield* TestClock.adjust(15_000);
+      const result = yield* Fiber.join(waiter);
+      assert.instanceOf(result, McpSchema.CallToolResult);
+      const text = JSON.stringify(result);
+      assert.include(text, "held 25000ms by slow-holder");
+      assert.include(text, "waited 15000ms");
+      assert.notInclude(text, "Not saved (board busy)");
+      assert.isFalse(written);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      yield* locks.board("a", Effect.void);
+      assert.isFalse(written);
+    }),
+);
+
+it.effect("#1412 a bounded read releases its lock without immediately retrying", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    let reads = 0;
+    const read = yield* locks
+      .step(
+        locks.boundedReads(
+          locks.access(
+            "a",
+            Effect.gen(function* () {
+              reads += 1;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(yield* Deferred.make<void>());
+            }),
+          ),
+        ),
+      )
+      .pipe(Effect.exit, Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* TestClock.adjust(2_000);
+    const result = yield* Fiber.join(read);
+    assert.isTrue(Exit.isFailure(result));
+    if (Exit.isFailure(result))
+      assert.instanceOf(Cause.squash(result.cause), BoardLocks.BoardReadBudgetExceeded);
+    yield* locks.board("a", Effect.void);
+    assert.strictEqual(reads, 1);
+    assert.deepStrictEqual(yield* locks.holders, []);
+  }),
+);
+
+it.effect("#1412 lock holds retain board and step attribution in metrics and analytics", () =>
+  Effect.gen(function* () {
+    const rows: AnalyticsEvent[] = [];
+    yield* Effect.gen(function* () {
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      const hold = yield* locks
+        .step(
+          locks.access(
+            "offbox",
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+          ),
+          undefined,
+          "KanbanService.tickStep:wakeDiscussionNudges",
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(1_500);
+      yield* Deferred.succeed(resume, undefined);
+      yield* Fiber.join(hold);
+      assert.deepInclude(rows[0], {
+        kind: "kanban.lock_hold",
+        boardId: "offbox",
+        durationMs: 1_500,
+        props: { phase: "wakeDiscussionNudges" },
+      });
+      const histogram = (yield* Metric.snapshot).find(
+        (row) =>
+          row.id === "kanban_board_lock_hold_duration" &&
+          row.attributes?.boardId === "offbox" &&
+          row.attributes?.name === "KanbanService.tickStep:wakeDiscussionNudges",
+      );
+      assert.isDefined(histogram);
+    }).pipe(
+      Effect.provide(
+        Layer.mock(Analytics)({
+          record: (event) =>
+            Effect.sync(() => {
+              rows.push(event);
+            }),
+        }),
+      ),
+    );
+  }),
+);

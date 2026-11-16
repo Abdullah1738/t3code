@@ -110,6 +110,8 @@ export function applyKanbanChange(state: KanbanBoardState, change: KanbanChange)
         lastMessages: withEntry(state.lastMessages, change.message.discussionId, change.message),
       };
     }
+    case "purgeThreads":
+    case "boardRemoved":
     case "script":
     case "scriptRun":
       return state;
@@ -121,6 +123,7 @@ export function applyKanbanWatchEvent(
   event: KanbanWatchEvent,
 ): KanbanBoardState | undefined {
   if (event._tag === "snapshot") return boardStateFromSnapshot(event.snapshot, state);
+  if (event.change._tag === "boardRemoved") return undefined;
   // Changes before the first snapshot cannot happen; the server sends it first.
   return state === undefined ? state : applyKanbanChange(state, event.change);
 }

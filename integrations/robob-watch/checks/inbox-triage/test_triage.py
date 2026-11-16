@@ -22,6 +22,28 @@ t = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(t)
 
 
+class ChargeDryRunReadOnly(unittest.TestCase):
+    def test_default_money_cases_data_is_unchanged(self):
+        fixtures = t.load_module('money_cases_read_only_fixtures',
+                                 Path(__file__).resolve().parents[1] / 'money-cases' / 'test_cases.py')
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory() as tmp:
+                with fixtures.screen_sources(Path(tmp), corrupt) as fixture:
+                    data, text, charged, now, server, orders, calls = fixture
+                    item = {'id': 'imsg:dry-charge', 'source': 'imessage', 'sender': 'EmiratesNBD',
+                            'subject': '', 'preview': text, 'ts': charged.timestamp()}
+                    before = fixtures.data_snapshot(data)
+                    with patch.object(t, 'MONEY_CASES', Path(fixtures.mc.__file__)):
+                        reasons, held, error = t.charge_checks([item], now.timestamp(), dry=True)
+                    self.assertIsNone(error)
+                    self.assertEqual(held, set())
+                    self.assertIn('charge_check', item)
+                    self.assertEqual(fixtures.data_snapshot(data), before)
+                    self.assertTrue(orders)
+                    self.assertTrue(calls.read_text().strip())
+                    self.assertTrue(any(path.endswith('/messages') for path, _, _ in server.calls))
+
+
 @contextlib.contextmanager
 def parsed_notifiers(root):
     """Use each bridge's real parser, recording delivery without opening its socket."""
@@ -495,7 +517,7 @@ class ChargeTests(unittest.TestCase):
         self.now = 1_800_000_000.0
         self.rows = []
 
-        def search(query, since, until=None, source=None, n=20, deadline=None):
+        def search(query, since, until=None, source=None, n=20, deadline=None, **_options):
             # Terms are AND'ed; "a OR b" is one term, as in msgs search.
             groups, prev = [], 'OR'
             for tok in query.split(' '):
@@ -511,8 +533,8 @@ class ChargeTests(unittest.TestCase):
         self.patches = [patch.object(self.mc, 'DATA', self.tmp / 'money'),
                         patch.object(t, 'chat_down', return_value=(False, '')),
                         patch.object(self.mc.charges, 'search', search),
-                        patch.object(self.mc.charges, 'show', lambda row, deadline=None: row['text']),
-                        patch.object(self.mc.charges, 'owner_texts', lambda since, until, deadline=None: []),
+                        patch.object(self.mc.charges, 'show', lambda row, deadline=None, **_options: row['text']),
+                        patch.object(self.mc.charges, 'owner_texts', lambda since, until, deadline=None, **_options: []),
                         patch.object(t, 'load_module', return_value=self.mc)]
         for p in self.patches:
             p.start()

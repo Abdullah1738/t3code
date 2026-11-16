@@ -25,7 +25,13 @@ vi.mock("../common/environment", () => ({
   usePairedEnvironmentId: () => "env",
 }));
 vi.mock("@react-navigation/native", () => ({ useNavigation: () => ({ goBack: vi.fn() }) }));
-function NativeView({ children, onLayout }: { children?: ReactNode; onLayout?: (event: unknown) => void }) {
+function NativeView({
+  children,
+  onLayout,
+}: {
+  children?: ReactNode;
+  onLayout?: (event: unknown) => void;
+}) {
   useEffect(() => {
     onLayout?.({ nativeEvent: { layout: { width: 390 } } });
   }, [onLayout]);
@@ -142,6 +148,23 @@ it("mobile removes archived boards live, handles stale board/card links, and re-
     await act(async () => show(null));
     expect(container.textContent).toContain("Live board");
     expect(container.querySelector("[data-list]")?.textContent).toBe("Mobile board");
+    await act(async () => {
+      feeds.list?.([]);
+      feeds.board?.({
+        _tag: "change",
+        change: { _tag: "boardRemoved", boardId: board.id },
+      } as never);
+    });
+    expect(container.querySelector("[data-list]")?.textContent).toBe("");
+    expect(container.textContent).toContain("This link does not open a board.");
+    await act(async () =>
+      stale.render(
+        <KanbanRecordRouteScreen
+          route={{ params: { boardId: board.id, kind: "card", id: "card-1" } } as never}
+        />,
+      ),
+    );
+    expect(container.textContent).toContain("This link does not open anything.");
     await act(async () => stale.unmount());
   } finally {
     container.remove();

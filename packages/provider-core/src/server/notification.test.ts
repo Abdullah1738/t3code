@@ -135,6 +135,55 @@ describe("notificationTurnItem", () => {
     });
   });
 
+  it.each([
+    ["completed", "failed", 'Delegated task "Baseline" finished; delegated task "Review" failed'],
+    [
+      "completed",
+      "interrupted",
+      'Delegated task "Baseline" finished; delegated task "Review" stopped',
+    ],
+    ["failed", "cancelled", 'Delegated task "Baseline" failed; delegated task "Review" stopped'],
+    [
+      "completed",
+      "running",
+      'Delegated task "Baseline" finished; delegated task "Review" status unknown',
+    ],
+  ] as const)("keeps each task's own outcome in a mixed %s/%s notice", (a, b, expected) => {
+    const item = notificationTurnItem(userMessage, delivery(["a", "b"]), [
+      task("a", "Baseline", a),
+      task("b", "Review", b),
+    ]);
+    assert.equal(item.type, "notification");
+    if (item.type === "notification") assert.equal(item.summary, expected);
+  });
+
+  it("keeps a missing task's identity without assigning its sibling's failure", () => {
+    const item = notificationTurnItem(userMessage, delivery(["missing", "b"]), [
+      task("b", "Review", "failed"),
+    ]);
+    assert.equal(item.type, "notification");
+    if (item.type === "notification")
+      assert.equal(
+        item.summary,
+        'Delegated task "missing" status unknown; delegated task "Review" failed',
+      );
+  });
+
+  it.each([
+    ["completed", "failed", 'Delegated task "Review" previously finished, now failed: stalled'],
+    ["completed", "completed", 'Delegated task "Review" finished'],
+    ["failed", "completed", 'Delegated task "Review" previously failed, now finished: stalled'],
+    ["completed", "running", 'Delegated task "Review" status unknown'],
+  ] as const)(
+    "reports an actual announced status change from %s to %s",
+    (previous, status, expected) => {
+      const item = notificationTurnItem(userMessage, delivery(["a"]), [
+        { ...task("a", "Review", status), lastAnnouncedStatus: previous, failureReason: "stalled" },
+      ]);
+      assert.equal(item.type === "notification" ? item.summary : null, expected);
+    },
+  );
+
   it("opens the child thread of a single delegated task", () => {
     const item = notificationTurnItem(userMessage, delivery(["a"]), tasks);
     assert.deepInclude(item, {

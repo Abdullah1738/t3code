@@ -1,3 +1,5 @@
+import * as McpSessionRegistry from "./McpSessionRegistry.ts";
+import * as McpSessionRegistryTestkit from "./McpSessionRegistry.testkit.ts";
 import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
@@ -91,7 +93,7 @@ import { delegatedTaskRun, hasPendingChildRuns } from "./OrchestratorMcpService.
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
-  Layer.provide(McpProviderSessions.layer),
+  Layer.provideMerge(McpSessionRegistryTestkit.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -839,12 +841,22 @@ describe("orchestrator MCP toolkit", () => {
             const parentRun = parent.runs[0];
             expect(parentRun?.status).toBe("running");
 
+            const credential = (yield* (yield* McpSessionRegistry.McpSessionRegistry).issue({
+              threadId: parentThreadId,
+              providerInstanceId: codexInstanceId,
+            })).config;
+            yield* (yield* McpProviderSessions.McpProviderSessions).set({
+              ...credential,
+              runtimeProviderSessionId: parent.providerThreads.find(
+                (thread) => thread.id === parentRun!.providerThreadId,
+              )!.providerSessionId!,
+            });
             const invocation: McpInvocationContext.McpInvocationScope = {
               environmentId: EnvironmentId.make("environment:mcp-orchestrator"),
-              requestNamespace: parent.providerSessions[0]!.id,
+              requestNamespace: credential.providerSessionId,
               thread: {
                 threadId: parentThreadId,
-                providerSessionId: parent.providerSessions[0]!.id,
+                providerSessionId: credential.providerSessionId,
                 providerInstanceId: codexInstanceId,
               },
               client: undefined,
@@ -4225,14 +4237,26 @@ describe("orchestrator MCP toolkit", () => {
               (event) =>
                 event.type === "provider-turn.updated" && event.payload.status === "running",
             );
-            const approvalCaller = yield* orchestrator.getThreadProjection(approvalParentId);
+            const approvalCredential = (yield* (yield* McpSessionRegistry.McpSessionRegistry).issue(
+              {
+                threadId: approvalParentId,
+                providerInstanceId: codexInstanceId,
+              },
+            )).config;
+            const approvalParentRecords = yield* orchestrator.getThreadProjection(approvalParentId);
+            yield* (yield* McpProviderSessions.McpProviderSessions).set({
+              ...approvalCredential,
+              runtimeProviderSessionId: approvalParentRecords.providerThreads.find(
+                (thread) => thread.id === approvalParentRecords.thread.activeProviderThreadId,
+              )!.providerSessionId!,
+            });
             const approvalScope = {
               ...invocation,
-              requestNamespace: approvalCaller.providerSessions[0]!.id,
+              requestNamespace: approvalCredential.providerSessionId,
               thread: {
                 ...invocation.thread!,
                 threadId: approvalParentId,
-                providerSessionId: approvalCaller.providerSessions[0]!.id,
+                providerSessionId: approvalCredential.providerSessionId,
               },
             };
             const delegateApproval = invokeAs(approvalScope, "delegate_task", {
@@ -4590,13 +4614,23 @@ describe("orchestrator MCP toolkit", () => {
               ),
             );
 
+          const credential = (yield* (yield* McpSessionRegistry.McpSessionRegistry).issue({
+            threadId: parentThreadId,
+            providerInstanceId: codexInstanceId,
+          })).config;
           const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+          yield* (yield* McpProviderSessions.McpProviderSessions).set({
+            ...credential,
+            runtimeProviderSessionId: parent.providerThreads.find(
+              (thread) => thread.id === parent.thread.activeProviderThreadId,
+            )!.providerSessionId!,
+          });
           const invocation: McpInvocationContext.McpInvocationScope = {
             environmentId: EnvironmentId.make("environment:mcp-replay"),
-            requestNamespace: parent.providerSessions[0]!.id,
+            requestNamespace: credential.providerSessionId,
             thread: {
               threadId: parentThreadId,
-              providerSessionId: parent.providerSessions[0]!.id,
+              providerSessionId: credential.providerSessionId,
               providerInstanceId: codexInstanceId,
             },
             client: undefined,

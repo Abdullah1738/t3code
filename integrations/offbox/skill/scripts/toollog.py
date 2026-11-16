@@ -30,7 +30,9 @@ BOOLEANS = {"peer_online"} | set("queued killed fresh bg noSync git noFallback n
 BOOLEANS.add("ok")
 BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
 BOOLEANS.add('deadlineKept')
+BOOLEANS.add('queueExpired')
 ENUMS = {
+    'signalName': {'SIGINT', 'SIGTERM', 'SIGHUP', 'SIGALRM', 'SIGPIPE', 'SIGQUIT'},
     "jdk_phase": {"check", "install", "result"},
     "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
     "jdk_trigger": {"command", "repo-marker", "harness"},
@@ -111,7 +113,7 @@ def _props(values, *, name=None):
             out[k] = v
         elif k == "size" and v in ("small", "default", "large", "xlarge"):
             out[k] = v
-        elif k == "errorClass" and _atom(v):
+        elif k == "errorClass" and isinstance(v, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]{0,79}', v):
             out[k] = v
         elif k == 'base' and (v is None or isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', v)):
             out[k] = v

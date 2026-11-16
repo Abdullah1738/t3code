@@ -167,6 +167,8 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None,
         if code is not None and row['mode'] == 'bg':
             from .misc import _catch_up_finished
             _catch_up_finished(con, rid, budget=10 if until is None else max(0, until-now()))
+        from .box_disk import hand_back
+        hand_back(con, con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone(), until=until)
         event(con, box, 'start_settled', f'{rid} {status} exit={code}: {error or reason}')
     except sqlite3.Error as error:
         state_warning(rid, code, error)

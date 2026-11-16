@@ -196,6 +196,20 @@ export interface KanbanStoreShape {
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanStoreError>;
   readonly board: (boardId: KanbanBoardId) => Effect.Effect<KanbanBoard | null, KanbanStoreError>;
   readonly putBoard: (board: KanbanBoard) => Effect.Effect<void, KanbanStoreError>;
+  readonly boardThreadIds: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<ThreadId>, KanbanStoreError>;
+  readonly purgeBoard: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<ThreadId>, KanbanStoreError>;
+  readonly pendingBoardPurges: Effect.Effect<
+    ReadonlyArray<{ boardId: KanbanBoardId; threadId: ThreadId }>,
+    KanbanStoreError
+  >;
+  readonly finishBoardPurgeThread: (
+    boardId: KanbanBoardId,
+    threadId: ThreadId,
+  ) => Effect.Effect<void, KanbanStoreError>;
   /** The board and any new pools in one transaction: all of it commits, or none of it does. */
   readonly putBoardWithPools: (
     board: KanbanBoard,
@@ -833,6 +847,91 @@ const make = Effect.gen(function* () {
           ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, json = excluded.json
         `;
       }),
+    );
+
+  const boardThreadIds = (boardId: KanbanBoardId) =>
+    runRead(
+      "board thread ids",
+      Effect.map(
+        sql<{ thread_id: string }>`
+    SELECT thread_id FROM (
+      SELECT thread_id FROM ardud_kanban_threads WHERE board_id = ${boardId}
+      UNION SELECT thread_id FROM ardud_kanban_thread_cards WHERE card_id IN
+        (SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId})
+      UNION SELECT active_thread_id FROM ardud_kanban_cards WHERE board_id = ${boardId}
+      UNION SELECT json_extract(json, '$.workThreadId') FROM ardud_kanban_cards WHERE board_id = ${boardId}
+      UNION SELECT json_extract(json, '$.reviewThreadId') FROM ardud_kanban_cards WHERE board_id = ${boardId}
+      UNION SELECT evaluator_thread_id FROM ardud_kanban_discussions WHERE board_id = ${boardId}
+      UNION SELECT thread_id FROM ardud_kanban_evaluator_queue WHERE board_id = ${boardId}
+    ) candidates WHERE thread_id IS NOT NULL AND NOT EXISTS
+      (SELECT 1 FROM ardud_kanban_threads other WHERE other.thread_id = candidates.thread_id AND other.board_id <> ${boardId})
+  `,
+        (rows) => rows.map((row) => ThreadId.make(row.thread_id)),
+      ),
+    );
+
+  const pendingBoardPurges = runRead(
+    "pending board purges",
+    Effect.map(
+      sql<{
+        board_id: string;
+        thread_id: string;
+      }>`SELECT board_id, thread_id FROM ardud_kanban_board_purges`,
+      (rows) =>
+        rows.map((row) => ({
+          boardId: KanbanBoardId.make(row.board_id),
+          threadId: ThreadId.make(row.thread_id),
+        })),
+    ),
+  );
+  const finishBoardPurgeThread = (boardId: KanbanBoardId, threadId: ThreadId) =>
+    run(
+      "finish board purge thread",
+      Effect.asVoid(
+        sql`DELETE FROM ardud_kanban_board_purges WHERE board_id = ${boardId} AND thread_id = ${threadId}`,
+      ),
+    );
+  const purgeBoard = (boardId: KanbanBoardId) =>
+    run(
+      "purge board",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const ids = yield* boardThreadIds(boardId);
+          for (const threadId of ids)
+            yield* sql`INSERT OR IGNORE INTO ardud_kanban_board_purges (board_id, thread_id) VALUES (${boardId}, ${threadId})`;
+          // Dependents must be removed before the rows that scope them.
+          yield* sql`DELETE FROM ardud_kanban_evaluator_reminders WHERE card_id IN (SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId})`;
+          yield* sql`DELETE FROM ardud_kanban_card_events WHERE card_id IN (SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId})`;
+          yield* sql`DELETE FROM ardud_kanban_messages WHERE discussion_id IN (SELECT id FROM ardud_kanban_discussions WHERE board_id = ${boardId})`;
+          yield* sql`DELETE FROM ardud_kanban_script_runs WHERE script_id IN (SELECT id FROM ardud_kanban_scripts WHERE board_id = ${boardId})`;
+          yield* sql`DELETE FROM ardud_kanban_thread_cards WHERE card_id IN (SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId})
+      OR (thread_id IN (SELECT thread_id FROM ardud_kanban_threads WHERE board_id = ${boardId})
+        AND NOT EXISTS (SELECT 1 FROM ardud_kanban_cards other WHERE other.id = ardud_kanban_thread_cards.card_id AND other.board_id <> ${boardId}))`;
+          for (const table of [
+            "ardud_kanban_slot_events",
+            "ardud_kanban_evaluator_requests",
+            "ardud_kanban_instruction_applications",
+            "ardud_kanban_evaluator_spawns",
+            "ardud_kanban_evaluator_queue",
+            "ardud_kanban_owner_routes",
+            "ardud_kanban_threads",
+            "ardud_kanban_discussions",
+            "ardud_kanban_scripts",
+            "ardud_kanban_automations",
+            "ardud_kanban_wiki",
+            "ardud_kanban_goals",
+            "ardud_kanban_groups",
+            "ardud_kanban_pools",
+            "ardud_kanban_cards",
+          ]) {
+            yield* sql`DELETE FROM ${sql(table)} WHERE board_id = ${boardId}`;
+          }
+          yield* sql`DELETE FROM ardud_kanban_boards WHERE id = ${boardId}`;
+          return (yield* pendingBoardPurges)
+            .filter((row) => row.boardId === boardId)
+            .map((row) => row.threadId);
+        }),
+      ),
     );
 
   const putBoardWithPools = (
@@ -1992,6 +2091,10 @@ const make = Effect.gen(function* () {
     boards,
     board,
     putBoard,
+    boardThreadIds,
+    purgeBoard,
+    pendingBoardPurges,
+    finishBoardPurgeThread,
     putBoardWithPools,
     cards,
     openCards,

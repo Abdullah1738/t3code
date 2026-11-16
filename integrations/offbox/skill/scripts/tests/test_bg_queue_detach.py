@@ -38,7 +38,7 @@ def configure_fixture(root, backend):
     os.environ['OFFBOX_TEST_ROOT'] = str(root)
     me = dict(owner='worker', repo_key='repo', repo_root=str(root), session='s', thread='t')
     a = SimpleNamespace(bg=True, no_sync=True, cmd=['proof'], steps=[], pull=[], env=[], size=None,
-                        template=None, base=None, fresh=False, git=False)
+                        template=None, base=None, fresh=False, git=False, no_fallback=True, remote=True)
     if os.environ.get('OFFBOX_TEST_ENTRY'):
         a.cmd = ['proof' + 'x' * 300000]
     pool.release_guard = lambda row: None
@@ -66,6 +66,17 @@ def configure_fixture(root, backend):
     def acquire(*args, **kwargs):
         _publish(root / 'waiting', str(os.getpid()))
         with common.file_lock('fixture-slot', timeout=15):
+            outcome = os.environ.get('OFFBOX_TEST_QUEUE_OUTCOME')
+            if outcome == 'exception':
+                raise ValueError('fixture queue exception')
+            if outcome == 'limit':
+                raise pool.PoolBusyError('fixture queue limit; nothing ran', queue_expired=True)
+            if outcome == 'caller':
+                runs.identity.require_proven(dict(proven=False, driver='codex', resolution='unavailable',
+                                                 lookupError='fixture endpoint down'), 'run')
+            if outcome == 'settled':
+                with contextlib.closing(common.db()) as con:
+                    con.execute("UPDATE runs SET status='killed',exit_code=130 WHERE run_id=?", (kwargs['run_id'],))
             return dict(box_id='box-fake', size='large', remote_dir='repo')
 
     def start(box, command, *, meta, **kwargs):
@@ -75,6 +86,9 @@ def configure_fixture(root, backend):
 
     pool.acquire = acquire
     api.cmd_start = start
+    api.cmd_attach = lambda *args, **kw: iter([dict(type='stderr',
+        data=f'{runs.COMMAND_STARTED_MARKER} {os.environ[runs.BACKGROUND_RUN_ENV]}\n')])
+    runs._ttl_keeper = lambda *args: None
     return a, me
 
 
@@ -438,7 +452,8 @@ class NeverStartedTests(Isolated):
                         with self.subTest(backend=backend, source=source, steps=steps):
                             self.infra_row(error=error, exit_code=2, steps=steps)
                             text = self.assert_refusal(2, error, safe=False)
-                            self.assertEqual(text, f'offbox: run-refused: never started: {error}\n')
+                            self.assertEqual(text.splitlines()[0], f'offbox: run-refused: never started: {error}')
+                            self.assertIn('client log ends with no end record', text)
                             self.assertNotIn('retry', text.lower())
                             self.assertNotIn('safe to rerun', text)
 
@@ -447,7 +462,8 @@ class NeverStartedTests(Isolated):
         self.infra_row(error=error, exit_code=7)
         reason = ' '.join(error.split())[:300]
         text = self.assert_refusal(7, reason)
-        self.assertEqual(text, f'offbox: run-refused: never started: {reason}; nothing ran, safe to rerun\n')
+        self.assertEqual(text.splitlines()[0], f'offbox: run-refused: never started: {reason}; nothing ran, safe to rerun')
+        self.assertIn('client log ends with no end record', text)
 
     def test_started_local_and_recovery_marked_infra_are_not_never_started(self):
         for error in ('nothing ran', 'box bx_test734f went to error: timed out'):
@@ -545,7 +561,8 @@ class NeverStartedTests(Isolated):
                             patch.object(misc, '_catch_up_log', side_effect=AssertionError('nothing ran')):
                         self.assertEqual(command(), 130)
                         self.assertIn('killed while queued; never started; nothing ran, safe to rerun', err.getvalue())
-                        self.assertEqual(len(err.getvalue().splitlines()), 1)
+                        self.assertEqual(len(err.getvalue().splitlines()), 2)
+                        self.assertIn('client log ends with no end record', err.getvalue())
                         self.assertEqual(out.getvalue(), '')
                         self.assertNotIn('incomplete', err.getvalue())
                         self.assertNotIn('history', err.getvalue())
@@ -556,7 +573,7 @@ class NeverStartedTests(Isolated):
             self.con.execute('DELETE FROM runs')
             self.con.execute("INSERT INTO runs(run_id,mode,status,start_at,client_pid) "
                              "VALUES ('run-race','bg','starting',100,111)")
-            def alive(pid, began):
+            def alive(pid, began, **diagnostics):
                 if pid == 111:
                     self.con.execute("UPDATE runs SET client_pid=222,start_at=200 WHERE run_id='run-race'")
                     return False
@@ -749,6 +766,7 @@ class BackgroundRetryTests(Isolated):
                     patch.object(outage, 'wait_for_capacity', side_effect=lambda *a: (waiting(), None)) as capacity_retry, \
                     patch.object(outage, 'CAPACITY_RETRY_S', 0), patch.object(api, 'get', return_value={'state': 'running'}), \
                     patch.object(lease, 'ensure_ttl'), contextlib.redirect_stdout(io.StringIO()), \
+                    patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                     contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(runs.background_client(a, self.me), 0)
             self.assertEqual(attempts, ['run-retry', 'run-retry'])
@@ -814,6 +832,7 @@ class BackgroundFailoverTests(Isolated):
                 patch.object(home, '_forward_background') as forward, patch.object(os, 'execve') as execute, \
                 patch.object(runs.Runner, 'start', start), patch.object(outage, 'wait_until_up', side_effect=waiting) as wait, \
                 patch.object(api, 'get', return_value={'state': 'running'}), patch.object(lease, 'ensure_ttl'), \
+                patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(runs.background_client(a, self.me), 0)
         self.assertEqual(attempts, ['run-stays-home', 'run-stays-home'])

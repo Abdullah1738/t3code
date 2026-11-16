@@ -2,6 +2,7 @@
 import datetime as dt
 import fcntl
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -11,7 +12,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('money_cases', Path(__file__).with_name('cases.py'))
@@ -77,6 +78,103 @@ class Base(unittest.TestCase):
         (folder / 'state.json').write_text(json.dumps({'status': status, 'fires': fires,
                                                        'last_fire_at': '2026-10-23T10:44:18Z',
                                                        'last_run_at': '2026-10-23T11:00:00Z'}))
+
+
+def data_snapshot(data):
+    return {str(p.relative_to(data)): (p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest(),
+                                      p.stat().st_mtime_ns)
+            for p in data.rglob('*') if p.is_file()}
+
+
+@contextmanager
+def screen_sources(root, corrupt=False, locks=True):
+    """Real cache readers/writers with only the control API and subprocess sources replaced."""
+    data = root / 'data'
+    data.mkdir()
+    charged, now = at('2026-10-24T04:10'), at('2026-10-24T05:00')
+    text = 'Purchase of AED 12.34 with Credit Card ending 1111 at noon, Dubai. Avl Cr. Limit'
+    book = {'version': 1, 'questions': []}
+    mc.new_question(book, mc.charges.parse(text, 'EmiratesNBD'), text, charged, now, 'sms')
+    owner = {'a': {'version': mc.charges.OWNER_CACHE_VERSION, 'updatedAt': '2026-10-24T00:00:00Z',
+                  'coveredFrom': '2026-10-23T00:00:00Z', 'title': 'iMessage test', 'texts': []}}
+    files = {'cases.json': {'version': 1, 'cases': [], 'purchases': []}, 'questions.json': book,
+             'owner-texts.json': owner, 'order-details.json': [], 'msgs-searches.json': {},
+             'subscriptions.json': {'version': 1, 'subscriptions': []},
+             'cards.json': {'dead': {}}}
+    import marketplace
+    files['marketplace-placements.json'] = marketplace.empty()
+    for name, value in files.items():
+        (data / name).write_text(json.dumps(value) + '\n')
+    if corrupt:
+        (data / 'owner-texts.json').write_text('{broken owner cache\n')
+    if locks:
+        for name in ('cases', 'questions', 'cards', 'subscriptions', 'order-details', 'marketplace-refresh'):
+            (data / (name + '.lock')).touch()
+    (data / 'nested').mkdir()
+    (data / 'nested' / 'sentinel').write_bytes(b'unchanged')
+    msgs = root / 'msgs'
+    calls = root / 'msgs-calls'
+    msgs.write_text('#!/bin/sh\nprintf "called\\n" >> ' + str(calls) + '\nprintf "\\n"\n')
+    msgs.chmod(0o700)
+    original = subprocess.run
+    orders = []
+
+    def run(argv, *args, **kwargs):
+        if len(argv) > 3 and str(argv[3]) == str(Path(mc.charges.order_lookup.__file__).resolve()):
+            orders.append(json.loads(kwargs['input']))
+            row = dict(service='food', order='new-order', total='99.00', currency='AED',
+                       placed_at=charged.isoformat(), status='delivered', raw_status='delivered')
+            result = {'orders': [row], 'complete': True,
+                      'lanes': {name: {'exhaustive': True, 'covered_from': None, 'limit': None,
+                                       'walked_at': now.isoformat()} for name in mc.charges.order_lookup.LANES}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(result), '')
+        return original(argv, *args, **kwargs)
+
+    with ExitStack() as stack:
+        server = stack.enter_context(ControlServer([summary('unrelated owner words')]))
+        stack.enter_context(patch.dict(os.environ, {'MONEY_CASES_DIR': str(data),
+                                                   'ROBOB_TOOL_LOG_DIR': str(root / 'logs'),
+                                                   'TOOLLOG_ROOT': str(root / 'logs')}))
+        stack.enter_context(patch.object(mc, 'DATA', data))
+        stack.enter_context(patch.object(mc.charges, 'MSGS', str(msgs)))
+        stack.enter_context(patch.object(subprocess, 'run', side_effect=run))
+        yield data, text, charged, now, server, orders, calls
+
+
+class ScreenReadOnly(unittest.TestCase):
+    def test_screen_default_sources_leave_every_file_unchanged(self):
+        for corrupt, locks in ((False, True), (True, True), (False, False)):
+            with self.subTest(corrupt=corrupt, locks=locks), tempfile.TemporaryDirectory() as tmp:
+                with screen_sources(Path(tmp), corrupt, locks) as (data, text, charged, now, server, orders, calls):
+                    before = data_snapshot(data)
+                    result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=False)
+                    self.assertEqual(result['verdict'], 'ask', result)
+                    self.assertEqual(result['errors'], [])
+                    self.assertEqual(data_snapshot(data), before)
+                    self.assertTrue(orders)
+                    self.assertTrue(calls.read_text().strip())
+                    self.assertTrue(any(path.endswith('/messages') for path, _, _ in server.calls))
+
+    def test_read_only_screen_does_not_create_a_missing_data_directory(self):
+        with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
+            data, text, charged, now, server, orders, calls = fixture
+            missing = data.parent / 'missing-data'
+            result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=missing, record=False)
+            self.assertEqual(result['verdict'], 'ask', result)
+            self.assertFalse(missing.exists())
+
+    def test_recording_still_saves_both_caches_and_question(self):
+        with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
+            data, text, charged, now, server, orders, calls = fixture
+            before = data_snapshot(data)
+            result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=True)
+            self.assertEqual(result['verdict'], 'ask', result)
+            after = data_snapshot(data)
+            for name in ('owner-texts.json', 'order-details.json', 'questions.json'):
+                self.assertNotEqual(before[name], after[name], name)
+            self.assertEqual(json.loads((data / 'owner-texts.json').read_text())['a']['texts'][0]['text'],
+                             'unrelated owner words')
+            self.assertEqual(json.loads((data / 'order-details.json').read_text())[0]['order'], 'new-order')
 
 
 class Moments(unittest.TestCase):
@@ -3519,6 +3617,7 @@ class CheckBudget(Base):
                             mc.case_from(self.data, book['questions'][0], now, 'check', self.root)
                 cid = mc.load(self.data)['cases'][0]['id']
                 self.assertEqual(self.questions()[0]['status'], 'open')
+                before = data_snapshot(self.data) if entry == 'readonly' else None
                 if entry == 'answered':
                     mc.answered(self.data, qid, 'not mine', now)
                     q = self.questions()[0]
@@ -3536,6 +3635,8 @@ class CheckBudget(Base):
                 else:
                     mc.triaged(self.data, [(qid, 'imsg:test', False)], now)
                 q = self.questions()[0]
+                if entry == 'readonly':
+                    self.assertEqual(data_snapshot(self.data), before)
                 if entry not in ('answered', 'readonly'):
                     self.assertEqual((q['status'], q['case']), ('case', cid))
                 self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'open')

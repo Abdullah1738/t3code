@@ -20,6 +20,7 @@
   money-cases close ID --outcome TEXT
   money-cases reopen ID --deadline D --note TEXT
   money-cases brief    one line for open cases or closed cases with running reply watchers
+  money-cases runs [--since 24h] [--json]    summarize check history
   money-cases check    the robob-watch check for the money-cases watcher
 
 Charge questions (owner rule, nightly 2026-10-24: never ask about a charge a receipt or his own
@@ -60,6 +61,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import data_io  # noqa: E402
+import run_history  # noqa: E402
 import charges  # noqa: E402
 from state_json import write_json as atomic_write_json
 import payments  # noqa: E402
@@ -564,9 +566,10 @@ def receipt_for_question(data, charge, qid=None, questions=None, at=None):
     return accepts
 
 
-def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, qid=None, *, purchases=True):
+def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, qid=None, *, purchases=True, write_cache=True):
     said = said or (lambda *a, **kw: charges.owner_texts(
-        *a, **kw, cache_path=Path(data or DATA) / 'owner-texts.json', cache_reset=lambda: record_event('cache_reset')))
+        *a, **kw, cache_path=Path(data or DATA) / 'owner-texts.json',
+        cache_reset=lambda: record_event('cache_reset'), write_cache=write_cache))
     if charge['kind'] != 'charge':
         return charges.explain(charge, at, now, deadline, find, said)
     questions = load_questions(data)['questions']
@@ -579,7 +582,7 @@ def explain_charge(data, charge, at, now, deadline=None, find=None, said=None, q
         return shared
     stop = deadline if deadline is not None else time.time() + 30
     aliases = [current] + [q for q in questions if q['id'] != qid and alert_alias(current, q)]
-    memo = {('orders_cache',): Path(data or DATA) / 'order-details.json'}
+    memo = {('orders_cache',): Path(data or DATA) / 'order-details.json', ('write_cache',): write_cache}
     for app in ('noon', 'careem'):
         times = [parse_time(q['at']) - charges.SAME_TIME for q in aliases
                  if charges.order_app(charge_of(q)) == app]
@@ -2454,6 +2457,7 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
     at = (at or now).astimezone(TZ)
     chan = channel(sender)
     q = question_for(load_questions(data), charge, at, chan, item)
+    # Recovery only projects persisted case state into this local question.
     recover_case(data, q)
     owner = charges.card_owner(charge)
     base = {'kind': charge['kind'], 'owner': owner, 'errors': []}
@@ -2477,7 +2481,8 @@ def screen(text, sender='', at=None, now=None, deadline=None, data=None, find=No
         return {**base, 'verdict': 'asked', 'why': f"another alert for this charge ({q['item']}) went to him",
                 'id': q['id']}
     matched = subscription_match(data, charge, at, record=record, end=deadline) if dated else None
-    r = matched or explain_charge(data, charge, at, now, deadline, find, said, q['id'] if q else None)
+    r = matched or explain_charge(data, charge, at, now, deadline, find, said, q['id'] if q else None,
+                                  write_cache=record)
     verdict = 'explained' if r['verdict'] in ('receipt', 'owner', 'subscription') else r['verdict']
     qid = q['id'] if q else None
     if record:
@@ -3490,10 +3495,12 @@ def follow_order_charges(data, now, deadline, find=None, stats=None, end=None, r
 
 
 @log_scope
+@run_history.record_check
 def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     parent = data_io.current_scope()
     stats = parent['stats'] if parent is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
     started = parent['deadline'] - CHECK_BUDGET if parent is not None else time.time()
+    run_history.current()['stats'] = stats
     with data_io.scope(started + CHECK_BUDGET, stats):
         stats['dataless_files'] = data_io.dataless_files(data or DATA)
         skip = read_json(wd / 'data-skips.json', {})
@@ -3527,6 +3534,9 @@ def _scoped_run_check(wd, run, data, root, now, find, said, stats, marketplace_r
         diagnostic['ok'] = diagnostic.get('complete', True)
         return event
     finally:
+        run_history.current().update({key: value for key, value in diagnostic.items()
+                                      if key not in ('at', 'started', 'stats', 'owner_result')})
+        run_history.current()['owner_result'] = stats.get('owner_result', 'not_read')
         from marketplace import launch_refresh
         try:
             # The check owns the start and timing samples; logging adds no second timer.
@@ -3777,6 +3787,11 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
         # The old pings file is intact; never emit an event without its committed outbox.
         event = ''
     result = timing()
+    diagnostic['question_errors'] = state.get('question_errors', {}).get('errors', [])
+    if not saved:
+        diagnostic['stop_reason'] = 'pings_save_timeout'
+    elif diagnostic['budgetHit']:
+        diagnostic['stop_reason'] = 'out_of_budget'
     diagnostic.update(result, complete=saved and not state.get('question_errors', {}).get('errors'),
                       fired=int(bool(event)))
     if not saved or result['total_s'] > 20:
@@ -3931,6 +3946,7 @@ def record_data_skip(wd, error):
     return int(now - state['first_skip_at'] >= 2 * 60 * 60)
 
 
+@run_history.record_check
 def check_command(wd, run, data):
     stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
     wd.mkdir(parents=True, exist_ok=True)
@@ -4034,6 +4050,9 @@ def main(argv=None):
             p.add_argument('--' + field.replace('_', '-'), required=operation == 'add' and field == 'merchant')
     sub.add_parser('brief')
     sub.add_parser('check')
+    p = sub.add_parser('runs')
+    p.add_argument('--since', default='24h')
+    p.add_argument('--json', action='store_true')
     p = sub.add_parser('note-purchase')
     for field in ('merchant', 'amount', 'currency', 'card', 'asked-by', 'thread'):
         p.add_argument('--' + field, required=True)
@@ -4064,7 +4083,15 @@ def main(argv=None):
     mode.add_argument('--ask', action='store_true')
     args = parser.parse_args(argv)
     try:
-        if args.command == 'note-purchase':
+        if args.command == 'runs':
+            try:
+                result = run_history.summary(Path(os.environ.get('WATCH_DIR', LIVE)), args.since)
+            except BlockingIOError as exc:
+                raise CaseError('run history busy; try again') from exc
+            except (ValueError, OverflowError) as exc:
+                raise CaseError('invalid --since: use a duration (24h) or an ISO time with timezone') from exc
+            print(json.dumps(result, indent=2) if args.json else run_history.format_summary(result))
+        elif args.command == 'note-purchase':
             entry = note_purchase(DATA, args.merchant, args.amount, args.currency, args.card, args.asked_by, args.thread, args.invoice)
             print(json.dumps(entry, ensure_ascii=False))
         elif args.command == 'migrate-legacy-asks':

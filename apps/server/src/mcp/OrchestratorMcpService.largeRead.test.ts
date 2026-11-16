@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -330,7 +331,14 @@ it.live(
           assert.equal(page.nextPosition, view === "messages" ? 80 : 99);
           assert.isTrue(page.hasMore);
         }
-      }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+      }).pipe(
+        Effect.provide(
+          OrchestratorMcpService.layer.pipe(
+            Layer.provide(McpProviderSessions.layer),
+            Layer.provide(dependencies),
+          ),
+        ),
+      );
     }).pipe(Effect.provide(storage)),
   { timeout: 120000 },
 );

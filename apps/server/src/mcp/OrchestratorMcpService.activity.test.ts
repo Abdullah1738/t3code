@@ -9,6 +9,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   RunId,
   ScheduledTaskId,
   ThreadId,
@@ -111,6 +112,7 @@ it.effect.each(["caller row", "caller records", "idle target", "dispatch"] as co
 );
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -1204,15 +1206,17 @@ it.effect("wake tools that need a run return run_starting until admission", () =
       const sessions = yield* McpProviderSessions.McpProviderSessions;
       const service = yield* OrchestratorMcpService.OrchestratorMcpService;
       const caller = scope.thread;
-      yield* sessions.set({
+      const credential = {
         ...caller,
+        runtimeProviderSessionId: ProviderSessionId.make("runtime:wake-activity"),
         environmentId,
         endpoint: "http://localhost/mcp",
         authorizationHeader: "Bearer test",
         browserToolsAvailable: false,
-      });
+      };
+      yield* sessions.set(credential);
       let state: McpProviderSessions.WakeCallerState = "starting";
-      yield* sessions.registerWakeCaller(caller, () => state);
+      yield* sessions.registerWakeCaller(credential, () => state);
       const calls = [
         service
           .delegateTask(scope, { task: "requires a run", clientRequestId: "wake-delegate" })

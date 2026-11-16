@@ -60,8 +60,12 @@ function fields(entry: LogEntry, at: Date) {
     ids[key] = logId(key, value);
   }
   const props: Record<string, unknown> = {};
+  const fileEvent = ["data_read.retried", "data_read.failed", "data_write.retried", "data_write.failed", "runs_log.write_failed"].includes(entry.name);
   for (const [key, value] of Object.entries(entry.props ?? {})) {
-    if (key === "holders" && (entry.name === "slot.wait" || entry.name === "slot.backlog") && Array.isArray(value)) {
+    if (fileEvent && key === "path" && typeof value === "string" && value.length <= 1024 && value.startsWith("/") && !/[\x00-\x1f]/.test(value)) props[key] = value;
+    else if (fileEvent && (key === "attempts" || key === "ms") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (fileEvent && key === "dataless" && typeof value === "boolean") props[key] = value;
+    else if (key === "holders" && (entry.name === "slot.wait" || entry.name === "slot.backlog") && Array.isArray(value)) {
       props[key] = value.slice(0, 100).flatMap(value => {
         const holder = record(value);
         return (typeof holder.watcher === "string" || typeof holder.watcher === "number") && milliseconds(holder.elapsedMs)

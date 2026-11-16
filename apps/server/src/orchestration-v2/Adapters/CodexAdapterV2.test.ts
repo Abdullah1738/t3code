@@ -2916,7 +2916,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           yield* (yield* McpProviderSessions.McpProviderSessions).set({
             environmentId: EnvironmentId.make("environment-codex-mcp"),
             threadId,
-            providerSessionId: `provider-session-${scenario}`,
+            providerSessionId: `mcp-credential-${scenario}`,
+            runtimeProviderSessionId: ProviderSessionId.make(`provider-session-${scenario}`),
             providerInstanceId: ProviderInstanceId.make("codex"),
             endpoint: "http://127.0.0.1:43123/mcp",
             authorizationHeader: "Bearer secret-codex-token",
@@ -3133,7 +3134,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* (yield* McpProviderSessions.McpProviderSessions).set({
         environmentId: EnvironmentId.make("environment-codex-mcp"),
         threadId: ThreadId.make(`thread-${scenario}`),
-        providerSessionId: `provider-session-${scenario}`,
+        providerSessionId: `mcp-credential-${scenario}`,
+        runtimeProviderSessionId: ProviderSessionId.make(`provider-session-${scenario}`),
         providerInstanceId: ProviderInstanceId.make("codex"),
         endpoint: "http://127.0.0.1:43123/mcp",
         authorizationHeader: "Bearer secret-codex-token",
@@ -3188,7 +3190,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* (yield* McpProviderSessions.McpProviderSessions).set({
         environmentId: EnvironmentId.make("environment-codex-recall"),
         threadId,
-        providerSessionId: `provider-session-${scenario}`,
+        providerSessionId: `mcp-credential-${scenario}`,
+        runtimeProviderSessionId: ProviderSessionId.make(`provider-session-${scenario}`),
         providerInstanceId: ProviderInstanceId.make("codex"),
         endpoint: "http://127.0.0.1:43123/mcp",
         authorizationHeader: "Bearer secret-codex-token",
@@ -5061,6 +5064,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           environmentId: EnvironmentId.make("test"),
           threadId: harness.threadId,
           providerSessionId: "context-session",
+          runtimeProviderSessionId: ProviderSessionId.make("provider-session-restore-context"),
           providerInstanceId: ProviderInstanceId.make("codex"),
           endpoint: "http://127.0.0.1:43123/mcp",
           authorizationHeader: "Bearer test",
@@ -6852,6 +6856,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           assert.isTrue(
             yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
           );
+          assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
           assert.lengthOf(harness.continuationRequests, 0);
           const terminalIndex = harness.events.findIndex((event) => event.type === "turn.terminal");
 
@@ -6893,6 +6898,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           );
           assert.lengthOf(harness.terminalEvents(), 1);
           assert.isFalse(yield* harness.hasPendingBackgroundWork);
+          assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
         }).pipe(
           Effect.provide(
             Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
@@ -7273,8 +7279,10 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         const unload = harness.runtime.unloadThread!({ providerThread: harness.providerThread });
         yield* unload;
         assert.isTrue(yield* harness.hasPendingBackgroundWork);
+        assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
         yield* unload;
         assert.isTrue(yield* harness.hasPendingBackgroundWork);
+        assert.lengthOf(harness.continuationRequests, 0);
         yield* unload;
         assert.equal(yield* harness.hasPendingBackgroundWork, retainContext);
         yield* Deferred.await(interrupted);
@@ -7301,10 +7309,18 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             items: ["running", "interrupted"],
             nodes: ["running", "interrupted"],
             roots: ["completed"],
-            continuations: 0,
+            continuations: 1,
           },
         );
+        assert.equal(
+          harness.continuationRequests[0]?.detail,
+          `Background command interrupted (Codex thread closed): ${BG_COMMAND}`,
+        );
+        assert.equal(harness.continuationRequests[0]?.delivery, "message_text");
+        assert.equal(harness.continuationRequests[0]?.threadId, harness.threadId);
+        assert.equal(harness.continuationRequests[0]?.notification?.outcome, "cancelled");
         assert.isFalse(yield* harness.hasPendingBackgroundWork);
+        assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
         assert.isFalse(
           yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
         );

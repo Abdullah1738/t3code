@@ -102,7 +102,7 @@ class DiskProbeTests(unittest.TestCase):
         path = self.root / 'offbox_disk_space.py'
         shutil.copyfile(disk.__file__, path)
         module = load_copy(path)
-        source = ('import os,json,subprocess,sys\nfrom pathlib import Path\n'
+        source = ('import os,json,re,subprocess,sys\nfrom pathlib import Path\n'
                   f'WARN_BYTES={module.WARN_BYTES}\nGATE_BYTES={module.GATE_BYTES}\nMARKER={module.MARKER!r}\n'
                   + '\n'.join(inspect.getsource(f) for f in (module.snapshot, module.warning, module.probe)) + '\nprobe()\n')
         before = module.probe_payload()

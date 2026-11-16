@@ -7,7 +7,9 @@ import type { AgentAnswerReceipt } from "./agent-bus.ts";
 import { LineError, type ChatKey, type Line } from "./line.ts";
 
 export type RemoteBoxConfig = { kind: "remote-box"; url: string; tokenFile: string; callbackTokenFile: string;
-  publicKeyFile: string; boxRouterPort?: number; macRouterPort?: number; callbackPort: number; epoch: string; boxId: string };
+  publicKeyFile: string; boxRouterPort?: number; macRouterPort?: number; callbackPort: number; epoch: string; boxId: string;
+  noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number };
+type Outage = { id: string; unreachableSince: number | null; reachableSince: number | null; noticeAttempted?: boolean };
 export function remoteBoxConfig(config: { chatBackends?: unknown }, slug: string): RemoteBoxConfig | undefined {
   const entries = config.chatBackends as Record<string, unknown> | undefined;
   const entry = entries?.[slug] as RemoteBoxConfig | undefined;
@@ -15,6 +17,7 @@ export function remoteBoxConfig(config: { chatBackends?: unknown }, slug: string
   if (slug !== "moni" || entry.kind !== "remote-box" || !/^http:\/\/127\.0\.0\.1:\d+$/.test(entry.url)
     || ![entry.tokenFile, entry.callbackTokenFile, entry.publicKeyFile].every(p => typeof p === "string" && p.startsWith("/"))
     || [entry.boxRouterPort, entry.macRouterPort].some(p => p !== undefined && (!Number.isInteger(p) || p < 1024 || p > 65535))
+    || [entry.noticeAfterMs, entry.outageClearMs, entry.noticeMinGapMs].some(ms => ms !== undefined && (!Number.isSafeInteger(ms) || ms < 0))
     || !Number.isInteger(entry.callbackPort) || entry.callbackPort < 1024 || entry.callbackPort > 65535
     || !/^[a-zA-Z0-9_-]{1,64}$/.test(entry.epoch) || !/^bx_[a-zA-Z0-9]+$/.test(entry.boxId)) throw new Error("Invalid remote box configuration");
   return entry;
@@ -44,18 +47,33 @@ export class RemoteBox {
     if (this.token.length < 32 || this.callbackToken.length < 32) throw new Error("Invalid remote credentials");
     store.db.exec(`CREATE TABLE IF NOT EXISTS remote_inbox (seq INTEGER PRIMARY KEY, id TEXT UNIQUE, sealed TEXT, receipt TEXT);
       CREATE TABLE IF NOT EXISTS remote_sends (id TEXT PRIMARY KEY, at INTEGER, state TEXT, handle TEXT);`);
+    if (!store.db.query<{ name: string }, []>("PRAGMA table_info(remote_inbox)").all().some(c => c.name === "kind")) {
+      // Old ciphertext cannot be classified on the relay. Unknown rows never cause a notice.
+      store.db.exec("ALTER TABLE remote_inbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'unknown'");
+    }
+    if (store.get("remoteNoticeAt") === undefined) {
+      // Older sends have no kind. Conservatively count the newest send during the upgrade.
+      const at = store.db.query<{ at: number | null }, []>("SELECT max(at) at FROM remote_sends").get()?.at;
+      if (at !== null && at !== undefined) store.set("remoteNoticeAt", at);
+    }
+    const outage = store.get<Outage | null>("remoteOutage");
+    if (outage) {
+      // Neither continuous downtime nor recovery can include time the bridge was stopped.
+      outage.unreachableSince = null; outage.reachableSince = null; store.set("remoteOutage", outage);
+    }
   }
   private emit(event: string, code?: string, durationMs?: number) {
     this.io.log(event, code);
     toolLog.capture(() => toolLog.write({ component: "remote-box", kind: durationMs === undefined ? "event" : "perf",
       name: event, ids: { chat: "moni" }, ...(durationMs === undefined ? {} : { durationMs }),
-      ...(code?.startsWith("n=") ? { props: { count: Number(code.slice(2)) } } : {}) }));
+      ...(code?.startsWith("n=") ? { props: { count: Number(code.slice(2)) } }
+        : event === "moni-notice-suppressed" && code ? { props: { reason: code } } : {}) }));
   }
   private now() { return (this.io.now ?? Date.now)(); }
-  accept(id: string, input: unknown, receipt?: AgentAnswerReceipt): boolean {
+  accept(id: string, input: unknown, receipt?: AgentAnswerReceipt, kind: "inbound" | "wake" = "inbound"): boolean {
     const key = opaqueId(id);
-    return this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt) VALUES (?,?,?)")
-      .run(key, JSON.stringify(seal(this.publicKey, input)), receipt ? JSON.stringify(receipt) : null).changes === 1;
+    return this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind) VALUES (?,?,?,?)")
+      .run(key, JSON.stringify(seal(this.publicKey, input)), receipt ? JSON.stringify(receipt) : null, kind).changes === 1;
   }
   receipt(id: string): AgentAnswerReceipt | undefined {
     const row = this.store.db.query<{ receipt: string | null }, [string]>("SELECT receipt FROM remote_inbox WHERE id=?").get(opaqueId(id));
@@ -66,7 +84,7 @@ export class RemoteBox {
   }
   async request(path: string, body: unknown): Promise<Record<string, unknown>> {
     const response = await (this.io.fetch ?? fetch)(this.config.url + path, { method: "POST", redirect: "error",
-      headers: { authorization: `Bearer ${this.token}`, "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(10_000) });
+      headers: { authorization: `Bearer ${this.token}`, "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(path === "/lease" ? 12_000 : 10_000) });
     if (!response.ok) throw new Error("Box request failed");
     return jsonBody(response as unknown as Request);
   }
@@ -85,14 +103,36 @@ export class RemoteBox {
         this.store.db.query("UPDATE remote_inbox SET sealed=NULL WHERE id=?").run(row.id);
         delivered++;
       }
-      if (this.store.get("remoteOutage")) { this.emit("moni-box-up"); this.store.set("remoteOutage", null); }
+      const outage = this.store.get<Outage | null>("remoteOutage");
+      if (outage) {
+        outage.unreachableSince = null;
+        outage.reachableSince ??= this.now();
+        if (this.now() - outage.reachableSince >= (this.config.outageClearMs ?? 300_000)) {
+          this.emit("moni-box-up"); this.store.set("remoteOutage", null);
+        } else this.store.set("remoteOutage", outage);
+      }
       if (delivered) this.emit("moni-queue-delivered", `n=${delivered}`);
       this.emit("moni-queue-depth", `n=${this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n}`);
       this.nextProbe = this.now() + 5_000;
     } catch {
-      const outage = this.store.get<{ id: string } | null>("remoteOutage") ?? { id: opaqueId(String(this.now())) };
-      if (!this.store.get("remoteOutage")) { this.store.set("remoteOutage", outage); this.emit("moni-box-down"); }
-      try { await this.io.notice(outage.id, "I’m temporarily offline. I’ll reply when I’m back."); } catch { this.emit("moni-notice-error"); }
+      const saved = this.store.get<Outage | null>("remoteOutage");
+      const outage: Outage = saved ?? { id: opaqueId(String(this.now())), unreachableSince: this.now(), reachableSince: null };
+      outage.unreachableSince ??= this.now(); outage.reachableSince = null;
+      this.store.set("remoteOutage", outage);
+      if (!saved) this.emit("moni-box-down");
+      const lastNotice = this.store.get<number | null>("remoteNoticeAt");
+      const reason = this.now() - outage.unreachableSince < (this.config.noticeAfterMs ?? 120_000) ? "grace"
+        : !this.store.db.query("SELECT 1 FROM remote_inbox WHERE sealed IS NOT NULL AND kind='inbound' LIMIT 1").get() ? "not-waiting"
+        : outage.noticeAttempted ? "already-sent"
+        : lastNotice !== undefined && lastNotice !== null && this.now() - lastNotice < (this.config.noticeMinGapMs ?? 21_600_000) ? "rate-limited" : undefined;
+      if (reason) this.emit("moni-notice-suppressed", reason);
+      else {
+        // Reserve before the side effect: an ambiguous send or process exit must not reset the cap.
+        this.store.db.transaction(() => {
+          this.store.set("remoteNoticeAt", this.now()); outage.noticeAttempted = true; this.store.set("remoteOutage", outage);
+        })();
+        try { await this.io.notice(outage.id, "I’m temporarily offline. I’ll reply when I’m back."); } catch { this.emit("moni-notice-error"); }
+      }
       this.nextProbe = this.now() + Math.min(60_000, 1_000 * 2 ** Math.min(++this.failures, 6));
       this.emit("moni-runner-error", "unreachable");
     } finally { this.busy = false; }

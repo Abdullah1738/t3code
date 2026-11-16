@@ -27,7 +27,7 @@ class InstallTests(unittest.TestCase):
             live.mkdir()
             data.mkdir()
             kept = {}
-            for path in (live / 'pings.json', live / 'state.json', live / 'check.lock', live / '.run-ok',
+            for path in (live / 'pings.json', live / 'runs.jsonl', live / 'runs.jsonl.1', live / 'runs.lock', live / 'state.json', live / 'check.lock', live / '.run-ok',
                          data / 'cases.json', data / 'cases.lock'):
                 path.write_text('private ' + path.name)
                 kept[path] = path.read_bytes()

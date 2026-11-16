@@ -29,6 +29,46 @@ def summary(text, **extra):
             'createdBy': 'user', 'creationSource': 'web', 'automated': False, 'inboundMessageId': None, **extra}
 
 
+class ReadOnlySearchCache(unittest.TestCase):
+    def test_closed_search_reads_cache_but_never_saves_in_read_only_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / 'msgs-searches.json'
+            cache.write_text('{}\n')
+            binary = root / 'msgs'
+            binary.write_text('#!/bin/sh\nexit 0\n')
+            binary.chmod(0o700)
+            before = cache.read_bytes(), cache.stat().st_mtime_ns
+            memo = {('msgs_cache',): cache, ('write_cache',): False}
+            with patch.object(ch, 'MSGS', str(binary)):
+                self.assertEqual(ch.search('receipt', '2026-10-23', until='2026-10-24', memo=memo), [])
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), before)
+                self.assertEqual(ch.search('receipt', '2026-10-23', until='2026-10-24',
+                                           memo={('msgs_cache',): cache}, write_cache=False), [])
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), before)
+                ch.search('receipt', '2026-10-23', until='2026-10-24', memo={('msgs_cache',): cache})
+                self.assertNotEqual(cache.read_bytes(), before[0])
+                saved = cache.read_bytes(), cache.stat().st_mtime_ns
+                with patch.object(ch, 'msgs', side_effect=AssertionError('cache miss')):
+                    self.assertEqual(ch.search('receipt', '2026-10-23', until='2026-10-24', memo=memo), [])
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), saved)
+
+
+    def test_owner_cache_default_path_is_read_only_even_when_corrupt_or_missing(self):
+        for content in ('{}\n', '{bad json', None):
+            with self.subTest(content=content), ControlServer([summary('owner words')]) as server:
+                cache = Path(server.tmp.name) / 'owner-texts.json'
+                if content is not None:
+                    cache.write_text(content)
+                before = (cache.read_bytes(), cache.stat().st_mtime_ns) if cache.exists() else None
+                with patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(Path(server.tmp.name) / 'logs'),
+                                             'TOOLLOG_ROOT': str(Path(server.tmp.name) / 'logs')}):
+                    rows = ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), write_cache=False)
+                self.assertEqual(len(rows), 1)
+                after = (cache.read_bytes(), cache.stat().st_mtime_ns) if cache.exists() else None
+                self.assertEqual(after, before)
+
+
 class ControlServer:
     """Loopback-only control fixtures. Never reads credentials or state from the real home."""
     def __init__(self, rows=None, threads=None, stall=None, drip=False, page_size=500,
