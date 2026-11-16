@@ -1,4 +1,6 @@
 import contextlib
+import fcntl
+import importlib.util
 import os
 from pathlib import Path
 import plistlib
@@ -7,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -191,6 +194,41 @@ class WriterTest(unittest.TestCase):
             store.set_state(self.db, "after", True)
         self.assertTrue(store.get_state(self.db, "after"))
 
+    def test_startup_pragma_contention_maps_to_lock_timeout_and_closes_connection(self):
+        self.db.close()
+        other = sqlite3.connect(common.DB_PATH)
+        self.addCleanup(other.close)
+        other.execute("PRAGMA locking_mode=EXCLUSIVE")
+        other.execute("BEGIN EXCLUSIVE")
+        opened, statements = [], []
+
+        class TrackedConnection(timing.Connection):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                opened.append(self)
+
+            def execute(self, sql, parameters=()):
+                statements.append(sql)
+                return super().execute(sql, parameters)
+
+        with patch.object(store, "SQLITE_WAIT_SECONDS", .02), \
+                patch.object(timing, "Connection", TrackedConnection):
+            with self.assertRaises(store.LockTimeout) as raised:
+                store.connect()
+        self.assertEqual(raised.exception.holder, "unknown")
+        self.assertGreaterEqual(raised.exception.waited, .015)
+        self.assertIn("PRAGMA cache_size=-131072", statements)
+        self.assertNotIn("PRAGMA mmap_size=1073741824", statements)
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")
+        self.assertEqual(store.WRITE.snapshot()["source"], "unknown")
+        other.close()
+        with contextlib.closing(store.connect()) as recovered:
+            with store.writing(recovered):
+                store.set_state(recovered, "after_startup", True)
+            self.assertTrue(store.get_state(recovered, "after_startup"))
+
     def test_sqlite_error_in_body_rolls_back_and_non_lock_errors_keep_type(self):
         for message, error in [("database is locked", store.LockTimeout),
                                ("database table is locked", store.LockTimeout),
@@ -307,6 +345,88 @@ class LoopTest(unittest.TestCase):
         api.get = Mock(side_effect=store.LockTimeout(120, "gmail"))
         with self.assertRaises(store.LockTimeout):
             gmail_sync._fetch(api, "gmail", "1", {}, "me")
+
+
+class OAuthLockTest(unittest.TestCase):
+    def setUp(self):
+        path = Path(__file__).resolve().parents[2] / "local-helpers/libexec/mail/mail_oauth.py"
+        spec = importlib.util.spec_from_file_location("fixture_mail_oauth", path)
+        self.oauth = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.oauth)
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(self.oauth, "STATE_DIR", root))
+        self.enterContext(patch.object(self.oauth, "seconds_left", return_value=None))
+        self.enterContext(patch.object(self.oauth, "token_age", return_value=None))
+        self.enterContext(patch.object(self.oauth, "get_token", return_value="fixture-token"))
+        self.enterContext(patch.object(self.oauth, "log"))
+        self.refresh_command = self.enterContext(patch.object(self.oauth.subprocess, "run",
+                                                              return_value=Mock(returncode=0)))
+        self.enterContext(patch.object(gmail_sync, "mail_oauth", self.oauth))
+        self.enterContext(patch.object(imap_sync, "mail_oauth", self.oauth))
+        self.enterContext(patch.object(store, "LOCK_WAIT_SECONDS", .02))
+
+    def held_refresh_lock(self, acct, operation, error_type=store.LockTimeout):
+        done, errors = threading.Event(), []
+        def run():
+            try:
+                operation()
+            except BaseException as e:
+                errors.append(e)
+            finally:
+                done.set()
+
+        with open(f"{self.oauth.STATE_DIR}/{acct}.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            worker = threading.Thread(target=run)
+            worker.start()
+            try:
+                self.assertTrue(done.wait(.5), "refresh lock wait was not bounded")
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(errors[0], error_type)
+                self.assertEqual(getattr(errors[0], "holder", "unknown"), "unknown")
+                self.assertGreaterEqual(errors[0].waited, .015)
+                self.refresh_command.assert_not_called()
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                worker.join(1)
+        self.assertFalse(worker.is_alive())
+        return errors[0]
+
+    def test_gmail_proactive_and_401_refresh_give_up_and_can_retry(self):
+        for acct in ("gmail", "fund", "juno"):
+            for method in ("_token", "_renew"):
+                with self.subTest(acct=acct, method=method):
+                    self.refresh_command.reset_mock()
+                    api = gmail_sync.Api(acct)
+                    if method == "_renew":
+                        api.token = "stale"
+                    operation = api._token if method == "_token" else lambda: api._renew("stale")
+                    self.held_refresh_lock(acct, operation)
+                    self.assertEqual(api.checked, 0)
+                    self.assertFalse(api.lock.locked())
+                    operation()
+                    self.assertEqual(api.token, "fixture-token")
+                    self.refresh_command.assert_called_once()
+
+    def test_outlook_auth_heal_refresh_gives_up_and_can_retry(self):
+        with patch.object(self.oauth, "_v4_addrs", return_value=[]), \
+                patch.object(self.oauth.os.path, "expanduser", return_value=f"{self.oauth.STATE_DIR}/good-ip"), \
+                patch.object(self.oauth.imaplib, "IMAP4_SSL") as connection:
+            connection.return_value.authenticate.side_effect = imap_sync.imaplib.IMAP4.error("auth failed")
+            self.held_refresh_lock("outlook", lambda: imap_sync.connect("outlook"))
+            connection.return_value.shutdown.assert_called()
+            connection.return_value.authenticate.side_effect = None
+            self.assertIs(imap_sync.connect("outlook"), connection.return_value)
+
+    def test_refresh_deadline_takes_precedence_over_longer_timeout(self):
+        self.held_refresh_lock("gmail", lambda: self.oauth.refresh("gmail", lock_timeout=10,
+                               deadline=time.monotonic() + .02), self.oauth.RefreshLockTimeout)
+
+    def test_refresh_timeout_reaches_loop_giveup_and_normal_retry(self):
+        error = self.held_refresh_lock("gmail", gmail_sync.Api("gmail")._token)
+        waits, logs = LoopTest().run_loop([RuntimeError("earlier error"), error])
+        self.assertEqual(waits, [360, 180])
+        self.assertTrue(any("gmail: LOCK_GIVEUP waited=" in line and "holder=unknown" in line for line in logs))
 
 
 class WatchdogTest(unittest.TestCase):

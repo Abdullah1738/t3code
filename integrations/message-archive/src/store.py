@@ -247,14 +247,15 @@ def connect(readonly=False):
         db = sqlite3.connect(f"file:{common.DB_PATH}?mode=ro", uri=True, timeout=30)
     else:
         common.require_volume()
-        db = sqlite3.connect(common.DB_PATH, timeout=SQLITE_WAIT_SECONDS, factory=timing.Connection)
-        db.execute(f"PRAGMA busy_timeout={SQLITE_WAIT_SECONDS * 1000}")
-        # FTS5 segment merges reread big parts of the index; the 2 MB default cache turns every
-        # merge into a stream of small reads and spills on the USB disk.
-        db.execute("PRAGMA cache_size=-131072")
-        db.execute("PRAGMA mmap_size=1073741824")
+        db = None
         try:
             with _writer():
+                db = sqlite3.connect(common.DB_PATH, timeout=SQLITE_WAIT_SECONDS, factory=timing.Connection)
+                db.execute(f"PRAGMA busy_timeout={int(SQLITE_WAIT_SECONDS * 1000)}")
+                # FTS5 segment merges reread big parts of the index; the 2 MB default cache turns every
+                # merge into a stream of small reads and spills on the USB disk.
+                db.execute("PRAGMA cache_size=-131072")
+                db.execute("PRAGMA mmap_size=1073741824")
                 db.execute("PRAGMA journal_mode=WAL")
                 db.execute("PRAGMA synchronous=NORMAL")
                 db.executescript(SCHEMA)
@@ -263,7 +264,8 @@ def connect(readonly=False):
                 db.execute("CREATE INDEX IF NOT EXISTS items_deleted ON items(source, account, ext_id) "
                            "WHERE deleted_at IS NOT NULL")
         except BaseException:
-            db.close()
+            if db is not None:
+                db.close()
             raise
     if readonly:
         db.execute("PRAGMA busy_timeout=60000")

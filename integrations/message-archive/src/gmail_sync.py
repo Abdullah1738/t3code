@@ -43,7 +43,10 @@ class Api:
     def _token(self):
         with store.waiting(self.lock, self.acct):
             if self.token is None or time.time() - self.checked > 300:
-                mail_oauth.ensure_fresh(self.acct)
+                try:
+                    mail_oauth.ensure_fresh(self.acct, lock_timeout=store.LOCK_WAIT_SECONDS)
+                except mail_oauth.RefreshLockTimeout as e:
+                    raise store.LockTimeout(e.waited) from e
                 self.token = mail_oauth.get_token(self.acct)
                 self.checked = time.time()
             return self.token
@@ -51,7 +54,10 @@ class Api:
     def _renew(self, stale):
         with store.waiting(self.lock, self.acct):
             if self.token == stale:
-                mail_oauth.refresh(self.acct, reason="gmail api 401")
+                try:
+                    mail_oauth.refresh(self.acct, reason="gmail api 401", lock_timeout=store.LOCK_WAIT_SECONDS)
+                except mail_oauth.RefreshLockTimeout as e:
+                    raise store.LockTimeout(e.waited) from e
                 self.token = mail_oauth.get_token(self.acct)
                 self.checked = time.time()
 

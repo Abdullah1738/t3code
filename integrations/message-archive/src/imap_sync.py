@@ -51,7 +51,11 @@ def connect(acct, timeout=60):
         m = imaplib.IMAP4_SSL(cfg["host"], timeout=timeout)
         m.login(cfg["user"], pw)
         return m
-    return mail_oauth.xoauth2_connect(acct, cfg["host"], cfg["user"], timeout=timeout)
+    try:
+        return mail_oauth.xoauth2_connect(acct, cfg["host"], cfg["user"], timeout=timeout,
+                                         lock_timeout=store.LOCK_WAIT_SECONDS)
+    except mail_oauth.RefreshLockTimeout as e:
+        raise store.LockTimeout(e.waited) from e
 
 
 @timing.timed("fetch")
