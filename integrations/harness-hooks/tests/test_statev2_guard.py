@@ -2044,6 +2044,18 @@ test('failure', () => {
             with self.subTest(command=command):
                 self.assertIsNone(self.classify(command))
 
+    def test_js_temp_database_keeps_other_database_root_evidence(self):
+        setup = 'const root = mkdtempSync(tmpdir()); '
+        self.js_mutation_cases((suffix, setup + f'const fixture = join(root, "{suffix}"); ' +
+            'readFileSync("~/.config/spectrum-bridge/state.sqlite");') for suffix in (
+                '.robob/userdata/statev2.sqlite', 'robob-data/userdata/state.sqlite',
+                '.local/share/opencode/opencode.db'))
+
+    def test_js_temp_database_config_strip_cannot_supply_proof(self):
+        setup = 'const root = mkdtempSync(tmpdir()); '
+        self.js_mutation_cases((tool, setup + f'const config = "~/.config/{tool}/state.sqlite"; ' +
+            'readFileSync(join(root, ".robob/userdata/statev2.sqlite"));') for tool in ('homedir', 'cwd', 'HOME'))
+
     def test_js_temp_database_fixture_expressions(self):
         imports = '''import { mkdtempSync, realpathSync } from 'node:fs';
 import { mkdtemp, realpath } from 'node:fs/promises';

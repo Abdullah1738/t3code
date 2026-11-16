@@ -1948,7 +1948,9 @@ def _js_fixture_source(source):
             if value and value[0] == 'temp' and end > i and DATABASE_NAME.search(source[matches[i].start():matches[end - 1].end()]):
                 spans.append((matches[i].start(), matches[end - 1].end()))
     for start, end in sorted(spans, reverse=True):
-        source = source[:start] + re.sub(r'[^\n]', ' ', source[start:end]) + source[end:]
+        # Other operands may reuse a protected root, even when this path is
+        # temporary. Discharge its DB name without erasing that root evidence.
+        source = source[:start] + DATABASE_NAME.sub(lambda match: ' ' * len(match[0]), source[start:end]) + source[end:]
     return source
 
 
@@ -3357,6 +3359,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 live_assignments.add(str(path) if path is not None else candidate)
 
     def check_source(source, directory, python=False, rule="live-database-script", shell=False, test_target=None, location=None):
+        # Config/foreign operand discounts cannot supply fixture evidence.
         checked = _js_fixture_source(source) if test_target is not None and not python and not shell else source
         if _source_hit(checked, directory, python, shell):
             if test_target is not None:
