@@ -150,6 +150,8 @@ const GeneralEvent = Schema.Struct({
   discussionId: Schema.optionalKey(Id),
   threadId: Schema.optionalKey(DerivedId),
   durationMs: Schema.optionalKey(Measurement),
+  phase: Schema.optionalKey(Label),
+  waitedMs: Schema.optionalKey(Measurement),
   lateMs: Schema.optionalKey(Measurement),
   afterCap: Schema.optionalKey(Schema.Boolean),
   tool: Schema.optionalKey(Label),
