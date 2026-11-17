@@ -1177,6 +1177,78 @@ it.effect("a work thread with nothing active defaults to the cards still its own
   }).pipe(Effect.provide(layer));
 });
 
+it.effect.each(["card_get", "card_update"] as const)(
+  "#1754 %s during rollback returns a retryable conflict with saved false",
+  (tool) =>
+    Effect.gen(function* () {
+      let reject = false;
+      const fake = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+        findExisting: true,
+        send: () =>
+          reject
+            ? Effect.fail(
+                new KanbanThreadError({ operation: "send", detail: "rejected", rejected: true }),
+              )
+            : Effect.void,
+      });
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const store = yield* KanbanStore.KanbanStore;
+        const server = yield* McpServer.McpServer;
+        const board = yield* kanban.ensureBoard({
+          slug: "rollback",
+          name: "Rollback",
+          defaultProjectId: ProjectId.make("project-1"),
+        });
+        yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "A", prompt: "A", description: "Original" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const current = (yield* kanban.card(card.id)).card;
+        const worker = current.workThreadId!;
+        yield* store.putCard({
+          ...current,
+          stage: "todo",
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+        const replies: Array<Effect.Success<ReturnType<typeof call>>> = [];
+        fake.storeControl.beforeCardEvent = (event) =>
+          event.body?.startsWith("Assignment wake did not complete:")
+            ? call(worker, tool, {
+                card: card.id,
+                ...(tool === "card_update" ? { description: "Must not save" } : {}),
+              }).pipe(
+                Effect.provideService(McpServer.McpServer, server),
+                Effect.orDie,
+                Effect.tap((reply) =>
+                  Effect.sync(() => {
+                    replies.push(reply);
+                  }),
+                ),
+                Effect.asVoid,
+              )
+            : Effect.void;
+        reject = true;
+        yield* kanban.dispatchNow;
+        assert.lengthOf(replies, 1);
+        const result = replies[0]!;
+        assert.isTrue(result.isError);
+        const failure = yield* decodeToolFailure(result.text);
+        assert.equal(failure.reason, "conflict");
+        assert.equal(failure.reasonClass, "conflict");
+        assert.strictEqual(failure.saved, false);
+        assert.include(failure.message, "retry shortly");
+        assert.include(failure.message, "Nothing was saved");
+        assert.equal((yield* kanban.card(card.id)).card.description, "Original");
+      }).pipe(Effect.provide(fake.layer));
+    }),
+);
+
 it.effect("card_update preserves the not-written error from the board service", () => {
   const error = new KanbanError({
     code: "failed",
