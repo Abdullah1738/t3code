@@ -636,6 +636,8 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 try:
                     from .misc import _catch_up_finished
                     _catch_up_finished(con, run['run_id'])
+                    from . import quint_tools, runs
+                    quint_tools.record(con, run, runs.LOGS_DIR / (run['run_id'] + '.log'), api.BACKEND)
                     event(con, bid, "run_reaped", f"{run['run_id']} {status} exit={code}")
                     if state in api.LIVE_STATES:
                         from .runs import settle_docker

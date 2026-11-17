@@ -545,7 +545,7 @@ class BlockRunTests(unittest.TestCase):
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                     patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', '.', cmd_argv or ['node --version'], None, 'run-test',
-                                            steps=steps, node=blk)
+                                            steps=steps, node=blk, repo_root=repo)
             bindir = Path(home) / 'bin'
             bindir.mkdir()
             curl = bindir / 'curl'
