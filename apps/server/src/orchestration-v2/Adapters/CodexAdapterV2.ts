@@ -5252,6 +5252,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         );
         yield* client.handleServerNotification("thread/closed", (payload) =>
           Effect.gen(function* () {
+            yield* Effect.logInfo("codex.thread-closed", {
+              provider: CODEX_PROVIDER,
+              providerSessionId: input.providerSessionId,
+              nativeThreadId: payload.threadId,
+            });
             yield* reportRetainedStateLoss(payload.threadId);
             yield* handleNativeThreadShutdown(payload.threadId);
           }),
@@ -8138,13 +8143,24 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             function* (unloadInput) {
               const nativeThreadId = yield* getNativeThreadId(unloadInput.providerThread);
               sessionApprovals.delete(nativeThreadId);
-              yield* client.request("thread/unsubscribe", { threadId: nativeThreadId }).pipe(
-                // An exited app-server holds no subscriptions left to drop.
-                Effect.catchTags({
-                  CodexAppServerProcessExitedError: () => Effect.void,
-                  CodexAppServerInputStreamEndedError: () => Effect.void,
-                }),
-              );
+              const response = yield* client
+                .request("thread/unsubscribe", { threadId: nativeThreadId })
+                .pipe(
+                  // An exited app-server holds no subscriptions left to drop.
+                  Effect.catchTags({
+                    CodexAppServerProcessExitedError: () => Effect.succeed(null),
+                    CodexAppServerInputStreamEndedError: () => Effect.succeed(null),
+                  }),
+                );
+              // The acknowledgement precedes native shutdown and MCP termination;
+              // thread/closed is logged separately when that cleanup completes.
+              yield* Effect.logInfo("codex.thread-unsubscribe", {
+                provider: CODEX_PROVIDER,
+                providerSessionId: input.providerSessionId,
+                threadId: unloadInput.providerThread.appThreadId,
+                nativeThreadId,
+                status: response?.status ?? "runtimeExited",
+              });
               yield* reportRetainedStateLoss(nativeThreadId);
             },
             (effect, unloadInput) =>

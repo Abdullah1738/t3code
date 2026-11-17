@@ -7114,6 +7114,54 @@ it.effect("ProviderSessionManagerV2 retries an idle unload after a transient fai
   }),
 );
 
+it.effect("ProviderSessionManagerV2 logs each deferred and completed idle-unload decision", () =>
+  Effect.gen(function* () {
+    const pendingWork = yield* Ref.make(true);
+    const logs: Array<unknown> = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(message);
+    });
+    yield* runIdleThreadUnloadScenario(
+      "idle-decision-log",
+      ({ state, providerSessionId, threadA, startTurn, endTurn }) =>
+        Effect.gen(function* () {
+          yield* startTurn(threadA, 1);
+          yield* endTurn(threadA, 1);
+          yield* TestClock.adjust("1 second");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, []);
+          yield* Ref.set(pendingWork, false);
+          yield* TestClock.adjust("1 second");
+          assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [`native-${threadA}`]);
+          const decisions = logs
+            .filter(Array.isArray)
+            .filter((message) => message[0] === "orchestration-v2.driver-session.idle-unload")
+            .map((message) => message[1]);
+          assert.lengthOf(decisions, 2);
+          for (const decision of decisions) {
+            assert.include(decision, {
+              provider: CODEX_DRIVER,
+              providerSessionId,
+              threadId: threadA,
+              nativeThreadId: `native-${threadA}`,
+              source: "timer",
+            });
+          }
+          assert.include(decisions[0], {
+            outcome: "deferred",
+            reason: "background_work",
+            idleMs: 1000,
+          });
+          assert.include(decisions[1], {
+            outcome: "unloaded",
+            reason: "runtime_released",
+            idleMs: 2000,
+          });
+        }),
+      { hasPendingBackgroundWorkForThread: Ref.get(pendingWork) },
+    ).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  }),
+);
+
 it.effect(
   "ProviderSessionManagerV2 keeps an idle shared-runtime thread loaded while its background work runs",
   () =>
