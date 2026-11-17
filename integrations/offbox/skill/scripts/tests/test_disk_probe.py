@@ -268,11 +268,16 @@ class DiskProbeTests(unittest.TestCase):
     def test_queued_plain_and_steps_survive_temp_reinstall(self):
         install = self.root / 'install'
         shutil.copytree(SCRIPTS.parent, install, ignore=shutil.ignore_patterns('tests', '__pycache__'))
+        # install.zsh stages this wrapper outside the scripts tree.
+        (install / 'tools').mkdir(exist_ok=True)
+        shutil.copyfile(runs.quint_tools.wrapper_path(), install / 'tools/quint')
         child = r'''import base64,json,os,subprocess,sys,zlib
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import offbox_disk_space as disk
-from offbox_lib import runs
+from offbox_lib import common, quint_tools, runs
+common.SKILL_DIR = Path(sys.argv[1]).parent
+assert quint_tools.wrapper_path() == common.SKILL_DIR / 'tools/quint'
 before = disk.probe_payload()
 print('queue-ready', flush=True)
 sys.stdin.readline()
