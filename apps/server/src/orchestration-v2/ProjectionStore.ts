@@ -1,4 +1,7 @@
-import { threadReadCount } from "../ardud/persistence/threadReadCount.ts";
+import {
+  threadReadCount,
+  readThreadIndexAvailability,
+} from "../ardud/persistence/threadReadCount.ts";
 import * as Deferred from "effect/Deferred";
 import { ShellRunLookupMigration } from "../ardud/persistence/shellRunLookupMigration.ts";
 import * as IdSetQueries from "./IdSetQueries.ts";
@@ -6426,6 +6429,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       threadId: ThreadId,
       options: ProjectionTimelinePageOptions,
     ) {
+      const readIndexes = yield* readThreadIndexAvailability(sql);
       // Stream global positions before filtering messages, stopping at the lookahead.
       // Sorting this numbered stream or reusing it for totals would exhaust the history.
       const rows = yield* sql<{
@@ -6458,7 +6462,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         }
         LIMIT ${options.limit + 1}
       )
-      SELECT ${threadReadCount(sql, threadId)} AS total_items, page.turn_item_id, page.position
+      SELECT ${threadReadCount(sql, threadId, readIndexes)} AS total_items, page.turn_item_id, page.position
       FROM (SELECT 1) LEFT JOIN page ON 1 ORDER BY page.position ASC`;
       const page = rows.filter((row) => row.turn_item_id !== null && row.position !== null);
       const items = yield* Effect.forEach(page.slice(0, options.limit), (row) =>

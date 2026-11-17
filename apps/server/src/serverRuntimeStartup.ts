@@ -51,6 +51,7 @@ import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import { forkParked, forkParkedFiber } from "./serverActivation.ts";
+import { maintainThreadReadIndexes } from "./ardud/persistence/threadReadMaintenance.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
@@ -772,6 +773,15 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
         },
       }),
     );
+    if (Option.isSome(sql)) {
+      yield* maintainThreadReadIndexes().pipe(
+        Effect.provideService(SqlClient.SqlClient, sql.value),
+        Effect.catch((cause) =>
+          Effect.logWarning("Thread read index maintenance failed", { cause }),
+        ),
+        Effect.forkScoped,
+      );
+    }
     // Delivery mutations share the live parent dispatch lock and recheck durable
     // cohort generations/transfers inside it. Recovery can safely trail readiness.
     yield* runStartupPhase(
