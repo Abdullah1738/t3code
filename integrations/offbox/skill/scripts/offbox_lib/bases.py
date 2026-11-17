@@ -447,7 +447,9 @@ def recipe(name: str) -> tuple[str, str]:
         for spec in ("20", ">=22.13 <23", "24"):
             node_bootstrap += node_version.block((node_version.parse_range(spec), f"crpko-node recipe {spec}"), require_nvm=True) + "\n"
     # Shared download helpers must precede bootstrap and every recipe that uses them.
-    body = ((TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n" + node_bootstrap +
+    fetch = (TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n"
+    sqlite = "bash -c " + shlex.quote(fetch + (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) + " || exit 1\n"
+    body = (fetch + sqlite + node_bootstrap +
             (TEMPLATES_DIR / "common-env.sh").read_text() + "\n# ---- recipe ----\n" + (crpko_tools + fdb_tools + p.read_text()) +
             "\n# ---- keep docker images ----\n(\n" + (TEMPLATES_DIR / "docker-images.sh").read_text() + "\n)\n")
     return body, hashlib.sha256(body.encode()).hexdigest()[:12]

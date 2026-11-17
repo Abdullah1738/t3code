@@ -10,7 +10,7 @@ function refuse(reason) {
   throw new ToolchainMismatch(reason);
 }
 
-export async function loadToolchain(main) {
+export async function loadToolchain(main, configRoot = main) {
   const vpPackage = path.join(main, "node_modules/vite-plus");
   const metadata = JSON.parse(fs.readFileSync(path.join(vpPackage, "package.json"), "utf8"));
   const { loadConfigFromFile } = await import(
@@ -18,7 +18,7 @@ export async function loadToolchain(main) {
   );
   return loadConfigFromFile(
     { command: "serve", mode: "development" },
-    path.join(main, "vite.config.ts"),
+    path.join(configRoot, "vite.config.ts"),
   );
 }
 
@@ -92,7 +92,7 @@ function installedPackage(name, requireFrom) {
   }
 }
 
-export function checkToolchain(root, main, loaded) {
+export function checkToolchain(root, main, loaded, configRoot = main) {
   const requireMain = createRequire(path.join(main, "package.json"));
   const vpFile = path.join(main, "node_modules/vite-plus/package.json");
   const requireVp = createRequire(fs.realpathSync(vpFile));
@@ -186,11 +186,11 @@ export function checkToolchain(root, main, loaded) {
     if (plugin.startsWith(".") || path.isAbsolute(plugin)) {
       const file = requireMain.resolve(plugin);
       let dir = path.dirname(file);
-      while (dir.startsWith(`${main}/`) && !fs.existsSync(path.join(dir, "package.json")))
+      while (dir.startsWith(`${configRoot}/`) && !fs.existsSync(path.join(dir, "package.json")))
         dir = path.dirname(dir);
-      const local = lock.importers[path.relative(main, dir)];
+      const local = lock.importers[path.relative(configRoot, dir)];
       if (local) {
-        const requirePlugin = createRequire(file);
+        const requirePlugin = createRequire(path.join(main, path.relative(configRoot, file)));
         for (const [name, entry] of Object.entries(local.dependencies ?? {}))
           visit(name, entry.version, requirePlugin);
       }

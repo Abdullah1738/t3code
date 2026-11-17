@@ -41,6 +41,11 @@ export const wrap = (
   return {
     ...store,
     boards: locks.observe(store.boards),
+    boardThreadIds: (id) => locks.access(id, store.boardThreadIds(id)),
+    purgeBoard: (id) => locks.access(id, store.purgeBoard(id), true),
+    pendingBoardPurges: locks.observe(store.pendingBoardPurges),
+    finishBoardPurgeThread: (id, threadId) =>
+      locks.access(id, store.finishBoardPurgeThread(id, threadId), true),
     board: (id) => locks.access(id, store.board(id), false, "board"),
     putBoard: (row) => locks.access(row.id, store.putBoard(row), true, "board"),
     putBoardWithPools: (row, pools, application) =>
@@ -57,12 +62,22 @@ export const wrap = (
     cardsByThread: (id) => thread(id, store.cardsByThread(id)),
     nextCardNumber: (id) => locks.access(id, store.nextCardNumber(id)),
     putCard: (row) => locks.access(row.boardId, store.putCard(row), true, `card:${row.id}`),
-    addCardEvent: (row, applicationId) =>
-      card(row.cardId, store.addCardEvent(row, applicationId), true),
+    updateCard: (row, before) =>
+      locks.access(before.boardId, store.updateCard(row, before), true, `card:${row.id}`),
+    addCardEvent: (row, applicationId, snapshot) =>
+      snapshot?.id === row.cardId
+        ? locks.access(
+            snapshot.boardId,
+            store.addCardEvent(row, applicationId, snapshot),
+            true,
+            `card:${row.cardId}`,
+          )
+        : card(row.cardId, store.addCardEvent(row, applicationId), true),
     pendingInstructionApplications: (cardId, boardId, field, askId) =>
       card(cardId, store.pendingInstructionApplications(cardId, boardId, field, askId)),
     cardEvents: (id) => card(id, store.cardEvents(id)),
     boardEvents: (id, since, until) => locks.access(id, store.boardEvents(id, since, until)),
+    evaluatorStepEvents: (id) => locks.access(id, store.evaluatorStepEvents(id)),
     activityHistory: (id, window) => locks.access(id, store.activityHistory(id, window)),
     slotHistory: (filter) => locks.access(filter.boardId, store.slotHistory(filter)),
     lastTransitions: (id, cardIds, beforeId) =>
@@ -87,14 +102,16 @@ export const wrap = (
     putDiscussion: (row) =>
       locks.access(row.boardId, store.putDiscussion(row), true, `discussion:${row.id}`),
     messages: (id, options) => discussion(id, store.messages(id, options)),
-    ownerWait: (id) => discussion(id, store.ownerWait(id)),
+    ownerWait: (id, includeScripts, atSeq) =>
+      discussion(id, store.ownerWait(id, includeScripts, atSeq)),
     allMessages: (id) => discussion(id, store.allMessages(id)),
     message: (id, seq) => discussion(id, store.message(id, seq)),
     putMessage: (row) => discussion(row.discussionId, store.putMessage(row), true),
     scripts: (id) => locks.access(id, store.scripts(id)),
     automations: (id) => locks.access(id, store.automations(id)),
     putAutomation: (row) => locks.access(row.boardId, store.putAutomation(row), true),
-    wiki: (id) => locks.access(id, store.wiki(id)),
+    wiki: (id, slugs) => locks.access(id, store.wiki(id, slugs)),
+    wikiIndex: (id, slugs) => locks.access(id, store.wikiIndex(id, slugs)),
     putWiki: (row) => locks.access(row.boardId, store.putWiki(row), true),
     threadLink: (id) => thread(id, store.threadLink(id)),
     threadLinksByIds: (ids) => locks.observe(store.threadLinksByIds(ids)),

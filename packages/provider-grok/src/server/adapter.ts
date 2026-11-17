@@ -334,6 +334,7 @@ export function makeGrokAcpAdapterFlavor(
     isProviderWakeNotification: isXAiTaskCompletedWakeNotification,
     deferFinalizeForBackgroundWork: true,
     enablePostSettleContinuation: true,
+    backgroundTasksEndWithProcess: true,
     ...(options.assertComplete === undefined ? {} : { assertComplete: options.assertComplete }),
   };
 }

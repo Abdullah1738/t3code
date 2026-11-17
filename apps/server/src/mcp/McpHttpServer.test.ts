@@ -5,6 +5,7 @@ import { NodeHttpServer } from "@effect/platform-node";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import {
+  AnalyticsEvent,
   EnvironmentId,
   OrchestratorMcpFailure,
   PreviewTabId,
@@ -34,9 +35,11 @@ import {
 
 import * as ProjectService from "../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
+import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as PullRequestReviewGuideService from "../pullRequest/PullRequestReviewGuideService.ts";
 import * as ServerConfig from "../config.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
+import * as WikiReadTiming from "../ardud/analytics/WikiReadTiming.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolAccessTestkit from "./McpToolAccess.testkit.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -48,13 +51,16 @@ import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import * as ReplyBuilders from "../ardud/http/ReplyBuilders.ts";
+import { MAX_REPLY_BYTES } from "../ardud/http/replyBudget.ts";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 
 const environmentId = EnvironmentId.make("environment-mcp-test");
 const threadId = ThreadId.make("thread-mcp-test");
 const tabId = PreviewTabId.make("tab-mcp-test");
 const alternateTabId = PreviewTabId.make("tab-mcp-alternate");
+const decodeAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent);
 const decodeJsonText = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const encodeOrchestratorFailure = Schema.encodeSync(OrchestratorMcpFailure);
 const invocation = {
@@ -98,6 +104,7 @@ const layerPullRequestsTest = McpHttpServer.layerPullRequestsToolkit.pipe(
         resolve: () => Effect.succeed(null),
       }),
       Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
+      Layer.mock(PullRequestService.PullRequestService)({}),
       Layer.mock(Orchestrator.OrchestratorV2)({}),
       Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
       NodeServices.layer,
@@ -156,6 +163,221 @@ const callTool = (name: string, args: Record<string, unknown>) =>
   });
 
 const callSnapshot = (args: Record<string, unknown>) => callTool("preview_snapshot", args);
+
+const delegationTaskId =
+  "node:delegated-task:command%3Amcp%3Adelegate-task%3Aenv%3Aparent%3Arequest";
+const delegationReceipt = {
+  taskId: delegationTaskId,
+  status: "running",
+  providerInstanceId: "codex",
+  model: "gpt-6.1-sol",
+  options: [{ id: "serviceTier", value: "default" }],
+};
+
+const delegationProbe = (
+  response: Effect.Effect<unknown, OrchestratorMcpFailure>,
+  track = true,
+) => {
+  // Unknown models a future handler/encoder regression at the actual tool boundary.
+  const toolkit = Toolkit.make(
+    Tool.make("delegate_task", {
+      success: Schema.Unknown,
+      failure: OrchestratorMcpFailure,
+      failureMode: "return",
+    }),
+  );
+  return McpHttpServer.toolkitRegistration(
+    toolkit,
+    McpToolAccess.toLayer(toolkit, {
+      delegate_task: McpToolAccess.reads(() =>
+        (track
+          ? McpCallAnalytics.trackDelegation(delegationTaskId, Effect.succeed("unknown"))
+          : Effect.void
+        ).pipe(Effect.andThen(response)),
+      ),
+    }),
+  ).pipe(Layer.provideMerge(McpServer.McpServer.layer));
+};
+
+it.effect.each([
+  ["empty object", {}],
+  ["null", null],
+  ["text", "accepted"],
+  ["null options", { ...delegationReceipt, options: null }],
+  ["scalar options", { ...delegationReceipt, options: "default" }],
+  ["numeric model", { ...delegationReceipt, model: 42 }],
+  ...(["taskId", "status", "providerInstanceId", "model"] as const).map((key) => [
+    `missing ${key}`,
+    Object.fromEntries(Object.entries(delegationReceipt).filter(([field]) => field !== key)),
+  ]),
+])("rejects incomplete encoded delegation receipts: %s", ([_name, receipt]) =>
+  callTool("delegate_task", {}).pipe(
+    Effect.tap((result) =>
+      Effect.sync(() => {
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          _tag: "OrchestratorMcpFailure",
+          code: "delegation_uncertain",
+          saved: "unknown",
+          taskId: delegationTaskId,
+        });
+        const part = result.content.find((part) => part.type === "text");
+        expect(part?.type === "text" && JSON.parse(part.text)).toEqual(result.structuredContent);
+        expect(part?.type === "text" && part.text).toContain("use task_status");
+      }),
+    ),
+    Effect.provide(delegationProbe(Effect.succeed(receipt))),
+  ),
+);
+
+it.effect.each([
+  ["full", delegationReceipt],
+  [
+    "omitted options",
+    Object.fromEntries(Object.entries(delegationReceipt).filter(([field]) => field !== "options")),
+  ],
+  ["empty options", { ...delegationReceipt, options: [] }],
+  ["nullable model", { ...delegationReceipt, model: null }],
+  [
+    "nullable model and omitted options",
+    { taskId: delegationTaskId, status: "running", providerInstanceId: "codex", model: null },
+  ],
+])("preserves valid encoded delegation receipts: %s", ([_name, receipt]) =>
+  callTool("delegate_task", {}).pipe(
+    Effect.tap((result) =>
+      Effect.sync(() => {
+        expect(result.isError).toBe(false);
+        expect(result.structuredContent).toEqual(receipt);
+      }),
+    ),
+    Effect.provide(delegationProbe(Effect.succeed(receipt))),
+  ),
+);
+
+it.effect.each(["caller_unresolved", "capability_denied", "parent_not_active"] as const)(
+  "preserves known-unsaved pre-dispatch classification: %s",
+  (code) => {
+    const failure = new OrchestratorMcpFailure({
+      code,
+      message: "Delegation did not reach dispatch.",
+    });
+    return callTool("delegate_task", {}).pipe(
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          expect(result.isError).toBe(true);
+          expect(result.structuredContent).toMatchObject({
+            code,
+            saved: false,
+            message: failure.message,
+          });
+          expect(result.structuredContent).not.toHaveProperty("taskId");
+          const state: McpCallAnalytics.McpCall["Service"] = {
+            callerResolved: false,
+            callerResolveMs: 0,
+            readerLane: "test",
+            phase: "caller",
+            saved: "unknown",
+          };
+          expect(McpCallAnalytics.callOutcome(Exit.succeed(result), state).saved).toBe(false);
+        }),
+      ),
+      Effect.provide(delegationProbe(Effect.fail(failure), false)),
+    );
+  },
+);
+
+it.effect.each([undefined, false, true, "unknown"] as const)(
+  "retains the timeout error that a receipt-only projection hid (saved=%s)",
+  (saved) => {
+    const failure = new OrchestratorMcpFailure({
+      code: "delegation_timeout",
+      message:
+        "delegate_task timed out during dispatch; use task_status. Retry only with the same clientRequestId.",
+      ...(saved === undefined ? {} : { saved }),
+    });
+    // This was the caller's projection: undefined receipt fields serialize to {}.
+    const oldError = encodeOrchestratorFailure(failure);
+    expect(
+      JSON.stringify({
+        taskId: Reflect.get(oldError, "taskId"),
+        status: Reflect.get(oldError, "status"),
+      }),
+    ).toBe("{}");
+    return callTool("delegate_task", {}).pipe(
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          expect(result.isError).toBe(true);
+          expect(result.structuredContent).toMatchObject({
+            _tag: "OrchestratorMcpFailure",
+            code: "delegation_timeout",
+            saved: saved ?? "unknown",
+            taskId: delegationTaskId,
+            message: failure.message,
+          });
+          const part = result.content.find((part) => part.type === "text");
+          expect(part?.type === "text" && JSON.parse(part.text)).toEqual(result.structuredContent);
+        }),
+      ),
+      Effect.provide(delegationProbe(Effect.fail(failure))),
+    );
+  },
+);
+
+it.effect.each(
+  [8191, 8192, 8193, 32_768].flatMap((length) => [false, true].map((saved) => ({ length, saved }))),
+)(
+  "retains typed delegation failures around the text limit: $length saved=$saved",
+  ({ length, saved }) => {
+    const fields = { code: "invalid_request" as const, saved };
+    const emptyFailure = encodeOrchestratorFailure(
+      new OrchestratorMcpFailure({ ...fields, message: "" }),
+    );
+    const failure = new OrchestratorMcpFailure({
+      ...fields,
+      message: "x".repeat(length - JSON.stringify(emptyFailure).length),
+    });
+    expect(JSON.stringify(encodeOrchestratorFailure(failure))).toHaveLength(length);
+    return callTool("delegate_task", {}).pipe(
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          expect(result.isError).toBe(true);
+          expect(result.structuredContent).toMatchObject({ ...fields, taskId: delegationTaskId });
+          expect(result.structuredContent).toHaveProperty("message", failure.message);
+          const part = result.content.find((part) => part.type === "text");
+          expect(part?.type === "text" && JSON.parse(part.text)).toEqual(result.structuredContent);
+        }),
+      ),
+      Effect.provide(delegationProbe(Effect.fail(failure))),
+    );
+  },
+);
+
+it.effect("keeps the reply budget after mirroring a large delegation failure", () =>
+  callTool("delegate_task", {}).pipe(
+    Effect.tap((result) =>
+      Effect.sync(() => {
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          code: "delegation_uncertain",
+          saved: "unknown",
+          taskId: delegationTaskId,
+        });
+        expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(MAX_REPLY_BYTES);
+      }),
+    ),
+    Effect.provide(
+      delegationProbe(
+        Effect.fail(
+          new OrchestratorMcpFailure({
+            code: "invalid_request",
+            saved: false,
+            message: "x".repeat(MAX_REPLY_BYTES / 2 + 512),
+          }),
+        ),
+      ),
+    ),
+  ),
+);
 
 // Real tool definitions with handlers that record what they decoded.
 const layerRecordingTools = (calls: Array<unknown>) => {
@@ -310,6 +532,7 @@ it.effect("mirrors encoded typed handler failures without changing text or analy
 
 it.each([
   '{ "code": "delegation_timeout", "taskId": "task-1567", "retryHint": "same key" }',
+  '{ "_tag": "OrchestratorMcpFailure", "code": "parent_not_active", "saved": false, "message": "Delegated task was not created; safe to retry with the same clientRequestId. Parent run ended." }',
   "{}",
   JSON.stringify({ message: "x".repeat(8178) }),
 ])("mirrors JSON object failures and preserves their original text: %.80s", (text) => {
@@ -612,16 +835,7 @@ it.effect("uses one scheduled-read budget across lane, readiness and handler", (
   }),
 );
 
-it.effect.each([
-  "board_get",
-  "board_activity",
-  "card_get",
-  "wiki_read",
-  "discussion_read",
-  "card_search",
-  "t3_thread_read",
-  "t3_thread_list",
-])("traces %s without adding a scheduled-read deadline", (name) =>
+it.effect.each(["t3_thread_read"])("traces %s without adding a scheduled-read deadline", (name) =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
@@ -667,6 +881,290 @@ it.effect.each([
       expect(span?.attributes.get("replyBytes")).toBe(Buffer.byteLength(JSON.stringify(result)));
       expect(span?.attributes.has("taskCount")).toBe(false);
     }).pipe(Effect.provide(layer), Effect.withTracer(tracer));
+  }),
+);
+
+const boardReadNames = [
+  "board_get",
+  "board_activity",
+  "card_get",
+  "wiki_read",
+  "discussion_read",
+  "card_search",
+];
+
+it.effect.each(
+  boardReadNames.flatMap((name) =>
+    (["lane", "readiness", "handler", "masked handler"] as const).flatMap((blocked) =>
+      (["timeout", "disconnect"] as const).map((ending) => ({ name, blocked, ending })),
+    ),
+  ),
+)(
+  "bounds $name during $blocked on $ending and records the reached phase",
+  ({ name, blocked, ending }) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const cleaned = yield* Deferred.make<void>();
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const stuck = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+      );
+      const handler =
+        blocked === "handler" || blocked === "masked handler"
+          ? (blocked === "masked handler" ? Effect.uninterruptible(stuck) : stuck).pipe(
+              Effect.as({ ready: true }),
+              Effect.ensuring(Deferred.succeed(cleaned, undefined)),
+            )
+          : Effect.succeed({ ready: true });
+      const toolkit = Toolkit.make(
+        Tool.make(name, {
+          description: "Synthetic board read.",
+          success: Schema.Struct({ ready: Schema.Boolean }),
+        }),
+      );
+      const registration = McpHttpServer.toolkitRegistration(
+        toolkit,
+        McpToolAccess.toLayer(toolkit, { [name]: McpToolAccess.reads(() => handler) }),
+      ).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provideMerge(ReplyBuilders.layer),
+        Layer.provide(
+          Layer.mock(BoardsDatabase)({
+            ready: blocked === "readiness" ? stuck : Effect.void,
+            path: "/synthetic/boards.sqlite",
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (row) =>
+              row.kind === "mcp.call"
+                ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const builders = yield* ReplyBuilders.ReplyBuilders;
+        const lane = name === "wiki_read" ? "wiki" : "mcp";
+        if (blocked === "lane") yield* builders[lane].take(ReplyBuilders.PERMITS[lane]);
+        const pending = yield* callTool(name, {}).pipe(Effect.forkChild);
+        if (blocked !== "lane") yield* Deferred.await(entered);
+        yield* TestClock.adjust(ending === "disconnect" ? "100 millis" : "20 seconds");
+        const phase =
+          blocked === "lane" && name === "wiki_read"
+            ? "admission"
+            : blocked === "masked handler"
+              ? "handler"
+              : blocked;
+        const waitedMs = ending === "disconnect" ? 100 : 20000;
+        if (ending === "disconnect") yield* Fiber.interrupt(pending);
+        else {
+          const result = yield* Fiber.join(pending);
+          expect(result.isError).toBe(true);
+          expect(result.structuredContent).toEqual({ reason: "server_busy", phase, waitedMs });
+          expect(result.content).toEqual([
+            { type: "text", text: "Robob is busy; nothing was read. Retry the same call." },
+          ]);
+        }
+        const row = yield* Deferred.await(recorded);
+        expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+          tool: name,
+          phase,
+          waitedMs,
+          outcome: ending === "disconnect" ? "interrupted" : "timeout",
+        });
+        if (blocked === "lane") yield* builders[lane].release(ReplyBuilders.PERMITS[lane]);
+        // Every permit is available even while a masked handler still unwinds.
+        expect(yield* builders[lane].takeIfAvailable(ReplyBuilders.PERMITS[lane])).toBe(true);
+        yield* builders[lane].release(ReplyBuilders.PERMITS[lane]);
+        if (blocked === "masked handler") expect(yield* Deferred.isDone(cleaned)).toBe(false);
+        if (blocked === "handler") yield* Deferred.await(cleaned);
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(registration));
+    }),
+);
+
+const WikiReadToolkit = Toolkit.make(
+  Tool.make("wiki_read", {
+    description: "Synthetic wiki read.",
+    success: Schema.Struct({ ready: Schema.Boolean }),
+  }),
+);
+const wikiReadLayer = (handler: Effect.Effect<{ ready: boolean }>, ready = Effect.void) =>
+  McpHttpServer.toolkitRegistration(
+    WikiReadToolkit,
+    McpToolAccess.toLayer(WikiReadToolkit, { wiki_read: McpToolAccess.reads(() => handler) }),
+  ).pipe(
+    Layer.provideMerge(McpServer.McpServer.layer),
+    Layer.provideMerge(ReplyBuilders.layer),
+    Layer.provide(Layer.mock(BoardsDatabase)({ ready, path: "/synthetic/boards.sqlite" })),
+  );
+
+it.effect.each([
+  "admission",
+  "readiness",
+  "caller",
+  "board",
+  "metadata",
+  "body",
+  "section",
+  "handler",
+  "encode",
+  "masked body",
+] as const)(
+  "wiki_read bounds a blocked %s and releases its permit before masked cleanup",
+  (blocked) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const stuck = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+      );
+      const phase = blocked === "masked body" ? "body" : blocked;
+      const handler =
+        phase === "admission" || phase === "readiness"
+          ? Effect.succeed({ ready: true })
+          : WikiReadTiming.step(
+              phase,
+              blocked === "masked body" ? Effect.uninterruptible(stuck) : stuck,
+            ).pipe(Effect.as({ ready: true }));
+      yield* Effect.gen(function* () {
+        const builders = yield* ReplyBuilders.ReplyBuilders;
+        if (blocked === "admission") yield* builders.wiki.take(ReplyBuilders.PERMITS.wiki);
+        const pending = yield* callTool("wiki_read", {}).pipe(
+          Effect.withSpan("incoming-tool-call"),
+          Effect.forkChild,
+        );
+        if (blocked !== "admission") yield* Deferred.await(entered);
+        yield* TestClock.adjust("20 seconds");
+        const result = yield* Fiber.join(pending);
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          reason: "server_busy",
+          phase,
+          waitedMs: 20000,
+        });
+        if (blocked === "admission") yield* builders.wiki.release(ReplyBuilders.PERMITS.wiki);
+        // Taking every permit before unblocking cleanup proves none was retained.
+        yield* builders.wiki.take(ReplyBuilders.PERMITS.wiki);
+        yield* builders.wiki.release(ReplyBuilders.PERMITS.wiki);
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.provide(wikiReadLayer(handler, blocked === "readiness" ? stuck : Effect.void)),
+      );
+    }),
+);
+
+it.effect("wiki_read keeps the #1628 tools/call timings and savedReply tracing", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const spans: Array<Tracer.NativeSpan> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    yield* Effect.gen(function* () {
+      const pending = yield* callTool("wiki_read", {}).pipe(
+        Effect.withSpan("incoming-tool-call"),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("7 seconds");
+      yield* Deferred.succeed(release, undefined);
+      const result = yield* Fiber.join(pending);
+      expect(result.structuredContent).toEqual({ ready: true });
+      const span = spans.find((span) => span.attributes.get("mcp.tool.name") === "wiki_read");
+      expect(span?.attributes.get("handlerMs")).toBe(7000);
+      expect(span?.attributes.get("laneWaitMs")).toBe(0);
+      expect(span?.attributes.get("readinessWaitMs")).toBe(0);
+      expect(span?.attributes.get("replyBytes")).toBe(Buffer.byteLength(JSON.stringify(result)));
+      expect(span?.attributes.has("taskCount")).toBe(false);
+      const savedReply = spans.find((span) => span.name === "KanbanTools.savedReply");
+      expect(savedReply?.attributes.get("kanban.reply.elapsed_ms")).toBe(7000);
+      expect(savedReply?.attributes.get("kanban.reply.timed_out")).toBe(false);
+      expect(savedReply?.parent).toMatchObject({ value: { spanId: span?.spanId } });
+    }).pipe(
+      Effect.provide(
+        wikiReadLayer(
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as({ ready: true }),
+          ),
+        ),
+      ),
+      Effect.withTracer(tracer),
+    );
+  }),
+);
+
+it.effect.each(
+  (["foreground", "background", "writer"] as const).flatMap((lane) =>
+    (["success", "timeout"] as const).map((ending) => ({ lane, ending })),
+  ),
+)("wiki_read separates $lane acquisition from query/encode time on $ending", ({ lane, ending }) =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const spans: Array<Tracer.NativeSpan> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        spans.push(span);
+        return span;
+      },
+    });
+    const handler = Effect.gen(function* () {
+      const start = yield* NodeSqliteClient.ReaderWaitStartedObserver;
+      const acquired = yield* NodeSqliteClient.ReaderWaitObserver;
+      const statement = yield* NodeSqliteClient.StatementTimingObserver;
+      yield* WikiReadTiming.step(
+        "body",
+        Effect.gen(function* () {
+          const finish = start?.("foreground");
+          finish?.(lane, false);
+          yield* TestClock.adjust("2 seconds");
+          finish?.(lane, true);
+          if (lane !== "writer") acquired?.(2000, lane);
+          yield* TestClock.adjust("3 seconds");
+          statement?.({
+            operation: "read",
+            connection: lane === "writer" ? "writer" : "reader",
+            ...(lane === "writer" ? {} : { lane }),
+            durationMs: 3000,
+            outcome: "success",
+          });
+        }),
+      );
+      yield* WikiReadTiming.step(
+        "encode",
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      );
+      return { ready: true };
+    });
+    yield* Effect.gen(function* () {
+      const pending = yield* callTool("wiki_read", {}).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(ending === "success" ? "4 seconds" : "20 seconds");
+      if (ending === "success") yield* Deferred.succeed(release, undefined);
+      const result = yield* Fiber.join(pending);
+      expect(result.isError === true).toBe(ending === "timeout");
+      if (ending === "timeout") expect(result.structuredContent).toMatchObject({ phase: "encode" });
+      const span = spans.find((span) => span.name === "WikiReadDeadline.bound");
+      expect(span?.attributes.get("wiki.phase_ms.reader_wait")).toBe(2000);
+      expect(span?.attributes.get("wiki.phase_ms.query")).toBe(3000);
+      expect(span?.attributes.get("wiki.phase_ms.body")).toBe(5000);
+      expect(span?.attributes.get("wiki.phase_ms.encode")).toBe(
+        ending === "success" ? 4000 : 15000,
+      );
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+      Effect.provide(wikiReadLayer(handler)),
+      Effect.withTracer(tracer),
+    );
   }),
 );
 
@@ -1851,4 +2349,37 @@ it.effect("returns a text-only snapshot without requiring screenshot bytes", () 
       expect(result.content.some((entry) => entry.type === "image")).toBe(false);
     }),
   ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("thread lists leave every large-read reply permit available while scanning", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const toolkit = Toolkit.make(
+      Tool.make("t3_thread_list", {
+        description: "A latched bounded list.",
+        success: Schema.Struct({ ready: Schema.Boolean }),
+      }),
+    );
+    const layer = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        t3_thread_list: McpToolAccess.reads(() =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as({ ready: true }),
+          ),
+        ),
+      }),
+    ).pipe(Layer.provideMerge(McpServer.McpServer.layer), Layer.provideMerge(ReplyBuilders.layer));
+    yield* Effect.gen(function* () {
+      const pending = yield* callTool("t3_thread_list", {}).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const builders = yield* ReplyBuilders.ReplyBuilders;
+      expect(yield* builders.mcp.takeIfAvailable(ReplyBuilders.PERMITS.mcp)).toBe(true);
+      yield* builders.mcp.release(ReplyBuilders.PERMITS.mcp);
+      yield* Deferred.succeed(release, undefined);
+      expect((yield* Fiber.join(pending)).isError).not.toBe(true);
+    }).pipe(Effect.provide(layer));
+  }),
 );

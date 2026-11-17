@@ -1,5 +1,6 @@
 #!/bin/zsh
 # Recovery card on its own: fires once per Dubai day when today's WHOOP recovery is scored.
+# Today means the sleep woke up on today's Dubai date, regardless of when WHOOP uploaded it.
 # It no longer needs the morning brief first. Gates:
 #   - never 00:00-08:00 Dubai (MINS must be > 480)
 #   - before 12:00 Dubai only if a brief already went out held (pending-recovery-$D or out/$D-recovery-held)
@@ -32,20 +33,21 @@ fi
 # Dubai is UTC+4 all year: day D runs from 20:00Z the day before to 20:00Z on D.
 LO=$(/usr/bin/python3 -c "import datetime,sys;print((datetime.date.fromisoformat(sys.argv[1])-datetime.timedelta(days=1)).isoformat()+'T20:00:00')" "$D")
 HI=${D}T20:00:00
-R=$(sqlite3 "$HDB" "select json_extract(raw_json,'\$.created_at') from whoop_recovery where json_extract(raw_json,'\$.score_state')='SCORED' and json_extract(raw_json,'\$.created_at') >= '$LO' and json_extract(raw_json,'\$.created_at') < '$HI' order by 1 desc limit 1")
+R=$(sqlite3 "$HDB" "select r.created_at_api, s.end_utc from whoop_recovery r join whoop_sleep s on s.sleep_id = r.sleep_id where r.score_state='SCORED' and s.end_utc >= '$LO' and s.end_utc < '$HI' and (coalesce(s.is_nap,0)=0 or (julianday(s.end_utc)-julianday(s.start_utc))*24 >= 3) order by s.end_utc desc limit 1")
 if [[ -n $R ]]; then
+  RECOVERY_END=${R#*|}; R=${R%%|*}
   touch "$WATCH_DIR/sent-$D"; rm -f $P
   if [[ -f $WATCH_DIR/norec-$D ]]; then
-    echo "Today's ($D) WHOOP recovery just scored after all (created $R); earlier today Abdullah was told there was no recovery score. Send the fresh recovery card and say it came in after all."
+    echo "Today's ($D) WHOOP recovery just scored after all (created $R) for the sleep that ended $RECOVERY_END; earlier today Abdullah was told there was no recovery score. Send the fresh recovery card and say it came in after all."
   else
-    echo "Today's ($D) WHOOP recovery just scored (created $R). Send the fresh recovery card."
+    echo "Today's ($D) WHOOP recovery just scored (created $R) for the sleep that ended $RECOVERY_END. Send the fresh recovery card."
   fi
   exit 0
 fi
 # Newest scored main sleep (naps under 3h are ignored: a nap is tied to the previous cycle, and must
-# not stand in for today's sleep). Recovery normally lands with it, so 45 min after such a sleep
-# scored today with no recovery today means WHOOP tied the night to an older cycle and no card is coming.
-S=$(sqlite3 "$HDB" "select json_extract(raw_json,'\$.created_at') from whoop_sleep where score_state='SCORED' and json_extract(raw_json,'\$.created_at') >= '$LO' and json_extract(raw_json,'\$.created_at') < '$HI' and (coalesce(json_extract(raw_json,'\$.nap'),0)=0 or (julianday(json_extract(raw_json,'\$.end'))-julianday(json_extract(raw_json,'\$.start')))*24 >= 3) order by 1 desc limit 1")
+# not stand in for today's sleep). Recovery normally lands with it; if a sleep woke today and still
+# has no scored recovery 45 min after scoring, no card is coming.
+S=$(sqlite3 "$HDB" "select s.created_at_api from whoop_sleep s where s.score_state='SCORED' and s.end_utc >= '$LO' and s.end_utc < '$HI' and (coalesce(s.is_nap,0)=0 or (julianday(s.end_utc)-julianday(s.start_utc))*24 >= 3) and not exists (select 1 from whoop_recovery r where r.sleep_id = s.sleep_id and r.score_state='SCORED') order by s.end_utc desc limit 1")
 [[ -z $S ]] && exit 0
 AGE=$(/usr/bin/python3 -c "import datetime,os,sys,time;now=float(os.environ.get('NOW_EPOCH') or time.time());print(int(now-datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')).timestamp()))" "$S")
 (( AGE >= 2700 )) || exit 0

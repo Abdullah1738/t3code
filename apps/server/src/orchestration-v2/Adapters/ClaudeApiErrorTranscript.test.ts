@@ -3,7 +3,11 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
-import { readLastApiError } from "./ClaudeApiErrorTranscript.ts";
+import {
+  readLastApiError,
+  isNetworkApiError,
+  isTransientApiError,
+} from "./ClaudeApiErrorTranscript.ts";
 
 it.effect.each([
   { status: 401, formatted: "401 authentication_error: Invalid authentication credentials" },
@@ -11,6 +15,7 @@ it.effect.each([
   { status: 502, formatted: "502 ERR_HTTP2_STREAM_ERROR: NGHTTP2_ENHANCE_YOUR_CALM" },
   { status: undefined, formatted: "Connection dropped (ECONNRESET)" },
   { status: null, formatted: "Connection refused (ECONNREFUSED)" },
+  { message: "Request timed out.", connection: null, isNetworkDown: false, noResponse: null },
 ])("recovers the original API cause before synthetic model_not_found: $formatted", (error) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -43,8 +48,8 @@ it.effect.each([
         since: Date.parse("2026-11-08T10:00:00Z"),
       };
       const result = yield* readLastApiError(input);
-      assert.equal(result?.formatted, error.formatted);
-      assert.equal(result?.status, error.status ?? undefined);
+      assert.equal(result?.formatted, "formatted" in error ? error.formatted : error.message);
+      assert.equal(result?.status, ("status" in error ? error.status : undefined) ?? undefined);
       assert.isUndefined(
         yield* readLastApiError({ ...input, since: Date.parse("2026-11-08T11:00:00Z") }),
       );
@@ -135,3 +140,45 @@ it.effect.each([
     }),
   ).pipe(Effect.provide(NodeServices.layer)),
 );
+
+it.each([
+  ...["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ENOTFOUND"].map((connectionCode) => ({
+    formatted: "Connection failed",
+    connectionCode,
+    expected: true,
+  })),
+  { formatted: "Request timed out.", expected: true },
+  { formatted: "Connection error before any HTTP response.", expected: true },
+  { formatted: "Claude API no HTTP response: unknown.", expected: true },
+  { formatted: "upstream connection lost", expected: true },
+  { formatted: "502 fetch connect timeout", expected: true },
+  { formatted: "No response", noResponse: true, expected: true },
+  { formatted: "Network down", isNetworkDown: true, expected: true },
+  ...[400, 401, 403, 404, 429].map((status) => ({
+    status,
+    formatted: "Connection dropped (ECONNRESET)",
+    expected: false,
+  })),
+  { formatted: "authentication failed ECONNRESET", expected: false },
+  { formatted: "usage limit reached ECONNRESET", expected: false },
+  { formatted: "usage limit reached; no HTTP response", expected: false },
+  { formatted: "quota exceeded ECONNRESET", expected: false },
+  { formatted: "Unknown error", expected: false },
+])("classifies the native network cause $formatted", (input) => {
+  assert.equal(isNetworkApiError(input), input.expected);
+});
+
+it.each([false, true])("allows native upstream 404 only after a response: %s", (successful) => {
+  for (const formatted of ["HTTP 404", "404 model_not_found", "404 model not found"])
+    assert.equal(isTransientApiError({ status: 404, formatted }, successful), successful);
+  for (const status of [400, 401, 403, 413, 429])
+    assert.isFalse(isTransientApiError({ status, formatted: "HTTP error" }, successful));
+  for (const formatted of [
+    "401 authentication failed",
+    "403 forbidden",
+    "429 rate limit",
+    "usage limit reached",
+    "invalid API key",
+  ])
+    assert.isFalse(isTransientApiError({ status: 404, formatted }, successful));
+});

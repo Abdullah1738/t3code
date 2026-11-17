@@ -37,6 +37,8 @@ import {
   OrchestrationV2ProviderTurn,
   OrchestrationV2ProviderTurnJson,
   OrchestrationV2RpcSchemas,
+  OrchestrationV2RunJson,
+  OrchestrationV2CancelReason,
   OrchestrationV2ShellSnapshot,
   OrchestrationV2SubscribeThreadInput,
   OrchestrationV2Subagent,
@@ -49,6 +51,8 @@ import {
   OrchestrationV2TurnItemJson,
 } from "./orchestrationV2.ts";
 
+const encodeRunJson = Schema.encodeSync(OrchestrationV2RunJson);
+const decodeRunJson = Schema.decodeSync(OrchestrationV2RunJson);
 const now = DateTime.makeUnsafe("2026-04-20T00:00:00.000Z");
 function emptyThreadProjection() {
   return {
@@ -637,6 +641,38 @@ describe("orchestration V2 contracts", () => {
       throw new Error(`Expected run.created, received ${event.type}.`);
     }
     expect(event.payload.id).toBe(RunId.make("run-1"));
+    expect(event.payload.cancelReason).toBeUndefined();
+    const legacy = encodeRunJson(event.payload);
+    expect(decodeRunJson(legacy).cancelReason).toBeUndefined();
+    for (const phase of ["post_tool", "first_event"] as const) {
+      const run = {
+        ...event.payload,
+        delegatedTaskStallRecovery: {
+          phase,
+          lastProgressAt: DateTime.formatIso(now),
+          attemptId: RunAttemptId.make("attempt-1"),
+        },
+        delegatedTaskStall: {
+          idleTimeoutMs: 900_000,
+          lastProgressAt: now,
+          lastProgressKind: phase === "post_tool" ? "dynamic_tool_finished" : "run_started",
+          phase,
+          silentSeconds: 900,
+          lastProgressTool: "list_thread_pull_requests",
+        },
+      };
+      expect(decodeRunJson(encodeRunJson(run))).toEqual(run);
+    }
+    for (const cancelReason of OrchestrationV2CancelReason.literals) {
+      const run = {
+        ...event.payload,
+        status: "cancelled" as const,
+        cancelReason,
+        cancelDetail: "Stopped before launch.",
+      };
+      expect(decodeRunJson(encodeRunJson(run))).toEqual(run);
+    }
+    expect(() => Schema.decodeUnknownSync(OrchestrationV2CancelReason)("not_a_reason")).toThrow();
   });
 
   it("accepts a thread Stop without a client-resolved run", () => {

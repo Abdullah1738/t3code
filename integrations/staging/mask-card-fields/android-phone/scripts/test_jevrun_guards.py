@@ -53,9 +53,11 @@ class Guards(unittest.TestCase):
     def test_empty_hold_and_other_owner_yield(self):
         with tempfile.TemporaryDirectory() as tmp:
             hold = pathlib.Path(tmp) / 'priority-hold'
-            original = phonelock.HOLD
-            phonelock.HOLD = hold
-            self.addCleanup(setattr, phonelock, 'HOLD', original)
+            for name, value in [('LOCK_DIR', pathlib.Path(tmp)), ('HOLD', hold),
+                                ('LEASE', pathlib.Path(tmp)/'lease.json')]:
+                guard = patch.object(phonelock, name, value)
+                guard.start()
+                self.addCleanup(guard.stop)
             for contents, owner in [('', ''), ('someone-else', ''), ('someone-else', 'me')]:
                 hold.write_text(contents)
                 with patch.dict(os.environ, {'PHONE_HOLD_OWNER': owner}):

@@ -1,3 +1,5 @@
+import * as Scope from "effect/Scope";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
@@ -6,6 +8,7 @@ import {
   OrchestratorMcpThreadSendResult,
   ProviderInstanceId,
   ProviderInteractionMode,
+  ProviderSessionId,
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
@@ -467,4 +470,103 @@ it.effect("read-only clients retain the refusal text and carry read_only_client"
       ),
     ),
   ),
+);
+
+it.effect.each(["card_update", "card_move", "link_pull_request"] as const)(
+  "%s accepts only the current session's native wake",
+  (toolName) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessions = yield* McpProviderSessions.McpProviderSessions;
+        const threadId = ThreadId.make("thread:wake-access");
+        const caller = {
+          threadId,
+          providerSessionId: "wake-current",
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        };
+        const config = {
+          ...caller,
+          runtimeProviderSessionId: ProviderSessionId.make("runtime:wake-access"),
+          environmentId: EnvironmentId.make("test"),
+          endpoint: "http://localhost/mcp",
+          authorizationHeader: "Bearer test",
+          browserToolsAvailable: false,
+        };
+        const scope = { ...threadCaller(threadId), thread: caller };
+        let archived = false;
+        let state: McpProviderSessions.WakeCallerState = "starting";
+        const shell = () => ({
+          ...liveThreadShell(threadId, { activeRunId: null }),
+          providerInstanceId: caller.providerInstanceId,
+          archivedAt: archived ? liveThreadShell(threadId).updatedAt : null,
+        });
+        yield* sessions.set(config);
+        const tools = Toolkit.make(
+          Tool.make("card_update", probe),
+          Tool.make("card_move", probe),
+          Tool.make("link_pull_request", probe),
+        );
+        const handlers = McpToolAccess.toLayer(tools, {
+          card_update: McpToolAccess.actsAsCaller(() => ran),
+          card_move: McpToolAccess.actsAsCaller(() => ran),
+          link_pull_request: McpToolAccess.writesThreads(
+            () => [],
+            () => ran,
+          ),
+        });
+        const server = McpHttpServer.toolkitRegistration(tools, handlers).pipe(
+          Layer.provideMerge(McpServer.McpServer.layer),
+          Layer.provideMerge(
+            Layer.mock(ThreadManagement.ThreadManagementService)({
+              getCallerRow: () => Effect.sync(shell),
+              getThreadShell: () => Effect.sync(shell),
+            }),
+          ),
+        );
+        const check = (expected: string, invocation = scope) =>
+          call(toolName, invocation).pipe(
+            Effect.tap((result) => Effect.sync(() => expect(result).toBe(expected))),
+            Effect.provide(server),
+          );
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* sessions.registerWakeCaller(config, () => state);
+            yield* check("run_starting");
+            state = "live";
+            yield* check("ran");
+            yield* check("parent_not_active", {
+              ...scope,
+              thread: { ...caller, providerSessionId: "wake-stale" },
+            });
+            yield* check("parent_not_active", {
+              ...scope,
+              thread: { ...caller, providerInstanceId: ProviderInstanceId.make("codex") },
+            });
+            archived = true;
+            yield* check("parent_not_active");
+            archived = false;
+            state = "inactive";
+            yield* check("parent_not_active");
+            state = "live";
+            yield* sessions.set({ ...config, providerSessionId: "replacement" });
+            yield* check("parent_not_active");
+          }),
+        );
+        yield* sessions.set(config);
+        yield* check("parent_not_active");
+        const outerScope = yield* Effect.scope;
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* sessions.registerWakeCaller(config, () => "inactive");
+            yield* sessions
+              .registerWakeCaller(config, () => "live")
+              .pipe(Effect.provideService(Scope.Scope, outerScope));
+          }),
+        );
+        yield* check("ran");
+        yield* sessions.clear(threadId);
+        yield* sessions.set(config);
+        yield* check("parent_not_active");
+      }).pipe(Effect.provide(McpProviderSessions.layer)),
+    ),
 );

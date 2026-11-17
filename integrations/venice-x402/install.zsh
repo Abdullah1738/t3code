@@ -17,6 +17,8 @@ prefix="${here#$repo/}"
 live="${VENICE_X402_HOME:-$HOME/.local/share/venice-x402}"
 label=com.ardud.venice-x402
 plist="$HOME/Library/LaunchAgents/$label.plist"
+guard_label=com.ardud.venice-x402-guard
+guard_plist="$HOME/Library/LaunchAgents/$guard_label.plist"
 token="$HOME/.config/venice-x402/client-token"
 domain="gui/$(id -u)"
 node_bin=/Users/ardud/.nvm/versions/node/v24.22.3/bin
@@ -52,6 +54,8 @@ if [[ $mode == check ]]; then
   out="$(rsync $rs --dry-run --itemize-changes "$here/" "$live/" | grep -v '/$' || true)"
   [[ -z "$out" ]] || { print "drift (repo -> live):"; print -r -- "$out"; rc=1 }
   cmp -s "$here/launchd/$label.plist" "$plist" || { print "drift: $plist"; rc=1 }
+  cmp -s "$here/launchd/$guard_label.plist" "$guard_plist" || { print "drift: $guard_plist"; rc=1 }
+  launchctl print "$domain/$guard_label" >/dev/null 2>&1 || { print "not loaded: $guard_label"; rc=1 }
   launchctl print "$domain/$label" >/dev/null 2>&1 || { print "not loaded: $label"; rc=1 }
   (( rc == 0 )) && print "venice-x402: live matches repo"
   exit $rc
@@ -67,7 +71,7 @@ fi
 mkdir -p "$live" "$live/data" "${token:h}"
 chmod 700 "$live/data" "${token:h}"
 rsync $rs --itemize-changes "$here/" "$live/"
-chmod 755 "$live/bin/egress-check" "$live/cli.mjs"
+chmod 755 "$live/bin/egress-check" "$live/bin/venice-ensure" "$live/guard.sh" "$live/cli.mjs"
 (cd "$live" && PATH="$node_bin:$PATH" npm ci --omit=dev --no-fund --loglevel=error)
 
 if [[ ! -s "$token" ]]; then
@@ -81,4 +85,9 @@ launchctl bootout "$domain/$label" 2>/dev/null || true
 # bootout returns before the job is gone; wait, then bootstrap (retry once).
 for _ in {1..20}; do launchctl print "$domain/$label" >/dev/null 2>&1 || break; sleep 0.5; done
 launchctl bootstrap "$domain" "$plist" 2>/dev/null || { sleep 2; launchctl bootstrap "$domain" "$plist" }
+# Guard (every 60 s): re-bootstraps or kickstarts the proxy when nothing listens.
+cp "$here/launchd/$guard_label.plist" "$guard_plist"
+launchctl bootout "$domain/$guard_label" 2>/dev/null || true
+for _ in {1..20}; do launchctl print "$domain/$guard_label" >/dev/null 2>&1 || break; sleep 0.5; done
+launchctl bootstrap "$domain" "$guard_plist" 2>/dev/null || { sleep 2; launchctl bootstrap "$domain" "$guard_plist" }
 print "venice-x402: installed; LaunchAgent $label (re)loaded. Log: ~/Library/Logs/venice-x402.log"

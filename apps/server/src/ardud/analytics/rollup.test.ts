@@ -15,6 +15,54 @@ const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
 });
 
 describe("analytics rollups", () => {
+  it("sums statement work and actual process bytes without counting unavailable intervals as idle", () => {
+    const target = makeAccumulator();
+    for (const connection of ["reader", "reader", "export"])
+      accumulate(
+        target,
+        event({
+          kind: "db.statement.summary",
+          props: {
+            database: "statev2.sqlite",
+            connection,
+            lane: "background",
+            sqlFingerprint: "abc",
+            key: "SELECT:threads",
+            count: 12,
+            totalMs: 20,
+            maxMs: 5,
+            resultCount: 6,
+            failures: 1,
+          },
+        }),
+      );
+    accumulate(
+      target,
+      event({ kind: "db.process.disk_read", props: { readBytes: 1000, sampleMs: 60000 } }),
+    );
+    accumulate(
+      target,
+      event({ kind: "db.process.disk_read", props: { readBytes: 0, sampleMs: 60000 } }),
+    );
+    accumulate(target, event({ kind: "db.process.disk_read", props: { reason: "unavailable" } }));
+    const result = finishRollup(target, "2026-11-13", ts);
+    assert.deepInclude(result.dbStatementFamilies?.[0], {
+      connection: "reader",
+      calls: 24,
+      totalMs: 40,
+      maxMs: 5,
+      returnedRows: 12,
+      failures: 2,
+    });
+    assert.strictEqual(result.dbStatementFamilies?.length, 2);
+    assert.deepEqual(result.processDiskRead, {
+      readBytes: 1000,
+      sampleMs: 120000,
+      samples: 2,
+      unavailableSamples: 1,
+    });
+  });
+
   it("groups control routes by UTC hour and method, retaining statuses and deadline counts", () => {
     const target = makeAccumulator();
     const sample = (durationMs: number, status: number, hour = "12", method = "GET") =>
@@ -351,7 +399,7 @@ describe("analytics rollups", () => {
       rollup.mcpCalls.find((group) => group.build === "new")!.hour,
       "2026-11-13T13:00:00.000Z",
     );
-    assert.deepEqual(rollup.mcpOverflow, { groups: 0, retryAttempts: 0 });
+    assert.deepEqual(rollup.mcpOverflow, { groups: 0, retryAttempts: 0, detachedOutcomes: 0 });
     assert.deepEqual(finishRollup(accumulator, "2026-11-13", ts), rollup);
   });
   it("keeps deadline stages separate from dispatch and historical handler failures", () => {
@@ -873,6 +921,54 @@ it("preserves all 25 groups until overflow requires an other row", () => {
   );
 });
 
+it("retains pool configuration changes per board alongside pool snapshots beyond sample limits", () => {
+  const target = makeAccumulator();
+  for (let index = 0; index < 501; index++)
+    accumulate(
+      target,
+      event({
+        kind: "kanban.pool_change",
+        boardId: "board-a",
+        props: {
+          poolKey: "codex/sol#xhigh",
+          fromSlots: index,
+          toSlots: index + 1,
+          op: "set",
+          actorKind: "owner",
+          actorId: null,
+        },
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "kanban.pool_change",
+      boardId: "board-b",
+      props: {
+        poolKey: "codex/sol#xhigh",
+        fromSlots: 2,
+        toSlots: 0,
+        op: "auto_zero",
+        actorKind: "system",
+        actorId: null,
+      },
+    }),
+  );
+  const boards = finishRollup(target, "2026-11-13", ts).boards;
+  assert.equal(boards.find((board) => board.boardId === "board-a")!.poolChanges!.length, 501);
+  assert.deepEqual(boards.find((board) => board.boardId === "board-b")!.poolChanges, [
+    {
+      at: ts,
+      poolKey: "codex/sol#xhigh",
+      fromSlots: 2,
+      toSlots: 0,
+      op: "auto_zero",
+      actorKind: "system",
+      actorId: null,
+    },
+  ]);
+});
+
 it("groups fixed denial reasons and roles and measures each timeout phase separately", () => {
   const target = makeAccumulator();
   for (const [callerRole, denyReason] of [
@@ -1027,4 +1123,351 @@ it("#1490 counts evaluator starts by origin without treating steers and queued i
     5,
   );
   assert.deepEqual(result.errorCounts, {});
+});
+
+it("counts and bounds refusal classes and fields per tool and hour", () => {
+  const target = makeAccumulator();
+  for (let i = 0; i < 160; i++)
+    accumulate(
+      target,
+      event({
+        kind: "mcp.call",
+        tool: "card_create",
+        outcome: "error",
+        saved: false,
+        reasonClass: i % 2 === 0 ? "duplicate_title" : "missing_required",
+        invalidField: `field${i}`,
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "mcp.call",
+      tool: "wiki_read",
+      outcome: "error",
+      reasonClass: "not_found",
+      invalidField: "slug",
+    }),
+  );
+  const rows = finishRollup(target, "2026-11-13", ts).mcpCalls;
+  const write = rows.find((row) => row.tool === "card_create")!;
+  assert.deepEqual(write.reasonClasses, { duplicate_title: 80, missing_required: 80 });
+  assert.equal(Object.keys(write.invalidFields).length, 129);
+  assert.equal(
+    Object.values(write.invalidFields).reduce((sum, count) => sum + count, 0),
+    160,
+  );
+  assert.deepEqual(write.savedCounts, { false: 160 });
+  const read = rows.find((row) => row.tool === "wiki_read")!;
+  assert.deepEqual(read.reasonClasses, { not_found: 1 });
+  assert.deepEqual(read.invalidFields, { slug: 1 });
+  assert.deepEqual(read.savedCounts, { "n/a": 1 });
+});
+const timeoutCall = (input: Partial<AnalyticsEvent> = {}) =>
+  event({
+    kind: "mcp.call",
+    route: "mcp",
+    tool: "delegate_task",
+    outcome: "timeout",
+    errorPhase: "dispatch",
+    clientRequestId: "a".repeat(64),
+    callerThreadId: "caller",
+    build: "test",
+    bootId: "boot",
+    durationMs: 10000,
+    ...input,
+  });
+const detachedResult = (input: Partial<AnalyticsEvent> = {}) =>
+  timeoutCall({
+    ts: "2026-11-13T12:00:15.000Z",
+    kind: "mcp.detached",
+    outcome: "committed",
+    startedAt: ts,
+    lateMs: 5000,
+    ...input,
+  });
+const finishDetached = (events: AnalyticsEvent[]) => {
+  const target = makeAccumulator();
+  for (const event of events) accumulate(target, event);
+  return finishRollup(target, "2026-11-13", ts);
+};
+
+it("splits dispatch timeouts into matched outcomes and missing results", () => {
+  const rows = finishDetached([
+    timeoutCall(),
+    timeoutCall({ clientRequestId: "b".repeat(64) }),
+    detachedResult(),
+  ]).mcpCalls;
+  assert.deepEqual(rows[0]!.dispatchTimeouts, { committed: 1, failed: 0, capped: 0, noOutcome: 1 });
+});
+
+it.each([false, true])(
+  "matches overlapping same-id retries once, independent of emission order (reversed=%s)",
+  (reverse) => {
+    const events = [
+      timeoutCall(),
+      timeoutCall({ ts: "2026-11-13T12:00:20.000Z" }),
+      timeoutCall({ ts: "2026-11-13T12:00:40.000Z" }),
+      timeoutCall({ ts: "2026-11-13T12:00:50.000Z", outcome: "ok" }),
+      detachedResult({ startedAt: "2026-11-13T12:00:20.000Z", ts: "2026-11-13T12:01:00.000Z" }),
+    ];
+    const target = makeAccumulator();
+    for (const event of reverse ? events.toReversed() : events) accumulate(target, event);
+    const rollup = finishRollup(target, "2026-11-13", ts);
+    assert.deepEqual(rollup.mcpCalls[0]!.dispatchTimeouts, {
+      committed: 1,
+      failed: 0,
+      capped: 0,
+      noOutcome: 2,
+    });
+    assert.deepEqual(finishRollup(target, "2026-11-13", ts), rollup);
+  },
+);
+
+it.each(["committed", "failed", "capped"] as const)(
+  "counts %s once, including an after-cap settlement",
+  (outcome) => {
+    const rows = [timeoutCall(), detachedResult({ outcome: "capped" })];
+    if (outcome !== "capped")
+      rows.push(detachedResult({ outcome, ts: "2026-11-13T12:02:10.000Z", afterCap: true }));
+    const counts = { committed: 0, failed: 0, capped: 0, noOutcome: 0, [outcome]: 1 };
+    assert.deepEqual(finishDetached(rows.toReversed()).mcpCalls[0]!.dispatchTimeouts, counts);
+    if (outcome !== "capped")
+      assert.deepEqual(finishDetached([rows[0]!, rows[2]!]).mcpCalls[0]!.dispatchTimeouts, counts);
+  },
+);
+
+it.each([
+  { tool: "other" },
+  { clientRequestId: "b".repeat(64) },
+  { bootId: "other" },
+  { ts: "2026-11-14T00:00:01.000Z" },
+  { startedAt: "2026-11-13T12:00:01.000Z" },
+])("does not cross correlation boundaries: %j", (boundary) => {
+  assert.deepEqual(
+    finishDetached([timeoutCall(), detachedResult(boundary)]).mcpCalls[0]!.dispatchTimeouts,
+    { committed: 0, failed: 0, capped: 0, noOutcome: 1 },
+  );
+});
+
+it("attributes a late result to the call's original UTC hour", () => {
+  const call = timeoutCall({ ts: "2026-11-13T12:59:55.000Z" });
+  const result = detachedResult({ ts: "2026-11-13T13:00:15.000Z", startedAt: call.ts });
+  const row = finishDetached([result, call]).mcpCalls[0]!;
+  assert.equal(row.hour, "2026-11-13T12:00:00.000Z");
+  assert.equal(row.dispatchTimeouts!.committed, 1);
+});
+
+it("keeps unkeyed timeouts and bounds detached observations without counting one call twice", () => {
+  const target = makeAccumulator();
+  accumulate(target, timeoutCall());
+  const { clientRequestId: _requestId, ...unkeyed } = timeoutCall();
+  accumulate(target, unkeyed);
+  for (let index = 0; index < 100001; index++) accumulate(target, detachedResult());
+  const result = finishRollup(target, "2026-11-13", ts);
+  assert.deepEqual(result.mcpCalls[0]!.dispatchTimeouts, {
+    committed: 1,
+    failed: 0,
+    capped: 0,
+    noOutcome: 1,
+  });
+  assert.equal(result.mcpOverflow.detachedOutcomes, 1);
+  assert.equal(target.detachedOutcomes, 100000);
+});
+
+it.each(["failed", "noOutcome"] as const)(
+  "keeps a never-saved first dispatch %s when only its same-id retry commits (#1559 watcher sighting)",
+  (firstOutcome) => {
+    const first = timeoutCall({ ts: "2026-11-13T12:59:40.000Z" });
+    const retry = timeoutCall({ ts: "2026-11-13T13:00:05.000Z" });
+    const retryResult = detachedResult({ startedAt: retry.ts, ts: "2026-11-13T13:00:20.000Z" });
+    const events = [retryResult, retry, first];
+    if (firstOutcome === "failed")
+      events.push(
+        detachedResult({
+          startedAt: first.ts,
+          ts: "2026-11-13T12:59:51.000Z",
+          outcome: "failed",
+          props: { cause: "unknown" },
+        }),
+      );
+    const rows = finishDetached(events).mcpCalls;
+    assert.deepEqual(rows[0]!.dispatchTimeouts, {
+      committed: 0,
+      failed: firstOutcome === "failed" ? 1 : 0,
+      capped: 0,
+      noOutcome: firstOutcome === "noOutcome" ? 1 : 0,
+    });
+    assert.deepEqual(rows[1]!.dispatchTimeouts, {
+      committed: 1,
+      failed: 0,
+      capped: 0,
+      noOutcome: 0,
+    });
+  },
+);
+
+it("keeps runtime, restart-admission and Git rate rollups within the combined day budget", () => {
+  const accumulator = makeAccumulator();
+  for (let minute = 0; minute < 1440; minute++) {
+    accumulate(accumulator, {
+      ts: `2026-11-13T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`,
+      kind: "server.runtime_sample",
+      surface: "server",
+      route: "server",
+      props: {
+        runningTurns: { total: minute % 60, byProvider: {}, byModel: {} },
+        ...(minute % 2 === 0 ? { queuedRuns: minute % 60 } : {}),
+        host: { load1: (minute % 60) * 2, load5: 1, load15: 1, rssMiB: 10, heapUsedMiB: 5 },
+        sampleMs: (minute % 60) / 100,
+      },
+    });
+  }
+  for (let minute = 0; minute < 1440; minute++) {
+    const at = `2026-11-13T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`;
+    accumulate(
+      accumulator,
+      event({
+        ts: at,
+        kind: "vcs.git_exec_rate",
+        props: {
+          total: 120,
+          distinctCwds: 20,
+          maxPerSecond: 10,
+          windowMs: 60_000,
+          overflow: 0,
+          top: Array.from({ length: 20 }, (_, index) => ({
+            operation: `GitManager.op${index}`,
+            subcommand: "status",
+            cwdHash: index.toString(16).padStart(16, "0"),
+            count: 6,
+          })),
+        },
+      }),
+    );
+    accumulate(
+      accumulator,
+      event({
+        ts: at,
+        kind: "restart.admission.admitted",
+        bootId: "boot-one",
+        restartAdmission: {
+          sourceRunId: `source-${minute}`,
+          classification: "continuation",
+          queuedAtMs: 0,
+          waitedMs: minute,
+          positionAtEntry: 12,
+          position: 1,
+          total: 7,
+          maxQueueDepth: 20,
+          active: 1,
+          maxActive: 4,
+          loaded: true,
+        },
+      }),
+    );
+  }
+  const rollup = finishRollup(accumulator, "2026-11-13", "2026-11-14T00:00:00.000Z");
+  assert.equal(rollup.runtimeSamples!.length, 24);
+  assert.deepEqual(rollup.runtimeSamples![0], {
+    hour: "00",
+    samples: 60,
+    runningTurnsMax: 59,
+    runningTurnsAvg: 29.5,
+    queuedRunsMax: 58,
+    load1Max: 118,
+    sampleMsMax: 0.59,
+  });
+  assert.equal(rollup.total, 4320);
+  assert.equal(rollup.kindCounts["vcs.git_exec_rate"], 1440);
+  assert.equal(rollup.kindCounts["restart.admission.admitted"], 1440);
+  assert.equal(rollup.restartAdmission!.groups.length, 24);
+  assert.equal(rollup.restartAdmission!.groups[0]!.admissions, 60);
+  assert.isBelow(JSON.stringify(rollup).length, 50_000);
+});
+
+it("does not turn an unavailable queue count into zero", () => {
+  const accumulator = makeAccumulator();
+  accumulate(accumulator, {
+    ts: "2026-11-13T12:00:00.000Z",
+    kind: "server.runtime_sample",
+    surface: "server",
+    route: "server",
+    props: {
+      runningTurns: { total: 0, byProvider: {}, byModel: {} },
+      host: { load1: 0, load5: 0, load15: 0, rssMiB: 1, heapUsedMiB: 1 },
+      sampleMs: 0.1,
+    },
+  });
+  assert.equal(
+    finishRollup(accumulator, "2026-11-13", "2026-11-14T00:00:00.000Z").runtimeSamples![0]!
+      .queuedRunsMax,
+    null,
+  );
+});
+
+describe("restart admission rollup", () => {
+  const admission = (waitedMs: number, input: Partial<AnalyticsEvent> = {}): AnalyticsEvent =>
+    event({
+      kind: "restart.admission.admitted",
+      bootId: "boot-one",
+      restartAdmission: {
+        sourceRunId: "source-" + waitedMs,
+        classification: "continuation",
+        queuedAtMs: 0,
+        waitedMs,
+        positionAtEntry: 12,
+        position: 1,
+        total: 7,
+        maxQueueDepth: 20,
+        active: 1,
+        maxActive: 4,
+        loaded: true,
+      },
+      ...input,
+    });
+  it("reports waits, depth, active reservations and each bound rule by boot/hour", () => {
+    const target = makeAccumulator();
+    for (const waitedMs of [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000])
+      accumulate(target, admission(waitedMs));
+    for (const rule of ["no_progress", "no_progress", "absolute_backstop", "wall_time"] as const)
+      accumulate(
+        target,
+        admission(1800000, {
+          kind: "restart.admission.failed",
+          restartAdmission: {
+            ...admission(0).restartAdmission!,
+            rule,
+            waitedMs: 1800000,
+            maxQueueDepth: 34,
+            active: 2,
+          },
+        }),
+      );
+    accumulate(target, admission(50, { bootId: "boot-two" }));
+    accumulate(target, admission(80, { ts: "2026-11-13T13:00:00.000Z" }));
+    const result = finishRollup(target, "2026-11-13", ts).restartAdmission!;
+    assert.strictEqual(result.scope, "server-wide");
+    assert.strictEqual(result.loadedTimeShare, null);
+    assert.strictEqual(result.groups.length, 3);
+    assert.deepEqual(result.groups[0], {
+      bootId: "boot-one",
+      hour: "2026-11-13T12Z",
+      admissions: 10,
+      maxQueueDepth: 34,
+      maxActiveObserved: 2,
+      maxActive: 4,
+      observations: 14,
+      loadedObservations: 14,
+      failuresByRule: { no_progress: 2, absolute_backstop: 1, wall_time: 1 },
+      wait: { count: 10, p50Ms: 500, p90Ms: 900, maxMs: 1000, approximate: false },
+    });
+  });
+  it("bounds boot/hour groups and exposes overflow", () => {
+    const target = makeAccumulator();
+    for (let i = 0; i < 140; i++) accumulate(target, admission(i, { bootId: "boot-" + i }));
+    const result = finishRollup(target, "2026-11-13", ts).restartAdmission!;
+    assert.strictEqual(result.groups.length, 128);
+    assert.strictEqual(result.overflow, 12);
+  });
 });

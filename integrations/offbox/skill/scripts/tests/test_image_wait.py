@@ -1,6 +1,7 @@
 """Exercise the actual image-wait preamble with hung tools, without Docker or root."""
 import os
 import contextlib
+import datetime as dt
 import io
 import json
 from pathlib import Path
@@ -15,7 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tests._env import clean_env
-from offbox_lib import cli, runs
+from offbox_lib import cli, common, runs
 from test_capacity import Isolated
 
 
@@ -203,7 +204,7 @@ class ImageWaitTests(unittest.TestCase):
             fx.tool('docker', '#!/bin/bash\necho docker >> "$CALLS"\nexit 1\n')
             fx.tool('systemctl', '#!/bin/bash\necho systemctl >> "$CALLS"\nexit 0\n')
             fx.env['HOME'] = d
-            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
+            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), \
                  patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('missing-dir', '.', ['echo USER_COMMAND'], None, 'r', wait_images=True)
             script = script.replace(runs.IMAGE_WAIT, fx.script())
@@ -465,12 +466,20 @@ class RunnerImageSelectionTests(Isolated):
                  (['--', 'make', 'check'], True, False), (['--', 'go', 'vet', './pkg'], True, False),
                  (['--', 'docker', 'ps'], True, True),
                  (['--step', 'true', '--step', 'echo ' + 'x' * 4000 + '; docker ps'], True, True)]
+        # The first and last draws share their low 16 bits: a two-byte suffix collides in this second.
+        draws = iter((0x1111c75c, 0x22221111, 0x33332222, 0x44443333, 0x55554444, 0x6666c75c))
+        def random_bytes(width):
+            return (next(draws) & ((1 << (8 * width)) - 1)).to_bytes(width, 'big')
+        fixed = dt.datetime(2026, 11, 16, 10, 55, 55, tzinfo=common.TZ)
         with contextlib.redirect_stderr(io.StringIO()), \
+             patch.object(common.dt, 'datetime', wraps=dt.datetime) as clock, \
+             patch.object(common.secrets, 'token_bytes', side_effect=random_bytes), \
              patch.object(runs.pool, 'acquire', return_value=row), \
              patch.object(runs.Runner, '_prepare_box', return_value=None), \
              patch.object(runs, '_ttl_keeper'), \
              patch.object(runs.api, 'cmd_start', return_value={'processId': 7}), \
              patch.object(runs.lease, 'touch'), patch.object(runs.node_version, 'want', return_value=None):
+            clock.now.return_value = fixed
             for argv, expected, docker_used in cases:
                 with self.subTest(argv=argv[0:3]):
                     args = cli.build_parser().parse_args(['run', *argv])

@@ -101,6 +101,8 @@ export function runSummary(run: OrchestrationV2Run) {
     runId: run.id,
     ordinal: run.ordinal,
     status: run.status,
+    cancelReason: run.cancelReason,
+    cancelDetail: run.cancelDetail,
     model: formatModel(run.modelSelection),
     requestedAt: iso(run.requestedAt),
     startedAt: iso(run.startedAt),

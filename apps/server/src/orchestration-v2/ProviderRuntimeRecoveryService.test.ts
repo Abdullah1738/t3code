@@ -269,7 +269,11 @@ it.effect("awaits the stale OpenCode abort before committing startup recovery", 
     assert.equal(commits.length, 1);
     assert.isTrue(
       commits[0]!.events.some(
-        (event) => event.type === "run.updated" && event.payload.status === "cancelled",
+        (event) =>
+          event.type === "run.updated" &&
+          event.payload.status === "cancelled" &&
+          event.payload.cancelReason === "server_restart" &&
+          event.payload.cancelDetail?.includes("server restarted") === true,
       ),
     );
     assert.deepEqual(
@@ -334,7 +338,14 @@ it.effect("does not abort stale OpenCode sessions during shutdown", () =>
     assert.equal(summary.terminalizedRuns, 1);
     assert.equal(summary.staleOpenCodeAborted, 0);
     assert.equal(summary.staleOpenCodeAbortFailed, 0);
-    assert.isTrue(commits[0]!.events.some((event) => event.type === "run.updated"));
+    assert.isTrue(
+      commits[0]!.events.some(
+        (event) =>
+          event.type === "run.updated" &&
+          event.payload.cancelReason === "server_shutdown" &&
+          event.payload.cancelDetail?.includes("server shut down") === true,
+      ),
+    );
   }),
 );
 

@@ -362,3 +362,140 @@ describe("analytics read budget", () => {
     expect(last.hasMore).toBe(false);
   });
 });
+
+it("pages dispatch outcome counts under the existing reply budget", () => {
+  const rollup = finish(largeEvents);
+  const withOutcomes = {
+    ...rollup,
+    mcpCalls: rollup.mcpCalls.map((row) => ({
+      ...row,
+      dispatchTimeouts: { committed: 12, failed: 3, capped: 2, noOutcome: 1 },
+    })),
+  };
+  const pager = makeReadPager();
+  const input = { day, section: "mcpCalls", limit: 7 } as const;
+  let page = pager.read(input, withOutcomes, []);
+  const rows = [...page.rows!];
+  check(page);
+  while (page.hasMore) {
+    page = pager.resume({ ...input, cursor: page.cursor! })!;
+    check(page);
+    rows.push(...page.rows!);
+  }
+  expect(restore(rows)).toEqual(withOutcomes.mcpCalls);
+});
+
+it("pages the server-wide restartAdmission section with its schema and exact waits", () => {
+  const rows: AnalyticsEvent[] = [100, 200, 300].map((waitedMs) =>
+    event({
+      kind: "restart.admission.admitted",
+      bootId: "boot-one",
+      restartAdmission: {
+        sourceRunId: "source-" + waitedMs,
+        classification: "continuation",
+        queuedAtMs: 0,
+        waitedMs,
+        positionAtEntry: 12,
+        position: 1,
+        total: 7,
+        maxQueueDepth: 20,
+        active: 1,
+        maxActive: 4,
+        loaded: true,
+      },
+    }),
+  );
+  const result = makeReadPager().read({ day, section: "restartAdmission" }, finish(rows), rows);
+  check(result);
+  expect(restore(result.rows!)).toEqual(finish(rows).restartAdmission);
+  expect(finish(rows).restartAdmission?.groups[0]?.wait).toEqual({
+    count: 3,
+    p50Ms: 200,
+    p90Ms: 300,
+    maxMs: 300,
+    approximate: false,
+  });
+});
+
+it("keeps combined runtime, restart-admission and Git rate reads inside the cap", () => {
+  const events: AnalyticsEvent[] = [];
+  for (let minute = 0; minute < 1440; minute++) {
+    const ts = `${day}T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`;
+    events.push(
+      event({
+        ts,
+        kind: "server.runtime_sample",
+        props: {
+          runningTurns: { total: 350, byProvider: { codex: 350 }, byModel: { sol: 350, other: 0 } },
+          runningByOrigin: {
+            boardWork: 50,
+            boardReview: 50,
+            boardEvaluator: 50,
+            delegatedChild: 50,
+            scheduledTask: 0,
+            other: 150,
+          },
+          providerSessions: { codex: 1 },
+          host: { load1: 60, load5: 50, load15: 40, rssMiB: 2000, heapUsedMiB: 1500 },
+          sampleMs: 0.25,
+        },
+      }),
+      event({
+        ts,
+        kind: "vcs.git_exec_rate",
+        props: {
+          total: 120,
+          distinctCwds: 20,
+          maxPerSecond: 10,
+          windowMs: 60_000,
+          overflow: 0,
+          top: Array.from({ length: 20 }, (_, index) => ({
+            operation: `GitManager.op${index}`,
+            subcommand: "status",
+            cwdHash: index.toString(16).padStart(16, "0"),
+            count: 6,
+          })),
+        },
+      }),
+      event({
+        ts,
+        kind: "restart.admission.admitted",
+        bootId: `boot-${minute % 6}`,
+        restartAdmission: {
+          sourceRunId: `source-${minute}`,
+          classification: "continuation",
+          queuedAtMs: 0,
+          waitedMs: minute,
+          positionAtEntry: 12,
+          position: 1,
+          total: 7,
+          maxQueueDepth: 20,
+          active: 1,
+          maxActive: 4,
+          loaded: true,
+        },
+      }),
+    );
+  }
+  const rollup = finish(events);
+  expect(rollup.runtimeSamples).toHaveLength(24);
+  expect(rollup.restartAdmission!.groups).toHaveLength(128);
+  expect(rollup.restartAdmission!.overflow).toBeGreaterThan(0);
+  expect(rollup.kindCounts["vcs.git_exec_rate"]).toBe(1440);
+  const pager = makeReadPager();
+  check(pager.read({ day }, rollup, events));
+  for (const section of ["runtimeSamples", "restartAdmission", "samples"] as const) {
+    let result = pager.read({ day, section, limit: 500 }, rollup, events);
+    check(result);
+    const rows = [...result.rows!];
+    let pages = 1;
+    while (result.hasMore) {
+      result = pager.resume({ day, section, limit: 500, cursor: result.cursor! })!;
+      check(result);
+      rows.push(...result.rows!);
+      expect(++pages).toBeLessThan(200);
+    }
+    expect(restore(rows)).toEqual(section === "samples" ? events : rollup[section]);
+    expect(rows.some((row) => row.truncated)).toBe(false);
+  }
+});

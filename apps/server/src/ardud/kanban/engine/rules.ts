@@ -18,6 +18,9 @@ import {
   kanbanWaiting,
   kanbanWaitStale,
   kanbanWaitsOnEvaluator,
+  kanbanStepSubtasks,
+  kanbanWaitExpired,
+  type KanbanOwnerAsk,
   kanbanReviewAlreadyDone,
   type KanbanBoard,
   type KanbanCard,
@@ -29,8 +32,10 @@ import {
   type KanbanStage,
   type ModelSelection,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
-import { heldForRetry } from "./retries.ts";
+import { releaseWindow } from "./subtasks.ts";
+import { heldForRetry, NO_VERDICT_REASON, REFUSED_VERDICT_PREFIX } from "./retries.ts";
 
 /**
  * Who is asking for a move. `cardThread` is the card's own work or review thread.
@@ -224,6 +229,83 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
+export const IDLE_EVALUATOR_HOURS = 6;
+
+export const isNotice = (ask: Pick<KanbanOwnerAsk, "kind">) => ask.kind === "notice";
+
+export type IdleEvaluatorBoard = Pick<KanbanBoard, "id" | "standingApprovals" | "releaseLedger"> & {
+  readonly nextReleaseWindowAt?: string | null;
+  readonly nextReleaseWindowByService?: Readonly<Record<string, string>>;
+};
+
+export const idleEvaluatorStall = (
+  card: KanbanCard & { readonly lastEventAt?: string },
+  nowMs: number,
+  board: IdleEvaluatorBoard,
+): {
+  step: number;
+  openEvaluatorSubtasks: string[];
+  idleSinceAt: string;
+  reason: string;
+} | null => {
+  if (
+    card.settledAt !== null ||
+    (card.stage !== "completed" && card.stage !== "deployed") ||
+    card.stalled !== null ||
+    (kanbanWaiting(card) &&
+      card.wait !== undefined &&
+      !kanbanWaitExpired(card.wait, nowMs) &&
+      !(
+        card.wait.on === "time" &&
+        card.wait.until !== null &&
+        Date.parse(card.wait.until) <= nowMs
+      )) ||
+    card.asks.some((ask) => ask.closedAt === null && ask.to !== "evaluator" && !isNotice(ask)) ||
+    !kanbanWaitsOnEvaluator({ ...card, stage: "todo" })
+  )
+    return null;
+  const open = kanbanStepSubtasks(card);
+  if (open.length === 0 || open.some((subtask) => subtask.owner !== "evaluator")) return null;
+  const localWindow = releaseWindow({
+    approvals: board.standingApprovals,
+    ledger: board.releaseLedger ?? [],
+    boardId: board.id,
+    at: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
+  });
+  if (
+    open.some((subtask) => {
+      if (!subtask.interrupting) return false;
+      const next =
+        subtask.service === undefined
+          ? (board.nextReleaseWindowAt ?? localWindow?.next)
+          : (board.nextReleaseWindowByService?.[subtask.service] ??
+            releaseWindow(
+              {
+                approvals: board.standingApprovals,
+                ledger: board.releaseLedger ?? [],
+                boardId: board.id,
+                at: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
+              },
+              subtask.service,
+            )?.next);
+      return next !== undefined && next !== null && Date.parse(next) > nowMs;
+    })
+  ) {
+    // An interrupting release legitimately parks the step until its pacing window opens.
+    return null;
+  }
+  // Callers supply the latest stored event, including events outside the activity window.
+  const idleSinceAt = card.lastEventAt ?? card.updatedAt;
+  if (!(nowMs - Date.parse(idleSinceAt) >= IDLE_EVALUATOR_HOURS * 60 * 60_000)) return null;
+  const ids = open.map((subtask) => subtask.id);
+  return {
+    step: open[0]!.step,
+    openEvaluatorSubtasks: ids,
+    idleSinceAt,
+    reason: `Idle evaluator step ${ids.join(", ")}`,
+  };
+};
+
 const REVIEW_EVALUATOR_WAKE_MS = 6 * 60 * 60_000;
 
 /** All remaining steps, including later ones, must belong to the evaluator or scripts. */
@@ -324,7 +406,7 @@ export function workerHandoffNudged(
       Date.parse(event.at) >= since &&
       (event.body === WORKER_NUDGE_EVENT ||
         event.body === "Interrupted: stuck on its own question" ||
-        event.body?.startsWith("No activity for ")),
+        isSilentRunStop(event.body)),
   );
   return latest === undefined || latest.body === WORKER_NUDGE_EVENT;
 }
@@ -339,6 +421,16 @@ export function workerWorkDone(card: KanbanCard): boolean {
 }
 
 export const RUN_SILENT_MS = 30 * 60 * 1000;
+export const RUN_OPEN_TOOL_MAX_MS = (4 * 60 + 15) * 60 * 1000;
+
+export const isSilentRunStop = (body: string | null | undefined): boolean =>
+  body?.startsWith("No activity for ") === true || body?.startsWith("Tool call open ") === true;
+
+export const openToolHoldsRun = (
+  view: { readonly openToolSince?: string | null },
+  nowMs: number,
+): boolean =>
+  view.openToolSince != null && nowMs - Date.parse(view.openToolSince) < RUN_OPEN_TOOL_MAX_MS;
 
 export function runSilentDue(
   card: KanbanCard,
@@ -346,6 +438,7 @@ export function runSilentDue(
     readonly state: string;
     readonly lastActivityAt: string | null;
     readonly backgroundWork: number;
+    readonly openToolSince?: string | null;
   },
   nowMs: number,
 ): boolean {
@@ -359,6 +452,7 @@ export function runSilentDue(
     card.stalled !== null ||
     view.state !== "running" ||
     view.backgroundWork !== 0 ||
+    openToolHoldsRun(view, nowMs) ||
     view.lastActivityAt === null
   )
     return false;
@@ -443,13 +537,18 @@ export function waitingOnBackground(
     readonly state: string;
     readonly quietSince: string;
     readonly backgroundWork: number;
+    readonly backgroundWorkUntil?: string;
     readonly prWatches: number;
   },
   nowMs: number,
 ): boolean {
   return (
     view.state === "idle" &&
-    ((view.backgroundWork > 0 && nowMs - Date.parse(view.quietSince) < BACKGROUND_GRACE_MS) ||
+    ((view.backgroundWork > 0 &&
+      nowMs <
+        (view.backgroundWorkUntil === undefined
+          ? Date.parse(view.quietSince) + BACKGROUND_GRACE_MS
+          : Date.parse(view.backgroundWorkUntil))) ||
       // Reviewers never hold PR watches, so this shared guard needs no role check.
       (view.prWatches > 0 && nowMs - Date.parse(view.quietSince) < PR_WATCH_GRACE_MS))
   );
@@ -481,7 +580,7 @@ export function reviewerQuietDue(
 // A response-header timeout is the provider not answering, so it waits for the
 // probe like an outage instead of flagging the card as a broken run.
 const OUTAGE_TEXT =
-  /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired|timed out waiting for response headers/i;
+  /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired|timed out waiting for response headers|model unavailable/i;
 
 /**
  * A failed run the same request would pass once the provider is back. The normalized
@@ -673,8 +772,133 @@ export interface AssignmentWakeRetry {
   readonly retryAt: number;
 }
 
+export type QueueReason =
+  | "archived"
+  | "setup_running"
+  | "paused"
+  | "backlog"
+  | "blocked"
+  | "evaluator_step"
+  | "deciding"
+  | "retry_backoff"
+  | "review_done"
+  | "has_thread"
+  | "attempted"
+  | "pool_full"
+  | "would_start"
+  | "no_pool"
+  | "joins_thread"
+  | "batch_full"
+  | `wait:${string}`
+  | `stalled:${string}`;
+
+type QueueEntry = { readonly card: KanbanCard; readonly role: "work" | "review" };
+export interface QueuedCard {
+  readonly card: number;
+  readonly stage: KanbanCard["stage"];
+  readonly role: "work" | "review";
+  readonly hours: number;
+  readonly reason: QueueReason;
+  readonly blockedBy?: ReadonlyArray<number>;
+  readonly pool?: string;
+  readonly slots?: number;
+  readonly rank?: number;
+  readonly ahead?: { readonly count: number; readonly items: ReadonlyArray<number> };
+  /** A held reservation may outlive its card's active link. */
+  readonly held?: ReadonlyArray<{ readonly card: number | null; readonly role: "work" | "review" }>;
+}
+
+/** Eligibility and pick order shared by dispatch and current-state activity reads. */
+export function dispatchQueue(
+  board: KanbanBoard,
+  cards: ReadonlyArray<KanbanCard>,
+  nowMs = kanbanBoardClock(cards),
+  attempted: ReadonlySet<string> = new Set(),
+  reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
+  assignmentWakeRetries: ReadonlyMap<string, AssignmentWakeRetry> = new Map(),
+) {
+  const kept = board.pause ? new Set<string>(board.pause.keep) : null;
+  const byId = new Map(cards.map((card) => [card.id as string, card]));
+  const queue: Array<QueueEntry> = [];
+  const ineligible: Array<QueuedCard> = [];
+  for (const card of cards) {
+    if (card.settledAt !== null || (card.stage !== "todo" && card.stage !== "needs_review"))
+      continue;
+    const role = card.stage === "todo" ? "work" : "review";
+    const retry = assignmentWakeRetries.get(card.id);
+    const reason = (): QueueReason | undefined => {
+      if (board.setup?.status === "running") return "setup_running";
+      if (attempted.has(card.id)) return "attempted";
+      if (retry?.movedAt === card.movedAt && nowMs < retry.retryAt) return "retry_backoff";
+      if (kept !== null && !kept.has(card.id)) return "paused";
+      if (card.activeThreadId !== null) return "has_thread";
+      if (card.stalled !== null) {
+        const { reason, by } = card.stalled;
+        const kind =
+          reason.startsWith("Run failed") || (by._tag === "system" && reason === NO_VERDICT_REASON)
+            ? "run_failed"
+            : by._tag === "system" && reason.startsWith(REFUSED_VERDICT_PREFIX)
+              ? "verdict_refused"
+              : "flagged";
+        return `stalled:${kind}`;
+      }
+      if (card.priority === KANBAN_BACKLOG) return "backlog";
+      if (heldForRetry(card, nowMs)) return "retry_backoff";
+      if (kanbanWaitsOnEvaluator(card)) return "evaluator_step";
+      if (kanbanReviewAlreadyDone(card, reviews.get(card.id))) return "review_done";
+      if (kanbanWaiting(card)) return `wait:${card.wait!.on}`;
+      if (kanbanDeciding(card, nowMs)) return "deciding";
+      if (role === "work" && isBlocked(card, byId)) return "blocked";
+      return undefined;
+    };
+    const excluded = reason();
+    if (excluded === undefined) queue.push({ card, role });
+    else
+      ineligible.push({
+        ...queuedCard(card, role, nowMs),
+        reason: excluded,
+        ...(excluded === "blocked" ? { blockedBy: blockingNumbers(card, byId) } : {}),
+      });
+  }
+  const ranking = kanbanSchedule(cards, { nowMs });
+  const pickOrder = kanbanPickOrder(cards, { nowMs });
+  const priority = ({ card }: QueueEntry) => ranking.get(card.id)?.rank ?? card.priority;
+  // Reviews and their follow-up work must drain before new work. Thread ids
+  // alone also name first-run retries, which keep their ordinary work ranking.
+  const newWork = ({ card, role }: QueueEntry) =>
+    Number(role === "work" && card.reviewRound === 0 && card.reviewThreadId === null);
+  queue.sort(
+    (a, b) =>
+      newWork(a) - newWork(b) ||
+      priority(a) - priority(b) ||
+      (a.role !== b.role ? (a.role === "review" ? -1 : 1) : pickOrder(a.card, b.card)),
+  );
+  return { queue, ineligible };
+}
+
+const queuedCard = (card: KanbanCard, role: "work" | "review", nowMs: number) => ({
+  card: card.number,
+  stage: card.stage,
+  role,
+  hours:
+    Math.round(
+      Math.max(0, nowMs - Date.parse(card.analyticsStageEnteredAt ?? card.movedAt)) / 36_000,
+    ) / 100,
+});
+
+const blockingNumbers = (
+  card: KanbanCard,
+  byId: ReadonlyMap<string, KanbanCard>,
+  thread = card.workThreadId,
+) =>
+  card.blockedBy.flatMap((id) => {
+    const blocker = byId.get(id);
+    return blocker && isBlocked({ ...card, blockedBy: [id] }, byId, thread) ? [blocker.number] : [];
+  });
+
 /**
- * Fill free pool slots by effective urgency, reviews before todos at the same rank.
+ * Fill free pool slots with reviews and their follow-up work before other todos.
+ * Reviews and follow-up work compete by effective urgency, reviews winning a tie.
  * Within each role, pick order uses rank, holds, then oldest first.
  * Skip blocked, settled and backlog cards. Lowering a pool below what is
  * running frees nothing; it only stops new starts, and a pool at 0 takes no
@@ -704,8 +928,77 @@ export function planDispatch(
   workThreadHomes: ReadonlyMap<string, KanbanCard | null> = new Map(),
   assignmentWakeRetries: ReadonlyMap<string, AssignmentWakeRetry> = new Map(),
 ): ReadonlyArray<Dispatch> {
+  return allocateDispatch(
+    board,
+    cards,
+    pools,
+    holds,
+    pick,
+    nowMs,
+    attempted,
+    reviews,
+    workThreadHomes,
+    assignmentWakeRetries,
+    false,
+  ).plan;
+}
+
+/** Deterministic slot simulation; ties use model order, with the same free-pool fallback as dispatch. */
+export function dispatchQueueStatus(
+  board: KanbanBoard,
+  cards: ReadonlyArray<KanbanCard>,
+  pools: ReadonlyArray<KanbanPool>,
+  holds: ReadonlyMap<string, string> = new Map(),
+  nowMs?: number,
+  reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
+  workThreadHomes: ReadonlyMap<string, KanbanCard | null> = new Map(),
+  assignmentWakeRetries: ReadonlyMap<string, AssignmentWakeRetry> = new Map(),
+  attempted: ReadonlySet<string> = new Set(),
+): ReadonlyArray<QueuedCard> {
+  // Archiving is gated outside planDispatch; leave its legacy planning behavior intact.
+  if (board.archivedAt !== null) {
+    const clock = nowMs ?? kanbanBoardClock(cards);
+    return cards.flatMap((card) =>
+      card.settledAt === null && (card.stage === "todo" || card.stage === "needs_review")
+        ? [
+            {
+              ...queuedCard(card, card.stage === "todo" ? "work" : "review", clock),
+              reason: "archived" as const,
+            },
+          ]
+        : [],
+    );
+  }
+  return allocateDispatch(
+    board,
+    cards,
+    pools,
+    holds,
+    () => 0,
+    nowMs,
+    attempted,
+    reviews,
+    workThreadHomes,
+    assignmentWakeRetries,
+    true,
+  ).items;
+}
+
+function allocateDispatch(
+  board: KanbanBoard,
+  cards: ReadonlyArray<KanbanCard>,
+  pools: ReadonlyArray<KanbanPool>,
+  holds: ReadonlyMap<string, string> = new Map(),
+  pick: (count: number) => number = () => 0,
+  nowMs?: number,
+  attempted: ReadonlySet<string> = new Set(),
+  reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
+  workThreadHomes: ReadonlyMap<string, KanbanCard | null> = new Map(),
+  assignmentWakeRetries: ReadonlyMap<string, AssignmentWakeRetry> = new Map(),
+  diagnostics = false,
+): { plan: ReadonlyArray<Dispatch>; items: ReadonlyArray<QueuedCard> } {
   // A board's first setup holds all card work and review until the setup evaluator ends it.
-  if (board.setup?.status === "running") return [];
+  if (!diagnostics && board.setup?.status === "running") return { plan: [], items: [] };
   const kept = board.pause ? new Set<string>(board.pause.keep) : null;
   const holding = poolThreads(cards, holds);
   const carrying = new Map<string, number>();
@@ -719,56 +1012,75 @@ export function planDispatch(
   for (const pool of pools) free.set(pool.key, pool.slots - (holding.get(pool.key)?.size ?? 0));
   const byId = new Map(cards.map((card) => [card.id as string, card]));
   const clock = nowMs ?? kanbanBoardClock(cards);
-  const waiting = cards.filter(
-    (card) =>
-      !attempted.has(card.id) &&
-      !(
-        assignmentWakeRetries.get(card.id)?.movedAt === card.movedAt &&
-        clock < assignmentWakeRetries.get(card.id)!.retryAt
-      ) &&
-      (kept === null || kept.has(card.id)) &&
-      card.settledAt === null &&
-      card.activeThreadId === null &&
-      card.stalled === null &&
-      card.priority !== KANBAN_BACKLOG &&
-      !heldForRetry(card, clock) &&
-      // A step that's only the evaluator's is done by an evaluator, not a new thread.
-      // An unfinished review can still run before an evaluator step.
-      !kanbanWaitsOnEvaluator(card) &&
-      !kanbanReviewAlreadyDone(card, reviews.get(card.id)) &&
-      // Parked on a wait: the tick wakes it when the wait ends.
-      !kanbanWaiting(card) &&
-      // Its wait ended and its evaluator decides what it does next.
-      !kanbanDeciding(card, clock),
+  const { queue, ineligible } = dispatchQueue(
+    board,
+    cards,
+    clock,
+    attempted,
+    reviews,
+    assignmentWakeRetries,
   );
-  const reviewQueue = waiting
-    .filter((card) => card.stage === "needs_review")
-    .map((card) => ({ card, role: "review" as const }));
-  const ranking = kanbanSchedule(cards, { nowMs: clock });
-  const pickOrder = kanbanPickOrder(cards, { nowMs: clock });
-  const todos = waiting
-    .filter((card) => card.stage === "todo" && !isBlocked(card, byId))
-    .map((card) => ({ card, role: "work" as const }));
-  const priority = ({ card }: (typeof reviewQueue)[number] | (typeof todos)[number]) =>
-    ranking.get(card.id)?.rank ?? card.priority;
-  const queue = [...reviewQueue, ...todos].toSorted(
-    (a, b) =>
-      priority(a) - priority(b) ||
-      (a.role !== b.role ? (a.role === "review" ? -1 : 1) : pickOrder(a.card, b.card)),
-  );
+  const items: Array<QueuedCard> = diagnostics ? [...ineligible] : [];
+  const aheadByPool = new Map<string, Array<number>>();
+  const heldByPool = new Map<string, NonNullable<QueuedCard["held"]>>();
+  if (diagnostics) {
+    const linked = new Map<string, KanbanCard>();
+    for (const card of cards) {
+      if (card.activeThreadId !== null && card.activePool !== null)
+        linked.set(`${card.activePool}:${card.activeThreadId}`, card);
+    }
+    for (const [key, threads] of holding) {
+      heldByPool.set(
+        key,
+        [...threads].map((thread) => {
+          const card = linked.get(`${key}:${thread}`);
+          return {
+            card: card?.number ?? null,
+            role: card?.activeRole === "review" ? "review" : "work",
+          };
+        }),
+      );
+    }
+  }
   const busyElsewhere = (thread: string, key: string) =>
     [...holding].some(([other, threads]) => other !== key && threads.has(thread));
 
   const plan: Array<Dispatch> = [];
   for (const { role, card } of queue) {
     // An existing work thread follows the card's pinned model.
-    const model =
+    const selected =
       role === "work" && card.workThreadId === null
         ? weightedModel(card, pools, free, pick)
         : nextModel(board, card);
+    // A full fresh-work pool has no selected model. Activity still names its highest-weight choice.
+    const model =
+      selected ??
+      (diagnostics
+        ? (kanbanCardModels(card).toSorted((a, b) => b.weight - a.weight)[0]?.model ?? card.model)
+        : null);
     if (model === null) continue;
-    const key = poolFor(pools, model)?.key;
-    if (key === undefined || (slots.get(key) ?? 0) <= 0) continue;
+    const pool = poolFor(pools, model);
+    const key = pool?.key ?? poolKey(model);
+    const ahead = aheadByPool.get(key) ?? [];
+    const report = (reason: QueueReason, blockedBy?: ReadonlyArray<number>) => {
+      if (!diagnostics) return;
+      items.push({
+        ...queuedCard(card, role, clock),
+        reason,
+        pool: key,
+        slots: slots.get(key) ?? 0,
+        rank: ahead.length + 1,
+        ahead: { count: ahead.length, items: ahead.slice(0, 10) },
+        held: heldByPool.get(key) ?? [],
+        ...(blockedBy ? { blockedBy } : {}),
+      });
+      ahead.push(card.number);
+      aheadByPool.set(key, ahead);
+    };
+    if (pool === undefined || (slots.get(key) ?? 0) <= 0) {
+      report("no_pool");
+      continue;
+    }
     let thread = role === "work" ? card.workThreadId : null;
     // Missing links are legacy threads. A linked thread keeps claimed cards only
     // while its home card is still part of that batch.
@@ -782,19 +1094,30 @@ export function planDispatch(
       : undefined;
     const fresh = thread !== null && (homeMovedOn || busyElsewhere(thread, key));
     // A new thread can't take a card its old thread's own work still holds up.
-    if (fresh && isBlocked(card, byId, null)) continue;
+    if (fresh && isBlocked(card, byId, null)) {
+      report("blocked", blockingNumbers(card, byId, null));
+      continue;
+    }
     if (fresh) thread = null;
     if (
       thread !== null &&
       kept !== null &&
       cards.some((other) => other.activeThreadId === thread && !kept.has(other.id))
-    )
+    ) {
+      report("paused");
       continue;
+    }
     const joins = thread !== null && (holding.get(key)?.has(thread) ?? false);
-    if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) continue;
+    if (joins && (carrying.get(thread ?? "") ?? 0) >= MAX_BATCH) {
+      report("batch_full");
+      continue;
+    }
     if (!joins) {
       const left = free.get(key) ?? 0;
-      if (left <= 0) continue;
+      if (left <= 0) {
+        report("pool_full");
+        continue;
+      }
       free.set(key, left - 1);
     }
     if (thread !== null) {
@@ -803,6 +1126,7 @@ export function planDispatch(
       set.add(thread);
       holding.set(key, set);
     }
+    report(joins ? "joins_thread" : "would_start");
     plan.push({
       cardId: card.id,
       role,
@@ -813,7 +1137,7 @@ export function planDispatch(
       ...(freshReason === undefined ? {} : { freshReason }),
     });
   }
-  return plan;
+  return { plan, items };
 }
 
 /** Same provider, model and options, whatever order their keys were written in. */
@@ -898,12 +1222,20 @@ export interface ClaimContext {
   readonly pools?: ReadonlyArray<KanbanPool>;
   /** Now: a card held for its evaluator is let go when the time to decide runs out. */
   readonly nowMs?: number;
+  /**
+   * The card is being created and taken by its own work thread in one call
+   * (card_create assignToSelf): the plan is the caller's, so an open step that
+   * is the evaluator's is not a reason to refuse the take.
+   */
+  readonly takeAtOnce?: boolean;
 }
 
 /**
  * A work thread may take a todo card that runs on its pool and project, isn't
  * running, stalled or kept for another work thread, and isn't blocked by work
- * outside the thread or awaiting review or merge.
+ * outside the thread or awaiting review or merge. A card it creates and takes in
+ * one call (`takeAtOnce`) is its own plan, so an open step owned by the
+ * evaluator or a script does not hold it back.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
   // Same hold as planDispatch: no card work starts while the board's setup runs.
@@ -936,7 +1268,7 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
       "evaluator_decision_pending",
     );
   }
-  if (kanbanWaitsOnEvaluator(card)) {
+  if (!ctx.takeAtOnce && kanbanWaitsOnEvaluator(card)) {
     return no(
       `card #${card.number} waits on ${kanbanScriptStep(card) ? "a script's" : "an evaluator's"} subtask first`,
       "evaluator_step_pending",

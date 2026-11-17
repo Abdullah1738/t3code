@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
+script_dir=$(cd -- "${BASH_SOURCE[0]%/*}" && pwd) || exit $?
 
 usage() {
   echo "Usage: $0 <out-dir> <integration-name> [test-file ...]" >&2
@@ -28,6 +29,7 @@ log="$out_dir/integration-$name.log"
     echo GATE_BUN_MISSING
     exit 127
   fi
+  source "$script_dir/release-gate-env.sh" || exit $?
   version=$(bun --version) || exit $?
   printf 'GATE_BUN_VERSION %s\n' "$version"
 

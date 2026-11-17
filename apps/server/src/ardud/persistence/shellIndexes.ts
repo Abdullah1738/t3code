@@ -13,6 +13,26 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
     ON orchestration_v2_projection_messages(thread_id, updated_at DESC, message_id DESC)
     WHERE role = 'user' AND json_extract(payload_json, '$.createdBy') = 'user'
   `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_active_threads_idx
+    ON orchestration_v2_projection_threads(thread_id)
+    WHERE deleted_at IS NULL AND json_extract(payload_json, '$.archivedAt') IS NULL
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_live_threads_idx
+    ON orchestration_v2_projection_runs(thread_id, ordinal DESC)
+    WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_pending_requests_idx
+    ON orchestration_v2_projection_runtime_requests(thread_id, created_at, runtime_request_id)
+    WHERE status = 'pending'
+  `;
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_recovery_child_subagents_idx
+    ON orchestration_v2_projection_subagents(thread_id, COALESCE(started_at, ''), subagent_id)
+    WHERE child_thread_id IS NOT NULL
+  `;
   // Periodic session maintenance starts from loaded native IDs or nonempty rosters,
   // never every provider thread accumulated by a long-lived application thread.
   yield* sql`
@@ -77,6 +97,13 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
   yield* sql`
     CREATE INDEX IF NOT EXISTS ardud_v2_threads_updated_idx
     ON orchestration_v2_projection_threads(updated_at DESC, thread_id ASC)
+  `;
+  // MCP lists seek within a project and stop before decoding unrelated histories.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_mcp_project_recency_idx
+    ON orchestration_v2_projection_threads(project_id,
+      CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) DESC, thread_id DESC)
+    WHERE deleted_at IS NULL AND archived_at IS NULL
   `;
   // Control pages/counts must not fetch each thread's payload to inspect lineage.
   // Keep the narrow recency index above for other queries; only control opts into this one.

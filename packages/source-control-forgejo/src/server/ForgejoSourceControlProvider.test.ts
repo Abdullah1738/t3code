@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as HttpClient from "effect/http/HttpClient";
@@ -1516,7 +1517,11 @@ it.effect("falls back to tea when fj is missing or has no account for this serve
                       operation: input.operation,
                       command: input.command,
                       cwd: input.cwd,
-                      cause: new Error("fj not found"),
+                      cause: PlatformError.systemError({
+                        _tag: "NotFound",
+                        module: "ChildProcess",
+                        method: "spawn",
+                      }),
                     }),
                   );
                 assert.strictEqual(input.command, "tea");
@@ -1704,7 +1709,11 @@ it.effect(
                             operation: input.operation,
                             command: input.command,
                             cwd: input.cwd,
-                            cause: new Error("fj not found"),
+                            cause: PlatformError.systemError({
+                              _tag: "NotFound",
+                              module: "ChildProcess",
+                              method: "spawn",
+                            }),
                           }),
                         );
                       if (input.args[0] === "version")

@@ -10,7 +10,7 @@ import { assert, describe, it } from "@effect/vitest";
 import {
   AuthSessionId,
   OrchestrationV2AppThreadJson,
-  type AnalyticsEvent,
+  AnalyticsEvent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   ProjectId,
@@ -55,6 +55,7 @@ import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import { makePersistedServerRuntimeState } from "../../serverRuntimeState.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
+import { CONTROL_REQUEST_ID_HEADER } from "./ControlRequestAnalytics.ts";
 import * as Analytics from "../analytics/Analytics.ts";
 import { guidanceContext } from "../imessage/guidance.ts";
 import { accumulate, finishRollup, makeAccumulator } from "../analytics/rollup.ts";
@@ -65,6 +66,9 @@ const askedAt = DateTime.makeUnsafe("2026-01-01T00:05:00.000Z");
 const encodeThreadPayload = Schema.encodeEffect(
   Schema.fromJsonString(OrchestrationV2AppThreadJson),
 );
+const decodeAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent, {
+  onExcessProperty: "error",
+});
 
 const shell = (
   id: string,
@@ -469,17 +473,23 @@ const makeHarness = (
       ),
       (handler) => Effect.promise(() => handler.dispose()),
     );
-    const get = (path: string) =>
+    const get = (path: string, requestId?: string) =>
       Effect.promise(async () => {
         const response = await web.handler(
           new Request(`http://env.local${CONTROL_ROUTE_PREFIX}${path}`, {
-            headers: { authorization: "Bearer shared" },
+            headers: {
+              authorization: "Bearer shared",
+              ...(requestId === undefined ? {} : { [CONTROL_REQUEST_ID_HEADER]: requestId }),
+            },
           }),
         );
+        const text = await response.text();
         return {
           status: response.status,
           retryAfter: response.headers.get("retry-after"),
-          body: (await response.json()) as Record<string, any>,
+          requestId: response.headers.get(CONTROL_REQUEST_ID_HEADER),
+          responseBytes: Buffer.byteLength(text),
+          body: JSON.parse(text) as Record<string, any>,
         };
       });
     const threadIds = (path: string) =>
@@ -522,6 +532,75 @@ const run = <A, E>(
   ).pipe(Effect.provide(Sqlite.layerMemory));
 
 describe("control listings", () => {
+  it.live("correlates message pages, empty results and errors with their encoded byte sizes", () =>
+    run(({ get, sql, analyticsEvents }) =>
+      Effect.gen(function* () {
+        const at = "2026-03-01T00:00:00.000Z";
+        for (const id of ["size-a", "size-b"]) {
+          yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+            message_id: id,
+            thread_id: "quiet",
+            run_id: null,
+            node_id: null,
+            role: "user",
+            streaming: 0,
+            created_at: at,
+            updated_at: at,
+            payload_json: JSON.stringify({
+              id,
+              threadId: "quiet",
+              runId: null,
+              nodeId: null,
+              role: "user",
+              text: "message-size-test \u4f60\u597d",
+              phase: "answer",
+              attachments: [],
+              streaming: false,
+              createdBy: "user",
+              creationSource: "web",
+              createdAt: at,
+              updatedAt: at,
+            }),
+          })}`;
+        }
+        for (const [index, endpoint] of [
+          "/threads/quiet/messages?role=user&limit=1",
+          "/threads/quiet/messages?role=user&all=true",
+          "/messages?since=0&limit=1",
+          "/messages?since=0",
+          "/threads/quiet/messages?since=9999999999999",
+          "/messages?since=9999999999999",
+        ].entries()) {
+          const id = `size-test:${index}`;
+          const response = yield* get(endpoint, id);
+          assert.equal(response.status, 200);
+          assert.equal(response.requestId, id);
+          const event = analyticsEvents.find((event) => event.props?.requestId === id)!;
+          assert.deepEqual(yield* decodeAnalyticsEvent(event), event);
+          assert.equal(event.props?.itemCount, response.body.messages.length);
+          assert.equal(event.props?.itemsTotal, response.body.total);
+          assert.equal(event.props?.responseBytes, response.responseBytes);
+          assert.isAbove(event.props!.responseBytes!, 0);
+          const row = JSON.stringify(event);
+          assert.notInclude(row, "message-size-test");
+          assert.notInclude(row, "since=");
+        }
+        const response = yield* get("/threads/missing/messages", "not-found-test");
+        assert.equal(response.status, 404);
+        assert.equal(response.requestId, "not-found-test");
+        const error = analyticsEvents.find((event) => event.props?.requestId === "not-found-test")!;
+        assert.equal(error.outcome, "error");
+        assert.equal(error.props?.status, 404);
+        assert.equal(error.threadId, "missing");
+        const generated = yield* get("/messages?since=0&limit=1");
+        assert.equal(generated.status, 200);
+        assert.match(generated.requestId!, /^[0-9a-f-]{36}$/);
+        assert.isDefined(
+          analyticsEvents.find((event) => event.props?.requestId === generated.requestId),
+        );
+      }),
+    ),
+  );
   it.live("by-native owner reads complete while the background reader holds a transaction", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

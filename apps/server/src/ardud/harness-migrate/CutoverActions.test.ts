@@ -1411,6 +1411,7 @@ it.effect(
             runId: RunId.make("run:running:1"),
             commandId: CommandId.make("harness-cutover:v1:thread:running:interrupt:run:running:1"),
             reason: "Harness cutover",
+            cancelReason: "superseded",
           },
         ]);
         assert.deepStrictEqual(h.commands, []);

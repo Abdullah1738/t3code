@@ -91,6 +91,22 @@ function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => voi
   };
 }
 
+test("statement metrics cover source reads and replica writes without counting a drain twice", () => {
+  const f = fixture();
+  f.finish();
+  const rows = f.exporter.takeMetrics().statements!;
+  expect(
+    rows.some(
+      (row) => row.database === f.options.sourcePath && row.rows > 0 && row.connection === "export",
+    ),
+  ).toBe(true);
+  expect(
+    rows.some((row) => row.database === f.options.replicaPath && /INSERT/i.test(row.sql)),
+  ).toBe(true);
+  expect(rows.every((row) => row.calls! > 0 && row.executionMs >= row.maxMs!)).toBe(true);
+  expect(f.exporter.takeMetrics().statements).toEqual([]);
+});
+
 test.each(["gap", "empty_page"])(
   "an unexplained %s preserves the published generation throughout reset",
   (reason) => {

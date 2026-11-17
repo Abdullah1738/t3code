@@ -66,6 +66,13 @@ const outcome = (status: number | undefined): "sent" | "skip" | "retry" =>
 /** A notification retry has an identical payload, so only a queue acknowledgement is success. */
 export const notificationAccepted = (status: number | undefined): boolean => status === 200 || status === 202;
 
+export function fenceOwnerAlert(socketPath: string) {
+  // A stalled local queue must not delay the next fence observation.
+  const post = socketPost(socketPath, 1_000);
+  return async (severity: "attention", text: string, key: string): Promise<boolean> =>
+    notificationAccepted(await post("/notify", { source: SOURCE, severity, text, dedupeKey: key }));
+}
+
 const text = (...parts: Array<string | undefined>) =>
   parts.map(part => part === undefined ? "" : stripInternalText(part).trim()).filter(Boolean).join("\n").slice(0, MAX_TEXT);
 

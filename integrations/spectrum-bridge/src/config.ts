@@ -23,6 +23,7 @@ export interface Config {
   appsPort: number;
   /** "openchamber" (default) or "robob"; BRIDGE_BACKEND overrides it. */
   backend?: string;
+  chatBackends?: Record<string, import("./remote-box.ts").RemoteBoxConfig | { kind: "robob" }>;
   /** Registered Robob project root for iMessage chat folders. */
   robobChatRoot?: string;
   /** "photon" (default, the rollback) or "sendblue". */

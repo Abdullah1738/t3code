@@ -1,4 +1,6 @@
-import { CommandId, NonNegativeInt, ProjectId, ThreadId } from "@t3tools/contracts";
+import { CommandId, NodeId, NonNegativeInt, ProjectId, ThreadId } from "@t3tools/contracts";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as SqlSchema from "effect/sql/SqlSchema";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -64,7 +66,33 @@ export type ProjectCommandReceiptV2 = typeof ProjectCommandReceiptV2.Type;
 
 type AnyCommandReceiptV2 = CommandReceiptV2 | ProjectCommandReceiptV2;
 
+const DelegationTimeout = Schema.Struct({
+  attemptId: Schema.String,
+  commandId: CommandId,
+  parentThreadId: ThreadId,
+  clientRequestId: Schema.String,
+  taskId: NodeId,
+  createdAt: Schema.String,
+  analyticsJson: Schema.NullOr(Schema.String),
+});
+export type DelegationTimeout = typeof DelegationTimeout.Type;
+
 export interface CommandReceiptStoreV2Shape {
+  readonly saveDelegationTimeout: (
+    record: DelegationTimeout,
+  ) => Effect.Effect<boolean, CommandReceiptStoreWriteError>;
+  readonly removeDelegationTimeout: (
+    commandId: CommandId,
+    attemptId?: string,
+  ) => Effect.Effect<void, CommandReceiptStoreWriteError>;
+  readonly listDelegationTimeouts: () => Effect.Effect<
+    ReadonlyArray<DelegationTimeout>,
+    CommandReceiptStoreReadError
+  >;
+  readonly getDelegationTimeout: (
+    commandId: CommandId,
+    attemptId?: string,
+  ) => Effect.Effect<Option.Option<DelegationTimeout>, CommandReceiptStoreReadError>;
   readonly findMcpThreadCreations: OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository["Service"]["findMcpThreadCreations"];
   readonly insertIfAbsent: (
     receipt: AnyCommandReceiptV2,
@@ -131,13 +159,80 @@ function toApplicationReceipt(
 const layerBase: Layer.Layer<
   CommandReceiptStoreV2,
   never,
-  OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository
+  OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository | SqlClient.SqlClient
 > = Layer.effect(
   CommandReceiptStoreV2,
   Effect.gen(function* () {
     const receipts = yield* OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository;
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`CREATE TABLE IF NOT EXISTS ardud_delegation_timeouts (
+      command_id TEXT NOT NULL,
+      attempt_id TEXT NOT NULL,
+      parent_thread_id TEXT NOT NULL,
+      client_request_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      analytics_json TEXT,
+      PRIMARY KEY (command_id, attempt_id)
+    )`.pipe(Effect.orDie);
+    const timeoutRows = sql`SELECT attempt_id AS "attemptId", command_id AS "commandId", parent_thread_id AS "parentThreadId",
+      client_request_id AS "clientRequestId", task_id AS "taskId", created_at AS "createdAt",
+      analytics_json AS "analyticsJson" FROM ardud_delegation_timeouts`;
+    const listTimeouts = SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: DelegationTimeout,
+      execute: () => timeoutRows,
+    });
+    const getTimeout = SqlSchema.findOneOption({
+      Request: Schema.Struct({ commandId: CommandId, attemptId: Schema.optional(Schema.String) }),
+      Result: DelegationTimeout,
+      execute: ({ commandId, attemptId }) =>
+        attemptId === undefined
+          ? sql`${timeoutRows} WHERE command_id = ${commandId} LIMIT 1`
+          : sql`${timeoutRows} WHERE command_id = ${commandId} AND attempt_id = ${attemptId}`,
+    });
 
     return CommandReceiptStoreV2.of({
+      saveDelegationTimeout: (record) =>
+        sql
+          .withTransaction(
+            sql`INSERT INTO ardud_delegation_timeouts
+        (command_id, attempt_id, parent_thread_id, client_request_id, task_id, created_at, analytics_json)
+        VALUES (${record.commandId}, ${record.attemptId}, ${record.parentThreadId}, ${record.clientRequestId},
+          ${record.taskId}, ${record.createdAt}, ${record.analyticsJson})
+        ON CONFLICT(command_id, attempt_id) DO NOTHING RETURNING command_id`,
+          )
+          .pipe(
+            Effect.map((rows) => rows.length > 0),
+            Effect.mapError(
+              (cause) => new CommandReceiptStoreWriteError({ commandId: record.commandId, cause }),
+            ),
+          ),
+      removeDelegationTimeout: (commandId, attemptId) =>
+        sql
+          .withTransaction(
+            attemptId === undefined
+              ? sql`DELETE FROM ardud_delegation_timeouts WHERE command_id = ${commandId}`
+              : sql`DELETE FROM ardud_delegation_timeouts WHERE command_id = ${commandId} AND attempt_id = ${attemptId}`,
+          )
+          .pipe(
+            Effect.asVoid,
+            Effect.mapError((cause) => new CommandReceiptStoreWriteError({ commandId, cause })),
+          ),
+      listDelegationTimeouts: () =>
+        listTimeouts(undefined).pipe(
+          Effect.mapError(
+            (cause) =>
+              new CommandReceiptStoreReadError({
+                commandId: CommandId.make("delegation-timeout-sweep"),
+                cause,
+              }),
+          ),
+        ),
+      getDelegationTimeout: (commandId, attemptId) =>
+        getTimeout({ commandId, ...(attemptId === undefined ? {} : { attemptId }) }).pipe(
+          Effect.mapError((cause) => new CommandReceiptStoreReadError({ commandId, cause })),
+        ),
       findMcpThreadCreations: receipts.findMcpThreadCreations,
       insertIfAbsent: (receipt) =>
         receipts.insertIfAbsent(toApplicationReceipt(receipt)).pipe(

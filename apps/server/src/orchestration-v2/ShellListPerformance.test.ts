@@ -82,16 +82,24 @@ it.effect(
       WHERE ordinal = 100`;
       const activeBefore = yield* projection.getShellSnapshot({ location: "active" });
       const archiveBefore = yield* projection.getShellSnapshot({ location: "archive" });
-      const candidatesBefore = yield* projection.getThreadListCandidates(projectId);
+      const candidatesBefore = yield* projection.getThreadListCandidates(projectId, {
+        limit: 1000,
+      });
       yield* sql`DROP INDEX ardud_shell_project_threads_idx`;
       yield* sql`DROP INDEX ardud_shell_activity_run_idx`;
       yield* sql`DROP INDEX ardud_shell_executed_run_idx`;
       assert.deepEqual(yield* projection.getShellSnapshot({ location: "active" }), activeBefore);
       assert.deepEqual(yield* projection.getShellSnapshot({ location: "archive" }), archiveBefore);
-      assert.deepEqual(yield* projection.getThreadListCandidates(projectId), candidatesBefore);
+      assert.deepEqual(
+        yield* projection.getThreadListCandidates(projectId, { limit: 1000 }),
+        candidatesBefore,
+      );
       yield* sql.withTransaction(Migration0068);
       yield* Deferred.succeed(lookupMigration!, undefined);
-      assert.deepEqual(yield* projection.getThreadListCandidates(projectId), candidatesBefore);
+      assert.deepEqual(
+        yield* projection.getThreadListCandidates(projectId, { limit: 1000 }),
+        candidatesBefore,
+      );
       const beforeStart = performance.now();
       const baseline = yield* projection.getShellSnapshot();
       const beforeMs = performance.now() - beforeStart;
@@ -118,7 +126,7 @@ it.effect(
       assert.lengthOf(archive.threads, 0);
       const candidatesStart = performance.now();
       const candidates = yield* projection
-        .getThreadListCandidates(projectId)
+        .getThreadListCandidates(projectId, { limit: 1000 })
         .pipe(Effect.withTracer(tracer));
       const selected = candidates.toSorted((a, b) => b.id.localeCompare(a.id)).slice(0, 50);
       const page = yield* projection.getShellSnapshot({
@@ -136,10 +144,10 @@ it.effect(
       }
       for (const shell of page.threads) assert.deepEqual(shell, expectedById.get(shell.id));
       assert.lengthOf(page.threads, 50);
-      // Five full candidate pages plus the empty final page; only the result page reads counts.
-      assert.lengthOf(statements, 7);
+      // One bounded candidate page; only the result page reads counts.
+      assert.lengthOf(statements, 2);
       for (const candidateQuery of statements.slice(1)) {
-        assert.include(candidateQuery, "INDEXED BY ardud_shell_project_threads_idx");
+        assert.include(candidateQuery, "INDEXED BY ardud_mcp_project_recency_idx");
         assert.include(candidateQuery, "0 AS item_count");
         assert.include(candidateQuery, "LIMIT ?");
       }
@@ -157,13 +165,111 @@ it.effect(
         assert.match(details, /SEARCH .*USING INDEX ardud_shell_executed_run_idx/, details);
         assert.match(details, /SEARCH .*USING INDEX ardud_shell_activity_run_idx/, details);
         if (statement !== statements[0]) {
-          assert.match(details, /SEARCH .*USING INDEX ardud_shell_project_threads_idx/, details);
+          assert.match(details, /SEARCH .*USING INDEX ardud_mcp_project_recency_idx/, details);
           assert.isFalse(
             plan.some((row) => row.parent === 0 && /USE TEMP B-TREE/.test(row.detail)),
             details,
           );
         }
       }
+      yield* sql`UPDATE orchestration_v2_projection_threads SET title = CASE
+        WHEN CAST(substr(thread_id, 6) AS INTEGER) % 2 = 0 THEN 'Case exit' ELSE 'Other' END`;
+      yield* sql`UPDATE orchestration_v2_projection_threads SET payload_json = json_set(payload_json, '$.title', title)`;
+      const boundedStatements: string[] = [];
+      const boundedTracer = Tracer.make({
+        span(options) {
+          const span = new Tracer.NativeSpan(options);
+          const end = span.end.bind(span);
+          span.end = (time, exit) => {
+            end(time, exit);
+            const query = span.attributes.get("db.query.text");
+            if (typeof query === "string" && query.includes("WITH shell_runs"))
+              boundedStatements.push(query);
+          };
+          return span;
+        },
+      });
+      const bounded = yield* projection
+        .getThreadListCandidates(projectId, { limit: 6, titleContains: "case EXIT" })
+        .pipe(Effect.withTracer(boundedTracer));
+      assert.deepEqual(
+        bounded.map((t) => t.id),
+        [998, 996, 994, 992, 990, 988].map((i) => `seed-${i}`),
+      );
+      assert.lengthOf(boundedStatements, 1);
+      assert.include(boundedStatements[0]!, "instr(lower(t.title)");
+      const last = bounded.at(-1)!;
+      boundedStatements.length = 0;
+      const second = yield* projection
+        .getThreadListCandidates(projectId, {
+          limit: 6,
+          titleContains: "case exit",
+          after: { updatedAtMs: DateTime.toEpochMillis(last.updatedAt), threadId: last.id },
+        })
+        .pipe(Effect.withTracer(boundedTracer));
+      assert.lengthOf(boundedStatements, 1);
+      const sameTimePlan = yield* sql.unsafe<{ detail: string }>(
+        `EXPLAIN QUERY PLAN ${boundedStatements[0]!}`,
+        Array.from({ length: (boundedStatements[0]!.match(/\?/g) ?? []).length }, () => null),
+      );
+      assert.match(
+        sameTimePlan.map((row) => row.detail).join("\n"),
+        /ardud_mcp_project_recency_idx.*project_id=\? AND <expr>=\? AND thread_id<\?/,
+      );
+      assert.deepEqual(
+        second.map((t) => t.id),
+        [986, 984, 982, 980, 978, 976].map((i) => `seed-${i}`),
+      );
+      // Exercise the older-time continuation too, including equal-time ids and
+      // timestamp encodings that represent the same millisecond.
+      yield* sql`UPDATE orchestration_v2_projection_threads SET updated_at = CASE
+        WHEN thread_id >= 'seed-900' THEN '2026-01-02T00:00:00Z' ELSE '2026-01-01T00:00:00.000Z' END,
+        payload_json = json_set(payload_json, '$.updatedAt', CASE
+          WHEN thread_id >= 'seed-900' THEN '2026-01-02T00:00:00Z' ELSE '2026-01-01T00:00:00.000Z' END)`;
+      boundedStatements.length = 0;
+      const crossing = yield* projection
+        .getThreadListCandidates(projectId, {
+          limit: 6,
+          titleContains: "case exit",
+          after: {
+            updatedAtMs: DateTime.toEpochMillis(DateTime.makeUnsafe("2026-01-02T00:00:00.000Z")),
+            threadId: "seed-902",
+          },
+        })
+        .pipe(Effect.withTracer(boundedTracer));
+      assert.deepEqual(
+        crossing.map((t) => t.id),
+        [900, 898, 896, 894, 892, 890].map((i) => `seed-${i}`),
+      );
+      assert.lengthOf(boundedStatements, 2);
+      const olderPlan = yield* sql.unsafe<{ detail: string }>(
+        `EXPLAIN QUERY PLAN ${boundedStatements[1]!}`,
+        Array.from({ length: (boundedStatements[1]!.match(/\?/g) ?? []).length }, () => null),
+      );
+      assert.match(
+        olderPlan.map((row) => row.detail).join("\n"),
+        /ardud_mcp_project_recency_idx.*project_id=\? AND <expr><\?/,
+      );
+      // SQLite's ASCII lower() must not drop locale-aware matches or treat LIKE
+      // metacharacters as wildcards. SQL returns Unicode candidates for JS to check.
+      yield* sql`UPDATE orchestration_v2_projection_threads SET title = 'ÉTAPE 100%_done',
+        payload_json = json_set(payload_json, '$.title', 'ÉTAPE 100%_done') WHERE thread_id = 'seed-998'`;
+      const unicode = yield* projection.getThreadListCandidates(projectId, {
+        limit: 6,
+        titleContains: "étape",
+      });
+      assert.deepEqual(
+        unicode.map((t) => t.id),
+        ["seed-998"],
+      );
+      const literal = yield* projection.getThreadListCandidates(projectId, {
+        limit: 6,
+        titleContains: "100%_done",
+      });
+      assert.deepEqual(
+        literal.map((t) => t.id),
+        ["seed-998"],
+      );
       const archiveQuery = statements[0]!;
       const bindings = Array.from({ length: (archiveQuery.match(/\?/g) ?? []).length }, () => null);
       const beforeSqlStart = performance.now();

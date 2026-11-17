@@ -38,6 +38,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import { modelSelectionResult, type ModelInput } from "./engine/defaults.ts";
 import { KanbanService, askAnswerVia } from "./engine/KanbanService.ts";
+import { ExactEdits } from "./engine/exactEdits.ts";
 import { requireOwner } from "./ownerGate.ts";
 import { selectionRoutingEnabled } from "./engine/selectionSettings.ts";
 import { KanbanScripts } from "./engine/ScriptService.ts";
@@ -76,7 +77,10 @@ const fail = (code: KanbanError["code"], detail: string) =>
 
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
-const body = Effect.fn("KanbanHttp.body")(function* <S extends Schema.Top>(schema: S) {
+const body = Effect.fn("KanbanHttp.body")(function* <S extends Schema.Top>(
+  schema: S,
+  options?: { readonly onExcessProperty: "error" },
+) {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const text = yield* request.text.pipe(Effect.mapError(() => fail("invalid", "Unreadable body.")));
   const raw =
@@ -85,7 +89,7 @@ const body = Effect.fn("KanbanHttp.body")(function* <S extends Schema.Top>(schem
       : yield* decodeJsonText(text).pipe(
           Effect.mapError(() => fail("invalid", "Body is not JSON.")),
         );
-  return yield* Schema.decodeUnknownEffect(schema)(raw).pipe(
+  return yield* Schema.decodeUnknownEffect(schema)(raw, options).pipe(
     Effect.mapError((error) => fail("invalid", error.message)),
   );
 });
@@ -135,6 +139,16 @@ const CreateCardBody = Schema.Struct({
   question: Text,
   reviewChain: Text,
 });
+
+const CardPatchBody = Schema.Struct({
+  promptEdits: Schema.optional(ExactEdits),
+  subtaskEdits: Schema.optional(ExactEdits),
+  comment: Text,
+}).check(
+  Schema.makeFilter(
+    (input) => Object.keys(input).length > 0 || "Pass promptEdits, subtaskEdits or comment.",
+  ),
+);
 
 const MoveBody = Schema.Struct({ to: KanbanStage, ...KanbanMoveOptions.fields });
 
@@ -511,6 +525,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         const model = yield* modelOf(input.model, apply);
         return yield* service.setPool(board.id, model, input.slots, {
           replaces: input.replaces,
+          actor: { actorKind: "owner", actorId: null },
         });
       }),
     );
@@ -519,6 +534,14 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       Effect.gen(function* () {
         const card: KanbanCard = yield* cardOf(yield* param("card"));
         return yield* service.card(card.id);
+      }),
+    );
+
+    const patchCard = write(
+      Effect.gen(function* () {
+        const card = yield* cardOf(yield* param("card"));
+        const input = yield* body(CardPatchBody, { onExcessProperty: "error" });
+        return yield* service.editCard(card.id, input, OWNER);
       }),
     );
 
@@ -1051,6 +1074,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
       HttpRouter.route("POST", `${p}/scripts/:script/acknowledge`, handle(acknowledgeScript)),
       HttpRouter.route("GET", `${p}/scripts/:script/runs`, handle(listRuns)),
       HttpRouter.route("GET", `${p}/cards/:card`, handle(getCard)),
+      HttpRouter.route("PATCH", `${p}/cards/:card`, handle(patchCard)),
       HttpRouter.route("POST", `${p}/cards/:card/move`, handle(moveCard)),
       HttpRouter.route("POST", `${p}/cards/:card/discussion`, handle(cardDiscussion)),
       HttpRouter.route("GET", `${p}/asks`, handle(listAsks)),

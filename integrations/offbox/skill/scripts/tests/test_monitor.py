@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tests._env import clean_env
+from tests._env import clean_env, require_shim_interpreter
 import monitor
 import monitor_sample as sample
 import monitor_support as support
@@ -381,6 +381,7 @@ class MonitorTests(unittest.TestCase):
             con.close()
 
     def test_shim_exemption_passthrough_and_expiry(self):
+        require_shim_interpreter(self, Path(monitor.__file__).parent / "blockers/docker")
         import os
         import shlex
         import subprocess

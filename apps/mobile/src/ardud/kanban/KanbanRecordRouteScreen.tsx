@@ -33,7 +33,7 @@ import {
 import { DiscussionList } from "./DiscussionList";
 import { GoalView } from "./GoalView";
 import { useHideCardDiscussions } from "./useHideCardDiscussions";
-import { kanbanClient, useKanbanBoard, useKanbanBoardFeed } from "./kanbanStore";
+import { kanbanClient, useKanbanBoard, useKanbanBoardFeed, useKanbanBoards } from "./kanbanStore";
 import { kanbanRecordState, type KanbanRecordParams, requestTitle } from "./logic";
 import { useKanbanNav } from "./nav";
 
@@ -52,12 +52,14 @@ export function KanbanRecordRouteScreen({
   const record = kanbanRecordState(route.params);
   const boardId = record?.boardId ?? "";
   const state = useKanbanBoard(boardId);
+  const boards = useKanbanBoards();
+  const missing = boards !== undefined && !boards.some((entry) => entry.board.id === boardId);
   const feed = useKanbanBoardFeed(boardId);
   const nav = useKanbanNav(boardId);
   const back = () => navigation.goBack();
   const filter = useBoardFilter(boardId);
 
-  if (record === null || state?.board.archivedAt != null) {
+  if (record === null || missing || state?.board.archivedAt != null) {
     return (
       <Shell title="Board" onBack={back}>
         <EmptyLine label="This link does not open anything." />

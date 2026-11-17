@@ -13,6 +13,11 @@ spec.loader.exec_module(installer)
 
 
 class InstallTests(unittest.TestCase):
+    def setUp(self):
+        pin = patch.object(installer, 'pin_data_dir', return_value='already pinned')
+        pin.start()
+        self.addCleanup(pin.stop)
+
     def dirs(self, tmp):
         return Path(tmp) / 'live', Path(tmp) / 'data', Path(tmp) / 'bin' / 'money-cases'
 
@@ -22,7 +27,7 @@ class InstallTests(unittest.TestCase):
             live.mkdir()
             data.mkdir()
             kept = {}
-            for path in (live / 'pings.json', live / 'state.json', live / 'check.lock', live / '.run-ok',
+            for path in (live / 'pings.json', live / 'runs.jsonl', live / 'runs.jsonl.1', live / 'runs.lock', live / 'state.json', live / 'check.lock', live / '.run-ok',
                          data / 'cases.json', data / 'cases.lock'):
                 path.write_text('private ' + path.name)
                 kept[path] = path.read_bytes()

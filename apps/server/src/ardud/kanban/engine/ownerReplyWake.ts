@@ -2,6 +2,41 @@ import { KanbanCardId, KanbanDiscussionId, type ThreadId } from "@t3tools/contra
 import * as Effect from "effect/Effect";
 import type { KanbanStoreShape } from "../store/KanbanStore.ts";
 
+export const postRecoveryIdentity = (messageId: string) => {
+  const match = /^kanban:post-recovery:([^:]+):(\d+):/.exec(messageId);
+  if (!match) return null;
+  const seq = Number(match[2]);
+  if (!Number.isSafeInteger(seq) || seq < 1) return null;
+  try {
+    return { discussionId: KanbanDiscussionId.make(decodeURIComponent(match[1]!)), seq };
+  } catch {
+    return null;
+  }
+};
+export const postRecoveryKey = (discussionId: string, seq: number, delivery: string) =>
+  `post-recovery:${encodeURIComponent(discussionId)}:${seq}:${encodeURIComponent(delivery)}`;
+
+export const postRecoveryPending = Effect.fn("Kanban.postRecoveryPending")(function* (
+  store: KanbanStoreShape,
+  discussionId: KanbanDiscussionId,
+  seq: number,
+) {
+  const discussion = yield* store.discussion(discussionId);
+  if (
+    !discussion ||
+    discussion.cardId === null ||
+    discussion.settledAt !== null ||
+    discussion.archivedAt !== null
+  )
+    return false;
+  // A newer post cannot replace this job's retained, still-unread body.
+  const waiting = yield* store.ownerWait(discussionId, true, seq);
+  if (!waiting || waiting.answered) return false;
+  // Admission owns this retained body until delivery. A later message's cumulative
+  // read receipt cannot prove that this particular body was delivered.
+  return true;
+});
+
 export const ownerReplyKey = (discussionId: string, threadId: string, action: string) =>
   `owner-reply:${encodeURIComponent(discussionId)}:${encodeURIComponent(threadId)}:${encodeURIComponent(action)}`;
 
