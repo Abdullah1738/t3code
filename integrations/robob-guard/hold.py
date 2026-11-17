@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 
-from guard import atomic_json, pid_alive, read_json, valid_hold
+from guard import HOLD_MAX_AGE, atomic_json, finite_number, pid_alive, read_json, valid_hold
 from quit_reason import write_reason, desktop_pid
 
 
@@ -38,7 +38,10 @@ class Holds:
             if not self.matches(by, pid) or not pid_alive(pid) or (token and meta.get("token") != token):
                 return False
             hold = read_json(self.path, {})
-            hold["beatAt"] = time.time()
+            now = time.time()
+            if not finite_number(hold.get("startedAt")) or not 0 <= now - hold["startedAt"] < HOLD_MAX_AGE:
+                return False
+            hold["beatAt"] = now
             atomic_json(self.path, hold)
             return True
 
@@ -48,6 +51,13 @@ class Holds:
                 raise ValueError("install PID is not alive")
             now = time.time()
             old = read_json(self.path, {})
+            if (isinstance(old, dict) and not self.matches(by, pid) and pid_alive(old.get("pid"))):
+                raise ValueError("another live installer owns the hold; stop its cycle before starting another")
+            started = now
+            if self.matches(by, pid):
+                started = old.get("startedAt")
+                if not finite_number(started) or not 0 <= now - started < HOLD_MAX_AGE:
+                    raise ValueError("hold expired; stop the old cycle before starting another")
             if valid_hold(old, now, pid_alive(old.get("pid")) if isinstance(old, dict) else False):
                 if not self.matches(by, pid):
                     raise ValueError("another live installer owns the hold")
@@ -56,7 +66,7 @@ class Holds:
                     self.record_quit_reason(by, pid)
                     return meta["beaterPid"]
             token = uuid.uuid4().hex
-            atomic_json(self.path, dict(by=by, pid=pid, startedAt=now, beatAt=now))
+            atomic_json(self.path, dict(by=by, pid=pid, startedAt=started, beatAt=now))
             command = [sys.executable, str(Path(__file__).resolve()), "_beater", "--by", by,
                        "--pid", str(pid), "--token", token]
             try:
