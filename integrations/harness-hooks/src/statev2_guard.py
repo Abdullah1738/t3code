@@ -4941,9 +4941,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 invalidate_print_bindings(words, current_line, loop=True)
             return scan(" ".join(args), directory, depth + 1, cwd_only=True) if binary == "eval" else after
         if binary == 'unset' and all(re.fullmatch(r'[A-Za-z_]\w*', arg) for arg in args):
-            if 'PATH' in args:
+            # Removing a selector setting enables fallback inputs that its
+            # inherited value does not prove.
+            removed_startup = next((name for name in args if startup_binding(name) or
+                                    STARTUP_ENV.fullmatch(name) or REPO_NODE_PIN_COMMAND.search(name + '=')), None)
+            if removed_startup is not None:
                 unsafe_bindings = True
-                unsafe_binding_cause = f'PATH unset at line {current_line}'
+                unsafe_binding_cause = f'{removed_startup} unset at line {current_line}'
             for name in args:
                 invalidate_variable(name)
                 script_values.pop(name, None)
