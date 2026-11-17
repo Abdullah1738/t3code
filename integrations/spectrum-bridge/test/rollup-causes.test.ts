@@ -12,7 +12,7 @@ test.each(cases)("replayed cause: $name", async fixture => {
     const row = { ts: "2026-11-16T12:00:00Z", component: fixture.request ? "robob" : "router",
       kind: fixture.request ? "perf" : "error", name: fixture.request ? "turn.robob_call" : "bridge.catch", ok: false,
       props: { ...fixture.props, ...(fixture.single ? { failureFormat: "single" } : {}) }, error: { tag, ...fixture.error }, ...fixture.row };
-    const input = Object.fromEntries(Object.entries(row).filter(([key]) => !fixture.omit?.includes(key)));
+    const input = Object.fromEntries(Object.entries(row).filter(([key]) => !fixture.omit?.some(omitted => omitted === key)));
     writeFileSync(join(root, "2026-11-16.ndjson"), JSON.stringify(input) + "\n");
     const result = await createToolLog({ root }).rollup("2026-11-16");
     expect(result?.topCauses ?? []).toEqual(fixture.expected ? [{ tag: fixture.expectedTag ?? tag, causeKey: fixture.expected, count: 1 }] : []);
