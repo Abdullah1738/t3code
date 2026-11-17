@@ -387,6 +387,8 @@ const GeneralEvent = Schema.Struct({
       poolKey: Schema.optionalKey(Label),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
+      itemKind: Schema.optionalKey(Label),
+      openToolSince: Schema.optionalKey(Timestamp),
       effectId: Schema.optionalKey(DerivedId),
       effectType: Schema.optionalKey(Label),
       commandType: Schema.optionalKey(Label),

@@ -9,6 +9,7 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationV2ProviderSession,
+  type OrchestrationV2Run,
   OrchestrationV2ProviderSessionJson,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
@@ -1609,6 +1610,117 @@ it.effect(
 
 it.effect("memory projection keeps restart-cancelled work through a stale run.updated", () =>
   restartCancelledWorkSurvivesStaleRunUpdate.pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+const openToolsFollowLifecycle = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const threadId = yield* addRolledBackRecoveryCandidate("open-tools");
+  const before = yield* store.getThreadProjection(threadId);
+  const run = { ...before.runs[0]!, status: "running" as const, completedAt: null };
+  const first = before.turnItems[0]!;
+  let seq = 0;
+  const updateRun = (payload: typeof run | OrchestrationV2Run) =>
+    store.apply({
+      id: EventId.make(`open-tools:run:${++seq}`),
+      type: "run.updated",
+      threadId,
+      occurredAt: run.requestedAt,
+      payload,
+    });
+  const updateItem = (payload: OrchestrationV2TurnItem) =>
+    store.apply({
+      id: EventId.make(`open-tools:item:${++seq}`),
+      type: "turn-item.updated",
+      threadId,
+      occurredAt: payload.updatedAt,
+      payload,
+    });
+  const tools = () =>
+    store
+      .getThreadRecords(threadId, ["runs"], { runIds: [run.id] })
+      .pipe(Effect.map((records) => records.runs[0]!.openTools ?? {}));
+  yield* updateRun(run);
+  const command = {
+    threadId,
+    runId: run.id,
+    nodeId: run.rootNodeId,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: first.ordinal + 1,
+    title: "Blocking wait",
+    updatedAt: run.requestedAt,
+    id: TurnItemId.make('tool:"quoted.id"'),
+    type: "command_execution" as const,
+    input: "offbox wait job",
+    status: "running" as const,
+    startedAt: DateTime.makeUnsafe("2099-11-09T10:00:00Z"),
+    completedAt: null,
+  };
+  const mcp = {
+    ...command,
+    id: TurnItemId.make("tool:mcp"),
+    type: "dynamic_tool" as const,
+    toolName: "example.wait",
+    startedAt: DateTime.makeUnsafe("2099-11-09T10:01:00Z"),
+  };
+  yield* updateItem(command);
+  yield* updateItem(mcp);
+  yield* updateItem({
+    ...command,
+    id: TurnItemId.make("reasoning"),
+    type: "reasoning",
+    text: "Thinking",
+    streaming: true,
+  });
+  const expected = {
+    [encodeURIComponent(command.id)]: {
+      kind: "command_execution",
+      since: "2099-11-09T10:00:00.000Z",
+    },
+    [encodeURIComponent(mcp.id)]: { kind: "dynamic_tool", since: "2099-11-09T10:01:00.000Z" },
+  };
+  assert.deepEqual(yield* tools(), expected);
+  yield* updateRun(run);
+  yield* updateItem({ ...command, updatedAt: DateTime.makeUnsafe("2099-11-09T10:30:00Z") });
+  assert.deepEqual(yield* tools(), expected);
+  yield* updateItem({ ...command, status: "completed" });
+  assert.deepEqual(Object.values(yield* tools()), [expected[encodeURIComponent(mcp.id)]]);
+  yield* updateItem({ ...mcp, type: "run_interrupt_request", message: "board stop" });
+  assert.deepEqual(yield* tools(), {});
+  yield* updateItem(command);
+  for (const status of [
+    "completed",
+    "interrupted",
+    "failed",
+    "cancelled",
+    "rolled_back",
+  ] as const) {
+    yield* updateRun({ ...run, status, completedAt: run.requestedAt });
+    yield* updateItem(mcp);
+    assert.deepEqual(yield* tools(), {});
+    yield* updateRun(run);
+    yield* updateItem(command);
+  }
+  const queries: string[] = [];
+  const record: Statement.Transformer = (statement) => {
+    queries.push(statement.compile()[0]);
+    return Effect.succeed(statement);
+  };
+  yield* tools().pipe(Effect.provideService(Statement.CurrentTransformer, record));
+  assert.isFalse(
+    queries.some((query) =>
+      /FROM (?:ardud_history_turn_items|orchestration_v2_projection_turn_items)/.test(query),
+    ),
+  );
+});
+
+it.effect("memory projection tracks open tools across completion, interrupt and recovery", () =>
+  openToolsFollowLifecycle.pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+it.effect("SQL projection tracks open tools across completion, interrupt and recovery", () =>
+  openToolsFollowLifecycle.pipe(Effect.provide(layerTest)),
 );
 
 const backgroundThreadUpdatesKeepTimestamp = Effect.gen(function* () {

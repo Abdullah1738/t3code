@@ -324,7 +324,7 @@ export function workerHandoffNudged(
       Date.parse(event.at) >= since &&
       (event.body === WORKER_NUDGE_EVENT ||
         event.body === "Interrupted: stuck on its own question" ||
-        event.body?.startsWith("No activity for ")),
+        isSilentRunStop(event.body)),
   );
   return latest === undefined || latest.body === WORKER_NUDGE_EVENT;
 }
@@ -339,6 +339,16 @@ export function workerWorkDone(card: KanbanCard): boolean {
 }
 
 export const RUN_SILENT_MS = 30 * 60 * 1000;
+export const RUN_OPEN_TOOL_MAX_MS = (4 * 60 + 15) * 60 * 1000;
+
+export const isSilentRunStop = (body: string | null | undefined): boolean =>
+  body?.startsWith("No activity for ") === true || body?.startsWith("Tool call open ") === true;
+
+export const openToolHoldsRun = (
+  view: { readonly openToolSince?: string | null },
+  nowMs: number,
+): boolean =>
+  view.openToolSince != null && nowMs - Date.parse(view.openToolSince) < RUN_OPEN_TOOL_MAX_MS;
 
 export function runSilentDue(
   card: KanbanCard,
@@ -346,6 +356,7 @@ export function runSilentDue(
     readonly state: string;
     readonly lastActivityAt: string | null;
     readonly backgroundWork: number;
+    readonly openToolSince?: string | null;
   },
   nowMs: number,
 ): boolean {
@@ -359,6 +370,7 @@ export function runSilentDue(
     card.stalled !== null ||
     view.state !== "running" ||
     view.backgroundWork !== 0 ||
+    openToolHoldsRun(view, nowMs) ||
     view.lastActivityAt === null
   )
     return false;

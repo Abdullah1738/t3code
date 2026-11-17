@@ -999,6 +999,13 @@ function preserveRunRecordedFields(
   if (current === undefined) return next;
   return {
     ...next,
+    ...(current.openTools === undefined
+      ? {}
+      : {
+          openTools: ["preparing", "queued", "starting", "running", "waiting"].includes(next.status)
+            ? current.openTools
+            : {},
+        }),
     ...((next.cancelReason === undefined ||
       next.cancelReason === "provider_cancelled" ||
       next.cancelReason === "provider_interrupted") &&
@@ -1258,6 +1265,24 @@ export function applyToProjection(
         runs: base.runs.map((run) => {
           if (run.id !== event.payload.runId) return run;
           const request = event.payload;
+          const openTools = { ...run.openTools };
+          if (request.type === "run_interrupt_request") {
+            for (const id of Object.keys(openTools)) delete openTools[id];
+          } else if (request.type === "command_execution" || request.type === "dynamic_tool") {
+            if (
+              request.status === "running" &&
+              ["starting", "running", "waiting"].includes(run.status)
+            ) {
+              openTools[encodeURIComponent(request.id)] ??= {
+                kind: request.type,
+                since: DateTime.formatIso(request.startedAt ?? request.updatedAt),
+              };
+            } else delete openTools[encodeURIComponent(request.id)];
+          }
+          const withTools =
+            run.openTools !== undefined || Object.keys(openTools).length > 0
+              ? { ...run, openTools }
+              : run;
           const recorded =
             request.type === "run_interrupt_request" &&
             request.cancelReason !== undefined &&
@@ -1266,14 +1291,14 @@ export function applyToProjection(
               run.cancelReason === "provider_cancelled" ||
               run.cancelReason === "provider_interrupted")
               ? {
-                  ...run,
+                  ...withTools,
                   cancelReason: request.cancelReason,
                   cancelDetail:
                     request.message === "Interrupt requested"
                       ? undefined
                       : request.message.slice(0, 500),
                 }
-              : run;
+              : withTools;
           return recorded.lastActivityAt === undefined ||
             DateTime.toEpochMillis(recorded.lastActivityAt) <
               DateTime.toEpochMillis(request.updatedAt)
@@ -1505,6 +1530,7 @@ const encodeTimelineSources = Schema.encodeEffect(
     Schema.Array(Schema.Struct({ threadId: Schema.String, id: Schema.String })),
   ),
 );
+const encodeJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 const encodeIdList = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)));
 
 // An empty list filter selects no rows, but SQLite still walks every row of
@@ -2468,7 +2494,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 status = excluded.status,
                 requested_at = excluded.requested_at,
                 completed_at = excluded.completed_at,
-                payload_json = json_patch(${keepRecordedRunField(
+                payload_json = json_patch(json_patch(${keepRecordedRunField(
                   keepRecordedRunField(
                     keepRecordedRunField(
                       keepRecordedRunField(
@@ -2488,6 +2514,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     'cancelReason', json_extract(orchestration_v2_projection_runs.payload_json, '$.cancelReason'),
                     'cancelDetail', json_extract(orchestration_v2_projection_runs.payload_json, '$.cancelDetail')
                   )
+                  ELSE '{}'
+                END), CASE WHEN json_type(orchestration_v2_projection_runs.payload_json, '$.openTools') IS NOT NULL
+                  THEN json_object('openTools', CASE
+                    WHEN excluded.status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
+                      THEN json_extract(orchestration_v2_projection_runs.payload_json, '$.openTools')
+                    ELSE json('{}')
+                  END)
                   ELSE '{}'
                 END)
             `;
@@ -3074,6 +3107,29 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     AND (status NOT IN ('cancelled', 'interrupted')
                       OR json_extract(payload_json, '$.cancelReason') IS NULL
                       OR json_extract(payload_json, '$.cancelReason') IN ('provider_cancelled', 'provider_interrupted'))`;
+              }
+              // Maintain only open tool identities on the run; board ticks never read item history.
+              const item = event.payload;
+              if (item.runId !== null && item.type === "run_interrupt_request") {
+                yield* sql`UPDATE orchestration_v2_projection_runs
+                  SET payload_json = json_set(payload_json, '$.openTools', json('{}'))
+                  WHERE run_id = ${item.runId}`;
+              } else if (
+                item.runId !== null &&
+                (item.type === "command_execution" || item.type === "dynamic_tool")
+              ) {
+                const path = `$.openTools.${encodeJsonString(encodeURIComponent(item.id))}`;
+                if (item.status === "running") {
+                  const since = DateTime.formatIso(item.startedAt ?? item.updatedAt);
+                  yield* sql`UPDATE orchestration_v2_projection_runs
+                    SET payload_json = json_set(payload_json, ${path}, json_object('kind', ${item.type}, 'since', ${since}))
+                    WHERE run_id = ${item.runId} AND status IN ('starting', 'running', 'waiting')
+                      AND json_type(payload_json, ${path}) IS NULL`;
+                } else {
+                  yield* sql`UPDATE orchestration_v2_projection_runs
+                    SET payload_json = json_remove(payload_json, ${path})
+                    WHERE run_id = ${item.runId}`;
+                }
               }
               // One run-row update keeps the board sweep independent of transcript size.
               if (event.payload.runId !== null) {

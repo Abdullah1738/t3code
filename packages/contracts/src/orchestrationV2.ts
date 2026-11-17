@@ -631,6 +631,16 @@ export const OrchestrationV2Run = Schema.Struct({
   ),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
   lastActivityAt: Schema.optional(Schema.DateTimeUtc),
+  /** Projection-owned running tools; lifecycle snapshots must not replace this map. */
+  openTools: Schema.optional(
+    Schema.Record(
+      Schema.String,
+      Schema.Struct({
+        kind: Schema.Literals(["command_execution", "dynamic_tool"]),
+        since: IsoDateTime,
+      }),
+    ),
+  ),
   restartCancelledBackgroundWork: Schema.optional(
     Schema.Array(OrchestrationV2RestartCancelledBackgroundWork),
   ),

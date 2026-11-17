@@ -3949,3 +3949,58 @@ it.effect.each([
     );
   }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
 );
+
+it.effect("find exposes the oldest active tool from the run projection without item reads", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("open-tools-view");
+    const runId = RunId.make("open-tools-run");
+    const shell = liveThreadShell(threadId, { activeRunId: runId });
+    const at = DateTime.makeUnsafe("2026-11-16T12:00:00Z");
+    const run: OrchestrationV2Run = {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId: shell.providerInstanceId,
+      modelSelection: shell.modelSelection,
+      providerThreadId: null,
+      userMessageId: MessageId.make("open-tool-user"),
+      rootNodeId: null,
+      activeAttemptId: null,
+      status: "running",
+      requestedAt: at,
+      startedAt: at,
+      completedAt: null,
+      checkpointId: null,
+      contextHandoffId: null,
+      openTools: {
+        newer: { kind: "dynamic_tool", since: "2026-11-16T12:10:00.000Z" },
+        oldest: { kind: "command_execution", since: "2026-11-16T12:01:00.000Z" },
+      },
+    };
+    let active = true;
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () => Effect.succeed(active ? shell : { ...shell, activeRunId: null }),
+      getThreadRecords: (_id, fields, filter) => {
+        expect(fields).not.toContain("turnItems");
+        if (active) expect(filter?.runIds).toEqual([runId]);
+        return Effect.succeed({ runs: [run], subagents: [] } as never);
+      },
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const view = yield* threads.find(threadId);
+      expect(view?.openToolSince).toBe("2026-11-16T12:01:00.000Z");
+      expect(view?.openToolKind).toBe("command_execution");
+      active = false;
+      expect((yield* threads.find(threadId))?.openToolSince).toBeNull();
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
+);

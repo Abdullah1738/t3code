@@ -11493,6 +11493,35 @@ const make = Effect.gen(function* () {
     return true;
   });
 
+  const openToolSkips = new Map<string, string>();
+  const skipOpenToolBackstop = Effect.fn("KanbanService.skipOpenToolBackstop")(function* (
+    card: KanbanCard,
+    view: KanbanThreadView,
+    now: number,
+  ) {
+    if (
+      !Rules.openToolHoldsRun(view, now) ||
+      !Rules.runSilentDue(card, { ...view, openToolSince: null }, now)
+    )
+      return false;
+    if (view.runId != null && openToolSkips.get(view.threadId) !== view.runId) {
+      yield* recordAnalytics({
+        kind: "kanban.nudge_skipped",
+        boardId: card.boardId,
+        cardId: card.id,
+        threadId: view.threadId,
+        props: {
+          reason: "open_tool_call",
+          runId: view.runId,
+          itemKind: view.openToolKind ?? "unknown",
+          openToolSince: view.openToolSince!,
+        },
+      });
+      openToolSkips.set(view.threadId, view.runId);
+    }
+    return true;
+  });
+
   const nudgeThread = Effect.fn("KanbanService.nudgeThread")(function* (
     threadId: ThreadId,
     cards: ReadonlyArray<KanbanCard>,
@@ -11875,8 +11904,27 @@ const make = Effect.gen(function* () {
       runtimeFailureRunId !== null
         ? "Your turn ended on a tool-host or provider-runtime failure. Reconcile running commands and offbox runs first: use offbox wait <run> for the existing run. Never start a duplicate run or kill a running command as recovery. Then continue.\n\n"
         : "";
-    if (first.length > 0)
-      yield* nudgeThread(threadId, first, recovery + Briefs.nudgeWorkText(first));
+    if (first.length > 0) {
+      let boardStop: string | undefined;
+      for (const card of first) {
+        const event = (yield* store.cardEvents(card.id)).findLast(
+          (event) =>
+            event.kind === "thread" &&
+            event.actor._tag === "system" &&
+            event.actor.component === "dispatcher" &&
+            Rules.isSilentRunStop(event.body),
+        );
+        if (
+          event?.body &&
+          now - Date.parse(event.at) <= 2 * Rules.RUN_SILENT_MS &&
+          event.body.endsWith(`\nThread: ${threadId}\nRun: ${view.latestRunId ?? view.runId}`)
+        ) {
+          boardStop = `${event.body.split("\n")[0]}. If a job is still running, re-join it; don't restart it. For waits longer than 30 min, use a background command or card_wait.`;
+          break;
+        }
+      }
+      yield* nudgeThread(threadId, first, recovery + Briefs.nudgeWorkText(first, boardStop));
+    }
     for (const card of released)
       yield* noteDiscussion(card, `Card #${card.number}: Work thread idle; slot freed`).pipe(
         Effect.provideService(EvaluatorAnalytics.origin, "stall_run_failure"),
@@ -14223,8 +14271,7 @@ const make = Effect.gen(function* () {
                   const due = Rules.runSilentDue(card, view, now);
                   if (!silentStops.has(card.id)) {
                     const event = (yield* store.cardEvents(card.id)).findLast(
-                      (event) =>
-                        event.kind === "thread" && event.body?.startsWith("No activity for "),
+                      (event) => event.kind === "thread" && Rules.isSilentRunStop(event.body),
                     );
                     const match = event?.body?.match(/\nThread: ([^\n]+)\nRun: ([^\n]+)$/);
                     silentStops.set(
@@ -14244,6 +14291,7 @@ const make = Effect.gen(function* () {
                     previous.runId !== view.runId &&
                     view.runRequestedAt != null &&
                     Date.parse(view.runRequestedAt) < Date.parse(previous.at);
+                  if (!stale && (yield* skipOpenToolBackstop(card, view, now))) return;
                   if (!due && !stale) return;
                   const fresh = yield* freshFind(threadId);
                   const current = yield* store.card(card.id);
@@ -14269,6 +14317,7 @@ const make = Effect.gen(function* () {
                     (yield* skipRestartRecovery(threadId, [current], fresh.value))
                   )
                     return;
+                  if (!stale && (yield* skipOpenToolBackstop(current, fresh.value, now))) return;
                   if (!stale && !Rules.runSilentDue(current, fresh.value, now)) return;
                   const at = yield* nowIso;
                   const system: KanbanActor = { _tag: "system", component: "dispatcher" };
@@ -14297,7 +14346,14 @@ const make = Effect.gen(function* () {
                   const minutes = Math.floor(
                     (now - Date.parse(fresh.value.lastActivityAt!)) / 60000,
                   );
-                  const reason = `No activity for ${minutes} min; the board stopped the run`;
+                  const toolMinutes =
+                    fresh.value.openToolSince == null
+                      ? null
+                      : Math.floor((now - Date.parse(fresh.value.openToolSince)) / 60000);
+                  const reason =
+                    toolMinutes === null
+                      ? `No activity for ${minutes} min (no open tool call); the board stopped the run`
+                      : `Tool call open ${Math.floor(toolMinutes / 60)} h ${toolMinutes % 60} min (${fresh.value.openToolKind ?? "tool"}); the board stopped the run`;
                   const runId = fresh.value.runId;
                   // A successful interrupt can't be replayed after a concurrent edit.
                   // Save its acknowledgement before reacquiring the original snapshot.
