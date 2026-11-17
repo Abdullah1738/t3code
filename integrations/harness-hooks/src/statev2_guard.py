@@ -2333,12 +2333,12 @@ def refusal_reason(rule, cause, cwd):
             return ("statev2 guard: this command was NOT run.\n"
                     f"Could not check {detail}. Resolved workdir: {cwd}.\nAccepted: {hint}")
         fix = "Use a literal absolute script path."
-        if cause and ('startup' in cause or 'repo-node-pin' in cause):
-            fix = "Resolve the named startup input, then retry."
-        elif cause and "unbalanced quote" in cause:
+        if cause and "unbalanced quote" in cause:
             fix = "Close the shell quote before running the command."
         elif cause and ('script source changed after its heredoc write' in cause or 'unchecked copy at script path' in cause):
             fix = "An intervening command may replace the checked source. Split source preparation and execution into separate calls."
+        elif cause and ('startup' in cause or 'repo-node-pin' in cause):
+            fix = "Resolve the named startup input, then retry."
         elif cause and ("MAX_SCRIPTS" in cause or "MAX_SHELL_DEPTH" in cause or "node --test lists" in cause):
             fix = "Split the steps into separate shell calls."
         elif cause and "node --test glob" in cause:

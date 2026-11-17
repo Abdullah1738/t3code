@@ -371,7 +371,8 @@ class GuardTests(unittest.TestCase):
                 command = prefix + 'bash -n tmp/checked.py\npython3 -I tmp/checked.py'
                 rule, cause = guard.classify_detail(command, str(self.root))
                 self.assertEqual(rule, UNRESOLVED, cause)
-                self.assertIn('shell lookup or startup proof failed', cause)
+                self.assertIn('BASH_ENV: expected ', cause)
+                self.assertIn(str(Path.home() / '.local/libexec/repo-node-pin/bash-env.sh'), cause)
             with patch.dict(os.environ, {'BASH_FUNC_node%%': "() { printf 'print(2)\\n' > tmp/checked.py; }"}):
                 command = prefix + self.heredoc('tmp/checked.mjs', 'console.log(1)')
                 command += 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py'
@@ -1493,8 +1494,11 @@ bash "$TASK_DIR/step5r.sh"
                 with patch.dict(os.environ, environment), self.subTest(mutation=mutation, execution=execution):
                     rule, cause = guard.classify_detail(source + mutation + '\n' + execution, str(self.root))
                     self.assertEqual(rule, UNRESOLVED, cause)
-                    self.assertIn('executable provenance or mutation proof failed' if mutation == 'opaque-mutator'
-                                  else 'startup proof failed', cause)
+                    if mutation == 'opaque-mutator':
+                        self.assertIn('executable provenance or mutation proof failed', cause)
+                    else:
+                        self.assertIn('may be changed by this command', cause)
+                        self.assertIn(str(package) if 'package-alias' in mutation else str(helper), cause)
         with patch.dict(os.environ, environment):
             for execution in ('bash tmp/a.sh', './tmp/a.sh'):
                 self.assertEqual(guard.classify_detail(source + "printf '%s' ok > sibling.txt\n" + execution,
