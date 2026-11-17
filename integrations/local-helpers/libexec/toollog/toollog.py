@@ -231,7 +231,7 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
          ids=None, props=None, error_tag=None):
     """Drop write failures. Error messages are fixed tags, never exception messages."""
     try:
-        if kind not in {'event', 'perf', 'error'} or not _LABEL.fullmatch(component) or not _LABEL.fullmatch(name):
+        if kind not in {'event', 'perf', 'error', 'opencode-reload'} or not _LABEL.fullmatch(component) or not _LABEL.fullmatch(name):
             return
         now = datetime.now(timezone.utc)
         day = now.strftime('%Y-%m-%d')
@@ -255,6 +255,30 @@ def emit(component, kind, name, *, board='agent-tools', duration_ms=None, ok=Non
         for key, value in [('ids', _metadata(ids, _IDS)), ('props', _metadata(props, _FIELDS))]:
             if value:
                 row[key] = value
+        if kind == 'opencode-reload':
+            # This event intentionally carries file paths and hashes, never bytes.
+            reload = props or {}
+            files = reload.get('files', [])
+            busy = reload.get('busy', {})
+            if (component != 'installers' or name != 'opencode-reload'
+                    or not _SLUG.fullmatch(reload.get('installer', ''))
+                    or not isinstance(files, list) or not files
+                    or not isinstance(busy, dict)
+                    or type(reload.get('waited_ms')) is not int or reload['waited_ms'] < 0
+                    or type(reload.get('allow_reload')) is not bool):
+                return
+            for item in files:
+                if (not isinstance(item, dict) or not isinstance(item.get('path'), str)
+                        or not os.path.isabs(item['path']) or any(
+                            item.get(key) is not None and not re.fullmatch(r'[a-f0-9]{64}', item[key])
+                            for key in ('sha256_before', 'sha256_after'))):
+                    return
+            if any(not _LABEL.fullmatch(key) or not (type(value) is int and value >= 0 or value == 'unknown')
+                   for key, value in busy.items()):
+                return
+            row['props'] = {key: reload[key] for key in ('installer', 'busy', 'waited_ms', 'allow_reload')}
+            row['props']['files'] = [{key: item[key] for key in ('path', 'sha256_before', 'sha256_after')}
+                                     for item in files]
         if error_tag:
             tag = error_tag if isinstance(error_tag, str) and _LABEL.fullmatch(error_tag) else 'other'
             row['error'] = {'tag': tag, 'message': tag}
@@ -945,7 +969,7 @@ def main(argv=None):
         p.add_argument('--board', required=True)
         p.add_argument('--day', default=datetime.now(timezone.utc).strftime('%Y-%m-%d'))
         if cmd == 'read':
-            p.add_argument('--kind', choices=['event', 'perf', 'error'])
+            p.add_argument('--kind', choices=['event', 'perf', 'error', 'opencode-reload'])
             p.add_argument('--name')
             p.add_argument('--limit', type=int, default=100)
         else:
