@@ -596,6 +596,38 @@ test("box watcher canary stays out of Mac state, archives and logs; lease expiry
   s.rollback(); s.advance(); await watches.tick(); expect(checks).toBe(1);
 });
 
+test("delivery card owner relay to a remote Moni chat reports the exact refusal without sending", async () => {
+  const s = setup(), ownerStore = new Store(join(s.mac, "delivery-owner.sqlite")); closes.push(() => ownerStore.close());
+  let sends = 0;
+  s.line.sendText = async () => { sends++; throw new Error("No real sends allowed"); };
+  const registry = new ChatRegistry({ owner: "+15555550123", ownerStore, stateRoot: s.mac, line: s.line,
+    access: () => ({ people: [{ name: "Moni", role: "admin", addresses: ["+15555550199"] }], groups: [] }),
+    build: chat => { if (chat.info.slug === "moni") chat.remote = s.remote; return { api: async () => Response.json({}) }; } });
+  registry.restore(); const moni = registry.open(chatKey.dm("+15555550199")); closes.push(() => moni.store.close());
+  const session = "ardud-control:thread:fake-owner";
+  ownerStore.set("route", { id: session, generation: 1 });
+  const api = createSbApi({ registry, line: s.line, accessPath: join(s.mac, "access.json"), enabled: () => true, health: () => ({}) });
+  const command = parseCommand(["send", "--to", "moni", "--text=https://cards.example.com/s/fake/", "--session", session,
+    "--key", "delivery-card:order-amazon-fake"]);
+  const response = await api(new Request(`http://bridge${command.path}`, { method: command.method, body: JSON.stringify(command.body) }));
+  expect(response.status).toBe(403);
+  expect(await response.json()).toEqual({ error: "Use agent-ask to reach this chat on its box" });
+  expect(sends).toBe(0);
+  expect(moni.store.pendingOutbox()).toEqual([]);
+  expect(s.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox").get()!.n).toBe(0);
+  const relay = parseCommand(["agent-ask", "--to", "moni", "--text=Send the fake delivery card once", "--session", session,
+    "--key", "delivery-card:order-amazon-fake"]);
+  const ask = () => api(new Request(`http://bridge${relay.path}`, { method: relay.method, body: JSON.stringify(relay.body) }));
+  const accepted = await ask();
+  expect(accepted.status).toBe(202);
+  const ack = await accepted.json() as { id: string; created: boolean };
+  expect(ack).toEqual({ id: expect.stringMatching(/^areq_[a-f0-9]{64}$/), created: true });
+  expect(await (await ask()).json()).toEqual({ id: ack.id, created: false });
+  expect(s.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox").get()!.n).toBe(1);
+  expect(sends).toBe(0);
+  expect(moni.store.pendingOutbox()).toEqual([]);
+});
+
 test("bus answer acknowledgement is idempotent; owner relays refuse before writing a local outbox", async () => {
   const s = setup(), ownerStore = new Store(join(s.mac, "bus-owner.sqlite")); closes.push(() => ownerStore.close());
   const registry = new ChatRegistry({ owner: "+15555550123", ownerStore, stateRoot: s.mac, line: s.line,

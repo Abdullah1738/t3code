@@ -1019,8 +1019,222 @@ class CardTests(unittest.TestCase):
         self.assertEqual(saved['card_meta']['items'],cfg['card_meta']['items'])
 
 
-if __name__ == '__main__':
-    unittest.main()
+    def test_remote_refusal_hands_off_once_with_original_key_and_url(self):
+        original_bridge = c.bridge
+        requests = []
+        def remote(args, **kw):
+            if args[0] == 'send':
+                raise c.BridgeError('{"error":"Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box"}', 1)
+            if args[0] == 'agent-ask':
+                requests.append(args)
+                oid = c.mine(args)
+                with sqlite3.connect(self.db('owner')) as con:
+                    con.execute('create table if not exists agent_requests (id text primary key, to_slug text, status text)')
+                    row = con.execute('select id from agent_requests where id=?', (oid,)).fetchone()
+                    con.execute('insert or ignore into agent_requests values (?, ?, ?)', (oid, 'moni', 'open'))
+                return {'id': oid, 'created': not row}
+            return original_bridge(args, **kw)
+        with patch.object(c, 'bridge', side_effect=remote):
+            self.assertEqual(c.sync(self.cfg, self.data, send=True)['status'], 'relayed')
+            path = c.ROOT / 'cards/order-talabat-123.json'
+            state = c.read(path)
+            self.assertEqual(state['open'], [])
+            self.assertEqual(state['bridge_error']['http'], 403)
+            self.assertEqual(requests[0][requests[0].index('--key') + 1], 'delivery-card:order-talabat-123')
+            self.assertIn(json.dumps(state['url']), next(a for a in requests[0] if a.startswith('--text=')))
+            c.sync(self.cfg, self.data, send=True)
+            self.assertEqual(len(requests), 1)
+            # A cut after bus acceptance reconciles the request row instead of sending twice.
+            state['status'] = 'failed:bridge_request_failed'
+            state['open'] = [{'args': state['send_args']}]
+            state.pop('agent_request_id')
+            c.atomic(path, state)
+            self.assertEqual(c.sync(self.cfg, self.data, send=True)['status'], 'relayed')
+            self.assertEqual(c.read(path)['agent_request_id'], c.mine(state['send_args']))
+            self.assertEqual(len(requests), 1)
+
+    def test_remote_refusal_does_not_switch_while_an_older_send_is_unanswered(self):
+        args = ['send', '--to', 'moni', '--text=https://cards.example.com/old', '--session', 'fixture-session', '--key', 'old-key']
+        holder = {'args': args, 'open': [{'args': args}]}
+        error = c.BridgeError('Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box', 1)
+        with patch.object(c, 'bridge', side_effect=error) as bridge:
+            with self.assertRaises(c.BridgeError):
+                c.attempt(holder, 'args', lambda: None)
+        self.assertEqual(bridge.call_count, 1)
+        self.assertEqual(holder['args'], args)
+        self.assertEqual(len(holder['open']), 1)
+
+    def test_remote_fallback_uses_the_refused_target_not_a_named_person(self):
+        args = ['send', '--to', 'remote-person', '--text=https://cards.example.com/fake/', '--session', 'fixture-session', '--key', 'delivery-card:fake']
+        relay = c.relay_args(args)
+        self.assertEqual(relay[relay.index('--to') + 1], 'remote-person')
+        self.assertEqual(relay[relay.index('--key') + 1], 'delivery-card:fake')
+
+    def test_remote_fallback_reconciles_all_older_outbox_outcomes_before_switching(self):
+        cases = [('pending', 0, 'sent'), ('sending', 1, 'sent'), ('sent', 1, 'sent'),
+                 ('uncertain', 1, 'failed:may_have_sent_check_chat'),
+                 ('cancelled', 1, 'failed:may_have_sent_check_chat'),
+                 ('failed', 0, 'relayed'), (None, 0, None)]
+        for suffix in ('same', 'different'):
+            for row, attempts, expected in cases:
+                with self.subTest(key=suffix, row=row):
+                    prior = ['send', '--to', 'moni', '--text=https://cards.example.com/fake/', '--session', 'fixture-session',
+                             '--key', f'delivery-card:race-{suffix}-{row}']
+                    args = list(prior)
+                    if suffix == 'different':
+                        args[-1] += '#2'
+                    holder = {'args': args, 'open': [{'args': prior}]}
+                    def remote(call):
+                        if call[0] == 'send':
+                            if row:
+                                self.queue(prior, row, attempts)
+                            raise c.BridgeError('Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box', 1)
+                        return {'id': c.mine(call), 'created': True}
+                    with patch.object(c, 'bridge', side_effect=remote) as bridge:
+                        if expected:
+                            self.assertEqual(c.attempt(holder, 'args', lambda: None), expected)
+                        else:
+                            with self.assertRaises(c.BridgeError):
+                                c.attempt(holder, 'args', lambda: None)
+                        self.assertEqual(bridge.call_count, 2 if expected == 'relayed' else 1)
+
+    def test_missing_older_outbox_row_cannot_become_safe_between_reads(self):
+        args = ['send', '--to', 'moni', '--text=https://cards.example.com/fake/', '--session', 'fixture-session', '--key', 'delivery-card:race']
+        holder = {'args': args, 'open': [{'args': args}]}
+        results = [(None, {}), (None, {c.mine(args): ('live', 'sent')})]
+        with patch.object(c, 'ops', side_effect=results) as ops, patch.object(c, 'bridge', side_effect=c.BridgeError(
+                'Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box', 1)) as bridge:
+            with self.assertRaises(c.BridgeError):
+                c.attempt(holder, 'args', lambda: None)
+            self.assertEqual((ops.call_count, bridge.call_count), (1, 1))
+
+    def test_prelaunch_failure_clears_only_its_attempt_and_uncertain_errors_stay_open(self):
+        import subprocess
+        args = ['send', '--to', 'moni', '--text=https://cards.example.com/fake/', '--session', 'fixture-session', '--key', 'delivery-card:launch']
+        cases = [(FileNotFoundError('missing bun'), False), (PermissionError('bun is not executable'), False),
+                 (OSError('unknown IO failure'), True), (subprocess.TimeoutExpired('bun', 12), True)]
+        for older in (False, True):
+            for error, remains_open in cases:
+                with self.subTest(older=older, error=type(error).__name__):
+                    prior = {'args': list(args), 'at': 1}
+                    holder = {'args': list(args), 'open': [prior] if older else []}
+                    with patch.object(c, 'bridge', side_effect=error), self.assertRaises(type(error)):
+                        c.attempt(holder, 'args', lambda: None)
+                    self.assertEqual(len(holder['open']), int(older) + int(remains_open))
+                    if older:
+                        self.assertEqual(holder['open'][0], prior)
+
+    def test_ambiguous_bus_handoff_stays_open_and_is_not_blindly_retried(self):
+        args = c.relay_args(['send', '--to', 'moni', '--text=https://cards.example.com/fake/', '--session', 'fixture-session', '--key', 'delivery-card:fake'])
+        with sqlite3.connect(self.db('owner')) as con:
+            con.execute('create table agent_requests (id text primary key, to_slug text, status text)')
+        holder = {'args': args, 'open': []}
+        with patch.object(c, 'bridge', side_effect=c.BridgeError('Bridge request timed out', 1)):
+            with self.assertRaises(c.BridgeError):
+                c.attempt(holder, 'args', lambda: None)
+        self.assertEqual(len(holder['open']), 1)
+        self.assertEqual(c.reconcile(args, holder, 'args'), ('failed:may_have_sent_check_chat', args))
+
+    def test_bad_bus_ack_keeps_the_attempt_open(self):
+        args = c.relay_args(['send', '--to', 'moni', '--text=https://cards.example.com/fake/', '--session', 'fixture-session', '--key', 'delivery-card:fake'])
+        holder = {'args': args, 'open': []}
+        with patch.object(c, 'bridge', return_value={'id': 'not-an-areq', 'created': True}):
+            with self.assertRaisesRegex(ValueError, 'card_bus_bad_ack'):
+                c.attempt(holder, 'args', lambda: None)
+        self.assertEqual(len(holder['open']), 1)
+
+    def test_existing_declined_or_timed_out_bus_request_is_not_reported_sent_or_retried(self):
+        args = c.relay_args(['send', '--to', 'moni', '--text=https://cards.example.com/fake/', '--session', 'fixture-session', '--key', 'delivery-card:fake'])
+        with sqlite3.connect(self.db('owner')) as con:
+            con.execute('create table agent_requests (id text primary key, to_slug text, status text)')
+        for status in ('declined', 'timed_out'):
+            with self.subTest(status=status), sqlite3.connect(self.db('owner')) as con:
+                con.execute('insert or replace into agent_requests values (?, ?, ?)', (c.mine(args), 'moni', status))
+            holder = {'args': args, 'open': []}
+            with patch.object(c, 'bridge', return_value={'id': c.mine(args), 'created': False}) as bridge:
+                self.assertEqual(c.attempt(holder, 'args', lambda: None), 'failed:may_have_sent_check_chat')
+                self.assertEqual(c.reconcile(args, holder, 'args'), ('failed:may_have_sent_check_chat', args))
+                self.assertEqual(bridge.call_count, 1)
+
+    def test_refused_bridge_reason_is_saved_and_returned(self):
+        self.fail_send = True
+        self.fail_err = '{"error":"Bridge request failed (HTTP 409): No chat for this session"}'
+        result = c.sync(self.cfg, self.data, send=True)
+        state = c.read(c.ROOT / 'cards/order-talabat-123.json')
+        self.assertEqual(state['open'], [])
+        self.assertEqual(result['status'], 'failed:bridge_request_failed')
+        self.assertEqual(result['bridge_error'], state['bridge_error'])
+        self.assertEqual(state['bridge_error']['http'], 409)
+        self.assertIn('No chat for this session', state['bridge_error']['message'])
+
+    def test_order_add_returns_refusal_detail_and_saves_failed_notice(self):
+        self.cfg['app'] = 'amazon'
+        self.cfg['order'] = '123'
+        self.cfg['watcher'] = 'order-amazon-123'
+        self.cfg['vertical'] = 'same-day'
+        t.write(t.ROOT / 'orders/order-amazon-123.json', self.cfg)
+        folder = t.WATCHERS / self.cfg['watcher']
+        folder.mkdir(parents=True)
+        t.write(folder / 'watcher.json', {'id': self.cfg['watcher']})
+        detail = c.BridgeError('Bridge request failed (HTTP 403): Forbidden', 1).detail
+        with patch.object(t, 'configure_problem_check'), patch.object(c, 'safe_sync', return_value={'status': 'failed:bridge_request_failed', 'bridge_error': detail}), contextlib.redirect_stdout(io.StringIO()) as out:
+            code = t.main(['add', '--app', 'amazon', '--order', '123', '--for', 'moni'])
+        receipt = json.loads(out.getvalue().splitlines()[-1])
+        self.assertEqual(code, t.NOTICE_FAILED_EXIT)
+        self.assertTrue(receipt['watcher_registered'])
+        self.assertEqual(receipt['bridge_error'], detail)
+        notice = t.read(t.ROOT / 'orders/order-amazon-123.json')['placed_notice']
+        self.assertEqual(notice['status'], 'failed:bridge_request_failed')
+        self.assertEqual(notice['bridge_error'], detail)
+
+
+class BridgeDiagnosticsTests(unittest.TestCase):
+    def test_credential_forms_are_fully_redacted_in_state_and_event_log(self):
+        import toollog
+        reason = 'Bridge request failed (HTTP 403): Forbidden'
+        cases = ['password="scarlet otter picnic notebook"', "password='scarlet otter picnic notebook'",
+                 'password="scarlet \\"otter\\" picnic notebook"', 'token=scarlet',
+                 'API_KEY="scarlet otter picnic notebook"', 'Cookie: scarlet=otter picnic notebook',
+                 json.dumps({'password': 'scarlet otter picnic notebook'}),
+                 json.dumps({'error': reason + ' password="scarlet otter picnic notebook"'}),
+                 json.dumps({'error': reason + " secret='scarlet otter picnic notebook'"})]
+        for raw in cases:
+            with self.subTest(raw=raw), tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, ROBOB_TOOL_LOG_DIR=folder):
+                error = c.BridgeError(reason + '\n' + raw, 1)
+                holder = {}
+                c.remember_bridge_error(holder, error)
+                c.log_bridge_error(error, ['send'])
+                logs = '\n'.join(path.read_text() for path in Path(folder).rglob('*.ndjson'))
+                saved = json.dumps(holder) + logs
+                for word in ('scarlet', 'otter', 'picnic', 'notebook'):
+                    self.assertNotIn(word, saved)
+                self.assertIn(reason, saved)
+                self.assertEqual(holder['bridge_error']['http'], 403)
+
+    def test_stderr_exit_and_http_survive_in_exception_and_event_log_with_secrets_scrubbed(self):
+        import subprocess
+        import toollog
+        # Patch through the original bridge, rather than the card fixture's mocked bridge.
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': folder}):
+            error = '{"error":"Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box"}\nAuthorization: Bearer secret123\nCookie: session=private\ntoken=private-token'
+            result = subprocess.CompletedProcess([], 7, '', error)
+            with patch.object(c.subprocess, 'run', return_value=result), self.assertRaises(c.BridgeError) as raised:
+                c.bridge(['send', '--to', 'moni'])
+            detail = raised.exception.detail
+            self.assertEqual((detail['http'], detail['exit_code']), (403, 7))
+            logs = '\n'.join(p.read_text() for p in Path(folder).rglob('*.ndjson'))
+            self.assertIn('Use agent-ask to reach this chat on its box', logs)
+            self.assertIn('bridge.error', logs)
+            self.assertIn('"exit_code":7', logs.replace(' ', ''))
+            for secret in ('secret123', 'session=private', 'private-token'):
+                self.assertNotIn(secret, json.dumps(detail) + logs)
+
+    def test_refusal_matrix_preserves_at_most_once_classification(self):
+        for stderr, refused in [('HTTP 403', False), ('Bridge request failed (HTTP 403): Forbidden', True),
+                                ('Bridge request failed (HTTP 503)', True), ('Invalid command arguments', True),
+                                ('Bridge request failed (HTTP 502)', False), ('Bridge request timed out', False)]:
+            with self.subTest(stderr=stderr):
+                self.assertEqual(c.BridgeError(stderr, 1).refused, refused)
 
 
 class RenderLoggingTests(unittest.TestCase):
