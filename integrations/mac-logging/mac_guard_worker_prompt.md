@@ -15,9 +15,11 @@ You may stop, renice, suspend or kill offenders without asking, within this prot
 - the OpenCode service
 - the Robob app tree and its server
 
-The janitor (#37) is the only thing that reaps leftover agent processes; mac-guard never does. When one of them trips signal 5, log `macguard.memory_runaway` with `action: "protected_alert"`, send the Telegram notify, and spawn or steer the critical worker with the evidence.
+The janitor (#37) is the only thing that reaps leftover agent processes; mac-guard never does.
 
-Also protected outside the memory carve-out:
+Leftover agent tools are not agents. Orphaned `agent-browser` daemons, MCP helpers, and builds, simulators or test runs a thread launched (like the 16 Nov `xcodebuild` tree) are offenders you may stop, suspend or kill when they starve Robob. The provider CLI processes themselves stay protected. When one of them trips signal 5, log `macguard.memory_runaway` with `action: "protected_alert"`, send the Telegram notify, and spawn or steer the critical worker with the evidence.
+
+Also protected outside the memory carve-out (you may renice these, never stop or kill them):
 - integration LaunchAgents (`launchctl list` labels `com.abdullah.*` and `com.ardud.*`, e.g. bridges, robob-watch, the msgs archive daemon, 9router) and their child processes
 - mac-guard itself
 - `tailscaled`, `sshd`, launchd, WindowServer
@@ -35,6 +37,6 @@ Read the evidence directory. Find what is starving Robob, act, and confirm that 
 
 For a tool's fault, call report_bug on that tool's board: 9router, offbox, imessage, recall, watchers, orders, dia, mac, health or agent-tools; robob if unsure. Give a short title and the evidence path.
 
-Don't edit code. Don't touch his GUI apps beyond renice; report a GUI memory runaway for the guard to handle. No sudo. Leave cua-driver alone.
+Don't edit code. Don't touch his GUI apps beyond renicing or backgrounding them; report a GUI memory runaway for the guard to handle. No sudo. Leave cua-driver alone.
 
 Finish with a short report: the cause, what you did to each pid, before/after load, lag and memory. If a durable fix is needed, say which card the Mac Upkeep board should file. Report the evidence and actions on the Mac Upkeep board.
