@@ -113,6 +113,7 @@ import {
   postRecoveryPending,
 } from "./ownerReplyWake.ts";
 import * as BoardLocks from "./boardLocks.ts";
+import { newWait } from "./waits.ts";
 import * as SavedWrite from "./savedWrite.ts";
 import * as SavedReply from "../tools/savedReply.ts";
 import { McpSchema } from "effect/ai";
@@ -49364,4 +49365,582 @@ it.effect.each(["attachment", "abandonment"] as const)(
         Effect.provide(testLayer(lifecycle)),
       );
     }),
+);
+
+it.effect.each([
+  "live evaluator",
+  "intervening activity",
+  "no evaluator",
+  "missing evaluator",
+  "archived evaluator",
+  "existing sweep",
+] as const)("#1768 idle evaluator backstop: %s", (mode) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00.000Z"));
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const created = yield* kanban.createCard(
+        board.id,
+        { title: "Idle evaluator", prompt: "Finish" },
+        owner,
+      );
+      const evaluator = ThreadId.make("idle-evaluator-1768");
+      yield* Ref.update(fake.threads, (all) =>
+        new Map(all).set(evaluator, {
+          title: "Evaluator",
+          model: board.evaluatorModel,
+          messages: [],
+          running: false,
+          archived: false,
+        }),
+      );
+      if (mode === "missing evaluator")
+        yield* Ref.update(fake.threads, (all) => {
+          const next = new Map(all);
+          next.delete(evaluator);
+          return next;
+        });
+      if (mode === "archived evaluator") yield* setArchived(fake, evaluator);
+      yield* store.putThreadLink({
+        threadId: evaluator,
+        boardId: board.id,
+        cardId: created.id,
+        role: "evaluator",
+        purpose: "discussion",
+        discussionId: null,
+        model: board.evaluatorModel,
+        startedAt: created.createdAt,
+        endedAt: mode === "no evaluator" || mode === "existing sweep" ? created.createdAt : null,
+        paused: null,
+      });
+      if (mode === "existing sweep") {
+        const sweep = ThreadId.make("existing-stalled-sweep");
+        yield* Ref.update(fake.threads, (all) =>
+          new Map(all).set(sweep, {
+            title: "Sweep",
+            model: board.evaluatorModel,
+            messages: [],
+            running: true,
+            archived: false,
+          }),
+        );
+        yield* store.putThreadLink({
+          threadId: sweep,
+          boardId: board.id,
+          cardId: null,
+          role: "evaluator",
+          purpose: "stalled",
+          discussionId: null,
+          model: board.evaluatorModel,
+          startedAt: created.createdAt,
+          endedAt: null,
+          paused: null,
+        });
+      }
+      yield* store.putCard({
+        ...created,
+        stage: "completed",
+        subtasks: [
+          {
+            id: "s1",
+            step: 1,
+            owner: "evaluator",
+            text: "Finish",
+            state: "open",
+            createdAt: created.createdAt,
+            doneAt: null,
+            doneBy: null,
+            note: null,
+          },
+        ],
+      });
+      const nudges = () =>
+        fake.sends.filter(
+          (send) => send.threadId === evaluator && send.text.includes("has sat in completed"),
+        );
+      yield* TestClock.adjust("7 hours");
+      yield* kanban.tick;
+      const expectedNudges = [
+        "no evaluator",
+        "missing evaluator",
+        "archived evaluator",
+        "existing sweep",
+      ].includes(mode)
+        ? 0
+        : 1;
+      assert.lengthOf(nudges(), expectedNudges);
+      if (mode === "existing sweep")
+        assert.isTrue(
+          fake.sends.some(
+            (send) =>
+              send.threadId === "existing-stalled-sweep" &&
+              send.text.includes("has sat in completed"),
+          ),
+        );
+      let detail = yield* kanban.card(created.id);
+      assert.strictEqual(detail.events.at(-1)!.kind, "thread");
+      assert.isTrue(detail.events.at(-1)!.body!.startsWith("Idle evaluator nudge: "));
+      assert.isNull(detail.card.stalled);
+      yield* TestClock.adjust("5 hours");
+      yield* kanban.tick;
+      assert.lengthOf(nudges(), expectedNudges);
+      assert.isNull((yield* kanban.card(created.id)).card.stalled);
+      if (mode === "intervening activity") {
+        yield* store.addCardEvent({
+          cardId: created.id,
+          at: DateTime.formatIso(yield* DateTime.now),
+          actor: owner,
+          kind: "comment",
+          fromStage: null,
+          toStage: null,
+          body: "Progress",
+          head: null,
+        });
+      }
+      yield* TestClock.adjust("1 hour");
+      yield* kanban.tick;
+      if (mode === "intervening activity") {
+        assert.isNull((yield* kanban.card(created.id)).card.stalled);
+        assert.lengthOf(nudges(), 1);
+        yield* TestClock.adjust("5 hours");
+        yield* kanban.tick;
+        assert.isNull((yield* kanban.card(created.id)).card.stalled);
+        assert.lengthOf(nudges(), 2);
+        yield* TestClock.adjust("6 hours");
+        yield* kanban.tick;
+      }
+      detail = yield* kanban.card(created.id);
+      assert.strictEqual(detail.card.stage, "completed");
+      assert.strictEqual(detail.card.stalled?.reason, "Idle evaluator step s1");
+      assert.deepEqual(detail.card.stalled?.by, { _tag: "system", component: "dispatcher" });
+      assert.isTrue(
+        (yield* store.threadLinks({ boardId: board.id, open: true })).some(
+          (link) => link.role === "evaluator" && link.purpose === "stalled",
+        ),
+      );
+      assert.lengthOf(nudges(), mode === "intervening activity" ? 2 : expectedNudges);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect.each(["rejected", "accepted then failed", "lookup failed"] as const)(
+  "#1768 retries a %s nudge across service recreation before escalating",
+  (failure) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Retry idle evaluator",
+            prompt: "Finish",
+            subtasks: [{ owner: "evaluator", text: "Finish" }],
+          },
+          owner,
+        );
+        yield* store.putCard({ ...card, stage: "completed" });
+        const evaluator = ThreadId.make("retry-idle-evaluator");
+        yield* Ref.update(fake.threads, (all) =>
+          new Map(all).set(evaluator, {
+            title: "Evaluator",
+            model: board.evaluatorModel,
+            messages: [],
+            running: false,
+            archived: false,
+          }),
+        );
+        yield* store.putThreadLink({
+          threadId: evaluator,
+          boardId: board.id,
+          cardId: card.id,
+          role: "evaluator",
+          purpose: "discussion",
+          discussionId: null,
+          model: board.evaluatorModel,
+          startedAt: card.createdAt,
+          endedAt: null,
+          paused: null,
+        });
+        if (failure === "rejected") fake.rejectSends.add(evaluator);
+        else if (failure === "accepted then failed") fake.commitThenReject.add(evaluator);
+        else
+          fake.findControl.beforeRead = (id) =>
+            id === evaluator
+              ? Effect.fail(new KanbanThreadError({ operation: "find", detail: "read failed" }))
+              : Effect.void;
+        yield* TestClock.adjust("7 hours");
+        yield* kanban.tick;
+        assert.isFalse(
+          (yield* kanban.card(card.id)).events.some((event) =>
+            event.body?.startsWith("Idle evaluator nudge: "),
+          ),
+        );
+        yield* TestClock.adjust("6 hours");
+        if (failure !== "accepted then failed") {
+          yield* kanban.tick;
+          assert.isNull((yield* kanban.card(card.id)).card.stalled);
+          assert.isFalse(
+            (yield* store.threadLinks({ boardId: board.id, open: true })).some(
+              (link) => link.purpose === "stalled",
+            ),
+          );
+          fake.rejectSends.delete(evaluator);
+          delete fake.findControl.beforeRead;
+        }
+        yield* Effect.gen(function* () {
+          const restarted = yield* KanbanService.KanbanService;
+          yield* restarted.ready;
+          yield* restarted.tick;
+          const detail = yield* restarted.card(card.id);
+          assert.isTrue(detail.events.at(-1)!.body!.startsWith("Idle evaluator nudge: "));
+          assert.isNull(detail.card.stalled);
+          const messages = (yield* Ref.get(fake.threads)).get(evaluator)!.messages;
+          assert.lengthOf(
+            messages.filter((text) => text.includes("has sat in completed")),
+            1,
+          );
+          yield* TestClock.adjust("5 hours");
+          yield* restarted.tick;
+          assert.isNull((yield* restarted.card(card.id)).card.stalled);
+          yield* TestClock.adjust("1 hour");
+          yield* restarted.tick;
+          assert.equal(
+            (yield* restarted.card(card.id)).card.stalled?.reason,
+            "Idle evaluator step s1",
+          );
+        }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect("#1768 serializes a shared release receipt with an outside-gate idle snapshot", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const read = yield* Deferred.make<void>();
+    const resume = yield* Deferred.make<void>();
+    const receiptRead = yield* Deferred.make<void>();
+    let idleId: KanbanCardId | undefined;
+    let receiptId: KanbanCardId | undefined;
+    let armed = false;
+    const observed = Layer.effect(
+      KanbanStore.KanbanStore,
+      Effect.map(KanbanStore.KanbanStore, (real) =>
+        KanbanStore.KanbanStore.of({
+          ...real,
+          card: (id) =>
+            real
+              .card(id)
+              .pipe(
+                Effect.tap(() =>
+                  id === receiptId && armed
+                    ? Deferred.succeed(receiptRead, undefined)
+                    : Effect.void,
+                ),
+              ),
+          threadLinks: (filter) =>
+            real
+              .threadLinks(filter)
+              .pipe(
+                Effect.tap(() =>
+                  armed && filter && "cardId" in filter && filter.cardId === idleId
+                    ? Deferred.succeed(read, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+                    : Effect.void,
+                ),
+              ),
+        }),
+      ),
+    ).pipe(Layer.provide(KanbanStore.layer));
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00Z"));
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const other = yield* kanban.ensureBoard({
+        slug: "receipt",
+        name: "Receipt",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      const idle = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Idle",
+          prompt: "Finish",
+          subtasks: [{ text: "Observe", owner: "evaluator" }],
+        },
+        owner,
+      );
+      const receipt = yield* kanban.createCard(
+        other.id,
+        {
+          title: "Receipt",
+          prompt: "Observe",
+          subtasks: [{ text: "Observe", owner: "evaluator" }],
+        },
+        owner,
+      );
+      idleId = idle.id;
+      receiptId = receipt.id;
+      yield* store.putCard({
+        ...idle,
+        stage: "completed",
+        subtasks: idle.subtasks.map((task) => ({ ...task, interrupting: true, service: "robob" })),
+      });
+      yield* store.putCard({
+        ...receipt,
+        subtasks: receipt.subtasks.map((task) => ({
+          ...task,
+          interrupting: true,
+          service: "robob",
+        })),
+      });
+      const evaluator = ThreadId.make("release-race-evaluator");
+      yield* Ref.update(fake.threads, (all) =>
+        new Map(all).set(evaluator, {
+          title: "Evaluator",
+          model: board.evaluatorModel,
+          messages: [],
+          running: false,
+          archived: false,
+        }),
+      );
+      yield* store.putThreadLink({
+        threadId: evaluator,
+        boardId: board.id,
+        cardId: idle.id,
+        role: "evaluator",
+        purpose: "discussion",
+        discussionId: null,
+        model: board.evaluatorModel,
+        startedAt: idle.createdAt,
+        endedAt: null,
+        paused: null,
+      });
+      yield* TestClock.adjust("7 hours");
+      armed = true;
+      const ticking = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(read);
+      const marking = yield* Effect.forkChild(
+        kanban.markSubtask(receipt.id, "s1", "done", null, owner, "evaluator"),
+      );
+      yield* Deferred.await(receiptRead);
+      // A regular write still finishes while the snapshot read is blocked.
+      yield* kanban.editCard(idle.id, { title: "Edited during snapshot" }, owner);
+      assert.isUndefined(marking.pollUnsafe());
+      armed = false;
+      yield* Deferred.succeed(resume, undefined);
+      yield* TestClock.adjust("10 seconds");
+      yield* Fiber.join(ticking);
+      yield* Fiber.join(marking);
+      const events = (yield* kanban.card(idle.id)).events;
+      assert.isFalse(events.some((event) => event.body?.startsWith("Idle evaluator nudge: ")));
+      const ledger = (yield* store.board(other.id))!.releaseLedger!;
+      assert.lengthOf(ledger, 1);
+      assert.equal(ledger[0]!.service, "robob");
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(resume, undefined)),
+      Effect.provide(testLayer(fake.layer, undefined, undefined, observed)),
+    );
+  }),
+);
+
+it.effect.each([
+  "eligible",
+  "wait",
+  "owner ask",
+  "notice",
+  "settled",
+  "progress",
+  "release",
+  "awaited release",
+] as const)("#1768 revalidates a capped idle evaluator delivery after %s", (change) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00Z"));
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const card = yield* kanban.createCard(
+        board.id,
+        {
+          title: "Queued idle evaluator",
+          prompt: "Observe",
+          subtasks: [{ text: "Observe", owner: "evaluator" }],
+        },
+        owner,
+      );
+      const idle = {
+        ...card,
+        stage: "completed" as const,
+        subtasks: card.subtasks.map((task) => ({ ...task, interrupting: true, service: "robob" })),
+      };
+      yield* store.putCard(idle);
+      const receipt =
+        change === "awaited release"
+          ? yield* kanban.createCard(
+              board.id,
+              {
+                title: "Awaited receipt",
+                prompt: "Observe",
+                subtasks: [
+                  { text: "Observe", owner: "work", step: 1 },
+                  { text: "Inspect", owner: "evaluator", step: 2 },
+                ],
+              },
+              owner,
+            )
+          : null;
+      if (receipt) yield* store.putCard({ ...receipt, stage: "needs_owner" });
+      const approval = {
+        id: "sa-idle",
+        gate: "deploy" as const,
+        minIntervalHours: 4,
+        quote: "Release",
+        sourceThreadId: "owner",
+        saidAt: card.createdAt,
+        approvedAsk: { cardId: card.id, askId: "q1" },
+        recordedAt: card.createdAt,
+        recordedBy: "evaluator",
+        revokedAt: null,
+        revokedBy: null,
+        revokeReason: null,
+      };
+      yield* store.putBoard({ ...board, standingApprovals: [approval] });
+      const other = yield* kanban.ensureBoard({
+        slug: "shared",
+        name: "Shared release",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* TestClock.adjust("7 hours");
+      for (let index = 0; index < 12; index++)
+        yield* kanban.submitEvaluator(
+          board.id,
+          { kind: "request", text: `Capacity ${index}` },
+          { forceNew: true },
+        );
+      for (const id of (yield* Ref.get(fake.threads)).keys()) yield* setArchived(fake, id);
+      yield* kanban.tick;
+      const sql = yield* SqlClient.SqlClient;
+      const queued = yield* sql<{
+        json: string;
+      }>`SELECT json FROM ardud_kanban_evaluator_queue WHERE job_key LIKE 'idle-evaluator:%' AND done_at IS NULL`;
+      assert.lengthOf(queued, 1);
+      assert.include(queued[0]!.json, '"idleEvaluator"');
+      yield* TestClock.adjust("2 minutes");
+      const at = DateTime.formatIso(yield* DateTime.now);
+      if (change === "wait")
+        yield* store.putCard({
+          ...idle,
+          wait: newWait(
+            {
+              on: "time",
+              until: DateTime.formatIso(DateTime.makeUnsafe(Date.parse(at) + 3_600_000)),
+              note: "Later",
+            },
+            owner,
+            at,
+          ),
+        });
+      if (change === "owner ask" || change === "notice")
+        yield* store.putCard({
+          ...idle,
+          asks: [
+            {
+              id: "q1",
+              text: "Park",
+              kind: change === "notice" ? "notice" : "pick",
+              blocking: change !== "notice",
+              by: owner,
+              at,
+              seq: null,
+              closedAt: null,
+            },
+          ],
+        });
+      if (change === "settled") yield* store.putCard({ ...idle, settledAt: at });
+      if (change === "progress")
+        yield* store.addCardEvent({
+          cardId: card.id,
+          at,
+          actor: owner,
+          kind: "comment",
+          fromStage: null,
+          toStage: null,
+          body: "Progress",
+          head: null,
+        });
+      if (change === "release")
+        yield* store.putBoard({
+          ...other,
+          releaseLedger: [
+            {
+              boardId: other.id,
+              cardId: card.id,
+              cardNumber: 1,
+              subtaskId: "s1",
+              service: "robob",
+              at,
+              critical: null,
+              approvalId: null,
+            },
+          ],
+        });
+      if (receipt) {
+        yield* store.putCard({
+          ...receipt,
+          stage: "completed",
+          subtasks: receipt.subtasks.map((task) =>
+            task.id === "s1"
+              ? {
+                  ...task,
+                  owner: "evaluator" as const,
+                  interrupting: true,
+                  service: "robob",
+                }
+              : task,
+          ),
+        });
+        // The release holds admission until its awaited child launches the next
+        // evaluator. An older idle job must stay pending without blocking it.
+        yield* kanban.markSubtask(receipt.id, "s1", "done", null, owner, "evaluator");
+        assert.lengthOf(
+          yield* sql`SELECT id FROM ardud_kanban_evaluator_queue WHERE job_key LIKE 'idle-evaluator:%' AND done_at IS NULL`,
+          1,
+        );
+        assert.isTrue(
+          [...(yield* Ref.get(fake.threads)).values()].some((thread) =>
+            thread.messages.some((text) => text.includes("Inspect")),
+          ),
+        );
+      }
+      const nudges = () =>
+        Effect.map(Ref.get(fake.threads), (all) =>
+          [...all.values()]
+            .flatMap((thread) => thread.messages)
+            .filter((text) => text.includes("has sat in completed")),
+        );
+      yield* Effect.gen(function* () {
+        const restarted = yield* KanbanService.KanbanService;
+        yield* restarted.ready;
+        yield* restarted.tick;
+        assert.lengthOf(yield* nudges(), change === "eligible" || change === "notice" ? 1 : 0);
+        assert.isNull((yield* restarted.card(card.id)).card.stalled);
+        if (change === "release" || change === "awaited release") {
+          yield* TestClock.adjust("4 hours");
+          yield* restarted.tick;
+          assert.lengthOf(yield* nudges(), 1);
+        }
+      }).pipe(Effect.provide(Layer.fresh(KanbanService.layer)));
+    }).pipe(
+      Effect.provide(
+        withOwnerRouteMode(
+          testLayer(fake.layer),
+          change === "awaited release" ? "await" : "inline",
+        ),
+      ),
+    );
+  }),
 );

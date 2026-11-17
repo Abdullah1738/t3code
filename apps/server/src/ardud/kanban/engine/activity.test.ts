@@ -2981,3 +2981,66 @@ describe("failure detail rows", () => {
     expect(JSON.stringify(result).length).toBeLessThanOrEqual(49000);
   });
 });
+
+it("reports current idle evaluator stalls even with no events inside the window", () => {
+  const lastEventAt = "2026-11-08T00:00:00.000Z";
+  const idle = card("idle-evaluator", {
+    number: 1768,
+    stage: "completed",
+    updatedAt: window.until,
+    subtasks: [
+      {
+        id: "s7",
+        step: 3,
+        owner: "evaluator",
+        text: "Next",
+        state: "open",
+        createdAt: before,
+        doneAt: null,
+        doneBy: null,
+        note: null,
+      },
+    ],
+  });
+  const input: Activity.RollupInput = {
+    window,
+    cards: [idle],
+    events: [],
+    pools: [],
+    idleEvaluatorBoard: { id: idle.boardId, standingApprovals: [] },
+    lastEventAtByCard: new Map([[idle.id, lastEventAt]]),
+    threads: [thread("idle-thread", idle.id, "evaluator", opus, lastEventAt)],
+  };
+  const run = Activity.rollup(input);
+  expect(run.stalls.byKind).toEqual({ idle_evaluator: 1 });
+  expect(run.stalls.items).toEqual([
+    expect.objectContaining({
+      kind: "idle_evaluator",
+      card: 1768,
+      stage: "completed",
+      step: 3,
+      openEvaluatorSubtasks: ["s7"],
+      lastEventAt,
+      evaluatorThreadAlive: true,
+      idleHours:
+        Math.round(((Date.parse(window.until) - Date.parse(lastEventAt)) / 3_600_000) * 10) / 10,
+    }),
+  ]);
+  const closed = Activity.rollup({
+    ...input,
+    threads: input.threads.map((link) => ({ ...link, endedAt: window.until })),
+  });
+  expect(closed.stalls.items[0]!.evaluatorThreadAlive).toBe(false);
+  const big = Activity.rollup({
+    ...input,
+    cards: Array.from({ length: 500 }, (_, number) => ({
+      ...idle,
+      number,
+      id: KanbanCardId.make(`idle-${number}`),
+      updatedAt: lastEventAt,
+    })),
+  });
+  expect(big.stalls.byKind.idle_evaluator).toBe(500);
+  expect(big.stalls.more).toBeGreaterThan(0);
+  expect(JSON.stringify(big).length).toBeLessThan(50_000);
+});

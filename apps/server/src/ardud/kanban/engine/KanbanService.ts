@@ -246,6 +246,7 @@ interface EvaluatorJob {
     readonly text?: string | undefined;
     readonly cardId?: KanbanCardId | null;
     readonly key?: string;
+    readonly idleEvaluator?: { readonly cardId: KanbanCardId; readonly eventId: number | null };
     readonly note?: boolean;
     readonly seq?: number;
     readonly answer?: EvaluatorAnswer;
@@ -567,6 +568,8 @@ export interface KanbanServiceShape {
   ) => Effect.Effect<
     {
       readonly currentAt?: string;
+      readonly idleEvaluatorBoard?: Rules.IdleEvaluatorBoard;
+      readonly lastEventAtByCard?: ReadonlyMap<string, string>;
       readonly currentSlots?: ReadonlyArray<SlotEvent>;
       readonly board: KanbanBoard | null;
       readonly cards: ReadonlyArray<KanbanCard>;
@@ -1888,6 +1891,22 @@ const make = Effect.gen(function* () {
   const context =
     yield* Effect.context<import("../../../serverSettings.ts").ServerSettingsService>();
   const locks = yield* BoardLocks.make();
+  // Release receipts and idle evaluator deliveries share admission across boards.
+  const releaseTicks = yield* Semaphore.make(1);
+  const releaseTickOwner = Context.Reference<number | undefined>("KanbanReleaseTickOwner", {
+    defaultValue: () => undefined,
+  });
+  const releaseAdmission = Effect.fn("KanbanService.releaseAdmission")(function* <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    wait = true,
+  ) {
+    const fiberId = yield* Effect.fiberId;
+    if ((yield* releaseTickOwner) === fiberId) return yield* effect;
+    const owned = effect.pipe(Effect.provideService(releaseTickOwner, fiberId));
+    return yield* wait
+      ? owned.pipe(releaseTicks.withPermits(1))
+      : owned.pipe(releaseTicks.withPermitsIfAvailable(1), Effect.map(Option.getOrUndefined));
+  });
   const ownerRouteMode = yield* OwnerRouteMode;
   const replayReads = yield* ReplayReads;
   const deferWrites = (yield* DeferWriteEffects) && ownerRouteMode !== "inline";
@@ -6183,6 +6202,53 @@ const make = Effect.gen(function* () {
       // @effect-diagnostics-next-line preferSchemaOverJson:off -- only written by admitEvaluator.
       let job = JSON.parse(row.json) as EvaluatorJob;
       const route = Effect.gen(function* () {
+        if (job.extra.idleEvaluator) {
+          const expected = job.extra.idleEvaluator;
+          yield* locks.access(boardId, Effect.void, false, "board");
+          yield* locks.access(boardId, Effect.void, false, `card:${expected.cardId}`);
+          const facts = yield* locks.outside(
+            Effect.gen(function* () {
+              const card = yield* rawStore.card(expected.cardId);
+              if (!card) return null;
+              const snapshot = yield* prWriteSnapshot(card);
+              const boards = yield* rawStore.boards;
+              const now = yield* nowMillis;
+              return {
+                card,
+                snapshot,
+                now,
+                release: BoardReplies.boardReleaseSummary(
+                  snapshot.board,
+                  DateTime.formatIso(DateTime.makeUnsafe(now)),
+                  boards,
+                ),
+              };
+            }),
+            undefined,
+            true,
+          );
+          const last = facts?.snapshot.events.at(-1);
+          if (!facts || (last?.id ?? null) !== expected.eventId || facts.card.settledAt !== null) {
+            yield* locks.access(
+              boardId,
+              tickSql`UPDATE ardud_kanban_evaluator_queue SET done_at = ${yield* nowIso} WHERE id = ${row.id}`,
+              true,
+              "evaluator-queue",
+            );
+            return;
+          }
+          if (
+            facts.snapshot.board.archivedAt !== null ||
+            (facts.snapshot.board.pause &&
+              !facts.snapshot.board.pause.keep.includes(expected.cardId)) ||
+            !Rules.idleEvaluatorStall(
+              { ...facts.card, lastEventAt: last?.at ?? facts.card.createdAt },
+              facts.now,
+              { ...facts.snapshot.board, ...facts.release },
+            )
+          )
+            return;
+        }
         const observed = row.job_key !== wanted ? yield* postRoutingTarget : undefined;
         if (
           job.extra.recoveryPost &&
@@ -6669,18 +6735,24 @@ const make = Effect.gen(function* () {
         if (row.job_key === wanted) result = { threadId };
       });
       const post = job.extra.routingPost;
-      const decision = yield* post && row.job_key !== wanted
-        ? observePostRouting(
-            {
-              id: post.discussionId,
-              boardId,
-              cardId: row.card_id ? KanbanCardId.make(row.card_id) : null,
-            },
-            { author: { _tag: post.authorKind }, seq: post.seq },
-            route,
-            "queue",
-          )
-        : route;
+      const delivery =
+        post && row.job_key !== wanted
+          ? observePostRouting(
+              {
+                id: post.discussionId,
+                boardId,
+                cardId: row.card_id ? KanbanCardId.make(row.card_id) : null,
+              },
+              { author: { _tag: post.authorKind }, seq: post.seq },
+              route,
+              "queue",
+            )
+          : route;
+      const decision = yield* job.extra.idleEvaluator
+        ? // Awaited release follow-ons run in a child fiber. Leave this row pending
+          // instead of waiting on the release permit held by their awaiting parent.
+          locks.outside(locks.fresh(locks.run(releaseAdmission(delivery, false))))
+        : delivery;
       if (decision === "blocked") break;
     }
     if (result) return result;
@@ -14805,6 +14877,127 @@ const make = Effect.gen(function* () {
                 initial.id,
               );
             }
+            const evaluatorCandidates = (yield* cardsForPlan).filter((card) =>
+              Rules.idleEvaluatorStall({ ...card, lastEventAt: card.createdAt }, now, board),
+            );
+            const evaluatorStepEvents = new Map(
+              (evaluatorCandidates.length > 0
+                ? yield* rawStore.evaluatorStepEvents(board.id)
+                : []
+              ).map((event) => [event.cardId, event]),
+            );
+            for (const initial of evaluatorCandidates) {
+              if (
+                !Rules.idleEvaluatorStall(
+                  {
+                    ...initial,
+                    lastEventAt: evaluatorStepEvents.get(initial.id)?.at ?? initial.createdAt,
+                  },
+                  now,
+                  board,
+                )
+              )
+                continue;
+              // Share release admission with subtask receipts before taking board permits.
+              // Another board cannot close a service window between this read and write.
+              yield* releaseAdmission(
+                step(
+                  "idleEvaluatorBackstop",
+                  Effect.gen(function* () {
+                    // Register the resources before releasing permits: outside revalidates
+                    // both generations before this snapshot can produce a write (#1656).
+                    yield* locks.access(board.id, Effect.void, false, "board");
+                    yield* locks.access(board.id, Effect.void, false, `card:${initial.id}`);
+                    const facts = yield* locks.outside(
+                      Effect.gen(function* () {
+                        const current = yield* rawStore.card(initial.id);
+                        if (!current) return null;
+                        const snapshot = yield* prWriteSnapshot(current);
+                        const boards = yield* rawStore.boards;
+                        const release = BoardReplies.boardReleaseSummary(
+                          snapshot.board,
+                          DateTime.formatIso(DateTime.makeUnsafe(now)),
+                          boards,
+                        );
+                        const links = yield* rawStore.threadLinks({ cardId: current.id });
+                        return { current, snapshot, release, links };
+                      }),
+                      undefined,
+                      true,
+                    );
+                    if (!facts) return;
+                    const { current, snapshot, release, links } = facts;
+                    if (
+                      snapshot.board.archivedAt !== null ||
+                      (snapshot.board.pause && !snapshot.board.pause.keep.includes(current.id))
+                    )
+                      return;
+                    const last = snapshot.events.at(-1);
+                    const lastEventAt = last?.at ?? current.createdAt;
+                    const idle = Rules.idleEvaluatorStall({ ...current, lastEventAt }, now, {
+                      ...snapshot.board,
+                      ...release,
+                    });
+                    if (!idle) return;
+                    const flag =
+                      last?.kind === "thread" &&
+                      last.body?.startsWith("Idle evaluator nudge: ") === true;
+                    const key = `idle-evaluator:${current.id}:${last?.id ?? "created"}:${flag ? "flag" : "nudge"}`;
+                    const text = `Card #${current.number} has sat in ${current.stage} for ${Math.floor((now - Date.parse(lastEventAt)) / 3_600_000)} h with evaluator step ${idle.openEvaluatorSubtasks.join(", ")} open and no event. Do the step, set a card_wait for what it waits on, or ask the owner.`;
+                    // Eligibility and the last event retain the retry key across restarts.
+                    // Only an accepted delivery starts the six-hour escalation clock.
+                    const delivered = yield* locks.outside(
+                      Effect.gen(function* () {
+                        const evaluator = links.findLast(
+                          (link) => link.role === "evaluator" && link.endedAt === null,
+                        );
+                        const view =
+                          !flag && evaluator ? yield* threads.find(evaluator.threadId) : null;
+                        if (!flag && evaluator && view && !view.archived) {
+                          yield* threads.send({
+                            threadId: evaluator.threadId,
+                            text,
+                            key,
+                            keyAcrossThreads: true,
+                          });
+                          return true;
+                        }
+                        const result = yield* evaluatorAdmission(
+                          board.id,
+                          admitEvaluator(
+                            snapshot.board,
+                            { kind: "stalled" },
+                            {
+                              text,
+                              key,
+                              idleEvaluator: { cardId: current.id, eventId: last?.id ?? null },
+                            },
+                          ),
+                        );
+                        return "threadId" in result;
+                      }),
+                      undefined,
+                      false,
+                    );
+                    if (!delivered) return;
+                    const at = yield* nowIso;
+                    const actor: KanbanActor = { _tag: "system", component: "dispatcher" };
+                    const next: KanbanCard = {
+                      ...current,
+                      updatedAt: at,
+                      ...(flag ? { stalled: { reason: idle.reason, by: actor, at } } : {}),
+                    };
+                    yield* logEvent(next, actor, flag ? "flagged" : "thread", {
+                      body: flag ? idle.reason : `Idle evaluator nudge: ${text}`,
+                      before: current,
+                    });
+                    yield* saveCard(next, undefined, false, undefined, undefined, snapshot);
+                    updateCard(next);
+                  }),
+                  initial.id,
+                ),
+              );
+            }
             // Backstop for a reviewer left idle with no verdict: a turn end skipped while
             // its own background work ran, or one that never arrived.
             for (const initial of yield* cardsForPlan) {
@@ -19923,8 +20116,6 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  // Board locks are independent; serialize release receipts so two boards cannot admit the same service together.
-  const releaseTicks = yield* Semaphore.make(1);
   const markSubtask: KanbanServiceShape["markSubtask"] = Effect.fn("KanbanService.markSubtask")(
     function* (cardId, subtaskId, state, note, actor, role, releasedAt) {
       // Admission precedes board locks: completing a step can release them for thread I/O.
@@ -20214,10 +20405,13 @@ const make = Effect.gen(function* () {
         }),
       );
       if (!paced) return yield* completing;
-      const immediate = yield* completing.pipe(releaseTicks.withPermitsIfAvailable(1));
+      const pacedCompletion = completing.pipe(
+        Effect.provideService(releaseTickOwner, yield* Effect.fiberId),
+      );
+      const immediate = yield* pacedCompletion.pipe(releaseTicks.withPermitsIfAvailable(1));
       if (Option.isSome(immediate)) return immediate.value;
       yield* Effect.logDebug("kanban release admission waiting", { cardId, subtaskId });
-      return yield* completing.pipe(releaseTicks.withPermits(1));
+      return yield* pacedCompletion.pipe(releaseTicks.withPermits(1));
     },
   );
 
@@ -23026,6 +23220,23 @@ const make = Effect.gen(function* () {
             slotHistory: store.slotHistory({ boardId, from: window.since, to: window.until }),
             history: store.activityHistory(boardId, window),
           });
+          const lastEventAtByCard = new Map(
+            (yield* store.evaluatorStepEvents(boardId)).map((event) => [
+              event.cardId as string,
+              event.at,
+            ]),
+          );
+          const idleEvaluatorBoard =
+            read.board === null
+              ? undefined
+              : {
+                  ...read.board,
+                  ...BoardReplies.boardReleaseSummary(
+                    read.board,
+                    read.currentAt,
+                    yield* store.boards,
+                  ),
+                };
           const readinessBefore = history.filter((event) => event.at < window.since);
           const prior = readinessBefore.filter(
             (event) => event.toStage !== null && event.fromStage !== event.toStage,
@@ -23040,6 +23251,8 @@ const make = Effect.gen(function* () {
             }
           return {
             ...read,
+            ...(idleEvaluatorBoard === undefined ? {} : { idleEvaluatorBoard }),
+            lastEventAtByCard,
             prior,
             after,
             readinessBefore,

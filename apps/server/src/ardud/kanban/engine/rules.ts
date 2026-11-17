@@ -18,6 +18,9 @@ import {
   kanbanWaiting,
   kanbanWaitStale,
   kanbanWaitsOnEvaluator,
+  kanbanStepSubtasks,
+  kanbanWaitExpired,
+  type KanbanOwnerAsk,
   kanbanReviewAlreadyDone,
   type KanbanBoard,
   type KanbanCard,
@@ -29,7 +32,9 @@ import {
   type KanbanStage,
   type ModelSelection,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import { releaseWindow } from "./subtasks.ts";
 import { heldForRetry, NO_VERDICT_REASON, REFUSED_VERDICT_PREFIX } from "./retries.ts";
 
 /**
@@ -223,6 +228,83 @@ export function applyReviewResult(
 
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
+
+export const IDLE_EVALUATOR_HOURS = 6;
+
+export const isNotice = (ask: Pick<KanbanOwnerAsk, "kind">) => ask.kind === "notice";
+
+export type IdleEvaluatorBoard = Pick<KanbanBoard, "id" | "standingApprovals" | "releaseLedger"> & {
+  readonly nextReleaseWindowAt?: string | null;
+  readonly nextReleaseWindowByService?: Readonly<Record<string, string>>;
+};
+
+export const idleEvaluatorStall = (
+  card: KanbanCard & { readonly lastEventAt?: string },
+  nowMs: number,
+  board: IdleEvaluatorBoard,
+): {
+  step: number;
+  openEvaluatorSubtasks: string[];
+  idleSinceAt: string;
+  reason: string;
+} | null => {
+  if (
+    card.settledAt !== null ||
+    (card.stage !== "completed" && card.stage !== "deployed") ||
+    card.stalled !== null ||
+    (kanbanWaiting(card) &&
+      card.wait !== undefined &&
+      !kanbanWaitExpired(card.wait, nowMs) &&
+      !(
+        card.wait.on === "time" &&
+        card.wait.until !== null &&
+        Date.parse(card.wait.until) <= nowMs
+      )) ||
+    card.asks.some((ask) => ask.closedAt === null && ask.to !== "evaluator" && !isNotice(ask)) ||
+    !kanbanWaitsOnEvaluator({ ...card, stage: "todo" })
+  )
+    return null;
+  const open = kanbanStepSubtasks(card);
+  if (open.length === 0 || open.some((subtask) => subtask.owner !== "evaluator")) return null;
+  const localWindow = releaseWindow({
+    approvals: board.standingApprovals,
+    ledger: board.releaseLedger ?? [],
+    boardId: board.id,
+    at: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
+  });
+  if (
+    open.some((subtask) => {
+      if (!subtask.interrupting) return false;
+      const next =
+        subtask.service === undefined
+          ? (board.nextReleaseWindowAt ?? localWindow?.next)
+          : (board.nextReleaseWindowByService?.[subtask.service] ??
+            releaseWindow(
+              {
+                approvals: board.standingApprovals,
+                ledger: board.releaseLedger ?? [],
+                boardId: board.id,
+                at: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
+              },
+              subtask.service,
+            )?.next);
+      return next !== undefined && next !== null && Date.parse(next) > nowMs;
+    })
+  ) {
+    // An interrupting release legitimately parks the step until its pacing window opens.
+    return null;
+  }
+  // Callers supply the latest stored event, including events outside the activity window.
+  const idleSinceAt = card.lastEventAt ?? card.updatedAt;
+  if (!(nowMs - Date.parse(idleSinceAt) >= IDLE_EVALUATOR_HOURS * 60 * 60_000)) return null;
+  const ids = open.map((subtask) => subtask.id);
+  return {
+    step: open[0]!.step,
+    openEvaluatorSubtasks: ids,
+    idleSinceAt,
+    reason: `Idle evaluator step ${ids.join(", ")}`,
+  };
+};
 
 const REVIEW_EVALUATOR_WAKE_MS = 6 * 60 * 60_000;
 
