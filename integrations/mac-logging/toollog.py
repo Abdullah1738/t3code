@@ -385,7 +385,26 @@ def u_sample_fields(values):
     return result
 
 
-def safe_fields(values, event=None):
+MACGUARD_KEYS = set("""pid start comm args action result errno actionClass owner cpuDelta footprintGiB compressedGiB growthGiBMin history at cpuS memoryClass label key threadId evidence summary probe failure cycleMs durationS signals load rCount rZeroCount lagS pressure swap usedMb totalMb largest treeGiB strain reason tmuxSession log idlePct""".split())
+
+
+def macguard_fields(values, depth=0):
+    # Only mac-guard opts into this bounded nested schema. Shared event kinds
+    # retain their existing filters; process arguments use the CPU redactor.
+    from cpu_labels import command_label
+    if depth > 5:
+        return None
+    if isinstance(values, dict):
+        return {key: macguard_fields(value, depth+1) for key, value in values.items() if key in MACGUARD_KEYS}
+    if isinstance(values, list):
+        return [macguard_fields(value, depth+1) for value in values[:30]]
+    if isinstance(values, str):
+        return command_label(values)
+    if values is None or type(values) is bool or finite_number(values):
+        return values
+    return None
+
+
     if event == 'scan.volume_crawl':
         result = {}
         for key, value in (values or {}).items():
@@ -420,6 +439,9 @@ def safe_fields(values, event=None):
                                for p in value[:4] if isinstance(p, dict) and type(p.get('pid')) is int
                                and 0 <= p['pid'] <= 2147483647 and isinstance(p.get('name'), str)]
         return result
+def safe_fields(values, event=None):
+    if event and event.startswith('macguard.'):
+        return macguard_fields(values or {})
     if event and event.startswith('tailnet.'):
         result = {}
         for key, value in (values or {}).items():

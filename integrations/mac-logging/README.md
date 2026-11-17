@@ -808,3 +808,42 @@ existing interlock. Notification retries preserve exact keys/text and never
 write alerts to stdout. The evaluator loads only the new probe label after
 review; the CPU job retains its original launcher. Installer tests set
 `MAC_LOG_SSD_PROBE_FILE` for fixture init/check; live reads use the fixed target.
+
+## Mac guard
+
+`com.abdullah.mac-guard` runs a 30-second Interactive loop, logging `macguard.*`
+to the same day files. `mac-log-status` shows its last sample, strain, actions
+and Robob memory restarts in 24 hours, and its critical worker.
+
+Under sustained strain it terminates stuck/orphaned build and tool trees,
+softens CPU hogs, then suspends and terminates persistent hogs. Live or unknown
+build owners and GUI apps get softening only. Stopped survivors resume when
+strain clears. Provider CLIs, their node/bun wrappers, OpenCode, Robob and
+macOS system processes are never signalled or reniced. Integration services
+and their children are protected from the strain ladder.
+
+The memory backstop uses top's footprint (including compressed pages), never
+RSS: >=16 GiB growing >=1 GiB/min over 60 seconds, or >=48 GiB regardless of
+growth. It terminates the offending PID only, including integration workers
+and GUI apps; agents, OpenCode, Robob and macOS remain exempt. Protected
+runaways alert and call one critical responder. All signals recheck PID birth
+identity. Evidence lives in `~/.robob/board-artifacts/mac-guard/`.
+
+A Robob process crossing the growth threshold, or the app tree totaling
+>=24 GiB, requests the overload watchdog's detached `restart` subcommand.
+Missing helpers, install holds, restart/install tmux sessions, release builds,
+server uptime under ten minutes and a memory restart within an hour skip it
+and alert the responder. The watchdog script is an external prerequisite;
+its tracker owns it through 23 November 2026 and must keep its interface stable.
+
+The separate runnable/idle diagnostic requires two valid minute samples of
+load >=100, host idle >=30% and process R >=64 (or >5s Robob lag). It records
+one thread/CPU-progress/stack/core packet per episode; it never selects a victim.
+Spindump and powermetrics are bounded, without sudo; permission failures are
+recorded as unavailable evidence. Stack capture runs outside the guard loop.
+
+Pause with `touch ~/.local/state/mac-guard/paused`; remove that file to resume.
+`MAC_GUARD_DRY_RUN=1` records proposed actions while sending no signals,
+notifications, restarts or worker launches. Neither mode changes the separate
+Robob crash reopener. The installer copies files and plists without loading
+agents; installation and read-back belong to the evaluator after review.

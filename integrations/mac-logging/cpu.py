@@ -358,7 +358,7 @@ def command(argv, run, timeout=30):
     return result.stdout
 
 
-def deltas(rows, previous, now):
+def deltas(rows, previous, now, top_limit=20):
     at = previous.get('at')
     window = now-at if finite_number(at) else 0
     valid = 0 < window <= 3600
@@ -394,7 +394,7 @@ def deltas(rows, previous, now):
                  processCount=len(rows), runnable=sum(p['state'].startswith('R') for p in rows),
                  uninterruptible=sum(p['state'].startswith('U') for p in rows), families=groups,
                  exiting=sum(p['state'].startswith('?') for p in rows),
-                 top=sorted(top, key=lambda p: (-p['cpuPct'], p['pid']))[:20],
+                 top=sorted(top, key=lambda p: (-p['cpuPct'], p['pid']))[:top_limit],
                  kernelTaskPct=None)
     # Exiting rows have reset CPU counters; don't seed a later delta from zero.
     state = dict(at=now, identities={str(p['pid']): p['start'] for p in rows},
