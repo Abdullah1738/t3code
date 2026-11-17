@@ -1156,6 +1156,29 @@ export class Router {
           const live = state.get(row.id)?.state;
           if (live !== "pending" && live !== "batched" || live === "batched" && state.get(leader)?.state === "processing"
             || this.store.get(`inbound-delivered:${row.id}`) !== undefined) return;
+          if (members.length > 1) {
+            // Carry admission must not receipt the old seal. Younger siblings
+            // keep its admission evidence so they can be recovered independently.
+            const payload = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?");
+            const backoff = this.replayProbeBackoff.get(leader);
+            const timedOutHere = timedOut.has(leader);
+            for (const member of members) {
+              const saved = payload.get(member);
+              if (!saved) continue;
+              const input = JSON.parse(saved.payload) as NormalizedInbound;
+              const batch = { ...input, batchIds: [member] };
+              const receipt = original ? { ...original, inboundId: member } : original;
+              this.store.set(`batch:${member}`, batch);
+              this.store.set(`batch-phase:${member}`, null);
+              if (receipt) this.store.set(`failed-delivery:${member}`, receipt);
+              // These receipts still probe the same original request.
+              if (backoff) this.replayProbeBackoff.set(member, backoff);
+              if (timedOutHere) timedOut.add(member);
+              parents.delete(member);
+              snapshots.set(member, { original: receipt, members: [member], batch, received: input.receivedAt });
+            }
+            this.latencyParentsAt = -Infinity;
+          }
           this.carryMissed(row.id, input.text, { uncertain: attemptUsed, at: input.receivedAt! });
           this.failInbound(row.id, "synthetic", "undelivered");
           toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "synthetic.carried_from_stranded",
@@ -1658,7 +1681,7 @@ export class Router {
     if (list.length === 0) return;
     if (Date.now() - list[0]!.at < (this.options.droppedBatchMs ?? DROPPED_BATCH_MS)) return;
     this.store.db.transaction(() => {
-      const notice = `synthetic-dropped:${hash(list.map(n => n.id).join(","))}`;
+      const notice = `synthetic-dropped:${hash(JSON.stringify(list.map(n => [n.id, n.reason])))}`;
       if (!this.store.getOperation(notice)) this.store.enqueue({ id: notice, kind: "control", text: droppedBatchText(list) });
       this.store.set("droppedNotices", null);
     }).immediate();

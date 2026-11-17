@@ -47,19 +47,22 @@ function setup() {
   setSystemTime(start);
   const store = new Store(":memory:"); stores.push(store);
   const backend = new Backend(), alerts: string[] = [];
-  const router = new Router(store, backend, { read: async () => {}, typing: async () => {}, downloadAttachment: async () => { throw new Error("unexpected file"); } }, {
+  const transport = { read: async () => {}, typing: async () => {}, downloadAttachment: async () => { throw new Error("unexpected file"); } };
+  const options: ConstructorParameters<typeof Router>[3] = {
     owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", quietMs: 0,
     skillPath: "/test/imessage/SKILL.md", alertSkillPath: "/test/telegram/SKILL.md", alertSocketPath: "/test/telegram.sock",
     openCodeConfigRoot: "/nonexistent/config", droppedBatchMs: 0,
     notifyFailure: async (_text, key) => { alerts.push(key); return true; },
-  });
+  };
+  const restart = () => new Router(store, backend, transport, options);
+  const router = restart();
   const input = (id: string, at = Date.now(), text = body(id)) => store.acceptInbound(id, {
     id, text, source: "typed", attachments: [], isAudioMessage: false, receivedAt: at,
   } satisfies NormalizedInbound);
   const state = (id: string) => store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state;
   const missed = () => store.get<Carry[]>("missedSynthetic") ?? [];
   const controls = () => store.pendingOutbox().filter(op => op.kind === "control");
-  return { store, backend, router, input, state, missed, controls, alerts };
+  return { store, backend, router, input, state, missed, controls, alerts, restart };
 }
 type Harness = ReturnType<typeof setup>;
 async function exhaust(h: Harness, id: string) {
@@ -96,6 +99,101 @@ function stranded(h: Harness, id: string, opts: { retired?: boolean; attempted?:
   h.store.set(`stuck-wake-retry:${id}`, start - 5 * 60_000);
   if (opts.attempted) h.store.set(`stuck-wake-attempt:${id}`, start - 5 * 60_000);
 }
+
+function retiredBatch(h: Harness, ages: readonly number[]) {
+  const ids = ages.map((_, i) => `wake:sealed-${i}`);
+  for (const [i, id] of ids.entries()) {
+    stranded(h, id, { retired: true, age: ages[i]! * 60_000 });
+    if (i) {
+      h.store.updateInbound(id, "batched");
+      // A real sealed member's admission evidence lives only under its leader.
+      h.store.set(`failed-delivery:${id}`, null);
+    }
+  }
+  h.store.set(`batch:${ids[0]}`, { id: ids[0], text: ids.map(body).join("\n"), batchIds: ids, attachments: [], receivedAt: start - ages[0]! * 60_000 });
+  return ids;
+}
+
+test.each([
+  { ages: [20, 10], restart: false }, { ages: [20, 10], restart: true },
+  { ages: [10, 20], restart: false }, { ages: [10, 20], restart: true },
+])("a younger sealed sibling survives an older sibling's carry admission ($ages, restart=$restart)", async ({ ages, restart }) => {
+  const h = setup(), ids = retiredBatch(h, ages);
+  const leader = ids[ages.indexOf(20)]!, member = ids[ages.indexOf(10)]!;
+  await h.router.checkInboundLatency();
+  expect(h.missed().map(m => m.id)).toEqual([leader]);
+  await submit(h);
+  expect(h.store.get<Turn>("activeTurn")?.carried).toEqual([leader]);
+  expect(h.backend.prompts.at(-1)!.system).not.toContain(body(member));
+  if (restart) h.router = h.restart();
+  setSystemTime(start + 1000); await h.router.checkInboundLatency();
+  expect(h.state(member)).toBe(ids.indexOf(member) === 0 ? "pending" : "batched");
+  expect(h.store.get(`inbound-delivered:${member}`)).toBeUndefined();
+  setSystemTime(start + 5 * 60_000); await h.router.checkInboundLatency();
+  expect(h.missed().map(m => m.id)).toEqual([member]);
+  expect(h.store.get(`inbound-delivered:${member}`)).toBeUndefined();
+  h.backend.finish(); await h.router.tick();
+  await submit(h, "human-2");
+  expect(h.store.get<Turn>("activeTurn")?.carried).toEqual([member]);
+  expect(h.store.get(`inbound-delivered:${member}`)).toBeNumber();
+  expect(h.backend.prompts.every(p => p.session !== "ses_old")).toBe(true);
+});
+
+test.each([{ restart: false }, { restart: true }])("a retired eight-member batch receipts only the five ids carried until the next prompt (restart=$restart)", async ({ restart }) => {
+  const h = setup(), ids = retiredBatch(h, Array(8).fill(20));
+  await h.router.checkInboundLatency();
+  expect(h.missed().map(m => m.id)).toEqual(ids);
+  await submit(h);
+  expect(h.store.get<Turn>("activeTurn")?.carried).toEqual(ids.slice(0, 5));
+  if (restart) h.router = h.restart();
+  setSystemTime(start + 1000); await h.router.checkInboundLatency();
+  expect(h.missed().map(m => m.id)).toEqual(ids.slice(5));
+  for (const id of ids.slice(5)) expect(h.store.get(`inbound-delivered:${id}`)).toBeUndefined();
+  h.backend.finish(); await h.router.tick();
+  await submit(h, "human-2");
+  expect(h.store.get<Turn>("activeTurn")?.carried).toEqual(ids.slice(5));
+  expect(h.missed()).toEqual([]);
+  for (const id of ids) expect(h.store.get(`inbound-delivered:${id}`)).toBeNumber();
+  expect(h.backend.prompts.every(p => p.session !== "ses_old")).toBe(true);
+});
+
+test.each([{ cooling: false }, { cooling: true }])("splitting stranded members retains their original probe timeout and cooldown (cooling=$cooling)", async ({ cooling }) => {
+  const h = setup(), ids = retiredBatch(h, Array(8).fill(20));
+  const reads: [string, string][] = [];
+  h.backend.promptAccepted = async (session, _directory, id) => {
+    reads.push([session, id]);
+    throw Object.assign(new Error("read timed out"), { code: "timeout" });
+  };
+  if (cooling) {
+    h.store.updateInbound(ids[0]!, "processing");
+    await h.router.checkInboundLatency();
+    expect(h.missed()).toEqual([]);
+    expect(reads).toHaveLength(1);
+    h.store.updateInbound(ids[0]!, "pending");
+    setSystemTime(start + 1000);
+  }
+  await h.router.checkInboundLatency();
+  expect(h.missed().map(m => m.id)).toEqual(ids);
+  expect(reads).toEqual([["ses_old", hash(ids[0]!)]]);
+  expect(h.backend.prompts).toEqual([]);
+});
+
+test.each(["pending", "sent"])("expiry gets its own durable notice after a %s exhaustion notice", async state => {
+  const h = setup(), id = "wake:expiry-after-notice";
+  await exhaust(h, id);
+  const initial = h.controls()[0]!;
+  expect(initial.text).toBe(syntheticDropped(id, body(id), "undelivered"));
+  if (state === "sent") h.store.outboxState(initial.id, "sent");
+  h.router = h.restart();
+  setSystemTime(Date.now() + HORIZON + 1);
+  const logs = await captureLogs(async () => { await submit(h); await h.router.tick(); await h.router.tick(); });
+  expect(h.missed()).toEqual([]);
+  expect(logs.filter(l => l.name === "synthetic.carry_evicted")).toHaveLength(1);
+  const expired = h.controls().filter(op => op.text === syntheticDropped(id, body(id), "expired"));
+  expect(expired).toHaveLength(1);
+  expect(expired[0]!.id).not.toBe(initial.id);
+  expect(h.store.getOperation(initial.id)?.text).toBe(initial.text);
+});
 
 test("eight exhausted wakes survive and land FIFO in prompts of five then three", async () => {
   const h = setup(), ids = Array.from({ length: 8 }, (_, i) => `wake:exhausted-${i}`);
