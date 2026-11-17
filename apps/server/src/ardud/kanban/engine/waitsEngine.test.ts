@@ -265,6 +265,7 @@ const makeWorld = (
   const threadsLayer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: () => Effect.succeed(null),
       view,
@@ -1125,6 +1126,7 @@ it.effect.each(["work", "review", "evaluator"] as const)(
         assert.isUndefined(woken.wait);
         if (wakeRole === "evaluator") {
           yield* world.waitForTold(dependent.id);
+          yield* world.waitForTold(sibling.id);
           assert.isAbove(world.toldEvaluator(`Card #${target.number}`), 0);
           assert.strictEqual(woken.boardId, board.id);
         } else {

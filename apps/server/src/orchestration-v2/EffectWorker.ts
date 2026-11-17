@@ -169,6 +169,7 @@ export const layerExecutor: Layer.Layer<
                           runId: run.id,
                           expectedAttemptId: run.activeAttemptId,
                           deadline: error.deadline,
+                          admission: error.admission,
                         });
                       })
                     : threads.recoverDelegatedTask(effect.threadId, sourceRunId),
@@ -289,6 +290,7 @@ export const layerExecutor: Layer.Layer<
                       runId: run.id,
                       expectedAttemptId: run.activeAttemptId,
                       deadline: error.deadline,
+                      admission: error.admission,
                     });
                   }),
               }),

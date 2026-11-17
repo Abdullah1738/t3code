@@ -169,6 +169,7 @@ import {
   type ProjectionCheckpointContext,
   type ShellSnapshotOptions,
   type ThreadListCandidate,
+  type ThreadListPageOptions,
 } from "./ProjectionStore.ts";
 import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -504,6 +505,7 @@ export interface OrchestratorV2Shape {
   >;
   readonly getThreadListCandidates: (
     projectId: ProjectId,
+    options?: ThreadListPageOptions,
   ) => Effect.Effect<ReadonlyArray<ThreadListCandidate>, OrchestratorV2Error>;
   readonly getCallerRow: (
     threadId: ThreadId,
@@ -4684,7 +4686,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (!input.forceRestart ||
         input.createdBy !== "system" ||
         input.creationSource !== "server" ||
-        !supportsSilentRecovery(providerThread?.driver, stallRecovery.phase) ||
+        !supportsSilentRecovery(providerThread?.driver) ||
         targetRun.delegatedTaskId === undefined ||
         !silentRecoveryStillSafe(input.projection, targetRun, stallRecovery))
     ) {
@@ -4880,24 +4882,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       selectionChanged &&
       (providerInstanceChanged || selectionTransition?.type !== "apply_on_next_turn");
     const steeringPolicy = yield* enforceCommandPolicy(input.command)(
-      // Claude normally queues steering. A verified request with no model event
-      // needs a fresh attempt, rather than another message on the hung request.
-      stallRecovery?.phase === "first_event" && providerThread.driver === "claudeAgent"
-        ? commandPolicy
-            .ensureInterrupt({
-              commandId: input.command.commandId,
-              threadId: input.command.threadId,
-              providerInstanceId: targetRun.providerInstanceId,
-              capabilities: session.providerSession.capabilities,
-            })
-            .pipe(Effect.as("interrupt_restart" as const))
-        : commandPolicy.decideSteeringExecution({
-            commandId: input.command.commandId,
-            threadId: input.command.threadId,
-            providerInstanceId: targetRun.providerInstanceId,
-            capabilities: session.providerSession.capabilities,
-            forceRestart: input.forceRestart || selectionMustApplyNow,
-          }),
+      commandPolicy.decideSteeringExecution({
+        commandId: input.command.commandId,
+        threadId: input.command.threadId,
+        providerInstanceId: targetRun.providerInstanceId,
+        capabilities: session.providerSession.capabilities,
+        forceRestart: input.forceRestart || selectionMustApplyNow,
+      }),
     );
 
     if (input.activeTurnOnly && steeringPolicy !== "active_steering") {
@@ -5621,6 +5612,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     );
     const continuedTaskId = continuationSource?.delegatedTaskId;
     const continuedStallRecovery = continuationSource?.delegatedTaskStallRecovery;
+    const continuedTransientRecovery = continuationSource?.transientRecovery;
     const continuedRecovery = continuedLaunchRecovery(continuationSource, projection.providerTurns);
 
     if (projection.thread.settledOverride !== null) {
@@ -6168,6 +6160,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(continuedStallRecovery === undefined
           ? {}
           : { delegatedTaskStallRecovery: continuedStallRecovery }),
+        ...(continuedTransientRecovery === undefined
+          ? {}
+          : { transientRecovery: continuedTransientRecovery }),
         ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
       };
@@ -6523,6 +6518,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(continuedStallRecovery === undefined
           ? {}
           : { delegatedTaskStallRecovery: continuedStallRecovery }),
+        ...(continuedTransientRecovery === undefined
+          ? {}
+          : { transientRecovery: continuedTransientRecovery }),
         ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
         ...(command.contextReset === true ? { contextReset: true } : {}),
         ...wakeWorkStartedAt(projection.runs, command),
@@ -7254,6 +7252,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ...(continuedStallRecovery === undefined
         ? {}
         : { delegatedTaskStallRecovery: continuedStallRecovery }),
+      ...(continuedTransientRecovery === undefined
+        ? {}
+        : { transientRecovery: continuedTransientRecovery }),
       ...(continuedRecovery === undefined ? {} : { launchRecovery: continuedRecovery }),
       ...(command.contextReset === true ? { contextReset: true } : {}),
       ...wakeWorkStartedAt(projection.runs, command),
@@ -9992,6 +9993,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : lostEvents
             ? `The provider accepted this run, but its events did not reach orchestration within ${PROVIDER_START_TIMEOUT_MS / 60_000} min (native session: ${command.nativeEvidence?.nativeSessionId ?? "unknown"}).`
             : `Robob could not confirm that the provider started this run within ${PROVIDER_START_TIMEOUT_MS / 60_000} min.`;
+    const failure = {
+      ...makeProviderFailure({
+        class: "provider_error",
+        code:
+          command.phase === "restart_admission"
+            ? "restart_admission_timeout"
+            : lostEvents
+              ? "provider_events_lost"
+              : PROVIDER_START_TIMEOUT_CODE,
+        ...(lostEvents ? { retryable: false } : {}),
+        message,
+      }),
+      ...(command.admission === undefined ? {} : { admission: command.admission }),
+    };
     for (const turn of projection.providerTurns.filter(
       (turn) => run.activeAttemptId !== null && turn.runAttemptId === run.activeAttemptId,
     )) {
@@ -10062,17 +10077,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         startedAt: now,
         completedAt: now,
         updatedAt: now,
-        failure: makeProviderFailure({
-          class: "provider_error",
-          code:
-            command.phase === "restart_admission"
-              ? "restart_admission_timeout"
-              : lostEvents
-                ? "provider_events_lost"
-                : PROVIDER_START_TIMEOUT_CODE,
-          ...(lostEvents ? { retryable: false } : {}),
-          message,
-        }),
+        failure,
       },
     });
     yield* emitEvent({
@@ -10080,7 +10085,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       threadId: command.threadId,
       runId: run.id,
       occurredAt: now,
-      payload: { ...run, status: "failed", completedAt: now },
+      payload: { ...run, status: "failed", completedAt: now, failure },
     });
     return {
       effectTypes: ["provider-turn.start", "provider-turn.restart"] as const,
@@ -14815,9 +14820,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           Effect.mapError(shellProjectionError),
           Effect.map(Effect.mapError(shellProjectionError)),
         ),
-    getThreadListCandidates: (projectId) =>
+    getThreadListCandidates: (projectId, options) =>
       projectionStore
-        .getThreadListCandidates(projectId)
+        .getThreadListCandidates(projectId, options)
         .pipe(NodeSqliteClient.readOnly, Effect.mapError(shellProjectionError)),
     getCallerRow: (threadId) =>
       projectionStore.getCallerRow(threadId).pipe(

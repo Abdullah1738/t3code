@@ -181,7 +181,8 @@ class LoggingTests(unittest.TestCase):
         state=self.root/'worker';state.mkdir()
         resources=[dict(id='expo:1',kind='expo',candidate=True,age_s=7200),
                    dict(id='container:local',kind='container',candidate=True,age_s=7400,image='localstack/localstack')]
-        scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0),resources=resources,candidates=[r['id'] for r in resources])
+        scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0,
+                  owner_calls={key: dict(count=0,p50_ms=None,p95_ms=None,max_ms=None,failures={}) for key in ('by_native','detail','recovery')}),resources=resources,candidates=[r['id'] for r in resources])
         with patch.object(watcher,'STATE_DIR',state), patch.object(janitor,'scan',return_value=scan), \
              patch.object(janitor,'act',side_effect=[(True,'done'),(False,'password=secret')]), \
              patch.object(janitor,'audit'), patch.object(janitor,'sh',return_value=(1,'','')), \
@@ -280,7 +281,8 @@ class LoggingTests(unittest.TestCase):
         import dev_janitor as janitor
         import janitor_watch as watcher
         resources=[dict(id='expo:1',kind='expo',candidate=True),dict(id='expo:2',kind='expo',candidate=True)]
-        scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0),resources=resources,candidates=['expo:1','expo:2'])
+        scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0,
+                  owner_calls={key: dict(count=0,p50_ms=None,p95_ms=None,max_ms=None,failures={}) for key in ('by_native','detail','recovery')}),resources=resources,candidates=['expo:1','expo:2'])
         for entry in ('cli','hourly'):
             with self.subTest(entry=entry), patch.object(janitor,'scan',return_value=scan), \
                  patch.object(janitor,'act',side_effect=[(True,'done'),RuntimeError('failed')]), \

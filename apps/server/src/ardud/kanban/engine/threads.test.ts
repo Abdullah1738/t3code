@@ -402,6 +402,49 @@ it.effect(
     }),
 );
 
+it.effect.each(["failed", "completed"] as const)(
+  "persisted admission failure is available without an error item only while the run is %s",
+  (status) => {
+    const threadId = ThreadId.make("thread-admission-failure");
+    const runId = RunId.make("run-admission-failure");
+    const model = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" };
+    const failure = {
+      class: "provider_error" as const,
+      code: "restart_admission_timeout",
+      message: "The restart admission queue never released this run (waited 30 min).",
+      retryable: null,
+      admission: {
+        queuedAtMs: 0,
+        waitedMs: 30 * 60_000,
+        positionAtFailure: 2,
+        totalAtFailure: 3,
+        rule: "no_progress" as const,
+      },
+    };
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadRecords: () =>
+        Effect.succeed({
+          runs: [{ id: runId, status, modelSelection: model, failure }],
+          turnItems: [],
+        } as never),
+    });
+    return Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      expect(yield* threads.findLastFailure(threadId)).toEqual(
+        status === "failed" ? { ...failure, runId, model } : null,
+      );
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  },
+);
+
 it.effect.each(["first", "second", "missing", "completed", "none"] as const)(
   "active model reads the recorded run instead of a next-turn selection (%s)",
   (active) =>
@@ -3948,4 +3991,59 @@ it.effect.each([
       ),
     );
   }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect("find exposes the oldest active tool from the run projection without item reads", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("open-tools-view");
+    const runId = RunId.make("open-tools-run");
+    const shell = liveThreadShell(threadId, { activeRunId: runId });
+    const at = DateTime.makeUnsafe("2026-11-16T12:00:00Z");
+    const run: OrchestrationV2Run = {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId: shell.providerInstanceId,
+      modelSelection: shell.modelSelection,
+      providerThreadId: null,
+      userMessageId: MessageId.make("open-tool-user"),
+      rootNodeId: null,
+      activeAttemptId: null,
+      status: "running",
+      requestedAt: at,
+      startedAt: at,
+      completedAt: null,
+      checkpointId: null,
+      contextHandoffId: null,
+      openTools: {
+        newer: { kind: "dynamic_tool", since: "2026-11-16T12:10:00.000Z" },
+        oldest: { kind: "command_execution", since: "2026-11-16T12:01:00.000Z" },
+      },
+    };
+    let active = true;
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () => Effect.succeed(active ? shell : { ...shell, activeRunId: null }),
+      getThreadRecords: (_id, fields, filter) => {
+        expect(fields).not.toContain("turnItems");
+        if (active) expect(filter?.runIds).toEqual([runId]);
+        return Effect.succeed({ runs: [run], subagents: [] } as never);
+      },
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const view = yield* threads.find(threadId);
+      expect(view?.openToolSince).toBe("2026-11-16T12:01:00.000Z");
+      expect(view?.openToolKind).toBe("command_execution");
+      active = false;
+      expect((yield* threads.find(threadId))?.openToolSince).toBeNull();
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
 );

@@ -76,7 +76,8 @@ const make = Effect.gen(function* () {
     const records = yield* orchestrator
       .getThreadRecords(caller.threadId, ["providerThreads"])
       .pipe(Effect.mapError(unavailable));
-    const runtimeId = yield* resolveCallerRuntime(credentials, caller, records);
+    const identity = yield* resolveCallerRuntime(credentials, caller, records);
+    const runtimeId = identity?.runtimeProviderSessionId;
     if (runtimeId === undefined) return yield* unavailable();
     const providerThread = records.providerThreads.find(
       (thread) => thread.id === records.thread.activeProviderThreadId,

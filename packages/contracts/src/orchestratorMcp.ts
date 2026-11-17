@@ -354,7 +354,15 @@ export type OrchestratorMcpTaskCancelInput = typeof OrchestratorMcpTaskCancelInp
 
 export const OrchestratorMcpTaskCancelResult = Schema.Struct({
   taskId: NodeId,
-  status: Schema.Literals(["cancel_requested", "completed", "failed", "cancelled", "interrupted"]),
+  status: Schema.Literals([
+    "cancel_pending",
+    "cancel_requested",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+  ]),
+  detail: Schema.optional(Schema.String),
 });
 export type OrchestratorMcpTaskCancelResult = typeof OrchestratorMcpTaskCancelResult.Type;
 
@@ -466,10 +474,13 @@ export type OrchestratorMcpThreadListItem = typeof OrchestratorMcpThreadListItem
 
 export const OrchestratorMcpThreadListResult = Schema.Struct({
   projectId: ProjectId,
+  projectTitle: Schema.optional(Schema.String),
   currentThreadId: Schema.NullOr(ThreadId),
   threads: Schema.Array(OrchestratorMcpThreadListItem),
   nextCursor: Schema.NullOr(NonNegativeInt),
+  /** Lower bound when totalIsExact is false; older servers always returned an exact total. */
   total: NonNegativeInt,
+  totalIsExact: Schema.optional(Schema.Boolean),
 });
 export type OrchestratorMcpThreadListResult = typeof OrchestratorMcpThreadListResult.Type;
 
@@ -806,12 +817,15 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "run_starting",
       "caller_unresolved",
       "delegation_timeout",
+      "delegation_uncertain",
       "ambiguous_replay",
       "provider_unavailable",
       "model_unavailable",
       "runtime_mode_escalation_denied",
       "interaction_mode_escalation_denied",
       "task_not_found",
+      "task_record_missing",
+      "task_creating",
       "task_not_cancellable",
       "thread_not_found",
       "run_not_found",
@@ -829,6 +843,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     reason: Schema.optional(McpDenyReason),
     reasonClass: Schema.optionalKey(McpReasonClass),
     invalidField: Schema.optionalKey(McpInvalidField),
-    saved: Schema.optional(Schema.Boolean),
+    saved: Schema.optional(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+    taskId: Schema.optional(NodeId),
   },
 ) {}

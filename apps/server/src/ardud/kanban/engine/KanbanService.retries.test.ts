@@ -111,6 +111,7 @@ const makeFake = () => {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: (threadId) =>
         read(threadId).pipe(
@@ -340,6 +341,101 @@ const reviewingCard = Effect.gen(function* () {
 
 const retriesOf = (card: KanbanCard) =>
   (card.retries ?? []).map((retry) => `${retry.kind}/${retry.role}/${retry.state}`);
+
+const admission = {
+  queuedAtMs: START,
+  waitedMs: 30 * 60_000,
+  positionAtFailure: 2,
+  totalAtFailure: 3,
+  rule: "no_progress" as const,
+};
+
+it.effect.each(["notification", "persisted failure"] as const)(
+  "restart failure retains admission details in the stored card event through %s",
+  (edge) => {
+    const fake = makeFake();
+    return Effect.gen(function* () {
+      const { kanban, thread, now } = yield* workingCard;
+      fake.fail(thread, {
+        code: "restart_admission_timeout",
+        runId: "run:expired",
+        message: "Restart admission expired",
+        admission,
+      });
+      const timeout = {
+        runId: "run:expired",
+        reason: "Restart admission expired",
+        restartAdmission: true,
+        admission,
+      };
+      yield* kanban.turnEnded(thread, edge === "notification" ? timeout : undefined);
+      yield* kanban.turnEnded(thread, timeout);
+      const detail = yield* now;
+      assert.strictEqual(detail.card.stage, "todo");
+      assert.include(detail.card.stalled!.reason, "Run failed: Restart admission expired");
+      const flags = detail.events.filter((event) => event.kind === "flagged");
+      assert.lengthOf(flags, 1);
+      assert.deepStrictEqual(flags[0]?.admission, admission);
+      assert.strictEqual(flags[0]?.runId, "run:expired");
+      assert.strictEqual(flags[0]?.failedThreadId, thread);
+      assert.include(flags[0]!.body!, "Run: run:expired");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  },
+);
+
+it.effect.each(["work", "review"] as const)(
+  "%s retry and stall events preserve the failed run's admission context",
+  (role) => {
+    const fake = makeFake();
+    return Effect.gen(function* () {
+      const context = yield* role === "work" ? workingCard : reviewingCard;
+      const thread = "reviewer" in context ? context.reviewer : context.thread;
+      fake.fail(thread, { runId: "run:retry", admission });
+      yield* context.kanban.turnEnded(thread);
+      const retry = (yield* context.now).events.findLast((event) =>
+        event.body?.startsWith("Run failed, retrying once:"),
+      );
+      assert.strictEqual(retry?.runId, "run:retry");
+      assert.strictEqual(retry?.failedThreadId, thread);
+      assert.deepStrictEqual(retry?.admission, admission);
+      yield* pastBackoff;
+      yield* context.kanban.tick;
+      fake.fail(thread, { runId: "run:stalled", admission });
+      yield* context.kanban.turnEnded(thread);
+      const flagged = (yield* context.now).events.findLast((event) => event.kind === "flagged");
+      assert.strictEqual(flagged?.runId, "run:stalled");
+      assert.strictEqual(flagged?.failedThreadId, thread);
+      assert.deepStrictEqual(flagged?.admission, admission);
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  },
+);
+
+it.effect.each(["work", "review"] as const)(
+  "%s fresh-thread failure events preserve admission context",
+  (role) => {
+    const fake = makeFake();
+    return Effect.gen(function* () {
+      const context = yield* role === "work" ? workingCard : reviewingCard;
+      const thread = "reviewer" in context ? context.reviewer : context.thread;
+      fake.fail(thread, {
+        runId: "run:fresh",
+        message: "Insufficient context allowance for the provider handoff.",
+        admission,
+      });
+      yield* context.kanban.turnEnded(thread);
+      const detail = yield* context.now;
+      assert.strictEqual(
+        role === "work" ? detail.card.workThreadId : detail.card.reviewThreadId,
+        null,
+      );
+      const moved = detail.events.findLast((event) => event.kind === "moved");
+      assert.strictEqual(moved?.runId, "run:fresh");
+      assert.strictEqual(moved?.failedThreadId, thread);
+      assert.deepStrictEqual(moved?.admission, admission);
+      assert.include(moved!.body!, "Insufficient context allowance for the provider handoff.");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  },
+);
 
 it.effect.each(["working", "todo", "reassigned"] as const)(
   "start timeout flags the owning card after queue promotion: %s",
@@ -1719,6 +1815,11 @@ it.effect(
               event.body === "Reviewer stopped without a verdict, retrying once",
           ),
         );
+        assert.strictEqual(
+          detail.events.findLast((event) => event.body === Retries.NO_VERDICT_RESTARTED_EVENT)
+            ?.failedThreadId,
+          reviewer,
+        );
         yield* kanban.dispatchNow;
         detail = yield* now;
         assert.strictEqual(detail.card.stage, "in_review");
@@ -1734,6 +1835,10 @@ it.effect(
         detail = yield* now;
         assert.strictEqual(detail.card.stage, "needs_review");
         assert.strictEqual(detail.card.stalled?.reason, "Reviewer stopped without a verdict");
+        assert.strictEqual(
+          detail.events.findLast((event) => event.kind === "flagged")?.failedThreadId,
+          reviewer,
+        );
         assert.isUndefined(detail.card.retries);
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
@@ -1810,6 +1915,10 @@ it.effect.each(["approval", "conflict", "early conflict"] as const)(
         detail = yield* now;
         assert.strictEqual(detail.card.stage, "needs_review");
         assert.strictEqual(detail.card.stalled?.reason, `Review verdict refused: ${reason}`);
+        assert.strictEqual(
+          detail.events.findLast((event) => event.kind === "flagged")?.failedThreadId,
+          reviewer,
+        );
         assert.deepStrictEqual(detail.card.stalled?.by, {
           _tag: "system",
           component: "dispatcher",
@@ -3178,3 +3287,30 @@ it.effect.each(["owner", "evaluator"] as const)(
     }).pipe(Effect.provide(testLayer(fake.layer)));
   },
 );
+
+it.effect("admission failure records the worker on every carried card", () => {
+  const fake = makeFake();
+  return Effect.gen(function* () {
+    const { kanban, board, card: primary, thread } = yield* workingCard;
+    const secondary = yield* kanban.createCard(
+      board.id,
+      { prompt: "Carried", title: "Carried" },
+      owner,
+    );
+    yield* kanban.claimCard(thread, secondary.id);
+    yield* kanban.turnEnded(thread, {
+      runId: "run:shared",
+      reason: "Restart admission expired",
+      restartAdmission: true,
+      admission,
+    });
+    for (const card of [primary, secondary]) {
+      const failure = (yield* kanban.card(card.id)).events.findLast(
+        (event) => event.kind === "flagged",
+      );
+      assert.strictEqual(failure?.failedThreadId, thread);
+      assert.strictEqual(failure?.runId, "run:shared");
+      assert.deepStrictEqual(failure?.admission, admission);
+    }
+  }).pipe(Effect.provide(testLayer(fake.layer)));
+});

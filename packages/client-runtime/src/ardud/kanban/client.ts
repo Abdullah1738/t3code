@@ -40,7 +40,7 @@ import {
   withOwnerRead,
   type KanbanBoardState,
 } from "./boardState.ts";
-import { mergeBoardList } from "./threads.ts";
+import { boardThreadIds, mergeBoardList } from "./threads.ts";
 import { isKanbanServerError, type KanbanRequestTag, type KanbanTransport } from "./transport.ts";
 import { mergeMessages } from "./viewModel.ts";
 
@@ -64,7 +64,8 @@ interface BoardFeed {
 export interface KanbanClient {
   /** Every board with its list counts, kept current by the server. */
   readonly boards: SnapshotStore<ReadonlyArray<KanbanBoardSummary>>;
-  board(boardId: string): SnapshotStore<KanbanBoardState>;
+  readonly boardThreads: SnapshotStore<ReadonlySet<string>>;
+  board(boardId: string): SnapshotStore<KanbanBoardState | undefined>;
   /**
    * The newest page of a discussion, kept current by the board feed, plus any earlier pages
    * read with `loadEarlier`. Seqs have no holes, so a first seq above 1 means more are
@@ -108,6 +109,7 @@ export interface KanbanClient {
     model: ModelSelection,
     options?: { readonly replaces?: string },
   ): Promise<void>;
+  purgeBoard(boardId: string): Promise<void>;
   updateBoard(input: KanbanBoardUpdateInput): Promise<void>;
   revokeStandingApproval(boardId: string, id: string): Promise<void>;
   /** Owner's New board: creates the board with its project and evaluator model. */
@@ -340,6 +342,10 @@ export function createKanbanClient(
         M.subscribe,
         { boardId: boardId as never },
         (event) => {
+          if (event._tag === "change" && event.change._tag === "boardRemoved") {
+            retainedPreviews.delete(boardId);
+            pendingReads.delete(boardId);
+          }
           const opened = created.state === undefined;
           const applied = applyKanbanWatchEvent(created.state, event);
           const next = opened ? withRetainedPreviews(boardId, applied) : applied;
@@ -446,49 +452,51 @@ export function createKanbanClient(
     };
   };
 
-  const board = createKeyedSnapshotStores<string, KanbanBoardState>((boardId, emit, fail) => {
-    // Discussions live outside the snapshot, so every snapshot (a reconnect
-    // included) reads the list again. Discussions a live change touches while
-    // the read is out are newer than the list and keep their entry.
-    let fresher: Set<string> | null = null;
-    const discussions = serialLoader(async () => {
-      const touched = new Set<string>();
-      fresher = touched;
-      try {
-        const list = await transport.request(M.discussions, { boardId: boardId as never });
-        update(boardId, (state) => withDiscussionList(state, list, touched));
-      } finally {
-        if (fresher === touched) fresher = null;
-      }
-    });
-    const emitState = () => {
-      const state = feeds.get(boardId)?.state;
-      if (state === undefined) return;
-      emit(state);
-      loadPreviews(boardId);
-    };
-    const listeners = stateListeners.get(boardId) ?? new Set();
-    stateListeners.set(boardId, listeners);
-    listeners.add(emitState);
-    const off = listen(
-      boardId,
-      (event) => {
-        if (event._tag === "snapshot") discussions.run();
-        else if (event.change._tag === "discussion") fresher?.add(event.change.discussion.id);
-        emitState();
-      },
-      fail,
-    );
-    // Joining a feed another store holds: it may have reconnected since the
-    // list was last read.
-    if (feeds.get(boardId)?.state !== undefined) discussions.run();
-    emitState();
-    return () => {
-      discussions.close();
-      listeners.delete(emitState);
-      off();
-    };
-  }, options);
+  const board = createKeyedSnapshotStores<string, KanbanBoardState | undefined>(
+    (boardId, emit, fail) => {
+      // Discussions live outside the snapshot, so every snapshot (a reconnect
+      // included) reads the list again. Discussions a live change touches while
+      // the read is out are newer than the list and keep their entry.
+      let fresher: Set<string> | null = null;
+      const discussions = serialLoader(async () => {
+        const touched = new Set<string>();
+        fresher = touched;
+        try {
+          const list = await transport.request(M.discussions, { boardId: boardId as never });
+          update(boardId, (state) => withDiscussionList(state, list, touched));
+        } finally {
+          if (fresher === touched) fresher = null;
+        }
+      });
+      const emitState = () => {
+        const state = feeds.get(boardId)?.state;
+        emit(state);
+        if (state !== undefined) loadPreviews(boardId);
+      };
+      const listeners = stateListeners.get(boardId) ?? new Set();
+      stateListeners.set(boardId, listeners);
+      listeners.add(emitState);
+      const off = listen(
+        boardId,
+        (event) => {
+          if (event._tag === "snapshot") discussions.run();
+          else if (event.change._tag === "discussion") fresher?.add(event.change.discussion.id);
+          emitState();
+        },
+        fail,
+      );
+      // Joining a feed another store holds: it may have reconnected since the
+      // list was last read.
+      if (feeds.get(boardId)?.state !== undefined) discussions.run();
+      emitState();
+      return () => {
+        discussions.close();
+        listeners.delete(emitState);
+        off();
+      };
+    },
+    options,
+  );
 
   const previewWatchers = new Map<string, number>();
   const loadPreviews = (boardId: string) => {
@@ -702,6 +710,7 @@ export function createKanbanClient(
 
   // Never fails: the stream follows reconnects, and after a server error it
   // opens again after a growing pause.
+  let purgingIds: ReadonlySet<string> = new Set();
   const boards = createSnapshotStore<ReadonlyArray<KanbanBoardSummary>>((emit) => {
     let list: ReadonlyArray<KanbanBoardSummary> | undefined;
     let close: Unsubscribe | null = null;
@@ -716,6 +725,9 @@ export function createKanbanClient(
         {},
         (update) => {
           pause = RETRY_MIN_MS;
+          purgingIds = new Set(
+            update.filter((entry) => entry.purged).flatMap((entry) => entry.threadIds),
+          );
           list = mergeBoardList(list, update);
           emit(list);
         },
@@ -891,8 +903,16 @@ export function createKanbanClient(
   const withDiscussion = (boardId: string, discussion: KanbanDiscussion) =>
     update(boardId, (state) => withDiscussions(state, [discussion], []));
 
+  const boardThreads = createSnapshotStore<ReadonlySet<string>>((emit) => {
+    const refresh = () => emit(new Set([...boardThreadIds(boards.get()), ...purgingIds]));
+    const stop = boards.subscribe(refresh);
+    refresh();
+    return stop;
+  }, options);
+
   return {
     boards,
+    boardThreads,
     board,
     messages: (boardId, discussionId) => messages(`${boardId}\n${discussionId}`),
     async loadEarlier(boardId, discussionId) {
@@ -964,6 +984,9 @@ export function createKanbanClient(
         id,
         reason: "Revoked from board settings",
       });
+    },
+    async purgeBoard(boardId) {
+      await transport.request(M.boardPurge, { boardId: boardId as never });
     },
     async updateBoard(input) {
       await transport.request(M.boardUpdate, input);

@@ -175,6 +175,15 @@ export const ProviderSessionManagerV2Error = Schema.Union([
 export type ProviderSessionManagerV2Error = typeof ProviderSessionManagerV2Error.Type;
 
 export interface ProviderSessionManagerV2Shape {
+  /** Reads only the live session map; does not refresh, probe, or count as activity. */
+  readonly runtimeSnapshot?: () => Effect.Effect<{
+    readonly turns: ReadonlyArray<{
+      readonly threadId: string;
+      readonly provider: string;
+      readonly model: string;
+    }>;
+    readonly providerSessions: Readonly<Record<string, number>>;
+  }>;
   readonly shutdown: Effect.Effect<void>;
   readonly sweepOrphanedThreads: (providerSessionId: ProviderSessionId) => Effect.Effect<void>;
   readonly observeThreadSessionUpdates: (
@@ -269,7 +278,7 @@ interface LiveSessionEntry {
   readonly workGeneration: number;
   readonly busyTurns: ReadonlyMap<
     string,
-    { readonly threadId: ThreadId; readonly nativeThreadKey: string }
+    { readonly threadId: ThreadId; readonly nativeThreadKey: string; readonly model: string | null }
   >;
   readonly lastActivityAtMs: number;
   readonly idleFiber: Fiber.Fiber<void, never> | null;
@@ -1677,6 +1686,7 @@ export const layerWithOptions = (
         turnKey: string,
         threadId: ThreadId,
         nativeThreadKey: string,
+        model: string | null,
       ) =>
         withActivityError(
           providerSessionId,
@@ -1692,7 +1702,11 @@ export const layerWithOptions = (
               updated.set(key, {
                 ...entry,
                 workGeneration: entry.workGeneration + 1,
-                busyTurns: new Map(entry.busyTurns).set(turnKey, { threadId, nativeThreadKey }),
+                busyTurns: new Map(entry.busyTurns).set(turnKey, {
+                  threadId,
+                  nativeThreadKey,
+                  model,
+                }),
                 idleFiber: null,
                 lastActivityAtMs: now,
                 pinnedSinceMs: null,
@@ -2250,6 +2264,7 @@ export const layerWithOptions = (
                     busyTurnKey(input.providerThread.id, input.runOrdinal),
                     input.threadId,
                     providerThreadRuntimeKey(input.providerThread),
+                    input.modelSelection.model,
                   ),
                 ),
                 () =>
@@ -2416,6 +2431,7 @@ export const layerWithOptions = (
                       busyTurnKey(input.providerThread.id, -1),
                       threadId,
                       providerThreadRuntimeKey(input.providerThread),
+                      null,
                     ),
                   ),
                   () => runtime.rollbackThread(input),
@@ -2819,7 +2835,27 @@ export const layerWithOptions = (
         ),
       );
 
+      const runtimeSnapshot = Effect.fn("ProviderSessionManager.runtimeSnapshot")(function* () {
+        const current = yield* Ref.get(sessions);
+        const turns: Array<{ threadId: string; provider: string; model: string }> = [];
+        const counts = new Map<string, number>();
+        for (const entry of current.values()) {
+          counts.set(entry.runtime.driver, (counts.get(entry.runtime.driver) ?? 0) + 1);
+          for (const turn of entry.busyTurns.values()) {
+            // Rollback holds the runtime busy without running a provider turn.
+            if (turn.model === null) continue;
+            turns.push({
+              threadId: turn.threadId,
+              provider: entry.runtime.instanceId,
+              model: turn.model,
+            });
+          }
+        }
+        return { turns, providerSessions: Object.fromEntries(counts) };
+      });
+
       return ProviderSessionManagerV2.of({
+        runtimeSnapshot,
         sweepOrphanedThreads,
         observeThreadSessionUpdates,
         refreshThreadSessionUpdates,

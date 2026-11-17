@@ -37,14 +37,15 @@ _NAMES = {
     'provider.track', 'provider.orders', 'provider.details', 'log.cap',
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
-    'order_watch.item_drop_check',
-    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared', 'collector.hold_alert_sent',
+    'order_watch.item_drop_check', 'order_watch.can_report',
+    'collector.hold_seen', 'collector.hold_cleared',
 }
 _ENUMS = {
     'route': {'cdp', 'phone', 'unspecified'},
     'field': {'card_name', 'card_number', 'card_expiry', 'card_cvc'},
     'cardNickname': {'Marriott', 'MashreqNoon', 'Skywards', 'Mashreq'},
     'reason': DELEGATION_REASONS,
+    'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage'},
     'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
              'quik', 'shops', 'box', 'same-day'},
@@ -65,7 +66,8 @@ _ENUMS = {
               'nearby', 'delivered', 'cancelled', 'pending confirmation'},
 }
 _ENUMS['from'] = _ENUMS['to'] = _ENUMS['state']
-_BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled'}
+_BOOLS = {'prepareOnly', 'changed', 'fallback', 'budgetHit', 'unmatched', 'deadlineMoved', 'answered', 'polled',
+          'untrackable', 'eta_given'}
 _NUMBERS = {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'exitCode', 'amountMinor', 'count', 'ageDays', 'openCases', 'fired', 'sourceLimits',
             'msgs_cpu_ms', 'msgs_concurrent_max', 'msgs_cache_hits', 'msgs_timeouts', 'msgs_p50_ms',
             'merchants_ms', 'order_charges_ms', 'payments_ms', 'questions_ms', 'refunds_ms',
@@ -552,10 +554,26 @@ def _fields(props):
                            for kind, bucket in value.items() if kind in {'receipt', 'order', 'refund', 'history', 'other'}
                            and isinstance(bucket, dict)}
         elif key == 'chargeCensus' and isinstance(value, dict):
-            result[key] = {app: {k: v for k, v in counts.items()
-                if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked', 'marketplace_hold', 'marketplace_stale'}
-                and type(v) is int and 0 <= v <= 10**9}
-                for app, counts in value.items() if app in {'noon', 'careem'} and isinstance(counts, dict)}
+            result[key] = {}
+            reason_codes = {
+                'marketplace_hold', 'marketplace_stale', 'receipt_out_of_time', 'msgs_timeout',
+                'owner_list_failed', 'owner_incomplete', 'receipt_not_checked', 'other',
+                'source_limit:ORDER_LIST_HOST_BINDING_UNVERIFIED',
+            } | {f'{kind}:{lane}' for kind in ('lane_uncovered', 'lane_slice_out', 'lane_error')
+                 for lane in ('minutes', 'marketplace', 'food', 'nownow')}
+            for app, counts in value.items():
+                if app not in {'noon', 'careem'} or not isinstance(counts, dict):
+                    continue
+                safe = {k: v for k, v in counts.items()
+                        if k in {'open', 'matched', 'proven_clean', 'limited', 'error', 'not_checked',
+                                 'marketplace_hold', 'marketplace_stale'}
+                        and type(v) is int and 0 <= v <= 10**9}
+                for field, allowed in (('limit_reasons', reason_codes),
+                                       ('limit_age_days', {'lt7', '7_30', '30_60', 'gt60'})):
+                    if isinstance(counts.get(field), dict):
+                        safe[field] = {k: v for k, v in counts[field].items() if k in allowed
+                                       and type(v) is int and 0 <= v <= 10**9}
+                result[key][app] = safe
         elif key == 'orderCoverage' and isinstance(value, dict):
             result[key] = {}
             for app in ('noon', 'careem'):
@@ -658,14 +676,20 @@ def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, 
                 # Run triggers are constructed here, never accepted from props.
                 row['props'].update(_caller_fields(props.get('caller'), props.get('trigger')))
             if component == 'order-watch' and name.startswith('collector.hold_'):
+                age = props.get('age_s')
+                comm = props.get('agent_comm')
                 row['props'] = {
-                    'owner': props.get('owner')[:120] if type(props.get('owner')) is str else None,
-                    'reason': props.get('reason') if props.get('reason') in {
-                        'hold_older_than_60m', 'lease_expired', 'holder_pid_dead', 'lease_live',
-                        'no_matching_lease_within_bound', 'hold_absent'} else None,
-                    'age_s': props.get('age_s') if type(props.get('age_s')) is int
-                             and props['age_s'] >= 0 else None,
+                    'age_s': age if type(age) in (int, float) and math.isfinite(age) and age >= 0 else None,
+                    'holder_alive': props.get('holder_alive') if type(props.get('holder_alive')) is bool else None,
+                    'agent_comm': comm if isinstance(comm, str) and re.fullmatch(r'[A-Za-z0-9_.+-]{1,80}', comm) else None,
                 }
+                failure = props.get('error')
+                if isinstance(failure, str) and (failure in {
+                        'ph timed out', 'invalid ph status', 'FileNotFoundError', 'PermissionError',
+                        'OSError', 'IsADirectoryError', 'NotADirectoryError', 'JSONDecodeError',
+                        'UnicodeDecodeError', 'ValueError', 'UnicodeError'}
+                        or re.fullmatch(r'ph exited -?[0-9]{1,3}', failure)):
+                    row['props']['error'] = failure
         if error is not None:
             code = tag(error)
             detail = cause or context.get('failure') or context.get('last') or _cause(error)
@@ -829,6 +853,7 @@ def rollup(day=None):
         component_totals, component_errors, component_samples, component_durations = {}, {}, {}, {}
         order_failures, poll_counts = {}, {}
         caller_counts, caller_durations = {}, {}
+        can_report_outcomes = {'success': 0, 'refused': 0}
         total = oks = failures = error_lines = invalid = source_bytes = 0
         path = folder / (day + '.ndjson')
         if path.exists():
@@ -855,6 +880,8 @@ def rollup(day=None):
                             'amazon', 'uber', 'toollog', 'money-cases', 'owner-go'}:
                         component = 'unknown'
                     component_totals[component] = component_totals.get(component, 0) + 1
+                    if component == 'order-watch' and name == 'order_watch.can_report' and type(row.get('ok')) is bool:
+                        can_report_outcomes['success' if row['ok'] else 'refused'] += 1
                     component_errors.setdefault(component, {})
                     component_samples.setdefault(component, {})
                     value = row.get('durationMs')
@@ -924,6 +951,7 @@ def rollup(day=None):
                             'p95': values[math.ceil(len(values) * .95) - 1],
                             'max': values[-1], 'count': len(values)}
         result['countsByCaller'] = dict(sorted(caller_counts.items()))
+        result['canReportByOutcome'] = can_report_outcomes
         for key, callers in sorted(caller_durations.items()):
             latency[key]['byCaller'] = {}
             for caller, values in sorted(callers.items()):
@@ -985,7 +1013,7 @@ def previous_day_rollup():
                 or previous.get('schemaVersion') != 2
                 or not all(key in previous for key in (
                     'countsByCaller', 'errorsByComponent', 'failureShare', 'topErrorSamplesByComponent',
-                    'topOrderFailuresByComponent', 'pollsByMerchant'))):
+                    'topOrderFailuresByComponent', 'pollsByMerchant', 'canReportByOutcome'))):
             rollup(day)
     except Exception:
         pass

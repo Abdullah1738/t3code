@@ -25,9 +25,10 @@ import * as Semaphore from "effect/Semaphore";
  * - controlRead: control message reads on foreground readers. One request
  *   at a time leaves the other foreground reader available to the UI, even
  *   when an all=true read hydrates a large imported transcript.
- * - mcp: a whole large MCP read (t3_thread_read, board/card/wiki reads...).
+ * - mcp: a whole large MCP read (t3_thread_read, board/card reads...).
  *   It bounds how many large results are built at once; a slow one delays
  *   only other large MCP reads.
+ * - wiki: selected wiki pages/indexes, isolated from slow thread-list reads.
  *
  * Light control reads (identity, thread status, health) take no lane at all.
  * On 10 Nov 2026 one shared 2-permit lane was held ~1.8 permits by
@@ -42,7 +43,8 @@ export type Lane =
   | "shellPage"
   | "poll"
   | "controlRead"
-  | "mcp";
+  | "mcp"
+  | "wiki";
 
 export const AdmissionObserver = Context.Reference<
   ((sample: { lane: Lane; waitMs: number; runMs: number; acquired: boolean }) => void) | undefined
@@ -65,6 +67,7 @@ export const PERMITS: { readonly [K in Lane]: number } = {
   poll: 4,
   controlRead: 1,
   mcp: 4,
+  wiki: 4,
 };
 
 export const layer = Layer.effect(
@@ -79,6 +82,7 @@ export const layer = Layer.effect(
       poll: yield* Semaphore.make(PERMITS.poll),
       controlRead: yield* Semaphore.make(PERMITS.controlRead),
       mcp: yield* Semaphore.make(PERMITS.mcp),
+      wiki: yield* Semaphore.make(PERMITS.wiki),
     };
   }),
 );

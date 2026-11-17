@@ -93,6 +93,73 @@ export function DeleteBoard(props: { board: KanbanBoard }) {
   );
 }
 
+function EraseBoard({ board }: { board: KanbanBoard }) {
+  const canErase = useKanbanPermission(KANBAN_WS_METHODS.boardPurge);
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const erase = async () => {
+    if (busy || !canErase || name !== board.name) return;
+    setBusy(true);
+    const saved = await runAction("Couldn't erase board", () => kanban.purgeBoard(board.id));
+    setBusy(false);
+    if (saved) setOpen(false);
+  };
+  return (
+    <>
+      <Button
+        variant="destructive"
+        disabled={!canErase}
+        aria-label={`Erase ${board.name}`}
+        onClick={() => {
+          setName("");
+          setOpen(true);
+        }}
+      >
+        Erase
+      </Button>
+      <Dialog
+        open={open}
+        onOpenChange={(next) => {
+          if (!busy) setOpen(next);
+        }}
+      >
+        <DialogPopup>
+          <DialogHeader>
+            <DialogTitle>Erase board</DialogTitle>
+            <DialogDescription>
+              Erases its cards, discussions, wiki and threads. This can't be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogPanel>
+            <label className="flex flex-col gap-2 text-sm">
+              <span className="break-words">Type {board.name} to confirm</span>
+              <Input
+                name="erase-board-name"
+                spellCheck={false}
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                disabled={busy}
+                autoComplete="off"
+              />
+            </label>
+          </DialogPanel>
+          <DialogFooter>
+            <DialogClose render={<Button variant="outline" disabled={busy} />}>Cancel</DialogClose>
+            <Button
+              variant="destructive"
+              disabled={busy || !canErase || name !== board.name}
+              onClick={() => void erase()}
+            >
+              {busy ? "Erasing…" : "Erase board"}
+            </Button>
+          </DialogFooter>
+        </DialogPopup>
+      </Dialog>
+    </>
+  );
+}
+
 export function DeletedBoards() {
   const boards = useBoards();
   const canEdit = useKanbanPermission(KANBAN_WS_METHODS.boardUpdate);
@@ -121,6 +188,7 @@ export function DeletedBoards() {
           >
             {pending === board.id ? "Restoring…" : "Restore"}
           </Button>
+          <EraseBoard board={board} />
         </li>
       ))}
     </ul>

@@ -118,6 +118,7 @@ export function tallyBoards(
 
 /** Folds one change in; true when a summary changed. Changes to unknown boards are dropped. */
 export function applyChange(tallies: BoardTallies, boardId: string, change: KanbanChange): boolean {
+  if (change._tag === "boardRemoved") return tallies.delete(boardId);
   if (change._tag === "board") {
     const tally = tallies.get(boardId);
     if (tally) {
@@ -240,23 +241,42 @@ export const follow = <E, R>(
   tallies: BoardTallies,
   changes: Stream.Stream<{ readonly boardId: string; readonly change: KanbanChange }, E, R>,
   now: () => number = Date.now,
-): Stream.Stream<ReadonlyArray<KanbanBoardListEntry>, E, R> =>
-  Stream.concat(
-    Stream.sync(() => listUpdate(tallies, true, now())),
+  pending: ReadonlyArray<{ readonly boardId: string; readonly threadId: ThreadId }> = [],
+): Stream.Stream<ReadonlyArray<KanbanBoardListEntry>, E, R> => {
+  const purging = new Map<string, ThreadId[]>();
+  for (const row of pending)
+    purging.set(row.boardId, [...(purging.get(row.boardId) ?? []), row.threadId]);
+  const list = (first: boolean, at: number): ReadonlyArray<KanbanBoardListEntry> => [
+    ...listUpdate(tallies, first, at),
+    ...[...purging].map(([boardId, threadIds]) => ({
+      boardId: boardId as KanbanBoard["id"],
+      board: null,
+      purged: true,
+      threadIds,
+      needsOwner: 0,
+      running: 0,
+      unread: 0,
+    })),
+  ];
+  return Stream.concat(
+    Stream.sync(() => list(true, now())),
     changes.pipe(
       Stream.mapAccumArray(
         () => tallies,
         (state, batch) => {
           let moved = false;
           for (const entry of batch) {
+            if (entry.change._tag === "purgeThreads") {
+              if (entry.change.threadIds.length === 0) purging.delete(entry.boardId);
+              else purging.set(entry.boardId, [...entry.change.threadIds]);
+              moved = true;
+            }
             if (applyChange(state, entry.boardId, entry.change)) moved = true;
           }
           const nowMs = now();
-          return [
-            state,
-            moved || countsMoved(state, nowMs) ? [listUpdate(state, false, nowMs)] : [],
-          ] as const;
+          return [state, moved || countsMoved(state, nowMs) ? [list(false, nowMs)] : []] as const;
         },
       ),
     ),
   );
+};

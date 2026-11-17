@@ -138,7 +138,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     capacity.schema(con)
     # Cleanup can declare an absent client/box lost before _check_unlocked ever sees its runs.
     # A saved result is stronger evidence, including for a placeholder left by an earlier pass.
-    from .runs import finish, restore_run_state, terminal_result
+    from .runs import finish, restore_run_state, terminal_result, settle_pulls
     recovered, unowned = set(), set()
     owned = f"(r.box_id IS NULL OR (l.box_id IS NOT NULL AND {mine('l')}))" if owner_scoped() else '1=1'
     for run in con.execute("SELECT r.* FROM runs r LEFT JOIN leases l USING(box_id) "
@@ -158,6 +158,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if terminal_result(saved):
             recovered.add(run['run_id'])
             if not dry:
+                if not settle_pulls(run['run_id'], 'reap', foreign=True):
+                    continue
                 finish(run['run_id'], saved['exit_code'], saved['status'], catch_up=False)
             actions.append(f"{'would repair' if dry else 'repair'} run {run['run_id']} exit={saved['exit_code']}")
     # Local runs (local-first or fallback) whose offbox process died without recording an end.
@@ -216,7 +218,15 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                         actions[-1] += ' (busy; skipped)'
                         return
                     current = con.execute('SELECT * FROM leases WHERE box_id=?', (box_id,)).fetchone()
-                    if current and (current['note'] or '').startswith(BOX_WEDGED_NOTE):
+                    if current and (current['note'] or '').startswith((BOX_WEDGED_NOTE, 'disk-full:')):
+                        from . import box_disk
+                        if (current['note'] or '').startswith(box_disk.NOTE) and what == 'refresh':
+                            fn()
+                            return
+                        if ((current['note'] or '').startswith(box_disk.NOTE) and not box_disk.safe_to_stop(box_id)):
+                            box_disk.keep_running(con, box_id)
+                            actions[-1] += ' (disk_full; live holders or unknown activity; kept)'
+                            return
                         if what == 'stop':
                             lease.stop_box(con, box_id, 'reap: box-wedged', images=False, locked=True)
                         actions[-1] += ' (set aside; stale action skipped)'
@@ -245,6 +255,15 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         bid = r["box_id"]
         b = live.get(bid)
         if con.execute("SELECT 1 FROM kv WHERE k=?", (f"resume_unanswered:{bid}",)).fetchone():
+            if not dry and (r['note'] or '').startswith('disk-full:'):
+                if api.left() is not None and api.left() <= 0.05:
+                    actions.append('defer retired resumes: maintenance budget exhausted')
+                    return actions
+                try:
+                    with file_lock('box-' + bid, timeout=0):
+                        lease.reconcile_retired_resume(con, bid)
+                except OffboxError as error:
+                    event(con, bid, 'resume_reconcile_deferred', str(error))
             actions.append(f"defer {bid}: unanswered resume needs reconciliation")
             continue
         if bid in protected:
@@ -294,7 +313,14 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
                 continue
         # A failed stop is retried without asking Docker; never refresh or automatically delete a wedged box.
         note = con.execute('SELECT note FROM leases WHERE box_id=?', (bid,)).fetchone()[0] or ''
-        if note.startswith(BOX_WEDGED_NOTE):
+        if note.startswith('disk-full:'):
+            stopped = iso_ts(b.get('stoppedAt'))
+            if ((r['pinned_until'] or 0) > now() and state in api.STOPPED_STATES and stopped and
+                    now() - stopped > KEEPALIVE_S and refreshes < 2):
+                refreshes += 1
+                act(bid, 'refresh', 'disk_full pinned disk retention',
+                    lambda bid=bid: lease.refresh_box(con, bid), expected=r)
+        if note.startswith((BOX_WEDGED_NOTE, 'disk-full:')):
             if not running_runs and state in api.LIVE_STATES:
                 act(bid, 'stop', 'set aside: box-wedged',
                     lambda bid=bid: lease.stop_box(con, bid, 'reap: box-wedged', images=False, locked=True))
@@ -473,14 +499,19 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
         con.commit()
         lease._release_locked(con, bid)
     if not dry:
-        reconcile_lost(con, bid, state=state, foreign=True)
+        reconcile_lost(con, bid, state=state, foreign=True, role='reap')
     from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND (status IN ('starting','running') OR "
-                           "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
+                           "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)) OR "
+                           "(exit_code IS NOT NULL AND pulls IS NOT NULL AND pulls!='[]' AND "
+                           "(pull_state IS NULL OR pull_state IN ('pending','running'))))",
                            (bid,)).fetchall():
         saved = restore_run_state(run)
         if terminal_result(saved):
             if not dry:
+                from .runs import settle_pulls
+                if not settle_pulls(run['run_id'], 'reap', foreign=True):
+                    continue
                 finish(run['run_id'], saved['exit_code'], saved['status'])
             actions.append(f"{'would repair' if dry else 'repair'} run {run['run_id']} exit={saved['exit_code']}")
             continue
@@ -506,7 +537,7 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 if modern or result.code is not None:
                     start_check.settle(con, run, result, run['error'] or 'client ended before the command started',
                                        until=None if api.left() is None else now() + max(0, api.left()),
-                                       foreign=True)
+                                       foreign=True, role='reap')
                     actions.append(f"settled run {run['run_id']} on {bid}: {result.verdict} exit={result.code}")
                     continue
             if state in api.LIVE_STATES and not pid:
@@ -583,15 +614,10 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 killed = killed_result(run['run_id'], wait=True, row=run, known_code=code) if code in (None, 137, 143) else None
                 if killed is not None and killed['process_id']:
                     status, code = 'killed', killed['exit_code']
-                if run['mode'] == 'bg' and status in ('done','failed','killed') and run['pulls']:
-                    import json
-                    from .runs import do_pulls
-                    try:
-                        do_pulls(bid, dict(run), json.loads(run['pulls']), foreign=True)
-                    except (OffboxError, OSError, sqlite3.Error) as error:
-                        if killed is None:
-                            raise
-                        say(f"warning: {run['run_id']}: artifact pull after offbox kill failed ({error})")
+                if status in ('done','failed','interrupted','killed','lost') and run['pulls']:
+                    from .runs import settle_pulls
+                    if not settle_pulls(run['run_id'], 'reap', foreign=True):
+                        continue
                 from .runs import planned_steps
                 code = finish(run['run_id'], code, status, run=run, bookkeeping=False, report=True)
                 try:

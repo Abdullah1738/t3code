@@ -40,6 +40,7 @@ import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import { resolveProjectFileBackedSetting } from "@t3tools/shared/projectSettings";
 import { gitCommandDuration, gitCommandsTotal, withMetrics } from "../observability/Metrics.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
+import * as GitExecRate from "./GitExecRate.ts";
 import { removeEmptyDirectory } from "./removeEmptyDirectory.ts";
 import { explicitBareRepositoryEnv, gitConfigEnv } from "./VcsProcess.ts";
 import { resolveWorktreesDirectory } from "../worktreesDirectory.ts";
@@ -914,6 +915,7 @@ export const windowsLongPathConfigEnv = (
   platform === "win32" ? gitConfigEnv(env, "core.longpaths", "true", platform) : {};
 
 export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* () {
+  const gitExecRate = yield* Effect.serviceOption(GitExecRate.GitExecRate);
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -961,6 +963,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         // A git.cmd wrapper would need cmd.exe, which cuts multi-line commit
         // messages at the first newline; leave that case to Node's lookup.
         const executable = resolved.shell ? "git" : resolved.command;
+        if (gitExecRate._tag === "Some") yield* gitExecRate.value.record(commandInput);
         const child = yield* commandSpawner
           .spawn(
             ChildProcess.make(executable, commandInput.args, {

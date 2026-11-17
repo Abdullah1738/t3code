@@ -38,6 +38,7 @@ export function mergeBoardList(
 ): ReadonlyArray<KanbanBoardSummary> {
   const held = new Map(previous?.map((summary) => [summary.board.id, summary]));
   return update.flatMap((entry) => {
+    if (entry.purged) return [];
     const before = held.get(entry.boardId);
     const board = entry.board ?? before?.board;
     if (board === undefined) return [];

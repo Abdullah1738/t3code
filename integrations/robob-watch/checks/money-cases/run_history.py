@@ -26,8 +26,9 @@ PHASES = {'reconcile', 'follow', 'attention', 'build_write', 'merchants', 'order
           'census', 'loads', 'writes', 'locks', 'untimed', 'none'}
 # Exception text can contain a message body or command stderr. Only retain known
 # diagnostic grammar; unknown details never enter the history, even after redaction.
+SOURCE_PREFIX = r'(?:(?:his threads|receipt|orders|merchant history|refund mail|noon orders|careem orders): )*'
 ERROR = re.compile(
-    r'(?:(?:his threads|receipt|orders|merchant history|refund mail|noon orders|careem orders): )*'
+    SOURCE_PREFIX +
     r'(?:Robob control: (?:message provenance unavailable; server update required|credentials unavailable|'
     r'request failed or timed out|invalid response|owner cache save failed|incomplete thread list|'
     r'invalid thread list|invalid thread count|invalid thread|missing thread id|invalid message list|'
@@ -37,7 +38,7 @@ ERROR = re.compile(
     r'out of time(?: saving pings)?(?:; the rest next check)?|lookup unavailable(?: or incomplete)?|'
     r'(?:receipt scan|merchant history) incomplete: (?:read|search) limit reached|'
     r'card-status merchant dead unavailable or invalid; merchant cases unchanged|'
-    r'card owners: settings unreadable|msgs: unreadable search output)')
+    r'card owners: settings unreadable|msgs: (?:unreadable search output|timed out))')
 
 
 def safe_error(error):
@@ -48,6 +49,12 @@ def safe_error(error):
         return error
     # Strip question identities; grouping is by failure, not by private book row.
     error = re.sub(r'^q-[a-f0-9]+: ', '', error[:4096])
+    # Case slugs are book keys, not message text; group them by failure.
+    error = re.sub(r'^(refund mail|receipt|merchant history) [a-z0-9][a-z0-9-]{0,80}: ', r'\1: ', error)
+    timeout = re.fullmatch(
+        r'(' + SOURCE_PREFIX + r")msgs: Command '\[.*\]' timed out after \d+(?:\.\d+)? seconds", error)
+    if timeout:
+        error = timeout[1] + 'msgs: timed out'
     # An incomplete owner read may end in another safe control error.
     parts = error.split('continuing next check: ', 1)
     if len(parts) == 2:

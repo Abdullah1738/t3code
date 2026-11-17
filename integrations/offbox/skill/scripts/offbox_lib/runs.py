@@ -22,12 +22,13 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
+from . import native_crash
+from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence, quint_tools
 from . import command_usage, common, containers, java_version, prune, prepare, userns
-from . import resources, queue_lifecycle
+from . import resources, box_disk, queue_lifecycle
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
-                     is_silenced, offsets_path, person, read_json, record_delivery, say, silence, write)
+                     is_silenced, offsets_path, person, read_json, record_delivery, say, silence, size_summary, write)
 
 
 def _source_stamp():
@@ -868,6 +869,9 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
                               f"Use offbox wait {run['run_id']}; do not rerun the command.", code=EXIT_INFRA)
     if probe_crashed:
         return EXIT_INFRA
+    native_code = native_crash.after_start_code(run, code, path)
+    if native_code is not None:
+        return native_code
     if not planned:
         return code
     checked = checked_steps_code(path, planned, code, report=report)
@@ -1044,7 +1048,7 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
         f'printf "%s\\n" "$1" > {f}.tmp && mv -f {f}.tmp {f}',
         *(["rm -f -- " + shlex.quote(script_file),
            'find "$HOME/.offbox/cmd" -name "*.sh" -mtime +2 -delete'] if script_file else []),
-        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" '
+        'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" -o -name "*.gate" '
         '-o -name "*.trace" -o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
     ])
     # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
@@ -1171,6 +1175,20 @@ def remote_alive(box_id: str, run_id: str, timeout: float = 20) -> str | None:
     return result if p.returncode == 0 and result in ("ended", "alive", "gone") else None
 
 
+def confirm_queue_loss(run_id, status, *, record=True):
+    data = status.get('command', status) if isinstance(status, dict) else {}
+    if (api.BACKEND != 'server' or not run_id or not isinstance(data, dict) or
+            data.get('status') != 'lost' or data.get('running') is True or
+            data.get('notAdmitted') is not True or data.get('startedAt') is not None or
+            data.get('queueLostReason') not in ('killed', 'kill_file', 'unit_inactive', 'unit_failed', 'unit_unknown')):
+        return False
+    if record:
+        with contextlib.closing(db()) as con:
+            con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{run_id}', 'not_admitted'))
+            con.commit()
+    return True
+
+
 def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: bool = True,
                    check_box: bool = False) -> dict | None:
     """Check retained history, then .rc, then liveness. None keeps the run reserved (alive or unknown)."""
@@ -1184,6 +1202,9 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
 
     con = db()
     try:
+        confirmed = con.execute('SELECT v FROM kv WHERE k=?', (f'lost_confirmed:{run_id}',)).fetchone()
+        if confirmed and confirmed['v'] == 'not_admitted':
+            return dict(status='lost', running=False, exitCode=None)
         if record:
             con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f'lost_checked:{run_id}', '1'))
             con.commit()
@@ -1195,7 +1216,10 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
             try:
                 # Leave time for the independent SSH evidence even if the tracker hangs.
                 with api.budget(min(5, left() / 2)):
-                    code = (api.history_get(box_id, row['command_id']) or {}).get('exitCode')
+                    history = api.history_get(box_id, row['command_id']) or {}
+                    if confirm_queue_loss(run_id, history, record=record):
+                        return dict(status='lost', running=False, exitCode=None)
+                    code = history.get('exitCode')
             except OffboxError as e:
                 history_unknown = not (isinstance(e, api.ApiError) and e.status == 404)
                 code = None
@@ -1248,11 +1272,32 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
 
 
 def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = None,
-                   until: float | None = None, *, foreign: bool = False) -> None:
+                   until: float | None = None, *, foreign: bool = False, role: str = 'wait',
+                   pull_artifacts: bool = True) -> None:
     """Under box-<id>: repair old lost rows before following or handing their box to another run."""
-    rows = con.execute("SELECT * FROM runs WHERE box_id=? AND status='lost' AND exit_code IS NULL "
-                       "AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)",
+    def settle_artifacts(row):
+        if not json.loads(row['pulls'] or '[]'):
+            return True
+        if not pull_artifacts:
+            return False
+        if foreign:
+            return settle_pulls(row['run_id'], role, until=until, foreign=True)
+        from .pulls import wait
+        wait(row['run_id'], role, until=until)
+        return True
+
+    rows = con.execute("SELECT * FROM runs WHERE box_id=? AND status='lost' AND exit_code IS NULL",
                        (box_id,)).fetchall()
+    unconfirmed = []
+    for row in rows:
+        proof = con.execute('SELECT v FROM kv WHERE k=?', (f"lost_confirmed:{row['run_id']}",)).fetchone()
+        if proof:
+            # Death without an exit receipt still leaves artifacts to collect; a fenced start never ran.
+            if proof['v'] != 'fenced':
+                settle_artifacts(row)
+        else:
+            unconfirmed.append(row)
+    rows = unconfirmed
     if not rows:
         return
     deadline = now() + timeout
@@ -1273,6 +1318,8 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
         con.executemany('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)',
                         [(f"lost_confirmed:{r['run_id']}", '1') for r in rows])
         con.commit()
+        for row in rows:
+            settle_artifacts(row)
         return
     if state not in api.LIVE_STATES:
         return
@@ -1283,6 +1330,8 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
             st = None
         if st and st['status'] == 'lost':
             con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f"lost_confirmed:{row['run_id']}", '1'))
+            con.commit()
+            settle_artifacts(row)
         else:
             code = st['exitCode'] if st else None
             status = ('done' if code == 0 else 'failed') if st else 'running'
@@ -1296,8 +1345,8 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
                 if wedged:
                     say(wedged_message(box_id, *wedged))
                     continue
-            if st and row['pulls']:
-                do_pulls(box_id, dict(row), json.loads(row['pulls']), until=until, foreign=foreign)
+            if st and not settle_artifacts(row):
+                continue
             if until is not None and now() >= until:
                 raise OffboxError(f"lost reconciliation timed out on {box_id}", code=EXIT_WAIT_TIMEOUT, started=True)
             if st:
@@ -1368,6 +1417,9 @@ def recover_lost_exit(box_id: str, run_id: str, log_path: Path | None, planned: 
         confirmed = con.execute('SELECT v FROM kv WHERE k=?', (f'lost_confirmed:{run_id}',)).fetchone()
     finally:
         con.close()
+    # A never-admitted command has no guest markers or output to recover, even on a live box.
+    if confirmed and confirmed['v'] == 'not_admitted':
+        return None, 'the server confirmed the command was not admitted'
     # Only box-state confirmation rules out SSH: a dead PID's saved exit can still be read on a live box.
     stopped = confirmed and confirmed['v'] == 'box'
     code = None if stopped else recorded_exit(box_id, run_id, timeout=timeout)
@@ -1428,6 +1480,10 @@ def space_result(run_id, code, path=None, *, report=False):
                        k == 'disk_probe_error' or k.startswith(('tmp_', 'var_tmp_', 'home_', 'workspace_'))})
     if previous.get('disk_probe_error') and 'disk_probe_error' not in record:
         record['disk_probe_error'] = None
+    if previous.get('setup_native_crash') is True:
+        record['setup_native_crash'] = True
+    if previous.get('infra_reason') == 'native_crash_after_start':
+        record.update(infra_failure='native_crash', infra_reason='native_crash_after_start')
     if any(previous.get(k) != v for k, v in record.items()):
         try:
             save_run_state(run_id, **record)
@@ -1441,6 +1497,8 @@ def space_result(run_id, code, path=None, *, report=False):
                              ok=not bool(record['infra_failure']), tag=record['infra_failure'])
             except Exception:
                 pass
+    if record.get('infra_reason') == 'native_crash_after_start':
+        return code
     if record.get('infra_failure'):
         if report:
             say(offbox_disk_space.message(record))
@@ -1557,10 +1615,12 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               repo_setup_block(repo_key, rdir),
               f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
-              node,
-              node_tools.block(rdir, repo_root),
+              # JDK activation prepends PATH; install command precedence after runtimes.
               java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
                                                        repo_key=repo_key, template=template)),
+              node,
+              quint_tools.block(),
+              node_tools.block(rdir, repo_root),
               ('''for _offbox_tool in terraform aws ruby vector gh; do
   if [ "$_offbox_tool" = terraform ] && [ "${OFFBOX_TERRAFORM_STATE:-}" = skipped ]; then continue; fi
   command -v "$_offbox_tool" >/dev/null || {
@@ -1686,38 +1746,64 @@ class Runner:
                 con.close()
         db_retry(update)
 
+    def decide_size(self, con, cmd_text):
+        a, me = self.a, self.me
+        # Freeze the decision in the submitter; --bg serializes it with the args for the detached client.
+        if not hasattr(a, '_size_decision'):
+            a._size_decision = lease.auto_size(con, cmd_text, me, a.size)
+            size, why = a._size_decision
+            if why:
+                say(f"NOTE run {self.run_id} will run on {size}" +
+                    (f", not the --size {a.size} you asked for" if a.size and a.size != size else "") +
+                    f": {why}")
+        return a._size_decision
+
     def register_pending(self) -> None:
         if self.registered:
             return
         a, me = self.a, self.me
-        con = db()
-        existing = con.execute('SELECT client_pid,mode FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
-        if existing:
-            con.close()
-            if existing['client_pid'] != os.getpid() or not (
-                    (a.bg and existing['mode'] == 'bg') or os.environ.get(home.RETURNED_HOME_ENV)):
-                raise OffboxError(f'{self.run_id}: queued run belongs to another client', code=EXIT_LOCAL)
-            self.registered = True
-            return
         steps = getattr(a, "steps", None) or []
-        if steps:
-            cmd_text = " ; ".join(steps)
-        else:
-            cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
+        cmd_text = " ; ".join(steps) if steps else (shlex.join(a.cmd) if len(a.cmd) > 1 else a.cmd[0])
+        con = db()
+        existing = con.execute('SELECT * FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+        if existing:
+            try:
+                if existing['client_pid'] != os.getpid() or not (
+                        (a.bg and existing['mode'] == 'bg') or os.environ.get(home.RETURNED_HOME_ENV)):
+                    raise OffboxError(f'{self.run_id}: queued run belongs to another client', code=EXIT_LOCAL)
+                if existing['size_note'] is None:
+                    # Pre-migration queued clients never saved a decision; the original argv is still available.
+                    size, why = self.decide_size(con, cmd_text)
+                    self.record(size=size, requested_size=a.size, size_note=why or '')
+                    if why:
+                        event(con, None, "size_override", json.dumps(dict(run_id=self.run_id, requested=a.size,
+                                                                         effective=size, reason=why)))
+                elif not hasattr(a, '_size_decision'):
+                    # A queued run can be re-entered after a backend handoff with a freshly parsed argv.
+                    a._size_decision = (existing['size'], existing['size_note'])
+                self.registered = True
+                return
+            finally:
+                con.close()
+        size, why = self.decide_size(con, cmd_text)
         # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
         def register():
             with write(con):
                 con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
-                               log_path, pulls, rel_cwd, local_cwd, client_pid, step_count) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?,?)""",
+                               log_path, pulls, rel_cwd, local_cwd, client_pid, step_count, size, requested_size, size_note)
+                               VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?,?,?,?,?)""",
                             (self.run_id, me["owner"], me.get("session"), me.get("thread"), me["repo_root"], str(self.cwd),
                              cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
-                             json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps)))
+                             json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps), size, a.size, why or ''))
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
                 if home.failed_over():
                     con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'failover_queue:{self.run_id}', '1'))
         try:
             db_retry(register)
             self.registered = True
+            if why:
+                event(con, None, "size_override", json.dumps(dict(run_id=self.run_id, requested=a.size,
+                                                                 effective=size, reason=why)))
             try:
                 save_run_state(self.run_id, resources=resources.unavailable(
                     'not_started' if api.BACKEND == 'server' else 'boat'),
@@ -1743,10 +1829,7 @@ class Runner:
         cmd_text = " ; ".join(steps) if steps else (shlex.join(a.cmd) if len(a.cmd) > 1 else a.cmd[0])
         self.wait_images = wait_images = needs_image_wait(cmd_text, me["repo_root"])
         t0 = now()
-        size, why = lease.auto_size(con, cmd_text, me, a.size)
-        if why and why != getattr(a, '_size_notice', None):
-            say(why)
-            a._size_notice = why
+        size, why = a._size_decision
         env, explicit = build_env(a.env or [])
         from . import start_check
         claim = start_check.claim_id(con, self.run_id)
@@ -1773,7 +1856,8 @@ class Runner:
         dead_attempts = 0
         replacement = None
         while True:
-            options = {'exclude': self.cold_boxes} if self.cold_boxes else {}
+            excluded = self.cold_boxes | set(getattr(a, '_disk_exclude', ())) | set(getattr(a, '_suspect_exclude', ()))
+            options = {'exclude': excluded} if excluded else {}
             queued_at = time.monotonic()
             try:
                 row = replacement or pool.acquire(me, size=size, template=a.template, base=a.base, fresh=a.fresh,
@@ -1783,6 +1867,14 @@ class Runner:
                 self.queue_s += time.monotonic() - queued_at
             replacement = None
             self.lease_row = row
+            moved = getattr(a, '_suspect_move', None)
+            if moved:
+                from . import unfit
+                with contextlib.closing(db()) as move_con:
+                    unfit.emit(move_con, 'run_moved_off_suspect', moved['box'], run_id=moved['run'],
+                               old_run_id=moved['run'], new_run_id=self.run_id,
+                               from_box=moved['box'], to_box=row['box_id'])
+                a._suspect_move = None
             self.box = row["box_id"]
             self.check_source('slot')
             rdir = row["remote_dir"]
@@ -1796,7 +1888,22 @@ class Runner:
                 row['_prepare_end'] = prepare.Budget(self.box).end
             try:
                 with _keep_ttl(self.box, row['_prepare_end']) as keeper_scope:
-                    replacement = self._prepare_box(con, a, rdir, env_file, body)
+                    try:
+                        replacement = self._prepare_box(con, a, rdir, env_file, body)
+                    except box_disk.Full as failure:
+                        if self.box in getattr(a, '_disk_cleaned', set()):
+                            box_disk.retire(con, self.box, failure.space, failure.fs)
+                            raise
+                        a._disk_cleaned = getattr(a, '_disk_cleaned', set()) | {self.box}
+                        healthy, space = box_disk.recover(con, self.box, failure.fs, failure.space,
+                                                          getattr(failure, 'path', None), rdir)
+                        if not healthy:
+                            raise box_disk.Full(self.box, failure.fs, space, cleaned=True)
+                        try:
+                            replacement = self._prepare_box(con, a, rdir, env_file, body)
+                        except box_disk.Full as repeated:
+                            box_disk.retire(con, self.box, repeated.space, repeated.fs)
+                            raise
                 if replacement is not None:
                     pool.release_guard(row)
                     self.lease_row, self.box = replacement, replacement['box_id']
@@ -1891,7 +1998,9 @@ class Runner:
                 if result.code is not None:
                     self.recovered_code = result.code
                     self.remote_code = None if steps else result.code
-                    saved = {'known_exit_code': result.code} if steps else {
+                    # A recovered receipt may be a pre-command gate. Keep waiters pending
+                    # until admission recovery decides whether this invocation needs another attempt.
+                    saved = {'known_exit_code': result.code} if steps or a.bg or result.code in (90, 97, 98) else {
                         'status': 'done' if result.code == 0 else 'failed', 'exit_code': result.code, 'end_at': now()}
                     save_run_state(self.run_id, box_id=self.box, wrapper_pid=result.pid, **saved)
                     try:
@@ -1902,7 +2011,7 @@ class Runner:
                         + start_check.hint(self.box, self.run_id))
                     return row
                 current = con.execute('SELECT * FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
-                start_check.settle(con, current, result, f'{e} on start')
+                start_check.settle(con, current, result, f'{e} on start', role='fg')
                 if result.verdict == 'fenced':
                     self.started = False
                     event(con, self.box, 'cmd_start_lost', f'{self.run_id}: {e}; fenced')
@@ -1963,6 +2072,10 @@ class Runner:
                     except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
                         raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
                     log(f"push_box_stopped_resumed {self.box}")
+        space = box_disk.measure(self.box, '/home/user/' + rdir)
+        fs = box_disk.low(space)
+        if fs:
+            raise box_disk.Full(self.box, fs, space)
         return None
 
     def _check_box(self, con, a, rdir) -> dict | None:
@@ -2017,6 +2130,7 @@ class Runner:
             ssh_sync.put_file(self.box, env_file, body, '600', upload_timeout)
             if getattr(self, 'command_file', None):
                 ssh_sync.put_file(self.box, self.command_file, self.command_body, '600', upload_timeout)
+            quint_tools.ensure_archive(self.box)
         upload = (err, upload_files)
         tw = None
         home = api.BACKEND == "server"
@@ -2032,8 +2146,13 @@ class Runner:
                 with prepare.phase("push", self.box):
                     candidates = _seed_candidates(con, self.box, rdir, self.me["repo_key"])
                     self.check_source('push')
+                    from .pulls import snapshot_baseline, record_baseline
+                    pull_paths = getattr(a, 'pull', None)
+                    baseline = snapshot_baseline(self.cwd, pull_paths) if pull_paths else None
                     st = ssh_sync.push(self.box, self.root, rdir, with_git=a.git, includes=getattr(a, "include", None),
                                        seed_candidates=candidates, run_id=self.run_id)
+                    if pull_paths:
+                        record_baseline(self.run_id, self.cwd, pull_paths, baseline)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s; "
@@ -2077,6 +2196,12 @@ class Runner:
                 raise lease.DeadMount(self.box, reason) from e
         sync_exc = push_exc if push_exc is not None else err[0] if err else None
         if sync_exc is not None:
+            disk_failure = box_disk.push_failure(sync_exc)
+            if disk_failure and not isinstance(sync_exc, api.ApiError):
+                fs, path = disk_failure
+                failure = box_disk.Full(self.box, fs, box_disk.measure(self.box))
+                failure.path = path
+                raise failure from sync_exc
             from . import disk_pressure
             if api.BACKEND == 'server' and disk_pressure.is_full(sync_exc):
                 disk_pressure.remember(True)
@@ -2191,7 +2316,7 @@ def _keep_ttl(box_id: str, prepare_end=None):
         if not requests.settled.is_set():
             # Reuse the existing persistent selection fence; keep the disk and let normal idle stopping handle it.
             with contextlib.closing(db()) as con:
-                con.execute('UPDATE leases SET note=? WHERE box_id=?',
+                con.execute("UPDATE leases SET note=? WHERE box_id=? AND COALESCE(note,'') NOT LIKE 'disk-full:%'",
                             (BOX_WEDGED_NOTE + ' unconfirmed keeper TTL PATCH', box_id))
                 con.commit()
                 event(con, box_id, 'ttl_unconfirmed', 'keeper PATCH sent without acknowledgement; box set aside')
@@ -2265,9 +2390,11 @@ def _ended(box_id: str, pid: int, until: float | None, run_id: str | None = None
         st = api.cmd_status(box_id, pid, timeout=left, retries=0, deadline=until)
     except OffboxError:
         return None
-    remember_interruption(run_id, st)
+    remember_interruption(run_id, st, until=until)
     if st and not st.get("running") and st.get("status") in ("exited", "lost", "interrupted"):
         if st.get('status') == 'lost' and run_id:
+            if confirm_queue_loss(run_id, st):
+                return st
             try:
                 return confirmed_lost(box_id, run_id, 20 if until is None else min(20, max(0, until - now())),
                                       check_box=True)
@@ -2288,12 +2415,12 @@ def interruption_info(status):
     return dict(info) if isinstance(info, dict) and info else None
 
 
-def remember_interruption(run_id, status):
+def remember_interruption(run_id, status, *, until=None):
     info = interruption_info(status)
     if (run_id and info is not None and
             read_json(LOGS_DIR / f'{run_id}.state.json', {}).get('interruption') != info):
         try:
-            save_run_state(run_id, interruption=info)
+            save_run_state(run_id, until=until, interruption=info)
         except OSError as error:
             say(f"warning: {run_id}: could not save interruption details ({error})")
     return info
@@ -2424,10 +2551,13 @@ def log_lock(run_id: str, timeout: float = 600, *, until: float | None = None):
         guard.__exit__(None, None, None)
 
 
+_COMMAND_RUNNING = object()
+
+
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
            start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None,
            replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0,
-           receipt_locked: bool = False) -> int | None:
+           receipt_locked: bool = False, until_command_started: bool = False):
     """Stream a remote command's output until it exits. Setting stop_evt (see lease._follow_bounded) makes it
     return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper.
     Past `until` (a time.time()-style deadline) it raises EXIT_WAIT_TIMEOUT and leaves the remote run alone.
@@ -2447,11 +2577,12 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
     guard = log_lock(run_id or Path(log_path).stem, until=until) if log_path else contextlib.nullcontext()
     with guard:
         return _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt, until,
-                              replay_path, mirror_path, mirror_keep)
+                              replay_path, mirror_path, mirror_keep, until_command_started)
 
 
 def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt, until,
-                   replay_path, mirror_path, mirror_keep):
+                   replay_path, mirror_path, mirror_keep, until_command_started=False):
+    startup_tail = ""
     out_off, err_off = start_offsets
     stop_evt = stop_evt or threading.Event()
     keeper = threading.Thread(target=_ttl_keeper, args=(box_id, stop_evt), daemon=True)
@@ -2524,8 +2655,10 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
         ended["n"] += 1
         return ended["n"]
 
-    def follow_lost():
+    def follow_lost(status=None):
         if not run_id:
+            return None
+        if confirm_queue_loss(run_id, status):
             return None
         while not stop_evt.is_set():
             if until is not None and now() >= until:
@@ -2551,13 +2684,13 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
         # An answer that arrives past the caller's deadline is not accepted: the wait ends with --timeout (124).
         if until is not None and now() >= until:
             raise timed_out()
-        remember_interruption(run_id, st)
+        remember_interruption(run_id, st, until=until)
         if st is not None and st.get("status") == "interrupted":
             raise Interrupted(what, st)
         if st is None or ended_again() < 2:
             return _RUNNING
         if st.get('status') == 'lost':
-            return follow_lost()
+            return follow_lost(st)
         return _status_code(st)
 
     def timed_out() -> OffboxError:
@@ -2591,15 +2724,15 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     # Absolute: a frame that arrives after the deadline (even an exit) is not accepted.
                     if until is not None and now() >= until:
                         raise timed_out()
-                    remember_interruption(run_id, fr)
+                    remember_interruption(run_id, fr, until=until)
                     t = fr.get("type")
-                    if t != "error" and run_id and (now() - last_home_read >= 5 or t == "exit"):
+                    if t != "error" and run_id and (now() - last_home_read >= 5 or t in ("hello", "attempt", "exit") or fr.get("status") is not None):
                         from .home_run_observation import observe
                         kind = {"hello": "stream connected", "heartbeat": "stream heartbeat",
                                 "reconnect": "stream connected", "attempt": "stream connected",
                                 "stdout": "output received", "stderr": "output received",
                                 "exit": fr.get("status", "exited")}.get(t)
-                        observe(run_id, kind)
+                        observe(run_id, kind, status=fr.get('status'), attempt=fr.get('attempt'))
                         last_home_read = now()
                     if t in ("stdout", "stderr"):
                         data = fr.get("data") or ""
@@ -2622,6 +2755,11 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                                 mf.write(b)
                                 mf.flush()
                                 _commit(mirror_path, out_off, err_off, mf.tell())
+                        if until_command_started and t == 'stderr':
+                            startup_tail += data
+                            if COMMAND_STARTED_MARKER + ' ' + (run_id or '') in startup_tail.splitlines():
+                                return _COMMAND_RUNNING
+                            startup_tail = startup_tail[-4096:]
                     elif t == "reconnect":
                         out_off, err_off = fr.get("stdoutOffset", out_off), fr.get("stderrOffset", err_off)
                         # boat ends a healthy stream every 10 min; an ended process gets its exit frame on the next
@@ -2644,11 +2782,14 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                         if fr.get("status") == "interrupted" and fr.get('running') is not True:
                             raise Interrupted(what, fr)
                         if fr.get('exitCode') is None and not fr.get('signal'):
-                            return follow_lost()
+                            return follow_lost(fr)
                         return fr.get("exitCode") if fr.get("exitCode") is not None else (
                             128 + 15 if fr.get("signal") else None)
                     elif t == "error":
                         raise OffboxError(f"attach error: {fr.get('error')} {fr.get('message')}")
+                    if home_run and run_id and (fr.get('status') == 'queued' or t == 'stderr'):
+                        from .home_run_observation import notice_queue_after_read
+                        notice_queue_after_read(run_id, path=target)
                     failures = 0
                     if until is not None and now() >= until:
                         again = True
@@ -2697,7 +2838,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     pass
                 if until is not None and now() >= until:
                     raise timed_out()
-                remember_interruption(run_id, st)
+                remember_interruption(run_id, st, until=until)
                 down_from = (down_from or failed_at) if boat_down else None
                 if home_run and boat_down and not seen["lost"]:
                     # The run was accepted, so it is never sent anywhere else (it would run twice): wait for the
@@ -2709,7 +2850,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                     raise Interrupted(what, st)
                 if st and not st.get("running") and st.get("status") in ("exited", "lost"):
                     if st.get("status") == "lost":
-                        return follow_lost()
+                        return follow_lost(st)
                     if ended_again() > 3:
                         return _status_code(st)
                 if failures > 20 and (down_from is None or now() - down_from >= window):
@@ -2749,45 +2890,9 @@ def new_checkout_hint(row: dict, root: Path, usage: command_usage.Usage) -> None
 
 
 def do_pulls(box_id: str, row: dict, pulls: list[str], *, until: float | None = None,
-             foreign: bool = False) -> None:
-    for p in pulls:
-        opts = {}
-        if until is not None:
-            remaining = until - now()
-            if remaining <= 0:
-                raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
-            opts['timeout'] = min(1800, remaining)
-        detail = f"{row.get('run_id', 'unknown')} {p} -> {row['local_cwd']}"
-        prefix = (f"settled background run {row['run_id']} (not this run): "
-                  f"pull {p} into {row['local_cwd']}" if foreign else f"pull {p}")
-        with contextlib.closing(db()) as con:
-            try:
-                st = ssh_sync.pull(box_id, row["remote_dir"], row["rel_cwd"] or ".", p, Path(row["local_cwd"]), **opts)
-            except Exception as error:
-                event(con, box_id, "run_pull_failed", f"{detail} error={error}")
-                if foreign:
-                    say(f"{prefix} failed: {error}")
-                if isinstance(error, subprocess.TimeoutExpired) and until is not None:
-                    raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True) from None
-                raise
-            if st.get("missing"):
-                event(con, box_id, "run_pull_failed", f"{detail} error=not created on the box: {st.get('error')}")
-            elif st.get("ok"):
-                event(con, box_id, "run_pulled", f"{detail} files={st.get('files', 0)}")
-            else:
-                event(con, box_id, "run_pull_failed", f"{detail} error={st.get('error')}")
-        if until is not None and now() >= until:
-            raise OffboxError("artifact pull deadline reached; wait again", code=EXIT_WAIT_TIMEOUT, started=True)
-        if st.get("missing"):
-            say(f"{prefix}: not created on the box")
-        elif st.get("ok"):
-            if foreign:
-                say(f"settled background run {row['run_id']} (not this run) and pulled {p} "
-                    f"into {row['local_cwd']} ({st.get('files', 0)} files)")
-            else:
-                say(f"pulled {p} ({st.get('files', 0)} files)")
-        else:
-            say(f"{prefix} failed: {st.get('error')}")
+             foreign: bool = False):
+    from .pulls import transfer
+    return transfer(row, pulls, until=until, foreign=foreign)
 
 
 def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int | None) -> bool:
@@ -2809,16 +2914,34 @@ def go_std_glitch(box: str | None, run_id: str, log_path: Path | None, code: int
     return True
 
 
-def save_run_state(run_id, **values):
+def save_run_state(run_id, *, until=None, **values):
     path = LOGS_DIR / f"{run_id}.state.json"
-    previous = read_json(path, {})
-    atomic_write_json(path, {**previous, **values})
+    guard = file_lock('run-state-' + run_id, timeout=0) if until is not None else file_lock('run-state-' + run_id)
+    while True:
+        try:
+            guard.__enter__()
+            break
+        except OffboxError:
+            if until is None:
+                raise
+            left = until-now()
+            if left <= 0:
+                raise OffboxError(f'{run_id}: artifact bookkeeping deadline reached; wait again',
+                                  code=EXIT_WAIT_TIMEOUT, started=True, run_id=run_id) from None
+            time.sleep(min(.01, left))
+            guard = file_lock('run-state-' + run_id, timeout=0)
+    try:
+        previous = read_json(path, {})
+        atomic_write_json(path, {**previous, **values})
+    finally:
+        guard.__exit__(None, None, None)
 
 
 def restore_run_state(row):
     """A remote handle/result survives a failed SQLite write; wait and reap can repair the row."""
     row = dict(row)
     saved = read_json(LOGS_DIR / f"{row['run_id']}.state.json", {})
+    saved.pop('pulls', None)  # The state-file pulls object is telemetry; the runs column holds path arguments.
     restored = {**dict(row), **saved}
     # A competing finisher can commit before a blocked writer saves its result to the file.
     # Keep recoverable handles, but a known terminal result already committed to SQLite wins.
@@ -2935,6 +3058,7 @@ def killed_result(run_id, *, wait=False, until=None, row=None, known_code=None):
                     if (current['status'], current['exit_code']) != ('killed', cached['exit_code']):
                         # Repair old killed/NULL rows and confirmed kills saved during a DB outage.
                         con.execute("UPDATE runs SET status='killed',exit_code=?,end_at=COALESCE(end_at,?) WHERE run_id=? "
+                                    "AND (COALESCE(pulls,'[]')='[]' OR pull_state IN ('none','done','partial','failed')) "
                                     "AND (status IN ('starting','running') OR exit_code IS NULL OR "
                                     "(status='failed' AND exit_code IN (137,143)))",
                                     (cached['exit_code'], cached.get('end_at') or now(), run_id))
@@ -2999,28 +3123,34 @@ def report_killed(row, log_path=None):
     return row['exit_code'] if row['exit_code'] is not None else 143
 
 
-def complete_killed(row, log_path=None, *, pulls=(), until=None):
+def complete_killed(row, log_path=None, *, pulls=(), until=None, role='wait'):
     pull_metadata = dict(row)
     if pulls and not (pull_metadata.get('local_cwd') and pull_metadata.get('remote_dir') and 'rel_cwd' in pull_metadata):
         say(f"warning: {row['run_id']}: artifact pull after offbox kill skipped (pull metadata unavailable)")
     elif pulls:
         try:
-            do_pulls(row['box_id'], dict(row), pulls, until=until)
+            from .pulls import wait, report
+            wait(row['run_id'], role, until=until)
+            killed_result(row['run_id'], known_code=row['exit_code'], until=until)
+            report(row['run_id'], until=until)
         except (OffboxError, OSError, subprocess.TimeoutExpired, sqlite3.Error) as error:
+            if isinstance(error, OffboxError) and error.code == EXIT_WAIT_TIMEOUT:
+                raise
             say(f"warning: {row['run_id']}: artifact pull after offbox kill failed ({error})")
     resources.finalize(row)
     return report_killed(row, log_path)
 
 
 def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up: bool = True,
-           until: float | None = None, report: bool = False, run=None, bookkeeping: bool = True) -> int | None:
+           until: float | None = None, report: bool = False, run=None, bookkeeping: bool = True, reclaim_tmp: bool = True) -> int | None:
     incoming = code
     log_row = None
     early_catchup = False
     early_history = None
+    native_result = False
     st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
     def prepare_result():
-        nonlocal code, st, early_catchup, early_history
+        nonlocal code, st, early_catchup, early_history, native_result
         if status == 'source_gone':
             return  # No command or step ran; only the caller's source check failed.
         if status == 'killed':
@@ -3051,7 +3181,10 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
             code = None
         from .misc import _raw_log, _catch_up_finished
         disk = offbox_disk_space.result(_raw_log(LOGS_DIR / f'{run_id}.log'), incoming)
-        if (catch_up and api.BACKEND == 'boat' and dict(prior).get('mode') == 'bg'
+        with contextlib.closing(db()) as output_con:
+            needs_history = dict(prior).get('mode') == 'bg' or output_con.execute(
+                'SELECT 1 FROM kv WHERE k=?', (f'lost_checked:{run_id}',)).fetchone()
+        if (catch_up and needs_history
                 and not planned_steps(prior) and disk.get('infra_failure') != 'disk_probe'):
             with contextlib.closing(db()) as output_con:
                 early_history = _catch_up_finished(output_con, run_id, budget=10 if until is None else max(0, until-now()),
@@ -3075,6 +3208,10 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         else:
             st = status or ("lost" if code is None else ("done" if code == 0 else "failed"))
         if dict(prior).get('mode') != 'local':
+            if prior['box_id']:
+                native_result = native_crash.settle(prior, code, _raw_log(LOGS_DIR / f'{run_id}.log'), report=report)
+                if native_result:
+                    st = 'infra'
             space_result(run_id, incoming if disk.get('infra_failure') == 'disk_probe' else code)
             if disk.get('infra_failure'):
                 st = 'infra'
@@ -3090,14 +3227,20 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
                             con.execute("UPDATE runs SET exit_code=143 WHERE run_id=?", (run_id,))
                     elif st == 'killed' and code == 143 and r['exit_code'] in (None, 137, 143):
                         # Kill confirmation may arrive after the attached client saved lost/infra.
-                        con.execute("UPDATE runs SET status='killed',exit_code=143,end_at=? WHERE run_id=?",
+                        con.execute("UPDATE runs SET status='killed',exit_code=143,end_at=? WHERE run_id=? "
+                                    "AND (COALESCE(pulls,'[]')='[]' OR pull_state IN ('none','done','partial','failed'))",
                                     (now(), run_id))
                     else:
                         con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? "
+                                    "AND (pull_state IS NULL OR pull_state!='running') "
                                 "AND (status IN ('starting','running') OR (status='lost' AND exit_code IS NULL AND ?='infra') OR "
                                 "(exit_code IS NULL AND ? IS NOT NULL AND (status='lost' OR "
                                 "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))))",
                                 (st, code, now(), run_id, st, code))
+                    if native_result:
+                        # Readback can discover setup evidence after an orphan's exit was already persisted.
+                        con.execute("UPDATE runs SET status='infra' WHERE run_id=? AND status IN ('done','failed') "
+                                    "AND exit_code=?", (run_id, code))
                     r = con.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
                     log_row = claim_terminal_log(con, r)
                     if terminal_result(r):
@@ -3118,9 +3261,17 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         return code
     if not r:
         return code
+    if (st == 'killed' and code == 143 and r['exit_code'] in (None, 137, 143)
+            and json.loads(r['pulls'] or '[]') and r['pull_state'] not in ('none','done','partial','failed')):
+        # Keep the receipt and box reservation from confirmation through the last pull write.
+        save_run_state(run_id, status=st, exit_code=code, end_at=now(), until=until)
+        return code
     st, code = r['status'], r['exit_code']
     if log_row is not None:
         emit_terminal(log_row)
+    if r['box_id'] and reclaim_tmp:
+        with contextlib.closing(db()) as handback_con:
+            box_disk.hand_back(handback_con, r, until=until)
     if not r["box_id"] or not bookkeeping:
         resources.finalize(r)
         return code
@@ -3146,7 +3297,15 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         if con:
             con.close()
     resources.finalize(r)
+    if catch_up:
+        from .pulls import footer
+        footer(run_id)
     return code
+
+
+def settle_pulls(run_id, role, *, until=None, foreign=False):
+    from .pulls import settle
+    return settle(run_id, role, until=until, foreign=foreign)
 
 
 def run_remote(a, me: dict) -> int:
@@ -3387,22 +3546,96 @@ def retry_background(error, *, run_id=None) -> None:
             con.close()
 
 
+def reset_disk_retry(error):
+    """A background invocation keeps its public run id when nothing ran on the first box."""
+    if error.started:
+        raise error
+    if getattr(error, 'disk_reset', False):
+        return
+    with contextlib.closing(db()) as con:
+        with write(con):
+            con.execute("UPDATE runs SET status='starting',box_id=NULL,process_id=NULL,command_id=NULL,"
+                        "wrapper_pid=NULL,known_exit_code=NULL,exit_code=NULL,end_at=NULL,error=NULL,"
+                        "logged_end_at=NULL WHERE run_id=? AND client_pid=?",
+                        (error.run_id, os.getpid()))
+            con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)',
+                        ('start_claim:' + error.run_id, new_id('claim')))
+    save_run_state(error.run_id, status='starting', box_id=None, process_id=None, exit_code=None,
+                   command_id=None, wrapper_pid=None, known_exit_code=None, end_at=None,
+                   infra_failure=None, infra_reason=None, setup_native_crash=False, disk_space={}, wrapper_exit_code=None)
+    # The public id survives, but stream offsets and disk markers belong to the old attempt.
+    # Retain its output for inspection without letting it classify the replacement's exit.
+    with log_lock(error.run_id):
+        path = LOGS_DIR / f'{error.run_id}.log'
+        archive = '.disk-full-' + new_id('attempt')
+        for old in (path, *path.parent.glob(path.name + '.*')):
+            if old.is_file() and '.disk-full-' not in old.name:
+                old.rename(old.with_name(old.name + archive))
+    error.disk_reset = True
+
+
+def clear_disk_receipt(error):
+    paths = ' '.join('"$HOME"/' + shlex.quote('.offbox/exit/' + error.run_id + suffix)
+                     for suffix in ('.rc', '.dk', '.pid', '.gate'))
+    try:
+        with api.budget(10):
+            ssh_sync.ssh(error.box, 'rm -f -- ' + paths, timeout=10, check=True)
+    except (OffboxError, OSError, subprocess.SubprocessError) as failure:
+        finish(error.run_id, EXIT_INFRA, 'infra', catch_up=False, bookkeeping=False, reclaim_tmp=False)
+        raise OffboxError(f'{error.box}: cannot clear the previous exit receipt ({failure}); '
+                          'nothing ran; retry manually', code=EXIT_INFRA) from failure
+
+
 def _run_prepared(a, me: dict) -> int:
     """Foreground or --bg remote run. Local state failures use exit 96; infrastructure/capacity failures retain 90/91/92."""
     # Refuse unsafe includes before allocating or preparing a box; sync validates again before transfer.
     if not a.no_sync and getattr(a, "include", None):
         ssh_sync.push_filters(Path(me["repo_root"]), a.git, a.include)
     wedged = []
-    for attempt in (1, 2):
+    attempt = getattr(a, "_box_attempt", 1)
+    while True:
         try:
             return _run_attempt(a, me)
+        except native_crash.Move as e:
+            a._suspect_exclude = set(getattr(a, '_suspect_exclude', ())) | {e.box}
+            if attempt == 2 or getattr(a, 'no_retry', False):
+                raise OffboxError(f'{e.box}: native crash; nothing ran; suspect box kept out of rotation',
+                                  code=EXIT_INFRA, run_id=e.run_id, box=e.box) from e
+            prepare.move_once(e)
+            attempt += 1
+            a._box_attempt = attempt
+            a._suspect_move = dict(box=e.box, run=e.run_id)
+            if os.environ.get(BACKGROUND_RUN_ENV):
+                reset_disk_retry(e)
+            say(f'{e.box}: setup native crash; moving this run once to another home box')
+        except box_disk.Full as e:
+            if not getattr(e, 'recovered', False):
+                a._disk_exclude = set(getattr(a, '_disk_exclude', ())) | {e.box}
+            if os.environ.get(BACKGROUND_RUN_ENV):
+                reset_disk_retry(e)
+            if getattr(e, 'recovered', False):
+                if getattr(e, 'has_receipt', False):
+                    clear_disk_receipt(e)
+                say(str(e) + '; retrying after cleanup')
+                continue
+            if attempt == 2 or getattr(a, 'no_retry', False):
+                if os.environ.get(BACKGROUND_RUN_ENV):
+                    finish(e.run_id, EXIT_INFRA, 'infra', catch_up=False, bookkeeping=False, reclaim_tmp=False)
+                raise OffboxError(str(e) + '; box marked disk_full; nothing ran', code=EXIT_INFRA) from e
+            prepare.move_once(e)
+            attempt += 1
+            a._box_attempt = attempt
+            say(str(e) + '; moved this run to another box')
         except BoxWedged as e:
             wedged.append(e.box)
             if attempt == 2:
-                raise OffboxError(f"{wedged[0]} and {wedged[1]} were both wedged before the command; "
-                                  "both set aside. Nothing ran: retry", code=EXIT_INFRA) from e
+                names = (f"{wedged[0]} and {wedged[1]} were both wedged" if len(wedged) == 2 else
+                         f"{e.box} was wedged on the replacement attempt")
+                raise OffboxError(names + " before the command; both set aside. Nothing ran: retry", code=EXIT_INFRA) from e
             prepare.move_once(e)
             say(wedged_message(e.box, e.evidence, e.stopped, retry=True))
+            attempt += 1
+            a._box_attempt = attempt
 
 
 def _run_attempt(a, me: dict) -> int:
@@ -3491,6 +3724,118 @@ def _detach(rn, signum) -> int:
     return EXIT_DETACHED
 
 
+def pre_command_disk_full(path, code):
+    """Find a candidate in display output; this alone never authorizes replay."""
+    from .misc import _raw_log
+    path = _raw_log(path)
+    if code in (None, 0) or not path.exists():
+        return None
+    text = path.read_text(errors='replace')
+    if COMMAND_STARTED_MARKER in text:
+        return None
+    record = offbox_disk_space.result(path, code)
+    phases = record['disk_space']
+    if record.get('infra_reason') == 'low_space_gate':
+        return 'tmp', None, phases.get('gate', {})
+    line = next((line for line in text.splitlines() if offbox_disk_space.error_line(line)), None)
+    if line:
+        fs, failed_path = box_disk.push_failure(line)
+        space = next((phases[p] for p in ('end', 'start', 'server_start') if p in phases), {})
+        return fs, failed_path, space
+    return None
+
+
+def complete_stderr(row):
+    # Interleaved display output cannot prove that a command never started.
+    return complete_stream(row, 'stderr', until_started=True)
+
+
+def complete_stream(row, stream, *, until_started=False):
+    if not row or not row['command_id']:
+        return None
+    chunks, offset, pages = [], 0, 0
+    try:
+        with api.budget(10):
+            while not until_started or pages < 8:
+                page = api.history_logs(row['box_id'], row['command_id'], stream, offset)
+                pages += 1
+                chunks.append(page.get('data') or '')
+                if until_started and COMMAND_STARTED_MARKER in ''.join(chunks):
+                    return ''.join(chunks)
+                if page.get('done') is True:
+                    return ''.join(chunks)
+                nxt = page.get('nextOffset')
+                if type(nxt) is not int or nxt <= offset:
+                    return None
+                offset = nxt
+    except (OffboxError, OSError):
+        pass
+    return None
+
+
+def confirmed_disk_full(row, path, code, gate_receipt=None):
+    from .misc import _raw_log
+    raw = _raw_log(path)
+    if raw.exists() and COMMAND_STARTED_MARKER in raw.read_text(errors='replace'):
+        return None
+    failure = pre_command_disk_full(path, code)
+    if not failure and gate_receipt is None:
+        return None
+    text = complete_stderr(row)
+    if text is not None and COMMAND_STARTED_MARKER in text:
+        return None
+    if gate_receipt is not None:
+        return gate_receipt
+    if text is None:
+        if row and code == EXIT_INFRA and failure[0] == 'tmp':
+            return read_gate_receipt(row, until=now()+10)
+        return None
+    line = next((line for line in text.splitlines() if offbox_disk_space.error_line(line)), None)
+    if line:
+        fs, failed_path = box_disk.push_failure(line)
+        return fs, failed_path, failure[2]
+    return failure
+
+
+def recover_admission_log(row, code):
+    from .misc import _catch_up_log, _raw_log
+    until = now() + 10
+    # Boat's retained box copy also serves a foreground caller whose response was lost.
+    _catch_up_log(dict(row, status='done', exit_code=code, mode='bg'), budget=10, locked=True)
+    path = _raw_log(LOGS_DIR / f"{row['run_id']}.log")
+    if code != EXIT_INFRA or now() >= until:
+        return
+    if path.exists() and COMMAND_STARTED_MARKER in path.read_text(errors='replace'):
+        return
+    return read_gate_receipt(row, until=until)
+
+
+def read_gate_receipt(row, *, until):
+    from .misc import _raw_log
+    path = _raw_log(LOGS_DIR / f"{row['run_id']}.log")
+    if path.exists() and COMMAND_STARTED_MARKER in path.read_text(errors='replace'):
+        return
+    try:
+        left = max(0, until - now())
+        if left <= 0:
+            return
+        with api.budget(left):
+            result = ssh_sync.ssh(row['box_id'], 'head -c 65536 -- "$HOME"/' +
+                                 shlex.quote('.offbox/exit/' + row['run_id'] + '.gate'), timeout=left)
+        record = json.loads(result.stdout) if result.returncode == 0 else {}
+        space = record.get('space') if isinstance(record, dict) else None
+        if not isinstance(record, dict) or record.get('phase') != 'gate' or not offbox_disk_space.valid_space(space):
+            return
+        free = space.get('tmp', {}).get('free_bytes')
+        if type(free) is int and free < offbox_disk_space.GATE_BYTES:
+            with log_lock(row['run_id'], until=until):
+                with path.open('a') as output:
+                    output.write('\n' + offbox_disk_space.MARKER + json.dumps(record) + '\n')
+            return 'tmp', None, space
+    except (OffboxError, OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+
 def _run_remote(a, rn) -> int:
     interrupted = {"sig": None}
 
@@ -3529,28 +3874,41 @@ def _run_remote(a, rn) -> int:
             if not isinstance(e, common.SourceGone):
                 rn.record(error=str(e)[:500])
             raise e
-        if a.bg and rn.recovered_code is not None:
+        if rn.recovered_code in (EXIT_INFRA, 97, 98):
+            # A lost start response has no local stream. Recover setup evidence before either
+            # foreground settlement or background detachment can discard the admission failure.
+            with contextlib.closing(db()) as con:
+                row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+            rn.gate_receipt = recover_admission_log(row, rn.recovered_code)
+            rn.admission_checked = True
+        if a.bg and rn.recovered_code is not None and not pre_command_disk_full(rn.log_path, rn.recovered_code) and offbox_disk_space.result(
+                rn.log_path, rn.recovered_code).get('infra_failure') != 'native_crash':
             from . import start_check
-            con = db()
-            row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
-            start_check.settle(con, row, start_check.Result('started', rn.recovered_code),
-                               'start receipt recovered')
+            with contextlib.closing(db()) as con:
+                row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+                start_check.settle(con, row, start_check.Result('started', rn.recovered_code),
+                                   'start receipt recovered', role='fg')
             finish(rn.run_id, rn.recovered_code)
             print(rn.run_id)
             background_wait_hint(rn.run_id)
             if os.environ.get(BACKGROUND_RUN_ENV):
                 queue_lifecycle.note(rn.run_id, 'handoff', 'handoff', box_id=rn.box, recovered_code=rn.recovered_code)
             return 0
-        if a.bg:
+        if a.bg and rn.recovered_code is None:
             # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
             # IDLE_STOP_S after the process ends (it checks process status itself).
             lease.ensure_ttl(rn.box, BG_TTL_S, api.get(rn.box))
-            print(rn.run_id)
-            background_wait_hint(rn.run_id)
-            say(f"started in background on {rn.box}")
-            if os.environ.get(BACKGROUND_RUN_ENV):
-                queue_lifecycle.note(rn.run_id, 'handoff', 'handoff', box_id=rn.box, process_id=rn.pid)
-            return 0
+            # Keep the detached client through admission so a disk gate can recover before handing back.
+            admission = follow(rn.box, rn.pid, rn.log_path, echo=False, run_id=rn.run_id,
+                               until_command_started=True)
+            if admission is _COMMAND_RUNNING:
+                print(rn.run_id)
+                background_wait_hint(rn.run_id)
+                say(f"started in background on {rn.box}")
+                if os.environ.get(BACKGROUND_RUN_ENV):
+                    queue_lifecycle.note(rn.run_id, 'handoff', 'handoff', box_id=rn.box, process_id=rn.pid)
+                return 0
+            rn.recovered_code = admission
         kill_hint = dict(run_id=rn.run_id, status='running', exit_code=None, process_id=getattr(rn, 'pid', None), box_id=rn.box,
                          step_count=len(getattr(a, 'steps', None) or []), mode='fg')
         stream_killed = None
@@ -3560,6 +3918,10 @@ def _run_remote(a, rn) -> int:
             rn.remote_code = None if getattr(a, 'steps', None) else code
         except Interrupted as error:
             remember_interruption(rn.run_id, {'interruption': error.interruption})
+            if a.pull:
+                save_run_state(rn.run_id, status='interrupted', exit_code=EXIT_INTERRUPTED)
+                from .pulls import wait
+                wait(rn.run_id, 'fg')
             code = finish(rn.run_id, EXIT_INTERRUPTED, "interrupted")
             if code is None:
                 raise OffboxError(f"{rn.run_id}: steps incomplete after the interruption; remote exit unknown",
@@ -3586,7 +3948,7 @@ def _run_remote(a, rn) -> int:
                               if code in (None, 137, 143) else None)
     if killed is not None and killed['process_id']:
         rn.remote_code = killed['exit_code']
-        return complete_killed(killed, rn.log_path, pulls=a.pull)
+        return complete_killed(killed, rn.log_path, pulls=a.pull, role='fg')
     if code is None:
         try:
             code, how = recover_lost_exit(rn.box, rn.run_id, rn.log_path, len(getattr(a, "steps", None) or []))
@@ -3595,14 +3957,71 @@ def _run_remote(a, rn) -> int:
             if killed is None or not killed['process_id']:
                 raise
             rn.remote_code = killed['exit_code']
-            return complete_killed(killed, rn.log_path, pulls=a.pull)
+            return complete_killed(killed, rn.log_path, pulls=a.pull, role='fg')
         if code is not None:
             say(f"boat lost track of the remote process after it ended; exit {code} taken from {how}")
     killed = killed_result(rn.run_id, wait=True, row=kill_hint, known_code=code) if code in (None, 137, 143) else None
     if killed is not None and killed['process_id']:
         rn.remote_code = killed['exit_code']
-        return complete_killed(killed, rn.log_path, pulls=a.pull)
+        return complete_killed(killed, rn.log_path, pulls=a.pull, role='fg')
     rn.remote_code = None if getattr(a, 'steps', None) else code
+    if (code in (EXIT_INFRA, 97, 98) and rn.registered and not getattr(rn, 'admission_checked', False)
+            and not pre_command_disk_full(rn.log_path, code)
+            and not (rn.log_path.exists() and COMMAND_STARTED_MARKER in rn.log_path.read_text(errors='replace'))):
+        # An accepted start can lose its attach stream too; status alone carries no admission evidence.
+        with contextlib.closing(db()) as con:
+            row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        rn.gate_receipt = recover_admission_log(row, code)
+    if (api.BACKEND == 'server' and code == EXIT_INFRA and
+            offbox_disk_space.result(rn.log_path, code).get('infra_failure') == 'native_crash'):
+        with contextlib.closing(db()) as native_con:
+            native_row = native_con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+        if native_row and native_crash.before_start(native_row, code, rn.log_path):
+            rn.started = False
+            rn.remote_code = None
+            settled = finish(rn.run_id, code, 'infra', catch_up=False, reclaim_tmp=False)
+            if settled != EXIT_INFRA:
+                return settled if settled is not None else EXIT_INFRA
+            raise native_crash.Move('setup native crash before user command', code=EXIT_INFRA,
+                                    run_id=rn.run_id, box=rn.box)
+    disk_candidate = pre_command_disk_full(rn.log_path, code)
+    setup_marker = (REPO_SETUP_FAILED_MARKER if repo_setup_failed(code, rn.log_path) else
+                    SETUP_FAILED_MARKER if code == 97 and setup_failed(rn.log_path) else None)
+    if setup_marker and COMMAND_STARTED_MARKER in rn.log_path.read_text(errors='replace'):
+        setup_marker = None
+    disk_row = None
+    gate_receipt = getattr(rn, 'gate_receipt', None)
+    if disk_candidate or gate_receipt or setup_marker:
+        with contextlib.closing(db()) as con:
+            disk_row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
+    disk_failure = confirmed_disk_full(disk_row, rn.log_path, code, gate_receipt)
+    setup_stderr = complete_stderr(disk_row) if setup_marker and not disk_candidate else None
+    setup_confirmed = (setup_stderr is not None and COMMAND_STARTED_MARKER not in setup_stderr
+                       and setup_marker in setup_stderr.splitlines())
+    if disk_failure:
+        rn.started = False
+        rn.remote_code = None
+        fs, failed_path, space = disk_failure
+        failure = box_disk.Full(rn.box, fs, space)
+        failure.run_id = rn.run_id
+        if os.environ.get(BACKGROUND_RUN_ENV):
+            reset_disk_retry(failure)
+        else:
+            finish(rn.run_id, code, 'infra', catch_up=False, bookkeeping=False, reclaim_tmp=False)
+        with contextlib.closing(db()) as con:
+            if rn.box not in getattr(a, '_disk_cleaned', set()):
+                a._disk_cleaned = getattr(a, '_disk_cleaned', set()) | {rn.box}
+                healthy, space = box_disk.recover(con, rn.box, fs, space, path=failed_path,
+                                                  current=disk_row['remote_dir'] or '')
+            else:
+                healthy = False
+                box_disk.retire(con, rn.box, space, fs)
+        # The normal pool path may pick this same box only after cleanup proved it healthy.
+        failure = box_disk.Full(rn.box, fs, space, cleaned=not healthy)
+        failure.disk_reset = bool(os.environ.get(BACKGROUND_RUN_ENV))
+        failure.has_receipt = bool(os.environ.get(BACKGROUND_RUN_ENV))
+        failure.recovered = healthy
+        raise failure
     if code not in (0, None) and scope_failed(rn.log_path):
         rn.started = False
         rn.record(error="box could not start the command (systemd scope)")
@@ -3626,7 +4045,7 @@ def _run_remote(a, rn) -> int:
         finish(rn.run_id, None, 'infra')
         raise OffboxError(f'{rn.run_id} on {rn.box}: start claim refused (exit 98); nothing ran',
                           started=True, run_id=rn.run_id, box=rn.box)
-    if repo_setup_failed(code, rn.log_path):
+    if setup_confirmed and code == EXIT_REPO_SETUP:
         rn.started = False
         rn.record(error="repo toolchain setup failed (exit 98)")
         finish(rn.run_id, None, "infra")
@@ -3641,15 +4060,15 @@ def _run_remote(a, rn) -> int:
         if wedged:
             rn.started = False
             raise BoxWedged(rn.box, *wedged)
-    if code == 97 and setup_failed(rn.log_path):
+    if setup_confirmed and code == 97:
         # The preamble failed before the user command was reached, so nothing ran and fallback is allowed.
         rn.started = False
         rn.record(error="box setup failed (exit 97)")
         finish(rn.run_id, None, "infra")
         raise OffboxError("box setup failed (exit 97), not your command", code=EXIT_INFRA)
     if a.pull:
-        con = db()
-        do_pulls(rn.box, dict(con.execute("SELECT * FROM runs WHERE run_id=?", (rn.run_id,)).fetchone()), a.pull)
+        from .pulls import wait
+        wait(rn.run_id, 'fg')
     steps = getattr(a, 'steps', None) or []
     if steps:
         con = db()
@@ -3671,6 +4090,10 @@ def _run_remote(a, rn) -> int:
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")
     resources.display(rn.run_id)
+    row = getattr(rn, 'lease_row', None)
+    line = size_summary(dict(requested_size=a.size, size=row['size'])) if row else ""
+    if line:
+        say(line)
     steps = getattr(a, "steps", None) or []
     deps_hint = box_deps_hint(rn.root, rn.log_path)
     effective = space_result(rn.run_id, code, rn.log_path, report=True)

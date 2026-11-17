@@ -140,6 +140,40 @@ export const EvaluatorPurposeKind = Schema.Literals([
   "request",
   "unknown",
 ]);
+// Provider instance/model ids may include punctuation excluded from routing labels.
+const RuntimeCounts = Schema.Record(Schema.String.check(Schema.isMaxLength(512)), Measurement);
+const RuntimeSampleProps = {
+  runningTurns: Schema.optionalKey(
+    Schema.Struct({
+      total: Measurement,
+      byProvider: RuntimeCounts,
+      byModel: RuntimeCounts,
+    }),
+  ),
+  runningByOrigin: Schema.optionalKey(
+    Schema.Struct({
+      boardWork: Measurement,
+      boardReview: Measurement,
+      boardEvaluator: Measurement,
+      delegatedChild: Measurement,
+      scheduledTask: Measurement,
+      other: Measurement,
+    }),
+  ),
+  queuedRuns: Schema.optionalKey(Measurement),
+  providerSessions: Schema.optionalKey(RuntimeCounts),
+  host: Schema.optionalKey(
+    Schema.Struct({
+      load1: Measurement,
+      load5: Measurement,
+      load15: Measurement,
+      rssMiB: Measurement,
+      heapUsedMiB: Measurement,
+      eventLoopLagP99Ms: Schema.optionalKey(Measurement),
+    }),
+  ),
+};
+
 const GeneralEvent = Schema.Struct({
   ts: Timestamp,
   kind: Label.check(Schema.makeFilter((kind) => kind !== "run.usage")),
@@ -148,8 +182,27 @@ const GeneralEvent = Schema.Struct({
   boardId: Schema.optionalKey(Id),
   cardId: Schema.optionalKey(Id),
   discussionId: Schema.optionalKey(Id),
+  restartAdmission: Schema.optionalKey(
+    Schema.Struct({
+      sourceRunId: DerivedId,
+      runId: Schema.optionalKey(DerivedId),
+      classification: Label,
+      queuedAtMs: Measurement,
+      waitedMs: Measurement,
+      positionAtEntry: Measurement,
+      position: Measurement,
+      total: Measurement,
+      maxQueueDepth: Measurement,
+      active: Measurement,
+      maxActive: Measurement,
+      loaded: Schema.Boolean,
+      rule: Schema.optionalKey(Schema.Literals(["no_progress", "absolute_backstop", "wall_time"])),
+    }),
+  ),
   threadId: Schema.optionalKey(DerivedId),
   durationMs: Schema.optionalKey(Measurement),
+  phase: Schema.optionalKey(Label),
+  waitedMs: Schema.optionalKey(Measurement),
   lateMs: Schema.optionalKey(Measurement),
   afterCap: Schema.optionalKey(Schema.Boolean),
   tool: Schema.optionalKey(Label),
@@ -266,6 +319,22 @@ const GeneralEvent = Schema.Struct({
   ),
   props: Schema.optionalKey(
     Schema.Struct({
+      ...RuntimeSampleProps,
+      total: Schema.optionalKey(Measurement),
+      distinctCwds: Schema.optionalKey(Measurement),
+      maxPerSecond: Schema.optionalKey(Measurement),
+      windowMs: Schema.optionalKey(Measurement),
+      overflow: Schema.optionalKey(Measurement),
+      top: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            operation: Label,
+            subcommand: Label,
+            cwdHash: Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/)),
+            count: Measurement,
+          }),
+        ).check(Schema.isMaxLength(20)),
+      ),
       on: Schema.optionalKey(Label),
       until: Schema.optionalKey(Timestamp),
       script: Schema.optionalKey(Label),
@@ -308,6 +377,12 @@ const GeneralEvent = Schema.Struct({
       exitCode: Schema.optionalKey(Schema.Int),
       kind: Schema.optionalKey(Label),
       ageMs: Schema.optionalKey(Measurement),
+      slot: Schema.optionalKey(Schema.Literals(["take", "release"])),
+      why: Schema.optionalKey(Label),
+      held: Schema.optionalKey(Schema.Boolean),
+      holdsSlot: Schema.optionalKey(Schema.Boolean),
+      carried: Schema.optionalKey(Measurement),
+      candidateCount: Schema.optionalKey(Measurement),
       used: Schema.optionalKey(Measurement),
       slots: Schema.optionalKey(Measurement),
       waiting: Schema.optionalKey(Measurement),
@@ -322,6 +397,12 @@ const GeneralEvent = Schema.Struct({
       readerQueryMs: Schema.optionalKey(Measurement),
       readerStatements: Schema.optionalKey(Measurement),
       serializationMs: Schema.optionalKey(Measurement),
+      requestId: Schema.optionalKey(
+        Schema.String.check(Schema.isPattern(/^[A-Za-z0-9._:-]{1,64}$/)),
+      ),
+      itemCount: Schema.optionalKey(Measurement),
+      itemsTotal: Schema.optionalKey(Measurement),
+      responseBytes: Schema.optionalKey(Measurement),
       readerHolders: Schema.optionalKey(
         Schema.Array(
           Schema.Struct({
@@ -375,6 +456,10 @@ const GeneralEvent = Schema.Struct({
         ]),
       ),
       idCanonical: Schema.optionalKey(Schema.Boolean),
+      commandId: Schema.optionalKey(DerivedId),
+      taskId: Schema.optionalKey(DerivedId),
+      receiptState: Schema.optionalKey(Schema.Literal("accepted")),
+      missingLookup: Schema.optionalKey(Schema.Literals(["subagents", "child_thread_id"])),
       dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
       idShape: Schema.optionalKey(
         Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
@@ -387,6 +472,8 @@ const GeneralEvent = Schema.Struct({
       poolKey: Schema.optionalKey(Label),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
+      itemKind: Schema.optionalKey(Label),
+      openToolSince: Schema.optionalKey(Timestamp),
       effectId: Schema.optionalKey(DerivedId),
       effectType: Schema.optionalKey(Label),
       commandType: Schema.optionalKey(Label),
@@ -398,6 +485,16 @@ const GeneralEvent = Schema.Struct({
       queuedCount: Schema.optionalKey(Measurement),
       heldCount: Schema.optionalKey(Measurement),
       phase: Schema.optionalKey(Label),
+      threadList: Schema.optionalKey(
+        Schema.Struct({
+          phase: Schema.Literals(["caller", "project", "candidates", "shell", "render"]),
+          batchCount: Measurement,
+          candidateRows: Measurement,
+          elapsedMs: Measurement,
+          readerWaitMs: Measurement,
+          queryMs: Measurement,
+        }),
+      ),
       subSteps: Schema.optionalKey(
         Schema.Array(Schema.Struct({ subStep: Label, ms: Measurement })).check(
           Schema.isMaxLength(3),
@@ -439,9 +536,17 @@ const GeneralEvent = Schema.Struct({
       ),
       hasBatchKey: Schema.optionalKey(Schema.Boolean),
       openAsksAtCreation: Schema.optionalKey(Measurement),
+      openNoticesAtCreation: Schema.optionalKey(Measurement),
       answeredVia: Schema.optionalKey(Schema.Literals(["single", "batch", "free_text"])),
       status: Schema.optionalKey(Measurement),
       count: Schema.optionalKey(Measurement),
+      database: Schema.optionalKey(Label),
+      connection: Schema.optionalKey(Label),
+      lane: Schema.optionalKey(Label),
+      sqlFingerprint: Schema.optionalKey(Label),
+      failures: Schema.optionalKey(Measurement),
+      readBytes: Schema.optionalKey(Measurement),
+      sampleMs: Schema.optionalKey(Measurement),
       bytes: Schema.optionalKey(Measurement),
       p50Ms: Schema.optionalKey(Measurement),
       p95Ms: Schema.optionalKey(Measurement),
@@ -577,6 +682,35 @@ export const AnalyticsRollup = Schema.Struct({
   total: Measurement,
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
+  restartAdmission: Schema.optionalKey(
+    Schema.Struct({
+      scope: Schema.Literal("server-wide"),
+      groupBy: Schema.Literal("boot-hour"),
+      loadedTimeShare: Schema.Null,
+      basis: Schema.String.check(Schema.isMaxLength(160)),
+      overflow: Measurement,
+      groups: Schema.Array(
+        Schema.Struct({
+          bootId: Id,
+          hour: Label,
+          maxQueueDepth: Measurement,
+          admissions: Measurement,
+          failuresByRule: Schema.Record(Label, Measurement),
+          maxActiveObserved: Measurement,
+          maxActive: Measurement,
+          loadedObservations: Measurement,
+          observations: Measurement,
+          wait: Schema.Struct({
+            count: Measurement,
+            p50Ms: Schema.NullOr(Measurement),
+            p90Ms: Schema.NullOr(Measurement),
+            maxMs: Schema.NullOr(Measurement),
+            approximate: Schema.Boolean,
+          }),
+        }),
+      ),
+    }),
+  ),
   textGenerationOverflow: Schema.optionalKey(Measurement),
   textGeneration: Schema.optionalKey(
     Schema.Array(
@@ -590,6 +724,19 @@ export const AnalyticsRollup = Schema.Struct({
         ...LatencyFields,
       }),
     ),
+  ),
+  runtimeSamples: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        hour: Label,
+        samples: Measurement,
+        runningTurnsMax: Measurement,
+        runningTurnsAvg: Measurement,
+        queuedRunsMax: Schema.NullOr(Measurement),
+        load1Max: Measurement,
+        sampleMsMax: Measurement,
+      }),
+    ).check(Schema.isMaxLength(24)),
   ),
   errorCounts: Schema.Record(Label, Measurement),
   controlRoutes: Schema.optionalKey(
@@ -662,6 +809,30 @@ export const AnalyticsRollup = Schema.Struct({
       phase: Label,
       totalWaitMs: Measurement,
       ...LatencyFields,
+    }),
+  ),
+  dbStatementFamilies: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        database: Label,
+        connection: Label,
+        lane: Label,
+        fingerprint: Label,
+        family: Label,
+        calls: Measurement,
+        totalMs: Measurement,
+        maxMs: Measurement,
+        returnedRows: Measurement,
+        failures: Measurement,
+      }),
+    ),
+  ),
+  processDiskRead: Schema.optionalKey(
+    Schema.Struct({
+      readBytes: Measurement,
+      sampleMs: Measurement,
+      samples: Measurement,
+      unavailableSamples: Measurement,
     }),
   ),
   longTasksByRoute: Schema.Array(

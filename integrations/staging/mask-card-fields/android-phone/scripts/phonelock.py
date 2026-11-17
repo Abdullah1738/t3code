@@ -153,24 +153,30 @@ def same_hold(left, right):
     return (left[0].st_ino, left[0].st_mtime_ns, left[1]) == (right[0].st_ino, right[0].st_mtime_ns, right[1])
 
 
+def rename_hold(snapshot, target):
+    os.rename(HOLD, target)
+    try:
+        unchanged = same_hold(snapshot, hold_snapshot(target))
+    except (OSError, UnicodeError):
+        unchanged = False
+    if not unchanged:
+        try:
+            os.link(target, HOLD)
+        except FileExistsError:
+            pass
+        else:
+            target.unlink()
+        return False
+    return True
+
+
 def archive_hold(snapshot):
     name = 'priority-hold.stale-' + now().strftime('%Y%m%dT%H%M%SZ') + '-' + str(os.getpid())
     archived = LOCK_DIR / name
     # Several stale holds can be swept by one process in the same second.
     if os.path.lexists(archived):
         archived = LOCK_DIR / (name + '-' + uuid.uuid4().hex)
-    os.rename(HOLD, archived)
-    try:
-        unchanged = same_hold(snapshot, hold_snapshot(archived))
-    except (OSError, UnicodeError):
-        unchanged = False
-    if not unchanged:
-        try:
-            os.link(archived, HOLD)
-        except FileExistsError:
-            pass
-        else:
-            archived.unlink()
+    if not rename_hold(snapshot, archived):
         return False
     remove_holder(snapshot[1].strip())
     return True
@@ -300,7 +306,15 @@ def hold_release(token=None):
             raise Busy('hold is not yours')
         if not same_hold(snapshot, hold_snapshot()):
             raise Busy('hold changed; yield')
-        HOLD.unlink()
+        # Legacy writers ignore the flock. Verify the moved inode before deletion.
+        released = LOCK_DIR / ('.hold-release-' + uuid.uuid4().hex)
+        try:
+            unchanged = rename_hold(snapshot, released)
+        except FileNotFoundError:
+            return
+        if not unchanged:
+            raise Busy('hold changed; yield')
+        released.unlink()
         remove_holder(token)
         # A successor can take over immediately; never remove it during readback.
         try:

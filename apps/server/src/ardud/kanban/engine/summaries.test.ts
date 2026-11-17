@@ -381,3 +381,39 @@ describe("board summaries", () => {
     }),
   );
 });
+
+it("board removal drops only its tally and emits the remaining complete list", () => {
+  const tallies = tallyBoards(
+    ["b1", "b2"].map((id) => ({ board: board(id), cards: [], discussions: [], threadIds: [] })),
+  );
+  expect(
+    applyChange(tallies, "b1", { _tag: "boardRemoved", boardId: KanbanBoardId.make("b1") }),
+  ).toBe(true);
+  expect(listUpdate(tallies, false, 0).map((entry) => entry.boardId)).toEqual(["b2"]);
+  expect(
+    applyChange(tallies, "b1", { _tag: "boardRemoved", boardId: KanbanBoardId.make("b1") }),
+  ).toBe(false);
+});
+
+it.effect(
+  "a fresh board-list subscription carries pending purge thread ids without board content",
+  () =>
+    Effect.gen(function* () {
+      const lists = yield* Stream.runCollect(
+        follow(tallyBoards([]), Stream.empty, () => 0, [
+          { boardId: "gone", threadId: ThreadId.make("failed-thread") },
+        ]),
+      );
+      expect(Array.from(lists)[0]).toEqual([
+        {
+          boardId: "gone",
+          board: null,
+          purged: true,
+          threadIds: ["failed-thread"],
+          needsOwner: 0,
+          running: 0,
+          unread: 0,
+        },
+      ]);
+    }),
+);

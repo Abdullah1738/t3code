@@ -51,8 +51,12 @@ class FreshnessTests(unittest.TestCase):
                     final = report.read_bytes()
                     self.assertIs(json.loads(final)['complete'], True)
                     self.assertEqual(json.loads(final)['total'], 2)
-                    with patch.object(poller, 'rollup', side_effect=AssertionError('complete rollup rewritten')):
+                    def current_only(day, *args, **kwargs):
+                        self.assertNotEqual(day, DAY, 'complete rollup rewritten')
+                        return rollup(day, *args, **kwargs)
+                    with patch.object(poller, 'rollup', side_effect=current_only) as build:
                         self.assertEqual(poller.poll(get, root, dt.datetime(2026, 11, 16, 1, tzinfo=UTC)), 0)
+                        self.assertEqual([call.args[0] for call in build.call_args_list], ['2026-11-16'])
                     self.assertEqual(report.read_bytes(), final)
 
     def test_distinct_dedupes_workers_and_restrikes_with_reset_metrics(self):

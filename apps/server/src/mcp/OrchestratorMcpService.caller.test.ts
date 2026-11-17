@@ -21,6 +21,9 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { McpCall } from "../ardud/analytics/McpCall.ts";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -35,6 +38,30 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 import * as OrchestratorMcp from "./OrchestratorMcpService.ts";
+
+const candidatePage = (
+  shells: ReadonlyArray<OrchestrationV2ThreadShell>,
+  options?: import("../orchestration-v2/ProjectionStore.ts").ThreadListPageOptions,
+) =>
+  shells
+    .filter(
+      (t) =>
+        options?.titleContains === undefined ||
+        t.title.toLocaleLowerCase().includes(options.titleContains.toLocaleLowerCase()),
+    )
+    .filter(
+      (t) =>
+        options?.after === undefined ||
+        DateTime.toEpochMillis(t.updatedAt) < options.after.updatedAtMs ||
+        (DateTime.toEpochMillis(t.updatedAt) === options.after.updatedAtMs &&
+          t.id < options.after.threadId),
+    )
+    .toSorted(
+      (a, b) =>
+        DateTime.toEpochMillis(b.updatedAt) - DateTime.toEpochMillis(a.updatedAt) ||
+        b.id.localeCompare(a.id),
+    )
+    .slice(0, options?.limit ?? 100);
 
 const callerId = ThreadId.make("caller:light");
 const targetId = ThreadId.make("target:light");
@@ -66,7 +93,21 @@ const layer = (
         Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
           list: () => Effect.succeed([]),
         }),
-        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(ProjectService.ProjectService)({
+          getById: (id) =>
+            Effect.succeed(
+              Option.some({
+                id,
+                title: "Test project",
+                workspaceRoot: "/test",
+                defaultModelSelection: null,
+                scripts: [],
+                createdAt: "2026-01-01T00:00:00.000Z",
+                updatedAt: "2026-01-01T00:00:00.000Z",
+                deletedAt: null,
+              }),
+            ),
+        }),
         Layer.mock(SecretRequests.SecretRequests)({}),
         Layer.mock(ScheduledTasks.ScheduledTaskService)(schedules),
         ServerSettings.layerTest(),
@@ -422,6 +463,31 @@ it.effect(
         { input: { snoozed: true }, expected: [] },
         { input: { titleContains: "étape" }, expected: shells.filter((_, i) => i % 2 === 0) },
         { input: { titleContains: "" }, expected: shells },
+        {
+          input: {
+            statuses: ["waiting" as const],
+            titleContains: "étape",
+            settled: true,
+            includeSubagents: false,
+            limit: 1,
+          },
+          expected: shells.filter(
+            (_, i) => i % 5 === 0 && i % 2 === 0 && i % 7 === 0 && i % 4 !== 0,
+          ),
+        },
+        {
+          input: {
+            statuses: ["waiting" as const],
+            titleContains: "étape",
+            settled: false,
+            includeSubagents: false,
+            cursor: 2,
+            limit: 3,
+          },
+          expected: shells.filter(
+            (_, i) => i % 5 === 0 && i % 2 === 0 && i % 7 !== 0 && i % 4 !== 0,
+          ),
+        },
         { input: { cursor: 11, limit: 1 }, expected: shells },
         { input: { cursor: 500 }, expected: shells },
       ];
@@ -437,7 +503,9 @@ it.effect(
             result.threads.map((t) => t.threadId),
             page.map((t) => t.id),
           );
-          assert.equal(result.total, expected.length);
+          assert.equal(result.total, Math.min(expected.length, offset + (input.limit ?? 50) + 1));
+          if (result.totalIsExact) assert.equal(result.total, expected.length);
+          assert.equal(result.projectTitle, "Test project");
           assert.equal(
             result.nextCursor,
             offset + page.length < sorted.length ? offset + page.length : null,
@@ -458,7 +526,7 @@ it.effect(
         Effect.provide(
           layer({
             getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
-            getThreadListCandidates: () => Effect.succeed(shells),
+            getThreadListCandidates: (_, options) => Effect.succeed(candidatePage(shells, options)),
             getShellSnapshot: (options) =>
               Effect.sync(() => {
                 const ids = [...(options?.threadIds ?? [])];
@@ -554,7 +622,8 @@ it.effect.each(listTransitionCases)(
         Effect.provide(
           layer({
             getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
-            getThreadListCandidates: () => Effect.succeed(candidates),
+            getThreadListCandidates: (_, options) =>
+              Effect.succeed(candidatePage(candidates, options)),
             getShellSnapshot: () =>
               Effect.succeed({
                 schemaVersion: 2,
@@ -586,7 +655,7 @@ it.effect.each(
       },
       {
         state: "accepted",
-        message: "This delegation was saved; its task projection is catching up.",
+        message: "This delegation was saved; its task record is missing.",
       },
       { state: "rejected", message: "This delegation was rejected: Parent run ended." },
     ] as const
@@ -609,24 +678,50 @@ it.effect.each(
   ),
 )(
   "recovers a missing task from its $state command $command for status and cancel",
-  ({ state, message, command }) =>
-    Effect.gen(function* () {
+  ({ state, message, command }) => {
+    const ownCommand = command.startsWith(
+      `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(callerId)}:`,
+    );
+    const cancelRequests: CommandId[] = [];
+    return Effect.gen(function* () {
       const commandId = CommandId.make(command);
       const taskId = IdAllocator.derive.delegatedTaskNode({ commandId });
       const service = yield* OrchestratorMcp.OrchestratorMcpService;
-      for (const operation of [
-        service.taskStatus(scope, taskId).pipe(Effect.asVoid),
-        service.cancelTask(scope, { taskId }).pipe(Effect.asVoid),
-      ]) {
+      for (const [name, operation] of [
+        ["status", service.taskStatus(scope, taskId).pipe(Effect.asVoid)],
+        ["cancel", service.cancelTask(scope, { taskId }).pipe(Effect.asVoid)],
+      ] as const) {
+        if (name === "cancel" && ownCommand && state === "pending") {
+          const cancelled = yield* service.cancelTask(scope, { taskId });
+          assert.equal(cancelled.status, "cancel_pending");
+          assert.include(cancelled.detail!, "as soon as");
+          continue;
+        }
         const error = yield* operation.pipe(Effect.flip);
-        assert.equal(error.code, "task_not_found");
+        const creating =
+          name === "status" && state === "pending" && !message.startsWith("No delegated");
+        const recordMissing = state === "accepted" && !message.startsWith("No delegated");
+        assert.equal(
+          error.code,
+          recordMissing ? "task_record_missing" : creating ? "task_creating" : "task_not_found",
+        );
         assert.include(error.message, message);
+        if (creating || recordMissing)
+          assert.notInclude(error.message, "No delegated task has this id.");
+        else assert.isTrue(error.message.startsWith("No delegated task has this id."));
       }
+      assert.deepEqual(cancelRequests, ownCommand && state === "pending" ? [commandId] : []);
     }).pipe(
       Effect.provide(
         layer({
           getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
           getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(callerId))),
+          requestCancelOnArrival: (commandId) =>
+            Effect.sync(() => {
+              cancelRequests.push(commandId);
+              // Accepted receipts need the committed-task lookup if no create is pending.
+              return state === "pending" ? "cancel_pending" : "not_pending";
+            }),
           getDelegationCommandState: (commandId) =>
             Effect.succeed(
               state === "accepted" || state === "rejected"
@@ -643,7 +738,52 @@ it.effect.each(
             ),
         }),
       ),
-    ),
+    );
+  },
+);
+
+it.effect.each(["provider_changed", "archived", "inactive"] as const)(
+  "does not register a pending cancel for a %s caller",
+  (state) =>
+    Effect.gen(function* () {
+      const shell = {
+        ...liveThreadShell(callerId),
+        ...(state === "provider_changed"
+          ? { providerInstanceId: ProviderInstanceId.make("claudeAgent") }
+          : state === "archived"
+            ? { archivedAt: DateTime.makeUnsafe(0) }
+            : { activeRunId: null, pendingBackgroundTasks: [] }),
+      };
+      let cancels = 0;
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcp.OrchestratorMcpService;
+        const commandId = CommandId.make(
+          `command:mcp:delegate-task:${encodeURIComponent(scope.environmentId)}:${encodeURIComponent(callerId)}:retry`,
+        );
+        const taskId = IdAllocator.derive.delegatedTaskNode({ commandId });
+        for (const operation of [
+          service.taskStatus(scope, taskId).pipe(Effect.asVoid),
+          service.cancelTask(scope, { taskId }).pipe(Effect.asVoid),
+        ]) {
+          const error = yield* operation.pipe(Effect.flip);
+          assert.equal(error.code, "parent_not_active");
+        }
+        assert.equal(cancels, 0);
+      }).pipe(
+        Effect.provide(
+          layer({
+            getCallerRow: () => Effect.succeed(shell),
+            getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
+            getDelegationCommandState: () => Effect.succeed({ status: "pending" }),
+            requestCancelOnArrival: () =>
+              Effect.sync(() => {
+                cancels++;
+                return "cancel_pending";
+              }),
+          }),
+        ),
+      );
+    }),
 );
 
 it.effect.each([
@@ -693,4 +833,89 @@ it.effect("does not expose another parent's rejection reason", () =>
       }),
     ),
   ),
+);
+
+it.effect("listThreads reads only six candidates for a five-thread title page", () =>
+  Effect.gen(function* () {
+    const shells = Array.from({ length: 600 }, (_, i) => ({
+      ...liveThreadShell(ThreadId.make(`bounded-${String(i).padStart(3, "0")}`)),
+      title: i % 2 === 0 ? "Case exit" : "Other",
+    }));
+    const reads: number[] = [];
+    yield* Effect.gen(function* () {
+      const mcp = yield* OrchestratorMcp.OrchestratorMcpService;
+      const result = yield* mcp.listThreads(scope, { titleContains: "case EXIT", limit: 5 });
+      assert.deepEqual(
+        result.threads.map((t) => t.threadId),
+        [598, 596, 594, 592, 590].map((i) => `bounded-${i}`),
+      );
+      assert.equal(result.nextCursor, 5);
+      assert.equal(result.total, 6);
+      assert.isFalse(result.totalIsExact);
+      assert.deepEqual(reads, [6]);
+    }).pipe(
+      Effect.provide(
+        layer({
+          getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
+          getThreadListCandidates: (_, options) =>
+            Effect.sync(() => {
+              const rows = candidatePage(shells, options);
+              reads.push(rows.length);
+              return rows;
+            }),
+          getShellSnapshot: (options) =>
+            Effect.succeed({
+              schemaVersion: 2,
+              snapshotSequence: 0,
+              threads: shells.filter((s) => options?.threadIds?.includes(s.id)),
+              archivedThreads: [],
+            }),
+        }),
+      ),
+    );
+  }),
+);
+
+it.effect("listThreads times out a held foreground reader and records the stalled phase", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<ReadonlyArray<OrchestrationV2ThreadShell>>();
+    const call: McpCall["Service"] = {
+      callerResolved: false,
+      callerResolveMs: 0,
+      readerLane: "background",
+      phase: "handler",
+      saved: "unknown",
+    };
+    yield* Effect.gen(function* () {
+      const mcp = yield* OrchestratorMcp.OrchestratorMcpService;
+      const pending = yield* mcp
+        .listThreads(scope, { limit: 5 })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("25 seconds");
+      const error = yield* Fiber.join(pending);
+      assert.equal(error.code, "lookup_timeout");
+      assert.include(error.message, "Test project (project:mcp-test)");
+      assert.include(error.message, "25s");
+      assert.include(error.message, "narrower titleContains");
+      assert.equal(call.threadList?.phase, "candidates");
+      assert.equal(call.threadList?.batchCount, 1);
+      assert.equal(call.threadList?.elapsedMs, 25000);
+      yield* Deferred.succeed(release, []);
+    }).pipe(
+      Effect.provide(
+        layer({
+          getCallerRow: () => Effect.succeed(liveThreadShell(callerId)),
+          getThreadListCandidates: () =>
+            Effect.gen(function* () {
+              assert.equal(yield* NodeSqliteClient.ReaderLane, "foreground");
+              yield* Deferred.succeed(entered, undefined);
+              return yield* Deferred.await(release);
+            }),
+        }),
+      ),
+      Effect.provideService(McpCall, call),
+    );
+  }),
 );

@@ -7,6 +7,7 @@ import { logDirectory } from "./log-directory.ts";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { cleanCalls, createCallAggregation, SLOW_CALL_MS, type CallSummary } from "./log-calls.ts";
+import { cleanRobobLink, createRobobLinkState, createRobobLinkAggregation, type RobobLink } from "./log-robob-link.ts";
 import { summarizeLog } from "./log-rollup.ts";
 import { createChainAggregation } from "./log-chains.ts";
 import { recordRenderCounts, renderCounts } from "./log-render-store.ts";
@@ -16,6 +17,8 @@ import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./l
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
   durationMs?: number; ok?: boolean; ids?: Record<string, string>; props?: Record<string, string | number | boolean>;
+  alreadyLogged?: boolean;
+  link?: RobobLink;
   site?: string;
   error?: { tag: string } & ErrorDetail;
   calls?: CallSummary;
@@ -26,7 +29,7 @@ const processRunId = randomUUID();
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
-const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId"]);
+const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId"]);
 const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs"]);
 const ENUMS: Record<string, readonly string[]> = {
   state: ["pending", "admitted", "processing", "batched", "done", "failed", "unknown", "cancelled", "observed"],
@@ -39,6 +42,8 @@ const ENUMS: Record<string, readonly string[]> = {
   failureCode: ["none", "renderer_failed", "preview_missing", "render_exception", "page_fetch", "page_http", "page_type", "page_body", "image_fetch", "image_http", "image_type", "image_body", "upload", "upload_url", "invalid_url", "file_prepare"],
   completionCheck: ["before", "after", "unchecked"],
   failureFormat: ["single"],
+  linkCause: ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"],
+  backend: ["robob", "openchamber", "remote-box", "unknown"],
 };
 
 // Only reduced diagnostics cross this boundary; input objects can contain prompts or credentials.
@@ -47,8 +52,11 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   const line: LogLine = { ts, tool: "imessage", component: entry.component, kind: entry.kind, name: entry.name };
   if (typeof entry.durationMs === "number" && Number.isFinite(entry.durationMs) && entry.durationMs >= 0) line.durationMs = entry.durationMs;
   if (typeof entry.ok === "boolean") line.ok = entry.ok;
+  if (entry.name === "bridge.catch" && entry.kind === "error" && entry.alreadyLogged === true) line.alreadyLogged = true;
   const ids: Record<string, string> = runId ? { runId } : {};
   for (const [key, value] of Object.entries(entry.ids ?? {})) {
+    // Correlation ids are UUIDs; arbitrary server header text must never become a log field.
+    if ((key === "requestId" || key === "serverRequestId" || key === "outageId") && !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value)) continue;
     if (key === "chat" && entry.name.startsWith("card.render")) { ids.chat = renderChat(value); continue; }
     if (ID_KEYS.has(key) && typeof value === "string" && value.length <= 250 && /^[a-zA-Z0-9_:%.@-]+$/.test(value)
       && !/^\+?\d{6,}$/.test(value)) ids[key] = value;
@@ -56,14 +64,23 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (["moni-box-fenced", "moni-box-unfenced"].includes(entry.name)) {
+      if (key === "event" && typeof value === "string" && /^[a-f0-9]{12}$/.test(value)
+        || key === "kind" && (value === "inbound" || value === "wake")
+        || key === "hasSend" && typeof value === "boolean"
+        || ["queuedBehind", "fencedMs"].includes(key) && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+        props[key] = value; continue;
+      }
+    }
     if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if ((NUMBERS.has(key) || key === "replies" && entry.name === "notice.reply") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
-    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
+    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders", "linkRecovery"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && ENUMS[key]?.includes(value)) props[key] = value;
     // A route template is code-owned; no query strings, ids, or URLs enter the log.
     else if (key === "route" && typeof value === "string" && /^(?:\/(?:[a-z-]+|:id))*$/.test(value)) props[key] = value;
   }
   if (Object.keys(props).length) line.props = props;
+  if (entry.component === "robob" && ["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply"].includes(entry.name)) line.link = cleanRobobLink(entry.link);
   if (entry.name === "card.renders" && entry.kind === "perf") line.renders = cleanRenders(entry.renders);
   if (entry.name === "turn.robob_calls" && entry.component === "robob" && entry.kind === "perf") line.calls = cleanCalls(entry.calls);
   if (entry.kind === "error" || entry.name === "turn.robob_call" && entry.ok === false) {
@@ -120,6 +137,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   let rolledYesterday = "";
   let recovery: Promise<void> | undefined;
   const calls = createCallAggregation(processRunId);
+  const robobLink = createRobobLinkState();
   const renders = createRenderAggregation();
   let writeFailed = false;
   function append(entry: Entry, stamp?: string): void {
@@ -153,7 +171,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
@@ -187,9 +205,11 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         if (entry.name === "card.render" || entry.name === "card.renders") writeFailed = true;
         return;
       }
-      for (const render of renders.accept(line)) for (const record of calls.accept(render, entry.ids?.runId !== undefined)) enqueue(record);
+      const link = robobLink.accept(line);
+      for (const event of link.events) enqueue(event);
+      for (const render of renders.accept(line)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
-      if (["turn.start", "reply.sent"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
+      if (["turn.start", "reply.sent", "inbound.answered"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
         refreshChains(`${line.ids.chat}\0${line.ids.inboundId}`);
       }
     } catch { writeFailed = true; }
@@ -224,7 +244,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       const later = Object.fromEntries(Object.entries(sources).filter(([date]) => date > day));
       const renders = readRenderCounts(dir, day);
       const result = { day, tool: "imessage", sourceBytes, renderSourceCount: renders.count, chainSources: sources,
-        ...await summarizeLog(records(dir, { [day]: sourceBytes }), records(dir, later), renders.lines) };
+        ...await summarizeLog(records(dir, { [day]: sourceBytes }), records(dir, later), renders.lines, day) };
       await saveRollup(dir, day, result);
       return result;
     } catch { return; }
@@ -286,6 +306,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     });
   }
   function flushAll(): boolean {
+    capture(() => { for (const line of robobLink.flush(now)) enqueue(line); });
     for (const line of renders.flush()) enqueue(line);
     for (const line of calls.flush()) enqueue(line);
     flush();
@@ -313,7 +334,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   }
   function validOwnDay(saved: Rollup, day: string, bytes: number): saved is NonNullable<Rollup> {
     return Boolean(saved?.day === day && saved.tool === "imessage" && saved.sourceBytes === bytes && saved.renderSourceCount === readRenderCounts(root(), day).count
-      && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && Array.isArray(saved.topErrorTags) && Array.isArray(saved.topCauses));
+      && Number.isSafeInteger(saved.total) && saved.total >= 0 && saved.byComponent && saved.chains && saved.robob_link && Array.isArray(saved.topErrorTags) && Array.isArray(saved.topCauses));
   }
   function recoverRollups(at: number, hourly: boolean, yesterday?: string): Promise<void> {
     const precedingJobs = [...jobs.values()];
@@ -345,24 +366,25 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       }
       if (!stale.size) return;
       const chains = createChainAggregation();
+      const links = createRobobLinkAggregation();
       const summaries = new Map<string, Awaited<ReturnType<typeof summarizeLog>>>();
       const renderSnapshots = new Map<string, ReturnType<typeof renderCounts>>();
       // Every file is streamed once for the entire sweep, including any daily counters needing a rebuild.
       for (const day of new Set([...Object.keys(sources), ...stale])) {
         async function* scan() {
-          for await (const line of records(dir, { [day]: sources[day] ?? 0 })) { chains.accept(line); yield line; }
+          for await (const line of records(dir, { [day]: sources[day] ?? 0 })) { chains.accept(line); links.accept(line); yield line; }
         }
         if (stale.has(day) && !cached.has(day)) {
           const renders = readRenderCounts(dir, day);
           renderSnapshots.set(day, renders);
-          summaries.set(day, await summarizeLog(scan(), undefined, renders.lines));
+          summaries.set(day, await summarizeLog(scan(), undefined, renders.lines, day));
         }
         else for await (const _line of scan()) { /* Only chain milestones are needed for unchanged daily totals. */ }
       }
       for (const day of stale) {
         const base = cached.get(day) ?? summaries.get(day)!;
         const result = { ...base, day, tool: "imessage", sourceBytes: sources[day] ?? 0, renderSourceCount: cached.get(day)?.renderSourceCount ?? renderSnapshots.get(day)?.count ?? 0,
-          chainSources: chainSources(sources, day), chains: chains.summary(day) };
+          chainSources: chainSources(sources, day), chains: chains.summary(day), robob_link: links.summary(day) };
         await saveRollup(dir, day, result);
       }
     })().catch(() => {}).finally(() => { recovery = undefined; });
@@ -400,9 +422,25 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
 export const toolLog = createToolLog({ defer: true });
 /** Cooperative read yielding is expected control flow, not a backend failure. */
 export const completionReady = Symbol("completionReady");
+// Keep correlation on the error identity without mutating or serializing caller-owned errors.
+const loggedFailures = new WeakMap<object, string>();
+export function markLoggedFailure(error: unknown, requestId: string): void {
+  if (error !== null && typeof error === "object") loggedFailures.set(error, requestId);
+}
+function loggedRequestId(error: unknown): string | undefined {
+  const seen = new Set<object>();
+  while (error !== null && typeof error === "object" && !seen.has(error)) {
+    const requestId = loggedFailures.get(error);
+    if (requestId) return requestId;
+    seen.add(error);
+    try { error = "cause" in error ? error.cause : undefined; } catch { return; }
+  }
+}
 export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"], props?: LogLine["props"]): void {
   if (cause === completionReady) return;
-  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids, props, error: { tag, cause } });
+  const requestId = loggedRequestId(cause);
+  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids: { ...ids, ...(requestId ? { requestId } : {}) }, props,
+    ...(requestId ? { alreadyLogged: true } : {}), error: { tag, cause } });
 }
 export function cardKind(value: string): string {
   // Generator names only; captions, query values and health data never enter the log.
