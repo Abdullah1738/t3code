@@ -1,4 +1,5 @@
 import { assert, it } from "@effect/vitest";
+import { withTestSchedulerBudget } from "./testSchedulerBudget.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import * as Cause from "effect/Cause";
@@ -33142,6 +33143,21 @@ it.live("an owner answer changed while its delivery is retrying is never deliver
   Effect.gen(function* () {
     const fake = yield* makeFake;
     let refuse = true;
+    const refused = yield* Deferred.make<void>();
+    const routesDone = yield* Deferred.make<void>();
+    let completedRoutes = 0;
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        const end = span.end.bind(span);
+        span.end = (at, exit) => {
+          end(at, exit);
+          if (span.name === "KanbanService.markOwnerRouteDone" && ++completedRoutes === 2)
+            Deferred.doneUnsafe(routesDone, Effect.void);
+        };
+        return span;
+      },
+    });
     yield* Effect.gen(function* () {
       const { kanban, board } = yield* toyBoard;
       const evaluator = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Pick" });
@@ -33160,11 +33176,11 @@ it.live("an owner answer changed while its delivery is retrying is never deliver
         },
       ]);
       yield* kanban.answer(channel.id, asked.seq, "change-choice", ["yes"], owner);
+      yield* Deferred.await(refused);
       yield* kanban.answer(channel.id, asked.seq, "change-choice", ["no"], owner);
       refuse = false;
-      const outcomes = yield* eventually(routeOutcomes, (all) =>
-        all.every((outcome) => outcome !== "pending"),
-      );
+      yield* Deferred.await(routesDone);
+      const outcomes = yield* routeOutcomes;
       assert.deepStrictEqual(outcomes, ["superseded", "delivered"]);
       const messages = (yield* Ref.get(fake.threads)).get(evaluator)!.messages;
       assert.isFalse(messages.some((text) => text.includes("Ship it")));
@@ -33172,12 +33188,19 @@ it.live("an owner answer changed while its delivery is retrying is never deliver
     }).pipe(
       Effect.provide(
         withOwnerRouteMode(
-          testLayer(refusingSends(fake, (text) => refuse && text.includes("Ship it"))),
+          testLayer(
+            refusingSends(fake, (text) => {
+              if (!refuse || !text.includes("Ship it")) return false;
+              Deferred.doneUnsafe(refused, Effect.void);
+              return true;
+            }),
+          ),
           "deferred",
         ),
       ),
+      Effect.withTracer(tracer),
     );
-  }),
+  }).pipe(withTestSchedulerBudget),
 );
 
 it.live("routes saved before a switch to inline still replay after the restart", () =>
@@ -37284,13 +37307,14 @@ it.effect(
     }),
 );
 
-it.effect.each(["submitEvaluator", "reportBug"] as const)(
+it.live.each(["submitEvaluator", "reportBug"] as const)(
   "#1440 %s persists admission and an unrelated card mutation while an evaluator launch holds serial",
   (entry) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
       const entered = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
+      const admitted = yield* Deferred.make<void>();
       let first = true;
       const gated = Layer.effect(
         KanbanThreads,
@@ -37331,10 +37355,15 @@ it.effect.each(["submitEvaluator", "reportBug"] as const)(
                   evidence: "An independent incident",
                   threadId: ThreadId.make("reporter"),
                 });
-          }).pipe(Effect.timeout("1 second")),
+          }).pipe(
+            Effect.provideService(SavedWrite.observer, (saved) => {
+              if (saved.kind === "evaluatorQueue") Deferred.doneUnsafe(admitted, Effect.void);
+            }),
+          ),
         );
-        yield* TestClock.adjust("1 second");
-        const queued = yield* Fiber.join(mutation);
+        const [queued] = yield* Effect.all([Fiber.join(mutation), Deferred.await(admitted)], {
+          concurrency: "unbounded",
+        }).pipe(Effect.timeout("1 second"));
         assert.isTrue("queued" in queued);
         const sql = yield* BoardsDatabase.client;
         const rows = yield* sql<{ id: number; started_at: string | null }>`
@@ -37364,7 +37393,7 @@ it.effect.each(["submitEvaluator", "reportBug"] as const)(
           (yield* evaluators)[0]!.messages.some((text) => text.includes("Novel failure")),
         );
       }).pipe(Effect.provide(inlineTestLayer(gated)));
-    }),
+    }).pipe(withTestSchedulerBudget),
 );
 
 it.effect("#1516 packet starts still share the preceding in-flight launch", () =>
@@ -42891,12 +42920,24 @@ it.effect.each(
         yield* kanban.dispatchNow;
         const work = (yield* kanban.card(created.id)).card.workThreadId!;
         const pr = { url: "https://github.com/o/r/pull/99", title: "Work", state: "open" as const };
+        const changes = yield* kanban.changes;
         if (prChanged) fake.prs.set(work, [pr]);
         yield* kanban.moveCard(created.id, "needs_review", "cardThread", {
           _tag: "thread",
           threadId: work,
         });
         yield* kanban.turnEnded(work);
+        if (prChanged)
+          yield* changes.pipe(
+            Stream.filter(
+              ({ change }) =>
+                change._tag === "card" &&
+                change.card.id === created.id &&
+                change.card.links.some((link) => link.url === pr.url && link.state === "open"),
+            ),
+            Stream.take(1),
+            Stream.runDrain,
+          );
         yield* kanban.dispatchNow;
         const before = (yield* kanban.card(created.id)).card;
         const review = before.activeThreadId!;
@@ -42939,7 +42980,7 @@ it.effect.each(
         assert.equal(reads.get(review), 1);
         assert.equal(reads.get(work), 1);
       }).pipe(Effect.provide(inlineTestLayer(failing)));
-    }),
+    }).pipe(withTestSchedulerBudget),
 );
 
 it.effect.each(
