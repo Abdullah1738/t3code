@@ -11723,7 +11723,7 @@ const make = Effect.gen(function* () {
       observed === undefined
         ? yield* freshThreads.find(threadId).pipe(Effect.catch(() => Effect.succeed(null)))
         : observed;
-    if (view !== null && view.state !== "idle") return;
+    if (view !== null && view.state !== "idle" && view.state !== "queued") return;
     for (const card of cards) {
       if (card.stage !== "working" || workerIdleSkipAt.has(card.id)) continue;
       // Reserve before yielding to the writer so overlapping tick/turn-end paths cannot double-log.
@@ -12132,7 +12132,7 @@ const make = Effect.gen(function* () {
     });
     const view = yield* freshThreads.find(threadId);
     if (yield* skipRestartRecovery(threadId, nudge, view)) return;
-    if ((yield* threads.queuedRuns(threadId)).length > 0) {
+    if (view?.state === "queued" || (yield* threads.queuedRuns(threadId)).length > 0) {
       yield* workerIdleSkip(threadId, nudge, "queued_run", view);
       return;
     }
@@ -12282,7 +12282,7 @@ const make = Effect.gen(function* () {
             yield* workerIdleSkip(
               threadId,
               [current ?? card],
-              queued.length > 0
+              queued.length > 0 || live?.state === "queued"
                 ? "queued_run"
                 : !sameCardState(current, card)
                   ? "state_changed"
@@ -12685,6 +12685,10 @@ const make = Effect.gen(function* () {
       }
       if (foundFailure.success !== null) {
         yield* turnEndedUnlocked(threadId, undefined, true);
+        continue;
+      }
+      if (view?.state === "queued") {
+        yield* workerIdleSkip(threadId, carried, "queued_run", view);
         continue;
       }
       if (!view || view.state !== "idle" || Rules.waitingOnBackground(view, yield* nowMillis))
@@ -13760,6 +13764,10 @@ const make = Effect.gen(function* () {
       // turn end nudges it (see nudgeWorker).
       const view = yield* threads.view(threadId);
       if (yield* skipRestartRecovery(threadId, carried, view)) return;
+      if (view?.state === "queued") {
+        yield* workerIdleSkip(threadId, carried, "queued_run", view);
+        return;
+      }
       // A repeated run event can arrive while the thread runs again.
       if (view === null || view.state !== "idle") return;
       // The run ended without failing: a retry it was on is over, and the next
@@ -15144,6 +15152,10 @@ const make = Effect.gen(function* () {
                     return;
                   }
                   if (yield* skipRestartRecovery(threadId, [card], view)) return;
+                  if (view?.state === "queued") {
+                    yield* workerIdleSkip(threadId, [card], "queued_run", view);
+                    return;
+                  }
                   // Provider recovery owns nudges, but a deferred wait can park
                   // once the work that held it after the outage has drained.
                   if ((yield* store.threadLink(threadId))?.paused) {
@@ -15259,15 +15271,17 @@ const make = Effect.gen(function* () {
                               ? "provider_pause"
                               : Option.isNone(fresh) || fresh.value === null
                                 ? "thread_unavailable"
-                                : Option.isSome(fresh) &&
-                                    fresh.value !== null &&
-                                    Rules.waitingOnBackground(fresh.value, now)
-                                  ? fresh.value.prWatches > 0 &&
-                                    now - Date.parse(fresh.value.quietSince) <
-                                      Rules.PR_WATCH_GRACE_MS
-                                    ? "pr_watch"
-                                    : "background_work"
-                                  : "quiet_not_due",
+                                : fresh.value.state === "queued"
+                                  ? "queued_run"
+                                  : Option.isSome(fresh) &&
+                                      fresh.value !== null &&
+                                      Rules.waitingOnBackground(fresh.value, now)
+                                    ? fresh.value.prWatches > 0 &&
+                                      now - Date.parse(fresh.value.quietSince) <
+                                        Rules.PR_WATCH_GRACE_MS
+                                      ? "pr_watch"
+                                      : "background_work"
+                                    : "quiet_not_due",
                       Option.isSome(fresh) ? fresh.value : view,
                     );
                     return;
