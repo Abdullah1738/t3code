@@ -1,3 +1,4 @@
+import * as CodexRetainedState from "../../ardud/orchestration/CodexRetainedState.ts";
 import {
   backgroundCommandWakeCommandId,
   backgroundCommandWakeMessageId,
@@ -1508,7 +1509,13 @@ function codexThreadRuntimeParams(input: {
 }
 
 const decodeCodexResumeMetadata = Schema.decodeUnknownEffect(
-  Schema.Struct({ thread: Schema.Struct({ id: Schema.String, updatedAt: Schema.Number }) }),
+  Schema.Struct({
+    thread: Schema.Struct({
+      id: Schema.String,
+      updatedAt: Schema.Number,
+      path: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    }),
+  }),
 );
 
 const CodexChildSelection = Schema.Struct({
@@ -2303,6 +2310,46 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           });
         });
 
+        const retainedState = yield* CodexRetainedState.make().pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+        );
+        const reportRetainedStateLoss = Effect.fn("CodexAdapterV2.reportRetainedStateLoss")(
+          function* (nativeThreadId: string) {
+            const detail = yield* retainedState.takeLoss(nativeThreadId);
+            const thread = rootProviderThreads.get(nativeThreadId);
+            if (
+              detail === undefined ||
+              thread?.appThreadId == null ||
+              continuationRequests === undefined
+            )
+              return;
+            const lossId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+            const itemId = `codex-retained-loss:${nativeThreadId}:${lossId}`;
+            yield* continuationRequests.offer({
+              messageId: backgroundCommandWakeMessageId(thread.appThreadId, itemId),
+              commandId: backgroundCommandWakeCommandId(thread.appThreadId, itemId),
+              threadId: thread.appThreadId,
+              providerThreadId: thread.id,
+              driver: CODEX_PROVIDER,
+              delivery: "message_text",
+              detail,
+              notification: {
+                source: { kind: "command" },
+                outcome: "unknown",
+                summary: "Codex retained state lost",
+                detail,
+              },
+            });
+          },
+        );
+        // Session eviction can beat per-thread unsubscribe and interrupts the
+        // exit observer. Run before the client's earlier process finalizer.
+        yield* Effect.addFinalizer(() =>
+          Effect.forEach([...rootProviderThreads.keys()], reportRetainedStateLoss, {
+            discard: true,
+          }),
+        );
+
         const registerRootTurn = Effect.fn("CodexAdapterV2.registerRootTurn")(function* (input: {
           readonly turnInput: ProviderAdapter.ProviderAdapterV2TurnInput;
           readonly nativeTurnId: string;
@@ -2345,6 +2392,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             next.delete(context.providerThread.id);
             return next;
           });
+          if (context.providerThread.nativeThreadRef?.nativeId)
+            retainedState.active(context.providerThread.nativeThreadRef.nativeId);
           beginTurnTokenUsage(context);
           endSessionApprovalsOnModeChange(context);
           yield* Ref.update(activeTurns, (current) => {
@@ -5202,7 +5251,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           Effect.orDie,
         );
         yield* client.handleServerNotification("thread/closed", (payload) =>
-          handleNativeThreadShutdown(payload.threadId),
+          Effect.gen(function* () {
+            yield* reportRetainedStateLoss(payload.threadId);
+            yield* handleNativeThreadShutdown(payload.threadId);
+          }),
         );
         yield* client.handleServerNotification("thread/archived", (payload) =>
           handleNativeThreadShutdown(payload.threadId),
@@ -5211,6 +5263,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         yield* client.handleServerNotification("rawResponseItem/completed", (payload) =>
           Effect.gen(function* () {
             const item = payload.item;
+            retainedState.observe(payload.threadId, item);
             if (item.type !== "function_call_output" && item.type !== "custom_tool_call_output")
               return;
             const processIds = new Set<string>();
@@ -5256,6 +5309,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerNotification("item/started", (payload) =>
           Effect.gen(function* () {
+            if (payload.item.type === "mcpToolCall")
+              retainedState.observeNested(payload.threadId, payload.item);
             const context = yield* awaitActiveTurn(payload.turnId);
             if (context === undefined) {
               return;
@@ -5411,6 +5466,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerNotification("item/completed", (payload) =>
           Effect.gen(function* () {
+            if (payload.item.type === "mcpToolCall")
+              retainedState.observeNested(payload.threadId, payload.item);
             if (payload.item.type === "contextCompaction")
               // The notification callback runs on the input reader. Let it read
               // the injection response while the session-scoped request waits.
@@ -6626,6 +6683,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 input.status === "interrupted" || input.status === "failed",
               );
               if (input.context.subagent === null) {
+                const nativeThreadId = input.context.providerThread.nativeThreadRef?.nativeId;
+                if (nativeThreadId) yield* retainedState.idle(nativeThreadId);
                 yield* emitOrDeferRootTerminal({
                   ...input,
                   ...(providerRetry === undefined ? {} : { providerRetry }),
@@ -7545,13 +7604,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         const failSessionEvents = Effect.fn("CodexAdapterV2.failSessionEvents")(
           (error: CodexErrors.CodexAppServerError) =>
-            Queue.fail(
-              events,
-              new ProviderAdapter.ProviderAdapterEventStreamError({
-                driver: CODEX_PROVIDER,
-                providerSessionId: input.providerSessionId,
-                cause: error,
-              }),
+            Effect.forEach([...rootProviderThreads.keys()], reportRetainedStateLoss).pipe(
+              Effect.andThen(
+                Queue.fail(
+                  events,
+                  new ProviderAdapter.ProviderAdapterEventStreamError({
+                    driver: CODEX_PROVIDER,
+                    providerSessionId: input.providerSessionId,
+                    cause: error,
+                  }),
+                ),
+              ),
             ),
         );
         // Drain and settle before failing the queue: session release closes this
@@ -7592,6 +7655,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           // against a long-delayed resume. Codex emits no resume-expected
           // signal to pin on.
           hasPendingBackgroundWork: Effect.gen(function* () {
+            for (const nativeThreadId of rootProviderThreads.keys()) {
+              yield* retainedState.refresh(nativeThreadId);
+              if (yield* retainedState.holds(nativeThreadId)) return true;
+            }
             for (const items of (yield* Ref.get(runningCommandItemsByTurn)).values()) {
               if (items.size > 0) {
                 return true;
@@ -7615,6 +7682,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           hasPendingBackgroundWorkForThread: Effect.fn(
             "CodexAdapterV2.hasPendingBackgroundWorkForThread",
           )(function* (providerThread) {
+            const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
+            if (nativeThreadId) {
+              yield* retainedState.refresh(nativeThreadId);
+              if (yield* retainedState.holds(nativeThreadId)) return true;
+            }
             const contexts = [
               ...(yield* Ref.get(activeTurns)).values(),
               ...(yield* Ref.get(settledTurns)).values(),
@@ -7638,13 +7710,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
             return false;
           }),
-          holdsWorkForThread: (providerThread) =>
-            Effect.sync(() =>
-              threadHoldsWorkUnsafe(
-                providerThread.id,
-                providerThread.nativeThreadRef?.nativeId ?? undefined,
-              ),
-            ),
+          holdsWorkForThread: Effect.fn("CodexAdapterV2.holdsWorkForThread")(
+            function* (providerThread) {
+              const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
+              return (
+                (nativeThreadId != null && (yield* retainedState.holds(nativeThreadId))) ||
+                threadHoldsWorkUnsafe(providerThread.id, nativeThreadId ?? undefined)
+              );
+            },
+          ),
           ensureThread: (threadInput) =>
             Effect.suspend(() => {
               let loadedNativeId: string | undefined;
@@ -7702,6 +7776,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       Effect.mapError((cause) => new CodexHistoryNotSentError({ cause })),
                     )
                   : preflight;
+                yield* retainedState.register(response.thread.id, response.thread.path);
                 const row = providerThreadFromCodexThread({
                   appThreadId: threadInput.threadId,
                   idAllocator,
@@ -7826,6 +7901,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
+              yield* retainedState.register(response.thread.id, response.thread.path);
               return {
                 ...threadInput.providerThread,
                 providerSessionId: input.providerSessionId,
@@ -8069,6 +8145,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   CodexAppServerInputStreamEndedError: () => Effect.void,
                 }),
               );
+              yield* reportRetainedStateLoss(nativeThreadId);
             },
             (effect, unloadInput) =>
               effect.pipe(
@@ -8829,6 +8906,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                       ),
                     )).thread;
                   }
+                  yield* retainedState.register(forkedThread.id, forkedThread.path);
                   return providerThreadFromCodexThread({
                     appThreadId: threadInput.targetThreadId,
                     idAllocator,
