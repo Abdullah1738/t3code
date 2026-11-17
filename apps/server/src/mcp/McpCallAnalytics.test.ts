@@ -183,6 +183,7 @@ const lookupCases = [
   {
     name: "accepted receipt",
     state: "accepted",
+    cancelRegistration: "cancel_pending",
     reason: "accepted",
     foundBy: "receipt",
     saved: true,
@@ -194,7 +195,7 @@ const lookupCases = [
     foundBy: "receipt",
     saved: true,
   },
-  { name: "pending", state: "pending", reason: "pending" },
+  { name: "pending", state: "pending", cancelRegistration: "cancel_pending", reason: "pending" },
   {
     name: "legacy pending without owner evidence",
     id: IdAllocator.derive.delegatedTaskNode({
@@ -254,6 +255,7 @@ const lookupCases = [
     (state) =>
       ({
         name: `missing child with ${state} receipt`,
+        cancelRegistration: "cancel_pending",
         hit: true,
         noChild: true,
         state,
@@ -261,6 +263,23 @@ const lookupCases = [
         foundBy: "subagents",
         saved: true,
       }) as const,
+  ),
+  ...(["pending", "accepted"] as const).flatMap((state) =>
+    (["not_pending", "capacity"] as const).flatMap((cancelRegistration) =>
+      [false, true].map((noChild) => ({
+        name: `${state} receipt, missing child ${noChild}, cancel registration ${cancelRegistration}`,
+        state,
+        cancelRegistration,
+        ...(noChild ? { hit: true, noChild: true } : {}),
+        reason: noChild ? ("missing_child_thread" as const) : state,
+        foundBy: noChild
+          ? ("subagents" as const)
+          : state === "accepted"
+            ? ("receipt" as const)
+            : ("none" as const),
+        saved: noChild || state === "accepted" ? true : ("unknown" as const),
+      })),
+    ),
   ),
   ...[
     "thread:project:private:uuid",
@@ -383,11 +402,17 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
     let parentReads = 0;
     let acknowledgements = 0;
     let stopped = false;
+    const cancelRequests: CommandId[] = [];
     const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
       getCallerRow: (id) => Effect.succeed(Testkit.liveThreadShell(id)),
       getThreadShell: (id) => Effect.succeed(Testkit.liveThreadShell(id)),
       getThreadProjection: () => Effect.succeed({ ...parent, subagents: [task] }),
       stopDelegatedTasks: () => Effect.void,
+      requestCancelOnArrival: (commandId) =>
+        Effect.sync(() => {
+          cancelRequests.push(commandId);
+          return "cancelRegistration" in testCase ? testCase.cancelRegistration : "not_pending";
+        }),
       getThreadRecords: (id) => {
         if (
           "pause" in testCase &&
@@ -521,6 +546,12 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
           name === "task_status" &&
           "reason" in testCase &&
           (testCase.reason === "pending" || testCase.reason === "accepted");
+        const cancelRegistration =
+          name === "task_cancel" && "cancelRegistration" in testCase
+            ? testCase.cancelRegistration
+            : undefined;
+        const cancelPending = cancelRegistration === "cancel_pending";
+        const cancelCapacity = cancelRegistration === "capacity";
         const call = server
           .callTool({ name, arguments: { taskId: "id" in testCase ? testCase.id : lookupId } })
           .pipe(Effect.provideService(McpSchema.McpServerClient, client));
@@ -558,15 +589,19 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
           },
         });
         expect(row.errorTag).toBe(
-          "reason" in testCase
-            ? creating
-              ? "task_creating"
-              : "task_not_found"
-            : "error" in testCase
-              ? testCase.error
-              : "invalid" in testCase
-                ? "invalid_request"
-                : undefined,
+          cancelPending
+            ? undefined
+            : cancelCapacity
+              ? "task_not_cancellable"
+              : "reason" in testCase
+                ? creating
+                  ? "task_creating"
+                  : "task_not_found"
+                : "error" in testCase
+                  ? testCase.error
+                  : "invalid" in testCase
+                    ? "invalid_request"
+                    : undefined,
         );
         if ("pause" in testCase)
           expect(row.outcome).toBe(
@@ -582,6 +617,32 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
         expect(JSON.stringify(row.props)).not.toMatch(/private|command:|node:|clientRequestId/);
         if (!("reason" in testCase)) expect(row.props).not.toHaveProperty("notFoundReason");
         if ("reason" in testCase) {
+          expect(row.outcome).toBe(cancelPending ? "ok" : "error");
+          expect(row.props?.code).toBe(
+            cancelPending
+              ? "unknown"
+              : cancelCapacity
+                ? "task_not_cancellable"
+                : creating
+                  ? "task_creating"
+                  : "task_not_found",
+          );
+          expect(row.reasonClass).toBe(
+            cancelPending ? undefined : creating || cancelCapacity ? "other" : "not_found",
+          );
+          if (cancelPending) {
+            expect(response?.isError).not.toBe(true);
+            expect(response?.structuredContent).toMatchObject({
+              taskId: lookupId,
+              status: "cancel_pending",
+            });
+            continue;
+          }
+          if (cancelCapacity) {
+            expect(response?.isError).toBe(true);
+            expect(response?.structuredContent).toMatchObject({ code: "task_not_cancellable" });
+            continue;
+          }
           const text = JSON.stringify(response);
           const threadShape =
             "shape" in testCase &&
@@ -597,6 +658,7 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
           if (creating) expect(row.props?.code).toBe("task_creating");
         }
       }
+      expect(cancelRequests).toEqual("cancelRegistration" in testCase ? [lookupCommand] : []);
       if ("ack" in testCase) {
         yield* Deferred.await(acknowledged);
         expect(acknowledgements).toBe(1);
