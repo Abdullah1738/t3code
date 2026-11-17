@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from test_cases import Base, ALERT, BANK, at, finder, nobody, mc
+from test_charges import ControlServer, summary
 
 
 HERE = Path(__file__).resolve().parent
@@ -22,6 +23,70 @@ SHARED = HERE.parents[2] / 'app-api-cli' / 'toollog.py'
 
 
 class Logging(Base):
+    def test_census_fixed_reason_and_age_allowlists(self):
+        reasons = {code: 1 for code in mc.charges.LIMIT_REASONS}
+        mc.toollog.emit('money-cases', 'check.run', props={'chargeCensus': {
+            'noon': {'limited': len(reasons), 'limit_reasons': {**reasons, 'PRIVATE': 1,
+                     'source_limit:PRIVATE': 1, 'lane_uncovered:PRIVATE': 1},
+                     'limit_age_days': {'lt7': 0, '7_30': 1, '30_60': 2, 'gt60': 3,
+                                        'PRIVATE': 1}},
+            'careem': {'limit_reasons': {'other': -1, 'msgs_timeout': True, 'owner_list_failed': 'PRIVATE'},
+                       'limit_age_days': {'lt7': -1, '7_30': True, 'gt60': 'PRIVATE'}}}})
+        row, = self.rows('check.run')
+        census = row['props']['chargeCensus']
+        self.assertEqual(census['noon']['limit_reasons'], reasons)
+        self.assertEqual(census['noon']['limit_age_days'], {'lt7': 0, '7_30': 1, '30_60': 2, 'gt60': 3})
+        self.assertEqual(census['careem']['limit_reasons'], {})
+        self.assertEqual(census['careem']['limit_age_days'], {})
+        self.assertNotIn('PRIVATE', json.dumps(row))
+        self.assertEqual((HERE / 'toollog.py').read_bytes(), SHARED.read_bytes())
+
+    def test_marketplace_metadata_is_sanitized_and_copies_match(self):
+        mc.toollog.emit('money-cases', 'check.run', props={
+            'marketplace_refresh': 'fresh', 'limitKinds': ['marketplace_hold', 'marketplace_stale'],
+            'chargeCensus': {'noon': {'limited': 3, 'marketplace_hold': 2, 'marketplace_stale': 1}},
+            'orderCoverage': {'noon': {'marketplace': {'hold_count': 2, 'placements_known': 4,
+                'placements_total': 4, 'snapshot_age_s': 60, 'stop_reason': 'snapshot_corrupt',
+                'hold_times': ['PRIVATE'], 'walked_at': 'PRIVATE', 'orders': ['PRIVATE']}}}})
+        mc.toollog.emit('money-cases', 'marketplace.refresh', props={
+            'orders_total': 4, 'known': 4, 'delivered': 2, 'fetched': 4, 'pages': 1, 'ms': 100,
+            'result': 'end_of_history', 'snapshot_error': 'snapshot_corrupt', 'private': 'PRIVATE'})
+        run, = self.rows('check.run')
+        self.assertEqual(run['props']['marketplace_refresh'], 'fresh')
+        self.assertEqual(run['props']['chargeCensus']['noon']['marketplace_hold'], 2)
+        lane = run['props']['orderCoverage']['noon']['marketplace']
+        self.assertEqual(lane['snapshot_age_s'], 60)
+        self.assertNotIn('PRIVATE', json.dumps(self.rows()))
+        self.assertEqual((HERE / 'toollog.py').read_bytes(), SHARED.read_bytes())
+
+    def test_owner_cache_reset_diagnostics_wait_for_book_unlock(self):
+        path = self.data / 'owner-texts.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('corrupt private text')
+        held, seen = [], []
+        emit = mc.toollog.emit
+
+        def logging(*args, **kwargs):
+            if args[1] == 'cache_reset':
+                seen.append(bool(held))
+            return emit(*args, **kwargs)
+
+        @mc.log_scope
+        def lookup():
+            with mc.Locked(self.data, 'questions'):
+                held.append(True)
+                try:
+                    mc.explain_charge(self.data, mc.charges.parse(ALERT, BANK),
+                                      at('2026-10-24T04:10'), at('2026-10-24T04:20'), find=finder())
+                finally:
+                    held.clear()
+
+        with ControlServer([summary('I paid Acme')]), patch.object(mc.toollog, 'emit', logging):
+            lookup()
+        self.assertEqual(seen, [False])
+        self.assertEqual(len(self.rows('cache_reset')), 1)
+        self.assertNotIn('private', json.dumps(self.rows('cache_reset')))
+
     def rows(self, name=None):
         rows = [json.loads(line) for path in (self.tmp / 'tool-logs/orders').glob('*.ndjson')
                 for line in path.read_text().splitlines()]
@@ -184,6 +249,23 @@ class Logging(Base):
         self.assertFalse(self.rows('check.run')[-1]['ok'])
         self.assertEqual(self.rows('check.run')[-1]['props']['fired'], 0)
 
+    def test_owner_refresh_metadata_is_logged_and_private_values_are_dropped(self):
+        stats = {key: n for n, key in enumerate(mc.charges.OWNER_TIMING_KEYS)}
+        def followed(*args, **kwargs):
+            kwargs['stats'].update(stats, owner_result='incomplete')
+            return ['his threads: fixture incomplete']
+        with patch.object(mc, 'follow', side_effect=followed):
+            mc.run_check(self.wd, 'owner', self.data, self.root, at('2026-11-14T10:00'), finder(), nobody)
+        row = self.rows('check.run')[-1]
+        self.assertFalse(row['ok'])
+        for key, value in stats.items():
+            self.assertEqual(row['props'][key], value)
+        self.assertEqual(row['props']['owner_result'], 'incomplete')
+        for bad in ('PRIVATE-TEXT', -1, True, 1.5, 10**13):
+            mc.toollog.emit('money-cases', 'check.run', props={
+                **dict.fromkeys(mc.charges.OWNER_TIMING_KEYS, bad), 'owner_result': 'PRIVATE-TEXT'})
+            self.assertEqual(self.rows('check.run')[-1]['props'], {})
+
     def test_known_source_limits_alone_complete_ok_and_bad_reason_is_dropped(self):
         def limited(*args, stats, **kw):
             stats['question_limits'] = [{'why': 'private fixture',
@@ -233,9 +315,9 @@ class Logging(Base):
         row, = self.rows('check.run')
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
-        self.assertEqual(row['props'], {'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
-            **dict.fromkeys(mc.TIMING_KEYS, 0), 'follow_ms': 40000, 'questions_ms': 40000,
-            'starved_by': 'questions'})
+        self.assertEqual(row['props'], {'marketplace_refresh': 'skipped', 'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
+            **dict.fromkeys((*mc.TIMING_KEYS, *mc.charges.OWNER_TIMING_KEYS), 0), 'owner_result': 'ok', 'follow_ms': 40000, 'questions_ms': 40000,
+            'starved_by': 'questions', **mc.charges.receipt_timing({})})
 
     def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
         self.case()
@@ -517,6 +599,31 @@ class Logging(Base):
         self.assertEqual(stats['follow_ms'], 6750)
         self.assertEqual(stats['untimed_ms'], 250)
         self.assertIsNone(mc.charges.TIMING_STATS.get())
+
+    def test_write_count_logs_only_successful_follow_state_commits(self):
+        def follow(*args, **kwargs):
+            mc.write_json(self.data / 'first.json', {'fixture': True})
+            with patch.object(mc, 'atomic_write_json', side_effect=OSError('fixture write failed')):
+                with self.assertRaises(OSError):
+                    mc.write_json(self.data / 'failed.json', {})
+            mc.write_json(self.data / 'second.json', {'fixture': True})
+            return []
+        with patch.object(mc, 'follow', follow):
+            mc.run_check(self.wd, 'counts', self.data, self.root, at('2026-11-14T12:00'), finder(), nobody)
+        props = self.rows('check.run')[-1]['props']
+        self.assertEqual(props['writes_n'], 2)
+        timing = json.loads((self.wd / 'pings.json').read_text())['timing']
+        self.assertEqual(timing['writes_n'], 2)
+        self.assertFalse((self.data / 'failed.json').exists())
+
+    def test_write_count_accepts_only_bounded_nonnegative_integers(self):
+        forms = [(0, True), (1, True), (10**12, True), (-1, False), (-10**12, False),
+                 (10**12 + 1, False), (True, False), (False, False), (1.5, False),
+                 ('1', False), (None, False)]
+        for value, accepted in forms:
+            with self.subTest(value=value):
+                mc.toollog.emit('money-cases', 'check.run', props={'writes_n': value})
+                self.assertEqual(self.rows('check.run')[-1]['props'], {'writes_n': value} if accepted else {})
 
     def test_follow_timers_survive_interrupts_and_count_storage_redaction(self):
         stats, clock = {}, [1000.0]

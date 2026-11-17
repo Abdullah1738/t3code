@@ -351,6 +351,22 @@ describe("desktop lease", () => {
     expect(store.callStart(caller("1"), "unauthorized").lease?.ticket).toBe(held.ticket);
   });
 
+  it("retries only a started admission on the current held ticket", () => {
+    const { open } = setup();
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "retry-call");
+    expect(store.callStart(caller("1"), "retry-call").lease?.ticket).toBe(held.ticket);
+    conflict(() => store.callStart(caller("2"), "retry-call"));
+    conflict(() => store.callStart({ ...caller("1"), rootThreadId: "other" }, "retry-call"));
+    store.callEnd("retry-call", "completed");
+    conflict(() => store.callStart(caller("1"), "retry-call"));
+    store.release(caller("1"), held.ticket);
+    const replacement = store.acquire(caller("1"), request("replacement"));
+    expect(replacement.ticket).not.toBe(held.ticket);
+    conflict(() => store.callStart(caller("1"), "retry-call"));
+  });
+
   it("waits for the last recorded call after release, including across reopened connections", () => {
     const { open } = setup();
     const a = open();

@@ -82,6 +82,8 @@ import {
 } from "@t3tools/provider-core/server/subagentProjection";
 import { openCodeToolTurnItem } from "./toolItems.ts";
 
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+
 export { openCodeToolProjectionKind } from "./toolItems.ts";
 
 export const OPENCODE_PROVIDER = ProviderDriverKind.make("opencode");
@@ -958,7 +960,12 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             : {}),
         });
 
-        const mcpSession = yield* mcpSessions.read(input.threadId);
+        const mcpSession = yield* McpProviderSessions.readForRuntime(
+          mcpSessions,
+          input.threadId,
+          input.providerSessionId,
+          OPENCODE_PROVIDER,
+        );
         const hasT3Mcp = mcpSession !== undefined && !connection.external;
         const orchestrationSystemPrompt = t3OrchestrationSystemPrompt(hasT3Mcp, {
           browser: mcpSession?.browserToolsAvailable ?? false,
@@ -3423,9 +3430,11 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
                 turn === null ||
                 turn.providerTurnId !== interruptInput.providerTurnId
               ) {
-                return yield* protocolError(
-                  `OpenCode turn ${interruptInput.providerTurnId} is not active`,
-                );
+                return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+                  driver: OPENCODE_PROVIDER,
+                  providerThreadId: interruptInput.providerThread.id,
+                  providerTurnId: interruptInput.providerTurnId,
+                });
               }
               turn.interrupted = true;
               if (interruptInput.stopBackgroundWork !== false)
@@ -3461,14 +3470,15 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
             },
             (effect, interruptInput) =>
               effect.pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapter.ProviderAdapterInterruptError({
-                      driver: OPENCODE_PROVIDER,
-                      providerThreadId: interruptInput.providerThread.id,
-                      providerTurnId: interruptInput.providerTurnId,
-                      cause,
-                    }),
+                Effect.mapError((cause) =>
+                  isTurnNotActiveError(cause)
+                    ? cause
+                    : new ProviderAdapter.ProviderAdapterInterruptError({
+                        driver: OPENCODE_PROVIDER,
+                        providerThreadId: interruptInput.providerThread.id,
+                        providerTurnId: interruptInput.providerTurnId,
+                        cause,
+                      }),
                 ),
               ),
           ),

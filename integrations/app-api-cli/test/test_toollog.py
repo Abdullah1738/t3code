@@ -54,6 +54,18 @@ class Logs(unittest.TestCase):
             log.emit('commerce','cmd.error',kind='error',error='FAILED')
         self.assertEqual([r['name'] for r in self.rows()], ['cmd.start','log.cap','cmd.error'])
 
+    def test_can_report_metadata_is_allowlisted(self):
+        for refusal in ('none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage'):
+            log.emit('order-watch', 'order_watch.can_report', props={
+                'refusal': refusal, 'eta_given': True, 'untrackable': False,
+                'eta': '14 November at Apartment 987', 'order': 'private-order'})
+        self.assertEqual([row['props'] for row in self.rows()], [
+            {'refusal': refusal, 'eta_given': True, 'untrackable': False}
+            for refusal in ('none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage')])
+        log.emit('order-watch', 'order_watch.can_report', props={
+            'refusal': 'private@example.test', 'eta_given': '14 November', 'untrackable': 'private-order'})
+        self.assertEqual(self.rows()[-1]['props'], {})
+
     def test_retention_and_rollup_statistics(self):
         self.folder.mkdir(parents=True)
         today = dt.datetime.now(dt.timezone.utc).date()

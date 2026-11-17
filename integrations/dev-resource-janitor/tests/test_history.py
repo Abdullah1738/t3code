@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from janitor_test_safety import JanitorTestCase
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
@@ -15,7 +16,7 @@ def session(sid, directory, updated=1000):
     return {'id': sid, 'location': {'directory': directory}, 'time': {'updated': updated}}
 
 
-class HistoryTests(unittest.TestCase):
+class HistoryTests(JanitorTestCase):
     def test_session_history_follows_every_cursor_and_maps_location_and_activity(self):
         pages = [{'data': [session('a', '/w', 3000)], 'cursor': {'next': 'next'}},
                  {'data': [session('b', '/w', 2000), session('c', '/other')], 'cursor': {'next': None}}]

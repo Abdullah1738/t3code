@@ -1,10 +1,17 @@
+import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
+import * as ThreadReadDeadline from "./ThreadReadDeadline.ts";
+import * as WikiReadDeadline from "./WikiReadDeadline.ts";
+import * as BoundedReadDeadline from "./BoundedReadDeadline.ts";
+import * as WikiReadTiming from "../ardud/analytics/WikiReadTiming.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
 import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
+import { delegationIdShape } from "./delegationTaskIdentity.ts";
+import * as CardNextMetrics from "../ardud/analytics/CardNextMetrics.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { analyticsErrorTag, recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
@@ -18,6 +25,7 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -30,6 +38,8 @@ import { AiError, McpProtocol, McpSchema, McpServer, Tool, Toolkit } from "effec
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import {
   OrchestratorMcpFailure,
+  OrchestratorMcpDelegateTaskResult,
+  NodeId,
   PreviewAutomationError,
   type RunId,
   ThreadId,
@@ -75,6 +85,7 @@ import { AttachmentToolkit } from "./toolkits/attachment/tools.ts";
 import * as AttachmentHandlers from "./toolkits/attachment/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import * as ThreadHandlers from "./toolkits/thread/handlers.ts";
+import * as BackgroundTerminals from "../ardud/exec-sessions/BackgroundTerminals.ts";
 import * as ThreadMetadataMcpService from "./ThreadMetadataMcpService.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
@@ -101,7 +112,7 @@ import * as ControlStore from "../ardud/control/ControlStore.ts";
 // ardud schedules: retry a scheduled task's blocked runs.
 import * as ScheduledTaskBlockRetry from "../ardud/schedules/blockRetryTools.ts";
 import * as KanbanHandlers from "../ardud/kanban/tools/handlers.ts";
-import { KanbanToolkit } from "../ardud/kanban/tools/tools.ts";
+import { KanbanToolkit, KanbanArgumentKeys, argumentFailure } from "../ardud/kanban/tools/tools.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
@@ -205,15 +216,14 @@ export const normalizeMcpHttpResponse = (
 
 // Session tokens are `<payload>.<signature>`; registry tokens are a bare base64url secret.
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
+// Thread lists bound their own SQL page and deadline; scanning must not occupy a reply permit.
 const LARGE_READ_TOOLS = new Set([
   "board_get",
   "board_activity",
   "card_get",
-  "wiki_read",
   "discussion_read",
   "card_search",
   "t3_thread_read",
-  "t3_thread_list",
   "list_scheduled_tasks",
 ]);
 const BOARD_READ_TOOLS = new Set([
@@ -505,7 +515,15 @@ const decodeAsAdvertised = <Tools extends Record<string, Tool.Any>>(
   // The clones keep each tool's id, name and decoded parameter type, so handlers still match.
   Toolkit.make(
     ...Object.values(toolkit.tools).map((tool) =>
-      tool.setParameters(Schema.toCodecJson(tool.parametersSchema)),
+      tool.setParameters(
+        Schema.toCodecJson(tool.parametersSchema).pipe(
+          // @effect-diagnostics-next-line anyUnknownInErrorContext:off - Tool.Any erases each codec's requirements at registration.
+          Schema.middlewareDecoding((decode) =>
+            // @effect-diagnostics-next-line anyUnknownInErrorContext:off - Preserve the erased requirements while observing failures.
+            decode.pipe(Effect.tapError(McpCallAnalytics.parameterFailure)),
+          ),
+        ),
+      ),
     ),
   ) as unknown as Toolkit.Toolkit<Tools>;
 
@@ -912,6 +930,88 @@ const handoffTargetIds = (
   return typeof threadId === "string" ? [threadId] : [];
 };
 
+export const withFailureStructuredContent = (
+  result: McpSchema.CallToolResult | McpSchema.InputRequired,
+  maxTextLength = 8192,
+) => {
+  if (
+    result instanceof McpSchema.InputRequired ||
+    result.isError !== true ||
+    result.structuredContent !== undefined
+  )
+    return result;
+  const part = result.content.find((part) => part.type === "text");
+  if (part?.type !== "text" || part.text.length > maxTextLength) return result;
+  try {
+    const failure = JSON.parse(part.text) as Schema.Json;
+    if (failure !== null && typeof failure === "object" && !Array.isArray(failure)) {
+      // Effect drops structuredContent on failures, but scripted callers read it.
+      return new McpSchema.CallToolResult({ ...result, structuredContent: failure });
+    }
+  } catch {
+    /* Plain-text failures stay unchanged. */
+  }
+  return result;
+};
+
+const encodeDelegationFailure = Schema.encodeSync(OrchestratorMcpFailure);
+const decodeDelegationFailure = Schema.decodeUnknownOption(OrchestratorMcpFailure);
+const isDelegationReceipt = Schema.is(
+  OrchestratorMcpDelegateTaskResult.mapFields(
+    ({ taskId, status, providerInstanceId, model, options }) => ({
+      taskId,
+      status,
+      providerInstanceId,
+      model,
+      options,
+    }),
+  ),
+);
+
+const withDelegationReceipt = (
+  result: McpSchema.CallToolResult | McpSchema.InputRequired,
+  state: McpCallAnalytics.McpCall["Service"],
+) => {
+  if (result instanceof McpSchema.InputRequired) return result;
+  const content = result.structuredContent;
+  if (result.isError !== true && isDelegationReceipt(content)) return result;
+  const taskId = state.delegation === undefined ? undefined : NodeId.make(state.delegation.taskId);
+  const originalFailure =
+    result.isError === true ? decodeDelegationFailure(content) : Option.none();
+  const failure = Option.isSome(originalFailure)
+    ? {
+        ...encodeDelegationFailure(originalFailure.value),
+        saved:
+          originalFailure.value.saved ??
+          McpCallAnalytics.callOutcome(Exit.succeed(result), state).saved ??
+          "unknown",
+        ...(originalFailure.value.taskId === undefined && taskId !== undefined ? { taskId } : {}),
+      }
+    : encodeDelegationFailure(
+        new OrchestratorMcpFailure({
+          code: "delegation_uncertain",
+          saved: "unknown",
+          ...(taskId === undefined ? {} : { taskId }),
+          message: `Delegation returned no complete receipt.${taskId === undefined ? "" : ` Task ${taskId}: use task_status to recover it.`} Retry only with the same clientRequestId.`,
+        }),
+      );
+  return new McpSchema.CallToolResult({
+    isError: true,
+    content: [{ type: "text", text: JSON.stringify(failure) }],
+    structuredContent: failure,
+  });
+};
+
+const inputKeyCache = new WeakMap<object, ReadonlySet<string>>();
+const inputKeysOf = (tool: McpSchema.Tool): ReadonlySet<string> => {
+  let keys = inputKeyCache.get(tool);
+  if (keys === undefined) {
+    keys = new Set(Object.keys(tool.inputSchema.properties ?? {}));
+    inputKeyCache.set(tool, keys);
+  }
+  return keys;
+};
+
 /**
  * Runs a tool registration against a server that records one anonymous
  * `mcp.tool.invoked` event per call: the tool, the calling agent's provider,
@@ -925,6 +1025,7 @@ const withToolAnalytics =
   Effect.fnUntraced(function* <A, E, R>(registration: Effect.Effect<A, E, R>) {
     const server = yield* McpServer.McpServer;
     const ledger = yield* McpCallLedger.McpCallLedger;
+    const kanbanContext = yield* Effect.serviceOption(KanbanService);
     const startup = yield* Effect.serviceOption(StartupPhaseLog.StartupPhaseLog);
     const callBootId = Option.isSome(startup) ? startup.value.snapshot().bootId : bootId;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
@@ -1039,6 +1140,13 @@ const withToolAnalytics =
       addTool: (options) =>
         server.addTool({
           ...options,
+          tool:
+            Context.getOrUndefined(options.annotations, KanbanArgumentKeys) === undefined
+              ? options.tool
+              : new McpSchema.Tool({
+                  ...options.tool,
+                  inputSchema: { ...options.tool.inputSchema, additionalProperties: false },
+                }),
           handle:
             /* Request instrumentation already owns the span; keep this helper in that context. */
             Effect.fnUntraced(function* (payload) {
@@ -1073,7 +1181,36 @@ const withToolAnalytics =
                       if (invocation?.thread)
                         delivery.value.callerThreadId = invocation.thread.threadId;
                     }
+                    const initialReaderLane = yield* NodeSqliteClient.ReaderLane;
+                    const readOnly = Context.get(options.annotations, Tool.Readonly);
+                    const boardWrite =
+                      Object.hasOwn(KanbanToolkit.tools, options.tool.name) && !readOnly;
                     const callState: McpCallAnalytics.McpCall["Service"] = {
+                      readOnly,
+                      boardWrite,
+                      inputKeys: inputKeysOf(options.tool),
+                      detachedAnalytics: {
+                        tool: options.tool.name,
+                        callerIdentity:
+                          invocation?.thread?.threadId ?? invocation?.requestNamespace,
+                        callerThreadId: invocation?.thread?.threadId,
+                        startedAt: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
+                        build,
+                        bootId: callBootId,
+                      },
+                      ...(options.tool.name === "task_status" || options.tool.name === "task_cancel"
+                        ? {
+                            taskLookup: {
+                              idShape: delegationIdShape(
+                                typeof payload === "object" &&
+                                  payload !== null &&
+                                  "taskId" in payload
+                                  ? payload.taskId
+                                  : undefined,
+                              ),
+                            },
+                          }
+                        : {}),
                       ...(options.tool.name === "t3_thread_read"
                         ? {
                             threadRead: {
@@ -1097,9 +1234,10 @@ const withToolAnalytics =
                         : {}),
                       callerResolved: false,
                       callerResolveMs: 0,
-                      readerLane: yield* NodeSqliteClient.ReaderLane,
+                      callerReaderLane: initialReaderLane,
+                      readerLane: initialReaderLane,
                       phase: "handler",
-                      saved: "unknown",
+                      saved: boardWrite ? false : "unknown",
                     };
                     if (callState.requestTiming !== undefined)
                       yield* Effect.annotateCurrentSpan({
@@ -1108,16 +1246,71 @@ const withToolAnalytics =
                         "mcp.pre_handler_ms": callState.requestTiming.preHandlerMs,
                       });
                     let handlerEnded: bigint | undefined;
+                    let threadReadAtExit: ReturnType<typeof ThreadReadMetrics.snapshot> | undefined;
+                    let cardNextAtExit:
+                      | (ReturnType<typeof CardNextMetrics.snapshot> &
+                          Pick<
+                            McpCallAnalytics.McpCall["Service"],
+                            "readerLane" | "callerResolved" | "callerResolveMs"
+                          >)
+                      | undefined;
                     const parentSaved = yield* SavedWrite.observer;
                     const parentCommitting = yield* SavedWrite.commitObserver;
                     const identifiers = McpCallAnalytics.callIdentifiers(
                       payload,
                       invocation?.thread?.threadId ?? invocation?.requestNamespace,
                     );
+                    const isKanbanTool = Object.hasOwn(KanbanToolkit.tools, options.tool.name);
+                    callState.callerRole = "none";
+                    callState.callerKind =
+                      invocation === undefined || invocation.thread ? "unknown" : "cli";
+                    callState.resolveCallerContext = (parentThreadId) => {
+                      if (callState.callerCardNumber !== undefined) return;
+                      const id = parentThreadId ?? invocation?.thread?.threadId;
+                      const context =
+                        id && Option.isSome(kanbanContext)
+                          ? kanbanContext.value.callerAnalytics?.(id)
+                          : undefined;
+                      const delegated =
+                        parentThreadId !== undefined || context?.callerKind === "delegated_child";
+                      callState.callerRole = context?.callerRole ?? "none";
+                      callState.callerKind = delegated
+                        ? "delegated_child"
+                        : (context?.callerKind ?? (context?.boardId ? "board_thread" : "unknown"));
+                      if (context) {
+                        if (
+                          (!isKanbanTool || identifiers.boardId === undefined) &&
+                          context.boardId !== undefined
+                        )
+                          callState.boardId = context.boardId;
+                        if (!isKanbanTool) {
+                          if (context.cardId !== undefined) callState.cardId = context.cardId;
+                          if (context.cardNumber !== undefined)
+                            callState.cardNumber = context.cardNumber;
+                          if (context.cardStage !== undefined)
+                            callState.cardStage = context.cardStage;
+                        }
+                        if (context.cardNumber !== undefined)
+                          callState.callerCardNumber = context.cardNumber;
+                        if (context.cardStage !== undefined)
+                          callState.callerCardStage = context.cardStage;
+                      }
+                    };
+                    if (invocation?.thread) callState.resolveCallerContext();
                     // The request span already covers ledger capture on this hot path.
                     const row = Effect.fnUntraced(function* (
                       outcome: ReturnType<typeof McpCallAnalytics.callOutcome>,
                     ) {
+                      if (outcome.outcome !== "ok") {
+                        callState.reasonClass ??= "other";
+                        if (boardWrite)
+                          callState.refusedAt =
+                            outcome.saved === true
+                              ? "post_write"
+                              : callState.boardAdmitted
+                                ? "in_write"
+                                : "pre_lock";
+                      }
                       const ended = handlerEnded ?? (yield* Clock.monotonicTimeNanos);
                       const interrupted =
                         outcome.outcome === "interrupted" ||
@@ -1145,6 +1338,7 @@ const withToolAnalytics =
                           : callState.requestTiming.preHandlerMs + durationMs;
                       if (totalMs !== undefined)
                         yield* Effect.annotateCurrentSpan({ "mcp.total_ms": totalMs });
+                      const callerReaderLane = callState.callerReaderLane ?? initialReaderLane;
                       return {
                         ts: DateTime.formatIso(DateTime.makeUnsafe(startedAt)),
                         kind: "mcp.call" as const,
@@ -1160,13 +1354,60 @@ const withToolAnalytics =
                         ...(invocation?.thread
                           ? { callerThreadId: invocation.thread.threadId }
                           : {}),
+                        callerRole: callState.callerRole ?? "none",
+                        callerKind: callState.callerKind ?? "unknown",
+                        ...(callState.cardNumber === undefined
+                          ? {}
+                          : { cardNumber: callState.cardNumber }),
+                        ...(callState.callerCardNumber === undefined
+                          ? {}
+                          : { callerCardNumber: callState.callerCardNumber }),
+                        ...(callState.callerCardStage === undefined
+                          ? {}
+                          : { callerCardStage: callState.callerCardStage }),
+                        ...(callState.writePhases === undefined
+                          ? {}
+                          : { writePhases: callState.writePhases }),
+                        ...(callState.cardStage === undefined
+                          ? {}
+                          : { cardStage: callState.cardStage }),
+                        ...(callState.denyReason === undefined
+                          ? {}
+                          : { denyReason: callState.denyReason }),
+                        ...(callState.reasonClass === undefined
+                          ? {}
+                          : { reasonClass: callState.reasonClass }),
+                        ...(callState.invalidField === undefined ||
+                        !callState.inputKeys?.has(callState.invalidField)
+                          ? {}
+                          : { invalidField: callState.invalidField }),
+                        ...(outcome.outcome === "ok" || callState.refusedAt === undefined
+                          ? {}
+                          : { refusedAt: callState.refusedAt }),
+                        ...(callState.replyStage === undefined
+                          ? {}
+                          : { replyStage: callState.replyStage }),
+                        ...(callState.replyPhases === undefined
+                          ? {}
+                          : { replyPhases: callState.replyPhases }),
+                        ...(callState.requestTiming === undefined
+                          ? {}
+                          : { requestTiming: callState.requestTiming }),
                         callerResolved: callState.callerResolved,
                         callerResolveMs:
                           callState.callerResolveMs +
                           (callState.callerStarted === undefined
                             ? 0
                             : Math.max(0, Number(ended - callState.callerStarted) / 1e6)),
-                        readerLane: callState.readerLane,
+                        callerReaderLane,
+                        readerLane:
+                          options.tool.name === "wiki_read"
+                            ? callState.readerLane
+                            : callerReaderLane,
+                        ...(callState.cardNext === undefined
+                          ? {}
+                          : (cardNextAtExit ??
+                            CardNextMetrics.snapshot(callState.cardNext, ended))),
                         ...(callState.waitStage === undefined
                           ? {}
                           : { waitStage: callState.waitStage }),
@@ -1177,20 +1418,30 @@ const withToolAnalytics =
                         ...(callState.threadRead === undefined
                           ? {}
                           : {
-                              ...ThreadReadMetrics.snapshot(callState.threadRead, ended),
+                              ...(threadReadAtExit ??
+                                ThreadReadMetrics.snapshot(callState.threadRead, ended)),
                               inFlightAtStart: activity.inFlightAtStart,
                             }),
                         ...callState.requestTiming,
                         ...(totalMs === undefined ? {} : { totalMs }),
                         ...outcome,
+                        ...(callState.boundedRead !== undefined &&
+                        (outcome.outcome === "timeout" || outcome.outcome === "interrupted")
+                          ? callState.boundedRead
+                          : {}),
                         ...(Option.isSome(delivery) ? delivery.value.snapshot() : {}),
                         props: {
                           ...outcome.props,
+                          ...(callState.threadList === undefined
+                            ? {}
+                            : { threadList: { ...callState.threadList } }),
                           ...(callState.boardId ? { boardId: callState.boardId } : {}),
                           ...(callState.cardNumber === undefined
                             ? {}
                             : { cardNumber: callState.cardNumber }),
-                          saved: outcome.saved ?? "unknown",
+                          ...(readOnly && callState.taskLookup === undefined
+                            ? {}
+                            : { saved: outcome.saved ?? "unknown" }),
                         },
                         ...(committed === undefined
                           ? {}
@@ -1205,8 +1456,27 @@ const withToolAnalytics =
                     const complete = yield* ledger.begin(() =>
                       row({
                         outcome: "interrupted_by_shutdown",
-                        props: { code: "unknown", cause: "shutdown" },
-                        saved: callState.saved,
+                        props: {
+                          code: "unknown",
+                          cause: "shutdown",
+                          ...(callState.taskLookup?.foundBy === undefined
+                            ? {}
+                            : { foundBy: callState.taskLookup.foundBy }),
+                          ...(callState.taskLookup?.idCanonical === undefined
+                            ? {}
+                            : { idCanonical: callState.taskLookup.idCanonical }),
+                          ...(callState.taskLookup?.idShape === undefined
+                            ? {}
+                            : { idShape: callState.taskLookup.idShape }),
+                        },
+                        ...(readOnly && callState.taskLookup === undefined
+                          ? {}
+                          : {
+                              saved:
+                                boardWrite && callState.saved === false
+                                  ? ("unknown" as const)
+                                  : callState.saved,
+                            }),
                         errorPhase: callState.phase,
                       }),
                     );
@@ -1229,8 +1499,10 @@ const withToolAnalytics =
                       : options.tool.name === "list_scheduled_tasks"
                         ? controlReplyReady
                         : Effect.void;
-                    const largeRead = LARGE_READ_TOOLS.has(options.tool.name);
+                    const measuredReadTool =
+                      LARGE_READ_TOOLS.has(options.tool.name) || options.tool.name === "wiki_read";
                     let phase: "lane" | "readiness" | "handler" = "lane";
+                    const clock = yield* Clock.Clock;
                     let phaseStarted = yield* Clock.monotonicTimeNanos;
                     const readStarted = phaseStarted;
                     const timings = { readinessWaitMs: 0, laneWaitMs: 0, handlerMs: 0 };
@@ -1246,9 +1518,57 @@ const withToolAnalytics =
                       phase = next;
                       phaseStarted = now;
                     });
-                    const result = readiness
-                      .pipe(Effect.andThen(largeRead ? advance("handler") : Effect.void))
-                      .pipe(Effect.andThen(options.handle(payload)))
+                    const result = (
+                      options.tool.name === "wiki_read"
+                        ? WikiReadTiming.step("readiness", readiness)
+                        : readiness
+                    )
+                      .pipe(Effect.andThen(measuredReadTool ? advance("handler") : Effect.void))
+                      .pipe(
+                        Effect.andThen(
+                          options.tool.name === "t3_thread_read"
+                            ? ThreadReadMetrics.enterPhase("query")
+                            : Effect.void,
+                        ),
+                      )
+                      .pipe(
+                        Effect.andThen(() => {
+                          const allowed = Context.getOrUndefined(
+                            options.annotations,
+                            KanbanArgumentKeys,
+                          );
+                          const failure =
+                            allowed === undefined
+                              ? undefined
+                              : argumentFailure(options.tool.name, allowed, payload);
+                          return failure === undefined
+                            ? options.tool.name === "wiki_read"
+                              ? WikiReadTiming.step("handler", options.handle(payload))
+                              : options.handle(payload)
+                            : Effect.succeed(
+                                new McpSchema.CallToolResult({
+                                  isError: true,
+                                  content: [{ type: "text", text: encodeJsonText(failure) }],
+                                }),
+                              );
+                        }),
+                      )
+                      .pipe(
+                        Effect.tap(() =>
+                          options.tool.name === "t3_thread_read"
+                            ? ThreadReadMetrics.enterPhase("render")
+                            : Effect.void,
+                        ),
+                      )
+                      .pipe(
+                        Effect.map((result) =>
+                          // Keep delegation failure metadata inside the shared reply-size check.
+                          withFailureStructuredContent(
+                            result,
+                            options.tool.name === "delegate_task" ? MAX_REPLY_BYTES : 8192,
+                          ),
+                        ),
+                      )
                       .pipe(Effect.provideService(ReplyRejection, rejection));
                     // Large reads run on their own "mcp" lane (whole call, so at most
                     // PERMITS.mcp large results are built at once). They queue only behind
@@ -1275,14 +1595,35 @@ const withToolAnalytics =
                         content: [{ type: "text", text: REPLY_TOO_LARGE }],
                       });
                     };
-                    const completed = result.pipe(
+                    const checkedResult =
+                      options.tool.name === "wiki_read"
+                        ? result.pipe(
+                            Effect.flatMap((built) =>
+                              WikiReadTiming.step(
+                                "encode",
+                                Effect.sync(() => check(built)),
+                              ),
+                            ),
+                          )
+                        : Effect.map(result, check);
+                    const completed = checkedResult.pipe(
                       (call) =>
-                        largeRead
+                        measuredReadTool
                           ? ReplyBuilders.bounded(
-                              advance("readiness").pipe(Effect.andThen(Effect.map(call, check))),
-                              "mcp",
+                              advance("readiness").pipe(
+                                Effect.andThen(
+                                  options.tool.name === "t3_thread_read" ||
+                                    BOARD_READ_TOOLS.has(options.tool.name) ||
+                                    options.tool.name === "list_scheduled_tasks"
+                                    ? // Keep the permit outside the detached waiter so masked cleanup
+                                      // cannot retain admission after the read deadline or disconnect.
+                                      McpDeadline.awaitInterruptibly(call)
+                                    : call,
+                                ),
+                              ),
+                              options.tool.name === "wiki_read" ? "wiki" : "mcp",
                             )
-                          : Effect.map(call, check),
+                          : call,
                       Effect.catchCauseIf(
                         (cause) =>
                           cause.reasons.some(
@@ -1308,32 +1649,24 @@ const withToolAnalytics =
                     );
                     // Reuse the bounded-read waiter so masked SQLite cleanup cannot hold the reply.
                     const boundedRead =
-                      options.tool.name === "list_scheduled_tasks"
-                        ? McpDeadline.awaitInterruptibly(completed).pipe(
-                            Effect.timeoutOrElse({
-                              duration: "20 seconds",
-                              orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(function* () {
-                                const now = yield* Clock.monotonicTimeNanos;
-                                return new McpSchema.CallToolResult({
-                                  isError: true,
-                                  content: [
-                                    {
-                                      type: "text",
-                                      text: "Robob is busy; nothing was read. Retry the same call.",
-                                    },
-                                  ],
-                                  structuredContent: {
-                                    reason: "server_busy",
-                                    phase,
-                                    waitedMs: Number(now - readStarted) / 1e6,
-                                  },
-                                });
-                              }),
-                            }),
-                          )
-                        : completed;
-                    const measuredRead = largeRead
-                      ? boundedRead.pipe(
+                      options.tool.name === "t3_thread_read"
+                        ? ThreadReadDeadline.withDeadline(completed)
+                        : options.tool.name === "wiki_read"
+                          ? WikiReadDeadline.withDeadline(completed)
+                          : BOARD_READ_TOOLS.has(options.tool.name) ||
+                              options.tool.name === "list_scheduled_tasks"
+                            ? BoundedReadDeadline.withDeadline(completed, () => ({
+                                phase,
+                                waitedMs:
+                                  Number(clock.monotonicTimeNanosUnsafe() - readStarted) / 1e6,
+                              }))
+                            : completed;
+                    const protectedRead = SavedBoardReply.TIMED_TOOLS.has(options.tool.name)
+                      ? SavedBoardReply.protect(boundedRead, options.tool.name)
+                      : boundedRead;
+                    // Keep read timings on tools/call, outside the saved-reply child span.
+                    const measuredRead = measuredReadTool
+                      ? protectedRead.pipe(
                           Effect.onExit((exit) =>
                             Effect.gen(function* () {
                               const now = yield* Clock.monotonicTimeNanos;
@@ -1367,23 +1700,27 @@ const withToolAnalytics =
                             }),
                           ),
                         )
-                      : boundedRead;
-                    const protectedCall = SavedBoardReply.TOOLS.has(options.tool.name)
-                      ? SavedBoardReply.protect(measuredRead, options.tool.name)
-                      : measuredRead;
-                    return yield* protectedCall.pipe(
+                      : protectedRead;
+                    return yield* measuredRead.pipe(
+                      Effect.map((result) =>
+                        options.tool.name === "delegate_task"
+                          ? withDelegationReceipt(withFailureStructuredContent(result), callState)
+                          : result,
+                      ),
                       Effect.provideService(McpCallAnalytics.McpCall, callState),
                       Effect.provideService(SavedWrite.observer, (receipt) => {
-                        callState.saved = true;
+                        if (!boardWrite) callState.saved = true;
                         if (receipt.kind === "card" && callState.cardId === undefined) {
                           callState.boardId = receipt.card.boardId;
                           callState.cardId = receipt.card.id;
                           callState.cardNumber = receipt.card.number;
+                          callState.cardStage = receipt.card.stage;
                         }
                         parentSaved(receipt);
                       }),
                       Effect.provideService(SavedWrite.commitObserver, () => {
-                        if (callState.saved !== true) callState.saved = "unknown";
+                        // Board writes scope commit evidence to the incoming request in SavedWrite.
+                        if (!boardWrite && callState.saved !== true) callState.saved = "unknown";
                         parentCommitting();
                       }),
                       Effect.onExit((exit) => {
@@ -1392,6 +1729,26 @@ const withToolAnalytics =
                         return Effect.gen(function* () {
                           const endedAt = yield* Clock.currentTimeMillis;
                           handlerEnded = yield* Clock.monotonicTimeNanos;
+                          // Detached cancellation cleanup can finish before response delivery.
+                          if (callState.threadRead !== undefined)
+                            threadReadAtExit = ThreadReadMetrics.snapshot(
+                              callState.threadRead,
+                              handlerEnded,
+                            );
+                          if (callState.cardNext !== undefined) {
+                            const timings = CardNextMetrics.snapshot(
+                              callState.cardNext,
+                              handlerEnded,
+                            );
+                            cardNextAtExit = {
+                              ...timings,
+                              readerLane: callState.readerLane,
+                              callerResolved: callState.callerResolved,
+                              callerResolveMs:
+                                timings.cardNextStages.find((part) => part.stage === "caller")
+                                  ?.durationMs ?? 0,
+                            };
+                          }
                           const resolved = {
                             ...(identifiers.boardId ? { boardId: identifiers.boardId } : {}),
                             ...(callState.boardId ? { boardId: callState.boardId } : {}),
@@ -1443,7 +1800,9 @@ const withToolAnalytics =
                                 durationMs: Math.max(0, endedAt - startedAt),
                                 props: {
                                   ...outcome.props,
-                                  saved: outcome.saved ?? "unknown",
+                                  ...(readOnly && callState.taskLookup === undefined
+                                    ? {}
+                                    : { saved: outcome.saved ?? "unknown" }),
                                   ...(callState.boardId
                                     ? { boardId: callState.boardId }
                                     : identifiers.boardId
@@ -1535,7 +1894,11 @@ export const layerPreviewToolkit = Layer.mergeAll(
 export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorToolkit,
   OrchestratorHandlers.layer,
-).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
+).pipe(
+  Layer.provide(OrchestratorMcpService.layer),
+  Layer.provide(ThreadMetadataMcpService.layer),
+  Layer.provide(BackgroundTerminals.layer),
+);
 
 export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
 

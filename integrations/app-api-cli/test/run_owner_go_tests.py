@@ -1,11 +1,19 @@
 """Run approval and affected commerce regressions without a live Keychain.
 
-PYTHONPATH=.:test python3 test/run_owner_go_tests.py
+From the package directory, install the pinned test dependencies in a venv:
+    python3 -m venv .venv
+    .venv/bin/python3 -I -m pip install -r test/requirements.txt
+    .venv/bin/python3 -I test/run_owner_go_tests.py
+    .venv/bin/python3 -I test/test_commerce_cli.py
 """
 import sys
 import os
 import types
 import unittest
+from pathlib import Path
+
+# -I excludes cwd and the script directory; resolve both test imports explicitly.
+sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
 
 # Captured lane fixtures use the explicitly selected Marriott fallback. The
 # fixture helper supplies the synthetic 9546 decline required by current policy.
@@ -27,6 +35,7 @@ if sys.platform != 'darwin':
 if __name__ == '__main__':
     names = [
         'test_owner_go',
+        'test_owner_go_delegation',
         'test_owner_go_gates',
         'test_install_cli',
         'test_commerce_journal',

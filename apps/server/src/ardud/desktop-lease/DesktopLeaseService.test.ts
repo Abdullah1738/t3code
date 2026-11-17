@@ -12,6 +12,8 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
@@ -112,6 +114,41 @@ const run = <A, E>(
 ) => Effect.scoped(Effect.flatMap(makeHarness(), body));
 
 describe("desktop lease service liveness", () => {
+  it.effect("attributes a six-second running-turn stall to its phase with the call id", () => {
+    const timings: { toolUseId: string; phase: string; durationMs: number }[] = [];
+    const logger = Logger.make(({ message }) => {
+      for (const value of Array.isArray(message) ? message : [message]) {
+        if (
+          typeof value === "object" &&
+          value !== null &&
+          "toolUseId" in value &&
+          "phase" in value &&
+          "durationMs" in value
+        ) {
+          timings.push(value as (typeof timings)[number]);
+        }
+      }
+    });
+    return run(({ service, setLookupGate }) =>
+      Effect.gen(function* () {
+        yield* service.acquire(caller, request);
+        setLookupGate(TestClock.adjust("6 seconds"));
+        yield* service.callStart(caller, "measured-call");
+        assert.deepEqual(
+          timings.map(({ phase, durationMs }) => [phase, durationMs]),
+          [
+            ["caller", 0],
+            ["lease", 0],
+            ["runningTurn", 6000],
+            ["persistence", 0],
+            ["total", 6000],
+          ],
+        );
+        assert.isTrue(timings.every(({ toolUseId }) => toolUseId === "measured-call"));
+      }),
+    ).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false })));
+  });
+
   it.effect("does not touch a replacement ticket for the same child after a paused lookup", () =>
     run(({ service, store, addTime, setLookupGate }) =>
       Effect.gen(function* () {

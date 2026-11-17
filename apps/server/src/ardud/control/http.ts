@@ -1,5 +1,5 @@
 import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
-import { continuationReport } from "../fast-install/report.ts";
+import { bootId, continuationReport } from "../fast-install/report.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 /**
  * Local control API for external integrations (iMessage and Telegram bridges,
@@ -11,11 +11,13 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CommandId,
+  type ControlErrorBody,
+  type ControlRejection,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   MessageId,
   type ModelSelection,
   type OrchestrationV2Command,
-  type OrchestrationV2StoredEvent,
+  OrchestrationV2CancelReason,
   type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderApprovalDecision,
@@ -30,7 +32,6 @@ import {
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import * as Crypto from "effect/Crypto";
-import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -38,7 +39,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import * as Stream from "effect/Stream";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 
 import { issueAttachmentUploadUrl } from "../../assets/AttachmentUpload.ts";
@@ -48,14 +48,23 @@ import * as OrchestrationEventStore from "../../persistence/OrchestrationEventSt
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadMessageIntake from "../../orchestration-v2/ThreadMessageIntake.ts";
 import * as SendAcknowledgement from "../orchestration/ThreadSendAcknowledgement.ts";
-import { userFacingDispatchErrorMessage } from "../../orchestration-v2/UserFacingErrors.ts";
 import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
+import * as ControlEvents from "./ControlEvents.ts";
+import * as Analytics from "../analytics/Analytics.ts";
 import * as ControlStore from "./ControlStore.ts";
+import {
+  ControlError,
+  type ControlErrorCode,
+  errorDetail,
+  fail,
+  operationFailure,
+  rejectionDetails,
+} from "./ControlErrors.ts";
 import * as ControlRequestAnalytics from "./ControlRequestAnalytics.ts";
 import * as ControlThreadRead from "./ControlThreadRead.ts";
 import * as Usage from "./usage.ts";
@@ -71,7 +80,6 @@ import {
 import { CONTROL_ACTOR, controlActor, telegramAnswerOwner } from "./actor.ts";
 import {
   formatModel,
-  lastAssistantText,
   messageSummary,
   modelSelectionFrom,
   parseSince,
@@ -81,13 +89,11 @@ import {
   stateFromRuns,
   stateFromShell,
   TERMINAL_RUN_STATUSES,
-  type ControlThreadState,
 } from "./model.ts";
 import { messagePreview, providerTurnsSettled, runToolEvidence } from "./evidence.ts";
 import * as ReplyBuilders from "../http/ReplyBuilders.ts";
 
 export const CONTROL_ROUTE_PREFIX = "/api/ardud/control";
-const SSE_HEARTBEAT = Duration.seconds(15);
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 500;
 const DEFAULT_MESSAGE_LIMIT = 50;
@@ -172,20 +178,6 @@ const nextThreadListCursor = (shells: ReadonlyArray<OrchestrationV2ThreadShell>,
     : null;
 };
 
-type ControlErrorCode =
-  | "unauthorized"
-  | "forbidden"
-  | "invalid_request"
-  | "not_found"
-  | "conflict"
-  | "unavailable"
-  | "internal";
-
-class ControlError extends Data.TaggedError("ControlError")<{
-  readonly code: ControlErrorCode;
-  readonly message: string;
-}> {}
-
 const STATUS: Record<ControlErrorCode, number> = {
   unauthorized: 401,
   forbidden: 403,
@@ -196,8 +188,6 @@ const STATUS: Record<ControlErrorCode, number> = {
   internal: 500,
 };
 
-const fail = (code: ControlErrorCode, message: string) => new ControlError({ code, message });
-
 /** A merged selection, or the conflict as a 400: a stale effort is never silently picked. */
 const selectionOrFail = (
   result:
@@ -207,9 +197,6 @@ const selectionOrFail = (
   result.kind === "selection"
     ? Effect.succeed(result.selection)
     : Effect.fail(fail("invalid_request", result.reason));
-
-const errorDetail = (cause: unknown): string =>
-  userFacingDispatchErrorMessage(cause) ?? (cause instanceof Error ? cause.message : String(cause));
 
 // ardud: the reaper retries a conflict later, so only the orchestrator's own
 // refusals count as one. Its rejections carry a text cause; a storage or read
@@ -241,7 +228,8 @@ const json = (body: unknown, status = 200) => jsonReply(body, status);
 
 // The agent reply lane covers only building the JSON body: every database read
 // and wait happens before it (ReplyBuilders.ts).
-const encoded = (body: unknown) => ReplyBuilders.bounded(Effect.sync(() => json(body)));
+const encoded = (body: unknown) =>
+  ReplyBuilders.bounded(ControlRequestAnalytics.encoding(Effect.sync(() => json(body))));
 
 const chunkIds = (ids: ReadonlyArray<string>, size = 400): Array<ReadonlyArray<string>> => {
   const out: Array<ReadonlyArray<string>> = [];
@@ -253,7 +241,14 @@ const READER_BUSY_MESSAGE = "The database reader is busy; retry shortly.";
 
 const errorResponse = (error: ControlError) => {
   const response = json(
-    { ok: false, error: { code: error.code, message: error.message } },
+    {
+      ok: false,
+      error: {
+        code: error.code,
+        message: error.message,
+        ...rejectionDetails(error),
+      } satisfies ControlErrorBody,
+    },
     STATUS[error.code],
   );
   // "unavailable" is transient (busy reader lane, startup): tell clients when to retry.
@@ -261,6 +256,16 @@ const errorResponse = (error: ControlError) => {
     ? HttpServerResponse.setHeader(response, "retry-after", "1")
     : response;
 };
+
+// The request span already measures the route; retain refusal diagnostics there.
+const logRejection = Effect.fnUntraced(function* (code: string, rejection: ControlRejection) {
+  yield* Effect.annotateCurrentSpan({
+    "control.reason": rejection.reason,
+    "control.retry_safe": rejection.retrySafe,
+    "control.holder": rejection.holder,
+  });
+  yield* Effect.logWarning("Control request rejected", { code, ...rejection });
+});
 
 type Scope = typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope;
 
@@ -277,6 +282,7 @@ const param = Effect.fn("ControlHttp.param")(function* (name: string) {
     return yield* fail("invalid_request", `Missing path parameter ${name}.`);
   }
   // The router already percent-decodes path parameters.
+  if (name === "threadId") yield* ControlRequestAnalytics.thread(value);
   return value;
 });
 
@@ -358,6 +364,7 @@ const SendBody = Schema.Struct({
 
 const InterruptBody = Schema.Struct({
   reason: OptionalString,
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
   clientRequestId: OptionalString,
   expectedRunId: OptionalString,
   expectedAttemptId: OptionalString,
@@ -407,7 +414,6 @@ const decodeOriginBody = Schema.decodeUnknownEffect(OriginBody);
 const decodeSettingsBody = Schema.decodeUnknownEffect(SettingsBody);
 const decodeArchiveIfIdleBody = Schema.decodeUnknownEffect(ArchiveIfIdleBody);
 const decodeUploadBody = Schema.decodeUnknownEffect(UploadBody);
-const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
 const decodeUploadInput = Schema.decodeUnknownEffect(AttachmentCreateUploadUrlInput);
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
@@ -429,102 +435,8 @@ const DECISIONS: Record<string, ProviderApprovalDecision> = {
   always: "acceptForSession",
 };
 
-export type ControlEvent =
-  | {
-      readonly type: "thread.created";
-      readonly threadId: string;
-      readonly projectId: string;
-      readonly title: string;
-      readonly parentThreadId: string | null;
-    }
-  | {
-      readonly type: "thread.status";
-      readonly threadId: string;
-      readonly runId: string;
-      readonly status: string;
-      readonly state: ControlThreadState;
-    }
-  | {
-      readonly type: "message.completed";
-      readonly threadId: string;
-      readonly runId: string | null;
-      readonly messageId: string;
-      readonly role: string;
-      readonly text: string;
-    }
-  | {
-      readonly type: "request.opened" | "request.resolved";
-      readonly threadId: string;
-      readonly requestId: string;
-      readonly kind: "approval" | "question";
-      readonly requestKind: string;
-      readonly status: string;
-    }
-  | { readonly type: "thread.updated"; readonly threadId: string; readonly change: string };
-
-/** Maps one stored orchestration event onto the small set of events integrations act on. */
-export function controlEventFromStored(stored: OrchestrationV2StoredEvent): ControlEvent | null {
-  const event = stored.event;
-  switch (event.type) {
-    case "thread.created":
-      return {
-        type: "thread.created",
-        threadId: event.threadId,
-        projectId: event.payload.projectId,
-        title: event.payload.title,
-        parentThreadId: event.payload.lineage.parentThreadId,
-      };
-    case "run.created":
-    case "run.updated":
-      return {
-        type: "thread.status",
-        threadId: event.threadId,
-        runId: event.payload.id,
-        status: event.payload.status,
-        state: stateFromRuns([event.payload], false).state,
-      };
-    case "message.updated":
-      if (event.payload.streaming || event.payload.role === "system") return null;
-      if (event.payload.role === "assistant" && event.payload.text.trim().length === 0) return null;
-      return {
-        type: "message.completed",
-        threadId: event.threadId,
-        runId: event.payload.runId,
-        messageId: event.payload.id,
-        role: event.payload.role,
-        text: event.payload.text,
-      };
-    case "runtime-request.updated":
-      return {
-        type: event.payload.status === "pending" ? "request.opened" : "request.resolved",
-        threadId: event.threadId,
-        requestId: event.payload.id,
-        kind: event.payload.kind === "user_input" ? "question" : "approval",
-        requestKind: event.payload.kind,
-        status: event.payload.status,
-      };
-    case "thread.archived":
-    case "thread.unarchived":
-    case "thread.deleted":
-    case "thread.metadata-updated":
-    case "thread.runtime-mode-updated":
-    case "thread.interaction-mode-updated":
-    case "thread.model-selection-updated":
-    case "thread.provider-switched":
-    case "thread.settled":
-    case "thread.unsettled":
-      return { type: "thread.updated", threadId: event.threadId, change: event.type };
-    default:
-      return null;
-  }
-}
-
-const encoder = new TextEncoder();
-const encodeEventJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
-const sseFrame = (sequence: number, event: ControlEvent & { readonly origin?: string | null }) =>
-  `id: ${sequence}\nevent: ${event.type}\ndata: ${encodeEventJson(event)}\n\n`;
-
 const makeRoutes = Effect.gen(function* () {
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
   const candidateBuildCommit = (yield* ServerConfig.ServerConfig).robobBuildCommit;
   const buildCommit =
     typeof candidateBuildCommit === "string" &&
@@ -642,7 +554,7 @@ const makeRoutes = Effect.gen(function* () {
       .enqueueCommand(
         ThreadMessageIntake.dispatchCommand(command).pipe(Effect.provide(intakeContext)),
       )
-      .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+      .pipe(Effect.mapError(operationFailure));
 
   const getShell = (threadId: string) =>
     threads.getThreadShell(ThreadId.make(threadId)).pipe(
@@ -698,11 +610,6 @@ const makeRoutes = Effect.gen(function* () {
           ? {}
           : { recentRunLimit: options.recentRunLimit }),
       })
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-
-  const readMessages = (threadId: string) =>
-    threads
-      .getThreadRecords(ThreadId.make(threadId), ["messages"])
       .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
 
   const filterByOrigin = Effect.fn("ControlHttp.filterByOrigin")(function* (
@@ -857,7 +764,7 @@ const makeRoutes = Effect.gen(function* () {
           workspaceRoot: directory,
           createWorkspaceRootIfMissing: true,
         })
-        .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+        .pipe(Effect.mapError(operationFailure));
       return { projectId: created.project.id, workspaceStrategy: { type: "root" as const } };
     }
     const scratch = yield* folders.ensureScratchProject.pipe(
@@ -936,7 +843,7 @@ const makeRoutes = Effect.gen(function* () {
           creationSource: "server",
         }).pipe(Effect.provide(intakeContext)),
       )
-      .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+      .pipe(Effect.mapError(operationFailure));
     if (body.origin !== undefined && body.origin.trim().length > 0) {
       yield* store
         .setOrigin(launched.threadId, body.origin.trim())
@@ -974,17 +881,21 @@ const makeRoutes = Effect.gen(function* () {
       return yield* fail("invalid_request", "active=true or active=false is required.");
     }
     // Pure reads: keep them off the single writer, as the board reads do.
-    const page = yield* recovery
-      .page({
-        active,
-        cursor: params.get("cursor") || null,
-        // The service applies the default and the 500 cap.
-        limit: Number(params.get("limit") ?? Number.NaN),
-      })
-      .pipe(
-        NodeSqliteClient.readOnly,
-        Effect.mapError((cause) => fail("internal", errorDetail(cause))),
-      );
+    const page = yield* ReplyBuilders.bounded(
+      recovery
+        .page({
+          active,
+          cursor: params.get("cursor") || null,
+          // The service applies the default and the 500 cap.
+          limit: Number(params.get("limit") ?? Number.NaN),
+        })
+        .pipe(
+          NodeSqliteClient.readOnly,
+          NodeSqliteClient.foregroundReads,
+          Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+        ),
+      "controlRead",
+    );
     return json({ ok: true, threads: page.threads, nextCursor: page.nextCursor });
   });
 
@@ -1180,7 +1091,7 @@ const makeRoutes = Effect.gen(function* () {
       threadDetail(threadId).pipe(NodeSqliteClient.foregroundReads),
       "poll",
     );
-    return json({ ok: true, thread });
+    return yield* ControlRequestAnalytics.encoding(Effect.sync(() => json({ ok: true, thread })));
   });
 
   const byNative = Effect.gen(function* () {
@@ -1240,6 +1151,22 @@ const makeRoutes = Effect.gen(function* () {
         "since must be an ISO timestamp or epoch milliseconds.",
       );
     }
+    const role = params.get("role") ?? "user";
+    if (role !== "user" && role !== "assistant" && role !== "system" && role !== "all") {
+      return yield* fail("invalid_request", "role must be user, assistant, system or all.");
+    }
+    const rawThreadIds = params.get("threadIds");
+    const threadIds =
+      rawThreadIds === null ? undefined : rawThreadIds.split(",").map((id) => id.trim());
+    if (
+      threadIds !== undefined &&
+      (threadIds.length > 50 || threadIds.some((id) => id.length === 0))
+    ) {
+      return yield* fail(
+        "invalid_request",
+        "threadIds must contain between 1 and 50 nonempty thread ids.",
+      );
+    }
     const cursor = yield* decodeUserMessageCursor(params.get("cursor"));
     return yield* ReplyBuilders.bounded(
       Effect.gen(function* () {
@@ -1247,6 +1174,8 @@ const makeRoutes = Effect.gen(function* () {
           .userMessagesSince({
             since,
             cursor,
+            role,
+            ...(threadIds === undefined ? {} : { threadIds }),
             limit: clampInt(params.get("limit"), 200, 1000),
           })
           .pipe(
@@ -1256,20 +1185,25 @@ const makeRoutes = Effect.gen(function* () {
                 : fail("internal", errorDetail(cause)),
             ),
           );
-        return json({
-          ok: true,
-          total: page.total,
-          messages: page.messages.map(({ message, ...thread }) => ({
-            ...messageSummary(message),
-            ...thread,
-          })),
-          nextCursor:
-            page.next === null
-              ? null
-              : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
-        });
+        yield* ControlRequestAnalytics.items(page.messages.length, page.total);
+        return yield* ControlRequestAnalytics.encoding(
+          Effect.sync(() =>
+            json({
+              ok: true,
+              total: page.total,
+              messages: page.messages.map(({ message, ...thread }) => ({
+                ...messageSummary(message),
+                ...thread,
+              })),
+              nextCursor:
+                page.next === null
+                  ? null
+                  : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
+            }),
+          ),
+        );
       }).pipe(NodeSqliteClient.foregroundReads),
-      "poll",
+      "controlRead",
     );
   });
 
@@ -1277,8 +1211,8 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
     const params = yield* searchParams;
-    // Bridge polls read one thread: they queue on the poll lane only, never
-    // behind thread lists, HTTP snapshots or MCP reads.
+    // Share the single foreground control permit with cross-thread messages;
+    // a burst must leave the second foreground reader available to the UI.
     const page = yield* ReplyBuilders.bounded(
       Effect.gen(function* () {
         yield* getShell(threadId);
@@ -1299,9 +1233,10 @@ const makeRoutes = Effect.gen(function* () {
                 : clampInt(params.get("limit"), DEFAULT_MESSAGE_LIMIT, 1000),
           })
           .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-      }),
-      "poll",
+      }).pipe(NodeSqliteClient.foregroundReads),
+      "controlRead",
     );
+    yield* ControlRequestAnalytics.items(page.messages.length, page.total);
     return yield* encoded({
       ok: true,
       threadId,
@@ -1413,9 +1348,7 @@ const makeRoutes = Effect.gen(function* () {
               : undefined;
           // Queue only a readiness marker: a cancelled send must never leave its
           // message effect in the startup worker after the commit lease expires.
-          yield* startup
-            .enqueueCommand(Effect.void)
-            .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+          yield* startup.enqueueCommand(Effect.void).pipe(Effect.mapError(operationFailure));
           const result = yield* ThreadMessageIntake.sendToThread({
             projectId: shell.projectId,
             commandId,
@@ -1433,11 +1366,7 @@ const makeRoutes = Effect.gen(function* () {
             // The captured services can include the route's background reader lane.
             NodeSqliteClient.foregroundReads,
             Effect.provide(intakeContext),
-            Effect.mapError((cause) =>
-              isThreadManagementError(cause) && cause._tag === "ThreadManagementThreadNotFoundError"
-                ? fail("not_found", cause.message)
-                : fail("conflict", errorDetail(cause)),
-            ),
+            Effect.mapError(operationFailure),
           );
           return {
             threadId: shell.id,
@@ -1449,12 +1378,7 @@ const makeRoutes = Effect.gen(function* () {
         }),
       serviceScope,
       body.clientRequestId,
-    ).pipe(
-      Effect.provideService(Crypto.Crypto, crypto),
-      Effect.mapError((cause) =>
-        cause._tag === "ControlError" ? cause : fail("conflict", errorDetail(cause)),
-      ),
-    );
+    ).pipe(Effect.provideService(Crypto.Crypto, crypto), Effect.mapError(operationFailure));
     return json({
       ok: true,
       threadId: result.threadId,
@@ -1491,6 +1415,11 @@ const makeRoutes = Effect.gen(function* () {
         return yield* fail(
           "conflict",
           `Run ${expectedRunId} is on attempt ${run.activeAttemptId}, not ${body.expectedAttemptId}.`,
+          {
+            reason: "attempt_changed",
+            retrySafe: false,
+            holder: { threadId, runId: run.id, status: run.status },
+          },
         );
       }
     }
@@ -1501,13 +1430,14 @@ const makeRoutes = Effect.gen(function* () {
           commandId: yield* commandIdFor(`interrupt:${threadId}`, body.clientRequestId),
           threadId: shell.id,
           ...(body.reason === undefined ? {} : { reason: body.reason }),
+          ...(body.cancelReason === undefined ? {} : { cancelReason: body.cancelReason }),
           ...(expectedRunId === undefined ? {} : { runId: RunId.make(expectedRunId) }),
           ...(body.expectedAttemptId === undefined
             ? {}
             : { attemptId: RunAttemptId.make(body.expectedAttemptId) }),
         }),
       )
-      .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+      .pipe(Effect.mapError(operationFailure));
     return json({
       ok: true,
       threadId: shell.id,
@@ -1528,7 +1458,19 @@ const makeRoutes = Effect.gen(function* () {
     if (request === undefined) {
       return yield* fail("not_found", `Request ${requestId} was not found on thread ${threadId}.`);
     }
-    const alreadyIs = () => fail("conflict", `Request ${requestId} is already ${request.status}.`);
+    const alreadyIs = () =>
+      fail("conflict", `Request ${requestId} is already ${request.status}.`, {
+        reason: "request_resolved",
+        retrySafe: false,
+        holder: {
+          threadId,
+          runId:
+            records.turnItems.find((item) => "requestId" in item && item.requestId === requestId)
+              ?.runId ?? null,
+          status: request.status,
+          requestId,
+        },
+      });
     if (request.status !== "pending") return yield* alreadyIs();
     const commandId = yield* commandIdFor(`respond:${requestId}`, body.clientRequestId);
     const decision: ProviderApprovalDecision | undefined =
@@ -1711,11 +1653,22 @@ const makeRoutes = Effect.gen(function* () {
         ),
       );
     if (!result.archived) {
+      yield* logRejection("not_idle", {
+        reason: result.reason,
+        retrySafe: true,
+        holder: { threadId, runId: null, status: result.reason },
+      });
       return json(
         {
           ok: false,
           archived: false,
-          error: { code: "not_idle", reason: result.reason, message: result.detail },
+          error: {
+            code: "not_idle",
+            reason: result.reason,
+            message: result.detail,
+            retrySafe: true,
+            holder: { threadId, runId: null, status: result.reason },
+          } satisfies ControlErrorBody,
         },
         STATUS.conflict,
       );
@@ -1755,12 +1708,14 @@ const makeRoutes = Effect.gen(function* () {
       }
     }).pipe(Effect.timeoutOption(Duration.millis(timeoutMs)));
     const detail = yield* threadDetail(shell.id);
-    const records = yield* readMessages(threadId);
+    const lastAssistant = yield* store
+      .lastAssistant(threadId, runIdParam ?? detail.run?.runId ?? null)
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
     return json({
       ok: true,
       timedOut: Option.isNone(waited),
       thread: detail,
-      lastAssistant: lastAssistantText(records.messages, runIdParam ?? detail.run?.runId),
+      lastAssistant,
     });
   });
 
@@ -1804,6 +1759,7 @@ const makeRoutes = Effect.gen(function* () {
       time: DateTime.formatIso(yield* DateTime.now),
       buildCommit,
       serverStartedAt,
+      bootId,
     });
   });
 
@@ -1848,11 +1804,6 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const request = yield* HttpServerRequest.HttpServerRequest;
     const params = yield* searchParams;
-    const resumeRaw = request.headers["last-event-id"] ?? params.get("after");
-    const resume =
-      resumeRaw === undefined || resumeRaw === null || resumeRaw === ""
-        ? Number.NaN
-        : Number(resumeRaw);
     const threadFilter = params.get("threadId");
     const originFilter = params.get("origin");
     const typeFilter = params.get("types")?.split(",").filter(Boolean);
@@ -1861,15 +1812,13 @@ const makeRoutes = Effect.gen(function* () {
       originCache.has(threadId)
         ? Effect.succeed(originCache.get(threadId) ?? null)
         : Effect.gen(function* () {
-            const own = yield* store.getOrigin(threadId).pipe(Effect.orElseSucceed(() => null));
+            const own = yield* store.getOrigin(threadId);
             let origin = own;
             if (origin === null) {
-              const shell = yield* threads
-                .getThreadShell(ThreadId.make(threadId))
-                .pipe(Effect.orElseSucceed(() => null));
+              const shell = yield* threads.getThreadShell(ThreadId.make(threadId));
               const rootId = shell?.lineage.rootThreadId;
               if (rootId !== undefined && rootId !== threadId) {
-                origin = yield* store.getOrigin(rootId).pipe(Effect.orElseSucceed(() => null));
+                origin = yield* store.getOrigin(rootId);
               }
             }
             // Origin rows can be written after a thread starts; only cache hits.
@@ -1877,43 +1826,57 @@ const makeRoutes = Effect.gen(function* () {
             return origin;
           });
 
-    // Without a cursor the stream starts at the live head instead of replaying history.
-    const afterSequence =
-      Number.isSafeInteger(resume) && resume >= 0
-        ? resume
-        : yield* eventStore.latestAgentSequence().pipe(Effect.orElseSucceed(() => 0));
-    const source = threads
-      .streamStoredEventsFrom({
-        afterSequence,
-        ...(threadFilter === null ? {} : { threadId: ThreadId.make(threadFilter) }),
-      })
-      .pipe(
-        Stream.mapEffect((stored) =>
-          Effect.gen(function* () {
-            const event = controlEventFromStored(stored);
-            if (event === null) return "";
-            if (typeFilter !== undefined && !typeFilter.includes(event.type)) return "";
-            const origin = yield* originOf(event.threadId);
-            if (originFilter !== null) {
-              const matches = originFilter === "none" ? origin === null : origin === originFilter;
-              if (!matches) return "";
-            }
-            return sseFrame(stored.sequence, { ...event, origin });
-          }),
-        ),
-        Stream.filter((frame) => frame.length > 0),
-      );
-    const hello = Stream.make(
-      `retry: 3000\nid: ${afterSequence}\nevent: ready\ndata: {"type":"ready","sequence":${afterSequence}}\n\n`,
+    const head = yield* eventStore
+      .latestAgentSequence()
+      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+    const requestedStart = ControlEvents.streamStart(
+      request.headers["last-event-id"],
+      params.get("after"),
+      head,
     );
-    const heartbeats = Stream.tick(SSE_HEARTBEAT).pipe(
-      Stream.drop(1),
-      Stream.map(() => ": ping\n\n"),
-    );
-    const body = Stream.concat(hello, Stream.merge(source, heartbeats)).pipe(
-      Stream.catchCause(() => Stream.make(`event: error\ndata: {"type":"error"}\n\n`)),
-      Stream.map((frame) => encoder.encode(frame)),
-    );
+    const compacted = requestedStart.resumed
+      ? yield* store
+          .hasCompactedEvents(requestedStart.afterSequence, head)
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))))
+      : false;
+    const start = compacted ? { afterSequence: head, resumed: false } : requestedStart;
+    const accepts = (stored: Parameters<typeof ControlEvents.controlEventFromStored>[0]) => {
+      const event = ControlEvents.controlEventFromStored(stored);
+      return event !== null && (typeFilter === undefined || typeFilter.includes(event.type));
+    };
+    const source = threads.streamStoredEventsFrom({
+      afterSequence: start.afterSequence,
+      ...(threadFilter === null ? {} : { threadId: ThreadId.make(threadFilter) }),
+      // Drop streaming deltas before projection and the bounded live queue.
+      filter: accepts,
+      ...(start.resumed
+        ? {
+            verifyReplay: (throughSequence: number) =>
+              store
+                .hasCompactedEvents(start.afterSequence, throughSequence)
+                .pipe(
+                  Effect.flatMap((missing) =>
+                    missing
+                      ? Effect.fail(new ControlEvents.ControlHistoryCompactedError())
+                      : Effect.void,
+                  ),
+                ),
+          }
+        : {}),
+    });
+    // Subscribe before catch-up; replay covers > cursor through the captured head,
+    // then live covers > head. A resumed connection can apply incrementally with
+    // the same filters. Compacted history resets to the head with resumed:false;
+    // compaction racing catch-up fails with history_compacted (refetch required).
+    const body = yield* ControlEvents.makeBody({
+      source,
+      ...start,
+      threadFilter,
+      originFilter,
+      accepts,
+      originOf,
+      analytics: Option.getOrUndefined(analytics),
+    });
     return HttpServerResponse.stream(body, {
       contentType: "text/event-stream",
       headers: {
@@ -1929,7 +1892,16 @@ const makeRoutes = Effect.gen(function* () {
     effect: Effect.Effect<HttpServerResponse.HttpServerResponse, ControlError, R>,
   ) =>
     effect.pipe(
-      Effect.catchTags({ ControlError: (error) => Effect.succeed(errorResponse(error)) }),
+      Effect.catchTags({
+        ControlError: (error) =>
+          Effect.gen(function* () {
+            const rejection = rejectionDetails(error);
+            if (rejection !== undefined) {
+              yield* logRejection(error.code, rejection);
+            }
+            return errorResponse(error);
+          }),
+      }),
       Effect.catchCause((cause) =>
         Effect.logWarning("ardud control request failed", { cause }).pipe(
           Effect.as(errorResponse(fail("internal", "Internal error."))),

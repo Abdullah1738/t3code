@@ -77,6 +77,22 @@ class StartupTests(HomeFiles):
         with patch.object(home, "_health", side_effect=data):
             return home.wait_while_starting(STARTING["phase"], "run-1", **kw)
 
+    def test_degraded_home_keeps_probe_and_start_wait_at_home(self):
+        for ok in (True, False):
+            degraded = {"ok": ok, "degraded": True, "reasons": ["reaper has not completed a pass for 200 s (disk)"]}
+            with self.subTest(ok=ok), patch.object(home, "_health", return_value=degraded):
+                self.assertIsNone(home.probe())
+                self.assertEqual(home.PROBE_FACTS.get()["class"], "degraded")
+                self.assertIsNone(home.wait_while_starting("reconcile", "run-1"))
+
+    def test_degraded_flag_never_masks_hard_admission_or_startup(self):
+        from offbox_lib.startup_health import accepting_health
+        for extra in ({"up": False}, {"starting": True}, {"reasons": ["incus is not answering"]},
+                      {"disk_full": True}, {"disk": {"level": "unknown"}},
+                      {"reasons": ["state database is not readable"]}):
+            with self.subTest(extra=extra):
+                self.assertFalse(accepting_health(dict({"ok": False, "degraded": True}, **extra)))
+
     def test_probe_and_person_legacy_startup_then_ready(self):
         for who in (None, "moni"):
             with self.subTest(who=who), patch.object(common, "person", return_value=who), \
@@ -91,7 +107,7 @@ class StartupTests(HomeFiles):
         self.assertEqual(reason, "home still starting after 12 s (reconcile)")
         self.assertEqual(self.clock.now, 12)
         self.assertEqual(self.events.call_args.kwargs["props"],
-                         {"phase": "reconcile", "checkpoint": "post", "outcome": "failover"})
+                         {"phase": "reconcile", "class": "starting", "checkpoint": "post", "outcome": "failover"})
         self.assertEqual(self.events.call_args.kwargs["ids"]["run"], "run-1")
 
     def test_reconcile_failure_is_never_starting(self):

@@ -9,7 +9,12 @@ import sqlite3
 import subprocess
 import time
 
+import phone_hold
+import toollog
+
 ROOT = Path(os.environ.get('DELIVERY_STORE', str(Path.home() / '.local/state/order-tracker')))
+# Keep priority_hold_stale for health rows written before the ph status migration.
+HOLD_DETAILS = {'deferred_priority_hold', 'priority_hold_stale'}
 PACKAGES = {'com.talabat': 'talabat', 'com.noon.buyerapp': 'noon',
             'com.careem.acma': 'careem', 'com.amazon.mShop.android.shopping': 'amazon'}
 
@@ -55,12 +60,36 @@ def parse_pushes(dump, now=None):
         yield (key, PACKAGES[pkg[1]], posted, now, text[:1500], json.dumps(ids))
 
 
+def hold_state(now=None):
+    # ph hold status sweeps freed holds (agent-tools #206), so present means a live holder
+    status = phone_hold.status()
+    if not status['present']:
+        return None
+    return {'state': 'live', **{key: status.get(key) for key in
+            ('age_s', 'holder_alive', 'agent_comm', 'stale_in_s', 'error')}}
+
+
+def log_hold_transition(previous, hold):
+    detail = 'deferred_priority_hold' if hold else None
+    if detail == previous or (detail is None and previous not in HOLD_DETAILS):
+        return
+    props = {key: hold.get(key) if hold else None
+             for key in ('age_s', 'holder_alive', 'agent_comm')}
+    if hold and hold.get('error'):
+        props['error'] = hold['error']
+    toollog.emit('order-watch', 'collector.hold_' + ('seen' if hold else 'cleared'),
+                 props=props)
+
+
 def collect():
     now = time.time()
     with connect() as db:
-        if (Path.home() / '.local/share/phone-lock/priority-hold').exists():
+        previous = db.execute('SELECT detail FROM health WHERE source="phone"').fetchone()
+        hold = hold_state(now)
+        log_hold_transition(previous['detail'] if previous else None, hold)
+        if hold is not None:
             db.execute('INSERT OR REPLACE INTO health VALUES (?,?,?,?)',
-                       ('phone', now, 0, 'priority_hold'))
+                       ('phone', now, 1, 'deferred_priority_hold'))
             return
         try:
             p = subprocess.run(['adb', '-s', '002473611000997', 'shell', 'dumpsys', 'notification', '--noredact'],
@@ -145,10 +174,13 @@ def reconcile(cfg, detected=None, source=None, evidence_time=None, reported=None
 
 
 def health_check():
+    now = time.time()
     with connect() as db:
         row = db.execute('SELECT * FROM health WHERE source="phone"').fetchone()
-        if not row or time.time() - row['checked'] > 120:
+        if not row or now - row['checked'] > 120:
             raise RuntimeError('notification collector is stale; restart com.ardud.delivery-notifications')
+        if row['detail'] in HOLD_DETAILS and hold_state(now) is not None:
+            return
         if not row['ok']:
             raise RuntimeError('notification collection unavailable: ' + row['detail'])
 

@@ -117,8 +117,10 @@ model's final checkout verification remain mandatory. Read `plans/COVERAGE.md`
 for actual validated routes, preconditions and gaps; a generic template is not
 evidence that every workflow is trained. Read-only catalog lookups use
 `app-api-search` APIs, without phone verification; Amazon remains app-only.
-Runner exit 5 means PHONE_BUSY: yield. Request tasks set `PHONE_HOLD_OWNER` to
-the exact contents of their own hold; background training must never bypass it.
+`ph` and the runner exit 5 (PHONE_BUSY) when another task holds the phone:
+yield without retrying in a loop. Request tasks export `PHONE_HOLD_OWNER` as
+their exact hold token for every `ph` call and runner. Background training uses
+`ph lease run --owner <card-or-thread-id> --purpose "training" -- <cmd>`.
 Runs also acquire an automatic `jevrun.lock` flock, released on process exit.
 
 Persistent tree reads are often <1s, but repeated standalone ph calls measured
@@ -244,19 +246,30 @@ For multi-step navigation, write a short plan JSON and run it in one call instea
 
 ## Shared phone: priority hold (owner rule 2026-10-02)
 
-**Cancellation/steering cleanup is immediate:** when a task is cancelled,
-superseded, or steered away from phone work, stop its pending phone inputs and
-release `~/.local/share/phone-lock/priority-hold` immediately if (and only if)
-the contents still match that task's recorded owner token. Do this before the
-reply or unrelated work, not at the old task's natural end. Use a `finally`/shell
-EXIT/INT/TERM cleanup for owned holds on failure as well. If an interrupted child
-cannot run cleanup, its parent must stop that child's phone process and release
-only the confirmed matching child's hold. Never remove another live task's hold,
-copy its token into PHONE_HOLD_OWNER, or reclaim based on age alone. Check release
-by readback (absent or a different owner's new hold), without deleting a successor.
+Take a request hold with `ph hold acquire --token <session-id>`, then export
+`PHONE_HOLD_OWNER=<session-id>` for every `ph` call and runner. Use
+`ph hold release` right away on completion, cancellation, steering away, or
+failure (stop pending phone inputs first, before replying or moving on);
+put cleanup in `finally` or a shell EXIT/INT/TERM trap. A parent cleans up an
+interrupted child's confirmed hold after stopping its phone work.
 
-Background/long-running phone work (e.g. app traffic capture, API reverse-engineering) must yield to owner/Moni tasks (orders, rides, lookups).
-- Request tasks: acquire the hold exclusively with their session ID (shell noclobber), refresh its mtime, and remove it on completion/failure only if its contents still match their session. If another holder exists, coordinate rather than overwrite it.
-- Background builds: before EVERY phone batch check `test -e ~/.local/share/phone-lock/priority-hold`; if present, stop phone input and do off-device work. Resume after release. A hold older than45min needs owner/session liveness checking, not automatic deletion or bypass.
+ph refreshes your hold on every call. Use `ph hold refresh` during a long wait
+without phone calls (an OTP or a reply). A hold frees itself when its recorded
+agent process exits or after 30 minutes without a refresh; ph archives it.
+`ph hold status` shows the holder's process, when known, and time until stale.
+Never delete another task's hold or copy its token into `PHONE_HOLD_OWNER`.
+
+`ph` enforces holds and leases (exit 5, PHONE_BUSY). Another request's hold
+blocks every device command, including reads. Exit 5 means yield, without
+retrying in a loop or deleting another task's claim.
+
+Background/long phone jobs (QA, captures, training) use
+`ph lease run --owner <card-or-thread-id> --purpose "<short>" -- <cmd>`, or
+`ph lease acquire`, `refresh`, and `release`. Direct uiautomator2/adb scripts
+must run under a lease or own the priority hold. Request holds outrank leases;
+expired leases are free. `ph lease status` shows the lease and sweeps free holds.
+A forward created before a lease was taken keeps working; inspect it with `adb forward --list`.
+The holder can remove it with `adb forward --remove <local>`; forwards are never removed automatically.
+
 - Proxy gotcha: deleting `http_proxy` (reads null) can leave a cached dead proxy (127.0.0.1:18089) so apps show "no internet". Clear explicitly with `adb shell settings put global http_proxy :0` and leave it at `:0`.
 - Phone serial 002473611000997 (always pass -s). Local emulators are blocked since 2026-10-09 (Run Cloud via the `run-cloud` skill instead), so this phone should be the only adb device.

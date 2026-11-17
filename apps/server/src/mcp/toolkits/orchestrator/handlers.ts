@@ -8,9 +8,25 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
 
+import * as BackgroundTerminals from "../../../ardud/exec-sessions/BackgroundTerminals.ts";
+
 const handlers = Effect.gen(function* () {
   const serviceScope = yield* Effect.scope;
   return {
+    t3_exec_sessions: McpToolAccess.readsAsCaller(() =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        const service = yield* BackgroundTerminals.BackgroundTerminals;
+        return yield* service.listBackgroundTerminals(scope);
+      }),
+    ),
+    t3_exec_session_stop: McpToolAccess.actsAsCaller((input) =>
+      Effect.gen(function* () {
+        const scope = yield* McpInvocationContext.McpInvocationContext;
+        const service = yield* BackgroundTerminals.BackgroundTerminals;
+        return yield* service.stopBackgroundTerminal(scope, input);
+      }),
+    ),
     orchestrator_capabilities: McpToolAccess.reads(() =>
       Effect.gen(function* () {
         const scope = yield* McpInvocationContext.McpInvocationContext;
@@ -49,6 +65,7 @@ const handlers = Effect.gen(function* () {
             Effect.mapError(
               (cause) =>
                 new OrchestratorMcpFailure({
+                  reason: "invalid_args",
                   code:
                     cause.reason === "unavailable" || cause.reason === "stop-failed"
                       ? "orchestration_error"

@@ -33,6 +33,8 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
+import * as Logger from "effect/Logger";
 import * as Exit from "effect/Exit";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -60,6 +62,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
+import * as ProviderStartProgress from "../ardud/orchestration/ProviderStartProgress.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as PreviewAgentActivity from "../preview/PreviewAgentActivity.ts";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
@@ -4265,6 +4268,189 @@ it.effect("fails the run when its event stream ends without a root terminal", ()
   }),
 );
 
+it.effect.each(
+  (["interrupted", "failed", "completed", "cancelled", "rolled_back"] as const).flatMap((status) =>
+    (["command", "held-text", "message", "node"] as const).flatMap((kind) =>
+      (["before-terminal", "unowned-terminal", "rejected-terminal"] as const).map((phase) => ({
+        status,
+        kind,
+        phase,
+      })),
+    ),
+  ),
+)(
+  "drops late activity and stops the exact provider turn of an externally $status run ($kind, $phase)",
+  ({ status, kind, phase }) =>
+    Effect.gen(function* () {
+      const stops: ProviderTurnId[] = [];
+      const logs: unknown[] = [];
+      const now = yield* DateTime.now;
+      let guarded = false;
+      let settled = phase === "before-terminal";
+      const result = yield* captureRootRunTermination({
+        key: `late-settled:${status}`,
+        shouldFinalizeRun: () => Effect.succeed(phase === "rejected-terminal"),
+        rejectTerminalWrite: phase === "rejected-terminal",
+        loadRunSettlement: () =>
+          Effect.succeed({
+            status: settled ? status : "running",
+            completedAt: settled ? now : null,
+          }),
+        responseStreamingMode: "turn",
+        events: (ids) => {
+          const event = backgroundTurnItemEvent(ids, "command_execution", "running", 1);
+          if (event.type !== "turn_item.updated") throw new Error("Expected turn item");
+          const item = {
+            ...event.turnItem,
+            id: TurnItemId.make(`${event.turnItem.id}:held`),
+            type: "assistant_message" as const,
+            text: "Still working",
+            streaming: true,
+          };
+          const late =
+            kind === "command"
+              ? event
+              : kind === "held-text"
+                ? { ...event, turnItem: item }
+                : kind === "message"
+                  ? {
+                      type: "message.updated" as const,
+                      driver,
+                      message: {
+                        id: MessageId.make("late-message"),
+                        threadId: ids.threadId,
+                        runId: ids.runId,
+                        role: "assistant" as const,
+                        text: "Finished",
+                        streaming: false,
+                      },
+                    }
+                  : {
+                      type: "node.updated" as const,
+                      driver,
+                      node: {
+                        id: ids.rootNodeId,
+                        threadId: ids.threadId,
+                        runId: ids.runId,
+                        kind: "command_execution",
+                        status: "running",
+                      },
+                    };
+          const lateEvents = Stream.make(
+            late,
+            late,
+          ) as Stream.Stream<ProviderAdapter.ProviderAdapterV2Event>;
+          return phase === "before-terminal"
+            ? lateEvents
+            : Stream.make(event).pipe(
+                Stream.concat(
+                  Stream.fromEffect(
+                    Effect.sync(() => {
+                      settled = true;
+                      return rootTerminalEvent(ids, "completed");
+                    }),
+                  ),
+                ),
+                Stream.concat(lateEvents),
+              );
+        },
+        ingestNormalized: (input) =>
+          Effect.sync(() => {
+            if (input.event.type !== "turn.terminal")
+              guarded = input.writeIfRunCurrent?.expectedStatus === "running";
+            return [];
+          }),
+        interruptTurn: (input) =>
+          Effect.sync(() => {
+            assert.isTrue(input.stopBackgroundWork);
+            stops.push(input.providerTurnId);
+          }),
+      }).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make(({ message }) => {
+              logs.push(message);
+            }),
+          ]),
+        ),
+      );
+      assert.equal(guarded, kind !== "held-text" || phase !== "before-terminal");
+      assert.deepEqual(stops, [`provider-turn:late-settled:${status}`]);
+      assert.isEmpty(result.written);
+      assert.isEmpty(result.observed);
+      assert.isTrue(result.previewActivityEnded);
+      assert.lengthOf(
+        logs.filter((m) => String(m).includes("provider item after run settlement")),
+        1,
+      );
+      const warning = logs
+        .flatMap((entry) => (Array.isArray(entry) ? entry : [entry]))
+        .find(
+          (entry) =>
+            typeof entry === "object" && entry !== null && "secondsSinceSettlement" in entry,
+        );
+      assert.deepInclude(warning, {
+        threadId: `thread:late-settled:${status}`,
+        runId: `run:late-settled:${status}`,
+        ordinal: 1,
+        providerTurnId: `provider-turn:late-settled:${status}`,
+        secondsSinceSettlement: 0,
+      });
+    }),
+);
+
+it.effect("stops a settled run by exact attempt when late activity precedes its turn id", () =>
+  Effect.gen(function* () {
+    const stops: string[] = [];
+    const result = yield* captureRootRunTermination({
+      key: "late-before-turn-id",
+      unobservedProviderTurn: true,
+      shouldFinalizeRun: () => Effect.succeed(false),
+      loadRunSettlement: () => Effect.succeed({ status: "interrupted", completedAt: null }),
+      events: (ids) => Stream.make(backgroundTurnItemEvent(ids, "command_execution", "running", 1)),
+      interruptStartingRun: (input) =>
+        Effect.sync(() => {
+          assert.isTrue(input.stopBackgroundWork);
+          stops.push(`${input.runId}:${input.attemptId}`);
+        }),
+      interruptTurn: () => Effect.die("No provider turn id is available"),
+    });
+    assert.deepEqual(stops, ["run:late-before-turn-id:attempt:late-before-turn-id"]);
+    assert.isEmpty(result.written);
+    assert.isEmpty(result.observed);
+  }),
+);
+
+it.effect("keeps confirmed background completions after the root run settles", () =>
+  Effect.gen(function* () {
+    let settled = false;
+    const items: string[] = [];
+    yield* captureRootRunTermination({
+      key: "confirmed-completion",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      loadRunSettlement: () =>
+        Effect.succeed({ status: settled ? "completed" : "running", completedAt: null }),
+      onTerminalRun: Effect.sync(() => {
+        settled = true;
+      }),
+      events: (ids) =>
+        Stream.make(
+          backgroundTurnItemEvent(ids, "command_execution", "running", 1),
+          rootTerminalEvent(ids, "completed"),
+          backgroundTurnItemEvent(ids, "command_execution", "completed", 2),
+        ),
+      ingestNormalized: ({ event }) =>
+        Effect.sync(() => {
+          if (event.type === "turn_item.updated") items.push(event.turnItem.status);
+          return [];
+        }),
+      interruptTurn: () =>
+        Effect.die("Confirmed background completion must not interrupt the turn"),
+    });
+    assert.deepEqual(items, ["running", "completed"]);
+  }),
+);
+
 // ardud (9 Nov): a failed projection read failed the run while the Claude turn
 // kept running unread, and the next send was refused as "previous turn is
 // still running". A failed run must stop its provider turn.
@@ -4302,6 +4488,197 @@ it.effect("stops the provider turn when ingestion fails the run before a termina
     assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
     assert.deepEqual(yield* Ref.get(interrupted), ["provider-turn:ingest-failure:orphaned-turn"]);
     assert.deepEqual(preservation, [[false, false]]);
+  }),
+);
+
+it.effect.each(["ended", "healthy-successor"] as const)(
+  "finalizes ingestion failure after one not-active Stop: %s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const stale = ProviderTurnId.make(`provider-turn:orphan-not-active:${scenario}`);
+      const active =
+        scenario === "healthy-successor" ? ProviderTurnId.make("healthy-successor") : null;
+      const calls: ProviderTurnId[] = [];
+      const warnings: unknown[] = [];
+      const result = yield* captureRootRunTermination({
+        key: `orphan-not-active:${scenario}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.fail(
+            new ProviderAdapter.ProviderAdapterEventStreamError({
+              driver,
+              providerSessionId: ProviderSessionId.make("session:orphan-not-active"),
+              cause: "reader unavailable",
+            }),
+          ),
+        interruptTurn: (turn) =>
+          Effect.gen(function* () {
+            calls.push(turn.providerTurnId);
+            assert.equal(turn.providerTurnId, stale);
+            assert.notEqual(turn.providerTurnId, active);
+            assert.isFalse(turn.requestRuntimeRestart);
+            assert.isFalse(turn.stopBackgroundWork);
+            return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+              driver,
+              providerThreadId: turn.providerThread.id,
+              providerTurnId: turn.providerTurnId,
+            });
+          }),
+        onTerminalRun: Effect.sync(() => assert.deepEqual(calls, [stale])),
+      }).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make(({ message, logLevel }) => {
+              if (logLevel === "Warn") warnings.push(message);
+            }),
+          ]),
+        ),
+      );
+      assert.deepEqual(calls, [stale]);
+      assert.equal(
+        warnings.map(String).filter((m) => m.includes("could not stop an orphaned provider turn"))
+          .length,
+        0,
+      );
+      assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+    }),
+);
+
+it.effect("caps orphan Stop failures with exponential backoff and finalizes the run", () =>
+  Effect.gen(function* () {
+    const attempts = yield* Queue.unbounded<number>();
+    const timestamps: number[] = [];
+    const logs: unknown[] = [];
+    const result = yield* captureRootRunTermination({
+      key: "orphan-stop-cap",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () =>
+        Stream.fail(
+          new ProviderAdapter.ProviderAdapterEventStreamError({
+            driver,
+            providerSessionId: ProviderSessionId.make("session:orphan-stop-cap"),
+            cause: "reader unavailable",
+          }),
+        ),
+      interruptTurn: () =>
+        Effect.gen(function* () {
+          timestamps.push(yield* Clock.currentTimeMillis);
+          yield* Queue.offer(attempts, timestamps.length);
+          return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+            driver,
+            detail: "interrupt transport unavailable",
+          });
+        }),
+      onTerminalRun: Effect.sync(() => assert.lengthOf(timestamps, 10)),
+      afterStart: () =>
+        Effect.gen(function* () {
+          assert.equal(yield* Queue.take(attempts), 1);
+          for (const delay of [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000]) {
+            yield* TestClock.adjust(delay);
+            yield* Queue.take(attempts);
+          }
+        }),
+    }).pipe(
+      Effect.provide(
+        Logger.layer([
+          Logger.make(({ message }) => {
+            logs.push(message);
+          }),
+        ]),
+      ),
+    );
+    assert.deepEqual(
+      timestamps.map((time) => time - timestamps[0]!),
+      [0, 1000, 3000, 7000, 15000, 31000, 61000, 91000, 121000, 151000],
+    );
+    const messages = logs.map(String);
+    assert.equal(
+      messages.filter((m) => m.includes("could not stop an orphaned provider turn")).length,
+      1,
+    );
+    assert.equal(
+      messages.filter((m) => m.includes("gave up stopping an orphaned provider turn")).length,
+      1,
+    );
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+  }),
+);
+
+it.effect.each(["ownership-read", "missing-turn-id"] as const)(
+  "bounds orphan Stop prerequisite failures: %s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const probes = yield* Queue.unbounded<void>();
+      let probeCount = 0;
+      let stops = 0;
+      const result = yield* captureRootRunTermination({
+        key: `orphan-prerequisite:${scenario}`,
+        unobservedProviderTurn: scenario === "missing-turn-id",
+        shouldFinalizeRun: () =>
+          Effect.gen(function* () {
+            probeCount++;
+            yield* Queue.offer(probes, undefined);
+            if (scenario === "ownership-read")
+              return yield* new ProjectionStore.ProjectionStoreReadError({
+                threadId: ThreadId.make(`thread:orphan-prerequisite:${scenario}`),
+                cause: "ownership read unavailable",
+              });
+            return true;
+          }),
+        events: () =>
+          Stream.fail(
+            new ProviderAdapter.ProviderAdapterEventStreamError({
+              driver,
+              providerSessionId: ProviderSessionId.make("session:orphan-prerequisite"),
+              cause: "reader unavailable",
+            }),
+          ),
+        interruptTurn: () =>
+          Effect.sync(() => {
+            stops++;
+          }),
+        afterStart: () =>
+          Effect.gen(function* () {
+            yield* Queue.take(probes);
+            for (const delay of [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000]) {
+              yield* TestClock.adjust(delay);
+              yield* Queue.take(probes);
+            }
+          }),
+      });
+      assert.equal(probeCount, 10);
+      assert.equal(stops, 0);
+      assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+    }),
+);
+
+it.effect("bounds slow orphan Stops with a five-minute total deadline", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    let attempts = 0;
+    const start = yield* Clock.currentTimeMillis;
+    const result = yield* captureRootRunTermination({
+      key: "orphan-stop-deadline",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () =>
+        Stream.fail(
+          new ProviderAdapter.ProviderAdapterEventStreamError({
+            driver,
+            providerSessionId: ProviderSessionId.make("session:orphan-stop-deadline"),
+            cause: "reader unavailable",
+          }),
+        ),
+      interruptTurn: () =>
+        Effect.sync(() => {
+          attempts++;
+        }).pipe(Effect.andThen(Deferred.succeed(entered, undefined)), Effect.andThen(Effect.never)),
+      afterStart: () => Deferred.await(entered).pipe(Effect.andThen(TestClock.adjust("5 minutes"))),
+      onTerminalRun: Effect.gen(function* () {
+        assert.equal((yield* Clock.currentTimeMillis) - start, 300_000);
+        assert.equal(attempts, 7);
+      }),
+    });
+    assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
   }),
 );
 
@@ -5238,6 +5615,9 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
 
 function captureRootRunTermination(input: {
   readonly key: string;
+  readonly cancelMetadata?: Pick<OrchestrationV2Run, "cancelReason" | "cancelDetail">;
+  readonly loadCancelMetadata?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRunCancelMetadata"];
+  readonly unobservedProviderTurn?: boolean;
   readonly providerDriver?: ProviderDriverKind;
   readonly onTerminalRun?: Effect.Effect<void>;
   readonly delegated?: boolean;
@@ -5249,6 +5629,7 @@ function captureRootRunTermination(input: {
     | "other_task"
     | "read_error";
   readonly recoveryRun?: OrchestrationV2Run["transientRecovery"];
+  readonly stallRecovery?: OrchestrationV2Run["delegatedTaskStallRecovery"];
   readonly providerStartDeadlineAt?: OrchestrationV2Run["providerStartDeadlineAt"];
   readonly responseStreamingMode?: "turn" | "paragraph";
   readonly launchRecovery?: OrchestrationV2Run["launchRecovery"];
@@ -5262,6 +5643,7 @@ function captureRootRunTermination(input: {
   readonly rejectRecoveryWrite?: boolean;
   readonly loadDelegatedTask?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadDelegatedTask"];
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
+  readonly loadRunSettlement?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRunSettlement"];
   readonly rejectTerminalWriteForAttempt?: RunAttemptId;
   readonly runStart?: (
     start: Effect.Effect<void, RunExecutionService.RunExecutionServiceV2Error>,
@@ -5286,6 +5668,7 @@ function captureRootRunTermination(input: {
   readonly awaitSessionExit?: ProviderAdapter.ProviderAdapterV2SessionRuntime["awaitSessionExit"];
   readonly unsafeProcessStop?: Effect.Effect<void>;
   readonly sharedSessionId?: ProviderSessionId;
+  readonly nativeSessionId?: string;
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2Shape["ingestNormalized"];
   readonly refreshAfterTurn?: Effect.Effect<void>;
   readonly onSubscriptionClose?: Effect.Effect<void>;
@@ -5500,6 +5883,7 @@ function captureRootRunTermination(input: {
           startedAt: input.recordUsage ? usageStartedAt : null,
           providerInstanceId,
           transientRecovery: input.recoveryRun,
+          delegatedTaskStallRecovery: input.stallRecovery,
           providerStartDeadlineAt: input.providerStartDeadlineAt,
           launchRecovery: input.launchRecovery,
           modelSelection: { instanceId: providerInstanceId, model: input.model ?? "gpt-5.4" },
@@ -5517,6 +5901,11 @@ function captureRootRunTermination(input: {
         providerThread: {
           id: ids.providerThreadId,
           driver,
+          ...(input.nativeSessionId === undefined
+            ? {}
+            : {
+                nativeThreadRef: { driver, nativeId: input.nativeSessionId, strength: "strong" },
+              }),
           ...(input.sessionRefused === undefined
             ? {}
             : { nativeMetadata: { claudeRefusalObserved: input.sessionRefused } }),
@@ -5524,7 +5913,7 @@ function captureRootRunTermination(input: {
         attempt: {
           id: ids.attemptId,
           attemptOrdinal: 1,
-          providerTurnId: ids.rootProviderTurnId,
+          providerTurnId: input.unobservedProviderTurn ? null : ids.rootProviderTurnId,
         } as OrchestrationV2RunAttempt,
         attemptId: ids.attemptId,
         ...(input.legacyOwnership === undefined
@@ -5562,6 +5951,11 @@ function captureRootRunTermination(input: {
           ? {}
           : { loadDelegatedTask: input.loadDelegatedTask }),
         shouldFinalizeRun: input.shouldFinalizeRun,
+        ...(input.loadRunSettlement === undefined
+          ? {}
+          : { loadRunSettlement: input.loadRunSettlement }),
+        loadRunCancelMetadata:
+          input.loadCancelMetadata ?? (() => Effect.succeed(input.cancelMetadata)),
         ...(input.durableRefusal === undefined && input.refusalRead === undefined
           ? {}
           : { loadClaudeRefusal: readRefusal }),
@@ -5935,6 +6329,97 @@ function rootTerminalEvent(
       }
     : { ...common, status, failure: null };
 }
+
+it.effect.each(["ack", "output"] as const)(
+  "retains non-Claude native %s evidence while ingestion is blocked",
+  (evidence) =>
+    Effect.gen(function* () {
+      const key = `blocked-native-${evidence}`;
+      const ids = backgroundScenarioIds(key);
+      const progress = yield* ProviderStartProgress.ProviderStartProgress;
+      const now = yield* DateTime.now;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      yield* progress.begin({
+        threadId: ids.threadId,
+        runId: ids.runId,
+        attemptId: ids.attemptId,
+        attemptOrdinal: 1,
+        provider: ProviderInstanceId.make("codex"),
+        model: "gpt-5.4",
+        delegated: false,
+        providerSessionId: ProviderSessionId.make(`session:${key}`),
+      });
+      const turn = {
+        id: ids.rootProviderTurnId,
+        providerThreadId: ids.providerThreadId,
+        nodeId: ids.rootNodeId,
+        runAttemptId: ids.attemptId,
+        nativeTurnRef: null,
+        ordinal: 1,
+        status: "running" as const,
+        startedAt: now,
+        completedAt: null,
+      };
+      yield* captureRootRunTermination({
+        key,
+        nativeSessionId: "codex-native-session",
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: () =>
+          Stream.fromIterable([
+            { type: "provider_turn.updated", driver, providerTurn: turn },
+            evidence === "ack"
+              ? {
+                  type: "provider_turn.updated",
+                  driver,
+                  providerTurn: { ...turn, promptAcceptedAt: now },
+                }
+              : {
+                  type: "turn_item.updated",
+                  driver,
+                  turnItem: {
+                    id: ids.itemId,
+                    type: "reasoning",
+                    threadId: ids.threadId,
+                    runId: ids.runId,
+                    nodeId: ids.rootNodeId,
+                    providerThreadId: ids.providerThreadId,
+                    providerTurnId: ids.rootProviderTurnId,
+                    nativeItemRef: { driver, nativeId: "native-reasoning", strength: "strong" },
+                    parentItemId: null,
+                    ordinal: 1,
+                    status: "running",
+                    title: null,
+                    startedAt: now,
+                    completedAt: null,
+                    updatedAt: now,
+                    text: "Working",
+                    streaming: true,
+                  },
+                },
+            rootTerminalEvent(ids, "completed"),
+          ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
+        ingestNormalized: ({ event }) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.promptAcceptedAt !== undefined
+            ? Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as([]),
+              )
+            : Effect.succeed([]),
+        afterStart: () =>
+          Effect.gen(function* () {
+            yield* Deferred.await(entered);
+            const snapshot = progress.get(ids.runId, ids.attemptId)!;
+            assert.isNotNull(snapshot.nativeAcceptedAt);
+            assert.equal(snapshot.nativeSessionId, "codex-native-session");
+            assert.equal(snapshot.step, "run_ingestion_write");
+            assert.isFalse(yield* Deferred.isDone(release));
+            yield* Deferred.succeed(release, undefined);
+          }),
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+    }).pipe(Effect.provide(ProviderStartProgress.layer)),
+);
 
 it.effect.each([
   { provider: "cursor", mode: "turn" },
@@ -6461,6 +6946,129 @@ it.effect.each([
   }),
 );
 
+it.effect.each(
+  ["claude_no_response_budget", "claude_retry_flap", "claude_network_error"].flatMap((code) =>
+    [true, false].map((retryable) => ({ code, retryable })),
+  ),
+)(
+  "resumes a coded Claude failure once only when retryable: $code/$retryable",
+  ({ code, retryable }) =>
+    Effect.gen(function* () {
+      for (const resumed of [false, true]) {
+        const result = yield* captureRootRunTermination({
+          key: `${code}-${retryable}-${resumed}`,
+          delegated: true,
+          ...(resumed
+            ? {
+                recoveryRun: {
+                  firstError: {
+                    class: "transport_error" as const,
+                    category: "transient" as const,
+                    code,
+                    retryable: true,
+                    message: "First: Request timed out",
+                  },
+                  since: DateTime.formatIso(yield* DateTime.now),
+                },
+              }
+            : {}),
+          shouldFinalizeRun: () => Effect.succeed(true),
+          events: (ids) =>
+            Stream.make({
+              ...rootTerminalEvent(ids, "failed"),
+              status: "failed" as const,
+              failureItemOrdinal: 101,
+              threadDisposition: "reusable" as const,
+              failure: {
+                class: "transport_error" as const,
+                category: "transient" as const,
+                code,
+                retryable,
+                message: "Second: upstream connection lost",
+              },
+            }),
+        });
+        assert.lengthOf(
+          result.committedEffects.filter((effect) =>
+            effect.id.startsWith("effect:delegated-transient-resume:"),
+          ),
+          resumed || !retryable ? 0 : 1,
+        );
+        if (resumed) {
+          const errors = result.finalEvents.filter(
+            (event) => event.type === "turn-item.updated" && event.payload.type === "error",
+          );
+          assert.isTrue(
+            errors.some(
+              (event) =>
+                event.type === "turn-item.updated" &&
+                event.payload.type === "error" &&
+                event.payload.failure.message.includes("First: Request timed out") &&
+                event.payload.failure.message.includes("Second: upstream connection lost"),
+            ),
+          );
+        }
+      }
+    }),
+);
+
+it.effect.each(
+  ["claude_no_response_budget", "claude_retry_flap", "claude_network_error"].flatMap((code) =>
+    (["first_event", "post_tool"] as const).flatMap((phase) =>
+      [undefined, "Please relay: ready", "[Watcher event from build] Ready"].map((relayText) => ({
+        code,
+        phase,
+        relayText,
+      })),
+    ),
+  ),
+)(
+  "a previous silent recovery blocks coded network and relay replay: $phase/$code/$relayText",
+  ({ code, phase, relayText }) =>
+    Effect.gen(function* () {
+      const result = yield* captureRootRunTermination({
+        key: `silent-then-network-${phase}-${code}-${relayText ?? "work"}`,
+        delegated: true,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        model: "claude-haiku-5-5",
+        ...(relayText === undefined ? {} : { relayText }),
+        stallRecovery: {
+          phase,
+          lastProgressAt: DateTime.formatIso(yield* DateTime.now),
+          attemptId: null,
+        },
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make({
+            ...rootTerminalEvent(ids, "failed"),
+            status: "failed" as const,
+            failureItemOrdinal: 101,
+            threadDisposition: "reusable" as const,
+            failure: {
+              class: "transport_error" as const,
+              category: "transient" as const,
+              code,
+              retryable: true,
+              message: "Connection dropped (ECONNRESET)",
+              claudeAccess: {
+                status: null,
+                beforeResponse: true,
+                refusalFree: true,
+                refused: false,
+              },
+            },
+          }),
+      });
+      assert.isFalse(
+        result.committedEffects.some((effect) => effect.request.type === "provider-turn.start"),
+      );
+      const run = result.finalEvents.findLast((event) => event.type === "run.updated");
+      assert.equal(run?.payload.status, "failed");
+      assert.isUndefined(run?.payload.transientRecovery);
+      assert.isUndefined(run?.payload.launchRecovery);
+    }),
+);
+
 it.effect.each([
   "app_owned",
   "provider_native",
@@ -6707,6 +7315,52 @@ it.effect.each([
           assert.isAtLeast(request.retryDelayMs ?? 0, 20_000);
       }
     }),
+);
+
+it.effect.each(
+  ["[Watcher event from build] Ready", "Please relay: ready"].flatMap((relayText) =>
+    [null, 401, 403, 404, 429].map((status) => ({ relayText, status })),
+  ),
+)("honors permanent relay evidence in the outbox: $relayText/$status", ({ relayText, status }) =>
+  Effect.gen(function* () {
+    for (const delegated of [false, true]) {
+      for (const retryable of [false, true]) {
+        const result = yield* captureRootRunTermination({
+          key: `relay-veto-${relayText}-${status}-${delegated}-${retryable}`,
+          relayText,
+          delegated,
+          model: "claude-haiku-5-5",
+          providerDriver: ProviderDriverKind.make("claudeAgent"),
+          shouldFinalizeRun: () => Effect.succeed(true),
+          events: (ids) =>
+            Stream.make({
+              ...rootTerminalEvent(ids, "failed"),
+              status: "failed" as const,
+              failureItemOrdinal: 101,
+              threadDisposition: "reusable" as const,
+              failure: {
+                class: "transport_error" as const,
+                category: "transient" as const,
+                code: "claude_network_error",
+                retryable,
+                message: "Request timed out.",
+                claudeAccess: { status, beforeResponse: true, refusalFree: true, refused: false },
+              },
+            }),
+        });
+        assert.lengthOf(
+          result.committedEffects.filter((effect) => effect.request.type === "provider-turn.start"),
+          retryable ? 1 : 0,
+        );
+        if (!retryable) {
+          const run = result.finalEvents.findLast((event) => event.type === "run.updated");
+          assert.equal(run?.payload.status, "failed");
+          assert.isUndefined(run?.payload.transientRecovery);
+          assert.isUndefined(run?.payload.launchRecovery);
+        }
+      }
+    }
+  }),
 );
 
 it.effect.each([false, true])("retries an unsent relay once, refusal=%s", (refused) =>
@@ -7728,6 +8382,155 @@ it.effect.each([
       if (!("runId" in row)) return assert.fail("missing usage");
       assert.equal(row.inputTokens, 123);
       assert.equal(row.outputTokens, 45);
+      assert.equal(row.endReason, status);
+    }),
+);
+
+it.effect.each([undefined, "server_shutdown", "task_cancel", "user_stop"] as const)(
+  "keeps cancellation provenance from the current run in the terminal event and analytics (%s)",
+  (cancelReason) =>
+    Effect.gen(function* () {
+      const usage: AnalyticsEvent[] = [];
+      const result = yield* captureRootRunTermination({
+        key: `cancel-provenance:${cancelReason ?? "provider"}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        ...(cancelReason === undefined
+          ? {}
+          : {
+              cancelMetadata: {
+                cancelReason,
+                cancelDetail: "Cancellation source read at finalization.",
+              },
+            }),
+        recordUsage: (event) =>
+          Effect.sync(() => {
+            usage.push(event);
+          }),
+        events: (ids) => Stream.make(rootTerminalEvent(ids, "cancelled")),
+      });
+      const ended = result.finalEvents.find(
+        (event) => event.type === "run.updated" && event.payload.status === "cancelled",
+      );
+      assert.isDefined(ended);
+      if (ended?.type !== "run.updated") return;
+      assert.equal(ended.payload.cancelReason, cancelReason ?? "provider_cancelled");
+      assert.equal(
+        ended.payload.cancelDetail,
+        cancelReason === undefined ? undefined : "Cancellation source read at finalization.",
+      );
+      const row = usage.find((event) => event.kind === "run.usage");
+      if (row === undefined || !("runId" in row)) return assert.fail("Missing run usage event");
+      assert.equal(row.cancelReason, cancelReason ?? "provider_cancelled");
+    }),
+);
+
+it.effect.each(
+  (["cancelled", "interrupted"] as const).flatMap((status) =>
+    (["server_shutdown", "server_restart", "thread_delete"] as const).flatMap((cancelReason) =>
+      [undefined, "user_stop" as const].map((staleReason) => ({
+        status,
+        cancelReason,
+        staleReason,
+      })),
+    ),
+  ),
+)(
+  "a rejected provider $status write keeps committed analytics cause $cancelReason (stale=$staleReason)",
+  ({ status, cancelReason, staleReason }) =>
+    Effect.gen(function* () {
+      const admitted = yield* Deferred.make<void>();
+      const committed = yield* Deferred.make<void>();
+      const processed = yield* Deferred.make<void>();
+      const ids = backgroundScenarioIds(
+        `rejected-cancel:${status}:${cancelReason}:${staleReason ?? "missing"}`,
+      );
+      const rows: AnalyticsEvent[] = [];
+      const result = yield* captureRootRunTermination({
+        key: `rejected-cancel:${status}:${cancelReason}:${staleReason ?? "missing"}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        rejectTerminalWriteForAttempt: ids.attemptId,
+        loadCancelMetadata: () =>
+          Deferred.succeed(committed, undefined).pipe(
+            Effect.andThen(Deferred.await(processed)),
+            Effect.as({ cancelReason: staleReason }),
+          ),
+        runUpdates: Stream.fromEffect(Deferred.await(committed)).pipe(
+          Stream.map(() => ({
+            sequence: 1,
+            commandId: null,
+            event: {
+              id: EventId.make("committed-cancellation"),
+              type: "run.updated" as const,
+              threadId: ids.threadId,
+              occurredAt: DateTime.makeUnsafe("2026-11-15T00:00:00Z"),
+              payload: { id: ids.runId, status, cancelReason } as OrchestrationV2Run,
+            },
+          })),
+          Stream.concat(
+            Stream.fromEffect(Deferred.succeed(processed, undefined)).pipe(Stream.drain),
+          ),
+        ),
+        recordUsage: (row) =>
+          Effect.sync(() => {
+            rows.push(row);
+          }),
+        startTurn: () => Deferred.succeed(admitted, undefined).pipe(Effect.asVoid),
+        events: (runtimeIds) =>
+          Stream.fromEffect(Deferred.await(admitted)).pipe(
+            Stream.flatMap(() => Stream.make(rootTerminalEvent(runtimeIds, status))),
+          ),
+      });
+      assert.isFalse(result.finalEvents.some((event) => event.type === "run.updated"));
+      const row = rows.find((event) => "runId" in event);
+      if (row === undefined || !("runId" in row)) return assert.fail("Missing usage event");
+      assert.equal(row.cancelReason, cancelReason);
+      assert.equal(row.endReason, status);
+    }),
+);
+
+it.effect.each(
+  (["cancelled", "interrupted"] as const).flatMap((status) =>
+    (
+      [
+        "user_stop",
+        "task_cancel",
+        "thread_reset",
+        "card_stop",
+        "delegated_parent_cancelled",
+        "superseded",
+        "thread_archive",
+      ] as const
+    ).map((cancelReason) => ({ status, cancelReason })),
+  ),
+)(
+  "successful $status finalization reloads committed $cancelReason for usage",
+  ({ status, cancelReason }) =>
+    Effect.gen(function* () {
+      let committed = false;
+      let reads = 0;
+      const rows: AnalyticsEvent[] = [];
+      const result = yield* captureRootRunTermination({
+        key: `successful-cancel:${status}:${cancelReason}`,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        loadCancelMetadata: () =>
+          Effect.sync(() => {
+            reads += 1;
+            return committed ? { cancelReason } : undefined;
+          }),
+        onTerminalRun: Effect.sync(() => {
+          committed = true;
+        }),
+        recordUsage: (row) =>
+          Effect.sync(() => {
+            rows.push(row);
+          }),
+        events: (ids) => Stream.make(rootTerminalEvent(ids, status)),
+      });
+      assert.isTrue(result.finalEvents.some((event) => event.type === "run.updated"));
+      assert.isAtLeast(reads, 2);
+      const row = rows.find((event) => "runId" in event);
+      if (row === undefined || !("runId" in row)) return assert.fail("Missing usage event");
+      assert.equal(row.cancelReason, cancelReason);
       assert.equal(row.endReason, status);
     }),
 );

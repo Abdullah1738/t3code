@@ -37,7 +37,7 @@ class InstallFixture:
                  check_failures=0, ready_secs="6", with_agent=False):
         self.root = root
         self.home = root / "home"
-        self.pkg = root / "source"
+        self.pkg = root / "integrations/harness-homes"
         self.dst = self.home / ".local/share/harness-homes"
         self.state = root / "launchd-state"
         self.state.mkdir()
@@ -51,6 +51,18 @@ class InstallFixture:
         write(self.config, 'original config with private fixture value\n')
         write(self.pkg / "install.zsh", (PKG / "install.zsh").read_text())
         write(self.pkg / "shared/flighty_python.py", (PKG / "shared/flighty_python.py").read_text())
+        helper = PKG.parent / 'local-helpers/libexec'
+        for directory in ('opencode-reload', 'toollog'):
+            shutil.copytree(helper / directory, root / 'integrations/local-helpers/libexec' / directory)
+        guard = root / 'integrations/local-helpers/libexec/opencode-reload/opencode_reload.py'
+        guard.write_text(guard.read_text() + "\nif os.environ.get('FAILURE') == 'config-commit' and 'harness-homes' in sys.argv and '--dry-run' not in sys.argv: raise SystemExit(1)\n")
+        write(self.pkg / 'shared/install_preflight.py', """import os, sys
+from pathlib import Path
+if os.environ['FAILURE'] == 'preflight':
+ raise SystemExit('install opencode-plugins first: missing plugin/phone-adb-guard.ts')
+Path(sys.argv[1]).write_text('migrated config')
+Path(sys.argv[3]).write_bytes((Path.home()/'.config/opencode/opencode.jsonc').read_bytes())
+""")
         self.base, self.dedicated = flighty_fixture(self.home)
         for label in self.labels:
             write(self.home / f"Library/LaunchAgents/{label}.plist", "old " + label)
@@ -69,6 +81,8 @@ def opencode_config_path(*args): return str(Path.home()/'.config/opencode/openco
         write(self.pkg / "generate_homes.py", helpers + '''
 if __name__ == '__main__':
  import sys
+ if os.environ['FAILURE'] in ('concurrent-config', 'same-config') and sys.argv[1] == 'check':
+  Path.home().joinpath('.config/opencode/opencode.jsonc').write_text('migrated config' if os.environ['FAILURE'] == 'same-config' else 'concurrent edit')
  raise SystemExit(int(os.environ['FAILURE'] == {'generate':'generation','check':'check'}.get(sys.argv[1])))
 ''')
         write(self.pkg / "manifest.json", "new manifest")
@@ -125,6 +139,7 @@ else: raise SystemExit(2)
 ''', executable=True)
         self.env = {**os.environ, "HARNESS_HOMES_PYTHON": sys.executable, "HOME": str(self.home), "TMPDIR": str(root),
                     "PATH": str(binary_dir) + os.pathsep + os.environ["PATH"],
+                    "OPENCODE_RELOAD_INSTANCES": '[{"name":"HOME","url":"http://127.0.0.1:1"},{"name":"BTSE","url":"http://127.0.0.1:1"}]',
                     "FAILURE": failure, "FAKE_LAUNCHD": str(self.state),
                     "LAUNCHCTL_LOG": str(self.log), "SLEEP_LOG": str(self.sleeps),
                     "BOOTOUT_PRINTS": str(bootout_prints), "BOOTSTRAP_CODES": json.dumps(bootstrap_codes or {}),
@@ -133,7 +148,7 @@ else: raise SystemExit(2)
         if ready_secs is not None:
             self.env["SHARED_MCP_READY_SECS"] = ready_secs
 
-    def run(self):
+    def run(self, *args):
         # Advance the shell's elapsed clock instead of sleeping through 90 s.
         wrapper = '''typeset -F SECONDS
 sleep() {
@@ -146,7 +161,7 @@ shift
 source "$installer" "$@"
 '''
         return subprocess.run(["/bin/zsh", "-f", "-c", wrapper, "installer-test", str(self.pkg / "install.zsh"),
-                               *(["--with-agent"] if self.with_agent else [])],
+                               *(["--with-agent"] if self.with_agent else []), *args],
                               env=self.env, capture_output=True, text=True, timeout=20)
 
     def calls(self, command, label=None, version=None):
@@ -231,7 +246,7 @@ class SharedInstallTests(unittest.TestCase):
             self.assertEqual((fixture.state / label).read_text(), "old " + label)
 
     def test_failure_restores_services_code_and_config(self):
-        for failure in ("bootstrap", "health", "migration", "generation", "check", "none"):
+        for failure in ("bootstrap", "health", "generation", "check", "none"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
                 fixture = InstallFixture(Path(tmp).resolve(), failure=failure)
                 result = fixture.run()
@@ -321,6 +336,136 @@ class SharedInstallTests(unittest.TestCase):
             fixture = InstallFixture(Path(tmp).resolve(), check_failures=16, ready_secs=None)
             self.assert_installed(fixture, fixture.run())
             self.assertEqual(int(fixture.checks.read_text()), 17)
+
+    def test_dry_run_does_not_prepare_python_or_change_package_config_and_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = InstallFixture(Path(tmp).resolve())
+            before = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+                      for p in fixture.home.rglob('*') if p.is_file()}
+            result = fixture.run('--dry-run')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(fixture.dedicated.exists())
+            self.assertFalse(fixture.log.exists())
+            self.assertNotIn('opencode-reload:', result.stdout)
+            for path, expected in before.items():
+                self.assertEqual((path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns), expected)
+
+    def test_mode_flags_are_exclusive_in_every_order(self):
+        modes = ('--dry-run', '--check', '--flighty-python')
+        for first in modes:
+            for second in modes:
+                with self.subTest(first=first, second=second), tempfile.TemporaryDirectory() as tmp:
+                    fixture = InstallFixture(Path(tmp).resolve())
+                    before = fixture.config.stat()
+                    result = fixture.run(first, second)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn('choose --check, --dry-run or --flighty-python', result.stderr)
+                    self.assertFalse(fixture.dedicated.exists())
+                    self.assertFalse(fixture.log.exists())
+                    self.assertEqual(fixture.config.stat().st_ino, before.st_ino)
+                    self.assertEqual(fixture.config.stat().st_mtime_ns, before.st_mtime_ns)
+
+    def test_guard_preflight_rejects_invalid_settings_and_symlink_before_setup(self):
+        cases = [(key, value) for key, values in (
+            ('OPENCODE_RELOAD_WAIT', ('invalid', '-1', '86401', 'nan', 'inf')),
+            ('OPENCODE_RELOAD_INSTANCES', ('[]', '{}', '[null]')))
+                 for value in values] + [('symlink', '')]
+        for key, value in cases:
+            with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as tmp:
+                fixture = InstallFixture(Path(tmp).resolve())
+                if key == 'symlink':
+                    original = fixture.home / 'original-config'
+                    fixture.config.rename(original)
+                    fixture.config.symlink_to(original)
+                else:
+                    fixture.env[key] = value
+                before = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+                          for p in fixture.home.rglob('*') if p.is_file()}
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(fixture.dedicated.exists())
+                self.assertFalse(fixture.log.exists())
+                self.assertNotIn('opencode-reload:', result.stdout)
+                for path, expected in before.items():
+                    self.assertEqual((path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns), expected)
+
+    def test_edit_during_flighty_preparation_preserves_original_preflight_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = InstallFixture(Path(tmp).resolve())
+            flighty = fixture.pkg / 'shared/flighty_python.py'
+            flighty.write_text(flighty.read_text() + "\nif '--dry-run' not in __import__('sys').argv: (Path.home()/'.config/opencode/opencode.jsonc').write_text('early concurrent edit')\n")
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(fixture.config.read_text(), 'early concurrent edit')
+            self.assertNotIn('opencode-reload:', result.stdout)
+
+    def test_another_writer_matching_staged_config_is_not_owned_for_rollback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = InstallFixture(Path(tmp).resolve(), failure='same-config')
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('config changed during installation', result.stderr)
+            self.assertEqual(fixture.config.read_text(), 'migrated config')
+            self.assertNotIn('opencode-reload:', result.stdout)
+
+    def test_concurrent_config_edit_is_not_overwritten_or_rolled_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = InstallFixture(Path(tmp).resolve(), failure="concurrent-config")
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('config changed during installation', result.stderr)
+            self.assertEqual(fixture.config.read_text(), 'concurrent edit')
+            self.assertNotIn('opencode-reload:', result.stdout)
+
+    def test_changed_rollback_is_guarded_and_logs_its_own_reload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = InstallFixture(Path(tmp).resolve(), failure="config-commit")
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(fixture.config.read_text(), 'original config with private fixture value\n')
+            self.assertEqual(result.stdout.count('opencode-reload:'), 2)
+            events = [json.loads(line) for path in fixture.home.rglob('*.ndjson') for line in path.read_text().splitlines()]
+            reloads = [e for e in events if e['kind'] == 'opencode-reload']
+            self.assertEqual([e['props']['installer'] for e in reloads], ['harness-homes', 'harness-homes-rollback'])
+            self.assertEqual(reloads[0]['props']['files'][0]['sha256_before'], reloads[1]['props']['files'][0]['sha256_after'])
+
+    def test_failed_identical_config_keeps_inode_and_mtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = InstallFixture(Path(tmp).resolve(), failure="bootstrap")
+            before = fixture.config.stat()
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((fixture.config.stat().st_ino, fixture.config.stat().st_mtime_ns),
+                             (before.st_ino, before.st_mtime_ns))
+            self.assertNotIn('opencode-reload:', result.stdout)
+
+    def test_missing_plugin_preflight_precedes_every_install_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = InstallFixture(Path(tmp).resolve(), failure="preflight")
+            before = {p: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+                      for root in (fixture.home, fixture.dst) for p in root.rglob('*') if p.is_file()}
+            result = fixture.run()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('install opencode-plugins first: missing plugin/phone-adb-guard.ts', result.stderr)
+            self.assertFalse(fixture.log.exists())
+            self.assertFalse(fixture.dedicated.exists())
+            for path, expected in before.items():
+                self.assertEqual((path.read_bytes(), path.stat().st_ino, path.stat().st_mtime_ns), expected)
+
+    def test_second_install_preserves_watched_config_and_reload_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = InstallFixture(Path(tmp).resolve())
+            first = fixture.run()
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertEqual(first.stdout.count('opencode-reload:'), 1)
+            before = fixture.config.stat()
+            logs = list(fixture.home.rglob('*.ndjson'))
+            events = {p: p.read_bytes() for p in logs}
+            second = fixture.run()
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertNotIn('opencode-reload:', second.stdout)
+            self.assertEqual((fixture.config.stat().st_ino, fixture.config.stat().st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+            self.assertEqual({p: p.read_bytes() for p in logs}, events)
 
     def test_invalid_readiness_window_fails_before_changing_files_or_jobs(self):
         for value in ("0", "-1", "1.5", "invalid"):

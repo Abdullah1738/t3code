@@ -48,7 +48,7 @@ A request already sent can still complete; the watcher records its result and
 stops further sends. Resume or expiry keeps pending work eligible and retains
 successful sends so they are not repeated. `status --json` reports pause state,
 pending incident/thread counts and the last successful scan, without message bodies.
-Control lives in `data/control.json`, separately from the scan ledger. Both use
+Control lives in `data/control.json`, separately from both ledgers. All use
 `STREAM_RECOVERY_DATA` when set. Resume clears the active pause and retains its
 time interval so the pause cannot use up recovery deadlines.
 
@@ -65,6 +65,8 @@ recovery retries if it expires. `BEGIN` precedes the metadata read, keeping data
 and readiness pinned to the same export. The next scan opens the next complete export.
 Before recovery actions, current control-API shell timestamps must not be newer
 than the export watermark; this also defers an idle Stop that kept the same run ID.
+That thread waits for the next export without using a recovery attempt; other
+threads continue recovering in the same scan.
 Both Robob homes (`~/.robob`, `~/.t3`, configured `ROBOB_HOME`/`T3CODE_HOME`)
 and native OpenCode default/XDG database paths are protected, including aliases;
 an arbitrary fixture basename is not blocked.
@@ -73,7 +75,9 @@ interrupts include the expected run ID so a newer run is not stopped instead.
 Missing, not-ready or stale recovery exports do not disable that API-only stall
 pass. It keeps its independent once-a-minute cadence and saves its own progress;
 recovery's `lastScan` advances only on a successful recovery scan. A recovery
-error still produces a nonzero CLI exit and `recoveryError` in JSON output.
+error still produces a nonzero `scan` exit and `recoveryError` in JSON output.
+`scan --dry-run --json` reports incidents and restarts; stalls are reported by
+`stall --dry-run --json`.
 
 ## Restart watch
 
@@ -103,8 +107,7 @@ also looks for those:
   Robob being back. Threads Robob already continued are busy and skipped. The
   installer's `pending.json` no longer holds notes back. The incident stays
   open until the restart window has closed, so a run cut late still joins it.
-  The stall watch inside the same scan keeps a once-a-minute pace
-  (`lastStallScan`).
+  The separate stall job keeps a once-a-minute pace.
 - Per lost subagent: re-dispatched (same session resumed, or same title with a
   `(resume)`-style suffix), still running, finished (result never delivered,
   or delivered: in Robob or in the parent's OpenCode history after a later
@@ -140,7 +143,7 @@ also looks for those:
 
 ## Stall watch
 
-Every scan also checks the sessions OpenCode reports as running
+`node cli.mjs stall [--dry-run] [--json] [--verbose]` checks the sessions OpenCode reports as running
 (`/api/session/active`) for ones that stopped moving without failing, e.g. a
 model stream that died mid tool call and left the session "running" for hours.
 
@@ -176,7 +179,20 @@ model stream that died mid tool call and left the session "running" for hours.
   After 3 interrupts of one session in 24h it only reports.
 - A Robob thread that shows a run as running for 15 min while its OpenCode session is not active and has no message from the last 15 min (the turn never reached OpenCode, as on #433 after the 29 Oct restart) is interrupted through Robob and gets the carry-on note (not crw/iMessage). It waits while the installer's resume is pending and only reports after 3 interrupts of a session in 24h. Ghost candidates are kept under `ghosts` in the state file.
 
-Stalls are kept in the same state file (`watch`, `stalls`, `servers`, `ghosts`).
+The `com.ardud.stream-recovery-stall` LaunchAgent runs `stall` every 60s,
+independently of the replica scan's 15s job. It uses `data/stall.lock` and
+`data/stall-state.json` (`watch`, `stalls`, `ghosts`, `lastStallScan`); replica
+recovery uses `data/scan.lock` and `data/state.json` (`handled`, `servers`,
+`lastScan`). A slow replica scan cannot delay the stall job or save its state.
+Both commands honor the same pause control.
+
+On the first non-dry stall run, the four stall keys migrate from `state.json`.
+Replica saves preserve that legacy source until `stall-state.json` exists,
+then omit the keys. Subsequent stall reads use only `stall-state.json`, even
+if an older in-flight process later writes legacy keys back into `state.json`.
+Restart detection reads the stall ledger to exclude the watcher's own interrupts;
+interrupt intents are saved before sending so a concurrent scan can exclude them.
+`status` combines pending work from both ledgers.
 
 ## Harness cutover and installer protocol
 
@@ -255,12 +271,13 @@ the new storage architecture.
 
 ```bash
 node cli.mjs scan [--dry-run] [--since ISO] [--max-age-hours 6] [--seed] [--json] [--verbose]
+node cli.mjs stall [--dry-run] [--json] [--verbose]
 node cli.mjs status
 ```
 
 - `--dry-run` shows the plan without sending anything or touching state.
 - `--seed` marks every incident found (stream drops and restarts) as handled
-  without acting, and skips the stall watch.
+  without acting.
 - Use `STREAM_RECOVERY_DATA=<dir>` to dry-run against a scratch state dir.
 
 ## Install
@@ -270,9 +287,16 @@ integrations/deploy.zsh stream-recovery
 node ~/.local/share/stream-recovery/cli.mjs scan --seed --max-age-hours 72
 cp integrations/stream-recovery/scripts/com.ardud.stream-recovery.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ardud.stream-recovery.plist
+cp integrations/stream-recovery/scripts/com.ardud.stream-recovery-stall.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ardud.stream-recovery-stall.plist
 ```
 
-Runs every 15s (stall watch once a minute), log `~/Library/Logs/stream-recovery.log`. Disable with
-`launchctl bootout gui/$(id -u)/com.ardud.stream-recovery`.
+Replica scans run every 15s and the separate stall job every 60s. Both log to
+`~/Library/Logs/stream-recovery.log`. Disable both with:
+
+```bash
+launchctl bootout gui/$(id -u)/com.ardud.stream-recovery
+launchctl bootout gui/$(id -u)/com.ardud.stream-recovery-stall
+```
 
 Tests: `node --test test/*.test.mjs`.

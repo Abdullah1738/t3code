@@ -4,8 +4,9 @@ import {
   type ContextResetMcpResult,
   MessageId,
   OrchestratorMcpFailure,
-  ProviderSessionId,
 } from "@t3tools/contracts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import { resolveCallerRuntime } from "../../mcp/callerCredential.ts";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -34,7 +35,11 @@ export class ContextResetService extends Context.Service<
 >()("t3/ardud/context-reset/ContextResetService") {}
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
-  new OrchestratorMcpFailure({ code, message });
+  new OrchestratorMcpFailure({
+    reason: code === "invalid_request" ? "invalid_args" : "capability_missing",
+    code,
+    message,
+  });
 
 const errorMessage = (error: unknown) =>
   typeof error === "object" && error !== null && "message" in error
@@ -52,6 +57,7 @@ export const stoppedWorkNote = (work: ReadonlyArray<RunningBackgroundWork>) =>
 
 const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
+  const credentials = yield* McpProviderSessions.McpProviderSessions;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
 
   // One reset per thread at a time: a second call would queue a second note
@@ -98,7 +104,7 @@ const make = Effect.gen(function* () {
   ) {
     const threadId = scope.thread.threadId;
     const projection = yield* threadManagement
-      .getThreadRecords(threadId, ["subagents", "providerThreads"])
+      .getThreadRecords(threadId, ["subagents", "providerThreads", "providerSessions"])
       .pipe(
         Effect.mapError((error) =>
           error._tag === "OrchestratorProjectionError"
@@ -115,6 +121,18 @@ const make = Effect.gen(function* () {
     if (projection.thread.archivedAt !== null) {
       return yield* failure("thread_not_sendable", `Thread '${threadId}' is archived.`);
     }
+
+    const caller = yield* resolveCallerRuntime(credentials, scope.thread, projection);
+    if (caller === undefined) {
+      return yield* failure(
+        "provider_unavailable",
+        "This MCP credential is stale or revoked. Reconnect the current provider session before resetting context.",
+      );
+    }
+    const runtimeId = caller.runtimeProviderSessionId;
+    const attached =
+      runtimeId !== undefined &&
+      projection.providerSessions.some((session) => session.id === runtimeId);
 
     // A fresh session cannot take over background work the old one started:
     // its results would land in a session that no longer exists.
@@ -163,6 +181,7 @@ const make = Effect.gen(function* () {
             threadId,
             commandId: CommandId.make(`${stopCommandId}:delegated`),
             reason: "Context reset.",
+            cancelReason: "thread_reset",
           })
           .pipe(Effect.catchCause(stopFailed));
       }
@@ -176,28 +195,38 @@ const make = Effect.gen(function* () {
             commandId: CommandId.make(`${stopCommandId}:interrupt`),
             threadId,
             reason: "Context reset: stopping background work.",
+            cancelReason: "thread_reset",
           })
           .pipe(Effect.catchCause(stopFailed));
       }
     }
 
-    const detached = yield* threadManagement
-      .dispatch({
-        type: "provider-session.detach",
-        commandId: detachCommandId,
-        threadId,
-        providerSessionId: ProviderSessionId.make(scope.thread.providerSessionId),
-        reason: "Context reset.",
-      })
-      .pipe(
-        Effect.as(true),
-        Effect.catchCause((cause) =>
-          Effect.logWarning("context reset could not detach the provider session", {
-            threadId,
-            cause,
-          }).pipe(Effect.as(false)),
-        ),
-      );
+    // Queuing or stopping work can replace the caller's credential. Never end
+    // the replacement session, even if it reuses the same runtime id.
+    const currentCaller = attached
+      ? yield* resolveCallerRuntime(credentials, scope.thread, projection)
+      : undefined;
+    const detached =
+      runtimeId !== undefined && attached && currentCaller?.runtimeProviderSessionId === runtimeId
+        ? yield* threadManagement
+            .dispatch({
+              type: "provider-session.detach",
+              commandId: detachCommandId,
+              threadId,
+              providerSessionId: runtimeId,
+              reason: "Context reset.",
+              cancelReason: "thread_reset",
+            })
+            .pipe(
+              Effect.as(true),
+              Effect.catchCause((cause) =>
+                Effect.logWarning("context reset could not detach the provider session", {
+                  threadId,
+                  cause,
+                }).pipe(Effect.as(false)),
+              ),
+            )
+        : false;
 
     const stopNote = stopped
       ? ""
@@ -207,7 +236,9 @@ const make = Effect.gen(function* () {
       note:
         (detached
           ? "Context reset scheduled. Your current turn ends now; a fresh session starts with the resume note as its only context. Do not do any more work in this turn."
-          : "Resume note queued for a fresh session, but the current session could not be ended. End your turn now; the fresh session starts when it ends.") +
+          : !attached
+            ? "Resume note queued for a fresh session. No provider session is attached to this caller, so no session was ended. End your turn now."
+            : "Resume note queued for a fresh session, but the current session could not be ended. End your turn now; the fresh session starts when it ends.") +
         stopNote,
     };
     return result;
@@ -242,5 +273,7 @@ const make = Effect.gen(function* () {
 export const layer: Layer.Layer<
   ContextResetService,
   never,
-  Crypto.Crypto | ThreadManagementService.ThreadManagementService
+  | Crypto.Crypto
+  | ThreadManagementService.ThreadManagementService
+  | McpProviderSessions.McpProviderSessions
 > = Layer.effect(ContextResetService, make);

@@ -1,3 +1,5 @@
+import { markReactionAnswered } from "./unanswered.ts";
+import { parseHealthSidecar } from "./health-receipts.ts";
 import { messageLengthError } from "./message-length.ts";
 import { toolError } from "./toollog.ts";
 import { newFormKeys } from "./secret-crypto.ts";
@@ -298,7 +300,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       if (!enabled() || !chat) throw new ApiError(503);
 
       if (path === "/files") {
-        fields(body, ["base64", "name", "mimeType", "text", "dedupeKey", "sessionId"]);
+        fields(body, ["base64", "name", "mimeType", "text", "dedupeKey", "sessionId", "healthReceipt"]);
         const { base64, name, mimeType, dedupeKey, sessionId } = body;
         const text = body.text === undefined ? "" : body.text;
         if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
@@ -315,7 +317,10 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         if (data.toString("base64") !== base64 || data.length === 0) throw new ApiError(400);
         if (data.length > MAX_FILE_BYTES) throw new ApiError(413);
         const attachment = { sha256: createHash("sha256").update(data).digest("hex"), name, mimeType, size: data.length };
-        const { id, created } = queueSession(store, "file", dedupeKey, sessionId, { text, attachment }, () => store.putBlob(data));
+        const healthReceipt = body.healthReceipt === undefined ? undefined : parseHealthSidecar(body.healthReceipt, attachment.sha256);
+        if (body.healthReceipt !== undefined && !healthReceipt) throw new ApiError(400);
+        const { id, created } = queueSession(store, "file", dedupeKey, sessionId,
+          { text, attachment, ...(healthReceipt ? { healthReceipt } : {}) }, () => store.putBlob(data));
         // Durable queue acceptance only; upload and delivery happen outside this handler.
         return json({ id, created, chat: "owner" }, created ? 202 : 200);
       }
@@ -462,6 +467,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         if (!inbound && !store.byProviderId(target)) throw new ApiError(403);
         const id = `reaction:${hash(target + kind)}`;
         await photon.react(chat, target, kind as ReactionKind, id);
+        markReactionAnswered(store, target);
         return json({ id });
       }
 

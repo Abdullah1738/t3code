@@ -502,7 +502,12 @@ export class DesktopLease {
         row.child_thread_id !== caller.robobThreadId
       )
         return fail("Only the current lease holder may start desktop work.");
-      if (this.db.prepare("SELECT 1 FROM ardud_desktop_calls WHERE call_id = ?").get(toolUseId)) {
+      const existing = this.db
+        .prepare("SELECT ticket, state FROM ardud_desktop_calls WHERE call_id = ?")
+        .get(toolUseId) as CallRow | undefined;
+      // A hook may retry admission after losing the response. Completed calls cannot be replayed.
+      if (existing?.ticket === row.ticket && existing.state === "started") return this.snapshot();
+      if (existing) {
         return fail("toolUseId was already used; do not replay the call.");
       }
       this.db

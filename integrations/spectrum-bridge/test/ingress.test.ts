@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { parseMessageChangeEvent } from "@photon-ai/advanced-imessage/grpc";
 import { ingest } from "../src/ingress.ts";
 import { Store } from "../src/store.ts";
+import { captureLogs } from "./log-fixture.ts";
 
 const owner = "+15555550123";
 const cutoff = Date.parse("2026-09-10T10:00:00Z");
@@ -18,6 +19,19 @@ function event(sequence: number, at: number, sender = owner, prefix = "any") {
   }, sequence)!;
 }
 describe("durable ingress", () => {
+  test.each((["robob", "openchamber", undefined] as const).flatMap(backend => [false, true].map(live => ({ backend, live }))))(
+    "Photon receipts identify backend $backend, live=$live", async ({ backend, live }) => {
+      const store = setup();
+      if (live) store.set("bootstrapped", true);
+      const logs = await captureLogs(async () => {
+        expect(ingest(store, event(1, cutoff), owner, true, backend)).toBe(true);
+        expect(ingest(store, event(1, cutoff), owner, true, backend)).toBe(false);
+      });
+      expect(logs.filter(line => line.name === "msg.received")).toMatchObject([
+        { ids: { chat: "owner", messageId: "message-1" }, props: { backend: backend ?? "unknown", source: live ? "live" : "backfill" } },
+      ]);
+      expect(JSON.stringify(logs)).not.toContain("hello");
+    });
   test("ignores pre-start history but never loses post-start input during bootstrap retry", () => {
     const store = setup();
     expect(ingest(store, event(1, cutoff - 1000), owner, true)).toBe(false);

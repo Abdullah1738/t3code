@@ -6,6 +6,7 @@ import {
   type ProviderSessionId,
   OrchestrationV2StoredEvent,
   ProviderThreadId,
+  type ProviderTurnId,
   RunAttemptId,
   RunId,
   RuntimeRequestId,
@@ -13,6 +14,8 @@ import {
   type ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
+import { recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -216,6 +219,10 @@ export interface EventSinkV2Shape {
     readonly threadId?: ThreadId;
     readonly afterSequence?: number;
     readonly eventType?: OrchestrationV2DomainEvent["type"];
+    /** Pure selection applied to replay and live before projection or retention. */
+    readonly filter?: (stored: OrchestrationV2StoredEvent) => boolean;
+    /** Runs after catch-up, before live delivery, to reject incomplete retained history. */
+    readonly verifyReplay?: (throughSequence: number) => Effect.Effect<void, unknown>;
     /** Bound RPC subscribers; internal workers must not drop their subscription under load. */
     readonly bounded?: boolean;
   }) => Stream.Stream<OrchestrationV2StoredEvent, EventSinkV2Error>;
@@ -270,6 +277,7 @@ const layerBase: Layer.Layer<
   EventSinkV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const analytics = yield* Effect.serviceOption(Analytics.Analytics);
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
@@ -436,6 +444,9 @@ const layerBase: Layer.Layer<
               }),
         ),
         Effect.ensuring(Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void))),
+        // An expiring start cancels its own worker. Once committed, its terminal
+        // events must still reach queue promotion and the other subscribers.
+        Effect.uninterruptible,
       );
     });
 
@@ -486,6 +497,8 @@ const layerBase: Layer.Layer<
       });
 
     const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
+      const providerTurnOrdinals = new Map<ProviderTurnId, number>();
+      const providerThreadMaxOrdinals = new Map<ProviderThreadId, number>();
       const providerSessions = new Map<
         ProviderThreadId,
         {
@@ -506,6 +519,35 @@ const layerBase: Layer.Layer<
         events,
         (event): Effect.Effect<OrchestrationV2DomainEvent, unknown> =>
           Effect.gen(function* () {
+            if (event.type === "provider-turn.updated") {
+              const turn = event.payload;
+              let ordinal = providerTurnOrdinals.get(turn.id);
+              if (ordinal === undefined) {
+                const existing = yield* sql<{ readonly ordinal: number }>`
+                  SELECT ordinal FROM orchestration_v2_projection_provider_turns
+                  WHERE provider_turn_id = ${turn.id} LIMIT 1
+                `;
+                ordinal = existing[0]?.ordinal;
+                if (ordinal === undefined) {
+                  // Starts and native continuations can carry the same stale ordinal.
+                  // Normalize before append inside the writer transaction, including
+                  // turns in this batch which have not reached the projection yet.
+                  let maximum = providerThreadMaxOrdinals.get(turn.providerThreadId);
+                  if (maximum === undefined) {
+                    const rows = yield* sql<{ readonly ordinal: number | null }>`
+                      SELECT MAX(ordinal) AS ordinal
+                      FROM orchestration_v2_projection_provider_turns
+                      WHERE provider_thread_id = ${turn.providerThreadId}
+                    `;
+                    maximum = rows[0]?.ordinal ?? 0;
+                  }
+                  ordinal = maximum + 1;
+                  providerThreadMaxOrdinals.set(turn.providerThreadId, ordinal);
+                }
+                providerTurnOrdinals.set(turn.id, ordinal);
+              }
+              return ordinal === turn.ordinal ? event : { ...event, payload: { ...turn, ordinal } };
+            }
             if (event.type === "provider-thread.updated") {
               const incoming = event.payload;
               if (incoming.driver !== "claudeAgent") {
@@ -1137,6 +1179,34 @@ const layerBase: Layer.Layer<
           }),
         (result) =>
           Effect.gen(function* () {
+            const executing = yield* EffectOutbox.ExecutingEffect;
+            if (
+              executing !== undefined &&
+              result.cancelledEffectIds.some((effectId) => effectId === executing.id)
+            ) {
+              const request = executing.request;
+              const runId = "runId" in request ? request.runId : undefined;
+              const props = {
+                effectId: executing.id,
+                effectType: request.type,
+                commandType: input.commandType,
+                ...(runId === undefined ? {} : { runId }),
+              };
+              yield* Effect.logInfo("effect_outbox.self_cancellation_deferred", {
+                threadId: input.threadId,
+                runId,
+                ...props,
+              });
+              if (Option.isSome(analytics))
+                yield* recordServerAnalytics(analytics.value, {
+                  ts: DateTime.formatIso(yield* DateTime.now),
+                  surface: "server",
+                  route: "orchestration",
+                  kind: "effect_outbox.self_cancellation_deferred",
+                  threadId: input.threadId,
+                  props,
+                });
+            }
             yield* effectOutbox.signalCancellations(result.cancelledEffectIds);
             if (result.committed && input.effects.length > 0) {
               yield* effectOutbox.notifyAvailable(input.effects.length);
@@ -1310,14 +1380,20 @@ const layerBase: Layer.Layer<
       const afterSequence = input?.afterSequence ?? 0;
       const matches = (stored: OrchestrationV2StoredEvent) =>
         (input?.threadId === undefined || stored.event.threadId === input.threadId) &&
-        (input?.eventType === undefined || stored.event.type === input.eventType);
+        (input?.eventType === undefined || stored.event.type === input.eventType) &&
+        (input?.filter?.(stored) ?? true);
       const replay = (throughSequence: number) =>
         catchUp({
           afterSequence,
           throughSequence,
           ...(input?.threadId === undefined ? {} : { threadId: input.threadId }),
           ...(input?.eventType === undefined ? {} : { eventType: input.eventType }),
-        }).pipe(Stream.filter(matches));
+        }).pipe(
+          Stream.filter(matches),
+          Stream.concat(
+            Stream.drain(Stream.fromEffect(input?.verifyReplay?.(throughSequence) ?? Effect.void)),
+          ),
+        );
       return Stream.unwrap(
         Effect.gen(function* () {
           let pubsub = liveEvents;

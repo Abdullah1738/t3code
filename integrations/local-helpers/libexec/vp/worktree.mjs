@@ -1,14 +1,17 @@
 import fs from "node:fs";
+import { brokenToolchainPath, danglingNotice, hasToolchain, logEvent } from "./events.mjs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { runChild } from "./child.mjs";
 import {
   checkToolchain,
   loadToolchain,
   syncToolchain,
   ToolchainMismatch,
 } from "./toolchain-state.mjs";
+import { configSnapshot } from "./config-snapshot.mjs";
 
 const [root, ...input] = process.argv.slice(2);
 const candidates = [];
@@ -19,6 +22,13 @@ while (input[0]?.startsWith("--candidate=")) {
 if (input.shift() !== "--") throw new Error("missing candidate separator");
 const [command, ...args] = input;
 let main;
+const started = Number(process.env.VP_SHIM_STARTED) || Date.now();
+const cwd = process.cwd();
+const reasons = JSON.parse(process.env.VP_SHIM_REASONS || "[]");
+const skipped = JSON.parse(process.env.VP_SHIM_SKIPPED || "[]");
+let selectedCandidate = null;
+let outcome = "refused";
+let toolchainHead = null;
 const hint = `run offbox run -- vp ${[command, ...args].filter(Boolean).join(" ")}`;
 function refuse(reason) {
   throw new Error(reason);
@@ -149,37 +159,8 @@ function argv() {
   return result;
 }
 
-function checkConfig() {
-  const configName =
-    /^(vite\.config\.|\.oxfmtrc|\.oxlintrc|oxfmt|oxlint|\.gitignore$|\.prettierignore$|\.eslintignore$)/;
-  const names = new Set(
-    [...fs.readdirSync(root), ...fs.readdirSync(main)].filter((name) => configName.test(name)),
-  );
-  for (const name of names) {
-    const a = path.join(root, name);
-    const b = path.join(main, name);
-    sameConfig(a, b, name);
-  }
-}
-
-function sameConfig(a, b, label) {
-  if (!fs.existsSync(a) || !fs.existsSync(b)) refuse(`config drift in ${label}`);
-  if (fs.statSync(a).isDirectory() && fs.statSync(b).isDirectory()) {
-    const names = new Set([...fs.readdirSync(a), ...fs.readdirSync(b)]);
-    for (const name of names) {
-      if (name !== "node_modules")
-        sameConfig(path.join(a, name), path.join(b, name), `${label}/${name}`);
-    }
-  } else if (
-    !fs.statSync(a).isFile() ||
-    !fs.statSync(b).isFile() ||
-    !fs.readFileSync(a).equals(fs.readFileSync(b))
-  ) {
-    refuse(`config drift in ${label}`);
-  }
-}
-
 let temporary;
+const snapshots = [];
 try {
   if (command !== "fmt" && command !== "lint") refuse("no node_modules in this worktree");
   const forwarded = argv();
@@ -187,42 +168,73 @@ try {
   let selectedConfig;
   let staleToolchain = false;
   for (const candidate of candidates) {
-    main = fs.realpathSync(candidate.dir);
-    if (main === root) continue;
     try {
-      if (candidate.kind === "toolchain copy") syncToolchain(root, main);
-      checkConfig();
-      process.chdir(main);
-      const requireMain = createRequire(path.join(main, "package.json"));
-      const loaded = await loadToolchain(main);
-      const config = loaded?.config[command];
-      if (!config) refuse(`main vite.config.ts has no ${command} config`);
-      checkToolchain(root, main, loaded);
-      // Imported config helpers and local lint plugins are configuration too.
-      const dependencies = [...loaded.dependencies];
-      if (command === "lint") {
-        config.jsPlugins = config.jsPlugins?.map((plugin) => {
-          if (typeof plugin !== "string") refuse("unsupported JS plugin config");
-          const resolved = requireMain.resolve(plugin);
-          if (plugin.startsWith(".")) dependencies.push(resolved);
-          return resolved;
-        });
+      main = candidate.dir;
+      if (!hasToolchain(main)) {
+        console.error(danglingNotice(candidate.kind, main));
+        const reason = {
+          candidate: candidate.kind,
+          reason: "dangling-vite-plus",
+          diagnosis: null,
+          file: path.join(main, "node_modules/vite-plus/bin/vp"),
+        };
+        reasons.push(reason);
+        skipped.push({ ...reason, directory: main, brokenRealpath: brokenToolchainPath(main) });
+        refuse("vite-plus/bin/vp does not resolve");
       }
-      for (const file of dependencies) {
-        const relative = path.relative(main, file);
-        if (relative.startsWith("../") || relative.split(path.sep).includes("node_modules"))
-          continue;
-        const counterpart = path.join(root, relative);
-        if (
-          !fs.existsSync(counterpart) ||
-          !fs.readFileSync(file).equals(fs.readFileSync(counterpart))
-        ) {
-          refuse(`config drift in ${relative}`);
+      fs.accessSync(path.join(main, "node_modules/.bin/vp"), fs.constants.X_OK);
+      main = fs.realpathSync(main);
+      if (main === root) continue;
+      if (candidate.kind === "toolchain copy") syncToolchain(root, main);
+      process.chdir(root);
+      const snapshot = await configSnapshot(root, main);
+      snapshots.push(snapshot.directory);
+      const loaded = await loadToolchain(main, snapshot.directory);
+      const config = loaded?.config[command];
+      if (!config) refuse(`worktree vite.config.ts has no ${command} config`);
+      // Validate local plugin dependencies at the corresponding installed package scope.
+      // The rules themselves come exclusively from the worktree snapshot.
+      const lint = loaded.config.lint;
+      if (lint?.jsPlugins) {
+        const requireWorktree = createRequire(path.join(root, "package.json"));
+        const plugins = [];
+        for (const plugin of lint.jsPlugins) {
+          if (typeof plugin !== "string") refuse("unsupported JS plugin config");
+          if (plugin.startsWith(".") || path.isAbsolute(plugin)) {
+            const file = path.resolve(root, plugin);
+            const original = file.startsWith(`${snapshot.directory}${path.sep}`)
+              ? path.join(root, path.relative(snapshot.directory, file))
+              : file;
+            plugins.push(await snapshot.stage(requireWorktree.resolve(original)));
+          } else plugins.push(plugin);
         }
+        lint.jsPlugins = plugins;
+      }
+      checkToolchain(root, main, loaded, snapshot.directory);
+      if (command === "lint") {
+        const requireConfig = createRequire(path.join(snapshot.directory, "package.json"));
+        config.jsPlugins = config.jsPlugins?.map((plugin) => requireConfig.resolve(plugin));
       }
       selectedConfig = config;
+      selectedCandidate = candidate.kind;
+      toolchainHead =
+        spawnSync("git", ["-C", main, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+          timeout: 5000,
+        }).stdout?.trim() || null;
       break;
     } catch (error) {
+      if (
+        !reasons.some(
+          (reason) => reason.candidate === candidate.kind && reason.reason === "dangling-vite-plus",
+        )
+      )
+        reasons.push({
+          candidate: candidate.kind,
+          reason: "toolchain-validation-failed",
+          diagnosis: null,
+          file: null,
+        });
       if (candidate.kind === "toolchain copy" && error instanceof ToolchainMismatch)
         staleToolchain = true;
       failures.push(
@@ -253,7 +265,7 @@ try {
       ? `vp: no node_modules in this worktree; running fmt with ${main}'s dependencies and the worktree config`
       : `vp: no node_modules in this worktree; running lint from ${main} with absolute paths`,
   );
-  const child = spawnSync(
+  const status = await runChild(
     path.join(main, "node_modules/.bin/vp"),
     [command, "--config", temporary, ...ignores, ...forwarded],
     {
@@ -261,11 +273,35 @@ try {
       stdio: "inherit",
     },
   );
-  if (child.error) throw child.error;
-  process.exitCode = child.status ?? 1;
+  outcome = "ran";
+  process.exitCode = status;
 } catch (error) {
+  if (!reasons.length)
+    reasons.push({ candidate: null, reason: "worktree-refused", diagnosis: null, file: null });
   console.error(`vp: ${error.message.replaceAll("\n", " ")}; ${hint}`);
   process.exitCode = 127;
 } finally {
+  const record = {
+    event: skipped.length ? "dangling-toolchain" : "outcome",
+    command: ["fmt", "lint"].includes(command) ? command : "other",
+    root,
+    cwd,
+    outcome,
+    candidate: selectedCandidate,
+    exitCode: process.exitCode ?? 127,
+    reasons,
+    skipped,
+    toolchainHead,
+    durationMs: Date.now() - started,
+  };
+  if (process.send) {
+    await new Promise((resolve) =>
+      process.send({ type: "vp-shim-outcome", record }, () => {
+        process.disconnect();
+        resolve();
+      }),
+    );
+  } else logEvent(record);
   if (temporary) fs.unlinkSync(temporary);
+  for (const directory of snapshots) fs.rmSync(directory, { recursive: true, force: true });
 }

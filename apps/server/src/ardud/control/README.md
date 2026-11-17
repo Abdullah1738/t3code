@@ -43,8 +43,17 @@ t3ctl's.
 - JSON in and out. Success is `{ "ok": true, ... }`. Failure is
   `{ "ok": false, "error": { "code", "message" } }` with HTTP 400 `invalid_request`,
   401 `unauthorized`, 403 `forbidden`, 404 `not_found`, 409 `conflict` (the
-  orchestrator rejected the command; the message says why), 503 `unavailable`,
-  or 500 `internal`.
+  orchestrator rejected the command), 503 `unavailable`, or 500 `internal`.
+  Every 409 also carries `error.reason`, `error.retrySafe`, and `error.holder`
+  (the observed thread/run/request, or null). `retrySafe: true` permits retrying
+  the identical request with its original `clientRequestId`; it does not
+  authorize a new id or delivery mode. False means reconcile or alert first.
+  Send preflight uses `no_steerable_turn` or `thread_archived`; a terminal
+  approval/question uses `request_resolved`. Other reasons include
+  `attempt_changed`, `run_not_interruptible`, `run_not_found`,
+  `command_id_conflict`, `command_rejected`, and `operation_conflict`.
+  Startup/send deadlines return 503 with `startup_unavailable`/`send_timeout`
+  and the same-id retry flag. Storage failures return 500, not 409.
 - Ids are opaque strings and can contain `:` and `%`. Always `encodeURIComponent`
   them in paths (the client does).
 - `clientRequestId` (optional on every mutation) makes retries safe: the same
@@ -92,7 +101,7 @@ All paths are under `/api/ardud/control`.
 | GET    | `/health`                                                | Token check plus the latest event sequence.                                                                                                                                                                                                                       |
 | GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                                                                                                                                                                           |
 | GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                                                                                                                                                                     |
-| GET    | `/messages?since=<ISO or epoch ms>&cursor=&limit=`       | User messages across all non-deleted threads, including archived threads; default 200, maximum 1000 per page.                                                                                                                                                     |
+| GET    | `/messages?since=<ISO or epoch ms>&role=&threadIds=&cursor=&limit=`       | Messages across non-deleted threads, including archived threads; role defaults to user (also assistant, system, all); optional comma-separated threadIds (max 50); default 200, max 1000 per page.                                                                                                                                                     |
 | GET    | `/usage`                                                 | Usage records in a time range, with optional board filter and cursor pagination.                                                                                                                                                                                  |
 | GET    | `/threads`                                               | List threads (see filters below).                                                                                                                                                                                                                                 |
 | POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                                                                                                                                                                  |
@@ -124,8 +133,8 @@ previous page with the same filters). The window is at most 72 hours; `until`
 defaults to the time of the first request and stays fixed across its pages.
 `limit` defaults to 1,000 and is capped at 5,000. Returns
 `{ ok: true, items: [...], nextCursor: string | null }`;
-`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor })`
-fetches one page.
+`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor }, { timeoutMs })`
+fetches one page with an optional request deadline (default 30 seconds).
 
 Items contain `threadId`, `rootThreadId`, `parentThreadId`, `boardId`, `cardId`,
 `workspace`, `providerInstanceId`, `driver`, `model`, `effort`, `startedAt`,
@@ -142,9 +151,13 @@ Pages are live reads, not a snapshot. A running turn may complete or move in the
 ordering while paging; consumers should periodically re-read overlapping windows
 and must not treat a partially paged result as a complete accounting snapshot.
 
-`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]`
+`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages] [--cursor CURSOR] [--timeout-ms MS]`
 prints one JSON page by default. `--all-pages` follows every cursor and prints one
-JSON object with all `items` and `nextCursor: null`.
+JSON object with all `items` and `nextCursor: null`, using 1,000 rows per page unless
+`--limit` is given. `--timeout-ms` overrides the per-page deadline, including
+`--request-timeout`. On failure, stderr names the page, cursor and number of items
+read; stdout remains empty. Resume with `--cursor` and the same window and board
+filters. A resumed result contains only the remaining rows.
 
 ### GET /threads
 
@@ -246,6 +259,8 @@ JSON-quoted incoming message ID in an iMessage channel-guidance context record,
 or null. Synthetic bridge IDs (`wake:`, `reset:`, `secret:`) are preserved so
 callers can distinguish them from relayed owner messages.
 
+Thread summaries and details include `changeMarker`, the latest V2 thread event sequence (0 if none). Compare it for incremental polling; `updatedAt` and `updatedSince` can miss timestamp ties. Poll known ids without `updatedSince`, then read changed messages with an overlapping `since` watermark.
+
 ### GET /threads/:id/wait
 
 Query: `timeoutMs` (default 10 min, max 60 min), `runId` (wait for that run),
@@ -298,9 +313,27 @@ server's compression middleware leaves it alone. Frames go out as they happen,
 with a `: ping` comment every 15 s. Each frame carries `id: <sequence>` and
 `event: <type>`. `data` is JSON with `type`, `threadId`, and `origin`.
 
-Start: the stream opens at the live head with an `event: ready` frame carrying
-`sequence`. Resume with the `Last-Event-ID` header or `?after=<sequence>` to
-replay everything since. The client reconnects and resumes on its own.
+Start: without a cursor the stream opens at the live head. Its `ready` frame
+carries `sequence` and `resumed:false`; fetch current state while buffering new
+events. Reconnect with `Last-Event-ID` or `?after=<sequence>` (the header wins).
+A decimal safe integer cursor at or below the head is honoured when its replay
+range has no compaction tombstones: `ready.resumed:true` means replay of matching
+events strictly after that cursor, then live events, with no gap or duplicate at
+the boundary. Keep the same filters when resuming. Invalid, future or compacted
+cursors start at the head with `resumed:false` and require a refetch.
+
+Failures send `event:error` with `type:error`, an optional `code`, and the last
+emitted sequence as `id`. Codes are `buffer_overflow`, `event_read_failed`,
+`origin_lookup_failed`, `history_compacted`, and `unknown`. Normal disconnects
+send no error. Reconnect from the last received id after transient failures;
+`history_compacted` means maintenance raced replay, so refetch current state.
+The client reconnects and resumes on its own.
+
+Control analytics records `events.stream_failed` with `props.code` and an
+`events.stream_failed.<code>` error tag, so existing analytics reads expose both
+the total and per-code counts. `events.stream_connected` and
+`events.stream_closed` record connection counts and lifetime separately from
+request setup latency.
 
 Filters: `threadId`, `origin` (or `none`), `types=a,b`.
 

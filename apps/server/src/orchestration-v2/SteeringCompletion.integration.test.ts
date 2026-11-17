@@ -1,5 +1,5 @@
 import { standardModelSelection } from "@t3tools/contracts";
-import { assert, it } from "@effect/vitest";
+import { assert, it, vi } from "@effect/vitest";
 import {
   CommandId,
   MessageId,
@@ -10,23 +10,30 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   ProviderTurnId,
+  RunId,
   ThreadId,
   TurnItemId,
   type ModelSelection,
+  type AnalyticsEvent,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2Subagent,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
+import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import {
   CodexProviderCapabilitiesV2,
   codexBackgroundCommandDetail,
 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
+import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as EventSink from "./EventSink.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
@@ -49,6 +56,7 @@ import * as ServerConfig from "../config.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
 import { layer as providerRegistryLayer } from "../provider/testUtils/providerRegistryMock.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as KanbanService from "../ardud/kanban/engine/KanbanService.ts";
 import * as KanbanModels from "../ardud/kanban/engine/models.ts";
 import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
@@ -581,6 +589,7 @@ const nextTurnSelectionHarness = Effect.fn("nextTurnSelectionHarness")(function*
   name: string,
   canRestart = false,
   runContinuationWorker = false,
+  nativeAcceptance = false,
 ) {
   const cwd = yield* checkpointWorkspace(name);
   const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
@@ -656,6 +665,7 @@ const nextTurnSelectionHarness = Effect.fn("nextTurnSelectionHarness")(function*
                   },
                   ordinal: turn.providerTurnOrdinal,
                   status: "running",
+                  ...(nativeAcceptance ? { promptAcceptedAt: now } : {}),
                   startedAt: now,
                   completedAt: null,
                 },
@@ -681,6 +691,7 @@ const nextTurnSelectionHarness = Effect.fn("nextTurnSelectionHarness")(function*
       { runEffectWorker: false, databaseLayer: db, runContinuationWorker },
     ),
     ProjectionStore.layer.pipe(Layer.provide(db)),
+    CommandReceiptStore.layer.pipe(Layer.provide(db)),
     runContinuationWorker ? ProviderContinuationRequests.layer : Layer.empty,
   );
   const startFirstTurn = Effect.gen(function* () {
@@ -1579,24 +1590,25 @@ it.effect.each(
               createdBy: "system",
               creationSource: "server",
             });
+          const before = yield* kanban.card(card.id);
           const result = yield* Effect.result(
             kanban.cardThread(card.id, action, text, { _tag: "owner" }),
           );
-          assert.equal(Result.isFailure(result), rejected);
+          const refused = rejected || !text.trim();
+          assert.equal(Result.isFailure(result), refused);
+          if (!text.trim()) {
+            assert(Result.isFailure(result));
+            assert.equal(result.failure.code, "invalid");
+            assert.deepEqual(yield* kanban.card(card.id), before);
+          }
           yield* worker.drain();
-          assert.deepEqual(
-            steered,
-            rejected ? [] : [...queuedText, text.trim() ? text : "latest snapshot"],
-          );
-          if (rejected) {
+          assert.deepEqual(steered, refused ? [] : [...queuedText, text]);
+          if (refused) {
             assert.lengthOf(yield* threads.queuedRuns(threadId), 1);
           }
-          yield* kanban.cardThread(card.id, "wake", "", { _tag: "owner" });
+          yield* orchestrator.promoteQueuedMessages(threadId, "wake");
           yield* worker.drain();
-          assert.deepEqual(steered, [
-            ...queuedText,
-            !rejected && text.trim() ? text : "latest snapshot",
-          ]);
+          assert.deepEqual(steered, [...queuedText, refused ? "latest snapshot" : text]);
           assert.lengthOf(yield* threads.queuedRuns(threadId), 0);
           const records = yield* orchestrator.getThreadRecords(threadId, ["runs"]);
           assert.equal(records.runs.find((run) => run.id === queuedId)!.status, "cancelled");
@@ -2070,4 +2082,965 @@ it.effect("queues a plain send behind the stopped queue and releases its hold", 
       }).pipe(Effect.provide(layer));
     }),
   ),
+);
+
+it.effect.each(["auto", "steer"] as const)(
+  "#1574 assignment stays queued after unrelated live input ($mode)",
+  (mode) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { steered, layer, db, startFirstTurn } = yield* nextTurnSelectionHarness(
+          `assignment-${mode}`,
+        );
+        const management = ThreadManagementService.layer.pipe(
+          Layer.provideMerge(layer),
+          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(db))),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provideMerge(db),
+        );
+        const lifecycle = KanbanThreads.layer.pipe(
+          Layer.provide(management),
+          Layer.provide(db),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        );
+        yield* Effect.gen(function* () {
+          const threadId = yield* startFirstTurn;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const threads = yield* KanbanThreads.KanbanThreads;
+          const before = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0]!;
+          const reminder = yield* threads.send({
+            threadId,
+            text: "Old reminder",
+            coalesce: "step:other",
+            mode: "queue",
+          });
+          const assignment = yield* threads.send({
+            threadId,
+            text: "New assigned card",
+            key: "assignment",
+            coalesce: "assignment:card",
+            mode: "queue",
+          });
+          if (typeof assignment !== "string") return yield* Effect.die("Assignment did not queue");
+          yield* threads.send({
+            threadId,
+            text: "Unrelated live input",
+            ...(mode === "steer" ? { mode: "steer" as const } : {}),
+          });
+          yield* worker.drain();
+          const after = yield* orchestrator.getThreadRecords(threadId, ["runs", "turnItems"]);
+          assert.equal(after.runs.find((run) => run.id === assignment)?.status, "queued");
+          assert.equal(after.runs.find((run) => run.id === before.id)?.status, "running");
+          assert.equal(
+            after.runs.find((run) => run.id === before.id)?.activeAttemptId,
+            before.activeAttemptId,
+          );
+          assert.deepEqual(steered, ["Unrelated live input"]);
+          assert.isTrue(
+            after.turnItems.some(
+              (item) =>
+                item.type === "user_message" &&
+                item.text === "Unrelated live input" &&
+                item.inputIntent === "steer",
+            ),
+          );
+          assert.equal(after.runs.find((run) => run.id === reminder)?.status, "cancelled");
+          assert.isTrue(yield* threads.cancelQueued(threadId, assignment));
+          assert.equal(
+            (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+              (run) => run.id === assignment,
+            )?.status,
+            "cancelled",
+          );
+        }).pipe(Effect.provide(Layer.merge(layer, lifecycle)));
+      }),
+    ),
+);
+
+it.effect("#1561 intake survives provider completion after steer acceptance", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const name = "kanban-intake-steer-completion";
+      const { events, started, steered, layer, db, startFirstTurn } =
+        yield* nextTurnSelectionHarness(name);
+      const measurements: AnalyticsEvent[] = [];
+      const management = ThreadManagementService.layer.pipe(
+        Layer.provideMerge(layer),
+        Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(db))),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provideMerge(db),
+      );
+      const lifecycle = KanbanThreads.layer.pipe(
+        Layer.provide(management),
+        Layer.provide(db),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+      );
+      let requestThread: ThreadId | undefined;
+      let evaluatorStarts = 0;
+      const existingThread = Layer.effect(
+        KanbanThreads.KanbanThreads,
+        Effect.map(KanbanThreads.KanbanThreads, (real) =>
+          KanbanThreads.KanbanThreads.of({
+            ...real,
+            launch: (input) =>
+              Effect.gen(function* () {
+                if (!requestThread)
+                  return yield* Effect.die("Initial provider turn must be running");
+                const threadId = requestThread;
+                evaluatorStarts += 1;
+                yield* input.onStarted?.(threadId) ?? Effect.void;
+                return threadId;
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(lifecycle));
+      const boardLayer = KanbanService.layer.pipe(
+        Layer.provideMerge(existingThread),
+        Layer.provideMerge(KanbanModels.layerTest(null)),
+        Layer.provideMerge(KanbanStore.layer.pipe(Layer.provide(db))),
+        Layer.provideMerge(db),
+        Layer.provide(Layer.mock(TextGeneration.TextGeneration)({})),
+        Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+        Layer.provide(providerRegistryLayer([opencodeTestProvider()])),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => {
+                measurements.push(event);
+              }),
+          }),
+        ),
+        Layer.provide(
+          ServerConfig.layerTest(process.cwd(), { prefix: "t3-intake-race-" }).pipe(
+            Layer.provideMerge(NodeServices.layer),
+            Layer.provideMerge(ServerSettings.layerTest()),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        requestThread = yield* startFirstTurn;
+        const kanban = yield* KanbanService.KanbanService;
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const board = yield* kanban.ensureBoard({
+          slug: "intake-race",
+          name: "Intake race",
+          defaultProjectId: ProjectId.make(`project:${name}`),
+        });
+        const options = { callerThreadId: ThreadId.make("reporter") };
+        const first = yield* kanban.submitEvaluator(
+          board.id,
+          { kind: "request", text: "First intake request" },
+          options,
+        );
+        const second = yield* kanban.submitEvaluator(
+          board.id,
+          { kind: "request", text: "Second intake request" },
+          options,
+        );
+        assert.deepEqual(second, first);
+        assert.equal(evaluatorStarts, 1);
+        assert.deepEqual(
+          measurements
+            .filter((event) => event.kind === "kanban.evaluator")
+            .map((event) => event.outcome),
+          ["started", "merged"],
+        );
+        // Dispatch accepted the intake, but its provider effect has not executed.
+        const nativeFirst = started[0]!;
+        const settled = yield* orchestrator.streamDomainEvents.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "run.updated" &&
+              event.payload.id === nativeFirst.runId &&
+              event.payload.status === "waiting",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        const turn = (yield* orchestrator.getThreadProjection(requestThread)).providerTurns[0]!;
+        yield* Queue.offer(events, {
+          type: "provider_turn.updated",
+          driver,
+          providerTurn: { ...turn, status: "completed", completedAt: yield* DateTime.now },
+        });
+        yield* Queue.offer(events, {
+          type: "turn.terminal",
+          driver,
+          providerThreadId: turn.providerThreadId,
+          providerTurnId: turn.id,
+          runOrdinal: nativeFirst.runOrdinal,
+          status: "completed",
+          failure: null,
+          threadDisposition: "reusable",
+        });
+        yield* Fiber.join(settled);
+        yield* worker.drain();
+        yield* orchestrator.resumeQueuedRuns;
+        yield* worker.drain();
+        assert.deepEqual(steered, []);
+        assert.equal(started.length, 2);
+        assert.include(started[1]!.message.text, "Second intake request");
+        assert.include(started[1]!.message.text, "t3-thread://v1/reporter");
+        assert.deepEqual(started[1]!.modelSelection, nativeFirst.modelSelection);
+        const projection = yield* orchestrator.getThreadProjection(requestThread);
+        assert.lengthOf(
+          projection.messages.filter((message) => message.text.includes("Second intake request")),
+          1,
+        );
+        const accepted = projection.messages.find((message) =>
+          message.text.includes("Second intake request"),
+        )!;
+        const port = yield* KanbanThreads.KanbanThreads;
+        assert.equal(yield* port.acceptedSend!(accepted.id.slice("kanban:".length)), requestThread);
+        assert.deepEqual(
+          yield* kanban.submitEvaluator(
+            board.id,
+            { kind: "request", text: "Second intake request" },
+            options,
+          ),
+          second,
+        );
+        yield* worker.drain();
+        assert.equal(evaluatorStarts, 1);
+        assert.equal(started.length, 2);
+        assert.equal(
+          measurements.filter((event) => event.kind === "kanban.evaluator").at(-1)!.reuseMissReason,
+          "duplicate",
+        );
+      }).pipe(Effect.provide(Layer.merge(layer, boardLayer)));
+    }),
+  ),
+);
+
+it.effect.each([
+  { restart: false, correction: false, acceptance: "native" },
+  { restart: true, correction: false, acceptance: "native" },
+  { restart: false, correction: true, acceptance: "native" },
+  { restart: false, correction: false, acceptance: "deferred" },
+  { restart: false, correction: false, acceptance: "wrong-node" },
+  { restart: false, correction: false, acceptance: "wrong-thread" },
+  { restart: false, correction: false, acceptance: "wrong-node-restart" },
+  { restart: false, correction: false, acceptance: "wrong-thread-restart" },
+  { restart: false, correction: false, acceptance: "retry" },
+  { restart: false, correction: false, acceptance: "projection-retry" },
+  { restart: false, correction: false, acceptance: "commit-exhaustion" },
+  { restart: false, correction: false, acceptance: "steer-commit-exhaustion" },
+  { restart: false, correction: false, acceptance: "offer-replay" },
+  { restart: false, correction: false, acceptance: "terminal-race" },
+  { restart: false, correction: false, acceptance: "unaccepted-restart" },
+  { restart: false, correction: false, acceptance: "failed-start" },
+  { restart: false, correction: false, acceptance: "interrupted-start" },
+])(
+  "#1711 accepts a wake before later siblings finish (restart=$restart correction=$correction acceptance=$acceptance)",
+  ({ restart, correction, acceptance }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const nativeAcceptance = acceptance === "native" || acceptance.startsWith("steer-");
+        const { events, started, steered, layer, startFirstTurn } = yield* nextTurnSelectionHarness(
+          `notice-1711-${restart}-${correction}-${acceptance}`,
+          false,
+          false,
+          nativeAcceptance,
+        );
+        const rows: AnalyticsEvent[] = [];
+        const offers: ProviderContinuationRequests.ProviderContinuationRequest[] = [];
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const sink = yield* EventSink.EventSinkV2;
+          const threadId = yield* startFirstTurn;
+          const initial = yield* orchestrator.getThreadProjection(threadId);
+          const source = initial.runs[0]!;
+          const turn = initial.providerTurns[0]!;
+          const now = yield* DateTime.now;
+          const terminalAt = DateTime.subtract(now, { seconds: 12 });
+          const ended = yield* sink
+            .stream({ afterSequence: yield* sink.latestSequence(), eventType: "run.updated" })
+            .pipe(
+              Stream.filter(
+                (e) =>
+                  e.event.type === "run.updated" &&
+                  e.event.payload.id === source.id &&
+                  e.event.payload.status === "waiting",
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped,
+            );
+          yield* Queue.offer(events, {
+            type: "provider_turn.updated",
+            driver,
+            providerTurn: { ...turn, status: "completed", completedAt: now },
+          });
+          yield* Queue.offer(events, {
+            type: "turn.terminal",
+            driver,
+            providerThreadId: turn.providerThreadId,
+            providerTurnId: turn.id,
+            runOrdinal: 1,
+            status: "completed",
+            failure: null,
+            threadDisposition: "reusable",
+          });
+          yield* Fiber.join(ended);
+          yield* worker.drain();
+          const firstMessageId = MessageId.make("message:1711-baseline");
+          const names = ["Baseline", "Review", "Later failure"];
+          const tasks: OrchestrationV2Subagent[] = names.map((title, i) => ({
+            id: NodeId.make(`node:1711-${i}`),
+            threadId,
+            runId: source.id,
+            parentNodeId: source.rootNodeId!,
+            origin: "app_owned",
+            createdBy: "agent",
+            driver,
+            providerInstanceId: instanceId,
+            providerThreadId: null,
+            childThreadId: ThreadId.make(`thread:1711-child-${i}`),
+            nativeTaskRef: null,
+            prompt: title,
+            title,
+            model: null,
+            completionWake: "always",
+            status:
+              i === 0
+                ? "completed"
+                : acceptance === "offer-replay" && i === 1
+                  ? "failed"
+                  : "running",
+            result: i === 0 ? "Baseline completed" : null,
+            startedAt: terminalAt,
+            completedAt: i === 0 || (acceptance === "offer-replay" && i === 1) ? terminalAt : null,
+            updatedAt: terminalAt,
+            completionDelivery: { state: i === 0 ? "claimed" : "pending", observedByRunId: null },
+            ...(correction && i === 1
+              ? {
+                  status: "completed" as const,
+                  result: "Previous answer",
+                  lastAnnouncedStatus: "completed" as const,
+                  completionDelivery: { state: "delivered" as const, observedByRunId: null },
+                }
+              : {}),
+          }));
+          const latestSource = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+            (r) => r.id === source.id,
+          )!;
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("event:1711-cohort"),
+                type: "run.updated",
+                threadId,
+                runId: source.id,
+                occurredAt: now,
+                payload: {
+                  ...latestSource,
+                  delegatedCompletion: {
+                    disposition: "open",
+                    nextGeneration: 2,
+                    delivery: { generation: 1, messageId: firstMessageId, taskIds: [tasks[0]!.id] },
+                  },
+                },
+              },
+              ...tasks.map((task) => ({
+                id: EventId.make(`event:${task.id}`),
+                type: "subagent.updated" as const,
+                threadId,
+                runId: source.id,
+                nodeId: task.id,
+                occurredAt: now,
+                payload: task,
+              })),
+            ],
+          });
+          for (const task of tasks) {
+            yield* sink.write({
+              events: [
+                {
+                  id: EventId.make(`event:1711-child-${task.id}`),
+                  type: "thread.created",
+                  threadId: task.childThreadId!,
+                  occurredAt: now,
+                  payload: {
+                    ...initial.thread,
+                    id: task.childThreadId!,
+                    activeProviderThreadId: null,
+                    lineage: {
+                      parentThreadId: threadId,
+                      relationshipToParent: "subagent",
+                      rootThreadId: threadId,
+                    },
+                    forkedFrom: { type: "node", nodeId: task.id },
+                  },
+                },
+              ],
+            });
+          }
+          const dispatchDelivery = Effect.fn("test.dispatchNotice1711")(function* () {
+            const projection = yield* orchestrator.getThreadProjection(threadId);
+            const delivery = projection.runs.find((r) => r.id === source.id)!.delegatedCompletion!
+              .delivery!;
+            const ack = !projection.runs.some((r) => r.status === "running")
+              ? yield* sink
+                  .stream({
+                    afterSequence: yield* sink.latestSequence(),
+                    eventType: "provider-turn.updated",
+                  })
+                  .pipe(
+                    Stream.filter(
+                      (e) =>
+                        e.event.type === "provider-turn.updated" &&
+                        e.event.threadId === threadId &&
+                        (nativeAcceptance
+                          ? e.event.payload.promptAcceptedAt !== undefined
+                          : e.event.payload.status === "running"),
+                    ),
+                    Stream.take(1),
+                    Stream.runDrain,
+                    Effect.forkScoped,
+                  )
+              : undefined;
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(`command:1711-${delivery.generation}`),
+              threadId,
+              messageId: delivery.messageId,
+              text: "Task completed",
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "agent",
+              creationSource: "server",
+              delegatedCompletion: {
+                parentRunId: source.id,
+                generation: delivery.generation,
+                taskIds: delivery.taskIds,
+              },
+            });
+            yield* worker.drain();
+            if (ack !== undefined) {
+              yield* Fiber.join(ack);
+              yield* worker.drain();
+            }
+          });
+          yield* dispatchDelivery();
+          if (!nativeAcceptance) {
+            const offered = yield* orchestrator.getThreadProjection(threadId);
+            assert.equal(
+              offered.subagents.find((t) => t.id === tasks[0]!.id)?.completionDelivery?.state,
+              "claimed",
+            );
+            assert.equal(rows.filter((row) => row.kind === "delegated.notice").length, 0);
+            const wake = offered.runs.find((r) => r.userMessageId === firstMessageId)!;
+            const nativeTurn = offered.providerTurns.find(
+              (t) => t.runAttemptId === wake.activeAttemptId,
+            )!;
+            if (acceptance.startsWith("wrong-node") || acceptance.startsWith("wrong-thread")) {
+              const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+              yield* ingestor.ingestNormalized({
+                providerSessionId: offered.providerSessions[0]!.id,
+                providerInstanceId: instanceId,
+                threadId,
+                runId: wake.id,
+                nodeId: wake.rootNodeId!,
+                event: {
+                  type: "provider_turn.updated",
+                  driver,
+                  ...(acceptance.startsWith("wrong-thread")
+                    ? { threadId: tasks[1]!.childThreadId! }
+                    : {}),
+                  providerTurn: {
+                    ...nativeTurn,
+                    id: ProviderTurnId.make("turn:foreign-ack"),
+                    ...(acceptance.startsWith("wrong-node") ? { nodeId: tasks[1]!.id } : {}),
+                    promptAcceptedAt: now,
+                  },
+                },
+              });
+              yield* worker.drain();
+              const ignored = yield* orchestrator.getThreadProjection(threadId);
+              assert.equal(
+                ignored.subagents.find((t) => t.id === tasks[0]!.id)?.completionDelivery?.state,
+                "claimed",
+              );
+              assert.equal(rows.filter((row) => row.kind === "delegated.notice").length, 0);
+            }
+            const cancelWake = sink.write({
+              events: [
+                {
+                  id: EventId.make("event:1711-cancel-before-bookkeeping"),
+                  type: "run.updated",
+                  threadId,
+                  runId: wake.id,
+                  occurredAt: now,
+                  payload: {
+                    ...wake,
+                    status:
+                      acceptance === "failed-start"
+                        ? "failed"
+                        : acceptance === "interrupted-start"
+                          ? "interrupted"
+                          : "cancelled",
+                    completedAt: now,
+                  },
+                },
+              ],
+            });
+            if (
+              acceptance.endsWith("-restart") ||
+              acceptance === "failed-start" ||
+              acceptance === "interrupted-start"
+            ) {
+              yield* cancelWake;
+              yield* orchestrator.recoverDelegatedTasks;
+              const recovered = yield* orchestrator.getThreadProjection(threadId);
+              assert.notEqual(
+                recovered.subagents.find((t) => t.id === tasks[0]!.id)?.completionDelivery?.state,
+                "delivered",
+              );
+              assert.deepEqual(
+                recovered.runs.find((r) => r.id === source.id)!.delegatedCompletion!.delivery!
+                  .taskIds,
+                [tasks[0]!.id],
+              );
+              assert.equal(rows.filter((row) => row.kind === "delegated.notice").length, 0);
+              return;
+            }
+            const outbox = yield* EffectOutbox.EffectOutboxV2;
+            if (acceptance === "deferred") {
+              yield* outbox.enqueue([
+                {
+                  id: "effect:1711-unsettled-start",
+                  commandId: CommandId.make("command:1711-unsettled-start"),
+                  threadId,
+                  request: { type: "provider-turn.start", runId: wake.id },
+                },
+              ]);
+              yield* outbox.claimNext({
+                workerId: "test-native-start",
+                leaseDurationMs: 60000,
+                onlyEffectTypes: ["provider-turn.start"],
+              });
+            }
+            const persisted = yield* sink
+              .stream({
+                afterSequence: yield* sink.latestSequence(),
+                eventType: "provider-turn.updated",
+              })
+              .pipe(
+                Stream.filter(
+                  (e) =>
+                    e.event.type === "provider-turn.updated" &&
+                    e.event.payload.id === nativeTurn.id &&
+                    e.event.payload.promptAcceptedAt !== undefined,
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+                Effect.forkScoped,
+              );
+            yield* Queue.offer(events, {
+              type: "provider_turn.updated",
+              driver,
+              providerTurn: { ...nativeTurn, promptAcceptedAt: now },
+            });
+            yield* Fiber.join(persisted);
+            if (acceptance === "terminal-race") {
+              yield* cancelWake;
+              yield* orchestrator.recoverDelegatedTasks;
+            }
+            if (acceptance === "retry") {
+              const threads = yield* ThreadManagementService.ThreadManagementService;
+              const fault = vi.spyOn(threads, "dispatch").mockImplementationOnce((command) =>
+                Effect.fail(
+                  new Orchestrator.OrchestratorDispatchError({
+                    commandId: command.commandId,
+                    commandType: command.type,
+                    cause: "acceptance persistence unavailable once",
+                  }),
+                ),
+              );
+              yield* worker.drain();
+              fault.mockRestore();
+              const waiting = yield* orchestrator.getThreadProjection(threadId);
+              assert.equal(
+                waiting.subagents.find((t) => t.id === tasks[0]!.id)?.completionDelivery?.state,
+                "claimed",
+              );
+              assert.equal(started.length, 2);
+              const effects = yield* outbox.listByCommandId(
+                CommandId.make(`command:notice-native-accepted:${threadId}:${firstMessageId}`),
+              );
+              assert.equal(
+                effects.find((e) => e.request.type === "notification.delivery.accept")?.status,
+                "pending",
+              );
+              yield* TestClock.adjust(100);
+            }
+            if (acceptance === "projection-retry" || acceptance === "commit-exhaustion") {
+              const projections = yield* ProjectionStore.ProjectionStoreV2;
+              const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+              const getRecords = projections.getThreadRecords;
+              const commit = sink.commitCommand;
+              const commandId = CommandId.make(
+                `command:notice-native-accepted:${threadId}:${firstMessageId}`,
+              );
+              const failureCount = acceptance === "projection-retry" ? 1 : 6;
+              let failures = 0;
+              const fault =
+                acceptance === "projection-retry"
+                  ? vi
+                      .spyOn(projections, "getThreadRecords")
+                      .mockImplementation((id, fields, filter) => {
+                        if (id === threadId && filter?.omitSettledLeafNodes && failures++ === 0)
+                          return Effect.fail(
+                            new ProjectionStore.ProjectionStoreReadError({
+                              threadId,
+                              cause: new Error("Database reader retired"),
+                            }),
+                          );
+                        return getRecords(id, fields, filter);
+                      })
+                  : vi.spyOn(sink, "commitCommand").mockImplementation((input) => {
+                      if (
+                        input.commandType === "notification.delivery.accept" &&
+                        failures++ < failureCount
+                      )
+                        return Effect.fail(
+                          new EventSink.EventSinkWriteError({
+                            eventCount: input.events.length,
+                            cause: new Error("acceptance transaction unavailable"),
+                          }),
+                        );
+                      return commit(input);
+                    });
+              for (let attempt = 1; attempt <= failureCount; attempt++) {
+                yield* worker.drain();
+                const pending = yield* outbox.listByCommandId(commandId);
+                assert.equal(pending[0]?.status, "pending");
+                assert.equal(pending[0]?.attemptCount, attempt);
+                assert.isTrue(Option.isNone(yield* receipts.getByCommandId(commandId)));
+                assert.equal(started.length, 2);
+                yield* TestClock.adjust(100 * 2 ** (attempt - 1));
+              }
+              fault.mockRestore();
+            }
+            if (acceptance === "offer-replay") {
+              const projections = yield* ProjectionStore.ProjectionStoreV2;
+              const getRecords = projections.getThreadRecords;
+              const commit = sink.commitCommand;
+              let commits = 0;
+              let failedOffer = false;
+              const commitSpy = vi.spyOn(sink, "commitCommand").mockImplementation((input) =>
+                commit(input).pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      if (input.commandType === "notification.delivery.accept") commits++;
+                    }),
+                  ),
+                ),
+              );
+              const readSpy = vi
+                .spyOn(projections, "getThreadRecords")
+                .mockImplementation((id, fields, filter) => {
+                  if (
+                    commits === 1 &&
+                    !failedOffer &&
+                    id === threadId &&
+                    fields.length === 1 &&
+                    fields[0] === "runs" &&
+                    filter === undefined
+                  ) {
+                    failedOffer = true;
+                    return Effect.fail(
+                      new ProjectionStore.ProjectionStoreReadError({
+                        threadId,
+                        cause: new Error("Reader lane unavailable during sibling offer"),
+                      }),
+                    );
+                  }
+                  return getRecords(id, fields, filter);
+                });
+              offers.length = 0;
+              yield* worker.drain();
+              assert.isTrue(failedOffer);
+              assert.equal(commits, 1);
+              assert.lengthOf(offers, 0);
+              assert.equal(
+                (yield* outbox.listByCommandId(
+                  CommandId.make(`command:notice-native-accepted:${threadId}:${firstMessageId}`),
+                ))[0]?.status,
+                "pending",
+              );
+              readSpy.mockRestore();
+              yield* TestClock.adjust(100);
+              yield* worker.drain();
+              commitSpy.mockRestore();
+              assert.equal(commits, 1, "receipt replay must not commit acceptance twice");
+              assert.lengthOf(offers, 1, "receipt replay must re-offer the reserved sibling");
+              const ready = yield* orchestrator.getThreadProjection(threadId);
+              const delivery = ready.runs.find((r) => r.id === source.id)!.delegatedCompletion!
+                .delivery!;
+              assert.deepEqual(delivery.taskIds, [tasks[1]!.id]);
+              assert.equal(offers[0]!.delegatedCompletion?.messageId, delivery.messageId);
+              yield* dispatchDelivery();
+              assert.equal(started.length, 2);
+              assert.lengthOf(steered, 1);
+              const announcements = rows.filter((row) => row.kind === "delegated.notice");
+              assert.deepEqual(
+                announcements.map((row) => row.children?.[0]?.childTaskId),
+                [tasks[0]!.id, tasks[1]!.id],
+              );
+              assert.equal(announcements[0]!.children?.[0]?.delayMs, 12000);
+              assert.equal(announcements[1]!.children?.[0]?.delayMs, 12100);
+              return;
+            }
+            yield* worker.drain();
+            if (acceptance === "deferred")
+              yield* outbox.succeed({
+                effectId: "effect:1711-unsettled-start",
+                workerId: "test-native-start",
+              });
+          }
+          const accepted = yield* orchestrator.getThreadProjection(threadId);
+          assert.equal(
+            accepted.subagents.find((t) => t.id === tasks[0]!.id)?.completionDelivery?.state,
+            "delivered",
+          );
+          assert.isNull(
+            accepted.runs.find((r) => r.id === source.id)!.delegatedCompletion!.delivery,
+          );
+          assert.equal(started.length, 2);
+          if (acceptance === "terminal-race") {
+            assert.equal(rows.filter((row) => row.kind === "delegated.notice").length, 1);
+            return;
+          }
+          yield* orchestrator.dispatch({
+            type: "notification.delivery.accept",
+            commandId: CommandId.make("command:1711-repeat-accept"),
+            threadId,
+            messageId: firstMessageId,
+          });
+          const baseline = tasks[0]!;
+          const baselineReconciled = yield* sink
+            .stream({
+              afterSequence: yield* sink.latestSequence(),
+              eventType: "context-transfer.created",
+            })
+            .pipe(
+              Stream.filter(
+                (e) =>
+                  e.event.type === "context-transfer.created" &&
+                  e.event.payload.sourceThreadId === baseline.childThreadId,
+              ),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkScoped,
+            );
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("event:1711-baseline-child"),
+                type: "run.updated",
+                threadId: baseline.childThreadId!,
+                occurredAt: now,
+                payload: {
+                  ...source,
+                  id: RunId.make("run:1711-baseline"),
+                  threadId: baseline.childThreadId!,
+                  providerThreadId: null,
+                  activeAttemptId: null,
+                  delegatedTaskId: baseline.id,
+                  status: "completed",
+                  completedAt: terminalAt,
+                },
+              },
+            ],
+          });
+          yield* Fiber.join(baselineReconciled);
+          if (restart) {
+            const wake = accepted.runs.find((r) => r.userMessageId === firstMessageId)!;
+            yield* sink.write({
+              events: [
+                {
+                  id: EventId.make("event:1711-restart"),
+                  type: "run.updated",
+                  threadId,
+                  runId: wake.id,
+                  occurredAt: now,
+                  payload: { ...wake, status: "cancelled", completedAt: now },
+                },
+              ],
+            });
+            yield* orchestrator.recoverDelegatedTasks;
+          }
+          for (const task of tasks.slice(1)) {
+            const finished = yield* sink
+              .stream({
+                afterSequence: yield* sink.latestSequence(),
+                eventType: "subagent.updated",
+              })
+              .pipe(
+                Stream.filter(
+                  (e) =>
+                    e.event.type === "subagent.updated" &&
+                    e.event.payload.id === task.id &&
+                    e.event.payload.status === "failed",
+                ),
+                Stream.take(1),
+                Stream.runDrain,
+                Effect.forkScoped,
+              );
+            const childRunId = RunId.make(`run:1711-child-${task.id}`);
+            yield* sink.write({
+              events: [
+                {
+                  id: EventId.make(`event:1711-terminal-${task.id}`),
+                  type: "run.updated",
+                  threadId: task.childThreadId!,
+                  runId: childRunId,
+                  occurredAt: now,
+                  payload: {
+                    ...source,
+                    id: childRunId,
+                    threadId: task.childThreadId!,
+                    providerThreadId: null,
+                    activeAttemptId: null,
+                    delegatedTaskId: task.id,
+                    status: "failed",
+                    completedAt: terminalAt,
+                    delegatedTaskStall: {
+                      idleTimeoutMs: 900000,
+                      lastProgressAt: terminalAt,
+                      lastProgressKind: "tool_call",
+                    },
+                  },
+                },
+              ],
+            });
+            yield* Fiber.join(finished);
+            const ready = yield* orchestrator.getThreadProjection(threadId);
+            assert.deepEqual(
+              ready.runs.find((r) => r.id === source.id)!.delegatedCompletion!.delivery!.taskIds,
+              [task.id],
+            );
+            if (acceptance === "steer-commit-exhaustion" && task.id === tasks[1]!.id) {
+              const outbox = yield* EffectOutbox.EffectOutboxV2;
+              const delivery = ready.runs.find((r) => r.id === source.id)!.delegatedCompletion!
+                .delivery!;
+              const commit = sink.commitCommand;
+              let failures = 0;
+              const fault = vi.spyOn(sink, "commitCommand").mockImplementation((input) => {
+                if (input.commandType === "notification.delivery.accept" && failures++ < 6)
+                  return Effect.fail(
+                    new EventSink.EventSinkWriteError({
+                      eventCount: input.events.length,
+                      cause: new Error("accepted steer transaction unavailable"),
+                    }),
+                  );
+                return commit(input);
+              });
+              yield* dispatchDelivery();
+              for (let attempt = 1; attempt <= 6; attempt++) {
+                const effects = yield* outbox.listByCommandId(
+                  CommandId.make(`command:1711-${delivery.generation}`),
+                );
+                const steer = effects.find(
+                  (effect) => effect.request.type === "provider-turn.steer",
+                )!;
+                assert.equal(
+                  steer.status,
+                  "pending",
+                  "accepted steer bookkeeping must survive the native retry budget",
+                );
+                assert.equal(steer.attemptCount, attempt);
+                assert.isTrue(
+                  steer.request.type === "provider-turn.steer" &&
+                    steer.request.providerAccepted === true,
+                );
+                assert.lengthOf(steered, 1, "retry must never resend accepted input");
+                yield* TestClock.adjust(100 * 2 ** (attempt - 1));
+                if (attempt < 6) yield* worker.drain();
+              }
+              fault.mockRestore();
+              yield* worker.drain();
+              assert.lengthOf(steered, 1);
+            } else {
+              yield* dispatchDelivery();
+            }
+          }
+          const final = yield* orchestrator.getThreadProjection(threadId);
+          assert.equal(final.subagents.find((t) => t.id === tasks[0]!.id)?.status, "completed");
+          const notices = final.turnItems.filter(
+            (i) => i.type === "notification" && i.source.kind === "delegated_task",
+          );
+          assert.equal(notices.length, 3);
+          for (const [i, title] of names.entries()) {
+            const notice = notices.find(
+              (n) =>
+                n.type === "notification" &&
+                n.source.kind === "delegated_task" &&
+                n.source.taskIds.includes(tasks[i]!.id),
+            );
+            assert.equal(
+              notice?.type === "notification" ? notice.summary : null,
+              `Delegated task "${title}" ${correction && i === 1 ? "previously finished, now failed: stalled" : i === 0 ? "finished" : "failed"}`,
+            );
+          }
+          if (!restart && acceptance !== "terminal-race") assert.equal(steered.length, 2);
+          const announcements = rows.filter((row) => row.kind === "delegated.notice");
+          assert.equal(announcements.length, 3);
+          for (const row of announcements) {
+            assert.deepInclude(row, { parentThreadId: threadId, parentRunId: source.id });
+            assert.equal(
+              row.children?.[0]?.delayMs,
+              acceptance === "steer-commit-exhaustion"
+                ? row.children?.[0]?.childTaskId === tasks[0]!.id
+                  ? 12000
+                  : 18300
+                : acceptance === "commit-exhaustion"
+                  ? 18300
+                  : acceptance === "retry" || acceptance === "projection-retry"
+                    ? 12100
+                    : 12000,
+            );
+          }
+          const changes = rows.filter((row) => row.kind === "delegated.terminal-status-changed");
+          assert.equal(changes.length, correction ? 1 : 0);
+          if (correction)
+            assert.deepInclude(changes[0], {
+              taskId: tasks[1]!.id,
+              oldStatus: "completed",
+              newStatus: "failed",
+              reason: "stalled_child_terminal_reconciled",
+            });
+        }).pipe(
+          Effect.provide(
+            layer.pipe(
+              Layer.provide(
+                Layer.succeed(ProviderContinuationRequests.ProviderContinuationRequests, {
+                  offer: (request) =>
+                    Effect.sync(() => {
+                      offers.push(request);
+                    }),
+                  take: Effect.never,
+                }),
+              ),
+              Layer.provide(
+                Layer.succeed(Analytics.Analytics, {
+                  record: (event) =>
+                    Effect.sync(() => {
+                      rows.push(event);
+                    }),
+                  flush: Effect.void,
+                  ingest: () => Effect.void,
+                  read: () => Effect.die("unused"),
+                }),
+              ),
+            ),
+          ),
+        );
+      }),
+    ),
 );

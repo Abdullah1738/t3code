@@ -714,6 +714,52 @@ class IntegratedCapacityTests(Isolated):
         self.assertEqual(self.clock.t, 1040)
         self.assertIn("boat out of machine capacity; nothing ran", err.getvalue())
 
+    def test_pool_lock_cannot_extend_the_capacity_outage_window(self):
+        calls = 0
+        def acquire(me):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise api.BoatAtCapacity()
+            return pool.acquire(me)
+        real_lock = common.file_lock
+        @contextlib.contextmanager
+        def lock(name, timeout=600):
+            if name == pool.lock_name('repo'):
+                self.clock.sleep(timeout)
+                raise common.OffboxError('pool lock busy')
+            with real_lock(name, timeout=timeout):
+                yield
+        with patch.dict(os.environ, OFFBOX_OUTAGE_WAIT_SECONDS='40', OFFBOX_POOL_WAIT_SECONDS='600'), \
+                patch.object(pool, 'time', self.clock.time), patch.object(pool, 'file_lock', side_effect=lock), \
+                patch.object(pool, '_refresh_background'):
+            code, executed, _ = self.run_cli(acquire)
+        self.assertEqual((code, executed), (90, []))
+        self.assertEqual(self.clock.t, 1040)
+
+    def test_api_blip_does_not_make_a_capacity_window_pausable(self):
+        for bid in ('one', 'two'):
+            self.box(bid, member=True)
+            self.busy(bid)
+        calls = 0
+        def acquire(me):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise api.BoatAtCapacity()
+            if calls == 2:
+                raise api.NetworkError('no answer')
+            return pool.acquire(me)
+        def recover(*args, **kwargs):
+            self.clock.sleep(15)
+            return True
+        with patch.dict(os.environ, OFFBOX_OUTAGE_WAIT_SECONDS='90', OFFBOX_POOL_WAIT_SECONDS='600'), \
+                patch.object(pool, 'time', self.clock.time), patch.object(outage, 'wait_until_up', side_effect=recover), \
+                patch.object(pool, '_refresh_background'):
+            code, executed, _ = self.run_cli(acquire)
+        self.assertEqual((code, executed), (90, []))
+        self.assertEqual(self.clock.t, 1090)
+
     def test_resume_read_timeout_during_capacity_round_is_confirmed_on_same_box(self):
         self.box("cold", "stopped", member=True)
         calls = []

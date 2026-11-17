@@ -33,19 +33,38 @@ export const startTimeoutOf = (event: OrchestrationV2DomainEvent) =>
   event.type === "turn-item.updated" &&
   event.payload.type === "error" &&
   event.payload.status === "failed" &&
-  event.payload.failure.code === "provider_start_timeout" &&
+  (event.payload.failure.code === "provider_start_timeout" ||
+    event.payload.failure.code === "provider_events_lost" ||
+    event.payload.failure.code === "restart_admission_timeout") &&
   event.payload.runId !== null
-    ? { runId: event.payload.runId, reason: event.payload.failure.message }
+    ? {
+        runId: event.payload.runId,
+        reason: event.payload.failure.message,
+        ...(event.payload.failure.admission === undefined
+          ? {}
+          : { admission: event.payload.failure.admission }),
+        ...(event.payload.failure.code === "restart_admission_timeout"
+          ? { restartAdmission: true }
+          : {}),
+      }
     : undefined;
 
 /** Which board action a domain event triggers, if any. Exported so the route is tested itself. */
 export const boardEventRoute = (
   event: OrchestrationV2DomainEvent,
-): "turnEnd" | "threadChanged" | null => {
+): "turnEnd" | "threadChanged" | "cancelReason" | null => {
+  if (cancelReasonRunOf(event) !== null) return "cancelReason";
   if (event.type === "run.updated" && TERMINAL_RUN_STATUSES.has(event.payload.status))
     return "turnEnd";
   return THREAD_STATE_EVENTS.has(event.type) ? "threadChanged" : null;
 };
+
+export const cancelReasonRunOf = (event: OrchestrationV2DomainEvent) =>
+  event.type === "turn-item.updated" &&
+  event.payload.type === "run_interrupt_request" &&
+  event.payload.cancelReason !== undefined
+    ? event.payload.runId
+    : null;
 
 /**
  * Streamed output (nodes, turn items) fires per paragraph and does not change
@@ -55,6 +74,7 @@ const STREAMING_EVENTS = new Set<string>(["node.updated", "turn-item.updated"]);
 
 /** The thread an event changed, for the board's read fences. Exported so it is tested itself. */
 export const threadEventOf = (event: OrchestrationV2DomainEvent): string | null => {
+  if (cancelReasonRunOf(event) !== null) return event.threadId;
   if (STREAMING_EVENTS.has(event.type)) return null;
   const threadId = (event as { readonly threadId?: unknown }).threadId;
   return typeof threadId === "string" ? threadId : null;
@@ -131,6 +151,8 @@ export const ArdudKanbanLive = Layer.effectDiscard(
         if (startTimeout !== undefined)
           return service.notifyTurnEnded(event.threadId, startTimeout);
         const route = boardEventRoute(event);
+        if (route === "cancelReason")
+          return service.notifyRunCancellation(event.threadId, cancelReasonRunOf(event)!);
         if (route === "turnEnd") return service.notifyTurnEnded(event.threadId);
         if (route === "threadChanged")
           return service

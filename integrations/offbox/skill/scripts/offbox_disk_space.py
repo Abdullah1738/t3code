@@ -23,7 +23,7 @@ PROBE_BEGIN_MARKER = 'offbox-space-probe: '
 PROBE_ERROR_MARKER = 'offbox-space-probe-error: '
 PROBE_FAILED = 'offbox: disk-space probe failed (exit '
 PROBE_INVALID = 'offbox: infra: disk probe payload invalid (client code changed on disk since start?)'
-ENOSPC = re.compile(r'No space left on device|\bENOSPC\b|os error 28|Errno 28', re.I)
+ENOSPC = re.compile(r'No space left on device|\bENOSPC\b|os error 28|Errno\s*28|errno[ :=]*28', re.I)
 
 
 def snapshot(workspace=None, home=None):
@@ -139,9 +139,11 @@ def remove_checked(parent, name, uid, cutoff, device, expected=None):
 
 
 def reap(root, uid, live, *, clock=time.time, proc=Path('/proc'), emit=print,
-         mountinfo=Path('/proc/self/mountinfo')):
+         mountinfo=Path('/proc/self/mountinfo'), finished_before=None, keep_prefixes=()):
     root = Path(root)
-    cutoff = min([clock()-600] + [r['started_at'] for r in live])
+    # A confirmed finished run needs no grace period; every live wrapper still fences its files.
+    cutoff = min([finished_before if finished_before is not None else clock()-600] +
+                 [r['started_at'] for r in live])
     device = root.stat().st_dev
     # st_dev alone cannot distinguish a bind mount of the same filesystem.
     mounts = [re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), line.split()[4])
@@ -149,7 +151,7 @@ def reap(root, uid, live, *, clock=time.time, proc=Path('/proc'), emit=print,
     removed = 0
     for path in root.iterdir():
         # The parent is protected too: never recurse into any run's private scratch.
-        if path.name in ('offbox-run', '.X11-unix', 'snap-private-tmp') or path.name.startswith('systemd-private-'):
+        if path.name in ('offbox-run', '.X11-unix', 'snap-private-tmp') or path.name.startswith(('systemd-private-', *keep_prefixes)):
             continue
         if any(m == str(path) or m.startswith(str(path) + '/') for m in mounts):
             continue
@@ -231,7 +233,8 @@ def result(path, code, *, offset=0):
     probe_error, traceback_line, string_trace, command_started = None, None, 0, False
     probe_errors, started_attempts = {}, set()
     native_crash = False
-    native_attempts = set()
+    native_attempts = {}
+    native_reason = None
     try:
         with open(path, 'rb') as f:
             f.seek(offset)
@@ -257,15 +260,16 @@ def result(path, code, *, offset=0):
                                         (record.get('infra_failure') != 'disk_probe' or
                                          record.get('infra_reason') == 'probe_crashed') and
                                         (record.get('infra_failure') != 'native_crash' or
-                                         record.get('infra_reason') == 'toolchain_unpack_crash') and
+                                         isinstance(record.get('infra_reason'), str)) and
                                         (final is None or attempt >= final[0])):
                                     final = attempt, record
                             continue
-                        if phase == 'toolchain':
+                        if phase in ('toolchain', 'setup'):
                             if (item.get('infra_failure') == 'native_crash' and
-                                    item.get('infra_reason') == 'toolchain_unpack_crash'):
+                                    isinstance(item.get('infra_reason'), str)):
                                 native_crash = True
-                                native_attempts.add(seen_attempt)
+                                native_reason = item['infra_reason']
+                                native_attempts[seen_attempt] = native_reason
                             continue
                         space = item['space']
                         if phase not in ('server_start', 'start', 'end', 'gate') or not valid_space(space):
@@ -308,7 +312,9 @@ def result(path, code, *, offset=0):
         # Older servers summarize disk failures only. Preserve the explicit stderr
         # toolchain marker for that same attempt so a client-only install is enough.
         native_crash = (final[1].get('infra_failure') == 'native_crash' or
-                        final[0] in native_attempts)
+                        final[1].get('setup_native_crash') is True or final[0] in native_attempts)
+        native_reason = (final[1].get('infra_reason') if final[1].get('infra_failure') == 'native_crash'
+                         else native_attempts.get(final[0]))
     if authoritative:
         probe_error = final[1].get('disk_probe_error') or probe_errors.get(final[0])
         command_started = final[0] in started_attempts
@@ -332,8 +338,10 @@ def result(path, code, *, offset=0):
             probe_crashed = final[1].get('infra_failure') == 'disk_probe'
         if probe_crashed:
             out.update(infra_failure='disk_probe', infra_reason='probe_crashed', command_exit_code=None)
-    if code == 90 and native_crash:
-        out.update(infra_failure='native_crash', infra_reason='toolchain_unpack_crash', command_exit_code=None)
+    if native_crash:
+        out['setup_native_crash'] = True
+    if code == 90 and native_crash and native_reason:
+        out.update(infra_failure='native_crash', infra_reason=native_reason, command_exit_code=None)
     return out
 
 
@@ -351,8 +359,7 @@ def message(record):
     if record.get('infra_failure') == 'disk_probe':
         return 'infra: the offbox disk probe crashed before your command started; nothing ran. Rerun.'
     if record.get('infra_failure') == 'native_crash':
-        return ('infra: the box crashed unpacking a checksum-verified toolchain archive twice; '
-                'this is a box/host fault, not your repo. Nothing ran (exit 90).')
+        return 'infra: this box crashed native programs during setup (exit 90).'
     phases = record.get('disk_space', {})
     start = phases.get('start', phases.get('server_start', {}))
     end = phases.get('end', phases.get('gate', {}))
@@ -367,18 +374,34 @@ def probe():
     space = snapshot(sys.argv[2] if len(sys.argv) > 2 else None)
     print(MARKER + json.dumps(dict(phase=phase, space=space)), file=sys.stderr, flush=True)
     if phase == 'start':
+        receipt = None
+        run = os.environ.get('OFFBOX_RUN_ID', '')
+        if re.fullmatch(r'run-[A-Za-z0-9-]+', run):
+            receipt = Path.home() / '.offbox/exit' / (run + '.gate')
+            try:
+                receipt.unlink(missing_ok=True)
+            except OSError:
+                pass
         line = warning(space, os.environ.get('OFFBOX_BOX_ID', '<box>'))
         if line:
             print(line, file=sys.stderr)
         if space.get('tmp', {}).get('free_bytes', GATE_BYTES) < GATE_BYTES:
-            print(MARKER + json.dumps(dict(phase='gate', space=space)), file=sys.stderr, flush=True)
+            record = json.dumps(dict(phase='gate', space=space))
+            # A lost command-start response has no API log identity, including on home boxes.
+            if receipt is not None:
+                try:
+                    receipt.parent.mkdir(parents=True, exist_ok=True)
+                    receipt.write_text(record)
+                except OSError:
+                    pass
+            print(MARKER + record, file=sys.stderr, flush=True)
             print('offbox: infra: /tmp below 256 MiB; command not started; see remote-compute: Disk space', file=sys.stderr)
             sys.exit(90)
 
 
 def _build_probe_payload():
     # Send only the probe, not the reaper; wrapped shell commands must remain below 64 KiB.
-    source = ('import os,json,subprocess,sys\nfrom pathlib import Path\n'
+    source = ('import os,json,re,subprocess,sys\nfrom pathlib import Path\n'
               f'WARN_BYTES={WARN_BYTES}\nGATE_BYTES={GATE_BYTES}\nMARKER={MARKER!r}\n'
               + '\n'.join(inspect.getsource(f) for f in (snapshot, warning, probe)) + '\nprobe()\n')
     compile(source, '<offbox disk probe>', 'exec')

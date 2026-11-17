@@ -2,63 +2,92 @@
 export const queryPlanExceptions = [
   {
     route: "shell.selection",
-    queryHash: "1d4cf785c489c8217fc17ac594e1d57c6f46557bcc449a40fed02bcc869237bb",
-    pattern: "^SCAN\\ t\\ USING\\ INDEX\\ sqlite_autoindex_orchestration_v2_projection_threads_1$",
-    reason: "Existing M0 shell derivation; replace with indexed materialized views in M1/M3.",
+    queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
+    pattern: "^SCAN t USING INDEX ardud_recovery_active_threads_idx$",
+    reason:
+      "The existing full active-shell fallback now scans the narrower active-ID partial index instead of the primary key. Its query and sorting are unchanged; recovery itself uses a bounded indexed range.",
+  },
+  {
+    route: "shell.client-selection",
+    queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
+    pattern: "^SCAN t USING INDEX ardud_recovery_active_threads_idx$",
+    reason:
+      "The existing full client-shell fallback now scans the narrower active-ID partial index instead of the primary key. Its query and sorting are unchanged; recovery itself uses a bounded indexed range.",
   },
   {
     route: "shell.selection",
-    queryHash: "1d4cf785c489c8217fc17ac594e1d57c6f46557bcc449a40fed02bcc869237bb",
-    pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
-    reason: "Existing M0 shell derivation; replace with indexed materialized views in M1/M3.",
+    queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
+    pattern: "^SCAN\\ t\\ USING\\ INDEX\\ sqlite_autoindex_orchestration_v2_projection_threads_1$",
+    reason:
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
   {
     route: "shell.selection",
-    queryHash: "1d4cf785c489c8217fc17ac594e1d57c6f46557bcc449a40fed02bcc869237bb",
-    pattern: "^Interactive\\ query\\ references\\ history/archive$",
-    reason: "Existing M0 shell derivation; replace with indexed materialized views in M1/M3.",
-  },
-  {
-    route: "shell.client-selection",
-    queryHash: "c05a01229612410cb04d05d94ca92f9aab581c312ea4c662f28755f18dae919f",
-    pattern: "^SCAN\\ t\\ USING\\ INDEX\\ sqlite_autoindex_orchestration_v2_projection_threads_1$",
-    reason:
-      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
-  },
-  {
-    route: "shell.client-selection",
-    queryHash: "c05a01229612410cb04d05d94ca92f9aab581c312ea4c662f28755f18dae919f",
+    queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
     pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
     reason:
-      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+  },
+  {
+    route: "shell.selection",
+    queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
+    pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    historyTables: [
+      "ardud_archive.ardud_turn_items",
+      "ardud_base.orchestration_v2_projection_turn_items",
+    ],
+    reason:
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
   {
     route: "shell.client-selection",
-    queryHash: "c05a01229612410cb04d05d94ca92f9aab581c312ea4c662f28755f18dae919f",
-    pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
+    pattern: "^SCAN\\ t\\ USING\\ INDEX\\ sqlite_autoindex_orchestration_v2_projection_threads_1$",
     reason:
-      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes.",
+      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+  },
+  {
+    route: "shell.client-selection",
+    queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
+    pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
+    reason:
+      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+  },
+  {
+    route: "shell.client-selection",
+    queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
+    pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    historyTables: [
+      "ardud_archive.ardud_turn_items",
+      "ardud_base.orchestration_v2_projection_turn_items",
+    ],
+    reason:
+      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
   {
     route: "shell.recent-page",
-    queryHash: "46df03a4292bde2d9afc9858263e80eddfe43cdfc4141b32e1b5c18559ef8e77",
+    queryHash: "a95dd95f396ba7995c675ecca4467e4613f88c3c9c58b03d1f0fab3bd4c9acfd",
     pattern: "^SCAN\\ t\\ USING\\ INDEX\\ ardud_v2_threads_updated_idx$",
     reason:
-      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'.",
+      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
   {
     route: "shell.recent-page",
-    queryHash: "46df03a4292bde2d9afc9858263e80eddfe43cdfc4141b32e1b5c18559ef8e77",
+    queryHash: "a95dd95f396ba7995c675ecca4467e4613f88c3c9c58b03d1f0fab3bd4c9acfd",
     pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
     reason:
-      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'.",
+      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
   {
     route: "shell.recent-page",
-    queryHash: "46df03a4292bde2d9afc9858263e80eddfe43cdfc4141b32e1b5c18559ef8e77",
+    queryHash: "a95dd95f396ba7995c675ecca4467e4613f88c3c9c58b03d1f0fab3bd4c9acfd",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    historyTables: [
+      "ardud_archive.ardud_turn_items",
+      "ardud_base.orchestration_v2_projection_turn_items",
+    ],
     reason:
-      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'.",
+      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
   {
     route: "sweep.threads-with-pull-requests",
@@ -70,15 +99,21 @@ export const queryPlanExceptions = [
   },
   {
     route: "board.thread-state",
-    queryHash: "ddadfd7116f5f1550d086ce91157d3915c22eeec29cc94cb31ab1e7cc7d67442",
+    queryHash: "569234241364e03255371b2a0c6dc0d1559655d9af8509b143cabee0b8c39fa6",
     pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
-    reason: "Existing M0 shell derivation; replace with indexed materialized views in M1/M3.",
+    reason:
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
   {
     route: "board.thread-state",
-    queryHash: "ddadfd7116f5f1550d086ce91157d3915c22eeec29cc94cb31ab1e7cc7d67442",
+    queryHash: "569234241364e03255371b2a0c6dc0d1559655d9af8509b143cabee0b8c39fa6",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
-    reason: "Existing M0 shell derivation; replace with indexed materialized views in M1/M3.",
+    historyTables: [
+      "ardud_archive.ardud_turn_items",
+      "ardud_base.orchestration_v2_projection_turn_items",
+    ],
+    reason:
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
   },
   {
     route: "discussion.messages",
@@ -126,6 +161,7 @@ export const queryPlanExceptions = [
     route: "turn-start.history",
     queryHash: "9909f9aa617527a5bf630e848966cfad87762ee842e0d8e71df315244c2e1078",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
+    historyTables: ["ardud_history_turn_items"],
     reason:
       "Explicit history read across hot/delta/base; preserves existing transcript order and indexed thread/run selection.",
   },

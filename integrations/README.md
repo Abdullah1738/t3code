@@ -22,6 +22,7 @@ code here, test here, then sync it over.
 | `local-helpers` | `~/.local/libexec/{mail,card-preview,qcard}`, `~/.local/bin/{himalaya-heal,mailsearch,qcard}` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh` (mail OAuth heal, OTP watcher, card helpers; deploy via `local-helpers/install.zsh`) |
 | `tail-gateway` | `~/.local/share/tail-gateway`, `~/.local/bin/tailname` | `com.ardud.tail-gateway-{node,dns,proxy}` (friendly `https://<name>.tail` names for local services, tailnet only; deploy via `tail-gateway/install.zsh`) |
 | `robob-cards` | none (runs from the repo; builds and enrollments in `~/.local/share/robob-cards`) | none (iMessage card app; `bin/robob-cards-build`, `bin/robob-cards-enroll`) |
+| `venice-x402` | `~/.local/share/venice-x402` | `com.ardud.venice-x402` (OpenAI-compatible proxy on 127.0.0.1:43402 paying Venice AI via x402 from a Keychain wallet, spend caps, Mullvad egress gate; deploy via `venice-x402/install.zsh`) |
 
 Never add credentials, SQLite state, logs, `data/`, virtualenvs, watcher
 state (`robob-watch/watchers`, `archive`) or `.bak` files here. Runtime state

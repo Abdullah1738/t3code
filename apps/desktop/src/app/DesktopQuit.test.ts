@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
@@ -14,6 +15,7 @@ const files = vi.hoisted(() => ({
   existsSync: vi.fn(() => false),
   statSync: vi.fn(() => ({ size: 256 * 1024 })),
   renameSync: vi.fn(),
+  writeFileSync: vi.fn(),
 }));
 vi.mock("node:fs", async (original) => ({ ...(await original()), ...files }));
 
@@ -48,7 +50,15 @@ describe("DesktopQuit", () => {
       const [file, line] = files.appendFileSync.mock.calls[0]!;
       assert.equal(file, "/logs/desktop-quits.ndjson");
       const record = JSON.parse(line);
-      assert.deepEqual(record, { ...trigger, at: record.at, pid: process.pid });
+      assert.containsAllKeys(record, [
+        ...Object.keys(trigger),
+        "at",
+        "pid",
+        "initiator",
+        "osShutdownInProgress",
+      ]);
+      assert.equal(record.trigger, trigger.trigger);
+      assert.equal(record.pid, process.pid);
       assert.isTrue(Number.isFinite(Date.parse(record.at)));
     }).pipe(Effect.provide(layer)),
   );
@@ -75,8 +85,29 @@ describe("DesktopQuit", () => {
       yield* DesktopQuit.record({ trigger: "before-quit" });
       assert.deepEqual(files.renameSync.mock.calls, [
         ["/logs/desktop-quits.ndjson", "/logs/desktop-quits.ndjson.1"],
+        [`/logs/desktop-last-quit.json.${process.pid}.tmp`, "/logs/desktop-last-quit.json"],
       ]);
     }).pipe(Effect.provide(layer)),
+  );
+
+  it.effect(
+    "retains receipt time through later quit callbacks and clears it after a failed quit",
+    () =>
+      Effect.gen(function* () {
+        const state = yield* DesktopState.DesktopState;
+        yield* DesktopQuit.prepare({ trigger: "quitAndInstall" });
+        const first = yield* Ref.get(state.quitTrigger);
+        yield* TestClock.adjust("2 seconds");
+        yield* DesktopQuit.record({ trigger: "before-quit" });
+        assert.deepEqual(yield* Ref.get(state.quitTrigger), first);
+        assert.equal(first?.trigger, "quitAndInstall");
+        assert.isTrue(Number.isFinite(Date.parse(first!.at)));
+        yield* DesktopQuit.reset;
+        assert.isUndefined(yield* Ref.get(state.quitTrigger));
+        yield* DesktopQuit.prepare({ trigger: "before-quit" });
+        const next = yield* Ref.get(state.quitTrigger);
+        assert.equal(Date.parse(next!.at) - Date.parse(first!.at), 2000);
+      }).pipe(Effect.provide(Layer.provideMerge(layer, TestClock.layer()))),
   );
 
   it.effect("does not block shutdown when the log is unwritable", () =>

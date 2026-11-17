@@ -13,6 +13,23 @@
 set -eu
 person=${1:?usage: offbox-person-wa-new <person> <jid>}
 jid=${2:?usage: offbox-person-wa-new <person> <jid>}
+if [[ $person == moni ]]; then
+  config=${SPECTRUM_BRIDGE_CONFIG:-$HOME/.config/spectrum-bridge/config.json}
+  /usr/bin/python3 -I - "$config" <<'PYGUARD'
+import json, pathlib, sys
+try:
+    config = json.loads(pathlib.Path(sys.argv[1]).read_text())
+except FileNotFoundError:
+    sys.exit(0)
+except (OSError, ValueError):
+    print("Cannot verify Moni watcher destination", file=sys.stderr)
+    sys.exit(2)
+if config.get("chatBackends", {}).get("moni", {}).get("kind") == "remote-box":
+    print("Moni watchers run on her box. Use moni-agent watch there; raw text is unavailable here.", file=sys.stderr)
+    sys.exit(2)
+PYGUARD
+fi
+
 id=${WATCH_ID:?run this as a robob-watch check (WATCH_ID unset)}
 dir=${WATCH_DIR:-.}
 [[ $id =~ '^[a-z0-9][a-z0-9-]{0,47}$' ]] || { print -u2 "bad WATCH_ID"; exit 2; }

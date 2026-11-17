@@ -76,6 +76,8 @@ import {
 } from "@t3tools/provider-core/server/subagentProjection";
 import * as CursorAgentSdk from "./CursorAgentSdk.ts";
 import { ConfigurationError } from "./sdk.ts";
+
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
 export { cursorSdkModelSelection } from "./sdkModel.ts";
 
 export const CURSOR_DRIVER_KIND = CursorAgentSdk.CURSOR_PROVIDER;
@@ -2139,7 +2141,12 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             runtimePolicy: openInput.runtimePolicy,
             platform,
             threadId: openInput.threadId,
-            mcpSession: yield* mcpSessions.read(openInput.threadId),
+            mcpSession: yield* McpProviderSessions.readForRuntime(
+              mcpSessions,
+              openInput.threadId,
+              input.providerSessionId,
+              CursorAgentSdk.CURSOR_PROVIDER,
+            ),
           });
           if (
             platform === "win32" &&
@@ -2266,7 +2273,14 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               modelSelection: turnInput.modelSelection,
               runtimePolicy: turnInput.runtimePolicy,
             });
-            const mcpServers = cursorMcpServers(yield* mcpSessions.read(turnInput.threadId));
+            const mcpServers = cursorMcpServers(
+              yield* McpProviderSessions.readForRuntime(
+                mcpSessions,
+                turnInput.threadId,
+                input.providerSessionId,
+                CursorAgentSdk.CURSOR_PROVIDER,
+              ),
+            );
             const message = yield* resolveUserMessage(turnInput, mcpServers);
             const pendingUpdates: Array<InteractionUpdate> = [];
             let context: ActiveCursorTurn | null = null;
@@ -2534,9 +2548,10 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               const context = yield* Ref.get(activeTurn);
               if (context === null && turnInput.requestRuntimeRestart === true) return;
               if (context?.providerTurnId !== turnInput.providerTurnId) {
-                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
                   driver: CursorAgentSdk.CURSOR_PROVIDER,
-                  detail: `Cursor provider turn ${turnInput.providerTurnId} is not active.`,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
                 });
               }
               context.interrupted = true;
@@ -2556,14 +2571,15 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             },
             (effect, turnInput) =>
               effect.pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapter.ProviderAdapterInterruptError({
-                      driver: CursorAgentSdk.CURSOR_PROVIDER,
-                      providerThreadId: turnInput.providerThread.id,
-                      providerTurnId: turnInput.providerTurnId,
-                      cause,
-                    }),
+                Effect.mapError((cause) =>
+                  isTurnNotActiveError(cause)
+                    ? cause
+                    : new ProviderAdapter.ProviderAdapterInterruptError({
+                        driver: CursorAgentSdk.CURSOR_PROVIDER,
+                        providerThreadId: turnInput.providerThread.id,
+                        providerTurnId: turnInput.providerTurnId,
+                        cause,
+                      }),
                 ),
               ),
           ),
