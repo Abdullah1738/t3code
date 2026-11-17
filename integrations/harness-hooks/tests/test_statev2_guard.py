@@ -3755,6 +3755,60 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
                 if '--' in words:
                     self.assertEqual(guard._offbox_payload(words, known_only=False), words[words.index('--') + 1:])
 
+    def test_recall94_fixture_invocation_rejects_shell_operators(self):
+        target = self.recall94_fixture()
+        for name in ('PATH', 'LD_PRELOAD'):
+            for separator in (';', '; ', ' ; ', '\n', '&&', '&& ', '||', '|| ', '&', '& ', '|', '| '):
+                command = f'X=1{separator}{name}=/tmp/x bash {target}'
+                commands = (command,
+                            f'offbox run --bg --no-fallback -- {command}',
+                            f'X=1{separator}{name}=/tmp/x offbox run --bg -- bash {target}',
+                            f'offbox run --bg -- {shlex.quote(command)}')
+                for wrapped in commands:
+                    with self.subTest(name=name, separator=separator, command=wrapped):
+                        rule, reason = guard.classify_detail(wrapped, str(self.root))
+                        self.assertIsNotNone(rule)
+                        self.assertTrue(reason)
+        for operator in (';', ';;', ';&', ';;&', '\n', '&&', '||', '&', '|', '|&', '(', ')', '{', '}',
+                         '<', '>', '<<', '>>', '<<<', '<>', '>&', '<&', '>|'):
+            for command in (f'X=1{operator}Y=2 bash {target}',
+                            f'offbox run --bg -- X=1{operator}Y=2 bash {target}'):
+                with self.subTest(operator=operator, command=command):
+                    self.assertEqual(guard._fixture_invocation(command), [])
+
+    def test_recall94_fixture_invocation_keeps_quoted_punctuation_literal(self):
+        target = self.recall94_fixture()
+        for operator in (';', '&', '|', '&&', '||', '(', ')', '{', '}', '<', '>', '\n'):
+            for quote in ("'", '"'):
+                for value in (operator, '1' + operator + 'PATH=/tmp/x'):
+                    assignment = f'X={quote}{value}{quote}'
+                    for wrapper in ('', 'env ', 'offbox run --bg -- ', 'offbox run --env '):
+                        command = f'{wrapper}{assignment} bash {target}'
+                        if wrapper == 'offbox run --env ':
+                            command = f'{wrapper}{assignment} -- bash {target}'
+                        with self.subTest(operator=operator, quote=quote, command=command):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        for operator in (';', '&', '|', '(', ')', '{', '}', '<', '>'):
+            assignment = f'X=1\\{operator}PATH=/tmp/x'
+            for wrapper in ('', 'env ', 'offbox run --bg -- '):
+                with self.subTest(operator=operator, wrapper=wrapper):
+                    self.assertEqual(guard.classify_detail(f'{wrapper}{assignment} bash {target}', str(self.root)), (None, None))
+
+    def test_recall94_fixture_invocation_boundary_newlines(self):
+        target = self.recall94_fixture()
+        for prefix in ('', '\n', '\n \t\n', '# comment\n'):
+            for suffix in ('\n', '\n \t\n', ' # comment\n'):
+                for wrapper in ('', 'X=1 ', 'X=$(mktemp -d) ', 'env X=1 ', 'offbox run --bg -- '):
+                    command = f'{prefix}{wrapper}bash {target}{suffix}'
+                    with self.subTest(prefix=prefix, suffix=suffix, wrapper=wrapper):
+                        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        for wrapper in ('', 'offbox run --bg -- '):
+            command = f'\n{wrapper}X=1\nPATH=/tmp/x bash {target}\n'
+            with self.subTest(wrapper=wrapper):
+                rule, reason = guard.classify_detail(command, str(self.root))
+                self.assertIsNotNone(rule)
+                self.assertTrue(reason)
+
     def test_mktemp_fixture_plain_subpaths(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
         original = backup.read_text()

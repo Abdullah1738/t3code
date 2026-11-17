@@ -2974,7 +2974,18 @@ def _fixture_invocation(source):
     # shlex alone splits unquoted $(mktemp -d) into two words. Reuse the
     # walker's opaque substitutions without evaluating or trusting their body.
     text, quoted = _quoted_punctuation(source)
-    words = shlex.split(text, comments=True)
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=';&|(){}\n<>')
+    lexer.whitespace = ' \t\r'
+    lexer.whitespace_split = True
+    words = list(lexer)
+    while words and re.fullmatch(r'\n+', words[0]):
+        words.pop(0)
+    while words and re.fullmatch(r'\n+', words[-1]):
+        words.pop()
+    # A later command can change lookup or startup bindings. Reject operators
+    # before stripping assignments; quoted punctuation remains ordinary data.
+    if any(re.fullmatch(r'[;&|(){}\n<>]+', word) for word in words):
+        return []
     for key, value in reversed(quoted.items()):
         words = [word.replace(key, value) for word in words]
 
