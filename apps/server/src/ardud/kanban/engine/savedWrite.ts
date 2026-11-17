@@ -19,6 +19,12 @@ export const subStepReporter = Context.Reference<(steps: ReadonlyArray<SubStep>)
   { defaultValue: () => () => {} },
 );
 
+// Whole-call diagnostics include outside I/O; the board-hold reporter must not.
+export const callSubStepReporter = Context.Reference<(steps: ReadonlyArray<SubStep>) => void>(
+  "KanbanSavedWriteCallSubStepReporter",
+  { defaultValue: () => () => {} },
+);
+
 export interface SubStepCollection {
   (long: boolean): ReadonlyArray<SubStep> | undefined;
   readonly snapshot: () => ReadonlyArray<SubStep>;
@@ -122,12 +128,8 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
     );
   };
   const finish = includeOutsideLocks ? hold(yield* Effect.fiberId) : undefined;
-  const report = yield* subStepReporter;
+  const report = yield* callSubStepReporter;
   return yield* effect.pipe(
-    // Lock collectors still return their diagnostics, but only the enclosing
-    // whole-call collector publishes to the reply ledger.
-    (effect) =>
-      includeOutsideLocks ? effect.pipe(Effect.provideService(subStepReporter, () => {})) : effect,
     Effect.withTracer(tracer),
     Effect.provideService(subStepObserver, {
       tracer: parent?.tracer ?? delegate,

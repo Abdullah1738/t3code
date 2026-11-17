@@ -8129,44 +8129,209 @@ it.effect("a work thread's card_create numbers the packet first in its gated rep
   }).pipe(Effect.provide(layer));
 });
 
-it.effect("a work thread's card_create with assignToSelf takes its own plan", () => {
-  const { layer, running } = fakeThreads();
+it.effect.each([false, true])(
+  "a work thread's card_create with assignToSelf takes its own plan (ids=%s)",
+  (explicit) => {
+    const { layer, running } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "worker-self-gates",
+        name: "Worker self gates",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+      running.add(worker);
+      const created = yield* call(worker, "card_create", {
+        title: "Worker follow-up self",
+        prompt: "Follow-up",
+        assignToSelf: true,
+        subtasks: [
+          { ...(explicit ? { id: "s1" } : {}), step: 1, text: "Implement", owner: "work" },
+          { ...(explicit ? { id: "s2" } : {}), step: 2, text: "Review", owner: "review" },
+          {
+            ...(explicit ? { id: "s3" } : {}),
+            step: 3,
+            text: "Deploy the helper",
+            owner: "evaluator",
+          },
+        ],
+      });
+      assert.isFalse(created.isError, created.text);
+      // The caller's own plan is the whole plan: no packet step in front of it.
+      assert.deepStrictEqual(created.structured.gated, [
+        { id: "s3", gate: "deploy", source: "guessed" },
+      ]);
+      const card = yield* decodeKanbanCard(created.structured.card);
+      assert.deepStrictEqual(
+        card.subtasks.map(({ id, step, text }) => [id, step, text]),
+        [
+          ["s1", 1, "Implement"],
+          ["s2", 2, "Review"],
+          ["s3", 3, "Deploy the helper"],
+        ],
+      );
+      assert.strictEqual(card.subtaskSeq, 3);
+      assert.strictEqual(card.workThreadId, worker);
+      assert.strictEqual(card.stage, "working");
+      const bare = yield* call(worker, "card_create", {
+        title: "Worker follow-up bare",
+        prompt: "Follow-up",
+        assignToSelf: true,
+      });
+      assert.isFalse(bare.isError, bare.text);
+      assert.deepStrictEqual((yield* decodeKanbanCard(bare.structured.card)).subtasks, []);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each(["evaluator", "worker", "forThread"] as const)(
+  "card_create with explicit ids through %s keeps allocated ids in its reply",
+  (route) => {
+    const { layer, running } = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+      findExisting: true,
+      send: () => Effect.succeed("assignment-run"),
+    });
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "create-ids",
+        name: "Create ids",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+      running.add(worker);
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+      const created = yield* call(route === "worker" ? worker : evaluator, "card_create", {
+        title: "Numbered follow-up",
+        prompt: "Follow-up",
+        ...(route === "forThread" ? { forThread: worker } : {}),
+        subtasks: [
+          { id: "s1", step: 1, text: "Implement", owner: "work" },
+          { id: "s2", step: 2, text: "Review", owner: "review" },
+          { id: "s3", step: 3, text: "Deploy the helper", owner: "evaluator" },
+        ],
+      });
+      assert.isFalse(created.isError, created.text);
+      const card = yield* decodeKanbanCard(created.structured.card);
+      const offset = route === "worker" ? 1 : 0;
+      assert.deepStrictEqual(
+        card.subtasks.map(({ id, step, text }) => [id, step, text]),
+        [
+          ...(offset ? [["s1", 1, PACKET_SUBTASK]] : []),
+          [`s${1 + offset}`, 1 + offset, "Implement"],
+          [`s${2 + offset}`, 2 + offset, "Review"],
+          [`s${3 + offset}`, 3 + offset, "Deploy the helper"],
+        ],
+      );
+      assert.strictEqual(card.subtaskSeq, 3 + offset);
+      assert.deepStrictEqual(created.structured.gated, [
+        { id: `s${3 + offset}`, gate: "deploy", source: "guessed" },
+      ]);
+      if (route === "forThread") assert.strictEqual(card.workThreadId, worker);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each(["assignToSelf", "worker", "evaluator"] as const)(
+  "card_create bad ids through %s refuse without saving",
+  (route) => {
+    const { layer, running } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "bad-create-ids",
+        name: "Bad create ids",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+      running.add(worker);
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+      const before = yield* kanban.cards(board.id);
+      for (const ids of [
+        ["s1", "s1"],
+        [" s1 ", "s1"],
+        ["foo"],
+        ["S1"],
+        ["s0"],
+        ["s01"],
+        ["s 1"],
+        ["s"],
+        ["1"],
+        ["s1x"],
+      ]) {
+        const refused = yield* call(route === "evaluator" ? evaluator : worker, "card_create", {
+          title: "Refused numbered card",
+          prompt: "Must not be saved",
+          assignToSelf: route === "assignToSelf",
+          subtasks: ids.map((id) => ({ id, text: "Implement", owner: "work" })),
+        });
+        assert.isTrue(refused.isError, refused.text);
+        assert.include(
+          refused.text,
+          ids.length === 2 ? "subtask s1 is listed twice" : "is not a subtask id; use s1, s2, ...",
+        );
+        assert.notInclude(refused.text, "Missions board invalid");
+        assert.deepStrictEqual(yield* kanban.cards(board.id), before);
+      }
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("a script's card_create shifts explicit ids past its packet", () => {
+  const { layer } = fakeThreads();
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
     const board = yield* kanban.ensureBoard({
-      slug: "worker-self-gates",
-      name: "Worker self gates",
-      defaultProjectId: ProjectId.make("project-1"),
+      slug: "script-create-ids",
+      name: "Script create ids",
+      defaultProjectId: null,
     });
-    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
-    const origin = yield* kanban.createCard(board.id, { title: "Origin", prompt: "Origin" }, owner);
-    yield* kanban.dispatchNow;
-    const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
-    running.add(worker);
-    const created = yield* call(worker, "card_create", {
-      title: "Worker follow-up self",
-      prompt: "Follow-up",
-      assignToSelf: true,
-      subtasks: [{ text: "Deploy the helper", owner: "evaluator" }],
-    });
-    assert.isFalse(created.isError, created.text);
-    // The caller's own plan is the whole plan: no packet step in front of it.
-    assert.deepStrictEqual(created.structured.gated, [
-      { id: "s1", gate: "deploy", source: "guessed" },
-    ]);
-    const card = yield* decodeKanbanCard(created.structured.card);
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Script follow-up",
+        prompt: "Follow-up",
+        subtasks: [
+          { id: "s1", step: 1, text: "Implement", owner: "work" },
+          { id: "s2", step: 2, text: "Review", owner: "review" },
+          { id: "s3", step: 3, text: "Read back", owner: "evaluator" },
+        ],
+      },
+      { _tag: "script", scriptId: KanbanScriptId.make("script-one") },
+    );
     assert.deepStrictEqual(
       card.subtasks.map(({ id, step, text }) => [id, step, text]),
-      [["s1", 1, "Deploy the helper"]],
+      [
+        ["s1", 1, PACKET_SUBTASK],
+        ["s2", 2, "Implement"],
+        ["s3", 3, "Review"],
+        ["s4", 4, "Read back"],
+      ],
     );
-    assert.strictEqual(card.workThreadId, worker);
-    const bare = yield* call(worker, "card_create", {
-      title: "Worker follow-up bare",
-      prompt: "Follow-up",
-      assignToSelf: true,
-    });
-    assert.isFalse(bare.isError, bare.text);
-    assert.deepStrictEqual((yield* decodeKanbanCard(bare.structured.card)).subtasks, []);
+    assert.strictEqual(card.subtaskSeq, 4);
+    assert.deepStrictEqual((yield* kanban.card(card.id)).card.subtasks, card.subtasks);
   }).pipe(Effect.provide(layer));
 });
 

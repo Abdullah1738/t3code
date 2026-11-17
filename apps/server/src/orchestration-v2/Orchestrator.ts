@@ -7769,22 +7769,56 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const admittedRun = parentProjection.runs.find(
         (candidate) => candidate.id === command.parentRunId,
       );
+      const rejectParent = (reason: string, run = admittedRun, stopping = false) =>
+        Effect.annotateCurrentSpan({
+          "t3.delegate.rejection_reason": reason,
+          "t3.delegate.parent_run_id": command.parentRunId,
+          "t3.delegate.parent_run_status": admittedRun?.status ?? null,
+          "t3.delegate.parent_admitted_at":
+            command.parentAdmittedAt === undefined
+              ? null
+              : DateTime.formatIso(command.parentAdmittedAt),
+          "t3.delegate.parent_requested_at":
+            admittedRun === undefined ? null : DateTime.formatIso(admittedRun.requestedAt),
+          "t3.delegate.parent_completed_at":
+            admittedRun?.completedAt == null ? null : DateTime.formatIso(admittedRun.completedAt),
+          "t3.delegate.attachment_run_id": run?.id ?? null,
+          "t3.delegate.attachment_run_status": run?.status ?? null,
+        }).pipe(
+          Effect.andThen(
+            Effect.fail(
+              new OrchestratorDispatchError({
+                commandId: command.commandId,
+                commandType: command.type,
+                cause: `Parent run ${run?.id ?? command.parentRunId} is ${stopping ? "stopping" : "not active"}: ${reason}.`,
+              }),
+            ),
+          ),
+        );
+      if (admittedRun === undefined) return yield* rejectParent("run_not_found");
       // Async creates can commit after their caller has returned. Normal completion
       // preserves admission; Stop and other unsuccessful endings revoke it.
       const completedAfterAdmission =
-        admittedRun?.status === "completed" &&
+        admittedRun.status === "completed" &&
         command.parentAdmittedAt !== undefined &&
         admittedRun.completedAt !== null &&
         DateTime.toEpochMillis(admittedRun.requestedAt) <=
           DateTime.toEpochMillis(command.parentAdmittedAt) &&
         DateTime.toEpochMillis(admittedRun.completedAt) >=
           DateTime.toEpochMillis(command.parentAdmittedAt);
-      if (admittedRun === undefined || (!isBlockingRun(admittedRun) && !completedAfterAdmission)) {
-        return yield* new OrchestratorDispatchError({
-          commandId: command.commandId,
-          commandType: command.type,
-          cause: `Parent run ${command.parentRunId} is not active.`,
-        });
+      if (!isBlockingRun(admittedRun) && !completedAfterAdmission) {
+        const reason =
+          admittedRun.status !== "completed"
+            ? "run_not_completed"
+            : command.parentAdmittedAt === undefined
+              ? "admission_time_missing"
+              : admittedRun.completedAt === null
+                ? "completion_time_missing"
+                : DateTime.toEpochMillis(admittedRun.requestedAt) >
+                    DateTime.toEpochMillis(command.parentAdmittedAt)
+                  ? "admission_before_run"
+                  : "admission_after_completion";
+        return yield* rejectParent(reason);
       }
       // Stop also revokes work admitted by an earlier turn which completed while
       // its create was detached. A newer stopped run must not disappear from this check.
@@ -7797,26 +7831,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         })
         .pipe(mapDispatchError(command));
       if (stops.turnItems.length > 0) {
-        return yield* new OrchestratorDispatchError({
-          commandId: command.commandId,
-          commandType: command.type,
-          cause: `Parent run ${command.parentRunId} is stopping.`,
-        });
+        return yield* rejectParent("stop_requested", admittedRun, true);
       }
       const admittedNode = parentProjection.nodes.find(
         (candidate) => candidate.id === command.parentNodeId,
       );
-      if (
-        admittedNode === undefined ||
-        admittedNode.runId !== admittedRun.id ||
-        admittedRun.rootNodeId === null
-      ) {
-        return yield* new OrchestratorDispatchError({
-          commandId: command.commandId,
-          commandType: command.type,
-          cause: `Parent node ${command.parentNodeId} is not part of active run ${admittedRun.id}.`,
-        });
-      }
+      if (admittedNode === undefined) return yield* rejectParent("admitted_node_missing");
+      if (admittedNode.runId !== admittedRun.id)
+        return yield* rejectParent("admitted_node_run_mismatch");
+      if (admittedRun.rootNodeId === null) return yield* rejectParent("admitted_root_missing");
       const providerThread = providerThreadForRun(parentProjection, admittedRun);
       const successor =
         completedAfterAdmission &&
@@ -7838,18 +7861,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         successor === undefined
           ? admittedNode
           : parentProjection.nodes.find((node) => node.id === successor.rootNodeId);
+      if (parentRun.rootNodeId === null)
+        return yield* rejectParent("successor_root_missing", parentRun);
+      if (parentNode === undefined) return yield* rejectParent("successor_node_missing", parentRun);
       if (
-        parentNode === undefined ||
-        parentRun.rootNodeId === null ||
-        (successor !== undefined &&
-          (yield* stopReachedRun(command, command.parentThreadId, successor.id)))
-      ) {
-        return yield* new OrchestratorDispatchError({
-          commandId: command.commandId,
-          commandType: command.type,
-          cause: `Parent run ${parentRun.id} is not active.`,
-        });
-      }
+        successor !== undefined &&
+        (yield* stopReachedRun(command, command.parentThreadId, successor.id))
+      )
+        return yield* rejectParent("successor_stop_requested", parentRun, true);
 
       const targetAdapter = yield* providerAdapters.get(command.modelSelection.instanceId).pipe(
         Effect.mapError(

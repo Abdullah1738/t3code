@@ -2095,20 +2095,20 @@ export const layer: Layer.Layer<
                 yield* Ref.set(terminalEvent, event);
               }
               let storedEventCount = 0;
-              // Restart supersedes the attempt before waiting for its native turn to end.
-              const rootTurnEnded =
-                event.type === "provider_turn.updated" &&
-                event.providerTurn.id === rootTurnId &&
-                event.providerTurn.providerThreadId === input.providerThread.id &&
-                event.providerTurn.runAttemptId === input.attempt.id &&
-                event.providerTurn.status !== "running";
               const guardRunActivity =
                 input.loadRunSettlement !== undefined &&
                 // A native terminal can arrive after external cancellation.
                 // Only our committed finalization permits trailing background output.
                 !(yield* Ref.get(rootFinalizationOwned)) &&
                 event.type !== "turn.terminal" &&
-                !rootTurnEnded;
+                // Restart supersedes the attempt before interrupting it. Cleanup
+                // still needs its exact root turn's terminal projection.
+                !(
+                  event.type === "provider_turn.updated" &&
+                  event.providerTurn.id === rootTurnId &&
+                  event.providerTurn.runAttemptId === input.attempt.id &&
+                  isTerminalProviderTurnStatus(event.providerTurn.status)
+                );
               const deliveredEvent = filterAssistantEvent(
                 event.type === "provider_turn.updated" &&
                   event.providerTurn.id === rootTurnId &&

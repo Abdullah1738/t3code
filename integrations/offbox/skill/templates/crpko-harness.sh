@@ -9,7 +9,7 @@ export DEBIAN_FRONTEND=noninteractive
 GO_VERSION="${OFFBOX_GO_VERSION:-1.26.9}"
 if ! /usr/local/go/bin/go version 2>/dev/null | grep -q "go${GO_VERSION} "; then
   offbox_fetch "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" "/tmp/go.tgz"
-  sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf /tmp/go.tgz && rm -f /tmp/go.tgz
+  sudo rm -rf /usr/local/go && sudo tar -C /usr/local --no-same-owner -xzf /tmp/go.tgz && rm -f /tmp/go.tgz
 fi
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends jq rsync postgresql-client zsh openjdk-21-jdk-headless >/dev/null

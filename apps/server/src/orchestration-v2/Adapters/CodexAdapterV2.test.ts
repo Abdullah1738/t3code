@@ -3503,45 +3503,85 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
-  it.effect("unsubscribes from the native thread when it is unloaded", () =>
-    Effect.gen(function* () {
-      const nativeThreadId = "unload-thread";
-      const preamble = codexReplayPreamble({
-        nativeThreadId,
-        nativeTurnId: "unused",
-        prompt: "unused",
+  it.effect.each(["unsubscribed", "notSubscribed", "notLoaded"] as const)(
+    "logs unsubscribe status %s separately from native closure",
+    (status) => {
+      const logs: Array<unknown> = [];
+      const logger = Logger.make(({ message }) => {
+        logs.push(message);
       });
-      const transcript = makeCodexReplayTranscript({
-        scenario: "unload-thread",
-        entries: [
-          ...preamble.slice(0, 5),
-          {
-            type: "expect_outbound",
-            label: "thread/unsubscribe",
-            frame: { id: 3, method: "thread/unsubscribe", params: { threadId: nativeThreadId } },
-          },
-          {
-            type: "emit_inbound",
-            label: "thread/unsubscribe",
-            frame: { id: 3, result: { status: "unsubscribed" } },
-          },
-        ],
-      });
-      const requests: Array<string> = [];
-      const harness = yield* makeCodexReplayHarness(
-        transcript,
-        () => Effect.void,
-        (method) => Effect.sync(() => requests.push(method)),
+      return Effect.gen(function* () {
+        const nativeThreadId = "unload-thread";
+        const preamble = codexReplayPreamble({
+          nativeThreadId,
+          nativeTurnId: "unused",
+          prompt: "unused",
+        });
+        const transcript = makeCodexReplayTranscript({
+          scenario: "unload-thread",
+          entries: [
+            ...preamble.slice(0, 5),
+            {
+              type: "expect_outbound",
+              label: "thread/unsubscribe",
+              frame: { id: 3, method: "thread/unsubscribe", params: { threadId: nativeThreadId } },
+            },
+            {
+              type: "emit_inbound",
+              label: "thread/unsubscribe",
+              frame: { id: 3, result: { status } },
+            },
+            {
+              type: "expect_outbound",
+              frame: { id: 4, method: "thread/unsubscribe", params: { threadId: nativeThreadId } },
+            },
+            {
+              type: "emit_inbound",
+              frame: { method: "thread/closed", params: { threadId: nativeThreadId } },
+            },
+            { type: "emit_inbound", frame: { id: 4, result: { status: "notLoaded" } } },
+          ],
+        });
+        const requests: Array<string> = [];
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          () => Effect.void,
+          (method) => Effect.sync(() => requests.push(method)),
+        );
+        assert.isDefined(harness.runtime.unloadThread);
+        yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
+        assert.deepEqual(requests, ["initialize", "thread/start", "thread/unsubscribe"]);
+        const lifecycleLogs = () =>
+          logs
+            .filter(Array.isArray)
+            .filter(
+              (message) =>
+                message[0] === "codex.thread-unsubscribe" || message[0] === "codex.thread-closed",
+            );
+        assert.lengthOf(lifecycleLogs(), 1);
+        assert.include(lifecycleLogs()[0]![1], {
+          nativeThreadId,
+          threadId: harness.threadId,
+          status,
+        });
+        yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
+        assert.deepEqual(
+          lifecycleLogs().map((message) => message[0]),
+          ["codex.thread-unsubscribe", "codex.thread-closed", "codex.thread-unsubscribe"],
+        );
+        assert.include(lifecycleLogs()[1]![1], { nativeThreadId });
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
       );
-      assert.isDefined(harness.runtime.unloadThread);
-      yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
-      assert.deepEqual(requests, ["initialize", "thread/start", "thread/unsubscribe"]);
-    }).pipe(
-      Effect.scoped,
-      Effect.provide(
-        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
-      ),
-    ),
+    },
   );
 
   it.effect("lists every loaded native thread across pages and deduplicates ids", () =>
