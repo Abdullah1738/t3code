@@ -265,6 +265,8 @@ it("decodes detached outcomes additively and rejects raw request ids", () => {
         failureRate: 1,
         outcomes: { timeout: 1 },
         savedCounts: { unknown: 1 },
+        reasonClasses: {},
+        invalidFields: {},
         errors: [],
         failedThenRetried: 0,
         retrySucceeded: 0,

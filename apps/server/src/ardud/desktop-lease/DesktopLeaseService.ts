@@ -1,13 +1,26 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off - bound arbitrary lease task IDs in analytics.
+import * as NodeCrypto from "node:crypto";
 import { ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
+import * as DateTime from "effect/DateTime";
+import * as Analytics from "../analytics/Analytics.ts";
+import { recordServerAnalytics } from "../../observability/RpcInstrumentation.ts";
 
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
-import { DesktopLease, DesktopLeaseError, type LeaseRequest } from "./DesktopLease.ts";
+import {
+  DesktopLease,
+  DesktopLeaseError,
+  type LeaseRequest,
+  type DesktopLeaseOptions,
+  type HolderTurnActive,
+  type LeaseTransition,
+} from "./DesktopLease.ts";
 
 export class DesktopLeaseServiceError extends Schema.TaggedError<DesktopLeaseServiceError>()(
   "DesktopLeaseServiceError",
@@ -31,7 +44,8 @@ type CallerIdentity = {
 type StoreOptions = {
   readonly filename?: string;
   readonly now?: () => number;
-  readonly factory?: (options: { filename?: string; now?: () => number }) => DesktopLease;
+  readonly holderTurnActive?: (rootThreadId: string) => HolderTurnActive;
+  readonly factory?: (options: DesktopLeaseOptions) => DesktopLease;
 };
 
 // Each measured phase owns its span; this wrapper only records the elapsed time on exit.
@@ -94,7 +108,41 @@ export class DesktopLeaseService extends Context.Service<
 const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOptions = {}) {
   const identity = yield* ExecutionIdentity.ExecutionIdentity;
   const projection = yield* ProjectionStore.ProjectionStoreV2;
-  const { factory = (storeOptions) => new DesktopLease(storeOptions), ...storeOptions } = options;
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  const transitions: LeaseTransition[] = [];
+  let checkedHolder: { ticket: string; root: string; active: HolderTurnActive } | undefined;
+  const {
+    factory = (storeOptions) => new DesktopLease(storeOptions),
+    holderTurnActive,
+    ...storeOptions
+  } = options;
+  const holderActivity = Effect.fn("DesktopLease.holderTurnActive")(function* (root: string) {
+    if (holderTurnActive) return holderTurnActive(root);
+    return yield* projection.getRunningTurnContext(ThreadId.make(root)).pipe(
+      Effect.map((context): HolderTurnActive => context.run?.status === "running"),
+      Effect.catchCause(() => Effect.succeed("unknown" as const)),
+    );
+  });
+  const recordTransitions = Effect.fn("DesktopLease.recordTransitions")(function* () {
+    const committed = transitions.splice(0);
+    if (Option.isNone(analytics)) return;
+    for (const event of committed) {
+      // Lease task IDs allow text; encode it and hash long IDs to fit the analytics row limit.
+      const encodedTaskId = encodeURIComponent(event.taskId.toWellFormed());
+      const taskId =
+        encodedTaskId.length <= 4096
+          ? encodedTaskId
+          : `sha256:${NodeCrypto.createHash("sha256").update(event.taskId).digest("hex")}`;
+      yield* recordServerAnalytics(analytics.value, {
+        ts: DateTime.formatIso(yield* DateTime.now),
+        surface: "server",
+        route: "desktop-lease",
+        kind: "desktop_lease.transition",
+        ...event,
+        taskId,
+      });
+    }
+  });
   let store: DesktopLease | undefined;
 
   // Opening is synchronous, so concurrent calls cannot construct two stores in this layer.
@@ -110,7 +158,14 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
       "lease",
       Effect.try({
         try: () => {
-          store ??= factory(storeOptions);
+          store ??= factory({
+            ...storeOptions,
+            holderTurnActive: (root) =>
+              checkedHolder?.root === root && store?.currentLease()?.ticket === checkedHolder.ticket
+                ? checkedHolder.active
+                : "unknown",
+            recordTransition: (event) => transitions.push(event),
+          });
           return { store, lease: store.currentLease() };
         },
         catch: failure,
@@ -127,16 +182,26 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
             ),
           )
         : false;
+    const activity =
+      lease?.state === "quarantined" ? yield* holderActivity(lease.rootThreadId) : "unknown";
     return yield* measure(
       "persistence",
       Effect.try({
         try: () => {
           if (running && lease) current.store.touchHolder(lease.childThreadId, lease.ticket);
-          return operation(current.store);
+          // The checked ticket is valid only for this synchronous operation, never another request.
+          checkedHolder = lease
+            ? { ticket: lease.ticket, root: lease.rootThreadId, active: activity }
+            : undefined;
+          try {
+            return operation(current.store);
+          } finally {
+            checkedHolder = undefined;
+          }
         },
         catch: failure,
       }),
-    );
+    ).pipe(Effect.onExit(() => recordTransitions()));
   });
 
   yield* Effect.addFinalizer(() => Effect.sync(() => store?.close()));

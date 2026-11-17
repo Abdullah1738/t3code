@@ -17,7 +17,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
-import { DesktopLease, QUIET_MS, STALE_MS } from "./DesktopLease.ts";
+import { DesktopLease, QUIET_MS, STALE_MS, type DesktopLeaseOptions } from "./DesktopLease.ts";
 import * as DesktopLeaseService from "./DesktopLeaseService.ts";
 
 const caller = { driver: "codex", nativeId: "native-child" };
@@ -48,7 +48,13 @@ const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* 
   let lookup: Lookup = "running";
   let lookupGate = Effect.void;
   const lookedUp: ThreadId[] = [];
-  const store = new DesktopLease({ filename: ":memory:", now: () => now });
+  let callbacks: DesktopLeaseOptions = {};
+  const store = new DesktopLease({
+    filename: ":memory:",
+    now: () => now,
+    holderTurnActive: (root) => callbacks.holderTurnActive?.(root) ?? "unknown",
+    recordTransition: (event) => callbacks.recordTransition?.(event),
+  });
   const identity = Layer.mock(ExecutionIdentity.ExecutionIdentity)({
     resolve: () =>
       Effect.succeed({
@@ -89,10 +95,12 @@ const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* 
       }),
   });
   const context = yield* Layer.build(
-    DesktopLeaseService.layerWithOptions({ factory: () => store }).pipe(
-      Layer.provide(identity),
-      Layer.provide(projection),
-    ),
+    DesktopLeaseService.layerWithOptions({
+      factory: (options) => {
+        callbacks = options;
+        return store;
+      },
+    }).pipe(Layer.provide(identity), Layer.provide(projection)),
   );
   return {
     service: Context.get(context, DesktopLeaseService.DesktopLeaseService),
@@ -271,6 +279,25 @@ describe("desktop lease service liveness", () => {
         assert.equal((yield* service.status()).lease?.state, "quarantined");
       }),
     ),
+  );
+
+  it.effect.each(["running", "idle", "failed"] as const)(
+    "checks the root before recovering an old quarantine (%s)",
+    (lookup) =>
+      run(({ service, lookedUp, addTime, setLookup }) =>
+        Effect.gen(function* () {
+          yield* service.acquire(caller, request);
+          yield* service.callStart(caller, "hung-root-check");
+          addTime(QUIET_MS);
+          assert.equal((yield* service.status()).lease?.state, "quarantined");
+          setLookup(lookup);
+          addTime(QUIET_MS);
+          const result = yield* service.status();
+          assert.equal(lookedUp.at(-1), "root-holder");
+          if (lookup === "idle") assert.isNull(result.lease);
+          else assert.equal(result.lease?.state, "quarantined");
+        }),
+      ),
   );
 
   it.effect.each(["acquire", "heartbeat", "callStart", "callEnd"] as const)(
