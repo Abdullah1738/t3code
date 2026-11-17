@@ -62,6 +62,7 @@ import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 import * as Tracer from "effect/Tracer";
@@ -7434,6 +7435,111 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),
       ),
+  );
+
+  it.effect.each([
+    ["cell", "thread"],
+    ["session", "thread"],
+    ["empty", "thread"],
+    ["cell", "scope"],
+    ["session", "scope"],
+    ["empty", "scope"],
+  ] as const)("retains Codex unread state until the idle cap (%j)", ([kind, unload]) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const retainedOutput =
+          kind === "cell"
+            ? "Script running with cell ID g2142:27\nOutput:\n"
+            : JSON.stringify({ chunk_id: "chunk", session_id: 90878, output: "" });
+        const transcript = makeCodexReplayTranscript({
+          scenario: `codex-retained-${kind}`,
+          entries: [
+            ...codexReplayPreamble({
+              nativeThreadId: BG_NATIVE_THREAD,
+              nativeTurnId: BG_NATIVE_TURN,
+              prompt: BG_PROMPT,
+            }),
+            ...(kind === "empty"
+              ? []
+              : [
+                  {
+                    type: "emit_inbound" as const,
+                    label: "raw yielded output",
+                    frame: {
+                      method: "rawResponseItem/completed",
+                      params: {
+                        threadId: BG_NATIVE_THREAD,
+                        turnId: BG_NATIVE_TURN,
+                        item: {
+                          type: "custom_tool_call_output",
+                          call_id: "outer-exec",
+                          output: retainedOutput,
+                        },
+                      },
+                    },
+                  },
+                ]),
+            backgroundExecTranscript.entries.at(-2)!,
+            {
+              type: "expect_outbound",
+              label: "unsubscribe",
+              frame: {
+                id: 4,
+                method: "thread/unsubscribe",
+                params: { threadId: BG_NATIVE_THREAD },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "closed",
+              frame: { method: "thread/closed", params: { threadId: BG_NATIVE_THREAD } },
+            },
+            {
+              type: "emit_inbound",
+              label: "unsubscribed",
+              frame: { id: 4, result: { status: "notSubscribed" } },
+            },
+          ],
+        });
+        const sessionScope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+          Scope.close(scope, Exit.void),
+        );
+        const harness = yield* makeCodexReplayHarness(transcript).pipe(
+          Effect.provideService(Scope.Scope, sessionScope),
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("retained-state"),
+            text: BG_PROMPT,
+          }),
+        );
+        yield* harness.firstTerminal;
+        assert.equal(
+          yield* harness.runtime.holdsWorkForThread!(harness.providerThread),
+          kind !== "empty",
+        );
+        yield* TestClock.adjust("31 minutes");
+        assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+        if (unload === "thread")
+          yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
+        yield* Scope.close(sessionScope, Exit.void);
+        assert.lengthOf(harness.continuationRequests, kind === "empty" ? 0 : 1);
+        if (kind !== "empty") {
+          const detail = harness.continuationRequests[0]!.detail;
+          assert.include(detail, kind === "cell" ? "g2142:27" : "90878");
+          assert.include(detail, "may or may not have run");
+          assert.equal(harness.continuationRequests[0]!.delivery, "message_text");
+          assert.equal(harness.continuationRequests[0]!.threadId, harness.threadId);
+        }
+      }),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
   );
 
   const backgroundStopCases = [true, false, "still_running", "thread_unloaded"] as const;
