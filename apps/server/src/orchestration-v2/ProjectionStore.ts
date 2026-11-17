@@ -2326,6 +2326,28 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
   ProjectionStoreV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const threadReadIndexes = yield* Ref.make(
+      // Offline maintenance attaches the archive after constructing this layer.
+      yield* readThreadIndexAvailability(sql).pipe(
+        NodeSqliteClient.readOnly,
+        NodeSqliteClient.foregroundReads,
+        Effect.orElseSucceed(() => ({ main: false, ardud_archive: false })),
+      ),
+    );
+    const getThreadReadIndexes = Effect.fn("ProjectionStore.getThreadReadIndexes")(function* () {
+      const cached = yield* Ref.get(threadReadIndexes);
+      const inTransaction = yield* Effect.serviceOption(sql.transactionService);
+      if (cached.main && cached.ardud_archive && inTransaction._tag === "None") return cached;
+      const available = yield* readThreadIndexAvailability(sql);
+      // Maintenance only adds committed indexes. An older concurrent probe must
+      // not undo another page's observation that a schema finished building.
+      yield* Ref.update(threadReadIndexes, (current) => ({
+        main: current.main || available.main,
+        ardud_archive: current.ardud_archive || available.ardud_archive,
+      }));
+      // A caller's existing transaction may predate another reader's promotion.
+      return available;
+    });
     const speedups = yield* Switches;
     const lookupMigration = yield* ShellRunLookupMigration;
     // ardud: the writer connection is synchronous on the main thread, so a scan there
@@ -6428,8 +6450,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     const readLocalTimelinePage = Effect.fn("ProjectionStore.readLocalTimelinePage")(function* (
       threadId: ThreadId,
       options: ProjectionTimelinePageOptions,
+      readIndexes: { main: boolean; ardud_archive: boolean },
     ) {
-      const readIndexes = yield* readThreadIndexAvailability(sql);
       // Stream global positions before filtering messages, stopping at the lookahead.
       // Sorting this numbered stream or reusing it for totals would exhaust the history.
       const rows = yield* sql<{
@@ -6488,13 +6510,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       return { items, totalItems: rows[0]?.total_items ?? 0, hasMore: page.length > options.limit };
     });
 
-    const getTimelinePage: ProjectionStoreV2Shape["getTimelinePage"] = (threadId, options) =>
-      sql
-        .withTransaction(
+    const getTimelinePage: ProjectionStoreV2Shape["getTimelinePage"] = Effect.fn(
+      "ProjectionStore.getTimelinePage",
+    )(
+      function* (threadId: ThreadId, options: ProjectionTimelinePageOptions) {
+        // Freeze index hints before opening this page's WAL snapshot. Maintenance
+        // may finish and another reader may promote the cache while it is open.
+        const readIndexes = yield* getThreadReadIndexes();
+        return yield* sql.withTransaction(
           Effect.gen(function* () {
             const records = yield* getThreadRecords(threadId, []);
             if (records.thread.forkedFrom?.type !== "run")
-              return yield* readLocalTimelinePage(threadId, options);
+              return yield* readLocalTimelinePage(threadId, options, readIndexes);
             const index = yield* readTimelineIndex(threadId, new Set());
             const matching = index.visible
               .map((row, position) => ({ ...row, position }))
@@ -6546,14 +6573,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               hasMore: matching.length > page.length,
             };
           }),
-        )
-        .pipe(
+        );
+      },
+      (effect, threadId) =>
+        effect.pipe(
           Effect.mapError((cause) =>
             isProjectionStoreThreadNotFoundError(cause) || isProjectionStoreReadError(cause)
               ? cause
               : new ProjectionStoreReadError({ threadId, cause }),
           ),
-        );
+        ),
+    );
 
     const getThreadSnapshotWindow: ProjectionStoreV2Shape["getThreadSnapshotWindow"] = (
       threadId,
