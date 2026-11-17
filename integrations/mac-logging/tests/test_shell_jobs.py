@@ -134,13 +134,17 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     git=fake/'git'
     git.write_text('#!'+sys.executable+'\nimport sys\na=sys.argv[1:]\nif "rev-parse" in a: print('+repr(str(REPO))+')\nelif "ls-remote" in a: print("fixture refs/heads/main")\n')
     git.chmod(0o755)
+    probe=root/'fixture-ssd/probe.bin'
+    env['MAC_LOG_SSD_PROBE_FILE']=str(probe)
     command=['zsh',str(HERE/'install.zsh')]
     dry_run=subprocess.run(command+['--dry-run'],env=env,capture_output=True,text=True,timeout=10)
     self.assertEqual(dry_run.returncode,0,dry_run.stderr)
     self.assertFalse((home/'.local').exists())
+    self.assertFalse(probe.exists())
     self.assertFalse((home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist').exists())
     installed=subprocess.run(command,env=env,capture_output=True,text=True,timeout=10)
     self.assertEqual(installed.returncode,0,installed.stderr)
+    self.assertEqual(probe.read_bytes(),bytes(4096))
     plist=home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist'
     self.assertTrue(plist.exists(),installed.stdout+installed.stderr)
     original=plist.read_text()
@@ -152,6 +156,8 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     self.assertNotIn('__HOME__',original)
     def check():
      return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=10).returncode
+    self.assertEqual(check(),0)
+    probe.write_bytes(b'bad');self.assertNotEqual(check(),0);probe.write_bytes(bytes(4096))
     self.assertEqual(check(),0)
     wrapper=home/'.local/bin/mac-log-status'
     self.assertEqual(wrapper.stat().st_mode & 0o777,0o755)

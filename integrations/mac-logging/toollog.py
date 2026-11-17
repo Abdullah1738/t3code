@@ -465,6 +465,22 @@ def safe_fields(values, event=None):
         return u_episode_fields(values)
     if event in ('cpu.sample', 'cpu.spike'):
         return cpu_fields(values)
+    if event == 'disk.ssd_read_probe':
+        result = {}
+        for key, value in (values or {}).items():
+            if key in ('statMs', 'readMs', 'loadavg1') and (value is None or finite_number(value) and value >= 0):
+                result[key] = value
+            elif key == 'nice' and type(value) is int and -20 <= value <= 20:
+                result[key] = value
+            elif key == 'stuckPrior' and type(value) is bool:
+                result[key] = value
+            elif key == 'outcome' and value in ('ok', 'slow', 'timeout', 'error'):
+                result[key] = value
+            elif key == 'errno' and (value is None or isinstance(value, str) and re.fullmatch(r'E[A-Z0-9]{1,30}', value)):
+                result[key] = value
+            elif key == 'processType' and value in ('Standard', 'Background', 'Interactive', 'Adaptive', 'unknown'):
+                result[key] = value
+        return result
     if event == 'disk.clone_wedge':
         result = {k: v for k, v in disk_wait_fields(values).items()
                   if k in ('count', 'sampleCount', 'sampling', 'failure')}

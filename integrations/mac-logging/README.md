@@ -278,7 +278,9 @@ Removing the minute agent stops checks; no Tailscale change is needed.
 ## CPU samples
 
 `com.abdullah.mac-cpu` runs `cpu.py` every 60 seconds at normal priority,
-through `/bin/zsh` for launchd file access. One `/bin/ps` inventory reads PID,
+with a direct `/usr/bin/python3` launchd entrypoint. This is intentional: the SSD
+read detector below must not inherit `/bin/zsh`'s Full Disk Access, which can
+hide an approval backlog affecting plain background jobs. One `/bin/ps` inventory reads PID,
 parent, uid, cumulative CPU time, RSS, state, start time and elapsed time with a
 30-second timeout. Normal samples never invoke top. The sampler never changes
 another process.
@@ -367,7 +369,8 @@ and plist; the evaluator must load `com.abdullah.mac-cpu` after review.
 
 ## Minute disk-wait samples
 
-The existing `com.abdullah.mac-cpu` 60-second schedule runs `u_sample.py`
+The existing `com.abdullah.mac-cpu` 60-second schedule first records
+`disk.ssd_read_probe`, then runs `u_sample.py`
 before the CPU probe, using one wide `ps` snapshot of PID, parent, start/elapsed/
 CPU times, state, executable and argv, capped at five seconds. A 1,024-column
 executable field preserves Darwin paths before taking their basename; argv
@@ -700,3 +703,27 @@ This event is attribution evidence, never authority to kill or throttle a PID.
 A process may exit between the argv read and lsof. Missing cwd
 prevents classification of relative operands. Crawls shorter than 30 seconds
 or wholly between minute samples are outside this detector's coverage.
+
+### Launchd SSD read probe
+
+The minute sampler stats and reads 4 KiB from
+`/Volumes/ExternalSSD/.mac-upkeep/probe.bin` (created by `install.zsh`). A plain
+Python child shares a three-second deadline for both operations. The parent
+polls and abandons a stalled child without killing or reaping it, and persists
+PID plus `ps lstart` before releasing the read gate. A living prior identity
+suppresses the next probe (`stuckPrior=true`); a reused PID permits a new one.
+The event keeps separate `statMs` and `readMs`, outcome (`ok`, `slow` above
+500 ms, `timeout`, `error`), symbolic errno, ProcessType, nice and loadavg1.
+
+After two failed minutes it atomically writes
+`~/.local/state/mac-upkeep/ssd-launchd-read-blocked` with `since`, `lastOutcome`
+and `errno`, and queues one Telegram alert through the collector's notification
+path. Restart tools must check this interlock. A successful `ok` probe removes
+it and queues one recovery line; a slow probe does not clear an active outage.
+Retries reuse the saved notification key and exact text. No alert goes to stdout.
+State and child output remain under `~/.local/state/mac-upkeep`, off the SSD.
+The evaluator must reload `com.abdullah.mac-cpu` after changing its entrypoint.
+Installer tests set `MAC_LOG_SSD_PROBE_FILE` to a private fixture path for both
+creation and `--check`; this override does not change the live reader target.
+The bounded `ps` helper is tracked by PID plus kernel birth time, so a reused
+helper PID cannot suppress future probes.

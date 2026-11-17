@@ -198,7 +198,7 @@ class USampleTests(unittest.TestCase):
                 self.assertFalse(event['ok'])
                 self.assertNotIn('private', json.dumps(event))
                 self.assertEqual((self.root/'state/proc-u.json').read_bytes(), before)
-        with patch.object(u_sample, 'sample', side_effect=RuntimeError('private')), patch.object(cpu, 'sample') as cpu_probe:
+        with patch('ssd_probe.sample'), patch.object(u_sample, 'sample', side_effect=RuntimeError('private')), patch.object(cpu, 'sample') as cpu_probe:
             cpu.main()
         cpu_probe.assert_called_once_with()
 
