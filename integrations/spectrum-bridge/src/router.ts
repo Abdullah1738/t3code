@@ -862,6 +862,7 @@ export class Router {
     if (!Number.isSafeInteger(quiet) || quiet < 0) throw new Error("Invalid quiet period");
     new Intl.DateTimeFormat("en-US", { timeZone: options.timezone });
     const restored = this.store.get<Turn | null>("activeTurn");
+    if (restored && this.current(restored)) this.restoreSteeredCoverage(restored);
     if (restored?.background && restored.leaderId === undefined && restored.inboundId === undefined && this.current(restored)) {
       this.store.db.transaction(() => {
         const entries = this.store.get<Pending[] | null>("pendingApprovals") ?? [];
@@ -5206,6 +5207,34 @@ export class Router {
     }
   }
 
+  private restoreSteeredCoverage(turn: Turn): void {
+    if (turn.covered !== undefined || !turn.steered?.length) return;
+    this.store.db.transaction(() => {
+      const prompts = new Set(turn.steered);
+      const covered = new Set<string>();
+      const leaders = new Set(this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? []);
+      // Legacy steered IDs were recorded before POST; only accepted batches prove coverage.
+      const accepted = this.store.db.query<{ id: string }, []>(`SELECT i.id FROM inbound i JOIN kv k ON k.key = 'batch-phase:' || i.id
+        WHERE i.state IN ('done', 'admitted') AND k.value = '"accepted"'`).all();
+      for (const { id } of accepted) {
+        if (synthetic(id) || !prompts.has(`msg_${hash(id)}`)) continue;
+        const members = this.store.get<NormalizedInbound>(`batch:${id}`)?.batchIds ?? [id];
+        if (!members.includes(id) || !members.every(member => {
+          const state = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(member)?.state;
+          return !synthetic(member) && (state === "done" || state === "admitted");
+        })) continue;
+        leaders.add(id);
+        for (const member of members) covered.add(member);
+      }
+      if (!covered.size) return;
+      const restored = { ...turn, covered: [...covered] };
+      this.store.set("activeTurn", restored);
+      this.store.set(`turn-human:${turn.messageId}`, [...leaders]);
+      this.store.set(`human-settled:${turn.messageId}`, false);
+      if (turn.phase === "failed") this.logTurnEnd(restored, "failed");
+    }).immediate();
+  }
+
   private trackHuman(turn: Turn, id: string): void {
     if (synthetic(id)) return;
     const members = this.store.get<NormalizedInbound>(`batch:${id}`)?.batchIds ?? [id];
@@ -5239,6 +5268,11 @@ export class Router {
     });
   }
 
+  private humanBatchLeader(id: string, candidates: Iterable<string>): string {
+    for (const candidate of candidates) if (this.store.get<NormalizedInbound>(`batch:${candidate}`)?.batchIds?.includes(id)) return candidate;
+    return id;
+  }
+
   private recoverHumanHandoffs(turn: Turn, outcome: string): void {
     const live = this.store.get<Turn | null>("activeTurn");
     const ids = new Set([...turn.covered ?? [], ...(live?.messageId === turn.messageId ? live.covered ?? [] : []),
@@ -5248,18 +5282,20 @@ export class Router {
       if (collected) ids.add(collected);
     }
     if (turn.replyInboundId) ids.add(turn.replyInboundId);
+    const leaders = [...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? [], ...ids];
     const recovered = new Set<string>();
     for (const id of ids) {
-      const members = this.store.get<NormalizedInbound>(`batch:${id}`)?.batchIds ?? [id];
+      const leader = this.humanBatchLeader(id, leaders);
+      const members = this.store.get<NormalizedInbound>(`batch:${leader}`)?.batchIds ?? [id];
       if (synthetic(id) || recovered.has(id) || members.every(member => this.answered(member))) continue;
       // Parent completion says nothing about an unresolved response POST on a child.
-      if (this.store.get<SteerAttempt>(`steer-attempt:${id}`)?.response) continue;
+      if (this.store.get<SteerAttempt>(`steer-attempt:${leader}`)?.response) continue;
       const reply = this.store.db.query(`SELECT 1 FROM outbox o WHERE json_extract(o.payload, '$.kind') = 'conversation' AND o.state IN ('pending', 'sending', 'sent', 'uncertain') AND
         ((json_extract(o.payload, '$.replyTo') = ? AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)) OR EXISTS (SELECT 1 FROM kv k, json_each(k.value) c
-          WHERE k.key = 'reply-covered:' || o.id AND c.value = ?)) LIMIT 1`).get(id, id);
+          WHERE k.key = 'reply-covered:' || o.id AND c.value = ?)) LIMIT 1`).get(leader, id);
       if (!reply && (outcome === "no_reply" || outcome === "failed" || outcome === "replied")) {
         for (const member of members) recovered.add(member);
-        this.requeueHuman(id, outcome === "failed" ? "turn_failed" : "background_no_reply", true);
+        this.requeueHuman(leader, outcome === "failed" ? "turn_failed" : "background_no_reply", true);
       }
     }
   }
@@ -5268,12 +5304,15 @@ export class Router {
     if (recover && !this.store.get(`human-settled:${turn.messageId}`)) {
       this.recoverHumanHandoffs(turn, outcome);
       this.store.set(`human-settled:${turn.messageId}`, true);
-      for (const id of new Set([turn.inboundId, ...turn.covered ?? []])) {
-        if (!id || synthetic(id)) continue;
+      const ids = new Set([turn.inboundId, ...turn.covered ?? []].filter((id): id is string => id !== undefined));
+      const leaders = [...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? [], ...ids];
+      for (const id of ids) {
+        if (synthetic(id)) continue;
+        const leader = this.humanBatchLeader(id, leaders);
         const row = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id);
         const reply = this.store.db.query(`SELECT 1 FROM outbox o WHERE json_extract(o.payload, '$.kind') = 'conversation' AND o.state IN ('pending', 'sending', 'sent', 'uncertain') AND
           ((json_extract(o.payload, '$.replyTo') = ? AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)) OR EXISTS (SELECT 1 FROM kv k, json_each(k.value) c
-            WHERE k.key = 'reply-covered:' || o.id AND c.value = ?)) LIMIT 1`).get(id, id);
+            WHERE k.key = 'reply-covered:' || o.id AND c.value = ?)) LIMIT 1`).get(leader, id);
         if (row && ["done", "failed", "unknown"].includes(row.state) && !reply && !this.answered(id) && !this.store.get(`human-own-turn:${id}`))
           toolLog.capture(() => toolLog.write({ component: "router", kind: "error", name: "inbound.unanswered", ok: false,
             ids: { inboundId: id, chat: this.options.context?.chat.slug ?? "owner", threadId: turn.id } }));

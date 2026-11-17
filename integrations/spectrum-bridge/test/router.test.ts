@@ -233,6 +233,124 @@ test("prompts carry the OpenCode-config preferred model, and fall back when it i
   expect(second.backend.prompts.map(prompt => prompt.model)).toEqual([undefined]);
 });
 
+async function legacySteeredTurn(leader: "human" | "wake", replyMode: "final" | "tool") {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-legacy-steers-"));
+  directories.push(directory);
+  const path = join(directory, "store.sqlite");
+  const h = setup(path, { replyMode });
+  const root = leader === "wake" ? "wake:old" : "root";
+  h.input(root, "Original work"); await h.router.tick();
+  for (const id of ["first-steer", "second-steer"]) {
+    h.input(id, `${id} question`); h.input(`${id}-member`, `${id} context`);
+    h.store.set(`batch:${id}`, { id, text: `${id} question\n${id} context`, attachments: [], isAudioMessage: false,
+      receivedAt: Date.now(), batchIds: [id, `${id}-member`] } satisfies NormalizedInbound);
+    h.store.set(`batch-phase:${id}`, "accepted");
+    for (const member of [id, `${id}-member`]) {
+      h.store.updateInbound(member, "done");
+      h.store.set(`inbound-delivered:${member}`, Date.now());
+    }
+    h.backend.records.push({ id: messageId(id), type: "user", text: `${id} question`, time: { created: Date.now() } });
+  }
+  const route = h.store.get<{ id: string; directory: string; generation: number }>("route")!;
+  // Before coverage tracking, consumeSteer stored only prompt IDs and admission receipts.
+  h.store.set("activeTurn", { ...route, inboundId: root, messageId: messageId(root), startedAt: Date.now(), phase: "running", outbox: 0,
+    steered: [messageId("first-steer"), messageId("second-steer")], steeredAt: Date.now(),
+    ...(leader === "wake" ? { typed: true, replyInboundId: "first-steer" } : {}) });
+  h.store.db.query("DELETE FROM kv WHERE key = ?").run(`turn-human:${messageId(root)}`);
+  return { ...h, path, root };
+}
+
+for (const leader of ["human", "wake"] as const) for (const replyMode of ["final", "tool"] as const) {
+  for (const outcome of ["no_reply", "failed", "restored-failed", "replied"] as const) test(`pre-upgrade accepted steers settle every batch after restart (${leader}, ${replyMode}, ${outcome})`, async () => {
+    const h = await legacySteeredTurn(leader, replyMode);
+    if (outcome === "restored-failed") {
+      h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), phase: "failed" });
+      h.store.set(`log-turn-end:${messageId(h.root)}`, true);
+      h.backend.failed();
+    }
+    h.store.close();
+    const reopened = new Store(h.path); stores.push(reopened);
+    const router = new Router(reopened, h.backend, h.transport, h.routerOptions);
+    if (outcome === "restored-failed") {
+      expect(reopened.get<number>("human-retries:first-steer")).toBe(1);
+      expect(reopened.get<number>("human-retries:second-steer")).toBe(1);
+    }
+    // A second startup must not infer ownership again from the legacy receipts.
+    new Router(reopened, h.backend, h.transport, h.routerOptions);
+    if (outcome === "replied" && replyMode === "tool") agentSends({ ...h, store: reopened }, "legacy-handled", "Handled");
+    if (outcome === "failed") h.backend.failed();
+    else if (outcome !== "restored-failed") h.backend.final(outcome === "replied" ? "Handled" : "NO_REPLY");
+    await router.tick(); await router.tick();
+    if (outcome === "replied") {
+      const replies = reopened.pendingOutbox().filter(op => op.kind === "conversation");
+      expect(replies.map(op => op.text)).toEqual(["Handled"]);
+      expect(reopened.get<string[]>(`reply-covered:${replies[0]!.id}`)).toEqual(expect.arrayContaining([
+        "first-steer", "first-steer-member", "second-steer", "second-steer-member",
+      ]));
+      for (const op of replies) reopened.outboxState(op.id, "sent");
+      await router.tick();
+      expect(h.backend.prompts).toHaveLength(1);
+    }
+    for (const id of ["first-steer", "second-steer"]) {
+      expect(reopened.get<number>(`human-retries:${id}`) ?? 0).toBe(outcome === "replied" ? 0 : 1);
+      expect(reopened.get<NormalizedInbound>(`batch:${id}`)?.batchIds).toEqual([id, `${id}-member`]);
+      expect(inbounds(reopened).filter(row => row.id === id || row.id === `${id}-member`).every(row => outcome === "replied" ? row.state === "done" : row.state !== "done")).toBe(true);
+    }
+    if (outcome !== "replied") expect(h.backend.prompts.at(-1)?.text).toContain("first-steer question");
+  });
+}
+
+for (const leader of ["human", "wake"] as const) for (const sent of [false, true]) {
+  test(`pre-upgrade accepted steers preserve an earlier legacy reply (${leader}, sent=${sent})`, async () => {
+    const h = await legacySteeredTurn(leader, "final");
+    h.store.enqueue({ id: "send:legacy", kind: "conversation", text: "First handled", sessionId: "ses_1", generation: 1, replyTo: "first-steer" });
+    h.store.db.query("DELETE FROM kv WHERE key = ?").run("reply-covered:send:legacy");
+    if (sent) h.store.outboxState("send:legacy", "sent");
+    h.store.close();
+    const reopened = new Store(h.path); stores.push(reopened);
+    const logs = await captureLogs(async () => {
+      const router = new Router(reopened, h.backend, h.transport, h.routerOptions);
+      h.backend.final("NO_REPLY"); await router.tick(); await router.tick();
+    });
+    expect(reopened.get<number>("human-retries:first-steer")).toBeUndefined();
+    expect(reopened.get<number>("human-retries:second-steer")).toBe(1);
+    expect(inbounds(reopened).filter(row => row.id.startsWith("first-steer")).map(row => row.state)).toEqual(["done", "done"]);
+    expect(reopened.get<string[]>("reply-covered:send:legacy")).toBeUndefined();
+    expect(logs.filter(log => log.name === "inbound.unanswered" && log.ids?.inboundId?.startsWith("first-steer"))).toEqual([]);
+  });
+}
+
+test("pre-upgrade accepted steers migrate only matching accepted human batches", async () => {
+  const h = await legacySteeredTurn("human", "final");
+  for (const [id, state, phase] of [
+    ["unrelated", "done", "accepted"], ["uncertain", "processing", "steering"],
+    ["not-accepted", "done", "queued-steer"], ["cancelled", "cancelled", "accepted"],
+    ["wake:synthetic", "done", "accepted"],
+  ] as const) {
+    h.input(id, id); h.store.updateInbound(id, state); h.store.set(`batch-phase:${id}`, phase);
+  }
+  h.input("cancelled-member", "Cancelled context"); h.store.updateInbound("cancelled-member", "cancelled");
+  h.input("mixed", "Mixed batch"); h.store.updateInbound("mixed", "done"); h.store.set("batch-phase:mixed", "accepted");
+  h.store.set("batch:mixed", { batchIds: ["mixed", "cancelled-member"] });
+  const turn = h.store.get<{ steered: string[] }>("activeTurn")!;
+  h.store.set("activeTurn", { ...turn, steered: [...turn.steered, ...["uncertain", "not-accepted", "cancelled", "mixed", "wake:synthetic"].map(messageId)] });
+  const before = inbounds(h.store);
+  new Router(h.store, h.backend, h.transport, h.routerOptions);
+  expect(h.store.get<{ covered: string[] }>("activeTurn")?.covered).toEqual(["first-steer", "first-steer-member", "second-steer", "second-steer-member"]);
+  expect(h.store.get<string[]>(`turn-human:${messageId(h.root)}`)).toEqual(["first-steer", "second-steer"]);
+  expect(inbounds(h.store)).toEqual(before);
+});
+
+test.each(["current-coverage", "stale-generation"])("pre-upgrade accepted steers leave %s untouched", async guard => {
+  const h = await legacySteeredTurn("human", "final");
+  const turn = h.store.get<{ generation: number }>("activeTurn")!;
+  h.store.set("activeTurn", { ...turn, ...(guard === "current-coverage" ? { covered: ["first-steer"] } : { generation: turn.generation + 1 }) });
+  const before = h.store.get<object>("activeTurn");
+  new Router(h.store, h.backend, h.transport, h.routerOptions);
+  expect(h.store.get<object>("activeTurn")).toEqual(before);
+  expect(h.store.get<string[]>(`turn-human:${messageId(h.root)}`)).toBeUndefined();
+});
+
 test("a configured imessage prompt replaces the built-in iMessage guidance", async () => {
   setSystemTime(10_000);
   const configRoot = mkdtempSync(join(tmpdir(), "spectrum-router-config-"));
