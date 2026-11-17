@@ -2025,6 +2025,11 @@ const make = Effect.gen(function* () {
     );
   });
   const store = LockedStore.wrap(rawStore, locks);
+  // Only the initial backstop snapshot leaves the card operation. Once step
+  // admits it, shared recovery and publication helpers keep their base ordering.
+  const readBackstopPlan = Effect.fn("KanbanService.readBackstopPlan")(
+    <A, E, R>(read: Effect.Effect<A, E, R>) => locks.outside(read, undefined, true),
+  );
   const threadIo = yield* KanbanThreads;
   const turnAdmission = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const inFlightSends = new Map<ThreadId, number>();
@@ -14256,6 +14261,29 @@ const make = Effect.gen(function* () {
               }
             };
             const updateCard = savedCard;
+            const backstopRevision = Effect.fn("KanbanService.backstopRevision")(function* (
+              card: KanbanCard,
+              threadId: ThreadId,
+            ) {
+              const versions = yield* Effect.forEach(
+                ["epoch", "board", `card:${card.id}`, `thread:${threadId}`],
+                (resource) => locks.resourceVersion(card.boardId, resource),
+              );
+              return [...versions, threadFences.get(threadId) ?? 0];
+            });
+            const backstopCard = Effect.fn("KanbanService.backstopCard")(function* (
+              planned: KanbanCard,
+              threadId: ThreadId,
+              revision: ReadonlyArray<number>,
+            ) {
+              const card = yield* turnEndCard(planned.id);
+              // The card read releases permits, so validate the thread fence after it returns.
+              const current = yield* backstopRevision(planned, threadId);
+              return current.every((version, index) => version === revision[index]) &&
+                sameCardState(card, planned)
+                ? card
+                : null;
+            });
             yield* step(
               "scribe",
               Effect.gen(function* () {
@@ -14448,10 +14476,26 @@ const make = Effect.gen(function* () {
                 (initial.detachedSteerAt === undefined || initial.workThreadId !== threadId)
               )
                 continue;
+              const revision = yield* backstopRevision(initial, threadId);
+              const plan = yield* readBackstopPlan(
+                Effect.gen(function* () {
+                  const view = yield* planView(threadId);
+                  // A stale queued run needs both identifiers; otherwise only
+                  // the silence deadline can require a confirmation read.
+                  const fresh =
+                    view?.state === "running" &&
+                    (Rules.runSilentDue(initial, view, now) ||
+                      (view.runId != null && view.runRequestedAt != null))
+                      ? yield* freshFind(threadId)
+                      : Option.none<KanbanThreadView | null>();
+                  return { view, fresh };
+                }).pipe(Effect.withSpan("KanbanService.silentRunBackstopPlan")),
+              );
               yield* step(
                 "silentRunBackstop",
                 Effect.gen(function* () {
-                  const view = yield* planView(threadId);
+                  if (!(yield* backstopCard(initial, threadId, revision))) return;
+                  const { view, fresh } = plan;
                   if (view?.state === "idle" && initial.detachedSteerAt !== undefined) {
                     const card = yield* store.card(initial.id);
                     if (card?.detachedSteerAt !== initial.detachedSteerAt) return;
@@ -14510,7 +14554,6 @@ const make = Effect.gen(function* () {
                     Date.parse(view.runRequestedAt) < Date.parse(previous.at);
                   if (!stale && (yield* skipOpenToolBackstop(card, view, now))) return;
                   if (!due && !stale) return;
-                  const fresh = yield* freshFind(threadId);
                   const current = yield* store.card(card.id);
                   if (
                     Option.isNone(fresh) ||
@@ -14803,10 +14846,48 @@ const make = Effect.gen(function* () {
                 initial.stalled !== null
               )
                 continue;
+              const plannedThreadId = initial.activeThreadId;
+              const revision = yield* backstopRevision(initial, plannedThreadId);
+              const plan = yield* readBackstopPlan(
+                Effect.gen(function* () {
+                  const eligible =
+                    !(board.pause && !board.pause.keep.includes(initial.id)) &&
+                    !(yield* Ref.get(unresolvedTurnEnds)).has(plannedThreadId) &&
+                    !discussionWakes.has(plannedThreadId) &&
+                    !backgroundRecoveryHolds.has(plannedThreadId);
+                  const view = eligible ? yield* planView(plannedThreadId) : null;
+                  const foundFailure =
+                    !eligible || view?.restartRecovery !== undefined
+                      ? undefined
+                      : yield* Effect.result(threads.findLastFailure(plannedThreadId));
+                  const fresh =
+                    foundFailure !== undefined &&
+                    Result.isSuccess(foundFailure) &&
+                    (foundFailure.success !== null
+                      ? foundFailure.success.runId != null
+                      : view !== null &&
+                        !Rules.waitingOnBackground(view, now) &&
+                        Rules.workerQuietDue(initial, view, now))
+                      ? yield* freshFind(plannedThreadId)
+                      : Option.none<KanbanThreadView | null>();
+                  const latestFailure =
+                    foundFailure !== undefined &&
+                    Result.isSuccess(foundFailure) &&
+                    foundFailure.success === null &&
+                    Option.isSome(fresh) &&
+                    fresh.value?.state === "idle" &&
+                    view?.state === "idle" &&
+                    !Rules.waitingOnBackground(fresh.value, now) &&
+                    Rules.workerQuietDue(initial, fresh.value, now)
+                      ? yield* Effect.result(threads.findLastFailure(plannedThreadId))
+                      : undefined;
+                  return { view, foundFailure, fresh, latestFailure };
+                }).pipe(Effect.withSpan("KanbanService.workerBackstopPlan")),
+              );
               yield* step(
                 "workerBackstop",
                 Effect.gen(function* () {
-                  const plannedCard = yield* store.card(initial.id);
+                  const plannedCard = yield* backstopCard(initial, plannedThreadId, revision);
                   if (!plannedCard) return;
 
                   const card = plannedCard;
@@ -14817,7 +14898,7 @@ const make = Effect.gen(function* () {
                   if ((yield* Ref.get(unresolvedTurnEnds)).has(threadId)) return;
                   if (discussionWakes.has(threadId) || backgroundRecoveryHolds.has(threadId))
                     return;
-                  const view = yield* planView(threadId);
+                  const { view, foundFailure, fresh, latestFailure } = plan;
                   if (yield* skipRestartRecovery(threadId, [card], view)) return;
                   // Provider recovery owns nudges, but a deferred wait can park
                   // once the work that held it after the outage has drained.
@@ -14828,7 +14909,7 @@ const make = Effect.gen(function* () {
                     else invalidateCards();
                     return;
                   }
-                  const foundFailure = yield* Effect.result(threads.findLastFailure(threadId));
+                  if (foundFailure === undefined) return;
                   if (Result.isFailure(foundFailure)) {
                     yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
                     return;
@@ -14838,7 +14919,6 @@ const make = Effect.gen(function* () {
                       yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
                       return;
                     }
-                    const fresh = yield* freshFind(threadId);
                     const current = yield* store.card(card.id);
                     if (
                       Option.isNone(fresh) ||
@@ -14871,7 +14951,6 @@ const make = Effect.gen(function* () {
                     return;
                   }
                   if (!Rules.workerQuietDue(card, view, now)) return;
-                  const fresh = yield* freshFind(threadId);
                   const current = yield* store.card(card.id);
                   if (
                     Option.isNone(fresh) ||
@@ -14887,7 +14966,7 @@ const make = Effect.gen(function* () {
                     return;
                   // A newly failed idle run is handled by the failure backstop next tick.
                   if (fresh.value.state === "idle") {
-                    const latestFailure = yield* Effect.result(threads.findLastFailure(threadId));
+                    if (latestFailure === undefined) return;
                     if (Result.isFailure(latestFailure)) {
                       yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
                       return;

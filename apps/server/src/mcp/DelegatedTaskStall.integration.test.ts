@@ -59,6 +59,9 @@ it.effect.each([
   "silent",
   "post_tool_recovery",
   "first_event_recovery",
+  "first_event_recovery_terminal_completed",
+  "first_event_recovery_terminal_cancelled",
+  "first_event_recovery_terminal_failed",
   "first_event_adapter_owned_claude",
   "first_event_recovery_continuation_queued",
   "first_event_recovery_continuation_preparing",
@@ -88,6 +91,13 @@ it.effect.each([
 ] as const)("delegated stall commit: %s", (race) => {
   const recovering =
     (race.startsWith("post_tool") || race.startsWith("first_event")) && !race.endsWith("claude");
+  const interruptedStatus = race.endsWith("_completed")
+    ? "completed"
+    : race.endsWith("_cancelled")
+      ? "cancelled"
+      : race.endsWith("_failed")
+        ? "failed"
+        : "interrupted";
   const recoveryRace = race.includes("_race");
   const firstEvent = race.startsWith("first_event");
   const postTool = race.startsWith("post_tool");
@@ -189,7 +199,7 @@ it.effect.each([
                       runAttemptId: entry.turn.attemptId,
                       nativeTurnRef: null,
                       ordinal: entry.turn.providerTurnOrdinal,
-                      status: "interrupted",
+                      status: interruptedStatus,
                       startedAt: now,
                       completedAt: yield* DateTime.now,
                     },
@@ -200,9 +210,19 @@ it.effect.each([
                     providerThreadId: entry.turn.providerThread.id,
                     providerTurnId,
                     runOrdinal: entry.turn.runOrdinal,
-                    status: "interrupted",
-                    failure: null,
                     threadDisposition: "reusable",
+                    ...(interruptedStatus === "failed"
+                      ? {
+                          status: "failed" as const,
+                          failureItemOrdinal: 101,
+                          failure: {
+                            class: "provider_error" as const,
+                            message: "Old attempt failed during restart",
+                            code: null,
+                            retryable: false,
+                          },
+                        }
+                      : { status: interruptedStatus, failure: null }),
                   });
                 }),
               respondToRuntimeRequest: () => Effect.die("unused"),
@@ -500,7 +520,24 @@ it.effect.each([
             );
             yield* worker.drain();
             yield* Fiber.join(running);
-            recovered = (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!;
+            const restartedProjection = yield* orchestrator.getThreadProjection(
+              task.childThreadId!,
+            );
+            recovered = restartedProjection.runs[0]!;
+            assert.equal(recovered.status, "running");
+            assert.lengthOf(restartedProjection.attempts, 2);
+            assert.equal(
+              restartedProjection.attempts.find(
+                (attempt) => attempt.id === childRun.activeAttemptId,
+              )?.status,
+              "superseded",
+            );
+            assert.equal(
+              restartedProjection.providerTurns.find(
+                (turn) => turn.runAttemptId === childRun.activeAttemptId,
+              )?.status,
+              interruptedStatus,
+            );
             assert.equal(recovered.id, childRun.id);
             assert.equal(recovered.providerThreadId, childRun.providerThreadId);
             assert.notEqual(recovered.activeAttemptId, childRun.activeAttemptId);
