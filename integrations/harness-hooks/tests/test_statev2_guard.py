@@ -411,6 +411,11 @@ class GuardTests(unittest.TestCase):
             'shell function': 'node() { cp tmp/replacement.py tmp/checked.py; }\n',
             'hash binding': f'hash -p {node} node\n',
         }
+        for template in ('', ' invalid', ' /missing/probe.XXXXXX', ' -t probe.XXXXXX'):
+            setup = 'd=$(mktemp -d' + template + ')\n'
+            target = '"$d' + str(node) + '"'
+            edits['fresh-root heredoc fallback' + template] = setup + self.heredoc(target, writer)
+            edits['fresh-root copy fallback' + template] = setup + 'cp tmp/replacement.sh ' + target + '\n'
         with patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {'PATH': str(node.parent) + os.pathsep + os.environ['PATH']}):
             self.assertTrue(guard._trusted_fixture_tool(str(node), 'node', self.root))
             self.assertEqual(self.classify(prefix + 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py'), None)
@@ -598,6 +603,128 @@ class GuardTests(unittest.TestCase):
                 with self.subTest(options=options, run=run):
                     command = prefix + run + '\nnode --test scripts/a.mjs'
                     self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_same_call_inline_node_executable_identity(self):
+        writer = "#!/bin/sh\nprintf 'console.log(2)\\n' > scripts/a.mjs\n"
+        wrapper = self.write('node', writer)
+        wrapper.chmod(0o755)
+        alias = self.root / 'alias/node'
+        alias.parent.mkdir()
+        alias.symlink_to(wrapper)
+        inherited_path = os.environ['PATH']
+        rows = [
+            ('relative wrapper', './node', inherited_path),
+            ('absolute wrapper', str(wrapper), inherited_path),
+            ('PATH wrapper', 'node', str(self.root) + os.pathsep + inherited_path),
+            ('relative symlink', './alias/node', inherited_path),
+            ('absolute symlink', str(alias), inherited_path),
+            ('PATH symlink', 'node', str(alias.parent) + os.pathsep + inherited_path),
+            ('relative PATH', 'node', '.' + os.pathsep + inherited_path),
+            ('unresolved PATH', 'node', str(self.root / 'missing-bin')),
+        ]
+        for target, setup in (('scripts/a.mjs', ''), ('"$d/a.mjs"', 'd=$(mktemp -d)\n')):
+            prefix = setup + self.heredoc(target, 'console.log(1)')
+            for label, executable, search in rows:
+                for inline in (" -e 'console.log(1)'\n", " --input-type=module - <<'JS'\nconsole.log(1)\nJS\n"):
+                    command = prefix + executable + inline + 'node --test ' + target
+                    with self.subTest(target=target, executable=label, inline=inline), patch.dict(os.environ, {'PATH': search}):
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, UNRESOLVED, cause)
+                        self.assertIn('node: executable provenance or mutation proof failed', cause)
+                        self.assertNotIn('console.log(2)', cause)
+                        self.adapters(command, UNRESOLVED)
+        with self.trusted_node_environment(), patch.dict(os.environ, {'BASH_FUNC_node%%': '() { :; }'}):
+            command = self.heredoc('scripts/a.mjs', 'console.log(1)')
+            command += "node -e 'console.log(1)'\nnode --test scripts/a.mjs"
+            rule, cause = guard.classify_detail(command, str(self.root))
+            self.assertEqual(rule, UNRESOLVED, cause)
+            self.assertIn('node: executable provenance or mutation proof failed', cause)
+        mktemp = self.write('untrusted-bin/mktemp', writer)
+        mktemp.chmod(0o755)
+        with self.trusted_node_environment():
+            search = str(mktemp.parent) + os.pathsep + os.environ['PATH']
+            with patch.dict(os.environ, {'PATH': search}):
+                command = 'd=$(mktemp -d)\n' + self.heredoc('scripts/a.mjs', 'console.log(1)')
+                command += "node -e 'console.log(1)'\nnode --test scripts/a.mjs"
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('node: executable provenance or mutation proof failed', cause)
+
+    def test_same_call_inline_node_tool_mutations(self):
+        home = (self.root / 'home').resolve()
+        node = self.write('home/.nvm/versions/node/v26.0.0/bin/node', '#!/bin/sh\nexit 0\n').resolve()
+        node.chmod(0o755)
+        alias = self.root / 'bin/node'
+        alias.parent.mkdir()
+        alias.symlink_to(node)
+        hardlink = self.root / 'node-hardlink'
+        os.link(node, hardlink)
+        early = self.root / 'early-bin'
+        early.mkdir()
+        search = os.pathsep.join((str(early), str(alias.parent), os.environ['PATH']))
+        writer = "#!/bin/sh\nprintf 'console.log(2)\\n' > scripts/a.mjs\n"
+        edits = {
+            'heredoc executable': self.heredoc(str(node), writer),
+            'redirect executable': f'cat replacement.sh > {node}\n',
+            'append executable': f'cat replacement.sh >> {node}\n',
+            'Python executable': "python3 -I -c " + shlex.quote(f'from pathlib import Path; Path({str(node)!r}).write_text({writer!r})') + '\n',
+            'copy executable': f'cp replacement.sh {node}\n',
+            'move executable': f'mv replacement.sh {node}\n',
+            'sed executable': f'sed -i s/exit/echo/ {node}\n',
+            'replace executable directory': f'mv replacement-bin {node.parent}\n',
+            'replace symlink': f'ln -sf replacement.sh {alias}\n',
+            'write symlink target': self.heredoc(str(alias), writer),
+            'write hardlink': self.heredoc(str(hardlink), writer),
+            'change PATH': f'PATH={self.root}:$PATH\n',
+            'unset PATH': 'unset PATH\n',
+        }
+        for template in ('', ' invalid', ' /missing/probe.XXXXXX', ' -t probe.XXXXXX'):
+            setup = 'd=$(mktemp -d' + template + ')\n'
+            target = '"$d' + str(node) + '"'
+            edits['fresh-root heredoc fallback' + template] = setup + self.heredoc(target, writer)
+            edits['fresh-root copy fallback' + template] = setup + 'cp replacement.sh ' + target + '\n'
+        with patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {'PATH': search}):
+            for executable in ('node', str(node), str(alias)):
+                for inline in (" -e 'console.log(1)'\n", " --input-type=module - <<'JS'\nconsole.log(1)\nJS\n"):
+                    prefix = self.heredoc('scripts/a.mjs', 'console.log(1)')
+                    run = executable + inline + 'node --test scripts/a.mjs'
+                    with self.subTest(executable=executable, inline=inline):
+                        self.assertEqual(guard.classify_detail(prefix + run, str(self.root)), (None, None))
+                    for label, edit in edits.items():
+                        for before in (True, False):
+                            command = (edit + prefix if before else prefix + edit) + run
+                            with self.subTest(executable=executable, inline=inline, mutation=label, before=before):
+                                rule, cause = guard.classify_detail(command, str(self.root))
+                                self.assertEqual(rule, UNRESOLVED, cause)
+                                self.adapters(command, UNRESOLVED)
+                                if before and label not in {'change PATH', 'unset PATH'}:
+                                    self.assertIn('node: executable provenance or mutation proof failed', cause)
+            for inline in (" -e 'console.log(1)'\n", " --input-type=module - <<'JS'\nconsole.log(1)\nJS\n"):
+                for spelling in ('node', 'Node', 'NODE'):
+                    edit = self.heredoc(str(early / spelling), writer) + 'chmod +x ' + str(early / spelling) + '\n'
+                    for before in (True, False):
+                        command = (edit + prefix if before else prefix + edit) + 'node' + inline + 'node --test scripts/a.mjs'
+                        with self.subTest(mutation='shadow earlier PATH entry', spelling=spelling, before=before, inline=inline):
+                            rule, cause = guard.classify_detail(command, str(self.root))
+                            self.assertEqual(rule, UNRESOLVED, cause)
+                            self.assertIn('node: executable provenance or mutation proof failed', cause)
+
+    def test_same_call_inline_node_tool_path_normalization(self):
+        home = (self.root / 'home').resolve()
+        node = self.write('home/.nvm/versions/node/v26.0.0/bin/node', '#!/bin/sh\nexit 0\n').resolve()
+        node.chmod(0o755)
+        early = self.root / 'early-é'
+        early.mkdir()
+        search = str(early) + os.pathsep + str(node.parent) + os.pathsep + os.environ['PATH']
+        for spelling in ('early-é/Node', 'EARLY-É/node', 'early-e\u0301/node', 'EARLY-E\u0301/NODE'):
+            edit = self.heredoc(str(self.root / spelling), '#!/bin/sh\nexit 0\n')
+            edit += 'chmod +x ' + str(self.root / spelling) + '\n'
+            prefix = self.heredoc('scripts/a.mjs', 'console.log(1)')
+            command = edit + prefix + "node -e 'console.log(1)'\nnode --test scripts/a.mjs"
+            with self.subTest(spelling=spelling), patch.object(Path, 'home', return_value=home), patch.dict(os.environ, {'PATH': search}):
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('node: executable provenance or mutation proof failed', cause)
 
     def test_same_call_inline_node_runtime_options(self):
         self.write('scripts/mutate.cjs', "require('node:fs').writeFileSync('scripts/a.mjs', 'console.log(2)')")

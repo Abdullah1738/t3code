@@ -3048,6 +3048,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return (parent is not None and child is not None and parent[:2] == child[:2] and
                 (parent[2] == child[2] or child[2].startswith(parent[2] + '/')))
 
+    def opaque_fallback(value, directory):
+        # Use the validated, unexpanded suffix: the variable's mktemp template
+        # can itself contain slashes after script_variants expands it.
+        return _literal_path(value[value.index('/'):], directory) if opaque_key(value, directory) else None
+
     def copied_source(key):
         # A named cp destination may already be a directory, in which case cp
         # writes below it using the source basename rather than replacing it.
@@ -3105,10 +3110,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 f'Accepted: d=$(mktemp -d); cat > "$d/x{extension}" <<\'EOF\' … EOF; {runner} '
                 '(quote "$d" and use a same-call heredoc), or create/write first and run its literal absolute script path in the next call.')
 
-    def affected_sources(path, descendants=False):
+    def affected_sources(path, descendants=False, *, track_tool=True):
         # Executable trust must survive the whole call, even writes before a
         # script is remembered. None records an unbounded mutation.
-        tool_changes.add(path)
+        if track_tool:
+            tool_changes.add(path)
         if path is None:
             return set(written)
         identity = source_identity(path)
@@ -3148,7 +3154,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             return False
         candidates.add(path)
         for changed in tool_changes:
-            if any(candidate is None or candidate == changed or candidate.is_relative_to(changed) for candidate in candidates):
+            identity = source_identity(changed)
+            if any(candidate is None or source_identity(candidate) == identity or
+                   source_identity(candidate).startswith(identity.rstrip('/') + '/') for candidate in candidates):
                 return False
             for candidate in candidates:
                 try:
@@ -3317,6 +3325,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             proof_failure = 'node: source or operation proof failed'
         elif re.fullmatch(r'python[\d.]*', binary):
             proof_failure = 'python: source proof failed'
+        # Fresh directory creation cannot replace an existing source or PATH
+        # executable. Reuse the bounded mktemp grammar and tool provenance.
+        if (binary == 'mktemp' and not unsafe_bindings and
+                _fresh_mktemp('$(' + ' '.join(['mktemp', *words[1:]]) + ')') and
+                not any(name.startswith('BASH_FUNC_') for name in os.environ) and
+                _trusted_fixture_tool(words[0], 'mktemp', directory) and unchanged_tool(words[0], directory)):
+            return False
         if binary == 'sed':
             args = words[1:]
             if args[:1] == ['-i']:
@@ -3344,6 +3359,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 return False
             root = re.fullmatch(r'\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))/([^$`*?\[\]{}]*)', target)
             if source is not None and root and (root[1] or root[2]) in fresh_variables:
+                tool_changes.add(opaque_fallback(target, directory))
                 # A named sibling preserves other paths. copied_opaque still
                 # prevents executing or replacing this unchecked copy itself.
                 if target in invocation_quoted and opaque_key(target, directory):
@@ -3422,7 +3438,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                    for source in sources):
                     return False
             elif binary in {'node', 'bun'}:
-                inline = node_inline_sources(words, stdin_sources, literal_eval=literal_eval)
+                inline = node_inline_sources(words, directory, stdin_sources, literal_eval=literal_eval)
                 if inline:
                     return not all(node_inline_preserves_sources(source, directory) for source in inline)
                 args = _interpreter_args(binary, words[1:])
@@ -3456,7 +3472,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             return not output_only_print(words)
         return binary not in {'cat', 'tee', 'mkdir', 'chmod', 'set', 'head', 'tail', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'ls', 'stat', 'wc', 'pwd'}
 
-    def node_inline_sources(words, stdin_sources, *, literal_eval=False):
+    def node_inline_sources(words, directory, stdin_sources, *, literal_eval=False):
         nonlocal proof_failure
         if not words or os.path.basename(words[0]) != 'node':
             return []
@@ -3467,6 +3483,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             return []
         proof_failure = 'node: inline runtime options or arguments unproved'
         if unsafe_bindings:
+            return []
+        # Literal source describes this invocation only if the resolved Node
+        # toolchain is trusted and no earlier write can have replaced it.
+        if (any(name.startswith('BASH_FUNC_') for name in os.environ) or
+                not _trusted_fixture_tool(words[0], 'node', directory) or
+                not unchanged_tool(words[0], directory)):
+            proof_failure = 'node: executable provenance or mutation proof failed'
             return []
         # _node_arguments removes options for operand discovery, including
         # --run. That is not evidence that the literal eval body runs alone.
@@ -4420,7 +4443,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         stdin_sources = documents if exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) else []
         literal_eval = bool(raw_words) and raw_words[-1] in binding_literal_words
         if written or opaque_written:
-            inline_sources = node_inline_sources(words, stdin_sources, literal_eval=literal_eval)
+            inline_sources = node_inline_sources(words, directory, stdin_sources, literal_eval=literal_eval)
             if inline_sources and not all(node_inline_preserves_sources(source, directory) for source in inline_sources):
                 raise AmbiguousScript(f'{proof_failure}; execution inline source: node at line {current_line}')
         changes_scripts = may_change_scripts(words, directory, stdin_sources, literal_eval=literal_eval)
@@ -4556,7 +4579,12 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 fresh_variables.clear()
             for candidate in script_variants(target):
                 path = _literal_path(candidate, directory)
-                affected = affected_sources(path)
+                fresh_target = bounded and key is not None and key[1] in fresh_variables
+                if fresh_target:
+                    # A fresh root cannot contain an existing executable, but
+                    # failed mktemp leaves the absolute empty-root fallback.
+                    tool_changes.add(opaque_fallback(target, directory))
+                affected = affected_sources(path, track_tool=not fresh_target)
                 if documents and binary in {'cat', 'tee'}:
                     affected.discard(path)
                 invalidate(affected, 'output redirect', words, 'redirect target overlaps or is unproved')
