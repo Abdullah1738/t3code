@@ -21,7 +21,14 @@ type ThreadReadStage = NonNullable<AnalyticsEvent["threadReadStages"]>[number];
 type MutableThreadReadStage = { -readonly [K in keyof ThreadReadStage]: ThreadReadStage[K] };
 type TaskLookup = Pick<
   NonNullable<AnalyticsEvent["props"]>,
-  "foundBy" | "notFoundReason" | "idCanonical" | "idShape"
+  | "foundBy"
+  | "notFoundReason"
+  | "idCanonical"
+  | "idShape"
+  | "commandId"
+  | "taskId"
+  | "receiptState"
+  | "missingLookup"
 >;
 
 export class McpCall extends Context.Service<

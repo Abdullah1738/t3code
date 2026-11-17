@@ -447,6 +447,19 @@ def candidates(con, key, size, source, me=None):
     return out, not full
 
 
+@contextlib.contextmanager
+def _pre_wait(reason):
+    from . import allocation
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        queue = allocation._QUEUE.get()
+        if queue is not None:
+            waits = queue.setdefault('pre_waits', {})
+            waits[reason] = waits.get(reason, 0) + time.monotonic() - started
+
+
 def _recycle_log(kind, detail):
     import toollog
     toollog.emit('pool', kind, ids={'run': detail['run_id'], 'box': detail.get('box_id'),
@@ -545,6 +558,10 @@ class _QueuePoll:
         self.deadline = time.monotonic() + wait if deadline is None else deadline
 
     def call(self, operation):
+        with _pre_wait('selection_and_lock'):
+            return self._call(operation)
+
+    def _call(self, operation):
         # Only DB polling/selection uses this budget, never a machine start or a remote command.
         timeout = self.con.execute('PRAGMA busy_timeout').fetchone()[0]
         try:
@@ -637,6 +654,7 @@ def _acquire_logged(me, size=None, template=None, base=None, fresh=False, run_id
             queue['check_source'] = check_source
             allocation.check_queue()
             queue["log_setup_ms"] = 0
+            queue["pre_wait_start"] = time.monotonic()
             poll = _QueuePoll(con, queue['wait'], run_id, deadline=queue['end'])
             poll.call(lambda: capacity.schema(con))
             def register():
@@ -738,10 +756,20 @@ def _lease_work(*, selected=True):
     finally:
         if queue is not None:
             queue["log_setup_ms"] = queue.get("log_setup_ms", 0) + (time.monotonic()-started)*1000
+            queue["pre_wait_start"] = time.monotonic()
 
 
 def _reuse_prepared(con, row, *args, **kwargs):
     from . import lease
+    from . import allocation
+    queue = allocation._QUEUE.get()
+    if queue is not None:
+        waits = queue.pop('pre_waits', {})
+        elapsed = max(0, time.monotonic() - queue.get('pre_wait_start', time.monotonic()))
+        detail = dict(duration_s=round(elapsed, 3),
+                      stages_s={key: round(value, 3) for key, value in waits.items()},
+                      queue_s=round(max(0, elapsed - sum(waits.values())), 3))
+        common.event(con, row['box_id'], 'pre_bring_up', json.dumps(detail, separators=(',', ':')))
     with _lease_work(), prepare.guard(row['box_id']) as budget:
         got = lease._reuse(con, row, *args, **kwargs)
         if got:
@@ -829,6 +857,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     unusable = set(exclude or ())
     pending_retries = set()
     pending_busy = {}
+    rejected_alternatives = set()
     affinity_deadline = min(deadline, started + AFFINITY_WAIT_S)
     grew = False
     prune_checked = False
@@ -887,14 +916,16 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                 with _pool_lock(key, deadline, wait, **lock_options):
                     con.execute("UPDATE pool_waiters SET reserved=0 WHERE token=?", (waiter,))
                     con.commit()
-                    alternatives = candidates(con, key, size, source, me)[0] if not _matches(pending, source) else []
+                    alternatives = (candidates(con, key, size, source, me)[0]
+                                    if resume_stall is not None or not _matches(pending, source) else [])
                     can_use_other = False
                     for alternative in alternatives:
                         other = alternative['box_id']
                         # An unresolved resume fences new machine starts: only a ready running peer can avoid recovery.
-                        if (other == bid or other in unusable or alternative['state'] != 'running'
+                        if (other == bid or other in unusable or other in rejected_alternatives
+                                or alternative['state'] != 'running'
                                 or (size and SIZES.index(alternative['size'] or 'default') < SIZES.index(size))
-                                or allocation.resume_inflight(con, other)
+                                or con.execute('SELECT 1 FROM kv WHERE k=?', (f'resume_unanswered:{other}',)).fetchone()
                                 or lease.active_runs(con, other) or _older(con, key, waiter, alternative)):
                             continue
                         try:
@@ -954,7 +985,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                     con.execute("UPDATE leases SET state='resume_stalled', note=? WHERE box_id=?", (str(e), bid))
                     con.commit()
                     prepare.move_once(e)
-                    resume_stall, create_first = e, True
+                    resume_stall, create_first = e, not isinstance(e, lease.ResumeNoProgress)
                     _unreserve_and_release(con, waiter, guard)
                     say(str(e))
                     continue
@@ -975,11 +1006,13 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         last_error = None
         if time.monotonic() >= next_refresh:
             # Outside the pool lock: it asks boat about every detached run.
-            _refresh_background(con, key)
+            with _pre_wait('background_refresh'):
+                _refresh_background(con, key)
             next_refresh = time.monotonic() + 10
         if not prune_checked:
             # Before reserving a create slot, and outside the pool lock: a held warm box may be ready now.
-            _recheck_prune_holds(con, key)
+            with _pre_wait('prune_recheck'):
+                _recheck_prune_holds(con, key)
             prune_checked = True
         tried = set(unusable)
         stopped_tries = 0
@@ -987,6 +1020,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
         capacity_outage = None
         start_limit = None
         stopped_failed = False  # the last stopped box tried could not be used (error or gone)
+        retry_pending = False
         while True:
             # The pool lock covers only the choice: a box (its box lock taken without waiting) or a create slot.
             # The resume or create runs after it is released, so one slow boat call never holds up other callers
@@ -1038,6 +1072,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                                 f"({len(members(con, key))}/{cap} boxes, none from {source}). Nothing ran. "
                                 "Run without --fresh to use an existing pool box." + split_pool_notice(con, me), code=2)
                         for r in rows:
+                            if resume_stall is not None and any(p['box_id'] == r['box_id'] for p in pending_rows):
+                                continue
                             if (r["box_id"] in tried or _older(con, key, waiter, r)
                                     or allocation.resume_inflight(con, r['box_id'])):
                                 continue
@@ -1170,7 +1206,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         con.commit()
                         prepare.move_once(e)
                         resume_stall = e
-                        create_first = True
+                        create_first = not isinstance(e, lease.ResumeNoProgress)
+                        stopped_failed = True
                         say(str(e))
                         continue
                     except lease.BoxNotReady as e:
@@ -1178,6 +1215,10 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         stopped_error, stopped_failed = e, True
                         continue
                     except (allocation.Busy, allocation.Fenced) as error:
+                        # A free local lock did not prove this peer ready. Let pending resumes be observed next.
+                        if pending_rows and row['box_id'] not in rejected_alternatives:
+                            retry_pending = True
+                        rejected_alternatives.add(row['box_id'])
                         if getattr(error, 'resume_retry_box', None) == row['box_id']:
                             pending_retries.add(row['box_id'])
                         if row['state'] != 'running':
@@ -1337,6 +1378,8 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
             if stopped_error is not None and not can_create:
                 raise stopped_error
             break
+        if retry_pending:
+            continue
         t = time.monotonic()
         if last_error and not isinstance(last_error, (api.SupplyOut, api.BoatAtCapacity)):
             raise last_error

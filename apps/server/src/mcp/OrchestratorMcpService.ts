@@ -2148,6 +2148,7 @@ const make = Effect.gen(function* () {
       });
     if (task === undefined || task.childThreadId === null) {
       let detail = "";
+      let acceptedCommandId: CommandId | undefined;
       if (identity?.canonical && (callerOwned || identity.thread === undefined)) {
         const state = yield* threadManagement.getDelegationCommandState(identity.commandId).pipe(
           NodeSqliteClient.readOnly,
@@ -2173,10 +2174,25 @@ const make = Effect.gen(function* () {
         yield* Effect.annotateCurrentSpan({ "t3.task.creation_state": state.status });
         switch (state.status) {
           case "accepted":
+            acceptedCommandId = identity.commandId;
             foundBy = "receipt";
             notFoundReason = "accepted";
+            // Admission commits the receipt and task together; close a commit race before diagnosing loss.
+            parentProjection = yield* threadManagement
+              .getThreadRecords(
+                scope.thread.threadId,
+                ["runs", "subagents", "contextTransfers"],
+                undefined,
+                { projectionOnly: true },
+              )
+              .pipe(
+                NodeSqliteClient.foregroundReads,
+                Effect.mapError(threadManagementFailure),
+                (effect) => McpTaskTrace.stage(effect, "parent_records", "t3.task"),
+              );
+            task = findDelegatedTask(parentProjection, scope.thread.threadId, taskId);
             detail =
-              " This delegation was saved; its task projection is catching up. Retry task_status with this task id.";
+              " This delegation was saved; its task record is missing. Preserve this task id and report the missing record; do not create a replacement delegation.";
             break;
           case "rejected":
             foundBy = "receipt";
@@ -2222,12 +2238,35 @@ const make = Effect.gen(function* () {
         }
       }
       if (task === undefined || task.childThreadId === null) {
+        if (acceptedCommandId !== undefined) {
+          const missingLookup = task === undefined ? "subagents" : "child_thread_id";
+          yield* McpCallAnalytics.setTaskLookup({
+            foundBy: "receipt",
+            notFoundReason: task === undefined ? "accepted" : "missing_child_thread",
+            idCanonical,
+            commandId: acceptedCommandId,
+            taskId,
+            receiptState: "accepted",
+            missingLookup,
+          });
+          yield* Effect.logError("delegated task record missing", {
+            commandId: acceptedCommandId,
+            taskId,
+            receiptState: "accepted",
+            missingLookup,
+          });
+          return yield* new OrchestratorMcpFailure({
+            code: "task_record_missing",
+            saved: true,
+            message: `${detail.trimStart()}${idHint()}`,
+          });
+        }
         if (task !== undefined) {
           foundBy = task.id === taskId ? "subagents" : "request_key_recovery";
           notFoundReason = "missing_child_thread";
         }
         yield* McpCallAnalytics.setTaskLookup({ foundBy, notFoundReason, idCanonical });
-        const creating = notFoundReason === "pending" || notFoundReason === "accepted";
+        const creating = notFoundReason === "pending";
         return yield* failure(
           creating ? "task_creating" : "task_not_found",
           creating
