@@ -27,7 +27,10 @@ The first fetch has a 6-second timeout. Transient timeouts, refused/reset socket
 and HTTP 502/503/504 get one retry after 1 second, bounded at 15 seconds.
 Two transient failures skip that tick without changing incidents or pending
 notices; the journal keeps the first and last unavailable times and consecutive
-count. A gap over five minutes starts a fresh streak; a valid snapshot logs
+count. An ongoing outage is checkpointed before fetching, so a runner-killed
+check does not break continuity. A gap over twelve minutes before the next
+check starts a fresh streak: five-minute backoff, four-minute queue wait,
+90-second runner timeout and 90 seconds of slack. A valid snapshot logs
 recovery and resets it.
 This watcher never auto-pauses; sustained unavailability fails after 15 minutes.
 The runner alerts after two failures; Telegram coalesces reminders to at most hourly.

@@ -24,7 +24,9 @@ const COOLDOWNS = [5 * 60_000, 15 * 60_000];
 const REPLAY_DELAY = 60_000;
 const DELIVERY_DEADLINE = 3 * 60_000;
 export const ROUTER_UNAVAILABLE_LIMIT_MS = 15 * 60_000;
-export const ROUTER_STREAK_GAP_MS = 5 * 60_000;
+// Allow 300s wake backoff + 240s slot queue + the runner's 90s timeout,
+// with 90s scheduling slack. Check execution can outlive our own 45s timer.
+export const ROUTER_STREAK_GAP_MS = 12 * 60_000;
 export const SUPERVISOR_DEADLINE_MS = 45_000;
 
 function newState() { return { version: 1, incidents: [], active: null }; }
@@ -313,13 +315,23 @@ export async function tick(ctx) {
 
 async function tickImpl(ctx) {
   const state = ctx.load();
+  const startedAt = ctx.now();
+  const continuing = state.routerUnavailableLastAt !== undefined
+    && startedAt >= state.routerUnavailableLastAt
+    && startedAt - state.routerUnavailableLastAt <= ROUTER_STREAK_GAP_MS;
+  // A killed fetch cannot publish its result. Preserve an ongoing outage's
+  // continuity before fetching so the following retry does not look like downtime.
+  if (continuing) {
+    state.routerUnavailableLastAt = startedAt;
+    ctx.save(state);
+  }
   let payload;
   try { payload = await ctx.providers(); }
   catch (error) {
     if (!(error instanceof RouterUnavailableError)) throw error;
     const now = ctx.now();
     // Legacy journals lack a last tick; their elapsed time cannot prove continuity.
-    if (state.routerUnavailableLastAt === undefined || now < state.routerUnavailableLastAt || now - state.routerUnavailableLastAt > ROUTER_STREAK_GAP_MS) {
+    if (!continuing) {
       state.routerUnavailableSince = now;
       state.routerUnavailableCount = 0;
     }

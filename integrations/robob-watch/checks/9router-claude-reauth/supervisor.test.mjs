@@ -973,18 +973,28 @@ test('invalid availability journal is an error rather than a fresh grace period'
 
 for (const [label, gap, legacy, resets] of [
   ['13-hour gap', 13 * 60 * 60_000, false, true],
-  ['over five minutes', ROUTER_STREAK_GAP_MS + 1, false, true],
-  ['exactly five minutes', ROUTER_STREAK_GAP_MS, false, false],
-  ['under five minutes', ROUTER_STREAK_GAP_MS - 1, false, false],
+  ['over continuity allowance', ROUTER_STREAK_GAP_MS + 1, false, true],
+  ['exactly at continuity allowance', ROUTER_STREAK_GAP_MS, false, false],
+  ['under continuity allowance', ROUTER_STREAK_GAP_MS - 1, false, false],
+  ['five-minute backoff plus 22-second check', 322_000, false, false],
+  ['five-minute backoff plus check and four-minute queue', 562_000, false, false],
   ['backwards clock', -1, false, true],
   ['legacy without last tick', 60_000, true, true],
 ]) test(`unavailable streak continuity: ${label}`, async t => {
-  const h = harness(t), last = h.sim.time;
-  const initial = { version: 1, incidents: [], active: null, routerUnavailableSince: last - 14 * 60_000, routerUnavailableCount: 15,
-    ...(!legacy ? { routerUnavailableLastAt: last } : {}) };
-  writeState(h.path, initial); h.sim.time += gap;
+  const h = harness(t), started = h.sim.time, lines = [];
   h.ctx.providers = async () => { throw new RouterUnavailableError([6000, 15000]); };
-  const lines = []; h.ctx.log = s => lines.push(s);
+  h.ctx.log = s => lines.push(s);
+  // Build the stored outage through real tick/save/read IO, not a seeded journal.
+  for (let n = 0; n < 15; n++) { h.sim.time = started + n * 60_000; await h.tick(); }
+  if (legacy) {
+    const old = h.state(); delete old.routerUnavailableLastAt; writeState(h.path, old);
+  }
+  const initial = h.state(); h.sim.time += gap;
+  h.ctx.providers = async () => {
+    // A stale checkpoint must be compared before any admission refresh.
+    if (resets) assert.equal(h.state().routerUnavailableLastAt, initial.routerUnavailableLastAt);
+    throw new RouterUnavailableError([6000, 15000]);
+  };
   if (resets) {
     await h.tick();
     assert.match(lines.at(-1), /skipped this tick \(1 consecutive, since /);
@@ -1014,4 +1024,78 @@ test('ticks four minutes apart still reach the unavailable bound, then a valid s
   h.ctx.providers = async () => { throw new RouterUnavailableError([6000, 15000]); };
   await h.tick(); assert.equal(h.state().routerUnavailableSince, h.sim.time);
   assert.equal(h.state().routerUnavailableCount, 1);
+});
+
+for (const [label, durationMs, queueMs] of [
+  ['22-second check', 22_000, 0],
+  ['22-second check and four-minute queue', 22_000, 240_000],
+  ['near-deadline check and four-minute queue', 44_000, 240_000],
+  ['90-second check', 90_000, 0],
+  ['90-second check and four-minute queue', 90_000, 240_000],
+]) test(`outage stays failed with advancing completion clock: ${label}`, async t => {
+  const h = harness(t), started = h.sim.time;
+  let failures = 0, ticks = 0, since;
+  h.ctx.providers = async () => {
+    h.sim.time += durationMs;
+    throw new RouterUnavailableError([6_000, 15_000]);
+  };
+  while (h.sim.time - started < 2 * 60 * 60_000) {
+    const checkStarted = h.sim.time;
+    if (failures || h.sim.time - started >= ROUTER_UNAVAILABLE_LIMIT_MS) {
+      await assert.rejects(h.tick(), RouterUnavailableError);
+      failures++;
+    } else {
+      await h.tick();
+    }
+    ticks++;
+    since ??= h.state().routerUnavailableSince;
+    assert.equal(h.state().routerUnavailableSince, since, 'outage never reset without a valid snapshot');
+    assert.equal(h.state().routerUnavailableCount, ticks);
+    assert.equal(h.state().routerUnavailableLastAt, h.sim.time);
+    // Successful skips schedule from admission; failures back off after completion.
+    h.sim.time = failures
+      ? h.sim.time + Math.min(60_000 * 2 ** Math.min(failures - 1, 8), 300_000) + queueMs
+      : Math.max(h.sim.time, checkStarted + 60_000);
+  }
+  assert.ok(failures > 5, 'outage must remain failed past the default pause threshold');
+});
+
+test('a runner-killed fetch checkpoints an ongoing outage before providers resolve', async t => {
+  const h = harness(t); h.sim.time += 60 * 60_000;
+  const started = h.sim.time, since = started - 30 * 60_000;
+  writeState(h.path, { version: 1, incidents: [], active: null,
+    routerUnavailableSince: since, routerUnavailableLastAt: started, routerUnavailableCount: 20 });
+  h.sim.time += 300_000 + 240_000;
+  const admission = h.sim.time;
+  let entered;
+  const fetching = new Promise(resolve => { entered = resolve; });
+  h.ctx.providers = () => { entered(); return new Promise(() => {}); };
+  void h.tick(); await fetching;
+  assert.equal(h.state().routerUnavailableLastAt, admission, 'checkpoint must precede a fetch that may be killed');
+  assert.equal(h.state().routerUnavailableSince, since);
+  assert.equal(h.state().routerUnavailableCount, 20);
+  // The killed check spends 90s, timeout retry waits 120s, then queues for 240s.
+  h.sim.time += 90_000 + 120_000 + 240_000;
+  h.ctx.providers = async () => { h.sim.time += 22_000; throw new RouterUnavailableError([6_000, 15_000]); };
+  await assert.rejects(h.tick(), RouterUnavailableError);
+  assert.equal(h.state().routerUnavailableSince, since);
+  assert.equal(h.state().routerUnavailableCount, 21);
+});
+
+test('a killed fetch without a known outage cannot start a streak or report router recovery', async t => {
+  const h = harness(t), lines = []; h.ctx.enforceSafetyFence = true; h.ctx.log = s => lines.push(s);
+  let entered, saves = 0;
+  const save = h.ctx.save; h.ctx.save = s => { saves++; save(s); };
+  const fetching = new Promise(resolve => { entered = resolve; });
+  h.ctx.providers = () => { entered(); return new Promise(() => {}); };
+  void h.tick(); await fetching;
+  assert.equal(saves, 0, 'no outage checkpoint exists before any unavailable result');
+  assert.equal(h.state().routerUnavailableSince, undefined);
+  assert.equal(h.state().routerUnavailableLastAt, undefined);
+  h.sim.time += 90_000 + 120_000;
+  h.ctx.providers = async () => ({ connections: [] }); await h.tick();
+  assert.equal(h.state().routerUnavailableSince, undefined);
+  assert.equal(h.state().routerUnavailableLastAt, undefined);
+  assert.equal(h.state().routerUnavailableCount, undefined);
+  assert.ok(lines.every(line => !line.includes('router recovered')));
 });
