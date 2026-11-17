@@ -6498,7 +6498,9 @@ it.effect.each(["card_move", "card_review_result"] as const)(
         yield* kanban.postToCard(card.id, owner, [{ _tag: "md", text: "Prepare the handoff" }]);
         yield* kanban.dispatchNow;
         const worker = (yield* kanban.card(card.id)).card.workThreadId!;
-        yield* kanban.markSubtask(
+        // The worker is still making the request; an idle one auto-advances here.
+        fake.running.add(worker);
+        const marked = yield* kanban.markSubtask(
           card.id,
           "s1",
           "done",
@@ -6506,6 +6508,8 @@ it.effect.each(["card_move", "card_review_result"] as const)(
           { _tag: "thread", threadId: worker },
           "work",
         );
+        assert.strictEqual(marked.stage, "working");
+        assert.strictEqual(marked.activeThreadId, worker);
         let caller = worker;
         if (tool === "card_review_result") {
           yield* kanban.moveCard(card.id, "needs_review", "cardThread", {
