@@ -3542,6 +3542,14 @@ const make = Effect.gen(function* () {
   // Only update the cache after its row commits, so a failed append remains retryable.
   const slotState = new Map<string, Map<string, Set<string>>>();
   const slotWrites = Semaphore.makeUnsafe(1);
+  const invalidateSlots = Effect.fn("KanbanService.invalidateSlots")(function* (
+    before: KanbanCard | null,
+    after: KanbanCard,
+  ) {
+    for (const id of new Set([before?.activeThreadId, after.activeThreadId])) {
+      if (id != null) yield* locks.invalidate(after.boardId, `slots:${id}`);
+    }
+  });
   const syncSlot = Effect.fn("KanbanService.syncSlot")(function* (
     boardId: string,
     threadId: string,
@@ -3785,6 +3793,7 @@ const make = Effect.gen(function* () {
             ? store.updateCard(card, snapshot.before)
             : store.putCard(card);
         yield* dispatchMetadata ? locks.dispatchMetadata(write) : write;
+        yield* invalidateSlots(before, card);
         yield* SavedWrite.record({ kind: "card", card });
         for (const event of BoardAnalytics.cardEvents(before, card, actor))
           yield* recordAnalytics(event);
@@ -18686,13 +18695,28 @@ const make = Effect.gen(function* () {
           true,
         );
         if (!location) return yield* failWith("not-found", `card ${cardId}`);
-        yield* locks.access(location.boardId, Effect.void);
-        // Every read finishes outside the gate; outside() checks the board
-        // generation before any guard or write can use this snapshot.
+        yield* locks.access(location.boardId, Effect.void, false, `card:${cardId}`);
+        yield* locks.access(location.boardId, Effect.void, false, "board");
+        const before = yield* locks.outside(
+          rawStore.card(cardId).pipe(Effect.withSpan("card.move.read.card")),
+          undefined,
+          true,
+        );
+        if (!before) return yield* failWith("not-found", `card ${cardId}`);
+        if (before.reviewThreadId !== null)
+          yield* locks.access(
+            before.boardId,
+            Effect.void,
+            false,
+            `thread:${before.reviewThreadId}`,
+          );
+        if (before.activeThreadId !== null)
+          yield* locks.access(before.boardId, Effect.void, false, `slots:${before.activeThreadId}`);
+        // Card and policy resources exclude discussion writes. Slot membership has
+        // its own fence because a newly assigned sibling was absent from the read.
         const snapshot = yield* locks.outside(
           Effect.gen(function* () {
-            const card = yield* rawStore.card(cardId).pipe(Effect.withSpan("card.move.read.card"));
-            if (!card) return yield* failWith("not-found", `card ${cardId}`);
+            const card = before;
             const board = yield* rawStore
               .board(card.boardId)
               .pipe(Effect.withSpan("card.move.read.board"));
@@ -19015,6 +19039,7 @@ const make = Effect.gen(function* () {
               if (!plan.changed) return null;
               const restoredCard = { ...plan.card, analyticsStageEnteredAt: yield* nowIso };
               yield* store.putCard(restoredCard);
+              yield* invalidateSlots(card, restoredCard);
               yield* store.putThreadLink(plan.link);
               yield* logEvent(
                 plan.card,
