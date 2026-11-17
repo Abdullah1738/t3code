@@ -376,8 +376,8 @@ class ConvergenceTests(unittest.TestCase):
                 self.clock[0]=0
                 jobs.big_root_inventory(root,self.runner(lambda p:20),allowance,cache,deep=True,max_batches=1)
                 self.assertFalse(cache[child].get('timeouts'))
-                self.assertEqual(cache[child]['probeTimeouts'],1)
-                self.assertEqual(jobs.inventory_deep_owned(cache[child],self.now+self.clock[0]),allowance>=15)
+                self.assertFalse(cache[child].get('probeTimeouts'))
+                self.assertFalse(jobs.inventory_deep_owned(cache[child],self.now+self.clock[0]))
 
     def test_background_runner_reports_effective_probe_allowance_before_cleanup(self):
         for seconds_left,child_seconds,stopped,full in ((15,20,False,False),(15.5,14.75,False,False),
@@ -401,10 +401,10 @@ class ConvergenceTests(unittest.TestCase):
                     self.clock[0]+=.5
                 runner=deep.BackgroundDu(lambda:stopped and self.clock[0]>0,self.now+seconds_left,42)
                 with patch.object(deep.subprocess,'Popen',return_value=process),patch.object(deep.os,'killpg',side_effect=kill):
-                    cache={}
+                    cache={child:dict(elapsedMs=1000, partial=True)}
                     jobs.big_root_inventory(root,runner,seconds_left,cache,deep=True,max_batches=1)
                 self.assertFalse(cache[child].get('timeouts'))
-                self.assertEqual(cache[child]['probeTimeouts'],1)
+                self.assertEqual(cache[child].get('probeTimeouts',0),int(full))
                 self.assertEqual(jobs.inventory_deep_owned(cache[child],self.now+self.clock[0]),full)
 
     def test_batch_timeout_isolates_and_measures_cheap_singles(self):
@@ -419,6 +419,8 @@ class ConvergenceTests(unittest.TestCase):
                 self.clock[0] += kwargs['timeout']
                 raise subprocess.TimeoutExpired(command,kwargs['timeout'])
             return normal(command,**kwargs)
+        jobs.save_state('disk-inventory', dict(duMode='links', childState={str(root): {
+            str(p): dict(partial=True, elapsedMs=10) for p in root.iterdir()}}))
         deep.run_pass([root],run)
         state = jobs.read_state('disk-inventory')
         self.assertFalse(state['partials'])

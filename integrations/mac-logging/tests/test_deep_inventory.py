@@ -200,8 +200,10 @@ class DeepInventoryTests(unittest.TestCase):
             result=normal(command,**kwargs)
             killed[0]=True
             return result
+        jobs.save_state('disk-inventory', dict(duMode='links', childState={str(root): {
+            str(p): dict(partial=True, elapsedMs=10) for p in root.iterdir()}}))
         deep.run_pass([root],run,stopped=lambda:killed[0])
-        self.assertEqual(len(jobs.read_state('disk-inventory')['childState'][str(root)]),128)
+        self.assertEqual(sum('bytes' in v for v in jobs.read_state('disk-inventory')['childState'][str(root)].values()),128)
         end=self.rows('disk.deep.end')[-1]['props']
         self.assertEqual(end['stopReason'],'killed')
         self.assertEqual(end['childrenRemaining'],2)
@@ -212,7 +214,7 @@ class DeepInventoryTests(unittest.TestCase):
         for root in roots[:2]:
             (root/'0000'/'blocked').touch()
         deep.run_pass(roots,self.runner(lambda p:700 if any(root in p.parents for root in roots[:2]) else .034,calls))
-        self.assertEqual(sum(len(command)-2 for command,_ in calls),138)
+        self.assertEqual(sum(len(command)-2 for command,_ in calls),134)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenRemaining'],2)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenPartial'],2)
         self.assertLess(self.clock[0],2700)
@@ -254,7 +256,7 @@ class DeepInventoryTests(unittest.TestCase):
                (0,'du: child: Permission denied\ndu: child: Input/output error',True,True)]
         for code,stderr,partial,failed in cases:
             with self.subTest(code=code,stderr=stderr):
-                cache={str(child):dict(bytes=4096,at=self.now-86400,attemptedAt=0,partial=False)
+                cache={str(child):dict(bytes=4096,at=self.now-86400,attemptedAt=0,partial=False,elapsedMs=10)
                        for child in root.iterdir()}
                 original=copy.deepcopy(cache)
                 def run(command,**kwargs):

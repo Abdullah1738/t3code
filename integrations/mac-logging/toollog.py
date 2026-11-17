@@ -36,6 +36,8 @@ FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'fi
                   'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
 NUMBERS.update(('probeTimeouts', 'secondsInProbeTimeouts', 'probeAllowanceMedianS', 'allowanceS'))
+NUMBERS.update(('cpuS', 'loadAvg1Start', 'loadAvg1End', 'loadAvg1Max', 'cpuSecondsDu',
+                'wallSecondsDu', 'firstAttempts', 'firstAttemptTimeouts', 'secondsWasted'))
 NUMBERS.update(('timeouts', 'secondsInTimeouts', 'childrenDescended', 'partsMeasured',
                 'childrenWithPartsInProgress', 'partsDone', 'partsTotal', 'partsFreshnessS'))
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
