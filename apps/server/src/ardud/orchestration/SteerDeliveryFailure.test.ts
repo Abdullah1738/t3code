@@ -321,6 +321,9 @@ it.effect.each(
       assert.include(notice.message, "http://opencode.test");
       assert.include(notice.message, "Acceptance is unconfirmed");
       assert.equal(notice.title, "Message delivery unconfirmed");
+      const message = projection.messages.find((row) => row.id === messageId)!;
+      assert.equal(message.deliveryFailure?.code, `provider_prompt_acceptance_${reason}`);
+      assert.equal(message.deliveryFailure?.retryable, false);
     }).pipe(Effect.provide(testLayer)),
 );
 

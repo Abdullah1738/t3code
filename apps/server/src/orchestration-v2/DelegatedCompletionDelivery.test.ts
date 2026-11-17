@@ -56,6 +56,7 @@ import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
+import * as SteerDeliveryFailure from "../ardud/orchestration/SteerDeliveryFailure.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as Orchestrator from "./Orchestrator.ts";
@@ -1631,22 +1632,31 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
 );
 
 it.effect.each(
-  (["timeout", "transport", "acknowledgement", null] as const).flatMap((reason) =>
-    (["failed", "cancelled"] as const).map((status) => ({ reason, status })),
-  ),
+  (["timeout", "transport", "acknowledgement", null] as const).flatMap((reason) => [
+    ...(["failed", "cancelled"] as const).map((status) => ({
+      reason,
+      status,
+      delivery: "start" as const,
+    })),
+    ...(["completed", "failed", "cancelled"] as const).map((status) => ({
+      reason,
+      status,
+      delivery: "steer" as const,
+    })),
+  ]),
 )(
-  "unconfirmed delegated wake holds its delivery generation ($reason, $status)",
-  ({ reason, status }) =>
+  "unconfirmed delegated wake holds its delivery generation ($reason, $status, $delivery)",
+  ({ reason, status, delivery }) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const sink = yield* EventSink.EventSinkV2;
       const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
       const now = yield* DateTime.now;
-      const name = `uncertain-wake-${reason}-${status}`;
+      const name = `uncertain-wake-${reason}-${status}-${delivery}`;
       const threadId = ThreadId.make(`thread:${name}`);
       const runId = RunId.make(`run:${name}`);
       const taskId = NodeId.make(`task:${name}`);
-      const deliveryRunId = RunId.make(`run:${name}:delivery`);
+      const deliveryRunId = delivery === "steer" ? runId : RunId.make(`run:${name}:delivery`);
       const messageId = MessageId.make(`message:delegated-delivery:${threadId}`);
       yield* seedParentWithTerminalTask({
         threadId,
@@ -1676,10 +1686,11 @@ it.effect.each(
                 budgetSeconds: 60,
               }),
             });
+      const parent = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
       const terminal = runEvent({
         threadId,
         runId: deliveryRunId,
-        ordinal: 2,
+        ordinal: delivery === "steer" ? 1 : 2,
         status,
         now,
         providerThreadId: parentProviderThreadId(threadId),
@@ -1709,22 +1720,68 @@ it.effect.each(
               delegatedCompletion: { parentRunId: runId, generation: 1, taskIds: [taskId] },
             },
           },
-          { ...terminal, payload: { ...terminal.payload, failure } },
+          ...(delivery === "start"
+            ? [{ ...terminal, payload: { ...terminal.payload, failure } }]
+            : []),
         ],
       });
+      if (delivery === "steer") {
+        yield* SteerDeliveryFailure.persist(
+          {
+            id: `effect:${name}`,
+            commandId: CommandId.make(`command:${name}:steer`),
+            threadId,
+            request: {
+              type: "provider-turn.steer",
+              providerSessionId: ProviderSessionId.make(`session:${name}`),
+              providerThreadId: parentProviderThreadId(threadId),
+              providerTurnId: ProviderTurnId.make(`turn:${name}`),
+              messageId,
+            },
+            status: "running",
+            attemptCount: 1,
+            availableAt: DateTime.formatIso(now),
+            leaseOwner: "test",
+            leaseExpiresAt: DateTime.formatIso(now),
+            createdAt: DateTime.formatIso(now),
+            updatedAt: DateTime.formatIso(now),
+            completedAt: null,
+            lastError: null,
+          },
+          reason === null ? undefined : failure,
+        );
+        yield* sink.write({
+          events: [{ ...terminal, payload: { ...parent, status, completedAt: now } }],
+        });
+        assert.isUndefined((yield* orchestrator.getThreadProjection(threadId)).runs[0]!.failure);
+      }
       for (let recovery = 0; recovery < 2; recovery++) {
         yield* orchestrator.recoverDelegatedTasks;
         const projection = yield* orchestrator.getThreadProjection(threadId);
         const cohort = projection.runs.find((run) => run.id === runId)!.delegatedCompletion!;
-        assert.equal(cohort.delivery?.generation, reason === null ? 2 : 1);
-        assert.equal(cohort.nextGeneration, reason === null ? 3 : 2);
+        assert.equal(cohort.delivery?.generation, reason === null && delivery === "start" ? 2 : 1);
+        assert.equal(cohort.nextGeneration, reason === null && delivery === "start" ? 3 : 2);
         assert.equal(
           projection.subagents.find((task) => task.id === taskId)?.completionDelivery?.state,
           "claimed",
         );
         assert.equal(yield* requests.pending!(threadId), reason === null);
       }
-      if (reason !== null) {
+      if (reason !== null && delivery === "steer") {
+        // Native acceptance, rather than completion of the unrelated parent input, settles the notice.
+        yield* orchestrator.dispatch({
+          type: "notification.delivery.accept",
+          threadId,
+          messageId,
+          commandId: CommandId.make(`command:${name}:accepted`),
+        });
+        const accepted = yield* orchestrator.getThreadProjection(threadId);
+        assert.isNull(accepted.runs.find((run) => run.id === runId)!.delegatedCompletion!.delivery);
+        assert.equal(
+          accepted.subagents.find((task) => task.id === taskId)?.completionDelivery?.state,
+          "delivered",
+        );
+      } else if (reason !== null) {
         yield* sink.write({
           events: [
             {
