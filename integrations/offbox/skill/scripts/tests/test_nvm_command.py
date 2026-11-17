@@ -1,6 +1,7 @@
 """nvm compatibility before command admission, with no Node selection changes."""
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import shlex
@@ -150,6 +151,25 @@ command -v node
 
 
 class ClientTests(Isolated):
+    def test_detected_and_setup_events_are_visible_in_run_event_view(self):
+        for result in ('installed', 'failed', 'present'):
+            with self.subTest(result=result):
+                a = cli.build_parser().parse_args(['run', '--', 'test -s "$NVM_DIR/nvm.sh"'])
+                with patch.object(lease, 'auto_size', return_value=('large', '')), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    runner = runs.Runner(a, self.me)
+                    runner.register_pending()
+                runner.log_path.write_text(f'offbox-nvm-sh: {runner.run_id} {result}\n')
+                runs.nvm_result(runner.run_id, runner.log_path)
+                runs.nvm_result(runner.run_id, runner.log_path)
+                output = io.StringIO()
+                with patch.object(misc, 'require_mine'), contextlib.redirect_stdout(output):
+                    misc.run_events(runner.run_id, as_json=True)
+                events = [row for row in json.loads(output.getvalue()) if row['kind'].startswith('nvm_')]
+                self.assertEqual([row['kind'] for row in events],
+                                 ['nvm_ref_detected'] + ([] if result == 'present' else [f'nvm_sh_{result}']))
+                self.assertTrue(all(json.loads(row['detail'])['run_id'] == runner.run_id for row in events))
+
     def test_precommand_download_failure_keeps_step_exit_99(self):
         log = runs.LOGS_DIR / 'run-failed.log'
         for content, expected in (

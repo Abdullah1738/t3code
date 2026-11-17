@@ -1553,7 +1553,7 @@ def nvm_result(run_id: str, path: Path) -> None:
         save_run_state(run_id, nvm_sh=result)
         if result in ('installed', 'failed'):
             with contextlib.closing(db()) as con:
-                event(con, previous.get('box_id'), f'nvm_sh_{result}', run_id)
+                event(con, previous.get('box_id'), f'nvm_sh_{result}', json.dumps(dict(run_id=run_id)))
     except OSError:
         pass
 
@@ -1911,7 +1911,7 @@ class Runner:
             except Exception:
                 pass
             if node_version.command_uses_nvm(cmd_text):
-                event(con, None, 'nvm_ref_detected', self.run_id)
+                event(con, None, 'nvm_ref_detected', json.dumps(dict(run_id=self.run_id)))
                 if api.BACKEND == 'server' and a.template != 'crpko-node':
                     say(NVM_WARNING)
             if a.bg:
