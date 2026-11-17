@@ -21,6 +21,8 @@ NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'clien
 NUMBERS.update({"since", "expires_at"})
 NUMBERS.add("waited_s")
 NUMBERS.add("sample")
+NUMBERS.update({"tracked_total", "tracked_heavy", "tracked_heavy_sent",
+                "tracked_node_modules_sent", "tracked_secret_sent"})
 NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
 NUMBERS.update({'outageS', 'waitedMs', 'placeBefore', 'placeAfter'})
 NUMBERS.update({'ageSeconds', 'runCount', 'waitSeconds', 'serving', 'held', 'pending', 'cap'})
@@ -123,6 +125,12 @@ def _props(values, *, name=None):
             markers = ('Lost connection to the event listener', 'websocket: close 1006',
                        'unexpected EOF', 'Incus is shutting down')
             out[k] = '; '.join(s for s in markers if s in v)
+        elif name == "run.sync" and k == "tracked_left_out" and isinstance(v, dict):
+            out[k] = {reason: count for reason, count in v.items()
+                      if reason in {"secret", "node_modules"} and type(count) is int and count >= 0}
+        elif name == "run.sync" and k == "tracked_left_out_first" and isinstance(v, list):
+            out[k] = [p for p in v if isinstance(p, str) and len(p) <= 4096
+                      and not p.startswith("/") and ".." not in p.split("/")][:5]
         elif k in NUMBERS and type(v) in (int, float) and math.isfinite(v):
             out[k] = v
         elif k in BOOLEANS and type(v) is bool:

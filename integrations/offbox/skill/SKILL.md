@@ -24,9 +24,10 @@ offbox run --size xlarge -- make test-integration
 ```
 
 offbox finds the repo root (`git rev-parse --show-toplevel`, else cwd), rsyncs it to your box (only changed files;
-gitignored files git doesn't track, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent; a tracked
-file sends even when .gitignore matches it, e.g. a committed `package-lock.json`), `cd`s into the same relative
-dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
+gitignored files git doesn't track, `.git`, secrets and local installs/caches are excluded).
+Tracked files sync even through those filters, except root or symlinked `node_modules`; secret-pattern files
+sync automatically only in `--git` runs while unmodified against HEAD. Offbox runs in the same relative
+directory, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
 
 A repo’s pool name (at home and on the Boat standby alike) comes from its origin URL’s basename, normalized to lowercase letters, digits and dashes.
 If git is slow or fails, offbox reuses the last good name for that resolved checkout root and logs the fallback; a first failure warns before using the directory name.
@@ -177,7 +178,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   `offbox run -- '<repo-install> && <repo-check>'`. Use `&&` so an install failure stops dependent checks;
   `--step` deliberately keeps going after a failed step.
   A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
-  that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
+  that box has no deps yet; the root `node_modules` install is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
 - Node version: offbox selects Node from the repo pin (`.nvmrc`/`.node-version`/`engines.node`), then the CI setup-node version, then the nvm default (or newest installed nvm Node, otherwise the box default), and prints its choice, provisioning a missing pinned version or stopping with exit 99; an open range pin (e.g. engines >=22) is narrowed to the CI setup-node version when that fits.
 - In JS repos, runs put the current directory's and ancestor `node_modules/.bin` directories up to the repo root first on PATH, so repo-pinned `vp`/`tsc-rs` win over global copies, including after `cd apps/server`. On a fresh checkout or box, install with the repo's package manager first (see **Install with the repo's package manager**); `vp i` itself needs vite-plus installed.
@@ -480,8 +481,8 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 - `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
 - Tests can't find a file: it's gitignored and untracked, or matched a secret filter (`.env*`, `*.pem`, `*.key`,
   ...). Use `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
-  Tracked files go even when .gitignore matches them (offbox prints `also synced N git-tracked file(s) that
-  .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm install --frozen-lockfile` and `go.sum` checks get their
+  Eligible tracked files go even when sync filters match them (offbox prints `also synced N git-tracked file(s)
+  that sync filters match: ...` only when it changed something on the box), so `npm ci`, `pnpm install --frozen-lockfile` and `go.sum` checks get their
   lockfile without `--include`.
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
 - A box wedged after resume (kept image restore stuck and Docker not answering) is stopped and set aside, and the run moves once to another box; offbox release <box> --delete drops it for good.
