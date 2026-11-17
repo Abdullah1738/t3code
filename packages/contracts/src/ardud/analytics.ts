@@ -268,6 +268,21 @@ const GeneralEvent = Schema.Struct({
   ),
   props: Schema.optionalKey(
     Schema.Struct({
+      total: Schema.optionalKey(Measurement),
+      distinctCwds: Schema.optionalKey(Measurement),
+      maxPerSecond: Schema.optionalKey(Measurement),
+      windowMs: Schema.optionalKey(Measurement),
+      overflow: Schema.optionalKey(Measurement),
+      top: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            operation: Label,
+            subcommand: Label,
+            cwdHash: Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/)),
+            count: Measurement,
+          }),
+        ).check(Schema.isMaxLength(20)),
+      ),
       on: Schema.optionalKey(Label),
       until: Schema.optionalKey(Timestamp),
       script: Schema.optionalKey(Label),

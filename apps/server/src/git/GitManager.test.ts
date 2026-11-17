@@ -1291,7 +1291,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
     }),
   );
 
-  it.effect("concurrent cold branch PR lookups share one git process per key", () =>
+  it.effect("concurrent cold branch PR lookups share the batched git discovery", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
       yield* initRepo(repoDir);
@@ -1301,7 +1301,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       yield* runGit(repoDir, ["push", "-u", "origin", "feature/shared-pr"]);
       const gitCommands: string[] = [];
       const gate = {
-        matches: (args: ReadonlyArray<string>) => args.length === 1 && args[0] === "remote",
+        matches: (args: ReadonlyArray<string>) => args[0] === "config" && args.includes("--list"),
         reached: yield* Deferred.make<void>(),
         release: yield* Deferred.make<void>(),
       };
@@ -1309,7 +1309,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       let arrivals = 0;
       const tracer = Tracer.make({
         span: (options) => {
-          if (options.name === "GitManager.rememberPrLookupGitState" && ++arrivals === 8) {
+          if (options.name === "GitRepositoryDiscovery.read" && ++arrivals === 8) {
             Deferred.doneUnsafe(entered, Effect.void);
           }
           return new Tracer.NativeSpan(options);
@@ -1326,12 +1326,13 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       yield* Deferred.succeed(gate.release, undefined);
       const results = yield* Fiber.join(lookups);
       expect(results).toEqual(Array.from({ length: 8 }, () => null));
-      expect(gitCommands.filter((command) => command === "remote")).toHaveLength(1);
+      expect(gitCommands.filter((command) => command.startsWith("config "))).toHaveLength(1);
+      expect(gitCommands.filter((command) => command.startsWith("for-each-ref "))).toHaveLength(1);
       expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(1);
 
       yield* manager.invalidateStatus(repoDir);
       yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/shared-pr" });
-      expect(gitCommands.filter((command) => command === "remote")).toHaveLength(2);
+      expect(gitCommands.filter((command) => command.startsWith("config "))).toHaveLength(2);
     }),
   );
 
@@ -1379,9 +1380,10 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       }
       expect(
         gitCommands.filter(
-          (command) => command === "for-each-ref --format=%(refname) refs/remotes",
+          (command) =>
+            command.startsWith("for-each-ref ") && command.endsWith("refs/heads refs/remotes"),
         ),
-      ).toHaveLength(3);
+      ).toHaveLength(1);
     }),
   );
 
@@ -1423,10 +1425,92 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       expect(gitCommands.length).toBeGreaterThan(0);
 
       gitCommands.length = 0;
+      yield* TestClock.adjust("1 minute");
       const warm = yield* lookupAll;
       expect(warm).toEqual(cold);
       expect(gitCommands).toEqual([]);
-      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(2);
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(3);
+    }),
+  );
+
+  it.effect.each([
+    "tracked",
+    "published",
+    "base-tracking",
+    "unpublished",
+    "remote-only",
+    "published-ahead",
+  ])("discovery launch budget for %s branches", (scenario) =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir("t3code-git-discovery-budget-");
+      yield* initRepo(cwd);
+      const remote = yield* createBareRemote();
+      yield* runGit(cwd, ["remote", "add", "origin", remote]);
+      yield* runGit(cwd, ["push", "origin", "main"]);
+      const branch = "feature/budget";
+      if (scenario === "remote-only") {
+        yield* runGit(cwd, ["push", "origin", `HEAD:refs/heads/${branch}`]);
+      } else {
+        yield* runGit(cwd, [
+          "checkout",
+          "-b",
+          branch,
+          ...(scenario === "base-tracking" ? ["origin/main"] : []),
+        ]);
+        if (scenario !== "unpublished")
+          yield* runGit(cwd, ["push", ...(scenario === "tracked" ? ["-u"] : []), "origin", branch]);
+      }
+      if (scenario === "published-ahead")
+        yield* runGit(cwd, ["commit", "--allow-empty", "-m", "Advance published branch"]);
+      const commands: string[] = [];
+      const { manager } = yield* makeManager({ gitCommands: commands });
+      const lookup = manager.branchPullRequest({ cwd, branch });
+      const counts: Record<string, number> = {};
+      for (const phase of [
+        "cold",
+        "minute",
+        "expired",
+        "fresh",
+        "config",
+        "ref",
+        "turn",
+      ] as const) {
+        if (phase === "minute") yield* TestClock.adjust("1 minute");
+        if (phase === "expired") yield* TestClock.adjust("5 minutes");
+        if (phase === "config") {
+          const fs = yield* FileSystem.FileSystem;
+          const config = `${cwd}/.git/config`;
+          yield* fs.writeFileString(
+            config,
+            (yield* fs.readFileString(config)) + "\n# budget refresh\n",
+          );
+        }
+        if (phase === "ref") {
+          const fs = yield* FileSystem.FileSystem;
+          yield* fs.utimes(
+            `${cwd}/.git/refs/${scenario === "remote-only" ? "remotes/origin" : "heads"}/${branch}`,
+            1_900_000_000,
+            1_900_000_000,
+          );
+        }
+        if (phase === "turn") yield* manager.invalidateStatus(cwd);
+        commands.length = 0;
+        if (phase === "fresh")
+          yield* manager.branchPullRequest({ cwd, branch }, { freshGitState: true });
+        else yield* lookup;
+        counts[phase] = commands.length;
+      }
+      yield* Effect.logInfo(`GIT_DISCOVERY_BUDGET ${encodeCliJson({ scenario, counts })}`);
+      if (process.env.T3_GIT_DISCOVERY_BASELINE !== "1")
+        expect(counts).toEqual({
+          cold: scenario === "published-ahead" ? 3 : 2,
+          minute: 0,
+          expired: 0,
+          fresh: 2,
+          config: scenario === "published-ahead" ? 3 : 2,
+          ref: scenario === "published-ahead" ? 2 : 1,
+          turn: 2,
+        });
     }),
   );
 
@@ -1507,7 +1591,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         ]);
       const gate = {
         matches: (args: ReadonlyArray<string>) =>
-          args[0] === "for-each-ref" && args.at(-1) === "refs/heads/feature/racing-upstream",
+          args[0] === "for-each-ref" && args.at(-1) === "refs/remotes",
         reached: yield* Deferred.make<void>(),
         release: yield* Deferred.make<void>(),
       };
@@ -1548,8 +1632,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       let held = false;
       const gate = {
         matches: (args: ReadonlyArray<string>) => {
-          if (held || args[0] !== "for-each-ref" || args.at(-1) !== "refs/heads/feature/fresh-race")
-            return false;
+          if (held || args[0] !== "for-each-ref" || args.at(-1) !== "refs/remotes") return false;
           held = true;
           return true;
         },
