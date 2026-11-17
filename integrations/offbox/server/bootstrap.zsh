@@ -79,7 +79,7 @@ EOF
     host)
       r 'mkdir -p /root/offbox-server'
       scp -q $SSHO $HERE/{boatd.py,boatd_disk.py,boatd_tmp.py,boatd_memory.py,host-memory-setup.py,boatd-wrap,base-image.sh,boatd.service,install-host.sh} root@$IP:/root/offbox-server/
-      scp -q $SSHO $HERE/../skill/scripts/{toollog,offbox_disk_space}.py root@$IP:/root/offbox-server/
+      scp -q $SSHO $HERE/../skill/scripts/{toollog,offbox_disk_space,offbox_protection}.py root@$IP:/root/offbox-server/
       scp -q $SSHO $HERE/../skill/templates/tools/{sqlite,fetch}.sh root@$IP:/root/offbox-server/
       scp -q $SSHO $HERE/../skill/templates/home/{offbox-mgmt-ssh.service,offbox_mgmt_sshd_config,offbox-ssh-runtime.conf} root@$IP:/root/offbox-server/
       tar -C $HERE -cf - home/install-update-policy.sh \

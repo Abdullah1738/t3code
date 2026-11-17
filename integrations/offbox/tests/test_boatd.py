@@ -307,7 +307,7 @@ class ReconcileRuns(Base):
         out = boatd.reconcile(self.con)
         self.assertEqual(out["boxes_failed"], 1)
         self.assertEqual(self.status(b, p)["status"], "interrupted")
-        self.assertEqual(self.state(b)["state"], "archived")
+        self.assertEqual(self.state(b)["state"], "error")
         self.assertEqual(self.f.spawned, [])
 
     def test_runner_that_cannot_be_spawned_ends_the_run_instead_of_blocking_the_queue(self):
