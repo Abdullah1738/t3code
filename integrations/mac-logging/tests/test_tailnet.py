@@ -32,6 +32,7 @@ class TailnetTests(unittest.TestCase):
         self.home_code = 0
         self.second_code = 0
         self.probe_failure = None
+        self.https_code, self.https_status, self.https_failure = 7, '000', None
         self.ips = ['100.1.1.1', 'fd00::1']
         self.raw = None
 
@@ -40,6 +41,7 @@ class TailnetTests(unittest.TestCase):
         if argv[0] == tailnet.APP_CLI:
             self.assertEqual(argv, [tailnet.APP_CLI, 'status', '--json'])
             self.assertEqual(kw['timeout'], tailnet.STATUS_TIMEOUT)
+            self.assertEqual(kw['timeout'], 15)
             if self.status_failure == 'timeout':
                 raise subprocess.TimeoutExpired(argv, tailnet.STATUS_TIMEOUT)
             if self.status_failure == 'unavailable':
@@ -61,6 +63,15 @@ class TailnetTests(unittest.TestCase):
             if self.probe_failure == 'unavailable':
                 raise FileNotFoundError()
             return subprocess.CompletedProcess(argv, self.home_code if argv[4] == tailnet.PROBE_HOST else self.second_code, '')
+        if argv[0] == '/usr/bin/curl':
+            self.assertEqual(argv, ['/usr/bin/curl', '-sS', '-o', '/dev/null', '-w', '%{http_code}',
+                                    '--max-time', '8', tailnet.SELF_HTTPS_URL])
+            self.assertEqual(kw['timeout'], 9)
+            if self.https_failure == 'timeout':
+                raise subprocess.TimeoutExpired(argv, kw['timeout'])
+            if self.https_failure == 'unavailable':
+                raise FileNotFoundError()
+            return subprocess.CompletedProcess(argv, self.https_code, self.https_status)
         self.assertEqual(argv[2], 'notify')
         self.assertNotIn('BUN_INSPECT', kw['env'])
         self.sent.append((argv[argv.index('--key')+1], argv[argv.index('--text')+1]))
@@ -142,6 +153,8 @@ class TailnetTests(unittest.TestCase):
                     props = self.tick()
                 self.assertEqual(props['cliOutcome'], 'unknown')
                 self.assertEqual(props['outcome'], 'up')
+                self.assertEqual(props['confirmedBy'], 'home_tcp')
+                self.assertEqual(props['statusError'], failure)
                 self.assertFalse(props['confirmedDown'])
                 self.assertEqual(props['notUpChecks'], 0)
                 self.assertEqual(self.sent, [])
@@ -262,18 +275,17 @@ class TailnetTests(unittest.TestCase):
         self.status_failure = 'timeout'
         self.home_code = self.second_code = 1
         start = self.now
-        for at in (start, start+1, start+179):
+        for at in (start, start+1, start+60, start+179, start+299):
             self.now = at
             props = self.tick()
             self.assertEqual(props['cliOutcome'], 'unknown')
             self.assertEqual(props['outcome'], 'down')
             self.assertTrue(props['confirmedDown'])
             self.assertEqual(self.sent, [])
-        self.now = start+180
+        self.now = start+300
         self.tick(); self.tick()
         self.assertEqual(len(self.sent), 1)
-        self.assertIn("Mac Tailscale isn't answering and tailnet peers are unreachable since", self.sent[0][1])
-        self.assertNotIn('timeout', self.sent[0][1])
+        self.assertIn('Mac Tailscale is unreachable (status CLI timing out) since', self.sent[0][1])
         self.assertNotIn('Unknown', self.sent[0][1])
         self.assertTrue(self.sent[0][0].startswith('mac-tailnet:unreachable:'))
 
@@ -285,6 +297,144 @@ class TailnetTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.tick()
         self.assertEqual(len(self.sent), 1)
+
+    def test_unknown_uses_five_checks_and_five_minutes(self):
+        self.status_failure = 'timeout'
+        self.home_code = self.second_code = 1
+        start = self.now
+        for offset in (0, 45, 90, 135, 180):
+            self.now = start+offset
+            self.tick()
+            self.assertEqual(self.sent, [])
+        self.now = start+300
+        self.tick()
+        self.assertEqual(len(self.sent), 1)
+
+    def test_samples_include_load_and_status_duration(self):
+        with patch.object(tailnet.os, 'getloadavg', return_value=(195.25, 90, 45)):
+            self.tick()
+        props = self.rows('tailnet.sample')[0]['props']
+        self.assertEqual(props['loadAvg1'], 195.25)
+        self.assertGreaterEqual(props['statusDurationMs'], 0)
+        self.assertEqual(props['statusDurationMs'], props['cliMs'])
+        self.assertIsNone(props['confirmedBy'])
+
+    def test_self_https_success_prevents_alert_and_preserves_cli_error(self):
+        self.status_failure = 'timeout'
+        self.home_code = self.second_code = 1
+        self.https_code, self.https_status = 0, '503'
+        for _ in range(10):
+            props = self.tick()
+            self.assertTrue(props['up'])
+            self.assertEqual(props['confirmedBy'], 'self_https')
+            self.assertEqual(props['statusError'], 'timeout')
+            self.assertEqual(props['notUpChecks'], 0)
+        sample = self.rows('tailnet.sample')[-1]['props']
+        self.assertEqual(sample['confirmedBy'], 'self_https')
+        self.assertTrue(sample['selfHttpsReachable'])
+        self.assertEqual(self.sent, [])
+
+    def test_https_response_matrix(self):
+        cases = [(0, str(code), True) for code in (100, 200, 204, 301, 401, 404, 503, 599)]
+        cases += [(28, '200', True), (7, '000', False)]
+        cases += [(0, value, False) for value in ('', '000', '99', '600', 'garbage', '200junk')]
+        self.status_failure = 'timeout'
+        self.home_code = self.second_code = 1
+        for code, status, reachable in cases:
+            with self.subTest(code=code, status=status):
+                self.https_code, self.https_status = code, status
+                props = self.tick()
+                self.assertEqual(props['up'], reachable)
+                self.assertEqual(props['selfHttpsReachable'], reachable)
+                self.assertEqual(props['confirmedBy'], 'self_https' if reachable else None)
+
+    def test_unknown_requires_check_count_even_after_five_minutes(self):
+        self.status_failure = 'timeout'
+        self.home_code = self.second_code = 1
+        start = self.now
+        for offset in (0, 300, 360, 420):
+            self.now = start+offset
+            self.tick()
+        self.assertEqual(self.sent, [])
+        self.tick()
+        self.assertEqual(len(self.sent), 1)
+        for _ in range(5):
+            self.tick()
+        self.assertEqual(len(self.sent), 1)
+        self.state, self.status_failure = 'Running', None
+        self.tick(); self.tick()
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(len(self.rows('tailnet.alert')), 1)
+        self.assertEqual(len(self.rows('tailnet.recovery')), 1)
+
+    def test_probe_confirmed_tick_resets_unknown_streak(self):
+        self.status_failure = 'timeout'
+        self.home_code = self.second_code = 1
+        self.tick(); self.tick()
+        self.home_code = 0
+        props = self.tick()
+        self.assertEqual(props['notUpChecks'], 0)
+        self.assertIsNone(props['outageStart'])
+        self.home_code = 1
+        props = self.tick()
+        self.assertEqual(props['notUpChecks'], 1)
+        self.assertEqual(self.sent, [])
+
+    def test_stopped_bunched_ticks_need_three_elapsed_minutes(self):
+        self.state = 'Stopped'
+        start = self.now
+        for offset in (0, 60, 120):
+            self.now = start+offset
+            self.tick()
+        self.assertEqual(self.sent, [])
+        self.now = start+180
+        self.tick()
+        self.assertEqual(len(self.sent), 1)
+
+    def test_all_four_thresholds_are_overridable(self):
+        for failure in (None, 'timeout'):
+            with self.subTest(failure=failure):
+                jobs.save_state('tailnet', {})
+                self.sent.clear()
+                self.state, self.status_failure = 'Stopped', failure
+                self.home_code = self.second_code = 1
+                start = self.now
+                opts = dict(threshold=2, threshold_seconds=30,
+                            unknown_threshold=2, unknown_threshold_seconds=45)
+                self.tick(**opts)
+                self.now = start+29
+                self.tick(**opts)
+                self.assertEqual(self.sent, [])
+                self.now = start+(45 if failure else 30)
+                self.tick(**opts)
+                self.assertEqual(len(self.sent), 1)
+
+    def test_probe_source_changes_do_not_spam_state_events(self):
+        self.status_failure = 'timeout'
+        self.tick(); self.tick()
+        self.home_code = 1
+        props = self.tick()
+        self.assertEqual(props['confirmedBy'], 'peer_tcp')
+        self.second_code = 1
+        self.https_code, self.https_status = 0, '200'
+        self.tick(); self.tick()
+        self.assertEqual(len(self.rows('tailnet.state')), 1)
+        self.status_failure = None
+        self.tick(); self.tick()
+        self.assertEqual(len(self.rows('tailnet.state')), 2)
+        self.status_failure = 'timeout'
+        self.tick(); self.tick()
+        self.assertEqual(len(self.rows('tailnet.state')), 3)
+
+    def test_https_tool_failure_is_not_a_confirmed_outage(self):
+        self.status_failure = 'timeout'
+        self.home_code = self.second_code = 1
+        self.https_failure = 'unavailable'
+        for _ in range(10):
+            props = self.tick()
+        self.assertEqual(props['outcome'], 'unknown')
+        self.assertEqual(props['notUpChecks'], 0)
+        self.assertEqual(self.sent, [])
 
     def test_second_peer_success_is_enough_and_resets_streak(self):
         self.home_code = 1
@@ -348,7 +498,8 @@ class TailnetTests(unittest.TestCase):
 
     def test_timeout_probes_are_confirmed_failures(self):
         self.status_failure = self.probe_failure = 'timeout'
-        for _ in range(4): props = self.tick()
+        self.https_failure = 'timeout'
+        for _ in range(6): props = self.tick()
         self.assertTrue(props['confirmedDown'])
         self.assertTrue(all(p['error'] == 'timeout' for p in props['confirmProbes'].values()))
         self.assertEqual(len(self.sent), 1)
@@ -423,10 +574,11 @@ class TailnetTests(unittest.TestCase):
 
     def test_subprocess_budget_and_read_only_commands(self):
         self.status_failure = self.pid_failure = self.probe_failure = 'timeout'
-        for _ in range(4):
+        self.https_failure = 'timeout'
+        for _ in range(6):
             self.calls.clear()
             self.tick()
-            self.assertLessEqual(sum(kw['timeout'] for _, kw in self.calls), 40)
+            self.assertLessEqual(sum(kw['timeout'] for _, kw in self.calls), 49)
         self.assertEqual([a for a, _ in self.calls if a[0] == tailnet.APP_CLI],
                          [[tailnet.APP_CLI, 'status', '--json']])
         self.assertEqual([a[4:] for a, _ in self.calls if a[0] == '/usr/bin/nc'],

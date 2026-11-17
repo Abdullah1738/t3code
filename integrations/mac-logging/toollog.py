@@ -305,15 +305,17 @@ def safe_fields(values, event=None):
         for key, value in (values or {}).items():
             if key == 'backendState' and value in ('Running', 'Stopped', 'NeedsLogin', 'NeedsMachineAuth', 'Starting', 'NoState', 'Unknown'):
                 result[key] = value
-            elif key in ('statusError', 'extensionError', 'homeProbeError') and value in (None, 'timeout', 'exit', 'parse', 'unavailable'):
+            elif key in ('statusError', 'extensionError', 'homeProbeError', 'selfHttpsError') and value in (None, 'timeout', 'exit', 'parse', 'unavailable'):
                 result[key] = value
-            elif key in ('up', 'selfOnline', 'timedOut', 'homeReachable', 'confirmedDown') and (value is None or type(value) is bool):
+            elif key in ('up', 'selfOnline', 'timedOut', 'homeReachable', 'confirmedDown', 'selfHttpsReachable') and (value is None or type(value) is bool):
                 result[key] = value
             elif key in ('tailscaleIPsCount', 'exitCode', 'extensionPid', 'notUpChecks') and (value is None or type(value) is int):
                 result[key] = value
             elif key in ('outcome', 'cliOutcome') and value in ('up', 'down', 'unknown'):
                 result[key] = value
-            elif key in ('cliMs', 'outageStart') and (value is None or finite_number(value) and value >= 0):
+            elif key in ('cliMs', 'statusDurationMs', 'loadAvg1', 'outageStart') and (value is None or finite_number(value) and value >= 0):
+                result[key] = value
+            elif key == 'confirmedBy' and value in (None, 'home_tcp', 'peer_tcp', 'self_https'):
                 result[key] = value
             elif key == 'suppressed' and type(value) is int and value >= 0:
                 result[key] = value

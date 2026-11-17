@@ -220,16 +220,21 @@ These events never alert or launch extra scans.
 independently of the hourly collector's slow disk scans. `tailnet.py` calls only
 `/Applications/Tailscale.app/Contents/MacOS/Tailscale status --json` (15-second
 timeout, no socket override). It never changes Tailscale preferences or reconnects.
-`THRESHOLD_CHECKS` (3) and `PROBE_HOST` (`100.75.104.72`) are its configuration
-values. A valid Running/online response is up; explicit Stopped, NeedsLogin,
+A valid Running/online response is up; explicit Stopped, NeedsLogin,
 NeedsMachineAuth, NoState, Starting or Running/offline is down. Missing or invalid
 CLI data is unknown. Unknown CLI checks probe home SSH (100.75.104.72:22) and the
 remote Mullvad de-dus-wg-102 DNS listener (100.64.1.71:53), using ordinary TCP
-connections through the Mac's Tailscale interface. Either success proves up;
-both failures confirm down. An unavailable probe tool leaves the outcome unknown.
-Only consecutive confirmed-down checks count: at least three checks AND 180
-elapsed seconds are required to alert. Up resets the streak; unknown breaks it
-without claiming recovery. Recovery is sent only for an alerted outage.
+connections through the Mac's Tailscale interface. Either success proves up.
+If neither responds, a read-only HTTPS request to `SELF_HTTPS_URL`
+(`https://abdullahs-macbook-pro.tailcca332.ts.net:18400/`) accepts any HTTP status
+as reachable, including application errors. Only when every probe fails can
+unknown CLI evidence count toward an outage. An unavailable probe tool leaves
+the outcome unknown and breaks the streak without claiming recovery.
+Explicit down states require `THRESHOLD_CHECKS=3` AND `THRESHOLD_SECONDS=180`;
+unknown CLI evidence requires `UNKNOWN_THRESHOLD_CHECKS=5` AND
+`UNKNOWN_THRESHOLD_SECONDS=300`. Both count and wall-clock gates apply, even
+when minute ticks bunch under load. Any up tick resets the streak. Recovery is
+sent only for an alerted outage.
 
 `state/tailnet.json` and a separate nonblocking lock preserve streaks and queued
 notification payloads across invocations. Keys and text remain identical on retry,
@@ -238,16 +243,20 @@ Recovery uses a distinct key. The first run drops legacy unproven counters and
 pending timeout alerts, while preserving already alerted explicit-state outages.
 Unix timestamps measure outages across processes; monotonic time measures CLI
 and probe duration. The CLI timeout is 15 s, pgrep 3 s, each of two probes 6 s
-(`nc -z -G 5`), and at most one Telegram send is attempted per invocation (10 s).
-The subprocess budget is at most 40 s per run.
+(`nc -z -G 5`), HTTPS has an 8 s curl deadline and a 9 s subprocess deadline,
+and at most one Telegram send is attempted per invocation (10 s).
+The subprocess budget is at most 49 s per run.
 
-`tailnet.sample` adds `outcome`, `cliOutcome`, `confirmedDown`, `cliMs` and, when
-CLI evidence is unknown, `confirmProbes` (host to port/ok/error/ms). Backend state,
+`tailnet.sample` adds `outcome`, `cliOutcome`, `confirmedDown`, `cliMs` (also
+`statusDurationMs`), `loadAvg1`, and `confirmedBy` (`home_tcp`, `peer_tcp`,
+`self_https`, or null). Unknown CLI evidence adds `confirmProbes` (host to
+port/ok/error/ms) and, if HTTPS ran, `selfHttpsReachable` / `selfHttpsError`. Backend state,
 online flag, IP count, CLI exit/timeout and extension PIDs remain available.
 Running samples retain a home SSH probe; its failure alone never overrides a
 healthy CLI. `tailnet.cli_slow` records unknown CLI evidence resolved up by peers,
 at most once per 900 seconds, with `suppressed` counting intervening occurrences.
 `tailnet.state` and `tailnet.extension` record initial observations and changes;
+switching between successful probe sources alone does not emit a state change.
 a PID change alone is not a crash. `tailnet.alert` / `tailnet.recovery` record
 notification queue acceptance or failure. Failed sends retry next minute.
 Only configured probe addresses enter these events; raw CLI output, identity,
