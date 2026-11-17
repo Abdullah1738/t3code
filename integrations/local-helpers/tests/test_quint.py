@@ -1,9 +1,11 @@
 """Exercise the wrapper with fake toolchains; never starts Apalache or touches ~/.quint."""
+import ast
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -13,6 +15,75 @@ import unittest
 
 
 HERE = Path(__file__).resolve().parents[1]
+
+
+@unittest.skipUnless(shutil.which('node'), 'Node is required for package resolution')
+class ReflectionProbeTest(unittest.TestCase):
+    def test_real_node_resolves_package_for_direct_symlink_and_pnpm_shim(self):
+        source = (HERE / 'bin/quint').read_text().split("<<'PYTHON_GUARD'\n", 1)[1].split('\nPYTHON_GUARD', 1)[0]
+        probe = next(ast.literal_eval(statement.value) for statement in ast.parse(source).body
+                     if isinstance(statement, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == 'REFLECTION_PROBE'
+                             for target in statement.targets))
+        node = shutil.which('node')
+        for layout in ('isolated', 'hoisted'):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory(prefix='quint-node-test-') as tmp:
+                root = Path(tmp)
+                modules = root / 'node_modules'
+                dependencies = modules / '.pnpm/quint-fixture/node_modules' if layout == 'isolated' else modules
+                package = dependencies / '@informalsystems/quint'
+                entry = package / 'dist/src/cli.js'
+                entry.parent.mkdir(parents=True)
+                (package / 'package.json').write_text(json.dumps({'name': '@informalsystems/quint',
+                                                                 'version': '0.33.1'}))
+                entry.write_text('console.log("0.33.1")\n')
+                (entry.parent / 'apalache.js').write_text('')
+                (entry.parent / 'reflection.proto').write_text('quint reflection fixture')
+                if layout == 'isolated':
+                    (modules / '@informalsystems').mkdir()
+                    (modules / '@informalsystems/quint').symlink_to(package, target_is_directory=True)
+                for name, body in {
+                    '@grpc/proto-loader': '''exports.loadSync = file => {
+  if (require('node:fs').readFileSync(file, 'utf8') !== 'quint reflection fixture') throw Error('wrong proto');
+  return {};
+};''',
+                    '@grpc/grpc-js': '''const { EventEmitter } = require('node:events');
+exports.credentials = { createInsecure() {} };
+exports.loadPackageDefinition = () => ({ grpc: { reflection: { v1alpha: {
+  ServerReflection: class {
+    close() {}
+    ServerReflectionInfo() {
+      const call = new EventEmitter();
+      call.cancel = () => {};
+      call.write = request => {
+        if (request.file_containing_symbol !== 'shai.cmdExecutor.CmdExecutor') throw Error('wrong request');
+        queueMicrotask(() => call.emit('data', { file_descriptor_response: { file_descriptor_proto: ['ready'] } }));
+      };
+      return call;
+    }
+  }
+} } } });''',
+                }.items():
+                    dependency = dependencies / name
+                    dependency.mkdir(parents=True)
+                    (dependency / 'index.js').write_text(body)
+                symlink = root / 'bin/quint'
+                symlink.parent.mkdir()
+                symlink.symlink_to(entry)
+                shim = modules / '.bin/quint'
+                shim.parent.mkdir()
+                shim.write_text('#!/bin/sh\nbasedir=$(dirname "$0")\n'
+                                'exec node "$basedir/../@informalsystems/quint/dist/src/cli.js" "$@"\n')
+                shim.chmod(0o755)
+                env = {'PATH': f'{Path(node).parent}:/usr/bin:/bin'}
+                version = subprocess.run([str(shim), '--version'], env=env, capture_output=True, text=True)
+                self.assertEqual(version.returncode, 0, version.stderr)
+                self.assertEqual(version.stdout.strip(), '0.33.1')
+                for cli in (entry, symlink, shim):
+                    with self.subTest(cli=str(cli.relative_to(root))):
+                        result = subprocess.run([node, '-e', probe, str(cli), '127.0.0.1:12345', '1000'],
+                                                env=env, capture_output=True, text=True, timeout=5)
+                        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class QuintTest(unittest.TestCase):

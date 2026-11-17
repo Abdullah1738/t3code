@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import common, node_tools, quint_tools
+from offbox_lib import common, java_version, node_tools, quint_tools, runs
 
 
 class QuintToolsTests(unittest.TestCase):
@@ -80,6 +80,62 @@ class QuintToolsTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ['GUARDED'] * 3)
+
+    def test_production_preamble_keeps_guard_after_java_activation(self):
+        repo = self.root / 'w/repo'
+        (repo / 'child').mkdir(parents=True)
+        (repo / 'package.json').write_text('{}')
+        jdk = self.root / 'jvm/java-21-openjdk-test'
+        for directory in (repo / 'node_modules/.bin', repo / 'child/node_modules/.bin',
+                          jdk / 'bin', self.root / 'node-commands'):
+            directory.mkdir(parents=True, exist_ok=True)
+            raw = directory / 'quint'
+            raw.write_text('#!/bin/sh\necho RAW\n')
+            raw.chmod(0o755)
+        for name, body in (('javac', 'echo javac 21.0.13'), ('java', ':')):
+            executable = jdk / 'bin' / name
+            executable.write_text('#!/bin/sh\n' + body + '\n')
+            executable.chmod(0o755)
+        for directory in (repo / 'node_modules/.bin', repo / 'child/node_modules/.bin',
+                          self.root / 'node-commands'):
+            executable = directory / 'node'
+            executable.write_text('#!/bin/sh\necho ' + ('SELECTED_NODE' if directory.name == 'node-commands'
+                                                       else 'RAW_NODE') + '\n')
+            executable.chmod(0o755)
+        wrapper = self.root / 'fake-wrapper'
+        wrapper.write_text('#!/bin/sh\necho GUARDED\n')
+        java_shell = java_version.SHELL.replace('/usr/lib/jvm', str(self.root / 'jvm'))
+        timeout = self.root / 'test-bin/timeout'
+        timeout.parent.mkdir()
+        timeout.write_text('#!/bin/sh\n[ "$1" != -k ] || shift 2\nshift\nexec "$@"\n')
+        timeout.chmod(0o755)
+        node_shell = ('export __offbox_node_commands="$HOME/node-commands"\n'
+                      'export PATH="$__offbox_node_commands:$PATH"')
+        for node in ('', node_shell):
+            for rel in ('.', 'child'):
+                for stepped in (False, True):
+                    with self.subTest(node=bool(node), rel=rel, stepped=stepped), \
+                            patch.object(quint_tools, 'wrapper_path', return_value=wrapper), \
+                            patch.object(java_version, 'SHELL', java_shell), \
+                            patch.multiple(runs, GO_REPAIR=':', DOCKER_REPAIR=':', LDCACHE_REPAIR=':',
+                                           SQLITE_SETUP=':', WATCH_REPAIR=':', CACHE_OWNER_REPAIR=':'), \
+                            patch.object(runs.userns, 'setup', return_value=':'), \
+                            patch.object(runs.containers, 'script', return_value=':'):
+                        invoke = 'quint verify' + ('; node' if node else '')
+                        child = invoke + '; bash -c ' + shlex.quote(invoke)
+                        command = ('[ "$JAVA_HOME" = "$HOME/jvm/java-21-openjdk-test" ] || exit 88; '
+                                   + invoke + '; cd "$HOME/w/repo/child" && ' + invoke
+                                   + '; bash -c ' + shlex.quote(child))
+                        script = runs.remote_script('w/repo', rel, [] if stepped else [command], None, 'test',
+                                                    steps=[command] if stepped else None,
+                                                    repo_root=repo, node=node)
+                        result = subprocess.run(['bash', '-c', script], cwd=self.root,
+                                                env={'HOME': str(self.root),
+                                                     'PATH': f'{timeout.parent}:/usr/bin:/bin'},
+                                                capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.splitlines(),
+                                         (['GUARDED', 'SELECTED_NODE'] if node else ['GUARDED']) * 4)
 
 
 if __name__ == '__main__':

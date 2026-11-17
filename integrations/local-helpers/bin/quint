@@ -127,7 +127,9 @@ FALLBACK = re.compile(rb'Downloading Apalache|Launching Apalache server|Started 
 REFLECTION_PROBE = r'''
 const { createRequire } = require('node:module');
 const { realpathSync } = require('node:fs');
-const req = createRequire(realpathSync(process.argv[1]));
+// pnpm's .bin executable is a shell shim; resolve the package before its private dependencies.
+const cliRequire = createRequire(realpathSync(process.argv[1]));
+const req = createRequire(cliRequire.resolve('@informalsystems/quint/dist/src/apalache.js'));
 const grpc = req('@grpc/grpc-js');
 const proto = req('@grpc/proto-loader');
 const definition = proto.loadSync(req.resolve('./reflection.proto'), {

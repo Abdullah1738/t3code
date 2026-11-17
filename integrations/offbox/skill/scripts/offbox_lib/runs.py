@@ -1544,11 +1544,12 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               repo_setup_block(repo_key, rdir),
               f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
+              # JDK activation prepends PATH; install command precedence after runtimes.
+              java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
+                                                       repo_key=repo_key, template=template)),
               node,
               quint_tools.block(),
               node_tools.block(rdir, repo_root),
-              java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
-                                                       repo_key=repo_key, template=template)),
               ('''for _offbox_tool in terraform aws ruby vector gh; do
   command -v "$_offbox_tool" >/dev/null || {
     echo "offbox: required tool missing on command PATH: $_offbox_tool" >&2
