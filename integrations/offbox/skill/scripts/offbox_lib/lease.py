@@ -55,6 +55,7 @@ def boot_dead(con, box_id):
 
 def _set_aside_boot(con, box_id, error):
     from . import allocation, home
+    home.record_box_failure(error)
     if not home.active() or home.probe() is not None:
         # A per-box response alone cannot prove the replacement backend is healthy.
         raise ResumeUnresolved(str(error), OffboxError(str(error), outage=home.may_fail_over())) from error

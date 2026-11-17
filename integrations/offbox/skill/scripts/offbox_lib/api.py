@@ -43,7 +43,7 @@ KEY_SERVICE = "offbox-server-api" if BACKEND == "server" else "boat-api"
 KEY_ACCOUNT = token_owner() if BACKEND == "server" else "ardud"
 _KEY: str | None = None
 LIVE_STATES = ("ready", "idle", "running")
-BOX_BOOT_CODES = frozenset(('boot_timeout', 'incus_failed', 'port_in_use'))
+BOX_BOOT_CODES = frozenset(('boot_timeout', 'incus_failed', 'port_in_use', 'incus_slow'))
 STARTING_STATES = ("init", "provisioning", "provisioned", "cloning", "starting", "resuming")
 STOPPED_STATES = ("archived",)
 STOPPING_STATES = ("stopping",)
@@ -57,18 +57,25 @@ class BoxBootFailed(OffboxError):
         super().__init__(f"box {box_id} went to {state}: {reason}")
         self.box_id, self.reason = box_id, reason
         self.status, self.api_code = status, api_code
+        self.box_error = {'box_id': box_id, 'error': reason}
+
+
+def start_failure_pending(state):
+    failure = state.get('startError')
+    return state.get('state') in STOPPING_STATES and isinstance(failure, dict) and bool(failure.get('class'))
 
 
 def box_boot_failure(box_id, state, *, since=None):
     from . import home
-    if not home.active() or state.get('state') not in (*STOPPED_STATES, 'error', 'cancelled'):
+    cleanup_pending = start_failure_pending(state)
+    if not home.active() or not (state.get('state') in (*STOPPED_STATES, 'error', 'cancelled') or cleanup_pending):
         return None
     reason = state.get('error') or ''
     match = re.match(r'^(5\d{2})\s+(\w+)(?::|\s|$)', reason)
     if not match:
         return None
     fresh = since is not None and (iso_ts(state.get('updatedAt')) or 0) >= since - .001
-    if match[2] in BOX_BOOT_CODES or fresh:
+    if match[2] in BOX_BOOT_CODES or fresh or cleanup_pending:
         return BoxBootFailed(box_id, state['state'], reason, int(match[1]), match[2])
 
 
@@ -1128,18 +1135,22 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         server_error = status is not None and status >= 500
         # Home clears the error before acknowledging a resume. A newer stopped error belongs to this attempt;
         # updatedAt is truncated to milliseconds by the server.
-        failed_resume = (home.active() and st in STOPPED_STATES and server_error and since is not None
+        cleanup_pending = start_failure_pending(s)
+        failed_resume = (home.active() and (st in STOPPED_STATES or cleanup_pending) and server_error and since is not None
                          and (iso_ts(s.get("updatedAt")) or 0) >= since - .001)
         failure = box_boot_failure(box_id, s, since=since)
-        if failure and (failed_resume or since is None or st in ('error', 'cancelled')):
+        if failure and (failed_resume or cleanup_pending or since is None or st in ('error', 'cancelled')):
             # Fresh allocation keeps its existing failover policy; lease reuse isolates the box against health.
             failure.outage = (st == 'error' or failed_resume) and home.may_fail_over()
+            home.record_box_failure(failure)
             raise failure
         if st in ("error", "cancelled") or failed_resume:
             failed_start = server_error and (st == "error" or failed_resume)
             error = OffboxError(f"box {box_id} went to {st}: {s.get('error')}",
                                 outage=failed_start and home.may_fail_over())
             error.status = status
+            error.box_error = {'box_id': box_id, 'error': s.get('error') or ''}
+            home.record_box_failure(error)
             raise error
         if on_state is not None:
             on_state(s)

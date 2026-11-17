@@ -37,8 +37,8 @@ ENUMS = {
     "jdk_phase": {"check", "install", "result"},
     "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
     "jdk_trigger": {"command", "repo-marker", "harness"},
-    "class": {"good", "hard", "slow", "starting"},
-    "outcome": {"boat_box", "good", "bad", "indeterminate", "slow", "starting", "ready", "failover"},
+    "class": {"good", "hard", "slow", "starting", "incus_slow"},
+    "outcome": {"boat_box", "good", "bad", "indeterminate", "slow", "starting", "ready", "failover", "ok", "error", "timeout"},
     "peer_path": {"direct", "relay", "unknown"},
     "refresh_stage": {"idle", "zpool", "incus", "mullvad", "sqlite"},
     "checkpoint": {"probe", "person", "post", "auto-stop", "request", "box-read"},
@@ -67,6 +67,9 @@ ENUMS.update(cause={'incus_unavailable', 'exec_stream_lost', 'host_restart', 'bo
              phase={'before_spawn', 'running'}, cleanup={'clean', 'stopped', 'unknown'})
 ENUMS['reason'].update({'incus_unavailable', 'state_unavailable', 'box_unreadable', 'invalid_receipt',
                         'cgroup_unverified', 'cgroup_kill_failed', 'cleanup_unconfirmed'})
+ENUMS['reason'].update({'incus_slow', 'incus_busy', 'bring_up'})
+ENUMS['reason'].update({'delete_gap', 'zfs_freeing', 'io_pressure', 'pressure_unknown', 'disk_busy'})
+ENUMS['infra_reason'].add('box_error')
 _DAYS = set()
 
 
@@ -119,6 +122,8 @@ def _props(values, *, name=None):
         elif k == "size" and v in ("small", "default", "large", "xlarge"):
             out[k] = v
         elif k == "errorClass" and isinstance(v, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]{0,79}', v):
+            out[k] = v
+        elif k == 'commandKind' and _atom(v):
             out[k] = v
         elif k == 'base' and (v is None or isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', v)):
             out[k] = v

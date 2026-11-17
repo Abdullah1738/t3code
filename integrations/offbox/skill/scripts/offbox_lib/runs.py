@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import offbox_disk_space
+import toollog
 
 import base64
 import contextlib
@@ -1442,6 +1443,9 @@ def space_result(run_id, code, path=None, *, report=False):
     if record.get('disk_probe_error'):
         log_probe_error(run_id, record['disk_probe_error'])
     previous = read_json(LOGS_DIR / f'{run_id}.state.json', {})
+    if (previous.get('infra_reason') == 'box_error' and previous.get('box_error') and
+            code in (None, EXIT_INFRA) and not record.get('infra_failure')):
+        return EXIT_INFRA
     # A missing/incomplete local log must not erase disk evidence already recorded for this exit.
     same_exit = code is not None and previous.get('wrapper_exit_code') == code
     probe_exit = code in (None, EXIT_INFRA) and previous.get('infra_failure') == 'disk_probe'
@@ -3767,6 +3771,18 @@ def _run_remote(a, rn) -> int:
                     code = e.code if not rn.box and (e.code == EXIT_BUSY or (
                         e.code in (2, EXIT_INFRA) and 'nothing ran' in str(e).lower())) else None
                     finish(rn.run_id, code, "busy" if e.code == EXIT_BUSY else "infra")
+                current, seen = e, set()
+                while current is not None and id(current) not in seen:
+                    seen.add(id(current))
+                    if getattr(current, 'box_error', None):
+                        home.record_box_failure(current, rn.run_id)
+                        save_run_state(rn.run_id, infra_failure=True, infra_reason='box_error',
+                                       box_error=current.box_error)
+                        toollog.emit('runs', 'run.error', kind='error', ok=False,
+                                     ids={'run': rn.run_id, 'box': current.box_error['box_id']},
+                                     props={'infra_reason': 'box_error'}, tag='box_error')
+                        break
+                    current = current.__cause__
             if not isinstance(e, common.SourceGone):
                 rn.record(error=str(e)[:500])
             raise e
