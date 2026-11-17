@@ -94,10 +94,12 @@ class Base(unittest.TestCase):
         self.addCleanup(log_env.stop)
         self.saved = {k: getattr(boatd, k) for k in (
             "VAR", "ETC", "CMDS", "DB_PATH", "ADMIT_LOCK", "incus", "_sh", "spawn_runner", "unit_active",
-            "ct_running", "_wait_boot", "boot_id", "mem_available", "provision", "log")}
+            "ct_running", "_wait_boot", "boot_id", "mem_available", "provision", "log", "CG_ROOT")}
         self.addCleanup(lambda: [setattr(boatd, k, v) for k, v in self.saved.items()])
         boatd.VAR, boatd.ETC = self.tmp / "var", self.tmp / "etc"
         boatd.CMDS, boatd.DB_PATH, boatd.ADMIT_LOCK = boatd.VAR / "cmds", boatd.VAR / "boatd.db", boatd.VAR / "admit.lock"
+        boatd.CG_ROOT = self.tmp / 'cgroups'
+        boatd.CG_ROOT.mkdir()
         boatd.ETC.mkdir(parents=True)
         self.f = Fakes()
         boatd.incus, boatd._sh, boatd.spawn_runner = self.f.incus, self.f._sh, self.f.spawn_runner
@@ -115,6 +117,9 @@ class Base(unittest.TestCase):
         self.addCleanup(scratch_host.stop)
         # Resource inputs are explicit in admission tests, independent of the test runner's host.
         boatd.CFG["cpu_pressure_limit"] = 0
+        memory_input = patch.object(boatd.boatd_memory, 'meminfo', return_value={'MemTotal': 1000 * 2**30})
+        memory_input.start()
+        self.addCleanup(memory_input.stop)
         for target, values in ((boatd.STATE, {"loops": {}}), (boatd.LOOP_SPECS, {}), (boatd.LOOP_THREADS, {})):
             fixture = patch.dict(target, values, clear=target is not boatd.STATE)
             fixture.start()
