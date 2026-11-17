@@ -8,19 +8,23 @@ import {
   ProjectId,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderThreadId,
   RunAttemptId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
 import { CursorSettings } from "../settings.ts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
@@ -42,6 +46,284 @@ import { ConfigurationError } from "./sdk.ts";
 const decodeCursorSettings = Schema.decodeEffect(CursorSettings);
 
 describe("CursorAdapterV2", () => {
+  it.effect.each([
+    { phase: "admitted", outcome: "settles" },
+    { phase: "admitted", outcome: "times out" },
+    { phase: "wait-rejected", outcome: "times out" },
+    { phase: "pending", outcome: "settles" },
+    { phase: "pending", outcome: "times out" },
+    { phase: "cancelled-caller", outcome: "settles" },
+    { phase: "expired-stop", outcome: "settles" },
+    { phase: "unclear-rejection", outcome: "settles" },
+    { phase: "model-rejection", outcome: "settles" },
+  ] as const)(
+    "retains native-only ownership through $phase admission when Stop $outcome",
+    ({ phase, outcome }) =>
+      Effect.gen(function* () {
+        const workspace = yield* (yield* FileSystem.FileSystem).makeTempDirectoryScoped({
+          prefix: "cursor-expired-start-",
+        });
+        const instanceId = ProviderInstanceId.make("cursor");
+        const threadId = ThreadId.make("cursor-expired-start");
+        const modelSelection = { instanceId, model: "composer-2.5" };
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: workspace,
+        });
+        const result = yield* Deferred.make<
+          Effect.Success<CursorAgentSdk.CursorAgentSdkRun["wait"]>,
+          CursorAgentSdk.CursorAgentSdkRunnerError
+        >();
+        const cancelled = yield* Deferred.make<void>();
+        const finished = yield* Deferred.make<void>();
+        const sendOffered = yield* Deferred.make<void>();
+        const sendResponse = yield* Deferred.make<void>();
+        let sends = 0;
+        let cancels = 0;
+        const adapter = yield* makeCursorAdapterV2({
+          instanceId,
+          settings: yield* decodeCursorSettings({}),
+          environment: { HOME: workspace },
+        }).pipe(
+          Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, {
+            assertComplete: Effect.void,
+            open: () =>
+              Effect.succeed({
+                agentId: "native-expired-start",
+                listMessages: Effect.succeed([]),
+                close: Effect.void,
+                send: () =>
+                  Effect.gen(function* () {
+                    sends++;
+                    if (sends === 1) {
+                      yield* Deferred.succeed(sendOffered, undefined);
+                      if (phase === "unclear-rejection" || phase === "model-rejection")
+                        return yield* new CursorAgentSdk.CursorAgentSdkRunnerError({
+                          method: "run.start",
+                          cause:
+                            phase === "model-rejection"
+                              ? new ConfigurationError("Cannot use this model: rejected")
+                              : new Error("response lost"),
+                        });
+                      if (phase !== "admitted" && phase !== "wait-rejected")
+                        yield* Deferred.await(sendResponse);
+                    }
+                    return {
+                      agentId: "native-expired-start",
+                      runId: `native-run-${sends}`,
+                      wait: sends === 1 ? Deferred.await(result) : Effect.never,
+                      cancel: Effect.sync(() => {
+                        cancels++;
+                      }).pipe(
+                        Effect.andThen(Deferred.succeed(cancelled, undefined)),
+                        Effect.asVoid,
+                      ),
+                    };
+                  }),
+              }),
+          }),
+          Effect.provide(TestProviderHost.layer({ cwd: workspace })),
+        );
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("cursor-expired-start-session"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const now = yield* DateTime.now;
+        const input = {
+          threadId,
+          providerThread,
+          modelSelection,
+          runtimePolicy,
+          runId: RunId.make("expired-run"),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make("expired-attempt"),
+          rootNodeId: NodeId.make("expired-root"),
+          appThread: {
+            id: threadId,
+            projectId: ProjectId.make("cursor-expired-start-project"),
+            createdBy: "user",
+            creationSource: "web",
+            title: "Expired start",
+            providerInstanceId: instanceId,
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+            activeProviderThreadId: providerThread.id,
+            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+            forkedFrom: null,
+            createdAt: now,
+            updatedAt: now,
+            archivedAt: null,
+            settledOverride: null,
+            settledAt: null,
+            lastVisitedAt: null,
+            deletedAt: null,
+          },
+          message: {
+            messageId: MessageId.make("expired-message"),
+            text: "Work",
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+          },
+        } satisfies ProviderAdapter.ProviderAdapterV2TurnInput;
+        // Native work is live while every adapter event is still unconsumed.
+        const starting = yield* runtime
+          .startTurn(input)
+          .pipe(Effect.result, Effect.forkChild({ startImmediately: true }));
+        yield* Deferred.await(sendOffered);
+        if (phase === "unclear-rejection" || phase === "model-rejection") {
+          assert.equal((yield* Fiber.join(starting))._tag, "Failure");
+          const unclear = phase === "unclear-rejection";
+          assert.equal(yield* runtime.holdsWorkForThread!(providerThread), unclear);
+          const stopped = yield* runtime.interruptStartingRun!({
+            providerThread,
+            runId: input.runId,
+            attemptId: input.attemptId,
+          }).pipe(Effect.result);
+          assert.equal(stopped._tag, unclear ? "Failure" : "Success");
+          const retry = yield* runtime
+            .startTurn({
+              ...input,
+              runId: RunId.make("retry"),
+              attemptId: RunAttemptId.make("retry-attempt"),
+            })
+            .pipe(Effect.result);
+          assert.equal(retry._tag, unclear ? "Failure" : "Success");
+          assert.equal(sends, unclear ? 1 : 2);
+          return;
+        }
+        if (phase === "admitted" || phase === "wait-rejected") yield* Fiber.join(starting);
+        if (phase === "cancelled-caller") yield* Fiber.interrupt(starting);
+        assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+        const successor = {
+          ...input,
+          runId: RunId.make("successor"),
+          attemptId: RunAttemptId.make("successor-attempt"),
+          runOrdinal: 2,
+          providerTurnOrdinal: 2,
+        };
+        assert.equal((yield* runtime.startTurn(successor).pipe(Effect.result))._tag, "Failure");
+        assert.equal(sends, 1);
+        const target = { providerThread, runId: input.runId, attemptId: input.attemptId };
+        for (const mismatch of [
+          { ...target, runId: RunId.make("another-run") },
+          { ...target, attemptId: RunAttemptId.make("another-attempt") },
+          {
+            ...target,
+            providerThread: { ...providerThread, id: ProviderThreadId.make("another-owner") },
+          },
+          {
+            ...target,
+            providerThread: {
+              ...providerThread,
+              nativeThreadRef: { ...providerThread.nativeThreadRef!, nativeId: "another-session" },
+            },
+          },
+        ])
+          yield* runtime.interruptStartingRun!(mismatch);
+        assert.equal(cancels, 0);
+        const stop = runtime.interruptStartingRun!(target);
+        const boundedStop =
+          phase === "expired-stop" ? stop.pipe(Effect.timeout("10 seconds")) : stop;
+        const stopping = yield* boundedStop.pipe(
+          Effect.result,
+          Effect.ensuring(Deferred.succeed(finished, undefined)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        const duplicate = yield* boundedStop.pipe(
+          Effect.result,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        if (phase !== "admitted" && phase !== "wait-rejected") {
+          assert.equal(cancels, 0);
+          assert.isFalse(yield* Deferred.isDone(finished));
+          if (phase === "expired-stop") {
+            yield* TestClock.adjust("10 seconds");
+            assert.equal((yield* Fiber.join(stopping))._tag, "Failure");
+            assert.equal((yield* Fiber.join(duplicate))._tag, "Failure");
+            assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+          }
+          yield* Deferred.succeed(sendResponse, undefined);
+        }
+        yield* Deferred.await(cancelled);
+        if (phase !== "expired-stop") assert.isFalse(yield* Deferred.isDone(finished));
+        assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+        assert.equal((yield* runtime.startTurn(successor).pipe(Effect.result))._tag, "Failure");
+        assert.equal(sends, 1);
+        if (phase === "wait-rejected") {
+          yield* Deferred.fail(
+            result,
+            new CursorAgentSdk.CursorAgentSdkRunnerError({
+              method: "run.wait",
+              cause: new Error("stream disconnected"),
+            }),
+          );
+          const terminal = Option.getOrThrow(
+            yield* runtime.events.pipe(
+              Stream.filter((event) => event.type === "turn.terminal"),
+              Stream.runHead,
+            ),
+          );
+          assert.isFalse("nativeWorkEnded" in terminal);
+          assert.isFalse(yield* Deferred.isDone(finished));
+          assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+          yield* TestClock.adjust("10 seconds");
+          assert.equal((yield* Fiber.join(stopping))._tag, "Failure");
+          assert.equal((yield* Fiber.join(duplicate))._tag, "Failure");
+          assert.equal((yield* runtime.startTurn(successor).pipe(Effect.result))._tag, "Failure");
+          assert.equal(sends, 1);
+          assert.equal(cancels, 1);
+          return;
+        }
+        if (outcome === "times out") {
+          yield* TestClock.adjust("10 seconds");
+          assert.equal((yield* Fiber.join(stopping))._tag, "Failure");
+          assert.equal((yield* Fiber.join(duplicate))._tag, "Failure");
+          assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+        }
+        yield* Deferred.succeed(result, {
+          id: "native-run-1",
+          requestId: "native-request",
+          status: "cancelled",
+          model: { id: "composer-2.5" },
+          durationMs: 1,
+        });
+        const terminal = Option.getOrThrow(
+          yield* runtime.events.pipe(
+            Stream.filter((event) => event.type === "turn.terminal"),
+            Stream.runHead,
+          ),
+        );
+        assert.equal(terminal.type === "turn.terminal" && terminal.status, "interrupted");
+        if (outcome === "settles" && phase !== "expired-stop") {
+          assert.equal((yield* Fiber.join(stopping))._tag, "Success");
+          assert.equal((yield* Fiber.join(duplicate))._tag, "Success");
+        }
+        if (phase !== "cancelled-caller") yield* Fiber.join(starting);
+        assert.isFalse(yield* runtime.holdsWorkForThread!(providerThread));
+        yield* runtime.startTurn(successor);
+        assert.equal(sends, 2);
+        assert.equal(cancels, 1);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+        ),
+      ),
+  );
+
   it.effect.each([
     { status: "finished", model: undefined, lateModel: undefined },
     { status: "cancelled", model: "claude-opus-4-6", lateModel: undefined },

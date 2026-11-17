@@ -220,6 +220,7 @@ interface ActiveTurn {
   nextOrdinal: number;
   flushScheduled: boolean;
   interruptRequested: boolean;
+  interruptAcknowledged?: boolean;
   compactionSubmitted: boolean;
   inheritedCompactionItems: Set<string>;
   compact: boolean;
@@ -952,6 +953,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         detail?: string,
         disposition: "reusable" | "broken" = "reusable",
         quota?: { readonly resetsAtMs: number },
+        nativeWorkEnded = false,
       ) {
         if (active !== turn || seenTerminals.has(turn.nativeId)) return;
         seenTerminals.add(turn.nativeId);
@@ -1022,6 +1024,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           });
           yield* emit({
             type: "turn.terminal",
+            ...(nativeWorkEnded ? { nativeWorkEnded: true as const } : {}),
             driver: MUSE_PROVIDER,
             providerThreadId: turn.providerTurn.providerThreadId,
             providerTurnId: turn.providerTurn.id,
@@ -1034,6 +1037,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         } else {
           yield* emit({
             type: "turn.terminal",
+            ...(nativeWorkEnded ? { nativeWorkEnded: true as const } : {}),
             driver: MUSE_PROVIDER,
             providerThreadId: turn.providerTurn.providerThreadId,
             providerTurnId: turn.providerTurn.id,
@@ -1435,6 +1439,9 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                     ? "cancelled"
                     : "failed",
                 item.failureReason ?? item.reason,
+                "reusable",
+                undefined,
+                true,
               );
             }
             break;
@@ -1508,6 +1515,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
               result.error?.message ?? result.reason,
               "reusable",
               result.error?.quota,
+              true,
             );
             break;
           }
@@ -2162,6 +2170,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           providerPayload: items,
         };
       });
+      const joinTurnStop = ProviderAdapter.makeTurnStopJoiner();
       const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
         instanceId: options.instanceId,
         driver: MUSE_PROVIDER,
@@ -2173,6 +2182,16 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         hasPendingBackgroundWork: Effect.sync(
           () => observedChildren.size > 0 || wake !== undefined,
         ),
+        holdsWorkForThread: (owner) =>
+          eventPermit
+            .withPermitsIfAvailable(1)(
+              Effect.sync(
+                () =>
+                  thread?.id === owner.id &&
+                  (active !== undefined || wake !== undefined || observedChildren.size > 0),
+              ),
+            )
+            .pipe(Effect.map(Option.getOrElse(() => true))),
         ensureThread: (args) =>
           register(args).pipe(
             commands.withPermits(1),
@@ -2250,6 +2269,23 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
               ),
             ),
         ),
+        interruptStartingRun: Effect.fn("MuseAdapter.interruptStartingRun")(function* (run) {
+          const turn = active;
+          if (
+            turn === undefined ||
+            turn.input.runId !== run.runId ||
+            turn.input.attemptId !== run.attemptId ||
+            turn.input.providerThread.id !== run.providerThread.id ||
+            !validateThread(run.providerThread)
+          )
+            return;
+          yield* runtime.interruptTurn({
+            providerThread: run.providerThread,
+            providerTurnId: turn.providerTurn.id,
+            requestRuntimeRestart: false,
+            stopBackgroundWork: false,
+          });
+        }),
         interruptTurn: Effect.fn("MuseAdapter.interruptTurn")(
           function* (args) {
             const turn = active;
@@ -2288,13 +2324,20 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
             if (args.stopBackgroundWork !== false)
               for (const joined of turn.joined)
                 yield* request("turn/interrupt", { turnId: joined }).pipe(Effect.ignore);
-            yield* request(
-              "turn/interrupt",
-              { turnId: turn.nativeId },
-              true,
-              undefined,
-              args.stopBackgroundWork === false,
-            );
+            if (!turn.interruptAcknowledged)
+              yield* request(
+                "turn/interrupt",
+                { turnId: turn.nativeId },
+                true,
+                undefined,
+                args.stopBackgroundWork === false,
+              ).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    turn.interruptAcknowledged = true;
+                  }),
+                ),
+              );
             yield* Deferred.await(turn.done).pipe(
               Effect.timeout(options.requestTimeoutMs ?? 30_000),
               Effect.mapError((cause) => protocolError("Muse did not confirm interruption", cause)),
@@ -2319,6 +2362,10 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                     }),
               ),
             ),
+          (effect, target) =>
+            target.stopBackgroundWork === false
+              ? joinTurnStop(target.providerTurnId, effect)
+              : effect,
         ),
         respondToRuntimeRequest: Effect.fn("MuseAdapter.respondToRuntimeRequest")(
           function* (args) {

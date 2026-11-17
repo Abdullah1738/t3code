@@ -13,6 +13,10 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
+  CommandId,
+  EventId,
+  MessageId,
+  ProjectId,
   CheckpointId,
   EnvironmentId,
   type ModelSelection,
@@ -20,6 +24,7 @@ import {
   ProviderInstanceId,
   ProviderSessionId,
   RunAttemptId,
+  RunId,
   type OrchestrationV2ProviderTurn,
   ProviderThreadId,
   ThreadId,
@@ -27,6 +32,13 @@ import {
   type OrchestrationV2TurnItem,
   type ProviderOptionDescriptor,
 } from "@t3tools/contracts";
+import * as EffectOutbox from "../EffectOutbox.ts";
+import * as EffectWorker from "../EffectWorker.ts";
+import * as EventSink from "../EventSink.ts";
+import * as Orchestrator from "../Orchestrator.ts";
+import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
+import * as ProviderSessionManager from "../ProviderSessionManager.ts";
+import { layerWithRegistry } from "../testkit/ProviderReplayHarness.ts";
 import { GrokSettings } from "@t3tools/provider-grok/settings";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { deriveBlockedOnThreadWait } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
@@ -554,6 +566,175 @@ const startedProviderTurnId = (
   });
 
 describe("AcpAdapterV2", () => {
+  it.effect.each(["settles", "times out"] as const)(
+    "stops an exact native-only attempt before admitting its successor when cancellation %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const prompted = yield* Queue.unbounded<number>();
+        const cancelled = yield* Deferred.make<void>();
+        const nativeResult = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
+        const stopFinished = yield* Deferred.make<void>();
+        let prompts = 0;
+        let cancels = 0;
+        const instanceId = ProviderInstanceId.make("acp-expired-native-only");
+        const adapter = yield* makeAcpAdapterV2({
+          instanceId,
+          selfInvocation: yield* resolveSelfInvocation(),
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+              mockAgentPath: yield* path.fromFileUrl(
+                new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+              ),
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                prompt: () =>
+                  Effect.gen(function* () {
+                    prompts++;
+                    yield* Queue.offer(prompted, prompts);
+                    return prompts === 1
+                      ? yield* Deferred.await(nativeResult)
+                      : { stopReason: "end_turn" as const };
+                  }),
+                cancel: Effect.sync(() => {
+                  cancels++;
+                }).pipe(Effect.andThen(Deferred.succeed(cancelled, undefined)), Effect.asVoid),
+              }),
+            }),
+          },
+        });
+        const threadId = ThreadId.make("thread-acp-expired-native-only");
+        const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const modelSelection = { instanceId, model: "default" } as const;
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("session-acp-expired-native-only"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const input = makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          now: yield* DateTime.now,
+        });
+        // Leave all initial adapter events unconsumed, as with stalled ingestion.
+        yield* runtime.startTurn(input);
+        assert.equal(yield* Queue.take(prompted), 1);
+        assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+        const target = { providerThread, runId: input.runId, attemptId: input.attemptId };
+        for (const mismatch of [
+          { ...target, runId: RunId.make("another-run") },
+          { ...target, attemptId: RunAttemptId.make("another-attempt") },
+          {
+            ...target,
+            providerThread: { ...providerThread, id: ProviderThreadId.make("another-owner") },
+          },
+          {
+            ...target,
+            providerThread: {
+              ...providerThread,
+              nativeThreadRef: {
+                ...providerThread.nativeThreadRef!,
+                nativeId: "another-native-session",
+              },
+            },
+          },
+        ])
+          yield* runtime.interruptStartingRun!(mismatch);
+        assert.equal(cancels, 0);
+        const stopping = yield* runtime.interruptStartingRun!(target).pipe(
+          Effect.result,
+          Effect.ensuring(Deferred.succeed(stopFinished, undefined)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Deferred.await(cancelled);
+        const duplicate = yield* runtime.interruptStartingRun!(target).pipe(
+          Effect.result,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        assert.isFalse(yield* Deferred.isDone(stopFinished));
+        assert.equal(cancels, 1);
+        assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+        const successor = yield* runtime
+          .startTurn(
+            makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              runtimePolicy,
+              now: yield* DateTime.now,
+              ordinal: 2,
+            }),
+          )
+          .pipe(Effect.result, Effect.forkChild({ startImmediately: true }));
+        assert.equal(prompts, 1);
+        if (outcome === "times out") {
+          yield* TestClock.adjust("10 seconds");
+          assert.equal((yield* Fiber.join(stopping))._tag, "Failure");
+          assert.equal((yield* Fiber.join(duplicate))._tag, "Failure");
+          assert.equal((yield* Fiber.join(successor))._tag, "Failure");
+          assert.equal(prompts, 1);
+          assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+          const snapshot = yield* runtime.readThreadSnapshot({ providerThread });
+          assert.equal(
+            snapshot.providerTurns.find((turn) => turn.runAttemptId === input.attemptId)?.status,
+            "running",
+          );
+        }
+        if (outcome === "times out") {
+          const retried = yield* runtime.interruptStartingRun!(target).pipe(
+            Effect.result,
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* TestClock.adjust("10 seconds");
+          assert.equal((yield* Fiber.join(retried))._tag, "Failure");
+        }
+        yield* Deferred.succeed(nativeResult, { stopReason: "cancelled" });
+        if (outcome === "settles") {
+          assert.equal((yield* Fiber.join(stopping))._tag, "Success");
+          assert.equal((yield* Fiber.join(duplicate))._tag, "Success");
+          assert.equal((yield* Fiber.join(successor))._tag, "Success");
+          assert.equal(yield* Queue.take(prompted), 2);
+        }
+        const terminal = Option.getOrThrow(
+          yield* runtime.events.pipe(
+            Stream.filter((event) => event.type === "turn.terminal" && event.runOrdinal === 1),
+            Stream.runHead,
+          ),
+        );
+        assert.equal(terminal.type === "turn.terminal" && terminal.status, "interrupted");
+        assert.equal(cancels, 1);
+        if (outcome === "times out") {
+          assert.isFalse(yield* runtime.holdsWorkForThread!(providerThread));
+          yield* runtime.startTurn(
+            makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              runtimePolicy,
+              now: yield* DateTime.now,
+              ordinal: 3,
+            }),
+          );
+          assert.equal(yield* Queue.take(prompted), 2);
+        }
+      }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
   it.effect.each([
     { reuseAttempt: false, reopen: false },
     { reuseAttempt: true, reopen: false },
@@ -14813,3 +14994,237 @@ describe("acpPostSettleMonitorPromptShouldSuppress", () => {
     );
   });
 });
+
+it.effect(
+  "confirms native ACP cancellation with a retained background task through the real worker",
+  () =>
+    Effect.gen(function* () {
+      const workspace = yield* (yield* FileSystem.FileSystem).makeTempDirectoryScoped({
+        prefix: "acp-cancel-expiry-",
+      });
+      const instanceId = ProviderInstanceId.make("acp-cancel-expiry");
+      const threadId = ThreadId.make("thread:acp-cancel-expiry");
+      const modelSelection = { instanceId, model: "default" };
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: workspace,
+      });
+      const offered = yield* Deferred.make<void>();
+      const aborted = yield* Deferred.make<void>();
+      const response = yield* Deferred.make<void>();
+      let prompts = 0;
+      let aborts = 0;
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        continuationRequests: { offer: () => Effect.void },
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          deferFinalizeForBackgroundWork: true,
+          enablePostSettleContinuation: true,
+          extractSubagentUpdate: (toolCall) =>
+            toolCall.toolCallId !== "tool-call-generic-1"
+              ? undefined
+              : {
+                  nativeTaskId: "retained-child",
+                  prompt: "background work",
+                  title: "Background",
+                  model: null,
+                  status: "running",
+                  childSessionId: null,
+                  result: null,
+                },
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+            mockAgentPath: yield* (yield* Path.Path).fromFileUrl(
+              new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+            ),
+            environment: { T3_ACP_EMIT_GENERIC_TOOL_PLACEHOLDERS: "1" },
+            wrapRuntime: (native) => ({
+              ...native,
+              prompt: (input) =>
+                Effect.gen(function* () {
+                  prompts++;
+                  const result = yield* native.prompt(input);
+                  if (prompts === 1) {
+                    yield* Deferred.succeed(offered, undefined);
+                    yield* Deferred.await(response);
+                    return { stopReason: "cancelled" as const };
+                  }
+                  return result;
+                }),
+              cancel: Effect.sync(() => {
+                aborts++;
+              }).pipe(Effect.andThen(Deferred.succeed(aborted, undefined)), Effect.asVoid),
+            }),
+          }),
+        },
+      });
+      const registry = ProviderAdapterRegistry.layerFromAdapters([adapter]);
+      yield* Effect.gen(function* () {
+        const engine = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+        yield* engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("acp-expiry-create"),
+          threadId,
+          createdBy: "user",
+          creationSource: "web",
+          projectId: ProjectId.make("acp-expiry-project"),
+          title: "Expiry",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: workspace,
+        });
+        const runtime = yield* sessions.open({
+          threadId,
+          providerSessionId: ProviderSessionId.make("acp-expiry-session"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const thread = yield* runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
+        const appThread = (yield* engine.getThreadProjection(threadId)).thread;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("acp-expiry-owner"),
+              threadId,
+              type: "provider-thread.updated",
+              driver: ACP_TEST_DRIVER,
+              providerInstanceId: instanceId,
+              occurredAt: yield* DateTime.now,
+              payload: thread,
+            },
+            {
+              id: EventId.make("acp-expiry-binding"),
+              threadId,
+              type: "thread.metadata-updated",
+              occurredAt: yield* DateTime.now,
+              payload: { ...appThread, activeProviderThreadId: thread.id },
+            },
+          ],
+        });
+        const send = (ordinal: number) =>
+          engine.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`acp-expiry-send-${ordinal}`),
+            threadId,
+            messageId: MessageId.make(`acp-expiry-message-${ordinal}`),
+            text: "Work",
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+            modelSelection,
+            dispatchMode: { type: "start_immediately" },
+          });
+        yield* send(1);
+        const run = (yield* engine.getThreadProjection(threadId)).runs[0]!;
+        const subscription = yield* runtime.subscribeEvents!;
+        yield* Effect.addFinalizer(() => subscription.close);
+        const localEnd = yield* subscription.events.pipe(
+          Stream.filter((event) => event.type === "turn.terminal"),
+          Stream.runHead,
+          Effect.forkScoped,
+        );
+        const starting = yield* runtime
+          .startTurn({
+            appThread,
+            threadId,
+            runId: run.id,
+            runOrdinal: 1,
+            providerTurnOrdinal: 1,
+            attemptId: run.activeAttemptId!,
+            rootNodeId: run.rootNodeId!,
+            providerThread: thread,
+            message: {
+              messageId: MessageId.make("acp-expiry-prompt"),
+              text: "Work",
+              attachments: [],
+              createdBy: "user",
+              creationSource: "web",
+            },
+            modelSelection,
+            runtimePolicy,
+          })
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(offered);
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("acp-expiry-deadline"),
+              threadId,
+              runId: run.id,
+              type: "run.updated",
+              occurredAt: now,
+              payload: { ...run, providerStartDeadlineAt: now },
+            },
+          ],
+        });
+        const expireId = CommandId.make("acp-expiry-expire");
+        yield* engine.dispatch({
+          type: "run.start-expire",
+          commandId: expireId,
+          threadId,
+          runId: run.id,
+          expectedAttemptId: run.activeAttemptId,
+          deadline: now,
+          phase: "provider",
+        });
+        const stop = (yield* outbox.listByCommandId(expireId)).find(
+          (row) => row.request.type === "provider-turn.interrupt",
+        )!;
+        assert.isDefined(stop);
+        assert.isTrue(Exit.isSuccess(yield* Fiber.join(starting)));
+        yield* send(2);
+        const workerLayer = EffectWorker.layerWithOptions({
+          workerId: "acp-expiry-stop",
+          maxAttempts: 2,
+        }).pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.succeed(EffectOutbox.EffectOutboxV2, outbox),
+              Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, executor),
+            ),
+          ),
+        );
+        yield* Effect.gen(function* () {
+          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+          const retrying = yield* worker.runStartOnce.pipe(Effect.forkScoped);
+          yield* TestClock.adjust("1 second");
+          const stopping = yield* worker.runControlOnce.pipe(Effect.forkScoped);
+          yield* Deferred.await(aborted);
+          assert.equal(prompts, 1);
+          yield* Deferred.succeed(response, undefined);
+          const terminal = Option.getOrThrow(yield* Fiber.join(localEnd));
+          assert.isTrue("nativeWorkEnded" in terminal && terminal.nativeWorkEnded === true);
+          yield* Fiber.join(stopping);
+          assert.equal(Option.getOrThrow(yield* outbox.get(stop.id)).status, "succeeded");
+          assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+          yield* Fiber.join(retrying);
+          assert.equal(prompts, 2);
+          assert.equal(aborts, 1);
+          assert.equal(
+            (yield* engine.getThreadProjection(threadId)).runs.find((row) => row.id === run.id)
+              ?.status,
+            "failed",
+          );
+        }).pipe(Effect.provide(workerLayer));
+      }).pipe(
+        Effect.provide(
+          layerWithRegistry(
+            { name: "acp-cancel-expiry", runtimePolicyOverride: { cwd: workspace } },
+            registry,
+            { runEffectWorker: false },
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(TestClock.layer(), layerTest))),
+);

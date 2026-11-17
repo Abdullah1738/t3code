@@ -244,7 +244,7 @@ function makeClaudeTestTurnInput(input: {
 }
 
 describe("ClaudeAdapterV2 runtime query policy", () => {
-  it.effect.each(["local", "native", "retained"] as const)(
+  it.effect.each(["local", "native", "active", "retained"] as const)(
     "cancels a timed-out queued prompt without closing the query, placement=%s",
     (placement) =>
       Effect.gen(function* () {
@@ -279,6 +279,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
           Effect.result,
         );
         assert.equal(result._tag, placement === "retained" ? "Failure" : "Success");
+        if (result._tag === "Success") assert.equal(result.success, placement !== "active");
         assert.deepEqual(
           requests,
           placement === "local"
@@ -3098,7 +3099,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   const makeWakeHarnessWithOptions = (options?: {
     readonly cancelPendingPrompt?: (
       uuid: string,
-    ) => Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
+    ) => Effect.Effect<boolean, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly close?: (
       sdkMessages: Queue.Queue<SDKMessage>,
     ) => Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
@@ -11533,7 +11534,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             cancelPendingPrompt: (uuid) =>
               Effect.sync(() => {
                 cancelled.push(uuid);
-              }).pipe(Effect.andThen(Effect.suspend(() => onCancel(uuid)))),
+              }).pipe(Effect.andThen(Effect.suspend(() => onCancel(uuid))), Effect.as(true)),
           });
           if (nativeResult)
             onCancel = (uuid) =>
@@ -13035,6 +13036,158 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         ),
       ),
     ),
+  );
+
+  it.effect.each(["interrupt", "cancel-fallback"] as const)(
+    "keeps Stop and the successor pending after a Claude %s receipt until the native result",
+    (route) =>
+      Effect.gen(function* () {
+        const receipt = yield* Deferred.make<void>();
+        const stopped = yield* Deferred.make<void>();
+        const successorSent = yield* Deferred.make<void>();
+        const deliverResult = yield* Deferred.make<void>();
+        let interrupts = 0;
+        const acknowledge = Effect.sync(() => {
+          interrupts++;
+        }).pipe(Effect.andThen(Deferred.succeed(receipt, undefined)));
+        const harness = yield* makeWakeHarnessWithOptions({
+          interrupt: acknowledge,
+          ...(route === "cancel-fallback"
+            ? {
+                cancelPendingPrompt: () => acknowledge.pipe(Effect.as(false)),
+              }
+            : {}),
+        });
+        const input = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("claude-expired-receipt"),
+          text: "Work the card",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn(input);
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "command_lifecycle",
+            command_uuid: harness.promptUuid(0),
+            state: "started",
+          }),
+        );
+        const stop = yield* harness.runtime.interruptStartingRun!({
+          providerThread: harness.providerThread,
+          runId: input.runId,
+          attemptId: input.attemptId,
+          stopBackgroundWork: false,
+        }).pipe(
+          Effect.tap(() => Deferred.succeed(stopped, undefined)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Deferred.await(receipt);
+        const next = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("claude-retry-after-receipt"),
+          text: "Replacement",
+          attachments: [],
+          providerTurnOrdinal: 2,
+        });
+        const successor = yield* harness.runtime.startTurn(next).pipe(
+          Effect.tap(() => Deferred.succeed(successorSent, undefined)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        assert.isTrue(Option.isNone(yield* Deferred.poll(stopped)));
+        assert.isTrue(Option.isNone(yield* Deferred.poll(successorSent)));
+        assert.lengthOf(harness.offeredMessages, 1);
+        assert.lengthOf(harness.terminalEvents(), 0);
+        assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+        const nativeResult = yield* Deferred.await(deliverResult).pipe(
+          Effect.andThen(
+            harness.offerAndWait(
+              claudeSdkFrame({
+                ...turnOneResult,
+                user_message_uuid: harness.promptUuid(0),
+              }),
+            ),
+          ),
+          Effect.forkScoped,
+        );
+        yield* Deferred.succeed(deliverResult, undefined);
+        yield* Fiber.join(nativeResult);
+        yield* Fiber.join(stop);
+        yield* Fiber.join(successor);
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "interrupted");
+        assert.lengthOf(harness.terminalEvents(), 1);
+        assert.lengthOf(harness.offeredMessages, 2);
+        assert.equal(harness.offeredMessages[1]?.message.content, "Ultrathink:\nReplacement");
+        assert.equal(interrupts, 1);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(["no-receipt", "acknowledged"] as const)(
+    "keeps a timed-out Stop busy until the native Claude turn ends: %s",
+    (delivery) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const stopEntered = yield* Deferred.make<void>();
+          let interruptCalls = 0;
+          const harness = yield* makeWakeHarnessWithOptions({
+            interrupt: Effect.sync(() => {
+              interruptCalls++;
+            }).pipe(
+              Effect.andThen(Deferred.succeed(stopEntered, undefined)),
+              Effect.andThen(delivery === "no-receipt" ? Effect.never : Effect.void),
+            ),
+          });
+          const input = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("expired-start-stop-idle-probe"),
+            text: "Work the card.",
+            attachments: [],
+          });
+          yield* harness.runtime.startTurn(input);
+          const stop = yield* harness.runtime.interruptStartingRun!({
+            providerThread: harness.providerThread,
+            runId: input.runId,
+            attemptId: input.attemptId,
+            stopBackgroundWork: false,
+          }).pipe(Effect.exit, Effect.forkScoped);
+          yield* Deferred.await(stopEntered);
+          assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+          yield* TestClock.adjust("10 seconds");
+          assert.isTrue(Exit.isFailure(yield* Fiber.join(stop)));
+          assert.lengthOf(harness.terminalEvents(), 0);
+          assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+          const retry =
+            delivery === "acknowledged"
+              ? yield* harness.runtime.interruptStartingRun!({
+                  providerThread: harness.providerThread,
+                  runId: input.runId,
+                  attemptId: input.attemptId,
+                  stopBackgroundWork: false,
+                }).pipe(Effect.forkChild({ startImmediately: true }))
+              : undefined;
+          assert.equal(interruptCalls, 1);
+          yield* harness.offerAndWait(turnOneResult);
+          yield* Queue.take(harness.terminalReceipts);
+          if (retry !== undefined) yield* Fiber.join(retry);
+          assert.equal(interruptCalls, 1);
+          assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
   );
 
   it.effect("counts a wake buffered for the thread as work it still holds", () =>

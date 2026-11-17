@@ -69,6 +69,20 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-turn.interrupt"),
     startTimeout: Schema.optional(Schema.Boolean),
+    startTimeoutContext: Schema.optional(
+      Schema.Struct({
+        runId: RunId,
+        code: Schema.String,
+        provider: Schema.String,
+      }),
+    ),
+    startingRun: Schema.optional(
+      Schema.Struct({
+        runId: RunId,
+        attemptId: RunAttemptId,
+        runOrdinal: Schema.Number,
+      }),
+    ),
     replacementProviderSessionId: Schema.optional(ProviderSessionId),
     providerSessionId: ProviderSessionId,
     providerThreadId: ProviderThreadId,
@@ -282,6 +296,9 @@ export interface EffectOutboxV2Shape {
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
+  readonly listStartTimeoutStops: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
     readonly runId?: RunId;
@@ -426,6 +443,16 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           SELECT 1
           FROM orchestration_v2_effect_outbox AS active
           WHERE active.thread_id = candidate.thread_id
+            -- Timeout Stop and successor admission join in the start service.
+            -- Both lanes must run for its bounded wait to observe settlement.
+            AND NOT (
+              (candidate.effect_type = 'provider-turn.start'
+                AND active.effect_type = 'provider-turn.interrupt'
+                AND COALESCE(json_extract(active.payload_json, '$.startTimeout'), 0) = 1)
+              OR (active.effect_type = 'provider-turn.start'
+                AND candidate.effect_type = 'provider-turn.interrupt'
+                AND COALESCE(json_extract(candidate.payload_json, '$.startTimeout'), 0) = 1)
+            )
             AND (
               active.status = 'running'
               OR (
@@ -632,6 +659,21 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         }
         yield* signalSettled([effectId]);
       }),
+      listStartTimeoutStops: Effect.fn("EffectOutbox.listStartTimeoutStops")(
+        function* (threadId) {
+          const rows = yield* sql<EffectRow>`
+            SELECT * FROM orchestration_v2_effect_outbox
+            WHERE thread_id = ${threadId} AND effect_type = 'provider-turn.interrupt'
+              AND json_extract(payload_json, '$.startTimeout') = 1
+              AND status != 'succeeded'
+            ORDER BY created_at, effect_id
+          `;
+          return yield* Effect.forEach(rows, rowToEffect);
+        },
+        Effect.mapError(
+          (cause) => new EffectOutboxError({ operation: "list-start-timeout-stops", cause }),
+        ),
+      ),
       reconcileAfterProcessLoss: Effect.gen(function* () {
         const now = DateTime.formatIso(yield* DateTime.now);
         const cancelledRows = yield* sql<{ readonly effect_id: string }>`

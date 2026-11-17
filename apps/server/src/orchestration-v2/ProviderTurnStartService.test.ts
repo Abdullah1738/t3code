@@ -1,4 +1,5 @@
 import * as TestClock from "effect/testing/TestClock";
+import packageJson from "../../package.json" with { type: "json" };
 import { PROVIDER_START_CLEANUP_TIMEOUT_MS } from "./providerStartDeadlinePolicy.ts";
 import { continuationReport, markQueuedRunRecovered } from "../ardud/fast-install/report.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -11,6 +12,7 @@ import {
   KanbanDiscussionId,
   type KanbanDiscussion,
   type ServerSettingsError,
+  CommandId,
   ContextHandoffId,
   CheckpointScopeId,
   EnvironmentId,
@@ -61,11 +63,19 @@ import * as ProviderAuthService from "../provider/ProviderAuthService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
 import * as EventSink from "./EventSink.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
+import * as EffectWorker from "./EffectWorker.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
+import * as CodexReplay from "effect-codex-app-server/replay";
+import * as CodexAdapterV2 from "./Adapters/CodexAdapterV2.ts";
+import * as CodexTestkit from "./Adapters/CodexAdapterV2.testkit.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
@@ -84,6 +94,325 @@ import {
 } from "@t3tools/provider-core/server/failure";
 
 const isDomainEvent = Schema.is(OrchestrationV2DomainEvent);
+
+effectIt.effect("keeps an acknowledged compaction owned after expiry exhausts Stop retries", () =>
+  Effect.gen(function* () {
+    const nativeThreadId = "expired-compaction-thread";
+    const nativeTurnId = "expired-compaction-turn";
+    const startCaptured = yield* Deferred.make<void>();
+    const emitStart = yield* Deferred.make<void>();
+    const emitEnd = yield* Deferred.make<void>();
+    const started = yield* Deferred.make<RunAttemptId | null>();
+    const ended = yield* Deferred.make<void>();
+    const transcript: CodexReplay.CodexAppServerReplayTranscript = {
+      provider: "codex",
+      protocol: "codex.app-server",
+      version: "0.144.0",
+      scenario: "expired-compaction-admission",
+      entries: [
+        {
+          type: "expect_outbound",
+          label: "initialize",
+          frame: {
+            id: 1,
+            method: "initialize",
+            params: {
+              clientInfo: { name: "T3 Code", title: "T3 Code", version: packageJson.version },
+              capabilities: {
+                experimentalApi: true,
+                optOutNotificationMethods: ["turn/diff/updated"],
+                extensions: {
+                  "io.modelcontextprotocol/ui": { mimeTypes: ["text/html;profile=mcp-app"] },
+                },
+              },
+            },
+          },
+        },
+        {
+          type: "emit_inbound",
+          label: "initialize",
+          frame: {
+            id: 1,
+            result: {
+              userAgent: "T3 Code/0.156.1",
+              codexHome: "/tmp/codex-home",
+              platformFamily: "unix",
+              platformOs: "macos",
+            },
+          },
+        },
+        { type: "expect_outbound", label: "initialized", frame: { method: "initialized" } },
+        {
+          type: "expect_outbound",
+          label: "thread/start",
+          frame: {
+            id: 2,
+            method: "thread/start",
+            params: { config: CodexAdapterV2.CODEX_THREAD_CONFIG },
+          },
+        },
+        {
+          type: "emit_inbound",
+          label: "thread/start",
+          frame: {
+            id: 2,
+            result: {
+              thread: {
+                id: nativeThreadId,
+                sessionId: nativeThreadId,
+                forkedFromId: null,
+                preview: "",
+                ephemeral: false,
+                modelProvider: "openai",
+                createdAt: 1782622440,
+                updatedAt: 1782622440,
+                status: { type: "idle" },
+                path: `/tmp/${nativeThreadId}.jsonl`,
+                cwd: "/workspace",
+                cliVersion: "0.144.0",
+                source: "vscode",
+                threadSource: null,
+                agentNickname: null,
+                agentRole: null,
+                gitInfo: null,
+                name: null,
+                turns: [],
+              },
+              model: "gpt-5.4",
+              modelProvider: "openai",
+              serviceTier: null,
+              cwd: "/workspace",
+              instructionSources: [],
+              approvalPolicy: "on-request",
+              approvalsReviewer: "user",
+              sandbox: { type: "workspaceWrite", writableRoots: [], networkAccess: false },
+              reasoningEffort: "medium",
+            },
+          },
+        },
+
+        {
+          type: "expect_outbound",
+          label: "compact",
+          frame: {
+            id: 3,
+            method: "thread/compact/start",
+            params: { threadId: nativeThreadId },
+          },
+        },
+        { type: "emit_inbound", label: "compact", frame: { id: 3, result: {} } },
+        ...(["inProgress", "completed"] as const).map((status) => ({
+          type: "emit_inbound" as const,
+          label: status,
+          frame: {
+            method: status === "inProgress" ? "turn/started" : "turn/completed",
+            params: {
+              threadId: nativeThreadId,
+              turn: {
+                id: nativeTurnId,
+                items: [],
+                itemsView: "notLoaded",
+                status,
+                error: null,
+                startedAt: 1782622440,
+                completedAt: status === "completed" ? 1782622450 : null,
+                durationMs: null,
+              },
+            },
+          },
+        })),
+      ],
+    };
+    const driver = yield* CodexReplay.makeReplayDriver(transcript, {
+      beforeEmitInbound: (entry) =>
+        entry.label === "inProgress"
+          ? Deferred.succeed(startCaptured, undefined).pipe(
+              Effect.andThen(Deferred.await(emitStart)),
+            )
+          : entry.label === "completed"
+            ? Deferred.await(emitEnd)
+            : Effect.void,
+    });
+    const context = yield* Layer.build(CodexTestkit.layer({ transcript, driver }));
+    const registry = yield* Effect.service(ProviderAdapterRegistry.ProviderAdapterRegistryV2).pipe(
+      Effect.provide(context),
+    );
+    const adapter = yield* registry.get(CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID);
+    const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      cwd: "/workspace",
+    });
+    const modelSelection = {
+      instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+      model: "gpt-5.4",
+    };
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    let owner: OrchestrationV2ThreadProjection["providerThreads"][number];
+    let runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
+    let idleProbes = 0;
+    const harness = makeLocalCommandHarness({
+      text: "Successor must not adopt the old compaction",
+      nativeDelivery: true,
+      expiredStopHoldsWork: (thread) => {
+        idleProbes++;
+        return runtime.holdsWorkForThread!(thread);
+      },
+      startTimeoutStops: {
+        listStartTimeoutStops: outbox.listStartTimeoutStops,
+        get: outbox.get,
+        awaitSettled: outbox.awaitSettled,
+      },
+    });
+    const projection = harness.projection();
+    const successor = projection.runs[0]!;
+    runtime = yield* adapter.openSession({
+      threadId: successor.threadId,
+      providerSessionId: projection.providerThreads[0]!.providerSessionId!,
+      modelSelection,
+      runtimePolicy,
+    });
+    owner = yield* runtime.ensureThread({
+      threadId: successor.threadId,
+      modelSelection,
+      runtimePolicy,
+    });
+    harness.setProjection({
+      ...projection,
+      thread: { ...projection.thread, activeProviderThreadId: owner.id },
+      runs: projection.runs.map((run) => ({ ...run, providerThreadId: owner.id })),
+      providerThreads: [owner],
+    });
+    yield* runtime.events.pipe(
+      Stream.runForEach((event) =>
+        event.type === "provider_turn.updated" &&
+        event.providerTurn.nativeTurnRef?.nativeId === nativeTurnId &&
+        event.providerTurn.status === "running"
+          ? Deferred.succeed(started, event.providerTurn.runAttemptId)
+          : event.type === "turn.terminal"
+            ? Deferred.succeed(ended, undefined)
+            : Effect.void,
+      ),
+      Effect.forkScoped,
+    );
+    const attemptId = RunAttemptId.make("expired-compaction-attempt");
+    const runId = RunId.make("expired-compaction-run");
+    yield* runtime.compactThread!({
+      appThread: projection.thread,
+      threadId: successor.threadId,
+      runId,
+      attemptId,
+      runOrdinal: 1,
+      providerTurnOrdinal: 1,
+      rootNodeId: projection.nodes[0]!.id,
+      providerThread: owner,
+      message: {
+        createdBy: "user",
+        creationSource: "web",
+        messageId: MessageId.make("compact-message"),
+        text: "/compact",
+        attachments: [],
+      },
+      modelSelection,
+      runtimePolicy,
+    });
+    yield* Deferred.await(startCaptured);
+    yield* TestClock.adjust("10 minutes");
+    yield* outbox.enqueue([
+      {
+        id: "expired-compaction-stop",
+        commandId: CommandId.make("expire-compaction"),
+        threadId: successor.threadId,
+        request: {
+          type: "provider-turn.interrupt",
+          startTimeout: true,
+          providerSessionId: owner.providerSessionId!,
+          providerThreadId: owner.id,
+          providerTurnId: ProviderTurnId.make("start-expire:expired-compaction-attempt"),
+          startingRun: { runId, attemptId, runOrdinal: 1 },
+        },
+      },
+    ]);
+    let stopAttempts = 0;
+    const workerLayer = EffectWorker.layerWithOptions({
+      workerId: "compaction-expiry",
+      maxAttempts: 5,
+    }).pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.succeed(EffectOutbox.EffectOutboxV2, outbox),
+          Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+            execute: (effect) =>
+              Effect.gen(function* () {
+                if (effect.request.type === "provider-turn.start") return yield* harness.start;
+                stopAttempts++;
+                yield* runtime.interruptStartingRun!({
+                  providerThread: owner,
+                  runId,
+                  attemptId,
+                  stopBackgroundWork: false,
+                });
+              }).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new EffectWorker.OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              ),
+          }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        expect(yield* worker.drain(1)).toBe(1);
+        if (attempt < 4) yield* TestClock.adjust(100 * 2 ** attempt);
+      }
+      const stop = Option.getOrThrow(yield* outbox.get("expired-compaction-stop"));
+      expect(stop.status).toBe("failed");
+      expect(stop.attemptCount).toBe(5);
+      expect(stopAttempts).toBe(5);
+      expect(yield* runtime.holdsWorkForThread!(owner)).toBe(true);
+      yield* outbox.enqueue([
+        {
+          id: "compaction-successor",
+          commandId: CommandId.make("compaction-successor"),
+          threadId: successor.threadId,
+          request: { type: "provider-turn.start", runId: successor.id },
+        },
+      ]);
+      expect(yield* worker.runStartOnce).toBe(true);
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      expect(idleProbes).toBe(1);
+      expect(harness.projection().runs[0]?.status).toBe("failed");
+      const item = harness.projection().turnItems.find((item) => item.type === "error");
+      expect(item?.type === "error" && item.failure.code).toBe("previous_turn_still_running");
+      yield* Deferred.succeed(emitStart, undefined);
+      expect(yield* Deferred.await(started)).toBe(attemptId);
+      expect(yield* runtime.holdsWorkForThread!(owner)).toBe(true);
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      yield* Deferred.succeed(emitEnd, undefined);
+      yield* Deferred.await(ended);
+      expect(yield* runtime.holdsWorkForThread!(owner)).toBe(false);
+    }).pipe(Effect.provide(workerLayer));
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.mergeAll(
+        EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+        McpProviderSessions.layer,
+        IdAllocator.layer,
+        NodeServices.layer,
+      ),
+    ),
+  ),
+);
+
 // Admission now persists a deadline before waiting on any provider I/O.
 const withoutStartDeadlineEvents = (
   events: ReadonlyArray<typeof OrchestrationV2DomainEvent.Type>,
@@ -174,6 +503,9 @@ function startWithMissingWorktree(
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listStartTimeoutStops: () => Effect.succeed([]),
+        }),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
@@ -339,6 +671,11 @@ it.each([
 
 function makeLocalCommandHarness(input: {
   readonly text: string;
+  readonly startTimeoutStops?: Partial<EffectOutbox.EffectOutboxV2Shape>;
+  readonly expiredStopIdle?: () => boolean;
+  readonly expiredStopHoldsWork?: ProviderAdapter.ProviderAdapterV2SessionRuntime["holdsWorkForThread"];
+  readonly expiredStopObservedEnd?: ProviderAdapter.ProviderAdapterV2SessionRuntime["hasObservedTurnEnd"];
+  readonly providerContinuation?: boolean;
   readonly executionLayer?: Layer.Layer<
     RunExecutionService.RunExecutionServiceV2,
     ServerSettingsError
@@ -421,8 +758,8 @@ function makeLocalCommandHarness(input: {
     text: input.text,
     attachments: [],
     streaming: false,
-    createdBy: "user",
-    creationSource: "web",
+    createdBy: input.providerContinuation ? "agent" : "user",
+    creationSource: input.providerContinuation ? "provider" : "web",
     createdAt: now,
     updatedAt: now,
   };
@@ -798,6 +1135,10 @@ function makeLocalCommandHarness(input: {
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        Layer.mock(EffectOutbox.EffectOutboxV2)({
+          listStartTimeoutStops: () => Effect.succeed([]),
+          ...input.startTimeoutStops,
+        }),
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: (request) =>
             input.allowRecoveryHandoff
@@ -874,7 +1215,19 @@ function makeLocalCommandHarness(input: {
                   }),
                 ),
         }),
-        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ open }),
+        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+          open,
+          isLive: () => Effect.succeed(true),
+          get: () =>
+            Effect.succeedSome({
+              ...(input.expiredStopObservedEnd === undefined
+                ? {}
+                : { hasObservedTurnEnd: input.expiredStopObservedEnd }),
+              holdsWorkForThread:
+                input.expiredStopHoldsWork ??
+                (() => Effect.sync(() => !(input.expiredStopIdle?.() ?? false))),
+            } as never),
+        }),
         Layer.mock(ProviderAuthService.ProviderAuthService)({ tryHandlePromptCommand }),
         input.executionLayer ??
           Layer.mock(RunExecutionService.RunExecutionServiceV2)({
@@ -3968,4 +4321,590 @@ effectIt.effect.each(["confirmed", "rejected", "unanswered"] as const)(
       expect(request?.stopBackgroundWork).toBe(false);
       expect(request?.requestRuntimeRestart).toBe(false);
     }).pipe(Effect.scoped),
+);
+
+effectIt.effect.each([
+  ["pending", "absent"],
+  ["pending", "false"],
+  ["pending", "true"],
+  ["running", "absent"],
+  ["running", "false"],
+  ["running", "true"],
+] as const)(
+  "preserves the outbox start barrier for a %s interrupt with startTimeout=%s",
+  ([phase, marker]) =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("stop-barrier-thread");
+      yield* outbox.enqueue([
+        {
+          id: "prior-interrupt",
+          commandId: CommandId.make("prior-stop"),
+          threadId,
+          request: {
+            type: "provider-turn.interrupt",
+            ...(marker === "absent" ? {} : { startTimeout: marker === "true" }),
+            providerSessionId: ProviderSessionId.make("barrier-session"),
+            providerThreadId: ProviderThreadId.make("barrier-owner"),
+            providerTurnId: ProviderTurnId.make("barrier-turn"),
+          },
+        },
+        {
+          id: "later-start",
+          commandId: CommandId.make("later-start"),
+          threadId,
+          request: { type: "provider-turn.start", runId: RunId.make("barrier-retry") },
+        },
+      ]);
+      if (phase === "running") {
+        const claimed = yield* outbox.claimNext({
+          workerId: "control",
+          leaseDurationMs: 60_000,
+          onlyEffectTypes: ["provider-turn.interrupt"],
+        });
+        expect(Option.getOrThrow(claimed).id).toBe("prior-interrupt");
+      }
+      expect(Option.isSome(yield* outbox.nextStartClaimableAt)).toBe(marker === "true");
+      const start = yield* outbox.claimNext({
+        workerId: "start",
+        leaseDurationMs: 60_000,
+        onlyEffectTypes: ["provider-turn.start"],
+      });
+      expect(Option.isSome(start)).toBe(marker === "true");
+    }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
+);
+
+effectIt.effect.each([
+  ["pending", "settles"],
+  ["pending", "times out"],
+  ["pending", "fails"],
+  ["running", "settles"],
+  ["running", "times out"],
+  ["running", "fails"],
+  ["running-idle", "settles"],
+  ["running-idle", "times out"],
+] as const)("bounds admission through the real outbox with a %s Stop that %s", ([phase, outcome]) =>
+  Effect.gen(function* () {
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const waiting = yield* Deferred.make<void>();
+    const stopping = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let nativeIdle = false;
+    const harness = makeLocalCommandHarness({
+      text: "Retry after start expiry",
+      expiredStopIdle: () => nativeIdle,
+      nativeDelivery: true,
+      startTimeoutStops: {
+        listStartTimeoutStops: outbox.listStartTimeoutStops,
+        get: outbox.get,
+        awaitSettled: (id) =>
+          Deferred.succeed(waiting, undefined).pipe(Effect.andThen(outbox.awaitSettled(id))),
+      },
+    });
+    const run = harness.projection().runs[0]!;
+    const owner = harness
+      .projection()
+      .providerThreads.find((row) => row.id === run.providerThreadId)!;
+    yield* outbox.enqueue([
+      {
+        id: "expiry-stop",
+        commandId: CommandId.make("expired-run"),
+        threadId: run.threadId,
+        request: {
+          type: "provider-turn.interrupt",
+          startTimeout: true,
+          providerSessionId: owner.providerSessionId!,
+          providerThreadId: owner.id,
+          providerTurnId: ProviderTurnId.make("expired-turn"),
+        },
+      },
+    ]);
+    const workerLayer = EffectWorker.layerWithOptions({
+      workerId: "expiry-stop-test",
+      maxAttempts: 1,
+    }).pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.succeed(EffectOutbox.EffectOutboxV2, outbox),
+          Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+            execute: (effect) =>
+              effect.request.type === "provider-turn.start"
+                ? harness.start.pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new EffectWorker.OrchestrationEffectExecutionError({
+                          effectId: effect.id,
+                          effectType: effect.request.type,
+                          cause,
+                        }),
+                    ),
+                  )
+                : Deferred.succeed(stopping, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                    Effect.andThen(
+                      outcome === "fails"
+                        ? Effect.fail(
+                            new EffectWorker.OrchestrationEffectExecutionError({
+                              effectId: effect.id,
+                              effectType: effect.request.type,
+                              cause: "Stop failed",
+                            }),
+                          )
+                        : Effect.void,
+                    ),
+                  ),
+          }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const cleanup =
+        phase !== "pending"
+          ? yield* worker.drain(1).pipe(Effect.forkChild({ startImmediately: true }))
+          : undefined;
+      if (phase !== "pending") yield* Deferred.await(stopping);
+      if (phase === "running-idle") nativeIdle = true;
+      yield* outbox.enqueue([
+        {
+          id: "successor-start",
+          commandId: CommandId.make("successor"),
+          threadId: run.threadId,
+          request: { type: "provider-turn.start", runId: run.id },
+        },
+      ]);
+      expect(Option.isSome(yield* outbox.nextStartClaimableAt)).toBe(true);
+      const requestedAt = DateTime.toEpochMillis(yield* DateTime.now);
+      const successor = yield* worker.runStartOnce.pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      expect(
+        yield* Effect.raceFirst(
+          Deferred.await(waiting).pipe(Effect.as("waiting")),
+          Fiber.await(successor).pipe(Effect.as("settled")),
+        ),
+      ).toBe("waiting");
+      const pendingCleanup =
+        cleanup ?? (yield* worker.drain(1).pipe(Effect.forkChild({ startImmediately: true })));
+      yield* Deferred.await(stopping);
+      expect(harness.open).not.toHaveBeenCalled();
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      if (outcome === "times out") yield* TestClock.adjust(PROVIDER_START_CLEANUP_TIMEOUT_MS);
+      else yield* Deferred.succeed(release, undefined);
+      expect(yield* Fiber.join(successor)).toBe(true);
+      expect(DateTime.toEpochMillis(yield* DateTime.now) - requestedAt).toBe(
+        outcome === "times out" ? PROVIDER_START_CLEANUP_TIMEOUT_MS : 0,
+      );
+      if (outcome === "settles") {
+        expect(harness.startRootRun).toHaveBeenCalledOnce();
+        yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
+        expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+        expect(harness.projection().runs[0]?.status).toBe("running");
+      } else {
+        expect(harness.open).not.toHaveBeenCalled();
+        if (outcome === "times out") {
+          expect(Option.getOrThrow(yield* outbox.get("expiry-stop")).status).toBe("running");
+          expect(Option.getOrThrow(yield* outbox.get("expiry-stop")).attemptCount).toBe(1);
+        }
+        expect(harness.projection().runs[0]?.status).toBe("failed");
+        const failure = harness.projection().turnItems.find((item) => item.type === "error");
+        expect(failure?.type === "error" && failure.failure.code).toBe(
+          "previous_turn_still_running",
+        );
+        expect(failure?.type === "error" && failure.failure.message).not.toContain(
+          "could not start this turn",
+        );
+      }
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(pendingCleanup);
+    }).pipe(Effect.provide(workerLayer));
+  }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
+);
+
+effectIt.effect.each(["failed", "cancelled"] as const)(
+  "admits a later retry after a %s Stop when its exact thread is idle",
+  (status) =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const harness = makeLocalCommandHarness({
+        text: "Retry after native completion",
+        nativeDelivery: true,
+        expiredStopIdle: () => true,
+        startTimeoutStops: {
+          listStartTimeoutStops: outbox.listStartTimeoutStops,
+          get: outbox.get,
+          awaitSettled: outbox.awaitSettled,
+        },
+      });
+      const run = harness.projection().runs[0]!;
+      const owner = harness
+        .projection()
+        .providerThreads.find((row) => row.id === run.providerThreadId)!;
+      yield* outbox.enqueue([
+        {
+          id: "old-failed-stop",
+          commandId: CommandId.make("old-expire"),
+          threadId: run.threadId,
+          request: {
+            type: "provider-turn.interrupt",
+            startTimeout: true,
+            providerSessionId: owner.providerSessionId!,
+            providerThreadId: owner.id,
+            providerTurnId: ProviderTurnId.make("old-native-turn"),
+          },
+        },
+      ]);
+      if (status === "cancelled")
+        yield* outbox.cancelUnsettled({
+          threadId: run.threadId,
+          effectTypes: ["provider-turn.interrupt"],
+          reason: "fixture cancelled stop",
+        });
+      else {
+        const layer = EffectWorker.layerWithOptions({
+          workerId: "failed-stop",
+          maxAttempts: 1,
+        }).pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.succeed(EffectOutbox.EffectOutboxV2, outbox),
+              Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+                execute: (effect) =>
+                  Effect.fail(
+                    new EffectWorker.OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause: "Stop failed",
+                    }),
+                  ),
+              }),
+            ),
+          ),
+        );
+        yield* Effect.gen(function* () {
+          yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
+        }).pipe(Effect.provide(layer));
+      }
+      expect(Option.getOrThrow(yield* outbox.get("old-failed-stop")).status).toBe(status);
+      yield* harness.start;
+      expect(harness.startRootRun).toHaveBeenCalledOnce();
+      yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
+      expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+    }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
+);
+
+const failedStopWorkerLayer = (
+  outbox: EffectOutbox.EffectOutboxV2Shape,
+  harness: ReturnType<typeof makeLocalCommandHarness>,
+) =>
+  EffectWorker.layerWithOptions({ workerId: "native-end-recovery", maxAttempts: 1 }).pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        Layer.succeed(EffectOutbox.EffectOutboxV2, outbox),
+        Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+          execute: (effect) => {
+            if (effect.request.type === "provider-turn.start")
+              return harness.start.pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new EffectWorker.OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
+            return Effect.fail(
+              new EffectWorker.OrchestrationEffectExecutionError({
+                effectId: effect.id,
+                effectType: effect.request.type,
+                cause: "Stop failed before native completion",
+              }),
+            );
+          },
+        }),
+      ),
+    ),
+  );
+
+const failedStopRecoveryCases = (
+  ["same", "captured-replacement", "unrelated-replacement"] as const
+).flatMap((binding) =>
+  ([false, true] as const).flatMap((ended) =>
+    ([false, true] as const).map((startingRun) => ({ binding, ended, startingRun })),
+  ),
+);
+effectIt.effect.each(failedStopRecoveryCases)(
+  "recovers failed Stop through the worker: $binding ended=$ended startingRun=$startingRun",
+  ({ binding, ended, startingRun }) =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      let nativeEnded = false;
+      const observedEnd = vi.fn<
+        NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["hasObservedTurnEnd"]>
+      >(() => Effect.sync(() => nativeEnded));
+      const harness = makeLocalCommandHarness({
+        text: "Retry after native completion",
+        nativeDelivery: true,
+        expiredStopObservedEnd: observedEnd,
+        // Buffered work is retained even after the old native turn ends.
+        expiredStopHoldsWork: () => Effect.succeed(true),
+        startTimeoutStops: outbox,
+      });
+      const run = harness.projection().runs[0]!;
+      const owner = harness
+        .projection()
+        .providerThreads.find((row) => row.id === run.providerThreadId)!;
+      const providerTurnId = ProviderTurnId.make("expired-native-turn");
+      const attemptId = RunAttemptId.make("expired-attempt");
+      yield* outbox.enqueue([
+        {
+          id: "failed-stop",
+          commandId: CommandId.make("expire"),
+          threadId: run.threadId,
+          request: {
+            type: "provider-turn.interrupt",
+            startTimeout: true,
+            providerSessionId:
+              binding === "same"
+                ? owner.providerSessionId!
+                : ProviderSessionId.make("original-session"),
+            ...(binding === "same"
+              ? {}
+              : {
+                  replacementProviderSessionId:
+                    binding === "captured-replacement"
+                      ? owner.providerSessionId!
+                      : ProviderSessionId.make("some-other-replacement"),
+                }),
+            providerThreadId: owner.id,
+            providerTurnId,
+            ...(startingRun
+              ? { startingRun: { runId: RunId.make("expired-run"), attemptId, runOrdinal: 1 } }
+              : {}),
+          },
+        },
+      ]);
+      yield* Effect.gen(function* () {
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        yield* worker.drain();
+        expect(Option.getOrThrow(yield* outbox.get("failed-stop")).status).toBe("failed");
+        nativeEnded = ended;
+        yield* outbox.enqueue([
+          {
+            id: "successor-start",
+            commandId: CommandId.make("retry"),
+            threadId: run.threadId,
+            request: { type: "provider-turn.start", runId: run.id },
+          },
+        ]);
+        yield* worker.drain();
+        const ready = ended && binding !== "unrelated-replacement";
+        expect(harness.startRootRun).toHaveBeenCalledTimes(ready ? 1 : 0);
+        if (ready) {
+          yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
+          expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+          expect(observedEnd).toHaveBeenCalledExactlyOnceWith({
+            providerThreadId: owner.id,
+            providerTurnId,
+            ...(startingRun ? { attemptId } : {}),
+          });
+        } else {
+          expect(harness.nativeStartTurn).not.toHaveBeenCalled();
+          const failure = harness.projection().turnItems.find((item) => item.type === "error");
+          expect(failure?.type === "error" && failure.failure.code).toBe(
+            "previous_turn_still_running",
+          );
+        }
+      }).pipe(Effect.provide(failedStopWorkerLayer(outbox, harness)));
+    }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
+);
+
+effectIt.effect("admits a buffered wake once after a failed Stop and late native terminal", () =>
+  Effect.gen(function* () {
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const nativeTerminal = yield* Deferred.make<void>();
+    const bufferedWake = ["Background result"];
+    const adopted: string[] = [];
+    const holdsWork = vi.fn(() => Effect.sync(() => bufferedWake.length > 0));
+    const harness = makeLocalCommandHarness({
+      text: "Continue with the background result",
+      nativeDelivery: true,
+      providerContinuation: true,
+      providerDriver: "claudeAgent",
+      expiredStopHoldsWork: holdsWork,
+      expiredStopObservedEnd: () => Deferred.isDone(nativeTerminal),
+      startTimeoutStops: outbox,
+    });
+    harness.nativeStartTurn.mockImplementation((input) =>
+      Effect.sync(() => {
+        expect(input.message.createdBy).toBe("agent");
+        expect(input.message.creationSource).toBe("provider");
+        adopted.push(...bufferedWake.splice(0));
+      }),
+    );
+    const run = harness.projection().runs[0]!;
+    const owner = harness
+      .projection()
+      .providerThreads.find((row) => row.id === run.providerThreadId)!;
+    yield* outbox.enqueue([
+      {
+        id: "failed-stop",
+        commandId: CommandId.make("expire"),
+        threadId: run.threadId,
+        request: {
+          type: "provider-turn.interrupt",
+          startTimeout: true,
+          providerSessionId: owner.providerSessionId!,
+          providerThreadId: owner.id,
+          providerTurnId: ProviderTurnId.make("expired-native-turn"),
+        },
+      },
+    ]);
+    yield* Effect.gen(function* () {
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* worker.drain();
+      expect(Option.getOrThrow(yield* outbox.get("failed-stop")).status).toBe("failed");
+      expect(yield* Deferred.isDone(nativeTerminal)).toBe(false);
+      yield* Deferred.succeed(nativeTerminal, undefined);
+      expect(yield* holdsWork()).toBe(true);
+      yield* outbox.enqueue([
+        {
+          id: "wake-start",
+          commandId: CommandId.make("wake"),
+          threadId: run.threadId,
+          request: { type: "provider-turn.start", runId: run.id },
+        },
+      ]);
+      yield* worker.drain();
+      expect(harness.startRootRun).toHaveBeenCalledOnce();
+      expect(bufferedWake).toEqual(["Background result"]);
+      yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
+      yield* worker.drain();
+      expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+      expect(adopted).toEqual(["Background result"]);
+      expect(bufferedWake).toEqual([]);
+    }).pipe(Effect.provide(failedStopWorkerLayer(outbox, harness)));
+  }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
+);
+
+effectIt.effect("rechecks an old failed Stop after a newer Stop settles through the outbox", () =>
+  Effect.gen(function* () {
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const stopping = yield* Deferred.make<void>();
+    const waiting = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let nativeIdle = false;
+    let idleProbes = 0;
+    const harness = makeLocalCommandHarness({
+      text: "Retry after the newer native turn stops",
+      nativeDelivery: true,
+      expiredStopIdle: () => {
+        idleProbes++;
+        return nativeIdle;
+      },
+      startTimeoutStops: {
+        listStartTimeoutStops: outbox.listStartTimeoutStops,
+        get: outbox.get,
+        awaitSettled: (id) =>
+          (id === "newer-stop" ? Deferred.succeed(waiting, undefined) : Effect.void).pipe(
+            Effect.andThen(outbox.awaitSettled(id)),
+          ),
+      },
+    });
+    const run = harness.projection().runs[0]!;
+    const owner = harness
+      .projection()
+      .providerThreads.find((row) => row.id === run.providerThreadId)!;
+    const request = {
+      type: "provider-turn.interrupt" as const,
+      startTimeout: true,
+      providerSessionId: owner.providerSessionId!,
+      providerThreadId: owner.id,
+      providerTurnId: ProviderTurnId.make("old-turn"),
+    };
+    yield* outbox.enqueue([
+      {
+        id: "old-failed-stop",
+        commandId: CommandId.make("old-expire"),
+        threadId: run.threadId,
+        request,
+      },
+    ]);
+    const workerLayer = EffectWorker.layerWithOptions({
+      workerId: "reconcile-all-stops",
+      maxAttempts: 1,
+    }).pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.succeed(EffectOutbox.EffectOutboxV2, outbox),
+          Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+            execute: (effect) => {
+              if (effect.id === "old-failed-stop")
+                return Effect.fail(
+                  new EffectWorker.OrchestrationEffectExecutionError({
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                    cause: "old Stop failed",
+                  }),
+                );
+              if (effect.request.type === "provider-turn.start")
+                return harness.start.pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new EffectWorker.OrchestrationEffectExecutionError({
+                        effectId: effect.id,
+                        effectType: effect.request.type,
+                        cause,
+                      }),
+                  ),
+                );
+              return Deferred.succeed(stopping, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(
+                  Effect.sync(() => {
+                    nativeIdle = true;
+                  }),
+                ),
+              );
+            },
+          }),
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* worker.drain();
+      expect(Option.getOrThrow(yield* outbox.get("old-failed-stop")).status).toBe("failed");
+      yield* outbox.enqueue([
+        {
+          id: "newer-stop",
+          commandId: CommandId.make("newer-expire"),
+          threadId: run.threadId,
+          request: { ...request, providerTurnId: ProviderTurnId.make("newer-turn") },
+        },
+        {
+          id: "successor-start",
+          commandId: CommandId.make("successor"),
+          threadId: run.threadId,
+          request: { type: "provider-turn.start", runId: run.id },
+        },
+      ]);
+      const cleanup = yield* worker.drain(1).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* Deferred.await(stopping);
+      const successor = yield* worker.runStartOnce.pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* Deferred.await(waiting);
+      expect(idleProbes).toBe(0);
+      expect(harness.startRootRun).not.toHaveBeenCalled();
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(cleanup);
+      expect(yield* Fiber.join(successor)).toBe(true);
+      expect(idleProbes).toBe(1);
+      expect(harness.startRootRun).toHaveBeenCalledOnce();
+      yield* startPreparedTurn(harness.startRootRun.mock.calls[0]![0]);
+      expect(harness.nativeStartTurn).toHaveBeenCalledOnce();
+    }).pipe(Effect.provide(workerLayer));
+  }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)))),
 );

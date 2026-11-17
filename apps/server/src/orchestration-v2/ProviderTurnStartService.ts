@@ -52,6 +52,7 @@ import {
 import { isClaudeSeeded, seededUnconfirmed } from "../ardud/harness-migrate/seededGuard.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
 import * as EventSink from "./EventSink.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
 import {
   DEFAULT_HANDOFF_TOKEN_CAP,
@@ -177,6 +178,7 @@ export const layer: Layer.Layer<
   ProviderTurnStartServiceV2,
   never,
   | EventSink.EventSinkV2
+  | EffectOutbox.EffectOutboxV2
   | ContextHandoffService.ContextHandoffServiceV2
   | IdAllocator.IdAllocatorV2
   | FileSystem.FileSystem
@@ -194,6 +196,7 @@ export const layer: Layer.Layer<
   ProviderTurnStartServiceV2,
   Effect.gen(function* () {
     const eventSink = yield* EventSink.EventSinkV2;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
     const contextHandoffService = yield* ContextHandoffService.ContextHandoffServiceV2;
     const idAllocator = yield* IdAllocator.IdAllocatorV2;
     const fileSystem = yield* FileSystem.FileSystem;
@@ -761,6 +764,94 @@ export const layer: Layer.Layer<
         },
       );
       const recoveryPost = postRecoveryIdentity(run.userMessageId);
+      // Control and start have independent workers. A failed run releases the
+      // queue before its native Stop settles, so admission must join that Stop.
+      const stops = yield* outbox.listStartTimeoutStops(run.threadId);
+      const isStopIdle = Effect.fn("ProviderTurnStartService.isExpiredTurnIdle")(function* (
+        stop: EffectOutbox.OrchestrationEffectV2,
+      ) {
+        if (stop.request.type !== "provider-turn.interrupt") return false;
+        const request = stop.request;
+        if (!(yield* providerSessions.isLive(request.providerSessionId))) return true;
+        const runtime = yield* providerSessions.get(request.providerSessionId);
+        if (Option.isNone(runtime)) return true;
+        const owners = yield* projectionStore.getThreadRecords(run.threadId, ["providerThreads"]);
+        const owner = owners.providerThreads.find(
+          (thread) => thread.id === request.providerThreadId,
+        );
+        if (owner === undefined) return false;
+        const replaced =
+          request.replacementProviderSessionId !== undefined &&
+          owner.providerSessionId === request.replacementProviderSessionId;
+        if (owner.providerSessionId !== request.providerSessionId && !replaced) return false;
+        if (
+          yield* (
+            runtime.value.hasObservedTurnEnd?.({
+              providerThreadId: owner.id,
+              providerTurnId: request.providerTurnId,
+              ...(request.startingRun === undefined
+                ? {}
+                : { attemptId: request.startingRun.attemptId }),
+            }) ?? Effect.succeed(false)
+          )
+        )
+          return true;
+        // A replacement may already have changed the native thread id. Only
+        // evidence retained by the original runtime can release that guard.
+        if (replaced || runtime.value.holdsWorkForThread === undefined) return false;
+        return !(yield* runtime.value.holdsWorkForThread(owner));
+      });
+      const liveStops = yield* Effect.filter(stops, (stop) =>
+        stop.request.type === "provider-turn.interrupt"
+          ? providerSessions.isLive(stop.request.providerSessionId)
+          : Effect.succeed(false),
+      );
+      if (liveStops.length > 0) {
+        const waitingAt = DateTime.toEpochMillis(yield* DateTime.now);
+        const confirmed = yield* Effect.gen(function* () {
+          // A Stop may already have captured its target without sending yet.
+          // Join every delivery before probing idle: a newer Stop can settle
+          // work that an older failed Stop would otherwise still see as busy.
+          yield* Effect.forEach(liveStops, (stop) => outbox.awaitSettled(stop.id));
+          return yield* Effect.forEach(liveStops, (stop) =>
+            Effect.gen(function* () {
+              const settled = yield* outbox.get(stop.id);
+              return (
+                Option.exists(settled, (row) => row.status === "succeeded") ||
+                (yield* isStopIdle(stop))
+              );
+            }),
+          );
+        }).pipe(Effect.timeoutOption(PROVIDER_START_CLEANUP_TIMEOUT_MS));
+        const ready = Option.isSome(confirmed) && confirmed.value.every(Boolean);
+        yield* Effect.logInfo("t3.run.start_expire_stop_wait", {
+          threadId: run.threadId,
+          runId: run.id,
+          provider: run.providerInstanceId,
+          waitedMs: DateTime.toEpochMillis(yield* DateTime.now) - waitingAt,
+          outcome: ready ? "stopped" : "previous_turn_still_running",
+        });
+        if (!ready) {
+          yield* settleRunBeforeStart({
+            signal: "previous-turn-still-running",
+            status: "failed",
+            now: yield* DateTime.now,
+            providerInstanceId: run.providerInstanceId,
+            itemProviderThreadId: providerThread.id,
+            item: {
+              type: "error",
+              title: "Previous turn still running",
+              failure: makeProviderFailure({
+                class: "provider_error",
+                code: "previous_turn_still_running",
+                message:
+                  "The previous provider turn has not confirmed that it stopped. This run was not sent.",
+              }),
+            },
+          });
+          return;
+        }
+      }
       if (
         run.userMessageId.startsWith("kanban:post-recovery:") &&
         Option.isSome(kanban) &&

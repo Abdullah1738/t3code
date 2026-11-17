@@ -34,6 +34,7 @@ import { CursorSettings } from "../settings.ts";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -350,6 +351,8 @@ class CursorModelUnavailableError extends Schema.TaggedError<CursorModelUnavaila
     return `Cursor cannot run the model "${this.model}". Cursor only runs models from your Cursor account. Choose one of those, or use OpenCode for OpenRouter and other API-key models.`;
   }
 }
+
+const isCursorModelUnavailableError = Schema.is(CursorModelUnavailableError);
 
 /**
  * Maps runner failures from opening or sending to an agent. The SDK checks the
@@ -872,7 +875,16 @@ interface ActiveCursorTurn {
   readonly assistantReply: CursorTransportFailure;
   readonly reasoning: ActiveCursorTextStream;
   interrupted: boolean;
+  cancelAcknowledged: boolean;
   finalized: boolean;
+}
+
+interface PendingCursorTurn {
+  readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
+  readonly admitted: Deferred.Deferred<ActiveCursorTurn | null>;
+  stopRequested: boolean;
+  offered: boolean;
+  hasHandle: boolean;
 }
 
 interface CursorLiveAgent {
@@ -920,6 +932,8 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
         const liveAgent = yield* Ref.make<CursorLiveAgent | null>(null);
         const warnedUnsupportedSandbox = yield* Ref.make(false);
         const activeTurn = yield* Ref.make<ActiveCursorTurn | null>(null);
+        const pendingTurn = yield* Ref.make<PendingCursorTurn | null>(null);
+        const joinTurnStop = ProviderAdapter.makeTurnStopJoiner();
         const planIds = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact["id"]>());
 
         const emitProviderEvent = (event: ProviderAdapter.ProviderAdapterV2Event) =>
@@ -2007,6 +2021,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
 
         const finalizeTurn = Effect.fnUntraced(function* (input: {
           readonly context: ActiveCursorTurn;
+          readonly nativeWorkEnded?: true;
           readonly status: Extract<
             OrchestrationV2ProviderTurn["status"],
             "completed" | "interrupted" | "failed" | "cancelled"
@@ -2014,59 +2029,61 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
           readonly failure?: OrchestrationV2ProviderFailure;
           readonly threadDisposition?: "reusable" | "broken";
         }) {
-          if (input.context.finalized) {
-            return;
-          }
+          const firstTerminal = !input.context.finalized;
+          if (!firstTerminal && input.nativeWorkEnded !== true) return;
           input.context.finalized = true;
-          const completedAt = yield* DateTime.now;
-          for (const tool of input.context.tools.values()) {
-            yield* emitToolArtifacts({
-              active: tool,
-              completed: true,
-              ...(input.status === "completed" ? {} : { unfinishedStatus: input.status }),
+          if (firstTerminal) {
+            const completedAt = yield* DateTime.now;
+            for (const tool of input.context.tools.values()) {
+              yield* emitToolArtifacts({
+                active: tool,
+                completed: true,
+                ...(input.status === "completed" ? {} : { unfinishedStatus: input.status }),
+              });
+            }
+            input.context.tools.clear();
+            for (const subagent of input.context.subagents.values()) {
+              if (!isOrchestrationV2WorkActive(subagent.task.status)) continue;
+              yield* emitSubagent({
+                context: input.context,
+                callId: subagent.callId,
+                toolCall: subagent.toolCall,
+                completed: true,
+                status: input.status === "completed" ? "idle" : input.status,
+              });
+            }
+            yield* completeReasoning(input.context);
+            yield* completeAssistant(input.context);
+            yield* emitProviderEvent({
+              type: "provider_turn.updated",
+              driver: CursorAgentSdk.CURSOR_PROVIDER,
+              providerTurn: providerTurnPayload({
+                context: input.context,
+                status: input.status,
+                completedAt,
+              }),
+            });
+            yield* emitProviderEvent({
+              type: "provider_thread.updated",
+              driver: CursorAgentSdk.CURSOR_PROVIDER,
+              providerThread: {
+                ...input.context.input.providerThread,
+                providerSessionId: session.id,
+                status: "active",
+                firstRunOrdinal:
+                  input.context.input.providerThread.firstRunOrdinal ??
+                  input.context.input.runOrdinal,
+                lastRunOrdinal: input.context.input.runOrdinal,
+                updatedAt: completedAt,
+              },
             });
           }
-          input.context.tools.clear();
-          for (const subagent of input.context.subagents.values()) {
-            if (!isOrchestrationV2WorkActive(subagent.task.status)) continue;
-            yield* emitSubagent({
-              context: input.context,
-              callId: subagent.callId,
-              toolCall: subagent.toolCall,
-              completed: true,
-              status: input.status === "completed" ? "idle" : input.status,
-            });
-          }
-          yield* completeReasoning(input.context);
-          yield* completeAssistant(input.context);
-          yield* emitProviderEvent({
-            type: "provider_turn.updated",
-            driver: CursorAgentSdk.CURSOR_PROVIDER,
-            providerTurn: providerTurnPayload({
-              context: input.context,
-              status: input.status,
-              completedAt,
-            }),
-          });
-          yield* emitProviderEvent({
-            type: "provider_thread.updated",
-            driver: CursorAgentSdk.CURSOR_PROVIDER,
-            providerThread: {
-              ...input.context.input.providerThread,
-              providerSessionId: session.id,
-              status: "active",
-              firstRunOrdinal:
-                input.context.input.providerThread.firstRunOrdinal ??
-                input.context.input.runOrdinal,
-              lastRunOrdinal: input.context.input.runOrdinal,
-              updatedAt: completedAt,
-            },
-          });
           const threadDisposition = input.threadDisposition ?? "reusable";
           yield* emitProviderEvent(
             input.status === "failed"
               ? {
                   type: "turn.terminal",
+                  ...(input.nativeWorkEnded === true ? { nativeWorkEnded: true as const } : {}),
                   driver: CursorAgentSdk.CURSOR_PROVIDER,
                   providerThreadId: input.context.input.providerThread.id,
                   providerTurnId: input.context.providerTurnId,
@@ -2081,6 +2098,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 }
               : {
                   type: "turn.terminal",
+                  ...(input.nativeWorkEnded === true ? { nativeWorkEnded: true as const } : {}),
                   driver: CursorAgentSdk.CURSOR_PROVIDER,
                   providerThreadId: input.context.input.providerThread.id,
                   providerTurnId: input.context.providerTurnId,
@@ -2090,10 +2108,14 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                   threadDisposition,
                 },
           );
-          yield* Ref.update(activeTurn, (current) =>
-            current?.providerTurnId === input.context.providerTurnId ? null : current,
-          );
-          yield* Deferred.succeed(input.context.completed, undefined);
+          // A failed wait only closes the local projection. The SDK offers no
+          // idle probe, so retain ownership until a native result proves settlement.
+          if (input.nativeWorkEnded === true) {
+            yield* Ref.update(activeTurn, (current) =>
+              current?.providerTurnId === input.context.providerTurnId ? null : current,
+            );
+            yield* Deferred.succeed(input.context.completed, undefined);
+          }
         });
 
         const terminalStatus = (
@@ -2252,6 +2274,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
 
         const startTurn = Effect.fn("CursorAdapterV2.startTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2TurnInput) {
+            const pending = (yield* Ref.get(pendingTurn))!;
             const current = yield* Ref.get(activeTurn);
             if (current !== null) {
               return yield* new ProviderAdapter.ProviderAdapterProtocolError({
@@ -2273,6 +2296,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             const pendingUpdates: Array<InteractionUpdate> = [];
             let context: ActiveCursorTurn | null = null;
             // MCP send overrides replace the ambient servers loaded when the agent opens.
+            pending.offered = true;
             const sdkRun = yield* agent.session
               .send({
                 message,
@@ -2289,7 +2313,16 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                   return handleInteractionUpdate(context, update);
                 },
               })
-              .pipe(Effect.mapError(classifyCursorModelRejection(turnInput.modelSelection)));
+              .pipe(
+                Effect.mapError(classifyCursorModelRejection(turnInput.modelSelection)),
+                Effect.tapError((cause) =>
+                  Effect.sync(() => {
+                    // This catalog rejection happens before Cursor offers native work.
+                    if (isCursorModelUnavailableError(cause)) pending.offered = false;
+                  }),
+                ),
+              );
+            pending.hasHandle = true;
             const startedAt = yield* DateTime.now;
             const completed = yield* Deferred.make<void, never>();
             const providerTurnId = idAllocator.derive.providerTurn({
@@ -2315,9 +2348,11 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 nextSegment: 0,
               },
               interrupted: false,
+              cancelAcknowledged: false,
               finalized: false,
             };
             yield* Ref.set(activeTurn, context);
+            yield* Deferred.succeed(pending.admitted, context);
             yield* emitProviderEvent({
               type: "provider_turn.updated",
               driver: CursorAgentSdk.CURSOR_PROVIDER,
@@ -2365,6 +2400,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                     yield* finalizeTurn({
                       context,
                       status,
+                      nativeWorkEnded: true,
                       ...(status === "failed"
                         ? {
                             failure:
@@ -2414,7 +2450,59 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               ),
               Effect.forkIn(sessionScope),
             );
+            if (pending.stopRequested && !context.finalized) {
+              yield* runtime.interruptTurn({
+                providerThread: turnInput.providerThread,
+                providerTurnId,
+                requestRuntimeRestart: false,
+                stopBackgroundWork: false,
+              });
+            }
           },
+          // The SDK send promise ignores cancellation. Session ownership must
+          // survive an expired start so its late handle can still be stopped.
+          (effect, turnInput) =>
+            Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                const pending: PendingCursorTurn = {
+                  input: turnInput,
+                  admitted: yield* Deferred.make<ActiveCursorTurn | null>(),
+                  stopRequested: false,
+                  offered: false,
+                  hasHandle: false,
+                };
+                const reserved = yield* Ref.modify(pendingTurn, (current) =>
+                  current === null ? ([true, pending] as const) : ([false, current] as const),
+                );
+                if (!reserved)
+                  return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver: CursorAgentSdk.CURSOR_PROVIDER,
+                    detail: "Cursor is still admitting the previous provider turn.",
+                    reason: "previous_turn_active",
+                  });
+                const fiber = yield* effect.pipe(
+                  Effect.interruptible,
+                  Effect.ensuring(
+                    Effect.gen(function* () {
+                      yield* Deferred.succeed(pending.admitted, null);
+                      // An ambiguous send failure is not evidence that native work ended.
+                      if (!pending.offered || pending.hasHandle)
+                        yield* Ref.update(pendingTurn, (current) =>
+                          current === pending ? null : current,
+                        );
+                    }),
+                  ),
+                  Effect.forkIn(sessionScope),
+                );
+                yield* restore(Fiber.join(fiber)).pipe(
+                  Effect.onInterrupt(() =>
+                    Effect.sync(() => {
+                      pending.stopRequested = true;
+                    }),
+                  ),
+                );
+              }),
+            ),
           (effect, turnInput) =>
             effect.pipe(
               Effect.mapError(
@@ -2457,6 +2545,15 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               ? cursorContextWindowTokens(selection, adapterOptions.getModels?.() ?? [])
               : undefined,
           events: Stream.fromEffectRepeat(Queue.take(events)),
+          holdsWorkForThread: Effect.fn("CursorAdapterV2.holdsWorkForThread")(function* (
+            owner: OrchestrationV2ProviderThread,
+          ) {
+            const active = yield* Ref.get(activeTurn);
+            const pending = yield* Ref.get(pendingTurn);
+            return [active, pending].some(
+              (turn) => turn !== null && turn.input.providerThread.id === owner.id,
+            );
+          }),
           ensureThread: Effect.fn("CursorAdapterV2.ensureThread")(
             function* (threadInput: ProviderAdapter.ProviderAdapterV2EnsureThreadInput) {
               const opened = yield* openAgent({
@@ -2531,6 +2628,33 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 providerThreadId: turnInput.providerThread.id,
               }),
             ),
+          interruptStartingRun: Effect.fn("CursorAdapterV2.interruptStartingRun")(function* (run) {
+            const matches = (turn: ActiveCursorTurn | PendingCursorTurn) =>
+              !(
+                turn.input.runId !== run.runId ||
+                turn.input.attemptId !== run.attemptId ||
+                turn.input.providerThread.id !== run.providerThread.id ||
+                nativeThreadId(turn.input.providerThread) !== nativeThreadId(run.providerThread)
+              );
+            let turn = yield* Ref.get(activeTurn);
+            const pending = yield* Ref.get(pendingTurn);
+            if (pending !== null && matches(pending)) {
+              pending.stopRequested = true;
+              turn = yield* Deferred.await(pending.admitted);
+              if (turn === null && pending.offered && !pending.hasHandle)
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CursorAgentSdk.CURSOR_PROVIDER,
+                  detail: "Cursor has not confirmed admission or cancellation of the expired turn.",
+                });
+            }
+            if (turn === null || !matches(turn)) return;
+            yield* runtime.interruptTurn({
+              providerThread: run.providerThread,
+              providerTurnId: turn.providerTurnId,
+              requestRuntimeRestart: false,
+              stopBackgroundWork: false,
+            });
+          }),
           interruptTurn: Effect.fn("CursorAdapterV2.interruptTurn")(
             function* (turnInput: ProviderAdapter.ProviderAdapterV2InterruptInput) {
               const context = yield* Ref.get(activeTurn);
@@ -2543,13 +2667,21 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                 });
               }
               context.interrupted = true;
-              yield* context.run.cancel;
+              if (!context.cancelAcknowledged) {
+                yield* context.run.cancel;
+                context.cancelAcknowledged = true;
+              }
               const stopped = yield* Deferred.await(context.completed).pipe(
                 Effect.timeoutOption("10 seconds"),
               );
               if (Option.isSome(stopped)) {
                 return;
               }
+              if (turnInput.stopBackgroundWork === false)
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: CursorAgentSdk.CURSOR_PROVIDER,
+                  detail: "Cursor has not confirmed that the expired turn stopped.",
+                });
               yield* Effect.logWarning("orchestration-v2.cursor-interrupt-timeout", {
                 providerSessionId: input.providerSessionId,
                 providerThreadId: turnInput.providerThread.id,
@@ -2570,6 +2702,10 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
                       }),
                 ),
               ),
+            (effect, target) =>
+              target.stopBackgroundWork === false
+                ? joinTurnStop(target.providerTurnId, effect)
+                : effect,
           ),
           respondToRuntimeRequest: (requestInput) =>
             Effect.fail(

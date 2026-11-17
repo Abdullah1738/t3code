@@ -202,15 +202,16 @@ const makeHarness = Effect.fnUntraced(function* (
     | "modelCatalog"
     | "continuationRequests"
     | "requestTimeoutMs"
-  > = {},
+  > & { readonly consumeEvents?: boolean } = {},
 ) {
+  const { consumeEvents = true, ...adapterOverrides } = overrides;
   let hostCount = 0;
   const adapter = yield* makeMuseAdapterV2({
     instanceId,
     settings: museSettings,
     environment: { PATH: "/fake/bin" },
     createHost: async () => (hostCount++ === 0 ? fake.host : (replacement ?? fake).host),
-    ...overrides,
+    ...adapterOverrides,
   });
   const runtime = yield* adapter.openSession({
     threadId: THREAD_ID,
@@ -222,17 +223,18 @@ const makeHarness = Effect.fnUntraced(function* (
   const emitted = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
   const allEvents: ProviderAdapter.ProviderAdapterV2Event[] = [];
   const eventsEnded = yield* Deferred.make<Exit.Exit<void, Stream.Error<typeof runtime.events>>>();
-  yield* runtime.events.pipe(
-    Stream.runForEach((event) =>
-      Effect.gen(function* () {
-        allEvents.push(event);
-        yield* Queue.offer(emitted, event);
-      }),
-    ),
-    Effect.exit,
-    Effect.flatMap((exit) => Deferred.succeed(eventsEnded, exit)),
-    Effect.forkScoped,
-  );
+  if (consumeEvents)
+    yield* runtime.events.pipe(
+      Stream.runForEach((event) =>
+        Effect.gen(function* () {
+          allEvents.push(event);
+          yield* Queue.offer(emitted, event);
+        }),
+      ),
+      Effect.exit,
+      Effect.flatMap((exit) => Deferred.succeed(eventsEnded, exit)),
+      Effect.forkScoped,
+    );
   const providerThread = yield* runtime.ensureThread({
     threadId: THREAD_ID,
     modelSelection: modelSelection(instanceId),
@@ -375,6 +377,96 @@ const approval = (turnId: string) => ({
 });
 
 describe("MuseAdapterV2", () => {
+  it.effect.each(["settles", "times out"] as const)(
+    "stops a native-only attempt and releases its ownership after native completion when Stop %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeMuse();
+        const harness = yield* makeHarness(
+          fake,
+          INSTANCE_ID,
+          undefined,
+          undefined,
+          undefined,
+          runtimePolicy,
+          { consumeEvents: false, requestTimeoutMs: 1000 },
+        );
+        const { runtime, providerThread } = harness;
+        const input = yield* turnInput(providerThread);
+        // The orchestration event queue remains unconsumed throughout Stop delivery.
+        yield* runtime.startTurn(input);
+        const nativeId = (yield* fake.takeCall("turn/start")).commandId!;
+        const target = { providerThread, runId: input.runId, attemptId: input.attemptId };
+        for (const mismatch of [
+          { ...target, runId: RunId.make("another-run") },
+          { ...target, attemptId: RunAttemptId.make("another-attempt") },
+          {
+            ...target,
+            providerThread: { ...providerThread, id: ProviderThreadId.make("another-owner") },
+          },
+          {
+            ...target,
+            providerThread: {
+              ...providerThread,
+              nativeThreadRef: { ...providerThread.nativeThreadRef!, nativeId: "another-session" },
+            },
+          },
+        ])
+          yield* runtime.interruptStartingRun!(mismatch);
+        assert.equal(fake.calls.filter((call) => call.method === "turn/interrupt").length, 0);
+        const finished = yield* Deferred.make<void>();
+        const stopping = yield* runtime.interruptStartingRun!(target).pipe(
+          Effect.result,
+          Effect.ensuring(Deferred.succeed(finished, undefined)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        assert.equal((yield* fake.takeCall("turn/interrupt")).params.turnId, nativeId);
+        const duplicate = yield* runtime.interruptStartingRun!(target).pipe(
+          Effect.result,
+          Effect.forkChild({ startImmediately: true }),
+        );
+        assert.isFalse(yield* Deferred.isDone(finished));
+        assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+        if (outcome === "times out") {
+          yield* TestClock.adjust(1000);
+          assert.equal((yield* Fiber.join(stopping))._tag, "Failure");
+          assert.equal((yield* Fiber.join(duplicate))._tag, "Failure");
+          assert.isTrue(yield* runtime.holdsWorkForThread!(providerThread));
+          assert.equal(
+            (yield* runtime.startTurn(yield* turnInput(providerThread, 2)).pipe(Effect.result))
+              ._tag,
+            "Failure",
+          );
+        }
+        if (outcome === "times out") {
+          const retried = yield* runtime.interruptStartingRun!(target).pipe(
+            Effect.result,
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* TestClock.adjust(1000);
+          assert.equal((yield* Fiber.join(retried))._tag, "Failure");
+        }
+        yield* fake.emit("turn/completed", { turnId: nativeId, terminal: "cancelled" });
+        const terminal = Option.getOrThrow(
+          yield* runtime.events.pipe(
+            Stream.filter((event) => event.type === "turn.terminal"),
+            Stream.runHead,
+          ),
+        );
+        assert.equal(terminal.type === "turn.terminal" && terminal.status, "interrupted");
+        if (outcome === "settles") {
+          assert.equal((yield* Fiber.join(stopping))._tag, "Success");
+          assert.equal((yield* Fiber.join(duplicate))._tag, "Success");
+        }
+        assert.isFalse(yield* runtime.holdsWorkForThread!(providerThread));
+        yield* runtime.startTurn(yield* turnInput(providerThread, 3));
+        yield* fake.takeCall("turn/start");
+        assert.equal(fake.calls.filter((call) => call.method === "turn/interrupt").length, 1);
+        assert.equal(fake.calls.filter((call) => call.method === "turn/start").length, 2);
+        assert.equal(fake.closeCount(), 0);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect.each([false, true])(
     "does not accept inherited Muse compaction as a fresh manual request, tagged=%s",
     (tagged) =>
