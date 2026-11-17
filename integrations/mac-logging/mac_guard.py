@@ -15,6 +15,10 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 
 # Helper subprocesses use -I; load only the reviewed siblings beside this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -64,6 +68,49 @@ def json_object(raw):
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError('expected JSON object')
+    return value
+
+
+def worker_thread_id(request_id):
+    return 'ardud-control:thread:'+request_id
+
+
+def worker_control(request, opener=urllib.request.urlopen):
+    # Match t3ctl's credential precedence. The parent bounds this helper's whole
+    # lifetime, including HTTP response reads, and never logs credentials.
+    url, token = os.environ.get('T3_CONTROL_URL'), os.environ.get('T3_CONTROL_TOKEN')
+    named = os.environ.get('T3_CONTROL_TOKEN_FILE')
+    paths = [Path(named)] if named else [Path.home()/'.robob/components/t3ctl.json', Path.home()/'.robob/ardud-control.json']
+    for path in paths:
+        if url and token:
+            break
+        try:
+            if path.stat().st_mode & 0o077:
+                raise ValueError('control credential permissions')
+            config = json_object(path.read_text())
+        except FileNotFoundError:
+            if named:
+                raise
+            continue
+        url, token = url or config.get('url'), token or config.get('token')
+        break
+    if not isinstance(url, str) or not isinstance(token, str) or not url or not token:
+        raise ValueError('control unavailable')
+    body = request.get('body')
+    req = urllib.request.Request(url.rstrip('/')+'/api/ardud/control'+request['path'],
+              data=json.dumps(body).encode() if body is not None else None, method=request['method'],
+              headers={'Authorization': 'Bearer '+token, 'Content-Type': 'application/json', 'Accept': 'application/json'})
+    try:
+        with opener(req, timeout=8) as response:
+            value = json_object(response.read(2_000_000).decode())
+    except urllib.error.HTTPError as exc:
+        value = json_object(exc.read(2_000_000).decode())
+        if (request['method'] == 'GET' and exc.code == 404
+                and isinstance(value.get('error'), dict) and value['error'].get('code') == 'not_found'):
+            return dict(missing=True)
+        raise ProbeError('worker_control_http') from None
+    if value.get('ok') is False:
+        raise ProbeError('worker_control_response')
     return value
 
 
@@ -216,11 +263,32 @@ class Host:
     def worker_send(self, tid, text):
         self.cmd([T3CTL, 'send', tid, text], 5)
 
-    def worker_create(self, prompt, now):
-        value = json_object(self.cmd([T3CTL, 'create', '--title', 'CRITICAL: Robob starved '+iso(now),
-                '--dir', '/Volumes/ExternalSSD/t3code-fork', '--instance', WORKER[0], '--model', WORKER[1],
-                '--option', 'reasoningEffort=xhigh', '--option', 'serviceTier=default', '--mode', 'full-access',
-                '--prompt', prompt], 10))
+    def worker_request(self, method, path, body=None):
+        try:
+            result = self.run(['/usr/bin/python3', '-I', str(Path(__file__).resolve()), '--worker-control'],
+                              input=json.dumps(dict(method=method, path=path, body=body)), capture_output=True,
+                              text=True, timeout=10, env={k: v for k, v in os.environ.items() if k != 'BUN_INSPECT'})
+        except (subprocess.TimeoutExpired, OSError):
+            raise ProbeError('worker_control_unavailable') from None
+        if result.returncode:
+            raise ProbeError('worker_control_unavailable')
+        return json_object(result.stdout)
+
+    def worker_lookup(self, request_id):
+        value = self.worker_request('GET', '/threads/'+urllib.parse.quote(worker_thread_id(request_id), safe=''))
+        if value.get('missing') is True:
+            return None
+        thread = value.get('thread', value)
+        if not isinstance(thread, dict) or thread.get('threadId') != worker_thread_id(request_id):
+            raise ValueError('unreadable launch correlation')
+        return thread['threadId']
+
+    def worker_create(self, launch):
+        value = self.worker_request('POST', '/threads', launch)
+        tid = worker_thread_id(launch['clientRequestId'])
+        if (value.get('threadId') != tid or value.get('messageId') != tid
+                or not isinstance(value.get('runId'), str) or not value['runId']):
+            raise ValueError('unexpected launch correlation')
         return value['threadId']
 
     def ownership(self, p, rows, now):
@@ -444,9 +512,10 @@ class Guard:
             # Saved argv is redacted. Classify fresh argv, but verify the hash
             # captured when this action was authorized across daemon restarts.
             p = dict(p, args=current.get('args', ''), sessionWrapper=current.get('sessionWrapper', False))
-        result, errno = 'would_'+action if self.muted else 'skipped_identity', None
+        allowed = cls not in ('A', 'B', 'C') or self.strain or action == 'CONT'
+        result, errno = ('cancelled_strain_clear' if not allowed else 'would_'+action if self.muted else 'skipped_identity'), None
         stop_intent, prior_stage = False, None
-        if (not self.muted and p['pid'] in self.rows and self.rows[p['pid']]['start'] == p['start']
+        if (allowed and not self.muted and p['pid'] in self.rows and self.rows[p['pid']]['start'] == p['start']
                 and not exempt(p, self.rows) and not p['state'].startswith('?') and self.host.identity(p) and not self.muted):
             try:
                 if action == 'STOP':
@@ -480,7 +549,8 @@ class Guard:
                      cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'))
         self.actions.append(value)
         self.log('action', **value)
-        if result == 'sent' or self.dry:
+        performed = result == 'sent' or self.dry and allowed
+        if performed:
             if self.strain and self.first_action is None:
                 self.first_action = self.now
             if not self.restore_due:
@@ -488,7 +558,7 @@ class Guard:
             if action == 'STOP' and self.dry:
                 self.stopped.append(dict(p))
                 self.hogs[(p['pid'], p['start'])] = dict(stage=2, at=self.now, confirmed=True)
-        return result == 'sent' or self.dry
+        return performed
 
     def terminate(self, processes, cls):
         sent = []
@@ -500,6 +570,7 @@ class Guard:
 
     def drain(self, now):
         self.now = now
+        self.cancel_calm_kills()
         remaining = []
         for entry in self.pending:
             if entry['due'] > now or self.muted and not self.dry:
@@ -516,11 +587,60 @@ class Guard:
         self.pending = remaining
         self.save()
 
+    def cancel_calm_kills(self):
+        if self.strain:
+            return
+        remaining = []
+        for entry in self.pending:
+            if entry['actionClass'] in ('A', 'B', 'C'):
+                p = entry['proc']
+                self.log('action', pid=p['pid'], start=p['start'], comm=p['comm'],
+                         args=command_label(p.get('args', '')), actionClass=entry['actionClass'],
+                         action='KILL', result='cancelled_strain_clear', owner=p.get('owner', {}).get('state', 'unknown'),
+                         cpuDelta=p.get('cpuDelta', 0), footprintGiB=p.get('footprintGiB'))
+            else:
+                remaining.append(entry)
+        if len(remaining) != len(self.pending):
+            self.pending = remaining
+            self.save()
+
+    def launch_worker(self, path, adopted=False):
+        if self.muted:
+            return
+        self.worker['nextReconcileAt'] = self.now+30
+        write_json(self.state/'worker.json', self.worker)
+        try:
+            tid = self.host.worker_create(self.worker['launch'])
+            self.worker = dict(threadId=tid, startedAt=self.worker['startedAt'])
+            write_json(self.state/'worker.json', self.worker)
+            self.log('worker_spawned', threadId=tid, evidence=str(path), result='adopted' if adopted else 'sent')
+            return tid
+        except (ProbeError, OSError, ValueError, KeyError):
+            self.log('error', probe='worker_create', failure='unknown')
+
     def worker_needed(self, path, summary, urgent=False):
         if self.muted:
             self.log('worker_steered' if self.worker.get('threadId') else 'worker_spawned',
                      result='would_act', evidence=str(path), summary=summary)
             return
+        if self.worker.get('launchUnknown'):
+            if self.now < self.worker.get('nextReconcileAt', 0):
+                return
+            self.worker['nextReconcileAt'] = self.now+30
+            write_json(self.state/'worker.json', self.worker)
+            try:
+                tid = self.host.worker_lookup(self.worker['launch']['clientRequestId'])
+            except (ProbeError, OSError, ValueError, KeyError):
+                self.log('error', probe='worker_reconcile', failure='unavailable')
+                return
+            if self.muted:
+                return
+            # Thread creation precedes initial-message acceptance. Replay the
+            # same command even for a found thread, and retain the full safety
+            # prompt until the server confirms its durable initial run. The
+            # shared command/message IDs also deduplicate a late first request.
+            if not self.launch_worker(path, adopted=tid is not None):
+                return
         tid = self.worker.get('threadId')
         if tid:
             try:
@@ -542,22 +662,18 @@ class Guard:
             self.worker.pop('threadId', None)
             self.worker['endedAt'] = self.now
             write_json(self.state/'worker.json', self.worker)
-        if self.worker.get('launchUnknown'):
-            return  # reconcile an ambiguous create manually; never blind resend
         if not urgent and self.now-self.worker.get('endedAt', 0) < 1200:
             return
         if self.muted:
             return
         template = Path(__file__).with_name('mac_guard_worker_prompt.md').read_text()
-        self.worker['launchUnknown'] = True
+        launch = dict(clientRequestId='mac-guard-'+uuid.uuid4().hex, title='CRITICAL: Robob starved '+iso(self.now),
+                      directory='/Volumes/ExternalSSD/t3code-fork', providerInstanceId=WORKER[0], model=WORKER[1],
+                      options=[dict(id='reasoningEffort', value='xhigh'), dict(id='serviceTier', value='default')],
+                      runtimeMode='full-access', prompt=template.replace('{{EVIDENCE}}', str(path)).replace('{{SUMMARY}}', summary))
+        self.worker = dict(launchUnknown=True, launch=launch, startedAt=self.now)
         write_json(self.state/'worker.json', self.worker)
-        try:
-            tid = self.host.worker_create(template.replace('{{EVIDENCE}}', str(path)).replace('{{SUMMARY}}', summary), self.now)
-            self.worker = dict(threadId=tid, startedAt=self.now)
-            write_json(self.state/'worker.json', self.worker)
-            self.log('worker_spawned', threadId=tid, evidence=str(path))
-        except (ProbeError, OSError, ValueError, KeyError):
-            self.log('error', probe='worker_create', failure='unknown')
+        self.launch_worker(path)
 
     def memory_event(self, p, kind, action):
         self.log('memory_runaway', pid=p['pid'], start=p['start'], comm=p['comm'], label=label(p, self.rows),
@@ -734,6 +850,7 @@ class Guard:
             self.first_action = None
             self.log('strain_clear', durationS=now-self.since, signals=[])
             self.hogs = {}
+        self.cancel_calm_kills()
         if not self.strain and self.stopped:
             remaining = []
             for p in self.stopped:
@@ -897,12 +1014,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--restart-check', action='store_true')
     parser.add_argument('--diagnostic', type=Path)
+    parser.add_argument('--worker-control', action='store_true')
     args = parser.parse_args()
     if args.restart_check:
         print(json.dumps(overload_checks()))
         return
     if args.diagnostic:
         capture_diagnostic(args.diagnostic)
+        return
+    if args.worker_control:
+        try:
+            print(json.dumps(worker_control(json_object(sys.stdin.read()))))
+        except (ProbeError, OSError, ValueError):
+            raise SystemExit(1)
         return
     guard = Guard()
     with (guard.state/'guard.lock').open('a') as lock:

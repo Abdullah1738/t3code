@@ -822,6 +822,8 @@ build owners and GUI apps get softening only. Stopped survivors resume when
 strain clears. Provider CLIs, their node/bun wrappers, OpenCode, Robob and
 macOS system processes are never signalled or reniced. Integration services
 and their children are protected from the strain ladder.
+Recovery cancels queued strain-ladder kills, including while paused and across
+daemon restarts; memory-runaway kills remain independent of strain.
 
 The memory backstop uses top's footprint (including compressed pages), never
 RSS: >=16 GiB growing >=1 GiB/min over 60 seconds, or >=48 GiB regardless of
@@ -845,6 +847,13 @@ load >=100, host idle >=30% and process R >=64 (or >5s Robob lag). It records
 one thread/CPU-progress/stack/core packet per episode; it never selects a victim.
 Spindump and powermetrics are bounded, without sudo; permission failures are
 recorded as unavailable evidence. Stack capture runs outside the guard loop.
+
+Worker launches persist their request ID and exact payload before using the
+control API (`t3ctl create` does not forward a request ID). After an uncertain
+response the guard looks up that ID and replays the same idempotent request,
+completing any partial thread launch. It confirms the initial safety message
+and durable run before adoption or steering. Unavailable lookups wait;
+they never authorize a second worker. These calls have a ten-second bound.
 
 Pause with `touch ~/.local/state/mac-guard/paused`; remove that file to resume.
 `MAC_GUARD_DRY_RUN=1` records proposed actions while sending no signals,
