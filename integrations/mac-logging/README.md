@@ -8,8 +8,17 @@ lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
 Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
 or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
-clock (include `Z` or an explicit UTC offset). The command always exits 0,
-including invalid arguments or unreadable input; inspect the report for errors.
+cadence clock (include `Z` or an explicit UTC offset); launchd checks always
+describe the current state. The command exits 1 for overdue jobs, unreadable
+input (including invalid timestamps) or a launchd state other than `loaded`,
+and 2 for invalid option syntax.
+JSON includes an overall `ok` boolean and `launchd`, mapping each of
+`com.abdullah.mac-log-collector`, `com.abdullah.mac-deep-inventory`,
+`com.abdullah.mac-memory` and `com.abdullah.mac-cpu` to `loaded`, `not-loaded`
+or `unknown`. Each read-only `launchctl print gui/<uid>/<label>` has a two-second
+timeout (eight seconds total for four timeouts). Only an explicit
+`Could not find service` error means `not-loaded`; other failures are `unknown`.
+Status never loads or restarts agents, and does not send notifications.
 It reads the UTC day files covering the last 36 hours (three files before noon
 UTC, two from noon onward). Missing and unreadable files are listed separately.
 Malformed rows, including invalid timestamps and dates that overflow when
