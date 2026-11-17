@@ -552,6 +552,7 @@ it.effect.each(["blocked", "defect"] as const)(
       );
       const result = yield* McpDeadline.awaitInterruptibly(Effect.succeed("saved"), {
         onTimeout: "detach",
+        startedAt: 0n,
         requestKey: "retry",
         deadline: { firedAt: 0n },
       }).pipe(

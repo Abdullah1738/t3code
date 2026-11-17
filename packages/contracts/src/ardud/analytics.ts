@@ -221,6 +221,14 @@ const GeneralEvent = Schema.Struct({
   waitedMs: Schema.optionalKey(Measurement),
   lateMs: Schema.optionalKey(Measurement),
   afterCap: Schema.optionalKey(Schema.Boolean),
+  detachedOutcomeWake: Schema.optionalKey(
+    Schema.Literals([
+      "sent",
+      "sent_after_restart",
+      "suppressed_retry_saved",
+      "suppressed_definite",
+    ]),
+  ),
   tool: Schema.optionalKey(Label),
   build: Schema.optionalKey(Label),
   bootId: Schema.optionalKey(Id),
