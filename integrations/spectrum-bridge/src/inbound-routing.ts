@@ -11,13 +11,6 @@ export function leaderKind(id: string | undefined): "human" | "wake" | "reset" {
   return id === undefined || /^(wake:|secret:)/.test(id) ? "wake" : "human";
 }
 
-/** Explicit successful tapbacks answer their target; automatic arrival reactions never call this. */
-export function markReactionAnswered(store: Store, id: string): void {
-  if (leaderKind(id) !== "human") return;
-  store.db.query(`UPDATE inbound SET payload = json_set(payload, '$.answeredAt', COALESCE(json_extract(payload, '$.answeredAt'), ?)),
-    state = CASE WHEN state = 'admitted' THEN 'done' ELSE state END WHERE id = ? AND state != 'cancelled'`).run(Date.now(), id);
-}
-
 /** Preserve sealed membership and uncertain POST identity; normal dispatch owns the retry. */
 export function requeueHuman(store: Store, id: string, reason: RequeueReason, options: { chat?: string; completed?: boolean; failure?: unknown } = {}): void {
   if (leaderKind(id) !== "human") return;

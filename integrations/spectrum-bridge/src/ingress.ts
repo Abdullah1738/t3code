@@ -1,4 +1,5 @@
 import { toolLog } from "./toollog.ts";
+import type { BackendKind } from "./backend.ts";
 import { canonicalOwnerChat, inboundOccurredAt, normalizeInbound, ownerChatGuid, type CatchUpEvent, type NormalizedInbound } from "./photon.ts";
 import { seenOwnPoll } from "./poll-match.ts";
 import type { PollRecord, Store } from "./store.ts";
@@ -31,7 +32,7 @@ function pollVote(store: Store, event: PollEvent, owner: string): { input: Norma
   };
 }
 
-export function ingest(store: Store, event: CatchUpEvent, owner: string, enabled: boolean): boolean {
+export function ingest(store: Store, event: CatchUpEvent, owner: string, enabled: boolean, backend?: BackendKind): boolean {
   const cutoff = store.get<number>("bootstrapCutoff");
   if (cutoff === undefined) throw new Error("Missing fixed bootstrap cutoff");
   if (event.type === "catchup.complete") {
@@ -66,7 +67,7 @@ export function ingest(store: Store, event: CatchUpEvent, owner: string, enabled
           accepted = store.acceptInbound(input.id, { ...input, receivedAt: Date.now() });
           if (accepted) toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "owner", messageId: input.id, inboundId: input.id },
             props: { bytesKnown: input.attachments.every(a => a.totalBytes > 0), attachmentCount: input.attachments.length, attachmentBytes: input.attachments.reduce((n, a) => n + (a.totalBytes ?? 0), 0),
-              source: historical ? "backfill" : "live", receiveLagMs: Math.max(0, Date.now() - (occurredAt ?? Date.now())) } }));
+              source: historical ? "backfill" : "live", receiveLagMs: Math.max(0, Date.now() - (occurredAt ?? Date.now())), backend: backend ?? "unknown" } }));
         }
       }
     }

@@ -275,6 +275,8 @@ def apply_locked():
 
 
 def main():
+    from io_priority import throttle_disk
+    throttle_disk()
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["scan", "apply"])
     ap.add_argument("--list", action="store_true")

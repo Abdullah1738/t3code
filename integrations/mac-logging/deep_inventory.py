@@ -33,9 +33,8 @@ class BackgroundDu:
             raise PassStopped()
         # Own the process group, including the exec wrappers. Inherit the flock
         # so even SIGKILL of Python cannot let hourly du overlap a surviving du.
-        # 14 Nov diag: utility 0.014–1.239 s; -b 0.019–2.624 s (warm-cache
-        # samples, no reproduced stall). Do not apply Darwin's -b I/O policy.
-        command = ['/usr/bin/nice', '-n', '10', '/usr/sbin/taskpolicy', '-c', 'utility', *command]
+        command = ['/usr/bin/nice', '-n', '10', '/usr/sbin/taskpolicy', '-c', 'utility',
+                   '-d', 'throttle', *command]
         process = subprocess.Popen(command, start_new_session=True,
                                    pass_fds=(self.lock_fd,), stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=kwargs.get('text', False),
@@ -86,6 +85,19 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
     deadline, wall_deadline = started+budget, wall_started+budget
     measured = partial = bytes_measured = 0
     metrics = dict(timeouts=0, secondsInTimeouts=0, probeTimeouts=0, secondsInProbeTimeouts=0, probeAllowances=[], childrenDescended=set(), partsMeasured=0)
+    metrics.update(cpuSecondsDu=0, wallSecondsDu=0, firstAttempts=0, firstAttemptTimeouts=0, secondsWasted=0)
+    load_start = os.getloadavg()[0]
+    load_end = load_max = load_start
+
+    def sample_load():
+        nonlocal load_end, load_max
+        load_end = os.getloadavg()[0]
+        load_max = max(load_max, load_end)
+
+    def contention_props():
+        return dict(loadAvg1Start=load_start, loadAvg1End=load_end, loadAvg1Max=load_max,
+                    **{key: metrics[key] for key in ('cpuSecondsDu', 'wallSecondsDu',
+                       'firstAttempts', 'firstAttemptTimeouts', 'secondsWasted')})
     roots = list(jobs.DIRECTORY_ROOTS if paths is None else paths)
     priorities = {str(Path('/Volumes/ExternalSSD')/name): i for i, name in enumerate(SLOW_ROOTS)}
     roots.sort(key=lambda p: (priorities.get(str(p), len(priorities)), str(p)))
@@ -95,7 +107,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
             emit('disk', 'event', 'disk.deep.end', props=dict(duMode='links', skipReason='lock_held',
                  timeouts=0, secondsInTimeouts=0, probeTimeouts=0, secondsInProbeTimeouts=0,
                  probeAllowanceMedianS=0, childrenDescended=0, partsMeasured=0,
-                 spawnPolicy='nice-10-utility'))
+                 spawnPolicy='nice-10-utility-io-throttle', **contention_props()))
             return
         state = jobs.read_state('disk-inventory')
         cursor = state.get('deepNextRoot')
@@ -163,13 +175,15 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                         probeTimeouts=metrics['probeTimeouts'], secondsInProbeTimeouts=metrics['secondsInProbeTimeouts'],
                         probeAllowanceMedianS=statistics.median(metrics['probeAllowances']) if metrics['probeAllowances'] else 0,
                         childrenDescended=len(metrics['childrenDescended']), partsMeasured=metrics['partsMeasured'],
-                        spawnPolicy='nice-10-utility', partsFreshnessS=jobs.INVENTORY_PARTS_FRESH_S)
+                        spawnPolicy='nice-10-utility-io-throttle', partsFreshnessS=jobs.INVENTORY_PARTS_FRESH_S,
+                        **contention_props())
 
         emit('disk', 'event', 'disk.deep.start', props=props())
         runner = run if run is not None else BackgroundDu(stopped, wall_deadline, lock_fd)
         attempted = {str(path): set() for path in roots}
         single_paths = {str(path): set() for path in roots}
         part_work = {str(path): {} for path in roots}
+        probe_retries = {str(path): set() for path in roots}
         def needs_work(root, entry):
             return (entry.path not in attempted[root]
                     and jobs.inventory_due(child_state[root].get(entry.path), time.time(), wall_deadline, root=root))
@@ -195,6 +209,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
 
                 def checkpoint(total, status, children):
                     nonlocal measured, partial, bytes_measured
+                    sample_load()
                     # Derive run counters from timestamps changed in this pass;
                     # persisted root totals still include every retained child.
                     changed = [v for root, cache in child_state.items() for child, v in cache.items()
@@ -220,6 +235,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                                                      attempted=attempted[key], max_batches=4, turn_seconds=60,
                                                      single_paths=single_paths[key], metrics=metrics,
                                                      part_work=part_work[key], due_at=wall_deadline,
+                                                     probe_retries=probe_retries[key],
                                                      # Each root gets one early part attempt; a
                                                      # second waits for ordinary work in every root.
                                                      descend=lambda: not part_work[key] or not healthy_pending(),
@@ -278,6 +294,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
             jobs.save_state('disk-inventory', state)
             if stop_reason == 'done' and (time.monotonic() >= deadline or time.time() >= wall_deadline):
                 stop_reason = 'budget'
+            sample_load()
             emit('disk', 'perf', 'disk.deep.end', duration_ms=(time.monotonic()-started)*1000, props=props())
 
 

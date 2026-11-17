@@ -91,6 +91,168 @@ class HomeRunObservation(unittest.TestCase):
         observation.notice(dict(self.row, command_at=1794728890), emit=output.append)
         self.assertIn("last good run read: command accepted at " + observation.stamp(1794728890), output[0])
 
+    def test_host_queue_down_notice_is_once_across_logs_wait_and_status(self):
+        common.BACKEND_STATE.write_text(json.dumps(dict(state='home_down', since=1794728800)))
+        observation.observe('run-test', 'queued')
+        output = []
+        with patch.object(observation.toollog, 'emit') as event:
+            observation.notice(self.row, emit=output.append)
+            observation.notice(self.row, emit=output.append)
+            # Each command reaches the same persistent deduplication, including a status routed to Boat.
+            with patch.object(misc, '_run_row', return_value=self.row), patch.object(misc, '_require_my_run'), \
+                    patch.object(misc, '_wait_locked', return_value=124), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                misc.wait('run-test', 1)
+                misc.logs('run-test', True)
+            with contextlib.closing(common.db()) as con:
+                con.execute('INSERT INTO runs(run_id,status,mode,owner,repo_root,box_id,process_id) VALUES (?,?,?,?,?,?,?)',
+                            ('run-test', 'running', 'bg', 'owner', '/repo', 'bx_home', 1))
+                con.commit()
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                misc._home_run_notices(dict(owner='owner', repo_root='/repo'))
+        self.assertEqual(len(output), 1)
+        self.assertIn('home_down since 07:46Z', output[0])
+        self.assertIn('accepted on bx_home and stays queued there; it will not move to Boat', output[0])
+        self.assertEqual(stderr.getvalue(), '')
+        self.assertEqual(stdout.getvalue(), '')
+        event.assert_called_once()
+        self.assertEqual(event.call_args.args[1], 'run.queue.home_down_notice')
+
+    def test_first_notice_from_each_client_entry_point(self):
+        self.state('home_down')
+        observation.observe('run-test', 'stream heartbeat', status='queued')
+        with contextlib.closing(common.db()) as con:
+            con.execute('INSERT INTO runs(run_id,status,mode,owner,repo_root,box_id,process_id) VALUES (?,?,?,?,?,?,?)',
+                        ('run-test', 'running', 'bg', 'owner', '/repo', 'bx_home', 1))
+            con.commit()
+        for action in ('wait', 'logs', 'status'):
+            with self.subTest(action=action):
+                (common.LOGS_DIR / 'run-test.home-queue-notice').unlink(missing_ok=True)
+                with patch.object(misc, '_run_row', return_value=self.row), patch.object(misc, '_require_my_run'), \
+                        patch.object(misc, '_wait_locked', return_value=124), contextlib.redirect_stderr(io.StringIO()) as stderr, \
+                        contextlib.redirect_stdout(io.StringIO()) as stdout:
+                    if action == 'status':
+                        misc._home_run_notices(dict(owner='owner', repo_root='/repo'))
+                    else:
+                        getattr(misc, action)('run-test', True if action == 'logs' else 1)
+                self.assertIn('it will not move to Boat', stdout.getvalue() + stderr.getvalue())
+
+    def test_first_wait_or_follow_logs_notices_fresh_queue_evidence_once(self):
+        from offbox_lib import runs
+        self.state('home_down')
+        common.LOGS_DIR.mkdir(exist_ok=True)
+        with contextlib.closing(common.db()) as con:
+            con.execute('INSERT INTO runs(run_id,status,mode,box_id,process_id) VALUES (?,?,?,?,?)',
+                        ('run-test', 'running', 'bg', 'bx_home', 1))
+            con.commit()
+        log = common.LOGS_DIR / 'run-test.log'
+        for action in ('wait', 'logs'):
+            for legacy in (False, True):
+                with self.subTest(action=action, legacy=legacy), contextlib.ExitStack() as stack:
+                    (common.LOGS_DIR / 'run-test.home-queue-notice').unlink(missing_ok=True)
+                    (common.LOGS_DIR / 'run-test.home-read.json').unlink(missing_ok=True)
+                    log.write_text('')
+                    observation.observe('run-test', 'accepted')
+                    output = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                    event = stack.enter_context(patch.object(observation.toollog, 'emit'))
+                    def frames():
+                        yield dict(type='hello', attempt=1, **({} if legacy else dict(status='queued')))
+                        if legacy:
+                            yield dict(type='stderr', data='offbox-server: waiting for earlier runs in the queue\n')
+                        self.assertEqual(event.call_count, 1)
+                        yield dict(type='heartbeat', status='queued')
+                        yield dict(type='exit', status='exited', exitCode=0)
+                    stack.enter_context(patch.object(api, 'cmd_attach', side_effect=lambda *a, **kw: frames()))
+                    stack.enter_context(patch.object(runs, '_ttl_keeper'))
+                    stack.enter_context(patch.object(misc, '_run_row', return_value=self.row))
+                    stack.enter_context(patch.object(misc, '_require_my_run'))
+                    stack.enter_context(patch.object(misc, '_wait_locked', side_effect=lambda *a, **kw:
+                                                    runs.follow('bx_home', 1, log, echo=False, run_id='run-test')))
+                    self.assertEqual(getattr(misc, action)('run-test', 45 if action == 'wait' else True), 0)
+                    self.assertEqual(output.getvalue().count('it will not move to Boat'), 1)
+                    event.assert_called_once()
+                    self.assertEqual(event.call_args.args[1], 'run.queue.home_down_notice')
+
+    def test_host_queued_evidence_matrix(self):
+        cases = [
+            ('queued', '', True),
+            ('running', 'offbox-server: waiting for earlier runs in the queue', False),
+            (None, 'offbox-server: waiting for earlier runs in the queue', True),
+            (None, 'offbox-server: waiting; position 2 of 2; memory', True),
+            (None, 'offbox-server: waiting\noffbox-command-started: yes', False),
+            (None, 'offbox-server: waiting\noffbox-space: {"phase": "start"}', False),
+            (None, '', False),
+        ]
+        common.LOGS_DIR.mkdir(exist_ok=True)
+        for remote, text, expected in cases:
+            with self.subTest(remote=remote, text=text):
+                (common.LOGS_DIR / 'run-test.log').write_text(text)
+                self.assertEqual(observation.queued_on_home(self.row, dict(status=remote)), expected)
+        self.assertFalse(observation.queued_on_home(dict(self.row, box_id=None), dict(status='queued')))
+
+    def test_queue_notice_only_for_accepted_home_run_during_home_down(self):
+        observation.observe('run-test', 'queued')
+        for backend, status, state in [('boat', 'running', 'home_down'), ('server', 'done', 'home_down'),
+                                       ('server', 'running', 'home_up'), ('server', 'running', 'home_slow')]:
+            with self.subTest(backend=backend, status=status, state=state):
+                self.state(state)
+                output = []
+                observation.notice(dict(self.row, status=status), backend=backend, emit=output.append)
+                self.assertFalse(any('it will not move to Boat' in x for x in output))
+
+    def test_stream_status_survives_output_observations_then_updates_to_running(self):
+        observation.observe('run-test', 'stream connected', status='queued')
+        observation.observe('run-test', 'output received')
+        path = common.LOGS_DIR / 'run-test.home-read.json'
+        self.assertEqual(json.loads(path.read_text())['status'], 'queued')
+        observation.observe('run-test', 'stream heartbeat', status='running')
+        self.assertEqual(json.loads(path.read_text())['status'], 'running')
+
+    def test_status_frames_are_persisted_despite_continuous_output_throttling(self):
+        from offbox_lib import runs
+        self.state('home_down')
+        log = common.LOGS_DIR / 'run-test.log'
+        common.LOGS_DIR.mkdir(exist_ok=True)
+        def frames():
+            yield dict(type='hello', attempt=1, status='queued')
+            yield dict(type='stdout', data='offbox-command-started: yes\n' + 'x' * 70000)
+            yield dict(type='heartbeat', status='running')
+            read = json.loads((common.LOGS_DIR / 'run-test.home-read.json').read_text())
+            self.assertEqual(read['status'], 'running')
+            self.assertFalse(observation.queued_on_home(self.row, read))
+            yield dict(type='attempt', attempt=2, status='queued')
+            read = json.loads((common.LOGS_DIR / 'run-test.home-read.json').read_text())
+            self.assertEqual((read['attempt'], read['status']), (2, 'queued'))
+            self.assertTrue(observation.queued_on_home(self.row, read))
+            yield dict(type='exit', status='exited', exitCode=0)
+        with patch.object(api, 'cmd_attach', side_effect=lambda *a, **kw: frames()), \
+                patch.object(runs, '_ttl_keeper'), patch.object(runs, 'now', return_value=10000):
+            self.assertEqual(runs.follow('bx_home', 1, log, echo=False, run_id='run-test'), 0)
+
+    def test_current_attempt_status_and_legacy_log_evidence_matrix(self):
+        old = 'offbox-space: {"phase": "attempt", "attempt": 1}\noffbox-command-started: yes\n'
+        new = 'offbox-space: {"phase": "attempt", "attempt": 2}\n'
+        queue = 'offbox-server: waiting; position 1 of 1; memory\n'
+        retry = 'offbox-server: the server restarted; it is queued again as attempt 2\n'
+        cases = [
+            ('explicit_queued_old_start', dict(status='queued', attempt=2), old, True),
+            ('explicit_running_old_queue', dict(status='running', attempt=2), old + new + queue, False),
+            ('legacy_new_attempt_queued', dict(attempt=2), old + new + queue, True),
+            ('legacy_new_attempt_running', dict(attempt=2), old + new + queue + 'offbox-command-started: yes', False),
+            ('legacy_retry_boundary', dict(attempt=2), old + retry + queue, True),
+            ('legacy_stale_attempt', dict(attempt=2), old + queue, False),
+            ('legacy_first_attempt_running', {}, queue + 'offbox-command-started: yes', False),
+        ]
+        common.LOGS_DIR.mkdir(exist_ok=True)
+        for name, read, log, expected in cases:
+            with self.subTest(name=name):
+                (common.LOGS_DIR / 'run-test.log').write_text(log)
+                self.assertEqual(observation.queued_on_home(self.row, read), expected)
+        observation.observe('run-test', 'stream connected', status='running', attempt=1)
+        observation.observe('run-test', 'stream connected', attempt=2)
+        read = json.loads((common.LOGS_DIR / 'run-test.home-read.json').read_text())
+        self.assertEqual(read['attempt'], 2)
+        self.assertIsNone(read['status'])
+
 
 if __name__ == "__main__":
     unittest.main()

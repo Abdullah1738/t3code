@@ -1,4 +1,5 @@
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Semaphore from "effect/Semaphore";
@@ -24,9 +25,10 @@ import * as Semaphore from "effect/Semaphore";
  * - controlRead: control message reads on foreground readers. One request
  *   at a time leaves the other foreground reader available to the UI, even
  *   when an all=true read hydrates a large imported transcript.
- * - mcp: a whole large MCP read (t3_thread_read, board/card/wiki reads...).
+ * - mcp: a whole large MCP read (t3_thread_read, board/card reads...).
  *   It bounds how many large results are built at once; a slow one delays
  *   only other large MCP reads.
+ * - wiki: selected wiki pages/indexes, isolated from slow thread-list reads.
  *
  * Light control reads (identity, thread status, health) take no lane at all.
  * On 10 Nov 2026 one shared 2-permit lane was held ~1.8 permits by
@@ -41,7 +43,12 @@ export type Lane =
   | "shellPage"
   | "poll"
   | "controlRead"
-  | "mcp";
+  | "mcp"
+  | "wiki";
+
+export const AdmissionObserver = Context.Reference<
+  ((sample: { lane: Lane; waitMs: number; runMs: number; acquired: boolean }) => void) | undefined
+>("t3/ardud/http/ReplyBuilders/AdmissionObserver", { defaultValue: () => undefined });
 
 export class ReplyBuilders extends Context.Service<
   ReplyBuilders,
@@ -60,6 +67,7 @@ export const PERMITS: { readonly [K in Lane]: number } = {
   poll: 4,
   controlRead: 1,
   mcp: 4,
+  wiki: 4,
 };
 
 export const layer = Layer.effect(
@@ -74,6 +82,7 @@ export const layer = Layer.effect(
       poll: yield* Semaphore.make(PERMITS.poll),
       controlRead: yield* Semaphore.make(PERMITS.controlRead),
       mcp: yield* Semaphore.make(PERMITS.mcp),
+      wiki: yield* Semaphore.make(PERMITS.wiki),
     };
   }),
 );
@@ -82,15 +91,39 @@ export const bounded = <A, E, R>(effect: Effect.Effect<A, E, R>, lane: Lane = "a
   Effect.flatMap(Effect.serviceOption(ReplyBuilders), (builders) =>
     builders._tag === "Some"
       ? Effect.suspend(() => {
-          const started = performance.now();
-          return builders.value[lane].withPermits(1)(
-            Effect.suspend(() =>
-              Effect.annotateCurrentSpan({
-                "reply_builder.admission_wait_ms": performance.now() - started,
-                "reply_builder.lane": lane,
-              }).pipe(Effect.andThen(effect)),
-            ),
-          );
+          return Effect.gen(function* () {
+            const clock = yield* Clock.Clock;
+            const observer = yield* AdmissionObserver;
+            const started = clock.monotonicTimeNanosUnsafe();
+            let admitted: bigint | undefined;
+            return yield* builders.value[lane]
+              .withPermits(1)(
+                Effect.suspend(() => {
+                  admitted = clock.monotonicTimeNanosUnsafe();
+                  return Effect.annotateCurrentSpan({
+                    "reply_builder.admission_wait_ms": Number(admitted - started) / 1e6,
+                    "reply_builder.lane": lane,
+                  }).pipe(Effect.andThen(effect));
+                }),
+              )
+              .pipe(
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    const ended = clock.monotonicTimeNanosUnsafe();
+                    try {
+                      observer?.({
+                        lane,
+                        waitMs: Number((admitted ?? ended) - started) / 1e6,
+                        runMs: admitted === undefined ? 0 : Number(ended - admitted) / 1e6,
+                        acquired: admitted !== undefined,
+                      });
+                    } catch {
+                      // Instrumentation must not change the reply or leak its permit.
+                    }
+                  }),
+                ),
+              );
+          });
         })
       : effect,
   );

@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import sys
 import tempfile
 import time
@@ -458,7 +460,10 @@ def codex_config(manifest: dict, codex_home: str, existing_state: dict | None,
                 "wire_api": "responses",
                 "requires_openai_auth": False,
                 "supports_websockets": False,
-                "stream_idle_timeout_ms": 900000,
+                # Leave time for a stream retry before Robob's 15-minute child guard.
+                # CU's measured Terra/max p99 is longer than Codex's Astra/Sol p99.
+                "stream_idle_timeout_ms": 480000 if harness == "codex-cu" else 360000,
+                "stream_max_retries": 1,
                 # For this provider, Codex 0.166 needs a non-empty actor header for image_gen; the fixed placeholder is not a credential and 9router never forwards it upstream.
                 "http_headers": {"x-9router-token-saver": "off",
                                  "x-openai-actor-authorization": "robob-9router-local"},
@@ -1050,11 +1055,41 @@ def generate(home_root: str | None, dry_run: bool, opencode_config: str | None =
 
 # ---------- check ----------
 
+def safe_chain_failures(homes: dict[str, str], opencode_start: Path) -> list[str]:
+    failures = []
+    for harness, home in homes.items():
+        try:
+            if harness == "claude":
+                config = json.loads((Path(home) / "settings.json").read_text(encoding="utf-8"))
+                path = config["env"]["PATH"]
+            else:
+                config = tomllib.loads((Path(home) / "config.toml").read_text(encoding="utf-8"))
+                path = config["shell_environment_policy"]["set"]["PATH"]
+            if not isinstance(path, str) or not shutil.which("safe-chain", path=path):
+                failures.append(f"{harness}: safe-chain is not executable on the configured shell PATH")
+        except (OSError, ValueError, KeyError, TypeError):
+            failures.append(f"{harness}: cannot read the configured shell PATH for safe-chain")
+
+    # Read the service's fixed PATH without executing its credential-bearing launcher.
+    try:
+        assignments = re.findall(r"^export PATH=(.*)$", opencode_start.read_text(encoding="utf-8"), re.MULTILINE)
+        parts = shlex.split(assignments[-1]) if assignments else []
+        if len(parts) != 1 or any(char in parts[0] for char in "$`\n"):
+            failures.append(f"opencode: {opencode_start} requires a literal export PATH= assignment")
+        elif not shutil.which("safe-chain", path=parts[0]):
+            failures.append(f"opencode: safe-chain is not executable on the PATH in {opencode_start}")
+    except (OSError, ValueError):
+        failures.append(f"opencode: cannot read {opencode_start} for the safe-chain PATH check")
+    return failures
+
+
 @logged_run('generate.check')
 def check(home_root: str | None, *, json_output: bool = False, opencode_config: str | None = None) -> int:
     manifest, homes, skills, unreadable, files = plan_all(home_root)
     guard_outputs([*homes.values(), *(os.path.join(home, "skills") for home in homes.values()), *files])
     failures: list[str] = []
+    if not home_root:
+        failures.extend(safe_chain_failures(homes, Path(expand("~/.local/share/opencode-service/start.zsh"))))
     if unreadable:
         failures.append("skills: could not inspect " + ", ".join(unreadable))
     if parity_applies(manifest, home_root, opencode_config):

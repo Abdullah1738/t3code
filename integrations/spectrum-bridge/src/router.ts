@@ -1,3 +1,4 @@
+import { findOverdue, reconcileLegacyReplies, turnMembers, unansweredAlert, type AnsweredInput } from "./unanswered.ts";
 import { toolLog as watcherLog } from "./watcherlog.ts";
 import { completionReady, toolError, toolLog } from "./toollog.ts";
 import { captureReadTiming, completionChecked, includeReadTiming, timeTick, type ReadTiming } from "./tick-timing.ts";
@@ -156,6 +157,7 @@ type Options = {
   /** "final" (default) forwards each turn's final text; "tool" forwards nothing and the agent sends with imessage_send. */
   replyMode?: ReplyMode;
   medsFold?: FoldOptions | false;
+  notifyUnanswered?: (severity: "attention", text: string, key: string) => Promise<boolean>;
   notifyFailure?: (text: string, key: string) => Promise<boolean>;
 };
 /** What a Sendblue swipe reply points at, kept per row. `unknown` is never guessed from neighbouring messages. */
@@ -699,7 +701,7 @@ export class Router {
     const start = records.findIndex(record => record.id === turn.messageId);
     if (start < 0 || !records.slice(start + 1).some(record => record.type === "idle")) return new Set();
     return new Set(this.store.pendingInbound().flatMap(row => {
-      const prompt = `msg_${hash(row.id)}`;
+      const prompt = this.promptId(row.id);
       const attempt = this.store.get<SteerAttempt | null>(`steer-attempt:${row.id}`);
       // Retire only the proven original run. The sealed attempt still owns readback and same-id replay.
       return attempt && this.current(attempt) && turn.steered?.includes(prompt)
@@ -861,6 +863,8 @@ export class Router {
     const quiet = options.quietMs ?? (options.context ? SENDBLUE_QUIET_MS : 15_000);
     if (!Number.isSafeInteger(quiet) || quiet < 0) throw new Error("Invalid quiet period");
     new Intl.DateTimeFormat("en-US", { timeZone: options.timezone });
+    const chat = options.context?.chat;
+    this.store.set("unanswered-chat", !chat || chat.kind === "owner" ? "owner" : chat.kind === "dm" && chat.slug === "moni" ? "moni" : "other");
     const restored = this.store.get<Turn | null>("activeTurn");
     if (restored && this.current(restored)) this.restoreSteeredCoverage(restored);
     if (restored?.background && restored.leaderId === undefined && restored.inboundId === undefined && this.current(restored)) {
@@ -881,7 +885,6 @@ export class Router {
       }).immediate();
     }
     toolLog.capture(() => {
-      const restored = this.store.get<Turn | null>("activeTurn");
       // A persisted running turn can poll without passing through setTurn again.
       if (restored && restored.phase !== "failed" && this.current(restored)) this.logTurnStart(restored);
     });
@@ -891,6 +894,91 @@ export class Router {
     const turn = this.store.get<Turn | null>("activeTurn");
     return this.ticking ??= timeTick({ chat: this.options.context?.chat.slug ?? "owner", ...(turn ? { threadId: turn.id } : {}) }, () => this.run())
       .finally(() => { this.ticking = undefined; });
+  }
+
+  private readonly unansweredStartedAt = Date.now();
+  private checkingUnanswered?: Promise<void>;
+  private reconciledLegacyReplies = false;
+
+  checkUnanswered(now = Date.now()): Promise<void> {
+    return this.checkingUnanswered ??= this.sweepUnanswered(now).finally(() => { this.checkingUnanswered = undefined; });
+  }
+
+  private promptId(id: string): string {
+    return this.store.get<string>(`human-retry-prompt:${id}`) ?? `msg_${hash(id)}`;
+  }
+
+  private async sweepUnanswered(now: number): Promise<void> {
+    const chat = this.store.get<string>("unanswered-chat") ?? "other";
+    if (chat === "other") return;
+    if (!this.reconciledLegacyReplies) {
+      reconcileLegacyReplies(this.store, this.unansweredStartedAt - 30 * 60_000, now);
+      this.reconciledLegacyReplies = true;
+    }
+    const turn = this.store.get<Turn | null>("activeTurn");
+    const running = turn && this.current(turn) && ["running", "submitting", "unknown"].includes(turn.phase)
+      ? { members: turnMembers(this.store, turn), leaderKind: turn.background ? "background" as const : leaderKind(turn.inboundId) } : undefined;
+    const rows = this.store.db.query<{ id: string; payload: string; state: string }, [number]>(
+      "SELECT id, payload, state FROM inbound WHERE json_extract(payload, '$.receivedAt') >= ? AND json_extract(payload, '$.answeredAt') IS NULL ORDER BY rowid",
+    ).all(this.unansweredStartedAt - 30 * 60_000).map(row => ({ ...row, payload: JSON.parse(row.payload) }));
+    for (const candidate of findOverdue(rows, running, now, { startedAt: this.unansweredStartedAt, chat })) {
+      const fresh = this.store.db.query<{ id: string; payload: string; state: string }, [string]>("SELECT id, payload, state FROM inbound WHERE id = ?").get(candidate.row.id);
+      if (!fresh) continue;
+      const active = this.store.get<Turn | null>("activeTurn");
+      const liveRunning = active && this.current(active) && ["running", "submitting", "unknown"].includes(active.phase)
+        ? { members: turnMembers(this.store, active), leaderKind: active.background ? "background" as const : leaderKind(active.inboundId) } : undefined;
+      const due = findOverdue([{ ...fresh, payload: JSON.parse(fresh.payload) }], liveRunning, now, { startedAt: this.unansweredStartedAt, chat })[0];
+      if (!due) continue;
+      const { row, input, ageMs, action, leaderKind: kind } = due;
+      // #37's queued technical-problem notice already owns these rows.
+      const notice = this.store.db.query(`SELECT 1 FROM outbox o WHERE (json_extract(o.payload, '$.replyTo') = ?
+        OR EXISTS (SELECT 1 FROM kv coverage, json_each(coverage.value) member WHERE coverage.key = 'reply-covered:' || o.id AND member.value = ?))
+        AND (o.id LIKE 'outage:%' OR o.id LIKE 'turn:%:failed') AND o.state IN ('pending', 'sending', 'sent', 'uncertain') LIMIT 1`).get(row.id, row.id);
+      if (notice) continue;
+      const state = { ...input.unanswered };
+      if (state.overdueAt !== undefined && !due.requeue && !due.alert) continue;
+      const parent = this.store.db.query<{ id: string }, [string]>(
+        "SELECT substr(kv.key, 7) AS id FROM kv, json_each(kv.value, '$.batchIds') member WHERE kv.key GLOB 'batch:*' AND member.value = ? LIMIT 1",
+      ).get(row.id)?.id;
+      const retained = this.store.get<SteerAttempt>(`steer-attempt:${parent ?? row.id}`);
+      if (due.requeue && !retained?.response && !retained?.sameMode && !retained?.reconcileOnly) {
+        this.store.db.transaction(() => {
+          // The shared own-turn marker prevents steering the retry back into a wake.
+          // Only a human batch keeps its sealed members. A swallowed wake member gets its own turn.
+          const id = parent && leaderKind(parent) === "human" ? parent : row.id;
+          const admitted = this.store.get(`inbound-delivered:${id}`) != null || this.store.get(`batch-phase:${id}`) === "accepted";
+          const completed = (admitted || ["done", "admitted", "failed", "unknown"].includes(row.state)) && !this.store.get(`steer-attempt:${id}`);
+          this.requeueHuman(id, "watchdog_overdue", completed);
+          const members = this.store.get<NormalizedInbound>(`batch:${id}`)?.batchIds ?? [id];
+          for (const member of members) {
+            const saved = this.store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(member);
+            if (!saved) continue;
+            const payload = JSON.parse(saved.payload) as AnsweredInput;
+            this.store.updateInbound(member, saved.state, { ...payload, unanswered: { ...payload.unanswered, requeuedAt: now } });
+          }
+          state.requeuedAt = now;
+          toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "inbound.watchdog_requeued", ids: { inboundId: row.id, chat }, props: { ageMs } }));
+        }).immediate();
+      }
+      if (state.overdueAt === undefined) {
+        state.overdueAt = now;
+        toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "inbound.overdue",
+          ids: { inboundId: row.id, chat }, props: { ageMs, state: row.state, action, leaderKind: kind, severity: "warn" } }));
+      }
+      // A sealed member remains batched; only requeueHuman chooses the pending leader.
+      const currentState = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)!.state;
+      this.store.updateInbound(row.id, currentState, { ...input, unanswered: state });
+      if (!due.alert || !this.options.notifyUnanswered) continue;
+      state.alertAttempts = (state.alertAttempts ?? 0) + 1;
+      this.store.updateInbound(row.id, currentState, { ...input, unanswered: state });
+      const sent = await this.options.notifyUnanswered("attention", unansweredAlert(chat, input, currentState, ageMs, action === "in_turn"), `imessage-unanswered:${row.id}`).catch(() => false);
+      // Re-read after the await: delivery may have answered or advanced the row meanwhile.
+      const live = this.store.db.query<{ payload: string; state: string }, [string]>("SELECT payload, state FROM inbound WHERE id = ?").get(row.id)!;
+      const latest = JSON.parse(live.payload) as AnsweredInput;
+      this.store.updateInbound(row.id, live.state, { ...latest, unanswered: { ...latest.unanswered, ...(sent ? { alertedAt: now } : {}) } });
+      toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "inbound.overdue_notice",
+        ids: { inboundId: row.id, chat }, props: { ageMs, state: row.state, telegram: sent ? "sent" : "failed", attempt: state.alertAttempts! } }));
+    }
   }
 
   private checkingFailed?: Promise<void>;
@@ -1312,14 +1400,14 @@ export class Router {
         const route = this.store.get<Route | null>("route");
         // Robob ignores the directory argument; other backends need their original directory as proof.
         if (op?.sessionId?.startsWith("ardud-control:thread:") && route) original = { ...route, id: op.sessionId, generation: op.generation ?? route.generation,
-          inboundId: parent, messageId: `msg_${hash(parent)}`, phase: "failed", startedAt: input.receivedAt ?? at };
+          inboundId: parent, messageId: this.promptId(parent), phase: "failed", startedAt: input.receivedAt ?? at };
       }
       const admitted = async (): Promise<boolean | undefined> => {
         if (receipted()) return true;
         const route = this.store.get<Route | null>("route");
         const destinations = original ? [original] : [];
         if (route && !destinations.some(item => item.id === route.id && item.directory === route.directory)) destinations.push({ ...route,
-          inboundId: parent, messageId: original?.messageId ?? `msg_${hash(parent)}`, phase: "failed", startedAt: at });
+          inboundId: parent, messageId: original?.messageId ?? this.promptId(parent), phase: "failed", startedAt: at });
         let conclusive = original !== undefined;
         for (const target of destinations) for (const id of [target.messageId, ...(target.earlier ?? [])]) {
           try { if (await bounded(this.backend.promptAccepted(target.id, target.directory, id))) return true; }
@@ -1919,7 +2007,7 @@ export class Router {
       const state = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state;
       const queued = state === "pending" && this.store.get(`batch-phase:${id}`) === "queued-steer";
       if (!this.current(attempt) || (state !== "processing" && !queued)) return;
-      const messageId = `msg_${hash(id)}`;
+      const messageId = this.promptId(id);
       this.store.set(`human-own-turn:${id}`, false);
       const turn = this.store.get<Turn | null>("activeTurn");
       const sourceAttempt = this.store.get<SteerAttempt | null>(`steer-attempt:${id}`);
@@ -1960,7 +2048,7 @@ export class Router {
       this.store.updateInbound(id, "pending");
       this.store.set(`batch-phase:${id}`, "queued-steer");
       const turn = this.store.get<Turn | null>("activeTurn");
-      const messageId = `msg_${hash(id)}`;
+      const messageId = this.promptId(id);
       if (turn?.steered?.includes(messageId)) this.setTurn({ ...turn, steered: turn.steered.filter(item => item !== messageId) });
     }).immediate();
   }
@@ -1980,7 +2068,7 @@ export class Router {
       || this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(row.id)?.state !== "processing")) return;
     const turn = this.store.get<Turn | null>("activeTurn");
     // Same id a turn of its own would use, so a later send of this batch replays rather than repeats.
-    const messageId = `msg_${hash(row.id)}`;
+    const messageId = this.promptId(row.id);
     const attempt: SteerAttempt | undefined = this.store.get<SteerAttempt | null>(`steer-attempt:${row.id}`)
       ?? (turn?.steered?.includes(messageId) ? turn : undefined);
     if (attempt) {
@@ -2123,7 +2211,6 @@ export class Router {
       return true;
     };
     if (attempt?.text === undefined && !await admission()) return;
-    // A different wake can own the turn by the time an uncertain steer is retried.
     const sent: SteerAttempt = { id: turn.id, inboundId: attempt ? attempt.inboundId : turn.inboundId, directory: turn.directory, generation: turn.generation, text: body, guidance, ...(parts ? { parts, fileGuidance } : {}), startedAt: attempt?.startedAt ?? Date.now(), outbox: attempt?.outbox ?? this.outboxMark() };
     this.store.db.transaction(() => {
       this.store.set(`steer-attempt:${row.id}`, sent);
@@ -2725,6 +2812,7 @@ export class Router {
       }
       return;
     }
+    this.logBatch(inboundId, "question_answer", turn.inboundId);
     const said = reply.trim();
     // For an approval, anything other than a clear yes or no leaves the request
     // open: the text stays queued as an ordinary message for after the work, and
@@ -3659,7 +3747,7 @@ export class Router {
     const { notes } = prepared;
     const parts = steerAttempt?.parts ?? prepared.parts;
     const members = input.batchIds ?? [row.id];
-    let promptId = `msg_${hash(row.id)}`;
+    let promptId = this.promptId(row.id);
     if (members.every(synthetic)) {
       // A retried synthetic row never POSTs again while an earlier prompt for it
       // might have landed: every earlier one is checked first.
@@ -4090,7 +4178,7 @@ export class Router {
       if (row?.state !== "processing") return;
       this.store.enqueue({ id: outage.id, kind: "control", text: OUTAGE_TEXT, ...this.replyTarget(id) });
       this.store.set("deliveryOutage", { ...outage, noticed: true });
-      this.watchdogLog("notice", { inboundId: id, messageId: `msg_${hash(id)}` });
+      this.watchdogLog("notice", { inboundId: id, messageId: this.promptId(id) });
     }).immediate();
   }
 
@@ -4153,7 +4241,7 @@ export class Router {
     const row = this.store.pendingInbound().find(row => row.id === preparing.id);
     if (!row || row.state !== "processing") { this.store.set("preparingDelivery", null); return; }
     if (this.expireFailedReplay(preparing.id)) return;
-    const turn = { inboundId: preparing.id, messageId: `msg_${hash(preparing.id)}` };
+    const turn = { inboundId: preparing.id, messageId: this.promptId(preparing.id) };
     if (this.wakeBatch(preparing.id)) {
       // Same rule as a POSTed wake: it never holds the chat or earns the outage
       // text. No prompt has been sent for it yet, so a person waiting takes its place at once.
@@ -4781,7 +4869,7 @@ export class Router {
             for (const row of this.store.pendingInbound()) {
               const steering = row.state === "processing" && this.steering(row.id)
                 || row.state === "pending" && this.store.get(`batch-phase:${row.id}`) === "queued-steer";
-              if (steering && successful.has(`msg_${hash(row.id)}`)) this.consumeSteer(row.id, turn!);
+              if (steering && successful.has(this.promptId(row.id))) this.consumeSteer(row.id, turn!);
             }
             const covered = [...new Set([turn!.inboundId, ...this.store.get<Turn | null>("activeTurn")?.covered ?? []])]
               .filter((id): id is string => id !== undefined);
@@ -4928,14 +5016,10 @@ export class Router {
       for (const row of this.store.pendingInbound()) {
         const steering = row.state === "processing" && this.steering(row.id)
           || row.state === "pending" && this.store.get(`batch-phase:${row.id}`) === "queued-steer";
-        if (steering && coveredSteers.has(`msg_${hash(row.id)}`)) this.consumeSteer(row.id, turn);
+        if (steering && coveredSteers.has(this.promptId(row.id))) this.consumeSteer(row.id, turn);
       }
       const covered = [...new Set([...(turn.inboundId ? [turn.inboundId] : []), ...turn.covered ?? [], ...this.store.get<Turn | null>("activeTurn")?.covered ?? [],
         ...this.store.get<string[]>(`turn-human:${turn.messageId}`) ?? []])];
-      for (const id of covered) if (id !== turn.inboundId && turn.steered?.includes(`msg_${hash(id)}`)
-        && !handledInputs.has(`msg_${hash(id)}`)) {
-        this.requeueHuman(id, "background_no_reply", true);
-      }
       for (const reply of outgoing) if (this.store.getOperation(`reply:${turn.generation}:${reply.id}`))
         this.store.set(`reply-covered:reply:${turn.generation}:${reply.id}`, this.replyCoverage(turn, scope, reply.id, covered, handledInputs).filter(id => !this.store.get(`human-own-turn:${id}`)));
       this.logTurnEnd(turn, said.length ? "replied" : "no_reply");
@@ -5072,7 +5156,10 @@ export class Router {
   // Clearing this pointer can be temporary during rebuilds; terminal paths log their own outcome.
   private setTurn(turn: Turn | null): void {
     const live = this.store.get<Turn | null>("activeTurn");
-    if (turn && live?.messageId === turn.messageId) turn = { ...turn, covered: [...new Set([...live.covered ?? [], ...turn.covered ?? []])] };
+    // Backend reads can settle after another path admits a follow-up into this turn.
+    if (turn && live?.messageId === turn.messageId && live.id === turn.id && live.generation === turn.generation) {
+      turn = { ...turn, covered: [...new Set([...live.covered ?? [], ...turn.covered ?? []])] };
+    }
     this.store.set("activeTurn", turn);
     if (turn && turn.phase !== "failed") this.logTurnStart(turn);
   }

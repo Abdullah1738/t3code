@@ -12,6 +12,9 @@ import * as ElectronMenu from "../electron/ElectronMenu.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopUpdates from "../updates/DesktopUpdates.ts";
 import * as DesktopWindow from "./DesktopWindow.ts";
+import * as DesktopQuit from "../app/DesktopQuit.ts";
+import * as DesktopState from "../app/DesktopState.ts";
+import * as ElectronApp from "../electron/ElectronApp.ts";
 
 export class DesktopApplicationMenuActionError extends Schema.TaggedError<DesktopApplicationMenuActionError>()(
   "DesktopApplicationMenuActionError",
@@ -35,7 +38,10 @@ export class DesktopApplicationMenu extends Context.Service<
 type DesktopApplicationMenuRuntimeServices =
   | DesktopUpdates.DesktopUpdates
   | DesktopWindow.DesktopWindow
-  | ElectronDialog.ElectronDialog;
+  | ElectronDialog.ElectronDialog
+  | DesktopEnvironment.DesktopEnvironment
+  | DesktopState.DesktopState
+  | ElectronApp.ElectronApp;
 
 const { logInfo: logUpdaterInfo } = makeComponentLogger("desktop-updater");
 
@@ -137,6 +143,13 @@ export const make = Effect.gen(function* () {
   };
 
   const configure = Effect.gen(function* () {
+    const quitClick = () => {
+      Effect.runSyncWith(context)(
+        DesktopQuit.record({ trigger: "menu" }).pipe(
+          Effect.andThen(Effect.flatMap(ElectronApp.ElectronApp, (app) => app.quit)),
+        ),
+      );
+    };
     const checkForUpdatesClick = () => {
       runMenuEffect("check-for-updates", handleCheckForUpdatesMenuClick);
     };
@@ -185,7 +198,11 @@ export const make = Effect.gen(function* () {
           { role: "hideOthers" },
           { role: "unhide" },
           { type: "separator" },
-          { role: "quit", label: `Quit ${environment.displayName}` },
+          {
+            label: `Quit ${environment.displayName}`,
+            accelerator: "CmdOrCtrl+Q",
+            click: quitClick,
+          },
         ],
       });
     }
@@ -204,7 +221,9 @@ export const make = Effect.gen(function* () {
                 },
                 { type: "separator" as const },
               ]),
-          { role: environment.platform === "darwin" ? "close" : "quit" },
+          ...(environment.platform === "darwin"
+            ? [{ role: "close" as const }]
+            : [{ label: "Quit", accelerator: "Alt+F4", click: quitClick }]),
         ],
       },
       {

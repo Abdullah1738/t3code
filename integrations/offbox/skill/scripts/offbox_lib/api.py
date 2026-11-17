@@ -1093,7 +1093,7 @@ def _supply_refusal(s: dict, st: str | None, since: float | None, stale_error: s
 
 
 def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7, since: float | None = None,
-               stale_error: str | None = None, on_state=None) -> dict:
+               stale_error: str | None = None, on_state=None, read_budget=None, observe_state=None) -> dict:
     """since: when this attempt started (a resume). stale_error: the box's error read just before it."""
     from . import home
     if _DEADLINE is not None:
@@ -1101,12 +1101,16 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
     deadline = time.time() + timeout
     network_failures = 0
     while True:
+        read_end = deadline
+        if read_budget is not None:
+            read_end = min(read_end, time.time() + read_budget())
         try:
-            s = readiness_get(box_id, deadline=deadline) if home.may_fail_over() else readiness_get(box_id)
+            s = (readiness_get(box_id, deadline=read_end)
+                 if read_budget is not None or home.may_fail_over() else readiness_get(box_id))
         except NetworkError as error:
             try:
                 s = home.recover_slow_read(error, lambda end: get(box_id, deadline=end), box=box_id,
-                                           deadline=deadline)
+                                           deadline=read_end)
             except NetworkError:
                 network_failures += 1
                 if not home.may_fail_over() or network_failures >= HOME_NETWORK_FAILURES:
@@ -1117,6 +1121,8 @@ def wait_state(box_id: str, want: tuple, timeout: float = 600, poll: float = 0.7
         if s is None:
             raise OffboxError(f"box {box_id} disappeared")
         st = s.get("state")
+        if observe_state is not None:
+            observe_state(s)
         if st in want:
             return s
         m = SUPPLY_OUT.search(s.get("error") or "")

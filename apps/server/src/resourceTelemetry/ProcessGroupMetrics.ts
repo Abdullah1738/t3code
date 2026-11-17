@@ -22,6 +22,15 @@ const processCount = Metric.gauge("t3_process_group_count", {
   attributes: { unit: "{process}" },
 });
 
+const runtimeChildCount = Metric.gauge("t3_provider_runtime_child_process_count", {
+  description: "Descendant processes of one provider runtime, excluding the runtime itself.",
+  attributes: { unit: "{process}" },
+});
+const runtimeChildResidentBytes = Metric.gauge("t3_provider_runtime_child_resident_bytes", {
+  description: "Resident memory of one provider runtime's descendant processes.",
+  attributes: { unit: "By" },
+});
+
 // Each direct child of the server names the group of its whole subtree. A fixed set keeps one
 // series per group per server, however many agents and processes come and go.
 const PROVIDER_GROUPS: ReadonlyArray<readonly [RegExp, string]> = [
@@ -90,6 +99,73 @@ export function groupProcesses(
   return totals;
 }
 
+export function providerRuntimeChildren(processes: ReadonlyArray<ResourceTelemetryProcess>) {
+  const serverPid = processes.find((process) => process.category === "server")?.identity.pid;
+  const byPid = new Map(processes.map((process) => [process.identity.pid, process]));
+  const runtimes = new Map(
+    processes.flatMap((process) => {
+      if (serverPid === undefined || process.ppid !== serverPid) return [];
+      const provider = childGroup(process.name, process.command);
+      if (!PROVIDER_GROUPS.some(([, name]) => name === provider)) return [];
+      const total = { process, provider, count: 0, residentBytes: 0 };
+      return [[process.identity.pid, total] as const];
+    }),
+  );
+  for (const process of processes) {
+    let parentPid = process.ppid;
+    for (let step = 0; step < processes.length; step++) {
+      const runtime = runtimes.get(parentPid);
+      if (runtime !== undefined) {
+        runtime.count++;
+        runtime.residentBytes += process.residentBytes;
+        break;
+      }
+      const parent = byPid.get(parentPid);
+      if (parent === undefined || parent === process) break;
+      parentPid = parent.ppid;
+    }
+  }
+  return [...runtimes.values()].map(({ process, ...total }) => ({
+    ...total,
+    pid: process.identity.pid,
+    startTimeMs: process.identity.startTimeMs,
+  }));
+}
+
+type RuntimeChildren = ReturnType<typeof providerRuntimeChildren>[number];
+type RuntimeSample = RuntimeChildren & { readonly slot: number };
+
+// Reuse labels after a runtime exits: PID labels would retain a metric series for every turn.
+export function assignRuntimeSlots(
+  runtimes: ReadonlyArray<RuntimeChildren>,
+  previous: ReadonlyArray<RuntimeSample>,
+) {
+  const sameRuntime = (a: RuntimeChildren, b: RuntimeChildren) =>
+    a.provider === b.provider && a.pid === b.pid && a.startTimeMs === b.startTimeMs;
+  const active = runtimes.flatMap((runtime) => {
+    const prior = previous.find((candidate) => sameRuntime(runtime, candidate));
+    return prior === undefined ? [] : [{ ...runtime, slot: prior.slot }];
+  });
+  for (const runtime of runtimes) {
+    if (active.some((candidate) => sameRuntime(runtime, candidate))) continue;
+    let slot = 0;
+    while (
+      active.some((candidate) => candidate.provider === runtime.provider && candidate.slot === slot)
+    )
+      slot++;
+    active.push({ ...runtime, slot });
+  }
+  const exited = previous
+    .filter(
+      (prior) =>
+        !active.some(
+          (runtime) => runtime.provider === prior.provider && runtime.slot === prior.slot,
+        ),
+    )
+    .map((runtime) => ({ ...runtime, count: 0, residentBytes: 0 }));
+  return { active, samples: [...active, ...exited] };
+}
+
 /**
  * Exports process totals by group while OTLP metrics export is on. Sampling walks the process
  * table, which an idle server otherwise never does, so only a server exporting metrics pays for
@@ -102,8 +178,10 @@ export const layer = Layer.effectDiscard(
     const telemetry = yield* ResourceTelemetry.ResourceTelemetry;
     // A group that empties reads zero rather than holding its last value.
     const seen = new Set<string>();
+    let previousRuntimes: ReadonlyArray<RuntimeSample> = [];
     const sample = Effect.fn("ProcessGroupMetrics.sample")(function* () {
-      const totals = groupProcesses((yield* telemetry.refresh).processes);
+      const processes = (yield* telemetry.refresh).processes;
+      const totals = groupProcesses(processes);
       for (const group of totals.keys()) seen.add(group);
       for (const group of seen) {
         const total = totals.get(group) ?? { residentBytes: 0, cpuPercent: 0, count: 0 };
@@ -112,6 +190,29 @@ export const layer = Layer.effectDiscard(
         yield* Metric.update(Metric.withAttributes(cpuPercent, attributes), total.cpuPercent);
         yield* Metric.update(Metric.withAttributes(processCount, attributes), total.count);
       }
+      const runtimes = assignRuntimeSlots(providerRuntimeChildren(processes), previousRuntimes);
+      for (const runtime of runtimes.samples) {
+        const attributes = metricAttributes({
+          provider: runtime.provider,
+          runtimeSlot: String(runtime.slot),
+        });
+        yield* Metric.update(Metric.withAttributes(runtimeChildCount, attributes), runtime.count);
+        yield* Metric.update(
+          Metric.withAttributes(runtimeChildResidentBytes, attributes),
+          runtime.residentBytes,
+        );
+      }
+      for (const runtime of runtimes.active) {
+        yield* Effect.logInfo("orchestration-v2.driver-session.child-processes", {
+          provider: runtime.provider,
+          runtimePid: runtime.pid,
+          runtimeStartTimeMs: runtime.startTimeMs,
+          runtimeSlot: runtime.slot,
+          childProcessCount: runtime.count,
+          childResidentBytes: runtime.residentBytes,
+        });
+      }
+      previousRuntimes = runtimes.active;
     });
     yield* sample().pipe(
       Effect.catch((error) =>

@@ -196,6 +196,20 @@ export interface KanbanStoreShape {
   readonly boards: Effect.Effect<ReadonlyArray<KanbanBoard>, KanbanStoreError>;
   readonly board: (boardId: KanbanBoardId) => Effect.Effect<KanbanBoard | null, KanbanStoreError>;
   readonly putBoard: (board: KanbanBoard) => Effect.Effect<void, KanbanStoreError>;
+  readonly boardThreadIds: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<ThreadId>, KanbanStoreError>;
+  readonly purgeBoard: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<ThreadId>, KanbanStoreError>;
+  readonly pendingBoardPurges: Effect.Effect<
+    ReadonlyArray<{ boardId: KanbanBoardId; threadId: ThreadId }>,
+    KanbanStoreError
+  >;
+  readonly finishBoardPurgeThread: (
+    boardId: KanbanBoardId,
+    threadId: ThreadId,
+  ) => Effect.Effect<void, KanbanStoreError>;
   /** The board and any new pools in one transaction: all of it commits, or none of it does. */
   readonly putBoardWithPools: (
     board: KanbanBoard,
@@ -275,6 +289,10 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
     cardIds: ReadonlyArray<KanbanCardId>,
     beforeId: number,
+  ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
+  /** Latest event on each unsettled completed/deployed card, using the card-event index. */
+  readonly evaluatorStepEvents: (
+    boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
   readonly activityHistory: (
     boardId: KanbanBoardId,
@@ -367,6 +385,8 @@ export interface KanbanStoreShape {
    */
   readonly ownerWait: (
     id: KanbanDiscussionId,
+    includeScripts?: boolean,
+    atSeq?: number,
   ) => Effect.Effect<
     { readonly seq: number; readonly createdAt: string; readonly answered: boolean } | null,
     KanbanStoreError
@@ -409,7 +429,17 @@ export interface KanbanStoreShape {
 
   readonly wiki: (
     boardId: KanbanBoardId,
+    slugs?: ReadonlyArray<string>,
   ) => Effect.Effect<ReadonlyArray<KanbanWikiPage>, KanbanStoreError>;
+  readonly wikiIndex: (
+    boardId: KanbanBoardId,
+    slugs?: ReadonlyArray<string>,
+  ) => Effect.Effect<
+    ReadonlyArray<
+      Pick<KanbanWikiPage, "slug" | "title" | "updatedAt"> & { readonly bytes: number }
+    >,
+    KanbanStoreError
+  >;
   readonly putWiki: (page: KanbanWikiPage) => Effect.Effect<void, KanbanStoreError>;
 
   /** Threads the board started; a thread belongs to at most one board. */
@@ -480,7 +510,12 @@ const make = Effect.gen(function* () {
   // metadata only after that enclosing operation succeeds, including bulk writes.
   const observeCallerWrites: KanbanStoreShape["observeCallerWrites"] = Effect.fnUntraced(
     function* (effect) {
-      if ((yield* callerWrites) !== undefined) return yield* effect;
+      const pending = yield* callerWrites;
+      if (pending !== undefined) {
+        const start = pending.length;
+        // A caught savepoint failure must not publish its rolled-back metadata at the outer commit.
+        return yield* effect.pipe(Effect.onError(() => Effect.sync(() => pending.splice(start))));
+      }
       const updates: Array<() => void> = [];
       const parent = yield* NodeSqliteClient.TransactionCommitObserver;
       const apply = () => {
@@ -821,6 +856,91 @@ const make = Effect.gen(function* () {
           ON CONFLICT (id) DO UPDATE SET slug = excluded.slug, json = excluded.json
         `;
       }),
+    );
+
+  const boardThreadIds = (boardId: KanbanBoardId) =>
+    runRead(
+      "board thread ids",
+      Effect.map(
+        sql<{ thread_id: string }>`
+    SELECT thread_id FROM (
+      SELECT thread_id FROM ardud_kanban_threads WHERE board_id = ${boardId}
+      UNION SELECT thread_id FROM ardud_kanban_thread_cards WHERE card_id IN
+        (SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId})
+      UNION SELECT active_thread_id FROM ardud_kanban_cards WHERE board_id = ${boardId}
+      UNION SELECT json_extract(json, '$.workThreadId') FROM ardud_kanban_cards WHERE board_id = ${boardId}
+      UNION SELECT json_extract(json, '$.reviewThreadId') FROM ardud_kanban_cards WHERE board_id = ${boardId}
+      UNION SELECT evaluator_thread_id FROM ardud_kanban_discussions WHERE board_id = ${boardId}
+      UNION SELECT thread_id FROM ardud_kanban_evaluator_queue WHERE board_id = ${boardId}
+    ) candidates WHERE thread_id IS NOT NULL AND NOT EXISTS
+      (SELECT 1 FROM ardud_kanban_threads other WHERE other.thread_id = candidates.thread_id AND other.board_id <> ${boardId})
+  `,
+        (rows) => rows.map((row) => ThreadId.make(row.thread_id)),
+      ),
+    );
+
+  const pendingBoardPurges = runRead(
+    "pending board purges",
+    Effect.map(
+      sql<{
+        board_id: string;
+        thread_id: string;
+      }>`SELECT board_id, thread_id FROM ardud_kanban_board_purges`,
+      (rows) =>
+        rows.map((row) => ({
+          boardId: KanbanBoardId.make(row.board_id),
+          threadId: ThreadId.make(row.thread_id),
+        })),
+    ),
+  );
+  const finishBoardPurgeThread = (boardId: KanbanBoardId, threadId: ThreadId) =>
+    run(
+      "finish board purge thread",
+      Effect.asVoid(
+        sql`DELETE FROM ardud_kanban_board_purges WHERE board_id = ${boardId} AND thread_id = ${threadId}`,
+      ),
+    );
+  const purgeBoard = (boardId: KanbanBoardId) =>
+    run(
+      "purge board",
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const ids = yield* boardThreadIds(boardId);
+          for (const threadId of ids)
+            yield* sql`INSERT OR IGNORE INTO ardud_kanban_board_purges (board_id, thread_id) VALUES (${boardId}, ${threadId})`;
+          // Dependents must be removed before the rows that scope them.
+          yield* sql`DELETE FROM ardud_kanban_evaluator_reminders WHERE card_id IN (SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId})`;
+          yield* sql`DELETE FROM ardud_kanban_card_events WHERE card_id IN (SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId})`;
+          yield* sql`DELETE FROM ardud_kanban_messages WHERE discussion_id IN (SELECT id FROM ardud_kanban_discussions WHERE board_id = ${boardId})`;
+          yield* sql`DELETE FROM ardud_kanban_script_runs WHERE script_id IN (SELECT id FROM ardud_kanban_scripts WHERE board_id = ${boardId})`;
+          yield* sql`DELETE FROM ardud_kanban_thread_cards WHERE card_id IN (SELECT id FROM ardud_kanban_cards WHERE board_id = ${boardId})
+      OR (thread_id IN (SELECT thread_id FROM ardud_kanban_threads WHERE board_id = ${boardId})
+        AND NOT EXISTS (SELECT 1 FROM ardud_kanban_cards other WHERE other.id = ardud_kanban_thread_cards.card_id AND other.board_id <> ${boardId}))`;
+          for (const table of [
+            "ardud_kanban_slot_events",
+            "ardud_kanban_evaluator_requests",
+            "ardud_kanban_instruction_applications",
+            "ardud_kanban_evaluator_spawns",
+            "ardud_kanban_evaluator_queue",
+            "ardud_kanban_owner_routes",
+            "ardud_kanban_threads",
+            "ardud_kanban_discussions",
+            "ardud_kanban_scripts",
+            "ardud_kanban_automations",
+            "ardud_kanban_wiki",
+            "ardud_kanban_goals",
+            "ardud_kanban_groups",
+            "ardud_kanban_pools",
+            "ardud_kanban_cards",
+          ]) {
+            yield* sql`DELETE FROM ${sql(table)} WHERE board_id = ${boardId}`;
+          }
+          yield* sql`DELETE FROM ardud_kanban_boards WHERE id = ${boardId}`;
+          return (yield* pendingBoardPurges)
+            .filter((row) => row.boardId === boardId)
+            .map((row) => row.threadId);
+        }),
+      ),
     );
 
   const putBoardWithPools = (
@@ -1290,6 +1410,28 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const evaluatorStepEvents: KanbanStoreShape["evaluatorStepEvents"] = (boardId) =>
+    runRead(
+      "read evaluator step events",
+      Effect.flatMap(
+        sql<IdJsonRow>`
+        SELECT e.id, e.json FROM ardud_kanban_cards c
+        JOIN ardud_kanban_card_events e ON e.id = (
+          SELECT MAX(id) FROM ardud_kanban_card_events INDEXED BY ardud_kanban_card_events_card WHERE card_id = c.id
+        )
+        WHERE c.board_id = ${boardId} AND c.stage IN ('completed', 'deployed')
+          AND json_extract(c.json, '$.settledAt') IS NULL
+      `,
+        (rows) =>
+          Effect.forEach(rows, (row) =>
+            Effect.map(
+              CardEvent.decode(row.json),
+              (event) => ({ ...event, id: Number(row.id) }) as KanbanCardEvent,
+            ),
+          ),
+      ),
+    );
+
   const activityHistory: KanbanStoreShape["activityHistory"] = (boardId, window) =>
     runRead(
       "read activity boundary history",
@@ -1643,7 +1785,7 @@ const make = Effect.gen(function* () {
     );
   // Walks the discussion's primary key newest first; json_extract stays in SQLite, so a
   // multi-MB history is never decoded.
-  const ownerWait = (id: KanbanDiscussionId) =>
+  const ownerWait = (id: KanbanDiscussionId, includeScripts = false, atSeq?: number) =>
     runRead(
       "read owner wait",
       Effect.map(
@@ -1656,7 +1798,9 @@ const make = Effect.gen(function* () {
                 AND json_extract(e.json, '$.author._tag') = 'evaluator'
             ) AS answered
           FROM ardud_kanban_messages m
-          WHERE m.discussion_id = ${id} AND json_extract(m.json, '$.author._tag') = 'owner'
+          WHERE m.discussion_id = ${id} AND (json_extract(m.json, '$.author._tag') = 'owner'
+            OR (${includeScripts} AND json_extract(m.json, '$.author._tag') = 'script'))
+            AND (${atSeq ?? null} IS NULL OR m.seq = ${atSeq ?? null})
           ORDER BY m.seq DESC LIMIT 1
         `,
         (rows) => {
@@ -1680,7 +1824,11 @@ const make = Effect.gen(function* () {
             WITH actions AS (
               SELECT seq, '' AS block, json_extract(json, '$.createdAt') AS at
               FROM ardud_kanban_messages
-              WHERE discussion_id = ${id} AND json_extract(json, '$.author._tag') = 'owner'
+              WHERE discussion_id = ${id} AND (json_extract(json, '$.author._tag') = 'owner'
+                OR (json_extract(json, '$.author._tag') = 'script' AND EXISTS (
+                  SELECT 1 FROM ardud_kanban_discussions d
+                  WHERE d.id = ${id} AND json_extract(d.json, '$.cardId') IS NOT NULL
+                )))
               UNION ALL
               SELECT m.seq, json_extract(a.value, '$.blockId'), json_extract(a.value, '$.at')
               FROM ardud_kanban_messages m, json_each(m.json, '$.answers') a
@@ -1827,13 +1975,26 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const wiki = (boardId: KanbanBoardId) =>
+  const wiki = (boardId: KanbanBoardId, slugs?: ReadonlyArray<string>) =>
     runRead(
       "read wiki",
       Effect.flatMap(
-        sql<JsonRow>`SELECT json FROM ardud_kanban_wiki WHERE board_id = ${boardId} ORDER BY slug`,
+        sql<JsonRow>`SELECT json FROM ardud_kanban_wiki
+          WHERE board_id = ${boardId} ${slugs === undefined ? sql`` : sql`AND slug IN ${sql.in(slugs)}`}
+          ORDER BY slug`,
         (rows) => decodeAll(rows, Wiki.decode),
       ),
+    );
+  const wikiIndex: KanbanStoreShape["wikiIndex"] = (boardId, slugs) =>
+    runRead(
+      "read wiki index",
+      sql<Pick<KanbanWikiPage, "slug" | "title" | "updatedAt"> & { readonly bytes: number }>`
+        SELECT slug, json_extract(json, '$.title') AS title,
+          json_extract(json, '$.updatedAt') AS updatedAt,
+          length(CAST(json_extract(json, '$.body') AS BLOB)) AS bytes
+        FROM ardud_kanban_wiki WHERE board_id = ${boardId}
+          ${slugs === undefined ? sql`` : sql`AND slug IN ${sql.in(slugs)}`}
+        ORDER BY slug`,
     );
   const putWiki = (page: KanbanWikiPage) =>
     run(
@@ -1961,6 +2122,10 @@ const make = Effect.gen(function* () {
     boards,
     board,
     putBoard,
+    boardThreadIds,
+    purgeBoard,
+    pendingBoardPurges,
+    finishBoardPurgeThread,
     putBoardWithPools,
     cards,
     openCards,
@@ -2001,6 +2166,7 @@ const make = Effect.gen(function* () {
     pendingInstructionApplications,
     cardEvents,
     boardEvents,
+    evaluatorStepEvents,
     activityHistory,
     lastTransitions,
     goals,
@@ -2035,6 +2201,7 @@ const make = Effect.gen(function* () {
     automations,
     putAutomation,
     wiki,
+    wikiIndex,
     putWiki,
     threadLink,
     threadLinksByIds,

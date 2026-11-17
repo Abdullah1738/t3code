@@ -1,3 +1,4 @@
+import { deliveredReplyCoverage, markAnswered, type AnsweredInput } from "./unanswered.ts";
 import { rememberHealthReceipt, type HealthSidecar } from "./health-receipts.ts";
 import { toolError, toolLog } from "./toollog.ts";
 import { Database } from "bun:sqlite";
@@ -168,6 +169,13 @@ export class Store {
   }
 
   updateInbound(id: string, state: string, payload?: unknown, failure?: InboundFailure): void {
+    if (payload !== undefined) {
+      const previous = this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(id);
+      const saved = previous ? JSON.parse(previous.payload) as AnsweredInput : undefined;
+      if (saved?.answeredAt !== undefined || saved?.unanswered !== undefined) payload = { ...payload as object,
+        ...(saved.answeredAt !== undefined ? { answeredAt: saved.answeredAt } : {}),
+        ...(saved.unanswered ? { unanswered: { ...saved.unanswered, ...(payload as AnsweredInput).unanswered } } : {}) };
+    }
     const detail = failure ?? (state === "failed" ? { stage: "state-transition", message: "No failure detail supplied", threadId: null, at: Date.now() } : undefined);
     const result = this.db.query(`UPDATE inbound SET state = ?, payload = COALESCE(?, payload), failure = COALESCE(?, failure)
       WHERE id = ?`).run(state, payload === undefined ? null : json(payload), detail ? json(detail) : null, id);
@@ -215,8 +223,10 @@ export class Store {
       const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
         ON CONFLICT(id) DO NOTHING`).run(op.id, payload);
       if (result.changes) {
-        if (op.kind === "conversation") this.set(`reply-covered:${op.id}`,
-          attribution?.covered ?? this.replyAttribution(op.sessionId, op.generation).covered);
+        this.set(`reply-covered:${op.id}`, attribution?.covered ?? [...new Set([
+          ...this.replyAttribution(op.sessionId, op.generation).covered,
+          ...(op.replyTo ? this.get<{ batchIds?: string[] }>(`batch:${op.replyTo}`)?.batchIds ?? [op.replyTo] : []),
+        ])]);
         if (op.app?.updateOf) this.set(`app-latest:${op.app.updateOf}`, op.id);
         toolLog.capture(() => {
           this.set(`log-queued:${op.id}`, Date.now());
@@ -302,8 +312,8 @@ export class Store {
         state = ?, providerId = COALESCE(?, providerId) WHERE id = ?`
       ).run(state, state, providerId ?? null, id);
       if (!result.changes) throw new Error(`Unknown outbox operation: ${id}`);
-      if (state === "sent") for (const inbound of this.get<string[]>(`reply-covered:${id}`) ?? [])
-        this.db.query("UPDATE inbound SET state = 'done' WHERE id = ? AND state = 'admitted'").run(inbound);
+      const op = state === "sent" ? this.getOperation(id) : undefined;
+      if (op?.kind === "conversation") markAnswered(this, deliveredReplyCoverage(this, op));
       rememberHealthReceipt(this, id, state);
     }).immediate();
   }

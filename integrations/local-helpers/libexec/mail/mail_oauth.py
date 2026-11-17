@@ -6,6 +6,7 @@ Microsoft's consumer IMAP frontends intermittently answer a valid XOAUTH2 login 
 frontend IP for hours. Healing = try other frontend IPs, and refresh the access token
 (rate-limited, under a lock) when logins keep failing. Never prints tokens.
 """
+import errno
 import fcntl
 import imaplib
 import json
@@ -69,17 +70,44 @@ def seconds_left(acct):
     return issued + exp - time.time() if issued else None
 
 
-def refresh(acct, reason="", force=False):
+class RefreshLockTimeout(TimeoutError):
+    def __init__(self, waited):
+        self.waited = waited
+        super().__init__(f"OAuth refresh lock wait {waited:.1f}s")
+
+
+def _refresh_lock(lk, timeout, deadline):
+    if timeout is None and deadline is None:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        return
+    started = time.monotonic()
+    if timeout is not None:
+        deadline = min(deadline, started + timeout) if deadline is not None else started + timeout
+    while True:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as e:
+            if e.errno not in (errno.EAGAIN, errno.EACCES):
+                raise
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RefreshLockTimeout(time.monotonic() - started)
+        time.sleep(min(.05, remaining))
+
+
+def refresh(acct, reason="", force=False, *, lock_timeout=None, deadline=None):
     """Refresh the ortie access token once, serialized across processes.
 
     Skips when another process refreshed within MIN_REFRESH_GAP_S (unless force).
-    Returns True if the token is fresh afterwards.
+    Returns True if the token is fresh afterwards. With lock_timeout or a monotonic deadline,
+    raises RefreshLockTimeout on contention; closing the descriptor abandons the wait safely.
     """
     if acct not in ORTIE_ACCOUNTS:
         return False
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(f"{STATE_DIR}/{acct}.lock", "w") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
+        _refresh_lock(lk, lock_timeout, deadline)
         age = token_age(acct)
         if not force and age is not None and age < MIN_REFRESH_GAP_S:
             return True
@@ -95,11 +123,12 @@ def refresh(acct, reason="", force=False):
         return ok
 
 
-def ensure_fresh(acct, margin=EARLY_REFRESH_S):
+def ensure_fresh(acct, margin=EARLY_REFRESH_S, *, lock_timeout=None, deadline=None):
     """Proactively refresh when the token expires within `margin` seconds."""
     left = seconds_left(acct)
     if left is None or left < margin:
-        return refresh(acct, reason=f"expiring ({int(left) if left is not None else '?'}s left)", force=True)
+        return refresh(acct, reason=f"expiring ({int(left) if left is not None else '?'}s left)", force=True,
+                       lock_timeout=lock_timeout, deadline=deadline)
     return True
 
 
@@ -132,7 +161,7 @@ class _PinnedIMAP(imaplib.IMAP4_SSL):
         return self.ssl_context.wrap_socket(raw, server_hostname=self.host)
 
 
-def xoauth2_connect(acct, host, user, timeout=30, deadline=None, max_tries=None):
+def xoauth2_connect(acct, host, user, timeout=30, deadline=None, max_tries=None, *, lock_timeout=None):
     """Log in with XOAUTH2, healing MS frontend flakes and stale tokens.
 
     Tries different frontend IPs; after repeated auth failures refreshes the token once and
@@ -197,7 +226,8 @@ def xoauth2_connect(acct, host, user, timeout=30, deadline=None, max_tries=None)
             # Google: one failure means a bad token. MS: refresh after a couple of bad frontends.
             if not refreshed and (not ms or i >= 1):
                 refreshed = True
-                if refresh(acct, reason=f"login failed: {str(e)[:60]}"):
+                if refresh(acct, reason=f"login failed: {str(e)[:60]}",
+                           lock_timeout=lock_timeout, deadline=deadline):
                     tok = get_token(acct, timeout)
             elif ms:
                 time.sleep(0.3)

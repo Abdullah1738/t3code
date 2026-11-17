@@ -31,6 +31,11 @@ if [[ "$name" == memory-system ]]; then
     fi
   done
   set -- "${deploy_args[@]}"
+  # A pre-fence tree would roll live recall back to stale memory-system code.
+  if [[ "${1:-}" != --dry-run ]] && ! grep -qF "sys.argv[1] == 'fence'" "${0:A:h}/memory-system/src/backup_control.py"; then
+    print -u2 "memory-system: this tree's backup_control.py has no backup fence; memory-system deploys come from an export of robob/recall-golive"
+    exit 2
+  fi
   if (( no_fence )); then
     print -u2 "WARNING: memory-system deploy is bypassing the backup fence (--no-fence)"
   elif [[ "${1:-}" != --dry-run && "${MEMORY_DEPLOY_FENCED:-}" != 1 ]]; then

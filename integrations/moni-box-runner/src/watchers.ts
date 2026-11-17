@@ -48,7 +48,7 @@ export class BoxWatchers {
           }
           if (!this.runner.active() || existsSync(join(dir, "disabled"))) continue;
           if (state.output.trim()) {
-            this.runner.enqueue(opaqueId(`watch:${id}:${state.run}`), { text: `[Watcher ${id}, not typed by Moni.]\n${state.output}\nContext: ${watch.context}` });
+            this.runner.enqueue(opaqueId(`watch:${id}:${state.run}`), { kind: "wake", watcher: id, text: `[Watcher ${id}, not typed by Moni.]\n${state.output}\nContext: ${watch.context}` });
             state.fires++;
           }
           writeFileSync(join(dir, ".run-ok"), state.run, { mode: 0o600 });
@@ -62,6 +62,7 @@ export class BoxWatchers {
 }
 async function boxCheck(watch: BoxWatch, run: string, ok: string, dir: string, retry: boolean) {
   const child = Bun.spawn(["/bin/bash", "-c", watch.check], { env: { HOME: process.env.HOME,
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 1000}`,
     PATH: `${process.env.HOME}/person/bin:${process.env.PATH}`, WATCH_DIR: dir, WATCH_ID: watch.id, WATCH_RUN: run, WATCH_OK: ok, WA_RETRY: retry ? "1" : "0" },
     stdout: "pipe", stderr: "ignore", timeout: 60_000, killSignal: "SIGKILL" });
   const [stdout, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);

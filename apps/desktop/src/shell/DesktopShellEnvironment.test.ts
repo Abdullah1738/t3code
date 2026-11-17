@@ -199,6 +199,74 @@ describe("DesktopShellEnvironment", () => {
     }),
   );
 
+  it.effect.each([
+    { probe: "login-shell", path: "/usr/bin:/bin:/usr/sbin:/sbin" },
+    { probe: "login-shell", path: "/sbin:/usr/sbin:/bin:/usr/bin" },
+    { probe: "login-shell", path: "/USR/BIN:/BIN:/USR/SBIN:/SBIN" },
+    { probe: "login-shell", path: ":/usr/bin::/usr/bin:/bin:" },
+    { probe: "login-shell", path: "/usr/bin/:/bin/.:/usr//sbin:/sbin/" },
+    { probe: "launchctl", path: "/usr/bin:/bin:/usr/sbin:/sbin" },
+    { probe: "launchctl", path: "  " },
+    ...[
+      "/System/Cryptexes/App/usr/bin",
+      "/system/cryptexes/app/usr/bin",
+      "/System/Volumes/Preboot/Cryptexes/App/usr/bin",
+      "/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin",
+      "/private/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin",
+      "/Library/Apple/usr/bin",
+    ].flatMap((applePath) =>
+      (["login-shell", "launchctl"] as const).map((probe) => ({
+        probe,
+        path: `${applePath}:/usr/bin:/bin:/usr/sbin:/sbin`,
+      })),
+    ),
+  ] as const)("does not mark a bare macOS probe prepared: %s", (scenario) =>
+    Effect.gen(function* () {
+      const env = { SHELL: "/bin/zsh", PATH: "/usr/bin:/bin:/usr/sbin:/sbin" };
+      const started = yield* Deferred.make<void>();
+      const install = yield* Effect.forkChild(
+        runShellEnvironment({
+          env,
+          platform: "darwin",
+          userShell: "/bin/zsh",
+          checkHydration: (hydration) => assert.equal(hydration.source, "none"),
+          handler: (command) => {
+            if (command._tag === "StandardCommand" && command.command === "/bin/launchctl")
+              return scenario.path;
+            if (scenario.probe === "login-shell") return envOutput({ PATH: scenario.path });
+            return Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never));
+          },
+        }).pipe(Effect.provide(Logger.layer([]))),
+      );
+      if (scenario.probe === "launchctl") {
+        yield* Deferred.await(started);
+        yield* TestClock.adjust("5 seconds");
+      }
+      assert.isFalse(yield* Fiber.join(install));
+      assert.equal(env.PATH, "/usr/bin:/bin:/usr/sbin:/sbin");
+    }),
+  );
+
+  it.effect.each([
+    "/custom/bin",
+    "/System/Cryptexes-tools/bin",
+    "/var/run/com.apple.security.cryptexd-tools/bin",
+    "/System/Volumes/Data/opt/homebrew/bin",
+  ])("validates the merged macOS PATH including inherited CLI directory %s", (cliPath) =>
+    Effect.gen(function* () {
+      const env = { SHELL: "/bin/zsh", PATH: `${cliPath}:/usr/bin` };
+      assert.isTrue(
+        yield* runShellEnvironment({
+          env,
+          platform: "darwin",
+          userShell: "/bin/zsh",
+          handler: () => envOutput({ PATH: "/usr/bin:/bin" }),
+        }),
+      );
+      assert.equal(env.PATH, `/usr/bin:/bin:${cliPath}`);
+    }),
+  );
+
   // Explicit opt-in keeps real shell coverage independent of globally installed tools.
   it.effect.runIf(process.env.T3_TEST_NU_PATH !== undefined)(
     "hydrates the desktop through a renamed Nushell symlink with native export conversions",

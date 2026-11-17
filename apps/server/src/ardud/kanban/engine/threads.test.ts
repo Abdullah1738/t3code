@@ -44,6 +44,7 @@ import * as ServerSettings from "../../../serverSettings.ts";
 import { CodexProviderCapabilitiesV2 } from "../../../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../../../orchestration-v2/CommandReceiptStore.ts";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
+import * as EffectOutbox from "../../../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../../../orchestration-v2/EffectWorker.ts";
 import * as EventSink from "../../../orchestration-v2/EventSink.ts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
@@ -62,6 +63,7 @@ import {
   prWatchesOf,
   viewStateOf,
 } from "./threads.ts";
+import { postRecoveryKey } from "./ownerReplyWake.ts";
 
 import { idleThreadProjection, liveThreadShell } from "../../../mcp/McpToolAccess.testkit.ts";
 import * as Analytics from "../../analytics/Analytics.ts";
@@ -323,7 +325,7 @@ describe("prWatchesOf", () => {
           ...(state === "current" ? { observedHeadSha: observed } : {}),
         };
         const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getThreadRecords: () => Effect.succeed({ subagents: [] } as never),
+          getThreadRecords: () => Effect.succeed({ subagents: [], runs: [] } as never),
           getThreadShell: () =>
             Effect.succeed({
               ...shell({}),
@@ -398,6 +400,49 @@ it.effect(
         ),
       );
     }),
+);
+
+it.effect.each(["failed", "completed"] as const)(
+  "persisted admission failure is available without an error item only while the run is %s",
+  (status) => {
+    const threadId = ThreadId.make("thread-admission-failure");
+    const runId = RunId.make("run-admission-failure");
+    const model = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" };
+    const failure = {
+      class: "provider_error" as const,
+      code: "restart_admission_timeout",
+      message: "The restart admission queue never released this run (waited 30 min).",
+      retryable: null,
+      admission: {
+        queuedAtMs: 0,
+        waitedMs: 30 * 60_000,
+        positionAtFailure: 2,
+        totalAtFailure: 3,
+        rule: "no_progress" as const,
+      },
+    };
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadRecords: () =>
+        Effect.succeed({
+          runs: [{ id: runId, status, modelSelection: model, failure }],
+          turnItems: [],
+        } as never),
+    });
+    return Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      expect(yield* threads.findLastFailure(threadId)).toEqual(
+        status === "failed" ? { ...failure, runId, model } : null,
+      );
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  },
 );
 
 it.effect.each(["first", "second", "missing", "completed", "none"] as const)(
@@ -879,6 +924,77 @@ it.effect("a keyed send passes stable command and message ids to thread manageme
       ),
     );
   }),
+);
+
+it.effect(
+  "#1603 retained recovery bodies survive owner wake coalescing and later message pruning",
+  () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("retained-post");
+      const runs: Array<{
+        id: RunId;
+        ordinal: number;
+        userMessageId: MessageId;
+        status: "queued" | "cancelled";
+      }> = [];
+      const messages: Array<{ id: MessageId; text: string }> = [];
+      const cancelled: RunId[] = [];
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: () =>
+          Effect.succeed({ projectId: ProjectId.make("project-1603"), deletedAt: null } as never),
+        getThreadRecords: () => Effect.succeed({ runs, messages } as never),
+        sendToThread: (input) =>
+          Effect.sync(() => {
+            const run = {
+              id: RunId.make(`retained-run-${runs.length + 1}`),
+              ordinal: runs.length + 1,
+              userMessageId: input.messageId,
+              status: "queued" as const,
+            };
+            runs.push(run);
+            messages.push({ id: input.messageId, text: input.text });
+            return { run, delivery: "queued" } as never;
+          }),
+        dispatch: (command) =>
+          Effect.sync(() => {
+            expect(command.type).toBe("queued-run.cancel");
+            if (command.type === "queued-run.cancel") {
+              cancelled.push(command.runId);
+              runs.find((run) => run.id === command.runId)!.status = "cancelled";
+            }
+            return undefined as never;
+          }),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        yield* threads.send({
+          threadId,
+          text: "Original script body",
+          key: postRecoveryKey("disc-1603", 39, "retained"),
+        });
+        const retained = runs[0]!;
+        yield* threads.send({
+          threadId,
+          text: "Another card's reminder",
+          coalesce: "owner:card-other",
+          key: "other-reminder",
+        });
+        yield* threads.send({ threadId, text: "Another card's actual message", key: "other-post" });
+        expect(cancelled).toEqual([runs[1]!.id]);
+        expect(retained.status).toBe("queued");
+        expect(messages.find((message) => message.id === retained.userMessageId)?.text).toBe(
+          "Original script body",
+        );
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }),
 );
 
 it.effect.each([
@@ -2769,6 +2885,200 @@ it.effect("#1574 assignment queue preserves a busy run and replays once", () => 
   );
 });
 
+it.effect.each(
+  (["sql", "memory"] as const).flatMap((storage) =>
+    (["codex", "claudeAgent"] as const).map((provider) => ({ storage, provider })),
+  ),
+)(
+  "short T3 $provider children hold through completion delivery ($storage)",
+  ({ storage, provider }) =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const parentId = ThreadId.make("short-parent");
+      const childId = ThreadId.make("short-child");
+      const quiet = at("2026-11-17T00:00:00.000Z");
+      const finished = at("2026-11-17T00:05:00.000Z");
+      for (const id of [parentId, childId])
+        yield* projections.apply({
+          id: EventId.make(`create:${id}`),
+          type: "thread.created",
+          threadId: id,
+          occurredAt: quiet,
+          payload: idleThreadProjection(liveThreadShell(id)).thread,
+        });
+      const childRun = {
+        id: RunId.make("short-child-run"),
+        threadId: childId,
+        ordinal: 1,
+        providerInstanceId: ProviderInstanceId.make(provider),
+        modelSelection: {
+          instanceId: ProviderInstanceId.make(provider),
+          model: provider === "codex" ? "gpt-6.1-sol" : "claude-sonnet-5-5",
+        },
+        providerThreadId: null,
+        userMessageId: MessageId.make("child-input"),
+        rootNodeId: null,
+        activeAttemptId: null,
+        status: "running" as const,
+        requestedAt: quiet,
+        startedAt: quiet,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+        lastActivityAt: quiet,
+      } satisfies OrchestrationV2Run;
+      yield* projections.apply({
+        id: EventId.make("parent-ended"),
+        type: "run.updated",
+        threadId: parentId,
+        occurredAt: quiet,
+        payload: {
+          ...childRun,
+          id: RunId.make("short-parent-run"),
+          threadId: parentId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+          status: "completed",
+          completedAt: quiet,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("child-started"),
+        type: "run.updated",
+        threadId: childId,
+        occurredAt: quiet,
+        payload: childRun,
+      });
+      const task = {
+        id: NodeId.make("short-task"),
+        threadId: parentId,
+        runId: null,
+        parentNodeId: NodeId.make("parent-root"),
+        origin: "app_owned" as const,
+        createdBy: "agent" as const,
+        driver: ProviderDriverKind.make(provider),
+        providerInstanceId: childRun.providerInstanceId,
+        providerThreadId: null,
+        childThreadId: childId,
+        nativeTaskRef: null,
+        prompt: "Review the head",
+        title: null,
+        model: childRun.modelSelection.model,
+        status: "running" as const,
+        idleTimeoutMs: 15 * 60_000,
+        completionDelivery: { state: "pending" as const, observedByRunId: null },
+        result: null,
+        startedAt: quiet,
+        completedAt: null,
+        updatedAt: quiet,
+      } satisfies OrchestrationV2Subagent;
+      yield* projections.apply({
+        id: EventId.make("task-started"),
+        type: "subagent.updated",
+        threadId: parentId,
+        occurredAt: quiet,
+        payload: task,
+      });
+      const taskItem = {
+        id: TurnItemId.make("short-task-item"),
+        threadId: parentId,
+        runId: RunId.make("short-parent-run"),
+        nodeId: task.id,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        status: "running" as const,
+        title: null,
+        startedAt: quiet,
+        completedAt: null,
+        updatedAt: quiet,
+        type: "subagent" as const,
+        subagentId: task.id,
+        origin: task.origin,
+        driver: task.driver,
+        providerInstanceId: task.providerInstanceId,
+        childThreadId: childId,
+        prompt: task.prompt,
+        result: null,
+      } satisfies OrchestrationV2TurnItem;
+      yield* projections.apply({
+        id: EventId.make("task-item-started"),
+        type: "turn-item.updated",
+        threadId: parentId,
+        occurredAt: quiet,
+        payload: taskItem,
+      });
+      const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+        getThreadShell: (id) => projections.getThreadShell(id).pipe(Effect.orDie),
+        getThreadRecords: (id, fields, filter) =>
+          projections.getThreadRecords(id, fields, filter).pipe(Effect.orDie),
+      });
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        const live = yield* threads.find(parentId);
+        expect(live?.backgroundWork).toBe(1);
+        expect(waitingOnBackground(live!, Date.parse("2026-11-17T00:04:00Z"))).toBe(true);
+        expect(waitingOnBackground(live!, Date.parse("2026-11-17T01:00:00Z"))).toBe(false);
+        yield* projections.apply({
+          id: EventId.make("child-ended"),
+          type: "run.updated",
+          threadId: childId,
+          occurredAt: finished,
+          payload: { ...childRun, status: "completed", completedAt: finished },
+        });
+        yield* projections.apply({
+          id: EventId.make("task-item-ended"),
+          type: "turn-item.updated",
+          threadId: parentId,
+          occurredAt: finished,
+          payload: { ...taskItem, status: "completed", completedAt: finished, updatedAt: finished },
+        });
+        for (const state of ["pending", "claimed", "delivered", "acknowledged"] as const) {
+          yield* projections.apply({
+            id: EventId.make(`task:${state}`),
+            type: "subagent.updated",
+            threadId: parentId,
+            occurredAt: finished,
+            payload: {
+              ...task,
+              status: "completed",
+              completedAt: finished,
+              updatedAt: finished,
+              result: "Review complete",
+              completionDelivery: { state, observedByRunId: null },
+            },
+          });
+          const shell = yield* projections.getThreadShell(parentId);
+          expect(shell?.pendingBackgroundTasks).toEqual([]);
+          const view = yield* threads.find(parentId);
+          const owed = state === "pending" || state === "claimed";
+          expect(view?.backgroundWork).toBe(owed ? 1 : 0);
+          for (const second of [1, 6, 10, 15, 22, 43])
+            expect(
+              waitingOnBackground(view!, Date.parse("2026-11-17T00:05:00Z") + second * 1000),
+            ).toBe(owed);
+          expect(waitingOnBackground(view!, Date.parse("2026-11-17T01:05:00Z"))).toBe(false);
+        }
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(management),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+            Layer.provide(Sqlite.layerMemory),
+          ),
+        ),
+      );
+    }).pipe(
+      Effect.provide(
+        storage === "sql"
+          ? ProjectionStore.layer.pipe(Layer.provide(Sqlite.layerMemory))
+          : ProjectionStore.layerMemory,
+      ),
+    ),
+);
+
 it.effect.each(["sql", "memory"] as const)(
   "find holds live child progress and pending final-summary delivery (%s)",
   (storage) =>
@@ -3697,4 +4007,237 @@ it.effect.each([false, true])(
         );
       }),
     ),
+);
+
+it.effect.each([
+  { effect: "pending", expected: "effect" },
+  { effect: "running", expected: "effect" },
+  { effect: "succeeded", expected: null },
+  { effect: "failed", expected: null },
+  { effect: "cancelled", expected: null },
+  { effect: "pending", queued: true, expected: null },
+  { status: "starting", recovery: true, expected: "run" },
+  { status: "starting", recovery: true, active: true, expected: "run" },
+  { status: "running", recovery: false, active: true, started: true, expected: null },
+  { status: "queued", recovery: true, expected: "run" },
+  { status: "running", recovery: true, started: true, expected: null },
+  { status: "completed", recovery: true, expected: null },
+  { status: "failed", recovery: true, expected: null },
+  { status: "cancelled", recovery: true, expected: null },
+  { status: "starting", recovery: false, expected: null },
+] as const)("thread recovery ownership: %j", (row) => {
+  const threadId = ThreadId.make("thread-restart-recovery");
+  const runId = RunId.make("run-restart-recovery");
+  const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+    getThreadShell: () =>
+      Effect.succeed({
+        ...shell({}),
+        id: threadId,
+        projectId: ProjectId.make("project-1"),
+        deletedAt: null,
+        activeRunId: "active" in row ? runId : null,
+        activityRunStartedAt: null,
+        archivedAt: null,
+        title: "Restart recovery",
+        pullRequests: [],
+      } as never),
+    getThreadRecords: (_, fields) => {
+      expect(fields).toEqual("active" in row ? ["runs"] : ["runs", "subagents"]);
+      return Effect.succeed({
+        subagents: [],
+        runs:
+          "status" in row
+            ? [
+                {
+                  id: runId,
+                  status: row.status,
+                  requestedAt: at(QUESTION_AT),
+                  startedAt: "started" in row ? at(FINISHED_AT) : null,
+                  ...(row.recovery ? { restartContinuationOfRunId: RunId.make("cut-run") } : {}),
+                },
+              ]
+            : [],
+      } as never);
+    },
+  });
+  return Effect.gen(function* () {
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    if ("effect" in row) {
+      yield* outbox.enqueue([
+        {
+          id: "effect:restart-continuation:cut-run",
+          threadId,
+          commandId: CommandId.make("restart"),
+          request: {
+            type: "provider-runtime.continue",
+            sourceRunId: RunId.make("cut-run"),
+            ...("queued" in row ? { queued: row.queued } : {}),
+          },
+        },
+      ]);
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET status = ${row.effect}`;
+      expect(yield* outbox.hasPendingRunContinuation(threadId)).toBe(row.expected === "effect");
+    }
+    const threads = yield* KanbanThreads;
+    const view = yield* threads.find(threadId);
+    expect(view?.restartRecovery).toEqual(
+      row.expected === "effect"
+        ? { effectId: "effect:restart-continuation:cut-run" }
+        : row.expected === "run"
+          ? { runId }
+          : undefined,
+    );
+  }).pipe(
+    Effect.provide(
+      layer.pipe(
+        Layer.provide(management),
+        Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        Layer.provideMerge(EffectOutbox.layer),
+        Layer.provideMerge(Sqlite.layerMemory),
+      ),
+    ),
+  );
+});
+
+it.effect.each([
+  { handoffAt: "before-find", effectStatus: "pending" },
+  { handoffAt: "shell-read", effectStatus: "pending" },
+  { handoffAt: "run-read", effectStatus: "pending" },
+  { handoffAt: "before-find", effectStatus: "running" },
+  { handoffAt: "shell-read", effectStatus: "running" },
+  { handoffAt: "run-read", effectStatus: "running" },
+] as const)("thread recovery ownership across the effect-to-run handoff: %j", (row) =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("handoff-thread");
+    const cutId = RunId.make("cut-run");
+    const recoveryId = RunId.make("recovery-run");
+    const effectId = "effect:restart-continuation:cut-run";
+    const now = at(FINISHED_AT);
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const sql = yield* SqlClient.SqlClient;
+    let handedOff = false;
+    const handoff = Effect.gen(function* () {
+      handedOff = true;
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'succeeded'
+        WHERE effect_id = ${effectId}`;
+    }).pipe(Effect.orDie);
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () =>
+        Effect.gen(function* () {
+          const snapshot = {
+            ...shell({}),
+            id: threadId,
+            projectId: ProjectId.make("project-1"),
+            deletedAt: null,
+            archivedAt: null,
+            title: "Handoff",
+            status: handedOff ? "running" : "idle",
+            activeRunId: handedOff ? recoveryId : null,
+            activityRunStatus: handedOff ? "starting" : null,
+            activityRunStartedAt: null,
+            latestRunCompletedAt: now,
+            pendingBackgroundTasks: [],
+            pullRequests: [],
+          };
+          if (!handedOff && row.handoffAt === "shell-read") yield* handoff;
+          return snapshot as never;
+        }),
+      getThreadRecords: () =>
+        Effect.gen(function* () {
+          const snapshot = handedOff
+            ? {
+                id: recoveryId,
+                status: "starting",
+                restartContinuationOfRunId: cutId,
+                requestedAt: now,
+                startedAt: null,
+              }
+            : { id: cutId, status: "cancelled", requestedAt: now, startedAt: now };
+          // Return the captured projection even if recovery commits before this read finishes.
+          if (!handedOff && row.handoffAt === "run-read") yield* handoff;
+          return { subagents: [], runs: [snapshot] } as never;
+        }),
+    });
+    yield* outbox.enqueue([
+      {
+        id: effectId,
+        threadId,
+        commandId: CommandId.make("restart"),
+        request: { type: "provider-runtime.continue", sourceRunId: cutId },
+      },
+    ]);
+    yield* sql`UPDATE orchestration_v2_effect_outbox SET status = ${row.effectStatus}
+      WHERE effect_id = ${effectId}`;
+    if (row.handoffAt === "before-find") yield* handoff;
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const view = yield* threads.find(threadId);
+      expect(handedOff).toBe(true);
+      expect([{ effectId }, { runId: recoveryId }]).toContainEqual(view?.restartRecovery);
+      expect((yield* threads.find(threadId))?.restartRecovery).toEqual({ runId: recoveryId });
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+        ),
+      ),
+    );
+  }).pipe(Effect.provide(EffectOutbox.layer.pipe(Layer.provideMerge(Sqlite.layerMemory)))),
+);
+
+it.effect("find exposes the oldest active tool from the run projection without item reads", () =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make("open-tools-view");
+    const runId = RunId.make("open-tools-run");
+    const shell = liveThreadShell(threadId, { activeRunId: runId });
+    const at = DateTime.makeUnsafe("2026-11-16T12:00:00Z");
+    const run: OrchestrationV2Run = {
+      id: runId,
+      threadId,
+      ordinal: 1,
+      providerInstanceId: shell.providerInstanceId,
+      modelSelection: shell.modelSelection,
+      providerThreadId: null,
+      userMessageId: MessageId.make("open-tool-user"),
+      rootNodeId: null,
+      activeAttemptId: null,
+      status: "running",
+      requestedAt: at,
+      startedAt: at,
+      completedAt: null,
+      checkpointId: null,
+      contextHandoffId: null,
+      openTools: {
+        newer: { kind: "dynamic_tool", since: "2026-11-16T12:10:00.000Z" },
+        oldest: { kind: "command_execution", since: "2026-11-16T12:01:00.000Z" },
+      },
+    };
+    let active = true;
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadShell: () => Effect.succeed(active ? shell : { ...shell, activeRunId: null }),
+      getThreadRecords: (_id, fields, filter) => {
+        expect(fields).not.toContain("turnItems");
+        if (active) expect(filter?.runIds).toEqual([runId]);
+        return Effect.succeed({ runs: [run], subagents: [] } as never);
+      },
+    });
+    yield* Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      const view = yield* threads.find(threadId);
+      expect(view?.openToolSince).toBe("2026-11-16T12:01:00.000Z");
+      expect(view?.openToolKind).toBe("command_execution");
+      active = false;
+      expect((yield* threads.find(threadId))?.openToolSince).toBeNull();
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  }),
 );
