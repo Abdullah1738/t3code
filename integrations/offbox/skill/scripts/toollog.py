@@ -26,10 +26,13 @@ NUMBERS.update({'outageS', 'waitedMs', 'placeBefore', 'placeAfter'})
 NUMBERS.update({'ageSeconds', 'runCount', 'waitSeconds', 'serving', 'held', 'pending', 'cap'})
 NUMBERS.update({'deficit', 'members_before'})
 NUMBERS.update({'created_at', 'since', 'total', 'headNeedBytes', 'freeBytes', 'running'})
+NUMBERS.update({'mem_available', 'shmem', 'committed_bytes', 'committed_as', 'admitted_bytes', 'reserve', 'free_bytes', 'need_bytes'})
+NUMBERS.update({'payload_current', 'payload_high', 'payload_max', 'payload_free', 'payload_reclaimable'})
 NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
                for field in ('free_bytes', 'size_bytes'))
 BOOLEANS = {"peer_online"} | set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
 BOOLEANS.add("ok")
+BOOLEANS.update({'fifo', 'room', 'cpu_room'})
 BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
 BOOLEANS.update({'deadlineKept', 'expired'})
 BOOLEANS.add('queueExpired')
@@ -61,6 +64,8 @@ ENUMS = {
 }
 ENUMS['reason'].update({'killed', 'kill_file', 'unit_inactive', 'unit_failed', 'unit_unknown',
                         'memory', 'fifo', 'cpu', 'cpu_config', 'cpu_unknown', 'cpu_settle', 'admitted_alone'})
+ENUMS['decision'].update({'admit', 'queue'})
+ENUMS['reason'].add('cleanup_unavailable')
 ENUMS['reason'].update({'history_empty', 'history_timeout', 'history_no_progress', 'history_unavailable'})
 ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
               for fs in ('tmp', 'var_tmp', 'home', 'workspace')})

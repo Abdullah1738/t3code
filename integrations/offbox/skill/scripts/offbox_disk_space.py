@@ -139,7 +139,7 @@ def remove_checked(parent, name, uid, cutoff, device, expected=None):
 
 
 def reap(root, uid, live, *, clock=time.time, proc=Path('/proc'), emit=print,
-         mountinfo=Path('/proc/self/mountinfo'), finished_before=None):
+         mountinfo=Path('/proc/self/mountinfo'), finished_before=None, keep_prefixes=()):
     root = Path(root)
     # A confirmed finished run needs no grace period; every live wrapper still fences its files.
     cutoff = min([finished_before if finished_before is not None else clock()-600] +
@@ -151,7 +151,7 @@ def reap(root, uid, live, *, clock=time.time, proc=Path('/proc'), emit=print,
     removed = 0
     for path in root.iterdir():
         # The parent is protected too: never recurse into any run's private scratch.
-        if path.name in ('offbox-run', '.X11-unix', 'snap-private-tmp') or path.name.startswith('systemd-private-'):
+        if path.name in ('offbox-run', '.X11-unix', 'snap-private-tmp') or path.name.startswith(('systemd-private-', *keep_prefixes)):
             continue
         if any(m == str(path) or m.startswith(str(path) + '/') for m in mounts):
             continue

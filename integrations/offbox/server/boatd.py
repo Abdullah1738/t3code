@@ -58,6 +58,7 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boatd_disk as disk
 import boatd_tmp
+import boatd_memory
 
 try:
     import offbox_disk_space
@@ -742,7 +743,11 @@ class Fail(Exception):
 
 
 def incus(*args, input: bytes | None = None, timeout: float = 600, check: bool = True) -> subprocess.CompletedProcess:
-    p = subprocess.run(["incus", *args], input=input, capture_output=True, timeout=timeout)
+    if args and args[0] in ('start','init','copy'):
+        with boatd_memory.lifecycle_lock(VAR):
+            p = subprocess.run(["incus", *args], input=input, capture_output=True, timeout=timeout)
+    else:
+        p = subprocess.run(["incus", *args], input=input, capture_output=True, timeout=timeout)
     if check and p.returncode != 0:
         raise Fail(500, "incus_failed", f"incus {' '.join(args[:3])}: {p.stderr.decode(errors='replace')[-500:]}")
     return p
@@ -764,7 +769,7 @@ def ct_running(box_id: str) -> bool:
 
 
 def cg_path(box_id: str) -> Path:
-    return CG_ROOT / f"lxc.payload.{ct(box_id)}"
+    return boatd_memory.payload_path(CG_ROOT, ct(box_id))
 
 
 def ct_exec(box_id: str, cmd: str, input: bytes | None = None, timeout: float = 120, user: int = 0,
@@ -852,9 +857,11 @@ def latest_snap(con, box_id: str):
     return con.execute("SELECT * FROM snaps WHERE box_id=? ORDER BY created_at DESC LIMIT 1", (box_id,)).fetchone()
 
 
-def held_runs(con, box_id: str) -> list[str]:
+def held_runs(con, box_id: str, *, exclude_pid=None) -> list[str]:
     held = []
     for c in con.execute("SELECT * FROM commands WHERE box_id=? AND (status='running' OR killed=1)", (box_id,)):
+        if c['pid'] == exclude_pid:
+            continue
         m = json.loads(c['metrics'] or '{}')
         info = m.get('interruption') or {}
         if (c['status'] == 'running' and (info.get('stream_state') in ('unknown', 'reattached') or info.get('cleanup') == 'unknown')) or \
@@ -1313,8 +1320,32 @@ def dispatching(fn):
     return wrapped
 
 
+@contextmanager
+def box_memory_lock(box_id):
+    path = VAR / 'memory-locks'
+    path.mkdir(exist_ok=True)
+    with open(path / box_id, 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 @dispatching
 def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
+    with box_memory_lock(box_id):
+        pid, cid, retry = queue_cmd(con, box_id, body, owner)
+    set_box(con, box_id, last_active=now())
+    d = cmd_dir(box_id)
+    for ext in ("out", "err"):
+        (d / f"{pid}.{ext}").touch()
+    err = spawn_runner(box_id, pid, 1)
+    if err:
+        con.execute("UPDATE commands SET status='exited', exit_code=127, ended_at=? WHERE box_id=? AND pid=?",
+                    (now(), box_id, pid))
+        raise Fail(500, "spawn_failed", err)
+    return {"ok": True, "processId": pid, "commandId": cid, "pid": pid, "attempt": 1, "retryInterrupted": bool(retry)}
+
+
+def queue_cmd(con, box_id, body, owner):
     r = box_row(con, box_id, owner)
     if r["state"] not in LIVE:
         raise Fail(409, "machine_not_running", f"{box_id} is {r['state']}")
@@ -1322,6 +1353,10 @@ def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
     if not command:
         raise Fail(400, "invalid_command", "command is empty")
     disk_admit()
+    previous = con.execute("SELECT * FROM commands WHERE box_id=? AND run_id IS NOT NULL "
+                           "AND status IN ('exited','lost','interrupted') ORDER BY ended_at DESC LIMIT 1", (box_id,)).fetchone()
+    if previous:
+        free_idle_tmp(con, previous, dict(status='exited', ended_at=previous['ended_at']))
     meta = body.get("meta") or {}
     con.execute("BEGIN IMMEDIATE")
     held = held_runs(con, box_id) if body.get('detached') else []
@@ -1341,16 +1376,7 @@ def start_cmd(con, box_id: str, body: dict, owner: str | None = None) -> dict:
                  meta.get("kind") or guess_kind(command), meta.get("repo"), meta.get("run_id"), retry,
                  int(sync), timeout_s))
     con.execute("COMMIT")
-    set_box(con, box_id, last_active=now())
-    d = cmd_dir(box_id)
-    for ext in ("out", "err"):
-        (d / f"{pid}.{ext}").touch()
-    err = spawn_runner(box_id, pid, 1)
-    if err:
-        con.execute("UPDATE commands SET status='exited', exit_code=127, ended_at=? WHERE box_id=? AND pid=?",
-                    (now(), box_id, pid))
-        raise Fail(500, "spawn_failed", err)
-    return {"ok": True, "processId": pid, "commandId": cid, "pid": pid, "attempt": 1, "retryInterrupted": bool(retry)}
+    return pid, cid, retry
 
 
 def guess_kind(command: str) -> str:
@@ -1707,6 +1733,14 @@ def terminal_result(res) -> bool:
 
 
 def _write_command_result(con, c, result, metrics, changes=None):
+    # A terminal row is the pool's hand-back signal. Cleanup finishes before it becomes visible.
+    with box_memory_lock(c['box_id']):
+        if terminal_result(result):
+            free_idle_tmp(con, c, result)
+        return _commit_command_result(con, c, result, metrics, changes)
+
+
+def _commit_command_result(con, c, result, metrics, changes=None):
     updates = {k: result.get(k, c[k]) for k in ('status', 'started_at', 'ended_at', 'boot_id')}
     metrics = dict(metrics)
     metrics.pop('queue_lost_reason', None)
@@ -1945,10 +1979,14 @@ def predicted_peak(con, kind: str) -> int:
 
 
 def admitted_bytes(con) -> int:
-    """Memory promised to runs that started in the last 60 s and may not have grown yet."""
+    """Future anon growth for every running box; existing shmem remains charged to the host."""
+    needs = {}
+    for r in con.execute(f"SELECT box_id,kind FROM commands WHERE {async_filter(con)}status='running'"):
+        needs[r['box_id']] = max(needs.get(r['box_id'], 0), predicted_peak(con, r['kind']))
     total = 0
-    for r in con.execute(f"SELECT kind FROM commands WHERE {async_filter(con)}status='running' AND started_at > ?", (now() - 60,)):
-        total += predicted_peak(con, r["kind"])
+    for box, need in needs.items():
+        anon = boatd_memory.anon_bytes(cg_path(box))
+        total += max(0, need - (int(anon) if anon is not None else 0))
     return total
 
 
@@ -2038,6 +2076,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
     reserve = int(CFG["mem_reserve_gb"] * 2**30)
     t0 = now()
     last_reason, last_said = None, None
+    last_decision = None
     while True:
         current = dict(cmd_row(con, box_id, pid))
         if current.get('killed') or current['status'] != 'queued' or (CMDS / box_id / f"{pid}.kill").exists() or json.loads(current['metrics'] or '{}').get('kill_request'):
@@ -2049,7 +2088,15 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             current = dict(cmd_row(con, box_id, pid))
             if current.get('killed') or current['status'] != 'queued' or (CMDS / box_id / f"{pid}.kill").exists() or json.loads(current['metrics'] or '{}').get('kill_request'):
                 return now() - t0
-            free = mem_available() - reserve - admitted_bytes(con)
+            try:
+                info = boatd_memory.meminfo()
+                promised = admitted_bytes(con)
+                memory = boatd_memory.capacity(info, mem_available(), reserve, promised,
+                                               boatd_memory.payload_capacity(CG_ROOT, promised))
+            except (OSError, ValueError):
+                memory = dict(mem_available=None, shmem=None, committed_bytes=None, committed_as=None,
+                              admitted_bytes=None, reserve=reserve, free_bytes=0)
+            free = memory['free_bytes']
             mine = head is None or (head['box_id'], head['pid']) == (box_id, pid)
             head_need = need if mine else predicted_peak(con, head['kind'])
             cap = int(CFG.get("max_running") or 0)
@@ -2062,9 +2109,15 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
             # PSI is a moving average: let a new run show up before admitting its neighbour.
             cpu_room = cpu_limit == 0 or (cpu_limit is not None and cpu_known and cpu < cpu_limit and
                                         (last_start is None or now() - last_start >= 10))
-            # The estimate can exceed this host's capacity. An empty host must still make FIFO progress.
             alone = running == 0
-            if mine and room and ((free >= need and cpu_room) or alone):
+            decision = mine and room and free >= need and (cpu_room or alone)
+            decision_state = (decision, mine, room, free >= need, cpu_room)
+            if decision or decision_state != last_decision:
+                toollog.emit('boatd', 'admit.decision', ids={'box': box_id, 'run': current['run_id']},
+                             props={**memory, 'need_bytes': need, 'decision': 'admit' if decision else 'queue',
+                                    'fifo': mine, 'room': room, 'cpu_room': cpu_room})
+                last_decision = decision_state
+            if decision:
                 guard = " AND killed=0" if 'killed' in current else ""
                 updated = con.execute("UPDATE commands SET status='running', started_at=?, queued_s=?, boot_id=? "
                             "WHERE box_id=? AND pid=? AND status='queued'" + guard,
@@ -2085,7 +2138,7 @@ def _admit(con, box_id: str, pid: int, kind: str, errf) -> float:
                 reason, why = 'cap', f"max_running cap {running}/{cap}"
             elif free < head_need:
                 reason = 'memory'
-                why = f"head {head_id} needs {head_need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free above reserve and recent admissions"
+                why = f"head {head_id} needs {head_need / 2**30:.2f} GiB, {max(0, free) / 2**30:.2f} GiB free above reserve and running headroom"
             elif cpu_limit is None:
                 reason, why = 'cpu_config', "a valid CPU admission setting"
             elif not cpu_known and cpu_limit > 0:
@@ -2214,6 +2267,46 @@ def disk_preflight(con, row, errf):
                 for line in text.decode(errors='replace').splitlines():
                     log(f"{row['box_id']} {row['run_id']}: {line}")
         return probe.returncode
+
+
+def free_idle_tmp(con, finishing, result):
+    box = finishing['box_id']
+    row = con.execute('SELECT * FROM boxes WHERE id=?', (box,)).fetchone()
+    if not row or row['pinned'] or row['owner'] in CFG.get('person_owners', []) or 'pool' not in row['name']:
+        return
+    if not finishing['run_id'] or not finishing['started_at'] or result.get('reason') == 'before_spawn':
+        return
+    if con.execute("SELECT 1 FROM commands WHERE box_id=? AND pid!=? AND status IN ('queued','running') LIMIT 1",
+                   (box, finishing['pid'])).fetchone() or held_runs(con, box, exclude_pid=finishing['pid']):
+        return
+    receipt = f"{finishing['pid']}/{finishing['attempt'] or 1}"
+    key = 'tmp_freed:' + box
+    prior = con.execute('SELECT v FROM meta WHERE k=?', (key,)).fetchone()
+    if prior and prior['v'] == receipt:
+        return
+    if run_processes(box, finishing['pid']) != []:
+        return
+    # #198's fd-anchored reaper preserves foreign owners, mounted trees, sockets and live-held files.
+    # Keep lock inodes as well as retained run scratch: a concurrent setup may be waiting on a lock.
+    source = Path(offbox_disk_space.__file__).read_text().split("\nif __name__ == '__main__':")[0]
+    source += "\nimport pwd\nroots=('/tmp','/dev/shm')\n"
+    source += "def used():\n return sum((s.f_blocks-s.f_bfree)*s.f_frsize for root in roots for s in [os.statvfs(root)])\n"
+    source += "before=used()\nremoved=0\n"
+    source += "\nfor root in ('/tmp','/dev/shm'):\n removed += reap(root,pwd.getpwnam('user').pw_uid,[],finished_before=" + repr(
+        result.get('ended_at') or now()) + ",keep_prefixes=('offbox-','.offbox'),emit=lambda item:None)\n"
+    source += "print(json.dumps(dict(bytes=max(0,before-used()))))\n"
+    try:
+        p = ct_exec(box, 'python3 -I -c ' + shlex.quote(source), timeout=30, check=False)
+        freed = json.loads(p.stdout) if p.returncode == 0 else None
+        if not isinstance(freed, dict) or type(freed.get('bytes')) is not int or freed['bytes'] < 0:
+            raise ValueError('tmp cleanup result unavailable')
+        con.execute('INSERT OR REPLACE INTO meta(k,v) VALUES (?,?)', (key, receipt))
+        toollog.emit('boatd', 'box.tmp_freed', ids={'box': box, 'run': finishing['run_id']},
+                     props=freed)
+    except (OSError, ValueError, Fail, subprocess.SubprocessError):
+        # A failed cleanup leaves allocations visible to admission; never turn an unknown run into idle.
+        toollog.emit('boatd', 'box.tmp_free_failed', kind='error', ok=False, ids={'box': box},
+                     props={'reason': 'cleanup_unavailable'})
 
 
 def run_cmd(box_id: str, pid: int) -> int:
