@@ -9,6 +9,7 @@ import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import {
   collectUint8StreamText,
@@ -315,6 +316,34 @@ const runProcessCore = Effect.fn("processRunner.runProcessCore")(function* (
       // entry is a file. That arrives as a defect, which `mapError` never sees,
       // so callers that recover from spawn failures would be bypassed.
       Effect.catchDefect((cause) => Effect.fail(toSpawnError(cause))),
+      Effect.tapError((error) => {
+        const cause = error.cause;
+        const missing = PlatformError.isPlatformError(cause)
+          ? cause.reason._tag === "NotFound"
+          : typeof cause === "object" &&
+            cause !== null &&
+            "code" in cause &&
+            cause.code === "ENOENT";
+        if (!missing) return Effect.void;
+        return Effect.gen(function* () {
+          const platform = yield* HostProcess.Platform;
+          const env = { ...(yield* HostProcess.Environment), ...input.env };
+          const pathKey =
+            platform === "win32"
+              ? Object.keys(env)
+                  .sort()
+                  .find((key) => key.toLowerCase() === "path")
+              : "PATH";
+          const path = (pathKey === undefined ? undefined : env[pathKey]) ?? "";
+          yield* Effect.logWarning("process spawn ENOENT", {
+            command: input.command,
+            path,
+            pathEntryCount: path
+              .split(platform === "win32" ? ";" : ":")
+              .filter((entry) => entry.trim()).length,
+          });
+        });
+      }),
     );
 
   const stdin = input.stdin;

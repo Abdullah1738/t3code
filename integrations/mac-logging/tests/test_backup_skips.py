@@ -170,6 +170,14 @@ class BackupSkipTests(unittest.TestCase):
             self.assertNotIn(secret,encoded)
         return rows[0], calls.read_text() if calls.exists() else ''
 
+    def assert_failure(self, row, reason='other'):
+        self.assertFalse(row['ok'])
+        self.assertEqual(row['props']['skipped'], 0)
+        self.assertNotIn('skipReason', row['props'])
+        self.assertEqual(row['props']['failReason'], reason)
+        self.assertIn(row['props']['failedStage'], toollog.BACKUP_STAGES)
+        self.assertEqual(row['error']['tag'], 'backup.failed_'+row['props']['failedStage'])
+
     def test_full_success_and_restic_failures(self):
         for target in ('health','memory'):
             for point, reason, rc in [('',None,0), ('password','password_unavailable',1),
@@ -179,13 +187,11 @@ class BackupSkipTests(unittest.TestCase):
                     row, calls = self.execute(self.setup_run(target,point), 0 if not point else 1)
                     self.assertEqual(row['props']['resticExitCode'],rc)
                     self.assertIn('backup',calls)
-                    self.assertEqual(row['props'].get('skipReason'),reason)
                     self.assertEqual(row['ok'],not point)
-                    if reason:
-                        self.assertEqual(row['error']['tag'],'backup.skipped_'+reason)
-                    elif point:
-                        self.assertEqual(row['error']['tag'],'backup.failed')
+                    if point:
+                        self.assert_failure(row, reason or 'other')
                     else:
+                        self.assertNotIn('skipReason',row['props'])
                         self.assertLess(row['props']['snapshotAgeS'],5)
 
     def test_pre_restic_exits_keep_their_exit_codes(self):
@@ -213,9 +219,13 @@ class BackupSkipTests(unittest.TestCase):
                 row, calls = self.execute(fixture,code)
                 self.assertEqual(calls,'')
                 self.assertNotIn('resticExitCode',row['props'])
-                self.assertEqual(row['props']['skipReason'],reason)
-                self.assertEqual(row['error']['tag'],'backup.skipped_'+reason)
-                self.assertFalse(row['ok'])
+                if code:
+                    self.assert_failure(row,reason)
+                else:
+                    self.assertEqual(row['props']['skipped'],1)
+                    self.assertEqual(row['props']['skipReason'],reason)
+                    self.assertEqual(row['error']['tag'],'backup.skipped_'+reason)
+                    self.assertFalse(row['ok'])
 
     def test_health_init_failure_records_actual_restic_exit(self):
         for point, reason in [('password','password_unavailable'),('repo_access','no_repo_access')]:
@@ -223,7 +233,7 @@ class BackupSkipTests(unittest.TestCase):
             (fixture[1]/'.local/share/health-backup/restic/config').unlink()
             row,calls=self.execute(fixture,1)
             self.assertIn('init',calls)
-            self.assertEqual(row['props']['skipReason'],reason)
+            self.assert_failure(row,reason)
             self.assertIn('resticExitCode',row['props'])
 
     def test_restic_launch_failure_forms_do_not_claim_a_restic_exit(self):
@@ -245,8 +255,7 @@ class BackupSkipTests(unittest.TestCase):
                     self.assertNotIn('resticExitCode',row['props'])
                     self.assertFalse(row['ok'])
                     reason='no_repo_access' if operation=='init' else 'other'
-                    self.assertEqual(row['props']['skipReason'],reason)
-                    self.assertEqual(row['error']['tag'],'backup.skipped_'+reason)
+                    self.assert_failure(row,reason)
 
     def test_repository_open_failure_forms_keep_the_actual_restic_exit(self):
         messages = [
@@ -266,8 +275,7 @@ class BackupSkipTests(unittest.TestCase):
                     row,calls=self.execute(fixture,1)
                     self.assertIn(operation,calls)
                     self.assertEqual(row['props']['resticExitCode'],1)
-                    self.assertEqual(row['props']['skipReason'],'no_repo_access')
-                    self.assertEqual(row['error']['tag'],'backup.skipped_no_repo_access')
+                    self.assert_failure(row,'no_repo_access')
                     self.assertFalse(row['ok'])
 
     def test_real_runner_validation_never_claims_a_restic_exit(self):
@@ -284,8 +292,7 @@ class BackupSkipTests(unittest.TestCase):
                 row,calls=self.execute(fixture,1)
                 self.assertEqual(calls,'')
                 self.assertNotIn('resticExitCode',row['props'])
-                self.assertEqual(row['props']['skipReason'],'other')
-                self.assertEqual(row['error']['tag'],'backup.skipped_other')
+                self.assert_failure(row)
                 self.assertFalse(row['ok'])
 
     def test_success_stays_success_if_restic_is_removed_after_it_started(self):
@@ -306,7 +313,7 @@ class BackupSkipTests(unittest.TestCase):
             if target=='health': (home/'Documents/assistant/pets/pets.db').unlink()
             (home/('Documents/assistant/pets' if target=='health' else '.local/share/memory-system/data')).rmdir()
             row,calls=self.execute(fixture,1)
-            self.assertEqual(row['props']['skipReason'],'source_missing')
+            self.assert_failure(row,'source_missing')
             self.assertEqual(calls,'')
             self.assertNotIn('resticExitCode',row['props'])
 
@@ -319,8 +326,7 @@ class BackupSkipTests(unittest.TestCase):
             if target=='memory': env['ROBOB_READONLY_DB']=str(root/'absent-export.sqlite')
             else: (home/'Documents/assistant/pets/pets.db').unlink()
             row,calls=self.execute(fixture,1)
-            self.assertEqual(row['props']['skipReason'],'source_missing')
-            self.assertEqual(row['error']['tag'],'backup.skipped_source_missing')
+            self.assert_failure(row,'source_missing')
             self.assertEqual(calls,'')
 
     def test_memory_redaction_wrapper_success_and_open_failure(self):
@@ -334,8 +340,9 @@ class BackupSkipTests(unittest.TestCase):
                 (home/'.local/share/memory-system/logs/state/redaction.flock').mkdir(parents=True)
             row,calls=self.execute(fixture,1 if failure else 0)
             self.assertEqual(row['ok'],not failure)
-            self.assertEqual(row['props'].get('skipReason'),'other' if failure else None)
+            self.assertNotIn('skipReason',row['props'])
             if failure:
+                self.assert_failure(row)
                 self.assertNotIn('resticExitCode',row['props'])
                 self.assertEqual(calls,'')
 
@@ -361,8 +368,7 @@ class BackupSkipTests(unittest.TestCase):
                 self.assertFalse(row['ok'])
                 after_snapshot=point in ('manifest_publish','check')
                 self.assertEqual('resticExitCode' in row['props'],after_snapshot)
-                self.assertEqual(row['props'].get('skipReason'),None if after_snapshot else 'other')
-                self.assertEqual(row['error']['tag'],'backup.failed' if after_snapshot else 'backup.skipped_other')
+                self.assert_failure(row)
 
     def test_memory_guard_legacy_holder_and_guard_error(self):
         for point in ('legacy','guard_error'):
@@ -373,7 +379,7 @@ class BackupSkipTests(unittest.TestCase):
             if point=='guard_error':
                 Path(str(lock)+'.flock').mkdir()
                 row,calls=self.execute(fixture,1)
-                self.assertEqual(row['props']['skipReason'],'other')
+                self.assert_failure(row)
                 self.assertNotIn('resticExitCode',row['props'])
             else:
                 child=subprocess.Popen(['/bin/bash','-c','exec -a memory_backup.sh /bin/sleep 30'])

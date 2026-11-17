@@ -10,6 +10,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
   RuntimeRequestId,
@@ -862,7 +863,16 @@ it.effect("a run Stop reached cannot delegate or start a watch, even after it en
       commandId: CommandId.make("cancel-queued"),
       threadId,
       runId: queued.id,
+      reason: "card_stop",
+      detail: "Card stopped before provider launch.",
     });
+    const cancelled = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+      (candidate) => candidate.id === queued.id,
+    )!;
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(cancelled.startedAt, null);
+    assert.equal(cancelled.cancelReason, "card_stop");
+    assert.equal(cancelled.cancelDetail, "Card stopped before provider launch.");
     yield* projections.apply({
       id: EventId.make("event:stop-barrier:interrupt-request"),
       type: "turn-item.updated",
@@ -1046,6 +1056,7 @@ it.effect.each(["thread.stop", "run.interrupt"] as const)(
       const stopped = yield* orchestrator.getThreadProjection(threadId);
       const interrupted = stopped.runs.find((run) => run.id === queued!.id)!;
       assert.equal(interrupted.status, "interrupted");
+      assert.equal(interrupted.cancelReason, "user_stop");
       assert.equal(DateTime.toEpochMillis(interrupted.completedAt!), DateTime.toEpochMillis(now));
       yield* orchestrator.dispatch({
         type: "message.dispatch",
@@ -1418,6 +1429,7 @@ it.effect.each(["missing session", "completed", "failed", "cancelled"] as const)
       const childRoot = {
         ...before.nodes.find((node) => node.id === run.rootNodeId)!,
         id: NodeId.make("node:native-stop-child-root"),
+        providerThreadId: ProviderThreadId.make("provider-thread:native-stop-child"),
         threadId: subagent.childThreadId!,
         runId: null,
         parentNodeId: null,
@@ -1432,6 +1444,25 @@ it.effect.each(["missing session", "completed", "failed", "cancelled"] as const)
         nodeId: childRoot.id,
         occurredAt: now,
         payload: childRoot,
+      });
+      const childTurnId = ProviderTurnId.make("turn:native-stop-child");
+      yield* projections.apply({
+        id: EventId.make("event:native-child-stop:child-turn"),
+        type: "provider-turn.updated",
+        threadId: childRoot.threadId,
+        nodeId: childRoot.id,
+        occurredAt: now,
+        payload: {
+          id: childTurnId,
+          nodeId: childRoot.id,
+          providerThreadId: childRoot.providerThreadId!,
+          runAttemptId: null,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        },
       });
       const providerThread = before.providerThreads.find(
         (thread) => thread.id === run.providerThreadId,
@@ -1597,6 +1628,14 @@ it.effect.each(["missing session", "completed", "failed", "cancelled"] as const)
       );
       const child = yield* orchestrator.getThreadProjection(childRoot.threadId);
       assert.equal(child.nodes.find((node) => node.id === childRoot.id)?.status, confirmedStatus);
+      assert.equal(
+        child.providerTurns.find((turn) => turn.id === childTurnId)?.status,
+        confirmedStatus,
+      );
+      assert.deepEqual(
+        child.providerTurns.find((turn) => turn.id === childTurnId)?.completedAt,
+        now,
+      );
       assert.isNotNull(child.nodes.find((node) => node.id === childRoot.id)?.completedAt);
       assert.equal(settled.subagents.find((task) => task.id === sibling.id)?.status, "running");
       assert.deepEqual(yield* threadState(threadId), stateBefore);
@@ -1738,5 +1777,121 @@ it.effect.each(["pointers", "indirect ownership"])(
       const after = yield* orchestrator.getThreadProjection(threadId);
       assert.equal(after.runs[0]!.status, "running");
       assert.equal(after.providerTurns[0]!.status, "running");
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each(["thread.stop", "run.interrupt"] as const)(
+  "%s ends a native child's runless provider turn with its root",
+  (stopType) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = ThreadId.make("thread:parent-stop-runless");
+      yield* createWatchingThread(threadId, 20);
+      yield* send(threadId, "owner", "start_immediately");
+      const childThreadId = yield* delegate(threadId, "native-child");
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const run = before.runs[0]!;
+      const now = yield* DateTime.now;
+      const subagent = {
+        ...before.subagents[0]!,
+        origin: "provider_native" as const,
+        status: "running" as const,
+      };
+      yield* projections.apply({
+        id: EventId.make("parent-stop:subagent"),
+        type: "subagent.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: subagent,
+      });
+      const item = before.turnItems.find(
+        (item) => item.type === "subagent" && item.subagentId === subagent.id,
+      )!;
+      if (item.type !== "subagent") throw new Error("Expected subagent item");
+      yield* projections.apply({
+        id: EventId.make("parent-stop:item"),
+        type: "turn-item.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...item, origin: "provider_native", status: "running", completedAt: null },
+      });
+      const root = {
+        ...before.nodes.find((node) => node.id === run.rootNodeId)!,
+        id: NodeId.make("parent-stop:child-root"),
+        threadId: childThreadId,
+        runId: null,
+        providerThreadId: ProviderThreadId.make("provider-thread:parent-stop-child"),
+        parentNodeId: null,
+        status: "running" as const,
+        countsForRun: false,
+        completedAt: null,
+      };
+      yield* projections.apply({
+        id: EventId.make("parent-stop:root"),
+        type: "node.updated",
+        threadId: childThreadId,
+        occurredAt: now,
+        payload: root,
+      });
+      const turnId = ProviderTurnId.make("parent-stop:child-turn");
+      yield* projections.apply({
+        id: EventId.make("parent-stop:turn"),
+        type: "provider-turn.updated",
+        threadId: childThreadId,
+        occurredAt: now,
+        payload: {
+          id: turnId,
+          nodeId: root.id,
+          providerThreadId: root.providerThreadId!,
+          runAttemptId: null,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "running",
+          startedAt: now,
+          completedAt: null,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("parent-stop:owner-turn"),
+        type: "provider-turn.updated",
+        threadId,
+        occurredAt: now,
+        payload: {
+          id: ProviderTurnId.make("parent-stop:owner-turn"),
+          nodeId: run.rootNodeId!,
+          providerThreadId: run.providerThreadId!,
+          runAttemptId: run.activeAttemptId,
+          nativeTurnRef: null,
+          ordinal: 1,
+          status: "completed",
+          startedAt: now,
+          completedAt: now,
+        },
+      });
+      yield* projections.apply({
+        id: EventId.make("parent-stop:owner-completed"),
+        type: "run.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+      });
+      yield* orchestrator.dispatch(
+        stopType === "thread.stop"
+          ? { type: stopType, commandId: CommandId.make("stop-parent-runless"), threadId }
+          : {
+              type: stopType,
+              commandId: CommandId.make("stop-parent-runless"),
+              threadId,
+              runId: run.id,
+            },
+      );
+      const child = yield* orchestrator.getThreadProjection(childThreadId);
+      assert.equal(child.nodes.find((node) => node.id === root.id)?.status, "interrupted");
+      assert.equal(child.providerTurns.find((turn) => turn.id === turnId)?.status, "interrupted");
+      assert.deepEqual(child.providerTurns.find((turn) => turn.id === turnId)?.completedAt, now);
     }).pipe(Effect.provide(layerTest)),
 );

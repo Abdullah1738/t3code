@@ -112,6 +112,60 @@ class ResumeProgressTests(Isolated):
         self.assertEqual(wait['stages_s']['background_refresh'], 60)
         self.assertGreaterEqual(wait['duration_s'], 60)
 
+    def test_startup_pause_preserves_elapsed_stall_without_counting_startup(self):
+        self.box('cold', 'stopped')
+        with prepare.guard('cold') as budget:
+            watch = lease._ResumeWatch(self.con, 'cold')
+            watch.observe({'state': 'resuming'})
+            self.clock.sleep(50)
+            end = budget.end
+            with prepare.pause_for_home_start():
+                self.clock.sleep(120)
+                watch.check()
+                self.assertEqual(watch.remaining(), 40)
+            self.assertEqual(budget.end, end + 120)
+            watch.observe({'state': 'resuming'})
+            self.clock.sleep(39)
+            watch.check()
+            self.clock.sleep(1)
+            with self.assertRaises(lease.ResumeNoProgress):
+                watch.check()
+        diag, = self.events('cold', 'resume_stuck')
+        self.assertEqual(diag['elapsed_s'], 210)
+        self.assertEqual(diag['no_progress_s'], 90)
+
+    def test_exhausted_home_start_wait_passes_through_without_quarantine(self):
+        for provisioning in (False, True):
+            with self.subTest(provisioning=provisioning):
+                self.box('cold', 'stopped')
+                with prepare.guard('cold'):
+                    watch = lease._ResumeWatch(self.con, 'cold')
+                    def starting(bid, **kwargs):
+                        with prepare.pause_for_home_start():
+                            self.clock.sleep(120)
+                        raise home.StartWaitFailed('home still starting')
+                    with patch.object(api, 'readiness_get', side_effect=starting):
+                        with self.assertRaises(home.StartWaitFailed):
+                            if provisioning:
+                                lease._wait_unanswered_resume(self.con, 'cold', watch)
+                            else:
+                                lease._resume_confirmed(self.con, 'cold', 600, None, pending=True, watch=watch)
+                self.assertFalse(self.events('cold', 'resume_stuck'))
+                self.con.execute('DELETE FROM leases')
+                self.con.execute('DELETE FROM kv')
+                self.con.commit()
+
+    def test_boot_failure_at_watchdog_boundary_keeps_boot_quarantine(self):
+        self.box('cold', 'stopped')
+        def get(bid, **kwargs):
+            self.clock.sleep(90)
+            return dict(state='archived', error='500 boot_timeout: sshd did not finish booting',
+                        updatedAt=dt.datetime.fromtimestamp(self.clock.t, dt.timezone.utc).isoformat())
+        with patch.object(api, 'get', side_effect=get):
+            with self.assertRaises(api.BoxBootFailed):
+                lease._bring_up_resumed(self.con, 'cold', None, False, since=1000)
+        self.assertFalse(self.events('cold', 'resume_stuck'))
+
     def test_failover_names_both_causes_without_unreachable_claim(self):
         reason = 'stuck resume of cold after 90s. Replacement allocation failed: ECR rate limit'
         output = io.StringIO()
@@ -182,6 +236,33 @@ class ResumeProgressTests(Isolated):
         self.assertEqual(self.starts, [])
         self.assertLessEqual(self.clock.t - 1000, 92)
         self.assertEqual(len(self.events('pending-one', 'resume_stuck')), 1)
+
+    def test_held_peer_does_not_starve_next_pending_resume(self):
+        self.acquire_after_held_peer(wait_seconds='0')
+
+    def test_held_peer_with_queue_does_not_starve_next_pending_resume(self):
+        self.acquire_after_held_peer(wait_seconds='120')
+
+    def acquire_after_held_peer(self, wait_seconds):
+        for bid in ('pending-one', 'pending-two'):
+            self.box(bid, 'stopped', member=True)
+            self.con.execute('INSERT INTO kv VALUES (?,?,?)', (f'resume_unanswered:{bid}', '', 0))
+        self.box('held-peer', 'running', member=True)
+        self.con.commit()
+        reads = []
+        def get(bid, **kw):
+            reads.append(bid)
+            return dict(id=bid, state='resuming' if bid == 'pending-one' else 'running', type='large',
+                        heldRuns=['run-alive'] if bid == 'held-peer' else [])
+        with patch.dict(os.environ, OFFBOX_POOL_WAIT_SECONDS=wait_seconds), \
+                patch.object(api, 'get', side_effect=get), \
+                patch.object(lease, 'acquire_private', side_effect=AssertionError('use recovered pending peer')):
+            got = pool.acquire(self.me)
+        pool.release_guard(got)
+        self.assertEqual(got['box_id'], 'pending-two')
+        self.assertEqual(reads.count('held-peer'), 1)
+        self.assertLessEqual(self.clock.t - 1000, 92)
+        self.assertEqual(self.starts, [])
 
     def test_size_refusal_then_second_resume_is_recorded_as_resent(self):
         self.box('cold', 'stopped', member=True, size='xlarge')

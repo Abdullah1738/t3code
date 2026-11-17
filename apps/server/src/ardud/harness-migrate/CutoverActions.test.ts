@@ -114,6 +114,33 @@ const board: KanbanBoard = {
   defaultCardModel: opus,
   reviewChains: [{ name: "review", steps: [sol, terra] }],
   defaultReviewChain: "review",
+  standingApprovals: [
+    {
+      id: "standing-deploy",
+      gate: "deploy",
+      minIntervalHours: 4,
+      quote: "This board may release every four hours",
+      sourceThreadId: "approval-thread",
+      saidAt: at,
+      approvedAsk: { cardId: "approval-card", askId: "q1" },
+      recordedAt: at,
+      recordedBy: "evaluator",
+      revokedAt: null,
+      revokedBy: null,
+      revokeReason: null,
+    },
+  ],
+  releaseLedger: [
+    {
+      boardId: KanbanBoardId.make("board:cutover-fixture"),
+      cardId: KanbanCardId.make("previous-release"),
+      cardNumber: 1,
+      subtaskId: "s1",
+      at,
+      critical: null,
+      approvalId: "standing-deploy",
+    },
+  ],
   instructions: {
     modelRouting: "Keep routing",
     reviewerRouting: "Keep review",
@@ -1384,6 +1411,7 @@ it.effect(
             runId: RunId.make("run:running:1"),
             commandId: CommandId.make("harness-cutover:v1:thread:running:interrupt:run:running:1"),
             reason: "Harness cutover",
+            cancelReason: "superseded",
           },
         ]);
         assert.deepStrictEqual(h.commands, []);

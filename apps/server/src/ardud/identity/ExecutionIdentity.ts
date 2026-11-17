@@ -18,6 +18,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+import { logNativeLookupIndexCheck } from "../control/nativeLookup.ts";
 
 export class ExecutionIdentityError extends Schema.TaggedError<ExecutionIdentityError>()(
   "ExecutionIdentityError",
@@ -181,6 +182,10 @@ const make = Effect.gen(function* () {
       ),
     );
   }
+
+  // The boards copy can still be initializing when this layer starts. Check
+  // once it is ready, after the state indexes above have been ensured.
+  yield* BoardsDatabase.onReady(logNativeLookupIndexCheck());
 
   // Driver and instance columns are newer than some rows; fall back to payload.
   const providerRowsFor = (nativeId: string) =>

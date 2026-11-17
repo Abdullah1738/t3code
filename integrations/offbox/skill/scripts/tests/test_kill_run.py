@@ -2,6 +2,7 @@
 import contextlib
 import io
 import itertools
+import json
 import os
 import signal
 import subprocess
@@ -88,6 +89,18 @@ class KillRunTests(Isolated):
         self.assertEqual(tuple(self.status_of('run-1')), ('killed', 143))
         self.assertIsNone(self.con.execute("SELECT 1 FROM kv WHERE k='start_unknown:run-1'").fetchone())
         self.assertEqual(err.getvalue().count('waiting up to 40 s'), 1)
+
+    def test_kill_preserves_confirmed_command_result(self):
+        for code in (0,1,200):
+            with self.subTest(code=code):
+                rid=f'run-completed-{code}'
+                self.run_row(rid)
+                with patch.object(api,'cmd_kill',return_value={}), \
+                     patch.object(api,'cmd_status',return_value=dict(status='exited',running=False,exitCode=code)), \
+                     patch.object(lease,'idle_ttl'), \
+                     contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(misc.kill_run(rid),0)
+                self.assertEqual(tuple(self.status_of(rid)),('done' if code==0 else 'failed',code))
 
     def test_kill_404_on_third_poll_confirms_stop(self):
         self.run_row()
@@ -735,6 +748,67 @@ while True:
         with self.assertRaises(api.OffboxError):
             misc.kill_run('run-done')
         km.assert_not_called()
+
+    def test_home_settled_cleanup_calls_delete_and_preserves_terminal_result(self):
+        for status, code in (('done', 0), ('failed', 7), ('interrupted', 94), ('killed', 143), ('lost', None)):
+            rid = 'run-' + status
+            self.run_row(rid, status=status)
+            self.con.execute('UPDATE runs SET exit_code=?,end_at=123 WHERE run_id=?', (code, rid))
+            self.con.commit()
+            info = dict(cleanup='stopped', leftover_killed=3, remaining=0)
+            with self.subTest(status=status), patch.object(api, 'BACKEND', 'server'), \
+                    patch.object(api, 'call', return_value={'cleanup': info}) as delete, \
+                    patch.object(api, 'cmd_status', side_effect=AssertionError('terminal status cannot prove cleanup')), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(misc.kill_run(rid), 0)
+            delete.assert_called_once_with('DELETE', '/sandboxes/bx_1/commands/42', ok404=True, retries=1)
+            row = self.con.execute('SELECT status,exit_code,end_at FROM runs WHERE run_id=?', (rid,)).fetchone()
+            self.assertEqual(tuple(row), (status, code, 123))
+            self.assertIn('cleanup: 3 stopped', out.getvalue())
+            saved = json.loads((runs.LOGS_DIR / f'{rid}.state.json').read_text())
+            self.assertEqual(saved['cleanup'], info)
+
+    def test_home_settled_cleanup_reports_clean_or_unknown(self):
+        cases = [(dict(cleanup='clean', leftover_killed=0, remaining=0), 0, 'clean'),
+                 (dict(cleanup='unknown', leftover_killed=None, remaining=None, reason='box_unreadable'), 1, 'unknown'),
+                 (dict(cleanup='stopped', leftover_killed=None, remaining=0), 1, 'unknown'),
+                 ({}, 1, 'unknown')]
+        for index, (info, code, text) in enumerate(cases):
+            rid = f'run-cleanup-{index}'
+            self.run_row(rid, status='failed')
+            with self.subTest(info=info), patch.object(api, 'BACKEND', 'server'), \
+                    patch.object(api, 'cmd_kill', return_value={'cleanup': info}) as delete, \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(misc.kill_run(rid), code)
+            delete.assert_called_once_with('bx_1', 42)
+            self.assertIn('cleanup: ' + text, out.getvalue())
+            self.assertEqual(self.status_of(rid)['status'], 'failed')
+
+    def test_home_settled_cleanup_still_requires_proven_caller_and_owner(self):
+        self.run_row('run-done', status='done', owner=self.me['owner'])
+        with patch.object(api, 'BACKEND', 'server'), patch.object(api, 'cmd_kill') as delete:
+            for me in (dict(self.me, proven=False), dict(self.me, proven=True, owner='another-worker')):
+                with self.subTest(me=me), self.assertRaises(api.OffboxError):
+                    misc.kill_run('run-done', me)
+            delete.assert_not_called()
+
+    def test_home_settled_cleanup_still_refuses_untrusted_wrapper_pid(self):
+        self.run_row('run-done', status='done')
+        self.con.execute("INSERT INTO kv(k,v) VALUES ('start_unknown:run-done','bx_1')")
+        self.con.commit()
+        with patch.object(api, 'BACKEND', 'server'), patch.object(api, 'cmd_kill') as delete, \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(misc.kill_run('run-done'), 1)
+        delete.assert_not_called()
+
+    def test_home_settled_without_remote_process_is_still_refused(self):
+        self.run_row('run-no-process', status='done', pid=None)
+        self.run_row('run-local-done', status='done', mode='local')
+        with patch.object(api, 'BACKEND', 'server'), patch.object(api, 'cmd_kill') as delete:
+            for rid in ('run-no-process', 'run-local-done'):
+                with self.subTest(rid=rid), self.assertRaises(api.OffboxError):
+                    misc.kill_run(rid)
+            delete.assert_not_called()
 
     def test_release_refusal_names_runs_and_suggests_kill(self):
         self.box('bx_busy')

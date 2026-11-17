@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createApi } from "./api.ts";
 import { startAppsServer } from "./apps.ts";
 import { Delivery } from "./delivery.ts";
+import { ReplyGapMonitor } from "./reply-gap.ts";
 import { alertSkillPath, loadConfig, skillPath, stateRoot, telegramBridgeSocket, transportKind } from "./config.ts";
 import { ingest } from "./ingress.ts";
 import { acquireLock } from "./lock.ts";
@@ -146,7 +147,8 @@ async function main(): Promise<void> {
   });
   const makeRouter = () => chatGuid ? new Router(store, backend, photon, {
     ...config, chatGuid, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
-    transcribe: input => transcribe(input), notifyFailure: notifyFailedInbound, log, recoverAttachment,
+    medsFold: {},
+    transcribe: input => transcribe(input), notifyUnanswered: (severity, text, key) => outlet.notify(severity, text, key), notifyFailure: notifyFailedInbound, log, recoverAttachment,
   }) : undefined;
   router = makeRouter();
   const health = { photonLastOk: 0, backendLastOk: 0, lastError: "", startedAt: Date.now() };
@@ -207,6 +209,7 @@ async function main(): Promise<void> {
     appsUrl: () => store.get<{ port: number; url: string } | null>("appsPublished")?.url,
     blob: sha256 => store.getBlob(sha256),
   });
+  const replyGap = new ReplyGapMonitor(store, { chat: "owner", notify: outlet.notify });
   const delivery = new Delivery(store, photon, { projectScope, chatGuid: () => chatGuid,
     beforeSend: async item => router?.beforeSend(item) ?? "send",
     enabled: () => ready() && !controlsPending && !stopping, log,
@@ -220,7 +223,7 @@ async function main(): Promise<void> {
         let complete = false;
         for await (const event of photon.catchUp(store.get<number>("photonCursor"))) {
           if (stopping) break;
-          if (ingest(store, event, config.owner, config.enabled)) {
+          if (ingest(store, event, config.owner, config.enabled, kind)) {
             ingressRevision++;
             controlsPending = true;
             chatGuid = store.get<string>("chatGuid");
@@ -285,8 +288,13 @@ async function main(): Promise<void> {
     }
   }
   let routerBusy = false;
+  const unansweredTimer = setInterval(() => {
+    if (ready()) void router?.checkUnanswered().catch(error => toolError("main", "unanswered.check", error));
+  }, 60_000);
   const timer = setInterval(() => {
     void delivery.tick().catch((caughtError) => { toolError("main", "main.catch12", caughtError); return log("sender-failed"); });
+    if (ready()) void router?.checkCompletion();
+    if (ready()) void replyGap.tick().catch((caughtError) => { toolError("main", "reply-gap.check", caughtError); });
     if (ready()) void router?.checkInboundLatency().catch((caughtError) => { toolError("main", "main.catch13", caughtError); return log("inbound-latency-check-failed"); });
     if (ready() && router && !routerBusy) {
       routerBusy = true;
@@ -303,6 +311,7 @@ async function main(): Promise<void> {
     stopping = true;
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     clearInterval(timer);
+    clearInterval(unansweredTimer);
     await server.stop(true);
     await apps?.stop().catch((caughtError) => { toolError("main", "main.catch16", caughtError);});
     await shares.stopAll().catch((caughtError) => { toolError("main", "main.catch17", caughtError);});

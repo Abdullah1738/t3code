@@ -2,15 +2,17 @@
 import datetime as dt
 import fcntl
 import importlib.util
+import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('money_cases', Path(__file__).with_name('cases.py'))
@@ -18,6 +20,8 @@ mc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mc)
 
 from test_charges import ControlServer, summary
+
+os.environ['MONEY_CASES_REFRESH_DISABLED'] = '1'
 
 TZ = mc.TZ
 
@@ -42,19 +46,27 @@ class Base(unittest.TestCase):
         registry.start()
         self.addCleanup(registry.stop)
 
+    def assert_census(self, actual, expected):
+        self.assertEqual(sum(actual['limit_reasons'].values()), actual['limited'])
+        self.assertEqual(sum(actual['limit_age_days'].values()), actual['limited'])
+        self.assertEqual(set(actual['limit_age_days']), {'lt7', '7_30', '30_60', 'gt60'})
+        self.assertTrue(set(actual['limit_reasons']) <= mc.charges.LIMIT_REASONS)
+        self.assertTrue(all(type(n) is int and n >= 0 for n in actual['limit_reasons'].values()))
+        self.assertEqual({k: v for k, v in actual.items() if k not in ('limit_reasons', 'limit_age_days')}, expected)
+
     def case(self, case_id='acme', deadline='2026-10-25', when=at('2026-10-24T09:00'), **extra):
         fields = dict(merchant='Acme', amount='120.50', currency='aed', state='refund asked',
                       next_action='dispute on the card', deadline=deadline, who='Abdullah')
         fields.update(extra)
         return mc.add(self.data, case_id, at=when, root=self.root, **fields)
 
-    def check(self, now, run='r1', ack=True, delivered_at=None):
+    def check(self, now, run='r1', ack=True, delivered_at=None, find=None):
         """One runner tick: build the event, ack the run, then deliver it.
 
         The runner delivers at `delivered_at` (default: the same moment), so a test can delay delivery. A
         delivered event raises `fires` and sets `last_fire_at` in state.json, which is what the check reads.
         With ack=False nothing is delivered (the runner never took the event)."""
-        event = mc.run_check(self.wd, run, self.data, self.root, at(now))
+        event = mc.run_check(self.wd, run, self.data, self.root, at(now), find=find or finder())
         if ack and event:
             (self.wd / '.run-ok').write_text(run)
             self.deliver(delivered_at or now)
@@ -74,6 +86,103 @@ class Base(unittest.TestCase):
         (folder / 'state.json').write_text(json.dumps({'status': status, 'fires': fires,
                                                        'last_fire_at': '2026-10-23T10:44:18Z',
                                                        'last_run_at': '2026-10-23T11:00:00Z'}))
+
+
+def data_snapshot(data):
+    return {str(p.relative_to(data)): (p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest(),
+                                      p.stat().st_mtime_ns)
+            for p in data.rglob('*') if p.is_file()}
+
+
+@contextmanager
+def screen_sources(root, corrupt=False, locks=True):
+    """Real cache readers/writers with only the control API and subprocess sources replaced."""
+    data = root / 'data'
+    data.mkdir()
+    charged, now = at('2026-10-24T04:10'), at('2026-10-24T05:00')
+    text = 'Purchase of AED 12.34 with Credit Card ending 1111 at noon, Dubai. Avl Cr. Limit'
+    book = {'version': 1, 'questions': []}
+    mc.new_question(book, mc.charges.parse(text, 'EmiratesNBD'), text, charged, now, 'sms')
+    owner = {'a': {'version': mc.charges.OWNER_CACHE_VERSION, 'updatedAt': '2026-10-24T00:00:00Z',
+                  'coveredFrom': '2026-10-23T00:00:00Z', 'title': 'iMessage test', 'texts': []}}
+    files = {'cases.json': {'version': 1, 'cases': [], 'purchases': []}, 'questions.json': book,
+             'owner-texts.json': owner, 'order-details.json': [], 'msgs-searches.json': {},
+             'subscriptions.json': {'version': 1, 'subscriptions': []},
+             'cards.json': {'dead': {}}}
+    import marketplace
+    files['marketplace-placements.json'] = marketplace.empty()
+    for name, value in files.items():
+        (data / name).write_text(json.dumps(value) + '\n')
+    if corrupt:
+        (data / 'owner-texts.json').write_text('{broken owner cache\n')
+    if locks:
+        for name in ('cases', 'questions', 'cards', 'subscriptions', 'order-details', 'marketplace-refresh'):
+            (data / (name + '.lock')).touch()
+    (data / 'nested').mkdir()
+    (data / 'nested' / 'sentinel').write_bytes(b'unchanged')
+    msgs = root / 'msgs'
+    calls = root / 'msgs-calls'
+    msgs.write_text('#!/bin/sh\nprintf "called\\n" >> ' + str(calls) + '\nprintf "\\n"\n')
+    msgs.chmod(0o700)
+    original = subprocess.run
+    orders = []
+
+    def run(argv, *args, **kwargs):
+        if len(argv) > 3 and str(argv[3]) == str(Path(mc.charges.order_lookup.__file__).resolve()):
+            orders.append(json.loads(kwargs['input']))
+            row = dict(service='food', order='new-order', total='99.00', currency='AED',
+                       placed_at=charged.isoformat(), status='delivered', raw_status='delivered')
+            result = {'orders': [row], 'complete': True,
+                      'lanes': {name: {'exhaustive': True, 'covered_from': None, 'limit': None,
+                                       'walked_at': now.isoformat()} for name in mc.charges.order_lookup.LANES}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(result), '')
+        return original(argv, *args, **kwargs)
+
+    with ExitStack() as stack:
+        server = stack.enter_context(ControlServer([summary('unrelated owner words')]))
+        stack.enter_context(patch.dict(os.environ, {'MONEY_CASES_DIR': str(data),
+                                                   'ROBOB_TOOL_LOG_DIR': str(root / 'logs'),
+                                                   'TOOLLOG_ROOT': str(root / 'logs')}))
+        stack.enter_context(patch.object(mc, 'DATA', data))
+        stack.enter_context(patch.object(mc.charges, 'MSGS', str(msgs)))
+        stack.enter_context(patch.object(subprocess, 'run', side_effect=run))
+        yield data, text, charged, now, server, orders, calls
+
+
+class ScreenReadOnly(unittest.TestCase):
+    def test_screen_default_sources_leave_every_file_unchanged(self):
+        for corrupt, locks in ((False, True), (True, True), (False, False)):
+            with self.subTest(corrupt=corrupt, locks=locks), tempfile.TemporaryDirectory() as tmp:
+                with screen_sources(Path(tmp), corrupt, locks) as (data, text, charged, now, server, orders, calls):
+                    before = data_snapshot(data)
+                    result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=False)
+                    self.assertEqual(result['verdict'], 'ask', result)
+                    self.assertEqual(result['errors'], [])
+                    self.assertEqual(data_snapshot(data), before)
+                    self.assertTrue(orders)
+                    self.assertTrue(calls.read_text().strip())
+                    self.assertTrue(any(path.endswith('/messages') for path, _, _ in server.calls))
+
+    def test_read_only_screen_does_not_create_a_missing_data_directory(self):
+        with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
+            data, text, charged, now, server, orders, calls = fixture
+            missing = data.parent / 'missing-data'
+            result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=missing, record=False)
+            self.assertEqual(result['verdict'], 'ask', result)
+            self.assertFalse(missing.exists())
+
+    def test_recording_still_saves_both_caches_and_question(self):
+        with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
+            data, text, charged, now, server, orders, calls = fixture
+            before = data_snapshot(data)
+            result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=True)
+            self.assertEqual(result['verdict'], 'ask', result)
+            after = data_snapshot(data)
+            for name in ('owner-texts.json', 'order-details.json', 'questions.json'):
+                self.assertNotEqual(before[name], after[name], name)
+            self.assertEqual(json.loads((data / 'owner-texts.json').read_text())['a']['texts'][0]['text'],
+                             'unrelated owner words')
+            self.assertEqual(json.loads((data / 'order-details.json').read_text())[0]['order'], 'new-order')
 
 
 class Moments(unittest.TestCase):
@@ -378,7 +487,7 @@ class Pings(Base):
         (self.data / 'cases.json').write_text(json.dumps(book))
         self.assertIn('has no valid deadline', self.check('2026-10-20T10:00'))
         cases = mc.load(self.data)['cases']
-        self.assertIn('Acme AED 120.50 (no valid deadline)', mc.brief(cases, at('2026-10-20T10:00')))
+        self.assertIn('1 with no deadline', mc.brief(cases, at('2026-10-20T10:00')))
         self.assertIn("'soon' (not a valid deadline)", mc.table(cases))
 
     def test_old_sent_keys_are_dropped(self):
@@ -455,6 +564,12 @@ class CheckEntry(Base):
     def test_check_runs_in_runner_environment_with_fake_msgs_and_temp_state(self):
         home = self.tmp / 'home'
         home.mkdir()
+        helpers = home / '.local/bin'
+        helpers.mkdir(parents=True)
+        card_status = helpers / 'card-status'
+        card_status.write_text('#!/usr/bin/python3\nimport sys\n'
+                               'assert sys.argv[1:] == ["merchant", "dead", "--json"]\nprint("[]")\n')
+        card_status.chmod(0o700)
         trace = self.tmp / 'msgs-calls'
         now = mc.now_dubai()
         book = {'version': 1, 'questions': []}
@@ -472,9 +587,11 @@ class CheckEntry(Base):
                                 '/bin', '/usr/sbin', '/sbin'])
         env = {'HOME': str(home), 'PATH': runner_path, 'LANG': 'en_US.UTF-8', 'WATCH_DIR': str(self.wd),
                'WATCH_ID': 'money-cases', 'MONEY_CASES_DIR': str(self.data),
-               'MONEY_CASES_MSGS': str(fake)}
+               'MONEY_CASES_MSGS': str(fake), 'ROBOB_TOOL_LOG_DIR': str(self.tmp / 'runner-logs')}
         started = time.monotonic()
-        with ControlServer() as server:
+        with ControlServer(threads=[{'threadId': 'a', 'title': 'iMessage test',
+                                     'creationSource': 'server', 'origin': 'imessage',
+                                     'updatedAt': mc.charges.iso(now)}]) as server:
             env['T3_CONTROL_TOKEN_FILE'] = str(server.credentials)
             done = subprocess.run(['/usr/bin/python3', '-B', str(Path(__file__).with_name('cases.py')), 'check'],
                                   env=env, stdin=subprocess.DEVNULL, start_new_session=True,
@@ -482,11 +599,67 @@ class CheckEntry(Base):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertLess(time.monotonic() - started, 5)
         state = json.loads((self.wd / 'pings.json').read_text())
-        self.assertEqual(state['timing']['owner_queries'], 2)
+        self.assertEqual(state['timing']['owner_queries'], 3)
+        timing = state['timing']
+        expected = {'owner_list_pages': 2, 'owner_threads_selected': 1,
+                    'owner_threads_fresh': 0, 'owner_threads_needed': 1,
+                    'owner_threads_fetched': 1, 'owner_timeouts': 0, 'owner_cache_size': 1}
+        for key, value in expected.items():
+            self.assertEqual(timing[key], value, key)
+        for key in ('owner_list_ms', 'owner_fetch_ms_max'):
+            self.assertGreaterEqual(timing[key], 0)
+        self.assertEqual(timing['owner_result'], 'ok')
+        self.assertNotIn('I paid', json.dumps(timing))
+        self.assertNotIn('iMessage', json.dumps(timing))
+        self.assertNotIn('test-secret', json.dumps(timing))
+
         self.assertEqual(state['timing']['msgs_calls'], 2)
         self.assertEqual(trace.read_text().splitlines(), ['search', 'show'])
         questions = json.loads((self.wd / 'scratch-books/questions.json').read_text())['questions']
         self.assertEqual(questions[0]['status'], 'closed')
+        rows = [json.loads(line) for path in (self.tmp / 'runner-logs/orders').glob('*.ndjson')
+                for line in path.read_text().splitlines()]
+        row, = [row for row in rows if row['name'] == 'check.run']
+        self.assertIs(row['ok'], True)
+        self.assertEqual(row['props']['fired'], int(bool(done.stdout)))
+
+    def test_check_records_success_after_a_normal_return(self):
+        with patch.object(mc, '_run_check', return_value=''), patch.object(mc, 'record_event') as record:
+            self.assertEqual(mc.run_check(self.wd, 'normal', self.data, self.root), '')
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args, ('check.run',))
+        self.assertIs(record.call_args.kwargs['ok'], True)
+
+    def test_check_records_failure_and_propagates_the_original_exception(self):
+        failure = RuntimeError('fixture check failed')
+        with patch.object(mc, '_run_check', side_effect=failure), patch.object(mc, 'record_event') as record:
+            with self.assertRaises(RuntimeError) as raised:
+                mc.run_check(self.wd, 'failure', self.data, self.root)
+        self.assertIs(raised.exception, failure)
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args, ('check.run',))
+        self.assertIs(record.call_args.kwargs['ok'], False)
+        self.assertEqual(record.call_args.kwargs['props']['fired'], 0)
+
+    def test_check_records_fired_event_and_success_when_nothing_is_due(self):
+        self.case()
+        now = at('2026-10-24T10:00')
+        with patch.object(mc, 'record_event') as record:
+            event = mc.run_check(self.wd, 'due', self.data, self.root, now, finder(), nobody)
+            self.assertTrue(event)
+            self.assertIs(record.call_args.kwargs['ok'], True)
+            self.assertEqual(record.call_args.kwargs['props']['fired'], 1)
+            self.assertEqual(mc.run_check(self.wd, 'nothing-new', self.data, self.root, now, finder(), nobody), '')
+            self.assertIs(record.call_args.kwargs['ok'], True)
+            self.assertEqual(record.call_args.kwargs['props']['fired'], 0)
+
+    def test_check_records_incomplete_follow_up_as_failure(self):
+        with patch.object(mc, 'follow', return_value=['fixture lookup error']), \
+                patch.object(mc, 'record_event') as record:
+            self.assertEqual(mc.run_check(self.wd, 'partial', self.data, self.root,
+                                         at('2026-10-24T10:00'), finder(), nobody), '')
+        self.assertIs(record.call_args.kwargs['ok'], False)
+        self.assertEqual(record.call_args.kwargs['props']['fired'], 0)
 
 
 class Rules(Base):
@@ -592,6 +765,23 @@ class Rules(Base):
         (self.wd / 'state.json').write_text(json.dumps({'fires': 0, 'pending': {'event': event, 'key': 'k'}}))
         self.assertEqual(self.check('2026-10-24T10:15', 'r2', ack=False), '')
         self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r1')
+
+    def test_a_batched_event_keeps_its_outbox_until_delivery(self):
+        self.case(deadline='2026-10-25')
+        event = self.check('2026-10-24T10:00', 'r1', ack=False)
+        self.assertTrue(event)
+        for queued, owned in [([event], True), (['unrelated event'], False), ([event, 'another event'], True)]:
+            with self.subTest(queued=queued):
+                (self.wd / 'state.json').write_text(json.dumps({'fires': 0, 'batch': {'events': queued}}))
+                self.assertEqual(mc.runner_owns(self.wd, {'event': event}), owned)
+        (self.wd / 'state.json').write_text(json.dumps({'fires': 0, 'batch': {'events': [event]}}))
+        self.assertEqual(self.check('2026-10-24T10:01', 'r2', ack=False), '')
+        self.assertEqual(json.loads((self.wd / 'pings.json').read_text())['outbox']['run'], 'r1')
+        self.deliver('2026-10-24T10:03')
+        self.assertEqual(self.check('2026-10-24T10:04', 'r3', ack=False), '')
+        pings = json.loads((self.wd / 'pings.json').read_text())
+        self.assertNotIn('outbox', pings)
+        self.assertIn('acme|r0|soon', pings['sent'])
 
     def test_a_reminder_delivered_two_days_late_counts_from_delivery(self):
         # Built 24 Oct 10:00, but the runner only delivers it on 26 Oct at 10:00 (a retry after an outage).
@@ -846,6 +1036,65 @@ class DueDates(Base):
 class Brief(Base):
     PAN_LENGTHS = ((13, '6'), (14, '2'), (15, '6'), (16, '2'), (17, '6'), (18, '2'), (19, '6'))
 
+    def test_counts_cases_without_valid_deadlines_instead_of_naming_them(self):
+        case = self.case()
+        for deadline in (None, '', 'soon', '2026-02-30'):
+            with self.subTest(deadline=deadline):
+                cases = [dict(case, id=f'case-{n}', merchant=f'Merchant {n}', deadline=deadline)
+                         for n in range(10)]
+                line = mc.brief(cases, at('2026-10-24T10:00'), root=self.root)
+                self.assertEqual(line, 'Money: 10 open; 10 with no deadline.')
+                for row in cases:
+                    self.assertNotIn(row['merchant'], line)
+                self.assertNotIn('nothing due in 48h', line)
+
+    def test_due_names_are_capped_in_due_date_order(self):
+        case = self.case(when=at('2026-10-20T09:00'))
+        cases = [dict(case, merchant=f'Due {n}', deadline=f'2026-10-25T{n:02}:00:00+04:00')
+                 for n in range(9)]
+        line = mc.brief(list(reversed(cases)), at('2026-10-24T10:00'), root=self.root)
+        expected = '; '.join(f'Due {n} AED 120.50 (Sun 25 Oct {n:02}:00)' for n in range(6))
+        self.assertEqual(line, f'Money: 9 open; due: {expected}; +3 more.')
+
+    def test_changed_names_are_capped_in_due_date_order(self):
+        case = self.case(when=at('2026-10-24T09:00'))
+        cases = [dict(case, merchant=f'Changed {n}', deadline=f'2026-11-{n + 1:02}')
+                 for n in range(9)]
+        line = mc.brief(list(reversed(cases)), at('2026-10-24T10:00'), root=self.root)
+        expected = '; '.join(f'Changed {n} AED 120.50' for n in range(6))
+        self.assertEqual(line, f'Money: 9 open; changed: {expected}; +3 more.')
+
+    def test_attention_cases_without_deadlines_stay_named(self):
+        case = dict(self.case(), deadline=None)
+        for fields, expected in (
+                ({'status': 'awaiting_answer'}, 'Acme AED 120.50 (awaiting answer)'),
+                ({'urgency': 'overdue'}, 'Acme AED 120.50 (refund asked)'),
+                ({'kind': 'merchant_card', 'state': 'Bupa still holds cancelled card ••5542'},
+                 'Bupa still holds cancelled card ••5542')):
+            with self.subTest(fields=fields):
+                line = mc.brief([dict(case, **fields)], at('2026-10-24T10:00'), root=self.root)
+                self.assertEqual(line, f'Money: 1 open; due: {expected}.')
+                self.assertNotIn('with no deadline', line)
+
+    def test_no_deadline_count_follows_due_and_precedes_changed(self):
+        case = self.case()
+        cases = [case, dict(case, merchant='No deadline', deadline=None),
+                 dict(case, merchant='Changed', deadline='2026-11-01')]
+        line = mc.brief(cases, at('2026-10-24T10:00'), root=self.root)
+        self.assertEqual(line, 'Money: 3 open; due: Acme AED 120.50 (Sun 25 Oct); '
+                              '1 with no deadline; changed: Changed AED 120.50.')
+
+    def test_fifty_without_deadlines_and_two_due_fit_one_short_line(self):
+        case = self.case(when=at('2026-10-20T09:00'))
+        cases = [dict(case, id=f'case-{n}', merchant=f'Merchant {n}', deadline=None)
+                 for n in range(50)]
+        cases.extend([dict(case, merchant='Due A'), dict(case, merchant='Due B')])
+        line = mc.brief(cases, at('2026-10-24T10:00'), root=self.root)
+        self.assertEqual(line, 'Money: 52 open; due: Due A AED 120.50 (Sun 25 Oct); '
+                              'Due B AED 120.50 (Sun 25 Oct); 50 with no deadline.')
+        self.assertEqual(len(line.splitlines()), 1)
+        self.assertLess(len(line), 400)
+
     def test_lists_due_and_changed_only(self):
         self.assertEqual(mc.brief([], at('2026-10-24T08:00')), '')
         self.case('acme', deadline='2026-10-25', when=at('2026-10-20T09:00'))
@@ -1063,20 +1312,36 @@ HISTORY = {'id': 1, 'ts': at('2026-09-01T12:00').timestamp(), 'sender': BANK, 's
            'body': 'Purchase of EUR 9.99 with Credit Card ending 1111 at ACME * EATS PENDING, Amsterdam. Avl Cr. Limit'}
 RECEIPT = {'id': 2, 'ts': at('2026-10-24T10:47').timestamp(), 'sender': 'Acme <noreply@acme.example>',
            'subject': 'Your Acme order', 'body': 'Thanks for ordering. Total €12.34', 'source': 'email', 'from_me': 0}
+DECLINED = ('Transaction of AED 775.01 on your Credit Card ending 1111 at ANTHROPIC* CLAUDE SUB '
+            'was declined due to insufficient limit')
+PAID = ('Purchase of AED 775.01 with Credit Card ending 1111 at ANTHROPIC* CLAUDE SUB, Amsterdam. '
+        'Avl Cr. Limit is AED 1')
+REFUND = {'id': 301, 'ts': at('2026-11-06T22:47').timestamp(), 'source': 'email', 'from_me': 0,
+          'sender': 'DigiCert Accounts Receivable <ar@digicert.com>',
+          'subject': 'RE: Fifth follow-up - final notice before card dispute: Refund request',
+          'body': 'we have manually processed the request and initiated refund from our end. '
+                  'The amount should be credited back to your card within the next few days.\n'
+                  '> If the refund hasn\'t been issued by Tuesday 10 November, I will dispute the charge'}
+NO_REFUND = dict(REFUND, id=302, sender='Dean Lewis <Dean.Lewis@digicert.com>',
+                 body='I am not able to provide any answers to your questions around the refund, '
+                      'as this falls out of my jurisdiction.')
 
 
 def read(row, deadline=None, **_):
+    if row.get('source') == 'email':
+        return (f"Account: fixture   Folder: INBOX\nDate: fixture\nFrom: {row.get('sender', '')}\n"
+                f"To: owner@example.test\nSubject: {row.get('subject', '')}\nFile: -\n\n{row.get('body', '')}")
     return f"{row.get('subject', '')}\n{row.get('body', '')}"
 
 
 def finder(*rows):
     """A fake msgs search; charges.py itself keeps rows by time, sender and source."""
-    def find(query, since, until=None, source=None, n=20, deadline=None):
+    def find(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None, all_copies=False):
         return [r for r in rows if source is None or r['source'] == source]
     return find
 
 
-def nobody(since, until, deadline=None):
+def nobody(since, until, deadline=None, **kwargs):
     return []
 
 
@@ -1101,6 +1366,823 @@ class Questions(Base):
             (self.wd / '.run-ok').write_text(run)
             self.deliver(now)
         return event
+
+    def test_paid_after_decline_closes_and_reports_once(self):
+        decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+        mc.triaged(self.data, [(decline['id'], 'imsg:decline', True)], at('2026-11-06T23:08'))
+        charge = self.screen(PAID, BANK, '2026-11-06T23:12', '2026-11-06T23:13', 'imsg:charge')
+        with mc.Locked(self.data, 'questions') as book:
+            mc.settle(mc.find_question(book, charge['id']), 'receipt', 'ask', at('2026-11-06T23:14'))
+        self.assertEqual(self.follow('2026-11-06T23:20', finder()), '')
+        q = mc.find_question(mc.load_questions(self.data), decline['id'])
+        self.assertEqual((q['status'], q['by']), ('closed', 'check'))
+        self.assertIn('paid after decline: declined 23:07, charged 23:12', q['outcome'])
+        event = self.follow('2026-11-07T08:00', finder(), 'r2')
+        self.assertEqual(event.count('explained now:'), 1)
+        self.assertEqual(self.follow('2026-11-07T08:15', finder(), 'r3'), '')
+
+    def test_paid_decline_does_not_explain_its_unmatched_charge(self):
+        decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+        mc.triaged(self.data, [(decline['id'], 'imsg:decline', True)], at('2026-11-06T23:08'))
+        charge = self.screen(PAID, BANK, '2026-11-06T23:12', '2026-11-06T23:13', 'imsg:charge')
+        event = self.follow('2026-11-07T08:00', finder())
+        declined = mc.find_question(mc.load_questions(self.data), decline['id'])
+        charged = mc.find_question(mc.load_questions(self.data), charge['id'])
+        self.assertEqual((declined['status'], declined['by']), ('closed', 'check'))
+        self.assertIn('paid after decline', declined['outcome'])
+        self.assertEqual(charged['status'], 'open')
+        cases = mc.load(self.data)['cases']
+        self.assertEqual(len(cases), 1)
+        self.assertEqual((cases[0]['id'], cases[0]['merchant']), (charged['case_opened'], mc.UNMATCHED))
+        self.assertEqual(event.count('explained now:'), 1)
+        self.assertNotIn('explained now:', self.follow('2026-11-07T08:15', finder(), 'r2'))
+        self.assertEqual(mc.load(self.data)['cases'], cases)
+
+    def test_decline_only_matches_exact_charge_after_it_within_an_hour(self):
+        rows = [
+            ('boundary', PAID, '2026-11-07T00:07', True),
+            ('late', PAID, '2026-11-07T00:08', False),
+            ('same-time', PAID, '2026-11-06T23:07', False),
+            ('earlier', PAID, '2026-11-06T23:06', False),
+            ('amount', PAID.replace('775.01', '775.02'), '2026-11-06T23:12', False),
+            ('currency', PAID.replace('AED 775', 'USD 775'), '2026-11-06T23:12', False),
+            ('card', PAID.replace('1111', '2222'), '2026-11-06T23:12', False),
+            ('merchant', PAID.replace('ANTHROPIC* CLAUDE SUB', 'OTHER MERCHANT'), '2026-11-06T23:12', False),
+        ]
+        for label, alert, charged, closes in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+                self.screen(alert, BANK, charged, '2026-11-07T00:10', 'imsg:charge')
+                mc.follow(self.data, at('2026-11-07T00:20'), find=finder(), said=nobody)
+                q = mc.find_question(mc.load_questions(self.data), decline['id'])
+                self.assertEqual(q['status'], 'closed' if closes else 'open')
+
+    def test_paid_decline_closes_only_untouched_linked_cases(self):
+        for edited in (False, True):
+            with self.subTest(edited=edited):
+                self.data = self.tmp / str(edited)
+                decline = self.screen(DECLINED, BANK, '2026-11-06T23:07', '2026-11-06T23:08', 'imsg:decline')
+                with mc.Locked(self.data, 'questions') as book:
+                    cid = mc.case_from(self.data, book['questions'][0], at('2026-11-06T23:09'), 'check')
+                if edited:
+                    mc.update(self.data, cid, {'state': 'owner working on it'}, at=at('2026-11-06T23:10'))
+                self.screen(PAID, BANK, '2026-11-06T23:12', '2026-11-06T23:13', 'imsg:charge')
+                mc.follow(self.data, at('2026-11-06T23:20'), find=finder(), said=nobody)
+                q = mc.find_question(mc.load_questions(self.data), decline['id'])
+                self.assertEqual(q['status'], 'closed')
+                self.assertEqual(mc.find(mc.load(self.data), cid)['status'], 'open' if edited else 'closed')
+
+    def refund_case(self, **kw):
+        return self.case('digicert-refund', merchant='DigiCert', amount='864', currency='USD',
+                         deadline=kw.pop('deadline', '2026-11-10'), when=at('2026-11-06T14:25'), **kw)
+
+    def test_refund_mail_holds_dispute_with_sourced_history_and_one_ping(self):
+        self.refund_case()
+        event = self.follow('2026-11-06T22:50', finder(REFUND))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual(mc.deadline_of(case), at('2026-11-13T22:47'))
+        self.assertIn('refund promised', case['state'])
+        self.assertTrue(case['next'].startswith('held: watch the card for the credit; then '))
+        self.assertEqual(case['refund_mail'], {'id': 301, 'at': mc.stamp(at('2026-11-06T22:47'))})
+        self.assertEqual(len(case['history']), 2)
+        self.assertIn('because: merchant mail 301 says the refund was processed; dispute step held', case['history'][-1]['text'])
+        self.assertEqual(case['history'][-1]['source'], 'mail:301')
+        self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+        self.assertEqual(self.follow('2026-11-06T22:55', finder(REFUND), 'r2'), '')
+        self.assertEqual(self.follow('2026-11-07T09:00', finder(REFUND), 'r3'), '')
+        self.assertEqual(mc.load(self.data)['cases'][0], case)
+
+    def test_identified_automatic_case_reports_refund_once_without_asking(self):
+        for status in ('open', 'awaiting_answer'):
+            with self.subTest(status=status):
+                self.data = self.tmp / status
+                self.wd = self.tmp / ('wd-' + status)
+                self.wd.mkdir()
+                cid = 'identified-refund'
+                self.case(cid, merchant=None, unmatched=True, amount='864', currency='USD',
+                          deadline='2026-11-06T14:00', when=at('2026-11-06T14:25'),
+                          next_action='owner: which order is this?',
+                          alert_at=mc.stamp(at('2026-11-06T12:00')))
+                mc.update(self.data, cid, {'merchant': 'DigiCert', 'state': 'refund requested'},
+                          source='mail:identified', at=at('2026-11-06T14:26'))
+                with mc.Locked(self.data) as book:
+                    book['cases'][0]['status'] = status
+                before = mc.load(self.data)['cases'][0]
+                self.assertFalse(mc.owner_answered(before))
+                self.assertEqual(self.follow('2026-11-06T14:30', finder(), 'before'), '')
+                event = self.follow('2026-11-06T22:50', finder(REFUND))
+                case = mc.load(self.data)['cases'][0]
+                self.assertEqual(mc.deadline_of(case), at('2026-11-13T22:47'))
+                self.assertEqual(case['refund_mail'], {'id': 301, 'at': mc.stamp(at('2026-11-06T22:47'))})
+                self.assertIn('refund promised', case['state'])
+                self.assertFalse(mc.owner_answered(case))
+                self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+                self.assertNotIn('which order is this?', event)
+                self.assertNotIn(mc.ASK, event)
+                key = f'{cid}|refund|301'
+                state = json.loads((self.wd / 'pings.json').read_text())
+                self.assertEqual(state['outbox']['keys'], [key])
+                self.assertEqual(self.follow('2026-11-06T22:55', finder(REFUND), 'r2'), '')
+                self.assertEqual(mc.load(self.data)['cases'][0], case)
+                clock = {cid: {'answer': mc.answered_at(case).isoformat(),
+                               'at': mc.stamp(at('2026-11-06T14:30'))}}
+                future = at('2026-11-14T09:00')
+                due = mc.attention([case], future, {}, self.root, clock)
+                self.assertEqual([k for _, items, _, _ in due for k, _ in items], [key])
+                self.assertEqual(due[0][2], '')
+                self.assertEqual(mc.attention([case], future, {key}, self.root, clock), [])
+                day = f'{cid}|day|2026-11-14'
+                self.assertEqual(mc.attention([case], future, {day}, self.root, clock), [])
+
+    def test_refund_mail_never_shortens_deadline_or_changes_unrelated_next(self):
+        self.refund_case(deadline='2026-11-20', next_action='watch for the credit')
+        self.follow('2026-11-06T22:50', finder(REFUND))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual((case['deadline'], case['rev'], case['next']), ('2026-11-20', 0, 'watch for the credit'))
+
+    def test_refund_mail_still_holds_a_case_awaiting_his_answer(self):
+        self.refund_case()
+        with mc.Locked(self.data) as book:
+            book['cases'][0]['status'] = 'awaiting_answer'
+        event = self.follow('2026-11-06T22:50', finder(REFUND))
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual((case['status'], mc.deadline_of(case)), ('awaiting_answer', at('2026-11-13T22:47')))
+        self.assertIn('mailed Fri 6 Nov 22:47', event)
+
+    def test_refund_lookup_searches_all_accepted_credit_wording(self):
+        rows = [
+            ('refund', dict(REFUND, body='Your refund was processed.')),
+            ('credit', dict(REFUND, subject='Credit confirmation', body='USD 864 was credited back to your card.')),
+            ('account', dict(REFUND, subject='Credit confirmation', body='USD 864 was credited back to your account.')),
+        ]
+        for label, row in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                self.refund_case()
+                def search(query, since, **kw):
+                    text = (row['subject'] + ' ' + row['body']).lower().split()
+                    return [row] if any(term in query.split() and term in text for term in ('refund', 'credited')) else []
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, search)
+                self.assertEqual(mc.load(self.data)['cases'][0]['refund_mail']['id'], row['id'])
+
+    def test_refund_ping_waits_for_daily_cap_and_survives_key_pruning(self):
+        self.refund_case()
+        now = at('2026-11-06T22:50')
+        case = mc.load(self.data)['cases'][0]
+        ask_key = f"digicert-refund|ask|{mc.answered_at(case).isoformat()}"
+        mc.write_json(self.wd / 'pings.json', {'sent': {ask_key: mc.stamp(now),
+                      'digicert-refund|day|2026-11-06': mc.stamp(now)}})
+        self.assertEqual(self.follow('2026-11-06T22:50', finder(REFUND)), '')
+        event = self.follow('2026-11-07T09:00', finder(REFUND), 'r2')
+        self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+        self.assertNotIn('mailed', self.follow('2027-02-01T09:00', finder(REFUND), 'r3'))
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertIn('digicert-refund|refund|301', state['built'])
+
+    def test_reopening_does_not_replay_the_previous_refund_mail(self):
+        self.refund_case()
+        self.follow('2026-11-06T22:50', finder(REFUND))
+        mc.close(self.data, 'digicert-refund', 'refund landed', at=at('2026-11-08T10:00'))
+        self.follow('2027-02-01T09:00', finder(REFUND), 'r2')
+        mc.reopen(self.data, 'digicert-refund', '2027-03-01', 'refund reversed', at=at('2027-02-01T10:00'))
+        self.assertNotIn('refund_mail', mc.load(self.data)['cases'][0])
+        self.assertNotIn('mailed', self.follow('2027-02-01T11:00', finder(REFUND), 'r3'))
+
+    def test_refund_mail_rejects_quotes_negations_senders_and_old_mail(self):
+        rows = [
+            ('dean', NO_REFUND),
+            ('own', dict(REFUND, from_me=1)),
+            ('other', dict(REFUND, sender='Other <ar@other.example>')),
+            ('bank', dict(REFUND, sender='Wio DigiCert alert')),
+            ('sms', dict(REFUND, source='imessage')),
+            ('old', dict(REFUND, ts=at('2026-11-06T14:24').timestamp())),
+            ('same-time', dict(REFUND, ts=at('2026-11-06T14:25').timestamp())),
+            ('later-edit', REFUND),
+        ]
+        for marker in ('> ', '-----Original Message-----\n', 'On Fri, 6 Nov someone wrote:\n'):
+            rows.append(('quoted-' + str(len(rows)), dict(REFUND, body='No update yet.\n' + marker + 'Refund was issued.')))
+        rows.append(('own-negated-quote', dict(REFUND, body="No update yet.\n> If the refund hasn't been issued, I will dispute it.")))
+        for negation in ("not", "can't", "cannot", "unable", "won't", "isn't", 'never'):
+            rows.append(('negation-' + negation, dict(REFUND, body=f'We are {negation} confirming your refund was processed.')))
+        rows.append(('wrapped-negation', dict(REFUND, body='We cannot\nconfirm your refund was issued.')))
+        for label, row in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / label
+                self.wd = self.tmp / ('wd-' + label)
+                self.wd.mkdir()
+                self.refund_case()
+                if label == 'later-edit':
+                    mc.update(self.data, 'digicert-refund', {'state': 'already handled'}, at=at('2026-11-07T01:35'))
+                before = mc.load(self.data)
+                event = self.follow('2026-11-07T09:00', finder(row))
+                self.assertEqual(mc.load(self.data), before)
+                self.assertNotIn('mailed', event)
+
+    def test_refund_done_wording_and_newest_mail(self):
+        forms = ('Refund processed', 'refund has been issued', 'refund was initiated', 'refund is credited',
+                 'refund refunded', 'refund sent', 'processed the refund', 'issued your refund',
+                 'initiated refund', 'credited back to your card', 'credited back to your account',
+                 'We processed the refund. Have you received it?',
+                 'Your refund was processed by Example Inc. Have you received it?',
+                 'We have initiated refund. Have you received it?',
+                 'We confirm that your refund was processed.',
+                 'Kindly note that your refund was processed.',
+                 'We can confirm that your refund was processed.',
+                 'We have initiated refund. The amount should be credited back to your card within a few days.',
+                 'Your refund was processed. We will send a confirmation email.',
+                 'Your refund was processed by Mr. Smith. Is there anything else we can help with?')
+        for i, body in enumerate(forms):
+            with self.subTest(body=body):
+                self.data = self.tmp / str(i)
+                self.refund_case()
+                newest = dict(REFUND, id=303, ts=at('2026-11-06T22:48').timestamp(), body=body)
+                self.assertEqual(mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8,
+                                               finder(REFUND, newest)), [])
+                self.assertEqual(mc.load(self.data)['cases'][0]['refund_mail']['id'], 303)
+
+    def test_refund_negation_survives_money_number_and_wrapped_line_formats(self):
+        amounts = ('USD 864.00', 'USD 1,864.00', 'USD 864,00', 'USD 1.864,00',
+                   'USD 0.50', 'USD 864.5', '$864.00', '864.00 USD', 'USD 864.00\n')
+        for i, amount in enumerate(amounts):
+            with self.subTest(amount=amount):
+                self.data = self.tmp / f'negative-amount-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot confirm whether the {amount} refund was processed.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_completion_requires_authored_body_not_mail_headers(self):
+        pending = 'Your request is still pending. We will contact you when there is an update.'
+        subject = 'RE: Refund processed?'
+        rows = [
+            ('archive', read(dict(REFUND, subject=subject, body=pending)), False),
+            ('header-only', f'Subject: {subject}\n\n{pending}', False),
+            ('folded-subject', f'Subject: RE:\n Refund processed?\n\n{pending}', False),
+            ('crlf', read(dict(REFUND, subject=subject, body=pending)).replace('\n', '\r\n'), False),
+            ('no-body', f'Subject: {subject}', False),
+            ('other-header', f'From: Refund processed <ar@digicert.com>\nSubject: Update\n\n{pending}', False),
+            ('affirmative-body', read(dict(REFUND, subject=subject, body='Your refund was processed.')), True),
+            ('question-body', read(dict(REFUND, subject='Status', body='Was your refund processed?')), False),
+            ('bare-body', 'Your refund was processed.', True),
+        ]
+        for label, shown, matches in rows:
+            with self.subTest(label=label):
+                self.data = self.tmp / ('header-' + label)
+                self.refund_case()
+                before = mc.load(self.data)
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(REFUND),
+                                read=lambda row, deadline: shown)
+                case = mc.load(self.data)['cases'][0]
+                if matches:
+                    self.assertEqual(case['refund_mail']['id'], REFUND['id'])
+                else:
+                    self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_questions_with_abbreviations_leave_case_and_notice_unchanged(self):
+        bodies = (
+            'Was your refund processed by Mr. Smith?',
+            'Is your refund processed by Dr. Smith?',
+            'Was your refund processed by Mr. I. Smith of Example Inc.?',
+            'Did Mr. Smith confirm that your refund was processed?',
+            'Could you confirm that Mr. Smith processed the refund?',
+            'What shows that your refund was processed by Mr. Smith?',
+            'Your refund was processed by Mr. Smith?',
+            'Your refund was processed by Mr. Will Smith?',
+            'Refund processed by Mr. Smith?',
+            'Hello, was your refund processed by Mr. Smith?',
+            'Hello,\nWas your refund processed by Mr. Smith?',
+            'Please confirm whether your refund was processed by Mr. Smith.',
+            'Let us know if your refund was processed by Mr. Smith.',
+            'Our agent asks if your refund was processed by Mr. Smith.',
+            'We are wondering if your refund was processed by Mr. Smith.',
+            'Please advise if your refund was processed by Mr. Smith.',
+            'Was your refund processed by Mr. Smith? Have you received it?',
+            'Was your refund processed by Mr. Smith. Have you received it?',
+            'Have you received it?',
+            'Your request is pending. Have you received it?',
+        )
+        for i, body in enumerate(bodies):
+            with self.subTest(row=i):
+                self.data = self.tmp / f'question-{i}'
+                self.wd = self.tmp / f'question-wd-{i}'
+                self.wd.mkdir()
+                self.refund_case()
+                before = mc.load(self.data)
+                event = self.follow('2026-11-06T22:50', finder(dict(REFUND, body=body)))
+                self.assertEqual(mc.load(self.data), before)
+                self.assertNotIn('mailed', event)
+
+    def test_refund_confirmation_requests_leave_case_and_notice_unchanged(self):
+        requests = (
+            'Kindly confirm that your refund was processed.',
+            'Confirm that your refund was processed.',
+            'Please kindly confirm that your refund was processed.',
+            'Kindly verify that your refund was processed.',
+            'Kindly\nverify that your refund was processed.',
+            'Verify that your refund was processed.',
+            'Check that your refund was processed.',
+            'Dear customer, kindly confirm that your refund was processed.',
+            'Dear customer,\nKindly confirm that your refund was processed.',
+            'Kindly provide confirmation that your refund was processed.',
+            'Send confirmation that your refund was processed.',
+            'Share confirmation that your refund was processed.',
+            'We ask you to please confirm that your refund was processed.',
+            'We ask you to confirm that your refund was processed.',
+            'You are requested to verify that your refund was processed.',
+            'Please just confirm that your refund was processed.',
+            'Kindly urgently confirm that your refund was processed.',
+            'Please let us know that your refund was processed.',
+            'Please can you confirm that your refund was processed.',
+            'Reconfirm that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(requests, 'request')
+
+    def test_future_or_conditional_refund_leaves_case_and_notice_unchanged(self):
+        bodies = (
+            'We will send a confirmation email once your refund is processed.',
+            'Once your refund is processed, a confirmation email will follow.',
+            'We send a confirmation email when your refund is processed.',
+            'After your refund has been issued, you will receive a confirmation email.',
+            'If approved, your refund is processed.',
+            'Your refund is processed only if the request is approved.',
+            'Your refund is processed provided that approval is received.',
+            'Your refund is processed provided\nthat approval is received.',
+            'Your refund is processed as long as approval is received.',
+            'Your refund is processed subject to approval.',
+            'We would confirm that your refund was processed.',
+            'We may confirm that your refund was processed.',
+            'We might confirm that your refund was processed.',
+            "We'll ensure that your refund is processed.",
+            "We'd confirm that your refund was processed.",
+            'We are going to ensure that your refund is processed.',
+            'We are about to ensure that your refund is processed.',
+            'We can get your refund processed.',
+            'We can ensure that your refund is processed.',
+            'We are working to ensure that your refund is processed.',
+            'We are trying to ensure that your refund is processed.',
+            'We are hoping that your refund was processed.',
+            'We expect that your refund was processed.',
+            'We hope that your refund was processed.',
+            'The amount should be credited back to your card within a few days.',
+            'The amount will be credited back to your card.',
+            'Your refund is processed tomorrow.',
+            'Your refund is processed next week.',
+            'Your refund is processed next\nweek.',
+            'Your refund is processed after approval.',
+            'Your refund is processed before the cutoff.',
+            'Your refund is processed upon approval.',
+            'Your refund is processed once approved.',
+            'Your refund is processed when approved.',
+        )
+        bodies += tuple(f'The amount {tense}credited back to your {destination} {timing}.'
+                        for tense in ('is ', 'is being ', '')
+                        for destination in ('card', 'account')
+                        for timing in ('after approval', 'before the cutoff', 'upon approval',
+                                       'once approved', 'when approved'))
+        bodies += tuple(f'The amount {tense}credited back to your {destination}{separator}'
+                        f'this will happen only {condition}.'
+                        for tense in ('is ', 'is being ', '')
+                        for destination in ('card', 'account')
+                        for separator in ('; ', '.\n')
+                        for condition in ('after approval', 'if approval is received'))
+        self.assert_refund_mail_ignored(bodies, 'future')
+
+    def test_completed_refund_keeps_past_timing_and_later_credit_estimates(self):
+        bodies = (
+            'We have initiated refund. The amount should be credited back to your card next week.',
+            'We have initiated refund. The amount should be credited back to your card next\nweek.',
+            'We have initiated refund. The amount should be credited back to your card tomorrow.',
+            'We have initiated refund. The amount should be credited back to your card soon.',
+            'Your refund was processed after approval.',
+            'Your refund has been processed after approval.',
+            'We processed the refund after approval.',
+            'Your refund was processed before the cutoff.',
+            'Your refund was processed upon approval.',
+            'Your refund was processed once approval was received.',
+            'Your refund was processed when approval was received.',
+        )
+        bodies += tuple(f'The amount {tense} credited back to your {destination} {timing}.'
+                        for tense in ('was', 'has been')
+                        for destination in ('card', 'account')
+                        for timing in ('after approval', 'before the cutoff', 'upon approval',
+                                       'once approval was received', 'when approval was received'))
+        bodies += (
+            'Your refund was processed. Confirmation will be sent.',
+            'After approval, your refund was processed. Confirmation will be sent.',
+            'Your refund was processed. Confirmation is required for our records.',
+            'We have initiated refund. The amount should be credited next week. Confirmation will follow.',
+            'After approval, confirmation: your refund was processed.',
+            'Your refund was processed. Confirmation from your bank that your refund was processed will be sent.',
+            'After approval, your refund was processed. Confirmation from your bank is required for our records.',
+            'Confirmation: your refund was processed. The amount should be credited next week.',
+            'Confirmation: your refund was processed. The amount will have been credited by Friday.',
+            'Your refund was processed. Confirmation must be obtained for our records.',
+            'Your refund was processed by Will Smith.',
+            'After approval, we confirm that your refund was processed.',
+            'Once approval was received, we can confirm that we processed the refund.',
+            'After approval, kindly note that your refund was processed.',
+            'After approval, DigiCert processed the refund.',
+            'After approval, the bank processed the refund.',
+            'After approval, your USD 864.00 refund was processed.',
+            'Once approval was received, the amount was credited back to your account.',
+            'After approval, ' + REFUND['body'],
+            'Confirmation: we confirm that your refund was processed. The amount should be credited next week.',
+            'After approval, confirmation: we can confirm that your refund was processed. The amount will be credited next week.',
+            'Your refund was processed. Confirmation needs the bank to verify it for our records.',
+            'Confirmation: we confirm that your refund was processed. The amount is expected to be credited next week.',
+            'After approval, confirmation: we confirm that your refund was processed. The amount is expected to have been credited by Friday.',
+            'Confirmation: we confirm that your refund was processed. The amount is expected to already be credited next week.',
+            'Confirmation: we confirm that your refund was processed. The amount is expected to be promptly credited next week.',
+            "Confirmation: we confirm that your refund was processed. It'll be credited next week.",
+            'Confirmation: we confirm that your refund was processed. It’ll be credited next week.',
+        )
+        self.assert_refund_mail_holds(bodies, 'completed-timing')
+
+    def test_past_timing_prefixes_preserve_completed_refund_and_one_notice(self):
+        prefixes = ('After approval', 'After the approval', 'Upon approval', 'Before the cutoff',
+                    'Once approval was received', 'Once approval has been received',
+                    'Once approval had been received', 'When approval was received',
+                    'Once the approval was received', 'After approval was granted',
+                    'Before approval was received')
+        completions = ('your refund was processed.', 'we processed the refund.',
+                       'the amount was credited back to your card.')
+        bodies = tuple(prefix + separator + completion
+                       for prefix in prefixes for separator in (', ', ',\n')
+                       for completion in completions)
+        self.assert_refund_mail_holds(bodies, 'past-prefix')
+
+    def test_unresolved_timing_prefixes_leave_case_and_notice_unchanged(self):
+        prefixes = ('After approval is received', 'Once approval is received',
+                    'Once approval has to be received', 'When approval is received',
+                    'Before approval is received', 'After your refund has been issued')
+        completions = ('your refund was processed.', 'we processed the refund.',
+                       'the amount was credited back to your card.')
+        bodies = tuple(prefix + separator + completion
+                       for prefix in prefixes for separator in (', ', ',\n')
+                       for completion in completions)
+        bodies += tuple(prefix + ', ' + completion
+                        for prefix in ('After approval', 'Once approval was received',
+                                       'When approval was received')
+                        for completion in ('your refund is processed.',
+                                           'your refund will be processed.',
+                                           'kindly confirm that your refund was processed.',
+                                           'was your refund processed by Mr. Smith?'))
+        self.assert_refund_mail_ignored(bodies, 'unresolved-prefix')
+
+    def test_past_prefix_cannot_authorize_a_request_for_confirmation(self):
+        requests = tuple(f'After approval, please {verb} {recipient} confirmation '
+                         'that your refund was processed.'
+                         for verb in ('provide', 'send', 'share', 'give')
+                         for recipient in ('me', 'us', 'him', 'her', 'them', 'you'))
+        requests += (
+            'After approval, please provide us with confirmation that your refund was processed.',
+            'After approval, please send to us confirmation that your refund was processed.',
+            'After approval, please share with us confirmation that your refund was processed.',
+            'Once approval was received, kindly send us confirmation that your refund was processed.',
+            'When approval was received, send us confirmation that your refund was processed.',
+            'After approval,\nplease send\nus confirmation that your refund was processed.',
+            'We ask you to please send us confirmation that your refund was processed.',
+            'Kindly provide me with confirmation that your refund was processed.',
+            'Send us confirmation that your refund was processed.',
+            'After approval, please send your bank confirmation that your refund was processed.',
+            'After approval, please provide the support team with confirmation that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(requests, 'recipient-request')
+
+    def test_nominal_confirmation_requests_leave_case_and_notice_unchanged(self):
+        requests = ('we request', 'our team requests', 'we requested', 'we are requesting',
+                    'we ask for', 'our team asks for', 'we asked for', 'we are asking for',
+                    'we need', 'our team needs', 'we needed', 'we are needing',
+                    'we want', 'our team wants', 'we wanted', 'we are wanting',
+                    'we require', 'our team requires', 'we required', 'we are requiring',
+                    'we seek', 'our team seeks', 'we sought', 'we are seeking')
+        bodies = tuple(f'After approval, {request} confirmation that your refund was processed.'
+                       for request in requests)
+        bodies += tuple(f'After approval, we request {noun} that your refund was processed.'
+                        for noun in ('a confirmation', 'the confirmation', 'your confirmation',
+                                     'written confirmation', 'a written confirmation'))
+        bodies += (
+            'Once approval was received, we request confirmation that your refund was processed.',
+            'When approval was received, we need confirmation that your refund was processed.',
+            'After approval, we request\nconfirmation that your refund was processed.',
+            'We request confirmation that your refund was processed.',
+            'After approval, we request written confirmations that your refund was processed.',
+            'After approval, we ask for a written confirmation that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(bodies, 'nominal-request')
+
+    def test_request_complements_leave_case_and_notice_unchanged(self):
+        requests = ('you need', 'our team needs', 'we needed', 'we are needing',
+                    'we request', 'our team requests', 'we requested', 'we are requesting',
+                    'we ask', 'our team asks', 'we asked', 'we are asking',
+                    'we want', 'our team wants', 'we wanted', 'we are wanting',
+                    'we require', 'our team requires', 'we required', 'we are requiring',
+                    'we seek', 'our team seeks', 'we sought', 'we are seeking')
+        bodies = tuple(f'After approval, {request} to confirm that your refund was processed.'
+                       for request in requests)
+        bodies += tuple(f'After approval, you need to {action} that your refund was processed.'
+                        for action in ('verify', 'check', 'reconfirm', 'provide confirmation',
+                                       'send us confirmation', 'obtain confirmation', 'please confirm'))
+        bodies += tuple(f'Once approval was received, we need {person} to confirm '
+                        'that your refund was processed.'
+                        for person in ('you', 'me', 'us', 'him', 'her', 'them'))
+        bodies += tuple(f'After approval, we ask for {person} to confirm '
+                        'that your refund was processed.'
+                        for person in ('you', 'me', 'us', 'him', 'her', 'them'))
+        bodies += tuple(f'After approval, we request that {person} confirm '
+                        'that your refund was processed.'
+                        for person in ('i', 'we', 'you', 'he', 'she'))
+        bodies += tuple(f'After approval, we {verb} {recipient} to confirm '
+                        'that your refund was processed.'
+                        for verb in ('need', 'request', 'ask', 'want', 'require', 'seek')
+                        for recipient in ('the bank', 'your bank', 'the support team',
+                                          'the finance department', 'Mr. I. Smith',
+                                          'the U.S. IT team', 'DigiCert Accounts Receivable',
+                                          'the representative handling your account at the bank'))
+        bodies += tuple(f'After approval, we {verb} that {subject} confirm '
+                        'that your refund was processed.'
+                        for verb in ('need', 'request', 'ask', 'want', 'require', 'seek')
+                        for subject in ('the bank', 'your bank', 'the support team',
+                                        'the finance department', 'Mr. I. Smith',
+                                        'the U.S. IT team', 'DigiCert Accounts Receivable',
+                                        'the representative handling your account at the bank'))
+        bodies += (
+            'After approval, you need\nto confirm that your refund was processed.',
+            'When approval was received, you need to confirm that your refund was processed.',
+            'You need to confirm that your refund was processed.',
+            'After approval, we request that they confirm that your refund was processed.',
+            'Once approval was received, we need the bank to verify that your refund was processed.',
+            'When approval was received, we need the bank to check that your refund was processed.',
+            'We need the bank to confirm that your refund was processed.',
+            'After approval, we need the bank\nto confirm that your refund was processed.',
+            'After approval, we need\nthe bank to confirm that your refund was processed.',
+            'After approval, we need the bank to obtain proof that your refund was processed.',
+            'Once approval was received, we request that the bank verify that your refund was processed.',
+            'When approval was received, we request that the bank check that your refund was processed.',
+            'We request that the bank confirm that your refund was processed.',
+            'After approval, we request\nthat the bank confirm that your refund was processed.',
+            'After approval, we request that\nthe bank confirm that your refund was processed.',
+            'After approval, we request that the bank provide confirmation that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(bodies, 'infinitive-request')
+
+    def test_passive_confirmation_requirements_leave_case_and_notice_unchanged(self):
+        prefixes = ('', 'After approval, ', 'Once approval was received, ')
+        bodies = tuple(f'{prefix}{noun} that your refund was processed is {predicate}.'
+                       for prefix in prefixes
+                       for noun in ('confirmation', 'a confirmation', 'written confirmation')
+                       for predicate in ('required', 'needed', 'requested', 'wanted', 'sought',
+                                         'awaited', 'expected', 'necessary', 'mandatory', 'essential'))
+        bodies += tuple(f'{prefix}confirmation that your refund was processed {predicate}.'
+                        for prefix in prefixes
+                        for predicate in ('will be sent', 'should be obtained',
+                                          'must be provided', 'can be requested'))
+        bodies += tuple(f'{prefix}confirmations that your refund was processed are required.'
+                        for prefix in prefixes)
+        bodies += (
+            'After approval, confirmation\nthat your refund was processed is still required.',
+            'After approval, confirmation that your refund was processed\nis required.',
+        )
+        bodies += tuple(f'After approval, {noun} that your refund was processed is required.'
+                        for noun in ('verification', 'proof', 'evidence', 'assurance'))
+        bodies += tuple(f'After approval, {noun} {qualifier} that your refund was processed is {predicate}.'
+                        for noun in ('confirmation', 'verification', 'proof', 'evidence', 'assurance')
+                        for qualifier in ('from your bank', 'from the support team',
+                                          'from Mr. I. Smith', 'from the U.S. IT team',
+                                          'from DigiCert Accounts Receivable', 'in writing',
+                                          'from the representative handling your account at the bank',
+                                          'from your\nbank')
+                        for predicate in ('required', 'needed'))
+        bodies += (
+            'Once approval was received, confirmation from your bank that your refund was processed is required.',
+            'When approval was received, confirmation from your bank that your refund was processed is required.',
+            'Confirmation from your bank that your refund was processed is required.',
+            'After approval, confirmation from your bank\nthat your refund was processed is required.',
+            'After approval, confirmation from your bank that your refund was processed\nis required.',
+        )
+        bodies += tuple(re.sub(r'\bthat\s+', '', body, count=1) for body in bodies)
+        bodies += (
+            'After approval, acknowledgement your refund was processed is required.',
+            'Acknowledgement your refund was processed is required.',
+            'After approval, confirmation: your refund was processed is required.',
+            'Confirmation: your refund was processed is required.',
+            'After approval, we need a response confirming your refund was processed.',
+            'We need a response confirming your refund was processed.',
+            'After approval, it is necessary to confirm that your refund was processed.',
+            'It is necessary to confirm that your refund was processed.',
+        )
+        self.assert_refund_mail_ignored(bodies, 'passive-confirmation')
+
+    def test_labelled_proof_modal_requirements_leave_case_and_notice_unchanged(self):
+        modals = ('must', 'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might')
+        bodies = tuple(f'After approval, confirmation: your refund was processed{qualifier} '
+                       f'{modal} be {predicate}.'
+                       for modal in modals
+                       for qualifier in ('', ' by Mr. I. Smith')
+                       for predicate in ('obtained from your bank', 'verified by the support team', 'appreciated'))
+        bodies += tuple(f'After approval, {noun}: your refund was processed must be obtained from your bank.'
+                        for noun in ('verification', 'proof', 'evidence', 'assurance'))
+        bodies += tuple(f'After approval, confirmation: your refund was processed {modal} {action}.'
+                        for modal in modals
+                        for action in ('come from your bank', 'originate at your bank', 'follow',
+                                       'help resolve verification', 'require proof'))
+        bodies += tuple(f'After approval, confirmation: your refund was processed {request}.'
+                        for request in ('needs the bank to verify it', 'requires independent bank verification',
+                                        'wants the support team to verify it', 'seeks independent bank verification',
+                                        'asks the bank for verification', 'requests independent bank verification'))
+        bodies += tuple(f'After approval, confirmation: your refund was processed. '
+                        f'{person}{quote}{ending} obtain confirmation from your bank.'
+                        for person in ('We', 'I', 'You', 'They', 'He', 'She', 'It')
+                        for quote in ("'", '’') for ending in ('ll', 'd'))
+        bodies += (
+            'Once approval was received, confirmation: your refund was processed must be obtained from your bank.',
+            'When approval was received, confirmation: your refund was processed must be obtained from your bank.',
+            'Confirmation: your refund was processed must be obtained from your bank.',
+            'After approval, confirmation: your refund was processed must\nbe obtained from your bank.',
+            'After approval, confirmation: your refund was processed must be\nobtained from your bank.',
+            'After approval, confirmation: your refund was processed may have been obtained from your bank.',
+            'After approval, confirmation: your refund was processed must urgently be obtained from your bank.',
+            'After approval, confirmation: your refund was processed must first be obtained from your bank.',
+            'Confirmation: your refund was processed. Confirmation from your bank that your refund was processed will be sent.',
+            'After approval, confirmation: your refund was processed has to be obtained from your bank.',
+            'After approval, confirmations: your refund was processed have to be obtained from your bank.',
+            'After approval, confirmation: your refund was processed had to be obtained from your bank.',
+            'After approval, confirmation: your refund was processed ought to be obtained from your bank.',
+            'Confirmation: your refund was processed by Will Smith.',
+            'Confirmation: your refund was processed by Mr. Will Smith.',
+            "Once approval was received, confirmation: your refund was processed. We'll obtain confirmation from your bank.",
+            "When approval was received, confirmation: your refund was processed. We'd obtain confirmation from your bank.",
+            "Confirmation: your refund was processed. We'll obtain confirmation from your bank.",
+            "After approval, confirmation: your refund was processed. We'll\nobtain confirmation from your bank.",
+        )
+        # Deliberate: a proof-labelled claim plus pending proof is insufficient for a hold.
+        self.assert_refund_mail_ignored(bodies, 'proof-modal')
+
+    def test_labelled_refund_pending_proof_leaves_case_and_notice_unchanged(self):
+        pending = (
+            'We await confirmation from your bank.',
+            'Our team awaits confirmation from your bank.',
+            'We are awaiting confirmation from your bank.',
+            'We awaited confirmation from your bank.',
+            'We expect confirmation from your bank.',
+            'Our team expects confirmation from your bank.',
+            'We are expecting confirmation from your bank.',
+            'We hope to obtain confirmation from your bank.',
+            'We are hoping to obtain confirmation from your bank.',
+            'We plan to obtain confirmation from your bank.',
+            'We are planning to obtain confirmation from your bank.',
+            'We anticipate confirmation from your bank.',
+            'We are anticipating confirmation from your bank.',
+            'We intend to obtain confirmation from your bank.',
+            'We are intending to obtain confirmation from your bank.',
+            'We aim to obtain confirmation from your bank.',
+            'We are scheduled to obtain confirmation from your bank.',
+            'We are going to obtain confirmation from your bank.',
+            'We are about to obtain confirmation from your bank.',
+            'We are trying to obtain confirmation from your bank.',
+            'We are attempting to obtain confirmation from your bank.',
+            'We are working to obtain confirmation from your bank.',
+            'We are working on obtaining confirmation from your bank.',
+        )
+        bodies = tuple(f'{prefix}Confirmation: your refund was processed.{separator}{tail}'
+                       for prefix in ('', 'After approval, ', 'Once approval was received, ')
+                       for separator in (' ', '\n') for tail in pending)
+        # Deliberate: a proof-labelled claim plus pending proof is insufficient for a hold.
+        self.assert_refund_mail_ignored(bodies, 'pending-proof')
+
+    def assert_refund_mail_holds(self, bodies, label):
+        for i, body in enumerate(bodies):
+            with self.subTest(row=i):
+                self.data = self.tmp / f'{label}-{i}'
+                self.wd = self.tmp / f'{label}-wd-{i}'
+                self.wd.mkdir()
+                self.refund_case()
+                row = dict(REFUND, body=body)
+                event = self.follow('2026-11-06T22:50', finder(row))
+                case = mc.load(self.data)['cases'][0]
+                self.assertEqual(mc.deadline_of(case), at('2026-11-13T22:47'))
+                self.assertEqual(case['refund_mail']['id'], row['id'])
+                self.assertIn('refund promised', case['state'])
+                self.assertEqual(event.count('mailed Fri 6 Nov 22:47'), 1)
+                self.assertEqual(self.follow('2026-11-06T22:55', finder(row), 'r2'), '')
+                self.assertEqual(mc.load(self.data)['cases'][0], case)
+
+    def assert_refund_mail_ignored(self, bodies, label):
+        for i, body in enumerate(bodies):
+            with self.subTest(row=i):
+                self.data = self.tmp / f'{label}-{i}'
+                self.wd = self.tmp / f'{label}-wd-{i}'
+                self.wd.mkdir()
+                self.refund_case()
+                before = mc.load(self.data)
+                event = self.follow('2026-11-06T22:50', finder(dict(REFUND, body=body)))
+                self.assertEqual(mc.load(self.data), before)
+                self.assertNotIn('mailed', event)
+
+    def test_refund_negation_blocks_a_later_affirmation_across_punctuation(self):
+        # Deliberate: any negation in the merchant's own text blocks the hold.
+        for i, punctuation in enumerate(('.', '!', '?', ';')):
+            with self.subTest(punctuation=punctuation):
+                self.data = self.tmp / f'positive-sentence-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot provide an exact arrival date{punctuation} '
+                                       'Your refund was processed.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_negation_survives_abbreviations(self):
+        actors = (
+            ('company', 'Example Inc.'), ('company-lower', 'Example inc.'),
+            ('company-upper', 'EXAMPLE INC.'), ('limited', 'Example Ltd.'),
+            ('corporation', 'Example Corp.'), ('company-short', 'Example Co.'),
+            ('dotted-company', 'Example L.L.C.'),
+            ('country', 'its U.S. team'), ('country-lower', 'its u.s. team'),
+            ('country-upper-next', 'its U.S. Operations team'), ('country-uk', 'its U.K. team'),
+            ('country-it', 'its U.S. IT team'), ('country-it-operations', 'its U.S. IT Operations team'),
+            ('country-uae', 'its U.A.E. team'), ('spaced-initials', 'its U. S. team'),
+            ('title', 'Dr. Example'), ('title-mr', 'Mr. Example'), ('title-ms', 'Ms. Example'),
+            ('title-initial-i', 'Mr. I. Smith'),
+            ('initial', 'J. Example'), ('initials', 'J. R. Example'),
+            ('dotted-initials', 'J.R. Example'), ('department', 'its billing dept.'),
+            ('example', 'its agent, e.g. Example'), ('clarification', 'its agent, i.e. Example'),
+            ('reference', 'the team named in ref. 301'), ('number', 'the team on invoice no. 301'),
+            ('wrapped-company', 'Example Inc.\n'),
+        )
+        for label, actor in actors:
+            with self.subTest(label=label):
+                self.data = self.tmp / ('abbreviation-' + label)
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot confirm that {actor} processed the refund.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_negation_blocks_a_later_affirmation_after_abbreviation(self):
+        # Deliberate: any negation in the merchant's own text blocks the hold.
+        for i, statement in enumerate(('Your refund was processed.', 'The refund was issued.',
+                                        'We processed the refund.', 'Our refund was initiated.')):
+            with self.subTest(statement=statement):
+                self.data = self.tmp / f'new-statement-abbreviation-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot give an arrival date for Example Inc. {statement}')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_negation_after_affirmation_leaves_case_and_ping_unchanged(self):
+        self.refund_case()
+        before = mc.load(self.data)
+        row = dict(REFUND, body='Your refund was processed. We cannot confirm when it will arrive.')
+        event = self.follow('2026-11-06T22:50', finder(row))
+        self.assertEqual(mc.load(self.data), before)
+        self.assertNotIn('mailed', event)
+
+    def test_embedded_questions_after_abbreviations_keep_negation(self):
+        for i, clause in enumerate(('when we', 'how our team', 'why our team', 'where our team', 'what team')):
+            with self.subTest(clause=clause):
+                self.data = self.tmp / f'embedded-question-{i}'
+                self.refund_case()
+                before = mc.load(self.data)
+                row = dict(REFUND, body=f'We cannot confirm, e.g. {clause} processed the refund.')
+                mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(row))
+                self.assertEqual(mc.load(self.data), before)
+
+    def test_refund_lookup_cannot_overwrite_concurrent_case_edit(self):
+        self.refund_case()
+        def edited(row, deadline):
+            mc.update(self.data, 'digicert-refund', {'deadline': '2026-11-25'}, source='mail:other',
+                      at=at('2026-11-06T22:49'))
+            return read(row)
+        mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8, finder(REFUND), edited)
+        case = mc.load(self.data)['cases'][0]
+        self.assertEqual(case['deadline'], '2026-11-25')
+        self.assertNotIn('refund_mail', case)
+
+    def test_refund_errors_are_recorded_and_budget_stops_remaining_cases(self):
+        self.refund_case()
+        for error in (mc.charges.Lookup('archive unavailable'), TimeoutError('read timed out')):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(mc.charges, 'show', side_effect=error):
+                    self.follow('2026-11-06T22:50', finder(REFUND))
+                state = json.loads((self.wd / 'pings.json').read_text())
+                self.assertIn(str(error), str(state['question_errors']))
+        self.case('other')
+        with patch.object(mc.time, 'time', return_value=100), patch.object(mc.charges, 'search') as find:
+            errors = mc.refund_mails(self.data, at('2026-11-06T22:50'), 99)
+        find.assert_not_called()
+        self.assertIn('out of time', errors[0])
+
+    def test_refund_lookup_skips_closed_holds_and_unmatched_cases(self):
+        self.refund_case(kind='hold')
+        self.case('unknown', merchant=None, unmatched=True)
+        self.case('closed')
+        mc.close(self.data, 'closed', 'done')
+        with patch.object(mc.charges, 'search') as find:
+            self.assertEqual(mc.refund_mails(self.data, at('2026-11-06T22:50'), time.time() + 8), [])
+        find.assert_not_called()
 
     def test_a_merchant_he_pays_waits_then_two_asks_at_most_then_a_money_case(self):
         known = finder(HISTORY)
@@ -1251,7 +2333,7 @@ class Questions(Base):
                           f'Subject: Usage notice\nFile: /m/{nid}.emlx\n\nYour card 1111 was used for AED 12.34 at Acme. Avl limit.')
         reads = []
 
-        def find(query, since, until=None, source=None, n=20, deadline=None):
+        def find(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None):
             return sorted([receipt] + notices, key=lambda r: -r['ts'])[:n]
 
         def read(row, deadline=None, **_):
@@ -1790,6 +2872,708 @@ class UnmatchedCharges(Base):
 
 
 class CheckBudget(Base):
+    def test_marketplace_limits_are_counted_as_limited(self):
+        now = at('2026-11-14T12:00')
+        when = now - dt.timedelta(days=3)
+        for kind in ('marketplace_hold', 'marketplace_stale'):
+            with self.subTest(kind=kind):
+                self.data = self.tmp / kind
+                self.seed([when])
+                with mc.Locked(self.data, 'questions') as book:
+                    book['questions'][0].update(merchant='noon', mkey='noon')
+                result = {'orders': [], 'complete': True, 'lanes': {
+                    name: {'exhaustive': True} for name in mc.charges.order_lookup.LANES}}
+                result['lanes']['marketplace'].update(
+                    walked_at=(when if kind == 'marketplace_stale' else now).isoformat(),
+                    hold_times=[when.isoformat()] if kind == 'marketplace_hold' else [])
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.charges.order_lookup, 'read', return_value=result):
+                    mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+                self.assertEqual(stats['charge_census']['noon'][kind], 1)
+                self.assertEqual(stats['charge_census']['noon']['limited'], 1)
+                self.assertEqual(stats['charge_census']['noon']['error'], 0)
+
+    def test_detached_refresh_runs_after_logging_without_affecting_check_duration(self):
+        import marketplace
+        from state_json import write_json
+        self.case()
+        with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                patch.object(marketplace.subprocess, 'Popen') as launch, \
+                patch.object(mc, 'record_event') as log:
+            self.check('2026-10-24T09:00')
+            launch.assert_called_once()
+            self.assertTrue(launch.call_args.kwargs['start_new_session'])
+            self.assertEqual(launch.call_args.kwargs['stdout'], subprocess.DEVNULL)
+            self.assertEqual(launch.call_args.kwargs['stderr'], subprocess.DEVNULL)
+            event = next(c for c in log.call_args_list if c.args[0] == 'check.run')
+            self.assertEqual(event.kwargs['props']['marketplace_refresh'], 'started')
+            launch.reset_mock()
+            write_json(self.data / 'marketplace-placements.json', dict(marketplace.empty(),
+                walked_at=dt.datetime.now(dt.timezone.utc).isoformat()))
+            self.check('2026-10-24T09:00')
+            launch.assert_not_called()
+            write_json(self.data / 'marketplace-placements.json', marketplace.empty())
+            with (self.data / 'marketplace-refresh.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.check('2026-10-24T09:00')
+            launch.assert_not_called()
+
+    def test_follow_redacts_repeated_text_once_without_batching_cursor_commits(self):
+        from collections import Counter
+        now = at('2026-10-25T12:00')
+        for count in (1, 8, 32):
+            with self.subTest(questions=count):
+                self.data = self.tmp / str(count)
+                self.seed([now - dt.timedelta(days=3, hours=n) for n in range(count)])
+                result = {'verdict': 'unverified', 'why': 'fixture unavailable', 'errors': ['fixture unavailable']}
+                visited = []
+
+                def source(charge, when, *args, **kwargs):
+                    # The cursor must already be durable before the external lookup.
+                    saved = mc.load_questions(self.data)
+                    visited.append(saved['follow_cursor']['id'])
+                    self.assertEqual(mc.parse_time(saved['follow_cursor']['at']), when)
+                    return result
+
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.charges, 'explain', source), \
+                        patch.object(mc, 'write_json', wraps=mc.write_json) as write, \
+                        patch.object(mc, 'redact', wraps=mc.redact) as redact:
+                    with mc.follow_timing(stats):
+                        mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+                self.assertEqual(len(set(visited)), count)
+                writes = Counter(call.args[0].name for call in write.call_args_list)
+                # One durable cursor per attempted lookup and one final result commit.
+                self.assertEqual(writes, {'questions.json': count + 1})
+                self.assertEqual(stats['writes_n'], count + 1)
+                calls = Counter(call.args[0] for call in redact.call_args_list)
+                self.assertEqual(calls[ALERT], 1)
+                self.assertEqual(calls['q-budget0'], 1)
+
+    def test_follow_redaction_cache_matches_uncached_writes_and_expires_on_interrupt(self):
+        rows = ['password: fixture123!', 'OTP: 123456', 'received € — 東京', 'ordinary text']
+        now = at('2026-10-25T12:00')
+        original = self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        original['questions'][0]['notes'] = [{'text': text} for text in rows]
+        changed = json.loads(json.dumps(original))
+        changed['questions'][0]['notes'][0]['text'] = 'password: changed456!'
+        snapshots = [original, changed, original]
+        expected = [(json.dumps(mc.redact_all(book), ensure_ascii=False, indent=1) + '\n').encode()
+                    for book in snapshots]
+        stats = {}
+        with patch.object(mc, 'redact', wraps=mc.redact) as redact:
+            with self.assertRaises(mc.CheckTimeout):
+                with mc.follow_timing(stats):
+                    for snapshot, fresh in zip(snapshots, expected):
+                        with mc.Locked(self.data, 'questions') as book:
+                            book.update(snapshot)
+                        self.assertEqual((self.data / 'questions.json').read_bytes(), fresh)
+                    raise mc.CheckTimeout('interrupted')
+            self.assertEqual(sum(call.args[0] == 'password: changed456!'
+                                 for call in redact.call_args_list), 1)
+            def original_calls():
+                return sum(call.args[0] == rows[0] for call in redact.call_args_list)
+            before = original_calls()
+            mc.redact_all(original)
+            self.assertEqual(original_calls() - before, 1)
+            with mc.follow_timing({}):
+                before = original_calls()
+                mc.redact_all(original)
+                self.assertEqual(original_calls() - before, 1)
+        self.assertEqual(original['questions'][0]['notes'][0]['text'], rows[0])
+
+    def test_follow_redaction_cache_has_a_fixed_entry_limit(self):
+        with mc.follow_timing({}):
+            for n in range(8200):
+                text = f'ordinary fixture text {n}'
+                self.assertEqual(mc.redact_all(text), mc.redact(text))
+            self.assertEqual(mc._REDACTION_CACHE.get().cache_info().currsize, 8192)
+        self.assertIsNone(mc._REDACTION_CACHE.get())
+
+    def test_follow_rotates_across_budgeted_runs_even_with_the_same_timestamp(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(5)])
+        visited, clock = [], [1000.0]
+
+        def slow(charge, when, *a, **kw):
+            visited.append(when)
+            clock[0] += 3
+            return {'verdict': 'unverified', 'why': 'fixture unavailable', 'errors': ['fixture unavailable']}
+
+        with patch.object(mc.time, 'time', lambda: clock[0]), patch.object(mc, 'FOLLOW_EACH', 3), \
+                patch.object(mc.charges, 'explain', slow):
+            for _ in range(5):
+                mc.follow(self.data, now, self.root, clock[0] + 5, finder(), nobody)
+        self.assertEqual(len(set(visited)), 5)
+        self.assertEqual(len(visited), 5)
+
+    def test_tail_question_gets_a_full_slice_on_the_next_run(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(4)])
+        visited, clock = [], [1000.0]
+
+        def slow(charge, when, at_now, deadline, *a, **kw):
+            self.assertEqual(deadline - clock[0], mc.FOLLOW_EACH)
+            visited.append(when)
+            clock[0] += 5.5 if when == now - dt.timedelta(days=3) else 5
+            return {'verdict': 'unverified', 'why': 'fixture unavailable', 'errors': ['fixture unavailable']}
+
+        with patch.object(mc.time, 'time', lambda: clock[0]), patch.object(mc.charges, 'explain', slow):
+            for _ in range(2):
+                mc.follow(self.data, now, self.root, clock[0] + 20, finder(), nobody)
+        self.assertEqual(len(set(visited)), 4)
+
+    def test_follow_persists_cursor_before_an_interrupted_lookup(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        visited = []
+
+        def interrupted(charge, when, *a, **kw):
+            visited.append(when)
+            raise mc.CheckTimeout('whole check interrupted')
+
+        with patch.object(mc.charges, 'explain', interrupted):
+            for _ in range(3):
+                with self.assertRaises(mc.CheckTimeout):
+                    mc.follow(self.data, now, self.root, time.time() + 10, finder(), nobody)
+        self.assertEqual(len(set(visited)), 3)
+
+    def test_cursor_save_cannot_shorten_the_question_slice(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3)])
+        clock, visited = [1000.0], []
+        write = mc.write_json
+
+        def slow_write(*args, **kw):
+            write(*args, **kw)
+            clock[0] += 1
+
+        def source(charge, when, at_now, deadline, *a, **kw):
+            visited.append(when)
+            self.assertEqual(deadline - clock[0], mc.FOLLOW_EACH)
+            clock[0] += 5.9
+            return {'verdict': 'unverified', 'why': 'fixture unavailable', 'errors': ['fixture unavailable']}
+
+        with patch.object(mc.time, 'time', lambda: clock[0]), patch.object(mc, 'write_json', slow_write), \
+                patch.object(mc.charges, 'explain', source):
+            mc.follow(self.data, now, self.root, 1006.5, finder(), nobody, end=1039)
+        self.assertEqual(len(visited), 1)
+
+    def test_cursor_commit_timeout_leaves_full_slice_before_outer_alarm(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3)])
+        start = time.time()
+        with patch.object(mc, 'FOLLOW_EACH', 0.06), \
+                patch.object(mc.fcntl, 'flock', side_effect=lambda *a: time.sleep(0.2)), \
+                patch.object(mc.charges, 'explain') as source:
+            with self.assertRaisesRegex(mc.CheckTimeout, 'cursor commit'):
+                with mc.within(start + 0.2, mc.CheckTimeout('whole check out of time')):
+                    mc.follow(self.data, now, self.root, start + 0.1, finder(), nobody, end=start + 0.2)
+        self.assertNotIn('follow_cursor', mc.load_questions(self.data))
+        source.assert_not_called()
+
+    def test_follow_resumes_after_a_removed_cursor_question(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        visited = []
+
+        def interrupted(charge, when, *a, **kw):
+            visited.append(when)
+            raise mc.CheckTimeout('whole check interrupted')
+
+        with patch.object(mc.charges, 'explain', interrupted):
+            with self.assertRaises(mc.CheckTimeout):
+                mc.follow(self.data, now, self.root, time.time() + 10, finder(), nobody)
+            book = mc.load_questions(self.data)
+            book['questions'] = [q for q in book['questions'] if q['id'] != book['follow_cursor']['id']]
+            mc.write_json(self.data / 'questions.json', book)
+            with self.assertRaises(mc.CheckTimeout):
+                mc.follow(self.data, now, self.root, time.time() + 10, finder(), nobody)
+        self.assertNotEqual(visited[0], visited[1])
+
+    def test_question_alarm_during_receipt_cannot_skip_reserved_orders(self):
+        from threading import Event
+        now = at('2026-11-14T12:00')
+        self.seed([now - dt.timedelta(hours=1)])
+        with mc.Locked(self.data, 'questions') as book:
+            book['questions'][0].update(merchant='noon', mkey='noon')
+        calls = []
+        def orders(app, deadline=None, **kwargs):
+            calls.append((app, deadline - time.time()))
+            return {'orders': [], 'complete': False, 'lanes': {
+                lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None, 'stop_reason': 'slice_out'}
+                for lane in mc.charges.order_lookup.LANES}}
+        def slow(*args, **kwargs):
+            Event().wait(1)
+            self.fail('receipt escaped its question alarm')
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        with patch.object(mc, 'FOLLOW_EACH', 0.02), \
+                patch.object(mc.charges.order_lookup, 'read', orders):
+            errors = mc.follow(self.data, now, self.root, time.time() + 10,
+                               slow, nobody, stats=stats)
+        self.assertEqual([app for app, _ in calls], ['noon'])
+        self.assertGreater(calls[0][1], 9)
+        self.assertEqual(set(stats['order_coverage']['noon']), set(mc.charges.order_lookup.LANES))
+        self.assertIn('out of time', str(errors))
+        self.assertTrue(self.questions()[0]['unverified'])
+        self.assertFalse(self.questions()[0].get('case_opened'))
+
+    def test_order_evidence_covers_every_question_when_sources_fill_cursor_budget(self):
+        now = at('2026-11-14T12:00')
+        for matched in (False, True):
+            with self.subTest(matched=matched):
+                self.data = self.tmp / str(matched)
+                self.seed([now - dt.timedelta(hours=1, minutes=n) for n in range(5)])
+                with mc.Locked(self.data, 'questions') as book:
+                    for q in book['questions']:
+                        q.update(merchant='noon', mkey='noon')
+                sample = book['questions'][0]
+                clock, reads, source_calls = [1000.0], [], []
+                def orders(app, **kwargs):
+                    reads.append(app)
+                    clock[0] += 10
+                    return {'orders': ([{'order': 'fixture', 'total': sample['amount'], 'currency': sample['currency'],
+                        'placed_at': (now - dt.timedelta(hours=1)).isoformat(), 'status': 'delivered'}]
+                        if matched else []), 'complete': False, 'lanes': {
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None if lane == 'marketplace' else
+                               (now - dt.timedelta(days=5)).isoformat(), 'exhaustive': False}
+                        for lane in mc.charges.order_lookup.LANES}}
+                def owner(*args, **kwargs):
+                    clock[0] += 3.5
+                    return []
+                def msgs(*args, **kwargs):
+                    source_calls.append(True)
+                    clock[0] += 6
+                    raise mc.charges.Lookup('fixture slow msgs')
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.time, 'time', lambda: clock[0]), \
+                        patch.object(mc.charges.order_lookup, 'read', orders):
+                    mc.follow(self.data, now, self.root, 1020, msgs, owner, end=1039, stats=stats)
+                self.assertEqual(reads, ['noon'])
+                questions = self.questions()
+                self.assertTrue(all(q.get('order_evidence') for q in questions))
+                self.assertEqual(stats['charge_census']['noon']['not_checked'], 0)
+                if matched:
+                    self.assertTrue(all(q['status'] == 'closed' for q in questions))
+                    self.assertEqual(stats['charge_census']['noon']['matched'], 5)
+                else:
+                    self.assertTrue(source_calls)
+                    self.assertTrue(all(q['order_evidence']['outcome'] == 'limited' for q in questions))
+                    self.assertTrue(all(q['status'] == 'open' for q in questions))
+                    self.assertFalse(any(q.get('case_opened') or q.get('asks') for q in questions))
+                    self.assertEqual(stats['charge_census']['noon']['proven_clean'], 0)
+
+    def test_order_only_pass_preserves_coverage_edges_without_authorizing_asks(self):
+        now = at('2026-11-14T12:00')
+        when = now - dt.timedelta(days=3)
+        edge = when - mc.charges.SAME_TIME
+        for offset, outcome in ((-1, 'proven_clean'), (0, 'limited'), (1, 'limited'), (None, 'limited')):
+            with self.subTest(offset=offset):
+                self.data = self.tmp / str(offset)
+                self.seed([when])
+                with mc.Locked(self.data, 'questions') as book:
+                    book['questions'][0].update(merchant='noon', mkey='noon')
+                clock = [1000.0]
+                def orders(*args, **kwargs):
+                    clock[0] += 11
+                    return {'orders': [], 'complete': False, 'lanes': {
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None if offset is None else
+                            (edge + dt.timedelta(seconds=offset)).isoformat(), 'exhaustive': False}
+                        for lane in mc.charges.order_lookup.LANES}}
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.time, 'time', lambda: clock[0]), \
+                        patch.object(mc.charges.order_lookup, 'read', orders):
+                    mc.follow(self.data, now, self.root, 1012, finder(), nobody, end=1039, stats=stats)
+                q, = self.questions()
+                self.assertEqual(q['order_evidence']['outcome'], outcome)
+                self.assertFalse(q.get('checked'))
+                self.assertEqual(q['status'], 'open')
+                self.assertFalse(q.get('case_opened') or q.get('asks'))
+                self.assert_census(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=1, matched=0,
+                    proven_clean=0, limited=1, error=0, not_checked=0))
+                self.assertEqual(stats['charge_census']['noon']['limit_reasons'],
+                    {'receipt_not_checked' if offset == -1 else 'lane_uncovered:minutes': 1})
+
+    def test_owner_precedes_reserved_order_reads_with_independent_slices(self):
+        now = at('2026-11-14T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(2)])
+        with mc.Locked(self.data, 'questions') as book:
+            for q, app in zip(book['questions'], ('noon', 'careem')):
+                q.update(merchant=app, mkey=app)
+        clock, calls = [1000.0], []
+        def orders(app, deadline=None, **kwargs):
+            calls.append((app, deadline - clock[0]))
+            if app == 'noon':
+                clock[0] += 9.5
+                raise ValueError('fixture reader failed')
+            return {'orders': [], 'complete': False}
+        def owner(*args, **kwargs):
+            calls.append(('owner', 0))
+            return []
+        with patch.object(mc.time, 'time', lambda: clock[0]), \
+                patch.object(mc.charges.order_lookup, 'read', orders):
+            mc.follow(self.data, now, self.root, 1030, finder(), owner)
+        self.assertEqual(calls[:3], [('owner', 0), ('noon', 10), ('careem', 2)])
+        self.assertTrue(all(q['unverified'] for q in self.questions()))
+
+    def test_slow_external_source_leaves_time_for_order_lanes(self):
+        from threading import Event
+        now = at('2026-11-14T12:00')
+        for source in ('owner', 'mail'):
+            with self.subTest(source=source):
+                self.seed([now - dt.timedelta(hours=1)])
+                with mc.Locked(self.data, 'questions') as book:
+                    book['questions'][0]['merchant'] = 'noon'
+                reads = []
+                def slow(*args, **kwargs):
+                    Event().wait(5)
+                    self.fail('source was not bounded')
+                def orders(app, deadline=None, **kwargs):
+                    reads.append(deadline - time.time())
+                    return {'orders': [], 'complete': False, 'lanes': {
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None, 'stop_reason': 'unproven_paging'}
+                        for lane in mc.charges.order_lookup.LANES}}
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.charges, 'OWNER_BUDGET', 0.05), \
+                        patch.object(mc.charges, 'MSGS_BUDGET', 0.05), \
+                        patch.object(mc.charges.order_lookup, 'read', orders):
+                    errors = mc.follow(self.data, now, self.root, time.time() + 10,
+                        slow if source == 'mail' else finder(),
+                        slow if source == 'owner' else nobody, stats=stats)
+                self.assertEqual(len(reads), 1)
+                self.assertGreater(reads[0], mc.FOLLOW_EACH - 1)
+                self.assertEqual(set(stats['order_coverage']['noon']), set(mc.charges.order_lookup.LANES))
+                self.assertEqual(stats['starved_by'], 'owner_threads' if source == 'owner' else 'receipt')
+                self.assertTrue(errors)
+                self.assertTrue(self.questions()[0]['unverified'])
+                self.assertEqual(self.questions()[0]['status'], 'open')
+                self.assertFalse(self.questions()[0].get('case_opened'))
+
+    def test_old_owner_windows_share_one_budget(self):
+        now = at('2026-11-14T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        clock = [1000.0]
+        calls = []
+        def owner(*args, deadline=None):
+            calls.append(deadline - clock[0])
+            clock[0] += 2.5
+            return []
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        with patch.object(mc.time, 'time', lambda: clock[0]), \
+                patch.object(mc.time, 'monotonic', lambda: clock[0]):
+            mc.follow(self.data, now, self.root, 1020, finder(), owner, stats=stats)
+        self.assertEqual(calls, [mc.charges.OWNER_BUDGET])
+        self.assertFalse(self.questions()[0].get('unverified'))
+        self.assertEqual(stats['owner_threads_ms'], 2500)
+
+    def test_warm_owner_read_precedes_twenty_second_msgs_lookup(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(hours=1)])
+        with ControlServer() as server:
+            mc.charges.owner_texts(now - dt.timedelta(hours=2), now,
+                                   cache_path=self.data / 'owner-texts.json')
+            server.calls.clear()
+            clock, sequence = [1000.0], []
+            def owner(*args, deadline=None):
+                sequence.append('owner')
+                self.assertEqual(deadline - clock[0], mc.charges.OWNER_BUDGET)
+                return mc.charges.owner_texts(*args, deadline=deadline, stats=stats,
+                                              cache_path=self.data / 'owner-texts.json')
+            def msgs(*args, **kwargs):
+                sequence.append('msgs')
+                clock[0] += 20
+                raise mc.charges.Lookup('fixture: msgs consumed 20 seconds')
+            stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+            with patch.object(mc.time, 'time', lambda: clock[0]):
+                mc.follow(self.data, now, self.root, 1040, msgs, owner, stats=stats)
+            self.assertEqual(sequence[0], 'owner')
+            self.assertIn('msgs', sequence)
+            self.assertEqual(stats['owner_result'], 'ok')
+            self.assertEqual(stats['owner_threads_fresh'], 1)
+            self.assertEqual(stats['owner_threads_fetched'], 0)
+            self.assertEqual(stats['owner_queries'], 2)
+
+    def test_owner_prefetch_leaves_budget_for_questions(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(hours=n) for n in range(3)])
+
+        def unavailable(*args, deadline=None):
+            self.assertEqual(deadline, 1000 + mc.charges.OWNER_BUDGET)
+            raise mc.LookupTimeout('out of time')
+
+        with patch.object(mc.time, 'time', return_value=1000):
+            mc.follow(self.data, now, self.root, 1020, finder(), unavailable)
+        self.assertTrue(all(q['checked'] and q['unverified'] for q in self.questions()))
+
+    def test_failed_owner_source_is_attempted_once_for_old_questions_per_run(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        with patch.object(mc.charges, 'owner_texts', side_effect=mc.charges.Lookup('Robob control: request failed or timed out')) as source:
+            errors = mc.follow(self.data, now, self.root, time.time() + 10, finder())
+        self.assertEqual(source.call_count, 1)
+        self.assertTrue(all(q['checked'] and q['unverified'] for q in self.questions()))
+        self.assertTrue(errors)
+
+    def test_deferred_census_reports_owner_failure_without_reclassifying_charges(self):
+        now = at('2026-11-14T12:00')
+        for owner_result, reason in (('list_failed', 'owner_list_failed'), ('incomplete', 'owner_incomplete')):
+            with self.subTest(owner_result=owner_result):
+                self.data = self.tmp / owner_result
+                self.seed([now - dt.timedelta(days=3)])
+                with mc.Locked(self.data, 'questions') as book:
+                    book['questions'][0].update(merchant='noon', mkey='noon')
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                clock = [1000.0]
+                def owner(*args, **kwargs):
+                    stats['owner_result'] = owner_result
+                    raise mc.charges.Lookup('fixture owner failure')
+                def orders(*args, **kwargs):
+                    clock[0] += 11
+                    return {'orders': [], 'complete': True, 'lanes': {
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'exhaustive': True}
+                        for lane in mc.charges.order_lookup.LANES}}
+                with patch.object(mc.time, 'time', lambda: clock[0]), \
+                        patch.object(mc.charges.order_lookup, 'read', orders):
+                    mc.follow(self.data, now, self.root, 1012, finder(), owner, end=1039, stats=stats)
+                counts = stats['charge_census']['noon']
+                self.assertEqual(counts['limit_reasons'], {reason: 1})
+                self.assertEqual(counts['limit_age_days'], {'lt7': 1, '7_30': 0, '30_60': 0, 'gt60': 0})
+                self.assertEqual((counts['limited'], counts['error']), (1, 0))
+                self.assertFalse(self.questions()[0].get('asks'))
+                self.assertFalse(self.questions()[0].get('checked'))
+
+    def test_census_reason_classes_age_edges_and_first_reason(self):
+        now = at('2026-11-14T12:00')
+        reasons = sorted(mc.charges.LIMIT_REASONS)
+        days = [1, 7 - 1/86400, 7, 30, 30 + 1/86400, 60, 60 + 1/86400]
+        self.seed([now - dt.timedelta(days=days[n % len(days)]) for n in range(len(reasons))])
+        with mc.Locked(self.data, 'questions') as book:
+            for n, q in enumerate(book['questions']):
+                q.update(merchant='noon' if n % 2 == 0 else 'careem', mkey='fixture-' + str(n), amount=str(10+n))
+        by_amount = {q['amount']: reason for q, reason in zip(self.questions(), reasons)}
+        def explained(charge, when, *args, **kwargs):
+            reason = by_amount[charge['amount']]
+            return {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+                    'limits': [{'why': 'fixture', 'kinds': ['food_page_1'], 'reason': reason},
+                               {'why': 'later', 'kinds': ['marketplace_hold'], 'reason': 'marketplace_hold'}]}
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        with patch.object(mc.charges, 'explain', side_effect=explained), \
+                patch.object(mc.charges, 'order_receipt', return_value=None):
+            mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+        for app in ('noon', 'careem'):
+            counts = stats['charge_census'][app]
+            selected = [q for q in self.questions() if q['merchant'] == app]
+            self.assertEqual(counts['limit_reasons'], {by_amount[q['amount']]: 1 for q in selected})
+            expected = dict.fromkeys(('lt7', '7_30', '30_60', 'gt60'), 0)
+            for q in selected:
+                bucket = ('lt7', 'lt7', '7_30', '7_30', '30_60', '30_60', 'gt60')[(int(q['amount']) - 10) % len(days)]
+                expected[bucket] += 1
+            self.assertEqual(counts['limit_age_days'], expected)
+            self.assertEqual(sum(counts['limit_reasons'].values()), counts['limited'])
+            self.assertEqual(sum(expected.values()), counts['limited'])
+            self.assertEqual(counts['error'], 0)
+
+    def test_source_census_accounts_for_matches_clean_limits_errors_and_deferred(self):
+        now = at('2026-11-14T12:00')
+        self.seed([now - dt.timedelta(days=3, hours=5-n) for n in range(5)])
+        with mc.Locked(self.data, 'questions') as book:
+            for n, q in enumerate(book['questions']):
+                q['merchant'] = 'careem' if n == 4 else 'noon'
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        outcomes = iter([
+            {'verdict': 'receipt', 'why': 'fixture match', 'errors': []},
+            {'verdict': 'wait', 'why': 'fixture wait', 'until': (now + dt.timedelta(days=1)).isoformat(), 'errors': []},
+            {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+             'limits': [{'why': 'fixture', 'kinds': ['food_page_1']}]},
+            {'verdict': 'unverified', 'why': 'fixture error', 'errors': ['fixture error']},
+            {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+             'limits': [{'why': 'fixture', 'kinds': ['ORDER_LIST_HOST_BINDING_UNVERIFIED']}]},
+        ])
+        with patch.object(mc.charges, 'explain', side_effect=lambda *a, **kw: next(outcomes)):
+            mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+        self.assert_census(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=4, matched=1,
+            proven_clean=1, limited=1, error=1, not_checked=0))
+        self.assert_census(stats['charge_census']['careem'], dict(open=1, matched=0,
+            proven_clean=0, limited=1, error=0, not_checked=0))
+        # No time to admit another screen: remaining rows are deferred, never clean.
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        mc.follow(self.data, now, self.root, deadline=time.time(), find=finder(), said=nobody, stats=stats)
+        for counts in stats['charge_census'].values():
+            self.assertEqual(counts['open'], counts['limited'])
+            self.assertEqual(counts['open'], counts['not_checked'])
+            self.assertEqual(counts['proven_clean'], 0)
+
+    def test_source_census_uses_final_alias_matches(self):
+        now = at('2026-11-14T12:00')
+        forms = {
+            'limited': {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+                'limits': [{'why': 'fixture', 'kinds': ['food_page_1']}]},
+            'error': {'verdict': 'unverified', 'why': 'fixture error', 'errors': ['fixture']},
+            'clean': {'verdict': 'ask', 'why': 'fixture clean', 'errors': []},
+            'deferred': None,
+        }
+        for form, first in forms.items():
+            with self.subTest(form=form):
+                self.data = self.tmp / form
+                self.seed([now - dt.timedelta(days=3)] * 2)
+                with mc.Locked(self.data, 'questions') as book:
+                    for n, q in enumerate(book['questions']):
+                        q['merchant'] = 'noon' if n == 0 else 'noon food'
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                clock = [1000.0]
+                receipt = {'verdict': 'receipt', 'why': 'fixture receipt', 'errors': []}
+                outcomes = iter([first, receipt])
+                def explain(*args, **kw):
+                    if form == 'deferred':
+                        clock[0] += 2
+                        return receipt
+                    return next(outcomes)
+                with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), \
+                        patch.object(mc.charges, 'explain', side_effect=explain):
+                    mc.follow(self.data, now, self.root, 1007 if form == 'deferred' else None,
+                              finder(), nobody, stats=stats)
+                self.assertTrue(all(q['status'] == 'closed' for q in self.questions()))
+                self.assert_census(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=2,
+                    proven_clean=0, limited=0, error=0, not_checked=0))
+
+    def census_alias_check(self, label, merchants, outcomes, deferred=False):
+        now = at('2026-11-14T12:00')
+        self.data, self.wd = self.tmp / label, self.tmp / ('wd-' + label)
+        self.wd.mkdir()
+        self.seed([now - dt.timedelta(days=3)] * len(merchants))
+        with mc.Locked(self.data, 'questions') as book:
+            for q, merchant in zip(book['questions'], merchants):
+                q.update(merchant=merchant, mkey=mc.merchant_key(merchant))
+        clock, results = [1000.0], iter(outcomes)
+        def explain(*args, **kw):
+            if deferred:
+                clock[0] += 2
+            return next(results)
+        with patch.object(mc.charges.order_lookup, 'read', return_value={'orders': [], 'complete': True,
+                    'lanes': {lane: {'exhaustive': True, 'walked_at': now.isoformat()}
+                              for lane in mc.charges.order_lookup.LANES}}), \
+                patch.object(mc.time, 'time', side_effect=lambda: clock[0]), \
+                patch.object(mc, 'FOLLOW_BUDGET', 7 if deferred else mc.FOLLOW_BUDGET), \
+                patch.object(mc.charges, 'explain', side_effect=explain):
+            mc.run_check(self.wd, label, self.data, self.root, now, finder(), nobody)
+        rows = [json.loads(line) for path in (self.tmp / 'tool-logs/orders').glob('*.ndjson')
+                for line in path.read_text().splitlines()]
+        return self.questions(), [r for r in rows if r['name'] == 'check.run'][-1]
+
+    def test_check_census_reconciles_unverified_aliases(self):
+        for kind in ('limited', 'error'):
+            blocked = {'verdict': 'unverified', 'why': 'fixture blocked',
+                'errors': ['fixture source error'] if kind == 'error' else [],
+                'limits': [] if kind == 'error' else [{'why': 'fixture source limit',
+                                                     'kinds': ['food_page_1']}]}
+            for clean in ('ask', 'wait'):
+                clear = {'verdict': clean, 'why': 'fixture clean', 'errors': [],
+                         'until': at('2026-11-15T12:00').isoformat()}
+                for peer in ('noon food', 'careem', 'other vendor'):
+                    for reverse in (False, True):
+                        label = f'{kind}-{clean}-{peer.replace(" ", "-")}-{reverse}'
+                        with self.subTest(label=label):
+                            merchants = ['noon', peer]
+                            outcomes = [clear, blocked]
+                            if reverse:
+                                merchants.reverse()
+                                outcomes.reverse()
+                            questions, row = self.census_alias_check(label, merchants, outcomes)
+                            self.assertTrue(all(q['unverified'] for q in questions))
+                            self.assertTrue(all(q['status'] == 'open' and not q['asks'] for q in questions))
+                            census = row['props']['chargeCensus']
+                            for source, count in (('noon', 2 if peer == 'noon food' else 1),
+                                                  ('careem', 1 if peer == 'careem' else 0)):
+                                self.assert_census(census[source], dict(
+                                    **({'marketplace_hold': 0, 'marketplace_stale': 0} if source == 'noon' else {}),
+                                    open=count, matched=0,
+                                    proven_clean=0, limited=count if kind == 'limited' else 0,
+                                    error=count if kind == 'error' else 0, not_checked=0))
+                                self.assertEqual(census[source]['limit_reasons'],
+                                    {'lane_uncovered:food': count} if kind == 'limited' and count else {})
+                            self.assertEqual(row['ok'], kind == 'limited')
+                            self.assertNotIn('fixture', json.dumps(row))
+
+    def test_check_census_carries_blocking_alias_reason_in_both_orders(self):
+        forms = [
+            ('verdict', 'msgs_timeout', {'limit_reason': 'msgs_timeout',
+                'limits': [{'why': 'fixture later limit', 'kinds': ['food_page_1'], 'reason': 'lane_uncovered:food'}]}),
+            ('limit', 'lane_uncovered:food', {'limits': [
+                {'why': 'fixture first limit', 'kinds': ['food_page_1'], 'reason': 'lane_uncovered:food'},
+                {'why': 'fixture later limit', 'kinds': ['marketplace_hold'], 'reason': 'marketplace_hold'}]}),
+            ('legacy', 'lane_uncovered:food', {'limits': [{'why': 'fixture limit', 'kinds': ['food_page_1']}]}),
+        ]
+        for form, reason, fields in forms:
+            for clean in ('ask', 'wait'):
+                clear = {'verdict': clean, 'why': 'fixture clean', 'errors': [],
+                         'until': at('2026-11-15T12:00').isoformat()}
+                blocked = {'verdict': 'unverified', 'why': 'fixture blocked', 'errors': [], **fields}
+                for reverse in (False, True):
+                    label = f'alias-reason-{form}-{clean}-{reverse}'
+                    with self.subTest(label=label):
+                        merchants, outcomes = ['noon', 'noon food'], [clear, blocked]
+                        if reverse:
+                            merchants.reverse()
+                            outcomes.reverse()
+                        questions, row = self.census_alias_check(label, merchants, outcomes)
+                        census = row['props']['chargeCensus']['noon']
+                        self.assert_census(census, dict(marketplace_hold=0, marketplace_stale=0,
+                            open=2, matched=0, proven_clean=0, limited=2, error=0, not_checked=0))
+                        self.assertEqual(census['limit_reasons'], {reason: 2})
+                        self.assertEqual(census['limit_age_days'], {'lt7': 2, '7_30': 0, '30_60': 0, 'gt60': 0})
+                        self.assertTrue(all(q['unverified'] and q['status'] == 'open' and not q['asks']
+                                            for q in questions))
+
+    def test_check_census_mixed_alias_errors_are_order_independent(self):
+        limited = {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+                   'limits': [{'why': 'fixture', 'kinds': ['food_page_1']}]}
+        failed = {'verdict': 'unverified', 'why': 'fixture error', 'errors': ['fixture']}
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                outcomes = [limited, failed] if not reverse else [failed, limited]
+                questions, row = self.census_alias_check('mixed-' + str(reverse),
+                    ['noon', 'noon food'], outcomes)
+                self.assertTrue(all(q['unverified'] for q in questions))
+                self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
+                    proven_clean=0, limited=0, error=2, not_checked=0))
+                self.assertFalse(row['ok'])
+
+    def test_check_census_does_not_propagate_through_distinct_same_descriptor_questions(self):
+        failed = {'verdict': 'unverified', 'why': 'fixture error', 'errors': ['fixture']}
+        limited = {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+                   'limits': [{'why': 'fixture', 'kinds': ['food_page_1']}]}
+        clear = {'verdict': 'ask', 'why': 'fixture clean', 'errors': []}
+        questions, row = self.census_alias_check('non-transitive',
+            ['noon', 'noon food', 'noon'], [failed, limited, clear])
+        self.assertTrue(all(q['unverified'] for q in questions))
+        self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=3, matched=0,
+            proven_clean=0, limited=1, error=2, not_checked=0))
+
+    def test_check_census_deferred_alias_has_only_order_evidence(self):
+        clear = {'verdict': 'ask', 'why': 'fixture clean', 'errors': []}
+        questions, row = self.census_alias_check('deferred-clean', ['noon', 'noon food'],
+                                               [clear], deferred=True)
+        self.assertTrue(questions[0]['unverified'])
+        self.assertFalse(questions[1].get('checked'))
+        self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
+            proven_clean=0, limited=2, error=0, not_checked=0))
+        self.assertFalse(row['ok'])
+
+    def test_check_census_does_not_combine_identical_descriptors(self):
+        clear = {'verdict': 'ask', 'why': 'fixture clean', 'errors': []}
+        for kind in ('limited', 'error'):
+            blocked = {'verdict': 'unverified', 'why': 'fixture blocked',
+                'errors': ['fixture'] if kind == 'error' else [],
+                'limits': [] if kind == 'error' else [{'why': 'fixture', 'kinds': ['food_page_1']}]}
+            with self.subTest(kind=kind):
+                questions, row = self.census_alias_check('distinct-' + kind,
+                                                       ['noon', 'noon'], [clear, blocked])
+                self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
+                    proven_clean=1, limited=1 if kind == 'limited' else 0,
+                    error=1 if kind == 'error' else 0, not_checked=0))
+                self.assertFalse(questions[0]['unverified'])
+                self.assertTrue(questions[1]['unverified'])
+
     def questions(self):
         return mc.load_questions(self.data)["questions"]
 
@@ -1801,6 +3585,32 @@ class CheckBudget(Base):
             q['id'] = f'q-budget{n}'
         mc.write_json(self.data / 'questions.json', book)
         return book
+
+    def test_limit_only_check_saves_limits_and_never_asks(self):
+        now = at('2026-11-10T12:00')
+        book = self.seed([now - dt.timedelta(days=3)])
+        book['questions'][0]['merchant'] = 'careem'
+        mc.write_json(self.data / 'questions.json', book)
+        limit = mc.charges.order_lookup.SourceLimit('ORDER_LIST_HOST_BINDING_UNVERIFIED')
+        # Use the native source-limit path, with all other evidence readable and empty.
+        with patch.object(mc.charges, 'receipt', return_value=None), \
+                patch.object(mc.charges.order_lookup, 'read', side_effect=limit), \
+                patch.object(mc.charges, 'card_owner', return_value='abdullah'):
+            event = mc.run_check(self.wd, 'limited', self.data, self.root, now, finder(), nobody)
+        state = json.loads((self.wd / 'pings.json').read_text())
+        self.assertFalse(state.get('question_errors'))
+        self.assertEqual(len(state['question_limits']['limits']), 1)
+        q = self.questions()[0]
+        self.assertTrue(q['unverified'])
+        self.assertEqual(q['asks'], [])
+        self.assertFalse(q.get('case_opened'))
+        self.assertEqual(event, '')
+        logs = list((self.tmp / 'tool-logs' / 'orders').glob('*.ndjson'))
+        rows = [json.loads(line) for path in logs for line in path.read_text().splitlines()]
+        run = next(r for r in rows if r['name'] == 'check.run')
+        self.assertTrue(run['ok'])
+        self.assertEqual(run['props']['sourceLimits'], 1)
+        self.assertEqual(run['props']['limitKinds'], ['ORDER_LIST_HOST_BINDING_UNVERIFIED'])
 
     def test_slow_lookups_leave_time_for_due_case_event(self):
         self.case()
@@ -1871,13 +3681,13 @@ class CheckBudget(Base):
                 with patch.object(mc.os, 'replace', interrupted_replace):
                     with self.assertRaises(mc.CheckTimeout):
                         if action == 'close':
-                            mc.follow(self.data, now, self.root, time.time() + 5, finder(), owner)
+                            mc.follow(self.data, now, self.root, time.time() + 10, finder(), owner)
                         else:
                             with mc.Locked(self.data, 'questions') as book:
                                 mc.case_from(self.data, book['questions'][0], now, 'check', self.root)
                 self.assertEqual(self.questions()[0]['status'], 'case' if action == 'close' else 'open')
                 self.assertEqual(len(mc.load(self.data)['cases']), 1)
-                mc.follow(self.data, now, self.root, time.time() + 5, finder(), owner)
+                mc.follow(self.data, now, self.root, time.time() + 10, finder(), owner)
                 q = self.questions()[0]
                 self.assertEqual(q['status'], 'closed')
                 self.assertTrue(q['case_closed'])
@@ -1908,6 +3718,7 @@ class CheckBudget(Base):
                             mc.case_from(self.data, book['questions'][0], now, 'check', self.root)
                 cid = mc.load(self.data)['cases'][0]['id']
                 self.assertEqual(self.questions()[0]['status'], 'open')
+                before = data_snapshot(self.data) if entry == 'readonly' else None
                 if entry == 'answered':
                     mc.answered(self.data, qid, 'not mine', now)
                     q = self.questions()[0]
@@ -1925,10 +3736,12 @@ class CheckBudget(Base):
                 else:
                     mc.triaged(self.data, [(qid, 'imsg:test', False)], now)
                 q = self.questions()[0]
+                if entry == 'readonly':
+                    self.assertEqual(data_snapshot(self.data), before)
                 if entry not in ('answered', 'readonly'):
                     self.assertEqual((q['status'], q['case']), ('case', cid))
                 self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'open')
-                mc.follow(self.data, now, self.root, time.time() + 5, finder(), nobody)
+                mc.follow(self.data, now, self.root, time.time() + 10, finder(), nobody)
                 self.assertEqual(len(mc.load(self.data)['cases']), 1)
 
     def test_slow_run_logs_phase_times_and_counts(self):
@@ -2130,11 +3943,12 @@ class CheckBudget(Base):
         with ControlServer(rows), patch.object(mc.charges, 'owner_texts', wraps=mc.charges.owner_texts) as query:
             mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
         self.assertEqual(query.call_count, 1)
+        self.assertTrue((self.data / 'owner-texts.json').exists())
         for n, q in enumerate(self.questions()):
             self.assertEqual(q['status'], 'closed')
             self.assertIn(f'item {n}', q['outcome'])
         state = json.loads((self.wd / 'pings.json').read_text())
-        self.assertEqual(state['timing']['owner_queries'], 2)
+        self.assertEqual(state['timing']['owner_queries'], 3)
 
     def test_stalled_control_lookup_keeps_check_in_budget_and_questions_unverified(self):
         now = at('2026-10-25T12:00')
@@ -2159,14 +3973,14 @@ class CheckBudget(Base):
         self.assertEqual(str(state['question_errors']).count('test source failed'), 1)
         self.assertTrue(all(q['status'] == 'open' for q in self.questions()))
 
-    def test_long_union_falls_back_to_each_question(self):
+    def test_long_union_uses_one_owner_read_and_the_checks_data_dir(self):
         now = at('2026-10-25T12:00')
         self.seed([now, now - dt.timedelta(days=3)])
         with patch.object(mc.charges, 'owner_texts', return_value=[]) as query:
             mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
-        self.assertEqual(query.call_count, 2)
-        self.assertTrue(all(call.args[1] - call.args[0] <= dt.timedelta(hours=1)
-                            for call in query.call_args_list))
+        self.assertEqual(query.call_count, 1)
+        self.assertEqual(query.call_args.args[:2], (now - dt.timedelta(days=3) - mc.charges.OWNER_AROUND, now))
+        self.assertEqual(query.call_args.kwargs['cache_path'], self.data / 'owner-texts.json')
 
     def test_msgs_cache_is_shared_by_ambiguous_questions_and_reset_each_run(self):
         now = at('2026-10-25T12:00')
@@ -3082,24 +4896,26 @@ class PaymentDeadlines(Base):
 
     def test_owner_closes_both_rows(self):
         parent = self.notice('Autopay of AED 3,532.73 is due tonight at 18:00', '2026-11-07T09:09', 'scheduled')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            self.check('2026-11-07T19:00')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.check('2026-11-07T19:00', find=search)
         child = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
         mc.close(self.data, child['id'], 'paid', at('2026-11-07T19:30'))
         self.assertEqual({c['status'] for c in mc.load(self.data)['cases']}, {'closed'})
         with patch.object(mc.charges, 'search') as search:
-            self.assertEqual('', self.check('2026-11-08T09:00'))
+            self.assertEqual('', self.check('2026-11-08T09:00', find=search))
             search.assert_not_called()
         self.assertEqual(mc.find(mc.load(self.data), parent)['status'], 'closed')
 
     def test_expected_missing_confirmation_escalates_at_due_plus_one(self):
         self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00', '2026-11-07T09:09', 'scheduled')
         with patch.object(mc.charges, 'search', return_value=[]) as search:
-            self.assertEqual('', self.check('2026-11-07T18:59'))
-            search.assert_not_called()
-            self.assertIn('Wio', self.check('2026-11-07T19:00'))
-            self.assertIsNotNone(search.call_args.kwargs['deadline'])
-            event = self.check('2026-11-07T20:00')
+            self.assertEqual('', self.check('2026-11-07T18:59', find=search))
+            self.assertTrue(all(call.args[0].endswith(' refund OR credited') for call in search.call_args_list))
+            self.assertIn('Wio', self.check('2026-11-07T19:00', find=search))
+            payment_calls = [call for call in search.call_args_list if not call.args[0].endswith(' refund OR credited')]
+            self.assertEqual(len(payment_calls), 1)
+            self.assertIsNotNone(payment_calls[0].kwargs['deadline'])
+            event = self.check('2026-11-07T20:00', find=search)
         self.assertIn('Wio', event)
         cases = mc.load(self.data)['cases']
         self.assertEqual(len(cases), 2)
@@ -3108,8 +4924,8 @@ class PaymentDeadlines(Base):
     def test_expected_uses_stated_repayment_deadline(self):
         self.notice('Autopay of AED 3,532.73 is scheduled today at 18:00; repay before midnight if it fails',
                     '2026-11-07T09:09', 'scheduled')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            self.check('2026-11-07T19:00')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.check('2026-11-07T19:00', find=search)
         self.assertEqual(mc.load(self.data)['cases'][1]['deadline'], '2026-11-07T23:59:00+04:00')
 
     def test_search_success_requires_bank_amount_currency_and_time(self):
@@ -3128,8 +4944,9 @@ class PaymentDeadlines(Base):
 
     def test_archive_timeout_still_tracks_an_unconfirmed_payment(self):
         self.notice('Autopay of AED 3,532.73 due today at 18:00', '2026-11-07T09:00', 'scheduled')
-        with patch.object(mc.charges, 'search', side_effect=mc.charges.Lookup('archive unavailable')):
-            self.check('2026-11-07T20:00')
+        with patch.object(mc.charges, 'search', side_effect=mc.charges.Lookup('archive unavailable')) as search:
+            self.check('2026-11-07T20:00', find=search)
+            search.assert_called()
         cases = mc.load(self.data)['cases']
         self.assertEqual(len(cases), 2)
         self.assertIn('confirmation', cases[1]['state'])
@@ -3172,25 +4989,104 @@ class PaymentDeadlines(Base):
         def slow_archive(*args, **kwargs):
             clock[0] = kwargs['deadline'] + .01
             raise mc.charges.Lookup('lookup budget exhausted')
-        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), patch.object(mc.charges, 'search', side_effect=slow_archive):
-            event = self.check('2026-11-07T20:00')
+        with patch.object(mc.time, 'time', side_effect=lambda: clock[0]), \
+                patch.object(mc.charges, 'search', side_effect=slow_archive) as search:
+            event = self.check('2026-11-07T20:00', find=search)
+            search.assert_called()
         self.assertIn('Wio', event)
         self.assertEqual(sum(c['kind'] == 'payment_deadline' for c in mc.load(self.data)['cases']), 2)
 
     def test_bank_deadline_supersedes_fallback(self):
         self.notice('Autopay of AED 100.00 scheduled today at 18:00', '2026-11-07T09:00', 'scheduled')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            self.check('2026-11-07T19:00', 'missing')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            self.check('2026-11-07T19:00', 'missing', find=search)
         fallback = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'payment_deadline')
         bank = self.notice('Autopay of AED 100.00 failed; repay before midnight', '2026-11-07T20:00', 'bank')
         self.assertEqual(mc.find(mc.load(self.data), fallback['id'])['status'], 'closed')
-        with patch.object(mc.charges, 'search', return_value=[]):
-            event = self.check('2026-11-07T21:00', 'bank-alert')
+        with patch.object(mc.charges, 'search', return_value=[]) as search:
+            event = self.check('2026-11-07T21:00', 'bank-alert', find=search)
         self.assertIn(bank, event)
         self.assertNotIn(fallback['id'], event)
         self.assertNotIn('21:00', event)
         parent = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'autopay_expected')
         self.assertEqual(parent['payment_case'], bank)
+
+
+class ReceiptVariantCompetition(unittest.TestCase):
+    def test_aed_usd_charges_compete_for_the_same_receipt(self):
+        observed = at('2026-11-12T12:00')
+        for merchant, brand in [('BOAT.DEV', 'Boat'), ('BROWSER USE INC', 'Browser Use')]:
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                       sender=f'{brand} <receipts@stripe.example>', subject='Receipt')
+            text = f'{brand} receipt\nAmount paid $50.00'
+            for currency, amount, rival_currency, rival_amount in [
+                    ('AED', '190.47', 'USD', '50.00'), ('USD', '50.00', 'AED', '190.47')]:
+                current = dict(id='q-current', kind='charge', currency=currency, card='1111',
+                               merchant=merchant, amount=amount, pending=False, at=mc.stamp(observed))
+                for bound in [False, True]:
+                    rival = dict(current, id='q-rival', currency=rival_currency, amount=rival_amount,
+                                 at=mc.stamp(observed + dt.timedelta(minutes=1)))
+                    if bound:
+                        # A recorded binding vetoes reuse even outside the matching window.
+                        rival.update(at=mc.stamp(observed - dt.timedelta(days=7)), status='closed',
+                                     explanation={'msgs': row['id']})
+                    for known in [False, True]:
+                        with self.subTest(merchant=merchant, currency=currency, bound=bound, known=known):
+                            questions = [current, rival] if known else [rival]
+                            accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                             questions, observed)
+                            self.assertFalse(accepts(row, text))
+
+    def test_unbound_fx_competitors_need_matching_evidence(self):
+        observed = at('2026-11-12T12:00')
+        row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                   sender='Boat <receipts@stripe.example>', subject='Receipt')
+        for currency, amount, rival_currency, rival_amount, wrong_amount in [
+                ('AED', '190.47', 'USD', '50.00', '25.00'),
+                ('USD', '50.00', 'AED', '190.47', '100.00')]:
+            current = dict(id='q-current', kind='charge', currency=currency, card='1111',
+                           merchant='BOAT.DEV', amount=amount, pending=False, at=mc.stamp(observed))
+            rival = dict(current, id='q-rival', currency=rival_currency, amount=rival_amount)
+            for label, changes in [('merchant', {'merchant': 'Other'}),
+                                   ('amount', {'amount': wrong_amount}), ('currency', {'currency': 'EUR'}),
+                                   ('time', {'at': mc.stamp(observed - dt.timedelta(days=7))})]:
+                with self.subTest(currency=currency, form=label):
+                    accepts = mc.receipt_for_question(None, current, 'q-current',
+                                                     [current, dict(rival, **changes)], observed)
+                    self.assertTrue(accepts(row, 'Boat receipt\nAmount paid $50.00'))
+
+    def test_different_amounts_cannot_share_a_variant_receipt(self):
+        observed = at('2026-11-12T12:00')
+        forms = [
+            ('UBER * PENDING', '201.03', True, '200.94', False,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', False),
+            ('UBER * PENDING', '201.03', True, '201.00', True,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', False),
+            ('BOAT.DEV', '190.47', False, '190.90', False,
+             'Boat <receipts@stripe.example>', 'Boat receipt\nAmount paid $50.00', False),
+            ('UBER * PENDING', '201.03', True, '200.94', True,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', True),
+        ]
+        for merchant, amount, pending, rival_amount, rival_pending, sender, text, bound in forms:
+            current = dict(id='q-current', kind='charge', currency='AED', card='1111',
+                           merchant=merchant, amount=amount, pending=pending, at=mc.stamp(observed))
+            rival = dict(current, id='q-rival', amount=rival_amount, pending=rival_pending,
+                         at=mc.stamp(observed + dt.timedelta(minutes=1)))
+            if bound:
+                rival.update(status='closed', explanation={'msgs': 7})
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                       sender=sender, subject='Receipt')
+            for known in [False, True]:
+                with self.subTest(merchant=merchant, rival=rival_amount, known=known):
+                    questions = [current, rival] if known else [rival]
+                    accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                     questions, observed)
+                    self.assertFalse(accepts(row, text))
+                    unrelated = dict(rival, merchant='Other', amount='999.00', pending=False)
+                    unrelated.pop('explanation', None)
+                    accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                     [unrelated], observed)
+                    self.assertTrue(accepts(row, text))
 
 
 if __name__ == '__main__':

@@ -1,3 +1,4 @@
+import type { McpDenyReason } from "@t3tools/contracts";
 import {
   KanbanError,
   kanbanWorkStep,
@@ -41,20 +42,22 @@ export const planCutoverCardRestore = (input: {
   readonly at: string;
 }): RestorePlan => {
   const { restore, board, card, link } = input;
-  const denied = (detail: string): RestorePlan => ({
+  const denied = (detail: string, reason: McpDenyReason): RestorePlan => ({
     ok: false,
-    error: new KanbanError({ code: "denied", detail }),
+    error: new KanbanError({ code: "denied", reason, detail }),
   });
-  if (board.pause === null) return denied("cutover card restore requires a paused board");
+  if (board.pause === null)
+    return denied("cutover card restore requires a paused board", "board_pause_required");
   if (board.pause.keep.includes(card.id))
-    return denied("cutover card must remain held by the board pause");
+    return denied("cutover card must remain held by the board pause", "card_pause_hold_required");
   if (board.id !== card.boardId || card.id !== restore.cardId) {
-    return denied("cutover card does not belong to this board");
+    return denied("cutover card does not belong to this board", "cross_board");
   }
-  if (card.settledAt !== null) return denied(`card #${card.number} is settled`);
+  if (card.settledAt !== null) return denied(`card #${card.number} is settled`, "card_settled");
 
   const role = restore.stage === "working" ? "work" : "review";
-  if (role === "work" && !kanbanWorkStep(card)) return denied("current step has no worker work");
+  if (role === "work" && !kanbanWorkStep(card))
+    return denied("current step has no worker work", "work_step_missing");
   const same =
     card.stage === restore.stage &&
     card.activeThreadId === restore.threadId &&
@@ -65,14 +68,21 @@ export const planCutoverCardRestore = (input: {
     card.activeThreadId === null &&
     card.activeRole === null &&
     card.activePool === null;
-  if (!stopped && !same) return denied(`card #${card.number} is not stopped or already restored`);
+  if (!stopped && !same)
+    return denied(
+      `card #${card.number} is not stopped or already restored`,
+      "cutover_restore_state_invalid",
+    );
   if (
     link === null ||
     link.threadId !== restore.threadId ||
     link.boardId !== board.id ||
     link.role !== role
   ) {
-    return denied(`thread ${restore.threadId} has no matching ${role} link on this board`);
+    return denied(
+      `thread ${restore.threadId} has no matching ${role} link on this board`,
+      "thread_board_link_mismatch",
+    );
   }
   const recorded = role === "work" ? card.workThreadId : card.reviewThreadId;
   // A shared worker can have dropped its pointer on stop; its history is still authoritative.
@@ -80,6 +90,7 @@ export const planCutoverCardRestore = (input: {
   if (recorded !== restore.threadId && !(recorded === null && historical)) {
     return denied(
       `thread ${restore.threadId} is not the recorded ${role} thread for card #${card.number}`,
+      "not_card_owner",
     );
   }
 
@@ -95,7 +106,7 @@ export const planCutoverCardRestore = (input: {
   const pool = input.pools.find(
     (candidate) => candidate.key === key && Rules.poolKey(candidate.model) === key,
   );
-  if (pool === undefined) return denied(`no migrated ${role} pool runs ${key}`);
+  if (pool === undefined) return denied(`no migrated ${role} pool runs ${key}`, "pool_missing");
 
   const others = input.cards.filter((other) => other.id !== card.id);
   if (
@@ -105,15 +116,18 @@ export const planCutoverCardRestore = (input: {
         (other.activePool !== key || other.activeRole !== role),
     )
   ) {
-    return denied(`thread ${restore.threadId} already occupies another pool or role`);
+    return denied(
+      `thread ${restore.threadId} already occupies another pool or role`,
+      "model_pool_mismatch",
+    );
   }
   const heldPool = input.holds.get(restore.threadId);
   if (heldPool !== undefined && heldPool !== key) {
-    return denied(`thread ${restore.threadId} already holds another pool`);
+    return denied(`thread ${restore.threadId} already holds another pool`, "model_pool_mismatch");
   }
   const occupied = Rules.poolThreads(others, input.holds).get(key) ?? new Set<string>();
   occupied.add(restore.threadId);
-  if (occupied.size > pool.slots) return denied(`the ${key} pool has no free slot`);
+  if (occupied.size > pool.slots) return denied(`the ${key} pool has no free slot`, "pool_full");
 
   const restored: KanbanCard = {
     ...card,

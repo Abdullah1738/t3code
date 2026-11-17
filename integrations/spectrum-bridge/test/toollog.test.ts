@@ -19,6 +19,13 @@ afterEach(() => dirs.splice(0).forEach(root => {
   rmSync(root, { recursive: true, force: true });
 }));
 
+test("notice suppression reasons survive structured-log redaction", () => {
+  const { log, lines } = setup();
+  const reasons = ["grace", "not-waiting", "already-sent", "rate-limited"];
+  for (const reason of reasons) log.write({ component: "remote-box", kind: "event", name: "moni-notice-suppressed", props: { reason } });
+  expect(lines().map(line => line.props?.reason)).toEqual(reasons);
+});
+
 test("shared format, UTC milliseconds, append-only and private modes", () => {
   const { root, log, lines } = setup();
   chmodSync(root, 0o755);
@@ -38,7 +45,7 @@ test("an entire message/error fixture cannot leak text, secrets, health values o
   for (const secret of [message.text, message.prompt, message.token, message.otp, "83.7", "PASSWORD_SENTINEL", "4111111111111111", "EMAIL_BODY_SENTINEL", "PRIVATE_CAPTION"]) expect(raw).not.toContain(secret);
   expect(JSON.parse(raw).ids.inboundId).toBe(message.id);
   expect(JSON.parse(raw).props).toEqual({ count: 2 });
-  expect(JSON.parse(raw).error).toEqual({ tag: "fixture.failed", name: "UnknownError", message: "[redacted]" });
+  expect(JSON.parse(raw).error).toEqual({ tag: "fixture.failed", name: "UnknownError", message: "[redacted]", causeKey: "callsite_failure" });
 });
 
 test("retention runs on the first write of each UTC day and touches only old log artifacts", () => {
@@ -59,6 +66,14 @@ test("cap suppresses event/perf, retains errors and emits one notice across writ
   createToolLog({ root, now: () => at, capBytes: 1 }).write(entry);
   log.write({ ...entry, kind: "error", name: "reply.failed", ok: false, error: { tag: "stop_opt_out", message: "private" } });
   expect(lines().map(l => l.name)).toEqual(["turn.robob_call", "log.degraded", "reply.failed"]);
+});
+
+test("degraded mode uses the five-second call threshold and retains every failure", () => {
+  const { log, lines } = setup({ capBytes: 1 });
+  log.write(entry);
+  for (const durationMs of [1_500, 5_000, 5_000.01]) log.write({ ...entry, durationMs });
+  log.write({ ...entry, durationMs: 2, ok: false, error: { tag: "control.request_failed" } });
+  expect(lines().filter(line => line.name === "turn.robob_call").map(line => line.durationMs)).toEqual([12, 5_000.01, 2]);
 });
 
 test("all logging failures, malformed input and optional attribution failures are swallowed", async () => {
@@ -140,8 +155,34 @@ test("empty days roll up once, and a broken clock cannot reject any logger opera
   expect(await log.rollup(day)).toMatchObject({ total: 0, day, topErrorTags: [] });
   const broken = createToolLog({ now: () => { throw new Error("clock unavailable"); } });
   expect(() => broken.write(entry)).not.toThrow();
+  expect(broken.flush()).toBe(false);
+  expect(broken.flush()).toBe(true);
   await expect(broken.rollup()).resolves.toBeUndefined();
   await expect(broken.tick()).resolves.toBeUndefined();
+});
+
+test("rejected renders and failed capture cannot pass the next flush acknowledgement", () => {
+  const { log, lines } = setup();
+  log.write({ ...entry, component: "invalid component", name: "card.render" });
+  expect(log.flush()).toBe(false);
+  expect(() => log.capture(() => { throw new Error("PRIVATE capture failure"); })).not.toThrow();
+  expect(log.flush()).toBe(false);
+  log.write(entry);
+  expect(log.flush()).toBe(true);
+  expect(lines()).toHaveLength(1);
+  expect(JSON.stringify(lines())).not.toContain("PRIVATE");
+});
+
+test.each([
+  { field: "component", component: "invalid component" },
+  { field: "name", name: "invalid name" },
+  { field: "kind", kind: "invalid" as "perf" },
+])("dropping a diagnostic with an invalid $field does not fail the next flush", invalid => {
+  const { log, lines } = setup();
+  log.write({ ...entry, ...invalid });
+  log.write(entry);
+  expect(log.flush()).toBe(true);
+  expect(lines()).toHaveLength(1);
 });
 
 // Process and recovery records share the same schema without any payload content.
@@ -216,4 +257,18 @@ test.each([
   expect(rollup?.topErrorTags).toHaveLength(1);
   expect(rollup?.topErrorTags[0]).toMatchObject({ tag: expected, count: 2, sampleId: "msg-fixture" });
   expect(JSON.stringify(rollup)).not.toContain("PRIVATE_MESSAGE");
+});
+
+test("failed control perf rows retain safe error detail and tick/completion measurements survive cleaning", () => {
+  const h = setup();
+  h.log.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok: false, durationMs: 25_001,
+    props: { method: "GET", route: "/threads/:id/messages" }, error: { tag: "control.request_failed", cause: new DOMException("private response content", "TimeoutError") } });
+  h.log.write({ component: "router", kind: "perf", name: "turn.tick_timing", durationMs: 5_001,
+    props: { route: "/threads", slowestReadMs: 5_000, completionCheck: "before", secret: "must be cut" } });
+  h.log.write({ component: "router", kind: "perf", name: "run-completed-seen", props: { completionLagMs: 123 } });
+  const lines = h.lines();
+  expect(lines[0]!.error?.name).toBe("TimeoutError");
+  expect(JSON.stringify(lines)).not.toContain("private response content");
+  expect(lines[1]!.props).toEqual({ route: "/threads", slowestReadMs: 5_000, completionCheck: "before" });
+  expect(lines[2]!.props).toEqual({ completionLagMs: 123 });
 });

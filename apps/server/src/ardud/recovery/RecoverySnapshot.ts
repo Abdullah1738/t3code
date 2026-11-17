@@ -189,24 +189,27 @@ const make = Effect.gen(function* () {
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
 
-  const threadIds = Effect.fn("RecoverySnapshot.threadIds")(function* (active: boolean) {
+  const threadIds = Effect.fn("RecoverySnapshot.threadIds")(function* (
+    active: boolean,
+    cursor: string | null,
+    limit: number,
+  ) {
     if (active) {
       return yield* control
-        .liveThreadIds()
+        .pageLiveThreadIds(cursor, limit)
         .pipe(
           Effect.mapError(
             (cause) => new RecoverySnapshotError({ operation: "list-live-threads", cause }),
           ),
         );
     }
-    const snapshot = yield* threads
-      .getShellSnapshot({ location: "active" })
+    return yield* threads
+      .pageActiveThreadIds(cursor, limit)
       .pipe(
         Effect.mapError(
           (cause) => new RecoverySnapshotError({ operation: "list-active-threads", cause }),
         ),
       );
-    return snapshot.threads.map((shell) => shell.id);
   });
 
   const entryFor = Effect.fn("RecoverySnapshot.entryFor")(function* (
@@ -220,7 +223,13 @@ const make = Effect.gen(function* () {
     // ThreadManagementService hydrates legacy transcripts on record reads;
     // recovery must read the existing projection without loading a session.
     const recordsRead = yield* orchestrator
-      .getThreadRecords(id, ["runs", "runtimeRequests", "providerThreads", "subagents"])
+      .getThreadRecords(id, ["runs", "runtimeRequests", "providerThreads", "subagents"], {
+        currentRunOnly: true,
+        pendingRuntimeRequestsOnly: true,
+        subagentsWithChildThreadOnly: true,
+        providerThreadIds:
+          shell.activeProviderThreadId === null ? [] : [shell.activeProviderThreadId],
+      })
       .pipe(Effect.option);
     if (Option.isNone(recordsRead)) {
       return unknownEntry(threadId, nativeId, shell.modelSelection.instanceId);
@@ -265,8 +274,9 @@ const make = Effect.gen(function* () {
     readonly cursor: string | null;
     readonly limit: number;
   }) {
-    const ids = yield* threadIds(input.active);
-    const window = pageIds(ids, input.cursor, clampLimit(input.limit));
+    const limit = clampLimit(input.limit);
+    const ids = yield* threadIds(input.active, input.cursor, limit + 1);
+    const window = pageIds(ids, input.cursor, limit);
     const natives = yield* identity
       .currentNative(window.ids)
       .pipe(

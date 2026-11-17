@@ -1,4 +1,9 @@
 """Reporter inputs are classified, never executed or resolved on old mounts."""
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 from contextlib import redirect_stdout
 import hashlib
 import io
@@ -31,12 +36,11 @@ class RelativeScriptReporterTests(unittest.TestCase):
         # Only source inspection matters here; do not contact identity services
         # or let the unrelated compute policy reject historical test commands.
         for mock in (
-            patch.dict(os.environ, isolated_source_cases.fixture_environment()),
+            isolated_source_cases.fixture_environment_patch(),
             patch.object(engine, '_native', return_value=(None, None, None)),
             patch.object(engine, '_offbox_mode', return_value='off'),
-            patch.object(engine, 'decide_coord', return_value={'decision':'allow', 'reason':'', 'context':{'rule':'no-policy'}}),
             patch.object(engine, '_log'),
-            patch.dict(os.environ, {name:'' for name in (engine.COMMAND_IDENTITY_ENV, 'AGENT_GUARD_APPROVED', 'HARNESS_COORD_APPROVED')}),
+            patch.dict(os.environ, {name:'' for name in (engine.COMMAND_IDENTITY_ENV,)}),
         ):
             mock.start()
             self.addCleanup(mock.stop)
@@ -99,6 +103,7 @@ class RelativeScriptReporterTests(unittest.TestCase):
                             self.check(event, 'live-database-read', harness)
 
     def test_isolated_migration_and_heredoc_controls_through_hook(self):
+        isolated_source_cases.write_migration_helpers(self.root)
         source = ROOT.parents[1] / 'apps/server/scripts/migrate-dev-db.ts'
         self.write('apps/server/scripts/migrate-dev-db.ts', source.read_text())
         self.write('package.json', json.dumps({'scripts':{'migrate-dev-db':'node apps/server/scripts/migrate-dev-db.ts'}}))
@@ -149,6 +154,7 @@ class RelativeScriptReporterTests(unittest.TestCase):
                         self.check(event, expected, harness)
 
     def test_fixture_and_migration_review_corpus_through_hooks(self):
+        isolated_source_cases.write_migration_helpers(self.root)
         backup = ROOT.parents[1] / 'integrations/memory-system/tests/test_backup_replica.sh'
         migrate = ROOT.parents[1] / 'apps/server/scripts/migrate-dev-db.ts'
         rows = [('tmp/fixture.sh', 'bash tmp/fixture.sh', row) for row in isolated_source_cases.setup_control_cases(backup.read_text())]

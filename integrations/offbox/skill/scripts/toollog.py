@@ -15,19 +15,59 @@ import tempfile
 import time
 
 CAP_BYTES = 50 * 1024 * 1024
-NUMBERS = set("bytes files skipped exitCode waitMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength".split())
-BOOLEANS = set("queued fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
+NUMBERS = set("bytes files skipped exitCode waitMs queueMs runMs position ttlSeconds reasonLength busy idle stopped count flagsCount envCount pullCount includeCount stepCount attempt pid timeoutSeconds commandLength cmd_bytes step_count".split())
+NUMBERS.update("ms slow_ms last_good_boatd_uptime_s snapshot_age_s boatd_uptime_s uptime_s slow slow_max_s slow_total_s starting starting_max_s down".split())
+NUMBERS.update({'command_exit_code', 'wrapper_exit_code', 'disk_attempt', 'client_started_at', 'disk_probe_module_mtime'})
+NUMBERS.update({"since", "expires_at"})
+NUMBERS.add("waited_s")
+NUMBERS.add("sample")
+NUMBERS.update({'leftoverKilled', 'boxRc', 'incusRc', 'cgroupProcessCount'})
+NUMBERS.update({'outageS', 'waitedMs', 'placeBefore', 'placeAfter'})
+NUMBERS.update({'ageSeconds', 'runCount', 'waitSeconds', 'serving', 'held', 'pending', 'cap'})
+NUMBERS.update({'deficit', 'members_before'})
+NUMBERS.update({'created_at', 'since', 'total', 'headNeedBytes', 'freeBytes', 'running'})
+NUMBERS.update(f'{fs}_{field}' for fs in ('tmp', 'var_tmp', 'home', 'workspace')
+               for field in ('free_bytes', 'size_bytes'))
+BOOLEANS = {"peer_online"} | set("queued killed fresh bg noSync git noFallback noRetry remote failed stale timeoutHit fallback dryRun baseGiven templateGiven sizeGiven".split())
+BOOLEANS.add("ok")
+BOOLEANS.update({'retry', 'rcFilePresent', 'superseded'})
+BOOLEANS.update({'deadlineKept', 'expired'})
+BOOLEANS.add('queueExpired')
 ENUMS = {
+    'signalName': {'SIGINT', 'SIGTERM', 'SIGHUP', 'SIGALRM', 'SIGPIPE', 'SIGQUIT'},
+    "jdk_phase": {"check", "install", "result"},
+    "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
+    "jdk_trigger": {"command", "repo-marker", "harness"},
+    "class": {"good", "hard", "slow", "starting"},
+    "outcome": {"boat_box", "good", "bad", "indeterminate", "slow", "starting", "ready", "failover"},
+    "peer_path": {"direct", "relay", "unknown"},
+    "refresh_stage": {"idle", "zpool", "incus", "mullvad", "sqlite"},
+    "checkpoint": {"probe", "person", "post", "auto-stop", "request", "box-read"},
+    "cmd_via": {"argv", "file"},
     "backend": {"home", "boat"}, "from": {"home", "boat"}, "to": {"home", "boat"},
-    "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down"},
+    "reason": {"pinned", "home_up", "home_down", "unreachable", "boat_only", "boat_only_base", "infra", "cap", "busy", "person_home_down", "base_home_down"},
+    "stream": {"stderr", "stdout"},
     "leaseKind": {"fresh", "reused", "saved-base"},
-    "decision": {"allowed", "denied", "local-override"},
+    "decision": {"allowed", "denied", "local-override", "boat", "wait_explicit_base", "wait_person", "wait_pinned"},
     "harness": {"opencode", "codex", "claudeAgent", "codex-cu"},
     "commandClass": {"cargo", "evm", "go-build", "go-test", "gradle", "js-test", "lint", "make-test", "pytest", "typecheck", "light", "heavy", "unknown", "test", "install", "build", "docker", "opaque", "cpu"},
     "action": {"stop", "delete", "forget", "settle", "keep", "other"},
     "linkType": {"wireguard", "residential", "down", "unknown"},
     "stage": {"ssh_setup", "ssh_drop", "readiness", "put_file", "sync", "pull", "command", "install_mid_run", "request", "reaper"},
+    "infra_failure": {"enospc", "native_crash", "disk_probe"},
+    "infra_reason": {"low_space_gate", "disk_exhausted", "toolchain_unpack_crash", "setup_native_crash", "go_inventory_crash", "native_crash_after_start", "probe_crashed"},
+    "stateBefore": {"running", "stopped"},
+    "result": {"detached", "stop_failed", "created"},
 }
+ENUMS['reason'].update({'killed', 'kill_file', 'unit_inactive', 'unit_failed', 'unit_unknown',
+                        'memory', 'fifo', 'cpu', 'cpu_config', 'cpu_unknown', 'cpu_settle', 'admitted_alone'})
+ENUMS['reason'].update({'history_empty', 'history_timeout', 'history_no_progress', 'history_unavailable'})
+ENUMS.update({f'{fs}_fstype': {'tmpfs', 'zfs', 'ext2', 'ext3', 'ext4', 'xfs', 'btrfs', 'overlay', 'unknown'}
+              for fs in ('tmp', 'var_tmp', 'home', 'workspace')})
+ENUMS.update(cause={'incus_unavailable', 'exec_stream_lost', 'host_restart', 'boatd_restart', 'runner_restart'},
+             phase={'before_spawn', 'running'}, cleanup={'clean', 'stopped', 'unknown'})
+ENUMS['reason'].update({'incus_unavailable', 'state_unavailable', 'box_unreadable', 'invalid_receipt',
+                        'cgroup_unverified', 'cgroup_kill_failed', 'cleanup_unconfirmed'})
 _DAYS = set()
 
 
@@ -46,25 +86,59 @@ def _atom(value):
 
 def _ids(values):
     return {k: v for k, v in (values or {}).items()
-            if k in {"run", "box", "thread", "card", "chat", "order", "owner"} and isinstance(v, str)
+            if k in {"run", "newRun", "box", "newBox", "thread", "card", "chat", "order", "owner"} and isinstance(v, str)
             and len(v) <= 200 and re.fullmatch(r"[A-Za-z0-9_:%.\-/]+", v)
             and not re.search(r"\d{13,}", v)}
 
 
-def _props(values):
+def _props(values, *, name=None):
     out = {}
     for k, v in (values or {}).items():
-        if k in NUMBERS and type(v) in (int, float) and math.isfinite(v):
+        if name in {"box_suspect_set", "box_suspect_cleared", "box_skipped_suspect", "run_moved_off_suspect"}:
+            if k == 'reason' and isinstance(v, str):
+                out[k] = v if v in {'native_crash', 'toolchain_unpack_crash', 'setup_native_crash',
+                                   'go_inventory_crash', 'native_crash_after_start'} else 'other'
+                out['reasonLength'] = len(v)
+                continue
+            if k in {'source', 'trigger', 'kind'}:
+                allowed = {'source': {'auto', 'manual'}, 'kind': {'suspect'},
+                           'trigger': {'exit90', 'setup_crash', 'after_start', 'manual'}}
+                if isinstance(v, str) and v in allowed[k]:
+                    out[k] = v
+                continue
+            if k == 'expires_at' and v is None:
+                out[k] = None
+                continue
+        if k == "reason" and name == "backend.failback" and isinstance(v, str):
+            out[k] = v[:200]
+        elif k in {'leftoverKilled', 'boxRc', 'cgroupProcessCount', 'placeBefore', 'placeAfter'} and v is None:
+            out[k] = None
+        elif k == 'stderrTail' and isinstance(v, str):
+            # Only Incus' fixed transport diagnostics belong here, never arbitrary command output.
+            markers = ('Lost connection to the event listener', 'websocket: close 1006',
+                       'unexpected EOF', 'Incus is shutting down')
+            out[k] = '; '.join(s for s in markers if s in v)
+        elif k in NUMBERS and type(v) in (int, float) and math.isfinite(v):
             out[k] = v
         elif k in BOOLEANS and type(v) is bool:
             out[k] = v
         elif k in ENUMS and isinstance(v, str) and v in ENUMS[k]:
             out[k] = v
+        elif k in ("boot_id", "last_good_boot_id") and isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", v):
+            out[k] = v
+        elif k == 'head' and isinstance(v, str) and re.fullmatch(r'bx_[A-Za-z0-9]+/[0-9]+', v):
+            out[k] = v
+        elif k == "day" and isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            out[k] = v
         elif k == "repo" and isinstance(v, str) and re.fullmatch(r"[a-f0-9]{16}", v):
             out[k] = v
         elif k == "size" and v in ("small", "default", "large", "xlarge"):
             out[k] = v
-        elif k == "errorClass" and _atom(v):
+        elif k == "errorClass" and isinstance(v, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]{0,79}', v):
+            out[k] = v
+        elif k == 'base' and (v is None or isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', v)):
+            out[k] = v
+        elif k in ('source', 'fromSource') and isinstance(v, str) and re.fullmatch(r'(?:template|recipe|base):[A-Za-z0-9_.:-]{1,200}|fresh', v):
             out[k] = v
         elif k == "exitRelay" and isinstance(v, str) and re.fullmatch(r"[a-z]{2}-[a-z]{3}-wg-\d{3}", v):
             out[k] = v
@@ -105,7 +179,7 @@ def emit(component, name, *, kind="event", duration_ms=None, ok=None, ids=None, 
             line["ok"] = ok
         if clean := _ids(ids):
             line["ids"] = clean
-        if clean := _props(props):
+        if clean := _props(props, name=name):
             line["props"] = clean
         if _atom(tag):
             # Messages are stable labels, never str(exception), stderr, or API response text.
@@ -167,6 +241,7 @@ def rollup(day=None):
     root = directory()
     counts, kinds, errors, samples, durations = Counter(), Counter(), Counter(), {}, {}
     total = ok = checked = bad = malformed = 0
+    sampled = False
     path = root / (day + ".ndjson")
     if path.exists():
         with path.open() as source:
@@ -176,26 +251,30 @@ def rollup(day=None):
                     if not isinstance(row, dict) or row.get("tool") != "offbox" or not _atom(row.get("name")) or row.get("kind") not in ("event", "perf", "error"):
                         raise ValueError()
                     name, kind = row["name"], row["kind"]
-                    total += 1
-                    counts[name] += 1
-                    kinds[kind] += 1
+                    weight = (row.get("props") or {}).get("sample", 1)
+                    if type(weight) is not int or weight < 1:
+                        weight = 1
+                    sampled |= weight > 1
+                    total += weight
+                    counts[name] += weight
+                    kinds[kind] += weight
                     if type(row.get("ok")) is bool:
-                        checked += 1
-                        ok += row["ok"]
-                    bad += kind == "error" or row.get("ok") is False
+                        checked += weight
+                        ok += weight * row["ok"]
+                    bad += weight * (kind == "error" or row.get("ok") is False)
                     ms = row.get("durationMs")
                     if type(ms) in (int, float) and math.isfinite(ms) and ms >= 0:
                         durations.setdefault(name, []).append(ms)
                     tag = (row.get("error") or {}).get("tag")
                     if _atom(tag):
-                        errors[tag] += 1
+                        errors[tag] += weight
                         samples.setdefault(tag, _ids(row.get("ids")))
                 except (ValueError, TypeError, AttributeError):
                     malformed += 1
     def stats(xs):
         xs.sort()
         return {"p50": xs[max(0, math.ceil(len(xs)*.50)-1)], "p95": xs[math.ceil(len(xs)*.95)-1], "max": xs[-1]}
-    result = {"day": day, "total": total, "countsByName": dict(counts), "countsByKind": dict(kinds),
+    result = {"day": day, "total": total, "sampled": sampled, "countsByName": dict(counts), "countsByKind": dict(kinds),
               "okRate": ok/checked if checked else None, "errorRate": bad/total if total else None,
               "durationMs": {name: stats(xs) for name, xs in durations.items()}, "malformedLines": malformed,
               "topErrors": [{"tag": tag, "count": count, "sampleIds": samples[tag]} for tag, count in errors.most_common(20)]}

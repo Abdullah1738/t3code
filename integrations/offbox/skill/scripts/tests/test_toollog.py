@@ -30,6 +30,39 @@ class Logs(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for path in self.root.glob('*.ndjson') for line in path.read_text().splitlines()]
 
+    def test_missing_stderr_metadata_survives_serialization(self):
+        props = dict(stream='stderr', backend='boat', reason='history_empty')
+        toollog.emit('run', 'run.log_stream_missing', kind='error', ok=False, ids={'run': 'run-fixture'}, props=props)
+        self.assertEqual(self.rows()[0]['props'], props)
+
+    def test_command_transport_fields_survive_serialization(self):
+        for mode in ('argv', 'file'):
+            for name in ('run.start', 'run.command'):
+                toollog.emit('run', name, props={'cmd_bytes': 140111, 'cmd_via': mode, 'step_count': 39})
+        self.assertEqual([row['props'] for row in self.rows()],
+                         [{'cmd_bytes': 140111, 'cmd_via': mode, 'step_count': 39}
+                          for mode in ('argv', 'file') for name in ('run.start', 'run.command')])
+
+    def test_disk_attempt_and_space_metadata_survive_the_logger_filter(self):
+        props = dict(tmp_free_bytes=123, tmp_size_bytes=456, tmp_fstype='tmpfs',
+                     workspace_free_bytes=789, workspace_size_bytes=1024, workspace_fstype='zfs',
+                     command_exit_code=2, wrapper_exit_code=2, disk_attempt=2,
+                     infra_failure='enospc', infra_reason='disk_exhausted')
+        toollog.emit('run', 'run.disk_space', props={**props, 'disk_space': {'path': '/private/secret'}})
+        self.assertEqual(self.rows()[0]['props'], props)
+
+    def test_toolchain_crash_metadata_survives_filter(self):
+        props = dict(infra_failure='native_crash', infra_reason='toolchain_unpack_crash', wrapper_exit_code=90)
+        toollog.emit('run', 'run.disk_space', ids={'box': 'bx_fixture'}, props=props)
+        self.assertEqual(self.rows()[0]['props'], props)
+        self.assertEqual(self.rows()[0]['ids'], {'box': 'bx_fixture'})
+
+    def test_queue_resume_fields_survive_serialization_including_unknown_places(self):
+        for place in (1, None):
+            props = dict(outageS=15, waitedMs=31000, placeBefore=place, placeAfter=place, deadlineKept=True)
+            toollog.emit('pool', 'run.queue_resumed', ids={'run': 'run-A'}, props=props)
+            self.assertEqual(self.rows()[-1]['props'], props)
+
     def test_format_private_modes_and_only_allowed_metadata(self):
         secret = 'password=secret-1234567890123456'
         toollog.emit('run', 'run.request', ok=True, duration_ms=1.2345,
@@ -102,8 +135,47 @@ class Logs(unittest.TestCase):
         self.assertEqual(len(result['topErrors']),20)
         self.assertEqual(result['topErrors'][0]['sampleIds'], {'run':'run-fixture'})
         self.assertEqual(result['malformedLines'],1)
+        self.assertFalse(result['sampled'])
         self.assertEqual(next(self.root.glob('rollup-*')).stat().st_mode & 0o777,0o600)
         with self.assertRaises(ValueError): toollog.rollup('../2026-01-01')
+
+    def test_rollup_weights_sampled_counts_and_rates_but_not_percentiles(self):
+        for ms, sampled, failed in ((1, True, False), (2, True, False), (3, True, True),
+                                    (4, False, False), (5, False, True)):
+            toollog.emit('gate', 'gate.decision', kind='error' if failed else 'perf',
+                         ok=not failed, duration_ms=ms, props={'sample': 20} if sampled else {},
+                         tag='gate_failed' if failed else None)
+        path = next(self.root.glob('*.ndjson'))
+        result = toollog.rollup(path.stem)
+        self.assertEqual(result['total'], 62)
+        self.assertEqual(result['countsByName'], {'gate.decision': 62})
+        self.assertEqual(result['countsByKind'], {'perf': 41, 'error': 21})
+        self.assertTrue(result['sampled'])
+        self.assertAlmostEqual(result['okRate'], 41/62)
+        self.assertAlmostEqual(result['errorRate'], 21/62)
+        self.assertEqual(result['topErrors'][0]['count'], 21)
+        self.assertEqual(result['durationMs']['gate.decision'], {'p50': 3, 'p95': 5, 'max': 5})
+        self.assertEqual(result['malformedLines'], 0)
+
+    def test_rollup_defaults_invalid_sample_weights_to_one(self):
+        weights = (None, True, False, 0, -20, 2.5, '20', [], {})
+        self.root.mkdir()
+        path = self.root / '2026-11-14.ndjson'
+        path.write_text(''.join(json.dumps({'tool': 'offbox', 'name': 'gate.decision', 'kind': 'perf',
+                                           'ok': True, 'props': {'sample': weight}}) + '\n' for weight in weights))
+        result = toollog.rollup(path.stem)
+        self.assertEqual(result['total'], len(weights))
+        self.assertFalse(result['sampled'])
+        self.assertEqual(result['okRate'], 1)
+        self.assertEqual(result['malformedLines'], 0)
+
+    def test_rollup_weights_only_explicit_ok_values_in_ok_rate(self):
+        toollog.emit('gate', 'gate.decision', kind='perf', props={'sample': 20})
+        toollog.emit('gate', 'gate.decision', kind='error', ok=False, tag='gate_failed')
+        result = toollog.rollup(next(self.root.glob('*.ndjson')).stem)
+        self.assertEqual(result['total'], 21)
+        self.assertEqual(result['okRate'], 0)
+        self.assertAlmostEqual(result['errorRate'], 1/21)
 
     def test_rollup_cli_and_first_recurring_tick_after_0005(self):
         toollog.emit('run','run.request',ok=True)
@@ -175,9 +247,9 @@ class Instrumentation(Isolated):
     def test_sync_pull_and_upload_outcomes(self):
         stats={'sent':123,'files':4}
         with patch.object(ssh_sync,'_push_files',return_value=stats), patch.object(ssh_sync,'tracked_secret_matches',return_value=['.env']):
-            ssh_sync.push('bx_fixture',Path('/checkout/repo'),'work',run_id='run-fixture')
+            ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work',run_id='run-fixture')
         with patch.object(ssh_sync,'_push_files',side_effect=common.OffboxError('private error')):
-            with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path('/checkout/repo'),'work')
+            with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work')
         self.outcomes('run.sync')
         self.assertEqual(self.rows('run.sync')[0]['props'],{'bytes':123,'files':4,'skipped':1})
         for rc in (0,23):

@@ -19,7 +19,7 @@ function definedTimes<Key extends string>(
   return result;
 }
 export const askKind = (
-  ask: KanbanOwnerAsk,
+  ask: Parameters<typeof kanbanAskResponse>[0],
 ): NonNullable<NonNullable<KanbanOwnerAsk["timing"]>["kind"]> => {
   const response = kanbanAskResponse(ask);
   return response.edit
@@ -71,6 +71,9 @@ export function askTimingProps(ask: KanbanOwnerAsk): NonNullable<AnalyticsEvent[
     ...(notifiedAt === undefined ? {} : { notifiedAt }),
     ...(firstSeenAt === undefined ? {} : { firstSeenAt, firstSeenBySurface }),
     ...(ask.answer === undefined ? {} : { answeredAt: ask.answer.at }),
+    ...(ask.timing?.openNoticesAtCreation === undefined
+      ? {}
+      : { openNoticesAtCreation: ask.timing.openNoticesAtCreation }),
     ...(ask.timing?.openAsksAtCreation === undefined
       ? {}
       : { openAsksAtCreation: ask.timing.openAsksAtCreation }),

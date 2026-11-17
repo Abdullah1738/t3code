@@ -7,23 +7,16 @@ session has touched in the last hour.
   dev_janitor.py apply --ids a,b,...  re-scans, acts only on ids that are STILL
                                       candidates, appends to the audit log
 
-Evidence of "used in the last hour" (any one keeps the resource):
-  - resource younger than IDLE_MIN (booted/started/created)
-  - any OpenCode session message created in the last IDLE_MIN minutes mentions one
-    of the resource's tokens (sim UDID or name; expo cwd or port; container name,
-    id, compose dir or published host port). Sessions titled "Dev resource
-    janitor..." are ignored.
-  - a running OpenCode session's directory contains the expo cwd (or vice versa)
-  - containers: non-healthcheck log lines in the last IDLE_MIN minutes
-  - Docker Desktop is only a candidate when zero containers are running and no
-    session mentioned "docker" in the last IDLE_MIN minutes (ad-hoc containers
-    like `docker run --rm` are invisible otherwise; quitting Docker under a
-    running session broke a review on 2026-09-29).
-Stdlib only. Opens opencode.db read-only.
+Liveness comes from the complete active-session API snapshot. Recent-message
+history is not exposed there, so legacy cleanup stays report-only until that
+usage check can be satisfied through a supported API. Process leftovers have a
+separate report-only inventory and cannot become action ids.
+Stdlib only. Liveness comes from the supported control and session APIs.
 """
-import argparse, calendar, json, os, re, signal, sqlite3, subprocess, sys, time
+import argparse, calendar, json, os, re, signal, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from active_sessions import snapshot  # noqa: E402
+import active_sessions  # noqa: E402
+import leftover_processes  # noqa: E402
 sys.path.insert(0, os.path.expanduser("~/.local/lib/mac-logging"))
 try:
     from toollog import emit
@@ -57,14 +50,11 @@ def log_run(started, found, killed, ok):
 
 
 IDLE_MIN = int(os.environ.get("DEV_JANITOR_IDLE_MIN", "60"))
-OC_DB = os.path.expanduser("~/.local/share/opencode/opencode.db")
-LOG_DIR = os.path.expanduser("~/.local/share/dev-janitor")
+LOG_DIR = os.path.expanduser(os.environ.get("DEV_JANITOR_LOG_DIR", "~/.local/share/dev-janitor"))
 AUDIT = os.path.join(LOG_DIR, "audit.jsonl")
 LAST = os.path.join(LOG_DIR, "last.json")
 KEEP_FILE = os.path.expanduser("~/.config/opencode/dev-janitor-keep.txt")
 DOCKER = "/usr/local/bin/docker" if os.path.exists("/usr/local/bin/docker") else "docker"
-SELF_TITLE = "Dev resource janitor"
-SELF_MARKER = "DEV-RESOURCE-JANITOR-RUN"  # put in the scheduled prompt; such sessions are ignored
 HEALTH_RE = re.compile(r"health|/_localstack|GET /_|readyz|livez|ping", re.I)
 os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + os.environ.get("PATH", "")
 
@@ -115,68 +105,38 @@ def keep_list():
         return []
 
 
-def running_sessions():
-    """(running OpenCode session ids, native thread dirs, error): complete snapshot, or (None, {}, why).
-
-    Only OpenCode ids come back as session ids, because session_evidence matches them against OpenCode's own
-    tables. Running Claude/Codex threads come back as {thread id: worktree path} so their checkouts are
-    treated as in use. An incomplete set (either source missing or truncated) returns None and scan() keeps
-    every resource.
-    """
-    snap = snapshot(timeout=20)
-    if not snap["complete"]:
-        return None, {}, "; ".join(snap["problems"]) or "active set incomplete"
-    return set(snap["opencode"]), dict(snap["workspaces"]), None
+def running_sessions(snap=None):
+    snap = active_sessions.checked_snapshot(timeout=20) if snap is None else snap
+    dirs, err = active_sessions.directories(snap)
+    if err:
+        return None, {}, err
+    return set(snap["opencode"]), dirs, None
 
 
 def session_evidence(tokens_by_res, running, native_dirs=None):
-    """tokens_by_res: {res_id: [token,...]} -> ({res_id: [{session,title,at,token}]}, {session: directory}).
+    # The active roster has no complete recent-message history. Absence of a
+    # mention cannot be proved from it; scan keeps these legacy resources.
+    return {rid: [] for rid in tokens_by_res}, dict(native_dirs or {})
 
-    native_dirs: {thread id: worktree path} for running Claude/Codex threads. They count as running work in
-    their directory, so an Expo server inside one of their worktrees is kept.
-    """
-    since = int((time.time() - IDLE_MIN * 60) * 1000)
-    c = sqlite3.connect(f"file:{OC_DB}?mode=ro", uri=True, timeout=30)
-    titles = {}
-    hits = {rid: {} for rid in tokens_by_res}
-    for sid, t, data in c.execute(
-            "SELECT session_id, time_created, data FROM session_message WHERE time_created >= ?", (since,)):
-        if sid not in titles:
-            row = c.execute("SELECT title, directory FROM session_v2 WHERE id=?", (sid,)).fetchone()
-            me = c.execute("SELECT 1 FROM session_message WHERE session_id=? AND type='user' AND instr(data, ?) > 0 LIMIT 1",
-                           (sid, SELF_MARKER)).fetchone()
-            titles[sid] = (row or ("", ""))[:2] + (bool(me),)
-        if titles[sid][2] or (titles[sid][0] or "").startswith(SELF_TITLE):
-            continue
-        for rid, toks in tokens_by_res.items():
-            for tok in toks:
-                if tok and tok in data:
-                    prev = hits[rid].get(sid)
-                    if not prev or prev["at_ms"] < t:
-                        hits[rid][sid] = {"session": sid, "title": titles[sid][0], "at_ms": t, "token": tok,
-                                          "running": bool(running and sid in running)}
-                    break
-    dirs = {}
-    if running:
-        for sid in running:
-            row = c.execute("SELECT directory FROM session_v2 WHERE id=?", (sid,)).fetchone()
-            if row:
-                dirs[sid] = row[0]
-    for tid, path in (native_dirs or {}).items():
-        if path:
-            dirs["thread:" + tid] = path
-    out = {}
-    for rid, d in hits.items():
-        lst = sorted(d.values(), key=lambda x: -x["at_ms"])
-        for x in lst:
-            x["at"] = time.strftime("%H:%M", time.localtime(x.pop("at_ms") / 1000))
-        out[rid] = lst
-    return out, dirs
+
+def process_cursor():
+    try:
+        with open(LAST) as report:
+            value = json.load(report).get('processes', {}).get('next_cursor', 0)
+        if type(value) is int and value >= 0:
+            return value
+        if (isinstance(value, dict) and type(value.get('priority')) is int and value['priority'] in (0, 1)
+                and type(value.get('pid')) is int and value['pid'] > 0):
+            return value
+        return 0
+    except (OSError, ValueError, AttributeError):
+        return 0
 
 
 def scan():
     now = time.time()
-    running, native_dirs, run_err = running_sessions()
+    live = active_sessions.checked_snapshot(timeout=20)
+    running, native_dirs, run_err = running_sessions(live)
     ps = procs()
     by_pid = {p["pid"]: p for p in ps}
     resources = []
@@ -217,7 +177,7 @@ def scan():
             pgroup.append(parent["pid"])
         resources.append({"id": f"expo:{p['pid']}", "kind": "expo", "pid": p["pid"], "pids": pgroup,
                           "age_s": p["age_s"], "rss_mb": p["rss_mb"], "cwd": cwd, "port": port,
-                          "cmd": c[:200],
+                          "cmd": leftover_processes.redact(c),
                           "tokens": [t for t in [cwd, f"--port {port}", f":{port}"] if t]})
 
     # Docker
@@ -265,7 +225,8 @@ def scan():
         r["sessions"] = evidence.get(r["id"], [])[:5]
         if running is None:
             # Incomplete active set: a missing source means "unknown", so nothing is a candidate.
-            reasons.append("cannot_read_running_sessions: " + (run_err or ""))
+            reasons.append("liveness_unavailable: " + (run_err or ""))
+        reasons.append("usage_history_unavailable: complete recent-message history is not exposed by the active API")
         if any(k and (k in r["id"] or k == r.get("name") or k == r.get("cwd")) for k in keep):
             reasons.append("keep_file")
         if r.get("age_s") is None or r["age_s"] < IDLE_MIN * 60:
@@ -288,8 +249,18 @@ def scan():
         r["keep_reasons"] = reasons
         r["candidate"] = not reasons
     return {"ts": int(now), "idle_min": IDLE_MIN, "running_sessions": len(running or []),
+            "liveness_unavailable": run_err,
+            "processes": leftover_processes.scan(live, keep, cursor=process_cursor()),
             "docker_up": docker_up, "resources": resources,
             "candidates": [r["id"] for r in resources if r["candidate"]]}
+
+
+def record_report(st):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(LAST, "w") as report:
+        json.dump(st, report, indent=1)
+    audit({"ts": st["ts"], "event": "report", "liveness_unavailable": st["liveness_unavailable"],
+           "processes": {key: st["processes"][key] for key in ("candidates", "problems", "checked", "skipped", "budget_skipped", "owner_calls")}})
 
 
 def audit(entry):
@@ -379,15 +350,16 @@ def run(stats=None):
     stats = stats if stats is not None else {}
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("scan")
+    scan_parser = sub.add_parser("scan")
+    scan_parser.add_argument("--no-write", action="store_true", help="read-only live dry run; no report files or logs")
     a = sub.add_parser("apply")
     a.add_argument("--ids", required=True)
     args = ap.parse_args()
     if args.cmd == "scan":
         st = scan()
         stats["found"] = len(st["resources"])
-        os.makedirs(LOG_DIR, exist_ok=True)
-        json.dump(st, open(LAST, "w"), indent=1)
+        if not args.no_write:
+            record_report(st)
         print(json.dumps(st, indent=1))
         return len(st["resources"]), 0, True
     else:
@@ -403,7 +375,8 @@ def main():
     try:
         _, _, ok = run(stats)
     finally:
-        log_run(started, stats["found"], stats["killed"], ok)
+        if not (sys.argv[1:2] == ["scan"] and "--no-write" in sys.argv[2:]):
+            log_run(started, stats["found"], stats["killed"], ok)
 
 
 if __name__ == "__main__":

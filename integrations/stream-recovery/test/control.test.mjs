@@ -76,8 +76,8 @@ test('status reads authenticate and guarded interrupts forward the observed sour
   assert.equal(calls[0].init.headers.authorization, 'Bearer fixture-token');
   await harnessCutoverStatus({ withClaims: true });
   assert.equal(calls[1].url, 'http://fixture/api/ardud/control/harness-cutover/status?claims=1');
-  await interruptThread('t', { expectedRunId: 'old', clientRequestId: 'receipt' });
-  assert.deepEqual(JSON.parse(calls[2].init.body), { expectedRunId: 'old', clientRequestId: 'receipt' });
+  await interruptThread('t', { expectedRunId: 'old', clientRequestId: 'receipt', cancelReason: 'task_stalled' });
+  assert.deepEqual(JSON.parse(calls[2].init.body), { expectedRunId: 'old', clientRequestId: 'receipt', cancelReason: 'task_stalled' });
   t.mock.method(globalThis, 'fetch', async () => new Response('<html>fallback</html>'));
   await assert.rejects(() => harnessCutoverStatus(), /invalid harness-cutover status/);
 });

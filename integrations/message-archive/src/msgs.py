@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -26,6 +27,7 @@ import common  # noqa: E402
 import mailparse  # noqa: E402
 import search  # noqa: E402
 import store  # noqa: E402
+import timing  # noqa: E402
 
 MAIL_EVERY = 180
 CHAT_EVERY = 30
@@ -245,9 +247,11 @@ def lock(name):
 def sync_one(name, stop=None, full=False):
     common.require_volume()
     lk = lock(name)
-    db = store.connect()
+    metrics = timing.CURRENT.get() or timing.Pass(name)
+    token = timing.CURRENT.set(metrics)
+    db = None
     try:
-        t = time.time()
+        db = store.connect()
         if name == "imessage":
             import imessage_sync
             stats = imessage_sync.sync(db, stop=stop, full=full)
@@ -265,11 +269,14 @@ def sync_one(name, stop=None, full=False):
         else:
             import imap_sync
             stats = imap_sync.sync(name, db, stop=stop)
-        stats["secs"] = round(time.time() - t, 1)
-        return stats
     finally:
-        db.close()
+        if db is not None:
+            with timing.phase("db_write"):
+                db.close()
+        timing.CURRENT.reset(token)
         lk.close()
+    stats.update(metrics.summary())
+    return stats
 
 
 def cmd_sync(args):
@@ -289,7 +296,42 @@ def cmd_sync(args):
     sys.exit(rc)
 
 
-def _loop(name, every, stop, full_every=None):
+WATCHDOG_SECONDS = 600
+
+
+class DaemonProgress:
+    def __init__(self):
+        self.started = time.monotonic()
+        self.last_report = self.started
+        self.passes = {}
+        self.finished = {}
+
+    def begin(self, name, metrics):
+        self.passes[name] = metrics
+
+    def finish(self, name):
+        self.finished[name] = time.monotonic()
+        self.passes[name] = None
+
+    def check(self):
+        now = time.monotonic()
+        if not common.volume_ready():
+            self.started = self.last_report = now
+            return
+        # Snapshot the small dictionaries: writers only replace entries, with no I/O or shared mutex.
+        passes = list(self.passes.items())
+        latest = max([self.started, *list(self.finished.values()),
+                      *(p.last_activity for _, p in passes if p)])
+        if now - latest < WATCHDOG_SECONDS or now - self.last_report < WATCHDOG_SECONDS:
+            return
+        self.last_report = now
+        phases = ", ".join(f"{name}={p.active_phase() if p else 'idle'}" for name, p in passes)
+        holder = store.WRITE.snapshot()
+        common.log(f"daemon: no pass finished in {int((now - latest) / 60)} min "
+                   f"(threads: {phases}; write lock: {holder['source']} for {holder['held']:.1f}s)")
+
+
+def _loop(name, every, stop, full_every=None, progress=None):
     last_full = 0.0
     backoff = every
     while not stop.is_set():
@@ -297,23 +339,38 @@ def _loop(name, every, stop, full_every=None):
             stop.wait(60)
             continue
         full = bool(full_every) and time.time() - last_full > full_every
+        metrics = timing.Pass(name)
+        token = timing.CURRENT.set(metrics)
+        if progress:
+            progress.begin(name, metrics)
         try:
             stats = sync_one(name, stop=stop, full=full and last_full > 0)
             if full:
                 last_full = time.time()
-            if stats.get("added") or stats.get("deleted") or stats.get("updated") or stats["secs"] > 30:
-                common.log(f"{name}: {stats}")
+            timing.log(f"{name}: {stats}")
+            backoff = every
+        except store.LockTimeout as e:
+            timing.log(f"{name}: LOCK_GIVEUP waited={e.waited:.1f}s holder={e.holder} held={e.held:.1f}s")
             backoff = every
         except Locked:
-            pass
+            timing.log(f"{name}: LOCK_GIVEUP waited=0.0s holder=unknown held=0.0s (source flock busy)")
+            backoff = every
+        except subprocess.TimeoutExpired as e:
+            timing.log(f"{name}: ERROR {type(e).__name__}: {e} {metrics.summary()}")
+            backoff = every
         except Exception as e:
-            common.log(f"{name}: ERROR {type(e).__name__}: {e}")
-            backoff = min(backoff * 2, 3600)
+            timing.log(f"{name}: ERROR {type(e).__name__}: {e} {metrics.summary()}")
+            backoff = min(backoff * 2, 600)
+        finally:
+            if progress:
+                progress.finish(name)
+            timing.CURRENT.reset(token)
         stop.wait(backoff)
 
 
 def cmd_daemon(args):
     stop = threading.Event()
+    progress = DaemonProgress()
 
     def handle(sig, frame):
         common.log(f"signal {sig}, stopping")
@@ -328,15 +385,17 @@ def cmd_daemon(args):
         except OSError:
             pass
     common.log(f"daemon start, archive {common.ROOT}")
-    threads = [threading.Thread(target=_loop, args=("imessage", CHAT_EVERY, stop, IMESSAGE_FULL_EVERY), daemon=True),
-               threading.Thread(target=_loop, args=("whatsapp", CHAT_EVERY, stop, IMESSAGE_FULL_EVERY), daemon=True)]
+    threads = [threading.Thread(target=_loop, args=("imessage", CHAT_EVERY, stop, IMESSAGE_FULL_EVERY, progress), daemon=True),
+               threading.Thread(target=_loop, args=("whatsapp", CHAT_EVERY, stop, IMESSAGE_FULL_EVERY, progress), daemon=True)]
     for a, cfg in common.MAIL_ACCOUNTS.items():
         full_every = MAIL_FULL_EVERY if cfg["kind"] == "gmail" else None
-        threads.append(threading.Thread(target=_loop, args=(a, MAIL_EVERY, stop, full_every), daemon=True))
+        threads.append(threading.Thread(target=_loop, args=(a, MAIL_EVERY, stop, full_every, progress), daemon=True))
     for t in threads:
         t.start()
     while not stop.is_set():
         stop.wait(5)
+        store.WRITE.check_hold()
+        progress.check()
     for t in threads:
         t.join(timeout=60)
     common.log("daemon stopped")

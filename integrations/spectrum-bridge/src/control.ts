@@ -1,12 +1,17 @@
-import { toolError, toolLog } from "./toollog.ts";
+import { markLoggedFailure, toolError, toolLog } from "./toollog.ts";
+import { errorDetail } from "./log-error.ts";
+import { startTickRead } from "./tick-timing.ts";
 // Client for Robob's local control API (/api/ardud/control/*), plus the
 // mapping from its thread and request shapes onto the bridge vocabulary.
 // telegram-bridge carries its own variant of this file, since each package is
 // deployed on its own; they differ in which control credential they read.
+import { randomUUID } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PermissionRequest, QuestionRequest } from "./openchamber.ts";
+
+export const CONTROL_REQUEST_ID_HEADER = "x-request-id";
 
 const COMPONENT = "spectrum-bridge";
 const PREFIX = "/api/ardud/control";
@@ -154,16 +159,25 @@ export class ControlClient {
   }
 
   async request<T>(method: string, path: string, body?: unknown, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
+    const requestId = randomUUID();
+    let serverRequestId: string | undefined;
     const loggingAt = performance.now();
-    let loggingIds: Record<string, string> | undefined;
+    const route = path.split("?", 1)[0]!.replace(/(\/threads\/)(?!by-native(?:\/|$))[^/]+/, "$1:id").replace(/(\/by-native\/)[^/]+/, "$1:id").replace(/(\/(?:runs|requests)\/)[^/]+/g, "$1:id");
+    const finishRead = method === "GET" ? startTickRead(route, loggingAt) : undefined;
+    let loggingIds: Record<string, string> = { requestId };
     toolLog.capture(() => {
       const encoded = /^\/threads\/(?!by-native(?:\/|$))([^/?]+)/.exec(path)?.[1];
-      loggingIds = toolLog.runIds(encoded ? decodeURIComponent(encoded) : undefined);
+      loggingIds = { ...toolLog.runIds(encoded ? decodeURIComponent(encoded) : undefined), requestId };
     });
     let loggingOk = false;
+    let responseStatus: number | undefined;
+    let requestTimeout: AbortSignal | undefined;
+    let loggingError: unknown;
+    let thrownError: unknown;
+    let loggingTag = "control.request_failed";
     try {
     // Reads get 25 s: Robob under load answers in seconds to tens of seconds, and giving up early only looks like an outage.
-    const timeout = AbortSignal.timeout(options.timeoutMs ?? 25_000);
+    const timeout = requestTimeout = AbortSignal.timeout(options.timeoutMs ?? 25_000);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
     let response: Response;
     try {
@@ -172,6 +186,7 @@ export class ControlClient {
         headers: {
           authorization: `Bearer ${this.token}`,
           accept: "application/json",
+          [CONTROL_REQUEST_ID_HEADER]: requestId,
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -180,23 +195,44 @@ export class ControlClient {
         proxy: "",
         verbose: false,
       });
-    } catch (caughtError) { toolError("control", "control.catch1", caughtError);
+    } catch (caughtError) {
+      loggingError = caughtError;
       throw new ControlError(0);
     }
+    responseStatus = response.status;
+    toolLog.capture(() => {
+      const echoed = response.headers?.get(CONTROL_REQUEST_ID_HEADER);
+      if (echoed && echoed !== requestId) serverRequestId = echoed;
+    });
     let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
-    } catch (caughtError) { toolError("control", "control.catch2", caughtError); /* Non-JSON bodies only come from proxies or crashes. */ }
+    } catch (caughtError) {
+      loggingError = caughtError;
+      if (caughtError instanceof SyntaxError) loggingTag = "control.invalid_json";
+    }
     if (!response.ok || data?.ok !== true) {
       throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "");
     }
     loggingOk = true;
     return data as T;
+    } catch (error) {
+      loggingError ??= error;
+      thrownError = error;
+      throw error;
     } finally {
       toolLog.capture(() => {
-      const route = path.split("?", 1)[0]!.replace(/(\/threads\/)(?!by-native(?:\/|$))[^/]+/, "$1:id").replace(/(\/by-native\/)[^/]+/, "$1:id").replace(/(\/(?:runs|requests)\/)[^/]+/g, "$1:id");
+      finishRead?.();
+      const detail = errorDetail(loggingError);
+      // HTTP rejections and caller cancellation are application outcomes, never link outages.
+      const transport = !loggingOk && !options.signal?.aborted && !(responseStatus && responseStatus >= 400)
+        ? requestTimeout?.aborted || detail.name === "TimeoutError" || ["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(String(detail.code))
+          ? "ETIMEDOUT" : detail.code === "ECONNREFUSED" || detail.code === "ECONNRESET" ? detail.code : undefined
+        : undefined;
       toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
-        ok: loggingOk, ids: loggingIds, props: { method, route } }));
+        ok: loggingOk, ids: { ...loggingIds, ...(serverRequestId ? { serverRequestId } : {}) }, props: { method, route, ...(transport ? { linkCause: transport } : {}), ...(!loggingOk ? { failureFormat: "single" } : {}) },
+        ...(!loggingOk ? { error: { tag: loggingTag, cause: loggingError } } : {}) }));
+      if (!loggingOk) markLoggedFailure(thrownError, requestId);
       });
     }
   }

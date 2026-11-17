@@ -19,14 +19,14 @@ TOP = node_version.TOP
 class ParserTests(unittest.TestCase):
     def test_nvmrc_cases(self):
         p = node_version.parse_nvmrc
-        self.assertEqual(p("22.13"), [(K(22, 13), K(23))])
-        self.assertEqual(p("v22.13.0"), [(K(22, 13), K(23))])
+        self.assertEqual(p("22.13"), [(K(22, 13), K(22, 14))])
+        self.assertEqual(p("v22.13.0"), [(K(22, 13), K(22, 13) + 1)])
         self.assertEqual(p("22"), [(K(22), K(23))])
         self.assertEqual(p("lts/jod"), [(K(22), K(23))])
         self.assertIsNone(p("lts/*"))
         self.assertIsNone(p("node"))
         self.assertIsNone(p(""))
-        self.assertEqual(p("# c\n20.11.1\n"), [(K(20, 11, 1), K(21))])
+        self.assertEqual(p("# c\n20.11.1\n"), [(K(20, 11, 1), K(20, 11, 1) + 1)])
         self.assertIsNone(p("abc"))
 
     def test_engines_cases(self):
@@ -80,14 +80,14 @@ class WantTests(unittest.TestCase):
         self.pkg('^24.13.1')
         self.write('sub/.nvmrc', '22.13\n')
         ranges, label = node_version.want(self.root, self.root / 'sub')
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
+        self.assertEqual(ranges, [(K(22, 13), K(22, 14))])
         self.assertEqual(label, 'sub/.nvmrc 22.13')
 
     def test_nvmrc_and_engines_intersect(self):
         self.write('.nvmrc', '22.13.0\n')
         self.pkg('>=22.13 <23')
         ranges, label = node_version.want(self.root, self.root)
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
+        self.assertEqual(ranges, [(K(22, 13), K(22, 13) + 1)])
         self.assertIn('.nvmrc 22.13.0', label)
         self.assertIn('package.json engines >=22.13 <23', label)
 
@@ -101,8 +101,8 @@ class WantTests(unittest.TestCase):
     def test_node_version_file_used_without_nvmrc(self):
         self.write('.node-version', '22.13.0\n')
         ranges, label = node_version.want(self.root, self.root)
-        self.assertEqual(ranges, [(K(22, 13), K(23))])
-        self.assertEqual(label, '.node-version 22.13.0')
+        self.assertEqual(ranges, [(K(22, 13), K(22, 13) + 1)])
+        self.assertEqual(label, '.node-version 22.13.0 (exact)')
 
     def test_unusable_inputs_give_none(self):
         self.write('package.json', '{not json')
@@ -267,13 +267,189 @@ class WantTests(unittest.TestCase):
         self.write('.github/workflows/ci.yml', 'node-version: 24')
         self.assertEqual(node_version.want(self.root, self.root)[0], [])
 
-    def test_conflicting_workflows_prefer_highest_major(self):
+    def test_open_engines_narrow_to_ci(self):
+        self.pkg('>=22')
+        self.write('.github/workflows/ci.yml', 'node-version: 22')
+        self.write('.github/workflows/test.yaml', 'node-version: 22')
+        ranges, label = node_version.want(self.root, self.root / 'sub')
+        self.assertEqual(ranges, [(K(22), K(23))])
+        self.assertEqual(label, 'package.json engines >=22, narrowed by '
+                               '.github/workflows/ci.yml node-version 22 (+1 workflows)')
+        self.assertNotIn('open range', node_version.block((ranges, label)))
+
+    def test_open_range_forms_and_exclusive_bounds(self):
+        self.write('.github/workflows/ci.yml', 'node-version: 22')
+        for spec, expected in [
+            ('>=22', [(K(22), K(23))]),
+            ('>=20 <24', [(K(22), K(23))]),
+            ('20 - 24', [(K(22), K(23))]),
+            ('20 || 22', [(K(22), K(23))]),
+            ('^20 || ^22 || >=24', [(K(22), K(23))]),
+            ('>=22.13 <24', [(K(22, 13), K(23))]),
+            ('>=22 <=23.0.0', [(K(22), K(23))]),
+            ('*', [(K(22), K(23))]),
+        ]:
+            with self.subTest(spec=spec):
+                self.pkg(spec)
+                ranges, label = node_version.want(self.root, self.root)
+                self.assertEqual(ranges, expected)
+                self.assertIn('narrowed by', label)
+
+    def test_closed_range_forms_keep_pin(self):
+        for ci in ['24', '22.13.0']:
+            self.write('.github/workflows/ci.yml', f'node-version: {ci}')
+            for spec in ['^22', '22.x', '~22.13', '22.13.0', '>=22 <23',
+                         '>=22.13 <23', '22.13 || 22.23']:
+                with self.subTest(ci=ci, spec=spec):
+                    self.pkg(spec)
+                    self.assertEqual(node_version.want(self.root, self.root),
+                                     (node_version.parse_range(spec), f'package.json engines {spec}'))
+                    self.assertNotIn('open range', node_version.block(node_version.want(self.root, self.root)))
+
+    def test_version_file_precedence_survives_ci(self):
+        self.pkg('>=22')
+        self.write('.github/workflows/ci.yml', 'node-version: 24')
+        for name in ['.nvmrc', '.node-version', 'sub/.nvmrc']:
+            with self.subTest(name=name):
+                self.write(name, '22.13.0')
+                ranges, label = node_version.want(self.root, self.root / 'sub')
+                self.assertEqual(ranges, [(K(22, 13), K(22, 13) + 1)])
+                self.assertIn(f'{name} 22.13.0 (exact)', label)
+                self.assertNotIn('narrowed', label)
+                (self.root / name).unlink()
+
+    def test_open_range_without_compatible_ci_keeps_pin_and_labels_choice(self):
+        self.pkg('>=22')
+        for ci in [None, '20', '${{ matrix.node }}']:
+            with self.subTest(ci=ci):
+                if ci is not None:
+                    self.write('.github/workflows/ci.yml', f'node-version: {ci}')
+                wanted = node_version.want(self.root, self.root)
+                self.assertEqual(wanted, ([(K(22), TOP)], 'package.json engines >=22'))
+                self.assertIn('package.json engines >=22; open range, newest on this box',
+                              node_version.block(wanted))
+
+    def test_ci_matrix_remaining_open_is_labelled(self):
+        self.pkg('>=20')
+        self.write('.github/workflows/ci.yml', 'node-version: [20, 22]')
+        wanted = node_version.want(self.root, self.root)
+        self.assertEqual(wanted[0], [(K(20), K(21)), (K(22), K(23))])
+        self.assertIn('narrowed by', wanted[1])
+        self.assertIn('open range, newest on this box', node_version.block(wanted))
+
+    def test_want_never_raises_on_ci_lookup_failure(self):
+        self.pkg('>=22')
+        with patch.object(node_version, '_ci_want', side_effect=OSError('unreadable')):
+            self.assertEqual(node_version.want(self.root, self.root),
+                             ([(K(22), TOP)], 'package.json engines >=22'))
+
+    def test_open_pin_follows_workflow_majority_and_names_minority(self):
+        self.pkg('>=22')
+        for i in range(15):
+            self.write(f'.github/workflows/ci{i:02}.yml', 'node-version: 22')
+        self.write('.github/workflows/registry.yml', 'node-version: 24')
+        ranges, label = node_version.want(self.root, self.root)
+        self.assertEqual(ranges, [(K(22), K(23))])
+        self.assertIn('narrowed by .github/workflows/ci00.yml node-version 22', label)
+        self.assertIn('(+14 workflows; 1 workflow uses 24)', label)
+
+    def test_no_pin_follows_workflow_majority(self):
+        self.write('.github/workflows/ci.yml', 'node-version: 22')
+        self.write('.github/workflows/other.yml', 'node-version: 22')
+        self.write('.github/workflows/registry.yml', 'node-version: 24')
+        ranges, label = node_version.want(self.root, self.root)
+        self.assertEqual(ranges, [(K(22), K(23))])
+        self.assertIn('(+1 workflows; 1 workflow uses 24)', label)
+
+    def test_open_pin_tied_workflows_choose_highest_major(self):
+        self.pkg('>=22')
+        self.write('.github/workflows/ci.yml', 'node-version: 22')
+        self.write('.github/workflows/registry.yml', 'node-version: 24')
+        ranges, label = node_version.want(self.root, self.root)
+        self.assertEqual(ranges, [(K(24), K(25))])
+        self.assertIn('1 workflow uses 22', label)
+
+    def test_majority_counts_only_workflows_compatible_with_pin(self):
+        self.pkg('>=22 <25')
+        for i in range(3):
+            self.write(f'.github/workflows/old{i}.yml', 'node-version: 20')
+        self.write('.github/workflows/ci.yml', 'node-version: 22')
+        self.write('.github/workflows/other.yml', 'node-version: 22')
+        self.write('.github/workflows/registry.yml', 'node-version: 24')
+        ranges, label = node_version.want(self.root, self.root)
+        self.assertEqual(ranges, [(K(22), K(23))])
+        self.assertIn('1 workflow uses 24', label)
+        self.assertNotIn('uses 20', label)
+
+    def test_matrix_entries_are_filtered_before_workflow_vote(self):
+        self.pkg('>=22 <25')
+        self.write('.github/workflows/ci.yml', 'node-version: [20, 22, 26]')
+        self.write('.github/workflows/other.yml', 'node-version: 22')
+        self.write('.github/workflows/registry.yml', 'node-version: 24')
+        self.assertEqual(node_version.want(self.root, self.root)[0], [(K(22), K(23))])
+
+    def test_workflow_votes_once_per_supported_major(self):
+        self.write('.github/workflows/ci.yml', 'node-version: [20, 22, 22, 22]')
+        self.write('.github/workflows/other.yml', 'node-version: [20, 22]')
+        self.write('.github/workflows/single.yml', 'node-version: 20')
+        self.assertEqual(node_version.want(self.root, self.root)[0], [(K(20), K(21))])
+
+    def test_ci_range_boundaries_participate_in_majority(self):
+        self.pkg('>=22')
+        for majority, minority, expected in [
+            ('>=22 <24', '>=22 <25', [(K(23), K(24))]),
+            ('22 - 23', '22 - 24', [(K(23), K(24))]),
+            ('>=22.13 <24', '>=22.13 <25', [(K(23), K(24))]),
+            ('>=22 <23', '>=22 <=23.0.0', [(K(22), K(23))]),
+            ('22 || 23', '22 || 24', [(K(22), K(23))]),
+        ]:
+            with self.subTest(majority=majority, minority=minority):
+                self.write('.github/workflows/ci.yml', f'node-version: "{majority}"')
+                self.write('.github/workflows/other.yml', f'node-version: "{majority}"')
+                self.write('.github/workflows/minority.yml', f'node-version: "{minority}"')
+                self.assertEqual(node_version.want(self.root, self.root)[0], expected)
+
+    def test_ci_compares_complete_major_coverage(self):
+        for pin in [None, '>=22']:
+            for majority, minority, expected in [
+                ('22 || 24', '22 - 24', [(K(24), K(25))]),
+                ('22 || 24 || 26', '22 - 26', [(K(26), K(27))]),
+                ('22 || 23', '22 - 23', [(K(22), K(23)), (K(22), K(24)), (K(23), K(24))]),
+            ]:
+                with self.subTest(pin=pin, majority=majority, minority=minority):
+                    if pin is not None:
+                        self.pkg(pin)
+                    else:
+                        (self.root / 'package.json').unlink(missing_ok=True)
+                    self.write('.github/workflows/ci.yml', f'node-version: "{majority}"')
+                    self.write('.github/workflows/other.yml', f'node-version: "{majority}"')
+                    self.write('.github/workflows/minority.yml', f'node-version: "{minority}"')
+                    self.assertEqual(node_version.want(self.root, self.root)[0], expected)
+
+    def test_open_engines_shell_selects_ci_major_over_newest_installed(self):
+        self.pkg('>=22')
+        self.write('.github/workflows/ci.yml', 'node-version: 22')
+        with tempfile.TemporaryDirectory() as home:
+            fake_nvm(home, ('v22.23.5', 'v24.22.1'))
+            wanted = node_version.want(self.root, self.root)
+            result = subprocess.run(['bash', '-c', node_version.block(wanted) +
+                                     '\nnode --version; command -v node; printf "%s\\n" "$PATH"'],
+                                    env={'HOME': home, 'PATH': '/usr/bin:/bin'},
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines()[0], 'v22.23.5')
+            executable = Path(result.stdout.splitlines()[1])
+            self.assertEqual(executable.resolve(), (Path(home) / '.nvm/versions/node/v22.23.5/bin/node').resolve())
+            self.assertEqual(result.stdout.splitlines()[2].split(':')[0], str(executable.parent))
+            self.assertIn('offbox: node v22.23.5 (package.json engines >=22, narrowed by', result.stderr)
+
+    def test_conflicting_workflows_tie_prefers_highest_major(self):
         self.write('.github/workflows/old.yml', 'node-version: 20')
         self.write('.github/workflows/ci.yaml', "node-version: '22.x'")
         ranges, label = node_version.want(self.root, self.root)
         self.assertEqual(ranges, [(K(22), K(23))])
         self.assertIn('.github/workflows/ci.yaml node-version 22.x', label)
-        self.assertIn('workflows disagree, highest major 22', label)
+        self.assertIn('1 workflow uses 20', label)
 
     def test_ci_unreadable_workflow_does_not_hide_other_signals(self):
         self.write('.github/workflows/ci.yml', 'node-version: 22')
@@ -367,7 +543,7 @@ class BlockRunTests(unittest.TestCase):
             w = node_version.want(repo, repo)
             blk = node_version.block(w)
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                    patch.object(runs, 'LDCACHE_REPAIR', ':'), patch.object(runs.userns, 'setup', return_value=':'):
+                    patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
                 script = runs.remote_script('w/repo', '.', cmd_argv or ['node --version'], None, 'run-test',
                                             steps=steps, node=blk)
             bindir = Path(home) / 'bin'
@@ -386,6 +562,13 @@ class BlockRunTests(unittest.TestCase):
     def test_caret_picks_24(self):
         r = self.run_block('^24.13.1')
         self.assertEqual(r.stdout.strip(), 'v24.21.0')
+
+    def test_open_range_without_ci_picks_newest_and_labels_choice(self):
+        r = self.run_block('>=22', versions=('v22.23.5', 'v24.22.1'))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), 'v24.22.1')
+        self.assertIn('offbox: node v24.22.1 (package.json engines >=22; '
+                      'open range, newest on this box)', r.stderr)
 
     def test_no_match_stops_before_command(self):
         r = self.run_block('18', cmd_argv=['echo ran'])
@@ -407,7 +590,7 @@ class BlockRunTests(unittest.TestCase):
         self.assertEqual(r.returncode, 99)
 
 class ProvisionTests(unittest.TestCase):
-    def run_provision(self, pin='v20', engine='^20.19.0 || >=22.12.0 <23', installed=(), fail=False, retry='once', system='v24.22.1', checksum_bad=False, require_nvm=False, workflow=None):
+    def run_provision(self, pin='v20', engine='^20.19.0 || >=22.12.0 <23', installed=(), fail=False, retry='once', system='v24.22.1', checksum_bad=False, require_nvm=False, workflow=None, nvm_hook=''):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); repo = root / 'repo'; repo.mkdir()
             if workflow is None:
@@ -421,23 +604,24 @@ class ProvisionTests(unittest.TestCase):
             fake_nvm(tmp, installed)
             bindir = root / 'bin'; bindir.mkdir()
             node = bindir / 'node'; node.write_text(FAKE.format(v=system)); node.chmod(0o755)
-            (root / 'index.tab').write_text('version date\nv24.22.1 1\nv22.23.2 1\nv22.12.0 1\nv20.20.2 1\nv20.18.0 1\n')
+            (root / 'index.tab').write_text('version date\nv24.22.1 1\nv22.23.5 1\nv22.23.2 1\nv22.13.9 1\nv22.13.0 1\nv22.12.0 1\nv20.20.2 1\nv20.18.0 1\n')
             body = b'node archive fixture'
             (root / 'archive').write_bytes(body)
             digest = '0' * 64 if checksum_bad else hashlib.sha256(body).hexdigest()
-            (root / 'sums').write_text(''.join(f'{digest}  node-{v}-linux-x64.tar.xz\n' for v in ('v20.20.2', 'v22.23.2', 'v24.22.1')))
+            (root / 'sums').write_text(''.join(f'{digest}  node-{v}-linux-x64.tar.xz\n' for v in ('v20.20.2', 'v22.13.0', 'v22.13.9', 'v22.23.2', 'v22.23.5', 'v24.22.1')))
             (root / 'nvm-fixture.sh').write_text(r'''
 nvm_get_download_slug() { echo node-$3-linux-x64; }
 nvm_get_artifact_compression() { echo tar.xz; }
 nvm() {
   [ "$1" = install ] || return 88
   [ "$2" = -b ] || return 89
+  @NVM_HOOK@
   mkdir -p "$NVM_DIR/versions/node/$3/bin"
   [ "$NVM_FAIL" = 1 ] && return 1
   printf '#!/bin/sh\necho %s\n' "$3" > "$NVM_DIR/versions/node/$3/bin/node"
   chmod +x "$NVM_DIR/versions/node/$3/bin/node"
 }
-''')
+'''.replace('@NVM_HOOK@', nvm_hook))
             curl = bindir / 'curl'; curl.write_text(r'''#!/bin/bash
 count=$(cat "$HOME/count" 2>/dev/null || echo 0); count=$((count+1)); echo "$count" > "$HOME/count"
 case " $* " in *" --connect-timeout 20 --speed-limit 30720 --speed-time 60 --max-time 600 "*) ;; *) exit 88 ;; esac
@@ -450,7 +634,7 @@ case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$H
 '''); curl.chmod(0o755)
             script = node_version.block(node_version.want(repo, repo), require_nvm=require_nvm) + '\necho COMMAND_MARKER\nnode --version'
             result = subprocess.run(['bash', '-c', script], env={'HOME': tmp, 'PATH': f'{bindir}:/usr/bin:/bin',
-                'NVM_FAIL': str(int(fail)), 'CURL_FAIL': retry}, capture_output=True, text=True, timeout=15)
+                'NVM_FAIL': str(int(fail)), 'CURL_FAIL': retry, 'OFFBOX_BOX_ID': 'bx_fixture'}, capture_output=True, text=True, timeout=15)
             count = int((root / 'count').read_text()) if (root / 'count').exists() else 0
             if fail:
                 self.assertFalse((root / '.nvm/versions/node/v20.20.2').exists())
@@ -461,7 +645,7 @@ case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$H
         for pin, engine, installed, expected in [
             ('v20', '^20.19.0 || >=22.12.0 <23', ('v22.23.2', 'v24.22.1'), 'v20.20.2'),
             ('v20', '^20.19.0 || >=22.12.0 <23', (), 'v20.20.2'),
-            ('22.13', '>=22.13 <23', (), 'v22.23.2'),
+            ('22.13', '>=22.13 <23', (), 'v22.13.9'),
         ]:
             with self.subTest(pin=pin, installed=installed):
                 result, count = self.run_provision(pin, engine, installed)
@@ -472,11 +656,16 @@ case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$H
                 self.assertEqual(count, 5)
 
     def test_crpko_devops_ci_only_provisions_22_over_box_24(self):
-        result, count = self.run_provision(workflow='jobs:\n  test:\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 22\n')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('offbox: node v22.23.2 (installed: .github/workflows/terraform-dev.yml node-version 22)', result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ['COMMAND_MARKER', 'v22.23.2'])
-        self.assertEqual(count, 5)
+        for pin, expected in [('22', 'v22.23.5'), ('22.23', 'v22.23.5'),
+                              ('22.13', 'v22.13.9'), ('22.13.0', 'v22.13.0')]:
+            with self.subTest(pin=pin):
+                result, count = self.run_provision(workflow='jobs:\n  test:\n    steps:\n'
+                    '      - uses: actions/setup-node@v4\n        with:\n'
+                    f'          node-version: {pin}\n')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'offbox: node {expected} (installed: .github/workflows/terraform-dev.yml node-version {pin})', result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ['COMMAND_MARKER', expected])
+                self.assertEqual(count, 5)
 
     def test_ci_unpublished_version_stops_before_command(self):
         result, _ = self.run_provision(workflow='node-version: 19')

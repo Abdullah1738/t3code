@@ -11,6 +11,7 @@ import time
 import uuid
 
 from guard import atomic_json, pid_alive, read_json, valid_hold
+from quit_reason import write_reason, desktop_pid
 
 
 class Holds:
@@ -52,6 +53,7 @@ class Holds:
                     raise ValueError("another live installer owns the hold")
                 meta = read_json(self.meta, {})
                 if self.beater_is_ours(meta):
+                    self.record_quit_reason(by, pid)
                     return meta["beaterPid"]
             token = uuid.uuid4().hex
             atomic_json(self.path, dict(by=by, pid=pid, startedAt=now, beatAt=now))
@@ -62,10 +64,20 @@ class Holds:
                                          stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
                                          env=dict(os.environ, HOME=str(self.home), PYTHONDONTWRITEBYTECODE="1"))
                 atomic_json(self.meta, dict(by=by, pid=pid, token=token, beaterPid=child.pid))
+                self.record_quit_reason(by, pid)
             except Exception:
                 self.path.unlink(missing_ok=True)
                 raise
             return child.pid
+
+    def record_quit_reason(self, by, pid):
+        # This watchdog holds immediately before its AppleEvent/SIGTERM fallback.
+        # Other holders may still be doing build preflight, so they opt in later.
+        if by == "overload-restart":
+            target = desktop_pid()
+            if target is None:
+                raise ValueError("expected one Robob desktop before watchdog quit")
+            write_reason(self.home, "watchdog", by, pid, target)
 
     def beater_is_ours(self, meta):
         if not isinstance(meta, dict) or not pid_alive(meta.get("beaterPid")) or not meta.get("token"):

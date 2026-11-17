@@ -1,8 +1,10 @@
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -46,6 +48,62 @@ class OwnerGoTests(unittest.TestCase):
         for changes in ({'at':(NOW + dt.timedelta(seconds=1)).isoformat()}, {'at':'2026-11-13'},
                         {'hours':25}, {'hours':0}, {'hours':float('nan')}):
             with self.subTest(changes=changes), self.assertRaises(ValueError): self.record(**changes)
+
+    def test_expired_record_refuses_before_opening_ledger_and_logs_metadata(self):
+        for age in (dt.timedelta(hours=25), dt.timedelta(hours=24),
+                    dt.timedelta(hours=24, microseconds=1)):
+            with self.subTest(age=age):
+                at = (NOW - age).isoformat()
+                expires = (NOW - age + go.MAX_AGE).isoformat()
+                logs = Path(self.temp.name) / 'logs'
+                with patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(logs)}), \
+                        patch.object(self.ledger, 'events', wraps=self.ledger.events) as events, \
+                        self.assertRaisesRegex(go.ApprovalError, 'approval already expired at') as raised:
+                    self.record(at=at, quote='PRIVATE OWNER QUOTE', source='PRIVATE SOURCE')
+                events.assert_not_called()
+                self.assertFalse(self.ledger.root.exists())
+                self.assertIn(expires, str(raised.exception))
+                self.assertIn('get a fresh yes from the owner', str(raised.exception))
+                raw = ''.join(p.read_text() for p in (logs / 'orders').glob('*.ndjson'))
+                logged = json.loads(raw.splitlines()[-1])
+                self.assertEqual((logged['component'], logged['name'], logged['kind'], logged['ok']),
+                                 ('owner-go', 'record.refused', 'error', False))
+                self.assertEqual(logged['props'], dict(reason='expired_at_write', amountMinor=53400,
+                    currency='USD', hours=24, at=at, expiresAt=expires))
+                self.assertEqual(logged['ids'], {field: hashlib.sha256(value.encode()).hexdigest()[:16]
+                    for field, value in [('vendorId', self.terms['vendor']), ('itemId', self.terms['item'])]})
+                self.assertEqual(logged['error']['tag'], 'OWNER_GO_INVALID')
+                self.assertNotIn('PRIVATE', raw)
+
+    def test_backdated_record_with_remaining_lifetime_verifies(self):
+        for age in (dt.timedelta(hours=23), dt.timedelta(hours=24) - dt.timedelta(microseconds=1)):
+            with self.subTest(age=age):
+                row = self.record(at=(NOW - age).isoformat())
+                self.assertEqual(row['expires_at'], (NOW - age + go.MAX_AGE).isoformat())
+                self.assertEqual(self.verify(), row)
+
+    def test_expired_short_lifetime_record_leaves_ledger_unchanged(self):
+        original = self.record()
+        path = self.ledger.root / 'events.jsonl'
+        before = path.read_bytes()
+        for age, hours in ((25, 24), (2, 1), (1, 1)):
+            with self.subTest(age=age, hours=hours), \
+                    self.assertRaisesRegex(go.ApprovalError, 'already expired'):
+                self.record(at=(NOW - dt.timedelta(hours=age)).isoformat(), hours=hours)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(self.verify(), original)
+
+    def test_cli_expired_record_returns_invalid_without_writing(self):
+        at = (dt.datetime.now(go.UTC) - dt.timedelta(hours=26)).isoformat()
+        args = ['record', '--vendor', 'run.cloud', '--item', 'synthetic test', '--amount', '20',
+                '--currency', 'USD', '--quote', 'yes', '--source', 'test/message', '--at', at]
+        with patch.object(go, 'Ledger', return_value=self.ledger), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(go.main(args), 2)
+        result = json.loads(out.getvalue())
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error'], 'OWNER_GO_INVALID')
+        self.assertIn('already expired', result['reason'])
+        self.assertFalse(self.ledger.root.exists())
 
     def test_amount_input_class(self):
         for amount in (-1, True, '53400', 5.34, None):

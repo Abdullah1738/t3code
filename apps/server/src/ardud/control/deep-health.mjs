@@ -1,4 +1,5 @@
 import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
@@ -13,7 +14,7 @@ export const defaultLagPath = () =>
   );
 
 // Include the writer's single rotation without exceeding the total read budget.
-export function readLagTail(file, io = NodeFS) {
+export async function readLagTail(file, io = NodeFSP) {
   let remaining = TAIL_BYTES;
   let bytesRead = 0;
   const parts = [];
@@ -22,8 +23,8 @@ export function readLagTail(file, io = NodeFS) {
     if (remaining === 0) break;
     let fd;
     try {
-      fd = io.openSync(name, NodeFS.constants.O_RDONLY | NodeFS.constants.O_NONBLOCK);
-      const stat = io.fstatSync(fd);
+      fd = await io.open(name, NodeFS.constants.O_RDONLY | NodeFS.constants.O_NONBLOCK);
+      const stat = await fd.stat();
       if (!stat.isFile()) throw new Error("lag log is not a regular file");
       const identity = `${stat.dev}:${stat.ino}`;
       if (identities.has(identity))
@@ -34,7 +35,7 @@ export function readLagTail(file, io = NodeFS) {
       const buffer = Buffer.alloc(size);
       let read = 0;
       while (read < size) {
-        const n = io.readSync(fd, buffer, read, size - read, start + read);
+        const { bytesRead: n } = await fd.read(buffer, read, size - read, start + read);
         if (!n) break;
         read += n;
       }
@@ -47,10 +48,10 @@ export function readLagTail(file, io = NodeFS) {
       parts.push(text);
     } catch (error) {
       if (error.code !== "ENOENT" || name === file) {
-        return { text: parts.join(""), bytesRead, error: error.code ?? error.message };
+        return { text: parts.join(""), bytesRead, error: safeFileError(error) };
       }
     } finally {
-      if (fd !== undefined) io.closeSync(fd);
+      if (fd !== undefined) await fd.close();
     }
   }
   return { text: parts.join(""), bytesRead, error: null };
@@ -109,6 +110,7 @@ export function summarizeLag(tail, now = Date.now()) {
   return {
     status: reasons.length ? "unknown" : "complete",
     reasons,
+    sampleCount: recent.length,
     stalls1s: recent.filter((row) => row.delay >= 1000).length,
     stalls5s: severe.length,
     severeMinutes: new Set(severe.map((row) => Math.floor(row.time / 60_000))).size,
@@ -152,47 +154,76 @@ export function healthLine(report) {
   return `${report.verdict}: ${lag.stalls1s} stalls >=1s in 10 min (${lag.stalls5s} >=5s)${worst}; round trip ${trip}; rss ${rss}${unknown}${connection}`;
 }
 
-export function readRuntimeState(file) {
-  let fd;
+function safeFileError(error) {
+  return ["ENOENT", "EACCES", "EPERM", "EIO"].includes(error?.code) ? error.code : "read failed";
+}
+
+export async function readRuntimeState(file) {
+  const fd = await NodeFSP.open(file, NodeFS.constants.O_RDONLY | NodeFS.constants.O_NONBLOCK);
   try {
-    fd = NodeFS.openSync(file, NodeFS.constants.O_RDONLY | NodeFS.constants.O_NONBLOCK);
-    const stat = NodeFS.fstatSync(fd);
+    const stat = await fd.stat();
     if (!stat.isFile() || stat.size > 8192) return null;
     const buffer = Buffer.alloc(8192);
-    const size = NodeFS.readSync(fd, buffer, 0, buffer.length, 0);
-    return JSON.parse(buffer.toString("utf8", 0, size));
-  } catch {
-    return null;
+    const { bytesRead } = await fd.read(buffer, 0, buffer.length, 0);
+    return JSON.parse(buffer.toString("utf8", 0, bytesRead));
   } finally {
-    if (fd !== undefined) NodeFS.closeSync(fd);
+    await fd.close();
   }
 }
 
-export function ownsListener({ pid, port }, run = NodeChildProcess.execFileSync) {
+export async function ownsListener(
+  { pid, port, signal, timeoutMs = 1000 },
+  run = NodeChildProcess.execFile,
+) {
   if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port) || port < 1 || port > 65535)
     return false;
-  try {
-    const output = run(
-      // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone Node CLI probe; no Effect runtime.
-      process.platform === "darwin" ? "/usr/sbin/lsof" : "lsof",
-      ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fp"],
-      {
-        encoding: "utf8",
-        timeout: 1000,
-        maxBuffer: 64 * 1024,
-        stdio: ["ignore", "pipe", "ignore"],
-      },
-    );
-    const owners = new Set(output.split("\n").filter((line) => /^p\d+$/.test(line)));
-    // Check all listeners on the port, including both address families. A
-    // second owner could be a tunnel that receives the loopback request.
-    return owners.size === 1 && owners.has(`p${pid}`);
-  } catch {
-    return false;
-  }
+  const output = await new Promise((resolve, reject) => {
+    let child;
+    let timer;
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      child?.kill("SIGKILL");
+      // A kernel-stuck child may never emit close, even after SIGKILL.
+      child?.unref();
+      child?.stdin?.destroy();
+      child?.stdout?.destroy();
+      child?.stderr?.destroy();
+      reject(new DOMException("Listener deadline", "TimeoutError"));
+    };
+    if (signal?.aborted) return abort();
+    timer = setTimeout(abort, Math.min(timeoutMs, 1000));
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      child = run(
+        // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone Node CLI probe; no Effect runtime.
+        process.platform === "darwin" ? "/usr/sbin/lsof" : "lsof",
+        ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fp"],
+        { encoding: "utf8", maxBuffer: 64 * 1024, killSignal: "SIGKILL" },
+        (error, stdout) => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", abort);
+          if (error) reject(error);
+          else resolve(stdout);
+        },
+      );
+      child?.stdin?.destroy();
+    } catch (error) {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(error);
+    }
+  }).catch((error) => {
+    if (error?.name === "TimeoutError") throw error;
+    return null;
+  });
+  if (output === null) return false;
+  const owners = new Set(output.split("\n").filter((line) => /^p\d+$/.test(line)));
+  // Check both address families: another owner could be a loopback tunnel.
+  return owners.size === 1 && owners.has(`p${pid}`);
 }
 
-function matchesLocalRuntime(url, connection, runtime, checkListener) {
+async function matchesLocalRuntime(url, connection, runtime, checkListener) {
   try {
     const target = new URL(url);
     const expected = new URL(runtime.origin);
@@ -211,86 +242,144 @@ function matchesLocalRuntime(url, connection, runtime, checkListener) {
     if (!Number.isFinite(recorded) || !Number.isInteger(runtime.pid) || runtime.pid <= 0)
       return false;
     process.kill(runtime.pid, 0);
-    // HTTP cannot identify its boot while blocked. Preserve local evidence only
-    // when the OS independently confirms the persisted process owns the listener.
-    if (connection.status !== "ok") {
-      const port = Number(expected.port || (expected.protocol === "https:" ? 443 : 80));
-      return checkListener({ pid: runtime.pid, port });
+    // Route initialization and ready-time publication can be minutes apart.
+    if (
+      connection.status === "ok" &&
+      connection.bootId !== undefined &&
+      runtime.bootId !== undefined
+    ) {
+      return validBootId(runtime.bootId) && connection.bootId === runtime.bootId;
     }
-    const started = Date.parse(connection.serverStartedAt);
-    return Number.isFinite(started) && Math.abs(started - recorded) <= 60_000;
+    // Older or blocked servers cannot identify their boot over HTTP. Confirm
+    // the persisted process owns the listener within the same deadline instead.
+    const port = Number(expected.port || (expected.protocol === "https:" ? 443 : 80));
+    return (await checkListener({ pid: runtime.pid, port })) === true;
   } catch {
     return false;
   }
 }
 
+const validBootId = (value) =>
+  typeof value === "string" &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+
+export const deepHealthBudget = (timeoutMs = 10_000) => Math.max(1, Math.min(timeoutMs, 10_000));
+
 export async function deepHealth({
   client,
   logPath = defaultLagPath(),
-  timeoutMs = 10_000,
+  timeoutMs,
   readTail = readLagTail,
   readRuntime = readRuntimeState,
   checkListener = ownsListener,
+  onStage = () => {},
 }) {
-  const controller = new AbortController();
-  const deadline = Math.min(timeoutMs, 10_000);
-  const probe = async (route, valid) => {
+  const budget = deepHealthBudget(timeoutMs);
+  const deadline = performance.now() + budget;
+  // Leave a small part of the same budget for local evidence during an HTTP stall.
+  const probeBudget = budget - Math.min(2000, budget / 5);
+  const stages = Object.fromEntries(
+    ["connection", "roundTrip", "runtime", "listener", "lagTail"].map((name) => [
+      name,
+      { status: "skipped", ms: 0 },
+    ]),
+  );
+  const controllers = [];
+  let expired = false;
+  const stage = async (name, run, fallback, capMs = Infinity) => {
     const start = performance.now();
+    const remaining = Math.ceil(deadline - start);
+    if (expired || remaining <= 0) return fallback;
+    const limit = Math.min(remaining, Math.ceil(capMs));
+    onStage(name);
+    const controller = new AbortController();
+    controllers.push(controller);
     let timer;
+    let status = "ok";
     try {
-      const response = await Promise.race([
-        client.request("GET", route, undefined, { signal: controller.signal, timeoutMs: deadline }),
+      return await Promise.race([
+        Promise.resolve().then(() => run({ signal: controller.signal, timeoutMs: limit })),
         new Promise((_, reject) => {
           timer = setTimeout(() => {
+            if (limit === remaining) expired = true;
+            // Reject before abort listeners run, preserving the timeout classification.
+            reject(new DOMException("Stage deadline", "TimeoutError"));
             controller.abort();
-            reject(new Error("timeout"));
-          }, deadline);
+          }, limit);
         }),
       ]);
-      if (!valid(response)) throw new Error("invalid response");
-      return {
-        status: "ok",
-        ms: Math.round(performance.now() - start),
-        ...(route === "/health"
-          ? { readiness: response.status, serverStartedAt: response.serverStartedAt }
-          : {}),
-      };
     } catch (error) {
-      // Keep server bodies and credentials out of the health output.
-      return {
-        status: controller.signal.aborted || error.name === "TimeoutError" ? "timeout" : "error",
-        ms: Math.round(performance.now() - start),
-      };
+      // Never include server bodies, credentials or arbitrary I/O error messages.
+      status = error?.name === "TimeoutError" ? "timeout" : "error";
+      return fallback;
     } finally {
       clearTimeout(timer);
+      stages[name] = { status, ms: Math.round(performance.now() - start) };
     }
   };
+  const probe = async (name, route, valid) => {
+    const response = await stage(
+      name,
+      async (options) => {
+        const result = await client.request("GET", route, undefined, options);
+        if (!valid(result)) throw new Error("invalid response");
+        return result;
+      },
+      null,
+      probeBudget,
+    );
+    return {
+      ...stages[name],
+      ...(response && route === "/health"
+        ? {
+            readiness: ["healthy", "degraded", "recovered-unverified"].includes(response.status)
+              ? response.status
+              : undefined,
+            serverStartedAt: Number.isFinite(Date.parse(response.serverStartedAt))
+              ? new Date(response.serverStartedAt).toISOString()
+              : undefined,
+            bootId: validBootId(response.bootId) ? response.bootId : undefined,
+          }
+        : {}),
+    };
+  };
   // TODO(#1124): use authenticated readiness once it proves state AND board reads.
-  // The since filter uses indexed projection rows and builds at most one shell;
-  // a plain list with limit=1 still builds the entire shell snapshot.
   const stateRoute = `/threads?limit=1&updatedSince=${Date.now() - 60_000}`;
   const [connection, roundTrip] = await Promise.all([
-    probe("/health", (response) => response?.ok === true),
-    probe(stateRoute, (response) => Array.isArray(response?.threads)),
+    probe("connection", "/health", (response) => response?.ok === true),
+    probe("roundTrip", stateRoute, (response) => Array.isArray(response?.threads)),
   ]);
-  // Read after the probes: a response must not hide a gap that opened while waiting.
-  // Bind local evidence to the persisted listener and this server boot, rather
-  // than trusting arbitrary loopback ports (including tunnels and dev servers).
-  const runtime = readRuntime(
-    NodePath.join(NodePath.dirname(logPath), "..", "server-runtime.json"),
+  // Read after the probes so a response cannot hide a newly opened sampler gap.
+  const runtime = await stage(
+    "runtime",
+    () => readRuntime(NodePath.join(NodePath.dirname(logPath), "..", "server-runtime.json")),
+    null,
   );
-  const local = matchesLocalRuntime(client.url, connection, runtime, checkListener);
+  const local = await matchesLocalRuntime(client.url, connection, runtime, (identity) =>
+    stage("listener", (options) => checkListener({ ...identity, ...options }), false),
+  );
   const tail = local
-    ? readTail(logPath)
+    ? await stage("lagTail", () => readTail(logPath), {
+        text: "",
+        bytesRead: 0,
+        error: "lagTail unavailable",
+      })
     : { text: "", bytesRead: 0, error: "local runtime identity unverified" };
+  for (const controller of controllers) controller.abort();
   const now = Date.now();
   const lag = summarizeLag(tail, now);
+  const timedOut = Object.keys(stages).filter((name) => stages[name].status === "timeout");
   const report = {
     at: new Date(now).toISOString(),
     connection,
     lag,
     roundTrip,
+    stages,
     ...healthVerdict(lag, connection, roundTrip),
+    ...(timedOut.length ? { status: "timeout", stage: timedOut[0], exitCode: 2 } : {}),
   };
-  return { ...report, summary: healthLine(report) };
+  return {
+    ...report,
+    summary: healthLine(report) + (timedOut.length ? `; timed out: ${timedOut.join(", ")}` : ""),
+  };
 }

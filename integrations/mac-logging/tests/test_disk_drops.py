@@ -317,12 +317,14 @@ class DiskDropTests(unittest.TestCase):
                 self.assertEqual(p['internalDeltaFromTs'], '2026-11-13T12:00:00.000Z')
 
     def test_unknown_number_and_timestamp_forms(self):
-        for value in (None, True, '100', -1, float('nan'), float('inf'), {}, []):
+        for value in (None, True, '100', -1, 10**400, -10**400,
+                      float('nan'), float('inf'), float('-inf'), {}, []):
             with self.subTest(value=value):
                 jobs.save_state('disk', dict(free={'internalFreeGb': value}, ts=self.now.isoformat()))
                 p = self.sample()
                 self.assertIsNone(p['internalFreeGbDelta'])
                 self.assertEqual(p['internalDeltaUnavailable'], 'no_previous_numeric')
+                self.assertEqual(self.sample(99)['internalFreeGbDelta'], -1)
         for stamp in (None, 42, '', 'yesterday', '2026-11-13T12:00:00',
                       '9999-12-31T23:59:59.000Z', '9999-12-31T23:59:59-01:00',
                       '0001-01-01T00:00:00+01:00', '9999-12-31T23:59:59.999999Z'):
@@ -332,6 +334,29 @@ class DiskDropTests(unittest.TestCase):
                 self.assertIsNone(p['internalFreeGbDelta'])
                 self.assertEqual(p['internalDeltaUnavailable'], 'invalid_timestamp')
                 self.assertEqual(self.sample(99)['internalFreeGbDelta'], -1)
+
+    def test_invalid_previous_timestamps_cannot_emit_a_swing(self):
+        for source in ('ts', 'freeTs'):
+            for stamp in (None, 10**400, '', 'yesterday', '2026-11-13T12:00:00',
+                          '9999-12-31T23:59:59.000Z', {}, []):
+                with self.subTest(source=source, stamp=stamp):
+                    previous = dict(sizes={}, free={'internalFreeGb': 5, 'externalFreeGb': 105})
+                    if source == 'ts':
+                        if stamp is not None:
+                            previous['ts'] = stamp
+                    else:
+                        previous['ts'] = self.now.isoformat()
+                        previous['freeTs'] = {key: stamp for key in previous['free']}
+                    jobs.save_state('disk', previous)
+                    count = len(self.rows('disk.swing'))
+                    p = self.sample()
+                    for prefix in ('internal', 'external'):
+                        self.assertIsNone(p[prefix+'FreeGbDelta'])
+                        self.assertEqual(p[prefix+'DeltaUnavailable'], 'invalid_timestamp')
+                    self.assertEqual(len(self.rows('disk.swing')), count)
+                    self.sample(195, 295)
+                    swing = self.rows('disk.swing')[-1]['props']
+                    self.assertEqual(swing['previousTs'], self.rows('disk.sample')[-2]['ts'])
 
     def test_partial_child_is_excluded_on_both_sides(self):
         for partial_first in (True, False):

@@ -20,7 +20,7 @@ plist="$HOME/Library/LaunchAgents/$label.plist"
 # Home server health monitor: a one-shot every minute, beside the load monitor (README: "Two monitors").
 home_label="com.ardud.offbox-home-monitor"
 home_plist="$HOME/Library/LaunchAgents/$home_label.plist"
-excludes=(--exclude __pycache__ --exclude '*.pyc' --exclude '*.bak*' --exclude tmp --exclude .DS_Store)
+excludes=(--exclude __pycache__ --exclude '*.pyc' --exclude '*.bak*' --exclude tmp --exclude .DS_Store --exclude /tools/)
 
 mode=install
 dry=()
@@ -56,6 +56,7 @@ if [[ $mode == check ]]; then
   cmp -s "$here/lib/toollog.ts" "$HOME/.config/opencode/lib/toollog.ts" || { print -u2 "offbox: toollog helper differs"; rc=1 }
   cmp -s "$here/plugin/offbox-gate.ts" "$plugin" || { print -u2 "offbox: $plugin differs"; rc=1 }
   cmp -s "$here/bin/boat" "$boat" || { print -u2 "offbox: $boat differs"; rc=1 }
+  cmp -s "$repo/integrations/local-helpers/bin/quint" "$skill/tools/quint" || { print -u2 "offbox: guarded Quint wrapper differs"; rc=1 }
   cmp -s "$here/launchd/$label.plist" "$plist" || { print -u2 "offbox: $plist differs"; rc=1 }
   cmp -s "$here/launchd/$home_label.plist" "$home_plist" || { print -u2 "offbox: $home_plist differs"; rc=1 }
   [[ "$(readlink "$link" 2>/dev/null)" == "$skill/scripts/offbox.py" ]] || { print -u2 "offbox: $link is not a link to the skill"; rc=1 }
@@ -72,6 +73,10 @@ fi
 
 # --delete keeps removed files from lingering; excluded files (tmp/, .bak, caches) on the live side are kept.
 rsync -a --delete --itemize-changes "${dry[@]}" "${excludes[@]}" "$here/skill/" "$skill/"
+if (( ! ${#dry} )); then
+  mkdir -p "$skill/tools"
+  cp -p "$repo/integrations/local-helpers/bin/quint" "$skill/tools/quint"
+fi
 home_plist_changed=0
 for pair in "lib/toollog.ts:$HOME/.config/opencode/lib/toollog.ts" "plugin/offbox-gate.ts:$plugin" "bin/boat:$boat" "launchd/$label.plist:$plist" \
             "launchd/$home_label.plist:$home_plist"; do

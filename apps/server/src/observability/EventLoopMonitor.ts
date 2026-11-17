@@ -1,8 +1,12 @@
-// @effect-diagnostics nodeBuiltinImport:off - only node:perf_hooks exposes the event loop delay histogram.
+// @effect-diagnostics nodeBuiltinImport:off - native delay/GC observations require Node hooks and event-loop delivery.
 import * as NodePerfHooks from "node:perf_hooks";
+import * as NodeTimersPromises from "node:timers/promises";
+import * as NodeFSP from "node:fs/promises";
+import { archiveFilename } from "../ardud/persistence/historyArchiveSql.ts";
 import * as NodeV8 from "node:v8";
 
 import { RotatingFileSink } from "@t3tools/shared/logging";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -12,6 +16,7 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
 import * as ServerConfig from "../config.ts";
+import * as HttpSocketTelemetry from "../ardud/http/HttpSocketTelemetry.ts";
 import * as Metrics from "./Metrics.ts";
 
 // Node's delay histogram wakes a native timer every RESOLUTION_MS and records the
@@ -42,32 +47,103 @@ export interface EventLoopReadings {
   >;
   readonly rssBytes: number;
   readonly heapUsedBytes: number;
+  readonly heapTotalBytes: number;
+  readonly externalBytes: number;
+  readonly gc: {
+    readonly count: number;
+    readonly totalMs: number;
+    readonly maxMs: number;
+    readonly majorCount: number;
+    readonly majorMaxMs: number;
+  };
   /** Wall time the readings cover. */
   readonly elapsedMs: number;
+  /** Sampling boundary, before waiting for native GC notification delivery. */
+  readonly sampledAt?: string;
 }
 
+export const makeGcWindow = () => {
+  const empty = () => ({
+    count: 0,
+    totalMs: 0,
+    maxMs: 0,
+    majorCount: 0,
+    majorMaxMs: 0,
+  });
+  let stats = empty();
+  let closing: { until: number; stats: ReturnType<typeof empty> } | undefined;
+  return {
+    record(
+      entries: ReadonlyArray<
+        Pick<NodePerfHooks.PerformanceEntry, "duration" | "startTime"> & {
+          readonly detail?: { readonly kind?: number };
+        }
+      >,
+    ) {
+      for (const entry of entries) {
+        const major = entry.detail?.kind === NodePerfHooks.constants.NODE_PERFORMANCE_GC_MAJOR;
+        const target =
+          closing !== undefined && entry.startTime + entry.duration <= closing.until
+            ? closing.stats
+            : stats;
+        target.count++;
+        target.totalMs += entry.duration;
+        target.maxMs = Math.max(target.maxMs, entry.duration);
+        if (major) {
+          target.majorCount++;
+          target.majorMaxMs = Math.max(target.majorMaxMs, entry.duration);
+        }
+      }
+    },
+    close(until: number) {
+      closing = { until, stats };
+      stats = empty();
+    },
+    read() {
+      if (closing !== undefined) {
+        const result = closing.stats;
+        closing = undefined;
+        return result;
+      }
+      const result = stats;
+      stats = empty();
+      return result;
+    },
+  };
+};
+
 // Node skips the first gap after a reset, so a stall right at a sample boundary can be missed.
-const makeNodeSampler = Effect.gen(function* () {
-  const histogram = yield* Effect.acquireRelease(
+export const makeNodeSampler = Effect.gen(function* () {
+  const gc = makeGcWindow();
+  const { histogram, observer } = yield* Effect.acquireRelease(
     Effect.sync(() => {
       const histogram = NodePerfHooks.monitorEventLoopDelay({ resolution: RESOLUTION_MS });
+      const observer = new NodePerfHooks.PerformanceObserver((list) =>
+        gc.record(list.getEntries()),
+      );
+      observer.observe({ entryTypes: ["gc"] });
       histogram.enable();
-      return histogram;
+      return { histogram, observer };
     }),
-    (histogram) => Effect.sync(() => histogram.disable()),
+    ({ histogram, observer }) =>
+      Effect.sync(() => {
+        observer.disconnect();
+        histogram.disable();
+      }),
   );
   let elu = NodePerfHooks.performance.eventLoopUtilization();
   let usage = process.resourceUsage();
   let sampledAt = NodePerfHooks.performance.now();
 
   // @effect-diagnostics-next-line returnEffectInGen:off - the read effect is the result.
-  return Effect.sync(() => {
+  return Effect.suspend(() => {
     const nextElu = NodePerfHooks.performance.eventLoopUtilization();
     const nextUsage = process.resourceUsage();
     const nextSampledAt = NodePerfHooks.performance.now();
     const memory = process.memoryUsage();
     const loop = NodePerfHooks.performance.eventLoopUtilization(nextElu, elu);
-    const readings: EventLoopReadings = {
+    gc.close(nextSampledAt);
+    const readings = {
       delayMaxNs: histogram.max,
       activeMs: loop.active,
       utilization: loop.utilization,
@@ -81,13 +157,25 @@ const makeNodeSampler = Effect.gen(function* () {
       },
       rssBytes: memory.rss,
       heapUsedBytes: memory.heapUsed,
+      heapTotalBytes: memory.heapTotal,
+      externalBytes: memory.external,
       elapsedMs: nextSampledAt - sampledAt,
+      sampledAt: DateTime.formatIso(
+        DateTime.makeUnsafe(NodePerfHooks.performance.timeOrigin + nextSampledAt),
+      ),
     };
     histogram.reset();
     elu = nextElu;
     usage = nextUsage;
     sampledAt = nextSampledAt;
-    return readings;
+    // Native GC notifications can arrive after the sampling timer. Let them reach
+    // the observer before finalizing; GC after the boundary belongs to the next window.
+    return Effect.promise(async () => {
+      await NodeTimersPromises.setImmediate();
+      await NodeTimersPromises.setImmediate();
+      gc.record(observer.takeRecords());
+      return { ...readings, gc: gc.read() };
+    });
   });
 });
 
@@ -126,6 +214,8 @@ export const layerWith = (
   stallLog: StallLogOptions,
   readHeapSpaces: typeof NodeV8.getHeapSpaceStatistics = NodeV8.getHeapSpaceStatistics,
   heapLimitBytes: number = NodeV8.getHeapStatistics().heap_size_limit,
+  sampleSockets: Effect.Effect<void> = Effect.void,
+  sampleArchiveWalBytes: Effect.Effect<number | null | undefined> = Effect.succeed(undefined),
 ) =>
   Layer.effectDiscard(
     Effect.gen(function* () {
@@ -145,14 +235,36 @@ export const layerWith = (
           }).pipe(Effect.as(undefined)),
         ),
       );
+      let heapUsedMbPrev = 0;
+      let nextMemoryLogAt = 0;
       const tick = Effect.gen(function* () {
         const readings = yield* sample;
+        const previousHeap = heapUsedMbPrev;
+        heapUsedMbPrev = Math.round(readings.heapUsedBytes / 1024 / 1024);
         yield* recordGauges(readings);
+        const now = yield* Clock.currentTimeMillis;
+        if (now >= nextMemoryLogAt) {
+          nextMemoryLogAt = now + 60_000;
+          const memory = {
+            pid: process.pid,
+            uptimeSeconds: Math.round(process.uptime()),
+            rss: readings.rssBytes,
+            heapUsed: readings.heapUsedBytes,
+            heapTotal: readings.heapTotalBytes,
+            external: readings.externalBytes,
+            heapLimit: heapLimitBytes,
+          };
+          yield* Effect.logInfo("server memory", memory).pipe(
+            Effect.withSpan("server.memory", { root: true, attributes: memory }),
+          );
+        }
+        yield* sampleSockets;
+        const archiveWalBytes = yield* sampleArchiveWalBytes;
         if (
           readings.heapUsedBytes > Math.min(HIGH_HEAP_BYTES, heapLimitBytes * HIGH_HEAP_RATIO) &&
           stallSink !== undefined
         ) {
-          const at = DateTime.formatIso(yield* DateTime.now);
+          const at = readings.sampledAt ?? DateTime.formatIso(yield* DateTime.now);
           yield* Effect.try(() => {
             return {
               at,
@@ -180,10 +292,13 @@ export const layerWith = (
         if (delayMaxMs === undefined) {
           // Silence must be distinguishable from a sampler blocked on the event loop.
           if (stallSink !== undefined) {
-            const time = DateTime.formatIso(yield* DateTime.now);
+            const time = readings.sampledAt ?? DateTime.formatIso(yield* DateTime.now);
             yield* encodeStallLine({
               time,
               kind: "sample",
+              archiveWalBytes,
+              gcTotalMs: readings.gc.totalMs,
+              gcMajorMaxMs: readings.gc.majorMaxMs,
               rssMb: Math.round(readings.rssBytes / 1024 / 1024),
             }).pipe(
               Effect.flatMap((line) => Effect.try(() => stallSink.write(`${line}\n`))),
@@ -198,7 +313,16 @@ export const layerWith = (
         }
         const { utilization, usage, rssBytes } = readings;
         const attributes = {
+          ...(archiveWalBytes === undefined ? {} : { archiveWalBytes }),
           delayMaxMs,
+          gcCount: readings.gc.count,
+          gcTotalMs: readings.gc.totalMs,
+          gcMaxMs: readings.gc.maxMs,
+          gcMajorCount: readings.gc.majorCount,
+          gcMajorMaxMs: readings.gc.majorMaxMs,
+          heapUsedMb: heapUsedMbPrev,
+          heapUsedMbPrev: previousHeap,
+          ...(readings.sampledAt === undefined ? {} : { sampledAt: readings.sampledAt }),
           utilization: Math.round(utilization * 100) / 100,
           cpuUserMs: Math.round(usage.userCPUTime / 1000),
           cpuSystemMs: Math.round(usage.systemCPUTime / 1000),
@@ -211,7 +335,7 @@ export const layerWith = (
           Effect.withSpan("server.eventLoop.stall", { root: true, level: "Warn", attributes }),
         );
         if (stallSink !== undefined) {
-          const time = DateTime.formatIso(yield* DateTime.now);
+          const time = readings.sampledAt ?? DateTime.formatIso(yield* DateTime.now);
           yield* encodeStallLine({ time, ...attributes }).pipe(
             Effect.flatMap((line) => Effect.try(() => stallSink.write(`${line}\n`))),
             Effect.catch(() =>
@@ -228,7 +352,15 @@ export const layerWith = (
       // loop for seconds on a large database, so skip it rather than warn at every
       // launch.
       yield* wait.pipe(
-        Effect.andThen(sample),
+        Effect.andThen(
+          sample.pipe(
+            Effect.tap((readings) =>
+              Effect.sync(() => {
+                heapUsedMbPrev = Math.round(readings.heapUsedBytes / 1024 / 1024);
+              }),
+            ),
+          ),
+        ),
         Effect.andThen(wait.pipe(Effect.andThen(tick), Effect.forever)),
         Effect.forkScoped,
       );
@@ -237,11 +369,21 @@ export const layerWith = (
 
 export const layer = Layer.unwrap(
   Effect.gen(function* () {
-    const { serverTracePath } = yield* ServerConfig.ServerConfig;
+    const { serverTracePath, dbPath } = yield* ServerConfig.ServerConfig;
     const path = yield* Path.Path;
-    return layerWith(makeNodeSampler, {
-      filePath: path.join(path.dirname(serverTracePath), "event-loop-stalls.ndjson"),
-      maxBytes: STALL_LOG_MAX_BYTES,
-    });
+    const sockets = yield* HttpSocketTelemetry.HttpSocketTelemetry;
+    return layerWith(
+      makeNodeSampler,
+      {
+        filePath: path.join(path.dirname(serverTracePath), "event-loop-stalls.ndjson"),
+        maxBytes: STALL_LOG_MAX_BYTES,
+      },
+      undefined,
+      undefined,
+      sockets.sample,
+      Effect.tryPromise(
+        async () => (await NodeFSP.stat(`${archiveFilename(dbPath)}-wal`)).size,
+      ).pipe(Effect.orElseSucceed(() => null)),
+    );
   }),
 );

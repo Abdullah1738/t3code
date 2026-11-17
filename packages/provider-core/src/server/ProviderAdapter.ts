@@ -400,6 +400,19 @@ export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAda
   }
 }
 
+export class ProviderAdapterTurnNotActiveError extends Schema.TaggedError<ProviderAdapterTurnNotActiveError>()(
+  "ProviderAdapterTurnNotActiveError",
+  {
+    driver: ProviderDriverKind,
+    providerThreadId: ProviderThreadId,
+    providerTurnId: ProviderTurnId,
+  },
+) {
+  override get message(): string {
+    return `${this.driver} provider turn ${this.providerTurnId} is no longer active.`;
+  }
+}
+
 export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterCapabilitiesError,
   ProviderAdapterOpenSessionError,
@@ -416,6 +429,7 @@ export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterRuntimeRequestResponseError,
   ProviderAdapterEventStreamError,
   ProviderAdapterProtocolError,
+  ProviderAdapterTurnNotActiveError,
 ]);
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 
@@ -469,6 +483,8 @@ export interface ProviderAdapterV2InterruptInput {
   readonly providerThread: OrchestrationV2ProviderThread;
   readonly providerTurnId: ProviderTurnId;
   readonly requestRuntimeRestart?: boolean;
+  /** Timeout cleanup must leave work from earlier turns running. */
+  readonly stopBackgroundWork?: boolean;
 }
 
 export interface ProviderAdapterV2RuntimeRequestResponseInput {
@@ -566,6 +582,17 @@ export type ProviderAdapterV2SubagentOutcome = {
   readonly result: OrchestrationV2Subagent["result"];
 };
 
+export const ProviderBackgroundTerminal = Schema.Struct({
+  processId: Schema.String,
+  command: Schema.optionalKey(Schema.String),
+  cwd: Schema.optionalKey(Schema.String),
+  itemId: Schema.optionalKey(Schema.String),
+  osPid: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+  cpuPercent: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+  rssKb: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+});
+export type ProviderBackgroundTerminal = typeof ProviderBackgroundTerminal.Type;
+
 export interface ProviderAdapterV2SessionRuntime {
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
@@ -640,14 +667,32 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly steerTurn: (
     input: ProviderAdapterV2SteerInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;
+  readonly listBackgroundTerminals?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+  }) => Effect.Effect<ReadonlyArray<ProviderBackgroundTerminal>, ProviderAdapterV2Error>;
+  readonly terminateBackgroundTerminal?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly processId: string;
+  }) => Effect.Effect<
+    { readonly terminated: true; readonly alreadyGone: boolean },
+    ProviderAdapterV2Error
+  >;
   readonly stopTask?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly taskId: string;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /** Checked by the delegated progress guard; adapters own native fencing and termination. */
+  readonly checkRetryHealth?: (input: {
+    readonly runId: RunId;
+    readonly attemptId: RunAttemptId | null;
+    readonly noResponseBudgetMs: number;
+    readonly flapLimit: number;
+  }) => Effect.Effect<boolean, ProviderAdapterV2Error>;
   readonly interruptStartingRun?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly runId: RunId;
     readonly attemptId: RunAttemptId;
+    readonly stopBackgroundWork?: boolean;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly interruptTurn: (
     input: ProviderAdapterV2InterruptInput,

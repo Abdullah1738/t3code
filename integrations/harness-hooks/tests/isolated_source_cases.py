@@ -1,10 +1,28 @@
 """Commands to classify only; none of these shell strings may be executed."""
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 
 def fixture_environment():
     return {name: '' for name in os.environ if name.startswith(('BASH_FUNC_', 'PYTHON', 'LD_', 'DYLD_')) or name in {'BASH_ENV', 'ENV', 'BASHOPTS', 'SHELLOPTS'}}
+
+
+def fixture_environment_patch():
+    # The guard refuses any exported function by name, empty or not, and
+    # offbox boxes export several; drop them instead of blanking.
+    kept = {name: value for name, value in os.environ.items() if not name.startswith('BASH_FUNC_')}
+    blanked = {name: value for name, value in fixture_environment().items() if not name.startswith('BASH_FUNC_')}
+    return patch.dict(os.environ, {**kept, **blanked}, clear=True)
+
+
+def write_migration_helpers(root):
+    repo = Path(__file__).resolve().parents[3]
+    for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+        relative = Path('apps/server/src/ardud/persistence') / name
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((repo / relative).read_text())
 
 
 def cases(root):

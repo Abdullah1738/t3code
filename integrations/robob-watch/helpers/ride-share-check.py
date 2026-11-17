@@ -28,6 +28,7 @@ Env overrides (all optional):
                      runs never touch live cards)
   RIDE_CARD_JOURNAL  share journal dir (default ~/.local/state/ride-card), read only here
   UBER_BIN           uber binary
+  UBER_AGENT_BROWSER agent-browser binary (same override as the Uber CLI)
   UBER_AUDIT_DIR     booking audit logs (default ~/Library/Application Support/uber/audit)
   RIDE_SHARE_NOW     epoch seconds to use as "now" (tests only)
 """
@@ -38,6 +39,8 @@ from math import isfinite
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from watch_admission import admitted_check
 sys.path.insert(0, str(HERE / "ride-card"))
 
 WD = os.environ.get("WATCH_DIR", os.getcwd())
@@ -89,6 +92,7 @@ def load():
     return s
 
 
+@admitted_check
 def save(s):
     tmp = STATE + ".tmp"
     with open(tmp, "w") as f:
@@ -100,6 +104,31 @@ def uber(*args, timeout=25):
     p = subprocess.run([UBER, *args, "--json"], capture_output=True, text=True, timeout=timeout, env=ENV,
                        stdin=subprocess.DEVNULL)
     return json.loads((p.stdout.strip().splitlines() or ["{}"])[-1])
+
+
+def stale_session(d):
+    error = d.get("error")
+    if d.get("ok") or not isinstance(error, dict) or error.get("code") != "runtime":
+        return False
+    message = error.get("message", "")
+    return isinstance(message, str) and "Unexpected token '<'" in message and "is not valid JSON" in message
+
+
+def rides_status():
+    # Two HTTP reads plus one reopen fit inside the watcher's default 60s budget.
+    d = uber("rides", "status", timeout=15)
+    if stale_session(d):
+        print("ride-share: stale Uber session; reopening saved profile once", file=sys.stderr)
+        browser = os.environ.get("UBER_AGENT_BROWSER") or "agent-browser"
+        profile = Path.home() / "Library/Application Support/uber/profiles/default/browser"
+        subprocess.run([browser, "--session", "uber-cli-default", "--profile", str(profile),
+                        "--headed", "open", "https://m.uber.com/go/home"],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=15, check=True, env=ENV)
+        d = uber("rides", "status", timeout=15)
+    if not d.get("ok"):
+        raise RuntimeError(json.dumps(d.get("error"))[:200])
+    return d
 
 
 POLL_LOG_MAX = 2_000_000    # bytes; polls.jsonl keeps its newest half past this
@@ -238,9 +267,10 @@ def mark_fare_checked(uuid, now):
     save(checkpoint)
 
 
+@admitted_check
 def queue_fare_alert(uuid, t, line):
     # The receipt cannot be read twice, so persist the result before anything else can fail.
-    alert = {"line": line}
+    alert = {"line": line, **({"run": os.environ["WATCH_RUN"]} if os.environ.get("WATCH_RUN") else {})}
     checkpoint = load()
     checkpoint["trips"].setdefault(uuid, {})["fare_alert"] = alert
     save(checkpoint)
@@ -281,6 +311,7 @@ def clear_acked_fares(trips):
             t.pop("fare_alert")
 
 
+@admitted_check
 def finish_run(s, out):
     trips = s["trips"]
     alerts = [t["fare_alert"] for t in trips.values() if t.get("fare_alert")]
@@ -349,9 +380,7 @@ def main():
     now = now_ts()
     clear_acked_fares(s["trips"])
     try:
-        d = uber("rides", "status")
-        if not d.get("ok"):
-            raise RuntimeError(json.dumps(d.get("error"))[:200])
+        d = rides_status()
         s["fail_since"] = None
     except Exception as e:
         s["fail_since"] = s.get("fail_since") or now

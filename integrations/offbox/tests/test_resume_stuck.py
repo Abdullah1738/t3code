@@ -214,6 +214,41 @@ class ResumeStuckTests(Isolated):
         finally:
             pool.release_guard(got)
 
+    def test_readiness_keeps_its_final_poll_for_aligned_and_unaligned_deadlines(self):
+        for timeout, poll in ((.5, .25), (1, .75), (2, .75)):
+            for ready in (False, True):
+                with self.subTest(timeout=timeout, poll=poll, ready=ready):
+                    start = self.clock.t
+                    end = start + timeout
+                    observations = []
+
+                    def get(box_id):
+                        observations.append(self.clock.t)
+                        state = 'running' if ready and self.clock.t >= end else 'resuming'
+                        return self.state(box_id, state)
+
+                    with patch.object(api, 'get', side_effect=get):
+                        if ready:
+                            self.assertEqual(api.wait_state('slow', api.LIVE_STATES, timeout=timeout,
+                                                            poll=poll)['state'], 'running')
+                        else:
+                            with self.assertRaises(api.BudgetExpired) as caught:
+                                api.wait_state('slow', api.LIVE_STATES, timeout=timeout, poll=poll)
+                            self.assertFalse(caught.exception.outage)
+                    self.assertGreaterEqual(observations[-1], end)
+                    self.assertLessEqual(observations[-1], end + poll)
+                    self.assertEqual(self.clock.t, observations[-1])
+
+    def test_final_poll_cannot_send_after_shared_request_budget_expires(self):
+        for seconds, sends in ((0, 0), (1, 1)):
+            with self.subTest(seconds=seconds), patch.object(api, '_key', return_value='fixture'), \
+                    patch.object(api, '_open', side_effect=lambda *a, **kw: io.BytesIO(
+                        b'{"sandbox":{"state":"resuming"}}')) as send, api.budget(seconds):
+                with self.assertRaises(api.BudgetExpired) as caught:
+                    api.wait_state('slow', api.LIVE_STATES, poll=1)
+                self.assertFalse(caught.exception.outage)
+                self.assertEqual(send.call_count, sends)
+
     def test_direct_caller_errors_after_two_resumes_and_leaves_lease_stopped(self):
         # The local record can say running even though boat already archived it.
         self.box('stuck', 'running')

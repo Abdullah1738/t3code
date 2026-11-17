@@ -28,6 +28,13 @@ args = [a for a in sys.argv[1:] if a != "--json"]
 with open(os.environ["FAKE_UBER_STATE"] + ".calls", "a") as f:
     f.write(" ".join(args) + "\\n")
 if args[:2] == ["rides", "status"]:
+    if state.get("status_responses"):
+        out = state["status_responses"].pop(0)
+        with open(os.environ["FAKE_UBER_STATE"], "w") as f:
+            json.dump(state, f)
+        if isinstance(out, str):
+            print(out); sys.exit(0)
+        print(json.dumps(out)); sys.exit(0 if out.get("ok") else 1)
     out = {"ok": True, "result": {"trip": state.get("trip")}}
 elif args[:2] == ["trips", "get"]:
     t = state.get("history", {}).get(args[2])
@@ -314,6 +321,156 @@ class Base(unittest.TestCase):
         self.card_cli("send", "--trip", uuid, "--session", "thread-1@3")
 
 
+class SessionRecoveryTest(Base):
+    stale = {"ok": False, "error": {"code": "runtime", "message":
+             "Unexpected token '<', \"<html>\r\n<h\"... is not valid JSON", "retryable": False}}
+    idle = {"ok": True, "result": {"trip": None}}
+
+    def setUp(self):
+        super().setUp()
+        self.browser_log = os.path.join(self.dir, "browser.calls")
+        self.browser = self._exe("agent-browser", """#!/usr/bin/python3
+import json, os, sys, time
+with open(os.environ['FAKE_BROWSER_LOG'], 'a') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\\n')
+if os.environ.get('FAKE_BROWSER_HANG'):
+    time.sleep(30)
+sys.exit(int(os.environ.get('FAKE_BROWSER_EXIT', '0')))
+""")
+        self.env.update(UBER_AGENT_BROWSER=self.browser, FAKE_BROWSER_LOG=self.browser_log)
+
+    def responses(self, *responses):
+        with open(self.fixture, "w") as f:
+            json.dump({"status_responses": responses}, f)
+
+    def browser_calls(self):
+        if not os.path.exists(self.browser_log):
+            return []
+        with open(self.browser_log) as f:
+            return [json.loads(line) for line in f]
+
+    def status_calls(self, count):
+        with open(self.fixture + ".calls") as f:
+            # Any booking/change/cancellation command would fail this assertion.
+            self.assertEqual(f.read().splitlines(), ["rides status"] * count)
+
+    def check_failed(self, **extra):
+        with open(self.state, "w") as f:
+            json.dump({"fail_since": 100}, f)
+        p = subprocess.run([sys.executable, HELPER], capture_output=True, text=True,
+                           env=dict(self.env, RIDE_SHARE_NOW="1000", **extra), timeout=25)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.stdout, "")
+        with open(self.state) as f:
+            self.assertEqual(json.load(f)["fail_since"], 100)
+        return p
+
+    def test_healthy_status_never_opens_browser(self):
+        self.assertEqual(self.run_check(1000), [])
+        self.assertEqual(self.browser_calls(), [])
+        self.status_calls(1)
+
+    def test_reopen_saved_profile_once_then_clear_failure_streak(self):
+        with open(self.state, "w") as f:
+            json.dump({"fail_since": 100}, f)
+        self.responses(self.stale, self.idle)
+        p = self.run_check_result(1000)
+        self.assertEqual(p.stdout, "")
+        self.status_calls(2)
+        self.assertEqual(self.browser_calls(), [["--session", "uber-cli-default", "--profile",
+                         os.path.expanduser("~/Library/Application Support/uber/profiles/default/browser"),
+                         "--headed", "open", "https://m.uber.com/go/home"]])
+        with open(self.state) as f:
+            self.assertIsNone(json.load(f)["fail_since"])
+
+    def test_recovered_active_trip_still_updates_card(self):
+        self.responses(self.stale, {"ok": True, "result": {"trip": trip(A, "Accepted")}})
+        self.assertEqual(self.run_check(1000), [])
+        self.assertEqual(self.card(A)["state"], "assigned")
+        self.status_calls(2)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_second_stale_response_is_failure_without_another_reopen(self):
+        self.responses(self.stale, self.stale, self.idle)
+        self.check_failed()
+        self.status_calls(2)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_retry_other_error_still_fails(self):
+        self.responses(self.stale, {"ok": False, "error": {"code": "network", "message": "offline"}})
+        self.check_failed()
+        self.status_calls(2)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_malformed_retry_still_fails(self):
+        self.responses(self.stale, "not JSON")
+        self.check_failed()
+        self.status_calls(2)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_malformed_initial_response_never_opens_browser(self):
+        self.responses("not JSON")
+        self.check_failed()
+        self.status_calls(1)
+        self.assertEqual(self.browser_calls(), [])
+
+    def test_failed_reopen_is_failure_without_retry(self):
+        self.responses(self.stale, self.idle)
+        self.check_failed(FAKE_BROWSER_EXIT="1")
+        self.status_calls(1)
+        self.assertEqual(len(self.browser_calls()), 1)
+
+    def test_missing_browser_still_fails(self):
+        self.responses(self.stale)
+        self.check_failed(UBER_AGENT_BROWSER=os.path.join(self.dir, "missing-browser"))
+        self.status_calls(1)
+
+    def test_reopen_timeout_is_bounded_and_preserves_failure(self):
+        import contextlib
+        import importlib.util
+        import io
+        with unittest.mock.patch.dict(os.environ, dict(self.env, FAKE_BROWSER_HANG="1", RIDE_SHARE_NOW="1000")):
+            spec = importlib.util.spec_from_file_location("recovery_test", HELPER)
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            real_run = subprocess.run
+            attempts = []
+            def run(args, **kwargs):
+                self.assertEqual(kwargs["timeout"], 15)
+                if args[0] == self.browser:
+                    attempts.append(args)
+                    kwargs["timeout"] = 0.1
+                return real_run(args, **kwargs)
+            self.responses(self.stale)
+            with open(self.state, "w") as f:
+                json.dump({"fail_since": 100}, f)
+            with unittest.mock.patch.object(m.subprocess, "run", side_effect=run), \
+                    contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exited:
+                m.main()
+            self.assertEqual(exited.exception.code, 1)
+            self.assertIn("timed out", err.getvalue())
+            self.status_calls(1)
+            self.assertEqual(len(attempts), 1)
+            with open(self.state) as f:
+                self.assertEqual(json.load(f)["fail_since"], 100)
+
+    def test_unrelated_errors_never_reopen(self):
+        errors = [
+            {"code": "network", "message": "offline"},
+            {"code": "auth.expired", "message": "sign in required"},
+            {"code": "runtime", "message": "Unexpected token 'x', not valid JSON"},
+            {"code": "runtime", "message": "upstream returned 500"},
+            {"code": "runtime", "message": None},
+            "not found",
+        ]
+        for i, error in enumerate(errors):
+            with self.subTest(error=error):
+                self.responses({"ok": False, "error": error})
+                self.check_failed()
+                self.assertEqual(self.browser_calls(), [])
+                self.status_calls(i + 1)
+
+
 class WatcherTest(Base):
     def test_lifecycle_one_card_ready_then_quiet_updates_and_dropoff(self):
         self.set_state(trip(A, "Searching"), {})
@@ -511,6 +668,37 @@ class WatcherTest(Base):
         self.ack("r2")
         self.assertEqual(self.run_check(now + 15 * 86400 + 30, WATCH_RUN="r3"), [])
         self.assertEqual(self.receipt_calls(A), 1)
+
+    def test_replaced_attempt_cannot_checkpoint_or_emit_a_fare_alert(self):
+        wdir = os.path.join(self.dir, "root", "watchers", "rides")
+        os.makedirs(wdir)
+        lock = sqlite3.connect(os.path.join(self.dir, "root", "relay-lock.sqlite"))
+        lock.close()
+        with open(os.path.join(wdir, "state.json"), "w") as f:
+            json.dump({"admitted_run": {"run": "replacement", "attempt": "replacement-attempt"}}, f)
+        with open(self.state, "w") as f:
+            json.dump({"trips": {}, "pending": {}}, f)
+        with open(self.state) as f:
+            before = f.read()
+        wrapper = self._exe("stale-fare", """#!/usr/bin/python3
+import importlib.util, os
+spec = importlib.util.spec_from_file_location('ride_share_check', os.environ['TEST_HELPER'])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+s = m.load(); t = s['trips'].setdefault('fixture', {})
+m.queue_fare_alert('fixture', t, 'PRIVATE FARE')
+m.finish_run(s, [])
+""")
+        env = dict(self.env, WATCH_DIR=wdir, WATCH_RUN="original", WATCH_ATTEMPT="original-attempt", TEST_HELPER=HELPER)
+        p = subprocess.run([sys.executable, wrapper], capture_output=True, text=True, timeout=10, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout, "")
+        with open(self.state) as f:
+            self.assertEqual(f.read(), before)
+        with open(os.path.join(wdir, "state.json"), "w") as f:
+            json.dump({"admitted_run": {"run": "original", "attempt": "original-attempt"}}, f)
+        p = subprocess.run([sys.executable, wrapper], capture_output=True, text=True, timeout=10, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "PRIVATE FARE")
 
     def test_fare_alert_replayed_after_exception_and_acked_replay(self):
         self.audit_quote(A)
@@ -1997,3 +2185,25 @@ class RenderLogTest(unittest.TestCase):
             self.assertEqual(child.call_args.args[0][2:5], ['log-card-render', '--kind', 'ride'])
         with unittest.mock.patch.object(rc.subprocess, 'Popen', side_effect=OSError('unavailable')):
             rc.log_render(time.monotonic(), True)
+
+
+    def test_render_chat_aliases_use_bridge_slugs_and_private_values_are_reduced(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('ride_log_alias_test', CARD)
+        rc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rc)
+        # All accepted owner input forms must survive person -> metadata -> log reduction.
+        cases = [('owner', 'owner'), ('abdullah', 'owner'), ('me', 'owner'), (' OWNER ', 'owner'),
+                 ('moni', 'moni'), ('MONI', 'moni'), ('friend', 'other')]
+        for value, expected in cases:
+            with self.subTest(value=value), unittest.mock.patch.object(rc, '_render_preview', return_value=False), \
+                    unittest.mock.patch.object(rc.subprocess, 'Popen') as child, unittest.mock.patch.object(rc.threading, 'Thread'):
+                self.assertFalse(rc.render_preview({'rider': rc.person(value)}, None))
+                command = child.call_args.args[0]
+                self.assertEqual(command[command.index('--chat') + 1], expected)
+                self.assertEqual(command[command.index('--failure-code') + 1], 'preview_missing')
+        private = '+971501234567 /Users/private/PRIVATE https://private/?token=PRIVATE'
+        with unittest.mock.patch.object(rc.subprocess, 'Popen') as child, unittest.mock.patch.object(rc.threading, 'Thread'):
+            rc.log_render(time.monotonic(), False, chat=private, failure_code=private)
+            self.assertNotIn('PRIVATE', str(child.call_args))
+            self.assertNotIn('971501234567', str(child.call_args))

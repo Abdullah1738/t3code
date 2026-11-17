@@ -2,7 +2,7 @@ import { afterEach, expect, setSystemTime, test } from "bun:test";
 import type { ChatContext, ChatInfo, Role } from "../src/chats.ts";
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import { JudgeError, type GroupJudge, type JudgeState } from "../src/group-judge.ts";
-import { Router, sendblueContextPrompt } from "../src/router.ts";
+import { Router, OUTAGE_NOTICE_AFTER_MS, sendblueContextPrompt } from "../src/router.ts";
 import { MAX_INCOMING_BYTES } from "../src/inbound-files.ts";
 import { Store } from "../src/store.ts";
 import type { Swipes, SwipeTarget } from "../src/swipe.ts";
@@ -92,7 +92,7 @@ function setup(ctx: ReturnType<typeof context>, overrides: { quietMs?: number; g
 }
 
 const stores: Store[] = [];
-afterEach(() => { for (const store of stores.splice(0)) store.db.close(); });
+afterEach(() => { setSystemTime(); for (const store of stores.splice(0)) store.db.close(); });
 
 test.each(["owner", "dm", "group"] as const)("%s skips an oversized file without directing non-owner files to the Mac", async kind => {
   const h = setup(context(kind), { quietMs: 0 });
@@ -205,6 +205,11 @@ test("group prompts say app cards are not available, owner and Moni keep the app
   const group = sendblueContextPrompt(context("group"), false, []);
   expect(group).toContain("app cards are not available in groups");
   expect(group).not.toContain("App cards still work");
+  expect(group).toContain("you have no private tools");
+  expect(group).toContain("ask quietly with `agent-ask --to owner` or `--to moni`");
+  expect(group).toContain("Answer in the group yourself once the answer arrives.");
+  expect(group).toContain("Don't say you're asking another assistant.");
+  expect(group).toContain("Never post private details unless the person they belong to asked for them here.");
   expect(sendblueContextPrompt(context("owner"), false, [])).toContain("App cards still work (`app`)");
   expect(sendblueContextPrompt(context("dm"), false, [])).toContain("App cards still work (`app`)");
 });
@@ -232,11 +237,18 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   expect(admin).toContain("Anything special they ask for");
   expect(admin).toContain("group chats Moni has written in");
   expect(admin).toContain("send --to <slug>");
+  expect(admin).toContain("agent-ask --to owner");
+  expect(admin).not.toContain("Other chats can't be reached from here");
+  expect(admin).toContain("agent-answer --request");
+  expect(admin).toContain("groups = no private data.");
+  expect(admin).toContain("Requests from a group include its members; answer for that audience.");
   const person = sendblueContextPrompt(context("dm", { roleOf: address => ({ name: address, role: "person" }) }), false, []);
   expect(person).not.toContain("send --to");
+  expect(person).not.toContain("Agent bus:");
   const guest = sendblueContextPrompt(context("group"), false, ["+447700900123"]);
   expect(guest).toContain("Tom (guest)");
   expect(guest).toContain("ask-owner");
+  expect(guest).not.toContain("Agent bus:");
   expect(guest).toContain("silent observer");
   expect(guest).toContain("send no tapback");
   expect(guest).not.toContain("A tapback (`react --kind like` or an emoji) plus NO_REPLY is a complete answer");
@@ -245,6 +257,22 @@ test("the admin role prompt says Moni acts like the owner; guests need ask-owner
   const owner = sendblueContextPrompt(context("owner"), false, []);
   expect(owner).toContain("send --to <slug>");
   expect(owner).not.toContain("ask-owner");
+  expect(owner).toContain("Agent bus:");
+  expect(owner).toContain("Requests from a group include its members; answer for that audience.");
+  expect(owner).toContain("agent-requests --session CURRENT_SESSION_ID");
+  expect(owner).toContain("owner = Abdullah's assistant on his Mac:");
+  expect(owner).toContain("moni = Moni's assistant:");
+});
+
+test.each(["final", "tool"] as const)("group quiet asks remain available on background turns in %s mode", mode => {
+  const group = sendblueContextPrompt(context("group"), false, [], true, mode);
+  expect(group).toContain("ask quietly with `agent-ask --to owner` or `--to moni`");
+  expect(group).toContain("you have no private tools");
+  for (const kind of ["owner", "dm"] as const) {
+    const dm = sendblueContextPrompt(context(kind), false, [], true, mode);
+    expect(dm).not.toContain("Group requests:");
+    expect(dm).toContain("Requests from a group include its members; answer for that audience.");
+  }
 });
 
 test("other chats' prompts say who reads background replies and keep agent talk out of them", () => {
@@ -1511,17 +1539,18 @@ test("owner, Moni and group outages each get one notice, with held messages orde
     for (const h of chats) await h.router.tick();
   }
   for (const h of chats) {
+    expect(h.store.pendingOutbox()).toEqual([]);
     h.input("second", "robob second question", "+971585933213");
     h.input("third", "robob third question", "+971585933213");
   }
-  setSystemTime(start + 180_000);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS);
   for (const h of chats) {
     await h.router.tick();
-    expect(h.store.pendingOutbox().map(op => op.text)).toEqual(["I'm having a technical problem; I'll answer this as soon as I'm back."]);
+    expect(h.store.pendingOutbox().map(op => [op.text, op.replyTo])).toEqual([["I'm having a technical problem; I'll answer this as soon as I'm back.", "first"]]);
     h.backend.prompt = Recorder.prototype.prompt.bind(h.backend);
   }
   // The health endpoint stays down: the thread answering is what brings the held batch back, a minute after the last try.
-  setSystemTime(start + 240_000);
+  setSystemTime(start + OUTAGE_NOTICE_AFTER_MS + 60_000);
   for (const h of chats) {
     await h.router.tick();
     await h.router.tick();
@@ -1786,4 +1815,14 @@ test.each(["dm", "group"].flatMap(kind => [false, true].flatMap(modelError => ["
   expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id IN ('second', 'second-member')").all().map(row => row.state)).toEqual(["done", "done"]);
   expect(h.backend.prompts).toHaveLength(1);
   expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
+});
+
+test("only the owner prompt teaches notify rules in both reply modes", () => {
+  for (const mode of ["final", "tool"] as const) for (const background of [false, true]) {
+    const owner = sendblueContextPrompt(context("owner"), false, [], background, mode);
+    expect(owner).toContain('When Abdullah says "tell me when Moni …"');
+    expect(owner).toContain('notify-rule add --text "<his words>" --session CURRENT_SESSION_ID');
+    expect(owner).toContain('notify-rule rm --id N --session CURRENT_SESSION_ID');
+    for (const kind of ["dm", "group"] as const) expect(sendblueContextPrompt(context(kind), false, [], background, mode)).not.toContain("notify-rule");
+  }
 });

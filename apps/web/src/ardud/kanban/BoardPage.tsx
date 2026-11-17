@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { KANBAN_WS_METHODS, type KanbanBoard } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   boardFilter,
@@ -108,8 +108,23 @@ export function BoardPage(props: {
   onSearch: (next: BoardSearch, options?: { readonly replace?: boolean }) => void;
 }) {
   const { boardId, search, onSearch } = props;
-  const state = useBoardState(boardId);
+  const snapshot = useBoardState(boardId);
+  const state = snapshot?.board.archivedAt === null ? snapshot : undefined;
   const feed = useFeed(kanban.board(boardId));
+  const navigate = useNavigate();
+  const boards = useBoards();
+  useEffect(() => {
+    if (snapshot === undefined || snapshot.board.archivedAt === null) return;
+    const next = boards?.find((entry) => entry.board.id !== boardId && entry.board.archivedAt === null);
+    if (next)
+      void navigate({
+        to: "/boards/$boardId",
+        params: { boardId: next.board.id },
+        search: {},
+        replace: true,
+      });
+    else void navigate({ to: "/", replace: true });
+  }, [snapshot, boards, navigate, boardId]);
   const canLiftPause = useKanbanPermission(KANBAN_WS_METHODS.boardPause);
   const view = search.view ?? "board";
   const nowMs = useNowMs();
@@ -612,9 +627,7 @@ function BoardSwitcher(props: {
   onHome: () => void;
 }) {
   const navigate = useNavigate();
-  const boards = (useBoards() ?? []).filter(
-    (entry) => entry.board.archivedAt === null || entry.board.id === props.boardId,
-  );
+  const boards = (useBoards() ?? []).filter((entry) => entry.board.archivedAt === null);
   const name = (
     <span className="flex min-w-0 items-center gap-2">
       {props.board ? <BoardIcon board={props.board} className="text-(--m-muted)" /> : null}

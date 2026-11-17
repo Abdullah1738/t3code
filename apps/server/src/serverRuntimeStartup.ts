@@ -32,6 +32,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "./config.ts";
+import * as ProviderProcessRegistry from "./ardud/providers/ProviderProcessRegistry.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import { flushCompileCache } from "./compileCache.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -50,6 +51,7 @@ import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import { forkParked, forkParkedFiber } from "./serverActivation.ts";
+import { maintainThreadReadIndexes } from "./ardud/persistence/threadReadMaintenance.ts";
 import * as AnalyticsService from "./telemetry/AnalyticsService.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
@@ -452,11 +454,13 @@ export const runOrderedV2StartupPhases = Effect.fn(
   WorkerContext,
   BootstrapContext,
 >(input: {
+  readonly reapProviderProcesses: Effect.Effect<void>;
   readonly importLegacyShells: Effect.Effect<Import, ImportError, ImportContext>;
   readonly recover: Effect.Effect<Recovery, RecoveryError, RecoveryContext>;
   readonly startEffectWorker: Effect.Effect<void, WorkerError, WorkerContext>;
   readonly autoBootstrap: Effect.Effect<Bootstrap, BootstrapError, BootstrapContext>;
 }) {
+  yield* input.reapProviderProcesses;
   const recovery = yield* input.recover;
   yield* input.importLegacyShells;
   yield* input.startEffectWorker;
@@ -466,6 +470,8 @@ export const runOrderedV2StartupPhases = Effect.fn(
 
 const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: StartupOptions) {
   const serverConfig = yield* ServerConfig.ServerConfig;
+  const processRegistry = yield* ProviderProcessRegistry.ProviderProcessRegistry;
+  const analytics = yield* AnalyticsService.AnalyticsService;
   const keybindings = yield* Keybindings.Keybindings;
   const legacyV1ThreadImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
   const providerRuntimeRecovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
@@ -588,6 +594,25 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
     yield* Deferred.await(httpListening);
     yield* Effect.yieldNow;
     const { recovery, bootstrap: bootstrapTargets } = yield* runOrderedV2StartupPhases({
+      reapProviderProcesses: processRegistry.reap.pipe(
+        Effect.flatMap((records) =>
+          Effect.forEach(
+            records,
+            (record) =>
+              Effect.gen(function* () {
+                const now = yield* DateTime.now;
+                yield* analytics.record("provider.previous_boot_process_reaped", {
+                  threadId: record.threadId,
+                  provider: record.provider,
+                  pid: record.pid,
+                  bootId: record.bootId,
+                  ageMs: Math.max(0, DateTime.toEpochMillis(now) - record.recordedAt),
+                });
+              }),
+            { discard: true },
+          ),
+        ),
+      ),
       importLegacyShells: runStartupPhase(
         "orchestration-v2.legacy-v1.import-shells",
         legacyV1ThreadImporter.reconcileShells.pipe(
@@ -748,6 +773,15 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
         },
       }),
     );
+    if (Option.isSome(sql)) {
+      yield* maintainThreadReadIndexes().pipe(
+        Effect.provideService(SqlClient.SqlClient, sql.value),
+        Effect.catch((cause) =>
+          Effect.logWarning("Thread read index maintenance failed", { cause }),
+        ),
+        Effect.forkScoped,
+      );
+    }
     // Delivery mutations share the live parent dispatch lock and recheck durable
     // cohort generations/transfers inside it. Recovery can safely trail readiness.
     yield* runStartupPhase(
@@ -756,6 +790,12 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
       (counts) => counts,
     ).pipe(
       Effect.catchCause((cause) => Effect.logWarning("Delegated task recovery failed", { cause })),
+      Effect.forkIn(startupScope),
+    );
+    yield* orchestrator.repairRunlessProviderTurns.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Runless provider turn repair failed", { cause }),
+      ),
       Effect.forkIn(startupScope),
     );
     yield* Effect.logDebug("startup phase: complete");

@@ -299,6 +299,8 @@ const ownerMutationMethods = new Set<string>([
   WS_METHODS.worktreeSetupCancel,
   KANBAN_WS_METHODS.boardCreate,
   KANBAN_WS_METHODS.boardUpdate,
+  KANBAN_WS_METHODS.boardPurge,
+  KANBAN_WS_METHODS.standingApprovalRevoke,
   KANBAN_WS_METHODS.setupStart,
   KANBAN_WS_METHODS.setupEnd,
   KANBAN_WS_METHODS.boardPause,

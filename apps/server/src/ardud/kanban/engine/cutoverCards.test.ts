@@ -13,6 +13,8 @@ import {
   type ModelSelection,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -29,6 +31,7 @@ import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions
 import * as KanbanStore from "../store/KanbanStore.ts";
 import { KanbanService, layer as kanbanLayer } from "./KanbanService.ts";
 import { planCutoverCardRestore } from "./cutoverCards.ts";
+import * as BoardLocks from "./boardLocks.ts";
 import * as KanbanModels from "./models.ts";
 import * as Rules from "./rules.ts";
 import { KanbanThreads, type KanbanThreadsShape, type KanbanThreadView } from "./threads.ts";
@@ -59,6 +62,33 @@ const board: KanbanBoard = {
   defaultCardModel: work,
   reviewChains: [{ name: "two-step", steps: [work, review] }],
   defaultReviewChain: "two-step",
+  standingApprovals: [
+    {
+      id: "standing-deploy",
+      gate: "deploy",
+      minIntervalHours: 4,
+      quote: "This board may release every four hours",
+      sourceThreadId: "approval-thread",
+      saidAt: at,
+      approvedAsk: { cardId: "approval-card", askId: "q1" },
+      recordedAt: at,
+      recordedBy: "evaluator",
+      revokedAt: null,
+      revokedBy: null,
+      revokeReason: null,
+    },
+  ],
+  releaseLedger: [
+    {
+      boardId: KanbanBoardId.make("cutover"),
+      cardId: KanbanCardId.make("previous-release"),
+      cardNumber: 1,
+      subtaskId: "s1",
+      at,
+      critical: null,
+      approvalId: "standing-deploy",
+    },
+  ],
   instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
   setup: null,
   pause: { reason: "Harness cutover", keep: [], at, by: "owner" },
@@ -294,7 +324,7 @@ const threadView = (threadId: ThreadId): KanbanThreadView => ({
   updatedAt: at,
   quietSince: at,
   runStartedAt: null,
-            lastActivityAt: null,
+  lastActivityAt: null,
   backgroundWork: 0,
   prWatches: 0,
   prs: [],
@@ -315,15 +345,30 @@ const testLayer = (
     readonly failLinkWrite?: boolean;
     readonly failEventWrite?: boolean;
     readonly separateBoards?: boolean;
+    readonly holdCardWrite?: {
+      cardId: string | null;
+      readonly entered: Deferred.Deferred<void>;
+      readonly resume: Deferred.Deferred<void>;
+    };
     readonly threads?: Partial<KanbanThreadsShape>;
   } = {},
 ) => {
   const storeLayer =
-    options.failLinkWrite || options.failEventWrite
+    options.failLinkWrite || options.failEventWrite || options.holdCardWrite
       ? Layer.effect(
           KanbanStore.KanbanStore,
           Effect.map(KanbanStore.KanbanStore, (real) => ({
             ...real,
+            putCard: (value: KanbanCard) =>
+              Effect.gen(function* () {
+                const hold = options.holdCardWrite;
+                if (hold?.cardId === value.id) {
+                  hold.cardId = null;
+                  yield* Deferred.succeed(hold.entered, undefined);
+                  yield* Deferred.await(hold.resume);
+                }
+                yield* real.putCard(value);
+              }),
             putThreadLink: (value: KanbanThreadLink) =>
               options.failLinkWrite && value.endedAt === null
                 ? Effect.fail(
@@ -334,20 +379,18 @@ const testLayer = (
                   )
                 : real.putThreadLink(value),
             addCardEvent: (event) =>
-              real
-                .addCardEvent(event)
-                .pipe(
-                  Effect.flatMap((saved) =>
-                    options.failEventWrite
-                      ? Effect.fail(
-                          new KanbanStore.KanbanStoreError({
-                            operation: "event fixture failure",
-                            cause: new Error("event write failed"),
-                          }),
-                        )
-                      : Effect.succeed(saved),
-                  ),
+              real.addCardEvent(event).pipe(
+                Effect.flatMap((saved) =>
+                  options.failEventWrite
+                    ? Effect.fail(
+                        new KanbanStore.KanbanStoreError({
+                          operation: "event fixture failure",
+                          cause: new Error("event write failed"),
+                        }),
+                      )
+                    : Effect.succeed(saved),
                 ),
+              ),
           })),
         ).pipe(Layer.provide(KanbanStore.layer))
       : KanbanStore.layer;
@@ -429,6 +472,46 @@ it.effect("a missing existing thread leaves the card and its link untouched", ()
     assert.deepStrictEqual(yield* store.threadLink(worker), link());
     assert.deepStrictEqual(yield* store.cardEvents(stopped.id), []);
   }).pipe(Effect.provide(testLayer({ exists: false }))),
+);
+
+it.live("restore rejects a foreign thread while its board is busy", () =>
+  Effect.gen(function* () {
+    const hold = {
+      cardId: null as string | null,
+      entered: yield* Deferred.make<void>(),
+      resume: yield* Deferred.make<void>(),
+    };
+    yield* Effect.gen(function* () {
+      const store = yield* seed;
+      const service = yield* KanbanService;
+      const foreignBoard = { ...board, id: KanbanBoardId.make("foreign"), slug: "foreign" };
+      const foreignCard = {
+        ...stopped,
+        id: KanbanCardId.make("foreign-card"),
+        boardId: foreignBoard.id,
+      };
+      yield* store.putBoard(foreignBoard);
+      yield* store.putCard(foreignCard);
+      yield* store.putThreadLink({ ...link(), boardId: foreignBoard.id, cardId: foreignCard.id });
+      hold.cardId = foreignCard.id;
+      const editing = yield* Effect.forkChild(
+        service.editCard(foreignCard.id, { description: "Concurrent edit" }, { _tag: "owner" }),
+      );
+      yield* Deferred.await(hold.entered);
+      yield* Effect.gen(function* () {
+        const error = yield* service
+          .restoreCutoverCard({ cardId: stopped.id, threadId: worker, stage: "working" })
+          .pipe(Effect.flip);
+        assert.strictEqual(error.reason, "thread_board_link_mismatch");
+        assert.deepStrictEqual(yield* store.card(stopped.id), stopped);
+        assert.deepStrictEqual(yield* store.cardEvents(stopped.id), []);
+      }).pipe(Effect.ensuring(Deferred.succeed(hold.resume, undefined)));
+      yield* Fiber.join(editing);
+    }).pipe(
+      Effect.provideService(BoardLocks.writeWaitMs, 200),
+      Effect.provide(testLayer({ holdCardWrite: hold, separateBoards: true })),
+    );
+  }),
 );
 
 it.effect("card/link/event writes roll back together if the link write fails", () =>
@@ -580,7 +663,6 @@ it("refuses worker cutover restoration while an evaluator step precedes work", (
   );
   assert.isFalse(result.ok);
 });
-
 
 it("cutover reconciliation re-stamps an existing wait with its restored move", () => {
   const wait = {

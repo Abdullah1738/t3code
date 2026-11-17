@@ -6,27 +6,140 @@ Source scripts use `toollog.py` (or the `toollog.sh` bridge) for local metadata 
 it rolls up yesterday. Quantiles use nearest rank. `okRate`/`failedRate` use
 lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
+Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
+or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
+cadence clock (include `Z` or an explicit UTC offset); launchd checks always
+describe the current state. The command exits 1 for overdue jobs, unreadable
+input (including invalid timestamps) or a launchd state other than `loaded`,
+and 2 for invalid option syntax.
+JSON includes an overall `ok` boolean and `launchd`, mapping each of
+`com.abdullah.mac-log-collector`, `com.abdullah.mac-deep-inventory`,
+`com.abdullah.mac-memory` and `com.abdullah.mac-cpu` to `loaded`, `not-loaded`
+or `unknown`. Each read-only `launchctl print gui/<uid>/<label>` has a two-second
+timeout (eight seconds total for four timeouts). Only an explicit
+`Could not find service` error means `not-loaded`; other failures are `unknown`.
+Status never loads or restarts agents, and does not send notifications.
+It reads the UTC day files covering the last 36 hours (three files before noon
+UTC, two from noon onward). Missing and unreadable files are listed separately.
+Malformed rows, including invalid timestamps and dates that overflow when
+converted to UTC, are skipped and counted. Future timestamps are ignored.
+It makes no network calls and creates no files or locks.
+
+The single cadence table is `CADENCES` in `status.py`, with schedule sources
+beside each row. Logging applies from 13 Nov 2026 UTC. Maximum gaps are two
+hours for disk sampling (guard every 30 minutes), inventory and crash collection
+(hourly collector), and janitor (hourly watcher); seven hours for health backup
+(every six), five hours for memory backup (every four), and 26 hours for the
+daily CVE sweep (09:00 Dubai / 05:00 UTC).
+The hourly collector's tooling, process-wait and clone-wedge probes also allow
+two hours. `memory.sample` runs every five minutes and allows 15 minutes;
+`cpu.sample` runs every minute and allows three minutes, from 15 Nov UTC;
+`disk.deep.end` completes the daily 03:30 Dubai pass and allows 26 hours.
+The memory, deep-pass and clone-wedge rows apply from 14 Nov UTC, when they
+first logged; the others apply from 13 Nov. Alerts and conditional detail
+events do not have independent cadence rows.
+
+`LATE` means the last line is older than the maximum gap. `SILENT` means that
+gap has elapsed and there is no matching line in the available 36-hour window.
+Before logging applies a row is `PENDING`; after that it gets one maximum gap
+of startup grace. A failed or skipped run still proves the job ran: `lastOk`
+reports the last line's boolean outcome (null if omitted), independently of
+cadence. Backups match `props.target` exactly (`health` or `memory`).
+An on-cadence `backup.failed_<stage>` line with `ok=false` and `skipped=0`
+sets `lastSeen` and `lastOk=false`; it is a failed run, not a skip. The separate
+daily `backup.failed_runs` counters count those same failed runs by target.
+
+Daily rollups add `jobs` and `missingJobs`, leaving all existing keys intact.
+The jobs view is frozen at the end of the requested UTC day and reads that day
+and its predecessor, capped to 36 hours. Each job has `lastSeen` (normalized
+UTC), `lastOk`, `lines` (matching lines in that window), `ageMin`, `gapMaxMin`,
+`since`, and `status`. `missingJobs` contains the `LATE` and `SILENT` job keys;
+backup keys are `backup.run:health` and `backup.run:memory`.
+
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.
-Unified-log queries cover at most the most recent hour; skipped older time is
-explicit in `skippedS`. Queries run in 15-minute chunks, checkpointing the cursor
-after each completed chunk. A failed query retains the unfinished suffix for retry.
+Unified-log windows cover at most the most recent 90 minutes, including retries;
+older time is skipped with exact `skippedS` and reason `lag_ceiling`. Queries start
+with 60 seconds of log and grow after successes. Two successful sizes estimate
+fixed startup cost separately from window work. Queries normally target 10 seconds
+of window work, increasing that target to amortize significant startup cost within
+the command deadline. Queries usually cover at most 15 minutes; startup-dominated
+reads may grow to the 90-minute ceiling. When the budget allows, a nominal-size
+probe checks window cost before a large jump. Accelerating marginal cost keeps
+queries within 15 minutes for the rest of the run. Each completed chunk checkpoints its cursor. A
+failed query retains the unfinished suffix, then continues into a fresh window
+when that suffix finishes. Each command has a 60-second cap including bounded
+process-group cleanup; the unified source shares a 135-second budget.
+`crash.unified.chunk` records requested bounds, elapsed time and outcome;
+`crash.unified.skip` records ceiling skips before advancing the cursor. Positive
+skip records and summaries survive the daily log cap so omitted time stays explicit.
+`crash.collect.stopReason` distinguishes completion, deadline and command failure.
 Boot observations include `observedAt` (Unix seconds) for the boot marker; duplicate
 markers at the same instant count once. Other observations remain aggregated.
 It rolls up yesterday on the first hourly run after 00:05 UTC. It writes only
 its own state, day logs, rollups and probe samples, and never changes crash evidence.
+Before any job can create today's log, it checks today's and yesterday's files
+(from the logging start date). If either is absent it emits one `log.missing_day`
+error per UTC reporting day, with `ids.runId`, the missing dates in `props.source`
+and their count. This uses collector state to suppress repeats; status and rollup
+readers never append log lines. A failed append retains the missing dates for
+retry and advances the daily marker only after a successful append. `emit()`
+returns true on append and false on failure, while existing callers ignore it.
+A stopped collector is visible through status's
+missing-file report and silent jobs.
 
 Disk samples use `statvfs`, sizes of the known Robob/OpenCode/recall database
 and WAL files (metadata only), the guard's cached TMPDIR measurement, and an hourly cached directory inventory of worktrees, caches and backup repositories.
-The collector gathers directory sizes with read-only du calls outside the guard,
-allowing up to 60 s per root under a shared 210 s scan budget. The two big
-roots (`~/.local/share` and `~/.robob`) scan one first-level child at a
-time with a 15 s child timeout. Roots rotate by their last attempt, and each
-gets at most 60 s. The collector
-also limits the scan to the time remaining in its five-minute run budget,
-running crash collection first (at most 165 s), then disk-wait collection, the disk tooling probe and
-inventory with the remaining time. Inventory keeps its own 210 s maximum. Samples expose
+The collector scans immediate children independently with `du -skl`, in batches
+of at most 128 paths / 32 KiB of arguments. Its 15 s allowance grows to 60 s
+for slow children. Completed children stay cached for 24 hours; missing and
+stale children get the hourly inventory's remaining time, up to 210 s within
+the collector's 290 s deadline. Crash collection runs first.
+
+A separate `com.abdullah.mac-deep-inventory` LaunchAgent runs daily at 03:30
+local time (Asia/Dubai on this Mac). It starts with the four SSD worktree farms
+and checkpoints the next root to visit, so interrupted passes rotate fairly.
+Cheap batches can share a turn; known timeouts follow healthy discovery and
+refresh work after one early part attempt per root. Ordinary children that will expire
+during the pass are refreshed before more parts work can crowd them out.
+Individual probes use 1.5 times the child's last successful duration, or twice
+its root's median successful duration, bounded to 15–120 seconds. Roots with
+no timing data start at 15 seconds. A short probe timeout doubles the next
+probe and keeps the child in ordinary discovery; only a full probe of at least
+60 seconds establishes a timeout for descent. Legacy timeouts with no recorded
+allowance or parts get one probe conversion. Batch deadlines fall back to
+individual probes. A confirmed timed-out child is split into immediate entries,
+with each completed part checkpointed and at most ten minutes per child per
+pass. A part whose measured or sibling-estimated cost exceeds the time left
+is deferred to the next pass. Checkpointed parts and their parent have a 72-hour freshness window so
+three nightly passes can finish a child. Ordinary children of the SSD worktree
+farms and crpko-devops/tmp retain their real timestamps for 48 hours, so a
+sweep larger than one nightly budget can converge. Other roots keep 24 hours.
+An expired ordinary child makes its root partial until measured again.
+The child has no total until its listing and every part are complete and
+fresh; the total retains the oldest part's timestamp. At expiry it becomes
+partial with no total again. Its own directory allocation is included.
+Parts do not recurse. The hourly scanner leaves parts parents and recent
+timeouts to this pass.
+The daily budget is 90 minutes; du runs under nice 10
+and utility scheduling without inherited launchd background I/O policy.
+Termination keeps completed rows; unfinished children remain explicit partials.
+Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
+daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
+and cached totals while crash collection continues. `disk.deep.start`,
+`disk.deep.root`, `disk.deep.parts` and `disk.deep.end` record coverage, ages,
+timeout time, parts progress, the parts freshness window and stop reason.
+Pass timeout totals include all command timeouts; `probeTimeouts` and
+`secondsInProbeTimeouts` report the short-probe subset, and
+`probeAllowanceMedianS` reports the median individual probe allowance.
+Timeout source events include `allowanceS`.
+`childrenRemaining` counts known eligible children; `rootsPartial` on pass
+summaries counts roots whose listing was unavailable, so zero remaining with
+unlisted roots is not complete coverage. All totals count hardlink occurrences,
+can exceed physical use, and are not freeable-space estimates.
+
+Samples expose
 `inventorySourceErrors`, `inventoryAgeS` (null if absent), and `inventoryStale`
 (absent or older than two hours). These do not affect the sample's own success.
 The five largest positive deltas in that tracked set are flattened as
@@ -40,15 +153,22 @@ was not reached. Fix versions use the sweep's known version transition or
 local package metadata; unavailable versions are `unknown`.
 
 Every `backup.run` includes `trigger` and `lastGoodSnapshotAgeS`. The latter
-comes from a lock-free restic snapshot query, even on admission skips; unreadable
-repositories yield null with a fixed `lastGoodSnapshotError` tag. The probe
+comes from a lock-free restic snapshot query, even on admission skips. On probe
+failure, memory backups fall back to the status file's last successful backup
+time; unavailable ages remain null. `lastGoodSnapshotSource` identifies `restic`
+or `status_file`, and `lastGoodSnapshotError` retains a fixed probe error. The probe
 uses an inherited password or the target's fixed Keychain entry, never a supplied
 password command/file, with one second for Keychain and three for restic.
 Lock skips include holder parent PID, elapsed process age, and a command reduced
 to a known executable and first argument; other arguments are redacted. Ancestry
 supplies a best-effort holder trigger, including `agent`; unavailable details are
 null/unknown. A proven missing PID becomes `stale_lock`. No lock is changed.
-Daily rollups count `backup.skipped_runs` and `backup.ok_runs` by target;
+Nonzero exits are failures with `failedStage` and `failReason`, including failure
+reasons passed through the legacy skip argument. Lock and load/boot deferrals
+retain their skip behavior. Memory failure stages use only fresh status metadata;
+unavailable stages are `unknown` and unrecognized stages are `other`.
+The memory-backup emitter sends `failureStage` on `backup.run`: `admission`, `stage`, `repo`, `disk`, `replica`, `verify`, `files`, `restic`, `prune`, `dropbox`, `manifest`, or `unknown`; other strings become `unknown` and non-strings are omitted.
+Daily rollups count `backup.skipped_runs`, `backup.ok_runs` and `backup.failed_runs` by target;
 `log.rollup` flattens them as e.g. `backup.skipped_runs.memory`. Healthy lock
 skips count only as skips.
 
@@ -94,6 +214,236 @@ Partial inventories and older snapshots without that evidence remain unknown.
 An unknown directory baseline also makes the event incomplete.
 These events never alert or launch extra scans.
 
+## Mac tailnet guard
+
+`com.abdullah.mac-tailnet` invokes `collector.py --tailnet` every 60 seconds,
+independently of the hourly collector's slow disk scans. `tailnet.py` calls only
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale status --json` (15-second
+timeout, no socket override). It never changes Tailscale preferences or reconnects.
+A valid Running/online response is up; explicit Stopped, NeedsLogin,
+NeedsMachineAuth, NoState, Starting or Running/offline is down. Missing or invalid
+CLI data is unknown. Unknown CLI checks probe home SSH (100.75.104.72:22) and the
+remote Mullvad de-dus-wg-102 DNS listener (100.64.1.71:53), using ordinary TCP
+connections through the Mac's Tailscale interface. Either success proves up.
+If neither responds, a read-only HTTPS request to `SELF_HTTPS_URL`
+(`https://abdullahs-macbook-pro.tailcca332.ts.net:18400/`) accepts any HTTP status
+as reachable, including application errors. Only when every probe fails can
+unknown CLI evidence count toward an outage. An unavailable probe tool leaves
+the outcome unknown and breaks the streak without claiming recovery.
+Explicit down states require `THRESHOLD_CHECKS=3` AND `THRESHOLD_SECONDS=180`;
+unknown CLI evidence requires `UNKNOWN_THRESHOLD_CHECKS=5` AND
+`UNKNOWN_THRESHOLD_SECONDS=300`. Both count and wall-clock gates apply, even
+when minute ticks bunch under load. Any up tick resets the streak. Recovery is
+sent only for an alerted outage.
+
+`state/tailnet.json` and a separate nonblocking lock preserve streaks and queued
+notification payloads across invocations. Keys and text remain identical on retry,
+including after a timeout that may have followed durable Telegram queueing.
+Recovery uses a distinct key. The first run drops legacy unproven counters and
+pending timeout alerts, while preserving already alerted explicit-state outages.
+Unix timestamps measure outages across processes; monotonic time measures CLI
+and probe duration. The CLI timeout is 15 s, pgrep 3 s, each of two probes 6 s
+(`nc -z -G 5`), HTTPS has an 8 s curl deadline and a 9 s subprocess deadline,
+and at most one Telegram send is attempted per invocation (10 s).
+The subprocess budget is at most 49 s per run.
+
+`tailnet.sample` adds `outcome`, `cliOutcome`, `confirmedDown`, `cliMs` (also
+`statusDurationMs`), `loadAvg1`, and `confirmedBy` (`home_tcp`, `peer_tcp`,
+`self_https`, or null). Unknown CLI evidence adds `confirmProbes` (host to
+port/ok/error/ms) and, if HTTPS ran, `selfHttpsReachable` / `selfHttpsError`. Backend state,
+online flag, IP count, CLI exit/timeout and extension PIDs remain available.
+Running samples retain a home SSH probe; its failure alone never overrides a
+healthy CLI. `tailnet.cli_slow` records unknown CLI evidence resolved up by peers,
+at most once per 900 seconds, with `suppressed` counting intervening occurrences.
+`tailnet.state` and `tailnet.extension` record initial observations and changes;
+switching between successful probe sources alone does not emit a state change.
+a PID change alone is not a crash. `tailnet.alert` / `tailnet.recovery` record
+notification queue acceptance or failure. Failed sends retry next minute.
+Only configured probe addresses enter these events; raw CLI output, identity,
+other peers and notification text are discarded. `mac-log-status` and daily
+rollups flag a missing sample after three minutes. The app CLI's “Skip a start
+command” and “Peer connection was rejected” logs are known harmless noise;
+check for `EditPrefs` and backend changes when verifying read-only behavior.
+
+After review and merge/push, run `zsh integrations/mac-logging/install.zsh`
+(`--dry-run` first, `--check` after). The installer copies but never loads agents.
+Bootstrap `~/Library/LaunchAgents/com.abdullah.mac-tailnet.plist` in the user's GUI
+domain for the minute checks; keep `com.abdullah.mac-log-collector` hourly.
+Removing the minute agent stops checks; no Tailscale change is needed.
+
+## CPU samples
+
+`com.abdullah.mac-cpu` runs `cpu.py` every 60 seconds at normal priority,
+through `/bin/zsh` for launchd file access. One `/bin/ps` inventory reads PID,
+parent, uid, cumulative CPU time, RSS, state, start time and elapsed time with a
+30-second timeout. Normal samples never invoke top. The sampler never changes
+another process.
+
+`state/cpu.json` retains PID, start time, cumulative CPU seconds, host CPU ticks,
+the daily spike counter and Unix observation time under its own nonblocking lock. CPU seconds
+and percentages compare successful inventories; 100% is one full core.
+New/reused PIDs and counter resets start at zero. Disappeared processes are
+dropped; their final CPU usage is unknown, so totals cover surviving processes.
+The first run, clock reset or gap over an hour establishes a baseline with
+null CPU totals and no top rows. Legacy monotonic timestamps establish one
+fresh baseline on upgrade. Monotonic time measures only each run's duration;
+Apple's Python 3.9 gives it a different epoch in each process, so it cannot
+measure intervals across minute invocations. Failed inventories emit a fixed `failure`
+code and `durationMs` without advancing state.
+
+`cpu.sample` includes `windowS`, `cpuS`, load averages, logical CPU count,
+total CPU percent, process count, runnable/uninterruptible counts, the top 15
+families (count, CPU, RSS MiB) and top 20 PIDs (parent, family, CPU seconds and
+percent, RSS MiB, elapsed time and optional script hint). Families use the
+innermost app bundle or executable basename; Python versions and mds variants
+are grouped. Only node/bun/python PIDs in that top 20 get a separate batched
+argv read with a five-second timeout and a start-time recheck. Hint failure
+sets `hintError` without losing numeric CPU evidence.
+
+`cpu.spike` captures up to 15 PIDs with parent families and redacted 160-character commands when load1 > 2× logical CPUs, plus host/unattributed CPU, observed spawn families and runnable thread counts; it is capped at 240 records/day and 8192 bytes/record, and is conditional rather than a cadence job.
+
+Host tick deltas add `systemCpuPct`, `userPct`, `sysPct`, `nicePct`, `idlePct` and
+`unattributedCpuPct` on the same one-core=100% scale; a failed read sets
+`systemCpuError` without losing the sample. The first valid read is a baseline.
+`spawned`/`exited` compare PID + start time, and `spawnedFamilies` counts only
+new processes still visible at the next inventory. `pidAdvance` is omitted:
+long-lived high PIDs hid a real 200-process burst after allocator wrap on this Mac.
+The optional thread read has a two-second timeout.
+
+`userPct` excludes nice time; user + sys + nice is busy CPU. `kernelTaskPct`
+is null on normal samples. Spikes read the second frame of a bounded
+`top -l 2 -s 1 -pid 0` call, with `kernelTaskWindowS: 1` and cumulative
+`kernelTaskTime` for reference; failure sets `kernelTaskError`.
+The expensive read is limited to once per five minutes, including failed
+attempts, using a wall timestamp in the existing sampler state. Skipped spikes
+report null CPU with `kernelTaskSkipped: "rate"`; quiet samples retain the
+cooldown, and a clock rollback starts a fresh cooldown.
+System time also runs in other
+processes, so neither kernel_task nor sys time should be added to process CPU.
+
+Exited-child CPU comes from `proc_pid_rusage` V1, converted from Mach ticks.
+Darwin 27's `ps -S` did not include it in the fork/wait proof. `childCpu` lists
+ten parent PIDs with their family and the parent's family in `parentFamily`;
+`childCpuFamilies` groups those family pairs before truncation. `childCpuPct`
+sums all readable parent deltas, separately from `totalCpuPct`.
+The reader captures Mach time before ps; later process starts are excluded with
+coverage reason `identity`, preventing PID reuse from corrupting a baseline.
+Ancestors are read before children to avoid racing a reaping transfer.
+Old CPU of disappeared descendants is subtracted when reaping transfers their
+lifetime counters. Ambiguous transfers (including possible orphan adoption) are excluded and counted in
+`childUncertainParents`. `unattributedAfterChildrenPct` subtracts the recovered
+child CPU from the original gap, floored at zero. Baseline or unavailable child
+readings leave the total null, rather than claiming zero.
+
+`childReadable`/`childUnreadable` and `childCoverage` expose failures by uid and
+fixed reason. Other-user processes, including launchd, normally deny reads;
+if PID 1 is readable, its child CPU is labelled `orphaned-exited`.
+`lostParents` counts vanished parents known from the old tree or child counters;
+parents born and gone inside the interval remain invisible. The syscall pass
+has a 30-second budget and adds no process inventory command.
+`observedSpawnsLowerBound`, its per-minute rate and `observedSpawnsByParent`
+count new PID/start identities still present in the next snapshot. They miss
+processes that exit between snapshots and are not an exact exec counter.
+
+Hints and spike commands use the janitor's reviewed #45 `leftover_processes.redact` helper,
+loaded from the sibling source tree or the installed
+`~/.config/opencode/skills/dev-resource-janitor/scripts/` directory (including
+its `active_sessions.py` dependency). No janitor scan runs. Hints omit inline
+programs and reduce paths to a basename, or the first directory after
+`ExternalSSD/` or `.local/share/` plus basename; intervening directories use
+`…`. Spike commands replace home prefixes with `~`; argv never enters sampler state. If the helper is
+missing, labels are omitted and the CPU measurements remain available.
+
+The logger bounds labels and lists and caps samples at 7000 bytes and spikes at 8192
+bytes, dropping lowest-ranked detail rows if necessary (`topOmitted` and
+`familiesOmitted`). At 1440 scheduled runs and 240 spikes/day, CPU records
+use at most 12.1 MB/day. The existing shared
+day-log cap and retention still apply. The installer copies the new helpers
+and plist; the evaluator must load `com.abdullah.mac-cpu` after review.
+
+## Minute disk-wait samples
+
+The existing `com.abdullah.mac-cpu` 60-second schedule runs `u_sample.py`
+before the CPU probe, using one wide `ps` snapshot of PID, parent, start/elapsed/
+CPU times, state, executable and argv, capped at five seconds. A 1,024-column
+executable field preserves Darwin paths before taking their basename; argv
+stays last. It never reads a volume or invokes lsof. Errors
+leave CPU sampling running and retain the last U state. Exiting `?` states
+are accepted; isolated torn rows are skipped with a `proc.u_parse` diagnostic
+(argv omitted). More than five bad rows and over 10% bad fails the probe.
+
+`proc.u_sample` requires the same PID/start time observed in U for ≥60 s.
+`ageS` is process age; the first observation is a baseline. Non-U observations,
+PID reuse, backward clocks or gaps over three minutes reset it. Snapshots
+cannot prove what happened between observations. `count` and `byComm` (top 50)
+cover qualifying processes; up to 15 `procs` include parent attribution, CPU
+seconds and argv (≤200 characters, known secrets redacted). `volume` is the
+first `/Volumes/<name>`, `/var/folders` or `/Users/<user>` argv prefix, or null:
+a hint, not a measured wait location. Unquoted names with spaces yield only
+the first word. PID 99184 stays counted but gets one detail row per UTC day.
+`lsofStuck` and up to five `lsofCallers` identify the parents starting lsof.
+Plain lsof can block on any wedged volume regardless of its target path or port.
+
+Private, nonblocking-locked `state/proc-u.json` keeps U baselines, the daily
+marker and one episode, using Unix wall-clock times only and no argv. Episodes
+start on a qualifying nonempty sample and close after three successful empty
+samples; errors/partial reads cannot close them. One `proc.u_episode` row
+records closure, retried after append failure. Other empty minutes are silent;
+there are no new alerts. A permanent waiter such as 99184 keeps the episode
+open even while its detail is suppressed. Rollup `uEpisodes` lists episodes sampled or closed
+that UTC day, retaining original starts across midnight, end (null while open),
+last seen, peak count, 15 volume hints and ten comms by peak concurrent count.
+Summaries cover all processes before detail truncation. U rows cap at 16 KiB
+with omission counters (≤23.6 MB per 1440 nonempty samples); shared retention
+and the day cap apply. The evaluator copies helpers with `install.zsh` in the
+batched release; no new or changed plist is needed.
+
+## Memory samples
+
+`com.abdullah.mac-memory` runs `memory.py` every 300 seconds independently of
+inventory, through `/bin/zsh` for launchd file access. `memory.sample` contains
+swap MB, VM page counts and page size, raw pressure counter/level and free percentage,
+load averages,
+the top 15 footprints with compressed MB, watched daemons with elapsed time,
+process/parent-1 counts, and disk0's second iostat sample. MB/GB use powers of
+1024. `top` MEM already includes compressed pages. The single-snapshot CPU column
+is omitted because it reports zero without a preceding observation; use
+`cpu.sample` for CPU usage. One full, memory-sorted top snapshot
+supplies both the first15 holders and watched PIDs, including those below15.
+ps supplies exact command names/elapsed time and matches the snapshot by PID.
+At most512 watched PIDs are retained; excess
+is explicit in `watchedOmitted` and makes the sample partial. Each subprocess,
+including notifications, has a ten-second timeout. Failed probes are null with
+fixed `…Error` codes; watched PID failures retain null metrics per PID.
+
+`state/memory.json` retains swap counter baselines and alert receipts under a
+separate nonblocking lock. `swapinsDelta`/`swapoutsDelta` compare successful reads
+on the same boot, with `deltaWindowS`; first reads, resets, gaps over an hour and
+clock rollback establish a null baseline. Missing/failed probes remain unknown.
+No process arguments, command output or notification text enter the day log.
+
+Swap above 16 GB, critical pressure in two consecutive samples, a footprint
+above 8 GB, or fseventsd above 2 GiB queues a Telegram notification and writes
+`memory.alert`. Critical means `kern.memorystatus_vm_pressure_level == 4` or
+free percentage below 15; unavailable/healthy samples or gaps over ten minutes reset the streak.
+`pressureLevel` logs that level (1 normal, 2 warning, 4 critical); `pressure` keeps
+`vm.memory_pressure` as a raw counter and never determines an alert. The level
+streak starts fresh when upgrading from the old counter-based implementation.
+
+A separate `fseventsd_growth` reason warns on footprint growth above 100 MiB/h
+for three consecutive intervals spanning at least 15 minutes. A baseline plus
+three five-minute samples is required; one jump does not qualify. Samples log
+`fseventsdGrowthMbPerHour`, `fseventsdGrowthSamples`, `fseventsdGrowthPid` and
+`fseventsdGrowthWindowS`. State follows each watched PID on the same boot;
+missing measurements, elapsed-age discontinuities, a flat/falling reading or
+a gap over ten minutes reset its streak. The growth check needs no new subprocess.
+Each reason has a six-hour cooldown
+across day boundaries. Keys start `mac-memory:<reason>:<YYYYMMDD>` with a time
+suffix so another alert can be queued after six hours on the same day. An
+unconfirmed send retains its exact key/text for idempotent retry. For a diagnostic
+sample without notifications, run `TOOLLOG_DIR=<private-temp-dir> /usr/bin/python3
+integrations/mac-logging/memory.py --no-alert`.
+
 ## Source events
 
 `disk.inventory` and `crash.collect` retain `count` and `sourceErrors` summary
@@ -103,6 +453,11 @@ or `crash.source` with `source` (root path or `unified`), `failure` (`timeout`,
 exit code is available), and `elapsedMs`. Budget-exhausted roots get their own
 timeout line without launching another command. Confirmed missing inventory
 paths retain a zero total without a source error.
+
+`disk.inventory` also reports `rootsOk`, `rootsPartial`, `rootsTimeout`,
+`rootsDenied` and `scanMs`. Timeout/denial counts include affected children and
+can overlap the partial count. Daily `diskInventory` rollups sum those counts
+and scan time across `scans`; lock-skipped hourly runs are excluded.
 
 Only these source errors accept a diagnostic `error.message`: the first stderr
 or filesystem-error line, trimmed to 300 characters with credential-like text
@@ -118,19 +473,28 @@ only readable entries; permission grants remain an owner action.
 
 Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
 `partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
-`failedCount`. Child timeouts/errors remain named source errors. An incomplete
+`failedCount`. `deniedCount` sums only explicit numeric permission-denial counts.
+Root aggregates also report `partialChildCount`: cached children without a valid
+numeric denial count whose `partial` flag is true or unknown. An explicit zero
+denial count does not contribute to `partialChildCount`. Both counts preserve
+the root's existing `partial` flag. Child timeouts/errors remain named source errors. An incomplete
 root emits an error with `failure=partial`, `partial=true`, and the available
-children's `bytes`. Cached sizes make that aggregate an estimate. `failedCount` includes one additional
+children's `bytes`. The aggregate includes only recorded child measurements. `failedCount` includes one additional
 incomplete remainder when the root deadline stops enumeration; it is not a
 count of every unvisited child. Summing child du totals does not deduplicate
 hard links across children and excludes the root directory's own blocks.
 Root attempts rotate oldest first, with never-attempted roots ahead of measured
 ones. Budget-skipped roots retain their place; full failed attempts rotate too.
 Shortened failed attempts keep priority for a full allowance on the next run.
-`disk.inventory.turn` identifies each attempted root's `source` and `turn`.
+`disk.inventory.root` summarizes each root once per run, including `deniedCount`
+and `partialChildCount`. Detailed child sizes stay
+in `state/disk-inventory.json` (`childState`); successful child lines are retained
+only for changes of at least 1 GiB or 20%, new children of at least 1 GiB,
+or measurements taking at least ten seconds. Partial and error diagnostics
+are always retained.
 Child attempts rotate the same way. A failed child retains its last good size
-and timestamp in `childState`; a root containing cached or unreadable children
-remains partial. `cachedCount` and `ageS` describe retained measurements.
+and timestamp in `childState`; missing, stale or unreadable children keep the
+root partial. `cachedCount` and `ageS` describe retained measurements.
 If every child fails without a last-good measurement, the root has no size.
 Inventory state retains child sizes in `children` and aggregate flags in `partials`.
 Summary `sourceErrors` counts affected roots, not their child error lines.
@@ -140,24 +504,19 @@ scan coverage cannot become a reported grower.
 `disk.sample` reports success when its own measurements succeed; cached inventory
 errors or staleness are metadata rather than sample failures. Its `sourceErrors`
 still counts failures of its own free-space and existing-file stat measurements.
-Confirmed missing optional database/WAL files retain zero sizes. The filtered unified-log query
-has a one-hour maximum window, split into contiguous 15-minute chunks under a
-shared 135 s budget, allowing four chunks at the observed 30 s cost plus headroom.
-Each command has at most 60 s, shortened to that shared
-budget and the collector's remaining absolute budget. Its source event/error and
-`crash.collect` record `windowStart` and `windowEnd` (Unix seconds), `windowS`,
-`skippedS` (older time omitted by the cap), `chunks` (planned for this attempt),
-and `chunksDone`. Each completed chunk emits its observations and saves its cursor
-before the next command. The next chunk excludes that cursor's instant, including
-when log's second rounding/end padding returns overlapping rows. Missing or invalid
-event timestamps fail the chunk rather than risk attributing events twice.
-On failure, `unifiedRetry` retains the exact unfinished suffix until it succeeds;
-completed chunks are not queried again. An old one-hour retry is split the same
-way. Chunk checkpoints retain unreported `skippedS`, including after the final
-chunk, so interruption before the source result cannot hide a coverage gap.
-Once the source result reports the gap, a retained suffix clears that metadata.
-After a delayed retry completes, the next run applies the recent-hour cap
-again and reports any omitted older time in `skippedS`.
+Confirmed missing optional database/WAL files retain zero sizes. Unified source
+results and `crash.collect` retain `windowStart`, `windowEnd` (Unix seconds),
+`windowS`, `skippedS`, `chunks` and `chunksDone`. With adaptive sizing, `chunks`
+estimates the total using the current chunk size; on completion it equals
+`chunksDone`. Chunk bounds exclude the previous cursor even when log's second
+rounding/end padding returns overlapping rows. Missing or invalid event
+timestamps fail the chunk rather than risk attributing events twice.
+Retry checkpoints retain unreported `skippedS`, including after the final chunk,
+so interruption before the source result cannot hide a coverage gap. Once the
+source result reports the gap, a retained suffix clears that metadata. Retries
+older than the moving 90-minute ceiling log the exact additional skip before
+checkpointing that ceiling; a retry inside it preserves its frozen end. Finishing
+a retry continues into a fresh window within the same run's remaining budget.
 
 Report sources have independent checkpoints. Each attempt allows up to 10 s per
 source, capped by the collector's absolute deadline. Directory enumeration,
@@ -212,24 +571,42 @@ storagekitd and `diskutil list` improved from an 8 s timeout to 0.04–0.74 s.
 
 ## Processes stuck in disk wait
 
-Each hourly run emits `proc.disk_wait` from a read-only, 10 s-bounded
-`ps -axo pid,ppid,etime,stat,comm,args`. It counts processes observed in
-`U` with a process age of at least ten minutes, retaining the ten oldest
-(`pid`, `ppid`, `ageS`, `stat`, `comm`, `args`). Arguments are limited
-to 300 characters, with credential-like values redacted; no environment
-is logged. `stuckUnmount` and `mountPoint` flag an unmount among all matches,
-even if it is outside the ten retained entries. A failed ps records an error
-without stopping the other collector sources.
+`disk.clone_wedge` also records U-state `cp -c`/`clonefile` commands of any
+age, and groups of U processes naming the same absolute path in three
+one-second samples. Both must remain in U in every sample; CPU may advance.
+It records PID, process age, path, CPU delta and wait
+channel (`-` when macOS hides it). The probe uses only `ps`, never pathname
+lookups. Argument parsing is best effort: `ps` does not preserve argv quoting,
+so ambiguous pathname fragments, quotes and escapes do not establish
+shared-path identity. Clone commands with ambiguous operands still qualify
+under their own PID identity.
+Umount is excluded and remains covered by `proc.disk_wait`.
+One Telegram alert per PID/start incident uses the existing notify helper;
+shared-path waiters alert together, and failed sends retry frozen text/key.
+This is an I/O workload signal: CPU or device progress can mean slow APFS
+extent copying, so the alert does not diagnose deadlock or recommend a kill.
+The clone probe shares the disk-wait budget, with its own 20 s ceiling.
 
-Process age is not time continuously spent in U: this is an hourly observation,
-and an old process can be caught during normal I/O. An umount aged at least
-30 minutes, or another process aged at least six hours, triggers one Telegram
-attention alert per PID/start time. A bounded ps start-time lookup prevents
-PID reuse from suppressing a new incident. Failed notifications retry with
-the same key and frozen text; they never fail collection. The shared 45 s disk-wait
-budget defers remaining alerts to the next run when notifications are slow.
-Daily `diskWait` rollups give runs with matches, maximum process age, and
-the latest stuck-unmount mount point.
+Each hourly run selects processes in `U` aged at least ten minutes, then
+samples their state and cumulative CPU time six times, one second apart.
+Only `U` in every sample with no CPU progress counts as stuck. Processes
+that leave `U` or use CPU appear in `busy`, for information only, with no
+alerts. Vanished PIDs are dropped. Calls are bounded to ten seconds within
+a shared 45 s budget; a partial observation needs at least three samples
+to classify a stall. Failed sources never stop the rest of collection.
+
+`processAgeS` is uptime. `stuckForS` is a lower bound from the first consecutive
+hourly stuck observation, reset by recovery, CPU progress or PID reuse.
+For umount, it includes process age because unmounting is its only task.
+Alerts use `stuckForS`: thirty minutes for umount, six hours otherwise.
+Each PID/start time alerts once; failures retry the same frozen text and key.
+The event retains ten stuck and ten busy processes, six state samples each,
+and at most 300 characters of arguments, with credential-like text redacted.
+`stuckUnmount` and `mountPoint` cover all stuck matches, including omitted rows.
+
+Daily `diskWait` rollups report stuck runs, maximum `stuckForS`, the latest
+stuck-unmount mount point, busy runs and five top busy command names.
+Old lines still count; their uptime maximum is kept as `legacyMaxProcessAgeS`.
 
 A kernel-stuck unmount can block the stat child of plain lsof, even for an
 unrelated APFS file, and may also affect diskutil. While a U-state umount
@@ -241,7 +618,8 @@ it and never changes mounts or restarts the Mac.
 
 ## Install after review and owner approval
 
-All scripts refuse dirty upkeep source or HEAD absent from origin/main. No
+Installation and checks refuse dirty upkeep source or HEAD absent from origin/main.
+`--dry-run` can describe a proposed branch without installing it. No
 installer starts or restarts any service. Install the helper first:
 
 ```sh
@@ -257,7 +635,8 @@ Memory-system belongs to the Recall board and is deployed from
 `robob/recall-golive`; send changes there as port requests. This installer
 refuses targets under `~/.local/share/memory-system`.
 The helper installer writes the proposed
-`com.abdullah.mac-log-collector.plist`; the evaluator must separately load it
+`com.abdullah.mac-log-collector.plist` and
+`com.abdullah.mac-deep-inventory.plist`; the evaluator separately loads them
 after approval. Existing job schedules and backup LaunchAgents stay in place.
 The collector starts via `/bin/zsh` because launchd attributes Full Disk Access to the job's own program.
 The jobs fail open if the helper is missing.

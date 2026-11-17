@@ -449,6 +449,8 @@ const makeHost = (watch: Watch) => {
                 head: pr.head,
                 headAt: at,
                 checks: pr.checks,
+                // Host reads include head-check evidence; thread snapshots do not.
+                failedChecks: [],
               });
             }
             return { readings, read, failed: [], carried: [] };
@@ -537,13 +539,22 @@ const makeThreads = (watch: Watch) => {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: (threadId) =>
+        read(threadId).pipe(
+          Effect.map((view) => {
+            const model = threads.get(threadId)?.model;
+            return view && model ? { projectId: view.projectId, model } : null;
+          }),
+        ),
       view: read,
       find: read,
       model: (threadId) => Effect.sync(() => threads.get(threadId)?.model ?? null),
       lastFailure: failureOf,
       findLastFailure: failureOf,
       latestRun: () => Effect.succeed(null),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: (input) =>
@@ -581,6 +592,7 @@ const makeThreads = (watch: Watch) => {
           const thread = threads.get(threadId);
           if (thread) thread.model = model;
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>
         Effect.gen(function* () {

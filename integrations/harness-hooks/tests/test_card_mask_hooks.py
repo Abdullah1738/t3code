@@ -1,4 +1,9 @@
 """Native hook stdin/output boundary, with isolated audit state."""
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 import contextlib
 import importlib
 import io

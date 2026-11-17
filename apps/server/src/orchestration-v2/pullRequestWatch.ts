@@ -3,8 +3,16 @@ import type {
   PullRequestCheck,
   PullRequestComment,
   PullRequestDetail,
+  PullRequestUnavailableError,
+  PullRequestOperationError,
   ThreadPullRequestWatch,
+  ThreadPullRequestLink,
 } from "@t3tools/contracts";
+
+import { parseChangeRequestUrl } from "@t3tools/shared/changeRequestUrl";
+import { threadPullRequestKeysEqual } from "@t3tools/shared/threadPullRequests";
+import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
+import * as Schema from "effect/Schema";
 
 /**
  * Wakes in a row that bring only comments. Check, conflict, or push news resets the count, so
@@ -13,6 +21,30 @@ import type {
 export const PULL_REQUEST_WATCH_WAKE_LIMIT = 10;
 const LISTED_ITEMS = 10;
 const SNIPPET_LENGTH = 200;
+
+const isProviderError = Schema.is(PullRequestProviderError);
+
+export const isMissingTool = (error: PullRequestUnavailableError | PullRequestOperationError) =>
+  error._tag === "PullRequestUnavailableError"
+    ? error.reason === "cli-missing"
+    : isProviderError(error.cause) && error.cause.reason === "missing-tool";
+
+export function pullRequestWatchStopMessage(
+  link: Pick<ThreadPullRequestLink, "host" | "number" | "url">,
+  failures: number,
+  error: PullRequestUnavailableError | PullRequestOperationError | undefined,
+  reason?: string,
+  serverPath?: string,
+): string {
+  const stopped = `T3 Code stopped watching pull request #${link.number} (${link.url}) after ${failures} consecutive unsuccessful ${failures === 1 ? "read" : "reads"}.${reason ? ` ${reason}` : ""}`;
+  const pathDetail =
+    error !== undefined && isMissingTool(error) ? ` Server PATH: ${serverPath || "(unset)"}.` : "";
+  if (error?._tag === "PullRequestUnavailableError") {
+    const host = link.host ?? parseChangeRequestUrl(link.url)?.host ?? "this host";
+    return `${stopped} The server can't read pull requests on ${host} (${error.reason}). ${error.message} Watching again won't help until server access is fixed. Check the PR with your own tools instead.${pathDetail}`;
+  }
+  return `${stopped}${error === undefined ? "" : ` Last error: ${error.message}`} Check it yourself, and call watch_pull_request to watch it again.${pathDetail}`;
+}
 
 export type PullRequestWatchChange =
   | { readonly kind: "checks-failed"; readonly failed: ReadonlyArray<PullRequestCheck> }
@@ -62,21 +94,32 @@ export function evaluatePullRequestWatch(
     | "author"
   >,
   remarks: ReadonlyArray<PullRequestComment> | null,
+  settlingExpired = false,
 ): PullRequestWatchReport {
   const changes: Array<PullRequestWatchChange> = [];
-  const headSha = detail.headSha ?? null;
+  const headSha = settlingExpired
+    ? (detail.headBranchSha ?? detail.checksHeadSha ?? detail.headSha ?? null)
+    : (detail.headSha ?? null);
   const headMoved = headSha !== watch.headSha;
+  const observedHeadSha = detail.headBranchSha ?? headSha;
+  const observedHeadMoved = observedHeadSha !== (watch.observedHeadSha ?? watch.headSha);
   // GitHub's PR record and rollup can lag its branch ref after a push. Preserve the
   // check watermark until these reads agree, so the settled head still gets its verdict.
-  const checksSettling = pullRequestChecksSettling(detail);
-  const checkHeadMoved = headMoved && !checksSettling;
+  const checksSettling = !settlingExpired && pullRequestChecksSettling(detail);
+  // A settling branch can return before its CI checkpoint moves, after its queued
+  // verdict was cancelled. Clear that watermark even if the return read still lags;
+  // check evaluation below must wait until the reads agree or settling expires.
+  const checkHeadMoved =
+    (headMoved && !checksSettling) ||
+    (observedHeadMoved && observedHeadSha !== null && observedHeadSha === watch.headSha);
+  const checksMatchHead = detail.checksHeadSha == null || detail.checksHeadSha === headSha;
 
   // An empty list keeps the last state: a host can answer with one when its check read fails.
   let failedChecks = checkHeadMoved ? [] : watch.failedChecks;
   let passed = checkHeadMoved ? false : watch.passed;
   let passedChecks = checkHeadMoved ? [] : watch.passedChecks;
   let passedPending = checkHeadMoved ? [] : watch.passedPending;
-  if (!checksSettling && detail.checks.length > 0) {
+  if (!checksSettling && checksMatchHead && detail.checks.length > 0) {
     const failed = detail.checks.filter(isFailedCheck);
     const newlyFailed = failed.filter((check) => !failedChecks.includes(check.name));
     if (newlyFailed.length > 0) changes.push({ kind: "checks-failed", failed: newlyFailed });
@@ -157,7 +200,7 @@ export function evaluatePullRequestWatch(
     next: {
       startedAt: watch.startedAt,
       headSha: checksSettling ? watch.headSha : headSha,
-      observedHeadSha: detail.headBranchSha ?? headSha,
+      observedHeadSha,
       failedChecks,
       passed,
       passedChecks,
@@ -257,12 +300,68 @@ export function pullRequestWatchMessage(input: {
     text,
     notification: {
       source: { kind: "monitor" },
+      ...(input.headSha !== null &&
+      changes.some((change) => change.kind === "checks-failed" || change.kind === "checks-passed")
+        ? { pullRequestWatch: { url: input.url, headSha: input.headSha } }
+        : {}),
       outcome: failed
         ? "failed"
         : changes.every((change) => change.kind === "checks-passed")
           ? "completed"
           : "updated",
       summary: `#${input.number}: ${summary.join(", ")}`,
+    },
+  };
+}
+
+/** Also recognizes wakes queued before head metadata was persisted. */
+export function refreshPullRequestCheckWake(
+  message: {
+    readonly text: string;
+    readonly notification?: OrchestrationV2Notification | undefined;
+  },
+  links: ReadonlyArray<ThreadPullRequestLink>,
+):
+  | { readonly text: string; readonly notification: OrchestrationV2Notification }
+  | null
+  | undefined {
+  const notification = message.notification;
+  if (notification?.source.kind !== "monitor") return;
+  const header =
+    /^Update on pull request #\d+ \(([^\n]+)\), which T3 Code is watching for you:\n/.exec(
+      message.text,
+    );
+  if (header === null) return;
+  const metadata = notification.pullRequestWatch;
+  const url = metadata?.url ?? header[1]!;
+  const identity = parseChangeRequestUrl(url);
+  const link = links.find(
+    (candidate) =>
+      candidate.url === url ||
+      (identity !== null && threadPullRequestKeysEqual(candidate, identity)),
+  );
+  const head = link?.watch?.observedHeadSha ?? link?.watch?.headSha;
+  // Ending a watch is a separate policy: only invalidate a verdict when a live watch left its head.
+  if (head == null) return;
+  const verdictHead =
+    metadata?.headSha ??
+    /(?:Checks failed|checks? passed) on ([a-f\d]+)[.:]/.exec(message.text)?.[1];
+  if (verdictHead === undefined || (metadata ? head === verdictHead : head.startsWith(verdictHead)))
+    return;
+  const text = message.text.replace(
+    /^- (?:Checks failed on [^\n]+:\n(?:  [^\n]*\n)*|All \d+ (?:required )?checks? passed on [^\n]+\.\n)/gm,
+    "",
+  );
+  if (text === message.text) return;
+  if (!/^- /m.test(text)) return null;
+  const { pullRequestWatch: _head, ...rest } = notification;
+  const summary = rest.summary.replace(/checks (?:failed|passed),? ?/g, "").replace(/, $/, "");
+  return {
+    text,
+    notification: {
+      ...rest,
+      summary,
+      outcome: summary.includes("merge conflict") ? "failed" : "updated",
     },
   };
 }

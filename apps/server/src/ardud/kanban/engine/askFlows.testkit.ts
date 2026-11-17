@@ -72,7 +72,9 @@ export const makeFake = Effect.gen(function* () {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: () => Effect.succeed(null),
       view,
       find: view,
       launch: (input) =>
@@ -99,6 +101,7 @@ export const makeFake = Effect.gen(function* () {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       model: (threadId) =>
@@ -109,6 +112,7 @@ export const makeFake = Effect.gen(function* () {
           const thread = all.get(threadId);
           return thread ? new Map(all).set(threadId, { ...thread, model }) : all;
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: () => Effect.void,
     }),
@@ -132,11 +136,14 @@ export const filesLayer = ServerConfig.layerTest(process.cwd(), { prefix: "t3-ka
   Layer.provideMerge(ServerSettings.layerTest()),
 );
 
-export const testLayer = (fake: Layer.Layer<KanbanThreads>) =>
+export const testLayer = (
+  fake: Layer.Layer<KanbanThreads>,
+  store: typeof KanbanStore.layer = KanbanStore.layer,
+) =>
   KanbanService.layer.pipe(
     Layer.provideMerge(fake),
     Layer.provideMerge(KanbanModels.layerTest(null)),
-    Layer.provideMerge(KanbanStore.layer),
+    Layer.provideMerge(store),
     Layer.provideMerge(Sqlite.layerMemory),
     Layer.provideMerge(Layer.mock(TextGeneration.TextGeneration)({})),
     Layer.provideMerge(Layer.mock(ProjectService.ProjectService)({})),

@@ -41,7 +41,7 @@ def setup(root, backend='boat'):
                 home.fail_over('fixture home unavailable', ['run', '--bg', '--env', 'PRIVATE=env-private-marker'])
             return acquire(*args, **kwargs)
         pool.acquire = failover_acquire
-        home.record_failure = lambda *args: None
+        home.record_failure = lambda *args, **kwargs: None
         api.probe_backend = lambda *args: None
     destination = root / 'synced'
     # Exercise the real snapshot and sync orchestration through an isolated local transport.
@@ -133,6 +133,9 @@ class ExecBoundaryTests(Isolated):
             out, err = proc.communicate(timeout=25)
             self.assertEqual(proc.returncode, 0, err.decode())
             rid = out.decode().strip()
+            self.assertIn(f"Hand off `offbox wait {rid}` using the remote-compute skill’s Waiting for a run route, "
+                          "then end your turn; completion wakes you.", err.decode())
+            self.assertNotIn('logs ' + rid + ' --follow', err.decode())
             row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
             self.assertIsNotNone(row)
             self.addCleanup(self.stop_child, row['client_pid'], proc.pid)

@@ -8,6 +8,7 @@ import time
 
 import common
 import store
+import timing
 from imessage_sync import Names
 
 QUERY = """
@@ -42,6 +43,7 @@ def _phone_name(jid, names):
     return None
 
 
+@timing.timed("parse")
 def _item(row, contacts, names):
     (rid, chat, chat_name, msg_id, sender_jid, sender_name, ts, from_me, text, display, media, caption,
      filename, revoked, deleted_at, edited_ts, emoji, reaction_to, kind) = row
@@ -64,34 +66,32 @@ def _item(row, contacts, names):
 
 def sync(db, stop=None, full=False):
     stats = {"added": 0, "updated": 0, "same": 0, "deleted": 0}
-    src = sqlite3.connect(f"file:{common.WACLI_DB}?mode=ro", uri=True, timeout=30)
-    contacts = _contacts(src)
-    names = Names()
-    st = store.get_state(db, "whatsapp", {})
-    cursor = 0 if full else int(st.get("rowid", 0))
-    top = cursor
-    while not (stop is not None and stop.is_set()):
-        rows = src.execute(QUERY, (cursor, 5000)).fetchall()
-        if not rows:
-            break
-        batch = [it for it in (_item(row, contacts, names) for row in rows) if it]
+    src = sqlite3.connect(f"file:{common.WACLI_DB}?mode=ro", uri=True, timeout=30, factory=timing.SourceConnection)
+    try:
+        contacts = _contacts(src)
+        names = Names()
+        st = store.get_state(db, "whatsapp", {})
+        cursor = 0 if full else int(st.get("rowid", 0))
+        top = cursor
+        while not (stop is not None and stop.is_set()):
+            rows = src.execute(QUERY, (cursor, 5000)).fetchall()
+            if not rows:
+                break
+            batch = [it for it in (_item(row, contacts, names) for row in rows) if it]
+            store.upsert_many(db, batch, stats)
+            cursor = rows[-1][0]
+            top = max(top, cursor)
+        if not full:
+            # Edits and deletions update rows below the cursor.
+            since = int(time.time()) - 3 * 86400
+            rows = src.execute(QUERY.replace("m.rowid > ?", "(m.edited_ts > ? OR m.deleted_at > ? OR m.revoked = 1) AND m.ts > ?"),
+                               (since, since, since - 30 * 86400, 5000)).fetchall()
+            batch = [it for it in (_item(row, contacts, names) for row in rows) if it]
+            store.upsert_many(db, batch, stats)
+        st["rowid"] = max(int(st.get("rowid", 0)), top)
+        st["last_ok"] = int(time.time())
         with store.writing(db):
-            for it in batch:
-                stats[store.upsert(db, it)] += 1
-        cursor = rows[-1][0]
-        top = max(top, cursor)
-    if not full:
-        # Edits and deletions update rows below the cursor.
-        since = int(time.time()) - 3 * 86400
-        rows = src.execute(QUERY.replace("m.rowid > ?", "(m.edited_ts > ? OR m.deleted_at > ? OR m.revoked = 1) AND m.ts > ?"),
-                           (since, since, since - 30 * 86400, 5000)).fetchall()
-        batch = [it for it in (_item(row, contacts, names) for row in rows) if it]
-        with store.writing(db):
-            for it in batch:
-                stats[store.upsert(db, it)] += 1
-    st["rowid"] = max(int(st.get("rowid", 0)), top)
-    st["last_ok"] = int(time.time())
-    with store.writing(db):
-        store.set_state(db, "whatsapp", st)
-    src.close()
+            store.set_state(db, "whatsapp", st)
+    finally:
+        src.close()
     return stats

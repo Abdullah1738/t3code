@@ -50,7 +50,10 @@ export interface DesktopBackendOutputLogShape {
     chunk: Uint8Array,
   ) => Effect.Effect<void>;
   readonly persistFailureSnapshot: (input: { readonly details: string }) => Effect.Effect<void>;
-  readonly persistFailure: (input: { readonly details: string }) => Effect.Effect<void>;
+  readonly persistFailure: (input: {
+    readonly details: string;
+    readonly annotations?: DesktopLogAnnotations;
+  }) => Effect.Effect<void>;
   readonly discardSession: Effect.Effect<void>;
 }
 
@@ -459,8 +462,15 @@ const makeBackendOutputLogShape = (
     onSome: (logFile) =>
       Effect.gen(function* () {
         const sessionRef = yield* Ref.make(Option.none<BackendOutputSession>());
+        const exporterDecoder = new TextDecoder();
+        let exporterLine = "";
         const writeFailure = Effect.fn("desktop.observability.backendOutput.writeFailure")(
-          function* (session: BackendOutputSession, details: string) {
+          function* (
+            session: BackendOutputSession,
+            details: string,
+            annotations?: DesktopLogAnnotations,
+          ) {
+            yield* Effect.annotateCurrentSpan(annotations ?? {});
             yield* writeBackendChildLogRecord(logFile, {
               message: "backend child process failure output start",
               level: "ERROR",
@@ -494,6 +504,7 @@ const makeBackendOutputLogShape = (
                 instanceId: id,
                 phase: "END",
                 details: sanitizeLogValue(details),
+                ...annotations,
               },
             });
           },
@@ -503,6 +514,8 @@ const makeBackendOutputLogShape = (
             details,
           }) {
             const runId = yield* currentDesktopRunId;
+            exporterLine = "";
+            exporterDecoder.decode();
             yield* Ref.set(
               sessionRef,
               Option.some({
@@ -513,7 +526,26 @@ const makeBackendOutputLogShape = (
               }),
             );
           }),
+          // Stream chunks can split JSON lines. Keep a bounded tail, and persist
+          // only exporter lifecycle records during a successful child session.
           writeOutputChunk: Effect.fnUntraced(function* (streamName, chunk) {
+            if (streamName === "stdout") {
+              exporterLine += exporterDecoder.decode(chunk, { stream: true });
+              const lines = exporterLine.split("\n");
+              exporterLine = lines.pop()!.slice(-16_384);
+              for (const line of lines) {
+                if (!line.startsWith('{"type":"readonly-export",')) continue;
+                yield* writeBackendChildLogRecord(logFile, {
+                  message: "Readonly export lifecycle",
+                  level: "INFO",
+                  annotations: {
+                    component: "readonly-export",
+                    instanceId: id,
+                    text: line.slice(0, 16_384),
+                  },
+                });
+              }
+            }
             if (environment.isDevelopment) {
               yield* writeDevelopmentConsoleOutput(streamName, chunk);
             }
@@ -531,10 +563,10 @@ const makeBackendOutputLogShape = (
             }
           }),
           persistFailure: Effect.fn("desktop.observability.backendOutput.persistFailure")(
-            function* ({ details }) {
+            function* ({ details, annotations }) {
               const session = yield* Ref.modify(sessionRef, (current) => [current, Option.none()]);
               if (Option.isNone(session)) return;
-              yield* writeFailure(session.value, details);
+              yield* writeFailure(session.value, details, annotations);
             },
           ),
           discardSession: Ref.set(sessionRef, Option.none()),

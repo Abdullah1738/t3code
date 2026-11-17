@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
@@ -28,6 +29,10 @@ import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/Claud
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import { continueRestartedRun } from "../orchestration-v2/RestartContinuation.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
+import * as ProviderRuntimeRecovery from "../orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -47,6 +52,7 @@ import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -62,6 +68,14 @@ it.effect.each([
   "native_background",
   "external_interrupt",
   "restart_without_result",
+  "restart_failed_without_result",
+  "shutdown_narration",
+  "startup_narration",
+  "restart_narration_only",
+  "restart_missing_spawn_target_narration",
+  "restart_narration_item_only",
+  "restart_answer_with_narration",
+  "restart_unknown_phase_result",
   "restart_unstarted_followup",
   "restart_legacy_without_result",
   "restart_legacy_continuation_with_result",
@@ -154,8 +168,20 @@ it.effect.each([
         layerAdapters,
         { runEffectWorker: false },
       );
-      const layerOrchestration = Layer.merge(
+      const layerRecovery = ProviderRuntimeRecovery.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            layerOrchestrator,
+            ProjectionStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+            EffectOutbox.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+            IdAllocator.layer,
+            ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+          ),
+        ),
+      );
+      const layerOrchestration = Layer.mergeAll(
         layerOrchestrator,
+        layerRecovery,
         ThreadManagementService.layer.pipe(
           Layer.provide(layerOrchestrator),
           Layer.provide(ServerSettings.layerTest()),
@@ -264,8 +290,12 @@ it.effect.each([
           const before = yield* orchestrator.getThreadProjection(task.childThreadId!);
           const run = before.runs[0]!;
           const now = yield* DateTime.now;
+          const terminalStatus =
+            scenario === "restart_failed_without_result" ? "failed" : "cancelled";
           const hasResult =
             scenario === "restart_with_result" ||
+            scenario === "restart_answer_with_narration" ||
+            scenario === "restart_unknown_phase_result" ||
             scenario === "restart_disposed_queue" ||
             scenario === "restart_legacy_continuation_with_result";
           if (scenario === "external_interrupt") {
@@ -310,122 +340,236 @@ it.effect.each([
             }
             if (
               scenario === "restart_legacy_without_result" ||
+              scenario === "restart_missing_spawn_target_narration" ||
               scenario === "restart_legacy_continuation_with_result"
             )
               delete cutRun.delegatedTaskId;
+            if (scenario === "restart_missing_spawn_target_narration") {
+              const spawn = before.contextTransfers.find(
+                (transfer) => transfer.type === "subagent_spawn",
+              );
+              assert.isDefined(spawn);
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("legacy:missing-spawn-target"),
+                    type: "context-transfer.updated",
+                    threadId: task.childThreadId!,
+                    occurredAt: now,
+                    payload: { ...spawn!, targetRunId: null },
+                  },
+                ],
+              });
+            }
             const resultRunId =
               scenario === "restart_legacy_continuation_with_result"
                 ? RunId.make("run:legacy-continuation")
                 : run.id;
-            yield* sink.writeWithEffects({
-              commandId,
-              events: [
-                {
-                  id: EventId.make("restart-cancelled-turn"),
-                  type: "provider-turn.updated",
-                  threadId: task.childThreadId!,
-                  runId: run.id,
-                  occurredAt: now,
-                  payload: { ...childTurn, status: "cancelled", completedAt: now },
-                },
-                {
-                  id: EventId.make("restart-cancelled-child"),
-                  type: "run.updated",
-                  threadId: task.childThreadId!,
-                  runId: run.id,
-                  occurredAt: now,
-                  payload: {
-                    ...cutRun,
-                    status: "cancelled",
-                    completedAt: now,
+            if (scenario === "shutdown_narration" || scenario === "startup_narration") {
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("recovery:narration"),
+                    type: "message.updated",
+                    threadId: task.childThreadId!,
+                    runId: run.id,
+                    occurredAt: now,
+                    payload: {
+                      id: MessageId.make("message:recovery-narration"),
+                      threadId: task.childThreadId!,
+                      runId: run.id,
+                      nodeId: run.rootNodeId,
+                      role: "assistant",
+                      createdBy: "agent",
+                      creationSource: "provider",
+                      phase: "narration",
+                      text: "I am checking the remaining edge cases.",
+                      attachments: [],
+                      streaming: false,
+                      createdAt: now,
+                      updatedAt: now,
+                    },
                   },
-                },
-                ...(unstartedFollowup
-                  ? [
-                      {
-                        id: EventId.make("unstarted-followup:origin"),
-                        type: "thread.metadata-updated" as const,
-                        threadId: task.childThreadId!,
-                        occurredAt: now,
-                        payload: {
-                          ...before.thread,
-                          forkedFrom: {
-                            type: "node" as const,
-                            nodeId: NodeId.make("node:previous-task"),
+                ],
+              });
+              const recovery = yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService;
+              const summary = yield* recovery.reconcile(
+                scenario === "shutdown_narration" ? "shutdown" : "startup",
+              );
+              assert.equal(summary.terminalizedRuns, 2);
+              yield* recovery.reconcile("startup");
+              assert.equal(
+                (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!.status,
+                "cancelled",
+              );
+              const resumedParent = yield* turnRunning();
+              yield* orchestrator.dispatch({
+                type: "message.dispatch",
+                commandId: CommandId.make("resume-parent"),
+                threadId: parentThreadId,
+                messageId: MessageId.make("message:resume-parent"),
+                text: "Check the child after restart.",
+                attachments: [],
+                dispatchMode: { type: "start_immediately" },
+                createdBy: "user",
+                creationSource: "web",
+              });
+              yield* worker.drain();
+              yield* Fiber.join(resumedParent);
+            } else
+              yield* sink.writeWithEffects({
+                commandId,
+                events: [
+                  {
+                    id: EventId.make("restart-cancelled-turn"),
+                    type: "provider-turn.updated",
+                    threadId: task.childThreadId!,
+                    runId: run.id,
+                    occurredAt: now,
+                    payload: { ...childTurn, status: "cancelled", completedAt: now },
+                  },
+                  {
+                    id: EventId.make("restart-cancelled-child"),
+                    type: "run.updated",
+                    threadId: task.childThreadId!,
+                    runId: run.id,
+                    occurredAt: now,
+                    payload: {
+                      ...cutRun,
+                      status: terminalStatus,
+                      completedAt: now,
+                    },
+                  },
+                  ...(unstartedFollowup
+                    ? [
+                        {
+                          id: EventId.make("unstarted-followup:origin"),
+                          type: "thread.metadata-updated" as const,
+                          threadId: task.childThreadId!,
+                          occurredAt: now,
+                          payload: {
+                            ...before.thread,
+                            forkedFrom: {
+                              type: "node" as const,
+                              nodeId: NodeId.make("node:previous-task"),
+                            },
                           },
                         },
-                      },
-                      {
-                        id: EventId.make("unstarted-followup:previous-run"),
-                        type: "run.created" as const,
-                        threadId: task.childThreadId!,
-                        occurredAt: now,
-                        payload: {
-                          ...run,
-                          id: RunId.make("run:previous-task"),
-                          status: "completed" as const,
-                          delegatedTaskId: NodeId.make("node:previous-task"),
-                          completedAt: now,
+                        {
+                          id: EventId.make("unstarted-followup:previous-run"),
+                          type: "run.created" as const,
+                          threadId: task.childThreadId!,
+                          occurredAt: now,
+                          payload: {
+                            ...run,
+                            id: RunId.make("run:previous-task"),
+                            status: "completed" as const,
+                            delegatedTaskId: NodeId.make("node:previous-task"),
+                            completedAt: now,
+                          },
                         },
-                      },
-                    ]
-                  : []),
-                ...(scenario === "restart_legacy_continuation_with_result"
-                  ? [
-                      {
-                        id: EventId.make("legacy-continuation-cancelled"),
-                        type: "run.updated" as const,
-                        threadId: task.childThreadId!,
-                        occurredAt: now,
-                        payload: {
-                          ...cutRun,
-                          id: resultRunId,
-                          ordinal: 2,
-                          status: "cancelled" as const,
-                          restartContinuationOfRunId: run.id,
-                          completedAt: now,
+                      ]
+                    : []),
+                  ...(scenario === "restart_legacy_continuation_with_result"
+                    ? [
+                        {
+                          id: EventId.make("legacy-continuation-cancelled"),
+                          type: "run.updated" as const,
+                          threadId: task.childThreadId!,
+                          occurredAt: now,
+                          payload: {
+                            ...cutRun,
+                            id: resultRunId,
+                            ordinal: 2,
+                            status: "cancelled" as const,
+                            restartContinuationOfRunId: run.id,
+                            completedAt: now,
+                          },
                         },
-                      },
-                    ]
-                  : []),
-                ...(hasResult
-                  ? [
-                      {
-                        id: EventId.make("child-result"),
-                        type: "message.updated" as const,
-                        threadId: task.childThreadId!,
-                        runId: resultRunId,
-                        occurredAt: now,
-                        payload: {
-                          id: MessageId.make("message:child-result"),
+                      ]
+                    : []),
+                  ...(scenario === "restart_narration_item_only" ||
+                  scenario === "restart_answer_with_narration"
+                    ? [
+                        {
+                          id: EventId.make("narration-item"),
+                          type: "turn-item.updated" as const,
                           threadId: task.childThreadId!,
                           runId: resultRunId,
-                          nodeId: run.rootNodeId,
-                          role: "assistant" as const,
-                          createdBy: "agent" as const,
-                          creationSource: "provider" as const,
-                          text: "Partial review before restart",
-                          attachments: [],
-                          streaming: false,
-                          createdAt: now,
-                          updatedAt: now,
+                          occurredAt: now,
+                          payload: {
+                            id: TurnItemId.make("turn-item:narration"),
+                            threadId: task.childThreadId!,
+                            runId: resultRunId,
+                            nodeId: run.rootNodeId,
+                            providerThreadId: childTurn.providerThreadId,
+                            providerTurnId: childTurn.id,
+                            nativeItemRef: null,
+                            parentItemId: null,
+                            ordinal: 999,
+                            status: "completed" as const,
+                            title: null,
+                            startedAt: now,
+                            completedAt: now,
+                            updatedAt: now,
+                            messageId: MessageId.make("message:narration"),
+                            type: "assistant_message" as const,
+                            text: "I am checking the remaining edge cases.",
+                            phase: "narration" as const,
+                            streaming: false,
+                          },
                         },
-                      },
-                    ]
-                  : []),
-              ],
-              effects: [
-                {
-                  id: `effect:restart-continuation:${resultRunId}`,
-                  commandId,
-                  threadId: task.childThreadId!,
-                  request: { type: "provider-runtime.continue", sourceRunId: resultRunId },
-                },
-              ],
-            });
+                      ]
+                    : []),
+                  ...(hasResult ||
+                  scenario === "restart_narration_only" ||
+                  scenario === "restart_missing_spawn_target_narration"
+                    ? [
+                        {
+                          id: EventId.make("child-result"),
+                          type: "message.updated" as const,
+                          threadId: task.childThreadId!,
+                          runId: resultRunId,
+                          occurredAt: now,
+                          payload: {
+                            id: MessageId.make("message:child-result"),
+                            threadId: task.childThreadId!,
+                            runId: resultRunId,
+                            nodeId: run.rootNodeId,
+                            role: "assistant" as const,
+                            createdBy: "agent" as const,
+                            creationSource: "provider" as const,
+                            text: "Partial review before restart",
+                            phase:
+                              scenario === "restart_unknown_phase_result"
+                                ? undefined
+                                : scenario === "restart_narration_only" ||
+                                    scenario === "restart_missing_spawn_target_narration"
+                                  ? ("narration" as const)
+                                  : ("answer" as const),
+                            attachments: [],
+                            streaming: false,
+                            createdAt: now,
+                            updatedAt: now,
+                          },
+                        },
+                      ]
+                    : []),
+                ],
+                effects: [
+                  {
+                    id: `effect:restart-continuation:${resultRunId}`,
+                    commandId,
+                    threadId: task.childThreadId!,
+                    request: { type: "provider-runtime.continue", sourceRunId: resultRunId },
+                  },
+                ],
+              });
             const firstPoll = yield* service.taskStatus(scope, task.id);
-            assert.equal(firstPoll.status, hasResult ? "running" : "cancelled");
+            assert.equal(firstPoll.status, hasResult ? "running" : terminalStatus);
             assert.equal(firstPoll.workState, hasResult ? "working" : "result_available");
+            if (scenario === "restart_missing_spawn_target_narration")
+              assert.isNull(firstPoll.childRunId);
             if (!hasResult) {
               // The status was exposed before recovery published the task row.
               // A delayed restart must fence publication and decline admission.
@@ -474,21 +618,29 @@ it.effect.each([
             // Recovery must settle a resultless cancellation even while its old
             // continuation effect is still pending; a real result stays held.
             yield* orchestrator.recoverDelegatedTasks;
+            if (!hasResult) {
+              const recoveredTask = (yield* orchestrator.getThreadProjection(
+                parentThreadId,
+              )).subagents.find((entry) => entry.id === task.id)!;
+              assert.equal(recoveredTask.status, terminalStatus);
+              assert.isNotNull(recoveredTask.result);
+            }
           }
           const status = yield* service.taskStatus(scope, task.id);
           const held = hasResult;
           assert.equal(
             status.status,
-            held ? "running" : scenario === "external_interrupt" ? "interrupted" : "cancelled",
+            held ? "running" : scenario === "external_interrupt" ? "interrupted" : terminalStatus,
           );
           assert.equal(status.workState, held ? "working" : "result_available");
           assert.isNull(status.currentRunId);
           assert.isFalse(status.hasPendingChildRuns);
           assert.equal(
             status.latestTerminalStatus,
-            scenario === "external_interrupt" ? "interrupted" : "cancelled",
+            scenario === "external_interrupt" ? "interrupted" : terminalStatus,
           );
           if (held) assert.isNull(status.summary);
+          if (scenario === "restart_failed_without_result") return;
           if (scenario === "restart_without_result") {
             yield* continueRestartedRun({
               threadId: task.childThreadId!,

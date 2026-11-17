@@ -142,6 +142,7 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     installed=subprocess.run(command,env=env,capture_output=True,text=True,timeout=10)
     self.assertEqual(installed.returncode,0,installed.stderr)
     plist=home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist'
+    self.assertTrue(plist.exists(),installed.stdout+installed.stderr)
     original=plist.read_text()
     rendered=plistlib.loads(original.encode())
     collector=home/'.local/lib/mac-logging/collector.py'
@@ -151,6 +152,50 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     self.assertNotIn('__HOME__',original)
     def check():
      return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=10).returncode
+    self.assertEqual(check(),0)
+    wrapper=home/'.local/bin/mac-log-status'
+    self.assertEqual(wrapper.stat().st_mode & 0o777,0o755)
+    status=subprocess.run([str(wrapper),'--now','2026-11-15T12:00:00Z','--json'],env=env,capture_output=True,text=True,timeout=10)
+    self.assertEqual(status.returncode,1,status.stderr)
+    self.assertFalse(json.loads(status.stdout)['ok'])
+    self.assertEqual(len(json.loads(status.stdout)['jobs']),14)
+    self.assertIn('tailnet.sample',json.loads(status.stdout)['jobs'])
+    wrapper.chmod(0o644);self.assertNotEqual(check(),0);wrapper.chmod(0o755)
+    original_wrapper=wrapper.read_text()
+    wrapper.write_text('stale');self.assertNotEqual(check(),0);wrapper.write_text(original_wrapper)
+    self.assertEqual(check(),0)
+    wrapper.rename(wrapper.with_suffix('.saved'));self.assertNotEqual(check(),0)
+    wrapper.with_suffix('.saved').rename(wrapper)
+    deep_script=home/'.local/lib/mac-logging/deep_inventory.py'
+    deep_plist=home/'Library/LaunchAgents/com.abdullah.mac-deep-inventory.plist'
+    self.assertIn('deep_inventory.py',dry_run.stdout)
+    self.assertIn('com.abdullah.mac-deep-inventory.plist',dry_run.stdout)
+    self.assertNotIn('.local/share/memory-system',dry_run.stdout)
+    daily=plistlib.loads(deep_plist.read_bytes())
+    self.assertEqual(daily['StartCalendarInterval'],dict(Hour=3,Minute=30))
+    self.assertNotIn('LowPriorityIO',daily)
+    self.assertEqual(daily['ProcessType'],'Standard')
+    self.assertEqual(daily['Nice'],10)
+    self.assertEqual(daily['ProgramArguments'],['/bin/zsh','-c',f'exec /usr/bin/python3 "{deep_script}"'])
+    memory_script=home/'.local/lib/mac-logging/memory.py'
+    memory_plist=home/'Library/LaunchAgents/com.abdullah.mac-memory.plist'
+    self.assertIn('memory.py',dry_run.stdout)
+    self.assertIn('com.abdullah.mac-memory.plist',dry_run.stdout)
+    memory=plistlib.loads(memory_plist.read_bytes())
+    self.assertEqual(memory['StartInterval'],300)
+    self.assertEqual(memory['ProgramArguments'],['/bin/zsh','-c',f'exec /usr/bin/python3 "{memory_script}"'])
+    tailnet_script=home/'.local/lib/mac-logging/tailnet.py'
+    tailnet_plist=home/'Library/LaunchAgents/com.abdullah.mac-tailnet.plist'
+    minute=plistlib.loads(tailnet_plist.read_bytes())
+    self.assertEqual(minute['StartInterval'],60)
+    self.assertEqual(minute['ProgramArguments'],['/bin/zsh','-c',f'exec /usr/bin/python3 "{collector}" --tailnet'])
+    self.assertEqual(tailnet_script.read_bytes(),(HERE/'tailnet.py').read_bytes())
+    for target in (deep_script,deep_plist,memory_script,memory_plist,tailnet_script,tailnet_plist):
+     saved=target.read_bytes()
+     target.chmod(0o644);self.assertNotEqual(check(),0);target.chmod(0o600)
+     target.write_text('stale');self.assertNotEqual(check(),0);target.write_bytes(saved)
+     missing=target.with_suffix('.saved')
+     target.rename(missing);self.assertNotEqual(check(),0);missing.rename(target)
     self.assertEqual(check(),0)
     plist.chmod(0o644);self.assertNotEqual(check(),0);plist.chmod(0o600)
     plist.write_text('stale');self.assertNotEqual(check(),0);plist.write_text(original)

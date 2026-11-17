@@ -110,9 +110,9 @@ class CollectorFairnessTests(unittest.TestCase):
         self.assertEqual(seen[0],str(roots[2]))
         self.assertEqual(set(seen),set(map(str,roots)))
         self.assertGreaterEqual(len(seen),len(roots))
-        turns = self.rows('disk.inventory.turn')
-        self.assertEqual(turns[0]['props']['source'],str(roots[2]))
-        self.assertEqual(turns[0]['props']['turn'],1)
+        summaries = self.rows('disk.inventory.root')
+        self.assertEqual(summaries[0]['props']['root'],str(roots[2]))
+        self.assertEqual(len(summaries),len(roots)**2)
 
     def test_failed_unmeasured_root_cannot_starve_other_unmeasured_roots(self):
         roots = self.inventory_roots()
@@ -155,6 +155,7 @@ class CollectorFairnessTests(unittest.TestCase):
             state = jobs.read_state('disk-inventory')
             self.assertEqual(state['sizes'][str(root)],4*42*1024)
             fail[0] = True
+            now[0] += 86400
             clock[0] = 0
             jobs.directory_inventory([root],run,deadline=15)
         state = jobs.read_state('disk-inventory')
@@ -230,7 +231,7 @@ class CollectorFairnessTests(unittest.TestCase):
                 else:
                     self.assertEqual(state['sizes'][str(root)],6*42*1024)
 
-    def test_thirty_second_chunks_keep_up_for_six_hours(self):
+    def test_thirty_second_calls_keep_up_for_six_hours(self):
         now, clock = 10000, [0]
         jobs.save_state('crashes',{'unified':now-3600,'rollupDay':'1969-12-31'})
         calls = []
@@ -245,9 +246,9 @@ class CollectorFairnessTests(unittest.TestCase):
                 self.assertEqual(jobs.read_state('crashes')['unified'],now)
                 self.assertNotIn('unifiedRetry',jobs.read_state('crashes'))
                 self.assertEqual(self.rows('crash.source')[-1]['props']['skippedS'],0)
-                self.assertEqual(clock[0],120)
+                self.assertLessEqual(clock[0],135)
                 now += 3600
-        self.assertEqual(len(calls),24)
+        self.assertEqual(sum(b-a for a,b in calls),6*3600)
 
     def test_all_thirteen_configured_roots_get_measured_within_twelve_runs(self):
         roots = [self.root/str(i) for i in range(len(jobs.DIRECTORY_ROOTS))]

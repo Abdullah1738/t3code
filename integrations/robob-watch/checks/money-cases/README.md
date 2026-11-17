@@ -4,7 +4,18 @@ One place for open money cases (refunds, disputes, failed or unexpected charges,
 
 The code lives here. The cases live in `~/Documents/assistant/money-cases/cases.json` (mode 600), never in git.
 
+Orders registered with `order-watch --amount ... --card LAST4` are checked on
+the first scheduled tick at least 15 minutes after placement. Missing bank
+evidence opens one `charge_unconfirmed` case per order, separate from unexplained
+charges. A matching bank SMS/email (merchant, card, currency, amount and placement
+window) closes it, including after tracker removal. Same-amount nearby orders
+remain unconfirmed when allocation is ambiguous. Archive failures retain the
+unconfirmed state; they never prove a payment failed. This needs both the
+app-api-cli deployment and the money-cases installer after approval.
+
 The check stops itself at 40 seconds, below the runner's 60-second timeout; `pings.json` records phase times, lookup and owner-query counts, msgs calls and the slowest phase in `timing`, also printed to stderr for runs over 20 seconds or when the final save times out (the previous pings file stays intact and no event is emitted). Timing in pings is sampled after the data fsync; stderr timing also includes the final timing-footer flush. The check uses null stdin for msgs and dumps a traceback and exits at 48 seconds if normal deadline handling cannot interrupt a hung C call (`MONEY_CASES_HARD_STOP` overrides this interval for subprocess tests). It reads owner messages through Robob's control API.
+
+Each check appends timing, owner-read counts/results and up to ten diagnostic errors (300 characters each) to `runs.jsonl` beside `pings.json` in the watcher directory, outside DATA. Free-form error details are omitted to keep message text and credentials out. Appends have a 40 ms budget, never fail the check, and count failures in `history_append_errors` for the process and runner stderr. A nonblocking `runs.lock` protects rotation, and the next append repairs an interrupted last line. The file rotates before exceeding 2 MiB, keeping `runs.jsonl.1`; installs preserve both. `money-cases runs --since 24h` (or `--json`, with a duration or timezone-aware ISO `--since`) reads both files and reports counts, runs over 40 seconds, p50/p95/max seconds (linearly interpolated percentiles), slowest phases, owner results and grouped errors. Corrupt lines are counted and skipped. Budget and iCloud skips are recorded; a hard stop in a hung C call cannot safely append Python diagnostics.
 
 ## Use
 
@@ -44,6 +55,8 @@ Rules added 2026-10-30 (money-cases fixes, card #10):
 - **Charges are never merged or split silently.** A new charge with the same merchant, amount, currency, day and kind as a recorded one is refused, and the refusal names the candidate. The caller decides: `--repeat ID` if it is the same charge (seen again, a note is added to that case), or `--distinct` if it is a second transaction. Free-form references such as "email 09:13" describe where a charge was seen, so they never tell two charges apart. An unmatched charge is never a candidate.
 - **Build once, acknowledge delivery separately.** Event keys and the case’s daily cap are recorded in `built` before the check prints an event; they suppress another build even if the runner never accepts or acknowledges it. Existing outbox keys migrate on the first check. Delivery still controls the reminder clock: The runner acks a run before it delivers the event and may retry it later or the next day. A reminder is recorded as sent, and it counts toward the one-a-day cap and starts the two-day clock, only when the runner's `state.json` confirms delivery (`fires` rose and `last_fire_at` is the delivery time). An event the runner owns stays pending; a lost event releases the outbox, while its keys remain consumed.
 - **Holds.** A pre-auth hold (`--kind hold`) that drops off is closed as `released`, not `refunded`.
+- A merchant mail after the case's last edit saying a refund was processed holds the dispute deadline until mail time + 7 days (or the existing later deadline) and tells him once; any negation in the merchant's own text blocks the hold.
+- A hold requires a direct completed-refund statement; questions, confirmation requests, and future or conditional processing do not qualify. Ambiguous proof-led wording keeps the existing deadline. Past approval timing before or after the confirmation, or a later card-credit estimate, does not cancel completed evidence. A trailing receipt or help question can be ignored after an affirmative statement.
 - **No guesses.** A charge whose merchant or order can't be matched is `unmatched`, never named by a guess.
 
 ## Saved merchant cards
@@ -84,6 +97,8 @@ The initial payment alert and reminders go alone through the existing outbox: on
 
 ## Charge questions
 
+- A decline closes as paid after decline when a charge with the same card, merchant, currency and amount follows within 60 minutes.
+
 Before anyone asks him about a card charge (owner rule, nightly review 24 Oct; his words that day: "Wait for the email"), `money-cases ask` decides whether to ask:
 
 ```sh
@@ -94,19 +109,33 @@ money-cases answered q-1a2b3c4d --note "his order"
 money-cases questions [--all] [--json]
 ```
 
-`charges.py` reads ENBD, Emirates Islamic, ADCB, Wio and Mashreq charge and decline alerts. A charge is explained by a receipt mail that shows the amount as money in the charge's currency and reads as a receipt or order, and either names the merchant (from two hours before through 36 hours after the alert) or shows the card's last four digits within 15 minutes of it. Something he typed in his own Robob threads within 30 minutes of it also explains it when one statement names the merchant and says he paid, ordered or owns it (and any amount in it is the charge's), unless the message denies, questions or hedges it. Only his typing counts: app turns, and iMessage turns that relay a real inbound message; scheduled runs, notifications, watcher and bridge wakes, coord and crw turns never do. A merchant that mailed him receipts before, or a pending hold from a merchant his bank alerts show, waits up to 36 hours for the receipt. Declines on his cards go to him. `ask` needs the alert's own time (`--at`) so the same alert stays one question; it exits 0 and counts the ask only when he should be asked, allows one re-ask 24 hours later, and a third ask instead opens a money case. Exit 3 says why not. Exit 4 prints `UNVERIFIED: source <name> unreadable` for each failed source and does not count an ask. `answered` on a question that became a case notes his answer on the case and leaves it open.
+`charges.py` reads ENBD, Emirates Islamic, ADCB, Wio and Mashreq charge and decline alerts. A charge is normally explained by a receipt mail that shows the amount as money in the charge's currency and reads as a receipt or order, and either names the merchant (from two hours before through 36 hours after the alert) or shows the card's last four digits within 15 minutes of it. Something he typed in his own Robob threads within 30 minutes of it also explains it when one statement names the merchant and says he paid, ordered or owns it (and any amount in it is the charge's), unless the message denies, questions or hedges it. Only his typing counts: app turns, and iMessage turns that relay a real inbound message; scheduled runs, notifications, watcher and bridge wakes, coord and crw turns never do. A merchant that mailed him receipts before, or a pending hold from a merchant his bank alerts show, waits up to 36 hours for the receipt. Declines on his cards go to him. `ask` needs the alert's own time (`--at`) so the same alert stays one question; it exits 0 and counts the ask only when he should be asked, allows one re-ask 24 hours later, and a third ask instead opens a money case. Exit 3 says why not. Exit 4 prints `UNVERIFIED: source <name> unreadable` for each failed source and does not count an ask. `answered` on a question that became a case notes his answer on the case and leaves it open.
+
+Uber pending holds can match a receipt from Uber within two hours: its total, or its total before an explicit wait-time fee, within 1% capped at AED 1. Boat and Browser Use AED charges can match a branded USD receipt's amount paid at the AED peg plus up to 4% bank markup. A receipt compatible with another charge stays ambiguous, including when the amounts differ.
 
 Owner-thread evidence comes from Robob's control API, using
 `T3_CONTROL_TOKEN_FILE`, the watchers component credential, or
 `~/.robob/ardud-control.json`. The server must supply message provenance
 (`automated` and `inboundMessageId`); an older server or a failed/timed-out
 lookup supplies no owner evidence and records a lookup error. There is no
-SQLite fallback. The per-check union-window fetch is capped at four seconds
-and the remaining check budget; `timing.owner_queries` counts HTTP requests.
+SQLite fallback. The per-check union-window fetch runs before receipt and order
+lookups in `follow()`, capped at ten seconds of the remaining check budget and
+three seconds per request. `timing.owner_queries` counts HTTP requests;
+`owner_result` reports complete coverage (`ok`), a partial refresh (`incomplete`),
+or a failed thread listing (`list_failed`). Partial refreshes save cache progress
+and supply no owner evidence.
 
 Inbox triage runs every card alert it sees through the same checks before its classifier, holds a fresh charge alert for five minutes in case its receipt comes with it, and sends every charge nothing explains on to the agent even when the classifier skips it. The SMS and the bank's mail copy of one charge are one question; two alerts of the same amount on the same channel are two. The check follows open questions each run, least recently checked first: it closes them when a receipt lands (and says so once if he was asked), routes expired waits to the daily list and retains asked questions as awaiting_answer without an age cutoff. Older linked money cases still accept receipt matches, closing a case nobody has touched when the receipt comes. Asked questions have no age cutoff. A receipt compatible with multiple distinct charge questions stays ambiguous; a historical receipt found later still counts when its timestamp uniquely matches the original charge window. Questions live in `questions.json` next to the cases. Runs outside the live watcher (`robob-watch test`, other `WATCH_DIR`s) work on a copy of the case, question and dead-card books in their own folder.
 
 ## Install or update
+
+Marketplace coverage comes from `marketplace-placements.json`, refreshed outside the check's budget. To prime it after installation, run the installed reader with the account-reader Python:
+
+```sh
+~/.local/share/uv/tools/mitmproxy/bin/python -I -B ~/.local/share/robob-watch/watchers/money-cases/order_lookup.py refresh-marketplace --data ~/Documents/assistant/money-cases --budget 180
+```
+
+The command prints counts and a result. `end_of_history` means the full cursor chain and every placement were read. Checks launch a detached refresh once the snapshot is ten minutes old; simultaneous refreshes exit `busy`. An incomplete snapshot cannot prove absence. A charge whose match window ends after the snapshot's walk began stays limited as `marketplace_stale`; a placement near an order not proven delivered stays limited as `marketplace_hold`.
 
 From this directory run `/usr/bin/python3 -B install.py`. It copies the named source files into `~/.local/share/robob-watch/watchers/money-cases/`, links `~/.local/bin/money-cases` to the live `cases.py` and registers `watcher.json` (paused while it holds `check.lock`, resumed afterwards). It keeps the case data, `pings.json`, the lock inode and the live pause state and session. Until the resume succeeds, the intended pause state is kept in `.install-paused`, so a rerun finishes a failed resume; `install.lock` keeps a second install out until the first has resumed. No service restart is needed.
 
@@ -157,3 +186,59 @@ The command screens receipts, orders, purchase notes and subscriptions before li
 After installing this fix, run `money-cases migrate-legacy-asks --dry-run`, review the list, then run `money-cases migrate-legacy-asks` once. It seeds the existing ask marker on open non-bill cases from the original daily list whose current cycle started before 13 Nov 2026 04:25Z, plus four verified legacy cases. Age and receipt-wait eligibility are frozen at that cutoff. It preserves their status; historical notifications do not become pending questions. Repeating it makes no further changes. Existing asks and answered state prevent another daily first ask, including linked questions and structured owner answers.
 
 Declined daily items retain a reason until their revision, cycle or charge evidence changes. Receipt waits resume at their expiry; timeouts and unreadable lookups can be retried. Cases without usable card evidence or a matching charge date are excluded from the daily count.
+
+## iCloud downloads
+
+DATA stays at `~/Documents/assistant/money-cases` (or `MONEY_CASES_DIR`).
+Book and cache reads, lock opens/flocks, and atomic writes retry EDEADLK after
+one bounded `brctl download` attempt. Backoffs and the download share the
+remaining check/phase deadline. Other I/O errors keep their existing behavior.
+An unreadable dependency aborts before any further save; it is never treated as
+an empty book. Temporary JSON files are renamed only after a complete write.
+
+The runner counts **every nonzero exit**, including 75, as a failure. There is no
+skip code. On EDEADLK exhaustion, `check` therefore prints one diagnostic line
+and returns 0 with no event. It retains pings.json and its outbox. The runner
+advances its acknowledgement; the next check resumes from money-cases' retained
+state. The existing busy-check.lock exit 75 is unchanged. Other CLI commands
+return 75 for an unavailable data file.
+
+Each skip records `skip_streak`, `first_skip_at` / `last_skip_at` (Unix seconds),
+`last_file`, `edeadlk_retries` and `edeadlk_ms` in `data-skips.json` in WATCH_DIR,
+**outside DATA**. A streak at least two hours old exits 1 to trigger the normal
+failure/alert path. A clean run removes that file and records the preceding
+streak as `timing.edeadlk_skips_before`. Successful pings.json timing also includes
+`edeadlk_retries`, `edeadlk_ms`, and a metadata-only startup `dataless_files` count
+(SF_DATALESS, 0x40000000); those counters are allowed in check.run tool logs too.
+
+### Keep Downloaded
+
+Every install attempts the idempotent pin, without failing the install when
+pinning fails. Run `money-cases pin` to retry, or `money-cases pin --check` for
+FileProvider's pin state and current dataless count. No data path changes.
+
+Verified on macOS 27.0.1 (26A434), 16 Nov 2026, in disposable folders under
+Documents, removed afterwards:
+
+```
+xattr -w 'com.apple.fileprovider.pinned#PX' 1 <folder>
+fileproviderctl evaluate <folder>
+```
+
+FileProvider processes this asynchronously. The installer waits up to eight
+seconds after setting the attribute and only reports `pinned` when
+`fileproviderctl evaluate` reports `isKeepDownloaded = 1;`. A repeated install
+reports `already pinned` only after the same confirmation. A written xattr alone
+is insufficient: the unsuffixed `com.apple.fileprovider.pinned` test did **not**
+report Keep Downloaded. The pinned folder's child also reported
+`isKeepDownloaded = 1;`; an unpinned control reported 0. `brctl evict <child>`
+refused eviction with NSFileProviderErrorDomain -2008 and the file remained
+materialized. The newly created, not-yet-uploaded control was also refused, so
+that refusal alone does not establish the cause. FileProvider's affirmative
+Keep Downloaded state is the verification used by the CLI and installer.
+`brctl` and `fileproviderctl` help list no pin subcommand on this OS. The xattr
+interface is not an Apple-supported public pin API, so failed or changed behavior
+is reported, never assumed successful.
+
+Sources: [Apple's Keep Downloaded guide](https://support.apple.com/guide/mac-help/work-with-folders-and-files-in-icloud-drive-mchl1a02d711/mac)
+and [the FileProvider/xattr investigation](https://eclecticlight.co/2026/10/13/pin-files-in-icloud-drive/).

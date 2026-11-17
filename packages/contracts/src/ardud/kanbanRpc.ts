@@ -64,6 +64,8 @@ export const KANBAN_WS_METHODS = {
   wiki: "kanban.wiki",
   boardCreate: "kanban.board.create",
   boardUpdate: "kanban.board.update",
+  boardPurge: "kanban.board.purge",
+  standingApprovalRevoke: "kanban.board.standing-approval.revoke",
   setupStart: "kanban.setup.start",
   setupEnd: "kanban.setup.end",
   boardPause: "kanban.board.pause",
@@ -118,6 +120,7 @@ export type KanbanCardPatchInput = typeof KanbanCardPatchInput.Type;
 
 export const KanbanBoardUpdateInput = Schema.Struct({
   boardId: KanbanBoardId,
+  archived: Schema.optional(Schema.Boolean),
   name: Schema.optional(Schema.String),
   icon: Schema.optional(Schema.NullOr(KanbanBoardIcon)),
   iconImage: Schema.optional(Schema.NullOr(KanbanBoardIconImage)),
@@ -210,6 +213,16 @@ export const KanbanRpcs = RpcGroup.make(
     KanbanBoard,
   ),
   call(M.boardUpdate, KanbanBoardUpdateInput, KanbanBoard),
+  call(M.boardPurge, BoardRef, Schema.Void),
+  call(
+    M.standingApprovalRevoke,
+    Schema.Struct({
+      boardId: KanbanBoardId,
+      id: TrimmedNonEmptyString,
+      reason: TrimmedNonEmptyString,
+    }),
+    KanbanBoard,
+  ),
   call(
     M.setupStart,
     Schema.Struct({
@@ -329,6 +342,8 @@ export const KANBAN_READ_SCOPES = {
 export const KANBAN_GUARDED_SCOPES = {
   [M.boardCreate]: AuthOrchestrationOperateScope,
   [M.boardUpdate]: AuthOrchestrationOperateScope,
+  [M.boardPurge]: AuthOrchestrationOperateScope,
+  [M.standingApprovalRevoke]: AuthOrchestrationOperateScope,
   [M.setupStart]: AuthOrchestrationOperateScope,
   [M.setupEnd]: AuthOrchestrationOperateScope,
   [M.boardPause]: AuthOrchestrationOperateScope,

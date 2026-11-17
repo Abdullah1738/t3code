@@ -36,7 +36,16 @@ export class ImessageSendService extends Context.Service<
 >()("t3/ardud/imessage/ImessageSendService") {}
 
 const failure = (code: OrchestratorMcpFailure["code"], message: string) =>
-  new OrchestratorMcpFailure({ code, message });
+  new OrchestratorMcpFailure({
+    reason:
+      code === "invalid_request"
+        ? "invalid_args"
+        : code === "capability_denied"
+          ? "imessage_thread_required"
+          : undefined,
+    code,
+    message,
+  });
 
 /**
  * The thread whose chat a caller serves: its root when the root has the
@@ -153,7 +162,7 @@ const make = Effect.gen(function* () {
         "The iMessage bridge CLI returned an unexpected reply; the message may still have been queued.",
       );
     }
-    return { id: ack.id, created: ack.created, chat: input.to ?? "owner" };
+    return { id: ack.id, created: ack.created, chat: ack.chat ?? input.to ?? "unknown" };
   });
 
   return ImessageSendService.of({ send });

@@ -356,6 +356,14 @@ describe("CLI entry point (no live socket)", () => {
   const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
   const directory = fileURLToPath(new URL("../src", import.meta.url));
 
+  test("keeps database filename markers out of CLI source", async () => {
+    // The harness statev2 guard scans script source, even when the command never opens a database.
+    const source = await fs.readFile(cli, "utf8");
+    for (const marker of ["state.sqlite", "statev2", "opencode.db"]) {
+      expect(source).not.toContain(marker);
+    }
+  });
+
   test.each([
     { args: ["health", "--private-value"], socket: cli, error: "Invalid command arguments" },
     { args: ["health"], socket: cli, error: "Bridge socket must be a Unix socket, not a file or symlink" },
@@ -388,6 +396,20 @@ describe("guest-allow", () => {
   });
 });
 
+test("message length errors name actual length, limit and a recovery", () => {
+  const cases: [string[], number][] = [
+    [["send", "--session", "s", "--key", "k"], 12_000],
+    [["send", "--to", "moni", "--session", "s", "--key", "k"], 12_000],
+    [["wake", "--source", "watch", "--key", "k"], 12_000],
+    [["guest-send", "--address", "+15555550199", "--session", "s", "--key", "k"], 2_000],
+  ];
+  for (const [args, limit] of cases) {
+    const actual = limit + 412;
+    expect(() => parseCommand([...args, "--text", "x".repeat(actual)])).toThrow(
+      `message too long: ${actual.toLocaleString("en-US")} chars, limit ${limit.toLocaleString("en-US")}; split it or send as a card`);
+  }
+});
+
 test("log-rollup is local, validates UTC dates and rolls up fixture input", async () => {
   const { parseLocalCommand, runLocalCommand, isLocalCommand } = await import("../src/cli.ts");
   const { captureLogs } = await import("./log-fixture.ts");
@@ -405,6 +427,43 @@ test("log-rollup is local, validates UTC dates and rolls up fixture input", asyn
   for (const ms of ["-1", "NaN", "Infinity", ""]) expect(() => parseLocalCommand(["log-card-render", "--kind", "quick", "--ms", ms, "--ok", "true"])).toThrow();
 });
 
+test("log-rollup excludes calls buffered before captureLogs", async () => {
+  const { parseLocalCommand, runLocalCommand } = await import("../src/cli.ts");
+  const { captureLogs } = await import("./log-fixture.ts");
+  const { toolLog } = await import("../src/toollog.ts");
+  toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: 5, ok: true,
+    props: { method: "GET", route: "/health" } });
+  const logs = await captureLogs(async () => {
+    toolLog.write({ component: "cli-fixture", kind: "event", name: "msg.received" });
+    const day = new Date().toISOString().slice(0, 10);
+    expect(await runLocalCommand(parseLocalCommand(["log-rollup", "--day", day]))).toMatchObject({ total: 1, day });
+  });
+  expect(logs.map(line => line.name)).toEqual(["msg.received"]);
+});
+
+test.each([false, true])("captureLogs drains action calls before restoring its directory (throws=%s)", async throws => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const { toolLog } = await import("../src/toollog.ts");
+  const failure = new Error("fixture action failed");
+  const outer = process.env.TOOLLOG_DIR;
+  const logs = await captureLogs(async () => {
+    const inner = captureLogs(async () => {
+      toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: 5, ok: true,
+        props: { method: "GET", route: "/health" } });
+      if (throws) throw failure;
+    });
+    if (throws) await expect(inner).rejects.toBe(failure);
+    else {
+      const captured = await inner;
+      expect(captured.map(line => line.name)).toEqual(["turn.robob_calls"]);
+      expect(captured[0]?.calls?.health.count).toBe(1);
+    }
+    toolLog.write({ component: "cli-fixture", kind: "event", name: "msg.received" });
+  });
+  expect(logs.map(line => line.name)).toEqual(["msg.received"]);
+  expect(process.env.TOOLLOG_DIR).toBe(outer);
+});
+
 test("nutrition's live-only renderer is observed at file preparation, on success and failure", async () => {
   const { captureLogs } = await import("./log-fixture.ts");
   const root = await fs.mkdtemp(join(os.tmpdir(), "nutrition-log-fixture-"));
@@ -415,7 +474,59 @@ test("nutrition's live-only renderer is observed at file preparation, on success
       await loadCommandPayload(parseCommand(["send-file", "--file", path, "--session", "fixture-session", "--key", "nutrition-fixture"]));
       await expect(loadCommandPayload(parseCommand(["send-file", "--file", join(root, "nutrition-missing.png"), "--session", "fixture-session", "--key", "missing-fixture"]))).rejects.toThrow();
     });
-    expect(logs.filter(l => l.name === "card.render").map(l => [l.component, l.ok, l.props?.cardKind])).toEqual([["card-file", true, "nutrition"], ["card-file", false, "nutrition"]]);
+    expect(logs.filter(l => l.name === "card.render" || l.name === "card.renders").map(l => [l.component, l.ok, l.props?.cardKind]).sort((a, b) => Number(b[1]) - Number(a[1]))).toEqual([["card-file", true, "nutrition"], ["card-file", false, "nutrition"]]);
     expect(JSON.stringify(logs)).not.toContain("PRIVATE_HEALTH_IMAGE");
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+describe("agent bus commands", () => {
+  const request = `areq_${"a".repeat(64)}`;
+  test("builds ask, parent ask, answer statuses and requests without changing text", () => {
+    const args = ["agent-ask", "--to", "moni", "--text", "  question\nline  ", "--session", "ses_1", "--key", "k"];
+    expect(parseCommand(args)).toEqual({ method: "POST", path: "/agent-ask",
+      body: { to: "moni", text: "  question\nline  ", sessionId: "ses_1", dedupeKey: "k" } });
+    expect(parseCommand([...args, "--parent", request]).body?.parent).toBe(request);
+    const answer = ["agent-answer", "--request", request, "--text", "answer", "--session", "ses_1"];
+    expect(parseCommand(answer)).toEqual({ method: "POST", path: "/agent-answer",
+      body: { request, text: "answer", sessionId: "ses_1" } });
+    for (const status of ["pending", "done", "declined"]) expect(parseCommand([...answer, "--status", status]).body?.status).toBe(status);
+    expect(parseCommand(["agent-requests", "--session", "ses_1"])).toEqual({ method: "POST", path: "/agent-requests", body: { sessionId: "ses_1" } });
+  });
+  test("requires sessions and ask keys; rejects invalid ids, status, slugs and lengths", () => {
+    for (const args of [
+      ["agent-ask", "--to", "owner", "--text", "q", "--key", "k"],
+      ["agent-ask", "--to", "owner", "--text", "q", "--session", "s"],
+      ["agent-answer", "--request", request, "--text", "a"], ["agent-requests"],
+      ["agent-ask", "--to", "Not A Slug", "--text", "q", "--session", "s", "--key", "k"],
+    ]) expect(() => parseCommand(args)).toThrow();
+    for (const command of ["agent-ask", "agent-answer"]) {
+      const base = command === "agent-ask" ? [command, "--to", "owner", "--key", "k"] : [command, "--request", request];
+      for (const text of ["", "  ", "x".repeat(12_001)]) expect(() => parseCommand([...base, "--text", text, "--session", "s"])).toThrow();
+      expect(parseCommand([...base, "--text", "x".repeat(12_000), "--session", "s"]).path).toBe(`/${command}`);
+    }
+    for (const bad of ["bad", "areq_", `areq_${"a".repeat(65)}`, `areq_${"A".repeat(64)}`, request + "\n"]) {
+      expect(() => parseCommand(["agent-answer", "--request", bad, "--text", "a", "--session", "s"])).toThrow("Invalid --request");
+      expect(() => parseCommand(["agent-ask", "--to", "owner", "--text", "a", "--session", "s", "--key", "k", "--parent", bad])).toThrow("Invalid --parent");
+    }
+    expect(() => parseCommand(["agent-answer", "--request", request, "--text", "a", "--session", "s", "--status", "timed_out"])).toThrow("Invalid --status");
+  });
+});
+
+describe("notify-rule commands", () => {
+  test("parses add/list/remove with a required session", () => {
+    expect(parseCommand(["notify-rule", "add", "--text", "tell me when Moni orders", "--session", "s"]))
+      .toEqual({ method: "POST", path: "/notify-rule", body: { action: "add", text: "tell me when Moni orders", sessionId: "s" } });
+    expect(parseCommand(["notify-rule", "list", "--session=s"]))
+      .toEqual({ method: "POST", path: "/notify-rule", body: { action: "list", sessionId: "s" } });
+    expect(parseCommand(["notify-rule", "rm", "--id=123", "--session=s"]))
+      .toEqual({ method: "POST", path: "/notify-rule", body: { action: "rm", id: 123, sessionId: "s" } });
+  });
+  test("rejects missing sessions, malformed ids/text, and unrelated options", () => {
+    for (const args of [["add", "--text=x"], ["list"], ["rm", "--id=1"]]) expect(() => parseCommand(["notify-rule", ...args])).toThrow("--session");
+    for (const args of [[], ["unknown"], ["add"], ["add", "--text="], ["add", "--text=x\ny"], ["add", `--text=${"x".repeat(2001)}`],
+      ["add", "--text=x", "--id=1"], ["list", "--text=x"], ["list", "--id=1"], ["list", "extra"], ["rm"],
+      ...["0", "-1", "1.5", "01", "1e3", "9007199254740992"].map(id => ["rm", `--id=${id}`]), ["rm", "--id=1", "--text=x"]]) {
+      expect(() => parseCommand(["notify-rule", ...args, "--session=s"])).toThrow();
+    }
+  });
 });

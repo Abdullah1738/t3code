@@ -1,8 +1,9 @@
-import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, mkdtempSync, openSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, mkdtempSync, openSync, readdirSync, statSync, renameSync, rmSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { constants } from "node:os";
+import { safeDependency } from "./cause.ts";
 
 export type LogEntry = {
   component: string; kind: "event" | "perf" | "error"; name: string;
@@ -10,19 +11,26 @@ export type LogEntry = {
   error?: { tag: string; message?: string };
 };
 const token = /^[a-zA-Z][a-zA-Z0-9_.-]{0,79}$/;
-const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper"]);
-const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources"]);
-const boolean = new Set(["deduped", "accepted", "timedOut", "notified"]);
+const idKeys = new Set(["watcher", "run", "thread", "chat", "key", "operation", "reminder", "update", "item", "helper", "meantFor"]);
+const numeric = new Set(["exitCode", "attempt", "count", "threshold", "failures", "bytes", "queuedMs", "failedSources", "totalSources", "events", "waitMs", "spanMs", "graceMs", "relays", "slotWaitMs", "slotQueueDepth", "slotActiveAtEnqueue", "startLateMs", "intervalMs", "depth", "oldestWaitMs", "active", "cap"]);
+const boolean = new Set(["deduped", "accepted", "timedOut", "notified", "batched", "urgent", "closing", "archived", "frozenContext", "batchOpen", "grace"]);
 const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
-  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout"],
-  source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored"],
+  severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy"],
+  source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored", "logged"],
+  authKind: ["otp", "signin_link"],
+  senderLabel: ["Emirates NBD", "Emirates Islamic", "Mashreq", "ADCB", "Wio", "Apple", "Google", "WHOOP", "Claude", "Virgin", "e&", "du", "your bank", "an inbox sender"],
   class: ["urgent", "today", "info", "noise", "candidate", "charge", "bank", "security", "otp", "unknown", "fail_open", "deduped"],
   action: ["create", "queue", "cancel", "snooze", "sent", "retry", "check", "wake", "notify", "send", "coalesce", "conflict", "expire", "pause", "remove", "cap", "resume"],
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
-  stderrClass: ["usage_error", "missing_file", "permission", "timeout", "python_traceback", "auth", "connect", "json", "unknown"],
+  stderrClass: ["usage_error", "missing_file", "permission", "timeout", "dependency_busy", "python_traceback", "auth", "connect", "json", "unknown"],
   triggerKind: ["file", "wal"],
+  step: ["native", "status", "send"],
+  route: ["person", "owner", "group", "creator", "other", "thread", "unverified", "refused"],
+  via: ["wake", "thread", "imessage-send", "telegram", "none", "wake:owner-fallback", "native:pending"],
+  confirmed: ["pending", "n/a"],
+  operation: ["check", "pending"],
 };
 let testRoot: string | undefined;
 export const logDirectory = () => {
@@ -37,23 +45,55 @@ export const logDirectory = () => {
 const initialized = new Set<string>();
 const CAP = 50 * 1024 * 1024;
 
+function logId(key: string, value: string | number): string {
+  const text = String(value);
+  // Names are needed for nightly attribution; arbitrary correlation IDs may contain private text.
+  return (key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(text) && !/\d{5}/.test(text)
+    ? text : createHash("sha256").update(text).digest("hex").slice(0, 24);
+}
+
 function fields(entry: LogEntry, at: Date) {
   if (!token.test(entry.component) || !token.test(entry.name) || !["event", "perf", "error"].includes(entry.kind)) return undefined;
+  const marker = entry.name === "deploy.marker" ? markerProps(entry.props) : undefined;
+  if (entry.name === "deploy.marker" && (!marker || entry.kind !== "event")) return undefined;
   const ids: Record<string, string> = {};
-  for (const [key, value] of Object.entries(entry.ids ?? {})) {
-    if (!idKeys.has(key) || !["string", "number"].includes(typeof value)) continue;
-    const text = String(value);
-    // Names are needed for nightly attribution; arbitrary correlation IDs may contain private text.
-    ids[key] = (key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(text) && !/\d{5}/.test(text)
-      ? text : createHash("sha256").update(text).digest("hex").slice(0, 24);
+  for (const [key, value] of Object.entries(marker ? {} : entry.ids ?? {})) {
+    if (!idKeys.has(key) || (typeof value !== "string" && typeof value !== "number")) continue;
+    ids[key] = logId(key, value);
   }
-  const props: Record<string, string | number | boolean | null> = {};
+  const props: Record<string, unknown> = {};
+  const fileEvent = ["data_read.retried", "data_read.failed", "data_write.retried", "data_write.failed", "runs_log.write_failed"].includes(entry.name);
   for (const [key, value] of Object.entries(entry.props ?? {})) {
-    if ((key === "exitCode" || key === "signal") && value === null) props[key] = null;
+    if (fileEvent && key === "path" && typeof value === "string" && value.length <= 1024 && value.startsWith("/") && !/[\x00-\x1f]/.test(value)) props[key] = value;
+    else if (fileEvent && (key === "attempts" || key === "ms") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (fileEvent && key === "dataless" && typeof value === "boolean") props[key] = value;
+    else if (key === "holders" && (entry.name === "slot.wait" || entry.name === "slot.backlog") && Array.isArray(value)) {
+      props[key] = value.slice(0, 100).flatMap(value => {
+        const holder = record(value);
+        return (typeof holder.watcher === "string" || typeof holder.watcher === "number") && milliseconds(holder.elapsedMs)
+          ? [{ watcher: logId("watcher", holder.watcher), elapsedMs: holder.elapsedMs }] : [];
+      });
+    } else if (key === "dependency" && safeDependency(value)) props[key] = value;
+    else if ((key === "exitCode" || key === "signal") && value === null) props[key] = null;
     else if (key === "stderrLines" && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) props[key] = value;
-    else if (key === "stderrHash" && typeof value === "string" && /^[a-f0-9]{16}$/.test(value)) props[key] = value;
+    else if (key === "missingForS" && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if ((key === "stderrHash" || key === "triggerPathHash") && typeof value === "string" && /^[a-f0-9]{16}$/.test(value)) props[key] = value;
+    else if (key === "missingSince" && typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+      && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value) props[key] = value;
     else if (key === "errnoCode" && typeof value === "string" && (errnoCodes.has(value) || value === "UNKNOWN")) props[key] = value;
     else if (key === "signal" && typeof value === "string" && signals.has(value)) props[key] = value;
+    else if ((entry.name === "watch.grace_ended" || entry.name === "watch.removed") && key === "reason" && typeof value === "string"
+      && ["expired", "resume", "now", "paused", "no_inflight_check"].includes(value)) props[key] = value;
+    else if (entry.name === "watch.route_checked" && key === "reason" && typeof value === "string"
+      && ["no --session", "live owner session", "iMessage thread", "live thread", "not_found", "archived", "invalid_id", "invalid_thread", "invalid_session", "lookup unavailable"].includes(value)) props[key] = value;
+    else if (entry.name === "watch.route_checked" && key === "durationMs" && typeof value === "number"
+      && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (entry.name === "wake.creator_fallback" && key === "reason" && typeof value === "string"
+      && /^(?:timeout|invalid|archived|error|exit:\d{1,3})$/.test(value)) props[key] = value;
+    else if (entry.name === "wake.creator_fallback" && key === "durationMs" && typeof value === "number"
+      && Number.isFinite(value) && value >= 0) props[key] = value;
+    else if (typeof value === "string" && (key === "via" && /^thread:[A-Za-z0-9%_-]{1,8}$/.test(value)
+      || key === "meant_for" && /^[A-Za-z0-9%_-]{1,8}$/.test(value))) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;
     else if (boolean.has(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && values[key]?.includes(value)) props[key] = value;
@@ -62,7 +102,7 @@ function fields(entry: LogEntry, at: Date) {
     ts: at.toISOString(), tool: "watchers", component: entry.component, kind: entry.kind, name: entry.name,
     ...(typeof entry.durationMs === "number" && Number.isFinite(entry.durationMs) && entry.durationMs >= 0 ? { durationMs: entry.durationMs } : {}),
     ...(typeof entry.ok === "boolean" ? { ok: entry.ok } : {}),
-    ...(Object.keys(ids).length ? { ids } : {}), ...(Object.keys(props).length ? { props } : {}),
+    ...(Object.keys(ids).length ? { ids } : {}), ...(marker ? { props: marker } : Object.keys(props).length ? { props } : {}),
     // Exception messages can embed payloads and credentials. Only the stable code is retained.
     ...(entry.error && token.test(entry.error.tag) ? { error: { tag: entry.error.tag, message: entry.error.tag } } : {}),
   };
@@ -98,7 +138,7 @@ export function toolLog(entry: LogEntry): void {
         const marker = openSync(join(dir, `${day}.cap`), "wx", 0o600); closeSync(marker);
         appendLine(file, { ts: at.toISOString(), tool: "watchers", component: "logger", kind: "error", name: "log.cap", ok: false, error: { tag: "log.cap", message: "log.cap" } });
       } catch { /* Another component already recorded the cap. */ }
-      if (entry.kind !== "error") return;
+      if (entry.kind !== "error" && entry.name !== "deploy.marker") return;
     }
     appendLine(file, line);
   } catch { /* Logging cannot affect the caller. */ }
@@ -108,113 +148,207 @@ export function toolError(component: string, tag: string, ids?: Record<string, u
   toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, props, error: { tag } });
 }
 
+// Only release metadata belongs here; never accept command lines, paths or arbitrary text.
+function markerProps(value: unknown) {
+  const props = record(value);
+  const { service, sha, step } = props;
+  if (typeof service !== "string" || !/^[a-z0-9][a-z0-9_.-]{0,63}$/.test(service) || /\d{5}/.test(service)
+    || typeof step !== "string" || !/^[a-z][a-z0-9_.-]{0,63}$/.test(step) || /\d{5}/.test(step)
+    || typeof sha !== "string" || !/^(?:[a-f0-9]{7,40}|[a-f0-9]{64})$/.test(sha)) return undefined;
+  return { service, sha, step };
+}
+
+export function logMarker(props: unknown): void {
+  try {
+    const safe = markerProps(props);
+    if (safe) toolLog({ component: "deploy", kind: "event", name: "deploy.marker", props: safe });
+  } catch { /* A marker must never interrupt a release. */ }
+}
+
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const safeId = (key: string, value: unknown): value is string => typeof value === "string" && (
   /^[a-f0-9]{24}$/.test(value) || ((key === "watcher" || key === "helper") && /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}$/.test(value) && !/\d{5}/.test(value))
 );
 const milliseconds = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
-const outcomes = () => ({ no_change: 0, fire: 0, fail: 0, timeout: 0 });
+const outcomes = () => ({ no_change: 0, fire: 0, fail: 0, timeout: 0, busy: 0 });
 function percentiles(samples: number[]) {
   samples.sort((a, b) => a - b);
   return { p50: samples[Math.ceil(samples.length * .5) - 1] ?? null, p95: samples[Math.ceil(samples.length * .95) - 1] ?? null, max: samples.at(-1) ?? null };
 }
 function watcherStats() {
-  return { runs: 0, fires: 0, outcomes: outcomes(), durations: [] as number[], queued: [] as number[], failStreak: 0, longestFailStreak: 0, lastFailureTag: null as string | null };
+  return { runs: 0, fires: 0, outcomes: outcomes(), durations: [] as number[], queued: [] as number[], slotWaits: [] as number[], lateRuns: 0, failStreak: 0, longestFailStreak: 0, lastFailureTag: null as string | null };
 }
 function helperStats() {
   return { runs: 0, failures: 0, exitCodes: Object.create(null) as Record<string, number>, durations: [] as number[] };
 }
 const byRuns = (a: [string, { runs: number }], b: [string, { runs: number }]) => b[1].runs - a[1].runs || a[0].localeCompare(b[0]);
 
-export async function rollup(day: string, dir = logDirectory()) {
+export type LogWindow = { since: string; until: string };
+const HALF_HOUR = 30 * 60_000;
+
+function isoTime(value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  if (!match || Number(match[2]) > 23 || Number(match[3]) > 59 || Number(match[4]) > 59) return undefined;
+  const date = Date.parse(`${match[1]}T00:00:00Z`);
+  if (!Number.isFinite(date) || new Date(date).toISOString().slice(0, 10) !== match[1]) return undefined;
+  if (match[5] !== "Z" && (Number(match[5]!.slice(1, 3)) > 23 || Number(match[5]!.slice(4)) > 59)) return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+type SourceError = { tag: string; source: string; id: string; count: number };
+const byErrors = (a: SourceError, b: SourceError) => b.count - a.count || a.tag.localeCompare(b.tag) || a.source.localeCompare(b.source) || a.id.localeCompare(b.id);
+function countSource(map: Map<string, SourceError>, tag: string, source: string, id: string) {
+  const key = JSON.stringify([tag, source, id]);
+  const entry = map.get(key) ?? { tag, source, id, count: 0 };
+  entry.count++;
+  map.set(key, entry);
+}
+
+export async function rollup(selection: string | LogWindow, dir = logDirectory(), out?: string) {
   try {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day) return undefined;
+    const day = typeof selection === "string" ? selection : undefined;
+    if (day !== undefined && (!/^\d{4}-\d{2}-\d{2}$/.test(day) || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day)) return undefined;
+    const window = typeof selection === "string" ? undefined : selection;
+    const since = isoTime(window?.since ?? `${day}T00:00:00Z`);
+    const until = window ? isoTime(window.until) : since === undefined ? undefined : since + 86400_000;
+    if (since === undefined || until === undefined || since >= until) return undefined;
+    // Atomic replacement also prevents an --out symlink/hardlink from overwriting a day file.
+    if (out && ((window && /^rollup-\d{4}-\d{2}-\d{2}\.json$/i.test(basename(out))) || /\.ndjson$/i.test(basename(out)))) return undefined;
     const { createReadStream } = await import("node:fs");
     const { createInterface } = await import("node:readline");
     const counts: Record<string, number> = Object.create(null), kinds: Record<string, number> = Object.create(null);
     const durations: Record<string, number[]> = Object.create(null);
-    const errors: Record<string, { count: number; sampleId?: string }> = Object.create(null);
+    const errors: Record<string, number> = Object.create(null);
     const watchers = new Map<string, ReturnType<typeof watcherStats>>();
+    const dependencies = new Map<string, { busyRuns: number; watchers: Set<string> }>();
     const helpers = new Map<string, ReturnType<typeof helperStats>>();
-    const sourceErrors = new Map<string, { tag: string; source: "watcher" | "helper"; id: string; count: number }>();
+    const sourceErrors = new Map<string, SourceError>();
+    const hours = new Map<string, { errors: Map<string, SourceError>; runs: number; fail: number; timeout: number; durations: number[] }>();
+    const markers: { ts: string; service: string; sha: string; step: string }[] = [];
+    const errorTimes: number[] = [];
     const wake = { sent: 0, failed: 0, attempts: 0, replyGuard: { total: 0, blocked: 0, accepted: 0 } };
+    let allSlotsBusyMs = 0;
+    const slotHolders = new Map<string, number>();
     let total = 0, ok = 0, failed = 0, withOk = 0;
-    const source = join(dir, `${day}.ndjson`);
-    let sourceExists = true;
-    try { statSync(source); }
+    // Read the halo too so marker comparisons retain their full 30 minutes across UTC midnight.
+    let files: string[];
+    try { files = readdirSync(dir); }
     catch (error) {
-      if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "ENOENT") throw error;
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-      sourceExists = false;
+      if (record(error).code !== "ENOENT") throw error;
+      files = [];
     }
-    const lines = sourceExists ? createInterface({ input: createReadStream(source), crlfDelay: Infinity }) : [];
-    for await (const line of lines) {
-      let row; try { row = record(JSON.parse(line)); } catch { continue; }
-      if (row.tool !== "watchers" || typeof row.name !== "string" || !token.test(row.name) || typeof row.kind !== "string" || !["event", "perf", "error"].includes(row.kind)) continue;
-      total++; counts[row.name] = (counts[row.name] ?? 0) + 1; kinds[row.kind] = (kinds[row.kind] ?? 0) + 1;
-      if (typeof row.ok === "boolean") { withOk++; if (row.ok) ok++; else failed++; }
-      if (milliseconds(row.durationMs)) (durations[row.name] ??= []).push(row.durationMs);
-      const ids = record(row.ids), props = record(row.props), error = record(row.error);
-      const watcher = safeId("watcher", ids.watcher) ? ids.watcher : undefined;
-      const helper = safeId("helper", ids.helper) ? ids.helper : undefined;
-      const tag = typeof error.tag === "string" && token.test(error.tag) ? error.tag : undefined;
-      // Only deliverPending emits this after success. wake.sent also includes failure escalations.
-      if (row.name === "watch.fire" && row.ok === true) {
-        const id = watcher ?? "unknown", stats = watchers.get(id) ?? watcherStats();
-        watchers.set(id, stats);
-        stats.fires++;
-      }
-      if (row.name === "watch.run") {
-        const id = watcher ?? "unknown", stats = watchers.get(id) ?? watcherStats();
-        watchers.set(id, stats);
-        stats.runs++;
-        const outcome = props.outcome;
-        if (outcome === "no_change" || outcome === "fire" || outcome === "fail" || outcome === "timeout") stats.outcomes[outcome]++;
-        if (milliseconds(row.durationMs)) stats.durations.push(row.durationMs);
-        if (milliseconds(props.queuedMs)) stats.queued.push(props.queuedMs);
-        // Runs for one watcher are serialized; helper errors and delivery retries are not new runs.
-        if (outcome === "fail" || outcome === "timeout" || row.ok === false) {
-          stats.longestFailStreak = Math.max(stats.longestFailStreak, ++stats.failStreak);
-          stats.lastFailureTag = tag ?? null;
-        } else if (outcome === "no_change" || outcome === "fire" || row.ok === true) stats.failStreak = 0;
-      }
-      if (row.name === "helper.run") {
-        const id = helper ?? "unknown", stats = helpers.get(id) ?? helperStats();
-        helpers.set(id, stats);
-        stats.runs++;
-        if (row.ok === false) stats.failures++;
-        if (props.exitCode === null || (typeof props.exitCode === "number" && Number.isSafeInteger(props.exitCode))) {
-          const code = String(props.exitCode);
-          stats.exitCodes[code] = (stats.exitCodes[code] ?? 0) + 1;
-        }
-        if (milliseconds(row.durationMs)) stats.durations.push(row.durationMs);
-      }
-      if (row.name === "wake.sent") {
-        wake.attempts++;
-        if (row.ok === true) wake.sent++;
-        else if (row.ok === false) wake.failed++;
-      } else if (row.name === "wake.reply_guard") {
-        wake.replyGuard.total++;
-        if (props.accepted === false) wake.replyGuard.blocked++;
-        else if (props.accepted === true) wake.replyGuard.accepted++;
-      }
-      if (tag) {
-        const entry = errors[tag] ??= { count: 0 };
-        entry.count++;
-        // Reuse sanitized IDs only, never text from a malformed fixture line.
-        for (const [key, value] of Object.entries(ids)) {
-          if (idKeys.has(key) && safeId(key, value)) {
-            entry.sampleId ??= value;
-            break;
+    const firstDay = new Date(since - HALF_HOUR).toISOString().slice(0, 10);
+    const lastDay = new Date(until + HALF_HOUR - 1).toISOString().slice(0, 10);
+    const days = new Set(files.filter(name => /^\d{4}-\d{2}-\d{2}\.ndjson$/.test(name) && name.slice(0, 10) >= firstDay && name.slice(0, 10) <= lastDay));
+    if (day) days.add(`${day}.ndjson`);
+    for (const file of [...days].sort()) {
+      const source = join(dir, file);
+      try { statSync(source); }
+      catch (error) { if (record(error).code === "ENOENT") continue; throw error; }
+      const lines = createInterface({ input: createReadStream(source), crlfDelay: Infinity });
+      for await (const line of lines) {
+        let row; try { row = record(JSON.parse(line)); } catch { continue; }
+        if (row.tool !== "watchers" || typeof row.name !== "string" || !token.test(row.name) || typeof row.kind !== "string" || !["event", "perf", "error"].includes(row.kind)) continue;
+        const ts = isoTime(row.ts);
+        if (ts !== undefined && ts >= since - HALF_HOUR && ts < until + HALF_HOUR && row.kind === "error") errorTimes.push(ts);
+        // Usage is flushed at least once a minute, including while a check spans midnight.
+        if (ts !== undefined && milliseconds(row.durationMs) && (row.name === "slot.busy" || row.name === "slot.hold")) {
+          const overlap = Math.max(0, Math.min(ts, until) - Math.max(ts - row.durationMs, since));
+          if (row.name === "slot.busy") allSlotsBusyMs += overlap;
+          else {
+            const id = record(row.ids).watcher;
+            if (safeId("watcher", id)) slotHolders.set(id, (slotHolders.get(id) ?? 0) + overlap);
           }
         }
-        // A helper can also carry its parent watcher ID. Attribute once to the immediate source.
-        const source = helper ? "helper" : "watcher", id = helper ?? watcher;
-        if (id) {
-          const key = JSON.stringify([tag, source, id]);
-          const error = sourceErrors.get(key) ?? { tag, source, id, count: 0 };
-          error.count++;
-          sourceErrors.set(key, error);
+        // Legacy day fixtures without timestamps still contribute to daily totals only.
+        if (window ? ts === undefined || ts < since || ts >= until : file !== `${day}.ndjson`) continue;
+        let hour;
+        if (ts !== undefined && ts >= since && ts < until) {
+          const key = new Date(ts).toISOString().slice(0, 13) + ":00:00Z";
+          hour = hours.get(key) ?? { errors: new Map<string, SourceError>(), runs: 0, fail: 0, timeout: 0, durations: [] as number[] };
+          hours.set(key, hour);
+        }
+        total++; counts[row.name] = (counts[row.name] ?? 0) + 1; kinds[row.kind] = (kinds[row.kind] ?? 0) + 1;
+        if (typeof row.ok === "boolean") { withOk++; if (row.ok) ok++; else failed++; }
+        if (milliseconds(row.durationMs)) (durations[row.name] ??= []).push(row.durationMs);
+        const ids = record(row.ids), props = record(row.props), error = record(row.error);
+        const watcher = safeId("watcher", ids.watcher) ? ids.watcher : undefined;
+        const helper = safeId("helper", ids.helper) ? ids.helper : undefined;
+        const tag = typeof error.tag === "string" && token.test(error.tag) ? error.tag : undefined;
+        const sourceKind = helper ? "helper" : watcher ? "watcher" : "component";
+        const sourceId = helper ?? watcher ?? (typeof row.component === "string" && token.test(row.component) ? row.component : "unknown");
+        if (row.kind === "error" && hour) countSource(hour.errors, tag ?? row.name, sourceKind, sourceId);
+        if (row.name === "deploy.marker" && row.kind === "event" && ts !== undefined) {
+          const props = markerProps(row.props);
+          if (props) markers.push({ ts: new Date(ts).toISOString(), ...props });
+        }
+        // Only deliverPending emits this after success. wake.sent also includes failure escalations.
+        if (row.name === "watch.fire" && row.ok === true) {
+          const id = watcher ?? "unknown", stats = watchers.get(id) ?? watcherStats();
+          watchers.set(id, stats);
+          stats.fires++;
+        }
+        if (row.name === "watch.run") {
+          if (hour) {
+            hour.runs++;
+            if (props.outcome === "timeout") hour.timeout++;
+            else if (props.outcome === "fail" || (row.ok === false && props.outcome !== "busy")) hour.fail++;
+            if (milliseconds(row.durationMs)) hour.durations.push(row.durationMs);
+          }
+          const id = watcher ?? "unknown", stats = watchers.get(id) ?? watcherStats();
+          watchers.set(id, stats);
+          stats.runs++;
+          const outcome = props.outcome;
+          if (outcome === "no_change" || outcome === "fire" || outcome === "fail" || outcome === "timeout" || outcome === "busy") stats.outcomes[outcome]++;
+          if (outcome === "busy" && safeDependency(props.dependency)) {
+            const dependency = dependencies.get(props.dependency) ?? { busyRuns: 0, watchers: new Set<string>() };
+            dependencies.set(props.dependency, dependency);
+            dependency.busyRuns++;
+            dependency.watchers.add(id);
+          }
+          if (milliseconds(row.durationMs)) stats.durations.push(row.durationMs);
+          if (milliseconds(props.queuedMs)) stats.queued.push(props.queuedMs);
+          // Runs for one watcher are serialized; helper errors and delivery retries are not new runs.
+          if (outcome === "fail" || outcome === "timeout" || row.ok === false) {
+            stats.longestFailStreak = Math.max(stats.longestFailStreak, ++stats.failStreak);
+            stats.lastFailureTag = tag ?? null;
+          } else if (outcome === "no_change" || outcome === "fire" || row.ok === true) stats.failStreak = 0;
+        }
+        if (row.name === "slot.start" && watcher) {
+          const stats = watchers.get(watcher) ?? watcherStats();
+          watchers.set(watcher, stats);
+          if (milliseconds(props.slotWaitMs)) stats.slotWaits.push(props.slotWaitMs);
+          if (milliseconds(props.startLateMs) && milliseconds(props.intervalMs) && props.intervalMs > 0 && props.startLateMs > props.intervalMs) stats.lateRuns++;
+        }
+        if (row.name === "helper.run") {
+          const id = helper ?? "unknown", stats = helpers.get(id) ?? helperStats();
+          helpers.set(id, stats);
+          stats.runs++;
+          if (row.ok === false) stats.failures++;
+          if (props.exitCode === null || (typeof props.exitCode === "number" && Number.isSafeInteger(props.exitCode))) {
+            const code = String(props.exitCode);
+            stats.exitCodes[code] = (stats.exitCodes[code] ?? 0) + 1;
+          }
+          if (milliseconds(row.durationMs)) stats.durations.push(row.durationMs);
+        }
+        if (row.name === "wake.sent") {
+          wake.attempts++;
+          if (row.ok === true) wake.sent++;
+          else if (row.ok === false && props.accepted !== true) wake.failed++;
+        } else if (row.name === "wake.confirmed") {
+          wake.sent++;
+        } else if (row.name === "wake.unconfirmed") {
+          wake.failed++;
+        } else if (row.name === "wake.reply_guard") {
+          wake.replyGuard.total++;
+          if (props.accepted === false) wake.replyGuard.blocked++;
+          else if (props.accepted === true) wake.replyGuard.accepted++;
+        }
+        if (tag) {
+          errors[tag] = (errors[tag] ?? 0) + 1;
+          countSource(sourceErrors, tag, sourceKind, sourceId);
         }
       }
     }
@@ -226,7 +360,7 @@ export async function rollup(day: string, dir = logDirectory()) {
     for (const stats of watchers.values()) {
       watcherTotals.runs += stats.runs;
       watcherTotals.fires += stats.fires;
-      for (const outcome of ["no_change", "fire", "fail", "timeout"] as const) watcherTotals.outcomes[outcome] += stats.outcomes[outcome];
+      for (const outcome of ["no_change", "fire", "fail", "timeout", "busy"] as const) watcherTotals.outcomes[outcome] += stats.outcomes[outcome];
     }
     const helperTotals = { helpers: helpers.size, runs: 0, failures: 0, exitCodes: Object.create(null) as Record<string, number> };
     for (const stats of helpers.values()) {
@@ -238,16 +372,49 @@ export async function rollup(day: string, dir = logDirectory()) {
     const byWatcher = Object.fromEntries([...watchers].sort(byRuns).slice(0, 40).map(([id, stats]) => [id, {
       runs: stats.runs, outcomes: stats.outcomes, fires: stats.fires, durationMs: percentiles(stats.durations), queuedMs: { p95: percentiles(stats.queued).p95 },
       longestFailStreak: stats.longestFailStreak, lastFailureTag: stats.lastFailureTag,
+      slotWaitMs: { count: stats.slotWaits.length, total: stats.slotWaits.reduce((sum, ms) => sum + ms, 0), p95: percentiles(stats.slotWaits).p95 }, lateRuns: stats.lateRuns,
     }]));
     const byHelper = Object.fromEntries([...helpers].sort(byRuns).slice(0, 40).map(([id, stats]) => [id, {
       runs: stats.runs, failures: stats.failures, exitCodes: stats.exitCodes, durationMs: { p95: percentiles(stats.durations).p95 },
     }]));
-    const errorsByTagAndSource = [...sourceErrors.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.source.localeCompare(b.source) || a.id.localeCompare(b.id)).slice(0, 20);
-    const result = { day, tool: "watchers", total, counts, kinds, ok, failed, okRate: withOk ? ok / withOk : null, errorRate: total ? (kinds.error ?? 0) / total : 0, durations: timing,
-      errors: Object.entries(errors).sort((a, b) => b[1].count - a[1].count).slice(0, 20).map(([tag, value]) => ({ tag, ...value })),
-      byWatcher, watcherTotals, byHelper, helperTotals, errorsByTagAndSource, wake };
-    const target = join(dir, `rollup-${day}.json`);
-    writeFileSync(target, JSON.stringify(result, null, 2) + "\n", { mode: 0o600 }); chmodSync(target, 0o600);
+    const errorsByTagAndSource = [...sourceErrors.values()].sort(byErrors).slice(0, 20);
+    const hourly = [...hours].sort(([a], [b]) => a.localeCompare(b)).map(([hour, stats]) => ({
+      hour, errors: [...stats.errors.values()].sort(byErrors).slice(0, 10),
+      watchRun: { count: stats.runs, fail: stats.fail, timeout: stats.timeout, p95: percentiles(stats.durations).p95 },
+    }));
+    errorTimes.sort((a, b) => a - b);
+    function lowerBound(time: number) {
+      let lo = 0, hi = errorTimes.length;
+      while (lo < hi) { const mid = (lo + hi) >>> 1; if (errorTimes[mid]! < time) lo = mid + 1; else hi = mid; }
+      return lo;
+    }
+    const rate = (start: number, end: number) => {
+      const errors = lowerBound(end) - lowerBound(start);
+      return { errors, minutes: 30, errorsPerMinute: errors / 30, complete: end <= Date.now() };
+    };
+    const deployMarkers = markers.sort((a, b) => a.ts.localeCompare(b.ts)).map(marker => {
+      const at = Date.parse(marker.ts);
+      return { ...marker, before: rate(at - HALF_HOUR, at), after: rate(at, at + HALF_HOUR) };
+    });
+    const result = { ...(window ? { since: new Date(since).toISOString(), until: new Date(until).toISOString() } : { day }), tool: "watchers", total, counts, kinds, ok, failed, okRate: withOk ? ok / withOk : null, errorRate: total ? (kinds.error ?? 0) / total : 0, durations: timing,
+      errors: Object.entries(errors).sort((a, b) => b[1] - a[1]).slice(0, 20).map(([tag, count]) => ({ tag, count,
+        topSources: [...sourceErrors.values()].filter(source => source.tag === tag).sort(byErrors).slice(0, 3).map(({ source, id, count }) => ({ source, id, count })),
+      })),
+      byDependency: Object.fromEntries([...dependencies].sort(([a, x], [b, y]) => y.busyRuns - x.busyRuns || a.localeCompare(b)).slice(0, 20)
+        .map(([name, stats]) => [name, { busyRuns: stats.busyRuns, watchers: stats.watchers.size }])),
+      dependencyTotals: { dependencies: dependencies.size, busyRuns: [...dependencies.values()].reduce((total, stats) => total + stats.busyRuns, 0) },
+      byWatcher, watcherTotals, byHelper, helperTotals, errorsByTagAndSource, wake, hourly, markers: deployMarkers,
+      slots: { allSlotsBusyMinutes: allSlotsBusyMs / 60_000, topHolders: [...slotHolders].filter(([, ms]) => ms > 0).sort(([a, x], [b, y]) => y - x || a.localeCompare(b)).slice(0, 20).map(([watcher, ms]) => ({ watcher, slotSeconds: ms / 1000 })) } };
+    const target = out ?? (day ? join(dir, `rollup-${day}.json`) : undefined);
+    if (target) {
+      mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+      const scratch = mkdtempSync(join(dirname(target), ".rollup-"));
+      try {
+        const temp = join(scratch, "result.json");
+        writeFileSync(temp, JSON.stringify(result) + "\n", { mode: 0o600 });
+        renameSync(temp, target);
+      } finally { rmSync(scratch, { recursive: true, force: true }); }
+    }
     return result;
   } catch { return undefined; }
 }

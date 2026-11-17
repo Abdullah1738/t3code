@@ -106,6 +106,7 @@ export function recordsFromThread(thread: Pick<ThreadDetail, "threadId" | "recen
       else records.push({ id: `${runId}:error`, type: "assistant", content: [], runId, finish: "error", error, time: { created: epoch(group.at(-1)?.updatedAt ?? null), completed: epoch(group.at(-1)?.updatedAt ?? null) } });
     }
     records.push({ id: `idle:${runId}`, type: "idle", outcome: result,
+      ...(run.completedAt ? { completedAt: epoch(run.completedAt) } : {}),
       ...(failure && run.ordinal === 1 ? { firstTurnFailure: true } : {}),
       ...(group.some(message => message.role === "assistant" && SELECTED_MODEL_ISSUE.test(message.text)) ? { modelError: true } : {}),
       time: { created: epoch(group.at(-1)?.updatedAt ?? null) } });
@@ -650,9 +651,9 @@ export class RobobBackend implements ChatBackend {
     }
   }
 
-  async abort(id: string, _directory?: string): Promise<boolean> {
+  async abort(id: string, _directory?: string, cancelReason?: Parameters<ChatBackend["abort"]>[2]): Promise<boolean> {
     const threadId = await this.resolve(id);
-    const result = await this.client.request<{ interrupted?: unknown }>("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, {});
+    const result = await this.client.request<{ interrupted?: unknown }>("POST", `/threads/${encodeURIComponent(threadId)}/interrupt`, cancelReason === undefined ? {} : { cancelReason });
     return result.interrupted === true;
   }
 

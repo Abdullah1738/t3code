@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests._env import isolate_boat, isolate_home
-from offbox_lib import api, bases, capacity, cli, common, fallback, lease, misc, pool, reap, runs, spend
+from offbox_lib import api, bases, capacity, cli, common, fallback, home, lease, misc, pool, reap, runs, spend
 
 
 class Isolated(unittest.TestCase):
@@ -26,6 +26,11 @@ class Isolated(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.dict(os.environ))
+        for name in (runs.BACKGROUND_RUN_ENV, home.RUN_ID_ENV):
+            os.environ.pop(name, None)
+        identity_token = home.INVOCATION_RUN.set('')
+        self.stack.callback(home.INVOCATION_RUN.reset, identity_token)
         key_lookup = self.stack.enter_context(patch.object(
             api, '_key', side_effect=AssertionError('real API-key lookup forbidden in unit tests; stub the API boundary')))
         # Cleanup also catches lookups swallowed by production error handling or background workers.
@@ -55,7 +60,9 @@ class Isolated(unittest.TestCase):
         self.tg = self.stack.enter_context(patch('offbox_lib.identity.telegram', return_value=True))
         self.stack.enter_context(patch.object(spend, 'telegram', self.tg))
         self.stack.enter_context(patch.object(fallback, 'telegram', self.tg))
-        self.me = dict(owner='worker', repo_key='repo', repo_root='/checkout/repo', session='s',thread='t')
+        source = root / 'isolated-source'
+        source.mkdir()
+        self.me = dict(owner='worker', repo_key='repo', repo_root=str(source), session='s',thread='t')
 
     def box(self, bid, state='running', used=100, member=False, size='large', source='template:crpko-go'):
         self.con.execute("""INSERT INTO leases(box_id,owner,repo_root,repo_key,remote_dir,state,size,last_used_at,source)
@@ -191,9 +198,10 @@ class PoolTests(Isolated):
             row = pool.acquire(self.me, run_id='mine')
             try:
                 self.assertEqual(row['box_id'],'idle')
-                self.assertEqual(row['remote_dir'],'w/repo-'+__import__('hashlib').sha1(b'/checkout/repo').hexdigest()[:6])
+                from offbox_lib.identity import remote_dir_for
+                self.assertEqual(row['remote_dir'],remote_dir_for(self.me['repo_root']))
                 self.assertEqual(self.con.execute("SELECT box_id FROM runs WHERE run_id='mine'").fetchone()[0],'idle')
-                self.assertEqual(lease.find_lease(self.con,'worker','/checkout/repo')['box_id'],'idle')
+                self.assertEqual(lease.find_lease(self.con,'worker',self.me['repo_root'])['box_id'],'idle')
                 new.assert_not_called()
             finally:
                 pool.release_guard(row)
@@ -260,7 +268,7 @@ class PoolTests(Isolated):
         self.box('other', size='large', member=True, used=900)
         self.box('mine', size='large', member=True, used=100)
         self.box('cold', 'stopped', size='large', member=True, used=50)
-        self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker','/checkout/repo','mine','w/m')")
+        self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker',?,'mine','w/m')", (self.me['repo_root'],))
         self.con.commit()
         with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private'):
             row = pool.acquire(self.me)
@@ -270,7 +278,7 @@ class PoolTests(Isolated):
     def test_callers_own_grown_xlarge_yields_to_a_stopped_box_for_an_ordinary_run(self):
         self.box('mine', size='xlarge', member=True, used=100)
         self.box('cold', 'stopped', size='large', member=True, used=50)
-        self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker','/checkout/repo','mine','w/m')")
+        self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker',?,'mine','w/m')", (self.me['repo_root'],))
         self.con.commit()
         with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private'):
             row = pool.acquire(self.me)
@@ -285,7 +293,7 @@ class PoolTests(Isolated):
     def test_callers_own_grown_xlarge_still_used_when_starts_are_tight(self):
         self.box('mine', size='xlarge', member=True, used=100)
         self.box('cold', 'stopped', size='large', member=True, used=50)
-        self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker','/checkout/repo','mine','w/m')")
+        self.con.execute("INSERT INTO pool_callers(owner,repo_root,box_id,remote_dir) VALUES ('worker',?,'mine','w/m')", (self.me['repo_root'],))
         self.con.executemany("INSERT INTO start_requests(ts) VALUES (?)",[(common.now()-7200,)]*400)
         self.con.commit()
         with patch.object(lease,'_reuse',side_effect=lambda c,r,s,**kw:dict(r)) as reuse, patch.object(lease,'acquire_private'):
@@ -410,6 +418,7 @@ class PoolTests(Isolated):
         self.assertEqual(row['box_id'], 'new')
         self.assertIn('skipping a', err.getvalue())
         self.assertIn('fresh lease', err.getvalue())
+        self.assertNotIn('--delete', err.getvalue())
         new.assert_called_once()
         # The marked box is never offered again: a second acquire never even tries to reuse it.
         tried = []

@@ -64,7 +64,7 @@ class RepoSetupTests(unittest.TestCase):
 
     def script(self, key=KEY):
         with patch.object(runs, 'REPO_RECIPES_DIR', self.recipes), \
-             patch.object(runs, 'DOCKER_REPAIR', ':'), patch.object(runs, 'LDCACHE_REPAIR', ':'), \
+             patch.object(runs, 'DOCKER_REPAIR', ':'), patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), \
              patch.object(runs, 'GO_REPAIR', 'echo GO_REPAIR'), patch.object(runs.userns, 'setup', return_value=':'):
             return runs.remote_script('w/repo', 'android', [], None, 'run-test', repo_key=key,
                                       steps=['echo USER_COMMAND; echo "$JAVA_HOME"; command -v gomobile'])
@@ -180,9 +180,15 @@ class RepoSetupTests(unittest.TestCase):
                                     wait_images=True, steps=['java -version'])
         result = subprocess.run(['bash', '-n', '-c', script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        wrapped = runs.exit_recording_command(script, 'run-test')
-        # Linux MAX_ARG_STRLEN is 128 KiB, including the terminating NUL. Leave room for user commands.
-        self.assertLess(len(wrapped.encode()) + 1, 64 * 1024)
+        # The file transport now handles commands that outgrow the inline budget.
+        for payload, large in ((script, False), (script + '\n#' + 'x' * (128 * 1024), True)):
+            with self.subTest(large=large):
+                wrapped, path = runs.command_payload(payload, 'run-test')
+                self.assertLessEqual(len(wrapped.encode()), runs.COMMAND_INLINE_MAX)
+                if large:
+                    self.assertIsNotNone(path)
+                result = subprocess.run(['bash', '-n', '-c', wrapped], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_real_recipe_provisions_bare_home_then_skips_installed_pieces(self):
         self.assert_real_recipe_provisions()
@@ -273,11 +279,16 @@ class RepoSetupExitTests(Isolated):
         return self.con.execute("SELECT * FROM runs WHERE run_id='run-setup'").fetchone()
 
     def test_wait_finalizes_setup_failure_as_infra_without_pulls(self):
-        with patch.object(runs, 'do_pulls') as pull:
-            self.assertEqual(misc._finalize(self.row(), 98, self.log), 90)
-        pull.assert_not_called()
-        self.assertEqual(self.row()['status'], 'infra')
-        self.assertEqual(misc._settled(self.row()), 90)
+        for planned in (0, 1, 4):
+            with self.subTest(planned=planned):
+                self.con.execute("UPDATE runs SET status='running',exit_code=NULL,step_count=? WHERE run_id='run-setup'", (planned,))
+                self.con.commit()
+                with patch.object(runs, 'do_pulls') as pull:
+                    self.assertEqual(misc._finalize(self.row(), 98, self.log), 90)
+                pull.assert_not_called()
+                self.assertEqual(self.row()['status'], 'infra')
+                self.assertEqual(self.row()['exit_code'], 90)
+                self.assertEqual(misc._settled(self.row()), 90)
 
     def test_settled_legacy_failure_uses_marker_but_user_98_is_preserved(self):
         self.con.execute("UPDATE runs SET status='failed',exit_code=98 WHERE run_id='run-setup'")
@@ -309,8 +320,9 @@ class RepoSetupExitTests(Isolated):
                 with self.subTest(path=path, case=label):
                     self.log.unlink(missing_ok=True)
                     common.offsets_path(self.log).unlink(missing_ok=True)
+                    (common.LOGS_DIR / 'run-setup.pulls.jsonl').unlink(missing_ok=True)
                     self.con.execute("UPDATE runs SET status='running',exit_code=NULL,command_id='cmd_setup',"
-                                     "pulls='[\"artifacts\"]' "
+                                     "pulls='[\"artifacts\"]',pull_state=NULL,pull_owner=NULL,pull_summary=NULL "
                                      "WHERE run_id='run-setup'")
                     self.con.commit()
                     status = dict(running=False, status='exited', exitCode=code, stderr=stderr)
@@ -326,13 +338,14 @@ class RepoSetupExitTests(Isolated):
                             reap._check_unlocked(self.con, 'bx_setup', 'running', False, [])
                         else:
                             pool._refresh_background(self.con, 'repo')
-                        self.assertEqual(self.log.read_text(), stderr)
+                        self.assertEqual(self.log.read_text().split('\n[offbox run-setup pulls]')[0], stderr)
+                        self.assertEqual('pull_end' in self.log.read_text(), expect_pull)
                         self.assertEqual(self.row()['status'], expected_status)
                         self.assertEqual(self.row()['exit_code'], expected_code)
                         out, err = io.StringIO(), io.StringIO()
                         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                             self.assertEqual(misc.logs('run-setup', False), 0 if stderr else 1)
-                        self.assertEqual(out.getvalue(), stderr)
+                        self.assertEqual(out.getvalue(), self.log.read_text())
                         if stderr:
                             self.assertEqual(err.getvalue(), '')
                         else:
@@ -341,8 +354,10 @@ class RepoSetupExitTests(Isolated):
                         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                             self.assertEqual(misc.wait('run-setup', None), expected_code)
                         self.assertEqual(out.getvalue(), f'run-setup: {expected_status} exit={expected_code}\n')
-                        self.assertEqual(err.getvalue(), '' if stderr else
-                                         'offbox: run-setup settled with no output on record\n')
+                        expected_err = '' if stderr else 'offbox: run-setup settled with no output on record\n'
+                        if expect_pull:
+                            expected_err += 'offbox: run-setup: pulls: done (0 files, 0 conflicts)\n'
+                        self.assertEqual(err.getvalue(), expected_err)
                     if expect_pull:
                         pull.assert_called_once()
                         self.assertEqual(pull.call_args.args[2], ['artifacts'])

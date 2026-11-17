@@ -1,7 +1,7 @@
 #!/bin/bash
 # Runs inside a fresh images:ubuntu/24.04 container; the result is published as `offbox-base`.
 # Mirrors what offbox relied on in boat.dev's base box: user `user` (uid 1000) with passwordless sudo, sshd,
-# Docker + compose, git/rsync/jq/build tools, Node 24 + pnpm, Go, Python 3 + uv, bun. Template recipes
+# Docker + compose, git/rsync/jq/build tools, zsh, Node 24 + pnpm, Go, Python 3 + uv, bun. Template recipes
 # (offbox skill/templates/*.sh) add the per-stack tools on top.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -9,7 +9,13 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends openssh-server sudo ca-certificates curl wget gnupg git rsync jq \
   build-essential pkg-config make unzip zip xz-utils zstd file less vim-tiny procps psmisc lsof iproute2 \
   iputils-ping dnsutils python3 python3-venv python3-pip python3-dev tzdata locales util-linux tmux htop \
-  fuse-overlayfs >/dev/null
+  fuse-overlayfs openjdk-21-jdk-headless sqlite3 zsh >/dev/null
+bash /root/offbox-sqlite.sh
+rm -f /root/offbox-sqlite.sh /root/fetch.sh
+update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
+update-alternatives --set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac
+javac -version 2>&1 | grep -q '^javac 21\.' || { echo 'offbox template: javac 21 missing' >&2; exit 1; }
+test -x /bin/zsh || { echo 'offbox base: /bin/zsh missing' >&2; exit 1; }
 locale-gen en_US.UTF-8 >/dev/null
 
 id user >/dev/null 2>&1 || { userdel -r ubuntu 2>/dev/null || true; useradd -m -u 1000 -s /bin/bash user; }

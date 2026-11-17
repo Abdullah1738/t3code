@@ -1,0 +1,32 @@
+--- a/src/platforms/apple/moduleScanner.ts
++++ b/src/platforms/apple/moduleScanner.ts
+@@ -150,7 +150,12 @@
+ 
+   let output: ScanModulesOutput;
+   try {
+-    output = await scanner.scanModules(roots, { timeout: 5000 });
++    // Background-priority device builds can spend tens of seconds reading cold package roots.
++    const configuredTimeout = Number(process.env.EXPO_MODULE_SCAN_TIMEOUT_MS);
++    const timeout = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2147483647
++      ? configuredTimeout
++      : 120000;
++    output = await scanner.scanModules(roots, { timeout });
+   } catch (error: any) {
+     console.warn(
+       `warning: Scanning for Expo modules failed, only modules declared in expo-module.config.json will be linked: ${error.message ?? error}`
+--- a/build/platforms/apple/moduleScanner.js
++++ b/build/platforms/apple/moduleScanner.js
+@@ -136,9 +136,10 @@
+     }
+     let output;
+     try {
+-        output = await scanner.scanModules(roots, {
+-            timeout: 5000
+-        });
++        // Background-priority device builds can spend tens of seconds reading cold package roots.
++        const configuredTimeout = Number(process.env.EXPO_MODULE_SCAN_TIMEOUT_MS);
++        const timeout = Number.isSafeInteger(configuredTimeout) && configuredTimeout > 0 && configuredTimeout <= 2147483647 ? configuredTimeout : 120000;
++        output = await scanner.scanModules(roots, { timeout });
+     } catch (error) {
+         console.warn(`warning: Scanning for Expo modules failed, only modules declared in expo-module.config.json will be linked: ${error.message ?? error}`);
+         return null;

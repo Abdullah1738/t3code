@@ -1,0 +1,517 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+export const SENTINEL = "crpko-acl-probe-absent";
+export const digest = (value) =>
+  createHash("sha256").update(JSON.stringify(value)).digest("hex");
+export const probeClass = (p) =>
+  p === "topic_provisioner"
+    ? "P"
+    : p === "clickhouse_balance_bootstrap"
+      ? "N"
+      : p === "harness-qa-reader-v1"
+        ? "H"
+        : [
+              "kafka-history-archiver-v1",
+              "backoffice_registry_recovery",
+            ].includes(p)
+          ? "T"
+          : [
+                "reporting-api-v1",
+                "kafbat-v1",
+                "telemetry",
+                "venue-router-release-observer",
+              ].includes(p)
+            ? "D"
+            : "S";
+const fail = (message) => {
+  throw new Error(message);
+};
+const matches = (r, name) =>
+  r.pattern_type === "PREFIXED"
+    ? name.startsWith(r.resource_name)
+    : name === r.resource_name;
+export function deriveProbeMatrix(manifest) {
+  const names = [
+    ...new Set(manifest.rows.map((r) => r.principal.replace(/^User:/, ""))),
+  ].sort();
+  if (
+    !names.length ||
+    names.some((p) => !/^[A-Za-z0-9_-]+$/.test(p) || p.startsWith("broker"))
+  )
+    fail("invalid probe principals");
+  if (
+    manifest.rows.some(
+      (r) => r.resource_name === SENTINEL || r.permission_type !== "ALLOW",
+    )
+  )
+    fail("sentinel row or unsupported ACL permission");
+  return {
+    schema: "crpko.kafka.acl-probe-matrix.v1",
+    environment: manifest.environment,
+    manifest_sha256: manifest.sha256,
+    principals: names.map((principal) => ({
+      principal,
+      class: probeClass(principal),
+      port: probeClass(principal) === "T" ? 9097 : 9096,
+      secret_name: `crpko/${manifest.environment}/kafka/scram/${principal}`,
+      row_count: manifest.rows.filter(
+        (r) => r.principal === `User:${principal}`,
+      ).length,
+      rows_sha256: digest(
+        manifest.rows.filter((r) => r.principal === `User:${principal}`),
+      ),
+    })),
+  };
+}
+export function planPrincipal(
+  manifest,
+  principal,
+  { stage = "post-topic", run = "dry-run" } = {},
+) {
+  if (
+    !["pre-topic", "post-topic"].includes(stage) ||
+    !/^[A-Za-z0-9-]{1,64}$/.test(run)
+  )
+    fail("invalid probe stage or run");
+  const entry = deriveProbeMatrix(manifest).principals.find(
+    (p) => p.principal === principal,
+  );
+  if (!entry || (stage === "pre-topic" && entry.class !== "P"))
+    fail("principal not admitted at this stage");
+  const rows = manifest.rows.filter((r) => r.principal === `User:${principal}`),
+    cls = entry.class;
+  const has = (type, name, op) =>
+    rows.some(
+      (r) =>
+        r.resource_type === type &&
+        matches(r, name) &&
+        (r.operation === op ||
+          (op === "DESCRIBE" &&
+            ["READ", "WRITE", "DELETE", "ALTER"].includes(r.operation))),
+    );
+  const allTopics = [
+    ...new Set(
+      manifest.rows
+        .filter((r) => r.resource_type === "TOPIC")
+        .map((r) => r.resource_name),
+    ),
+  ].sort(
+    (a, b) =>
+      Number(a.startsWith("__")) - Number(b.startsWith("__")) ||
+      a.localeCompare(b),
+  );
+  const allGroups = [
+    ...new Set(
+      manifest.rows
+        .filter(
+          (r) => r.resource_type === "GROUP" && r.pattern_type === "LITERAL",
+        )
+        .map((r) => r.resource_name),
+    ),
+  ].sort();
+  const probes = [],
+    inventory = rows.map((r) => ({
+      row_id: r.row_id,
+      resource_type: r.resource_type,
+      resource: r.resource_name,
+      operation: r.operation,
+      proof: "G-ACL exact row readback",
+    }));
+  const add = (api, resource = "", expected = "NONE", extra = {}) =>
+    probes.push({ api, resource, expected, ...extra });
+  const foreign = (type, op, list) => list.find((n) => !has(type, n, op));
+  const positiveTopics = (op) =>
+    [
+      ...new Set(
+        rows
+          .filter((r) => r.resource_type === "TOPIC" && r.operation === op)
+          .map((r) => r.resource_name),
+      ),
+    ].sort();
+  const topicDenied = "TOPIC_AUTHORIZATION_FAILED",
+    groupDenied = "GROUP_AUTHORIZATION_FAILED";
+  if (cls === "P" && stage === "pre-topic") {
+    add("DescribeCluster");
+    add("Metadata");
+    add("CreateTopics", positiveTopics("DESCRIBE")[0], "NONE", {
+      validateOnly: true,
+    });
+    add("DescribeAcls");
+    add("Fetch", SENTINEL, topicDenied, {
+      partition: 0,
+      offset: "0",
+      requiresTopic: false,
+    });
+    add("DeleteTopics", SENTINEL, topicDenied);
+    add("DeleteRecords", SENTINEL, topicDenied, { partition: 0, offset: "0" });
+  } else {
+    if (cls !== "H") add("Authenticate");
+    for (const topic of positiveTopics("DESCRIBE"))
+      if (cls !== "H") add("Metadata", topic);
+    for (const topic of positiveTopics("READ")) {
+      if (cls !== "N")
+        add("Fetch", topic, "NONE", { assignment: true, offset: "latest" });
+      add("ListOffsets", topic, "NONE", { time: "latest" });
+    }
+    if (cls !== "H") {
+      for (const r of rows
+        .filter(
+          (r) =>
+            r.resource_type === "GROUP" &&
+            ["DESCRIBE", "READ"].includes(r.operation) &&
+            r.pattern_type === "LITERAL",
+        )
+        .filter(
+          (r, i, a) =>
+            a.findIndex((x) => x.resource_name === r.resource_name) === i,
+        )) {
+        add("DescribeGroups", r.resource_name);
+        add("OffsetFetch", r.resource_name);
+      }
+      for (const r of rows.filter(
+        (r) =>
+          r.resource_type === "GROUP" &&
+          r.operation === "READ" &&
+          r.pattern_type === "PREFIXED",
+      ))
+        add("ProbeGroup", `${r.resource_name}acl-probe-${run}`);
+      if (
+        rows.some((r) => r.resource_type === "TOPIC" && r.operation === "WRITE")
+      )
+        add("InitProducerId");
+      for (const r of rows.filter(
+        (r) =>
+          r.resource_type === "TRANSACTIONAL_ID" && r.operation === "WRITE",
+      ))
+        add(
+          "InitProducerId",
+          r.pattern_type === "PREFIXED"
+            ? `${r.resource_name}acl-probe-${run}`
+            : r.resource_name,
+        );
+      for (const topic of positiveTopics("DESCRIBE_CONFIGS"))
+        add("DescribeConfigs", topic, "NONE", {
+          compacted: principal === "kafka-history-archiver-v1",
+          ...(principal === "kafka-history-archiver-v1"
+            ? {
+                required_configs: {
+                  "cleanup.policy": "compact",
+                },
+                minimum_configs: {
+                  "min.compaction.lag.ms": "604800000",
+                },
+              }
+            : {}),
+        });
+    }
+    const noRead = foreign("TOPIC", "READ", allTopics),
+      noDescribe = foreign("TOPIC", "DESCRIBE", allTopics),
+      noGroup = foreign("GROUP", "DESCRIBE", allGroups);
+    if (!noRead) fail(`${principal}: no foreign topic for Fetch/ListOffsets`);
+    add("Fetch", noRead, topicDenied, {
+      partition: 0,
+      offset: "latest",
+      assignment: true,
+    });
+    if (noDescribe)
+      add("ListOffsets", noDescribe, topicDenied, {
+        partition: 0,
+        time: "latest",
+      });
+    if (cls !== "H") {
+      if (noDescribe) add("Metadata", noDescribe, topicDenied);
+      if (noGroup) {
+        add("OffsetFetch", noGroup, groupDenied);
+        add("DescribeGroups", noGroup, groupDenied);
+      }
+      const tx = `crpko-acl-probe-foreign-${run}`;
+      if (has("TRANSACTIONAL_ID", tx, "WRITE"))
+        fail("foreign transaction overlaps grant");
+      add("InitProducerId", tx, "TRANSACTIONAL_ID_AUTHORIZATION_FAILED");
+      const alter = foreign("TOPIC", "ALTER_CONFIGS", allTopics);
+      if (cls !== "P" && alter)
+        add("IncrementalAlterConfigs", alter, topicDenied, {
+          validateOnly: true,
+          key: "retention.ms",
+          value: "604800000",
+        });
+      if (cls !== "P") {
+        const noConfigs = foreign("TOPIC", "DESCRIBE_CONFIGS", allTopics);
+        if (noConfigs) add("DescribeConfigs", noConfigs, topicDenied);
+      }
+      if (
+        !rows.some(
+          (r) => r.resource_type === "TOPIC" && r.operation === "WRITE",
+        ) &&
+        !has("CLUSTER", "kafka-cluster", "IDEMPOTENT_WRITE")
+      )
+        add("InitProducerId", "", "CLUSTER_AUTHORIZATION_FAILED");
+      if (cls !== "P") {
+        for (const topic of positiveTopics("DESCRIBE_CONFIGS"))
+          if (
+            !has("TOPIC", topic, "ALTER_CONFIGS") &&
+            !has("CLUSTER", "kafka-cluster", "ALTER_CONFIGS")
+          )
+            for (const api of ["AlterConfigs", "IncrementalAlterConfigs"])
+              add(api, topic, topicDenied, {
+                validateOnly: true,
+                key: "retention.ms",
+                value: "604800000",
+              });
+      }
+      add("Produce", SENTINEL, topicDenied);
+      add("DeleteTopics", SENTINEL, topicDenied);
+      add("DeleteRecords", SENTINEL, topicDenied, {
+        partition: 0,
+        offset: "0",
+      });
+      add(
+        "DescribeAcls",
+        "",
+        has("CLUSTER", "kafka-cluster", "DESCRIBE")
+          ? "NONE"
+          : "CLUSTER_AUTHORIZATION_FAILED",
+      );
+    }
+    if (cls !== "P")
+      add("CreateTopics", SENTINEL, topicDenied, { validateOnly: true });
+    else {
+      const topic = positiveTopics("ALTER_CONFIGS")[0];
+      add("IncrementalAlterConfigs", topic, "NONE", {
+        validateOnly: true,
+        key: "retention.ms",
+        value: "604800000",
+      });
+    }
+    if (cls === "N") {
+      // Keep N's set independent of the service templates.
+      probes.length = 0;
+      const ingestion = JSON.parse(
+        readFileSync(
+          new URL(
+            "../../plan/kafka/topic-manifests/clickhouse-ingestor.v1.json",
+            import.meta.url,
+          ),
+        ),
+      );
+      const priority = [
+        ingestion.modes["canonical-priority"].consumer_groups
+          .flatMap((g) => g.topics)
+          .find((t) => !t.includes("balance.updated")),
+        ingestion.modes["canonical-bulk"].consumer_groups.flatMap(
+          (g) => g.topics,
+        )[0],
+      ];
+      const cash = "evt.ledger.cash_balance.updated.v1",
+        projector = `clickhouse-balance-projector-v2-${manifest.environment}`;
+      for (const topic of priority) {
+        add("Metadata", topic);
+        add("ListOffsets", topic, "NONE", { time: "earliest" });
+        add("ListOffsets", topic, "NONE", { time: "latest" });
+      }
+      const laneGroups = [
+        ingestion.modes["canonical-priority"].consumer_groups.find((g) =>
+          g.topics.includes(cash),
+        ).group,
+      ];
+      for (const group of laneGroups) {
+        add("DescribeGroups", group);
+        add("OffsetFetch", group);
+      }
+      add("ProjectorFloor", projector, "NONE", {
+        topic: cash,
+        emptyAndMemberless: true,
+      });
+      add("InitProducerId", "", "CLUSTER_AUTHORIZATION_FAILED");
+      add("Produce", SENTINEL, topicDenied);
+      add("Fetch", priority[0], topicDenied, {
+        partition: 0,
+        offset: "latest",
+        assignment: true,
+      });
+      for (const group of [laneGroups[0], "reporting-commands"])
+        add("FencedOffsetCommit", group, groupDenied, {
+          topic: cash,
+          partition: 0,
+          generation: 2147483647,
+          member: `crpko-acl-probe-${run}`,
+        });
+      add("OffsetFetch", "reporting-commands", groupDenied);
+      add("DescribeGroups", "reporting-commands", groupDenied);
+      add("CreateTopics", SENTINEL, topicDenied, { validateOnly: true });
+      add("DeleteRecords", cash, topicDenied, { partition: 0, offset: "0" });
+      add("DescribeAcls", "", "CLUSTER_AUTHORIZATION_FAILED");
+    }
+    if (cls === "T")
+      for (const [transport, expected] of Object.entries({
+        port9096: "UNREACHABLE",
+        noSasl: "NO_KAFKA_RESPONSE",
+        plaintext: "TLS_RECORD_REFUSED",
+        saslPlaintext: "TLS_RECORD_REFUSED",
+        wrongCA: "CERTIFICATE_REFUSED",
+        wrongName: "HOSTNAME_REFUSED",
+        wrongPassword: "SASL_AUTHENTICATION_FAILED",
+      }))
+        add("Transport", transport, expected);
+  }
+  const plan = {
+    ...entry,
+    stage,
+    run,
+    probes,
+    inventory,
+    inventory_denials: [
+      "foreign WRITE",
+      "foreign GROUP READ",
+      "CLUSTER ALTER",
+      "DELETE",
+      "ALTER",
+    ],
+  };
+  assertSafePlan(plan);
+  return plan;
+}
+export function assertSafePlan(plan) {
+  for (const p of plan.probes) {
+    if (
+      [
+        "CreateAcls",
+        "DeleteAcls",
+        "OffsetCommit",
+        "JoinGroup",
+        "SyncGroup",
+      ].includes(p.api)
+    )
+      fail("unsafe direct mutation");
+    if (p.api === "Produce" && p.resource !== SENTINEL) fail("unsafe produce");
+    if (
+      ["CreateTopics", "AlterConfigs", "IncrementalAlterConfigs"].includes(
+        p.api,
+      ) &&
+      p.validateOnly !== true
+    )
+      fail("unsafe configuration mutation");
+    if (p.api === "ProbeGroup" && !p.resource.includes("acl-probe-"))
+      fail("unsafe group join");
+    if (
+      p.api.startsWith("Delete") &&
+      p.resource !== SENTINEL &&
+      !(
+        plan.class === "N" &&
+        p.api === "DeleteRecords" &&
+        p.resource === "evt.ledger.cash_balance.updated.v1" &&
+        p.offset === "0"
+      )
+    )
+      fail("unsafe delete");
+    if (
+      p.api === "ProjectorFloor" &&
+      !(plan.class === "N" && p.emptyAndMemberless === true)
+    )
+      fail("unsafe commit");
+    if (
+      p.api === "FencedOffsetCommit" &&
+      !(
+        plan.class === "N" &&
+        p.generation === 2147483647 &&
+        p.member.startsWith("crpko-acl-probe-")
+      )
+    )
+      fail("unfenced commit");
+  }
+  return plan;
+}
+export function assertEmpty(topology, topics) {
+  if (!topics.length || new Set(topics).size !== topics.length)
+    fail("empty range inventory unavailable");
+  for (const topic of topics) {
+    const parts = topology[topic];
+    if (
+      !Array.isArray(parts) ||
+      !parts.length ||
+      parts.some(
+        (p, i) =>
+          p.partition !== i || !/^\d+$/.test(p.start) || p.start !== p.end,
+      )
+    )
+      fail(`G-EMPTY failed: ${topic}`);
+  }
+}
+export const BINDINGS = [
+  "installation_id",
+  "environment",
+  "account_id",
+  "region",
+  "cluster_id",
+  "format_sha256",
+  "manifest_sha256",
+  "listing_sha256",
+  "user_list_sha256",
+];
+export function requireBinding(receipt, current) {
+  if (
+    !receipt ||
+    BINDINGS.some(
+      (k) =>
+        typeof current[k] !== "string" ||
+        !current[k] ||
+        receipt[k] !== current[k],
+    )
+  )
+    fail("probe evidence binding changed");
+}
+export function requirePreflight(receipts, current, principals) {
+  if (
+    !Array.isArray(receipts) ||
+    receipts.length !== principals.length ||
+    new Set(receipts.map((r) => r.principal)).size !== principals.length
+  )
+    fail("every principal needs preflight");
+  for (const p of principals) {
+    const r = receipts.find((r) => r.principal === p);
+    requireBinding(r, current);
+    if (r.preflight !== true || r.username !== p || r.passed !== true)
+      fail("preflight failed");
+  }
+}
+export function classifyResult(probe, result) {
+  if (
+    !result ||
+    result.outcome !== probe.expected ||
+    result.kind !== (probe.api === "Transport" ? "transport" : "kafka") ||
+    result.client_error
+  )
+    fail(
+      `${probe.api} expected ${probe.expected}, received ${result?.outcome ?? "missing"}`,
+    );
+  return true;
+}
+export function validateProbeReceipt(
+  receipt,
+  manifest,
+  principal,
+  { stage, run },
+) {
+  const plan = planPrincipal(manifest, principal, { stage, run });
+  if (
+    receipt?.principal !== principal ||
+    receipt.passed !== true ||
+    receipt.preflight !== false ||
+    receipt.stage !== stage ||
+    receipt.class !== plan.class ||
+    receipt.plan_sha256 !== digest(plan) ||
+    receipt.matrix_sha256 !== digest(deriveProbeMatrix(manifest)) ||
+    receipt.probe_count !== plan.probes.length ||
+    !Array.isArray(receipt.results) ||
+    receipt.results.length !== plan.probes.length
+  )
+    fail("probe receipt does not match the complete current plan");
+  for (let i = 0; i < plan.probes.length; i++) {
+    const probe = plan.probes[i],
+      actual = receipt.results[i];
+    if (actual?.api !== probe.api || actual.resource !== probe.resource)
+      fail("probe receipt operation differs");
+    classifyResult(probe, actual);
+  }
+  return receipt;
+}

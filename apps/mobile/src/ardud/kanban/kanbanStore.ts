@@ -7,7 +7,6 @@ import type {
 } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
 import {
-  boardThreadIds,
   createAtomKanbanTransport,
   createKanbanClient,
   type KanbanBoardState,
@@ -142,8 +141,7 @@ const NO_OWNER: SnapshotStore<null> = {
 
 /** Threads the boards started, archived boards too, for thread lists to leave out. */
 export function useKanbanBoardThreadIds(): ReadonlySet<string> {
-  const boards = useStore(kanbanClient().boards);
-  return useMemo(() => boardThreadIds(boards), [boards]);
+  return useStore(kanbanClient().boardThreads) ?? new Set();
 }
 
 export function useKanbanBoard(boardId: string): KanbanBoardState | undefined {

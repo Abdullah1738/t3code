@@ -92,6 +92,8 @@ import {
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import { museItemStatus, museToolPresentation } from "./itemPresentation.ts";
 
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+
 const MUSE_PROVIDER = ProviderDriverKind.make("muse");
 const isOpenSessionError = Schema.is(ProviderAdapter.ProviderAdapterOpenSessionError);
 const isProtocolError = Schema.is(ProviderAdapter.ProviderAdapterProtocolError);
@@ -218,6 +220,8 @@ interface ActiveTurn {
   nextOrdinal: number;
   flushScheduled: boolean;
   interruptRequested: boolean;
+  compactionSubmitted: boolean;
+  inheritedCompactionItems: Set<string>;
   compact: boolean;
 }
 
@@ -358,6 +362,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         params: Record<string, unknown>,
         command = true,
         commandId?: string,
+        preserveHostOnTimeout = false,
       ) =>
         Effect.tryPromise({
           try: () =>
@@ -386,6 +391,11 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           Effect.catchTags({
             TimeoutError: (cause) =>
               Effect.gen(function* () {
+                if (preserveHostOnTimeout)
+                  return yield* protocolError(
+                    `Muse ${method} timed out; native interruption is unconfirmed`,
+                    cause,
+                  );
                 yield* eventPermit.withPermits(1)(failHost(cause));
                 return yield* protocolError(`Muse ${method} timed out; its host was closed`, cause);
               }),
@@ -1329,7 +1339,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           params.turnId !== active?.nativeId &&
           params.turnId !== wake?.nativeId
         ) {
-          if (active && !active.compact) active.joined.add(params.turnId);
+          if (active) active.joined.add(params.turnId);
           else if (!active && !wake) {
             const held = { nativeId: params.turnId, events: [] };
             wake = held;
@@ -1362,6 +1372,17 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         if (typeof params.turnId === "string" && !owns(turn, params.turnId) && !turn.compact)
           return;
         switch (method) {
+          case "turn/started": {
+            if (params.turnId !== turn.nativeId || turn.providerTurn.promptAcceptedAt !== undefined)
+              break;
+            turn.providerTurn = { ...turn.providerTurn, promptAcceptedAt: yield* DateTime.now };
+            yield* emit({
+              type: "provider_turn.updated",
+              driver: MUSE_PROVIDER,
+              providerTurn: turn.providerTurn,
+            });
+            break;
+          }
           case "item/started":
           case "item/updated":
           case "item/completed": {
@@ -1376,8 +1397,36 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
             if (previous && previous.revision >= item.revision) return;
             turn.items.set(item.itemId, item);
             turn.dirty.delete(item.itemId);
+            const itemTurnIds = [item.turnId, params.turnId].filter(
+              (id): id is string => typeof id === "string",
+            );
+            if (
+              turn.compact &&
+              item.kind === "compaction" &&
+              (!turn.compactionSubmitted ||
+                itemTurnIds.some((id) => id !== turn.nativeId) ||
+                (itemTurnIds.length === 0 && turn.joined.size > 0))
+            )
+              turn.inheritedCompactionItems.add(item.itemId);
+            const currentCompaction =
+              turn.compact &&
+              item.kind === "compaction" &&
+              turn.compactionSubmitted &&
+              !turn.inheritedCompactionItems.has(item.itemId);
+            if (
+              currentCompaction &&
+              item.status === "inProgress" &&
+              turn.providerTurn.promptAcceptedAt === undefined
+            ) {
+              turn.providerTurn = { ...turn.providerTurn, promptAcceptedAt: yield* DateTime.now };
+              yield* emit({
+                type: "provider_turn.updated",
+                driver: MUSE_PROVIDER,
+                providerTurn: turn.providerTurn,
+              });
+            }
             yield* publishItem(turn, item);
-            if (turn.compact && item.kind === "compaction" && item.status !== "inProgress") {
+            if (currentCompaction && item.status !== "inProgress") {
               yield* finish(
                 turn,
                 item.status === "completed" && (!item.outcome || item.outcome === "compacted")
@@ -1420,10 +1469,13 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
             break;
           }
           case "turn/completed": {
-            if (turn.compact) return;
             const result = yield* decode(MuseTurnCompleted, params);
             // A joined Muse turn ending does not end this run; its own turn does.
-            if (result.turnId !== turn.nativeId) break;
+            if (result.turnId !== turn.nativeId) {
+              turn.joined.delete(result.turnId);
+              break;
+            }
+            if (turn.compact) return;
             if (result.usage) {
               const usage = result.usage;
               turn.providerTurn = {
@@ -1645,7 +1697,12 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
       );
       const launchHost = Effect.fnUntraced(function* () {
         const epoch = ++hostEpoch;
-        const mcpSession = yield* mcpSessions.read(input.threadId);
+        const mcpSession = yield* McpProviderSessions.readForRuntime(
+          mcpSessions,
+          input.threadId,
+          input.providerSessionId,
+          MUSE_PROVIDER,
+        );
         const environment = McpProviderSession.withAgentDeviceEnvironment(
           options.environment,
           mcpSession,
@@ -1775,7 +1832,12 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         let missingNativeSession = false;
         return yield* Effect.gen(function* () {
           nativeSessionId = requestedId ?? host.connection.mintCommandId();
-          const mcpSession = yield* mcpSessions.read(args.threadId);
+          const mcpSession = yield* McpProviderSessions.readForRuntime(
+            mcpSessions,
+            args.threadId,
+            input.providerSessionId,
+            MUSE_PROVIDER,
+          );
           if (mcpSession && !host.initializeResult.grantedCapabilities.includes("sessionMcp"))
             return yield* protocolError(
               "Update Muse Code to a version that supports session MCP servers",
@@ -1976,10 +2038,18 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           nextOrdinal: turnInput.providerTurnOrdinal * 100 + 1,
           flushScheduled: false,
           interruptRequested: false,
+          compactionSubmitted: false,
+          inheritedCompactionItems: new Set(),
           compact,
         };
         yield* Effect.gen(function* () {
-          thread = turnInput.providerThread;
+          // The queued turn can predate background updates already received by this host.
+          thread = {
+            ...turnInput.providerThread,
+            ...(thread?.id === turnInput.providerThread.id
+              ? { pendingBackgroundTasks: thread.pendingBackgroundTasks ?? [] }
+              : {}),
+          };
           active = turn;
           yield* emit({
             type: "provider_turn.updated",
@@ -2003,6 +2073,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         if (continuation) return;
         yield* Effect.gen(function* () {
           if (compact) {
+            turn.compactionSubmitted = true;
             const result = yield* request("session/compact", {}, true, nativeId).pipe(
               Effect.flatMap((value) => decode(MuseCompactResult, value)),
             );
@@ -2192,12 +2263,18 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         interruptTurn: Effect.fn("MuseAdapter.interruptTurn")(
           function* (args) {
             const turn = active;
-            if (
-              !turn ||
-              turn.providerTurn.id !== args.providerTurnId ||
-              !validateThread(args.providerThread)
-            )
+            if (!validateThread(args.providerThread))
               return yield* protocolError("This Muse turn is no longer active");
+            if (!turn || turn.providerTurn.id !== args.providerTurnId)
+              return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+                driver: MUSE_PROVIDER,
+                providerThreadId: args.providerThread.id,
+                providerTurnId: args.providerTurnId,
+              });
+            if (args.stopBackgroundWork === false && turn.compact)
+              return yield* protocolError(
+                "Muse cannot confirm cancellation of this compaction without stopping inherited work.",
+              );
             turn.interruptRequested = true;
             if (turn.compact) {
               yield* eventPermit.withPermits(1)(
@@ -2218,26 +2295,38 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
               return;
             }
             // Muse runs a joined turn first, so Stop must end it too.
-            for (const joined of turn.joined)
-              yield* request("turn/interrupt", { turnId: joined }).pipe(Effect.ignore);
-            yield* request("turn/interrupt", { turnId: turn.nativeId });
+            if (args.stopBackgroundWork !== false)
+              for (const joined of turn.joined)
+                yield* request("turn/interrupt", { turnId: joined }).pipe(Effect.ignore);
+            yield* request(
+              "turn/interrupt",
+              { turnId: turn.nativeId },
+              true,
+              undefined,
+              args.stopBackgroundWork === false,
+            );
             yield* Deferred.await(turn.done).pipe(
               Effect.timeout(options.requestTimeoutMs ?? 30_000),
               Effect.mapError((cause) => protocolError("Muse did not confirm interruption", cause)),
-              Effect.onError((cause) => eventPermit.withPermits(1)(failHost(cause))),
+              Effect.onError((cause) =>
+                args.stopBackgroundWork === false
+                  ? Effect.void
+                  : eventPermit.withPermits(1)(failHost(cause)),
+              ),
             );
           },
           (effect, args) =>
             effect.pipe(
               commands.withPermits(1),
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterInterruptError({
-                    driver: MUSE_PROVIDER,
-                    providerThreadId: args.providerThread.id,
-                    providerTurnId: args.providerTurnId,
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                isTurnNotActiveError(cause)
+                  ? cause
+                  : new ProviderAdapter.ProviderAdapterInterruptError({
+                      driver: MUSE_PROVIDER,
+                      providerThreadId: args.providerThread.id,
+                      providerTurnId: args.providerTurnId,
+                      cause,
+                    }),
               ),
             ),
         ),

@@ -792,6 +792,12 @@ function Subtasks(props: { card: KanbanCard }) {
                     >
                       {subtask.text}
                     </span>
+                    {(subtask.gate || subtask.ownerOnly) && (
+                      <span className="ml-1 inline-flex flex-wrap gap-1 align-middle">
+                        {subtask.gate && <Chip>{subtask.gate}</Chip>}
+                        {subtask.ownerOnly && <Chip>owner only</Chip>}
+                      </span>
+                    )}
                     <span className="block text-xs text-(--m-muted)">
                       {subtaskOwnerLabel(subtask)}
                       {subtask.note ? ` · ${subtask.note}` : ""}

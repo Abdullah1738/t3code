@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests._env import clean_env
-from offbox_lib import allocation, api, capacity, cli, common, fallback, lease, outage, pool, runs
+from offbox_lib import allocation, api, capacity, cli, common, fallback, home, lease, outage, pool, runs
 from test_capacity import Isolated
 from test_exit_and_queue import FakeClock
 
@@ -297,6 +297,7 @@ class ResumeQueueTests(Isolated):
                 patch.object(lease, '_bring_up'), patch.object(lease, 'ensure_ttl'), \
                 patch.object(lease.ssh_sync, 'close_master'), patch.object(self.clock.time, 'sleep', sleep), \
                 patch.object(runs.Runner, 'start', start), patch.object(fallback, 'run_local') as local, \
+                patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stdout(io.StringIO()):
             thread = threading.Thread(target=grower)
             thread.start()
@@ -757,8 +758,10 @@ class ResumeQueueTests(Isolated):
                     self.con.execute('DELETE FROM kv')
                     self.con.commit()
                     stack.enter_context(patch.dict(os.environ,{'OFFBOX_POOL_SIZE':'1','OFFBOX_POOL_WAIT_SECONDS':'2'}))
+                    stack.enter_context(patch.object(home,'preflight_reason',return_value=None))
                     if path=='resume':
                         self.marker('cold',os.getpid())
+                        stack.enter_context(patch.object(api,'get',return_value={'state':'archived','type':'large'}))
                     elif path=='box-lock':
                         self.marker('cold',age=900)
                         stack.enter_context(common.file_lock('box-cold'))

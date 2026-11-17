@@ -27,29 +27,38 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
     call.value.callerStarted = started;
     call.value.callerResolved = false;
     call.value.phase = "caller";
-    call.value.readerLane = "foreground";
+    call.value.callerReaderLane = "identity";
+    call.value.readerLane = "identity";
   }
-  // Bounded point reads gate every tool call, like foreground control thread detail.
+  // Caller liveness must not queue behind active-thread lists on the view readers.
   const row = yield* McpDeadline.waitingOn(
     threads.getCallerRow(threadId).pipe(
-      NodeSqliteClient.foregroundReads,
+      NodeSqliteClient.identityReadOnly,
       Effect.mapError((cause) =>
         NodeSqliteClient.readerLaneFailure(cause) === undefined
           ? cause
           : new OrchestratorMcpFailure({
               code: "caller_unresolved",
-              message: `Caller resolution could not acquire the foreground reader for thread ${threadId}. Nothing was saved; retry the same call.`,
+              message: `Caller resolution could not acquire the reserved identity reader for thread ${threadId}. Nothing was saved; retry the same call.`,
             }),
       ),
     ),
-    "statev2 foreground caller row",
+    "statev2 identity caller row",
   );
   if (row === null || row.deletedAt !== null) return null;
+  if (call._tag === "Some")
+    call.value.resolveCallerContext?.(
+      row.lineage?.relationshipToParent === "subagent"
+        ? (row.lineage.parentThreadId ?? row.lineage.rootThreadId)
+        : row.lineage === undefined && row.forkedFrom?.type === "run"
+          ? row.forkedFrom.threadId
+          : undefined,
+    );
   if (
-    row.archivedAt === null &&
-    row.providerInstanceId === providerInstanceId &&
-    (row.forkedFrom === null || row.forkedFrom.type === "node") &&
-    row.activeRunId !== null
+    row.pendingBackgroundTasks !== undefined ||
+    row.archivedAt !== null ||
+    row.providerInstanceId !== providerInstanceId ||
+    ((row.forkedFrom === null || row.forkedFrom.type === "node") && row.activeRunId !== null)
   ) {
     if (call._tag === "Some") {
       call.value.callerResolved = true;
@@ -57,10 +66,16 @@ export const readCallerIdentity = Effect.fn("mcp.readCallerIdentity")(function* 
       call.value.callerResolveMs += Number((yield* Clock.monotonicTimeNanos) - started) / 1e6;
       delete call.value.callerStarted;
     }
-    return { ...row, pendingBackgroundTasks: [] } satisfies CallerIdentity;
+    return {
+      ...row,
+      pendingBackgroundTasks: row.pendingBackgroundTasks ?? [],
+    } satisfies CallerIdentity;
   }
-  // Without an active run, native background subagents need the full shell's liveness facts.
-  if (call._tag === "Some") call.value.readerLane = "background";
+  // Only fork history or work exceeding the caller caps needs the exact shell.
+  if (call._tag === "Some") {
+    call.value.callerReaderLane = "background";
+    call.value.readerLane = "background";
+  }
   const shell = yield* McpDeadline.waitingOn(
     threads.getThreadShell(threadId).pipe(NodeSqliteClient.backgroundReads),
     "statev2 background caller shell",

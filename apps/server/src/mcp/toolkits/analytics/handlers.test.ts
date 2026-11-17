@@ -3,6 +3,7 @@ import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
 import { OrchestratorMcpFailure, type AnalyticsEvent } from "@t3tools/contracts";
 import * as McpHttpServer from "../../McpHttpServer.ts";
+import { makeReadPager } from "../../../ardud/analytics/readPages.ts";
 import { finishRollup, makeAccumulator } from "../../../ardud/analytics/rollup.ts";
 import { expect, it } from "@effect/vitest";
 import { EnvironmentId } from "@t3tools/contracts";
@@ -36,20 +37,27 @@ it.effect("reads a filtered day's rollup through the MCP service boundary", () =
         read: (input) =>
           Effect.sync(() => {
             calls.push(input);
-            return {
-              rollup: {
+            return makeReadPager().read(
+              input,
+              {
                 ...finishRollup(makeAccumulator(), "2026-11-13", "2026-11-13T00:00:00.000Z"),
                 kindCounts: { "ask.answered": 2 },
               },
-              samples: [],
-            };
+              [],
+            );
           }),
       }),
     );
     const run = Effect.gen(function* () {
       const toolkit = yield* AnalyticsToolkit;
       return yield* toolkit
-        .handle("analytics_read", { day: "2026-11-13", boardId: "board-robob", limit: 10 })
+        .handle("analytics_read", {
+          day: "2026-11-13",
+          kind: "run.usage",
+          boardId: "board-robob",
+          cardId: "card:one",
+          limit: 10,
+        })
         .pipe(Stream.unwrap, Stream.runCollect);
     });
     const result = yield* run.pipe(
@@ -64,7 +72,15 @@ it.effect("reads a filtered day's rollup through the MCP service boundary", () =
       rollup: { kindCounts: { "ask.answered": 2 } },
       samples: [],
     });
-    expect(calls).toEqual([{ day: "2026-11-13", boardId: "board-robob", limit: 10 }]);
+    expect(calls).toEqual([
+      {
+        day: "2026-11-13",
+        kind: "run.usage",
+        boardId: "board-robob",
+        cardId: "card:one",
+        limit: 10,
+      },
+    ]);
     const denied = yield* run.pipe(
       Effect.provide(
         McpToolAccess.HandlersLayer.layer(Handlers.layer).pipe(

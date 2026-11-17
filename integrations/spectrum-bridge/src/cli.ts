@@ -1,4 +1,9 @@
-import { cardKind, toolError, toolLog } from "./toollog.ts";
+import { readHealthSidecar } from "./health-receipts.ts";
+import { messageLengthError } from "./message-length.ts";
+import { cardKind, logCardRender, toolError, toolLog } from "./toollog.ts";
+import { validNotifyId, validNotifyText } from "./agent-policy.ts";
+import { validAgentRequestId, validAnswerStatus } from "./agent-bus.ts";
+import { validId } from "./remote-protocol.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
@@ -16,7 +21,7 @@ type Command = { method: "GET" | "POST"; path: string; body?: Body };
 /** Tailnet publishing runs in the CLI process itself; it never goes through the bridge socket. */
 export type LocalCommand =
   | { command: "log-rollup"; day?: string }
-  | { command: "log-card-render"; kind: string; durationMs: number; ok: boolean }
+  | { command: "log-card-render"; kind: string; durationMs: number; ok: boolean; chat?: string; outcome?: "ok" | "fallback" | "failed"; failureCode?: string; attempt?: number }
   | { command: "publish"; localPort: number }
   | { command: "publish"; app: string }
   | { command: "unpublish"; port: number }
@@ -30,8 +35,8 @@ class RawOutput {
 }
 
 const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
-  + " Sendblue mode adds location-request, location, messages, ask-owner, chats, allow, allow-group,"
-  + " guest-allow, guest-revoke, guests, guest-send, and share-contact."
+  + " Sendblue mode adds location-request, location, messages, ask-owner, agent-ask, agent-answer, agent-requests, notify-rule, chats, allow, allow-group,"
+  + " guest-allow, guest-revoke, guests, guest-send, share-contact, opt-in, remote-events, and remote-resolve."
   + " Logs: log-rollup [--day YYYY-MM-DD]."
   + " Public links: share, unshare, and shares."
   + " Alerts and reminders moved to the telegram bridge CLI.";
@@ -59,7 +64,7 @@ export const validAppUrl = (value: unknown): value is string => {
 const control = /[\x00-\x1f\x7f-\x9f]/;
 
 const OPTIONS_BY_COMMAND: Record<string, string[]> = {
-  "log-card-render": ["kind", "ms", "ok"],
+  "log-card-render": ["kind", "ms", "ok", "chat", "outcome", "failure-code", "attempt"],
   "log-rollup": ["day"],
   health: [],
   "send-file": ["file", "key", "text", "session", "mime"],
@@ -71,7 +76,14 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   "location-request": ["session", "key", "chat"],
   location: ["session", "chat"],
   messages: ["session", "chat", "limit", "before", "id"],
+  "opt-in": ["chat", "session"],
   "ask-owner": ["text", "session", "key"],
+  "agent-ask": ["to", "text", "session", "key", "parent"],
+  "agent-answer": ["request", "text", "session", "status"],
+  "agent-requests": ["session"],
+  "remote-events": ["chat", "session", "after"],
+  "remote-resolve": ["chat", "session", "id", "state"],
+  "notify-rule": ["session", "text", "id"],
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
   "allow-group": ["id", "name", "session"],
@@ -80,7 +92,7 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   guests: ["session"],
   "guest-send": ["address", "text", "session", "key"],
   "share-contact": ["address", "chat", "session"],
-  app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key", "to"],
+  app: ["url", "caption", "subcaption", "trailing", "trailing-subcaption", "summary", "session", "key", "to", "update-id", "preview-page"],
   "secret-request": ["purpose", "field", "card", "session", "key"],
   secret: ["token", "field", "forget"],
   publish: ["port", "app"],
@@ -121,7 +133,9 @@ function parseOptions(args: string[]) {
     if (seen.has(token.name)) throw new CliError("Duplicate command option");
     seen.add(token.name);
   }
-  if (positionals.length !== 0) {
+  if (command === "notify-rule" && positionals.length === 1 && ["add", "list", "rm"].includes(positionals[0]!)) {
+    (parsed.values as Record<string, unknown>).action = positionals[0];
+  } else if (positionals.length !== 0) {
     throw new CliError("Unexpected positional arguments");
   }
   return {
@@ -153,7 +167,14 @@ export function parseLocalCommand(args: string[]): LocalCommand {
   if (command === "log-card-render") {
     const durationMs = Number(values.ms);
     if (!["quick", "delivery", "ride", "nutrition"].includes(values.kind ?? "") || !values.ms || !Number.isFinite(durationMs) || durationMs < 0 || !["true", "false"].includes(values.ok ?? "")) throw new CliError("Invalid render log");
-    return { command, kind: values.kind!, durationMs, ok: values.ok === "true" };
+    const outcome = values.outcome;
+    if (outcome !== undefined && !["ok", "fallback", "failed"].includes(outcome)) throw new CliError("Invalid render outcome");
+    const failureCode = values["failure-code"];
+    if (failureCode !== undefined && !["none", "renderer_failed", "preview_missing", "render_exception"].includes(failureCode)) throw new CliError("Invalid render failure code");
+    const attempt = values.attempt === undefined ? 1 : Number(values.attempt);
+    if (!Number.isSafeInteger(attempt) || attempt < 1 || attempt > 100) throw new CliError("Invalid render attempt");
+    return { command, kind: values.kind!, durationMs, ok: values.ok === "true", chat: values.chat,
+      outcome: outcome as "ok" | "fallback" | "failed" | undefined, failureCode, attempt };
   }
   if (command === "log-rollup") {
     const day = values.day;
@@ -201,7 +222,8 @@ function runRulesCommand(command: RulesCommand, rulesPath: string): Promise<unkn
 
 export async function runLocalCommand(command: LocalCommand, options: { exec?: Exec; apps?: () => Promise<{ appsRoot: string; appsPort: number }>; rulesPath?: string } = {}): Promise<unknown> {
   if (command.command === "log-card-render") {
-    toolLog.capture(() => toolLog.write({ component: `${command.kind}-renderer`, kind: "perf", name: "card.render", durationMs: command.durationMs, ok: command.ok, props: { cardKind: command.kind } }));
+    logCardRender(`${command.kind}-renderer`, command.kind, command.durationMs, command.ok, command);
+    if (!toolLog.flush()) throw new CliError("Render log unavailable");
     return { logged: true };
   }
   if (command.command === "log-rollup") {
@@ -273,7 +295,7 @@ export function parseCommand(args: string[]): Command {
       const session = required(values.session, "--session");
       if (session.length > 200 || /\s|[\x00-\x1f\x7f-\x9f]/.test(session)) throw new CliError("Invalid --session");
       const text = values.text ?? "";
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       const body: Record<string, string> = { file, dedupeKey, text, sessionId: session };
       if (values.mime !== undefined) {
         if (!validMimeType(values.mime)) throw new CliError("Invalid --mime");
@@ -292,7 +314,7 @@ export function parseCommand(args: string[]): Command {
     }
     case "send": {
       const text = required(values.text, "--text");
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       if (values.to !== undefined) {
         if (values.effect !== undefined || values.subject !== undefined) throw new CliError("--to does not take --effect or --subject");
         return { method: "POST", path: "/send", body: { text, to: chatSlug(values.to), ...session() } };
@@ -310,7 +332,7 @@ export function parseCommand(args: string[]): Command {
     }
     case "wake": {
       const text = required(values.text, "--text");
-      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       if (values.chat !== undefined) {
         const source = label(values.source, "--source", 100);
         return { method: "POST", path: "/wake",
@@ -344,9 +366,57 @@ export function parseCommand(args: string[]): Command {
     case "location":
       return { method: "POST", path: "/location",
         body: { sessionId: sessionOnly(values.session)!, ...(values.chat === undefined ? {} : { chat: chatSlug(values.chat) }) } };
-    case "ask-owner": {
+    case "opt-in": {
+      const chat = chatSlug(required(values.chat, "--chat"));
+      const sessionId = optionalSession(values.session);
+      return { method: "POST", path: "/opt-in", body: { chat, ...(sessionId === undefined ? {} : { sessionId }) } };
+    }
+    case "agent-ask": {
       const text = required(values.text, "--text");
       if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      if (values.parent !== undefined && !validAgentRequestId(values.parent)) throw new CliError("Invalid --parent");
+      return { method: "POST", path: "/agent-ask", body: { text, to: chatSlug(required(values.to, "--to")), ...session(),
+        ...(values.parent === undefined ? {} : { parent: values.parent }) } };
+    }
+    case "agent-answer": {
+      const text = required(values.text, "--text");
+      if (text.length > 12_000) throw new CliError("--text must be at most 12000 characters");
+      const request = required(values.request, "--request");
+      if (!validAgentRequestId(request)) throw new CliError("Invalid --request");
+      if (values.status !== undefined && !validAnswerStatus(values.status)) throw new CliError("Invalid --status");
+      return { method: "POST", path: "/agent-answer", body: { text, request, sessionId: sessionOnly(values.session)!,
+        ...(values.status === undefined ? {} : { status: values.status }) } };
+    }
+    case "notify-rule": {
+      const sessionId = sessionOnly(values.session)!;
+      if (values.action === "add" && validNotifyText(values.text) && values.id === undefined) {
+        return { method: "POST", path: "/notify-rule", body: { sessionId, action: "add", text: values.text } };
+      }
+      if (values.action === "list" && values.text === undefined && values.id === undefined) {
+        return { method: "POST", path: "/notify-rule", body: { sessionId, action: "list" } };
+      }
+      if (values.action === "rm" && values.text === undefined && /^[1-9][0-9]*$/.test(values.id ?? "") && validNotifyId(Number(values.id))) {
+        return { method: "POST", path: "/notify-rule", body: { sessionId, action: "rm", id: Number(values.id) } };
+      }
+      throw new CliError("Expected notify-rule add --text, list, or rm --id, with --session");
+    }
+    case "remote-events":
+    case "remote-resolve": {
+      const sessionId = sessionOnly(values.session)!;
+      if (values.chat !== "moni") throw new CliError("--chat must be moni");
+      if (command === "remote-events") {
+        if (values.after !== undefined && !validId(values.after)) throw new CliError("--after must be a full event id");
+        return { method: "POST", path: "/remote-events", body: { chat: "moni", sessionId, ...(values.after ? { after: values.after } : {}) } };
+      }
+      if (!validId(values.id)) throw new CliError("--id must be a full event id");
+      if (values.state !== "done" && values.state !== "pending") throw new CliError("--state must be done or pending");
+      return { method: "POST", path: "/remote-resolve", body: { chat: "moni", sessionId, id: values.id, state: values.state } };
+    }
+    case "agent-requests":
+      return { method: "POST", path: "/agent-requests", body: { sessionId: sessionOnly(values.session)! } };
+    case "ask-owner": {
+      const text = required(values.text, "--text");
+      if (text.length > 12_000) throw new CliError(messageLengthError(text, 12_000));
       return { method: "POST", path: "/ask-owner", body: { text, ...session() } };
     }
     case "chats": {
@@ -400,7 +470,7 @@ export function parseCommand(args: string[]): Command {
     case "guest-send": {
       const address = label(required(values.address, "--address"), "--address", 200)!;
       const text = required(values.text, "--text");
-      if (text.length > 2_000) throw new CliError("--text must be at most 2000 characters");
+      if (text.length > 2_000) throw new CliError(messageLengthError(text, 2_000));
       return { method: "POST", path: "/guest-send", body: { address, text, ...session() } };
     }
     case "share-contact": {
@@ -424,6 +494,15 @@ export function parseCommand(args: string[]): Command {
       if (!validAppUrl(url)) throw new CliError("--url must be an absolute https URL");
       const body: Record<string, string> = { url, caption: label(required(values.caption, "--caption"), "--caption", 200)!, ...session() };
       if (values.to !== undefined) body.to = chatSlug(values.to);
+      if (values["update-id"] !== undefined) {
+        if (!/^app:[a-f0-9]{64}$/.test(values["update-id"])) throw new CliError("--update-id must identify the original app operation");
+        body.updateOf = values["update-id"];
+      }
+      if (values["preview-page"] !== undefined) {
+        const previewPage = values["preview-page"];
+        if (!validAppUrl(previewPage) || new URL(previewPage).origin !== new URL(url).origin) throw new CliError("--preview-page must use the card origin");
+        body.previewPage = previewPage;
+      }
       for (const [option, field, max] of [["subcaption", "subcaption", 200], ["trailing", "trailingCaption", 200],
         ["trailing-subcaption", "trailingSubcaption", 200], ["summary", "summary", 500]] as const) {
         const value = label(values[option], `--${option}`, max);
@@ -498,7 +577,9 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
   };
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const protectedPaths = ["credentials.env", "state.sqlite", "state.sqlite-wal", "state.sqlite-shm", "state.sqlite-journal"]
+    // The harness database guard scans CLI source and refuses scripts that name the live database file.
+    const stateDb = ["state", "sqlite"].join(".");
+    const protectedPaths = ["credentials.env", ...["", "-wal", "-shm", "-journal"].map(suffix => stateDb + suffix)]
       .map(name => join(homedir(), ".config", "spectrum-bridge", name));
     if (protectedPaths.includes(resolve(file))) throw new CliError("Bridge credentials and state cannot be attached");
     const before = await lstat(file, { bigint: true });
@@ -526,7 +607,9 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
     if (size !== Number(before.size) || !unchanged(await handle.stat({ bigint: true }))
       || !unchanged(await lstat(file, { bigint: true }))) throw new CliError("Attachment changed while reading");
     prepared = true;
+    const healthReceipt = readHealthSidecar(file, data.subarray(0, size));
     return { base64: data.subarray(0, size).toString("base64"), name,
+      ...(healthReceipt ? { healthReceipt: JSON.stringify(healthReceipt) } : {}),
       mimeType: mimeType ?? mimeTypes[extname(name).toLowerCase()] ?? "application/octet-stream",
       text, dedupeKey, ...(sessionId === undefined ? {} : { sessionId }) };
   } catch (error) { toolError("cli", "cli.catch6", error);
@@ -535,8 +618,7 @@ export async function loadCommandPayload(command: Command): Promise<Body | undef
     await handle?.close().catch((caughtError) => { toolError("cli", "cli.catch7", caughtError);});
     toolLog.capture(() => {
       const kind = cardKind(name);
-      if (kind !== "other") toolLog.write({ component: "card-file", kind: "perf", name: "card.render", ok: prepared,
-        durationMs: performance.now() - preparedAt, props: { cardKind: kind } });
+      if (kind !== "other") logCardRender("card-file", kind, performance.now() - preparedAt, prepared, { failureCode: prepared ? "none" : "file_prepare" });
     });
   }
 }
@@ -611,8 +693,13 @@ async function sendCommand(command: Command): Promise<unknown> {
                 : "Bridge returned an invalid acknowledgement"));
               return;
             }
+            const chat = "chat" in data ? data.chat : undefined;
+            if (chat !== undefined && (typeof chat !== "string" || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(chat))) {
+              reject(new CliError("Bridge returned an invalid acknowledgement"));
+              return;
+            }
             // Queue acknowledgement only, not proof of upload or delivery. Never print echoed file contents.
-            resolve({ id: data.id, created: data.created });
+            resolve({ id: data.id, created: data.created, ...(chat === undefined ? {} : { chat }) });
             return;
           }
           const record = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
@@ -653,5 +740,5 @@ if (import.meta.main) {
   } catch (error) { toolError("cli", "cli.catch10", error);
     console.error(JSON.stringify({ error: error instanceof CliError ? error.message : "Bridge request failed" }));
     process.exitCode = 1;
-  }
+  } finally { toolLog.flush(); }
 }

@@ -170,8 +170,9 @@ under `~/.config/spectrum-bridge/`.
   state other than `pending`.
 - A sealed batch with no prompt acceptance gets one retry after 60 seconds,
   using the same prompt ID. Acceptance is reconciled before retrying; a failed
-  read holds the batch. After another minute without acceptance, each chat
-  gets one technical-problem notice for that outage. The original batch stays
+  read holds the batch. A held batch still undelivered ten minutes after receipt
+  gets one technical-problem notice for that outage. Earlier acceptance sends no
+  notice and logs `outage-notice-deferred` once. The original batch stays
   held ahead of later messages, including across a bridge restart. A healthy
   backend probe replays it with its original ID and a note giving the sent time;
   a late acceptance instead adopts it without another send. Failed recovery sends are retried at most once a minute under the same ID
@@ -179,8 +180,10 @@ under `~/.config/spectrum-bridge/`.
   The exact body, files and model remain in kv `resendBody` until acceptance.
   `delivery-watchdog` logs JSON decisions `retry`, `notice` and `replay` with
   chat, batch and prompt IDs, never message text.
-- Prompt acceptance marks every batch member `done`, repairing any earlier
-  `failed` status. `batched` identifies members only while acceptance is pending;
+- Prompt acceptance marks every batch member `done` unless it is already
+  `failed`. A failed turn keeps its batch members `failed` with their failure
+  reasons; later receipt reconciliation preserves that outcome until a recovered
+  turn succeeds. `batched` identifies members only while acceptance is pending;
   the aggregate remains in kv `batch:<leaderId>` for reply targets.
 
 ## Group chats (Sendblue mode)
@@ -336,6 +339,10 @@ The operational setup and private credential handling remain in the local
 directory when changing the bridge.
 
 Tool-log rollups refresh at turn end, hourly, and after the UTC day changes.
+Catch rows marked `alreadyLogged: true` retain their context and request ID but count only toward row volume and `dedupedFailures`, leaving failure rates and top causes to the original request.
+Call summaries retain `singleFailures` so failure rates include outage requests whose individual details were suppressed; older summaries keep their original diagnostic handling.
+`notice.reply` records each completion-notice run's handling path, outcome,
+enqueued reply count and sealed-wake flag, with chat/run ids and no message text.
 Read today's saved rollup with:
 
 ```sh
@@ -345,6 +352,10 @@ jq . "$HOME/.robob/logs/tools/imessage/rollup-$(date -u +%F).json"
 `total` includes calls represented by turn summaries; `recordedRows` counts disk
 records. Call percentiles merge millisecond histograms, including slow and failed
 calls that also retain individual rows. `byComponent` includes each call name.
+Successful calls retain individual rows only above 5 seconds, capped at 20 per
+run and call name in a rolling 10-minute window. Summaries count every call and
+report `suppressedSlow` for capped rows. Failed requests always retain one
+`turn.robob_call` row with their reduced error, without a duplicate catch row.
 After 50 MB, `log.degraded` marks errors-and-turns logging for the rest of the day.
 
 ## Upstream

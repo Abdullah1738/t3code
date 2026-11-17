@@ -17,6 +17,7 @@ from datetime import datetime
 import common
 import mailparse
 import store
+import timing
 
 sys.path.insert(0, common.MAIL_LIBEXEC)
 import mail_oauth  # noqa: E402
@@ -39,6 +40,7 @@ def quote(name):
     return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+@timing.timed("fetch")
 def connect(acct, timeout=60):
     cfg = common.MAIL_ACCOUNTS[acct]
     if acct == "icloud":
@@ -49,9 +51,14 @@ def connect(acct, timeout=60):
         m = imaplib.IMAP4_SSL(cfg["host"], timeout=timeout)
         m.login(cfg["user"], pw)
         return m
-    return mail_oauth.xoauth2_connect(acct, cfg["host"], cfg["user"], timeout=timeout)
+    try:
+        return mail_oauth.xoauth2_connect(acct, cfg["host"], cfg["user"], timeout=timeout,
+                                         lock_timeout=store.LOCK_WAIT_SECONDS)
+    except mail_oauth.RefreshLockTimeout as e:
+        raise store.LockTimeout(e.waited) from e
 
 
+@timing.timed("fetch")
 def folders(m):
     typ, data = m.list()
     out = []
@@ -71,6 +78,7 @@ def folders(m):
     return out
 
 
+@timing.timed("fetch")
 def select(m, folder):
     typ, data = m.select(quote(folder), readonly=True)
     if typ != "OK":
@@ -80,6 +88,7 @@ def select(m, folder):
     return exists, uv
 
 
+@timing.timed("fetch")
 def search_uids(m, crit):
     typ, data = m.uid("SEARCH", None, crit)
     if typ != "OK":
@@ -121,7 +130,7 @@ class Pool:
             c = connect(self.acct)
             self.local.conn = c
             self.local.folder = None
-            with self.lock:
+            with store.waiting(self.lock):
                 self.conns.append(c)
         if self.local.folder != folder:
             self.local.folder = None
@@ -141,6 +150,7 @@ class Pool:
             except Exception:
                 pass
 
+    @timing.timed("fetch")
     def close(self):
         for c in self.conns:
             try:
@@ -157,6 +167,7 @@ BAD = {}  # (acct, folder, uidvalidity, uid) -> failed single-UID fetches since 
 _BAD_LOCK = threading.Lock()
 
 
+@timing.timed("fetch")
 def _fetch_raw(pool, folder, uids):
     for attempt in range(3):
         try:
@@ -174,7 +185,7 @@ def _fetch_raw(pool, folder, uids):
         pool.drop()
         if attempt == 2:
             raise err
-        common.log(f"{pool.acct}/{folder}: fetch retry ({err})")
+        timing.log(f"{pool.acct}/{folder}: fetch retry ({err})")
         time.sleep(RETRY_SLEEP * (attempt + 1))
 
 
@@ -184,12 +195,12 @@ def _fetch_chunk(pool, acct, folder, uv, uids):
     except Rejected as e:
         # One bad message must not stall the folder: fetch the chunk one UID at a time.
         if len(uids) == 1:
-            with _BAD_LOCK:
+            with store.waiting(_BAD_LOCK):
                 key = (acct, folder, uv, uids[0])
                 BAD[key] = BAD.get(key, 0) + 1
-            common.log(f"{acct}/{folder}: uid {uids[0]} rejected ({e}); skipped this pass")
+            timing.log(f"{acct}/{folder}: uid {uids[0]} rejected ({e}); skipped this pass")
             return []
-        common.log(f"{acct}/{folder}: chunk rejected ({e}); fetching {len(uids)} UIDs one by one")
+        timing.log(f"{acct}/{folder}: chunk rejected ({e}); fetching {len(uids)} UIDs one by one")
         items = []
         for u in uids:
             items.extend(_fetch_chunk(pool, acct, folder, uv, [u]))
@@ -197,6 +208,7 @@ def _fetch_chunk(pool, acct, folder, uv, uids):
     return _items(acct, folder, uv, data)
 
 
+@timing.timed("parse")
 def _items(acct, folder, uv, data):
     me = common.MAIL_ACCOUNTS[acct]["user"].lower()
     items = []
@@ -229,40 +241,33 @@ def _sync_folder(db, pool, ex, acct, folder, stats, stop):
     prefix = f"{folder}:{uv}:"
     if st.get("uidvalidity") not in (None, uv):
         old = f"{folder}:{st['uidvalidity']}:"
-        with store.writing(db):
-            stats["deleted"] += store.mark_deleted(db, "email", acct, store.known_ext_ids(db, "email", acct, old))
-        common.log(f"{acct}/{folder}: UIDVALIDITY changed {st['uidvalidity']} -> {uv}, refetching")
+        old_ids = store.known_ext_ids(db, "email", acct, old)
+        stats["deleted"] += store.reconcile(db, "email", acct, gone=old_ids)
+        timing.log(f"{acct}/{folder}: UIDVALIDITY changed {st['uidvalidity']} -> {uv}, refetching")
         st = {}
     server = search_uids(c, "ALL")
     known = {int(x[len(prefix):]) for x in store.known_ext_ids(db, "email", acct, prefix)}
-    with _BAD_LOCK:
+    with store.waiting(_BAD_LOCK):
         skipped = {u for (a, f, v, u), n in BAD.items() if (a, f, v) == (acct, folder, uv) and n >= BAD_LIMIT}
     missing = sorted(set(server) - known - skipped)
     if missing:
-        common.log(f"{acct}/{folder}: {len(server)} on server, {len(missing)} to fetch")
+        timing.log(f"{acct}/{folder}: {len(server)} on server, {len(missing)} to fetch")
     chunks = [missing[i:i + CHUNK] for i in range(0, len(missing), CHUNK)]
     done = 0
     for i in range(0, len(chunks), 20):
         if stop is not None and stop.is_set():
             return False
-        for items in ex.map(lambda ch: _fetch_chunk(pool, acct, folder, uv, ch), chunks[i:i + 20]):
+        for items in ex.map(timing.worker(lambda ch: _fetch_chunk(pool, acct, folder, uv, ch)), chunks[i:i + 20]):
             # One short write per chunk so the lock is never held while waiting on the network.
-            with store.writing(db):
-                for it in items:
-                    stats[store.upsert(db, it)] += 1
+            store.upsert_many(db, items, stats)
             done += len(items)
         if len(missing) > 1000:
-            common.log(f"{acct}/{folder}: fetched {done}/{len(missing)}")
+            timing.log(f"{acct}/{folder}: fetched {done}/{len(missing)}")
+    # Only trust deletions when the listing agrees with EXISTS; never trust an empty listing.
+    gone = known - set(server) if len(server) == exists and (server or not known) else set()
+    back = store.deleted_ext_ids(db, "email", acct, prefix) & {f"{prefix}{u}" for u in server}
+    stats["deleted"] += store.reconcile(db, "email", acct, {f"{prefix}{u}" for u in gone}, back)
     with store.writing(db):
-        # Deletions: only trust the listing when it agrees with the server's message count, and
-        # never read an empty listing as "everything was deleted".
-        if len(server) == exists and (server or not known):
-            gone = known - set(server)
-            if gone:
-                stats["deleted"] += store.mark_deleted(db, "email", acct, {f"{prefix}{u}" for u in gone})
-        back = store.deleted_ext_ids(db, "email", acct, prefix) & {f"{prefix}{u}" for u in server}
-        if back:
-            store.undelete(db, "email", acct, back)
         store.set_state(db, key, {"uidvalidity": uv, "exists": exists, "last_ok": int(time.time())})
     return True
 
@@ -282,9 +287,11 @@ def sync(acct, db, stop=None):
                 if not _sync_folder(db, pool, ex, acct, folder, stats, stop):
                     complete = False
                     break
+            except (store.LockTimeout, subprocess.TimeoutExpired):
+                raise
             except (OSError, imaplib.IMAP4.error, RuntimeError) as e:
                 # One unreadable folder (or a connection dropped while idle) must not stop the rest.
-                common.log(f"{acct}/{folder}: skipped this pass ({type(e).__name__}: {e})")
+                timing.log(f"{acct}/{folder}: skipped this pass ({type(e).__name__}: {e})")
                 pool.drop()
                 complete = False
         if complete:

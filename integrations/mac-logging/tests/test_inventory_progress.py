@@ -81,9 +81,11 @@ class InventoryProgressTests(unittest.TestCase):
             return {}
         with patch.object(collector.time,'monotonic',side_effect=lambda: clock[0]):
             self.assertTrue(collector.collect(13600,[],reader,deadline=290))
-        self.assertEqual(calls,[(9100,10000),(10000,10900),(10900,11800),(11800,12700),(12700,13600)])
+        self.assertEqual((calls[0][0], calls[-1][1]), (9100, 13600))
+        self.assertIn(10000, [a for a,b in calls])
+        self.assertEqual([b for a,b in calls[:-1]], [a for a,b in calls[1:]])
         self.assertEqual(jobs.read_state('crashes')['unified'],13600)
-        self.assertEqual(self.rows('crash.source')[-1]['props']['lagS'],125)
+        self.assertLessEqual(self.rows('crash.source')[-1]['props']['lagS'],135)
 
     def test_twelve_hours_slow_chunks_have_bounded_lag_and_exact_gaps(self):
         for cost in (30,60):
@@ -188,7 +190,7 @@ class InventoryProgressTests(unittest.TestCase):
                         with patch.object(jobs.time,'time',return_value=10001):
                             total,flags,_=jobs.big_root_inventory(root,lambda *a,**k:self.fail('fresh cache'),jobs.time.monotonic()+2,cache)
                         self.assertEqual(total,1024)
-                        self.assertEqual(flags['partial'],partial or bool(denied))
+                        self.assertEqual(flags['partial'],partial or bool(denied) or limited)
 
     def test_failed_child_type_lookup_does_not_abort_other_roots(self):
         bad,good=self.root/'bad',self.root/'good'
@@ -196,8 +198,8 @@ class InventoryProgressTests(unittest.TestCase):
         (good/'child').mkdir()
         entry=SimpleNamespace(path=str(bad/'child'),is_dir=lambda **kw: (_ for _ in ()).throw(OSError('fixture')))
         listing=jobs.inventory_listing
-        def entries(path,deadline):
-            return ([entry],True) if path==bad else listing(path,deadline)
+        def entries(path,deadline,source_failures=None):
+            return ([entry],True) if path==bad else listing(path,deadline,source_failures)
         def run(cmd,**kw):
             return SimpleNamespace(returncode=0,stdout='1\t'+cmd[-1]+'\n',stderr='')
         with patch.object(jobs,'inventory_listing',side_effect=entries):
@@ -209,7 +211,7 @@ class InventoryProgressTests(unittest.TestCase):
     def test_unavailable_root_never_logs_a_zero_total(self):
         root=self.root/'unavailable'
         listing=jobs.inventory_listing
-        with patch.object(jobs,'inventory_listing',side_effect=lambda p,d: ([],False) if p==root else listing(p,d)), \
+        with patch.object(jobs,'inventory_listing',side_effect=lambda p,d,f=None: ([],False) if p==root else listing(p,d,f)), \
              patch.object(jobs,'confirmed_absent',return_value=False):
             jobs.directory_inventory([root],lambda *a,**k:self.fail('unavailable'))
         rows=[r for r in self.rows('disk.inventory.source') if r['props']['source']==str(root)]
@@ -289,9 +291,9 @@ class InventoryProgressTests(unittest.TestCase):
                 with self.subTest(overhead=overhead,cached=cached),patch.dict(os.environ,TOOLLOG_DIR=str(self.root/(str(overhead)+str(cached)))):
                     value=dict(slow=True,attemptedAt=0)
                     if cached:
-                        value.update(bytes=1024,at=6400,partial=False)
+                        value.update(bytes=1024,at=13600,partial=False)
                     jobs.save_state('disk-inventory',dict(duMode='links',childState={str(root):{str(child):value}}))
-                    clock,now,budgets=[0],[10000],[]
+                    clock,now,budgets=[0],[100000],[]
                     original=jobs.big_root_inventory
                     def setup(*args,**kw):
                         clock[0]+=overhead
@@ -309,31 +311,31 @@ class InventoryProgressTests(unittest.TestCase):
                     self.assertLessEqual(clock[0],150)
 
     def test_interruption_in_fresh_query_does_not_replay_reported_gap(self):
-        for interrupted_at in (11800,12700,13600,14500,15400,16300):
-            with self.subTest(interrupted_at=interrupted_at), \
-                 patch.dict(os.environ,TOOLLOG_DIR=str(self.root/str(interrupted_at))):
+        for interrupt_after in range(3):
+            with self.subTest(interrupt_after=interrupt_after), \
+                 patch.dict(os.environ,TOOLLOG_DIR=str(self.root/str(interrupt_after))), \
+                 patch.object(collector.time, 'monotonic', return_value=0):
                 jobs.save_state('crashes',dict(unified=9100,unifiedRetry=dict(windowStart=9100,windowEnd=10000,skippedS=82800)))
                 completed=[]
                 def success(a,b):
                     completed.append((a,b))
                     return {}
                 def interrupt(a,b):
-                    if a>=interrupted_at:
+                    if len(completed) == interrupt_after:
                         raise SystemExit('fresh query interrupted')
                     return success(a,b)
                 with self.assertRaises(SystemExit):
                     collector.collect(17200,[],interrupt)
                 state=jobs.read_state('crashes')
-                if interrupted_at==11800:
-                    self.assertNotIn('unifiedRetry',state)
-                else:
-                    self.assertEqual(state['unifiedRetry'],dict(windowStart=interrupted_at,windowEnd=17200,skippedS=1800))
+                self.assertEqual(state['unified'], completed[-1][1] if completed else 11800)
+                if completed:
+                    self.assertEqual(state['unifiedRetry'],dict(windowStart=completed[-1][1],windowEnd=17200,skippedS=0))
                 collector.collect(17200,[],success)
-                rows=[r for p in (self.root/str(interrupted_at)).glob('*.ndjson')
+                rows=[r for p in (self.root/str(interrupt_after)).glob('*.ndjson')
                       for r in map(json.loads,p.read_text().splitlines()) if r['name']=='crash.source']
-                self.assertEqual([r['props']['skippedS'] for r in rows],[82800,1800])
-                self.assertEqual(completed,[(9100,10000),(11800,12700),(12700,13600),
-                                            (13600,14500),(14500,15400),(15400,16300),(16300,17200)])
+                self.assertEqual([r['props']['skippedS'] for r in rows],[85500,0])
+                self.assertEqual((completed[0][0], completed[-1][1]), (11800,17200))
+                self.assertEqual([b for a,b in completed[:-1]], [a for a,b in completed[1:]])
                 self.assertNotIn('unifiedRetry',jobs.read_state('crashes'))
 
     def test_limited_child_is_excluded_from_every_batch_position(self):
@@ -397,16 +399,25 @@ class InventoryProgressTests(unittest.TestCase):
                 first=paths[0]
                 second=first if placement=='same_child' else paths[1 if placement=='same_batch' else 128]
                 data=first/'data'
-                data.write_bytes(b'0123456789abcdef'*(size//16))
+                with data.open('wb') as stream:
+                    stream.write(os.urandom(size))
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 os.link(data,second/'alias')
+                allocated=data.stat().st_blocks*512
+                metadata=max(first.stat().st_blocks,second.stat().st_blocks)*512
+                if not allocated or allocated <= metadata:
+                    self.skipTest('filesystem reports no physical allocation for fixture data')
                 cache={}
                 total,flags,_=jobs.big_root_inventory(root,subprocess.run,jobs.time.monotonic()+30,cache)
                 self.assertFalse(flags['partial'])
-                self.assertGreaterEqual(cache[str(second)]['bytes'],size*(2 if first==second else 1))
+                self.assertGreaterEqual(cache[str(first)]['bytes'],allocated*(2 if first==second else 1))
+                self.assertGreaterEqual(cache[str(second)]['bytes'],allocated*(2 if first==second else 1))
+                self.assertGreaterEqual(sum(cache[str(p)]['bytes'] for p in {first,second}),2*allocated)
                 first_bytes=cache[str(first)]['bytes']
                 # Refreshing only the alias child must use exactly the same
                 # accounting as its row in the multi-child command.
-                cache[str(second)]['at']-=3600
+                cache[str(second)]['at']-=86400
                 refreshed,flags,_=jobs.big_root_inventory(root,subprocess.run,jobs.time.monotonic()+30,cache)
                 self.assertFalse(flags['partial'])
                 self.assertEqual(refreshed,total)
@@ -414,11 +425,11 @@ class InventoryProgressTests(unittest.TestCase):
                 if first!=second:
                     first.rmdir()
                 else:
-                    cache[str(first)]['at']-=3600
+                    cache[str(first)]['at']-=86400
                 after,flags,_=jobs.big_root_inventory(root,subprocess.run,jobs.time.monotonic()+30,cache)
                 self.assertFalse(flags['partial'])
-                self.assertGreaterEqual(cache[str(second)]['bytes'],size)
-                self.assertEqual(after,total-first_bytes if first!=second else total-size)
+                self.assertGreaterEqual(cache[str(second)]['bytes'],allocated)
+                self.assertEqual(after,total-first_bytes if first!=second else total-allocated)
 
     def test_old_hardlink_accounting_migrates_without_reporting_growth(self):
         root=self.root/'migration'

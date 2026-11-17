@@ -5,7 +5,8 @@ description: Use whenever you'd watch/monitor/wait for something for the owner (
 
 # Robob watchers
 
-`robob-watch` runs small check commands on a schedule (default every 15s, or within ~1s of a trigger file changing) and, when one prints something, **wakes the agent**: the event arrives as a new turn in whichever iMessage session is live (it follows session rotation and `/new`), together with the context you saved when you set it up. The agent handles it and its reply goes to the owner as usual.
+`robob-watch` runs small check commands on a schedule (default every 15s, or within ~1s of a trigger file changing) and, when one prints something, **wakes the agent**: the event arrives as a new turn, together with the context you saved when you set it up, in the thread that set the watcher up (`--session`). Watchers set up from an iMessage chat go to whichever iMessage session is live (they follow session rotation and `/new`), and `--chat` keeps its chat. If the setting-up thread is gone or can't be reached, the event goes to the owner's live chat with a line naming the thread it was meant for. The woken agent handles it there; from the owner's chat its reply goes to him as usual.
+Person-chat wakes batch events oldest first for 150 seconds; a check can return JSON with `"urgent": true` for an immediate wake (prices or yes/no offers), while other events keep their batch.
 
 ## When to use
 
@@ -44,7 +45,7 @@ Or `robob-watch add --json file.json` with `{id, title, check, interval_s, mode,
 
 ## Writing the context (the important part)
 
-The context is all the woken agent knows. Put what to do on a fire in its first 280 characters: later fires show only that start plus a `robob-watch context <id>` pointer. Write it for a fresh agent with no memory of this chat:
+The context is all the woken agent knows. Put what to do on a fire in its first 280 characters: later fires show only that start plus an immutable saved-context file pointer; `robob-watch context <id>` reads the current context. Write it for a fresh agent with no memory of this chat:
 
 1. **Owner's intent**: what they asked and why ("owner asked Nik on 27 Sep to order X for Y").
 2. **Background**: names, numbers, links, what has already been said and to whom.
@@ -52,6 +53,7 @@ The context is all the woken agent knows. Put what to do on a fire in its first 
 4. **What NOT to do**: "don't message Nik or Jashwanth without the owner's OK", "don't merge", "don't buy".
 
 Keep it under ~1500 characters. Never put secrets in it (it's stored in plain text).
+Edit with `robob-watch context ID --json FILE` (or `--context`/`--context-file`): JSON objects merge per key and lists append under a lock; prose appends; `--replace` explicitly overwrites the whole context.
 
 ## Messaging anyone besides the owner (since 24 Oct 2026)
 
@@ -116,7 +118,7 @@ Use `test` every time. Use `fire-test` only when the delivery path itself is in 
 
 ## What a fire looks like
 
-The woken turn starts with `[Watcher event from robob-watch <id>, not typed by the owner. ...]`, followed by the title, the event, the saved context and the fire count. Wakes show the first 280 characters of the context plus a `robob-watch context <id>` pointer, except the day's first fire, which carries the whole context. It's not the owner talking: don't treat it as an answer to anything, and follow the saved context.
+The woken turn starts with `[Watcher event from robob-watch <id>, not typed by the owner. ...]`, followed by the title, the event, the saved context and the fire count. Wakes show the first 280 characters of the context plus an immutable saved-context file pointer, except the day's first fire, which carries the whole context and its snapshot path. It's not the owner talking: don't treat it as an answer to anything, and follow the saved context.
 
 ## Quiet by default: NO_REPLY, activity log, digest
 
@@ -142,9 +144,10 @@ robob-watch list                  # status, fires, expiry, last run, failures, u
 robob-watch show ID               # definition, state, last 20 log lines
 robob-watch logs ID [-n 100]      # the watcher log tail (there is no `robob-watch log`)
 robob-watch pause ID | resume ID [--expires 7d]   # resume also re-arms a done/expired watcher
-robob-watch remove ID             # archived under ~/.local/share/robob-watch/archive/
+robob-watch remove ID             # cancel now; --inflight-check watchers get reply grace; --now skips it
 ```
 
+Removal (`remove` or `rm`) cancels ordinary or paused watchers immediately; only an unpaused watcher configured with `--inflight-check CMD` (`inflight_check` in JSON) gets 15 minutes of reply grace, running that frozen command with `WATCH_CLOSING=1` for existing outreach only (for example, `whatsapp-new-message KNOWN_JID`); it must never start new outreach, `--now` skips grace, `resume` returns to the normal check, and a removed ID stays retired (use a fresh ID for a replacement).
 Remove watchers once the thing is resolved, or when the owner says to stop. Done and expired watchers stay listed until removed. Remove them when you notice them.
 
 - Nightly 2026-10-15: `add --json` with `--replace` reads the expiry from the JSON key `expires_at` (an ISO time or a duration like "14d"). The `--expires` flag on the CLI is a separate option. If the JSON has no `expires_at`, the watcher gets the 14d default. After a replace, check `watcher.json` `expires_at` and fix it with `robob-watch resume ID --expires <ISO>`.

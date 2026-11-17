@@ -211,6 +211,8 @@ class DuplicateTests(unittest.TestCase):
 
     def test_schema_v2_migrates_exactly_and_preserves_fence(self):
         with sqlite3.connect(self.root/'journal.sqlite') as db:
+            # b63bddc127 added baskets in v4; a v2 fixture must not retain it.
+            db.execute('DROP TABLE baskets')
             db.execute('DROP TABLE duplicate_closures');db.execute('DROP INDEX active_account')
             db.execute(journal.SCHEMA_V2['active_account']);db.execute('PRAGMA user_version=2')
         self.assert_fenced()

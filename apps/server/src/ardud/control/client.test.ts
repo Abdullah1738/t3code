@@ -46,6 +46,36 @@ const controlEnv = (url: string) => ({
 const runCli = (url: string, args: string[]) =>
   runCommand(process.execPath, [cli, ...args], controlEnv(url));
 
+describe("native owner lookup clients", () => {
+  it("passes driver and view through the client and CLI", async () => {
+    const seen: string[] = [];
+    const url = await listen((request, response) => {
+      seen.push(request.url!);
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ ok: true, thread: { threadId: "owner" } }));
+    });
+    const client = new ControlClient({ url, token: "test" });
+    await client.threadByNativeSession("native/id", { driver: "claudeAgent", view: "owner" });
+    await client.threadByNativeSession("native/id");
+    await client.threadByNativeSession("native/id", { view: "" });
+    const result = await runCli(url, [
+      "native",
+      "native/id",
+      "--driver",
+      "codex",
+      "--view",
+      "owner",
+    ]);
+    expect(result.code).toBe(0);
+    expect(seen).toEqual([
+      "/api/ardud/control/threads/by-native/native%2Fid?driver=claudeAgent&view=owner",
+      "/api/ardud/control/threads/by-native/native%2Fid",
+      "/api/ardud/control/threads/by-native/native%2Fid?view=",
+      "/api/ardud/control/threads/by-native/native%2Fid?driver=codex&view=owner",
+    ]);
+  });
+});
+
 const runUsageCli = (url: string, args: string[]) =>
   execFile(process.execPath, [
     NodeURL.fileURLToPath(new URL("./t3ctl.mjs", import.meta.url)),
@@ -515,8 +545,68 @@ describe("ControlClient", () => {
     });
     const result = await runUsageCli(url, ["--since", "1000", "--all-pages"]);
     expect(JSON.parse(result.stdout)).toEqual({ items: [{ id: 1 }, { id: 2 }], nextCursor: null });
-    expect(seen).toEqual([{ since: "1000" }, { since: "1000", cursor: "next" }]);
+    expect(seen).toEqual([
+      { since: "1000", limit: "1000" },
+      { since: "1000", limit: "1000", cursor: "next" },
+    ]);
   });
+
+  it("usage applies a per-request deadline without putting it in the query", async () => {
+    let requested: string | undefined;
+    const url = await listen((request) => {
+      requested = request.url;
+    });
+    const client = new ControlClient({ url, token: "test", timeoutMs: 1 });
+    await expect(client.usage({ since: "0" }, { timeoutMs: 1000 })).rejects.toMatchObject({
+      name: "TimeoutError",
+    });
+    expect(requested).toBe("/api/ardud/control/usage?since=0");
+  });
+
+  it("usage CLI forwards a resume cursor and reports its per-page deadline", async () => {
+    let requested: URL | undefined;
+    const url = await listen((request) => {
+      requested = new URL(request.url!, "http://localhost");
+    });
+    await expect(
+      runUsageCli(url, [
+        "--since",
+        "0",
+        "--cursor",
+        "resume/+",
+        "--timeout-ms",
+        "1000",
+        "--all-pages",
+      ]),
+    ).rejects.toMatchObject({
+      code: 1,
+      stdout: "",
+      stderr: expect.stringContaining(
+        "usage page 1 timed out after 1000 ms; cursor resume/+; 0 items read; resume with --cursor 'resume/+'",
+      ),
+    });
+    expect(requested?.searchParams.get("cursor")).toBe("resume/+");
+    expect(requested?.searchParams.get("limit")).toBe("1000");
+    expect(requested?.searchParams.has("timeoutMs")).toBe(false);
+  });
+
+  it.each(["0", "-1", "NaN", "Infinity", "", "1.5", "2147483648"])(
+    "usage rejects invalid --timeout-ms=%s before sending",
+    async (value) => {
+      let requests = 0;
+      const url = await listen((_request, response) => {
+        requests++;
+        response.end();
+      });
+      await expect(
+        runUsageCli(url, ["--since", "0", `--timeout-ms=${value}`]),
+      ).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringContaining("--timeout-ms must be a positive integer"),
+      });
+      expect(requests).toBe(0);
+    },
+  );
 
   it("t3ctl usage reports later page errors without printing partial results", async () => {
     let calls = 0;
@@ -657,11 +747,26 @@ describe("ControlClient", () => {
         response.end(JSON.stringify({ ok: false, error: { code: "unauthorized", message: "no" } }));
         return;
       }
-      response.end(JSON.stringify({ ok: true, threads: [], total: 0, path: request.url }));
+      response.end(
+        JSON.stringify({
+          ok: true,
+          threads: [],
+          total: 0,
+          nextCursor: "next-page",
+          path: request.url,
+        }),
+      );
     });
     const client = new ControlClient({ url, token: "t0k" });
-    const result = await client.listThreads({ origin: "imessage", active: true });
-    expect(result.path).toBe("/api/ardud/control/threads?origin=imessage&active=true");
+    const result = await client.listThreads({
+      origin: "imessage",
+      active: true,
+      cursor: "current-page",
+    });
+    expect(result.nextCursor).toBe("next-page");
+    expect(result.path).toBe(
+      "/api/ardud/control/threads?origin=imessage&active=true&cursor=current-page",
+    );
     const bad = new ControlClient({ url, token: "wrong" });
     await expect(bad.projects()).rejects.toBeInstanceOf(ControlApiError);
   });
@@ -735,5 +840,36 @@ describe("ControlClient", () => {
       { type: "message.completed", text: "hi", sequence: 9 },
     ]);
     expect(seen).toEqual([undefined, "6"]);
+  });
+});
+
+describe("cross-thread user messages", () => {
+  it("passes the since window and opaque cursor through the client", async () => {
+    const seen: string[] = [];
+    const url = await listen((request, response) => {
+      seen.push(request.url!);
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ ok: true, total: 1, messages: [], nextCursor: null }));
+    });
+    const client = new ControlClient({ url, token: "test" });
+    expect(
+      await client.listUserMessages({ since: 0, cursor: "cursor/+?=&%", limit: 1000 }),
+    ).toEqual({
+      ok: true,
+      total: 1,
+      messages: [],
+      nextCursor: null,
+    });
+    await client.listUserMessages({ since: "2026-11-15T04:00:00+04:00" });
+    const first = new URL(seen[0]!, url);
+    expect(first.pathname).toBe("/api/ardud/control/messages");
+    expect(Object.fromEntries(first.searchParams)).toEqual({
+      since: "0",
+      cursor: "cursor/+?=&%",
+      limit: "1000",
+    });
+    expect(Object.fromEntries(new URL(seen[1]!, url).searchParams)).toEqual({
+      since: "2026-11-15T04:00:00+04:00",
+    });
   });
 });

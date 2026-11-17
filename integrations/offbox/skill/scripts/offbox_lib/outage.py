@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 import contextlib
+import contextvars
 
 from . import api, capacity
 from .common import EXIT_INFRA, OffboxError, db, iso, kv_get, kv_set, log, now, say
@@ -20,22 +21,73 @@ CAPACITY_RETRY_S = 30
 KEY = "boat_outage"
 SAME_OUTAGE_S = 300   # a "seen" older than this means the outage is over (or nobody has looked since)
 _ROUND_DEADLINE: float | None = None
+_QUEUE_IDLE: dict | None = None
+_MACHINE_ACCEPTED = contextvars.ContextVar('outage_machine_accepted', default=False)
 
 
 @contextlib.contextmanager
-def allocation_budget(seconds: float):
+def allocation_budget(seconds: float, *, pause_queue=True):
     """Bound the next allocation round without restricting SSH/bring-up after a start was accepted."""
-    global _ROUND_DEADLINE
-    previous = _ROUND_DEADLINE
+    global _ROUND_DEADLINE, _QUEUE_IDLE
+    previous, previous_idle = _ROUND_DEADLINE, _QUEUE_IDLE
+    idle = _QUEUE_IDLE = {'seconds': 0.0, 'pause_queue': pause_queue, 'cycle_at': time.monotonic(), 'failed': False}
     _ROUND_DEADLINE = time.monotonic() + max(0, seconds)
+    try:
+        yield idle
+    finally:
+        _ROUND_DEADLINE, _QUEUE_IDLE = previous, previous_idle
+
+
+@contextlib.contextmanager
+def queue_idle():
+    """Healthy pool contention must not spend the recovered API's allocation budget."""
+    started = time.monotonic()
     try:
         yield
     finally:
-        _ROUND_DEADLINE = previous
+        elapsed = time.monotonic() - started
+        pause = _QUEUE_IDLE is None or _QUEUE_IDLE['pause_queue']
+        if pause:
+            _exclude_queue_time(elapsed)
+
+
+def queue_api_failed():
+    if _ROUND_DEADLINE is not None and _QUEUE_IDLE is not None:
+        _QUEUE_IDLE['failed'] = True
+
+
+def queue_progress(*, healthy=True):
+    """A completed healthy queue pass must not accumulate API/DB latency into an outage timeout."""
+    if _ROUND_DEADLINE is not None and _QUEUE_IDLE is not None and _QUEUE_IDLE['pause_queue']:
+        t = time.monotonic()
+        if healthy and not _QUEUE_IDLE['failed']:
+            _exclude_queue_time(max(0, t - _QUEUE_IDLE['cycle_at']))
+        else:
+            _QUEUE_IDLE['cycle_at'] = t
+        _QUEUE_IDLE['failed'] = False
+
+
+def _exclude_queue_time(elapsed):
+    global _ROUND_DEADLINE
+    if _ROUND_DEADLINE is not None:
+        _ROUND_DEADLINE += elapsed
+        _QUEUE_IDLE['seconds'] += elapsed
+        _QUEUE_IDLE['cycle_at'] += elapsed
+    from . import home
+    budget = home.WAIT_BUDGET.get()
+    if budget is not None:
+        # The transient episode and startup deadline exclude the same healthy queue time.
+        for key in ('end', 'transient_since'):
+            if budget.get(key) is not None:
+                budget[key] += elapsed
 
 
 def allocation_left() -> float | None:
     return None if _ROUND_DEADLINE is None else max(0, _ROUND_DEADLINE - time.monotonic())
+
+
+def contention_left():
+    return allocation_left() if _QUEUE_IDLE is not None and not _QUEUE_IDLE['pause_queue'] else None
 
 
 @contextlib.contextmanager
@@ -43,10 +95,19 @@ def accepted_machine():
     global _ROUND_DEADLINE
     previous = _ROUND_DEADLINE
     _ROUND_DEADLINE = None
+    token = _MACHINE_ACCEPTED.set(True)
     try:
         yield
+    except OffboxError as error:
+        error.machine_accepted = True
+        raise
     finally:
+        _MACHINE_ACCEPTED.reset(token)
         _ROUND_DEADLINE = previous
+
+
+def machine_accepted():
+    return _MACHINE_ACCEPTED.get()
 
 
 def window_seconds() -> int:
@@ -81,10 +142,10 @@ def current() -> dict | None:
     return kv_get(db(), KEY, max_age=SAME_OUTAGE_S)
 
 
-def wait_until_up(reason: str, budget_s: float) -> bool:
+def wait_until_up(reason: str, budget_s: float, *, service: str = 'boat.dev') -> bool:
     """Probe boat until it answers or `budget_s` is spent. True when it is back."""
     since = note_down(reason)
-    say(f"boat.dev API is down ({reason} since {iso(since)[-5:]}); nothing has started. Waiting up to "
+    say(f"{service} API is down ({reason} since {iso(since)[-5:]}); nothing has started. Waiting up to "
         f"{int(budget_s)}s for it to come back. Use a tool timeout above {int(budget_s)}s or run this in a "
         "background shell.")
     start = time.monotonic()
@@ -100,13 +161,13 @@ def wait_until_up(reason: str, budget_s: float) -> bool:
         why = api.probe(timeout=min(PROBE_EVERY_S, left))
         if why is None:
             note_up()
-            say(f"boat.dev is back after {int(now() - since)}s; retrying")
+            say(f"{service} is back after {int(now() - since)}s; retrying")
             return True
         note_down(why)
         left = budget_s - (time.monotonic() - start)
         if last_say is None or time.monotonic() - last_say >= PROGRESS_EVERY_S:
             last_say = time.monotonic()
-            say(f"still waiting for boat.dev: down {int(now() - since)}s ({why}), {int(max(0, left))}s left")
+            say(f"still waiting for {service}: down {int(now() - since)}s ({why}), {int(max(0, left))}s left")
 
 
 def down_error(e, waited_s: float) -> OffboxError:

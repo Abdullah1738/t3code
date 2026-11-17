@@ -2,53 +2,40 @@
 // t3ctl: shell access to the ardud control API. Prints JSON unless --text.
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
-import * as NodeNet from "node:net";
 import * as NodePath from "node:path";
-import * as NodeChildProcess from "node:child_process";
-import * as NodeURL from "node:url";
 import * as NodeUtil from "node:util";
 
 import { ControlClient, SHARED_TOKEN_FILE, componentTokenFile } from "./client.mjs";
-import { deepHealth } from "./deep-health.mjs";
+import { runDeepHealthCli } from "./deep-health-cli.mjs";
+import { runLiveCli } from "./t3ctl-live-cli.mjs";
+export { checkLive } from "./live-check.mjs";
 
-// Like outboundHttp.ts, ignore macOS peer-reset EINVAL for undici's optional QoS hint.
-export function ignoreMacosTypeOfServiceEinval(
-  // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone Node CLI; no Effect runtime.
-  platform = process.platform,
-  socketPrototype = NodeNet.Socket.prototype,
-) {
-  if (platform !== "darwin") return;
-  const setTypeOfService = socketPrototype.setTypeOfService;
-  if (typeof setTypeOfService !== "function") return;
-  socketPrototype.setTypeOfService = function (...args) {
-    try {
-      return setTypeOfService.apply(this, args);
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "EINVAL") return this;
-      throw error;
-    }
-  };
-}
+import { ignoreMacosTypeOfServiceEinval } from "./control-qos.mjs";
+export { ignoreMacosTypeOfServiceEinval } from "./control-qos.mjs";
+
 ignoreMacosTypeOfServiceEinval();
 
 const TOKEN_FILE = componentTokenFile("t3ctl");
-const DEFAULT_REPO = "/Volumes/ExternalSSD/t3code-fork";
 
 const HELP = `t3ctl <command> [options]
 
   login --url URL --token TOKEN        save to ~/.robob/components/t3ctl.json (chmod 600)
   health [--deep] [--json]              connection/token; deep: lag + real state read (10s bound)
-  live SHA-OR-REF [--repo PATH]        check whether a commit is in the running build
+  live SHA-OR-REF [--repo PATH] [--timeout SECONDS]
+                                       check running build ancestry (20s total, health <=10s)
   requests [--origin O]                pending approvals and questions everywhere
   projects                             list projects
   models                               default model and available models
   usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]
-  threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--all-kinds]
+        [--cursor CURSOR] [--timeout-ms MS]  per-page deadline (default 30000ms)
+        --all-pages defaults to 1000 rows per page
+  threads [--origin O] [--active] [--state S] [--since ISO] [--limit N] [--cursor C] [--all-kinds]
   create [--prompt P] [--title T] [--dir D | --project ID] [--model M] [--instance I]
          [--variant V] [--option K=V ...] [--mode full-access|approval-required|...] [--origin O] [--plan]
          [--wait] [--timeout SECONDS]
   status THREAD                        state, run, pending requests
-  native SES_ID [--driver D]           thread for an OpenCode session id (or any native id)
+  native SES_ID [--driver D] [--view owner]
+                                       thread for a native session id
   identity NATIVE_ID [--driver D] [--instance I] [--agent A]
                                        resolve any native id to its exact Robob execution
   messages THREAD [--limit N] [--last] [--role user|assistant]
@@ -74,94 +61,60 @@ Keep the same credentials when retrying; an explicit --token is never printed.
 For a URL containing credentials or a query, set T3CTL_RETRY_URL before retrying.
 Use -- before a thread or text beginning with -.
 --request-timeout also limits wait requests and event streams when supplied;
---timeout separately controls how long the server waits for a thread.
+--timeout controls live's total deadline or how long the server waits for a thread.
 
 Connection: T3_CONTROL_URL / T3_CONTROL_TOKEN, else the file named by
 T3_CONTROL_TOKEN_FILE, else the first found of ${TOKEN_FILE} and
 ${SHARED_TOKEN_FILE}.`;
 
-/** Check whether a ref is an ancestor of the build reported by health. */
-export async function checkLive(commit, { health, repo = DEFAULT_REPO }) {
-  let response;
-  try {
-    response = await health();
-  } catch {
-    return { commit, buildCommit: null, live: null, reason: "health unavailable" };
-  }
-  if (
-    response?.ok !== true ||
-    !["healthy", "degraded", "recovered-unverified"].includes(response?.status)
-  ) {
-    return { commit, buildCommit: null, live: null, reason: "invalid health response" };
-  }
-  const buildCommit = response.buildCommit;
-  if (
-    typeof buildCommit !== "string" ||
-    buildCommit.trim() !== buildCommit ||
-    !/^[0-9a-f]{7,40}$/.test(buildCommit)
-  ) {
-    return { commit, buildCommit: null, live: null, reason: "build commit unavailable" };
-  }
-  if (typeof commit !== "string" || !commit || commit.startsWith("-")) {
-    return { commit: commit ?? null, buildCommit, live: null, reason: "invalid commit or ref" };
-  }
-
-  const gitEnv = { ...process.env, GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1" };
-  for (const key of [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_INDEX_FILE",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_CONFIG",
-    "GIT_CONFIG_COUNT",
-  ])
-    delete gitEnv[key];
-  const git = (...args) =>
-    NodeChildProcess.spawnSync("git", args, {
-      cwd: repo,
-      env: gitEnv,
-      encoding: "utf8",
-      timeout: 30_000,
-    });
-  const objectId = (prefix) => {
-    const result = git("rev-parse", `--disambiguate=${prefix.toLowerCase()}`);
-    const matches = result.stdout?.trim().split("\n").filter(Boolean) ?? [];
-    return result.status === 0 &&
-      matches.length === 1 &&
-      git("cat-file", "-t", matches[0]).stdout?.trim() === "commit"
-      ? matches[0]
-      : null;
-  };
-  const target = /^[0-9a-f]{7,40}$/i.test(commit)
-    ? objectId(commit)
-    : (() => {
-        const result = git("rev-parse", "--verify", "--end-of-options", `${commit}^{commit}`);
-        return result.status === 0 ? result.stdout.trim() : null;
-      })();
-  if (target === null) {
-    return { commit, buildCommit, live: null, reason: "commit or ref unavailable" };
-  }
-  const build = objectId(buildCommit);
-  if (build === null) {
-    return { commit, buildCommit, live: null, reason: "build commit unavailable in repo" };
-  }
-  const result = git("merge-base", "--is-ancestor", target, build);
-  if (result.status === 0) return { commit, buildCommit, live: true, reason: "ancestor of build" };
-  if (result.status === 1) {
-    const shallow = git("rev-parse", "--is-shallow-repository");
-    if (shallow.status === 0 && shallow.stdout.trim() === "false") {
-      return { commit, buildCommit, live: false, reason: "not ancestor of build" };
-    }
-    return { commit, buildCommit, live: null, reason: "ancestry incomplete or unavailable" };
-  }
-  return { commit, buildCommit, live: null, reason: "git ancestry check failed" };
-}
-
 const shellQuote = (value) => `'${value.replace(/'/g, "'\\''")}'`;
+
+export async function readUsage(
+  client,
+  filters,
+  { allPages = false, timeoutMs = client.timeoutMs ?? 30_000 } = {},
+) {
+  const items = [];
+  const seen = new Set(filters.cursor ? [filters.cursor] : []);
+  let cursor = filters.cursor;
+  let first;
+  let pageNumber = 1;
+  while (true) {
+    let page;
+    try {
+      page = await client.usage({ ...filters, cursor }, { timeoutMs });
+      if (
+        !page ||
+        !Array.isArray(page.items) ||
+        (page.nextCursor !== null && typeof page.nextCursor !== "string")
+      ) {
+        throw new Error("invalid usage page");
+      }
+      if (allPages && page.nextCursor !== null && seen.has(page.nextCursor)) {
+        throw new Error("usage pagination returned a repeated cursor");
+      }
+    } catch (cause) {
+      const failure =
+        cause?.name === "AbortError" || cause?.name === "TimeoutError"
+          ? `timed out after ${timeoutMs} ms`
+          : `failed: ${cause?.code ? `${cause.code}: ` : ""}${cause?.message ?? String(cause)}`;
+      const resume = cursor
+        ? `resume with --cursor ${shellQuote(cursor)}`
+        : "retry without --cursor";
+      throw new Error(
+        `usage page ${pageNumber} ${failure}; cursor ${cursor ?? "<start>"}; ${items.length} items read; ${resume}`,
+        { cause },
+      );
+    }
+    first ??= page;
+    if (!allPages) return page;
+    items.push(...page.items);
+    if (page.nextCursor === null) return { ...first, items, nextCursor: null };
+    seen.add(page.nextCursor);
+    cursor = page.nextCursor;
+    pageNumber++;
+  }
+}
 const shellOption = (name, value) =>
   value.startsWith("-") ? `--${name}=${shellQuote(value)}` : `--${name} ${shellQuote(value)}`;
 
@@ -246,6 +199,7 @@ async function main() {
       drain: { type: "boolean" },
       timeout: { type: "string" },
       "request-timeout": { type: "string" },
+      "timeout-ms": { type: "string" },
       "request-id": { type: "string" },
       active: { type: "boolean" },
       state: { type: "string" },
@@ -253,6 +207,7 @@ async function main() {
       until: { type: "string" },
       board: { type: "string" },
       limit: { type: "string" },
+      cursor: { type: "string" },
       "all-pages": { type: "boolean" },
       "all-kinds": { type: "boolean" },
       last: { type: "boolean" },
@@ -268,6 +223,7 @@ async function main() {
       unsettle: { type: "boolean" },
       thread: { type: "string" },
       session: { type: "string" },
+      view: { type: "string" },
       "expect-run": { type: "string" },
       "expect-attempt": { type: "string" },
       reason: { type: "string" },
@@ -324,13 +280,12 @@ async function main() {
   }
   if (command === "live") {
     const commit = need(args[0], "SHA-OR-REF");
-    const result = await checkLive(commit, {
-      repo: flags.repo,
-      health: () =>
-        new ControlClient({ url: flags.url, token: flags.token, component: "t3ctl" }).health(),
-    });
-    print(result);
-    process.exitCode = result.live === true ? 0 : result.live === false ? 3 : 2;
+    const seconds = flags.timeout === undefined ? 20 : Number(flags.timeout);
+    if (!Number.isFinite(seconds) || seconds <= 0 || seconds * 1000 > 2_147_481_647) {
+      throw new Error("--timeout must be a positive number of seconds");
+    }
+    const budget = Math.max(1, Math.round(seconds * 1000));
+    runLiveCli({ commit, repo: flags.repo, url: flags.url, token: flags.token, timeoutMs: budget });
     return;
   }
   let requestTimeoutMs;
@@ -346,27 +301,30 @@ async function main() {
     }
     requestTimeoutMs = Math.max(1, Math.round(seconds * 1000));
   }
+  if (command === "health" && flags.deep) {
+    runDeepHealthCli({
+      url: flags.url,
+      token: flags.token,
+      timeoutMs: requestTimeoutMs,
+      json: flags.json,
+    });
+    return;
+  }
   const client = new ControlClient({
     url: flags.url,
     token: flags.token,
     component: "t3ctl",
     timeoutMs: requestTimeoutMs,
   });
-  if (requestTimeoutMs !== undefined) {
+  if (requestTimeoutMs !== undefined && command !== "usage") {
     // wait() normally gives its long-poll an extra 30s; an explicit deadline wins.
     const request = client.request.bind(client);
     client.request = (method, path, body, options = {}) =>
       request(method, path, body, { ...options, timeoutMs: requestTimeoutMs });
   }
   switch (command) {
-    case "health": {
-      if (!flags.deep) return print(await client.health());
-      const report = await deepHealth({ client, timeoutMs: requestTimeoutMs });
-      if (!flags.json) console.log(report.summary);
-      print(report);
-      process.exitCode = report.exitCode;
-      return;
-    }
+    case "health":
+      return print(await client.health());
     case "requests":
       return print(await client.pendingRequests({ origin: flags.origin }));
     case "projects":
@@ -374,32 +332,32 @@ async function main() {
     case "models":
       return print(await client.models());
     case "usage": {
+      const pageTimeoutMs =
+        flags["timeout-ms"] === undefined
+          ? (requestTimeoutMs ?? 30_000)
+          : Number(flags["timeout-ms"]);
+      if (
+        !Number.isSafeInteger(pageTimeoutMs) ||
+        pageTimeoutMs < 1 ||
+        pageTimeoutMs > 2_147_483_647
+      ) {
+        throw new Error(
+          "--timeout-ms must be a positive integer of at most 2147483647 milliseconds",
+        );
+      }
       const filters = {
         since: need(flags.since, "--since"),
         until: flags.until,
         boardId: flags.board,
-        limit: flags.limit,
+        limit: flags.limit ?? (flags["all-pages"] ? "1000" : undefined),
+        cursor: flags.cursor,
       };
-      const first = await client.usage(filters);
-      if (!flags["all-pages"]) return print(first);
-      const items = [];
-      const seen = new Set();
-      let page = first;
-      while (true) {
-        if (
-          !page ||
-          !Array.isArray(page.items) ||
-          (page.nextCursor !== null && typeof page.nextCursor !== "string")
-        ) {
-          throw new Error("invalid usage page");
-        }
-        for (const item of page.items) items.push(item);
-        const cursor = page.nextCursor;
-        if (cursor === null) return print({ ...first, items, nextCursor: null });
-        if (seen.has(cursor)) throw new Error("usage pagination returned a repeated cursor");
-        seen.add(cursor);
-        page = await client.usage({ ...filters, cursor });
-      }
+      return print(
+        await readUsage(client, filters, {
+          allPages: flags["all-pages"],
+          timeoutMs: pageTimeoutMs,
+        }),
+      );
     }
     case "harness-cutover": {
       const action = need(args[0], "harness-cutover action");
@@ -463,6 +421,7 @@ async function main() {
         active: flags.active,
         state: flags.state,
         updatedSince: flags.since,
+        cursor: flags.cursor,
         limit: flags.limit,
         includeSubagents: flags["all-kinds"],
       });
@@ -499,7 +458,10 @@ async function main() {
       return print(await client.thread(need(args[0], "THREAD")));
     case "native":
       return print(
-        await client.threadByNativeSession(need(args[0], "SES_ID"), { driver: flags.driver }),
+        await client.threadByNativeSession(need(args[0], "SES_ID"), {
+          driver: flags.driver,
+          view: flags.view,
+        }),
       );
     case "identity":
       return print(
@@ -664,15 +626,7 @@ async function main() {
   }
 }
 
-let isMain = false;
-try {
-  isMain =
-    !!process.argv[1] &&
-    NodeFS.realpathSync(process.argv[1]) === NodeURL.fileURLToPath(import.meta.url);
-} catch {
-  // An importing process may have a non-file argv[1].
-}
-if (isMain) {
+if (import.meta.main) {
   main().catch((error) => {
     console.error(
       error.code ? `${error.code}: ${error.message}` : (error.message ?? String(error)),

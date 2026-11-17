@@ -1,0 +1,27 @@
+Processes: 1206 total, 12 running, 5 stuck, 1189 sleeping, 11487 threads
+2026/11/14 11:12:12
+Load Avg: 22.66, 22.30, 26.56
+CPU usage: 55.69% user, 35.5% sys, 9.24% idle
+SharedLibs: 1224M resident, 100M data, 93M linkedit.
+MemRegions: 1330932 total, 25G resident, 452M private, 2517M shared.
+PhysMem: 63G used (5724M wired, 10G compressor), 336M unused.
+VM: 657T vsize, 57G framework vsize, 18530928(0) swapins, 25200889(0) swapouts.
+Networks: packets: 807195951/1341G in, 1510266061/2444G out.
+Disks: 2284705926/51T read, 1634470082/24T written.
+
+PID    COMMAND          MEM   CMPRS
+75214  Robob            3678M 225M
+45411  codex            2813M 916M
+176    WindowServer     1992M 324M
+6662   cua-driver       1892M 1875M
+85654  Robob Helper (Re 1677M 174M
+482    Finder           1588M 1433M
+49082  Browser Helper ( 1356M 78M
+86824  Python           1297M 0B
+49059  Dia              1221M 764M
+48677  Python           980M  356M
+440    Telegram         874M  765M
+39001  node             868M  127M
+25545  opencode         802M  299M
+74420  Robob Helper     772M  64M
+456    Terminal         629M  103M

@@ -181,12 +181,15 @@ const makeTestRelay = Effect.fnUntraced(function* (
   const shellReads: ThreadId[] = [];
   const catchUp = { shellSnapshotReads: 0 };
   const threads = ThreadManagementService.ThreadManagementService.of({
+    promoteQueuedMessages: unused,
     getCallerRow: () => Effect.die("unused getCallerRow"),
     getThreadIdsForWorktree: () => Effect.die("unused getThreadIdsForWorktree"),
     getThreadShell: (threadId) =>
       Effect.sync(() => shellReads.push(threadId)).pipe(
         Effect.andThen(options.readShell?.(threadId) ?? Ref.get(currentShell)),
       ),
+    pageActiveThreadIds: () => Effect.die("unused pageActiveThreadIds"),
+    listActiveThreadIds: () => Effect.die("unused listActiveThreadIds"),
     getShellSnapshot: () =>
       Effect.sync(() => {
         catchUp.shellSnapshotReads += 1;
@@ -215,6 +218,8 @@ const makeTestRelay = Effect.fnUntraced(function* (
     assertProviderInstanceEnabled: unused,
     isProviderInstanceEnabledForProject: unused,
     hasReceipt: unused,
+    getDelegationCommandState: unused,
+    requestCancelOnArrival: unused,
     getCommandReceipt: unused,
     findMcpThreadCreations: unused,
     waitForThread: unused,

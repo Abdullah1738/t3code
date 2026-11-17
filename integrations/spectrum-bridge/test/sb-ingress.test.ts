@@ -40,6 +40,7 @@ function setup() {
     sendText: async () => ({ handle: "out" }), sendApp: async () => ({ handle: "app" }),
     upload: async () => "https://cdn.example/file", getMessage: async () => undefined,
     react: async () => {}, typing: async () => {}, read: async () => {}, requestLocation: async () => {},
+    setOptOut: async () => {},
     location: async () => undefined, download: async () => ({ data: new Uint8Array(), name: "file", mimeType: "text/plain" }),
   };
   const notify = mock(async (_text: string, _key: string) => true);

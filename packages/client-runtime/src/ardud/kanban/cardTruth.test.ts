@@ -169,6 +169,19 @@ describe("cardTruth: To-Do", () => {
     });
   });
 
+  it.each(["evaluator", "script"] as const)(
+    "pending findings on a %s step wait for the worker",
+    (owner) => {
+      const target = card(1, {
+        stage: "todo",
+        subtasks: [subtask(owner, "Check the build")],
+        reviewFindingsPending: true,
+      });
+      expect(truth(target)).toMatchObject({ state: "ready", label: "Ready" });
+      expect(truth({ ...target, reviewFindingsPending: false }).state).toBe("evaluator");
+    },
+  );
+
   it("names every unfinished blocker, lowest first, and skips finished ones", () => {
     const blocked = card(1, {
       stage: "todo",
@@ -381,6 +394,34 @@ describe("cardTruth: review", () => {
       "Held until Sat 14 Nov 09:00",
     );
   });
+
+  it.each([
+    ["foreign", "board-foreign", "Foreign", "foreign", "Held for #73 (Foreign)"],
+    ["same board outside page", "board-toy", null, "foreign", "Held for #73"],
+    ["missing", null, null, "foreign", "Held for another card"],
+    ["stale", "board-foreign", "Foreign", "old-target", "Held for another card"],
+  ] as const)(
+    "labels a wait with %s target metadata",
+    (_name, boardId, boardName, hintId, label) => {
+      const waiting = card(1, {
+        wait: wait({
+          on: "card",
+          card: "foreign" as never,
+          ...(boardId === null
+            ? {}
+            : {
+                cardTarget: {
+                  id: hintId as never,
+                  number: 73,
+                  boardId: boardId as never,
+                  boardName,
+                },
+              }),
+        }),
+      });
+      expect(truth(waiting, [card(73)]).label).toBe(label);
+    },
+  );
 
   it("shows a script wait by its script's name, with the check's latest status", () => {
     const script = (patch: Partial<KanbanWait> = {}) =>

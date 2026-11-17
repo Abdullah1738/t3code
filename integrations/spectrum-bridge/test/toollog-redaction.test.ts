@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createServer } from "node:net";
 import { createToolLog, toolError, toolLog, type LogLine } from "../src/toollog.ts";
-import { sweepSecrets } from "../src/secrets.ts";
+import { putSecretRequest, sweepSecrets } from "../src/secrets.ts";
 import { Store } from "../src/store.ts";
 import { ControlClient } from "../src/control.ts";
 
@@ -41,8 +41,10 @@ test("a real refused ControlClient connection logs the native fetch cause safely
   await expect(client.request("GET", "/health?message=PRIVATE_BODY&token=PRIVATE_QUERY")).rejects.toMatchObject({ name: "ControlError", status: 0 });
   toolLog.flush();
   const records = rows(new Date().toISOString().slice(0, 10));
-  const failure = records.find(line => line.error?.tag === "control.catch1")!;
-  expect(failure.error).toMatchObject({ name: "TypeError", code: "ECONNREFUSED" });
+  const failure = records.find(line => line.error?.tag === "control.request_failed")!;
+  expect(records.filter(line => line.error)).toHaveLength(1);
+  expect(failure.name).toBe("turn.robob_call");
+  expect(failure.error).toMatchObject({ code: "ECONNREFUSED" });
   expect(failure.site).toMatch(/^src\/control.ts:\d+$/);
   expect(JSON.stringify(records)).not.toMatch(/PRIVATE_|127\.0\.0\.1|message=|token=/);
 });
@@ -123,10 +125,14 @@ test.each(["bridge.catch", "reply.failed", "form.fail"])("%s uses the same safe 
   expect(JSON.stringify(line)).not.toContain("PRIVATE");
 });
 
-test("the real periodic form sweep reports ENOENT without leaking its directory", async () => {
+test("the real periodic form sweep reports ENOENT for an active submission without leaking its directory", async () => {
   const store = new Store(":memory:");
+  const now = Date.now();
   try {
-    await expect(sweepSecrets({ store, stateRoot: join(root, "PRIVATE_MISSING_DIRECTORY") })).resolves.toBeUndefined();
+    putSecretRequest(store, "t".repeat(43), { sessionId: "fixture", generation: 1, purpose: "Fixture",
+      fields: [{ name: "password", label: "Password", type: "password" }], state: "submitted",
+      createdAt: now, expiresAt: now + 900_000, valuesExpireAt: now + 1_800_000 });
+    await expect(sweepSecrets({ store, stateRoot: join(root, "PRIVATE_MISSING_DIRECTORY"), now: () => now })).resolves.toBeUndefined();
     toolLog.flush();
     const line = rows(new Date().toISOString().slice(0, 10)).find(line => line.error?.tag === "secrets.catch9")!;
     expect(line.site).toMatch(/^src\/secrets.ts:\d+$/);
@@ -308,4 +314,19 @@ test.each([
     expect(JSON.stringify(lines.map(line => ({ site: line.site, stack: line.error?.stack })))).not.toContain(`:${number}`);
     expect(JSON.stringify((await log.rollup(day))?.topErrorTags)).not.toContain(`:${number}`);
   }
+});
+
+test.each(["+971501234567", "/Users/private/PRIVATE.pdf", "https://private.test/?token=PRIVATE", "PRIVATE_TOKEN"])("render diagnostics reject private metadata shape %#", async privateValue => {
+  const log = createToolLog({ root, now: () => at, defer: true });
+  log.write({ component: "cards", kind: "perf", name: "card.render", ok: false, durationMs: 22,
+    ids: { chat: privateValue }, props: { cardKind: privateValue, outcome: "failed", failureCode: privateValue, attempt: 1 } });
+  log.write({ component: "router", kind: "error", name: "bridge.catch", error: {
+    tag: "router.catch49", cause: { name: "Error", message: privateValue, code: privateValue, causeKey: privateValue },
+  } });
+  log.flush();
+  expect(rows()[0]).toMatchObject({ ids: { chat: "other" }, props: { outcome: "failed", attempt: 1 } });
+  expect(rows()[0].props?.failureCode).toBeUndefined();
+  expect(rows()[1].error?.causeKey).toBe("background_watch");
+  expect(JSON.stringify(rows())).not.toContain(privateValue);
+  expect(JSON.stringify(await log.rollup(day))).not.toContain(privateValue);
 });

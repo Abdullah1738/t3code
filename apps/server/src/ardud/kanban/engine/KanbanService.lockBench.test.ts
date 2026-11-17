@@ -109,13 +109,22 @@ const makeThreads = Effect.gen(function* () {
   const layer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
+      claimContext: (threadId) =>
+        read(threadId).pipe(
+          Effect.map((view) => {
+            const model = threads.get(threadId)?.model;
+            return view && model ? { projectId: view.projectId, model } : null;
+          }),
+        ),
       view: read,
       find: read,
       model: (threadId) => quick(null).pipe(Effect.map(() => threads.get(threadId)?.model ?? null)),
       lastFailure: () => quick(null),
       findLastFailure: () => quick(null),
       latestRun: () => quick(null),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => quick(null),
       // A launch reads and writes thread state several times (receipts, projection, transcript).
@@ -144,6 +153,7 @@ const makeThreads = Effect.gen(function* () {
           const thread = threads.get(threadId);
           if (thread) thread.model = model;
         }),
+      queuedRuns: () => Effect.succeed([]),
       cancelQueued: () => Effect.succeed(false),
       interrupt: (threadId) =>
         Effect.gen(function* () {

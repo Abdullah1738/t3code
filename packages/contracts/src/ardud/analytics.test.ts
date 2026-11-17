@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
-import { AnalyticsEvent, AnalyticsIngestInput, AnalyticsReadInput } from "./analytics.ts";
+import {
+  AnalyticsEvent,
+  AnalyticsRollup,
+  RunUsageEvent,
+  AnalyticsIngestInput,
+  AnalyticsReadInput,
+} from "./analytics.ts";
 import { clientRpcRequiredScopes } from "../clientRpcPermissions.ts";
 import { AuthOrchestrationOperateScope } from "../auth.ts";
 import { WS_METHODS } from "../rpc.ts";
@@ -15,6 +21,7 @@ const event = {
 const decode = Schema.decodeUnknownSync(AnalyticsIngestInput);
 const decodeEvent = Schema.decodeUnknownSync(AnalyticsEvent);
 const decodeRead = Schema.decodeUnknownSync(AnalyticsReadInput);
+const decodeRunUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
 describe("analytics ingest contract", () => {
   it("preserves typed board metadata and excludes text", () => {
     const input = {
@@ -53,8 +60,9 @@ describe("analytics ingest contract", () => {
         kind: "mcp.call",
         tool: "card_update",
         outcome: "timeout",
+        responseDelivery: "closed",
       }),
-    ).toMatchObject({ tool: "card_update", outcome: "timeout" });
+    ).toMatchObject({ tool: "card_update", outcome: "timeout", responseDelivery: "closed" });
     expect(() => decodeRead({ day: "2026-11-13", outcome: "maybe" })).toThrow();
   });
   it("accepts bounded batches and strips unrecognized content", () => {
@@ -98,4 +106,169 @@ describe("analytics ingest contract", () => {
     ])
       expect(() => read(input)).toThrow();
   });
+});
+
+const usage = {
+  ts: event.ts,
+  kind: "run.usage",
+  surface: "server",
+  route: "provider",
+  runId: "run:one",
+  threadId: "thread:one",
+  role: "chat",
+  providerInstance: "codex",
+  model: "gpt-6.1-sol",
+  effort: "max",
+  inputTokens: null,
+  outputTokens: null,
+  cachedInputTokens: null,
+  reasoningTokens: null,
+  wallMs: null,
+  turnCount: 0,
+  endReason: "failed",
+  usageStatus: "unavailable",
+  reviewRound: null,
+};
+it("requires the metadata-only usage schema and preserves null measurements", () => {
+  const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
+  expect(decodeUsage(usage)).toEqual(usage);
+  expect(Object.hasOwn(decodeUsage(usage), "cancelReason")).toBe(false);
+  const cancelled = { ...usage, endReason: "cancelled", cancelReason: "server_shutdown" };
+  expect(decodeUsage(cancelled)).toEqual(cancelled);
+  expect(() => decodeUsage({ ...cancelled, cancelReason: "unclassified" })).toThrow();
+  for (const key of ["prompt", "message", "text", "toolArgs", "toolOutput", "output"]) {
+    expect(() => decodeUsage({ ...usage, [key]: "private" })).toThrow();
+  }
+  const decodeEvent = Schema.decodeUnknownSync(AnalyticsEvent, { onExcessProperty: "error" });
+  expect(() =>
+    decodeEvent({ ts: event.ts, kind: "run.usage", surface: "server", route: "provider" }),
+  ).toThrow();
+  expect(() => decode({ events: [{ ...usage, surface: "web" }] })).toThrow();
+  expect(() => decodeUsage({ ...usage, inputTokens: -1 })).toThrow();
+  expect(
+    Schema.decodeUnknownSync(AnalyticsReadInput)({
+      day: "2026-11-13",
+      kind: "run.usage",
+      cardId: "card:one",
+    }).cardId,
+  ).toBe("card:one");
+});
+
+it.each(["runId", "threadId"] as const)("accepts bounded derived usage %s values", (field) => {
+  const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent);
+  for (const value of ["derived:review!~'()*1338", "a".repeat(8192)]) {
+    expect(decodeUsage({ ...usage, [field]: value })[field]).toBe(value);
+  }
+  for (const value of ["a".repeat(8193), "unencoded space", "unencoded界", "line\nbreak"]) {
+    expect(() => decodeUsage({ ...usage, [field]: value })).toThrow();
+  }
+});
+
+it.each([
+  ["plain", "review-1338_v1.2"],
+  ["parentheses", "review(1338)"],
+  ["bang", "review!1338"],
+  ["apostrophe", "review'1338"],
+  ["star", "review*1338"],
+  ["tilde", "review~1338"],
+  ["separators", "review:/#@%+1338"],
+  ["whitespace", "review 1338\tunit"],
+  ["unicode", "مراجعة-1338"],
+  ["maximum-key", "界".repeat(256)],
+] as const)("accepts %s allocator keys in both run usage IDs", (_name, key) => {
+  const commandId = `command:mcp:delegate-task:caller:${encodeURIComponent(key)}`;
+  const threadId = `thread:delegated-task:${encodeURIComponent(commandId)}`;
+  const runId = `run:thread:${encodeURIComponent(threadId)}:ordinal:1`;
+  const row = { ...usage, threadId, runId };
+  expect(decodeRunUsage(row)).toEqual(row);
+  expect(decodeEvent(row)).toEqual(row);
+});
+
+it.each([
+  "claude-opus-5[1m]",
+  "Claude Opus 5.5",
+  "vendor/model:variant@2026-11-13",
+  "vendor/model|route?hint=value",
+  "m".repeat(161),
+  "m".repeat(4096),
+])("accepts provider-owned model identifiers: %s", (model) => {
+  expect(Schema.decodeUnknownSync(RunUsageEvent)({ ...usage, model }).model).toBe(model);
+});
+
+it.each(["live_thread", "steer", "start", "none"] as const)(
+  "#1603 post-routing target %s is retained without message content",
+  (target) => {
+    const row = {
+      ...event,
+      kind: "kanban.post_routing",
+      outcome: "ok",
+      props: { actor: "script", seq: 39, target, phase: "routed" },
+    };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(() =>
+      decodeEvent({ ...row, props: { ...row.props, target: "arbitrary text" } }),
+    ).toThrow();
+  },
+);
+
+it.each(["started", "reused", "merged", "queued_spawn_cap"] as const)(
+  "#1490 accepts evaluator outcome %s and bounded attribution labels",
+  (outcome) => {
+    const row = {
+      ...event,
+      kind: "kanban.evaluator",
+      surface: "server",
+      boardId: "board-offbox",
+      purposeKind: "request",
+      trigger: "report_bug",
+      outcome,
+      reuseMissReason: "no_card_reuse_scope",
+    };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(
+      decodeRead({ day: "2026-11-14", boardId: "board-offbox", kind: row.kind, outcome }),
+    ).toMatchObject({ outcome });
+    for (const field of ["purposeKind", "trigger", "reuseMissReason"])
+      expect(() => decodeEvent({ ...row, [field]: "private words" })).toThrow();
+  },
+);
+
+it("decodes detached outcomes additively and rejects raw request ids", () => {
+  const old = { ...event, kind: "mcp.call", tool: "delegate_task", outcome: "timeout" };
+  expect(decodeEvent(old)).toEqual(old);
+  for (const outcome of ["committed", "failed", "capped"] as const) {
+    const row = {
+      ...old,
+      kind: "mcp.detached",
+      outcome,
+      lateMs: 1234,
+      afterCap: true,
+      clientRequestId: "a".repeat(64),
+    };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(() => decodeEvent({ ...row, clientRequestId: "raw-request-id" })).toThrow();
+    expect(() => decodeEvent({ ...row, lateMs: -1 })).toThrow();
+  }
+  expect(
+    Schema.is(AnalyticsRollup.fields.mcpCalls)([
+      {
+        tool: "delegate_task",
+        hour: "2026-11-13T00:00:00.000Z",
+        build: "test",
+        bootId: "boot",
+        count: 1,
+        p50Ms: 10000,
+        p95Ms: 10000,
+        maxMs: 10000,
+        approximate: false,
+        failures: 1,
+        failureRate: 1,
+        outcomes: { timeout: 1 },
+        savedCounts: { unknown: 1 },
+        errors: [],
+        failedThenRetried: 0,
+        retrySucceeded: 0,
+      },
+    ]),
+  ).toBe(true);
 });
