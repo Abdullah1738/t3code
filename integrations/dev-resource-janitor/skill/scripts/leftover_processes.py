@@ -22,6 +22,7 @@ THREAD_KEYS = {"T3_THREAD_ID", "T3CODE_THREAD_ID", "ROBOB_THREAD_ID"}
 TERMINAL = {"completed", "cancelled", "failed", "interrupted"}
 OWNER_CALL_TIMEOUT = 20
 OBSERVATION_BUDGET = 10 * 60
+BROWSER_EXIT_GRACE = 5
 OWNER_ENDPOINTS = ("by_native", "detail", "recovery")
 
 
@@ -79,9 +80,9 @@ def parse_ps(raw):
     return rows
 
 
-def processes(pid=None):
+def processes(pid=None, *, timeout=15):
     select = ["-p", str(pid)] if pid else ["-ax"]
-    return parse_ps(run(["/bin/ps", *select, "-o", "pid=,ppid=,lstart=,tty=,args="]))
+    return parse_ps(run(["/bin/ps", *select, "-o", "pid=,ppid=,lstart=,tty=,args="], timeout=timeout))
 
 
 def parse_top(raw):
@@ -683,7 +684,7 @@ def close_agent_browser(item):
             raise RuntimeError("session close failed")
 
 
-def reap_agent_browsers(report, *, rescan=None, close=close_agent_browser, refresh=processes, validate=None):
+def reap_agent_browsers(report, *, rescan=None, close=close_agent_browser, refresh=None, validate=None):
     if os.environ.get("DEV_JANITOR_REAP_AGENT_BROWSER") != "1":
         return []
     if rescan is None:
@@ -707,9 +708,20 @@ def reap_agent_browsers(report, *, rescan=None, close=close_agent_browser, refre
                 else:
                     entry["action"] = "close"
                     close(candidate)
-                    remaining = refresh()
                     identities = [(candidate["pid"], candidate["start"])] + [(c["pid"], c["start"]) for c in candidate["children"]]
-                    entry.update(action="close", ok=not any(remaining.get(pid, {}).get("start") == start for pid, start in identities))
+                    # v0.38.2 acknowledges close before its 100 ms shutdown delay.
+                    # Bound both the grace period and each process read by one deadline.
+                    deadline = time.monotonic() + BROWSER_EXIT_GRACE
+                    pause = .1
+                    while (budget := deadline - time.monotonic()) > 0:
+                        remaining = processes(timeout=budget) if refresh is None else refresh()
+                        if not any(remaining.get(pid, {}).get("start") == start for pid, start in identities):
+                            entry["ok"] = True
+                            break
+                        delay = min(pause, deadline - time.monotonic())
+                        if delay > 0:
+                            time.sleep(delay)
+                        pause = min(pause * 2, .5)
                     if not entry["ok"]:
                         entry["reason"] = "close_incomplete"
         except Exception as exc:

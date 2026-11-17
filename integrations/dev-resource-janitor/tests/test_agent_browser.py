@@ -6,6 +6,7 @@ import subprocess
 import struct
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import time
 from unittest.mock import Mock, patch
@@ -155,11 +156,115 @@ class BrowserTests(JanitorTestCase):
                         raise RuntimeError('failed')
                     del tree[42]
                     tree[43]['ppid'] = 1
-                with patch.dict(lp.os.environ, DEV_JANITOR_REAP_AGENT_BROWSER='1'), patch.object(lp.os, 'kill') as signal:
+                clock = [100.]
+                with patch.dict(lp.os.environ, DEV_JANITOR_REAP_AGENT_BROWSER='1'), patch.object(lp.os, 'kill') as signal, \
+                        patch.object(lp.time, 'monotonic', side_effect=lambda: clock[0]), \
+                        patch.object(lp.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
                     actions = lp.reap_agent_browsers(report, rescan=lambda: report, close=close,
                                                     refresh=lambda pid=None: copy.deepcopy(tree), validate=self.validate)
                 self.assertFalse(actions[0]['ok'])
                 signal.assert_not_called()
+
+    def test_close_waits_for_exact_daemon_and_children_with_a_deadline(self):
+        report = self.detect()
+        forms = [
+            ('immediate_exit', {}, {}, True),
+            ('delayed_exit', self.rows, {}, True),
+            ('delayed_child', {43: {**self.child, 'ppid': 1}}, {}, True),
+            ('reused_daemon', {42: {**self.row, 'start': 'new'}}, {}, True),
+            ('reused_child', {43: {**self.child, 'start': 'new'}}, {}, True),
+            ('daemon_survives', {42: self.row}, {42: self.row}, False),
+            ('child_survives_reused_daemon', {42: {**self.row, 'start': 'new'}, 43: self.child},
+             {43: {**self.child, 'ppid': 1}}, False),
+        ]
+        for name, initial, later, expected in forms:
+            clock = [100.]
+            refresh = Mock(side_effect=lambda: copy.deepcopy(initial if clock[0] < 100.2 else later))
+            close = Mock()
+            with self.subTest(form=name), patch.dict(lp.os.environ, DEV_JANITOR_REAP_AGENT_BROWSER='1'), \
+                    patch.object(lp.time, 'monotonic', side_effect=lambda: clock[0]), \
+                    patch.object(lp.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                    patch.object(lp.os, 'kill') as signal:
+                action = lp.reap_agent_browsers(report, rescan=lambda: report, close=close,
+                                               refresh=refresh, validate=self.validate)[0]
+                self.assertEqual(action['ok'], expected)
+                self.assertEqual(action['action'], 'close')
+                close.assert_called_once()
+                signal.assert_not_called()
+                self.assertLessEqual(clock[0], 100. + lp.BROWSER_EXIT_GRACE)
+                if expected:
+                    self.assertNotIn('reason', action)
+                else:
+                    self.assertEqual(action['reason'], 'close_incomplete')
+                    self.assertEqual(clock[0], 100. + lp.BROWSER_EXIT_GRACE)
+
+    def test_exit_process_reads_share_the_deadline_and_unavailable_reads_fail(self):
+        report = self.detect()
+        for unavailable in [False, True]:
+            clock, budgets = [100.], []
+            def observe(pid=None, *, timeout):
+                budgets.append(timeout)
+                clock[0] += .1
+                if unavailable:
+                    raise subprocess.TimeoutExpired('ps', timeout)
+                return copy.deepcopy(self.rows)
+            with self.subTest(unavailable=unavailable), patch.dict(lp.os.environ, DEV_JANITOR_REAP_AGENT_BROWSER='1'), \
+                    patch.object(lp.time, 'monotonic', side_effect=lambda: clock[0]), \
+                    patch.object(lp.time, 'sleep', side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                    patch.object(lp, 'processes', side_effect=observe):
+                action = lp.reap_agent_browsers(report, rescan=lambda: report, close=Mock(), validate=self.validate)[0]
+                self.assertFalse(action['ok'])
+                self.assertEqual(action['reason'], 'TimeoutExpired' if unavailable else 'close_incomplete')
+                self.assertEqual(budgets[0], lp.BROWSER_EXIT_GRACE)
+                self.assertTrue(all(0 < budget <= lp.BROWSER_EXIT_GRACE for budget in budgets))
+                self.assertEqual(budgets, sorted(budgets, reverse=True))
+
+    def test_socket_close_acknowledged_before_daemon_and_child_exit(self):
+        with tempfile.TemporaryDirectory(prefix='browser-exit-') as directory:
+            path = str(Path(directory) / 'test.sock')
+            candidate = {**self.detect()['candidates'][0], 'pid': lp.os.getpid(), 'socket': path}
+            tree = {candidate['pid']: {**self.row, 'pid': candidate['pid']}, 43: self.child}
+            report = {'candidates': [candidate], 'problems': []}
+            release, acknowledged = threading.Event(), threading.Event()
+            clock = [100.]
+            with lp.socket.socket(lp.socket.AF_UNIX, lp.socket.SOCK_STREAM) as listener:
+                listener.settimeout(5)
+                listener.bind(path)
+                listener.listen()
+                def daemon():
+                    with listener.accept()[0] as connection:
+                        connection.settimeout(5)
+                        with connection.makefile('rb') as request:
+                            message = json.loads(request.readline())
+                        connection.sendall(b'{"success":true}\n')
+                        acknowledged.set()
+                        if not release.wait(5):
+                            raise RuntimeError('exit was not released')
+                        return message
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    response = executor.submit(daemon)
+                    def pause(seconds):
+                        self.assertTrue(acknowledged.wait(5))
+                        release.set()
+                        self.assertEqual(response.result(timeout=5)['action'], 'close')
+                        tree.clear()
+                        clock[0] += seconds
+                    try:
+                        with patch.dict(lp.os.environ, DEV_JANITOR_REAP_AGENT_BROWSER='1'), \
+                                patch.object(lp, 'browser_metadata', return_value={**self.meta, 'socket': path}), \
+                                patch.object(lp, 'browser_tree_matches', return_value=True), \
+                                patch.object(lp, 'cpu_processes', return_value=tree), \
+                                patch.object(lp.time, 'monotonic', side_effect=lambda: clock[0]), \
+                                patch.object(lp.time, 'sleep', side_effect=pause), \
+                                patch.object(lp.os, 'kill') as signal:
+                            action = lp.reap_agent_browsers(report, rescan=lambda: report, validate=lambda item: True,
+                                                           refresh=lambda: copy.deepcopy(tree))[0]
+                            self.assertTrue(action['ok'])
+                            self.assertGreater(clock[0], 100.)
+                            signal.assert_not_called()
+                    finally:
+                        release.set()
+                        response.result(timeout=5)
 
     def test_revalidation_blocks_changed_owner_pid_session_and_new_busy_child(self):
         report = self.detect()
