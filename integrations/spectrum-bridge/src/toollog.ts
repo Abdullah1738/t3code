@@ -42,6 +42,7 @@ const ENUMS: Record<string, readonly string[]> = {
   completionCheck: ["before", "after", "unchecked"],
   failureFormat: ["single"],
   linkCause: ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"],
+  backend: ["robob", "openchamber", "remote-box", "unknown"],
 };
 
 // Only reduced diagnostics cross this boundary; input objects can contain prompts or credentials.

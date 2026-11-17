@@ -28,6 +28,8 @@ export function cleanRobobLink(value: RobobLink | undefined): RobobLink | undefi
 }
 
 type Outage = { link: RobobLink; waiting: Set<string>; answered: Set<string>; down: boolean; dirty: boolean };
+// Remote-box and legacy backends do not depend on this process's local Robob connection.
+const robobReceipt = (line: LogLine) => line.name === "msg.received" && line.props?.backend === "robob";
 // The default tool logger is process-wide, so all ControlClient instances share this state.
 export function createRobobLinkState() {
   let active: Outage | undefined;
@@ -39,7 +41,7 @@ export function createRobobLinkState() {
     let keepDetail = true;
     // Pending reply identities have the same retention window as the day files.
     for (const [id, item] of recovered) if (Date.parse(line.ts) - Date.parse(item.link.firstFailureAt) > 30 * 86400_000) recovered.delete(id);
-    if (line.name === "msg.received" && active && line.ids?.chat && line.ids.messageId) {
+    if (robobReceipt(line) && active && line.ids?.chat && line.ids.messageId) {
       const id = `${line.ids.chat}\0${line.ids.messageId}`;
       if (!active.waiting.has(id) && !active.answered.has(id)) {
         active.waiting.add(id); active.link.inboundReceivedDuringOutage++; active.dirty = true;
@@ -108,7 +110,7 @@ export function createRobobLinkAggregation() {
       const first = firstFailures.get(line.ids.outageId);
       if (!first || line.ts < first.ts) firstFailures.set(line.ids.outageId, { ts: line.ts, order });
     }
-    const received = line.name === "msg.received";
+    const received = robobReceipt(line);
     const answered = line.name === "inbound.answered" || line.name === "reply.sent" && line.ok === true;
     const id = received ? line.ids?.messageId : line.ids?.inboundId;
     if ((received || answered) && line.ids?.chat && id) {

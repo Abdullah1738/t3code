@@ -24,7 +24,7 @@ function setup(capBytes?: number) {
   const log = createToolLog({ root, now: () => at, capBytes }); logs.push(log);
   const call = (cause?: string, ok = !cause, durationMs = 10) => log.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok, durationMs,
     props: { method: "GET", route: "/threads/:id/messages", ...(cause ? { linkCause: cause } : {}), failureFormat: "single" } });
-  const received = (id: string) => log.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "owner", messageId: id }, props: { text: "PRIVATE_MESSAGE" } });
+  const received = (id: string) => log.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "owner", messageId: id }, props: { backend: "robob", text: "PRIVATE_MESSAGE" } });
   const reply = (id: string) => log.write({ component: "router", kind: "perf", name: "inbound.answered", ids: { chat: "owner", inboundId: id }, durationMs: 10 });
   const rows = (date = day): LogLine[] => existsSync(join(root, `${date}.ndjson`)) ? readFileSync(join(root, `${date}.ndjson`), "utf8").trim().split("\n").map(row => JSON.parse(row)) : [];
   return { root, log, call, rows, received, reply, advance: (ms: number) => { at += ms; } };
@@ -171,7 +171,7 @@ test("an open outage cannot attribute later traffic beyond its last observation 
   for (let i = 0; i < 3; i++) f.call("ECONNREFUSED");
   await f.log.rollup(day);
   const restarted = createToolLog({ root: f.root, now: () => Date.parse(`${day}T15:00:00Z`) }); logs.push(restarted);
-  restarted.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "owner", messageId: "after-restart" } });
+  restarted.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "owner", messageId: "after-restart" }, props: { backend: "robob" } });
   expect((await restarted.rollup(day))?.robob_link.messagesWaiting).toBe(0);
 });
 
@@ -225,4 +225,30 @@ test.each(failureBoundaries)("first-failure boundary: $label", async row => {
   const outageId = result?.robob_link.outages[0]?.outageId;
   expect(f.rows().filter(line => line.name === "turn.robob_call" && !line.ok).every(line => line.ids?.outageId === outageId)).toBe(true);
   expect(f.rows().filter(line => line.name === "turn.robob_calls").every(line => line.ids?.outageId === undefined)).toBe(true);
+});
+
+const receiptBackends = [
+  { chat: "owner", backend: "robob", count: 1 },
+  { chat: "moni", backend: "robob", count: 1 },
+  { chat: "family-trip", backend: "robob", count: 1 },
+  { chat: "moni", backend: "remote-box", count: 0 },
+  { chat: "owner", backend: "openchamber", count: 0 },
+  { chat: "moni", backend: "openchamber", count: 0 },
+  { chat: "owner", backend: "unknown", count: 0 },
+  { chat: "moni", backend: undefined, count: 0 },
+  { chat: "owner", backend: "PRIVATE_BACKEND", count: 0 },
+];
+test.each(receiptBackends)("outage receipts: $chat via $backend", async row => {
+  const f = setup();
+  for (let i = 0; i < 3; i++) f.call("ECONNREFUSED");
+  f.log.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: row.chat, messageId: "message-a" },
+    props: row.backend === undefined ? {} : { backend: row.backend } });
+  f.call();
+  expect(f.rows().find(line => line.name === "robob.link_up")?.link?.inboundReceivedDuringOutage).toBe(row.count);
+  expect((await f.log.rollup(day))?.robob_link.messagesWaiting).toBe(row.count);
+  f.log.write({ component: "router", kind: "event", name: "inbound.answered", ids: { chat: row.chat, inboundId: "message-a" } });
+  const result = await f.log.rollup(day);
+  expect(result?.robob_link.messagesWaiting).toBe(0);
+  expect(result?.robob_link.outages[0]).toMatchObject({ inboundReceivedDuringOutage: row.count, inboundAnsweredAfter: row.count });
+  expect(JSON.stringify(f.rows())).not.toContain("PRIVATE_BACKEND");
 });
