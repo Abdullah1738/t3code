@@ -65,6 +65,16 @@ const refusalRow = Schema.decodeUnknownSync(
   ),
 );
 
+const cardLockBlockers = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      "board.blockers": Schema.Array(
+        Schema.Struct({ label: Schema.String, cardId: Schema.String, heldForMs: Schema.Number }),
+      ),
+    }),
+  ),
+);
+
 it.effect.each(["caller", "read", "mutate", "admission"] as const)(
   "%s reply timeout writes one durable refusal with the pre-cancellation lock snapshot",
   (phase) =>
@@ -155,6 +165,83 @@ it.effect.each(["caller", "read", "mutate", "admission"] as const)(
       if (phase === "admission") yield* Fiber.interrupt(owner);
       assert.deepStrictEqual(yield* locks.holders, []);
     }),
+);
+
+it.effect("#1748 a card_update deadline logs its card-lock holder before cancellation", () =>
+  Effect.gen(function* () {
+    const locks = yield* BoardLocks.make();
+    const entered = yield* Deferred.make<void>();
+    const rows: string[] = [];
+    const logger = Logger.make(({ message, fiber }) => {
+      const line = Array.isArray(message) ? message[0] : message;
+      if (
+        fiber.getRef(References.CurrentLogAnnotations)["board.lock_log"] === true &&
+        typeof line === "string" &&
+        line.includes('"event":"kanban board write refused"')
+      )
+        rows.push(line);
+    });
+    const holder = yield* locks
+      .run(
+        locks.access(
+          "board-recall",
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        ),
+        "card-target",
+      )
+      .pipe(
+        Effect.provideService(BoardLocks.operationName, "KanbanService.tickStep:workerBackstop"),
+        Effect.forkChild,
+      );
+    yield* Deferred.await(entered);
+    const call = yield* SavedReply.protect(
+      locks
+        .run(
+          locks.access("board-recall", Effect.succeed(reply), true, "card:card-target"),
+          "card-target",
+        )
+        .pipe(
+          Effect.provideService(BoardLocks.operationName, "card.update"),
+          // The reply watchdog fires before the lock's own admission deadline.
+          Effect.provideService(BoardLocks.writeWaitMs, 60_000),
+        ),
+      "card_update",
+    ).pipe(
+      Effect.provideService(McpCall, {
+        boardId: "board-recall",
+        cardId: "card-target",
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: false,
+      }),
+      Effect.provideService(References.MinimumLogLevel, "Error"),
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      Effect.forkChild,
+    );
+    yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
+    assert.strictEqual(
+      replyData(callResult(yield* Fiber.join(call)).structuredContent).saved,
+      false,
+    );
+    assert.lengthOf(rows, 1);
+    const row = refusalRow(rows[0]);
+    assert.strictEqual(row["board.waiter"], "card.update");
+    assert.strictEqual(row["board.card_id"], "card-target");
+    assert.strictEqual(row["board.waiting_on"], "card");
+    assert.strictEqual(row["board.waited_ms"], 25_000);
+    const holderRow = cardLockBlockers(rows[0]);
+    assert.deepStrictEqual(holderRow["board.blockers"], [
+      {
+        label: "KanbanService.tickStep:workerBackstop",
+        cardId: "card-target",
+        heldForMs: 25_000,
+      },
+    ]);
+    yield* Fiber.interrupt(holder);
+    assert.deepStrictEqual(yield* locks.holders, []);
+  }),
 );
 
 it.effect("refusal observation time precedes delayed cancellation cleanup", () =>

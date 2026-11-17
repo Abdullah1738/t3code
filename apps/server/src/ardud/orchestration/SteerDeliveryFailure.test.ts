@@ -228,6 +228,7 @@ const executorLayer = (
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProviderControl.ProviderTurnControlServiceV2)({ steer }),
+        Layer.mock(EffectOutbox.EffectOutboxV2)({ get: () => Effect.succeed(Option.none()) }),
         Layer.mock(ProviderSessions.ProviderSessionManagerV2)({}),
         Layer.mock(ProviderStart.ProviderTurnStartServiceV2)({}),
         Layer.mock(CheckpointRollback.CheckpointRollbackServiceV2)({}),

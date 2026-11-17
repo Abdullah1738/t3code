@@ -38,6 +38,9 @@ BOOLEANS.update({'deadlineKept', 'expired'})
 BOOLEANS.add('queueExpired')
 ENUMS = {
     'signalName': {'SIGINT', 'SIGTERM', 'SIGHUP', 'SIGALRM', 'SIGPIPE', 'SIGQUIT'},
+    "quint_phase": {"check", "install", "result"},
+    "quint_result": {"pending", "present", "installed", "failed"},
+    "quint_trigger": {"command", "repo-marker"},
     "jdk_phase": {"check", "install", "result"},
     "jdk_result": {"pending", "present", "installed", "compiler-missing", "apt-failed"},
     "jdk_trigger": {"command", "repo-marker", "harness"},

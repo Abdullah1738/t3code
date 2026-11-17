@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 mkdir -p tmp/perf/r2-evidence
-if [ "$(node -v)" != v24.22.2 ]; then
-  mkdir -p /tmp/perf-node
-  curl -fsSL https://nodejs.org/dist/v24.22.2/node-v24.22.2-linux-x64.tar.xz -o /tmp/perf-node/node.tar.xz
-  curl -fsSL https://nodejs.org/dist/v24.22.2/SHASUMS256.txt -o /tmp/perf-node/sums
-  (cd /tmp/perf-node; grep ' node-v24.22.2-linux-x64.tar.xz$' sums | sed 's/node-v24.22.2-linux-x64.tar.xz/node.tar.xz/' | sha256sum -c -)
-  tar xf /tmp/perf-node/node.tar.xz -C /tmp/perf-node
-  export PATH="/tmp/perf-node/node-v24.22.2-linux-x64/bin:$PATH"
+NODE_PIN="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["node"])' "$(dirname "$0")/../runtime.json")"
+if [ "$(node -v 2>/dev/null || true)" != "$NODE_PIN" ]; then
+  NODE_DIRECTORY="$(mktemp -d)"
+  trap 'rm -rf "$NODE_DIRECTORY"' EXIT
+  NODE_ARCHIVE="node-${NODE_PIN}-linux-x64.tar.xz"
+  curl -fsSL "https://nodejs.org/dist/${NODE_PIN}/${NODE_ARCHIVE}" -o "$NODE_DIRECTORY/$NODE_ARCHIVE"
+  curl -fsSL "https://nodejs.org/dist/${NODE_PIN}/SHASUMS256.txt" -o "$NODE_DIRECTORY/sums"
+  (cd "$NODE_DIRECTORY"; awk -v archive="$NODE_ARCHIVE" '$2 == archive' sums | sha256sum -c -)
+  tar xf "$NODE_DIRECTORY/$NODE_ARCHIVE" -C "$NODE_DIRECTORY"
+  export PATH="$NODE_DIRECTORY/node-${NODE_PIN}-linux-x64/bin:$PATH"
 fi
 bash packages/perf-harness/scripts/verify-round2.sh
 mkdir -p tmp/perf/r2-attribution

@@ -1162,18 +1162,22 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       const completedAt = status === "running" ? null : updatedAt;
       const nativeId = `${turn.scope}${id}`;
       yield* emitNode(state, turn, nativeId, "tool_call", status, startedAt, completedAt);
+      const turnItem = openCodeToolTurnItem(
+        itemBase(state, turn, nativeId, status, startedAt, completedAt, updatedAt),
+        {
+          name: tool.name,
+          input: tool.input,
+          output: result?.output,
+          completedMetadata: status === "completed" ? result?.metadata : undefined,
+        },
+      );
       yield* emit({
         type: "turn_item.updated",
         driver,
-        turnItem: openCodeToolTurnItem(
-          itemBase(state, turn, nativeId, status, startedAt, completedAt, updatedAt),
-          {
-            name: tool.name,
-            input: tool.input,
-            output: result?.output,
-            completedMetadata: status === "completed" ? result?.metadata : undefined,
-          },
-        ),
+        turnItem:
+          turnItem.type === "command_execution" || turnItem.type === "dynamic_tool"
+            ? { ...turnItem, toolResultIncomplete: result === undefined }
+            : turnItem,
       });
     });
 

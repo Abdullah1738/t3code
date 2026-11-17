@@ -103,11 +103,13 @@ and checkpoints the next root to visit, so interrupted passes rotate fairly.
 Cheap batches can share a turn; known timeouts follow healthy discovery and
 refresh work after one early part attempt per root. Ordinary children that will expire
 during the pass are refreshed before more parts work can crowd them out.
-Individual probes use 1.5 times the child's last successful duration, or twice
-its root's median successful duration, bounded to 15–120 seconds. Roots with
-no timing data start at 15 seconds. A short probe timeout doubles the next
-probe and keeps the child in ordinary discovery; only a full probe of at least
-60 seconds establishes a timeout for descent. Legacy timeouts with no recorded
+Individual probes use 1.5 times the child's last successful duration, bounded
+to 15–120 seconds. Children without timing data start at 60 seconds; legacy
+short probes get at least 60 seconds or twice their last allowance, up to 120.
+A known-cost probe below 60 seconds gets one doubled retry per pass and stays
+in ordinary discovery. Only a full probe of at least 60 seconds establishes a
+timeout for descent. Deep batches first learn a cost, then reserve twice the
+estimated work within their deadline. Legacy timeouts with no recorded
 allowance or parts get one probe conversion. Batch deadlines fall back to
 individual probes. A confirmed timed-out child is split into immediate entries,
 with each completed part checkpointed and at most ten minutes per child per

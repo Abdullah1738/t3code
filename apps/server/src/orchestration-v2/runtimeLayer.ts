@@ -45,6 +45,7 @@ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryService.ts";
+import { forkParked } from "../serverActivation.ts";
 import * as ProviderSwitchService from "./ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
@@ -157,6 +158,7 @@ const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
       layerCommandOutputHubProvided,
       layerProviderAdapterRegistryProvided,
       layerEventSinkProvided,
+      EffectOutbox.layer,
       IdAllocator.layer,
       layerProviderEventIngestorProvided,
       ProjectionStore.layer,
@@ -407,6 +409,7 @@ const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
     Layer.mergeAll(
       layerEventSinkProvided,
       ProjectionStore.layer,
+      EffectOutbox.layer,
       layerRestartPacingProvided,
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,
@@ -468,6 +471,14 @@ export const layer = Layer.mergeAll(
 ).pipe(Layer.provideMerge(layerStartProgress));
 
 export const layerProduction = Layer.mergeAll(
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      // Snapshot before activation so a new timeout cannot be mistaken for a previous process's work.
+      const pending = yield* threads.snapshotDelegationTimeouts();
+      yield* forkParked(threads.sweepDelegationTimeouts(pending));
+    }),
+  ).pipe(Layer.provide(layerThreadManagementProvided)),
   layer.pipe(Layer.provide(layerProjectService)),
   layerProjectService,
   layerManagedProjectFoldersProvided,

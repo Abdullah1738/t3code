@@ -50,6 +50,26 @@ describe("analytics ingest contract", () => {
     ).toThrow();
     expect(() => decodeEvent({ ...input, props: { ...input.props, head: "private" } })).toThrow();
   });
+  it.each(["host_reboot", "quarantine_max_age"])(
+    "accepts desktop lease recovery reason %s",
+    (reason) => {
+      expect(
+        decodeEvent({
+          ts: event.ts,
+          kind: "desktop_lease.transition",
+          surface: "server",
+          route: "desktop-lease",
+          ticket: "ticket-1",
+          taskId: "task-1",
+          mode: "native",
+          from: "quarantined",
+          to: "finished",
+          reason,
+          age_ms: 1000,
+        }),
+      ).toMatchObject({ reason, kind: "desktop_lease.transition" });
+    },
+  );
   it("accepts MCP filters and rejects unhashed request ids", () => {
     const call = { ...event, kind: "mcp.call", clientRequestId: "a".repeat(64) };
     expect(decodeEvent(call).clientRequestId).toBe("a".repeat(64));
@@ -301,6 +321,28 @@ it("decodes runtime samples with exact model ids and bounded hourly rollups", ()
     },
   };
   expect(decodeEvent(row)).toEqual(row);
+  const retry = {
+    ts: event.ts,
+    kind: "provider.retry",
+    surface: "server",
+    route: "provider",
+    threadId: "thread:watcher",
+    props: {
+      runId: "run:watcher",
+      provider: "claudeAgent",
+      model: "claude-sonnet-5-5",
+      attempt: 2,
+      maxRetries: 10,
+      errorMessage: "Request timed out.",
+      waitSinceResponseMs: 300000,
+    },
+  };
+  const guard = {
+    ...retry,
+    kind: "provider.guard_interrupt",
+    props: { ...retry.props, guardFiredDuringRetry: true },
+  };
+  for (const sample of [row, retry, guard]) expect(decodeEvent(sample)).toEqual(sample);
   expect(() => decode({ events: [row] })).toThrow();
   expect(() => decodeEvent({ ...row, props: { ...row.props, sampleMs: -1 } })).toThrow();
   const hour = {

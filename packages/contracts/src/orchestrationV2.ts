@@ -1624,6 +1624,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("command_execution"),
+    /** No tool result was received; this item may represent cleanup or a synthetic notice. */
+    toolResultIncomplete: Schema.optional(Schema.Boolean),
     input: Schema.String,
     output: Schema.optional(Schema.String),
     /** Set on the wire when output was withheld; fetch it with getTurnItem. */
@@ -1754,6 +1756,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("dynamic_tool"),
+    /** No tool result was received; this item may represent cleanup or a synthetic notice. */
+    toolResultIncomplete: Schema.optional(Schema.Boolean),
     toolName: Schema.NullOr(TrimmedNonEmptyString),
     viewedImagePath: Schema.optional(TrimmedNonEmptyString),
     input: Schema.Unknown,
@@ -2416,6 +2420,8 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("command_execution"),
+    /** No tool result was received; this item may represent cleanup or a synthetic notice. */
+    toolResultIncomplete: Schema.optional(Schema.Boolean),
     input: Schema.String,
     output: Schema.optional(Schema.String),
     /** Set on the wire when output was withheld; fetch it with getTurnItem. */
@@ -2546,6 +2552,8 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("dynamic_tool"),
+    /** No tool result was received; this item may represent cleanup or a synthetic notice. */
+    toolResultIncomplete: Schema.optional(Schema.Boolean),
     toolName: Schema.NullOr(TrimmedNonEmptyString),
     viewedImagePath: Schema.optional(TrimmedNonEmptyString),
     input: Schema.Unknown,
@@ -3379,6 +3387,9 @@ const OrchestrationV2InternalCommand = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("thread.background-work.settle"),
+    runOnly: Schema.optional(Schema.Boolean),
+    releasedAt: Schema.optional(Schema.DateTimeUtc),
+    preserveBackgroundWork: Schema.optional(Schema.Boolean),
     commandId: CommandId,
     threadId: ThreadId,
     providerThreadId: ProviderThreadId,
@@ -3394,6 +3405,14 @@ const OrchestrationV2InternalCommand = Schema.Union([
         }),
       }),
     ),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.provider-root.settle"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    providerThreadId: ProviderThreadId,
+    nodeId: NodeId,
+    startedAt: Schema.NullOr(Schema.DateTimeUtc),
   }),
   /**
    * Internal so no client can mark a request saved without the value being

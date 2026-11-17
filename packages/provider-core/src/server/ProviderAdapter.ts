@@ -538,6 +538,8 @@ export interface ProviderAdapterV2ForkThreadInput {
 export interface ProviderAdapterV2EventSubscription {
   readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
   readonly close: Effect.Effect<void>;
+  /** Acknowledge downstream writes before finalization can acquire session locks. */
+  readonly ingestionEnded?: Effect.Effect<void>;
 }
 
 export interface ProviderAdapterV2HistoricalContext {
@@ -607,6 +609,8 @@ export interface ProviderAdapterV2SessionRuntime {
    * Adapter runtimes may omit this and expose only their single-consumer event stream.
    */
   readonly subscribeEvents?: Effect.Effect<ProviderAdapterV2EventSubscription>;
+  /** Release waits for this consumer's close after admitted event writes have drained. */
+  readonly subscribeEventsForIngestion?: Effect.Effect<ProviderAdapterV2EventSubscription>;
   readonly hasPendingBackgroundWork?: Effect.Effect<boolean>;
   /**
    * When present, RunExecutionService uses only this probe (never the

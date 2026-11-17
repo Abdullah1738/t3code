@@ -5,14 +5,17 @@
  * queue and holds no slot. The pure decision is tested in retries.test.ts.
  */
 import { assert, it } from "@effect/vitest";
+import { withTestSchedulerBudget } from "./testSchedulerBudget.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Exit from "effect/Exit";
+import * as Queue from "effect/Queue";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -2303,6 +2306,40 @@ const gateFlaggedCard = Effect.gen(function* () {
 const gateRequeues = (events: ReadonlyArray<KanbanCardEvent>) =>
   events.filter((event) => event.body === Retries.REVIEW_GATE_REQUEUED_EVENT);
 
+// Register short board-lock retries explicitly: advancing TestClock before a
+// post-commit drain requests its backoff would leave that drain asleep forever.
+const advanceBoardRetries = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const clock = yield* Clock.Clock;
+    const scheduled = yield* Queue.unbounded<{
+      readonly until: number;
+      readonly resume: Deferred.Deferred<void>;
+    }>();
+    const retryClock: Clock.Clock = {
+      ...clock,
+      sleep: (duration) => {
+        const ms = Duration.toMillis(duration);
+        if (ms < 10 || ms > 80) return clock.sleep(duration);
+        return Effect.gen(function* () {
+          const resume = yield* Deferred.make<void>();
+          yield* Queue.offer(scheduled, { until: clock.currentTimeMillisUnsafe() + ms, resume });
+          yield* Deferred.await(resume);
+        });
+      },
+    };
+    const advance = Effect.forever(
+      Effect.gen(function* () {
+        const retry = yield* Queue.take(scheduled);
+        yield* TestClock.adjust(Math.max(0, retry.until - clock.currentTimeMillisUnsafe()));
+        yield* Deferred.succeed(retry.resume, undefined);
+      }),
+    );
+    return yield* Effect.raceFirst(
+      effect.pipe(Effect.provideService(Clock.Clock, retryClock)),
+      advance,
+    );
+  });
+
 it.effect(
   "a subtask edit requeues a gate-refused review, retaining queue age, wait and retries",
   () =>
@@ -2463,7 +2500,7 @@ it.effect.each(["approved", "picked"] as const)(
         assert.deepStrictEqual((yield* now).card.retries, card.retries);
         assert.lengthOf(gateRequeues((yield* now).events), 1);
       }).pipe(Effect.provide(testLayer(fake.layer)));
-    }),
+    }).pipe(advanceBoardRetries, withTestSchedulerBudget),
 );
 
 it.effect("changing guessedGates rechecks refused reviews on that board", () =>

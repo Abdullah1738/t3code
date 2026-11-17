@@ -1,3 +1,4 @@
+import { withBoardInputHint } from "../ardud/kanban/tools/inputErrors.ts";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
@@ -1541,10 +1542,13 @@ const withToolAnalytics =
                             allowed === undefined
                               ? undefined
                               : argumentFailure(options.tool.name, allowed, payload);
+                          const handled = options
+                            .handle(payload)
+                            .pipe(Effect.mapError(withBoardInputHint(options.tool.name, payload)));
                           return failure === undefined
                             ? options.tool.name === "wiki_read"
-                              ? WikiReadTiming.step("handler", options.handle(payload))
-                              : options.handle(payload)
+                              ? WikiReadTiming.step("handler", handled)
+                              : handled
                             : Effect.succeed(
                                 new McpSchema.CallToolResult({
                                   isError: true,

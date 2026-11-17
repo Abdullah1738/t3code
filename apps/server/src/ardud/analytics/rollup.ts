@@ -1,4 +1,9 @@
-import type { AnalyticsEvent, AnalyticsRollup, RunUsageEvent } from "@t3tools/contracts";
+import type {
+  AnalyticsEvent,
+  AnalyticsRollup,
+  KanbanPoolChange,
+  RunUsageEvent,
+} from "@t3tools/contracts";
 import { LONG_TASK_HISTOGRAM_RATIO } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
@@ -403,6 +408,7 @@ interface BoardGroup {
   asks: Map<string, AskObservation>;
   snapshotRows: number;
   snapshots: Map<string, { expected: number | undefined; asks: Map<string, AskObservation> }>;
+  poolChanges: KanbanPoolChange[];
   pools: Map<
     string,
     { hour: string; poolKey: string; samples: number; used: number; slots: number; waiting: number }
@@ -428,6 +434,7 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
       asks: new Map(),
       snapshotRows: 0,
       snapshots: new Map(),
+      poolChanges: [],
       pools: new Map(),
       overflow: 0,
     };
@@ -529,6 +536,28 @@ function boardAccumulate(target: ReturnType<typeof makeAccumulator>, event: Anal
         kind: p.kind ?? "question",
         blocking: p.blocking ?? false,
         createdAt: p.createdAt,
+      });
+  }
+  if (
+    event.kind === "kanban.pool_change" &&
+    p.poolKey &&
+    p.op &&
+    p.actorKind &&
+    p.fromSlots !== undefined &&
+    p.toSlots !== undefined &&
+    p.actorId !== undefined
+  ) {
+    if (board.poolChanges.length >= BOARD_LIMIT) board.overflow++;
+    else
+      board.poolChanges.push({
+        at: event.ts,
+        poolKey: p.poolKey,
+        ...(p.fromPoolKey === undefined ? {} : { fromPoolKey: p.fromPoolKey }),
+        fromSlots: p.fromSlots,
+        toSlots: p.toSlots,
+        op: p.op,
+        actorKind: p.actorKind,
+        actorId: p.actorId,
       });
   }
   if (
@@ -1335,6 +1364,7 @@ export function finishRollup(
       failureCounts: Object.fromEntries(board.failures),
       restarts: board.restarts,
       ...finishBoardAsks(board, day, generatedAt),
+      poolChanges: board.poolChanges.toSorted((a, b) => a.at.localeCompare(b.at)),
       poolUtilisation: [...board.pools.values()].map((pool) => ({
         ...pool,
         used: pool.used / pool.samples,
