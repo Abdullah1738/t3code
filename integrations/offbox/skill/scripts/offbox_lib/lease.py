@@ -465,8 +465,8 @@ def idle_ttl(box_id: str) -> None:
 
 def bootstrap_fresh(box_id: str) -> None:
     """Fresh box (not from a template/base): put tool caches under $HOME so stop/fork keep them."""
-    script = ("bash -c " + shlex.quote((TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n" +
-                                     (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) +
+    fetch = (TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n"
+    script = (fetch + "bash -c " + shlex.quote(fetch + (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) +
               " || exit 1\n" + (TEMPLATES_DIR / "common-env.sh").read_text()).encode()
     p = ssh_sync.ssh(box_id, "bash -s", input=script, timeout=120)
     if p.returncode != 0:

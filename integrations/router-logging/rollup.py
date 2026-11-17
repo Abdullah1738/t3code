@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import math
 import os
+import re
 from pathlib import Path
 import tempfile
 from toollog import directory
@@ -19,6 +20,18 @@ def percentiles(values):
 
 def metric(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def proxy_key_id(value):
+    if isinstance(value, str) and (value in ('none', 'unknown', 'lookup_failed')
+                                  or re.fullmatch(r'(?:[a-f0-9]{16}|unreg:[a-f0-9]{12})', value)):
+        return value
+    return 'unknown'
+
+
+def caller_breakdown(groups, dimension):
+    return [dict(**{dimension: value}, **g, clientAbortRate=g['aborted'] / g['count'])
+            for value, g in sorted(groups.items())]
 
 
 def interval_total(intervals):
@@ -56,7 +69,10 @@ def rollup(day, root=None, now=None):
     times, samples = defaultdict(list), {}
     proxy = {}
     models = defaultdict(lambda: dict(count=0, aborted=0))
-    abort_clients, abort_keys, attempts = Counter(), Counter(), Counter()
+    clients = defaultdict(lambda: dict(count=0, aborted=0))
+    keys = defaultdict(lambda: dict(count=0, aborted=0))
+    other_products = defaultdict(lambda: dict(count=0, aborted=0))
+    attempts = Counter()
     abort_ttfb = []
     locks, lock_accounts = {}, Counter()
     distinct, account_distinct = set(), defaultdict(set)
@@ -166,16 +182,22 @@ def rollup(day, root=None, now=None):
                         model = models[key[0]]
                         model['count'] += 1
                         model['aborted'] += aborted
+                        client = props.get('client')
+                        if client not in ('claude-code', 'codex', 'opencode', 'ai-sdk', 'curl', 'node', 'python', 'browser', 'other'):
+                            client = 'unknown'
+                        key_id = proxy_key_id(props.get('keyId'))
+                        for group_identity in (clients[client], keys[key_id]):
+                            group_identity['count'] += 1
+                            group_identity['aborted'] += aborted
+                        if client == 'other':
+                            product = props.get('uaProduct', '')
+                            product = product if isinstance(product, str) and re.fullmatch(r'[a-z0-9._-]{0,24}', product) else ''
+                            other_products[product]['count'] += 1
+                            other_products[product]['aborted'] += aborted
                         attempt_count = props.get('attempts')
                         if isinstance(attempt_count, int) and not isinstance(attempt_count, bool) and attempt_count >= 0:
                             attempts[attempt_count] += 1
                         if aborted:
-                            client = props.get('client', 'unknown')
-                            abort_clients[client if client in ('claude-code', 'codex', 'curl', 'node', 'python', 'browser', 'other') else 'unknown'] += 1
-                            key_id = props.get('keyId', 'unknown')
-                            if not isinstance(key_id, str) or not (key_id in ('none', 'unknown') or len(key_id) == 16 and all(c in '0123456789abcdef' for c in key_id)):
-                                key_id = 'unknown'
-                            abort_keys[key_id] += 1
                             if metric(props.get('ttfbMs')):
                                 abort_ttfb.append(props['ttfbMs'])
                         if metric(ms):
@@ -204,8 +226,15 @@ def rollup(day, root=None, now=None):
             topErrors=[dict(tag=tag, count=count, sampleReq=group['samples'][tag]) for tag, count in group['errors'].most_common(20)],
         ))
     result['proxySummary'] = dict(
-        byModel=[dict(model=m, **g, clientAbortRate=g['aborted'] / g['count']) for m, g in sorted(models.items())],
-        abortsByClient=dict(sorted(abort_clients.items())), abortsByKeyId=dict(sorted(abort_keys.items())),
+        byModel=caller_breakdown(models, 'model'),
+        byClient=caller_breakdown(clients, 'client'),
+        byKeyId=caller_breakdown(keys, 'keyId'),
+        otherByUaProduct=caller_breakdown(other_products, 'uaProduct'),
+        unregisteredRequests=sum(g['count'] for k, g in keys.items() if k.startswith('unreg:')),
+        distinctUnregisteredKeys=sum(k.startswith('unreg:') for k in keys),
+        lookupFailedRequests=keys.get('lookup_failed', {}).get('count', 0),
+        abortsByClient={k: g['aborted'] for k, g in sorted(clients.items()) if g['aborted']},
+        abortsByKeyId={k: g['aborted'] for k, g in sorted(keys.items()) if g['aborted']},
         attemptsHistogram={str(n): count for n, count in sorted(attempts.items())},
         abortTtfbMs=percentiles(abort_ttfb),
     )

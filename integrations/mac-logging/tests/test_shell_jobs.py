@@ -11,6 +11,9 @@ import unittest
 
 HERE=Path(__file__).resolve().parents[1]
 REPO=HERE.parents[1]
+sys.path.insert(0,str(HERE))
+import status as mac_status
+
 FAKE = r'''#!PYTHON
 import json,os,sys,time
 from pathlib import Path
@@ -134,13 +137,17 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     git=fake/'git'
     git.write_text('#!'+sys.executable+'\nimport sys\na=sys.argv[1:]\nif "rev-parse" in a: print('+repr(str(REPO))+')\nelif "ls-remote" in a: print("fixture refs/heads/main")\n')
     git.chmod(0o755)
+    probe=root/'fixture-ssd/probe.bin'
+    env['MAC_LOG_SSD_PROBE_FILE']=str(probe)
     command=['zsh',str(HERE/'install.zsh')]
     dry_run=subprocess.run(command+['--dry-run'],env=env,capture_output=True,text=True,timeout=10)
     self.assertEqual(dry_run.returncode,0,dry_run.stderr)
     self.assertFalse((home/'.local').exists())
+    self.assertFalse(probe.exists())
     self.assertFalse((home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist').exists())
     installed=subprocess.run(command,env=env,capture_output=True,text=True,timeout=10)
     self.assertEqual(installed.returncode,0,installed.stderr)
+    self.assertEqual(probe.read_bytes(),bytes(4096))
     plist=home/'Library/LaunchAgents/com.abdullah.mac-log-collector.plist'
     self.assertTrue(plist.exists(),installed.stdout+installed.stderr)
     original=plist.read_text()
@@ -153,12 +160,15 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     def check():
      return subprocess.run(command+['--check'],env=env,capture_output=True,text=True,timeout=10).returncode
     self.assertEqual(check(),0)
+    probe.write_bytes(b'bad');self.assertNotEqual(check(),0);probe.write_bytes(bytes(4096))
+    self.assertEqual(check(),0)
     wrapper=home/'.local/bin/mac-log-status'
     self.assertEqual(wrapper.stat().st_mode & 0o777,0o755)
     status=subprocess.run([str(wrapper),'--now','2026-11-15T12:00:00Z','--json'],env=env,capture_output=True,text=True,timeout=10)
     self.assertEqual(status.returncode,1,status.stderr)
     self.assertFalse(json.loads(status.stdout)['ok'])
-    self.assertEqual(len(json.loads(status.stdout)['jobs']),14)
+    self.assertEqual(set(json.loads(status.stdout)['jobs']),set(mac_status.CADENCES))
+    self.assertEqual(json.loads(status.stdout)['jobs']['disk.ssd_read_probe']['status'],'PENDING')
     self.assertIn('tailnet.sample',json.loads(status.stdout)['jobs'])
     wrapper.chmod(0o644);self.assertNotEqual(check(),0);wrapper.chmod(0o755)
     original_wrapper=wrapper.read_text()
@@ -190,7 +200,15 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     self.assertEqual(minute['StartInterval'],60)
     self.assertEqual(minute['ProgramArguments'],['/bin/zsh','-c',f'exec /usr/bin/python3 "{collector}" --tailnet'])
     self.assertEqual(tailnet_script.read_bytes(),(HERE/'tailnet.py').read_bytes())
-    for target in (deep_script,deep_plist,memory_script,memory_plist,tailnet_script,tailnet_plist):
+    probe_script=home/'.local/lib/mac-logging/ssd_probe.py'
+    probe_plist=home/'Library/LaunchAgents/com.abdullah.mac-ssd-read-probe.plist'
+    probe_job=plistlib.loads(probe_plist.read_bytes())
+    self.assertEqual(probe_job['StartInterval'],60)
+    self.assertEqual(probe_job['ProgramArguments'],['/bin/zsh','-fc','exec /usr/bin/python3 "$@"','--',str(probe_script),'sample'])
+    self.assertEqual(probe_job['ProcessType'],'Standard')
+    self.assertTrue(probe_job['AbandonProcessGroup'])
+    self.assertIn('com.abdullah.mac-ssd-read-probe.plist',dry_run.stdout)
+    for target in (deep_script,deep_plist,memory_script,memory_plist,tailnet_script,tailnet_plist,probe_script,probe_plist):
      saved=target.read_bytes()
      target.chmod(0o644);self.assertNotEqual(check(),0);target.chmod(0o600)
      target.write_text('stale');self.assertNotEqual(check(),0);target.write_bytes(saved)

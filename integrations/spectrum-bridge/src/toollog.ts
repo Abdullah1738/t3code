@@ -64,10 +64,14 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
-    if (["moni-box-fenced", "moni-box-unfenced"].includes(entry.name)) {
+    if (entry.name === "synthetic.carry_evicted" && key === "reason" && (value === "expired" || value === "overflow")
+      || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
+      props[key] = value; continue;
+    }
+    if (["moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "moni-box-backend-state"].includes(entry.name)) {
       if (key === "event" && typeof value === "string" && /^[a-f0-9]{12}$/.test(value)
         || key === "kind" && (value === "inbound" || value === "wake")
-        || key === "hasSend" && typeof value === "boolean"
+        || ["hasSend", "active", "busy", "fenced"].includes(key) && typeof value === "boolean"
         || ["queuedBehind", "fencedMs"].includes(key) && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
         props[key] = value; continue;
       }
@@ -171,7 +175,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls", "robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply", "moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed", "synthetic.carry_evicted", "synthetic.carried_from_stranded"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }

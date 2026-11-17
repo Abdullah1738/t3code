@@ -34,6 +34,7 @@ import type { SlotEvent } from "../store/KanbanStore.ts";
 
 import * as Retries from "./retries.ts";
 import * as Rules from "./rules.ts";
+import type { boardReleaseSummary } from "./boardReplies.ts";
 import { waitEventOf } from "./waits.ts";
 
 /** The longest window one read covers. */
@@ -437,6 +438,7 @@ const capped = <T>(items: ReadonlyArray<T>, max: number) =>
 
 export interface RollupInput {
   readonly window: ActivityWindow;
+  readonly release?: ReturnType<typeof boardReleaseSummary>;
   readonly currentAt?: string;
   readonly idleEvaluatorBoard?: Rules.IdleEvaluatorBoard;
   readonly lastEventAtByCard?: ReadonlyMap<string, string>;
@@ -1321,6 +1323,7 @@ export const rollup = (input: RollupInput) => {
 
   const build = (max: number, answeredMax: number, kindMax: number) => ({
     window: { since: window.since, until },
+    ...input.release,
     cards: {
       active: active.length,
       settled: active.filter((card) => card.settledAt !== null).length,

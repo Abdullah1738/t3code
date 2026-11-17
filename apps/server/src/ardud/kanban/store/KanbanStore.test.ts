@@ -19,6 +19,7 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import * as Tracer from "effect/Tracer";
+import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
 import {
@@ -52,6 +53,9 @@ import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions
 import { summaries, tallyBoards } from "../engine/summaries.ts";
 import * as KanbanStore from "./KanbanStore.ts";
 import * as Rules from "../engine/rules.ts";
+import { boardReleaseSummary } from "../engine/boardReplies.ts";
+import { releaseWindow } from "../engine/subtasks.ts";
+import { backfillRelease12 } from "./releaseBackfill.ts";
 
 const TestLayer = KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory));
 
@@ -147,6 +151,156 @@ const card = (number: number, stage: KanbanCard["stage"]): KanbanCard => ({
   updatedAt: at,
   movedAt: at,
 });
+
+it.effect.each([
+  { local: 4, peer: 96 },
+  { local: 96, peer: 4 },
+  { local: 4, peer: 4 },
+])(
+  "backfills .12 as audit history without changing gates (local $local h, peer $peer h)",
+  ({ local, peer }) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const releaseBoard: KanbanBoard = {
+        ...board,
+        id: KanbanBoardId.make("board-robob"),
+        standingApprovals: [
+          {
+            id: "sa-release12",
+            gate: "deploy",
+            minIntervalHours: local,
+            quote: "Board releases itself",
+            sourceThreadId: "owner",
+            saidAt: at,
+            approvedAsk: { cardId: "source", askId: "q1" },
+            recordedAt: at,
+            recordedBy: "evaluator",
+            revokedAt: null,
+            revokedBy: null,
+            revokeReason: null,
+          },
+        ],
+      };
+      const peerBoard = {
+        ...releaseBoard,
+        id: KanbanBoardId.make("board-peer"),
+        slug: "peer",
+        standingApprovals: releaseBoard.standingApprovals.map((approval) => ({
+          ...approval,
+          minIntervalHours: peer,
+        })),
+      };
+      const releaseCard = {
+        ...card(1460, "verified"),
+        id: KanbanCardId.make("card-9b02ad5e-c58b-4893-8474-8437cf436063"),
+        boardId: releaseBoard.id,
+        subtasks: [
+          {
+            id: "s4",
+            step: 4,
+            owner: "evaluator" as const,
+            text: "Install Robob",
+            state: "done" as const,
+            note: null,
+            doneBy: null,
+            doneAt: "2026-11-14T22:47:28.946Z",
+          },
+        ],
+      };
+      yield* store.putBoard(releaseBoard);
+      yield* store.putBoard(peerBoard);
+      yield* store.putCard(releaseCard);
+      yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00.000Z"));
+      yield* backfillRelease12(sql);
+      assert.deepStrictEqual((yield* store.board(releaseBoard.id))!.releaseLedger, []);
+      assert.isUndefined((yield* store.board(releaseBoard.id))!.historicalReleaseLedger);
+      yield* store.addCardEvent({
+        cardId: releaseCard.id,
+        at: "2026-11-14T22:47:28.947Z",
+        actor: { _tag: "evaluator", threadId: ThreadId.make("release-evaluator") },
+        kind: "subtask",
+        fromStage: null,
+        toStage: null,
+        head: null,
+        body: "s4 done: Install Robob (Installed 22:33Z from a new Terminal.app window. Healthy 22:43:13Z; health buildCommit d86aed779b94; cleared by standing approval sa-release12)",
+      });
+      const repaired = yield* Effect.gen(function* () {
+        const restarted = yield* KanbanStore.KanbanStore;
+        assert.notStrictEqual(restarted, store);
+        return (yield* restarted.board(releaseBoard.id))!;
+      }).pipe(Effect.provide(Layer.fresh(KanbanStore.layer)));
+      assert.deepStrictEqual(repaired.releaseLedger, []);
+      assert.deepStrictEqual(repaired.historicalReleaseLedger, [
+        {
+          boardId: releaseBoard.id,
+          cardId: releaseCard.id,
+          cardNumber: 1460,
+          subtaskId: "s4",
+          service: "robob",
+          at: "2026-11-14T22:33:00.000Z",
+          buildCommit: "d86aed779b94",
+          postHoc: true,
+          critical: null,
+          approvalId: "sa-release12",
+        },
+      ]);
+      assert.strictEqual(
+        boardReleaseSummary(repaired, "2026-11-17T00:00:00.000Z").nextReleaseWindowAt,
+        local === 4 ? null : "2026-11-18T22:33:00.000Z",
+      );
+      assert.strictEqual(
+        boardReleaseSummary(repaired, "2026-11-15T01:00:00.000Z").nextReleaseWindowAt,
+        local === 4 ? "2026-11-15T02:33:00.000Z" : "2026-11-18T22:33:00.000Z",
+      );
+      assert.deepStrictEqual(
+        boardReleaseSummary(repaired).releaseLedger,
+        repaired.historicalReleaseLedger,
+      );
+      const boards = yield* store.boards;
+      for (const consuming of boards) {
+        for (const service of [undefined, "robob", "recall"]) {
+          assert.strictEqual(
+            releaseWindow(
+              {
+                approvals: consuming.standingApprovals,
+                ledger: boards.flatMap((entry) => entry.releaseLedger ?? []),
+                boardId: consuming.id,
+                at: "2026-11-17T00:00:00.000Z",
+              },
+              service,
+            ),
+            null,
+          );
+        }
+        // Evaluator readiness uses the same inputs as admission, not audit history.
+        assert.deepStrictEqual(
+          boardReleaseSummary(consuming, "2026-11-17T00:00:00.000Z", boards, false),
+          { releaseLedger: [], nextReleaseWindowAt: null, nextReleaseWindowByService: {} },
+        );
+      }
+      assert.deepStrictEqual((yield* store.card(releaseCard.id))!.subtasks, releaseCard.subtasks);
+      yield* backfillRelease12(sql);
+      assert.deepStrictEqual(yield* store.board(releaseBoard.id), repaired);
+      // A corrected receipt remains authoritative on subsequent starts.
+      yield* store.putBoard({
+        ...repaired,
+        releaseLedger: repaired.historicalReleaseLedger!.map((row) => ({
+          ...row,
+          at: "2026-11-14T22:33:54.000Z",
+        })),
+      });
+      yield* backfillRelease12(sql);
+      assert.strictEqual(
+        (yield* store.board(releaseBoard.id))!.releaseLedger![0]!.at,
+        "2026-11-14T22:33:54.000Z",
+      );
+      assert.strictEqual(
+        boardReleaseSummary((yield* store.board(releaseBoard.id))!).releaseLedger[0]!.at,
+        "2026-11-14T22:33:54.000Z",
+      );
+    }).pipe(Effect.provide(TestLayer)),
+);
 
 it.effect("loads open review links with their cards, including missing cards, in one read", () =>
   Effect.gen(function* () {

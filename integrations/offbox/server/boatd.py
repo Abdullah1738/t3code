@@ -2784,6 +2784,7 @@ def ssh_sessions(box_id: str) -> int:
 @toollog.observed("boatd", "reaper.pass", "reaper_failed")
 def reap_once(con) -> None:
     toollog.rollup_previous()
+    toollog.rollup_today()
     t = now()
     for r in con.execute("SELECT * FROM boxes WHERE deleted_at IS NULL").fetchall():
         bid = r["id"]

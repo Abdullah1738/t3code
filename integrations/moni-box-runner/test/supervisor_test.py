@@ -56,6 +56,7 @@ class Deps:
     def both_ready(self):
         self.events.append(('both-ready', None))
         if self.readiness_error: raise self.readiness_error
+    def direct_ready(self, target): return True
     def pause(self): self.events.append(('pause', None))
     def refresh_lease(self):
         self.events.append(('refresh-lease', None))
@@ -108,7 +109,7 @@ class RouterTunnelTests(SupervisorTestCase):
             calls = []
             deps = module.OffboxDeps.__new__(module.OffboxDeps)
             deps.config = config
-            deps.ssh_sync = SimpleNamespace(tunnel=lambda *args: calls.append(args))
+            deps.ssh_sync = SimpleNamespace(tunnel=lambda *args: calls.append(args) or Child())
             deps.router_tunnel('bx_moni')
             self.assertEqual(calls, [('bx_moni', *ports, True)])
         for value in (None, True, 0, 1023, 65536, '20128', '20128:localhost:22'):
@@ -119,7 +120,7 @@ class RouterTunnelTests(SupervisorTestCase):
         source = Path(__file__).resolve().parents[2] / 'offbox/skill/scripts/offbox_lib/ssh_sync.py'
         node = next(node for node in ast.parse(source.read_text()).body if isinstance(node, ast.FunctionDef) and node.name == 'tunnel')
         calls = []
-        namespace = {'subprocess': SimpleNamespace(Popen=lambda args: calls.append(args)), 'ssh_base': lambda box: ['ssh', '-F', 'isolated-config']}
+        namespace = {'subprocess': SimpleNamespace(Popen=lambda args: calls.append(args) or Child()), 'ssh_base': lambda box: ['ssh', '-F', 'isolated-config']}
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec'), namespace)
         deps = module.OffboxDeps.__new__(module.OffboxDeps); deps.config = {}; deps.ssh_sync = SimpleNamespace(tunnel=namespace['tunnel'])
         deps.router_tunnel('bx_moni')
@@ -235,11 +236,30 @@ class RepairTests(SupervisorTestCase):
         self.assertEqual(supervisor.children, original)
         self.assertFalse(any(event['event'] == 'moni-supervisor-reconnect' for event in self.logs()))
 
+    def test_router_slow_directly_for_a_minute_never_rebuilds_a_healthy_forward(self):
+        supervisor = self.supervisor(); original = supervisor.children
+        self.deps.readiness_error = module.ReadinessError('router', 503)
+        self.deps.direct_ready = lambda target: False
+        for _ in range(12):
+            self.clock.advance(5); self.assertFalse(supervisor.connect())
+        self.assertEqual(supervisor.children, original)
+        self.assertTrue(all(not child.stopped for child in original))
+        self.assertEqual(len([row for row in self.logs() if row['event'] == 'moni-supervisor-router-slow']), 4)
+        self.assertFalse(any(row['event'] == 'moni-supervisor-reconnect' for row in self.logs()))
+
+    def test_callback_unready_locally_and_paused_runner_never_rebuild(self):
+        for error in (module.ReadinessError('callback', 503), module.ReadinessError('runner', 503)):
+            supervisor = self.supervisor(); original = supervisor.children
+            self.deps.readiness_error = error; self.deps.direct_ready = lambda target: False
+            for _ in range(6): self.assertFalse(supervisor.connect())
+            self.assertEqual(supervisor.children, original)
+            self.assertTrue(all(not child.stopped for child in original))
+
     def test_sustained_failure_repairs_only_the_implicated_forward(self):
         for target in module.TUNNELS:
             with self.subTest(target=target):
                 supervisor = self.supervisor(); original = supervisor.children
-                self.deps.readiness_error = (TimeoutError('private text') if target == 'runner'
+                self.deps.readiness_error = (module.ReadinessError('runner', None, 'ConnectionRefusedError', 'ssh-transport') if target == 'runner'
                                              else module.ReadinessError(target, 503))
                 for _ in range(2):
                     self.assertFalse(supervisor.connect())
@@ -399,7 +419,7 @@ class RepairTests(SupervisorTestCase):
         with self.assertRaises(KeyboardInterrupt): supervisor.run()
         self.assertTrue(before_shutdown[0].stopped)
         reconnects = [event for event in self.logs() if event['event'] == 'moni-supervisor-reconnect']
-        self.assertEqual(len(reconnects), 1); self.assertEqual(reconnects[0]['torn_down'], ['runner'])
+        self.assertEqual(reconnects, [])
         self.assertEqual(supervisor.children, [])
 
 
@@ -416,35 +436,36 @@ class LoggingTests(SupervisorTestCase):
         fixed_time = datetime(2026, 11, 16, 12, 0, 0, 123000, tzinfo=timezone.utc)
         with patch.object(module, 'datetime', SimpleNamespace(now=lambda zone: fixed_time)):
             for _ in range(3): self.assertFalse(supervisor.connect())
-        events = self.logs(); self.assertEqual(len(events), 4)
+        events = self.logs(); self.assertEqual(len(events), 3)
         for event in events:
             self.assertEqual(event['timestamp'], '2026-11-16T12:00:00.123Z')
             self.assertEqual((event['check'], event['probe'], event['target']), ('runner-lease', 'POST /lease', 'runner'))
             self.assertEqual(event['exception_class'], 'TimeoutError'); self.assertIsNone(event['status'])
             self.assertEqual(event['latency_ms'], 1234)
-        self.assertEqual([event['consecutive_failures'] for event in events], [1, 2, 3, 3])
-        self.assertEqual([event['torn_down'] for event in events], [[], [], [], ['runner']])
-        self.assertAlmostEqual(clock(), 5.702)
+        self.assertEqual([event['consecutive_failures'] for event in events], [1, 2, 3])
+        self.assertEqual([event['torn_down'] for event in events], [[], [], []])
+        self.assertAlmostEqual(clock(), 3.702)
         for secret in ('control-token', 'router-key', 'private personal text', 'raw ssh error'):
             self.assertNotIn(secret, self.output.getvalue())
 
-    def test_ssh_builder_inherits_suppressed_output_without_changing_its_call(self):
+    def test_ssh_stderr_is_bounded_and_only_fixed_diagnostics_reach_the_log(self):
         deps = module.OffboxDeps.__new__(module.OffboxDeps); deps.config = {}
         calls = []; old_fds = [(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in (1, 2)]
         def tunnel(*args):
             calls.append(args)
-            for fd in (1, 2): self.assertTrue(stat.S_ISCHR(os.fstat(fd).st_mode))
-            self.assertEqual(os.fstat(2).st_rdev, os.stat(os.devnull).st_rdev)
+            self.assertTrue(stat.S_ISCHR(os.fstat(1).st_mode))
+            self.assertTrue(stat.S_ISFIFO(os.fstat(2).st_mode))
             print('control-token private text')
             print('router-key raw ssh line', file=sys.stderr)
-            os.write(2, b'raw inherited ssh stderr\n')
+            os.write(2, b'x' * 3000 + b'PRIVATE_TOKEN private message: Permission denied\n')
             return Child()
         deps.ssh_sync = SimpleNamespace(tunnel=tunnel)
         stderr = io.StringIO()
-        with redirect_stderr(stderr): deps.router_tunnel('bx_moni')
+        with redirect_stderr(stderr): child = deps.router_tunnel('bx_moni')
         self.assertEqual(calls, [('bx_moni', 19465, 20128, True)])
         self.assertEqual(self.output.getvalue(), ''); self.assertEqual(stderr.getvalue(), '')
         self.assertEqual([(os.fstat(fd).st_dev, os.fstat(fd).st_ino) for fd in (1, 2)], old_fds)
+        self.assertEqual(child.moni_stderr.fields(), {'stderr_bytes': 2048, 'stderr_tail': ['permission-denied']})
 
 
 class ReadinessContractTests(SupervisorTestCase):
@@ -496,6 +517,18 @@ class ReadinessContractTests(SupervisorTestCase):
                 self.assertTrue(error_body.closed)
                 self.assertNotIn('private', str(result.exception))
 
+    def test_separate_readiness_flags_and_connection_refusal_keep_distinct_phases(self):
+        for target in ('router', 'callback'):
+            deps = self.deps()
+            deps.post = lambda *args: {'boxId': 'bx_moni', 'epoch': 'bound-epoch', 'routerReady': target != 'router', 'callbackReady': target != 'callback'}
+            with self.assertRaises(module.ReadinessError) as error: deps.both_ready()
+            self.assertEqual((error.exception.target, error.exception.phase), (target, target + '-http'))
+        for cause, phase in ((ConnectionRefusedError('PRIVATE_TOKEN'), 'ssh-transport'), (TimeoutError('PRIVATE_TEXT'), 'runner-http')):
+            deps = self.deps(); deps.post = lambda *args: (_ for _ in ()).throw(module.urllib.error.URLError(cause))
+            with self.assertRaises(module.ReadinessError) as error: deps.both_ready()
+            self.assertEqual(error.exception.phase, phase)
+            self.assertNotIn('PRIVATE_', str(error.exception))
+
     def test_http_status_and_fixed_target_reach_the_supervisor_log(self):
         deps = Deps(); remote = self.deps()
         supervisor = module.Supervisor({'boxId': 'bx_moni'}, deps)
@@ -505,7 +538,7 @@ class ReadinessContractTests(SupervisorTestCase):
                                               io.BytesIO(b'{"error":"Callback unavailable"}'))
         remote.post = post; deps.both_ready = remote.both_ready
         for _ in range(3): self.assertFalse(supervisor.connect())
-        for event in self.logs():
+        for event in [row for row in self.logs() if row['check'] == 'runner-lease']:
             self.assertEqual((event['target'], event['status'], event['exception_class']), ('callback', 503, 'HTTPError'))
         self.assertEqual(self.logs()[-1]['torn_down'], ['callback'])
         self.assertNotIn('control-token', self.output.getvalue()); self.assertNotIn('private text', self.output.getvalue())
@@ -557,7 +590,7 @@ class ReadinessContractTests(SupervisorTestCase):
         source = Path(__file__).resolve().parents[2] / 'offbox/skill/scripts/offbox_lib/ssh_sync.py'
         node = next(node for node in ast.parse(source.read_text()).body if isinstance(node, ast.FunctionDef) and node.name == 'tunnel')
         calls = []
-        namespace = {'subprocess': SimpleNamespace(Popen=lambda args: calls.append(args)), 'ssh_base': lambda box: ['ssh', '-F', 'isolated-config']}
+        namespace = {'subprocess': SimpleNamespace(Popen=lambda args: calls.append(args) or Child()), 'ssh_base': lambda box: ['ssh', '-F', 'isolated-config']}
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec'), namespace)
         deps = self.deps(); deps.ssh_sync = SimpleNamespace(tunnel=namespace['tunnel'])
         deps.tunnel('bx_moni', False); deps.tunnel('bx_moni', True); deps.router_tunnel('bx_moni')

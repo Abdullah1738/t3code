@@ -165,7 +165,9 @@ picked abdullah.fund: `~/.local/bin/cards-tunnel-setup` creates the tunnel (cred
 `~/.cloudflared/cards-tunnel.json`, never in this repo), points the DNS name at it and starts it.
 
 `robob-read-watchdog` probes `t3ctl threads --active --limit 5` with a 10-second
-request deadline every 30 seconds. After three minutes of failed reads it sends
+request deadline every 30 seconds. A separate 20-second child deadline also
+covers a probe stuck before JavaScript starts (`ROBOB_WD_PROBE_DEADLINE` overrides it).
+After three minutes of failed reads it sends
 one Telegram alert, then one recovery when reads work again. It clears the
 incident quietly while Robob is closed or `tmux -L restart` has the
 `robob-restart` session. State and stderr live in
@@ -178,8 +180,15 @@ Unload with `launchctl bootout gui/$(id -u)/com.ardud.robob-read-watchdog`.
 
 Installers can call `robob-read-watchdog --sustain 300 --every 30 --give-up 1800`
 to require five minutes of consecutive healthy reads. Any failed probe resets
-the healthy window; timeout exits 1. This mode sends no notifications and uses
-no watchdog state. `ROBOB_WD_PROBE`, `ROBOB_WD_NOTIFY`, `ROBOB_WD_APP_RUNNING`,
+the healthy window; timeout exits 1. This mode sends no notifications. All modes
+share probe state: after the child deadline the watchdog sends one TERM, waits
+at most two seconds, then records a surviving child's PID and start time in
+`stuck_probe`. Further runs skip the probe until that identity is gone.
+An unreadable start time keeps suppression in place; an initially unreadable
+identity is recorded as `unknown` and retained until the PID is gone.
+Start-time identities and stuck-time diagnostics use UTC, so manual and launchd
+runs agree even when they have different `TZ` settings.
+`ROBOB_WD_PROBE`, `ROBOB_WD_NOTIFY`, `ROBOB_WD_APP_RUNNING`,
 `ROBOB_WD_RESTARTING` and `ROBOB_WD_SLEEP` accept replacement commands;
 `ROBOB_WD_STATE` overrides the state directory. `ROBOB_WD_NOW` accepts epoch
 seconds or a command returning epoch seconds for an advancing test clock.

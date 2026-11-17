@@ -17,6 +17,7 @@ import type { SlotEvent } from "../store/KanbanStore.ts";
 
 import * as Activity from "./activity.ts";
 import * as Rules from "./rules.ts";
+import { boardReleaseSummary } from "./boardReplies.ts";
 
 const opus = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/claude-opus-5-5" };
 const sonnet = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/claude-sonnet-5-5" };
@@ -2113,6 +2114,63 @@ const activityBoard: KanbanBoard = {
   nightlyReview: null,
   archivedAt: null,
 };
+
+it.each([false, true])(
+  "activity retains the latest five receipts and current window outside its event window (historical: %s)",
+  (historical) => {
+    const board: KanbanBoard = {
+      ...activityBoard,
+      standingApprovals: [
+        {
+          id: "sa",
+          gate: "deploy",
+          minIntervalHours: 4,
+          quote: "Release under the standing rule",
+          sourceThreadId: "owner",
+          saidAt: before,
+          approvedAsk: { cardId: "source", askId: "q1" },
+          recordedAt: before,
+          recordedBy: "evaluator",
+          revokedAt: null,
+          revokedBy: null,
+          revokeReason: null,
+        },
+      ],
+      releaseLedger: Array.from({ length: 7 }, (_, i) => ({
+        boardId: activityBoard.id,
+        cardId: KanbanCardId.make(`release-${i}`),
+        cardNumber: i + 1,
+        subtaskId: "s1",
+        service: "robob",
+        at: t(`0${i}:00`),
+        critical: null,
+        approvalId: "sa",
+      })),
+    };
+    const reporting = historical
+      ? {
+          ...board,
+          releaseLedger: board.releaseLedger!.slice(0, -1),
+          historicalReleaseLedger: board.releaseLedger!.slice(-1),
+        }
+      : board;
+    const release = boardReleaseSummary(reporting, t("08:00"));
+    const result = Activity.rollup({
+      window: { since: t("01:00"), until: t("02:00") },
+      currentAt: t("08:00"),
+      board: reporting,
+      release,
+      cards: [],
+      events: [],
+      pools: [],
+      threads: [],
+    });
+    expect(result.releaseLedger).toEqual(board.releaseLedger!.slice(-5));
+    expect(result.nextReleaseWindowAt).toBe(t("10:00"));
+    expect(result.nextReleaseWindowByService).toEqual({ robob: t("10:00") });
+    expect(boardReleaseSummary(reporting, t("10:00")).nextReleaseWindowAt).toBeNull();
+  },
+);
 const subtask = (
   owner: KanbanSubtask["owner"],
   patch: Partial<KanbanSubtask> = {},

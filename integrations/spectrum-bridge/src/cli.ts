@@ -409,7 +409,7 @@ export function parseCommand(args: string[]): Command {
         return { method: "POST", path: "/remote-events", body: { chat: "moni", sessionId, ...(values.after ? { after: values.after } : {}) } };
       }
       if (!validId(values.id)) throw new CliError("--id must be a full event id");
-      if (values.state !== "done" && values.state !== "pending") throw new CliError("--state must be done or pending");
+      if (values.state !== "done" && values.state !== "pending" && values.state !== "failed") throw new CliError("--state must be done, failed or pending");
       return { method: "POST", path: "/remote-resolve", body: { chat: "moni", sessionId, id: values.id, state: values.state } };
     }
     case "agent-requests":
