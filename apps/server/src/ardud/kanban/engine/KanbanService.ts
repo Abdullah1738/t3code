@@ -5922,7 +5922,14 @@ const make = Effect.gen(function* () {
         yield* tickSql<EvaluatorQueueRow>`SELECT * FROM ardud_kanban_evaluator_queue WHERE job_key = ${key}`;
       return { queued: true as const, queueId: rows[0]!.id };
     }
-    return yield* drainEvaluatorQueue(board.id, key);
+    // Admission is durable. A sibling enqueue may invalidate delivery preparation,
+    // which must retry without replaying this already-committed queue write.
+    return yield* locks.outside(
+      locks.fresh(locks.run(drainEvaluatorQueue(board.id, key))),
+      undefined,
+      false,
+      Effect.succeed(true),
+    );
   });
 
   const drainEvaluatorQueue = Effect.fn("KanbanService.drainEvaluatorQueue")(function* (
