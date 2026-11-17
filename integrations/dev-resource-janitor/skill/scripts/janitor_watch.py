@@ -155,10 +155,18 @@ def worker(lock_fd):
             browser = scan["processes"]["agent_browser"]
             stats["found"] += len(browser["candidates"])
             stats["killed"] += sum(action["ok"] for action in browser["actions"])
+        if "xcode_builds" in scan.get("processes", {}):
+            dev_janitor.stop_xcode_candidates(scan)
+            builds = scan["processes"]["xcode_builds"]
+            stats["found"] += len(builds["candidates"])
+            stats["killed"] += sum(action["ok"] for action in builds["actions"])
         dev_janitor.record_report(scan)
         if any(action["action"] == "close" and not action["ok"]
                for action in scan.get("processes", {}).get("agent_browser", {}).get("actions", [])):
             raise RuntimeError("agent-browser close failed; see audit")
+        if any(action["action"] == "stop" and not action["ok"]
+               for action in scan.get("processes", {}).get("xcode_builds", {}).get("actions", [])):
+            raise RuntimeError("Xcode build stop failed; see audit")
         candidates = scan["candidates"]
         if candidates:
             # apply() re-scans immediately before *each* action; do not act on the initial snapshot alone.
