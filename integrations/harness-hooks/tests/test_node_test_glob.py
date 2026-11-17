@@ -224,8 +224,9 @@ class NodeTestGlobTests(unittest.TestCase):
                         payload = invocation + 'node --test test/*.test.js'
                         command = wrapper + shlex.quote(payload) if wrapper else payload
                         with self.subTest(shell=shell, body=body, invocation=invocation, wrapper=wrapper):
-                            self.assert_decision(command, self.a, expected,
-                                                 'written in the same call' if expected else None)
+                            verdict = 'live-database-script-unresolved' if wrapper and body == ':' else expected
+                            self.assert_decision(command, self.a, verdict,
+                                                 'written in the same call' if verdict else None)
 
     def test_shell_option_boundary_keeps_command_body_scan(self):
         for shell in ('bash', 'sh', 'zsh', 'dash', 'ksh'):
@@ -235,8 +236,9 @@ class NodeTestGlobTests(unittest.TestCase):
                         payload = shell + ' -c ' + shlex.quote(body) + suffix + '; node --test test/*.test.js'
                         command = wrapper + shlex.quote(payload) if wrapper else payload
                         with self.subTest(shell=shell, suffix=suffix, wrapper=wrapper, body=body):
-                            self.assert_decision(command, self.a, expected,
-                                                 'written in the same call' if expected else None)
+                            verdict = 'live-database-script-unresolved' if wrapper and body == ':' else expected
+                            self.assert_decision(command, self.a, verdict,
+                                                 'written in the same call' if verdict else None)
 
     def test_offbox_pull_invalidates_later_glob(self):
         for flags in ('--pull test', '--pull=test', '--no-sync --pull test', '--bg --pull=test'):
@@ -264,14 +266,21 @@ class NodeTestGlobTests(unittest.TestCase):
                         payload = writer + operator + ' ' + target + '; node --test test/*.test.js'
                         command = wrapper + shlex.quote(payload) if wrapper else payload
                         with self.subTest(operator=operator, writer=writer, target=target, wrapper=wrapper):
-                            self.assert_decision(command, self.a, expected,
-                                                 'written in the same call' if expected else None)
+                            if operator == '>|':
+                                self.assert_decision(command, self.a, 'live-database-script-unresolved',
+                                                     'clobber redirect unproved')
+                            else:
+                                verdict = ('live-database-script-unresolved'
+                                           if wrapper and writer in {'printf x ', '', ': '} else expected)
+                                self.assert_decision(command, self.a, verdict,
+                                                     'written in the same call' if verdict else None)
         (self.a / '2').mkdir()
         self.assert_decision('printf x >&2/../test/a.test.js; node --test test/*.test.js', self.a,
                              'live-database-script-unresolved', 'written in the same call')
         for redirect in ('>>|', '>!', '>>!', '>&!'):
             self.assert_decision('printf x ' + redirect + 'test/a.test.js; node --test test/*.test.js', self.a,
-                                 'live-database-script-unresolved', 'written in the same call')
+                                 'live-database-script-unresolved',
+                                 'written in the same call' if redirect == '>&!' else 'clobber redirect unproved')
         for redirect in ('2>&1', '2>& 1', '>&-', '0<&0'):
             self.assert_decision('printf x ' + redirect + '; node --test test/*.test.js', self.a)
         self.assert_decision("printf '%s' '&>' '<>' '>'; node --test test/*.test.js", self.a)
