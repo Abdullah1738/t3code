@@ -22,6 +22,9 @@ class ExportDeployTests(unittest.TestCase):
         self.script.write_text((INTEGRATIONS / 'deploy.zsh').read_text().replace('$HOME', str(self.home_fixture)))
         self.scripts = self.root / 'memory-system/scripts'
         self.scripts.mkdir(parents=True)
+        control = self.root / 'memory-system/src/backup_control.py'
+        control.parent.mkdir()
+        control.write_text("import sys\nif sys.argv[1] == 'fence':\n    raise AssertionError('inner install test')\n")
         self.name = 'com.abdullah.opencode-readonly.plist'
         shutil.copyfile(INTEGRATIONS / 'memory-system/scripts' / self.name, self.scripts / self.name)
         (self.scripts / 'recall').write_text('#!/bin/sh\nexit 0\n')
@@ -39,7 +42,9 @@ class ExportDeployTests(unittest.TestCase):
 
     def run_deploy(self, *args):
         result = subprocess.run(['zsh', '-f', str(self.script), 'memory-system', *args],
-                                env={**os.environ, 'PATH': str(self.bin) + os.pathsep + os.environ['PATH']},
+                                env={**os.environ, 'HOME': str(self.home_fixture), 'ZDOTDIR': str(self.home_fixture),
+                                     'MEMORY_DEPLOY_FENCED': '1',
+                                     'PATH': str(self.bin) + os.pathsep + os.environ['PATH']},
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
