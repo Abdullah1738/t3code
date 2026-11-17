@@ -89,6 +89,7 @@ const threadCaller = (threadId: ThreadId): McpInvocationContext.McpInvocationSco
 
 const decodeKanbanCard = Schema.decodeUnknownEffect(KanbanCard);
 const decodeToolFailure = Schema.decodeUnknownEffect(Schema.fromJsonString(OrchestratorMcpFailure));
+const isInvalidParams = Schema.is(McpSchema.InvalidParams);
 
 const mcpClient = McpSchema.McpServerClient.of({
   clientId: 1,
@@ -7079,6 +7080,11 @@ it.effect(
         waiting.events.at(-1)?.body,
         "Waiting for the linear-state script's check: ENG-123 to reach Done",
       );
+      for (const pattern of ["\u001b[31m", "\u0000", "\u007f", { nested: ["\u001b"] }]) {
+        const result = yield* wait({ script: "linear-state", args: { pattern } });
+        assert.isFalse(result.isError, result.text);
+        assert.deepEqual((yield* kanban.card(card.id)).card.wait?.args, { pattern });
+      }
     }).pipe(Effect.provide(layer));
   },
 );
@@ -9896,10 +9902,13 @@ it.effect("only evaluators can set or clear service via create and edit", () =>
           {
             title: "Apply",
             prompt: "Apply",
-            subtasks: [{ text: "Apply build", owner: "evaluator", service }],
+            subtasks: [{ text: "Apply build", owner: "evaluator", interrupting: true, service }],
           },
         ],
-        ["card_edit", { card: card.id, subtasks: [{ id: "s1", service }] }],
+        [
+          "card_edit",
+          { card: card.id, basedOn: card.updatedAt, subtasks: [{ id: "s1", service }] },
+        ],
       ] as const) {
         const refused = yield* call(worker, tool, input);
         assert.isTrue(refused.isError);
@@ -10511,8 +10520,8 @@ it.effect.each([
     archived: "target_thread_unavailable",
     model: "model_pool_mismatch",
     project: "project_mismatch",
-    backlog: "stage_not_allowed",
-    "needs-owner": "stage_not_allowed",
+    backlog: "invalid_args",
+    "needs-owner": "invalid_args",
     "full-batch": "thread_batch_full",
     "target-reviewer": "role_not_allowed",
   } as const;
@@ -10603,7 +10612,12 @@ it.effect.each([
     assert.include(result.text, "Nothing was saved");
     const row = yield* Deferred.await(pending);
     assert.equal(row.denyReason, expectedReasons[reason]);
-    assert.equal(row.errorTag, reason === "missing" ? "invalid_request" : "capability_denied");
+    assert.equal(
+      row.errorTag,
+      ["missing", "both", "backlog", "needs-owner"].includes(reason)
+        ? "invalid_request"
+        : "capability_denied",
+    );
     assert.equal(row.saved, false);
     assert.equal(
       row.callerRole,
@@ -11859,3 +11873,548 @@ it.effect("board_activity explains detached cards using the already loaded board
     assert.isAtLeast(activity.stages.withoutThread.items[0]!.hours, 0);
   }).pipe(Effect.provide(layer));
 });
+
+it.effect("stateless kanban refusals bypass a held board gate and caller reader", () => {
+  const fake = fakeThreads();
+  let recorded: Deferred.Deferred<AnalyticsEvent> | undefined;
+  const sink = Layer.mock(Analytics.Analytics)({
+    record: (event) =>
+      event.kind === "mcp.call" && recorded
+        ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+        : Effect.void,
+  });
+  return Effect.gen(function* () {
+    const service = yield* KanbanService.KanbanService;
+    const board = yield* service.ensureBoard({
+      slug: "preflight",
+      name: "Preflight",
+      defaultProjectId: null,
+    });
+    const card = yield* service.createCard(board.id, { prompt: "Keep this card" }, owner);
+    const before = (yield* service.card(card.id)).card;
+    const held = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let callerReads = 0;
+    fake.storeControl.afterBoardWrite = () =>
+      Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release)));
+    const holder = yield* service
+      .updateBoard(board.id, { name: "Held gate" })
+      .pipe(Effect.forkChild);
+    yield* Deferred.await(held);
+    fake.callerControl.beforeRead = () => {
+      callerReads++;
+      return Deferred.await(release);
+    };
+    const malformedTimes = [
+      "yesterday",
+      "2026-11-17",
+      "2026-02-30T00:00:00Z",
+      "2026-02-29T00:00:00Z",
+      "2026-13-01T00:00:00Z",
+      "2026-11-17T24:00:00Z",
+      "2026-11-17T00:60:00Z",
+      "2026-11-17T00:00:60Z",
+      "2026-11-17T00:00:00+25:00",
+      "2026-11-17 00:00:00Z",
+    ];
+    const controlMarkers = Array.from({ length: 33 }, (_, code) =>
+      String.fromCharCode(code === 32 ? 127 : code),
+    ).filter((char) => !["\t", "\n", "\r"].includes(char));
+    const cases: ReadonlyArray<
+      readonly [string, Record<string, unknown>, string, string | undefined]
+    > = [
+      ["card_edit", { prompt: "New prompt" }, "missing_required", "basedOn"],
+      [
+        "card_edit",
+        {
+          prompt: "New",
+          promptEdits: [{ oldString: "Old", newString: "New" }],
+          basedOn: card.updatedAt,
+        },
+        "conflict",
+        "prompt",
+      ],
+      [
+        "card_edit",
+        {
+          subtasks: [],
+          subtaskEdits: [{ oldString: "Old", newString: "New" }],
+          basedOn: card.updatedAt,
+        },
+        "conflict",
+        "subtasks",
+      ],
+      ["card_edit", { description: "bad\u0000text" }, "other", "description"],
+      ["card_edit", { priority: 6 }, "bad_type", "priority"],
+      ...controlMarkers.flatMap((marker) =>
+        (
+          [
+            ["wiki_write", "edits"],
+            ["card_edit", "promptEdits"],
+            ["card_edit", "subtaskEdits"],
+          ] as const
+        ).flatMap(([name, field]) =>
+          [
+            [],
+            [{ oldString: "unrelated", newString: "replacement" }],
+            [{ oldString: marker === "\u0000" ? "\u001b" : "\u0000", newString: "clean" }],
+          ].map(
+            (later) =>
+              [
+                name,
+                {
+                  ...(name === "wiki_write" ? { slug: "page" } : {}),
+                  [field]: [{ oldString: "left", newString: marker }, ...later],
+                },
+                "other",
+                field,
+              ] as const,
+          ),
+        ),
+      ),
+      ...["card_create", "card_edit"].map(
+        (name) => [name, { prompt: "New", models: [] }, "missing_required", "models"] as const,
+      ),
+      ...["card_create", "card_edit"].flatMap((name) =>
+        ["model", "models"].flatMap((field) =>
+          [
+            ...["variant", "effort", "reasoningEffort"].flatMap((id) =>
+              [true, false].map((value) => ({ options: [{ id, value }] })),
+            ),
+            ...["serviceTier", "reasoningEffort"].flatMap((id) =>
+              ["max", "high"].map((value) => ({
+                options: [
+                  { id, value: "max" },
+                  { id, value },
+                ],
+              })),
+            ),
+            { effort: "max", variant: "high" },
+            { effort: "max", options: [{ id: "reasoningEffort", value: "high" }] },
+            { variant: "max", options: [{ id: "reasoningEffort", value: "high" }] },
+            {
+              options: [
+                { id: "variant", value: "max" },
+                { id: "reasoningEffort", value: "high" },
+              ],
+            },
+          ].map(
+            (model) =>
+              [
+                name,
+                {
+                  ...(name === "card_create" ? { prompt: "New" } : {}),
+                  [field]:
+                    field === "model"
+                      ? { instanceId: "codex", model: "gpt-6.1-sol", ...model }
+                      : [{ instanceId: "codex", model: "gpt-6.1-sol", ...model, weight: 1 }],
+                },
+                "conflict",
+                field,
+              ] as const,
+          ),
+        ),
+      ),
+      ...malformedTimes.map(
+        (basedOn) => ["card_edit", { prompt: "New", basedOn }, "bad_time", "basedOn"] as const,
+      ),
+      ["card_move", { to: "needs_review", note: "\u0000" }, "other", "note"],
+      ["card_move", { to: "nowhere" }, "bad_enum", "to"],
+      ["card_update", { comment: "\u0000" }, "other", "comment"],
+      ["card_update", { links: "wrong" }, "bad_type", "links"],
+      ["card_create", { prompt: "", title: " " }, "missing_required", "prompt"],
+      [
+        "card_create",
+        { prompt: "New", forThread: "worker", assignToSelf: true },
+        "conflict",
+        "forThread",
+      ],
+      ...[
+        { forThread: "worker" },
+        { assignToSelf: true },
+        { forThread: "worker", assignToSelf: true },
+      ].flatMap((assignment) =>
+        [undefined, 1, 2, 3, 4, 5].flatMap((priority) =>
+          [undefined, "todo", "needs_owner"].flatMap((stage) => {
+            const invalidField =
+              assignment.forThread && assignment.assignToSelf
+                ? "forThread"
+                : priority === 5
+                  ? "priority"
+                  : assignment.forThread && stage === "needs_owner"
+                    ? "stage"
+                    : undefined;
+            return invalidField === undefined
+              ? []
+              : [
+                  [
+                    "card_create",
+                    {
+                      prompt: "New",
+                      ...assignment,
+                      ...(priority === undefined ? {} : { priority }),
+                      ...(stage === undefined ? {} : { stage }),
+                    },
+                    "conflict",
+                    invalidField,
+                  ] as const,
+                ];
+          }),
+        ),
+      ),
+      [
+        "card_create",
+        { prompt: "New", subtasks: [{ owner: "work" }] },
+        "missing_required",
+        "subtasks",
+      ],
+      [
+        "card_create",
+        { prompt: "New", subtasks: [{ text: "x".repeat(501), owner: "work" }] },
+        "too_long",
+        "subtasks",
+      ],
+      ...["card_create", "card_edit"]
+        .flatMap((name) => [
+          [
+            name,
+            {
+              prompt: "New",
+              basedOn: card.updatedAt,
+              subtasks: Array.from({ length: 31 }, () => ({ text: "Work", owner: "work" })),
+            },
+            "too_many",
+            "subtasks",
+          ] as const,
+          ...[
+            { text: " ", owner: "work" },
+            { text: "Work", owner: "work", gate: "deploy" },
+            { text: "Work", owner: "work", holdsDependents: true },
+            { text: "Review", owner: "review", interrupting: true },
+            { text: "Work", owner: "work", ownerOnly: true },
+            { text: "Work", owner: "work", script: "check" },
+            { text: "Release", owner: "evaluator", interrupting: true, service: "bad service" },
+            { text: "Release", owner: "evaluator", service: "robob" },
+          ].map(
+            (subtask) =>
+              [
+                name,
+                {
+                  prompt: "New",
+                  basedOn: card.updatedAt,
+                  subtasks: [subtask],
+                },
+                subtask.text.trim() ? "other" : "bad_type",
+                "subtasks",
+              ] as const,
+          ),
+        ])
+        .map(([name, fields, reason, field]) => {
+          // basedOn belongs to edits; creations have no existing card version.
+          const { basedOn: _basedOn, ...createFields } = fields;
+          return [name, name === "card_create" ? createFields : fields, reason, field] as const;
+        }),
+      ...["bad-id", "s0", "s01"].map(
+        (id) =>
+          [
+            "card_create",
+            { prompt: "New", subtasks: [{ id, text: "Work", owner: "work" }] },
+            "other",
+            "subtasks",
+          ] as const,
+      ),
+      ["subtask_done", { subtask: "s1", state: "done", note: "\u0000" }, "other", "note"],
+      ["subtask_done", { subtask: "s1", state: "wrong" }, "bad_enum", "state"],
+      ...malformedTimes.map(
+        (releasedAt) =>
+          [
+            "subtask_done",
+            { subtask: "s1", state: "done", releasedAt },
+            "bad_time",
+            "releasedAt",
+          ] as const,
+      ),
+      ...[undefined, "", " "].map(
+        (note) =>
+          [
+            "subtask_done",
+            { subtask: "s1", state: "skipped", ...(note === undefined ? {} : { note }) },
+            "missing_required",
+            "note",
+          ] as const,
+      ),
+      [
+        "subtask_done",
+        { subtask: "s1", state: "open", releasedAt: card.updatedAt },
+        "conflict",
+        "releasedAt",
+      ],
+      ["card_flag", { stalled: true, reason: "\u0000" }, "other", "reason"],
+      ["card_flag", { stalled: "true" }, "bad_type", "stalled"],
+      ["card_wait", {}, "missing_required", "on"],
+      ["card_wait", { on: "time" }, "missing_required", "note"],
+      ["card_wait", { on: "time", note: "Wait" }, "missing_required", "until"],
+      ["card_wait", { on: "time", note: "Wait", until: "bad date" }, "bad_time", "until"],
+      ["card_wait", { on: "card", note: "Wait" }, "missing_required", "waitsOn"],
+      ["card_wait", { on: "owner_go", note: "Wait" }, "missing_required", "ask"],
+      ["card_wait", { on: "time", note: "Wait", script: "poll" }, "conflict", "script"],
+      ["card_wait", { on: "script", note: "Wait" }, "missing_required", "script"],
+      [
+        "card_wait",
+        { script: "poll", note: "Wait", args: { everyMs: "fast" } },
+        "bad_type",
+        "args",
+      ],
+      ["card_ask", { question: " " }, "missing_required", "question"],
+      ["card_ask", { question: "Question", kind: "draft" }, "other", undefined],
+      ...[
+        "No",
+        "Not now",
+        "Don't deploy",
+        "Don’t deploy",
+        "Do not deploy",
+        "Reject",
+        "Drop",
+        "Skip",
+        "Leave it",
+        "Hold",
+        "Cancel",
+        "Wait",
+        "Stop",
+        "Approve later",
+        "Approve tomorrow",
+        "Approve next week",
+        "Approve next month",
+        "Approve, not yet",
+        "Approve if ready",
+        "Approve unless blocked",
+        "Approve after review",
+        "Approve before review",
+        "Approve once reviewed",
+        "Approve when ready",
+        "Approve pending review",
+        "First approve",
+        "Approve then verify",
+        "Approve, not s2",
+        "Approve, no restart",
+        "We won't approve",
+        "We can’t approve",
+        "We dont approve",
+        "Never approve",
+        "We cannot approve",
+        "Approve without restart",
+        "Approve except s2",
+        "Approve only s1",
+        "Approve instead",
+      ].flatMap((label) =>
+        [label, ` ${label.toUpperCase()} `].map(
+          (label) =>
+            [
+              "card_ask",
+              { question: "Proceed?", options: [{ label, approves: ["s1"] }, "Change"] },
+              "other",
+              undefined,
+            ] as const,
+        ),
+      ),
+      ...[
+        { min: 2, max: 1 },
+        { min: -1, max: 1 },
+        { min: 0, max: 0 },
+        { min: 0.5, max: 1 },
+      ].map(
+        (choose) =>
+          [
+            "card_ask",
+            { question: "Pick?", options: ["A", "B"], respond: { choose } },
+            "other",
+            undefined,
+          ] as const,
+      ),
+      ["card_ask", { question: "Question", title: "x".repeat(201) }, "too_long", "title"],
+      [
+        "card_ask",
+        { question: "Question", options: [{ label: "Approve", approves: [" "] }] },
+        "missing_required",
+        "options",
+      ],
+      ["discussion_post", {}, "missing_required", "text"],
+      ...[
+        { blocks: Array.from({ length: 13 }, () => ({ _tag: "md", text: "x" })) },
+        { text: "x", blocks: Array.from({ length: 12 }, () => ({ _tag: "md", text: "x" })) },
+        { blocks: [{ _tag: "md", text: "x".repeat(20_001) }] },
+        { blocks: [{ _tag: "collapse", title: "Title", text: "x".repeat(20_001) }] },
+        { blocks: [{ _tag: "html", html: "x".repeat(262_145), title: null, height: null }] },
+        {
+          blocks: Array.from({ length: 9 }, () => ({
+            _tag: "image",
+            url: "https://example.com/image",
+            alt: "Image",
+          })),
+        },
+      ].map(
+        (fields) =>
+          [
+            "discussion_post",
+            { ask: "q1", ...fields },
+            (fields.blocks[0]?._tag === "md" && fields.blocks.length === 1) ||
+            fields.blocks[0]?._tag === "collapse"
+              ? "too_long"
+              : "other",
+            "blocks",
+          ] as const,
+      ),
+      ["discussion_post", { ask: "q1", text: "x".repeat(20_001) }, "too_long", "text"],
+      [
+        "discussion_post",
+        { blocks: [{ _tag: "collapse", title: "Title", text: "\u0000" }] },
+        "other",
+        "blocks",
+      ],
+      ["wiki_read", { slug: "a", slugs: ["b"] }, "conflict", "slug"],
+      ["wiki_read", { section: "Heading" }, "missing_required", "slug"],
+      ["wiki_read", { outline: true }, "missing_required", "slug"],
+      ["wiki_read", { slug: "a", section: "Heading", outline: true }, "conflict", "section"],
+      ["wiki_read", { slugs: [] }, "bad_type", "slugs"],
+      ["wiki_write", { slug: "a" }, "conflict", "body"],
+      [
+        "wiki_write",
+        { slug: "a", body: "Body", edits: [{ oldString: "a", newString: "b" }] },
+        "conflict",
+        "body",
+      ],
+      ["wiki_write", { slug: "!!!", body: "Body" }, "missing_required", "slug"],
+      ["wiki_write", { slug: "a", body: "\u0000" }, "other", "body"],
+    ];
+    yield* Effect.gen(function* () {
+      for (const [name, fields, reasonClass, invalidField] of cases) {
+        recorded = yield* Deferred.make<AnalyticsEvent>();
+        const needsCard = !["card_create", "wiki_read", "wiki_write"].includes(name);
+        const args = {
+          ...(name === "card_wait" ? {} : { boardId: board.id }),
+          ...(needsCard ? { card: card.id } : {}),
+          ...fields,
+        };
+        const result = yield* call(ThreadId.make("preflight-evaluator"), name, args).pipe(
+          Effect.result,
+        );
+        if (Result.isSuccess(result)) {
+          assert.isTrue(result.success.isError, `${name}: ${result.success.text}`);
+          const failure = yield* decodeToolFailure(result.success.text);
+          assert.equal(failure.code, "invalid_request", `${name}: ${result.success.text}`);
+        } else {
+          assert.isTrue(isInvalidParams(result.failure), `${name}: ${String(result.failure)}`);
+        }
+        const row = yield* Deferred.await(recorded);
+        assert.equal(row.errorTag, "invalid_request", name);
+        assert.equal(row.reasonClass, reasonClass, `${name}: ${JSON.stringify(row)}`);
+        assert.equal(row.invalidField, invalidField, name);
+        assert.notEqual(row.saved, true, name);
+        assert.isFalse(yield* Deferred.isDone(release), name);
+      }
+      assert.equal(callerReads, 0);
+    }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+    yield* Fiber.join(holder);
+    delete fake.storeControl.afterBoardWrite;
+    fake.callerControl.beforeRead = () => Effect.void;
+    const after = (yield* service.card(card.id)).card;
+    assert.deepEqual(after, before);
+  }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
+});
+
+it.effect("card_ask keeps approval labels whose meaning needs the real subtask", () => {
+  const fake = fakeThreads();
+  return Effect.gen(function* () {
+    const service = yield* KanbanService.KanbanService;
+    const evaluator = ThreadId.make("preflight-evaluator");
+    const board = yield* service.ensureBoard({
+      slug: "approval-labels",
+      name: "Approvals",
+      defaultProjectId: null,
+    });
+    for (const label of ["Deploy the on-hold build", "Purchase the hold service"]) {
+      const card = yield* service.createCard(
+        board.id,
+        {
+          prompt: label,
+          subtasks: [{ text: label, owner: "evaluator", interrupting: true }],
+        },
+        { _tag: "evaluator", threadId: evaluator },
+      );
+      const response = yield* call(evaluator, "card_ask", {
+        card: card.id,
+        question: "Proceed?",
+        options: [{ label, approves: ["s1"] }, "Wait"],
+      });
+      assert.isFalse(response.isError, response.text);
+      assert.deepEqual((yield* service.card(card.id)).card.asks.at(-1)?.options?.[0]?.approves, [
+        "s1",
+      ]);
+    }
+  }).pipe(Effect.provide(fake.layer));
+});
+
+it.effect(
+  "exact edits allow temporary control markers and validate the final text atomically",
+  () => {
+    const fake = fakeThreads();
+    return Effect.gen(function* () {
+      const service = yield* KanbanService.KanbanService;
+      const board = yield* service.ensureBoard({
+        slug: "edit-markers",
+        name: "Edit markers",
+        defaultProjectId: null,
+      });
+      const card = yield* service.createCard(
+        board.id,
+        { prompt: "left right", subtasks: [{ text: "left right", owner: "work" }] },
+        owner,
+      );
+      yield* service.writeWiki(board.id, { slug: "page", body: "left right" }, owner);
+      const evaluator = ThreadId.make("thread-evaluator");
+      const markers = Array.from({ length: 33 }, (_, code) =>
+        String.fromCharCode(code === 32 ? 127 : code),
+      ).filter((char) => !["\t", "\n", "\r"].includes(char));
+      for (const [name, field] of [
+        ["wiki_write", "edits"],
+        ["card_edit", "promptEdits"],
+        ["card_edit", "subtaskEdits"],
+      ] as const) {
+        let current = "left right";
+        const read = () =>
+          field === "edits"
+            ? service.wiki(board.id).pipe(Effect.map((pages) => pages[0]!.body))
+            : service
+                .card(card.id)
+                .pipe(
+                  Effect.map(({ card }) =>
+                    field === "promptEdits" ? card.prompt : card.subtasks[0]!.text,
+                  ),
+                );
+        for (const marker of markers) {
+          const response = yield* call(evaluator, name, {
+            ...(name === "wiki_write" ? { slug: "page" } : { card: card.id }),
+            [field]: [
+              { oldString: "left", newString: marker },
+              { oldString: "right", newString: "left" },
+              { oldString: marker, newString: "right" },
+            ],
+          });
+          assert.isFalse(response.isError, response.text);
+          current = current === "left right" ? "right left" : "left right";
+          assert.strictEqual(yield* read(), current, field);
+        }
+        const rejected = yield* call(evaluator, name, {
+          ...(name === "wiki_write" ? { slug: "page" } : { card: card.id }),
+          [field]: [
+            { oldString: current, newString: "\u0000 marker \u0000" },
+            { oldString: "\u0000 marker", newString: "clean" },
+          ],
+        });
+        assert.isTrue(rejected.isError, rejected.text);
+        assert.include(rejected.text, "control character");
+        assert.strictEqual(yield* read(), current, field);
+      }
+    }).pipe(Effect.provide(fake.layer));
+  },
+);

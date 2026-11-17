@@ -465,11 +465,14 @@ const optionScopeIds = (
 const approvalQualifier =
   /\b(?:if|unless|after|before|once|when|pending|first|then|not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead)\b/i;
 
+export const optionLabelRefusesApproval = (label: string) =>
+  isNegativeOption(label) || approvalQualifier.test(label);
+
 export const optionApprovalIds = (
   card: Pick<KanbanCard, "subtasks">,
   option: Pick<KanbanAskOption, "label" | "approves">,
 ): ReadonlyArray<string> | undefined => {
-  if (isNegativeOption(option.label) || approvalQualifier.test(option.label)) return undefined;
+  if (optionLabelRefusesApproval(option.label)) return undefined;
   if (option.approves !== undefined) {
     if (!isNegativeChoice(option.label)) return option.approves;
     // Exact action targets can contain refusal words, such as an "on-hold build".
