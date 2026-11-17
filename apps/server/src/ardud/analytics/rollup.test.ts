@@ -1227,3 +1227,54 @@ it.each(["failed", "noOutcome"] as const)(
     });
   },
 );
+
+it("rolls runtime samples into at most 24 hourly rows with maxima and averages", () => {
+  const accumulator = makeAccumulator();
+  for (let minute = 0; minute < 1440; minute++) {
+    accumulate(accumulator, {
+      ts: `2026-11-13T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`,
+      kind: "server.runtime_sample",
+      surface: "server",
+      route: "server",
+      props: {
+        runningTurns: { total: minute % 60, byProvider: {}, byModel: {} },
+        ...(minute % 2 === 0 ? { queuedRuns: minute % 60 } : {}),
+        host: { load1: (minute % 60) * 2, load5: 1, load15: 1, rssMiB: 10, heapUsedMiB: 5 },
+        sampleMs: (minute % 60) / 100,
+      },
+    });
+  }
+  const rollup = finishRollup(accumulator, "2026-11-13", "2026-11-14T00:00:00.000Z");
+  assert.equal(rollup.runtimeSamples!.length, 24);
+  assert.deepEqual(rollup.runtimeSamples![0], {
+    hour: "00",
+    samples: 60,
+    runningTurnsMax: 59,
+    runningTurnsAvg: 29.5,
+    queuedRunsMax: 58,
+    load1Max: 118,
+    sampleMsMax: 0.59,
+  });
+  assert.equal(rollup.total, 1440);
+  assert.isBelow(JSON.stringify(rollup).length, 50_000);
+});
+
+it("does not turn an unavailable queue count into zero", () => {
+  const accumulator = makeAccumulator();
+  accumulate(accumulator, {
+    ts: "2026-11-13T12:00:00.000Z",
+    kind: "server.runtime_sample",
+    surface: "server",
+    route: "server",
+    props: {
+      runningTurns: { total: 0, byProvider: {}, byModel: {} },
+      host: { load1: 0, load5: 0, load15: 0, rssMiB: 1, heapUsedMiB: 1 },
+      sampleMs: 0.1,
+    },
+  });
+  assert.equal(
+    finishRollup(accumulator, "2026-11-13", "2026-11-14T00:00:00.000Z").runtimeSamples![0]!
+      .queuedRunsMax,
+    null,
+  );
+});
