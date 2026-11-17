@@ -524,22 +524,24 @@ class BackgroundStartTests(Isolated):
         def start(box, command, **kwargs):
             self.assertTrue(runner.log_path.exists())
             return dict(processId=7, commandId='cmd_a')
+        marker = f'{runs.COMMAND_STARTED_MARKER} {runner.run_id}\n'
         with patch.object(api, 'call', side_effect=AssertionError('offline: no API calls')), \
                 patch.object(pool, 'acquire', return_value=dict(box_id='bx', remote_dir='w/r', size='large')), \
                 patch.object(runs.Runner, '_prepare_box', return_value=None), patch.object(runs, '_ttl_keeper'), \
                 patch.object(lease, 'touch'), patch.object(lease, 'idle_ttl'), patch.object(lease, 'ensure_ttl'), \
                 patch.object(api, 'get', return_value=dict(state='running')), patch.object(api, 'cmd_start', side_effect=start), \
+                patch.object(api, 'cmd_attach', return_value=iter([dict(type='stderr',data=marker)])), \
                 patch.object(runs, 'settle_docker'), contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(runs._run_remote(a, runner), 0)
             def history(box, cmd, which, offset, **kw):
-                data = 'hello\n' if which == 'stdout' else 'error\n'
+                data = 'hello\n' if which == 'stdout' else marker+'error\n'
                 return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=True)
             with patch.object(api, 'history_logs', side_effect=history):
                 runs.finish(runner.run_id, 3)
                 self.assertEqual(misc.logs(runner.run_id, False), 0)
             self.assertEqual(runner.log_path.read_text(),
-                             'hello\nerror\n\noffbox: box pressure unavailable · host boxes unknown\n'
+                             marker+'hello\nerror\n\noffbox: box pressure unavailable · host boxes unknown\n'
                              'offbox: remote exit 3\n')
 
 class BackgroundStreamRecoveryTests(_BackgroundOutputFixture):

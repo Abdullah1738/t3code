@@ -61,12 +61,12 @@ C
 systemctl enable docker containerd >/dev/null
 
 # Node 24 + corepack (pnpm), Go, uv, bun.
-NODE=v24.22.1
-curl -fsSL "https://nodejs.org/dist/$NODE/node-$NODE-linux-x64.tar.xz" | tar -xJ -C /usr/local --strip-components=1
+NODE=v24.22.3
+curl -fsSL "https://nodejs.org/dist/$NODE/node-$NODE-linux-x64.tar.xz" | tar --no-same-owner -xJ -C /usr/local --strip-components=1
 corepack enable
 npm config -g set update-notifier false fund false audit false
 GO=1.26.9
-curl -fsSL "https://go.dev/dl/go$GO.linux-amd64.tar.gz" | tar -xz -C /usr/local
+curl -fsSL "https://go.dev/dl/go$GO.linux-amd64.tar.gz" | tar --no-same-owner -xz -C /usr/local
 ln -sf /usr/local/go/bin/go /usr/local/bin/go; ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
 # Stamp the tree the way the client's Go repair does (offbox_lib/runs.py GO_REPAIR, "_offbox_inventory").
 # Without the stamp every new box re-downloads the 75 MB archive before its first command (13 Nov 2026:
@@ -77,6 +77,17 @@ ln -sf /usr/local/go/bin/go /usr/local/bin/go; ln -sf /usr/local/go/bin/gofmt /u
 curl -fsSL https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
 sudo -u user bash -c 'curl -fsSL https://bun.sh/install | bash' >/dev/null
 ln -sf /home/user/.bun/bin/bun /usr/local/bin/bun
+
+# Root tar extraction must not import the archive's uid into trusted PATH ancestors.
+for path in /usr/local /usr/local/{bin,lib,include,share} /usr/local/bin/node \
+  /usr/local/lib/node_modules /usr/local/go /usr/local/bin/{npm,npx,corepack}; do
+  target=$(readlink -f -- "$path") || { echo "offbox base: cannot resolve $path" >&2; exit 1; }
+  [ "$(stat -c %u -- "$target")" = 0 ] || { echo "offbox base: not root-owned: $path -> $target" >&2; exit 1; }
+done
+foreign=$(find -P /usr/local -xdev ! -uid 0 -print -quit)
+[ -z "$foreign" ] || { echo "offbox base: not root-owned: $foreign" >&2; exit 1; }
+actual=$(/usr/local/bin/node --version)
+[ "$actual" = "$NODE" ] || { echo "offbox base: Node version $actual, expected $NODE" >&2; exit 1; }
 
 # Lingering so user services (Moni's wacli-sync etc.) start with the box.
 mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/user

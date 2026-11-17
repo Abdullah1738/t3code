@@ -68,12 +68,12 @@ def load_cache(path):
         return []
 
 
-def read(app, deadline=None, since=None, cache_path=None):
+def read(app, deadline=None, since=None, cache_path=None, *, write_cache=True):
     with data_io.scope(min(time.time() + 10, deadline) if deadline is not None else time.time() + 10):
-        return _read(app, deadline, since, cache_path)
+        return _read(app, deadline, since, cache_path, write_cache=write_cache)
 
 
-def _read(app, deadline, since, cache_path):
+def _read(app, deadline, since, cache_path, *, write_cache=True):
     from state_json import write_json
     remaining = 10 if deadline is None else min(10, deadline - time.time() - 0.1)
     if remaining < 1:
@@ -85,7 +85,7 @@ def _read(app, deadline, since, cache_path):
         'MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser() / 'order-details.json'
     lock_fd = None
     try:
-        if app == 'noon':
+        if app == 'noon' and write_cache:
             # The lock must precede the snapshot and span the subprocess: locking
             # only the write lets a stale reader restore an evicted receipt.
             data_io.materialize_io(lambda: cache_path.parent.mkdir(parents=True, exist_ok=True), cache_path.parent)
@@ -121,7 +121,7 @@ def _read(app, deadline, since, cache_path):
         if (not isinstance(result, dict) or not isinstance(result.get('orders'), list)
                 or type(result.get('complete')) is not bool):
             raise ValueError('invalid orders')
-        if app == 'noon':
+        if app == 'noon' and write_cache:
             merged = {(r['service'], r['order']): r for r in cache}
             invalidated = set()
             invalidations = result.get('invalidated', [])

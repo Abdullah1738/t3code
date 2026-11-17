@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { assert, it } from "@effect/vitest";
 import {
   type AnalyticsEvent,
@@ -185,6 +186,7 @@ it.effect.each(
         ),
       );
       const layerMcp = OrchestratorMcpService.layer.pipe(
+        Layer.provide(McpProviderSessions.layer),
         Layer.provideMerge(
           Layer.mergeAll(
             layer,

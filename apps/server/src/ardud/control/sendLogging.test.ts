@@ -36,6 +36,7 @@ import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
 import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as Analytics from "../analytics/Analytics.ts";
+import { CONTROL_REQUEST_ID_HEADER } from "./ControlRequestAnalytics.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "./http.ts";
 
 const threadId = ThreadId.make("thread:control-send-logging");
@@ -236,6 +237,7 @@ describe("control send refusal logging", () => {
           reason: "no_steerable_run",
         });
         assert.isAtLeast(rejection(logs).durationMs as number, 0);
+        assert.equal(rejection(logs).requestId, response.headers.get(CONTROL_REQUEST_ID_HEADER));
         assert.lengthOf(samples, 1);
         assert.deepEqual(decodeAnalyticsEvent(samples[0]), samples[0]);
         assert.deepInclude(samples[0]!.props, {
@@ -246,6 +248,7 @@ describe("control send refusal logging", () => {
           reason: "no_steerable_run",
         });
         assert.equal(samples[0]!.durationMs, rejection(logs).durationMs);
+        assert.equal(samples[0]!.props?.requestId, rejection(logs).requestId);
       }),
     ),
   );

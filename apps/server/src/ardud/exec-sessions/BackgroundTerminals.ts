@@ -1,3 +1,4 @@
+import { resolveCallerRuntime } from "../../mcp/callerCredential.ts";
 import { OrchestratorMcpFailure } from "@t3tools/contracts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -72,35 +73,17 @@ const make = Effect.gen(function* () {
     }
     const caller = (yield* requireThreadScope(scope, "t3_exec_sessions / t3_exec_session_stop"))
       .thread;
-    // MCP's providerSessionId identifies a credential, not a provider runtime.
-    const credential = yield* credentials.read(caller.threadId);
-    if (
-      credential?.providerSessionId !== caller.providerSessionId ||
-      credential.threadId !== caller.threadId ||
-      credential.providerInstanceId !== caller.providerInstanceId
-    ) {
-      return yield* unavailable();
-    }
     const records = yield* orchestrator
       .getThreadRecords(caller.threadId, ["providerThreads"])
       .pipe(Effect.mapError(unavailable));
-    const activeThread = records.providerThreads.find(
-      (thread) => thread.id === records.thread.activeProviderThreadId,
-    );
-    if (activeThread !== undefined && activeThread.driver !== "codex") return yield* unsupported();
+    const identity = yield* resolveCallerRuntime(credentials, caller, records);
+    const runtimeId = identity?.runtimeProviderSessionId;
+    if (runtimeId === undefined) return yield* unavailable();
     const providerThread = records.providerThreads.find(
-      (thread) =>
-        thread.id === records.thread.activeProviderThreadId &&
-        thread.appThreadId === caller.threadId &&
-        thread.providerInstanceId === caller.providerInstanceId &&
-        thread.driver === "codex",
-    );
-    if (records.thread.deletedAt !== null || providerThread?.providerSessionId == null) {
-      return yield* unavailable();
-    }
-    const runtime = yield* sessions
-      .get(providerThread.providerSessionId)
-      .pipe(Effect.mapError(unavailable));
+      (thread) => thread.id === records.thread.activeProviderThreadId,
+    )!;
+    if (providerThread.driver !== "codex") return yield* unsupported();
+    const runtime = yield* sessions.get(runtimeId).pipe(Effect.mapError(unavailable));
     if (Option.isNone(runtime)) return yield* unavailable();
     if (
       runtime.value.driver !== "codex" ||

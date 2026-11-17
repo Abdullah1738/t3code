@@ -9,6 +9,7 @@ import {
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   RunId,
   ScheduledTaskId,
   ThreadId,
@@ -24,6 +25,7 @@ import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import { ProviderSessionEndedError } from "../orchestration-v2/ProviderSessionManager.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -111,6 +113,7 @@ it.effect.each(["caller row", "caller records", "idle target", "dispatch"] as co
 );
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -540,6 +543,8 @@ it("readThread prefers waiting activity status over a newer cancelled queued run
 it.each([
   "working",
   "retrying",
+  "retrying-timeout",
+  "retrying-refused",
   "resuming",
   "cancelled",
   "interrupted",
@@ -561,6 +566,12 @@ it.each([
   "continuation-completed",
   "continuation-running",
 ])("taskStatus exposes live child state: %s", async (state) => {
+  const retryCause =
+    state === "retrying-timeout"
+      ? "Request timed out — retry 2/10 (request_retry), next in 1 s"
+      : state === "retrying-refused"
+        ? "Connection refused (ECONNREFUSED) — retry 2/10 (connection_retry), next in 1 s"
+        : "Claude API no HTTP response: unknown.";
   const continuation = state === "fallback-resumed" || state.startsWith("continuation-");
   const mirrored = state.includes("-mirrored");
   const legacy = state.endsWith("-legacy");
@@ -596,21 +607,20 @@ it.each([
       model: "gpt-5.4",
     }),
     runs: [makeRun({ id: activeRunId, ordinal: 1, status: "running" })],
-    turnItems:
-      state === "retrying"
-        ? [
-            {
-              type: "error",
-              status: "running",
-              runId: childRunId,
-              ordinal: 1,
-              failure: { message: "Claude API no HTTP response: unknown." },
-              retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
-              startedAt: now,
-              updatedAt: now,
-            },
-          ]
-        : [],
+    turnItems: state.startsWith("retrying")
+      ? [
+          {
+            type: "error",
+            status: "running",
+            runId: childRunId,
+            ordinal: 1,
+            failure: { message: retryCause },
+            retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
+            startedAt: now,
+            updatedAt: now,
+          },
+        ]
+      : [],
     visibleTurnItems: [],
     runtimeRequests: [],
     messages: [],
@@ -743,21 +753,20 @@ it.each([
           : {}),
       },
     ],
-    turnItems:
-      state === "retrying"
-        ? [
-            {
-              type: "error",
-              status: "running",
-              runId: childRunId,
-              ordinal: 1,
-              failure: { message: "Claude API no HTTP response: unknown." },
-              retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
-              startedAt: now,
-              updatedAt: now,
-            },
-          ]
-        : [],
+    turnItems: state.startsWith("retrying")
+      ? [
+          {
+            type: "error",
+            status: "running",
+            runId: childRunId,
+            ordinal: 1,
+            failure: { message: retryCause },
+            retry: { attempt: 2, maxAttempts: 10, retryDelayMs: 500 },
+            startedAt: now,
+            updatedAt: now,
+          },
+        ]
+      : [],
     visibleTurnItems: [],
     runtimeRequests: [],
     messages: [],
@@ -871,8 +880,8 @@ it.each([
     )
       expect(result.retry).toBeNull();
     else {
-      expect(result.retry?.state).toBe(state);
-      expect(result.retry?.lastError).toContain(state === "retrying" ? "no HTTP response" : "502");
+      expect(result.retry?.state).toBe(state.startsWith("retrying") ? "retrying" : state);
+      expect(result.retry?.lastError).toContain(state.startsWith("retrying") ? retryCause : "502");
       expect(result.retry?.since).toBe("2026-08-04T12:00:00.000Z");
     }
   }).pipe(Effect.provide(layer), Effect.runPromise);
@@ -1204,15 +1213,17 @@ it.effect("wake tools that need a run return run_starting until admission", () =
       const sessions = yield* McpProviderSessions.McpProviderSessions;
       const service = yield* OrchestratorMcpService.OrchestratorMcpService;
       const caller = scope.thread;
-      yield* sessions.set({
+      const credential = {
         ...caller,
+        runtimeProviderSessionId: ProviderSessionId.make("runtime:wake-activity"),
         environmentId,
         endpoint: "http://localhost/mcp",
         authorizationHeader: "Bearer test",
         browserToolsAvailable: false,
-      });
+      };
+      yield* sessions.set(credential);
       let state: McpProviderSessions.WakeCallerState = "starting";
-      yield* sessions.registerWakeCaller(caller, () => state);
+      yield* sessions.registerWakeCaller(credential, () => state);
       const calls = [
         service
           .delegateTask(scope, { task: "requires a run", clientRequestId: "wake-delegate" })
@@ -1315,7 +1326,9 @@ it.each(["missing-session", "capability", "replay"] as const)(
                       commandType: "message.dispatch",
                       cause:
                         kind === "missing-session"
-                          ? "Provider session provider-session-dead is not active."
+                          ? new ProviderSessionEndedError({
+                              providerSessionId: ProviderSessionId.make("provider-session-dead"),
+                            })
                           : new CommandPolicyCapabilityUnsupportedError({
                               commandId: input.commandId,
                               threadId: targetThreadId,
@@ -1356,7 +1369,11 @@ it.each(["missing-session", "capability", "replay"] as const)(
       } else {
         expect(failure.message).toBe(
           `Unable to send to thread ${targetThreadId}: ${
-            kind === "capability" ? reason : "Provider session provider-session-dead is not active."
+            kind === "capability"
+              ? reason
+              : new ProviderSessionEndedError({
+                  providerSessionId: ProviderSessionId.make("provider-session-dead"),
+                }).message
           }`,
         );
       }

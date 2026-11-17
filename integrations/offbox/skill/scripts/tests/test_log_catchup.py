@@ -665,20 +665,79 @@ class LogCatchupTests(Isolated):
                                     page_ms=[[4000, 4000, 4000], []], page_ms_omitted=[0, 0]))
 
     def test_queued_only_log_reports_utc_queue_time_without_incomplete_or_running(self):
+        lines = [
+            b'offbox-server: waiting for earlier runs in the queue\n',
+            b'offbox-server: waiting for memory (this kind peaks ~15.5 GB, 6.5 GB free after reserve)\n',
+            b'offbox-server: waiting; position 2 of 2; behind bx_head/1 queued 60 s; the head runner to admit; waited 60 s\n',
+            b'offbox-server: waiting; position 1 of 1; memory; waited 60 s\n',
+            b'offbox-server: waiting; position 1 of 1; max_running cap 1/1; waited 60 s\n',
+            b'offbox-server: waiting; position 1 of 1; host CPU pressure; waited 60 s\n',
+            b'offbox-server: waiting; position 1 of 1; memory; waited 60 s\n' * 20,
+        ]
         for status in ('starting', 'running', 'queued'):
-            with self.subTest(status=status):
-                self.state(status, None)
-                self.prefix(b'offbox-server: waiting for earlier runs in the queue\n', out=0, err=53)
-                def timeout(*args, **kwargs):
-                    raise OffboxError('timeout')
-                self.history.side_effect = timeout
-                with patch.object(misc, '_refresh_running_ttl'), patch.object(misc, 'now', return_value=1000):
+            for line in lines:
+                with self.subTest(status=status, line=line[:100]):
+                    self.state(status, None)
+                    self.prefix(line, out=0, err=len(line))
+                    def timeout(*args, **kwargs):
+                        raise OffboxError('timeout')
+                    self.history.side_effect = timeout
+                    with patch.object(misc, '_refresh_running_ttl'), patch.object(misc, 'now', return_value=1000):
+                        code, out, err = self.invoke()
+                    self.assertEqual((code, out), (0, self.path.read_text()))
+                    self.assertIn('is queued on the server (since 1970-01-01T00:15:00Z, 100s)', err)
+                    self.assertIn('nothing has run yet', err)
+                    self.assertNotIn('behind earlier runs', err)
+                    self.assertNotIn('incomplete', err)
+                    self.assertNotIn('still running', err)
+
+    def test_live_log_notice_uses_displayed_copy_and_authoritative_status(self):
+        self.state('running', None)
+        shown = self.path.with_suffix('.log.takeover')
+        shown.write_bytes(b'offbox-server: waiting; position 1 of 1; memory\n')
+        output = []
+        with patch.object(misc, 'say', side_effect=output.append):
+            self.assertTrue(misc._live_log_notice(self.row(), shown, 'n/a', 0))
+        self.assertIn('is queued on the server', output[0])
+        common.atomic_write_json(common.LOGS_DIR / 'run-x.home-read.json', dict(status='running'))
+        output = []
+        with patch.object(misc, 'say', side_effect=output.append):
+            self.assertFalse(misc._live_log_notice(self.row(), shown, 'n/a', 0))
+        self.assertEqual(output, [])
+        (common.LOGS_DIR / 'run-x.home-read.json').unlink()
+        shown.write_bytes(shown.read_bytes() + b'offbox-command-started: yes\n')
+        with patch.object(misc, 'say') as say:
+            self.assertFalse(misc._live_log_notice(self.row(), shown, 'n/a', 0))
+        say.assert_not_called()
+
+    def test_first_logs_fetch_notices_home_queue_without_preseeded_evidence(self):
+        from offbox_lib import home_run_observation as observation
+        self.state('running', None)
+        common.BACKEND_STATE.parent.mkdir(parents=True, exist_ok=True)
+        common.BACKEND_STATE.write_text(json.dumps(dict(state='home_down', since=1794728800)))
+        with patch.object(common, '_BACKEND', 'server'), patch.object(api, 'BACKEND', 'server'), \
+                patch.dict('os.environ', {'OFFBOX_BACKEND': 'server'}), patch.object(misc, '_refresh_running_ttl'), \
+                patch.object(observation.toollog, 'emit') as event:
+            for remote, text, expected in [(None, b'offbox-server: waiting; position 1 of 1; memory\n', True),
+                                           ('queued', b'', True), ('running', b'offbox-server: waiting; position 1 of 1\n', False)]:
+                with self.subTest(remote=remote):
+                    (common.LOGS_DIR / 'run-x.home-read.json').unlink(missing_ok=True)
+                    (common.LOGS_DIR / 'run-x.home-queue-notice').unlink(missing_ok=True)
+                    self.prefix(b'', out=0, err=0)
+                    self.streams(b'', text)
+                    history = self.history.side_effect
+                    self.history.side_effect = lambda *a, **kw: dict(history(*a, **kw), **(
+                        dict(status=remote, attempt=2) if remote else {}))
+                    event.reset_mock()
+                    observation.observe('run-x', 'accepted')
                     code, out, err = self.invoke()
-                self.assertEqual((code, out), (0, self.path.read_text()))
-                self.assertIn('is queued on the server behind earlier runs (since 1970-01-01T00:15:00Z, 100s)', err)
-                self.assertIn('nothing has run yet', err)
-                self.assertNotIn('incomplete', err)
-                self.assertNotIn('still running', err)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(out, text.decode())
+                    self.assertEqual(err.count('it will not move to Boat'), int(expected))
+                    self.assertEqual(event.call_count, int(expected))
+                    if expected:
+                        self.assertEqual(event.call_args.args[1], 'run.queue.home_down_notice')
+                    self.assertNotIn('it will not move to Boat', self.invoke()[2])
 
     def test_settled_logs_and_wait_timeout_keep_wording_and_record_fetch(self):
         for wait in (False, True):

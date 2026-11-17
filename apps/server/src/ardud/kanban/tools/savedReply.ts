@@ -54,6 +54,8 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   let timeoutElapsedMs = 0;
   let timeoutObservedAtMs = 0;
   let closed = false;
+  const admissions = new Map<symbol, { detail: Effect.Effect<string>; fiberId: number }>();
+  let admissionDetail: string | undefined;
   const updateStage = () => {
     if (closed) return;
     const now = elapsed();
@@ -86,6 +88,17 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const parentLookup = yield* SavedWrite.reportLookupObserver;
   const call = yield* Effect.serviceOption(McpCall);
   let slowSubSteps: ReadonlyArray<SavedWrite.SubStep> = [];
+  let wholeCallReported = false;
+  const reportSubSteps = (steps: ReadonlyArray<SavedWrite.SubStep>, wholeCall = false) => {
+    // A whole-call collection already includes the holds; do not count them twice.
+    if (wholeCallReported && !wholeCall) return;
+    wholeCallReported ||= wholeCall;
+    slowSubSteps = [...(wholeCall ? [] : slowSubSteps), ...steps]
+      .sort((a, b) => b.ms - a.ms)
+      .slice(0, 3);
+    span.attribute("kanban.reply.sub_steps", slowSubSteps);
+    if (call._tag === "Some") call.value.replySubSteps = slowSubSteps;
+  };
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
   let unverifiedReporter: SavedWrite.UnverifiedReporterReason | undefined;
@@ -139,11 +152,12 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     const saved = savedState();
     const savedMessage =
       saved === false
-        ? tool === "evaluator_start"
-          ? "Not saved; evaluator not started. Safe to retry with the same arguments."
-          : tool === "report_bug"
-            ? "Nothing was saved; retry with the same arguments."
-            : "Not saved (board busy). Safe to retry."
+        ? (admissionDetail ??
+          (tool === "evaluator_start"
+            ? "Not saved; evaluator not started. Safe to retry with the same arguments."
+            : tool === "report_bug"
+              ? "Nothing was saved; retry with the same arguments."
+              : `Not saved (reply timed out before a save; stage: ${stageAtTimeout ?? stage}). Safe to retry.`))
         : tool === "evaluator_start"
           ? receipt?.kind === "evaluator"
             ? `Saved; evaluator launched as ${receipt.threadId}. Do not retry. Use evaluator_status with this threadId to find its cards.`
@@ -231,6 +245,13 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     );
   };
   const work = effect.pipe(
+    Effect.provideService(BoardLocks.admissionObserver, (detail, fiberId) => {
+      const token = Symbol();
+      admissions.set(token, { detail, fiberId });
+      return () => {
+        admissions.delete(token);
+      };
+    }),
     // Interactive pre-write reads must not queue behind tick and maintenance scans.
     (effect) => (timingOnly ? effect : NodeSqliteClient.foregroundReads(effect)),
     Effect.provideService(SavedWrite.traceObserver, {
@@ -246,11 +267,8 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
         };
       },
     }),
-    Effect.provideService(SavedWrite.subStepReporter, (steps) => {
-      slowSubSteps = [...slowSubSteps, ...steps].sort((a, b) => b.ms - a.ms).slice(0, 3);
-      span.attribute("kanban.reply.sub_steps", slowSubSteps);
-      if (call._tag === "Some") call.value.replySubSteps = slowSubSteps;
-    }),
+    Effect.provideService(SavedWrite.subStepReporter, reportSubSteps),
+    Effect.provideService(SavedWrite.callSubStepReporter, (steps) => reportSubSteps(steps, true)),
     Effect.provideService(
       BoardLocks.writeWaitMs,
       timingOnly ? yield* BoardLocks.writeWaitMs : ADMISSION_BUDGET_MS,
@@ -316,12 +334,17 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     return Effect.sleep(REPLY_BUDGET_MS);
   }).pipe(
     Effect.andThen(
-      Effect.sync(() => {
+      Effect.gen(function* () {
         stageAtTimeout = stage;
         timeoutElapsedMs = elapsed();
         timeoutObservedAtMs = clock.currentTimeMillisUnsafe();
         timeoutLocks = [...lockSnapshots.values()].at(-1)?.(timeoutObservedAtMs) ?? {};
         timerLatenessMs = Math.max(0, elapsed() - scheduledAt - REPLY_BUDGET_MS);
+        const foreground = [...scopes.values()].findLast((scope) => scope.stage === "admission");
+        const detail = [...admissions.values()].findLast(
+          (entry) => entry.fiberId === foreground?.fiberId,
+        )?.detail;
+        if (stageAtTimeout === "admission" && detail !== undefined) admissionDetail = yield* detail;
       }),
     ),
     Effect.as(Option.none()),

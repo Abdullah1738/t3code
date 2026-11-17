@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 from toollog import directory
+from volume import REASONS, integer
 
 
 def percentiles(values):
@@ -31,8 +32,25 @@ def interval_total(intervals):
     return round(total, 3)
 
 
-def rollup(day, root=None):
+def lock_identity(row, fallback):
+    props = row.get('props', {})
+    account = row.get('ids', {}).get('account')
+    try:
+        until = dt.datetime.fromisoformat(props['until'].replace('Z', '+00:00'))
+        identity = (account, props.get('provider'), props.get('model'))
+        if until.tzinfo is None or not all(isinstance(value, str) and value.strip() and value.strip().lower() != 'unknown' for value in identity):
+            return fallback
+        minute = until.astimezone(dt.timezone.utc).replace(second=0, microsecond=0).isoformat()
+        return (*identity, minute)
+    except (KeyError, ValueError, TypeError, AttributeError):
+        # Legacy rows without an identity cannot safely be deduplicated.
+        return fallback
+
+
+def rollup(day, root=None, now=None):
     day = dt.date.fromisoformat(day).isoformat()
+    generated = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+    next_day = dt.datetime.combine(dt.date.fromisoformat(day) + dt.timedelta(days=1), dt.time(), dt.timezone.utc)
     root = Path(root) if root is not None else directory()
     counts, kinds, tags = Counter(), Counter(), Counter()
     times, samples = defaultdict(list), {}
@@ -41,12 +59,14 @@ def rollup(day, root=None):
     abort_clients, abort_keys, attempts = Counter(), Counter(), Counter()
     abort_ttfb = []
     locks, lock_accounts = {}, Counter()
+    distinct, account_distinct = set(), defaultdict(set)
     unlocks = 0
     supervisor = dict(unresponsive=0, crawling=0, memoryHigh=0, killed=0,
                       exitedBySignal=Counter(), exitedByCode=Counter(), killedByReason=Counter())
     heartbeat_observations = {}
     day_start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc).timestamp() * 1000
     day_end = day_start + 86400000
+    volume_writers = {}
     ok = failed = total = malformed = 0
     source = root / (day + '.ndjson')
     if source.exists():
@@ -114,13 +134,30 @@ def rollup(day, root=None):
                         if row['name'] == 'account.unlock':
                             unlocks += 1
                         else:
-                            group = locks.setdefault(dims, dict(count=0, durations=[]))
+                            group = locks.setdefault(dims, dict(count=0, durations=[], distinct=set(), capped=0, resets=[]))
                             group['count'] += 1
+                            identity = lock_identity(row, total)
+                            distinct.add(identity)
+                            group['distinct'].add(identity)
+                            group['capped'] += props.get('capped') is True
+                            if metric(props.get('upstreamResetMs')):
+                                group['resets'].append(props['upstreamResetMs'])
                             if metric(props.get('lockMs')):
                                 group['durations'].append(props['lockMs'])
                             account = row.get('ids', {}).get('account')
                             if isinstance(account, str) and len(account) == 16 and all(c in '0123456789abcdef' for c in account):
                                 lock_accounts[account] += 1
+                                account_distinct[account].add(identity)
+                    if row['name'] == 'log.volume':
+                        writer = row.get('ids', {}).get('writer')
+                        props = row.get('props', {})
+                        drops = props.get('droppedByReason')
+                        if (isinstance(writer, str) and len(writer) == 16 and all(c in '0123456789abcdef' for c in writer)
+                                and isinstance(drops, dict) and all(k in REASONS and integer(v) for k,v in drops.items())
+                                and integer(props.get('droppedLines')) and props['droppedLines'] == sum(drops.values())):
+                            previous = volume_writers.setdefault(writer, Counter())
+                            for reason,count in drops.items():
+                                previous[reason] = max(previous[reason], count)
                     if row['name'] == 'proxy.request':
                         group = proxy.setdefault(key, dict(count=0, aborted=0, durations=[], ttfb=[], errors=Counter(), samples={}))
                         group['count'] += 1
@@ -156,6 +193,7 @@ def rollup(day, root=None):
         durations[name] = {'p50': values[math.ceil(len(values) * .50) - 1], 'p95': values[math.ceil(len(values) * .95) - 1], 'max': values[-1]}
     measured = ok + failed
     result = dict(day=day, total=total, malformed=malformed, countsByName=dict(counts), countsByKind=dict(kinds), okRate=ok / measured if measured else None, errorRate=kinds['error'] / total if total else None, failedRate=failed / measured if measured else None, durationMs=durations, topErrors=[dict(tag=tag, count=count, sampleIds=samples[tag]) for tag, count in tags.most_common(20)])
+    result.update(generatedAt=generated.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), complete=generated >= next_day)
     result['proxy'] = []
     for (model, route, stream), group in sorted(proxy.items()):
         result['proxy'].append(dict(
@@ -172,9 +210,9 @@ def rollup(day, root=None):
         abortTtfbMs=percentiles(abort_ttfb),
     )
     result['locks'] = dict(
-        count=sum(g['count'] for g in locks.values()), unlocks=unlocks,
-        byProviderModelCause=[dict(provider=p, model=m, cause=c, count=g['count'], lockMs=percentiles(g['durations'])) for (p, m, c), g in sorted(locks.items())],
-        topAccounts=[dict(account=a, count=n) for a, n in lock_accounts.most_common(5)],
+        count=sum(g['count'] for g in locks.values()), distinct=len(distinct), unlocks=unlocks,
+        byProviderModelCause=[dict(provider=p, model=m, cause=c, count=g['count'], distinct=len(g['distinct']), capped=g['capped'], upstreamResetMs=percentiles(g['resets']), lockMs=percentiles(g['durations'])) for (p, m, c), g in sorted(locks.items())],
+        topAccounts=[dict(account=a, count=n, distinct=len(account_distinct[a])) for a, n in lock_accounts.most_common(5)],
     )
     heartbeat_intervals, open_heartbeat = [], set()
     for (primary, worker, since), observation in heartbeat_observations.items():
@@ -186,6 +224,12 @@ def rollup(day, root=None):
                 open_heartbeat.add((primary, worker))
     result['supervisor'] = {**supervisor, 'noHeartbeatMs': interval_total(heartbeat_intervals),
                             'openNoHeartbeatWorkers': len(open_heartbeat)}
+    drops = Counter()
+    for writer in volume_writers.values():
+        drops.update(writer)
+    result['droppedLines'] = sum(drops.values()) if volume_writers else None
+    result['dropsByReason'] = dict(sorted(drops.items()))
+    result['volumeWriters'] = len(volume_writers)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(root, 0o700)
     fd, tmp = tempfile.mkstemp(prefix='.rollup-', dir=root)

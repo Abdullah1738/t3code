@@ -52,6 +52,8 @@ export function operationFailure(cause: unknown, depth = 0): ControlError {
   const refusal = (reason: ControlRejection["reason"], retrySafe = false) =>
     fail("conflict", message, { reason, retrySafe, holder });
   switch (tagged._tag) {
+    case "ProviderSessionEndedError":
+      return refusal("no_steerable_turn");
     case "ThreadManagementNoSteerableRunError":
       return refusal("no_steerable_turn", true);
     case "ThreadManagementThreadArchivedError":

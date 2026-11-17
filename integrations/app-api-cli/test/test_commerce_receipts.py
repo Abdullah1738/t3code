@@ -695,7 +695,7 @@ class HoldersScanTest(unittest.TestCase):
         import commerce_receipts as R
         import tempfile, os
         with tempfile.TemporaryDirectory() as tmp:
-            real = os.path.realpath(tmp)
+            real = str(Path(tmp).resolve() / 'commerce')
             with patch.object(R, 'ROOT', real):
                 b1 = R.create(flow_id=str(uuid.uuid4()), app='talabat', vertical='shops',
                               account_hash='a'*64, scope_hash='b'*64)

@@ -1,18 +1,24 @@
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import type * as Option from "effect/Option";
-import type * as HttpServerResponse from "effect/http/HttpServerResponse";
+import * as HttpServerRequest from "effect/http/HttpServerRequest";
+import * as HttpServerResponse from "effect/http/HttpServerResponse";
 import type * as HttpRouter from "effect/http/HttpRouter";
 import * as HttpServerError from "effect/http/HttpServerError";
 
 import * as Analytics from "../analytics/Analytics.ts";
 import { recordServerAnalytics } from "../../observability/RpcInstrumentation.ts";
 import * as ReplyBuilders from "../http/ReplyBuilders.ts";
+
+export const CONTROL_REQUEST_ID_HEADER = "x-request-id";
+const validRequestId = /^[A-Za-z0-9._:-]{1,64}$/;
 
 export interface FailureDetails {
   readonly errorTag: string;
@@ -22,6 +28,10 @@ export interface FailureDetails {
 type SendMode = "auto" | "queue" | "steer" | "restart";
 interface RequestDetails {
   method: string;
+  requestId: string;
+  itemCount?: number;
+  itemsTotal?: number;
+  responseBytes?: number;
   serializationMs: number;
   threadId?: string | undefined;
   mode?: SendMode;
@@ -260,12 +270,13 @@ export const failure = Effect.fnUntraced(function* (code: string, details?: Fail
 // Route layers supply services while building handlers, before the HTTP request fiber exists.
 export const make = Effect.gen(function* () {
   const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  const crypto = yield* Crypto.Crypto;
   return <E, R>(
     method: string,
     effect: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>,
     route?: { readonly path: string; readonly method: string },
-  ) => observe(method, effect, route, analytics);
-});
+  ) => observe(method, effect, route, analytics).pipe(Effect.provideService(Crypto.Crypto, crypto));
+}).pipe(Effect.provide(NodeCrypto.layer));
 
 // Use route patterns here so auxiliary handlers never put request IDs into metric labels.
 export const observeRoutes = Effect.fn("ArdudControl.observeRoutes")(function* <E, R>(
@@ -293,13 +304,30 @@ export const sendMode = Effect.fnUntraced(function* (mode: SendMode) {
 
 export const thread = requestThread;
 
+// Counts belong to the request span alongside encoding, without another span per page.
+export const items = Effect.fnUntraced(function* (count: number, total?: number) {
+  const request = yield* RequestContext;
+  if (request) {
+    request.itemCount = count;
+    if (total !== undefined) request.itemsTotal = total;
+  }
+});
+
 // Response encoding belongs to the request span, rather than another span per reply.
-export const encoding = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+export const encoding = Effect.fnUntraced(function* <E, R>(
+  effect: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>,
+) {
   const request = yield* RequestContext;
   if (!request) return yield* effect;
   const clock = yield* Clock.Clock;
   const started = clock.monotonicTimeNanosUnsafe();
   return yield* effect.pipe(
+    Effect.tap((response) =>
+      Effect.sync(() => {
+        if (response.body._tag === "Uint8Array")
+          request.responseBytes = response.body.contentLength;
+      }),
+    ),
     Effect.ensuring(
       Effect.sync(() => {
         request.serializationMs += Number(clock.monotonicTimeNanosUnsafe() - started) / 1e6;
@@ -320,7 +348,19 @@ export const observe = Effect.fnUntraced(function* <E, R>(
   const clock = yield* Clock.Clock;
   const started = clock.monotonicTimeNanosUnsafe();
   const startedAt = DateTime.formatIso(yield* DateTime.now);
-  const request: RequestDetails = { method, serializationMs: 0 };
+  const httpRequest = yield* Effect.serviceOption(HttpServerRequest.HttpServerRequest);
+  const incomingId =
+    httpRequest._tag === "Some" ? httpRequest.value.headers[CONTROL_REQUEST_ID_HEADER] : undefined;
+  const request: RequestDetails = {
+    method,
+    requestId:
+      incomingId !== undefined && validRequestId.test(incomingId)
+        ? incomingId
+        : yield* Effect.flatMap(Crypto.Crypto, (crypto) => crypto.randomUUIDv4()).pipe(
+            Effect.orDie,
+          ),
+    serializationMs: 0,
+  };
   let waitMs = 0;
   const readerTimings = new Map<
     string,
@@ -342,6 +382,9 @@ export const observe = Effect.fnUntraced(function* <E, R>(
   const parentContention = yield* NodeSqliteClient.ReaderContentionObserver;
   const readerHolders = new Map<string, { lane: string; holder: string; holdMs: number }>();
   return yield* effect.pipe(
+    Effect.map((response) =>
+      HttpServerResponse.setHeader(response, CONTROL_REQUEST_ID_HEADER, request.requestId),
+    ),
     Effect.provideService(RequestContext, request),
     Effect.provideService(NodeSqliteClient.ReaderWaitObserver, (ms, lane) => {
       waitMs += ms;
@@ -406,6 +449,7 @@ export const observe = Effect.fnUntraced(function* <E, R>(
             : undefined);
         if (status < 200 || status >= 300) {
           yield* Effect.logWarning("ardud control request rejected", {
+            requestId: request.requestId,
             httpRoute: route?.path ?? null,
             httpMethod: route?.method ?? null,
             threadId: request.threadId ?? null,
@@ -432,6 +476,14 @@ export const observe = Effect.fnUntraced(function* <E, R>(
           outcome,
           props: {
             method: request.method,
+            requestId: request.requestId,
+            ...(outcome === "interrupted" || request.responseBytes === undefined
+              ? {}
+              : {
+                  responseBytes: request.responseBytes,
+                  ...(request.itemCount === undefined ? {} : { itemCount: request.itemCount }),
+                  ...(request.itemsTotal === undefined ? {} : { itemsTotal: request.itemsTotal }),
+                }),
             ...(route === undefined ? {} : { httpMethod: route.method, httpRoute: route.path }),
             phase: "unary",
             waitMs,
@@ -455,10 +507,12 @@ export const observe = Effect.fnUntraced(function* <E, R>(
       }),
     ),
     Effect.withSpan("ArdudControl.request", {
-      attributes:
-        route === undefined
+      attributes: {
+        "control.request_id": request.requestId,
+        ...(route === undefined
           ? {}
-          : { "http.route": route.path, "http.request.method": route.method },
+          : { "http.route": route.path, "http.request.method": route.method }),
+      },
     }),
   );
 });

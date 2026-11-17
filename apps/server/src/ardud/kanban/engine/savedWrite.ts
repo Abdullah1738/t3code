@@ -19,10 +19,21 @@ export const subStepReporter = Context.Reference<(steps: ReadonlyArray<SubStep>)
   { defaultValue: () => () => {} },
 );
 
+// Whole-call diagnostics include outside I/O; the board-hold reporter must not.
+export const callSubStepReporter = Context.Reference<(steps: ReadonlyArray<SubStep>) => void>(
+  "KanbanSavedWriteCallSubStepReporter",
+  { defaultValue: () => () => {} },
+);
+
+export interface SubStepCollection {
+  (long: boolean): ReadonlyArray<SubStep> | undefined;
+  readonly snapshot: () => ReadonlyArray<SubStep>;
+}
+
 export const subStepObserver = Context.Reference<
   | {
       readonly tracer: Tracer.Tracer;
-      readonly hold: (fiberId: number) => (long: boolean) => ReadonlyArray<SubStep> | undefined;
+      readonly hold: (fiberId: number) => SubStepCollection;
     }
   | undefined
 >("KanbanSavedWriteSubSteps", { defaultValue: () => undefined });
@@ -49,7 +60,11 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
   const account = (fiberId: number) => {
     if (holds.size === 0) return;
     const at = now();
-    const span = active.get(fiberId)?.at(-1);
+    const stack = active.get(fiberId);
+    const span =
+      stack?.findLast((span) =>
+        /^(?:read.card|syncPrs.fetch|syncPrs.write|apply)$/.test(span.name),
+      ) ?? stack?.at(-1);
     // Store SELECTs share one span name; retain their static operation label
     // so a reader wait identifies the table instead of just "KanbanStore.read".
     const operation =
@@ -92,10 +107,8 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
   const hold = (fiberId: number) => {
     const held = { fiberId, since: now(), totals: new Map<string, number>() };
     holds.add(held);
-    return (long: boolean) => {
+    const snapshot = () => {
       account(fiberId);
-      holds.delete(held);
-      if (!long) return undefined;
       return [...held.totals]
         .sort((a, b) => b[1] - a[1])
         .slice(0, 3)
@@ -105,14 +118,18 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
           ms,
         }));
     };
+    return Object.assign(
+      (long: boolean) => {
+        const steps = long ? snapshot() : undefined;
+        holds.delete(held);
+        return steps;
+      },
+      { snapshot },
+    );
   };
   const finish = includeOutsideLocks ? hold(yield* Effect.fiberId) : undefined;
-  const report = yield* subStepReporter;
+  const report = yield* callSubStepReporter;
   return yield* effect.pipe(
-    // Lock collectors still return their diagnostics, but only the enclosing
-    // whole-call collector publishes to the reply ledger.
-    (effect) =>
-      includeOutsideLocks ? effect.pipe(Effect.provideService(subStepReporter, () => {})) : effect,
     Effect.withTracer(tracer),
     Effect.provideService(subStepObserver, {
       tracer: parent?.tracer ?? delegate,

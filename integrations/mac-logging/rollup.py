@@ -25,6 +25,7 @@ def rollup(day, root=None):
     busy_comms = Counter()
     latest_unmount_at = ''
     spikes = dict(minutes=0, highestLoad=[])
+    u_episodes = {}
     total = oks = failed = outcomes = malformed = 0
     source = root / (day + '.ndjson')
     if source.exists():
@@ -117,6 +118,14 @@ def rollup(day, root=None):
                         stamp = row.get('ts', '')
                         if props.get('stuckUnmount') and mount and stamp >= latest_unmount_at:
                             waits['latestStuckUnmountMountPoint'], latest_unmount_at = mount, stamp
+                    if name in ('proc.u_sample', 'proc.u_episode') and row.get('ok') is True:
+                        props = safe_fields(row.get('props'), name)
+                        episode = props.get('episode', {}) if name == 'proc.u_sample' else props
+                        if episode:
+                            start = episode['start']
+                            stamp = row.get('ts', '')
+                            if stamp >= u_episodes.get(start, ('', {}))[0]:
+                                u_episodes[start] = (stamp, episode)
                     tag = row.get('error', {}).get('tag')
                     if tag:
                         tags[tag] += 1
@@ -138,6 +147,9 @@ def rollup(day, root=None):
     end = dt.datetime.combine(date + dt.timedelta(days=1), dt.time(), dt.timezone.utc)
     cadence = report(end, root, day=date)
     result.update(jobs=cadence['jobs'], missingJobs=cadence['missingJobs'])
+    result['uEpisodes'] = [dict(start=ep['start'], end=ep['end'], lastSeen=ep['lastSeen'],
+                              peakCount=ep['peakCount'], volumes=ep['volumes'], topComms=ep['topComms'])
+                           for _, (_, ep) in sorted(u_episodes.items())]
     private_dir(root)
     fd, temp = tempfile.mkstemp(prefix='.rollup-', dir=root)
     try:

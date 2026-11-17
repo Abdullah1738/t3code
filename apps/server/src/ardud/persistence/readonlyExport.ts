@@ -3,6 +3,7 @@ import type * as NodeSqlite from "node:sqlite";
 import type * as NodeFS from "node:fs";
 import type * as NodePath from "node:path";
 import { resolveHistoryBasePath } from "./historySourceFiles.ts";
+import type { StatementCompletion } from "@t3tools/shared/nodeSqliteClient";
 
 export interface ReadonlyReplicaOptions {
   readonly sourcePath: string;
@@ -62,6 +63,7 @@ export interface LineageRepairBump {
 }
 
 export interface ReadonlyExportMetrics {
+  readonly statements?: ReadonlyArray<StatementCompletion>;
   readonly lineageRepairCounts: Record<string, number>;
   readonly lineageRepairs: LineageRepairBump[];
   readonly phaseMs: Record<string, number>;
@@ -95,6 +97,7 @@ export function createReadonlyReplica(
     identityLagMaxMs: 0,
   });
   let metrics = emptyMetrics();
+  const statements = new Map<string, StatementCompletion>();
   const measure = <A>(phase: string, body: () => A): A => {
     const started = Date.now();
     try {
@@ -151,19 +154,58 @@ export function createReadonlyReplica(
       Object.assign(error, { sqliteFile: file, sqliteRole: role, sqliteOperation: operation });
     throw error;
   };
-  const protect = <T extends object>(target: T, file: string, role: "primary" | "replica"): T =>
+  const protect = <T extends object>(
+    target: T,
+    file: string,
+    role: "primary" | "replica",
+    sql?: string,
+  ): T =>
     new Proxy(target, {
       get(object, key) {
         const value: unknown = Reflect.get(object, key, object);
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => {
+          const text = key === "exec" && typeof args[0] === "string" ? args[0] : sql;
+          const observed =
+            text !== undefined &&
+            (key === "all" || key === "get" || key === "run" || key === "exec");
+          const started = observed ? performance.now() : 0;
+          let rows = 0;
+          let failed = true;
           try {
             const result: unknown = Reflect.apply(value, object, args);
+            rows =
+              key === "all" && Array.isArray(result)
+                ? result.length
+                : key === "get" && result !== undefined
+                  ? 1
+                  : 0;
+            failed = false;
             return key === "prepare" && typeof result === "object" && result !== null
-              ? protect(result, file, role)
+              ? protect(result, file, role, String(args[0]))
               : result;
           } catch (error) {
             return origin(error, file, role, String(key));
+          } finally {
+            if (observed) {
+              const identity = `${file}/${text}`;
+              const bucket =
+                statements.has(identity) || statements.size < 512 ? identity : "overflow";
+              const previous = statements.get(bucket);
+              const elapsed = performance.now() - started;
+              statements.set(bucket, {
+                database: bucket === "overflow" ? "all" : file,
+                connection: "export",
+                lane: "export",
+                sql: bucket === "overflow" ? "export_overflow" : text!,
+                executionMs: (previous?.executionMs ?? 0) + elapsed,
+                maxMs: Math.max(previous?.maxMs ?? 0, elapsed),
+                rows: (previous?.rows ?? 0) + rows,
+                failed,
+                calls: (previous?.calls ?? 0) + 1,
+                failures: (previous?.failures ?? 0) + Number(failed),
+              });
+            }
           }
         };
       },
@@ -2116,7 +2158,8 @@ export function createReadonlyReplica(
         }
       },
       takeMetrics() {
-        const result = metrics;
+        const result = { ...metrics, statements: Array.from(statements.values()) };
+        statements.clear();
         metrics = emptyMetrics();
         return result;
       },

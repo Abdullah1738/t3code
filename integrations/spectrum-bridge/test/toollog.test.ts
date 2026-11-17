@@ -19,6 +19,13 @@ afterEach(() => dirs.splice(0).forEach(root => {
   rmSync(root, { recursive: true, force: true });
 }));
 
+test("notice suppression reasons survive structured-log redaction", () => {
+  const { log, lines } = setup();
+  const reasons = ["grace", "not-waiting", "already-sent", "rate-limited"];
+  for (const reason of reasons) log.write({ component: "remote-box", kind: "event", name: "moni-notice-suppressed", props: { reason } });
+  expect(lines().map(line => line.props?.reason)).toEqual(reasons);
+});
+
 test("shared format, UTC milliseconds, append-only and private modes", () => {
   const { root, log, lines } = setup();
   chmodSync(root, 0o755);
@@ -59,6 +66,16 @@ test("cap suppresses event/perf, retains errors and emits one notice across writ
   createToolLog({ root, now: () => at, capBytes: 1 }).write(entry);
   log.write({ ...entry, kind: "error", name: "reply.failed", ok: false, error: { tag: "stop_opt_out", message: "private" } });
   expect(lines().map(l => l.name)).toEqual(["turn.robob_call", "log.degraded", "reply.failed"]);
+});
+
+test("remote fence diagnostics survive the log cap and writer restart", () => {
+  const { root, log, lines } = setup({ capBytes: 1 }); log.write(entry);
+  for (const name of ["moni-box-backend-state", "moni-box-fenced", "moni-box-unfenced", "moni-box-wake-autofailed"]) {
+    createToolLog({ root, now: () => at, capBytes: 1 }).write({ component: "remote-box", kind: "event", name,
+      props: { backend: "remote-box", active: false, fenced: true, event: "609fe8828d46", queuedBehind: 3, ageMs: 600_000 } });
+  }
+  expect(lines().filter(l => l.component === "remote-box")).toHaveLength(4);
+  expect(lines().at(-1)?.props).toMatchObject({ event: "609fe8828d46", queuedBehind: 3, ageMs: 600_000 });
 });
 
 test("degraded mode uses the five-second call threshold and retains every failure", () => {

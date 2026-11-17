@@ -6,6 +6,7 @@
     "ssd"
   ],
   "interval_s": 15,
+  "owner_imessage_alerts": true,
   "mode": "notify",
   "expires_at": null,
   "max_fires": 0,

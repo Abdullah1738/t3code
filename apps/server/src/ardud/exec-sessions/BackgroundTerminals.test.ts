@@ -55,7 +55,13 @@ const fixture = (
   driver = "codex",
   foreign = false,
   staleSession = false,
-  credential: "valid" | "missing" | "foreign_thread" | "foreign_provider" = "valid",
+  credential:
+    | "valid"
+    | "missing"
+    | "foreign_thread"
+    | "foreign_provider"
+    | "unbound"
+    | "other_runtime" = "valid",
   callerScope = scope,
 ) => {
   const shell = { ...liveThreadShell(threadId), activeProviderThreadId: providerThreadId };
@@ -134,6 +140,14 @@ const fixture = (
                 threadId:
                   credential === "foreign_thread" ? ThreadId.make("thread:other") : threadId,
                 providerSessionId: callerScope.thread!.providerSessionId,
+                ...(credential === "unbound"
+                  ? {}
+                  : {
+                      runtimeProviderSessionId:
+                        credential === "other_runtime"
+                          ? ProviderSessionId.make("session:other")
+                          : sessionId,
+                    }),
                 providerInstanceId:
                   credential === "foreign_provider" ? ProviderInstanceId.make("other") : instanceId,
                 endpoint: "http://127.0.0.1/mcp",
@@ -245,6 +259,8 @@ it.effect.each([
   "missing_credential",
   "credential_foreign_thread",
   "credential_foreign_provider",
+  "unbound",
+  "other_runtime",
   "no_capability",
   "no_runtime",
   "claudeAgent",
@@ -261,7 +277,9 @@ it.effect.each([
         ? "foreign_thread"
         : scenario === "credential_foreign_provider"
           ? "foreign_provider"
-          : "valid",
+          : scenario === "unbound" || scenario === "other_runtime"
+            ? scenario
+            : "valid",
   );
   const caller =
     scenario === "no_caller"

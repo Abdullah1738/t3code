@@ -37,8 +37,15 @@ export const layer = Layer.succeed(DelegatedTaskRecoveryService, {
       thread.lineage?.relationshipToParent !== "subagent" ||
       thread.forkedFrom?.type !== "node" ||
       failure.category !== "transient" ||
-      !failure.message.startsWith("Claude gave up after repeated API errors.") ||
+      failure.retryable === false ||
+      !(
+        failure.code === "claude_no_response_budget" ||
+        failure.code === "claude_retry_flap" ||
+        failure.code === "claude_network_error" ||
+        failure.message.startsWith("Claude gave up after repeated API errors.")
+      ) ||
       run.transientRecovery !== undefined ||
+      run.delegatedTaskStallRecovery !== undefined ||
       thread.archivedAt !== null ||
       thread.deletedAt !== null
     )

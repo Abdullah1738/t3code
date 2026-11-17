@@ -1,5 +1,6 @@
 """install.zsh against a throwaway HOME and a fake launchctl. Run: /usr/bin/python3 -m unittest discover -s tests"""
 import os
+import plistlib
 import shutil
 import stat
 import subprocess
@@ -168,7 +169,8 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         for rel in (".local/libexec/mail/mail_oauth.py", ".local/libexec/mail/kc-read",
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
                     ".local/bin/toollog", ".local/libexec/toollog/toollog.py",
-                    ".local/bin/vp", ".local/libexec/vp/worktree.mjs",
+                    ".local/bin/vp", ".local/libexec/vp/launcher.mjs",
+                    ".local/libexec/vp/child.mjs", ".local/libexec/vp/events.mjs", ".local/libexec/vp/worktree.mjs",
                     ".local/libexec/vp/config-snapshot.mjs",
                     ".local/libexec/vp/toolchain-state.mjs", ".local/libexec/vp/toolchain",
                     ".local/libexec/repo-node-pin/shared-deps.sh",
@@ -205,6 +207,18 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         self.assertIn("deploy that integration first", err)
         self.assertNotIn("differs", err)
         self.assertNotIn("not loaded", err)
+
+    def test_installed_read_watchdog_starts_with_granted_shell(self):
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        with open(self.live("Library/LaunchAgents/com.ardud.robob-read-watchdog.plist"), "rb") as source:
+            plist = plistlib.load(source)
+        # TCC attributes launchd reads to the entrypoint, even for shell scripts.
+        self.assertEqual(plist["ProgramArguments"], [
+            "/bin/zsh", "-f", self.live(".local/bin/robob-read-watchdog"),
+        ])
+        self.assertEqual(plist["StartInterval"], 30)
+        self.assertTrue(plist["RunAtLoad"])
 
     def test_invalid_plist_fails_smoke(self):
         plist = os.path.join(self.pkg, "launchd/com.ardud.opencode-web.plist")

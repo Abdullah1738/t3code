@@ -29,6 +29,46 @@ def summary(text, **extra):
             'createdBy': 'user', 'creationSource': 'web', 'automated': False, 'inboundMessageId': None, **extra}
 
 
+class ReadOnlySearchCache(unittest.TestCase):
+    def test_closed_search_reads_cache_but_never_saves_in_read_only_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / 'msgs-searches.json'
+            cache.write_text('{}\n')
+            binary = root / 'msgs'
+            binary.write_text('#!/bin/sh\nexit 0\n')
+            binary.chmod(0o700)
+            before = cache.read_bytes(), cache.stat().st_mtime_ns
+            memo = {('msgs_cache',): cache, ('write_cache',): False}
+            with patch.object(ch, 'MSGS', str(binary)):
+                self.assertEqual(ch.search('receipt', '2026-10-23', until='2026-10-24', memo=memo), [])
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), before)
+                self.assertEqual(ch.search('receipt', '2026-10-23', until='2026-10-24',
+                                           memo={('msgs_cache',): cache}, write_cache=False), [])
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), before)
+                ch.search('receipt', '2026-10-23', until='2026-10-24', memo={('msgs_cache',): cache})
+                self.assertNotEqual(cache.read_bytes(), before[0])
+                saved = cache.read_bytes(), cache.stat().st_mtime_ns
+                with patch.object(ch, 'msgs', side_effect=AssertionError('cache miss')):
+                    self.assertEqual(ch.search('receipt', '2026-10-23', until='2026-10-24', memo=memo), [])
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), saved)
+
+
+    def test_owner_cache_default_path_is_read_only_even_when_corrupt_or_missing(self):
+        for content in ('{}\n', '{bad json', None):
+            with self.subTest(content=content), ControlServer([summary('owner words')]) as server:
+                cache = Path(server.tmp.name) / 'owner-texts.json'
+                if content is not None:
+                    cache.write_text(content)
+                before = (cache.read_bytes(), cache.stat().st_mtime_ns) if cache.exists() else None
+                with patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(Path(server.tmp.name) / 'logs'),
+                                             'TOOLLOG_ROOT': str(Path(server.tmp.name) / 'logs')}):
+                    rows = ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), write_cache=False)
+                self.assertEqual(len(rows), 1)
+                after = (cache.read_bytes(), cache.stat().st_mtime_ns) if cache.exists() else None
+                self.assertEqual(after, before)
+
+
 class ControlServer:
     """Loopback-only control fixtures. Never reads credentials or state from the real home."""
     def __init__(self, rows=None, threads=None, stall=None, drip=False, page_size=500,
@@ -1733,6 +1773,73 @@ class MarketplaceProof(unittest.TestCase):
                         charges.order_receipt(charge, at, at, lookup=reader)
                 else:
                     self.assertIsNone(charges.order_receipt(charge, at, at, lookup=reader))
+
+
+class LimitReasons(unittest.TestCase):
+    def test_order_limits_keep_exception_types_and_first_blocker(self):
+        when = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(merchant='noon', amount='12.34', currency='AED')
+        for name in ch.order_lookup.LANES:
+            for stop, kind in ((None, 'lane_uncovered'), ('covered', 'lane_uncovered'),
+                               ('end_of_history', 'lane_uncovered'), ('unproven_paging', 'lane_uncovered'),
+                               ('slice_out', 'lane_slice_out'), ('list_error', 'lane_error'),
+                               ('reader_error', 'lane_error'), ('detail_error', 'lane_error'),
+                               ('snapshot_missing', 'lane_error')):
+                for page_one in (False, True):
+                    with self.subTest(lane=name, stop=stop, page_one=page_one):
+                        result = {'orders': [], 'complete': False, 'lanes': {
+                            lane: {'exhaustive': True} for lane in ch.order_lookup.LANES}}
+                        result['lanes']['marketplace']['walked_at'] = (when + ch.SAME_TIME).isoformat()
+                        result['lanes'][name].update(exhaustive=False, covered_from=when.isoformat(),
+                            stop_reason=stop, limit='page-1 history only' if page_one else None)
+                        with self.assertRaises(ch.Lookup) as exc:
+                            ch.order_receipt(charge, when, when, lookup=lambda *a, **kw: result)
+                        self.assertEqual(type(exc.exception), ch.SourceLimit if page_one else ch.Lookup)
+                        self.assertEqual(exc.exception.reason, kind + ':' + name)
+        for kind in ('marketplace_hold', 'marketplace_stale'):
+            self.assertEqual(ch.SourceLimit('private', [kind]).reason, kind)
+        self.assertEqual(ch.SourceLimit('private', ['food_page_1', 'marketplace_hold']).reason,
+                         'lane_uncovered:food')
+        with self.assertRaises(ch.SourceLimit) as exc:
+            ch.order_receipt({**charge, 'merchant': 'careem'}, when, when,
+                lookup=lambda *a, **kw: (_ for _ in ()).throw(
+                    ch.order_lookup.SourceLimit(ch.order_lookup.BINDING_LIMIT)))
+        self.assertEqual(exc.exception.reason, 'source_limit:ORDER_LIST_HOST_BINDING_UNVERIFIED')
+        self.assertEqual(ch.SourceLimit('private', ['private-id']).reason, 'other')
+        self.assertEqual(ch.Lookup('private', 'private-id').reason, 'other')
+
+    def test_marketplace_checks_precede_lane_gaps_and_first_lane_wins(self):
+        when = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(merchant='noon', amount='12.34', currency='AED')
+        result = {'orders': [], 'complete': False, 'lanes': {
+            lane: {'exhaustive': False, 'stop_reason': 'slice_out'} for lane in ch.order_lookup.LANES}}
+        result['lanes']['marketplace']['hold_times'] = [when.isoformat()]
+        def check(reason, error_class):
+            with self.assertRaises(error_class) as exc:
+                ch.order_receipt(charge, when, when, lookup=lambda *a, **kw: result)
+            self.assertEqual(exc.exception.reason, reason)
+        check('marketplace_stale', ch.SourceLimit)
+        result['lanes']['marketplace']['walked_at'] = (when + ch.SAME_TIME).isoformat()
+        check('marketplace_hold', ch.SourceLimit)
+        result['lanes']['marketplace']['hold_times'] = []
+        check('lane_slice_out:minutes', ch.Lookup)
+        result['orders'] = [dict(order='N1', placed_at=when.isoformat(), total='12.34', currency='AED')]
+        self.assertEqual(ch.order_receipt(charge, when, when, lookup=lambda *a, **kw: result)['verdict'], 'receipt')
+
+    def test_receipt_timeout_is_first_even_when_order_is_limited(self):
+        when = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(kind='charge', merchant='noon', amount='12.34', currency='AED', card='1111')
+        for failure, reason in ((ch.Lookup('receipt lookup over time'), 'receipt_out_of_time'),
+                                (ch.Lookup('private', 'msgs_timeout'), 'msgs_timeout')):
+            with self.subTest(reason=reason), patch.object(ch, 'receipt', side_effect=failure), \
+                    patch.object(ch, 'order_receipt', side_effect=ch.SourceLimit('private', ['marketplace_hold'])), \
+                    patch.object(ch, 'card_owner', return_value='abdullah'), \
+                    patch.object(ch, 'owner_said', return_value=None):
+                result = ch.explain(charge, when, when)
+            self.assertEqual(result['verdict'], 'unverified')
+            self.assertTrue(result['errors'])
+            self.assertEqual(result['limit_reason'], reason)
+            self.assertEqual(result['limits'][0]['reason'], 'marketplace_hold')
 
 
 if __name__ == '__main__':

@@ -94,6 +94,8 @@ export interface EventSinkV2Shape {
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   readonly writeWithEffects: (input: {
+    /** Finalization must not replay a roster cached before session release. */
+    readonly preserveProviderThreadBackgroundTasks?: true;
     /** Restate still-bound canonical session rows inside the write transaction. */
     readonly refreshBoundProviderSessions?: true;
     /**
@@ -112,6 +114,7 @@ export interface EventSinkV2Shape {
   }) => Effect.Effect<ReadonlyArray<OrchestrationV2StoredEvent>, EventSinkV2Error>;
   /** Provider lifecycle writes preserve the orchestrator's completion cohort. */
   readonly writeIfRunCurrent: (input: {
+    readonly preserveProviderThreadBackgroundTasks?: true;
     readonly unlessClaudeRefused?: ProviderThreadId;
     readonly guardPendingUserInputCancellations?: boolean;
     readonly commandId?: CommandId;
@@ -496,7 +499,10 @@ const layerBase: Layer.Layer<
         });
       });
 
-    const normalizeEvents = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
+    const normalizeEvents = (
+      events: ReadonlyArray<OrchestrationV2DomainEvent>,
+      preserveProviderThreadBackgroundTasks = false,
+    ) => {
       const providerTurnOrdinals = new Map<ProviderTurnId, number>();
       const providerThreadMaxOrdinals = new Map<ProviderThreadId, number>();
       const providerSessions = new Map<
@@ -549,7 +555,24 @@ const layerBase: Layer.Layer<
               return ordinal === turn.ordinal ? event : { ...event, payload: { ...turn, ordinal } };
             }
             if (event.type === "provider-thread.updated") {
-              const incoming = event.payload;
+              let incoming = event.payload;
+              if (preserveProviderThreadBackgroundTasks) {
+                const { providerThreads } = yield* projectionStore.getThreadRecords(
+                  event.threadId,
+                  ["providerThreads"],
+                  { providerThreadIds: [incoming.id] },
+                );
+                const current = providerThreads.find((thread) => thread.id === incoming.id);
+                if (current !== undefined) {
+                  const { pendingBackgroundTasks: _cachedTasks, ...rest } = incoming;
+                  incoming = {
+                    ...rest,
+                    ...(current.pendingBackgroundTasks === undefined
+                      ? {}
+                      : { pendingBackgroundTasks: current.pendingBackgroundTasks }),
+                  };
+                }
+              }
               if (incoming.driver !== "claudeAgent") {
                 providerSessions.set(incoming.id, {
                   native_id: incoming.nativeThreadRef?.nativeId ?? null,
@@ -557,7 +580,7 @@ const layerBase: Layer.Layer<
                   driver: incoming.driver,
                   refused: 0,
                 });
-                return event;
+                return { ...event, payload: incoming };
               }
               const prior =
                 providerSessions.get(incoming.id) ??
@@ -782,6 +805,7 @@ const layerBase: Layer.Layer<
                 input.guardPendingUserInputCancellations === true
                   ? yield* guardUserInputCancellations(events)
                   : events,
+                input.preserveProviderThreadBackgroundTasks,
               ),
             );
             const committed = yield* timing.measure(
@@ -972,6 +996,7 @@ const layerBase: Layer.Layer<
                   input.guardPendingUserInputCancellations === true
                     ? yield* guardUserInputCancellations(lifecycleEvents)
                     : lifecycleEvents,
+                  input.preserveProviderThreadBackgroundTasks,
                 ),
               );
               const storedEvents = yield* timing.measure(

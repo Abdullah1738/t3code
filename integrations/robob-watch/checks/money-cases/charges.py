@@ -119,14 +119,46 @@ OWNER_BUYS = re.compile(r"\b(?:ordering|ordered|paying|paid|set ?up|subscrib(?:e
                         r"|\b\w+ orders?\b(?! of)|\border (?:#|no\.?|number)\s*\d", re.I)
 
 
+LIMIT_REASONS = frozenset({
+    'marketplace_hold', 'marketplace_stale', 'receipt_out_of_time', 'msgs_timeout',
+    'owner_list_failed', 'owner_incomplete', 'receipt_not_checked', 'other',
+    'source_limit:ORDER_LIST_HOST_BINDING_UNVERIFIED',
+} | {f'{kind}:{lane}' for kind in ('lane_uncovered', 'lane_slice_out', 'lane_error')
+     for lane in order_lookup.LANES})
+
+
+def limit_reason(value):
+    return value if isinstance(value, str) and value in LIMIT_REASONS else 'other'
+
+
+def source_limit_reason(kinds):
+    first = next(iter(kinds), '')
+    if first in ('marketplace_hold', 'marketplace_stale'):
+        return first
+    if first in {lane + '_page_1' for lane in order_lookup.LANES}:
+        return 'lane_uncovered:' + first.removesuffix('_page_1')
+    return limit_reason('source_limit:' + first)
+
+
+def lane_limit_reason(name, lane):
+    stop = lane.get('stop_reason')
+    kind = 'lane_slice_out' if stop == 'slice_out' else 'lane_uncovered' if stop in (
+        None, 'covered', 'end_of_history', 'unproven_paging') else 'lane_error'
+    return limit_reason(f'{kind}:{name}')
+
+
 class Lookup(Exception):
     """A source couldn't be read; the charge is then not explained by it."""
 
+    def __init__(self, message, reason='other'):
+        self.reason = limit_reason(reason)
+        super().__init__(message)
+
 
 class SourceLimit(Lookup):
-    def __init__(self, message, kinds):
+    def __init__(self, message, kinds, reason=None):
         self.kinds = kinds
-        super().__init__(message)
+        super().__init__(message, reason or source_limit_reason(kinds))
 
 
 OWNER_BUDGET = 10
@@ -217,6 +249,8 @@ def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None, stats=
                     options = {'since': (memo or {}).get(('orders_since', app), at - SAME_TIME)}
                     if memo is not None and ('orders_cache',) in memo:
                         options['cache_path'] = memo[('orders_cache',)]
+                    if memo is not None and not memo.get(('write_cache',), True):
+                        options['write_cache'] = False
                 with step_timing(stats, 'lookups', deadline):
                     result = (lookup or order_lookup.read)(app, deadline=deadline, **options)
             except (ValueError, OSError) as exc:
@@ -273,14 +307,16 @@ def order_receipt(charge, at, now, deadline=None, lookup=None, memo=None, stats=
                     names = ', '.join(name for name, lane in short)
                     raise SourceLimit(f'noon orders: {names} history does not reach '
                                       f'{(at - SAME_TIME).date()} (source limit)',
-                                      [name + '_page_1' for name, lane in short])
-                raise ValueError('incomplete history cannot authorize an ask')
+                                      [name + '_page_1' for name, lane in short], lane_limit_reason(*short[0]))
+                error = ValueError('incomplete history cannot authorize an ask')
+                error.reason = lane_limit_reason(*short[0])
+                raise error
         elif not complete:
             raise ValueError('incomplete history cannot authorize an ask')
     except order_lookup.SourceLimit as e:
         raise SourceLimit('careem orders: order list binding unverified (source limit)', [e.code]) from e
     except (ValueError, TypeError, KeyError, InvalidOperation, OSError) as e:
-        raise Lookup(f'{app} orders: lookup unavailable or incomplete') from e
+        raise Lookup(f'{app} orders: lookup unavailable or incomplete', getattr(e, 'reason', 'other')) from e
     return None
 
 
@@ -364,6 +400,8 @@ def msgs(argv, deadline, cap, memo=None, stats=None):
     except (OSError, subprocess.TimeoutExpired, Lookup) as e:
         timed_out = isinstance(e, subprocess.TimeoutExpired) or getattr(e, '_money_cases_timeout', False)
         error = e if isinstance(e, Lookup) else Lookup(f'msgs: {e}')
+        if timed_out:
+            error.reason = 'msgs_timeout'
         if memo is not None:
             memo[key] = error
         raise error from e
@@ -464,7 +502,7 @@ class SearchRows(list):
         self.raw_count = raw_count
 
 
-def search(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None, all_copies=False):
+def search(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None, all_copies=False, *, write_cache=True):
     """Rows from the message archive (the msgs CLI), newest first, without bodies."""
     # Deduplication happens after msgs limits raw rows, hiding truncated searches.
     # Keep the raw count, then fold Message-ID copies before any body reads.
@@ -507,7 +545,7 @@ def search(query, since, until=None, source=None, n=20, deadline=None, memo=None
     rows = SearchRows(unique, raw_count)
     # A capped result is incomplete. Do not freeze it (or any failed search)
     # into a negative screen; open windows always go back to the archive.
-    if key is not None and raw_count < n:
+    if write_cache and (memo or {}).get(('write_cache',), True) and key is not None and raw_count < n:
         cache[key] = {'saved': time.time(), 'rows': [
             {field: row[field] for field in SEARCH_ROW_FIELDS if field in row} for row in rows]}
         cache = dict(sorted(cache.items(), key=lambda item: item[1]['saved'])[-SEARCH_CACHE_LIMIT:])
@@ -693,7 +731,7 @@ def save_owner_cache(path, cache, since, until):
         raise Lookup('Robob control: owner cache save failed') from None
 
 
-def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None):
+def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_reset=None, *, write_cache=True):
     """His app/iMessage typing, fetched once per check within its own total cap."""
     if stats is not None:
         for key in OWNER_TIMING_KEYS:
@@ -708,7 +746,7 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
     with within(stop, error):
         # Stop network work early enough to persist completed threads. The outer
         # deadline also bounds cache reads, fsync, pruning and result assembly.
-        rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25)
+        rows = _owner_texts(since, until, stats, cache_path, cache_reset, stop - 0.25, write_cache=write_cache)
         if time.time() >= stop:
             raise error
         if stats is not None:
@@ -716,7 +754,7 @@ def owner_texts(since, until, deadline=None, stats=None, cache_path=None, cache_
         return rows
 
 
-def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
+def _owner_texts(since, until, stats, cache_path, cache_reset, stop, *, write_cache=True):
     with within(stop, Lookup('Robob control: incomplete thread list')):
         config = control_config()
         # The API's since filter is strict on updatedAt; include messages created exactly at since.
@@ -868,7 +906,7 @@ def _owner_texts(since, until, stats, cache_path, cache_reset, stop):
                 stats['owner_threads_fetched'] += 1
         except Lookup as exc:
             errors.append(exc)
-    size = save_owner_cache(path, cache, since, until)
+    size = save_owner_cache(path, cache, since, until) if write_cache else len(cache)
     if stats is not None:
         stats['owner_cache_size'] = size
     if len(covered) != len(selected):
@@ -1213,10 +1251,11 @@ def known(charge, at, find=None, deadline=None, read=None, stats=None, memo=None
     return None
 
 
-def found(charge, at, now, deadline=None, find=None, said=None, errors=None, memo=None, stats=None, receipt_ok=None, limits=None):
+def found(charge, at, now, deadline=None, find=None, said=None, errors=None, memo=None, stats=None, receipt_ok=None, limits=None, reasons=None):
     """A receipt or his own words that explain the charge, or None."""
     errors = [] if errors is None else errors
     limits = [] if limits is None else limits
+    reasons = [] if reasons is None else reasons
     receipt_result = 'error'
     receipt_end = time.time()
     try:
@@ -1241,6 +1280,8 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
         receipt_result = 'out_of_time' if getattr(e, '_money_cases_timeout', False) or \
             time.time() >= receipt_end or 'out of time' in str(e) or \
             'over time' in str(e) or isinstance(e.__cause__, subprocess.TimeoutExpired) else 'error'
+        reasons.append(e.reason if e.reason != 'other' else
+                       'receipt_out_of_time' if receipt_result == 'out_of_time' else 'other')
         errors.append(f'receipt: {e}')
     except BaseException as exc:
         if getattr(exc, '_money_cases_timeout', False) or time.time() >= receipt_end:
@@ -1256,15 +1297,17 @@ def found(charge, at, now, deadline=None, find=None, said=None, errors=None, mem
         if hit:
             return {**hit, 'errors': errors}
     except SourceLimit as e:
-        limits.append({'why': str(e), 'kinds': e.kinds})
+        reasons.append(e.reason)
+        limits.append({'why': str(e), 'kinds': e.kinds, 'reason': e.reason})
     except Lookup as e:
+        reasons.append(e.reason)
         errors.append(f'orders: {e}')
     if card_owner(charge) == 'moni':
         return None
-    return owner_found(charge, at, now, deadline, said, errors)
+    return owner_found(charge, at, now, deadline, said, errors, reasons)
 
 
-def owner_found(charge, at, now, deadline=None, said=None, errors=None):
+def owner_found(charge, at, now, deadline=None, said=None, errors=None, reasons=None):
     errors = [] if errors is None else errors
     try:
         hit = owner_said(charge, at, now, said, deadline)
@@ -1273,26 +1316,29 @@ def owner_found(charge, at, now, deadline=None, said=None, errors=None):
             return {'verdict': 'owner', 'why': f'he wrote about it at {when} in "{hit[2]}": {hit[1][:100]}',
                     'errors': errors}
     except Lookup as e:
+        if reasons is not None:
+            reasons.append(e.reason)
         errors.append(f'his threads: {e}')
     return None
 
 
 def explain(charge, at, now, deadline=None, find=None, said=None, receipt_ok=None, *, memo=None, stats=None):
     """verdict receipt | owner | wait | ask, with why and any lookup errors."""
-    errors, limits = [], []
+    errors, limits, reasons = [], [], []
     owner = card_owner(charge)
     if charge['kind'] != 'charge' and owner == 'moni':
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if charge['kind'] != 'charge':
         return {'verdict': 'ask', 'why': 'a declined payment goes to him', 'errors': errors}
-    hit = found(charge, at, now, deadline, find, said, errors, memo, stats, receipt_ok=receipt_ok, limits=limits)
+    hit = found(charge, at, now, deadline, find, said, errors, memo, stats, receipt_ok=receipt_ok, limits=limits, reasons=reasons)
     if hit:
         return hit
     if errors:
-        return {'verdict': 'unverified', 'why': 'sources unreadable; do not ask', 'errors': errors, 'limits': limits}
+        return {'verdict': 'unverified', 'why': 'sources unreadable; do not ask', 'errors': errors, 'limits': limits,
+                'limit_reason': next(iter(reasons), 'other')}
     if limits:
         return {'verdict': 'unverified', 'why': 'source limit: ' + '; '.join(l['why'] for l in limits) + '; do not ask',
-                'errors': [], 'limits': limits}
+                'errors': [], 'limits': limits, 'limit_reason': next(iter(reasons), 'other')}
     if owner == 'moni':
         return {'verdict': 'held', 'why': 'held for Moni', 'errors': []}
     if now < at + WAIT:

@@ -5,6 +5,43 @@ import { toolLog } from "./toollog.ts";
 export const UNANSWERED_REQUEUE_MS = 5 * 60_000;
 export const UNANSWERED_ALERT_MS = 10 * 60_000;
 export const UNANSWERED_RESTART_WINDOW_MS = 30 * 60_000;
+
+/** Remote content stays encrypted; the relay needs only receipt times and reply attribution. */
+export class RemoteUnanswered {
+  private checking?: Promise<void>;
+  constructor(private readonly store: Store, private readonly notify?: (severity: "attention", text: string, key: string) => Promise<boolean>) {
+    store.db.exec(`CREATE TABLE IF NOT EXISTS remote_unanswered (
+      id TEXT PRIMARY KEY, received_at INTEGER NOT NULL, answered_at INTEGER, alert TEXT, alerted_at INTEGER)`);
+  }
+  accept(id: string, at: number) {
+    this.store.db.query("INSERT OR IGNORE INTO remote_unanswered(id,received_at) VALUES (?,?)").run(id, at);
+  }
+  answered(id: string, at: number) {
+    this.store.db.query("UPDATE remote_unanswered SET answered_at=COALESCE(answered_at,?) WHERE id=?").run(at, id);
+  }
+  check(now: number): Promise<void> {
+    return this.checking ??= this.sweep(now).finally(() => { this.checking = undefined; });
+  }
+  private async sweep(now: number) {
+    if (!this.notify) return;
+    const rows = this.store.db.query<{ id: string; received_at: number; alert: string | null }, [number]>(
+      "SELECT id,received_at,alert FROM remote_unanswered WHERE answered_at IS NULL AND alerted_at IS NULL AND received_at<=? ORDER BY received_at",
+    ).all(now - UNANSWERED_ALERT_MS);
+    for (const row of rows) {
+      const live = this.store.db.query("SELECT 1 FROM remote_unanswered WHERE id=? AND answered_at IS NULL AND alerted_at IS NULL").get(row.id);
+      if (!live) continue;
+      const ageMs = Math.max(0, now - row.received_at);
+      const time = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Dubai", hour: "2-digit", minute: "2-digit" }).format(row.received_at);
+      // Freeze the payload before sending: Telegram rejects changed text for the same key.
+      const text = row.alert ?? `Moni's iMessage from ${time} (Dubai) has had no reply for ${Math.floor(ageMs / 60_000)} min (backend: remote-box). Check her box queue.`;
+      if (!row.alert) this.store.db.query("UPDATE remote_unanswered SET alert=? WHERE id=?").run(text, row.id);
+      const sent = await this.notify("attention", text, `imessage-unanswered:${row.id}`).catch(() => false);
+      if (sent) this.store.db.query("UPDATE remote_unanswered SET alerted_at=? WHERE id=?").run(now, row.id);
+      toolLog.capture(() => toolLog.write({ component: "remote-box", kind: "error", name: "unanswered.alert",
+        ids: { inboundId: row.id, chat: "moni" }, props: { backend: "remote-box", ageMs, telegram: sent ? "sent" : "failed" }, error: { tag: "inbound.unanswered" } }));
+    }
+  }
+}
 export const humanRow = (id: string) => !/^(?:wake|secret|reset):/.test(id);
 export type AnsweredInput = NormalizedInbound & { answeredAt?: number; unanswered?: {
   overdueAt?: number; requeuedAt?: number; alertAttempts?: number; alertedAt?: number;

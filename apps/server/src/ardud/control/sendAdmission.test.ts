@@ -123,6 +123,7 @@ it.live.each(
                 Layer.provide(Layer.succeed(NodeSqliteClient.ReaderLane, "background")),
                 Layer.provide(
                   Layer.mergeAll(
+                    replay,
                     Layer.mock(EnvironmentAuth.EnvironmentAuth)({
                       authenticateHttpRequest: () =>
                         Effect.succeed({
@@ -132,6 +133,7 @@ it.live.each(
                           scopes: ["orchestration:read", "orchestration:operate"],
                         }),
                     }),
+                    // Override the replay harness's partial mock with the real management service.
                     Layer.succeed(ThreadManagementService.ThreadManagementService, {
                       ...threads,
                       sendToThread: (input) =>
@@ -140,7 +142,6 @@ it.live.each(
                           Effect.tap(() => Deferred.await(releasePostCommit)),
                         ),
                     }),
-                    replay,
                     database,
                     settings,
                     Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),

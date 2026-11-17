@@ -31,6 +31,7 @@ class RepairFixture:
                         FAKE_GOROOT=str(self.root), CALLS=str(self.calls), FIXTURE=str(self.home))
         self.tool('go', '#!/bin/bash\nexec "$FAKE_GOROOT/bin/go" "$@"\n')
         self.tool('sudo', '#!/bin/bash\nshift; exec "$@"\n')
+        self.tool('chown', '#!/bin/bash\n[ "$1" = -R ] || exit 0\necho "chown $*" >> "$CALLS"\n[ -z "$FAIL_CHOWN" ]\n')
         self.tool('stat', f'''#!{sys.executable}
 import os, sys
 st = os.stat(sys.argv[-1])
@@ -296,6 +297,21 @@ class GoSwapTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.fx.calls.exists())
 
+    def test_replacement_is_root_owned_before_install(self):
+        self.fx.broken()
+        result = self.fx.run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.fx.calls.read_text().splitlines()
+        ownership = next(i for i, line in enumerate(calls) if line.startswith('chown -R --no-dereference root:root '))
+        install = next(i for i, line in enumerate(calls) if line.startswith('move ') and line.endswith(' -> ' + str(self.fx.root)))
+        self.assertLess(ownership, install)
+
+    def test_ownership_failure_preserves_live_tree(self):
+        self.fx.broken()
+        result = self.fx.run(FAIL_CHOWN='1')
+        self.assertEqual(result.returncode, 97, result.stderr)
+        self.assertNotIn('move ', self.fx.calls.read_text())
+
     def test_stray_older_release_file_is_mixed_and_repaired(self):
         stray = self.fx.root / 'src/cmd/cgo/ast_go118.go'
         stray.parent.mkdir(parents=True)
@@ -427,7 +443,8 @@ class GoRepairTests(unittest.TestCase):
             (home / 'w').mkdir()
             (home / 'w/go.mod').write_text('module repair-fixture\n')
             env = clean_env(HOME=tmp, PATH=f'{bins}:/usr/bin:/bin', FAKE_GOROOT=str(root))
-            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), \
+            with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.multiple(runs, NODE_OWNER_REPAIR=':', LDCACHE_REPAIR=':', SQLITE_SETUP=':'), \
+                    patch.object(runs.quint_tools, 'block', return_value=':'), \
                     patch.object(runs.userns, 'setup', return_value=':'):
                 script = remote_script('w', '.', ['echo USER_COMMAND'], None, 'test', repo_root=home / 'w')
             script = script.replace(
@@ -518,9 +535,10 @@ class NonGoRepairTests(unittest.TestCase):
                     repair = GO_REPAIR.replace('/usr/local', str(fx.local)).replace(
                         '/tmp/offbox-go-repair.lock', str(fx.home / 'repair.lock'))
                     with patch.object(runs, 'GO_REPAIR', repair), patch.object(runs, 'DOCKER_REPAIR', ':'), \
-                         patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
+                         patch.multiple(runs, NODE_OWNER_REPAIR=':', LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
                          patch.object(runs.userns, 'setup', return_value=':'), \
              patch.object(runs.containers, 'script', return_value=':'), \
+                         patch.object(runs.quint_tools, 'block', return_value=':'), \
                          patch.object(runs.node_tools, 'block', return_value=':'):
                         fx.script = remote_script('w/repo', '.', [cmd], None, 'test', repo_root=repo)
                     result = fx.run()
