@@ -150,6 +150,8 @@ interface FakeThread {
   running: boolean;
   runStartedAt?: string;
   lastActivityAt?: string;
+  openToolSince?: string | null;
+  openToolKind?: string | null;
   runId?: string;
   runRequestedAt?: string;
   stuck?: boolean;
@@ -264,6 +266,9 @@ const makeFake = Effect.gen(function* () {
             runStartedAt: thread.runStartedAt ?? null,
             lastActivityAt: thread.lastActivityAt ?? thread.runStartedAt ?? null,
             runId: thread.runId ?? null,
+            latestRunId: thread.runId ?? null,
+            openToolSince: thread.openToolSince ?? null,
+            openToolKind: thread.openToolKind ?? null,
             runRequestedAt: thread.runRequestedAt ?? null,
             backgroundWork: thread.background ?? 0,
             restartRecovery: thread.restartRecovery,
@@ -36079,6 +36084,154 @@ it.effect("an MCP-started drain gives a later owner route the background admissi
       assert.strictEqual(messages.filter((text) => text.includes("Later owner route")).length, 1);
     }).pipe(Effect.provide(withOwnerRouteMode(testLayer(gated), "deferred")));
   }),
+);
+
+it.effect.each(["held", "ceiling", "completed", "fresh tool"] as const)(
+  "the silent-run backstop handles an open command (%s)",
+  (kind) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const analytics: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00Z"));
+        const { kanban, board } = yield* toyBoard;
+        const card = yield* kanban.createCard(
+          board.id,
+          { title: "Open command", prompt: "Wait" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const thread = (yield* kanban.card(card.id)).card.activeThreadId!;
+        yield* Ref.update(fake.threads, (all) => {
+          Object.assign(all.get(thread)!, {
+            running: true,
+            runId: "open-tool-run",
+            runStartedAt: "2026-10-25T12:56:00.000Z",
+            lastActivityAt: "2026-10-25T13:00:00.000Z",
+            openToolSince:
+              kind === "completed" || kind === "fresh tool" ? null : "2026-10-25T12:56:00.000Z",
+            openToolKind: "command_execution",
+          });
+          return all;
+        });
+        if (kind === "fresh tool") {
+          let reads = 0;
+          fake.findControl.beforeRead = (id) =>
+            Ref.update(fake.threads, (all) => {
+              if (id === thread && ++reads >= 2)
+                all.get(thread)!.openToolSince = "2026-10-25T12:56:00.000Z";
+              return all;
+            });
+        }
+        const before = (yield* kanban.card(card.id)).events.length;
+        yield* TestClock.adjust(kind === "ceiling" ? Rules.RUN_OPEN_TOOL_MAX_MS : 31 * 60000);
+        yield* kanban.tick;
+        const held = kind === "held" || kind === "fresh tool";
+        assert.deepEqual(fake.interrupted, held ? [] : [thread]);
+        const stops = (yield* kanban.card(card.id)).events.filter((event) =>
+          Rules.isSilentRunStop(event.body),
+        );
+        const skips = () => analytics.filter((event) => event.props?.reason === "open_tool_call");
+        if (held) {
+          assert.lengthOf(stops, 0);
+          assert.lengthOf((yield* kanban.card(card.id)).events, before);
+          assert.lengthOf(skips(), 1);
+          assert.deepInclude(skips()[0]!.props, {
+            runId: "open-tool-run",
+            itemKind: "command_execution",
+            openToolSince: "2026-10-25T12:56:00.000Z",
+          });
+          yield* decodeAnalyticsEvent(skips()[0]);
+          yield* kanban.tick;
+          assert.lengthOf(skips(), 1);
+          if (kind === "held") {
+            yield* Ref.update(fake.threads, (all) => {
+              all.get(thread)!.openToolSince = "2026-10-25T13:31:00.000Z";
+              return all;
+            });
+            yield* TestClock.adjust(Rules.RUN_OPEN_TOOL_MAX_MS - 31 * 60000);
+            yield* kanban.tick;
+            assert.lengthOf(skips(), 1);
+            yield* Ref.update(fake.threads, (all) => {
+              all.get(thread)!.runId = "replacement-run";
+              return all;
+            });
+            yield* kanban.tick;
+            assert.lengthOf(skips(), 2);
+          }
+        } else {
+          assert.lengthOf(stops, 1);
+          assert.include(
+            stops[0]!.body!,
+            kind === "ceiling"
+              ? "Tool call open 4 h 19 min (command_execution)"
+              : "No activity for 31 min (no open tool call)",
+          );
+        }
+      }).pipe(
+        Effect.provide(
+          testLayer(fake.layer).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    analytics.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect.each(["board stop", "tool ceiling", "normal end", "different run", "old stop"] as const)(
+  "working nudge attributes a recent stop (%s)",
+  (kind) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-10-25T13:00:00Z"));
+        const { kanban, board } = yield* toyBoard;
+        const created = yield* kanban.createCard(
+          board.id,
+          { title: "Nudge", prompt: "Work" },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const card = (yield* kanban.card(created.id)).card;
+        const thread = card.activeThreadId!;
+        yield* Ref.update(fake.threads, (all) => {
+          Object.assign(all.get(thread)!, { running: false, runId: "stopped-run" });
+          return all;
+        });
+        if (kind !== "normal end") {
+          const store = yield* KanbanStore.KanbanStore;
+          yield* store.addCardEvent({
+            cardId: card.id,
+            at: kind === "old stop" ? "2026-10-25T11:00:00.000Z" : "2026-10-25T13:00:00.000Z",
+            actor: { _tag: "system", component: "dispatcher" },
+            kind: "thread",
+            fromStage: null,
+            toStage: null,
+            body: `${kind === "tool ceiling" ? "Tool call open 4 h 16 min (command_execution)" : "No activity for 31 min (no open tool call)"}; the board stopped the run\nThread: ${thread}\nRun: ${kind === "different run" ? "other" : "stopped-run"}`,
+            head: null,
+          });
+        }
+        yield* kanban.turnEnded(thread);
+        const text = (yield* Ref.get(fake.threads)).get(thread)!.messages.at(-1)!;
+        assert.include(
+          text,
+          kind === "board stop" || kind === "tool ceiling"
+            ? "the board stopped the run"
+            : "your turn ended",
+        );
+        if (kind === "board stop" || kind === "tool ceiling") {
+          assert.notInclude(text, "your turn ended");
+          assert.include(text, "re-join it; don't restart it");
+        }
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
 );
 
 it.effect.each(["working", "todo", "in_review", "needs_review"] as const)(

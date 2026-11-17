@@ -46,6 +46,7 @@ import {
   failedTurnResumeDue,
   isRuntimeFailure,
   runSilentDue,
+  RUN_OPEN_TOOL_MAX_MS,
   reviewerQuietDue,
   waitingOnBackground,
   BACKGROUND_GRACE_MS,
@@ -2480,6 +2481,15 @@ describe("runSilentDue", () => {
     expect(
       runSilentDue({ ...working, nudgedAt: "2026-10-25T00:20:00.000Z" }, running, at(50)),
     ).toBe(true);
+  });
+  it("holds an open tool only up to its ceiling and still respects nudge/background grace", () => {
+    const tool = { ...running, openToolSince: start };
+    expect(runSilentDue(working, tool, at(35))).toBe(false);
+    expect(runSilentDue(working, tool, Date.parse(start) + RUN_OPEN_TOOL_MAX_MS - 1)).toBe(false);
+    expect(runSilentDue(working, tool, Date.parse(start) + RUN_OPEN_TOOL_MAX_MS)).toBe(true);
+    expect(runSilentDue(working, { ...tool, backgroundWork: 1 }, at(256))).toBe(false);
+    expect(runSilentDue({ ...working, nudgedAt: iso(at(250)) }, tool, at(256))).toBe(false);
+    expect(runSilentDue(working, { ...running, openToolSince: null }, at(31))).toBe(true);
   });
   it.each(["todo", "needs_review", "working", "in_review"] as const)("covers %s", (stage) => {
     const active = stage === "working" || stage === "in_review";
