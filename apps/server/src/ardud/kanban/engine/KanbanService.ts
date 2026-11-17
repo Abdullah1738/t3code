@@ -1115,6 +1115,8 @@ export interface KanbanServiceShape {
   readonly threadEvent: (threadId: string) => Effect.Effect<void>;
   /** Announces a board thread's live state (running, needs input) as it changes mid-turn. */
   readonly notifyThreadChanged: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
+  /** Refreshes PR chips on the work thread's cards, including cards it has finished. */
+  readonly notifyPullRequestsChanged: (threadId: ThreadId) => Effect.Effect<void, KanbanError>;
   /** Background worker: runs queued dispatch kicks and turn ends; never returns. */
   readonly worker: Effect.Effect<never>;
 }
@@ -18923,18 +18925,21 @@ const make = Effect.gen(function* () {
           yield* logEvent(source, actor, "comment", { body: clearNote, before: snapshot.before });
         }
         const moved = yield* moveUnlocked(source, to, role, actor, moveOptions, snapshot);
+        const refreshPrs =
+          to === "needs_review" ||
+          (role === "evaluator" && (to === "completed" || to === "deployed" || to === "verified"));
         const deferred = yield* effectSink;
         if (deferred === undefined || deferred.closed) {
           yield* forkPostCommit(
             Effect.gen(function* () {
               yield* evaluatorTurn(card, moved, actor);
-              if (to === "needs_review") yield* syncPrs(moved);
+              if (refreshPrs) yield* syncPrs(moved);
             }),
           );
         } else {
           yield* laterEvaluatorTurn(card, moved, actor);
         }
-        if (to === "needs_review") {
+        if (refreshPrs) {
           // The PR read is thread state: a deferred write returns the card without it.
           if (deferred !== undefined && !deferred.closed && moved.workThreadId !== null)
             deferred.effects.push({
@@ -23841,6 +23846,22 @@ const make = Effect.gen(function* () {
               lastActivityAt: view.updatedAt,
             },
           });
+        }),
+      ),
+    notifyPullRequestsChanged: (threadId) =>
+      read(
+        Effect.gen(function* () {
+          // Active assignments disappear after review; ownership history includes finished cards.
+          for (const id of yield* carriedIds(threadId)) {
+            yield* guard(
+              "pullRequestsChanged",
+              Effect.gen(function* () {
+                const card = yield* store.card(KanbanCardId.make(id));
+                if (card?.workThreadId === threadId) yield* syncPrs(card);
+              }),
+              id,
+            );
+          }
         }),
       ),
     worker: Stream.fromQueue(jobs).pipe(
