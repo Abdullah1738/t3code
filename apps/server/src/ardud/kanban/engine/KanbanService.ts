@@ -13610,8 +13610,9 @@ const make = Effect.gen(function* () {
               threadId: ThreadId,
               revision: ReadonlyArray<number>,
             ) {
-              const current = yield* backstopRevision(planned, threadId);
               const card = yield* turnEndCard(planned.id);
+              // The card read releases permits, so validate the thread fence after it returns.
+              const current = yield* backstopRevision(planned, threadId);
               return current.every((version, index) => version === revision[index]) &&
                 sameCardState(card, planned)
                 ? card
