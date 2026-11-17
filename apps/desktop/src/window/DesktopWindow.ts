@@ -410,7 +410,7 @@ export const make = Effect.gen(function* () {
       return Option.none();
     }
 
-    yield* rendererHistory.register(window.webContents, { surface: "main" });
+    yield* rendererHistory.register(window.webContents, { surface: "main" }, window);
     if (environment.platform === "darwin") {
       window.setAutoHideCursor(false);
     }
@@ -927,7 +927,7 @@ export const make = Effect.gen(function* () {
       yield* electronWindow.destroyAll;
       return;
     }
-    yield* rendererHistory.register(splash.webContents, { surface: "splash" });
+    yield* rendererHistory.register(splash.webContents, { surface: "splash" }, splash);
     yield* Ref.set(splashWindowRef, Option.some(splash));
     splash.once("closed", () => {
       void runPromise(Ref.set(splashWindowRef, Option.none()));
