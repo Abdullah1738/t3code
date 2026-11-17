@@ -3302,6 +3302,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               appThread: childThread,
             });
             yield* emitProviderEvent({
+              type: "provider_thread.updated",
+              driver: CODEX_PROVIDER,
+              providerThread,
+            });
+            yield* emitProviderEvent({
               type: "node.updated",
               driver: CODEX_PROVIDER,
               node: {
@@ -3321,6 +3326,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 startedAt: now,
                 completedAt: null,
               },
+            });
+            // Recovery must discover and own the child before any running child work appears.
+            yield* emitSubagentTaskUpdate({
+              subagent,
+              status: "running",
             });
             yield* emitProviderEvent({
               type: "node.updated",
@@ -3342,11 +3352,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 startedAt: now,
                 completedAt: null,
               },
-            });
-            yield* emitProviderEvent({
-              type: "provider_thread.updated",
-              driver: CODEX_PROVIDER,
-              providerThread,
             });
             if (input.emitInitialPrompt && input.prompt.length > 0) {
               const promptNativeItemId = `${input.nativeItemId}:prompt`;
@@ -3381,10 +3386,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 turnItem: promptArtifacts.turnItem,
               });
             }
-            yield* emitSubagentTaskUpdate({
-              subagent,
-              status: "running",
-            });
 
             const pendingTurns = yield* Ref.modify(pendingSubagentTurns, (current) => {
               const pending = current.get(input.nativeThreadId) ?? [];

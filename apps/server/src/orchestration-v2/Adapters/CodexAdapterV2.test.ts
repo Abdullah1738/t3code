@@ -74,6 +74,8 @@ import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEve
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectWorker from "../EffectWorker.ts";
 import * as Orchestrator from "../Orchestrator.ts";
+import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
+import * as ProviderSessionManager from "../ProviderSessionManager.ts";
 import * as ProviderReplayHarness from "../testkit/ProviderReplayHarness.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -11512,6 +11514,248 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       childTurnCompleted(RESUME_CHILD_TURN_2),
     ],
   });
+
+  it.effect.each(["thread", "binding", "parent node", "parent task", "child root"] as const)(
+    "recovers a native child released after publishing its %s",
+    (boundary) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          // Native replay timestamps must precede the release's virtual clock.
+          yield* TestClock.setTime(1782622445000);
+          const fs = yield* FileSystem.FileSystem;
+          const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-native-init-" });
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          for (const args of [
+            ["init", "--quiet"],
+            [
+              "-c",
+              "user.name=Test",
+              "-c",
+              "user.email=test@example.com",
+              "commit",
+              "--allow-empty",
+              "--quiet",
+              "-m",
+              "Initial commit",
+            ],
+          ]) {
+            assert.equal(
+              Number(yield* spawner.exitCode(ChildProcess.make("git", args, { cwd }))),
+              0,
+            );
+          }
+          const transcript = makeCodexReplayTranscript({
+            scenario: `native-init-${boundary.replaceAll(" ", "-")}`,
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId: RESUME_NATIVE_THREAD,
+                nativeTurnId: RESUME_NATIVE_TURN,
+                prompt: RESUME_PROMPT,
+              }),
+              {
+                type: "emit_inbound",
+                label: "spawn native child",
+                frame: {
+                  method: "item/completed",
+                  params: {
+                    threadId: RESUME_NATIVE_THREAD,
+                    turnId: RESUME_NATIVE_TURN,
+                    item: {
+                      type: "subAgentActivity",
+                      id: "native-init-spawn",
+                      kind: "started",
+                      agentThreadId: RESUME_CHILD_THREAD,
+                      agentPath: "/root/init_agent",
+                    },
+                  },
+                },
+              },
+            ],
+          });
+          const localTranscript = yield* decodeReplayTranscriptJson(
+            (yield* encodeReplayTranscriptJson(transcript)).replaceAll(
+              yield* encodeStringJson("/workspace"),
+              yield* encodeStringJson(cwd),
+            ),
+          );
+          const childId = (yield* IdAllocator.IdAllocatorV2).derive.threadFromProviderThread({
+            driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+            nativeThreadId: RESUME_CHILD_THREAD,
+          });
+          const parentId = ThreadId.make("native-init-parent");
+          const atBoundary = (event: ProviderAdapter.ProviderAdapterV2Event) => {
+            switch (boundary) {
+              case "thread":
+                return event.type === "app_thread.created" && event.appThread.id === childId;
+              case "binding":
+                return (
+                  event.type === "provider_thread.updated" &&
+                  event.providerThread.appThreadId === childId
+                );
+              case "parent node":
+                return (
+                  event.type === "node.updated" &&
+                  event.node.kind === "subagent" &&
+                  event.node.threadId === parentId
+                );
+              case "parent task":
+                return (
+                  event.type === "subagent.updated" && event.subagent.childThreadId === childId
+                );
+              case "child root":
+                return (
+                  event.type === "node.updated" &&
+                  event.node.kind === "root_turn" &&
+                  event.node.threadId === childId
+                );
+            }
+          };
+          const registry = Layer.effect(
+            ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+            Effect.gen(function* () {
+              const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
+              return {
+                ...registry,
+                get: (id: ProviderInstanceId) =>
+                  registry.get(id).pipe(
+                    Effect.map((adapter) => ({
+                      ...adapter,
+                      openSession: (input: Parameters<typeof adapter.openSession>[0]) =>
+                        adapter.openSession(input).pipe(
+                          Effect.map((runtime) => ({
+                            ...runtime,
+                            events: runtime.events.pipe(
+                              Stream.rechunk(1),
+                              Stream.takeUntil(atBoundary),
+                              Stream.concat(Stream.never),
+                            ),
+                          })),
+                        ),
+                    })),
+                  ),
+              };
+            }),
+          ).pipe(Layer.provide(CodexAdapterV2Testkit.layer({ transcript: localTranscript })));
+          yield* Effect.gen(function* () {
+            const engine = yield* Orchestrator.OrchestratorV2;
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+            yield* engine.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("native-init-create"),
+              threadId: parentId,
+              projectId: ProjectId.make("native-init-project"),
+              title: "Native initialization",
+              modelSelection: CODEX_TEST_MODEL_SELECTION,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: cwd,
+              createdBy: "user",
+              creationSource: "web",
+            });
+            const persisted = yield* engine.streamDomainEvents.pipe(
+              Stream.filter((event) => {
+                switch (boundary) {
+                  case "thread":
+                    return event.type === "thread.created" && event.threadId === childId;
+                  case "binding":
+                    return (
+                      event.type === "provider-thread.updated" &&
+                      event.payload.appThreadId === childId
+                    );
+                  case "parent node":
+                    return (
+                      event.type === "node.updated" &&
+                      event.payload.kind === "subagent" &&
+                      event.threadId === parentId
+                    );
+                  case "parent task":
+                    return (
+                      event.type === "subagent.updated" && event.payload.childThreadId === childId
+                    );
+                  case "child root":
+                    return (
+                      event.type === "node.updated" &&
+                      event.payload.kind === "root_turn" &&
+                      event.threadId === childId
+                    );
+                }
+              }),
+              Stream.runHead,
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* engine.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make("native-init-start"),
+              threadId: parentId,
+              messageId: MessageId.make("native-init-message"),
+              text: RESUME_PROMPT,
+              attachments: [],
+              createdBy: "user",
+              creationSource: "web",
+              dispatchMode: { type: "start_immediately" },
+            });
+            yield* worker.drain();
+            yield* Fiber.join(persisted);
+            const parent = yield* engine.getThreadProjection(parentId);
+            const child = yield* engine.getThreadProjection(childId);
+            const now = yield* DateTime.now;
+            assert.isFalse(
+              parent.providerTurns.some(
+                (turn) => turn.startedAt !== null && DateTime.isGreaterThan(turn.startedAt, now),
+              ),
+            );
+            const providerSessionId = parent.providerThreads.find(
+              (binding) => binding.id === parent.runs[0]?.providerThreadId,
+            )?.providerSessionId;
+            if (providerSessionId == null)
+              return yield* Effect.die("The started run must own a provider session.");
+            assert.equal((yield* sessions.get(providerSessionId))._tag, "Some");
+            if (boundary === "child root") {
+              assert.lengthOf(child.providerThreads, 1);
+              assert.isTrue(parent.subagents.some((task) => task.childThreadId === childId));
+              assert.equal(child.nodes[0]?.status, "running");
+              assert.lengthOf(child.providerTurns, 0);
+            }
+            yield* sessions.release({
+              providerSessionId,
+              reason: "runtime_error",
+            });
+            assert.equal((yield* sessions.get(providerSessionId))._tag, "None");
+            yield* worker.drain();
+            const after = yield* engine.getThreadProjection(childId);
+            assert.isFalse(
+              after.nodes.some((node) => ["pending", "running", "waiting"].includes(node.status)),
+            );
+            assert.lengthOf(after.providerTurns, 0);
+            const owner = yield* engine.getThreadProjection(parentId);
+            assert.isFalse(
+              owner.subagents.some(
+                (task) =>
+                  task.childThreadId === childId &&
+                  ["pending", "running", "waiting"].includes(task.status),
+              ),
+            );
+            assert.isFalse(
+              owner.nodes.some(
+                (node) =>
+                  node.kind === "subagent" &&
+                  ["pending", "running", "waiting"].includes(node.status),
+              ),
+            );
+          }).pipe(
+            Effect.provide(
+              ProviderReplayHarness.layerWithRegistry(
+                { name: `native-init-${boundary}`, runtimePolicyOverride: { cwd } },
+                registry,
+                { runEffectWorker: false },
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, IdAllocator.layer))),
+      ),
+  );
 
   it.effect.each([
     { name: "current Codex Sol", model: "gpt-6-sol" },
