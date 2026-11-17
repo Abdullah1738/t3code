@@ -5227,6 +5227,28 @@ export class Router {
         for (const member of members) covered.add(member);
       }
       if (!covered.size) return;
+      // Legacy session tools stored their human source in logging metadata, without replyTo or coverage.
+      const replies = this.store.db.query<{ id: string; source: string; queued: number }, [string, number, number, number]>(`SELECT o.id, json_extract(source.value, '$') AS source, queued.rowid AS queued
+        FROM outbox o JOIN kv source ON source.key = 'log-inbound-id:' || o.id JOIN kv queued ON queued.key = 'log-queued:' || o.id
+        WHERE (o.id GLOB 'send:*' OR o.id GLOB 'file:*' OR o.id GLOB 'app:*' OR o.id GLOB 'poll:*' OR o.id GLOB 'secret-form:*')
+          AND json_extract(o.payload, '$.kind') = 'conversation' AND json_extract(o.payload, '$.replyTo') IS NULL
+          AND o.state IN ('pending', 'sending', 'sent', 'uncertain')
+          AND json_extract(o.payload, '$.sessionId') = ? AND json_extract(o.payload, '$.generation') = ? AND o.rowid > ?
+          AND CAST(queued.value AS INTEGER) >= ? AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)`)
+        .all(turn.id, turn.generation, turn.outbox ?? 0, turn.startedAt);
+      for (const reply of replies) {
+        if (!covered.has(reply.source)) continue;
+        const leader = this.humanBatchLeader(reply.source, leaders);
+        // Old admission backfill retagged earlier wake sends; their enqueue keys precede the human receipt even within the same millisecond.
+        const receipt = this.store.db.query<{ rowid: number }, [string]>("SELECT rowid FROM kv WHERE key = ?").get(`inbound-delivered:${leader}`);
+        if (!receipt || reply.queued <= receipt.rowid) continue;
+        const members = this.store.get<NormalizedInbound>(`batch:${leader}`)?.batchIds ?? [leader];
+        // Legacy data cannot distinguish a pre-admission wake send from a post-admission human reply.
+        // We deliberately avoid replaying completed work; see the #58 card disposition.
+        this.store.set(`reply-covered:${reply.id}`, members.filter(id => covered.has(id)));
+        toolLog.capture(() => toolLog.write({ component: "router", kind: "event", level: "warn", name: "inbound.legacy_attribution_trusted",
+          ids: { inboundId: leader, outboxId: reply.id, threadId: turn.id, messageId: turn.messageId }, props: { generation: turn.generation } }));
+      }
       const restored = { ...turn, covered: [...covered] };
       this.store.set("activeTurn", restored);
       this.store.set(`turn-human:${turn.messageId}`, [...leaders]);

@@ -16,6 +16,7 @@ import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
+  level?: "warn";
   durationMs?: number; ok?: boolean; ids?: Record<string, string>; props?: Record<string, string | number | boolean>;
   site?: string;
   error?: { tag: string } & ErrorDetail;
@@ -27,8 +28,8 @@ const processRunId = randomUUID();
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
-const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount"]);
+const ID_KEYS = new Set(["chat", "messageId", "inboundId", "outboxId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "generation"]);
 const ENUMS: Record<string, readonly string[]> = {
   controlReason: CONTROL_REASONS,
   leaderKind: ["human", "wake", "reset"],
@@ -46,6 +47,7 @@ const ENUMS: Record<string, readonly string[]> = {
 function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (!LABEL.test(entry.component) || !LABEL.test(entry.name) || !["event", "perf", "error"].includes(entry.kind)) return;
   const line: LogLine = { ts, tool: "imessage", component: entry.component, kind: entry.kind, name: entry.name };
+  if (entry.level === "warn") line.level = "warn";
   if (typeof entry.durationMs === "number" && Number.isFinite(entry.durationMs) && entry.durationMs >= 0) line.durationMs = entry.durationMs;
   if (typeof entry.ok === "boolean") line.ok = entry.ok;
   const ids: Record<string, string> = runId ? { runId } : {};
@@ -155,7 +157,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
         finally { if (marker !== undefined) closeSync(marker); }
         const renderDetail = line.name === "card.render" && (line.ok === false || (line.durationMs ?? 0) > 1_000);
         const slowOrFailedCall = line.name === "turn.robob_call" && ((line.durationMs ?? 0) > SLOW_CALL_MS || line.ok === false);
-        if (line.kind !== "error" && !["turn.start", "turn.end", "turn.robob_calls"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
+        if (line.kind !== "error" && line.level !== "warn" && !["turn.start", "turn.end", "turn.robob_calls"].includes(line.name) && !slowOrFailedCall && !renderDetail) {
           if (line.name === "card.render" || line.name === "card.renders") writeFailed = true;
           return;
         }
