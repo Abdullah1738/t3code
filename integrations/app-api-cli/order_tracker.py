@@ -2032,7 +2032,7 @@ def main(argv=None, _locked=False):
                        f'Run order-watch remove --app {app} --order {args.order} {shlex.join(merchant_args(cfg))} only to stop tracking early. Item/shipment-scoped evidence (Amazon or noon marketplace) proves only that part: say package/item, and verify all shipments before closing. whole_order_complete=false is never a whole-order completion. '
                        'Amazon aftercare is scoped return/refund/cancellation evidence, not a fresh arrival or whole-order cancellation: do not remove tracking or initiate any return/refund/cancellation from it. Historical package evidence is not a new arrival. '
                        'On candidate delivered, verify or ask Abdullah before removing. '
-                       'Use existing read-only evidence first; no phone UI while priority-hold is present.')
+                       'Use existing read-only evidence first; no phone UI while `ph hold status --json` shows present true.')
             command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'check', '--app', app, '--order', args.order,
                                   *merchant_args(cfg)])
             # For native apps, add writes watcher.json, then primes one real check (robob-watch
