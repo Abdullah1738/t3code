@@ -402,7 +402,15 @@ it.layer(layerTest)("delegated completion delivery repairs", (it) => {
       message: "Connection dropped after native send; outcome unknown",
       code: null,
       registered: true,
+      accepted: true,
       retain: false,
+      held: false,
+    },
+    {
+      name: "unknown-without-native-acceptance",
+      message: "Connection dropped without native acceptance",
+      code: null,
+      registered: true,
       held: false,
     },
     {
@@ -427,6 +435,9 @@ it.layer(layerTest)("delegated completion delivery repairs", (it) => {
       const before = yield* orchestrator.getThreadProjection(threadId);
       const parent = before.runs.find((run) => run.id === runId)!;
       const receiver = before.runs.find((run) => run.id === deliveryRunId)!;
+      assert.isNotNull(receiver.activeAttemptId);
+      assert.isNotNull(receiver.providerThreadId);
+      assert.isNotNull(receiver.rootNodeId);
       yield* sink.write({
         events: [
           {
@@ -437,6 +448,28 @@ it.layer(layerTest)("delegated completion delivery repairs", (it) => {
             occurredAt: now,
             payload: { ...parent, status: "completed", completedAt: now },
           },
+          ...("accepted" in row && row.accepted
+            ? [
+                {
+                  id: EventId.make(`event:${row.name}:native-acceptance`),
+                  type: "provider-turn.updated" as const,
+                  threadId,
+                  occurredAt: now,
+                  payload: {
+                    id: ProviderTurnId.make(`provider-turn:${row.name}`),
+                    providerThreadId: receiver.providerThreadId!,
+                    nodeId: receiver.rootNodeId!,
+                    runAttemptId: receiver.activeAttemptId!,
+                    nativeTurnRef: null,
+                    ordinal: 1,
+                    status: "failed" as const,
+                    promptAcceptedAt: now,
+                    startedAt: now,
+                    completedAt: now,
+                  },
+                },
+              ]
+            : []),
           ...(row.message === null
             ? []
             : [
@@ -2008,6 +2041,15 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
             });
           }
           yield* TestClock.adjust("30 minutes");
+          if (phase === "provider_events_lost") {
+            // Native notice acceptance owns delivery even when turn events are lost.
+            yield* orchestrator.dispatch({
+              type: "notification.delivery.accept",
+              commandId: CommandId.make(`command:native-accepted-notice:${phase}`),
+              threadId,
+              messageId: delivery.messageId,
+            });
+          }
           yield* orchestrator.dispatch({
             type: "run.start-expire",
             phase: phase === "restart_admission" ? phase : "provider",
