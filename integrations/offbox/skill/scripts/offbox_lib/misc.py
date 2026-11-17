@@ -1468,6 +1468,7 @@ def logs(run_id: str, do_follow: bool) -> int:
     if killed is not None and killed['process_id']:
         return report_killed(killed, p)
     code = settled_steps_code(r, r['exit_code'], catch_up=False, history_result=result)
+    _report_deps_hint(r, code, p)
     _incomplete_log(_validated_step_row(r, code), result)
     if code is None:
         from .run_evidence import report
@@ -1870,6 +1871,7 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
         _tail_selected(log_path, pos, echo)
         return complete_killed(killed, log_path, pulls=json.loads(r['pulls'] or '[]'), until=deadline)
     code = settled_steps_code(r, code, log_path=log_path, until=deadline)
+    _report_deps_hint(r, code, log_path)
     from . import resources
     resources.finalize(r)
     _tail_selected(log_path, pos, echo)

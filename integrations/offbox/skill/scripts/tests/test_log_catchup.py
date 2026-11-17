@@ -82,6 +82,27 @@ class LogCatchupTests(Isolated):
         self.assertIn('failed exit=7', out)
         self.assertEqual(err, '')
 
+    def test_logs_and_stuck_wait_replay_failure_advice(self):
+        for content, expected in (
+                ('offbox: node v24.22.3 (box default)\n'
+                 '/home/user/.nvm/nvm.sh: No such file or directory\n',
+                 'your command sourced ~/.nvm/nvm.sh'),
+                (runs.NO_NODE_MODULES_MARKER + '\n' + runs.DEPS_INSTALL_MARKER + '[1, "npm ci"]\n',
+                 'its own install step (npm ci)')):
+            for entry in ('logs', 'stuck'):
+                with self.subTest(entry=entry, expected=expected):
+                    self.state('failed', 1)
+                    self.prefix(content.encode())
+                    self.streams(content.encode(), b'')
+                    if entry == 'logs':
+                        _, _, err = self.invoke()
+                    else:
+                        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as output:
+                            self.assertEqual(misc._holder_stuck(
+                                self.row(), {'status': 'exited', 'exitCode': 1}, self.path, 0, False), 1)
+                        err = output.getvalue()
+                    self.assertIn(expected, err)
+
     def test_detached_recovery_places_setup_before_command_output(self):
         preamble = b'offbox: node v24.22.1\noffbox: pnpm v11.10.0\noffbox-command-started: run-x\n'
         stdout = b'pytest failure details\n20 failed, 3 passed\n'

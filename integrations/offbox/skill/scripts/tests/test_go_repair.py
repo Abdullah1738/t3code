@@ -545,7 +545,7 @@ class NonGoRepairTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 97 if go else 3, result.stderr)
                     self.assertEqual('USER_COMMAND' in result.stdout, not go)
                     self.assertEqual(runs.SETUP_FAILED_MARKER in result.stderr, go)
-                    self.assertNotIn(runs.NO_NODE_MODULES_MARKER, result.stderr)
+                    self.assertEqual(runs.NO_NODE_MODULES_MARKER in result.stderr, not go)
                     if not go:
                         self.assertIn("offbox: Go repair failed (official archive download failed); continuing because this run doesn't use Go", result.stderr)
 
