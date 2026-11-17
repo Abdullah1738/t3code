@@ -2019,6 +2019,18 @@ function makeCodexReplayTranscript(input: {
   };
 }
 
+function codexShutdownReplay(
+  threadId: string,
+  id: number,
+): Array<CodexReplay.CodexAppServerReplayEntry> {
+  // Codex 0.144.1 and 0.166.0 reply before emitting thread/archived, without thread/closed.
+  return [
+    { type: "expect_outbound", frame: { id, method: "thread/archive", params: { threadId } } },
+    { type: "emit_inbound", frame: { id, result: {} } },
+    { type: "emit_inbound", frame: { method: "thread/archived", params: { threadId } } },
+  ];
+}
+
 function withReplayRequestId(
   entry: CodexReplay.CodexAppServerReplayEntry,
   id: number,
@@ -3776,6 +3788,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       });
       const turnStartSent = yield* Deferred.make<void>();
       const interruptSent = yield* Deferred.make<void>();
+      const archiveSent = yield* Deferred.make<void>();
       const harness = yield* makeCodexReplayHarness(
         transcript,
         () => Effect.void,
@@ -3784,7 +3797,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ? Deferred.succeed(turnStartSent, undefined)
             : method === "turn/interrupt"
               ? Deferred.succeed(interruptSent, undefined)
-              : Effect.void,
+              : method === "thread/archive"
+                ? Deferred.succeed(archiveSent, undefined)
+                : Effect.void,
       );
       const start = yield* harness.runtime
         .startTurn(
@@ -3803,6 +3818,11 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       assert.isFalse(yield* Deferred.isDone(interruptSent));
       yield* TestClock.adjust("1 second");
       yield* Deferred.await(interruptSent);
+      yield* TestClock.adjust("10 seconds");
+      assert.isFalse(
+        yield* Deferred.isDone(archiveSent),
+        "Caller cancellation preserves earlier background work",
+      );
       // The abandoned turn is never adopted as this run's turn.
       assert.isUndefined(
         harness.events.find(
@@ -3817,6 +3837,725 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
     ),
+  );
+
+  it.effect("fences an exact attempt stopped before native-start registration", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "stopped-before-registration-thread";
+      const nativeTurnId = "new-attempt-turn";
+      const prompt = "Work the card.";
+      const turnStarts: unknown[] = [];
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "stopped-before-registration",
+          entries: codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }),
+        }),
+        undefined,
+        (method, params) =>
+          Effect.sync(() => {
+            if (method === "turn/start") turnStarts.push(params);
+          }),
+      );
+      const input = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("stopped-before-registration-attempt"),
+        text: prompt,
+      });
+      assert.isDefined(harness.runtime.interruptStartingRun);
+      yield* harness.runtime.interruptStartingRun!({
+        providerThread: harness.providerThread,
+        runId: input.runId,
+        attemptId: input.attemptId,
+      });
+      const stopped = yield* harness.runtime.startTurn(input).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(stopped));
+      assert.isEmpty(turnStarts);
+      yield* harness.runtime.startTurn({ ...input, attemptId: RunAttemptId.make("new-attempt") });
+      assert.lengthOf(turnStarts, 1, "A delayed Stop must not fence another attempt");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("allows a new attempt after Stop fences native prompt preparation", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "stopped-preparation-thread";
+      const nativeTurnId = "new-preparation-turn";
+      const prompt = "Work the card.";
+      const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt });
+      const preparing = yield* Deferred.make<void>();
+      const releasePreparation = yield* Deferred.make<void>();
+      const statusEntries = (id: number): Array<CodexReplay.CodexAppServerReplayEntry> => [
+        {
+          type: "expect_outbound",
+          frame: {
+            id,
+            method: "mcpServerStatus/list",
+            params: { threadId: nativeThreadId, serverName: "t3-code", detail: "toolsAndAuthOnly" },
+          },
+        },
+        {
+          type: "emit_inbound",
+          frame: {
+            id,
+            result: {
+              data: [
+                {
+                  name: "t3-code",
+                  authStatus: "unsupported",
+                  runtimeStatus: "connected",
+                  tools: { card_get: { name: "card_get", inputSchema: {} } },
+                  resources: [],
+                  resourceTemplates: [],
+                },
+              ],
+              nextCursor: null,
+            },
+          },
+        },
+      ];
+      const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId,
+        codexInput: [{ type: "text", text: prompt }],
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        modelSelection: CODEX_TEST_MODEL_SELECTION,
+        hasT3Mcp: true,
+      });
+      let checks = 0;
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "stopped-preparation",
+          entries: [
+            ...preamble.slice(0, 5),
+            ...statusEntries(3),
+            ...statusEntries(4),
+            { type: "expect_outbound", frame: { id: 5, method: "turn/start", params } },
+            withReplayRequestId(preamble[6]!, 5),
+            preamble[7]!,
+          ],
+        }),
+        undefined,
+        (method) =>
+          method === "mcpServerStatus/list" && ++checks === 1
+            ? Deferred.succeed(preparing, undefined).pipe(
+                Effect.andThen(Deferred.await(releasePreparation)),
+              )
+            : Effect.void,
+      );
+      yield* (yield* McpProviderSessions.McpProviderSessions).set({
+        environmentId: EnvironmentId.make("environment-stopped-preparation"),
+        threadId: harness.threadId,
+        providerSessionId: "mcp-stopped-preparation",
+        runtimeProviderSessionId: ProviderSessionId.make("provider-session-stopped-preparation"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer test-token",
+        browserToolsAvailable: true,
+      });
+      const input = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("stopped-preparation"),
+        text: prompt,
+      });
+      const start = yield* harness.runtime.startTurn(input).pipe(Effect.forkScoped);
+      yield* Deferred.await(preparing);
+      yield* harness.runtime.interruptStartingRun!({
+        providerThread: harness.providerThread,
+        runId: input.runId,
+        attemptId: input.attemptId,
+      });
+      yield* Deferred.succeed(releasePreparation, undefined);
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(start)));
+      yield* harness.runtime.startTurn({
+        ...input,
+        attemptId: RunAttemptId.make("new-preparation"),
+      });
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("does not archive a native thread after an explicitly rejected start", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "rejected-start-thread";
+      const nativeTurnId = "retried-start-turn";
+      const prompt = "Work the card.";
+      const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt });
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "rejected-start",
+          entries: [
+            ...preamble.slice(0, -2),
+            {
+              type: "emit_inbound",
+              frame: { id: 3, error: { code: -32000, message: "Start rejected" } },
+            },
+            ...preamble.slice(5, 7).map((entry) => withReplayRequestId(entry, 4)),
+            preamble[7]!,
+          ],
+        }),
+      );
+      const input = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("rejected-start"),
+        text: prompt,
+      });
+      assert.isTrue(Exit.isFailure(yield* harness.runtime.startTurn(input).pipe(Effect.exit)));
+      yield* harness.runtime.startTurn({ ...input, attemptId: RunAttemptId.make("retried-start") });
+      yield* TestClock.adjust("10 seconds");
+      assert.isEmpty(harness.terminalEvents());
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect("delivers Stop for the exact starting attempt from turn/started without a reply", () =>
+    Effect.gen(function* () {
+      const nativeThreadId = "abandoned-notification-thread";
+      const nativeTurnId = "abandoned-notification-turn";
+      const prompt = "Work the card.";
+      const startSent = yield* Deferred.make<void>();
+      const stopSent = yield* Deferred.make<void>();
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: "abandoned-start-notification-only",
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }).slice(0, -2),
+            {
+              type: "emit_inbound",
+              afterMs: 1000,
+              frame: {
+                method: "turn/started",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+                },
+              },
+            },
+            {
+              type: "expect_outbound",
+              frame: {
+                id: 4,
+                method: "turn/interrupt",
+                params: { threadId: nativeThreadId, turnId: nativeTurnId },
+              },
+            },
+            { type: "emit_inbound", frame: { id: 4, result: {} } },
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "interrupted" }),
+                },
+              },
+            },
+          ],
+        }),
+        () => Effect.void,
+        (method) =>
+          method === "turn/start"
+            ? Deferred.succeed(startSent, undefined)
+            : method === "turn/interrupt"
+              ? Deferred.succeed(stopSent, undefined)
+              : Effect.void,
+      );
+      const turnInput = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("abandoned-notification-attempt"),
+        text: prompt,
+      });
+      const start = yield* harness.runtime.startTurn(turnInput).pipe(Effect.forkScoped);
+      yield* Deferred.await(startSent);
+      assert.isDefined(harness.runtime.interruptStartingRun);
+      const stopInput = {
+        providerThread: harness.providerThread,
+        runId: turnInput.runId,
+        attemptId: turnInput.attemptId,
+      };
+      yield* harness.runtime.interruptStartingRun!({
+        ...stopInput,
+        runId: RunId.make("stale-run"),
+      });
+      yield* harness.runtime.interruptStartingRun!({
+        ...stopInput,
+        attemptId: RunAttemptId.make("stale-attempt"),
+      });
+      const stop = yield* harness.runtime.interruptStartingRun!(stopInput).pipe(Effect.forkScoped);
+      yield* TestClock.adjust("1 second");
+      assert.isTrue(yield* Deferred.isDone(stopSent));
+      yield* Fiber.join(stop);
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(start)));
+      assert.isEmpty(harness.terminalEvents());
+      assert.isFalse(harness.events.some((event) => event.type === "provider_turn.updated"));
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each(["thread/archived", "thread/closed", undefined] as const)(
+    "bounds Stop without a native turn id (shutdown=%s)",
+    (shutdown) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "abandoned-missing-id-thread";
+        const nativeTurnId = "abandoned-missing-id-turn";
+        const prompt = "Work the card.";
+        const startSent = yield* Deferred.make<void>();
+        const archiveSent = yield* Deferred.make<void>();
+        const requests: string[] = [];
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: "abandoned-start-missing-id",
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }).slice(0, -2),
+              {
+                type: "expect_outbound",
+                frame: {
+                  id: 4,
+                  method: "thread/archive",
+                  params: { threadId: nativeThreadId },
+                },
+              },
+              { type: "emit_inbound", frame: { id: 4, result: {} } },
+              ...(shutdown !== undefined
+                ? [
+                    {
+                      type: "emit_inbound",
+                      frame: { method: shutdown, params: { threadId: nativeThreadId } },
+                    } satisfies CodexReplay.CodexAppServerReplayEntry,
+                  ]
+                : []),
+            ],
+          }),
+          () => Effect.void,
+          (method) =>
+            Effect.gen(function* () {
+              requests.push(method);
+              if (method === "turn/start") yield* Deferred.succeed(startSent, undefined);
+              if (method === "thread/archive") yield* Deferred.succeed(archiveSent, undefined);
+            }),
+        );
+        const turnInput = makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("abandoned-missing-id-attempt"),
+          text: prompt,
+        });
+        yield* harness.runtime.startTurn(turnInput).pipe(Effect.forkScoped);
+        yield* Deferred.await(startSent);
+        assert.isDefined(harness.runtime.interruptStartingRun);
+        const stop = yield* harness.runtime.interruptStartingRun!({
+          providerThread: harness.providerThread,
+          runId: turnInput.runId,
+          attemptId: turnInput.attemptId,
+        }).pipe(Effect.exit, Effect.forkScoped);
+        yield* TestClock.adjust("10 seconds");
+        assert.isTrue(yield* Deferred.isDone(archiveSent));
+        if (shutdown === undefined) yield* TestClock.adjust("10 seconds");
+        const result = yield* Fiber.join(stop);
+        assert.equal(Exit.isSuccess(result), shutdown !== undefined);
+        assert.deepEqual(requests.slice(2), ["turn/start", "thread/archive"]);
+        assert.isEmpty(harness.terminalEvents());
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    [undefined, true, false].flatMap((first) =>
+      [undefined, true, false].flatMap((second) =>
+        ["missing", "reply", "notification"].map(
+          (nativeIdSource) => [first, second, nativeIdSource] as const,
+        ),
+      ),
+    ),
+  )(
+    "keeps full Stop permission through startup cleanup (first=%s, second=%s, id=%s)",
+    ([first, second, nativeIdSource]) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "startup-stop-permission-thread";
+        const nativeTurnId = "startup-stop-permission-turn";
+        const prompt = "Work the card.";
+        const fullStop = first !== false || second !== false;
+        const startSent = yield* Deferred.make<void>();
+        const cleanupStarted = yield* Deferred.make<void>();
+        const archiveObserved = yield* Deferred.make<void>();
+        const releaseArchive = yield* Deferred.make<void>();
+        const stopFinished = yield* Deferred.make<void>();
+        const requests: Array<{ readonly method: string; readonly params: unknown }> = [];
+        const lateNativeId: Array<CodexReplay.CodexAppServerReplayEntry> =
+          nativeIdSource === "missing"
+            ? []
+            : [
+                {
+                  type: "emit_inbound",
+                  afterMs: 1000,
+                  frame:
+                    nativeIdSource === "reply"
+                      ? {
+                          id: 3,
+                          result: {
+                            turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+                          },
+                        }
+                      : {
+                          method: "turn/started",
+                          params: {
+                            threadId: nativeThreadId,
+                            turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+                          },
+                        },
+                },
+                {
+                  type: "expect_outbound",
+                  frame: {
+                    id: 4,
+                    method: "turn/interrupt",
+                    params: { threadId: nativeThreadId, turnId: nativeTurnId },
+                  },
+                },
+                { type: "emit_inbound", frame: { id: 4, result: {} } },
+              ];
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: "startup-stop-permission",
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }).slice(0, -2),
+              ...lateNativeId,
+              ...(fullStop
+                ? codexShutdownReplay(nativeThreadId, nativeIdSource === "missing" ? 4 : 5)
+                : []),
+            ],
+          }),
+          undefined,
+          (method, params) =>
+            Effect.sync(() => requests.push({ method, params })).pipe(
+              Effect.andThen(
+                method === "turn/start" ? Deferred.succeed(startSent, undefined) : Effect.void,
+              ),
+            ),
+          undefined,
+          undefined,
+          {},
+          undefined,
+          (method) =>
+            method === "thread/archived"
+              ? Deferred.succeed(archiveObserved, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseArchive)),
+                )
+              : Effect.void,
+        );
+        const turnInput = makeCodexTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("startup-stop-permission"),
+          text: prompt,
+        });
+        const stopInput = {
+          providerThread: harness.providerThread,
+          runId: turnInput.runId,
+          attemptId: turnInput.attemptId,
+        };
+        const start = yield* harness.runtime.startTurn(turnInput).pipe(
+          // RunExecutionService cancels startup and cleans up with this weaker permission.
+          Effect.onInterrupt(() =>
+            Deferred.succeed(cleanupStarted, undefined).pipe(
+              Effect.andThen(
+                harness.runtime.interruptStartingRun!({ ...stopInput, stopBackgroundWork: false }),
+              ),
+              Effect.exit,
+              Effect.asVoid,
+            ),
+          ),
+          Effect.exit,
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(startSent);
+        const stops = yield* Effect.forEach([first, second], (stopBackgroundWork) =>
+          harness.runtime.interruptStartingRun!({
+            ...stopInput,
+            ...(stopBackgroundWork === undefined ? {} : { stopBackgroundWork }),
+          }).pipe(
+            Effect.exit,
+            Effect.tap(() => Deferred.succeed(stopFinished, undefined)),
+            Effect.forkScoped({ startImmediately: true }),
+          ),
+        );
+        yield* Deferred.await(cleanupStarted);
+        yield* TestClock.adjust("10 seconds");
+        if (fullStop) {
+          yield* Deferred.await(archiveObserved);
+          assert.isFalse(
+            yield* Deferred.isDone(stopFinished),
+            "Archive acknowledgement is insufficient",
+          );
+          assert.deepEqual(
+            requests.filter(({ method }) => method === "thread/archive"),
+            [{ method: "thread/archive", params: { threadId: nativeThreadId } }],
+          );
+          yield* Deferred.succeed(releaseArchive, undefined);
+        } else {
+          assert.isFalse(requests.some(({ method }) => method === "thread/archive"));
+        }
+        assert.deepEqual(
+          requests.filter(({ method }) => method === "turn/interrupt"),
+          nativeIdSource === "missing"
+            ? []
+            : [
+                {
+                  method: "turn/interrupt",
+                  params: { threadId: nativeThreadId, turnId: nativeTurnId },
+                },
+              ],
+        );
+        for (const stop of stops) assert.equal(Exit.isSuccess(yield* Fiber.join(stop)), fullStop);
+        assert.isTrue(Exit.isFailure(yield* Fiber.join(start)));
+        assert.isEmpty(harness.terminalEvents(), "An abandoned native start is never adopted");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    [true, false].flatMap((reply) =>
+      ["thread/archived", "thread/closed", "turn/completed"].map(
+        (shutdown) => [reply, shutdown] as const,
+      ),
+    ),
+  )(
+    "requires native shutdown after an unconfirmed interrupt (reply=%s, shutdown=%s)",
+    ([reply, shutdown]) =>
+      Effect.gen(function* () {
+        const nativeThreadId = `unconfirmed-interrupt-thread-${reply}`;
+        const nativeTurnId = `unconfirmed-interrupt-turn-${reply}`;
+        const prompt = "Work the card.";
+        const interruptSent = yield* Deferred.make<void>();
+        const archiveSent = yield* Deferred.make<void>();
+        const shutdownObserved = yield* Deferred.make<void>();
+        const releaseShutdown = yield* Deferred.make<void>();
+        const stopFinished = yield* Deferred.make<void>();
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: `unconfirmed-interrupt-${reply}`,
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }),
+              {
+                type: "expect_outbound",
+                frame: {
+                  id: 4,
+                  method: "turn/interrupt",
+                  params: { threadId: nativeThreadId, turnId: nativeTurnId },
+                },
+              },
+              ...(reply ? [{ type: "emit_inbound" as const, frame: { id: 4, result: {} } }] : []),
+              {
+                type: "expect_outbound",
+                frame: {
+                  id: 5,
+                  method: "thread/archive",
+                  params: { threadId: nativeThreadId },
+                },
+              },
+              { type: "emit_inbound", frame: { id: 5, result: {} } },
+              {
+                type: "emit_inbound",
+                frame: {
+                  method: shutdown,
+                  params: {
+                    threadId: nativeThreadId,
+                    ...(shutdown === "turn/completed"
+                      ? { turn: makeCodexReplayTurn({ id: nativeTurnId, status: "interrupted" }) }
+                      : {}),
+                  },
+                },
+              },
+            ],
+          }),
+          () => Effect.void,
+          (method) =>
+            method === "turn/interrupt"
+              ? Deferred.succeed(interruptSent, undefined)
+              : method === "thread/archive"
+                ? Deferred.succeed(archiveSent, undefined)
+                : Effect.void,
+          undefined,
+          undefined,
+          {},
+          undefined,
+          (method) =>
+            method === shutdown
+              ? Deferred.succeed(shutdownObserved, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseShutdown)),
+                )
+              : Effect.void,
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make(`unconfirmed-interrupt-attempt-${reply}`),
+            text: prompt,
+          }),
+        );
+        const providerTurnId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+          nativeTurnId,
+        });
+        const interrupt = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId,
+          })
+          .pipe(Effect.ensuring(Deferred.succeed(stopFinished, undefined)), Effect.forkScoped);
+        yield* Deferred.await(interruptSent);
+        yield* TestClock.adjust("10 seconds");
+        assert.isTrue(yield* Deferred.isDone(archiveSent));
+        yield* Deferred.await(shutdownObserved);
+        assert.isFalse(
+          yield* Deferred.isDone(stopFinished),
+          "Archive acknowledgement is insufficient",
+        );
+        assert.isEmpty(harness.terminalEvents(), "An interrupt reply is not native shutdown");
+        yield* Deferred.succeed(releaseShutdown, undefined);
+        yield* Fiber.join(interrupt);
+        yield* harness.firstTerminal;
+        assert.equal(harness.terminalEvents()[0]?.status, "interrupted");
+        assert.lengthOf(harness.terminalEvents(), 1);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(["thread/archived", "thread/closed", "turn/completed"] as const)(
+    "does not confirm Stop from another native thread (%s)",
+    (shutdown) =>
+      Effect.gen(function* () {
+        const nativeThreadId = "unconfirmed-shutdown-thread";
+        const nativeTurnId = "unconfirmed-shutdown-turn";
+        const prompt = "Work the card.";
+        const interruptSent = yield* Deferred.make<void>();
+        const archiveSent = yield* Deferred.make<void>();
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: "unconfirmed-shutdown",
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }),
+              {
+                type: "expect_outbound",
+                frame: {
+                  id: 4,
+                  method: "turn/interrupt",
+                  params: { threadId: nativeThreadId, turnId: nativeTurnId },
+                },
+              },
+              { type: "emit_inbound", frame: { id: 4, result: {} } },
+              {
+                type: "expect_outbound",
+                frame: {
+                  id: 5,
+                  method: "thread/archive",
+                  params: { threadId: nativeThreadId },
+                },
+              },
+              { type: "emit_inbound", frame: { id: 5, result: {} } },
+              {
+                type: "emit_inbound",
+                frame: {
+                  method: shutdown,
+                  params: {
+                    threadId: "unrelated-thread",
+                    ...(shutdown === "turn/completed"
+                      ? {
+                          turn: makeCodexReplayTurn({
+                            id: "unrelated-turn",
+                            status: "interrupted",
+                          }),
+                        }
+                      : {}),
+                  },
+                },
+              },
+            ],
+          }),
+          () => Effect.void,
+          (method) =>
+            method === "turn/interrupt"
+              ? Deferred.succeed(interruptSent, undefined)
+              : method === "thread/archive"
+                ? Deferred.succeed(archiveSent, undefined)
+                : Effect.void,
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("unconfirmed-shutdown-attempt"),
+            text: prompt,
+          }),
+        );
+        const providerTurnId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+          driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+          nativeTurnId,
+        });
+        const interrupt = yield* harness.runtime
+          .interruptTurn({
+            providerThread: harness.providerThread,
+            providerTurnId,
+          })
+          .pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(interruptSent);
+        yield* TestClock.adjust("10 seconds");
+        assert.isTrue(yield* Deferred.isDone(archiveSent));
+        yield* TestClock.adjust("10 seconds");
+        const result = yield* Fiber.join(interrupt);
+        assert.isTrue(Exit.isFailure(result));
+        if (Exit.isFailure(result)) {
+          const error = Cause.squash(result.cause);
+          assert.isTrue(
+            Predicate.isObject(error) && error._tag === "ProviderAdapterInterruptError",
+          );
+        }
+        assert.isEmpty(harness.terminalEvents());
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 
   it.effect("settles Stop when a queued native turn fails before starting", () =>
@@ -5085,6 +5824,151 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),
+      ),
+    ),
+  );
+
+  it.effect.each(
+    (["before-reply", "after-reply"] as const).flatMap((phase) =>
+      (["turn", "archive", "unconfirmed"] as const).map(
+        (confirmation) => [phase, confirmation] as const,
+      ),
+    ),
+  )("confirms Stop during compaction start (%s, %s)", ([phase, confirmation]) =>
+    Effect.gen(function* () {
+      const nativeThreadId = "stopped-compact-thread";
+      const nativeTurnId = "stopped-compact-turn";
+      const reachedWindow = yield* Deferred.make<void>();
+      const releaseTurnId = yield* Deferred.make<void>();
+      const requests: string[] = [];
+      const nativeStartFiber = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+      const reply: CodexReplay.CodexAppServerReplayEntry = {
+        type: "emit_inbound",
+        frame: { id: 3, result: {} },
+      };
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: `stopped-compact-${phase}-${confirmation}`,
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "unused" }).slice(0, 5),
+            {
+              type: "expect_outbound",
+              frame: {
+                id: 3,
+                method: "thread/compact/start",
+                params: { threadId: nativeThreadId },
+              },
+            },
+            ...(phase === "after-reply" ? [reply] : []),
+            {
+              type: "emit_inbound",
+              frame: { method: "thread/goal/cleared", params: { threadId: nativeThreadId } },
+            },
+            ...(confirmation === "turn"
+              ? [
+                  {
+                    type: "emit_inbound" as const,
+                    frame: {
+                      method: "turn/started",
+                      params: {
+                        threadId: nativeThreadId,
+                        turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+                      },
+                    },
+                  },
+                  {
+                    type: "expect_outbound" as const,
+                    frame: {
+                      id: 4,
+                      method: "turn/interrupt",
+                      params: { threadId: nativeThreadId, turnId: nativeTurnId },
+                    },
+                  },
+                  { type: "emit_inbound" as const, frame: { id: 4, result: {} } },
+                  {
+                    type: "emit_inbound" as const,
+                    frame: {
+                      method: "turn/completed",
+                      params: {
+                        threadId: nativeThreadId,
+                        turn: makeCodexReplayTurn({ id: nativeTurnId, status: "interrupted" }),
+                      },
+                    },
+                  },
+                ]
+              : codexShutdownReplay(nativeThreadId, 4).slice(
+                  0,
+                  confirmation === "archive" ? undefined : 2,
+                )),
+            ...(phase === "before-reply" ? [reply] : []),
+          ],
+        }),
+        undefined,
+        (method) =>
+          Effect.sync(() => {
+            requests.push(method);
+          }).pipe(
+            Effect.andThen(
+              method === "thread/compact/start"
+                ? Effect.withFiber((fiber) => Deferred.succeed(nativeStartFiber, fiber)).pipe(
+                    Effect.asVoid,
+                  )
+                : Effect.void,
+            ),
+          ),
+        undefined,
+        undefined,
+        {},
+        undefined,
+        (method) =>
+          method === "thread/goal/cleared"
+            ? Deferred.succeed(reachedWindow, undefined).pipe(Effect.asVoid)
+            : method === "turn/started"
+              ? Deferred.await(releaseTurnId)
+              : Effect.void,
+      );
+      const input = makeCodexTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("stopped-compact-attempt"),
+        text: "/compact",
+      });
+      const compact = yield* harness.runtime.compactThread!(input).pipe(
+        Effect.exit,
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(reachedWindow);
+      const stop = yield* harness.runtime.interruptStartingRun!({
+        providerThread: harness.providerThread,
+        runId: input.runId,
+        attemptId: input.attemptId,
+      }).pipe(Effect.exit, Effect.forkScoped({ startImmediately: true }));
+      yield* Deferred.succeed(releaseTurnId, undefined);
+      if (confirmation !== "turn") yield* TestClock.adjust("10 seconds");
+      if (confirmation === "unconfirmed") yield* TestClock.adjust("10 seconds");
+      assert.equal(Exit.isSuccess(yield* Fiber.join(stop)), confirmation !== "unconfirmed");
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(compact)));
+      const ownedStart = yield* Deferred.await(nativeStartFiber);
+      if (confirmation === "unconfirmed") {
+        assert.isUndefined(
+          ownedStart.pollUnsafe(),
+          "Unconfirmed Stop retains native-start ownership",
+        );
+      } else {
+        const nativeExit = yield* Fiber.await(ownedStart);
+        assert.equal(Exit.isFailure(nativeExit), confirmation === "archive");
+      }
+      assert.deepEqual(requests.slice(2), [
+        "thread/compact/start",
+        confirmation === "turn" ? "turn/interrupt" : "thread/archive",
+      ]);
+      assert.isEmpty(harness.terminalEvents());
+      assert.isFalse(harness.events.some((event) => event.type === "provider_turn.updated"));
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
       ),
     ),
   );
@@ -7194,9 +8078,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
-  it.effect.each([false, true])(
-    "keeps commands interrupted after native thread closure (persistent tool: %s)",
-    (retainContext) =>
+  it.effect.each(
+    [false, true].flatMap((retainContext) =>
+      ["thread/closed", "thread/archived"].map((shutdown) => [retainContext, shutdown] as const),
+    ),
+  )(
+    "keeps commands interrupted after native shutdown (persistent tool: %s, shutdown=%s)",
+    ([retainContext, shutdown]) =>
       Effect.gen(function* () {
         const notification = (method: string, params: unknown) => ({
           type: "emit_inbound" as const,
@@ -7230,7 +8118,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             frame: { id, result: { status: "notSubscribed" } },
           },
         ];
-        const closed = notification("thread/closed", { threadId: BG_NATIVE_THREAD });
+        const closed = notification(shutdown, { threadId: BG_NATIVE_THREAD });
         const transcript = makeCodexReplayTranscript({
           scenario: `codex-background-thread-closed-${retainContext}`,
           entries: [
@@ -7238,7 +8126,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ...(retainContext ? [monitor("inProgress")] : []),
             backgroundExecTranscript.entries.at(-2)!,
             ...unsubscribe(4),
-            ...unsubscribe(5, [notification("thread/closed", { threadId: "unrelated-thread" })]),
+            ...unsubscribe(5, [notification(shutdown, { threadId: "unrelated-thread" })]),
             ...unsubscribe(6, [closed]),
             ...unsubscribe(7, [
               closed,
@@ -8949,56 +9837,64 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ],
   });
 
-  it.effect("settles a failed root without waiting for subagents that keep running", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const harness = yield* makeCodexReplayHarness(failedRootLiveChildTranscript);
-        const now = yield* DateTime.now;
-        const childTurnCompleted = () =>
-          harness.events.some(
-            (event) =>
-              event.type === "provider_turn.updated" &&
-              event.threadId !== harness.threadId &&
-              event.providerTurn.status === "completed",
+  it.effect.each(["turn", "startingRun"] as const)(
+    "settles a failed root with live subagents (Stop=%s)",
+    (stopMethod) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeCodexReplayHarness(failedRootLiveChildTranscript);
+          const now = yield* DateTime.now;
+          const childTurnCompleted = () =>
+            harness.events.some(
+              (event) =>
+                event.type === "provider_turn.updated" &&
+                event.threadId !== harness.threadId &&
+                event.providerTurn.status === "completed",
+            );
+
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("attempt-codex-failed-root-live-subagent"),
+              text: INTERRUPT_PROMPT,
+            }),
+          );
+          yield* awaitUntil(() => harness.terminalEvents().length === 1, "failed root terminal");
+
+          const terminal = harness.terminalEvents()[0];
+          assert.equal(terminal?.status, "failed");
+          assert.isTrue(terminal?.status === "failed" && terminal.childTurnsContinue === true);
+          assert.isFalse(childTurnCompleted(), "the subagent is still running");
+          if (terminal?.status !== "failed") return;
+          const stop = yield* Effect.exit(
+            stopMethod === "startingRun"
+              ? harness.runtime.interruptStartingRun!({
+                  providerThread: harness.providerThread,
+                  runId: RunId.make("run-attempt-codex-failed-root-live-subagent"),
+                  attemptId: RunAttemptId.make("attempt-codex-failed-root-live-subagent"),
+                })
+              : harness.runtime.interruptTurn({
+                  providerThread: harness.providerThread,
+                  providerTurnId: terminal.providerTurnId,
+                }),
+          );
+          assert.equal(
+            stop._tag,
+            "Failure",
+            "An ended parent alone cannot confirm its live child's Stop",
           );
 
-        yield* harness.runtime.startTurn(
-          makeCodexTestTurnInput({
-            threadId: harness.threadId,
-            providerThread: harness.providerThread,
-            now,
-            attemptId: RunAttemptId.make("attempt-codex-failed-root-live-subagent"),
-            text: INTERRUPT_PROMPT,
-          }),
-        );
-        yield* awaitUntil(() => harness.terminalEvents().length === 1, "failed root terminal");
-
-        const terminal = harness.terminalEvents()[0];
-        assert.equal(terminal?.status, "failed");
-        assert.isTrue(terminal?.status === "failed" && terminal.childTurnsContinue === true);
-        assert.isFalse(childTurnCompleted(), "the subagent is still running");
-        if (terminal?.status !== "failed") return;
-        const stop = yield* Effect.exit(
-          harness.runtime.interruptTurn({
-            providerThread: harness.providerThread,
-            providerTurnId: terminal.providerTurnId,
-          }),
-        );
-        assert.equal(
-          stop._tag,
-          "Failure",
-          "An ended parent alone cannot confirm its live child's Stop",
-        );
-
-        yield* TestClock.adjust("30 seconds");
-        yield* awaitUntil(childTurnCompleted, "subagent turn completion");
-        assert.lengthOf(harness.terminalEvents(), 1);
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          yield* TestClock.adjust("30 seconds");
+          yield* awaitUntil(childTurnCompleted, "subagent turn completion");
+          assert.lengthOf(harness.terminalEvents(), 1);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
         ),
       ),
-    ),
   );
 
   const childTerminationResponseIndex = interruptSubagentCommandTranscript.entries.findIndex(
@@ -9026,6 +9922,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           },
         },
       },
+      ...codexShutdownReplay(INTERRUPT_NATIVE_THREAD, 7),
+      ...codexShutdownReplay(INTERRUPT_CHILD_NATIVE_THREAD, 8),
     ],
   });
 
@@ -9132,6 +10030,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         label: "turn/interrupt/late-child",
         frame: { id: 7, result: {} },
       },
+      ...codexShutdownReplay(INTERRUPT_CHILD_NATIVE_THREAD, 8),
       { type: "runtime_exit", status: "success" },
     ],
   });
@@ -9274,6 +10173,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         label: "turn/interrupt/late-child-2",
         frame: { id: 8, result: {} },
       },
+      ...codexShutdownReplay(INTERRUPT_NATIVE_THREAD, 9),
+      ...codexShutdownReplay(INTERRUPT_CHILD_NATIVE_THREAD, 10),
       { type: "runtime_exit", status: "success" },
     ],
   });
@@ -9468,11 +10369,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           },
         },
       },
+      ...codexShutdownReplay(INTERRUPT_NATIVE_THREAD, 6),
       {
         type: "expect_outbound",
         label: "thread/backgroundTerminals/terminate/two",
         frame: {
-          id: 6,
+          id: 7,
           method: "thread/backgroundTerminals/terminate",
           params: { threadId: INTERRUPT_NATIVE_THREAD, processId: "57681" },
         },
@@ -9480,7 +10382,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       {
         type: "emit_inbound",
         label: "thread/backgroundTerminals/terminate/two",
-        frame: { id: 6, result: { terminated: true } },
+        frame: { id: 7, result: { terminated: true } },
       },
       {
         type: "emit_inbound",

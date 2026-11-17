@@ -4858,6 +4858,10 @@ it.effect(
         assert.include(error.detail, "may have been applied");
         assert.lengthOf(fake.interrupted, 1);
         const id = [...(yield* Ref.get(fake.threads)).keys()][0]!;
+        assert.deepEqual(fake.interrupted, [id]);
+        assert.deepEqual(fake.interruptSources, [
+          { threadId: ThreadId.make(id), cancelReason: "superseded" },
+        ]);
         assert.isTrue((yield* Ref.get(fake.threads)).get(id)!.running);
         assert.isNotNull((yield* kanban.caller(ThreadId.make(id)))?.endedAt);
       }).pipe(Effect.provide(inlineTestLayer(delayed)));
