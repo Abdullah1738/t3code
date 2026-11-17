@@ -824,6 +824,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "runtime_mode_escalation_denied",
       "interaction_mode_escalation_denied",
       "task_not_found",
+      "task_record_missing",
       "task_creating",
       "task_not_cancellable",
       "thread_not_found",

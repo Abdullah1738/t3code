@@ -456,6 +456,10 @@ const GeneralEvent = Schema.Struct({
         ]),
       ),
       idCanonical: Schema.optionalKey(Schema.Boolean),
+      commandId: Schema.optionalKey(DerivedId),
+      taskId: Schema.optionalKey(DerivedId),
+      receiptState: Schema.optionalKey(Schema.Literal("accepted")),
+      missingLookup: Schema.optionalKey(Schema.Literals(["subagents", "child_thread_id"])),
       dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
       idShape: Schema.optionalKey(
         Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),

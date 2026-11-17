@@ -543,11 +543,14 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
             : ["task_status"];
       for (const name of names) {
         const creating =
-          name === "task_status" &&
-          "reason" in testCase &&
-          (testCase.reason === "pending" || testCase.reason === "accepted");
+          name === "task_status" && "reason" in testCase && testCase.reason === "pending";
+        const recordMissing =
+          "state" in testCase &&
+          testCase.state === "accepted" &&
+          !("foreign" in testCase) &&
+          !("wrongCommand" in testCase);
         const cancelRegistration =
-          name === "task_cancel" && "cancelRegistration" in testCase
+          !recordMissing && name === "task_cancel" && "cancelRegistration" in testCase
             ? testCase.cancelRegistration
             : undefined;
         const cancelPending = cancelRegistration === "cancel_pending";
@@ -594,9 +597,11 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
             : cancelCapacity
               ? "task_not_cancellable"
               : "reason" in testCase
-                ? creating
-                  ? "task_creating"
-                  : "task_not_found"
+                ? recordMissing
+                  ? "task_record_missing"
+                  : creating
+                    ? "task_creating"
+                    : "task_not_found"
                 : "error" in testCase
                   ? testCase.error
                   : "invalid" in testCase
@@ -614,7 +619,15 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
                   : "interrupted",
           );
         expect(isAnalyticsEvent(row)).toBe(true);
-        expect(JSON.stringify(row.props)).not.toMatch(/private|command:|node:|clientRequestId/);
+        if (recordMissing) {
+          expect(row.props).toMatchObject({
+            commandId: lookupCommand,
+            taskId: lookupId,
+            receiptState: "accepted",
+            missingLookup: "noChild" in testCase ? "child_thread_id" : "subagents",
+          });
+        } else
+          expect(JSON.stringify(row.props)).not.toMatch(/private|command:|node:|clientRequestId/);
         if (!("reason" in testCase)) expect(row.props).not.toHaveProperty("notFoundReason");
         if ("reason" in testCase) {
           expect(row.outcome).toBe(cancelPending ? "ok" : "error");
@@ -623,12 +636,18 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
               ? "unknown"
               : cancelCapacity
                 ? "task_not_cancellable"
-                : creating
-                  ? "task_creating"
-                  : "task_not_found",
+                : recordMissing
+                  ? "task_record_missing"
+                  : creating
+                    ? "task_creating"
+                    : "task_not_found",
           );
           expect(row.reasonClass).toBe(
-            cancelPending ? undefined : creating || cancelCapacity ? "other" : "not_found",
+            cancelPending
+              ? undefined
+              : creating || cancelCapacity || recordMissing
+                ? "other"
+                : "not_found",
           );
           if (cancelPending) {
             expect(response?.isError).not.toBe(true);
@@ -654,11 +673,13 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
               : "Expected the taskId returned by delegate_task.",
           );
           expect(text).not.toContain("id" in testCase ? testCase.id : lookupId);
-          expect(text.includes("No delegated task has this id.")).toBe(!creating);
+          expect(text.includes("No delegated task has this id.")).toBe(!creating && !recordMissing);
           if (creating) expect(row.props?.code).toBe("task_creating");
         }
       }
-      expect(cancelRequests).toEqual("cancelRegistration" in testCase ? [lookupCommand] : []);
+      expect(cancelRequests).toEqual(
+        "cancelRegistration" in testCase && testCase.state === "pending" ? [lookupCommand] : [],
+      );
       if ("ack" in testCase) {
         yield* Deferred.await(acknowledged);
         expect(acknowledgements).toBe(1);
