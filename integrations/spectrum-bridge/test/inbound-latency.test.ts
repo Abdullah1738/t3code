@@ -7,7 +7,13 @@ import type { ChatContext } from "../src/chats.ts";
 import type { NormalizedInbound } from "../src/photon.ts";
 import { toolLog } from "../src/toollog.ts";
 import { captureReadTiming, completionChecked, includeReadTiming, startTickRead, tickRead, timeTick } from "../src/tick-timing.ts";
-import { ControlClient } from "../src/control.ts";
+import { RobobBackend } from "../src/robob.ts";
+import { ProbeBudget } from "../src/probe-policy.ts";
+import * as preferences from "../src/preferred-model.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ControlClient, ControlError } from "../src/control.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { FAILED_INBOUND_REPLAY_MAX_AGE_MS } from "../src/inbound-failure.ts";
 
@@ -21,7 +27,7 @@ class Backend extends OpenChamber {
   records: MessageRecord[] = [];
   unavailable = false;
   constructor() { super("http://127.0.0.1:1"); }
-  override async request<T>(): Promise<T | undefined> { throw new Error("Unexpected backend call"); }
+  override async request<T>(..._args: Parameters<OpenChamber["request"]>): Promise<T | undefined> { throw new Error("Unexpected backend call"); }
   override async createChat() { return { id: "ses_1", directory: "/Chats/ses_1" } as SessionRecord; }
   override async isSessionAutoAccepting() { return false; }
   override async permissions() { return []; }
@@ -31,7 +37,9 @@ class Backend extends OpenChamber {
   override async getSession(id: string, directory: string) { return { id, directory, title: "Chat", time: { created: now, updated: now } } as SessionRecord; }
   override async messages() { return this.records; }
   override async promptAccepted(_id: string, _dir: string, id: string) { return this.records.some(r => r.id === id && r.type === "user"); }
-  override async prompt(_id: string, _dir: string, id: string, text: string) {
+  override async prompt(...args: Parameters<OpenChamber["prompt"]>) {
+    const [_id, _dir, id, text, , , , , beforeSend] = args;
+    beforeSend?.();
     this.prompts.push(id);
     this.targets.push(_id);
     if (this.unavailable) throw new Error("unavailable");
@@ -40,9 +48,9 @@ class Backend extends OpenChamber {
 }
 const stores: Store[] = [];
 afterEach(() => { stores.splice(0).forEach(s => s.close()); setSystemTime(); });
-function setup(slug = "owner", overrides: Partial<ConstructorParameters<typeof Router>[3]> = {}) {
+function setup(slug = "owner", overrides: Partial<ConstructorParameters<typeof Router>[3]> = {}, path = ":memory:") {
   setSystemTime(now);
-  const store = new Store(":memory:"); stores.push(store);
+  let store = new Store(path); stores.push(store);
   const backend = new Backend();
   const logs: string[] = [], alerts: string[] = [];
   const ctx: ChatContext = {
@@ -50,14 +58,20 @@ function setup(slug = "owner", overrides: Partial<ConstructorParameters<typeof R
     roleOf: () => ({ role: "admin", name: slug }), typing: () => false, react: async () => {},
   };
   if (slug === "owner") ctx.chat.kind = "owner";
-  const router = new Router(store, backend, { read: async () => {}, typing: async () => {}, downloadAttachment: async () => { throw new Error("unexpected file"); } }, {
+  const makeRouter = () => new Router(store, backend, { read: async () => {}, typing: async () => {}, downloadAttachment: async () => { throw new Error("unexpected file"); } }, {
     owner: "+15555550123", chatGuid: ctx.chat.key, timezone: "Asia/Dubai", skillPath: "/test/imessage/SKILL.md",
     alertSkillPath: "/test/telegram/SKILL.md", alertSocketPath: "/test/telegram.sock", openCodeConfigRoot: "/nonexistent/config", quietMs: 0,
     context: ctx, log: (event, code) => logs.push(`${event} ${code ?? ""}`), notifyFailure: async (_text, key) => { alerts.push(key); return true; }, ...overrides,
   });
+  const router = makeRouter();
+  const restart = () => {
+    stores.splice(stores.indexOf(store), 1); store.close();
+    store = new Store(path); stores.push(store);
+    return makeRouter();
+  };
   const input = (id: string, age = 120_000) => store.acceptInbound(id, { id, text: id, source: "typed", attachments: [], isAudioMessage: false, receivedAt: now - age } satisfies NormalizedInbound);
   const states = () => store.db.query<{ state: string }, []>("SELECT state FROM inbound ORDER BY rowid").all().map(r => r.state);
-  return { store, backend, router, input, states, logs, alerts, ctx };
+  return { get store() { return store; }, backend, router, input, states, logs, alerts, ctx, restart, makeRouter };
 }
 
 function stalledProbe(id = "stalled", age = 120_000, earlier: string[] = []) {
@@ -104,6 +118,7 @@ test("replay catch records safe probe positions and a stable hashed row ref", as
   });
   const catches = rows.filter(row => row.error?.tag === "router.catch1");
   expect(catches).toHaveLength(2);
+  expect(rows.filter(row => row.name === "router.probe_backoff").map(row => row.props?.waitMs)).toEqual([60_000, 120_000]);
   for (const row of catches) expect(row).toMatchObject({
     ids: { inboundId: `row_${createHash("sha256").update(id).digest("hex").slice(0, 16)}` },
     props: { probeIndex: 0, probeCount: 2 }, error: { name: "TimeoutError", code: "timeout", causeKey: "code.timeout" },
@@ -111,17 +126,16 @@ test("replay catch records safe probe positions and a stable hashed row ref", as
   expect(JSON.stringify(rows)).not.toMatch(/PRIVATE|971501234567|\/Users\/private|https:\/\//);
 });
 
-test("a non-timeout probe error still checks earlier ids without backing off", async () => {
+test("a non-timeout probe error cools the leader and all earlier ids", async () => {
   const h = stalledProbe("stalled", 120_000, ["earlier"]);
   const probes: string[] = [];
-  h.backend.promptAccepted = async (_session, _dir, id) => {
-    probes.push(id);
-    if (id === hash("stalled")) throw new Error("backend error");
-    return false;
-  };
+  h.backend.promptAccepted = async (_session, _dir, id) => { probes.push(id); throw new ControlError(503); };
   await h.router.checkInboundLatency();
   setSystemTime(now + 1_000); await h.router.checkInboundLatency();
-  expect(probes).toEqual([hash("stalled"), "earlier", hash("stalled"), "earlier"]);
+  expect(probes).toEqual([hash("stalled")]);
+  setSystemTime(now + 60_000); await h.router.checkInboundLatency();
+  expect(probes).toEqual([hash("stalled"), hash("stalled")]);
+  expect(h.backend.prompts).toEqual([]);
 });
 
 test("a cooling row does not block a different row's acceptance", async () => {
@@ -154,7 +168,7 @@ test("backoff leaves stuck-wake alerts active for every sealed member", async ()
   expect(h.states()).toEqual(["processing", "batched"]);
 });
 
-test("backoff ends before the replay horizon and an absent row still replays", async () => {
+test("near-deadline probes respect the full cooldown before an absent row replays", async () => {
   const h = stalledProbe("deadline", FAILED_INBOUND_REPLAY_MAX_AGE_MS - 10 * 60_000 - 30_000);
   let probes = 0;
   let failing = true;
@@ -162,12 +176,12 @@ test("backoff ends before the replay horizon and an absent row still replays", a
   await h.router.checkInboundLatency();
   setSystemTime(now + 29_000); await h.router.checkInboundLatency();
   expect(probes).toBe(1);
-  // The nominal minute backoff is cut short at ten minutes before expiry.
+  // Crossing into the final ten minutes cannot shorten a failed read cooldown.
   setSystemTime(now + 30_000); await h.router.checkInboundLatency();
-  expect(probes).toBe(2);
+  expect(probes).toBe(1);
   failing = false;
-  setSystemTime(now + 31_000); await h.router.checkInboundLatency();
-  expect(probes).toBeGreaterThan(2);
+  setSystemTime(now + 60_000); await h.router.checkInboundLatency();
+  expect(probes).toBe(2);
   expect(h.states()).toEqual(["done"]);
   expect(h.backend.prompts).toEqual([hash("deadline")]);
 });
@@ -334,7 +348,7 @@ test.each(["read-error", "active-turn"])("requesting a wake retry does not spend
   await h.router.checkInboundLatency(); expect(h.backend.prompts).toEqual([]);
   expect(h.store.get("stuck-wake-attempt:wake:blocked")).toBeUndefined();
   h.backend.promptAccepted = async () => false; h.store.set("activeTurn", null);
-  setSystemTime(now + 1000); await h.router.checkInboundLatency();
+  setSystemTime(now + (blocked === "read-error" ? 60_000 : 1000)); await h.router.checkInboundLatency();
   expect(h.backend.prompts).toEqual([hash("wake:blocked")]); expect(h.backend.targets).toEqual(["ses_original"]);
 });
 
@@ -351,7 +365,7 @@ class Backend extends OpenChamber {
   lookup?: (session: string, id: string) => Promise<boolean>;
   unavailable = false;
   constructor() { super('http://127.0.0.1:1'); }
-  override async request<T>(): Promise<T | undefined> { throw new Error('Unexpected backend call'); }
+  override async request<T>(..._args: Parameters<OpenChamber["request"]>): Promise<T | undefined> { throw new Error('Unexpected backend call'); }
   override async createChat() { this.creates++; return { id: `ses_new_${this.creates}`, directory: '/Chats/new' } as SessionRecord; }
   override async isSessionAutoAccepting() { return false; }
   override async permissions() { return []; }
@@ -361,7 +375,9 @@ class Backend extends OpenChamber {
   override async getSession(id: string, directory: string) { return { id, directory, title: 'Chat', time: { created: stamp, updated: stamp } } as SessionRecord; }
   override async messages() { return this.records; }
   override async promptAccepted(session: string, _dir: string, id: string) { return this.lookup ? this.lookup(session, id) : this.records.some(r => r.id === id && r.type === 'user'); }
-  override async prompt(session: string, _dir: string, id: string, text: string) {
+  override async prompt(...args: Parameters<OpenChamber["prompt"]>) {
+    const [session, _dir, id, text, , , , , beforeSend] = args;
+    beforeSend?.();
     this.prompts.push({ session, id });
     if (this.unavailable) throw new Error('unavailable');
     this.records.push({ id, type: 'user', text, time: { created: Date.now() } });
@@ -887,3 +903,437 @@ test.each(["owner", "moni"].flatMap(slug => [true, false].map(bus => ({ slug, bu
     expect(h.backend.prompts).toEqual([]);
   },
 );
+
+test.each([
+  ["router timeout", () => probeTimeout()], ["HTTP 503", () => new ControlError(503)],
+  ["network ControlError", () => new ControlError(0)], ["other HTTP error", () => new ControlError(409)],
+  ["generic read failure", () => new Error("failed read")],
+] as const)("%s cooldown persists across store reopen, requeue, and timer paths", async (_name, error) => {
+  const root = mkdtempSync(join(tmpdir(), "probe-restart-"));
+  let h: ReturnType<typeof setup> | undefined;
+  try {
+    h = setup("owner", {}, join(root, "test.sqlite")); h.input("leader");
+    const turn = { id: "ses_original", directory: "/Chats/ses_original", generation: 1,
+      inboundId: "leader", messageId: hash("leader"), startedAt: now - 120_000, phase: "unknown" };
+    h.store.set("route", turn); h.store.set("failed-delivery:leader", turn); h.store.updateInbound("leader", "processing");
+    let probes = 0;
+    h.backend.promptAccepted = async () => { probes++; throw error(); };
+    await h.router.checkInboundLatency(); const restarted = h.restart();
+    for (const at of [1_000, 30_000, 59_000]) {
+      setSystemTime(now + at); restarted.requeueHuman("leader", "watchdog_overdue");
+      await restarted.checkInboundLatency(); await restarted.checkFailedInbound(); await restarted.tick();
+      expect(probes).toBe(1); expect(h.backend.prompts).toEqual([]);
+    }
+    h.backend.promptAccepted = async () => { probes++; return true; };
+    setSystemTime(now + 60_000); await restarted.checkInboundLatency();
+    expect(probes).toBe(2); expect(h.states()).toEqual(["done"]); expect(h.backend.prompts).toEqual([]);
+  } finally {
+    if (h) { stores.splice(stores.indexOf(h.store), 1); h.store.close(); }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fourteen fresh failures probe at their deadline despite an exhausted retry budget", async () => {
+  const h = setup(); const budget = new ProbeBudget(h.store);
+  for (let i = 0; i < 60; i++) expect(budget.take()).toBe(true);
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 }; h.store.set("route", route);
+  const starts: number[] = [];
+  for (let i = 0; i < 14; i++) {
+    const id = `leader-${i}`; h.input(id);
+    h.store.set(`failed-delivery:${id}`, { ...route, inboundId: id, messageId: hash(id), startedAt: now - 120_000, phase: "unknown" });
+    h.store.updateInbound(id, "processing");
+  }
+  h.backend.promptAccepted = async () => { starts.push(Date.now()); throw new ControlError(503); };
+  await h.router.checkInboundLatency(); expect(starts).toEqual(Array(14).fill(now));
+  for (let second = 1; second < 60; second++) {
+    setSystemTime(now + second * 1_000); await h.router.checkInboundLatency(); await h.router.tick();
+  }
+  expect(starts).toHaveLength(14); expect(h.backend.prompts).toEqual([]);
+});
+
+test("fourteen ten-second timeout probes stay within sixty starts per rolling minute", async () => {
+  const h = setup(); const starts: number[] = [];
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 }; h.store.set("route", route);
+  for (let i = 0; i < 14; i++) {
+    const id = `slow-${i}`; h.input(id);
+    h.store.set(`failed-delivery:${id}`, { ...route, inboundId: id, messageId: hash(id), startedAt: now - 120_000, phase: "unknown" });
+    h.store.updateInbound(id, "processing");
+  }
+  h.backend.promptAccepted = async () => { starts.push(Date.now()); setSystemTime(Date.now() + 10_000); throw probeTimeout(); };
+  for (let scan = 0; scan < 8; scan++) { setSystemTime(Date.now() + 1_000); await h.router.checkInboundLatency(); }
+  expect(starts.length).toBeGreaterThanOrEqual(14);
+  for (const at of starts) expect(starts.filter(start => start >= at && start < at + 60_000).length).toBeLessThanOrEqual(60);
+  expect(h.backend.prompts).toEqual([]);
+});
+
+test("a cooling row and exhausted probe budget do not delay the unanswered alarm", async () => {
+  const alerts: number[] = [];
+  const h = setup("owner", { notifyUnanswered: async () => { alerts.push(Date.now()); return true; } });
+  h.input("alarm", 10 * 60_000 - 1_000);
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 }; h.store.set("route", route);
+  h.store.set("failed-delivery:alarm", { ...route, inboundId: "alarm", messageId: hash("alarm"), startedAt: now - 599_000, phase: "unknown" });
+  h.store.updateInbound("alarm", "processing"); h.backend.promptAccepted = async () => { throw new ControlError(503); };
+  await h.router.checkInboundLatency(); const budget = new ProbeBudget(h.store);
+  while (budget.take()) {}
+  await h.router.checkUnanswered(); expect(alerts).toEqual([]);
+  setSystemTime(now + 1_000); await h.router.checkUnanswered();
+  expect(alerts).toEqual([now + 1_000]); expect(h.backend.prompts).toEqual([]);
+});
+
+test("failure on the second prompt preserves the whole leader's exponential cooldown", async () => {
+  const h = stalledProbe("multi", 120_000, ["earlier"]);
+  const starts: { at: number; id: string }[] = [];
+  h.backend.promptAccepted = async (_session, _dir, id) => {
+    starts.push({ at: Date.now(), id });
+    if (id === "earlier") throw new ControlError(503);
+    return false;
+  };
+  const rows = await captureLogs(async () => {
+    for (const at of [0, 60_000, 180_000, 420_000]) {
+      setSystemTime(now + at); await h.router.checkInboundLatency();
+      const count = starts.length;
+      setSystemTime(now + at + 59_000); await h.router.checkInboundLatency();
+      expect(starts).toHaveLength(count);
+    }
+  });
+  expect(starts).toEqual([0, 60_000, 180_000, 420_000].flatMap(at => [hash("multi"), "earlier"].map(id => ({ at: now + at, id }))));
+  expect(rows.filter(row => row.name === "router.probe_backoff").map(row => row.props?.waitMs)).toEqual([60_000, 120_000, 240_000, 480_000]);
+  expect(h.backend.prompts).toEqual([]);
+});
+
+test("eighty live first reads bypass the cap while failed retries share sixty per minute across restart", async () => {
+  const root = mkdtempSync(join(tmpdir(), "shared-probes-"));
+  let budgetStore = new Store(join(root, "budget.sqlite"));
+  try {
+    const options = { probeBudget: new ProbeBudget(budgetStore) };
+    const owner = setup("owner", options), moni = setup("moni", options);
+    const starts: number[] = [];
+    for (const [chat, h] of [["owner", owner], ["moni", moni]] as const) {
+      const route = { id: `ses_${chat}`, directory: `/Chats/${chat}`, generation: 1 }; h.store.set("route", route);
+      for (let i = 0; i < 40; i++) {
+        const id = `${chat}-${i}`; h.input(id);
+        h.store.set(`failed-delivery:${id}`, { ...route, inboundId: id, messageId: hash(id), startedAt: now - 120_000, phase: "unknown" });
+        h.store.updateInbound(id, "processing");
+      }
+      h.backend.promptAccepted = async () => { starts.push(Date.now()); throw new ControlError(503); };
+    }
+    await Promise.all([owner.router.checkInboundLatency(), moni.router.checkInboundLatency()]);
+    expect(starts).toEqual(Array(80).fill(now));
+    setSystemTime(now + 60_000);
+    await Promise.all([owner.router.checkInboundLatency(), moni.router.checkInboundLatency()]);
+    expect(starts).toHaveLength(140);
+    budgetStore.close(); budgetStore = new Store(join(root, "budget.sqlite"));
+    options.probeBudget = new ProbeBudget(budgetStore);
+    const routers = [owner.makeRouter(), moni.makeRouter()];
+    for (const at of [61_000, 90_000, 119_999]) {
+      setSystemTime(now + at); await Promise.all(routers.map(router => router.checkInboundLatency())); expect(starts).toHaveLength(140);
+    }
+    setSystemTime(now + 121_000); await Promise.all(routers.map(router => router.checkInboundLatency()));
+    expect(starts.length).toBeGreaterThan(140);
+    const retries = starts.slice(80);
+    for (const at of retries) expect(retries.filter(start => start >= at && start < at + 60_000).length).toBeLessThanOrEqual(60);
+    expect(owner.backend.prompts).toEqual([]); expect(moni.backend.prompts).toEqual([]);
+  } finally { budgetStore.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a probe failing during wake preparation cannot spend the wake POST attempt", async () => {
+  const id = "wake:preparation"; const h = stalledProbe(id, 15 * 60_000);
+  const original = h.store.get("failed-delivery:" + id);
+  h.store.set("latency-route:" + id, original);
+  h.store.set("batch:" + id, { id, text: "update", attachments: [], receivedAt: now - 15 * 60_000, batchIds: [id] });
+  h.store.set("batch-phase:" + id, "queued-steer"); h.store.updateInbound(id, "pending");
+  h.store.set("stuck-wake-retry:" + id, now);
+  const sibling = h.makeRouter(); let failed = false;
+  h.backend.promptAccepted = async () => { throw new ControlError(503); };
+  h.backend.statuses = async () => {
+    if (!failed && h.store.get("batch-phase:" + id) === "preparing") { failed = true; await sibling.checkInboundLatency(); }
+    return {};
+  };
+  await h.router.tick();
+  expect(failed).toBe(true); expect(h.backend.prompts).toEqual([]);
+  expect(h.store.get("stuck-wake-attempt:" + id)).toBeUndefined();
+  setSystemTime(now + 60_000); h.backend.promptAccepted = async () => false;
+  await h.router.tick(); expect(h.backend.prompts).toEqual([hash(id)]);
+});
+
+test("a probe failing during steer admission prevents its POST after a negative readback", async () => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  const turn = h.store.get<{ id: string; directory: string; generation: number; messageId: string; startedAt: number }>("activeTurn")!;
+  h.input("follow", 120_000);
+  h.store.set("batch:follow", { id: "follow", text: "follow", attachments: [], receivedAt: now - 120_000, batchIds: ["follow"] });
+  h.store.set("batch-phase:follow", "steering"); h.store.updateInbound("follow", "processing");
+  h.store.set("steer-attempt:follow", { ...turn, inboundId: "follow" });
+  h.store.set("failed-delivery:follow", { ...turn, inboundId: "follow", messageId: hash("follow") });
+  const sibling = h.makeRouter(); let admitting = false, failed = false, posts = 0, negatives = 0;
+  h.backend.promptAccepted = async () => { negatives++; return false; };
+  h.backend.steer = async (_id, _dir, _prompt, _text, _guidance, _files, guard) => {
+    admitting = true;
+    if (!await guard!.beforeSend()) return "refused";
+    posts++; return "steered";
+  };
+  h.backend.statuses = async () => {
+    if (admitting && !failed) {
+      failed = true; h.backend.promptAccepted = async () => { throw new ControlError(503); };
+      await sibling.checkInboundLatency();
+    }
+    return {};
+  };
+  await h.router.tick();
+  expect(negatives).toBeGreaterThan(0); expect(failed).toBe(true); expect(posts).toBe(0);
+  expect(h.backend.prompts).toEqual([hash("first")]);
+});
+
+test("normal steer readback keeps its thirty-second budget for a twenty-five-second read", async () => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  const turn = h.store.get<{ id: string; directory: string; generation: number; messageId: string }>("activeTurn")!;
+  h.input("follow", 0);
+  h.store.set("batch:follow", { id: "follow", text: "follow", attachments: [], batchIds: ["follow"] });
+  h.store.set("batch-phase:follow", "steering"); h.store.updateInbound("follow", "processing");
+  h.store.set("steer-attempt:follow", { ...turn, inboundId: "follow" });
+  h.backend.promptAccepted = async () => { setSystemTime(now + 25_000); return true; };
+  const original = globalThis.setTimeout;
+  const budgets: number[] = [];
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(new Proxy(original, {
+    apply(target, receiver, args) {
+      if (new Error().stack?.includes("probeAccepted")) budgets.push(args[1] ?? 0);
+      return Reflect.apply(target, receiver, args);
+    },
+  }));
+  try { await h.router.tick(); } finally { timer.mockRestore(); }
+  expect(budgets).toContain(30_000); expect(budgets).not.toContain(10_000);
+  expect(h.states()).toEqual(["done", "done"]);
+  expect(h.backend.prompts).toEqual([hash("first")]);
+});
+
+test("normal turn and completion polling bypass an exhausted retry budget", async () => {
+  const h = setup(); h.input("live", 0); await h.router.tick();
+  const budget = new ProbeBudget(h.store); for (let i = 0; i < 60; i++) expect(budget.take()).toBe(true);
+  let reads = 0;
+  h.backend.messages = async () => { reads++; return h.backend.records; };
+  h.backend.records.push({ id: "finished", type: "idle", outcome: "succeeded", time: { created: now } });
+  await h.router.checkCompletion(); await h.router.tick();
+  expect(reads).toBeGreaterThan(0); expect(h.backend.prompts).toEqual([hash("live")]);
+  expect(h.states()).toEqual(["done"]);
+});
+
+
+test("repeated failed reads pause wake preparation attempts until admission can resume", async () => {
+  const id = "wake:cooling-preparation"; const h = stalledProbe(id, 15 * 60_000);
+  h.store.set(`latency-route:${id}`, h.store.get(`failed-delivery:${id}`));
+  h.store.set(`batch:${id}`, { id, text: "update", attachments: [], receivedAt: now - 15 * 60_000, batchIds: [id] });
+  h.store.set(`batch-phase:${id}`, "queued-steer"); h.store.updateInbound(id, "pending");
+  h.store.set(`stuck-wake-retry:${id}`, now);
+  const sibling = h.makeRouter(); let failed = false;
+  h.backend.promptAccepted = async () => { throw new ControlError(503); };
+  h.backend.statuses = async () => {
+    if (!failed && h.store.get(`batch-phase:${id}`) === "preparing") { failed = true; await sibling.checkInboundLatency(); }
+    return {};
+  };
+  await h.router.tick();
+  for (const second of [60, 120, 180, 240, 300, 360, 420, 480, 540, 600]) {
+    setSystemTime(now + second * 1_000);
+    await sibling.checkInboundLatency(); await h.router.tick();
+    expect(h.states()).toEqual(["processing"]);
+    expect(h.store.get<{ attempts: number }>(`synthetic-retry:${id}`)?.attempts ?? 0).toBe(0);
+    expect(h.store.get<{ attempt: number }>("preparingDelivery")?.attempt).toBe(1);
+    expect(h.store.get(`stuck-wake-attempt:${id}`)).toBeUndefined();
+    expect(h.backend.prompts).toEqual([]);
+  }
+  setSystemTime(now + 900_000); h.backend.promptAccepted = async () => false;
+  await h.router.tick();
+  expect(h.backend.prompts).toEqual([hash(id)]);
+  expect(h.states()).toEqual(["done"]);
+});
+
+test("a confirmed steer clears failure history before a fresh requeued admission read", async () => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  const turn = h.store.get<{ id: string; directory: string; generation: number; messageId: string; startedAt: number }>("activeTurn")!;
+  h.input("follow", 120_000);
+  h.store.set("batch:follow", { id: "follow", text: "follow", attachments: [], receivedAt: now - 120_000, batchIds: ["follow"] });
+  h.store.set("batch-phase:follow", "steering"); h.store.updateInbound("follow", "processing");
+  h.store.set("steer-attempt:follow", { ...turn, inboundId: "follow" });
+  h.backend.promptAccepted = async () => { throw new ControlError(503); };
+  await h.router.tick();
+  setSystemTime(now + 60_000); h.backend.promptAccepted = async () => false;
+  h.backend.steer = async (_id, _dir, id, text) => {
+    h.backend.records.push({ id, type: "user", text, time: { created: Date.now() } });
+    return "steered";
+  };
+  await h.router.tick();
+  expect(h.store.get<string>("batch-phase:follow")).toBe("accepted");
+  expect(h.store.get("replay-probe-backoff:follow") ?? null).toBeNull();
+  h.backend.records.push(
+    { id: "answer", type: "assistant", content: [{ type: "text", text: "Answer" }], finish: "stop", time: { created: now + 60_000, completed: now + 60_000 } },
+    { id: "idle", type: "idle", outcome: "succeeded", time: { created: now + 60_000 } });
+  await h.router.tick();
+  h.router.requeueHuman("follow", "watchdog_overdue", true);
+  const newPrompt = h.store.get<string>("human-retry-prompt:follow")!;
+  const budget = new ProbeBudget(h.store); while (budget.take()) {}
+  let freshReads = 0;
+  h.backend.promptAccepted = async (_id, _dir, prompt) => { if (prompt === newPrompt) freshReads++; return false; };
+  h.backend.unavailable = true;
+  await h.router.tick();
+  expect(h.backend.prompts).toContain(newPrompt);
+  expect(freshReads).toBeGreaterThan(0);
+});
+
+
+test("a failed earlier-prompt alias must fence a rebatched synthetic POST", async () => {
+  const h = setup();
+  const old = "wake:former-leader", member = "wake:former-member";
+  h.input(old, 15 * 60_000); h.input(member, 15 * 60_000);
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 };
+  h.store.set("route", route);
+  const prompt = { sessionId: route.id, directory: route.directory, generation: 1, messageId: hash(`${old}:1`), startedAt: now - 150_000 };
+  h.store.set(`failed-delivery:${old}`, { ...route, inboundId: old, messageId: prompt.messageId, startedAt: prompt.startedAt, phase: "unknown" });
+  h.store.set(`synthetic-retry:${old}`, { attempts: 2, nextAt: now + 30_000, prompts: [prompt] });
+  h.store.set(`synthetic-retry:${member}`, { attempts: 1, nextAt: 0, prompts: [prompt] });
+  h.backend.promptAccepted = async () => false;
+  const sibling = h.makeRouter(); let failures = 0;
+  const paused = spyOn(preferences, "imessagePreferences").mockImplementation(async () => {
+    h.backend.promptAccepted = async () => { failures++; throw new ControlError(503); };
+    await sibling.checkInboundLatency();
+    return {};
+  });
+  try { await h.router.tick(); } finally { paused.mockRestore(); }
+  expect(failures).toBe(1);
+  expect(h.backend.prompts).toEqual([]);
+});
+
+
+test("full completion evidence clears failure history before a new prompt admission", async () => {
+  const h = setup(); h.input("first", 0); await h.router.tick();
+  h.backend.steer = async () => "steered";
+  h.input("follow", 0); await h.router.tick();
+  expect(h.store.get<string>("batch-phase:follow")).toBe("accepted");
+  h.backend.promptAccepted = async () => { throw new ControlError(503); };
+  await h.router.tick();
+  expect(h.store.get(`replay-probe-backoff:first`)).toBeDefined();
+  h.backend.records.push(
+    { id: hash("follow"), type: "user", text: "follow", time: { created: now } },
+    { id: "answer", type: "assistant", content: [{ type: "text", text: "Answer" }], finish: "stop", time: { created: now, completed: now } },
+    { id: "idle", type: "idle", outcome: "succeeded", time: { created: now } });
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.get("replay-probe-backoff:first") ?? null).toBeNull();
+  expect(h.store.get(`replay-probe-backoff:prompt:ses_1:${hash("follow")}`) ?? null).toBeNull();
+  setSystemTime(now + 61_000);
+  h.router.requeueHuman("first", "watchdog_overdue", true);
+  const prompt = h.store.get<string>("human-retry-prompt:first")!;
+  const budget = new ProbeBudget(h.store); while (budget.take()) {}
+  let newReads = 0;
+  h.backend.promptAccepted = async (_id, _dir, id) => { if (id === prompt) newReads++; return false; };
+  h.backend.unavailable = true;
+  await h.router.tick();
+  expect(h.backend.prompts).toContain(prompt);
+  expect(newReads).toBeGreaterThan(0);
+});
+
+
+test("late failure cannot resurrect history after positive completion", async () => {
+  const h = stalledProbe("stale-read");
+  const turn = h.store.get("failed-delivery:stale-read");
+  h.store.set("activeTurn", turn);
+  h.store.set("batch:stale-read", { id: "stale-read", text: "stale-read", attachments: [], batchIds: ["stale-read"], receivedAt: now - 120_000 });
+  h.store.set("batch-phase:stale-read", "submitting");
+  h.store.set("resendBody", {inboundId:"stale-read", text:"stale-read", system:"", parts:[]});
+  const read = Promise.withResolvers<boolean>();
+  const entered = Promise.withResolvers<void>();
+  h.backend.promptAccepted = async () => { entered.resolve(); return read.promise; };
+  const scan = h.router.checkInboundLatency();
+  await entered.promise;
+  h.backend.records.push(
+    { id: hash("stale-read"), type: "user", text: "stale-read", time: { created: now } },
+    { id: "idle", type: "idle", outcome: "succeeded", time: { created: now } });
+  await h.router.tick();
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.states()).toEqual(["done"]);
+  expect(h.store.get("replay-probe-backoff:stale-read") ?? null).toBeNull();
+  read.reject(new ControlError(503));
+  await scan;
+  expect(h.store.get("replay-probe-backoff:stale-read") ?? null).toBeNull();
+  setSystemTime(now + 61_000);
+  h.router.requeueHuman("stale-read", "watchdog_overdue", true);
+  const fresh = h.store.get<string>("human-retry-prompt:stale-read")!;
+  const budget = new ProbeBudget(h.store); while (budget.take()) {}
+  let freshReads = 0;
+  h.backend.promptAccepted = async (_id, _dir, id) => { if (id === fresh) freshReads++; return false; };
+  h.backend.unavailable = true;
+  await h.router.tick();
+  expect(freshReads).toBeGreaterThan(0);
+});
+
+
+test.each([
+  ["OpenChamber", "submit"], ["Robob", "submit"], ["OpenChamber", "replay"], ["Robob", "replay"],
+] as const)("%s %s alias failure during backend preparation must fence the POST", async (engine, path) => {
+  const h = setup();
+  const old = "wake:former-leader", member = "wake:former-member";
+  h.input(old, 15 * 60_000); h.input(member, 15 * 60_000);
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 };
+  h.store.set("route", route);
+  const prompt = { sessionId: route.id, directory: route.directory, generation: 1, messageId: hash(`${old}:1`), startedAt: now - 150_000 };
+  h.store.set(`failed-delivery:${old}`, { ...route, inboundId: old, messageId: prompt.messageId, startedAt: prompt.startedAt, phase: "unknown" });
+  h.store.set(`synthetic-retry:${old}`, { attempts: 2, nextAt: now + 30_000, prompts: [prompt] });
+  h.store.set(`synthetic-retry:${member}`, { attempts: 1, nextAt: 0, prompts: [prompt] });
+  if (path === "replay") {
+    const turn = { ...route, inboundId: member, messageId: hash(member), earlier: [prompt.messageId], startedAt: now - 60_000, phase: "unknown" };
+    h.store.set("activeTurn", turn); h.store.set(`failed-delivery:${member}`, turn);
+    h.store.set(`batch:${member}`, { id: member, text: "update", attachments: [], batchIds: [member] });
+    h.store.set(`batch-phase:${member}`, "submitting"); h.store.updateInbound(member, "processing");
+    h.store.set("resendBody", { inboundId: member, text: "update", system: "guidance", parts: [] });
+  }
+  h.backend.promptAccepted = async () => false;
+  const sibling = h.makeRouter();
+  let failed = false;
+  let failPreparation = true;
+  h.backend.request = async <T>(path: string, options?: {body?: unknown}) => {
+    if (failPreparation && path.endsWith("/synthetic")) {
+      h.backend.promptAccepted = async () => { failed = true; throw new ControlError(503); };
+      await sibling.checkInboundLatency();
+    }
+    if (path.endsWith("/prompt")) {
+
+      h.backend.prompts.push((options?.body as { id?: string } | undefined)?.id ?? "missing");
+    }
+    return {} as T;
+  };
+  h.backend.prompt = OpenChamber.prototype.prompt;
+  if (engine === "Robob") {
+    const client = new ControlClient({url:"http://127.0.0.1:1", token:"synthetic-test-token"});
+    client.byNative = async () => {
+      if (failPreparation) {
+        h.backend.promptAccepted = async () => { failed = true; throw new ControlError(503); };
+        await sibling.checkInboundLatency();
+      }
+      return { thread: { threadId: "resolved-thread" } } as Awaited<ReturnType<ControlClient["byNative"]>>;
+    };
+    client.request = async <T>(_method: string, path: string, body?: unknown) => {
+      if (path.endsWith("/send")) {
+
+        h.backend.prompts.push((body as { clientRequestId: string }).clientRequestId);
+      }
+      return {} as T;
+    };
+    const robob = new RobobBackend({ chatRoot:"/Chats", client });
+    h.backend.prompt = robob.prompt.bind(robob);
+  }
+  await h.router.tick();
+  expect(failed).toBe(true);
+  expect(h.backend.prompts).toEqual([]);
+  const initialAttempts = h.store.get<{ attempts: number }>(`synthetic-retry:${member}`)?.attempts;
+  const budget = new ProbeBudget(h.store);
+  for (const at of [1_000, 60_000, 120_000, 240_000]) {
+    setSystemTime(now + at);
+    if (at === 240_000) while (budget.take()) {}
+    await h.router.tick();
+    expect(h.backend.prompts).toEqual([]);
+    expect(h.store.get<{ attempts: number }>(`synthetic-retry:${member}`)?.attempts).toBe(initialAttempts);
+    expect(h.store.get(`stuck-wake-attempt:${member}`)).toBeUndefined();
+  }
+  failPreparation = false;
+  h.backend.promptAccepted = async () => false;
+  setSystemTime(now + 301_000);
+  await h.router.tick();
+  expect(h.backend.prompts.length).toBeGreaterThan(0);
+});

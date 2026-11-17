@@ -427,8 +427,9 @@ test("Moni remote-box receipt and delivered reply never wait on a local Robob ou
   const moni = registry.open(key); closes.push(() => moni.store.close());
   const call = (ok: boolean) => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok, durationMs: 10,
     props: { method: "GET", route: "/threads/:id/messages", ...(ok ? {} : { linkCause: "ECONNREFUSED" }), failureFormat: "single" } });
+  // Recover a prior test's process-wide outage before capturing this fixture's outage.
+  call(true);
   const rows = await captureLogs(async () => {
-    call(true);
     for (let i = 0; i < 3; i++) call(false);
     try {
       const sink = registry.sink(async () => {}).acceptInto(key, undefined, "+15555550199");

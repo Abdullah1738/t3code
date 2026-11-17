@@ -13,6 +13,9 @@ const at = Date.parse(`${day}T12:00:00Z`);
 let root: string;
 let previous: string | undefined;
 beforeEach(() => {
+  // A prior test's process-wide outage must not suppress this fixture's first failure.
+  toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok: true, durationMs: 0,
+    props: { method: "GET", route: "/health" } });
   toolLog.flush();
   root = mkdtempSync(join(tmpdir(), "toollog-redaction-"));
   previous = process.env.TOOLLOG_DIR;

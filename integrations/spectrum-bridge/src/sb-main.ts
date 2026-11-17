@@ -1,3 +1,4 @@
+import { ProbeBudget } from "./probe-policy.ts";
 import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
 import { readFileSync } from "node:fs";
 import { toolError, toolLog, type LogLine } from "./toollog.ts";
@@ -133,6 +134,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   });
   await chmod(socketPath, 0o600);
   const ownerStore = new Store(join(stateRoot, "state.sqlite"));
+  const probeBudget = new ProbeBudget(ownerStore);
   // A separate key from Photon's "identity", so rolling back to Photon still starts.
   const identity = { line: line.number, owner: config.owner };
   const previousIdentity = ownerStore.get<typeof identity>("sendblueIdentity");
@@ -231,7 +233,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     // getMessage may resolve undefined for an unknown handle; the router's reply lookup already treats a throw there as unavailable.
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
-      medsFold: {},
+      medsFold: {}, probeBudget,
       transcribe: input => transcribe(input), notifyUnanswered: outlet.notify, notifyFailure: notifyFailedInbound, log, context: chat.context,
       ...(chat.info.kind === "group" ? { groupJudge } : {}),
       swipes: { find: swipes, line: config.sendblueNumber ?? "" },

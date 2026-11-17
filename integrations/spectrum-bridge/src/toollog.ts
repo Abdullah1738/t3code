@@ -1,3 +1,4 @@
+import { probeDeferred } from "./probe-policy.ts";
 import { safeLineFailureCode, sendblueErrorKey } from "./line.ts";
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fstatSync, fchmodSync, mkdirSync, openSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -437,7 +438,7 @@ function loggedRequestId(error: unknown): string | undefined {
   }
 }
 export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"], props?: LogLine["props"]): void {
-  if (cause === completionReady) return;
+  if (cause === completionReady || cause === probeDeferred) return;
   const requestId = loggedRequestId(cause);
   toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids: { ...ids, ...(requestId ? { requestId } : {}) }, props,
     ...(requestId ? { alreadyLogged: true } : {}), error: { tag, cause } });
