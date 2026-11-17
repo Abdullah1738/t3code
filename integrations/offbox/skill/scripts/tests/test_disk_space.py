@@ -29,12 +29,18 @@ class DiskSpaceTests(unittest.TestCase):
                 self.assertEqual(bool(disk.warning(self.space(free), 'bx_test')), free < disk.WARN_BYTES)
 
     def test_toolchain_crash_survives_authoritative_server_result(self):
+        self.assert_native_crash_survives_authoritative_result('toolchain_unpack_crash')
+
+    def test_go_inventory_crash_survives_authoritative_server_result(self):
+        self.assert_native_crash_survives_authoritative_result('go_inventory_crash')
+
+    def assert_native_crash_survives_authoritative_result(self, reason):
         marker = disk.MARKER + json.dumps(dict(phase='toolchain', infra_failure='native_crash',
-                                               infra_reason='toolchain_unpack_crash')) + '\n'
+                                               infra_reason=reason)) + '\n'
         self.log.write_text(marker)
         record = disk.result(self.log, 90)
         self.assertEqual(record['infra_failure'], 'native_crash')
-        self.assertEqual(record['infra_reason'], 'toolchain_unpack_crash')
+        self.assertEqual(record['infra_reason'], reason)
         self.assertIsNone(record['command_exit_code'])
         self.assertNotIn('ran out of disk', disk.message(record))
         summary = disk.MARKER + json.dumps(dict(phase='result', attempt=1, record=record)) + '\n'
@@ -57,7 +63,7 @@ class DiskSpaceTests(unittest.TestCase):
 
     def test_toolchain_marker_requires_infra_exit_and_known_reason(self):
         for code, reason in ((0, 'toolchain_unpack_crash'), (99, 'toolchain_unpack_crash'),
-                             (90, 'unknown')):
+                             (0, 'go_inventory_crash'), (97, 'go_inventory_crash'), (90, 'unknown')):
             with self.subTest(code=code, reason=reason):
                 self.log.write_text(disk.MARKER + json.dumps(dict(phase='toolchain', infra_failure='native_crash',
                                                                  infra_reason=reason)) + '\n')

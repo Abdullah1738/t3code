@@ -52,10 +52,12 @@ class Logs(unittest.TestCase):
         self.assertEqual(self.rows()[0]['props'], props)
 
     def test_toolchain_crash_metadata_survives_filter(self):
-        props = dict(infra_failure='native_crash', infra_reason='toolchain_unpack_crash', wrapper_exit_code=90)
-        toollog.emit('run', 'run.disk_space', ids={'box': 'bx_fixture'}, props=props)
-        self.assertEqual(self.rows()[0]['props'], props)
-        self.assertEqual(self.rows()[0]['ids'], {'box': 'bx_fixture'})
+        for reason in ('toolchain_unpack_crash', 'go_inventory_crash'):
+            with self.subTest(reason=reason):
+                props = dict(infra_failure='native_crash', infra_reason=reason, wrapper_exit_code=90)
+                toollog.emit('run', 'run.disk_space', ids={'box': 'bx_fixture'}, props=props)
+                self.assertEqual(self.rows()[-1]['props'], props)
+                self.assertEqual(self.rows()[-1]['ids'], {'box': 'bx_fixture'})
 
     def test_queue_resume_fields_survive_serialization_including_unknown_places(self):
         for place in (1, None):

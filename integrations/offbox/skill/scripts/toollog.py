@@ -54,7 +54,7 @@ ENUMS = {
     "linkType": {"wireguard", "residential", "down", "unknown"},
     "stage": {"ssh_setup", "ssh_drop", "readiness", "put_file", "sync", "pull", "command", "install_mid_run", "request", "reaper"},
     "infra_failure": {"enospc", "native_crash", "disk_probe"},
-    "infra_reason": {"low_space_gate", "disk_exhausted", "toolchain_unpack_crash", "probe_crashed"},
+    "infra_reason": {"low_space_gate", "disk_exhausted", "toolchain_unpack_crash", "go_inventory_crash", "probe_crashed"},
     "stateBefore": {"running", "stopped"},
     "result": {"detached", "stop_failed", "created"},
 }

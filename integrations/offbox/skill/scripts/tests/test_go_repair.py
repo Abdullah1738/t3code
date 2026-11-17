@@ -1,5 +1,6 @@
 """Exercise the actual remote preamble against fake toolchains, without boat or sudo."""
 import os
+import json
 import hashlib
 from pathlib import Path
 import subprocess
@@ -135,6 +136,32 @@ esac
     def run(self, **env):
         return subprocess.run(['bash', '-c', self.script], env=dict(self.env, **env),
                               capture_output=True, text=True, timeout=15)
+
+    def fault_inventory(self, tool, failure, at=1):
+        original = self.bins / tool
+        real = self.bins / (tool + '-real')
+        if original.exists():
+            original.rename(real)
+        else:
+            real = Path('/usr/bin') / tool
+        self.tool(tool, f'''#!/bin/bash
+count=0
+[ ! -f "$FIXTURE/{tool}-count" ] || read -r count < "$FIXTURE/{tool}-count"
+count=$((count+1))
+echo "$count" > "$FIXTURE/{tool}-count"
+if [ "$count" -ge {at} ]; then
+  {failure}
+fi
+exec "{real}" "$@"
+''')
+
+    def state(self, result):
+        log = self.home / 'run-fixture.log'
+        log.write_text(result.stderr)
+        with patch.object(runs, 'LOGS_DIR', self.home):
+            runs.save_run_state('run-fixture', box_id='bx_fixture')
+            runs.space_result('run-fixture', result.returncode, log)
+        return json.loads((self.home / 'run-fixture.state.json').read_text())
 
     def broken(self):
         (self.root / 'src/unsafe/unsafe.go').unlink()
@@ -377,6 +404,120 @@ class GoSwapTests(unittest.TestCase):
         self.assertEqual(result.returncode, 97, result.stderr)
         self.assertNotIn('USER_COMMAND', result.stdout)
 
+    def test_signal_inventory_is_infra_without_reinstall(self):
+        for tool in ('find', 'sort', 'sha256sum'):
+            for sig, rc in (('SEGV', 139), ('ABRT', 134)):
+                for needs_go in (0, 1):
+                    with self.subTest(tool=tool, sig=sig, needs_go=needs_go), tempfile.TemporaryDirectory() as home:
+                        fx = RepairFixture(home)
+                        fx.fault_inventory(tool, f'echo "*** stack smashing detected ***: terminated" >&2; kill -{sig} $$')
+                        fx.tool('curl', '#!/bin/bash\necho UNEXPECTED_DOWNLOAD >&2\nexit 99\n')
+                        fx.script = f'_offbox_needs_go={needs_go}\nulimit -c 0\n' + fx.script
+                        stamp = (fx.root / '.offbox-manifest').read_bytes()
+                        result = fx.run()
+                        self.assertEqual(result.returncode, 90 if needs_go else 0, result.stderr)
+                        self.assertEqual('USER_COMMAND' in result.stdout, not needs_go)
+                        self.assertNotIn('replacing', result.stderr)
+                        self.assertNotIn('mismatch', result.stderr)
+                        self.assertNotIn('UNEXPECTED_DOWNLOAD', result.stderr)
+                        self.assertFalse(fx.calls.exists())
+                        self.assertEqual((fx.root / '.offbox-manifest').read_bytes(), stamp)
+                        self.assertIn('Go check: cannot inventory', result.stderr)
+                        self.assertIn(f'box-health: native-crash tool={tool} rc={rc} stage=go-inventory', result.stderr)
+                        self.assertIn('box-health: native-crash signature=stack-smashing stage=go-inventory', result.stderr)
+                        state = fx.state(result)
+                        self.assertEqual(state['wrapper_exit_code'], result.returncode)
+                        self.assertEqual(state['infra_failure'], 'native_crash' if needs_go else None)
+                        self.assertEqual(state['infra_reason'], 'go_inventory_crash' if needs_go else None)
+                        self.assertEqual(state['box_id'], 'bx_fixture')
+                        if needs_go:
+                            self.assertIsNone(state['command_exit_code'])
+                        else:
+                            self.assertIn("continuing because this run doesn't use Go", result.stderr)
+
+    def test_non_signal_inventory_error_never_reinstalls(self):
+        self.fx.fault_inventory('find', 'exit 1')
+        result = self.fx.run()
+        self.assertEqual(result.returncode, 97, result.stderr)
+        self.assertIn('cannot inventory', result.stderr)
+        self.assertIn('find rc=1 sort rc=0 sha256sum rc=0', result.stderr)
+        self.assertNotIn('box-health:', result.stderr)
+        self.assertNotIn('replacing', result.stderr)
+        self.assertFalse(self.fx.calls.exists())
+        self.assertIsNone(self.fx.state(result)['infra_failure'])
+
+    def test_overlay_cleanup_rechecks_manifest_before_repair(self):
+        for change, expected in (('overlay-only', 0), ('changed-size', 0), ('missing-stamp', 0),
+                                 ('unreadable-before', 97), ('unreadable-after', 97), ('crashed-after', 90)):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as home:
+                fx = RepairFixture(home)
+                runtime = fx.root / 'src/runtime'
+                runtime.mkdir()
+                overlay = runtime / 'traceexp.go'
+                overlay.write_text('old')
+                if change == 'changed-size':
+                    (fx.root / 'src/unsafe/unsafe.go').write_text('package unsafe\n// changed\n')
+                elif change == 'missing-stamp':
+                    (fx.root / '.offbox-manifest').unlink()
+                elif change.startswith('unreadable-') or change == 'crashed-after':
+                    fx.fault_inventory('sort', 'kill -SEGV $$' if change == 'crashed-after' else 'exit 1',
+                                       at=1 if change == 'unreadable-before' else 2)
+                repair = change in ('changed-size', 'missing-stamp')
+                if not repair:
+                    fx.tool('curl', '#!/bin/bash\necho UNEXPECTED_DOWNLOAD >&2\nexit 99\n')
+                result = fx.run()
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual('USER_COMMAND' in result.stdout, expected == 0)
+                self.assertEqual(overlay.exists(), change == 'unreadable-before')
+                self.assertEqual('replacing mixed' in result.stderr, repair)
+                self.assertNotIn('UNEXPECTED_DOWNLOAD', result.stderr)
+                if not repair:
+                    self.assertFalse(fx.calls.exists())
+                if change == 'overlay-only':
+                    self.assertNotIn('old tree', result.stderr)
+                if expected:
+                    self.assertIn('cannot inventory', result.stderr)
+                    self.assertEqual(fx.state(result)['infra_reason'], 'go_inventory_crash' if expected == 90 else None)
+
+    def test_unreadable_tree_overrides_other_repair_reasons(self):
+        self.fx.broken()
+        runtime = self.fx.root / 'src/runtime'
+        runtime.mkdir()
+        overlay = runtime / 'traceexp.go'
+        overlay.write_text('old')
+        self.fx.fault_inventory('find', 'exit 1')
+        result = self.fx.run()
+        self.assertEqual(result.returncode, 97, result.stderr)
+        self.assertIn('old tree manifest=unreadable', result.stderr)
+        self.assertNotIn('replacing', result.stderr)
+        self.assertFalse(self.fx.calls.exists())
+        self.assertTrue(overlay.exists())
+        self.assertTrue((self.fx.root / 'go').is_dir())
+
+    def test_staged_and_post_swap_inventory_failures_preserve_tree(self):
+        # Inventory 1 reads the old tree; 2 stamps the archive; 3 verifies it;
+        # 4 verifies the installed tree. Both pre-swap failures and rollback matter.
+        for at in (2, 3, 4):
+            for failure, expected in (('kill -SEGV $$', 90), ('exit 1', 97)):
+                with self.subTest(at=at, failure=failure), tempfile.TemporaryDirectory() as home:
+                    fx = RepairFixture(home)
+                    fx.broken()
+                    fx.fault_inventory('sort', failure, at=at)
+                    fx.script = 'ulimit -c 0\n' + fx.script
+                    result = fx.run()
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertNotIn('USER_COMMAND', result.stdout)
+                    self.assertIn('cannot inventory', result.stderr)
+                    self.assertIn('inventory unreadable', result.stderr)
+                    self.assertNotIn('archive verification failed', result.stderr)
+                    self.assertTrue((fx.root / 'go').is_dir())
+                    if at < 4:
+                        self.assertNotIn('move ', fx.calls.read_text())
+                    else:
+                        self.assertIn('rollback to previous GOROOT', result.stderr)
+                    state = fx.state(result)
+                    self.assertEqual(state['infra_reason'], 'go_inventory_crash' if expected == 90 else None)
+
     def test_archive_must_compile_std_even_when_go_list_would_pass(self):
         self.fx.broken()
         (self.fx.home / 'archive/build-invalid').touch()
@@ -530,6 +671,30 @@ class NonGoRepairTests(unittest.TestCase):
                     self.assertNotIn(runs.NO_NODE_MODULES_MARKER, result.stderr)
                     if not go:
                         self.assertIn("offbox: Go repair failed (official archive download failed); continuing because this run doesn't use Go", result.stderr)
+
+    def test_remote_wrapper_keeps_inventory_crash_exit(self):
+        for needs_go in (False, True):
+            with self.subTest(needs_go=needs_go), tempfile.TemporaryDirectory() as home:
+                fx = RepairFixture(home)
+                fx.fault_inventory('sort', 'kill -ABRT $$')
+                repo = Path(home) / 'w/repo'
+                repo.mkdir(parents=True)
+                if needs_go:
+                    (repo / 'go.mod').touch()
+                repair = GO_REPAIR.replace('/usr/local', str(fx.local)).replace(
+                    '/tmp/offbox-go-repair.lock', str(fx.home / 'repair.lock'))
+                with patch.multiple(runs, GO_REPAIR=repair, DOCKER_REPAIR=':', LDCACHE_REPAIR=':',
+                                    SQLITE_SETUP=':', WATCH_REPAIR=':'), \
+                     patch.object(runs.userns, 'setup', return_value=':'), \
+                     patch.object(runs.containers, 'script', return_value=':'), \
+                     patch.object(runs.node_tools, 'block', return_value=':'):
+                    fx.script = 'ulimit -c 0\n' + remote_script(
+                        'w/repo', '.', ['echo USER_COMMAND'], None, 'test', repo_root=repo)
+                result = fx.run()
+                self.assertEqual(result.returncode, 90 if needs_go else 0, result.stderr)
+                self.assertEqual('USER_COMMAND' in result.stdout, not needs_go)
+                self.assertNotIn('offbox-setup-failed', result.stderr)
+                self.assertEqual(fx.state(result)['infra_failure'], 'native_crash' if needs_go else None)
 
     def test_archive_curl_has_stall_only_bounds(self):
         script = remote_script('w/repo', '.', ['go test ./pkg'], None, 'test')
