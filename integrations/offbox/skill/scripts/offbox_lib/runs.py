@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 from . import native_crash
 from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence, quint_tools
-from . import command_usage, common, containers, java_version, prune, prepare, userns
+from . import bun_version, command_usage, common, containers, java_version, prune, prepare, userns
 from . import resources, box_disk, queue_lifecycle
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
@@ -842,6 +842,24 @@ def argument_list_failure(run, path: Path, *, report: bool) -> bool:
     return True
 
 
+def toolchain_setup_failed(code: int | None, path: Path) -> bool:
+    if code != 99:
+        return False
+    try:
+        lines = path.read_text(errors='replace').splitlines()
+    except OSError:
+        return False
+    failed, started = False, False
+    for line in lines:
+        if STEP_RETRY.fullmatch(line):
+            failed, started = False, False
+        elif line.startswith(COMMAND_STARTED_MARKER):
+            started = True
+        elif re.fullmatch(r'offbox: toolchain unavailable: .+; nothing ran \(exit 99\)', line):
+            failed = True
+    return failed and not started
+
+
 def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, planned: int | None = None,
                        locked: bool = False, until: float | None = None, catch_up: bool = True,
                        report: bool = True, history_result: str | None = None,
@@ -902,6 +920,9 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     native_code = native_crash.after_start_code(run, code, path)
     if native_code is not None:
         return native_code
+    # Setup exits before any step marker; only confirmed pre-command failures bypass completeness.
+    if not history_incomplete and toolchain_setup_failed(code, path):
+        return code
     if not planned:
         return code
     checked = checked_steps_code(path, planned, code, report=report)
@@ -1497,7 +1518,11 @@ def log_probe_error(run_id, reason):
 
 def space_result(run_id, code, path=None, *, report=False):
     from .misc import _raw_log
-    record = offbox_disk_space.result(_raw_log(path or LOGS_DIR / f'{run_id}.log'), code)
+    raw = _raw_log(path or LOGS_DIR / f'{run_id}.log')
+    record = offbox_disk_space.result(raw, code)
+    bun = bun_version.result(raw.read_text(errors='replace')) if raw and raw.exists() else None
+    if bun:
+        record['bun'] = bun
     if record.get('disk_probe_error'):
         log_probe_error(run_id, record['disk_probe_error'])
     previous = read_json(LOGS_DIR / f'{run_id}.state.json', {})
@@ -1580,7 +1605,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
                   image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None,
                   preserve_containers: str = 'private lease', box_id: str = "<box>",
-                  usage: command_usage.Usage | None = None, template: str = "") -> str:
+                  usage: command_usage.Usage | None = None, template: str = "", bun: str = "") -> str:
     cmd = steps_block(steps) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     if api.BACKEND == 'server':
@@ -1650,6 +1675,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
                                                        repo_key=repo_key, template=template)),
               node,
+              bun,
               quint_tools.block(),
               node_tools.block(rdir, repo_root),
               ('''for _offbox_tool in terraform aws ruby vector gh; do
@@ -1868,6 +1894,11 @@ class Runner:
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
         w = node_version.want(self.root, self.cwd)
         node_block = node_version.block(w)
+        words = steps or a.cmd
+        bun_choice = (bun_version.want(self.root, self.cwd, words, bun_version.mac_version(),
+                                       os.environ.get('OFFBOX_BUN_VERSION'))
+                      if bun_version.uses_bun(self.root, self.cwd, words) else None)
+        bun_block = bun_version.block(bun_choice)
         pm = pnpm_version.want(self.root, self.cwd)
         if pm:
             node_block += "\n" + pnpm_version.block(pm)
@@ -1878,7 +1909,8 @@ class Runner:
             script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                    node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
                                    repo_key=me["repo_key"], repo_root=self.root,
-                                   preserve_containers=preserve, box_id=box, usage=usage, template=template)
+                                   preserve_containers=preserve, box_id=box, usage=usage, template=template,
+                                   bun=bun_block)
             command, path = command_payload(script, self.run_id, claim_id=claim)
             return command, path, script.encode()
 

@@ -180,6 +180,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
 - Node version: offbox selects Node from the repo pin (`.nvmrc`/`.node-version`/`engines.node`), then the CI setup-node version, then the nvm default (or newest installed nvm Node, otherwise the box default), and prints its choice, provisioning a missing pinned version or stopping with exit 99; an open range pin (e.g. engines >=22) is narrowed to the CI setup-node version when that fits.
+- Bun-using runs match the Mac's installed Bun exactly, unless `.bun-version` or `packageManager: "bun@X.Y.Z"` pins it; `OFFBOX_BUN_VERSION=X.Y.Z` overrides once. Offbox installs a missing version and logs `offbox: bun X.Y.Z (from mac; box had …; box|cached|installed in Ns)`; without a working Mac Bun it uses 1.4.1.
 - In JS repos, runs put the current directory's and ancestor `node_modules/.bin` directories up to the repo root first on PATH, so repo-pinned `vp`/`tsc-rs` win over global copies, including after `cd apps/server`. On a fresh checkout or box, install with the repo's package manager first (see **Install with the repo's package manager**); `vp i` itself needs vite-plus installed.
 - pnpm: repos with `pnpm-lock.yaml` use `packageManager` (including explicit pnpm 11+) > CI `PNPM_VERSION` / `pnpm/action-setup` version > lockfile compatibility (9.0 → pnpm 10; fallback never 11+). A verified package in the box-local cache supplies a PATH shim, bypassing Corepack defaults. `offbox: pnpm vX (<source>)` records the selection; activation failure exits 99. Matching installed/cached toolchains make no network requests. Downloads retry all errors twice with 20 s connect, <30 KB/s for 60 s stall, and 600 s per attempt limits.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has
@@ -402,7 +403,7 @@ Telegram is attempted at most every six hours. Account activity outside offbox m
   A run missing any planned step result exits 90 (`steps incomplete`), except a confirmed `offbox kill` returns 143 with the stopped step. Rerun the checks before treating them as passed.
   `--step` plus a trailing `-- cmd` is a usage error (2). Exit 1 whose last pipeline stage is grep gets a hint line:
   it may mean "no match" or an earlier stage failed.
-- **99** = the repo-pinned Node or pnpm could not be provided or activated. The command never started; fix the pin or retry after the download failure. Offbox does not run on the box default instead.
+- **99** = the selected Node, pnpm or Bun could not be provided or activated. The command never started; fix the pin or retry after the download failure. Offbox does not run on the box default instead.
 - **97 + "box setup failed (exit 97), not your command"** = the box's toolchain setup failed before your command ran
   (18 Oct: `mv: cannot overwrite '/usr/local/go'`). Offbox turns it into 90 (infra) and the normal infra/fallback rules
   apply. A plain 97 without that line is your command's own exit code.

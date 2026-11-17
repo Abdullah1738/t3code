@@ -51,4 +51,36 @@ if ! sudo grep -qF "$BEGIN" /etc/environment 2>/dev/null; then
 fi
 
 git config --global --get safe.directory >/dev/null 2>&1 || git config --global --add safe.directory '*'
+
+# Keep fresh templates on the shipping Bun; runs may select another exact repo pin.
+OFFBOX_BUN_DEFAULT=1.4.1
+if [ "$("$H/.bun/bin/bun" --version 2>/dev/null || true)" != "$OFFBOX_BUN_DEFAULT" ]; then
+  (
+    case $(uname -m) in
+      x86_64|amd64) bun_arch=x64 ;;
+      aarch64|arm64) bun_arch=aarch64 ;;
+      *) echo 'offbox: unsupported Bun architecture' >&2; exit 1 ;;
+    esac
+    mkdir -p "$H/.bun-versions" "$H/.bun/bin"
+    exec 9>"$H/.bun-versions/$OFFBOX_BUN_DEFAULT.lock"
+    flock -w 120 9
+    bun_cache="$H/.bun-versions/$OFFBOX_BUN_DEFAULT"
+    if [ "$("$bun_cache/bin/bun" --version 2>/dev/null || true)" != "$OFFBOX_BUN_DEFAULT" ]; then
+      bun_stage=$(mktemp -d "$H/.bun-versions/.stage.XXXXXX")
+      trap 'rm -rf -- "$bun_stage"' EXIT
+      offbox_fetch "https://github.com/oven-sh/bun/releases/download/bun-v$OFFBOX_BUN_DEFAULT/bun-linux-$bun_arch.zip" "$bun_stage/bun.zip"
+      unzip -q "$bun_stage/bun.zip" -d "$bun_stage"
+      mkdir -p "$bun_stage/ready/bin"
+      mv "$bun_stage/bun-linux-$bun_arch/bun" "$bun_stage/ready/bin/bun"
+      chmod +x "$bun_stage/ready/bin/bun"
+      [ "$("$bun_stage/ready/bin/bun" --version)" = "$OFFBOX_BUN_DEFAULT" ]
+      ln -s bun "$bun_stage/ready/bin/bunx"
+      if [ -e "$bun_cache" ]; then mv "$bun_cache" "$bun_stage/invalid"; fi
+      mv "$bun_stage/ready" "$bun_cache"
+    fi
+    ln -sf "$bun_cache/bin/bun" "$H/.bun/bin/bun"
+    ln -sf bun "$H/.bun/bin/bunx"
+  )
+fi
+export PATH="$H/.bun/bin:$PATH"
 echo "offbox cache env ok"
