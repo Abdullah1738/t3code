@@ -164,7 +164,7 @@ const SubtasksInput = describe(
         ),
       ),
     }),
-  ),
+  ).check(Schema.isMaxLength(MAX_SUBTASKS)),
   `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id or with a new s<N> id; open ones left out go, done ones stay.`,
 );
 
