@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off -- serialized native adapter; no Effect runtime crosses the worker boundary.
 import type * as NodeChildProcess from "node:child_process";
 import type * as NodeWorkerThreads from "node:worker_threads";
+import type { createCommandResolver } from "./commandResolver.ts";
 
 export interface SpawnRequest {
   readonly command: string;
@@ -27,8 +28,12 @@ export type SpawnEvent =
 
 // Keep this function self-contained: toString works in the bundled CLI as well
 // as development, without shipping a separate worker entry or loading the server.
-export function spawnWorker(cp: typeof NodeChildProcess, parent: NodeWorkerThreads.MessagePort) {
-  parent.on("message", (request: SpawnRequest) => {
+export function spawnWorker(
+  cp: typeof NodeChildProcess,
+  parent: NodeWorkerThreads.MessagePort,
+  resolver?: ReturnType<typeof createCommandResolver>,
+) {
+  parent.on("message", async (request: SpawnRequest) => {
     const { port } = request;
     // Native errors may also hold output or arguments; only transport diagnostic fields.
     const sendError = (error: NodeJS.ErrnoException) => {
@@ -48,7 +53,45 @@ export function spawnWorker(cp: typeof NodeChildProcess, parent: NodeWorkerThrea
       return;
     }
     try {
-      const child = cp.spawn(request.command, request.args, request.options);
+      const start = (previous?: string, native = false): Promise<NodeChildProcess.ChildProcess> => {
+        if (Atomics.load(state, 1)) return Promise.reject(new Error("Spawn cancelled"));
+        let command = native
+          ? request.command
+          : resolver!.resolve(request.command, request.options);
+        // A missing interpreter or changed permissions can invalidate a hit.
+        // If it resolves again, let native PATH search decide whether to skip it.
+        if (command === previous) {
+          command = request.command;
+        }
+        return new Promise((resolve, reject) => {
+          const onError = (error: NodeJS.ErrnoException) => {
+            if (
+              (error.code === "ENOENT" || error.code === "EACCES" || error.code === "ENOTDIR") &&
+              command !== request.command
+            ) {
+              start(command, previous !== undefined).then(resolve, reject);
+            } else reject(error);
+          };
+          try {
+            const child = cp.spawn(command, request.args, {
+              ...request.options,
+              ...(command === request.command
+                ? {}
+                : { argv0: request.options.argv0 ?? request.command }),
+            });
+            child.once("error", onError);
+            child.once("spawn", () => {
+              child.removeListener("error", onError);
+              resolve(child);
+            });
+          } catch (error) {
+            onError(error as NodeJS.ErrnoException);
+          }
+        });
+      };
+      const child = resolver
+        ? await start()
+        : cp.spawn(request.command, request.args, request.options);
       if (child.pid) Atomics.store(state, 0, child.pid);
       const kill = () => {
         if (!child.pid) return;
@@ -61,7 +104,8 @@ export function spawnWorker(cp: typeof NodeChildProcess, parent: NodeWorkerThrea
       // Cancellation may arrive while uv_spawn is blocked; the shared flag is
       // visible before the worker can service its next message.
       if (Atomics.load(state, 1)) kill();
-      child.on("spawn", () => port.postMessage({ type: "spawn", pid: child.pid }));
+      if (resolver) port.postMessage({ type: "spawn", pid: child.pid });
+      else child.on("spawn", () => port.postMessage({ type: "spawn", pid: child.pid }));
       child.on("error", sendError);
       child.on("exit", (code, signal) => {
         port.postMessage({ type: "exit", code, signal });
