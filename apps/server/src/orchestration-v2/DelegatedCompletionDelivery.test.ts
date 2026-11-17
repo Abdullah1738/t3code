@@ -1776,6 +1776,7 @@ it.effect.each(
           commandId: CommandId.make(`command:${name}:accepted`),
         });
         const accepted = yield* orchestrator.getThreadProjection(threadId);
+        assert.isUndefined(accepted.messages.find((row) => row.id === messageId)?.deliveryFailure);
         assert.isNull(accepted.runs.find((run) => run.id === runId)!.delegatedCompletion!.delivery);
         assert.equal(
           accepted.subagents.find((task) => task.id === taskId)?.completionDelivery?.state,

@@ -13111,6 +13111,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const delivery = cohort?.delivery;
     const now = yield* DateTime.now;
     const emitEvent = emit(events, command);
+    if (message?.deliveryFailure !== undefined) {
+      const { deliveryFailure: _deliveryFailure, ...acceptedMessage } = message;
+      yield* emitEvent({
+        type: "message.updated",
+        threadId: command.threadId,
+        occurredAt: now,
+        payload: { ...acceptedMessage, updatedAt: now },
+      });
+    }
     if (
       parentRun === undefined ||
       cohort === undefined ||

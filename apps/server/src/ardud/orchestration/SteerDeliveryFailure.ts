@@ -34,6 +34,17 @@ export const persist = Effect.fn("SteerDeliveryFailure.persist")(function* (
     acceptedAt: now,
     effects: [],
     events: [
+      ...(failure === undefined || context.message === undefined
+        ? []
+        : [
+            {
+              id: EventId.make(`event:steer-delivery-unconfirmed:${effect.id}`),
+              type: "message.updated" as const,
+              threadId: effect.threadId,
+              occurredAt: now,
+              payload: { ...context.message, deliveryFailure: failure, updatedAt: now },
+            },
+          ]),
       {
         id: EventId.make(`event:steer-delivery-failed:${effect.id}`),
         type: "turn-item.updated",
