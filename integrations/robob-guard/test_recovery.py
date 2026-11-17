@@ -1,5 +1,6 @@
 """Regression simulations for the 17 November five-hour backend outage."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import tempfile
@@ -512,6 +513,105 @@ class LateRecoveryTests(unittest.TestCase):
                     self.assertIsNone(state["unready_since"])
                     self.assertEqual(state["last_replace"], self.now)
                     self.assertEqual(state["history"], [self.now])
+
+
+class ProvenanceLockTests(unittest.TestCase):
+    def test_provenance_failure_cleans_only_its_new_acquisition(self):
+        for acquisition in ["fresh", "reuse", "replace-beater"]:
+            for failure in ["lookup", "write", "new-same-owner", "new-other-owner"]:
+                with self.subTest(acquisition=acquisition, failure=failure), tempfile.TemporaryDirectory() as directory:
+                    holds = Holds(Path(directory))
+                    original = dict(by="overload-restart", pid=os.getpid(), startedAt=10000, beatAt=10000)
+                    if acquisition != "fresh":
+                        guard.atomic_json(holds.path, original)
+                        guard.atomic_json(holds.meta, dict(token="existing", beaterPid=99))
+                    successor = dict(original, by="next" if failure == "new-other-owner" else "overload-restart",
+                                     startedAt=10001, beatAt=10001)
+
+                    def failed_write(*args):
+                        if failure.startswith("new-"):
+                            guard.atomic_json(holds.path, successor)
+                            guard.atomic_json(holds.meta, dict(token="successor", beaterPid=100))
+                        raise OSError("provenance unavailable")
+
+                    with patch("hold.time.time", return_value=10000), \
+                            patch("hold.desktop_pid", return_value=None if failure == "lookup" else 42), \
+                            patch("hold.write_reason", side_effect=failed_write), \
+                            patch("hold.subprocess.Popen", return_value=Mock(pid=99)), \
+                            patch.object(holds, "beater_is_ours", return_value=acquisition == "reuse"):
+                        with self.assertRaises(ValueError if failure == "lookup" else OSError):
+                            holds.start("overload-restart", os.getpid())
+                    if failure.startswith("new-"):
+                        self.assertEqual(json.loads(holds.path.read_text()), successor)
+                    elif acquisition == "reuse":
+                        self.assertEqual(json.loads(holds.path.read_text()), original)
+                    else:
+                        self.assertFalse(holds.path.exists())
+
+    def test_blocked_provenance_cannot_hold_recovery_past_creation_cap(self):
+        for acquisition in ["fresh", "reuse", "replace-beater"]:
+            for present in [False, True]:
+                with self.subTest(acquisition=acquisition, present=present), tempfile.TemporaryDirectory() as directory:
+                    home = Path(directory)
+                    holds = Holds(home)
+                    clock = [10000]
+                    entered, release = threading.Event(), threading.Event()
+                    results, errors, opens = [], [], []
+                    if acquisition != "fresh":
+                        guard.atomic_json(holds.path, dict(by="overload-restart", pid=os.getpid(),
+                            startedAt=10000, beatAt=10000))
+                        guard.atomic_json(holds.meta, dict(by="overload-restart", pid=os.getpid(),
+                            token="existing", beaterPid=99))
+
+                    def blocked_write(*args):
+                        entered.set()
+                        release.wait()
+
+                    def start():
+                        try:
+                            results.append(holds.start("overload-restart", os.getpid()))
+                        except Exception as error:
+                            errors.append(error)
+
+                    desktop = dict(pid=42, identity="fixture-birth", startedAt=9000) if present else None
+                    with patch("hold.time.time", side_effect=lambda: clock[0]), \
+                            patch("hold.desktop_pid", return_value=42), patch("hold.write_reason", side_effect=blocked_write), \
+                            patch.object(holds, "beater_is_ours", return_value=acquisition == "reuse"), \
+                            patch("hold.subprocess.Popen", return_value=Mock(pid=99)) as spawned, \
+                            patch("guard.backend_ready", return_value=False), patch("guard.desktop_snapshot", return_value=desktop), \
+                            patch("guard.boot_epoch", return_value=0), patch("guard.stop_unready_desktop", return_value=True) as stopped, \
+                            patch("guard.reopen", side_effect=lambda home: opens.append(clock[0])):
+                        worker = threading.Thread(target=start, daemon=True)
+                        worker.start()
+                        try:
+                            self.assertTrue(entered.wait(5), "start never reached provenance write")
+                            # Fail deterministically before calling check() if start still owns the lock.
+                            with (holds.root / "hold.lock").open("a") as lock:
+                                try:
+                                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                except BlockingIOError:
+                                    self.fail("blocked provenance still owns the recovery hold lock")
+                            clock[0] = 10020
+                            self.assertTrue(holds.beat("overload-restart", os.getpid()))
+                            guard.check(home)
+                            self.assertEqual(opens, [])
+                            end = 11980 if present else 11830
+                            for now in range(11800, end + 1, 30):
+                                clock[0] = now
+                                hold = json.loads(holds.path.read_text())
+                                hold["beatAt"] = now
+                                guard.atomic_json(holds.path, hold)
+                                guard.check(home)
+                            self.assertEqual(opens, [end])
+                            self.assertEqual(stopped.call_count, int(present))
+                            self.assertFalse(release.is_set())
+                        finally:
+                            release.set()
+                            worker.join(5)
+                        self.assertFalse(worker.is_alive())
+                        self.assertEqual(errors, [])
+                        self.assertEqual(results, [99])
+                        self.assertEqual(spawned.call_count, int(acquisition != "reuse"))
 
 
 class NestedHoldTests(unittest.TestCase):
