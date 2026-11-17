@@ -101,6 +101,7 @@ import {
   modelSelectionOf,
 } from "./defaults.ts";
 import * as Rules from "./rules.ts";
+import { PACKET_SUBTASK } from "./subtasks.ts";
 import * as Retries from "./retries.ts";
 import * as Activity from "./activity.ts";
 import * as Briefs from "./briefs.ts";
@@ -2312,6 +2313,68 @@ it.effect("a dispatch model refusal preserves a concurrent PR refresh", () =>
       assert.deepStrictEqual(after.links, newer);
       assert.strictEqual(after.updatedAt, "1970-01-01T00:00:01.000Z");
     }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, undefined, registry)));
+  }),
+);
+
+it.effect.each(
+  (["primary", "carried"] as const).flatMap((link) =>
+    (["explicit", "legacy"] as const).flatMap((lookup) =>
+      (["failed", "cancelled", "interrupted"] as const).map((status) => ({ link, lookup, status })),
+    ),
+  ),
+)("compaction failure preserves $link attribution with $lookup lookup and $status run", (row) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      const store = yield* KanbanStore.KanbanStore;
+      const primary = yield* kanban.createCard(board.id, { prompt: "Primary" }, owner);
+      yield* kanban.dispatchNow;
+      const work = (yield* kanban.card(primary.id)).card.workThreadId!;
+      const carried = yield* kanban.createCard(board.id, { prompt: "Carried" }, owner);
+      yield* kanban.claimCard(work, carried.id);
+      const target = row.link === "primary" ? primary : carried;
+      const other = row.link === "primary" ? carried : primary;
+      yield* kanban.moveCard(other.id, "todo", "owner", owner);
+      yield* kanban.editCard(other.id, { priority: 99 }, owner);
+      yield* kanban.moveCard(target.id, "todo", "owner", owner);
+      // Maintenance keeps the shared home; an owner's handoff above withdraws it.
+      const home = (yield* kanban.card(primary.id)).card;
+      yield* store.putCard({ ...home, workThreadId: work });
+      const before = (yield* kanban.card(target.id)).card;
+      const compactRunId = "failed-compact";
+      yield* store.addCardEvent({
+        cardId: target.id,
+        at: before.movedAt,
+        actor: { _tag: "system", component: "dispatcher" },
+        kind: "moved",
+        fromStage: "working",
+        toStage: "todo",
+        body:
+          "Thread too long; compacting it before the next run" +
+          (row.lookup === "explicit" ? ` [compact-run ${compactRunId}]` : ""),
+        head: null,
+      });
+      fake.runHistory.set(compactRunId, { status: row.status, message: "/compact" });
+      fake.lastRuns.set(work, { runId: compactRunId, status: row.status, message: "/compact" });
+      yield* kanban.dispatchNow;
+      const detail = yield* kanban.card(target.id);
+      const failure = detail.events.findLast(
+        (event) => event.body === `${Retries.FRESH_START_EVENT}: compaction failed`,
+      );
+      assert.isDefined(failure, JSON.stringify(detail));
+      assert.strictEqual(failure?.failedThreadId, work);
+      assert.strictEqual(failure?.runId, compactRunId);
+      const window = {
+        since: "1970-01-01T00:00:00.000Z",
+        until: "1970-01-01T01:00:00.000Z",
+      };
+      const report = Activity.rollup({ window, ...(yield* kanban.activity(board.id, window)) });
+      const failureRow = report.failures.rows.find((row) => row.card === target.number);
+      assert.strictEqual(failureRow?.threadId, work);
+      assert.strictEqual(failureRow?.runId, compactRunId);
+      assert.strictEqual(failureRow?.kind, "fresh_thread");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
 
@@ -4858,6 +4921,10 @@ it.effect(
         assert.include(error.detail, "may have been applied");
         assert.lengthOf(fake.interrupted, 1);
         const id = [...(yield* Ref.get(fake.threads)).keys()][0]!;
+        assert.deepEqual(fake.interrupted, [id]);
+        assert.deepEqual(fake.interruptSources, [
+          { threadId: ThreadId.make(id), cancelReason: "superseded" },
+        ]);
         assert.isTrue((yield* Ref.get(fake.threads)).get(id)!.running);
         assert.isNotNull((yield* kanban.caller(ThreadId.make(id)))?.endedAt);
       }).pipe(Effect.provide(inlineTestLayer(delayed)));
@@ -16295,6 +16362,52 @@ it.effect("a thread's new card waits for an evaluator's packet; the owner's goes
       assert.strictEqual(started.stage, "working");
       const messages = (yield* Ref.get(fake.threads)).get(started.activeThreadId!)!.messages;
       assert.include(messages[0] ?? "", "retry with backoff");
+    }).pipe(Effect.provide(testLayer(fake.layer)));
+  }),
+);
+
+it.effect("a card a work thread takes at once keeps its own plan, without a packet", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    yield* Effect.gen(function* () {
+      const { kanban, board } = yield* toyBoard;
+      yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.activeThreadId!;
+      // The caller's plan starts on the evaluator's step. Taken at once, it is
+      // still the whole plan: no packet step goes in front of it, and the take
+      // is not refused for waiting on the evaluator.
+      const taken = yield* kanban.createForThread(worker, {
+        title: "Deploy the helper",
+        prompt: "Deploy the helper",
+        subtasks: [{ text: "Deploy the helper", owner: "evaluator" }],
+      });
+      assert.deepStrictEqual(
+        taken.card.subtasks.map(({ id, step, text }) => [id, step, text]),
+        [["s1", 1, "Deploy the helper"]],
+      );
+      const carried = (yield* kanban.card(taken.card.id)).card;
+      assert.strictEqual(carried.stage, "working");
+      assert.strictEqual(carried.workThreadId, worker);
+      assert.strictEqual(carried.activeThreadId, worker);
+      // The ordinary thread create still waits on its evaluator's packet.
+      const queued = yield* kanban.createCard(
+        board.id,
+        { title: "Queued", prompt: "Queued", subtasks: [{ text: "Fix it", owner: "work" }] },
+        { _tag: "thread", threadId: worker },
+      );
+      assert.deepStrictEqual(
+        queued.subtasks.map(({ id, step, owner: by, text }) => [id, step, by, text]),
+        [
+          ["s1", 1, "evaluator", PACKET_SUBTASK],
+          ["s2", 2, "work", "Fix it"],
+        ],
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -29014,10 +29127,13 @@ it.effect.each(["deployed", "working", "todo", "legacy"] as const)(
           assert.isFalse(
             result.events.some((event) => event.body?.startsWith("fresh work thread:")),
           );
-          assert.include(
-            (yield* Ref.get(fake.threads)).get(current)!.messages.at(-1)!,
-            "P2: preserve batch ownership",
-          );
+          // Rework runs before new work, so the todo home may wake this thread afterward.
+          const rework = (yield* Ref.get(fake.threads))
+            .get(current)!
+            .messages.slice(oldMessages)
+            .filter((message) => message.startsWith(`Card #${claimed.number} is back with you.`));
+          assert.lengthOf(rework, 1);
+          assert.include(rework[0]!, "P2: preserve batch ownership");
         }
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),

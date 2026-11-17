@@ -193,12 +193,12 @@ class TriageLoggingTests(unittest.TestCase):
                               return_value=outcome):
                 if isinstance(outcome, Exception):
                     with self.assertRaises(subprocess.TimeoutExpired):
-                        t.run_mail('icloud', {**payload, 'fast': True})
+                        t.run_mail_fetch('icloud', {**payload, 'fast': True})
                 elif outcome.returncode:
                     with self.assertRaises(RuntimeError):
-                        t.run_mail('icloud', payload)
+                        t.run_mail_fetch('icloud', payload)
                 else:
-                    self.assertEqual(t.run_mail('icloud', payload), good)
+                    self.assertEqual(t.run_mail_fetch('icloud', payload), good)
         rows = self.rows('helper.run')
         self.assertEqual([row['ok'] for row in rows], [True, False, False])
         self.assertEqual(rows[-1]['props'], {'outcome': 'timeout', **t.stderr_cause('private stderr', True)})

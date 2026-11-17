@@ -242,7 +242,7 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "run":
         # Routing waits for a live preflight; alert hysteresis can lag behind recovery.
         return "server"
-    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec", "box", "events"):
+    if sub in ("logs", "wait", "kill", "status", "release", "ssh", "ports", "keep", "exec", "box", "events"):
         named = [x for x in argv if x.startswith(("run-", "bx_"))]
         if sub in ('box', 'events'):
             from .cli import build_parser
@@ -252,7 +252,7 @@ def entry_backend(argv: list[str]) -> str:
             from .cli import parse_args
             a = parse_args(argv)
             named = a.cmd[:1] if a.cmd and a.cmd[0].startswith("bx_") else []
-        elif sub in ("logs", "wait", "kill"):
+        elif sub in ("logs", "wait", "kill", "status"):
             named = []
             args = iter(argv[argv.index(sub) + 1:])
             for arg in args:
@@ -446,6 +446,15 @@ def say(msg: str) -> None:
     _emit(f"offbox: {msg}")
 
 
+def size_summary(row) -> str:
+    requested = row['requested_size'] if 'requested_size' in row.keys() else None
+    effective = row['size'] if 'size' in row.keys() else None
+    if not requested or not effective or requested == effective:
+        return ""
+    hint = "; OFFBOX_ALLOW_XLARGE=1 keeps xlarge" if requested == 'xlarge' and effective == 'large' else ""
+    return f"size: {effective} (asked {requested}{hint})"
+
+
 def warn_loud(msg: str) -> None:
     bar = "!" * 78
     _emit(f"\n{bar}\noffbox WARNING: {msg}\n{bar}\n")
@@ -572,19 +581,31 @@ CAPACITY_SCHEMA = """
 """
 
 
-SCHEMA_VERSION = 6
+# 9: #174 (6->7, pull_* columns) and #220 (6->8, size columns) were bumped in parallel, so a
+# DB can sit at 7 or 8 with only one set; 9 re-runs the idempotent column loop for both.
+SCHEMA_VERSION = 9
 DB_TIMEOUT = 30
 
 
 class StateConnection(sqlite3.Connection):
     last_statement = "connect"
+    deadline = None
+
+    def _busy_budget(self):
+        if self.deadline is not None:
+            remaining = max(0, min(DB_TIMEOUT, self.deadline - now()))
+            super().execute(f'PRAGMA busy_timeout={int(remaining * 1000)}')
 
     def execute(self, sql, parameters=(), /):
         self.last_statement = " ".join(sql.split())[:100]
         try:
+            self._busy_budget()
             return super().execute(sql, parameters)
         except sqlite3.Error as error:
             error.add_note(f"local state SQL: {self.last_statement}")
+            if self.deadline is not None and busy(error) and now() >= self.deadline - .002:
+                raise OffboxError('local state deadline reached; wait again', code=EXIT_WAIT_TIMEOUT,
+                                  started=True) from error
             raise
 
 
@@ -648,7 +669,9 @@ def _migrate(con):
             con.execute(statement)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL", "cmd_bytes INTEGER", "cmd_via TEXT"):
+                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL", "cmd_bytes INTEGER", "cmd_via TEXT",
+                "requested_size TEXT", "size_note TEXT",
+                "pull_state TEXT", "pull_started_at REAL", "pull_ended_at REAL", "pull_owner TEXT", "pull_summary TEXT"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE runs ADD COLUMN {col}")
     if 'wrapper_pid' not in have:
@@ -679,15 +702,17 @@ def _migrate(con):
                 (str(con.execute('SELECT COALESCE(MAX(rowid),0) FROM events').fetchone()[0]), now()))
 
 
-def db() -> sqlite3.Connection:
+def db(*, until=None) -> sqlite3.Connection:
     ensure_dirs()
     # Standalone writes commit immediately. Only read/modify/write units use write(), never network work.
     try:
-        con = sqlite3.connect(DB_PATH, timeout=DB_TIMEOUT, isolation_level=None, factory=StateConnection)
+        timeout = DB_TIMEOUT if until is None else max(0, min(DB_TIMEOUT, until-now()))
+        con = sqlite3.connect(DB_PATH, timeout=timeout, isolation_level=None, factory=StateConnection)
     except sqlite3.Error as error:
         error.add_note('local state SQL: connect')
         raise
     con.row_factory = sqlite3.Row
+    con.deadline = until
     try:
         db_retry(lambda: ensure_schema(con))
         _owner_columns(con)
@@ -766,7 +791,7 @@ def file_lock(name: str, timeout: float = 600):
                     fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
-                    if now() > deadline:
+                    if timeout <= 0 or now() > deadline:
                         raise OffboxError(f"timed out waiting for lock {name}")
                     time.sleep(0.3)
     except BaseException:

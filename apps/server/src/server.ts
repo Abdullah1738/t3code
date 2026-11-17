@@ -5,6 +5,7 @@ import * as AnalyticsDatabase from "./observability/AnalyticsDatabase.ts";
 import { layerServerAnalyticsErrors } from "./observability/RpcInstrumentation.ts";
 import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
 import * as RuntimeSampler from "./ardud/analytics/RuntimeSampler.ts";
+import * as GitExecRate from "./vcs/GitExecRate.ts";
 import * as ThreadRedaction from "./ardud/redaction/ThreadRedaction.ts";
 import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
 import { redactionRouteLayer } from "./ardud/redaction/http.ts";
@@ -1196,6 +1197,11 @@ const layerMakeServer = Layer.unwrap(
         Layer.provide(ReplyBuilders.layer),
         Layer.provideMerge(FetchHttpClient.layer),
         Layer.provide(VcsProcess.layer),
+        Layer.provide(
+          GitExecRate.layer.pipe(
+            Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
+          ),
+        ),
         Layer.provideMerge(AgentScopeLive.layer),
         Layer.provideMerge(ProviderProcessRegistry.layer),
       )

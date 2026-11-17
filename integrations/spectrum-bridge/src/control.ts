@@ -1,4 +1,4 @@
-import { toolError, toolLog } from "./toollog.ts";
+import { markLoggedFailure, toolError, toolLog } from "./toollog.ts";
 import { errorDetail } from "./log-error.ts";
 import { startTickRead } from "./tick-timing.ts";
 // Client for Robob's local control API (/api/ardud/control/*), plus the
@@ -173,6 +173,7 @@ export class ControlClient {
     let responseStatus: number | undefined;
     let requestTimeout: AbortSignal | undefined;
     let loggingError: unknown;
+    let thrownError: unknown;
     let loggingTag = "control.request_failed";
     try {
     // Reads get 25 s: Robob under load answers in seconds to tens of seconds, and giving up early only looks like an outage.
@@ -217,6 +218,7 @@ export class ControlClient {
     return data as T;
     } catch (error) {
       loggingError ??= error;
+      thrownError = error;
       throw error;
     } finally {
       toolLog.capture(() => {
@@ -230,6 +232,7 @@ export class ControlClient {
       toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
         ok: loggingOk, ids: { ...loggingIds, ...(serverRequestId ? { serverRequestId } : {}) }, props: { method, route, ...(transport ? { linkCause: transport } : {}), ...(!loggingOk ? { failureFormat: "single" } : {}) },
         ...(!loggingOk ? { error: { tag: loggingTag, cause: loggingError } } : {}) }));
+      if (!loggingOk) markLoggedFailure(thrownError, requestId);
       });
     }
   }

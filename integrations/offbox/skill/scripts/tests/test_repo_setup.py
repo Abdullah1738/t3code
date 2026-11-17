@@ -320,8 +320,9 @@ class RepoSetupExitTests(Isolated):
                 with self.subTest(path=path, case=label):
                     self.log.unlink(missing_ok=True)
                     common.offsets_path(self.log).unlink(missing_ok=True)
+                    (common.LOGS_DIR / 'run-setup.pulls.jsonl').unlink(missing_ok=True)
                     self.con.execute("UPDATE runs SET status='running',exit_code=NULL,command_id='cmd_setup',"
-                                     "pulls='[\"artifacts\"]' "
+                                     "pulls='[\"artifacts\"]',pull_state=NULL,pull_owner=NULL,pull_summary=NULL "
                                      "WHERE run_id='run-setup'")
                     self.con.commit()
                     status = dict(running=False, status='exited', exitCode=code, stderr=stderr)
@@ -337,13 +338,14 @@ class RepoSetupExitTests(Isolated):
                             reap._check_unlocked(self.con, 'bx_setup', 'running', False, [])
                         else:
                             pool._refresh_background(self.con, 'repo')
-                        self.assertEqual(self.log.read_text(), stderr)
+                        self.assertEqual(self.log.read_text().split('\n[offbox run-setup pulls]')[0], stderr)
+                        self.assertEqual('pull_end' in self.log.read_text(), expect_pull)
                         self.assertEqual(self.row()['status'], expected_status)
                         self.assertEqual(self.row()['exit_code'], expected_code)
                         out, err = io.StringIO(), io.StringIO()
                         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                             self.assertEqual(misc.logs('run-setup', False), 0 if stderr else 1)
-                        self.assertEqual(out.getvalue(), stderr)
+                        self.assertEqual(out.getvalue(), self.log.read_text())
                         if stderr:
                             self.assertEqual(err.getvalue(), '')
                         else:
@@ -352,8 +354,10 @@ class RepoSetupExitTests(Isolated):
                         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                             self.assertEqual(misc.wait('run-setup', None), expected_code)
                         self.assertEqual(out.getvalue(), f'run-setup: {expected_status} exit={expected_code}\n')
-                        self.assertEqual(err.getvalue(), '' if stderr else
-                                         'offbox: run-setup settled with no output on record\n')
+                        expected_err = '' if stderr else 'offbox: run-setup settled with no output on record\n'
+                        if expect_pull:
+                            expected_err += 'offbox: run-setup: pulls: done (0 files, 0 conflicts)\n'
+                        self.assertEqual(err.getvalue(), expected_err)
                     if expect_pull:
                         pull.assert_called_once()
                         self.assertEqual(pull.call_args.args[2], ['artifacts'])

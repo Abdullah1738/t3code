@@ -1197,11 +1197,18 @@ it.effect.each([
             },
     };
     let admissions = 0;
+    const admission = {
+      queuedAtMs: 0,
+      waitedMs: 30 * 60_000,
+      positionAtFailure: 7,
+      totalAtFailure: 12,
+      rule: "no_progress" as const,
+    };
     const expire = Effect.sync(() => {
       admissions++;
     }).pipe(
       Effect.andThen(
-        Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now })),
+        Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now, admission })),
       ),
     );
     const layer = layerExecutorFor({
@@ -1291,6 +1298,7 @@ it.effect.each([
           runId,
           expectedAttemptId: attemptId,
           deadline: now,
+          admission,
         },
       ]);
     else assert.deepEqual(commands, []);

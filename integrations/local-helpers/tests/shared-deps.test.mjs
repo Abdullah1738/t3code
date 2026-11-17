@@ -27,11 +27,18 @@ function fixture(t, shape) {
     if (shape === ".bin") fs.rmdirSync(path.join(modules, ".bin"));
     if (shape) fs.symlinkSync(path.join(store, shape), path.join(modules, shape));
   }
+  fs.mkdirSync(path.join(modules, "vite-plus/bin"), { recursive: true });
+  fs.writeFileSync(path.join(modules, "vite-plus/bin/vp"), "fixture");
   fs.writeFileSync(path.join(modules, ".bin/vp"), "#!/bin/sh\necho forwarded\n", { mode: 0o755 });
   const cli = path.join(temporary, "pnpm.cjs");
   fs.writeFileSync(cli, "console.log('forwarded');\n");
   function run(tool, args, cwd = root) {
-    const env = { ...process.env, ROBOB_REPO_NODE: process.execPath, ROBOB_REPO_PNPM_CLI: cli };
+    const env = {
+      ...process.env,
+      XDG_STATE_HOME: path.join(temporary, "state"),
+      ROBOB_REPO_NODE: process.execPath,
+      ROBOB_REPO_PNPM_CLI: cli,
+    };
     delete env.REPO_VP_SHIM_ACTIVE;
     return spawnSync(tool === "vp" ? vp : pnpm, args, { cwd, env, encoding: "utf8" });
   }

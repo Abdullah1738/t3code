@@ -1058,7 +1058,12 @@ export interface KanbanServiceShape {
     threadId: ThreadId,
     cardId: KanbanCard["id"],
   ) => Effect.Effect<ClaimResult, KanbanError>;
-  /** Creates and takes a card atomically; evaluator assignments also queue its brief. */
+  /**
+   * Creates and takes a card atomically; evaluator assignments also queue its
+   * brief. A card the thread makes for itself (no assignment) keeps the caller's
+   * subtasks as its whole plan: no evaluator packet step goes in front of them,
+   * and the take is not refused for a plan whose first step is the evaluator's.
+   */
   readonly createForThread: (
     threadId: ThreadId,
     input: NewCard,
@@ -1110,6 +1115,7 @@ interface StartTimeout {
   readonly restartAdmission?: boolean;
   readonly runId: string;
   readonly reason: string;
+  readonly admission?: KanbanCardEvent["admission"];
 }
 type Job =
   | { readonly _tag: "kick" }
@@ -3761,6 +3767,9 @@ const make = Effect.gen(function* () {
       readonly toStage?: KanbanStage | null;
       readonly body?: string | null;
       readonly sourceThreadId?: ThreadId;
+      readonly runId?: string;
+      readonly admission?: KanbanCardEvent["admission"];
+      readonly failedThreadId?: ThreadId;
       readonly head?: string | null;
       readonly instructionApplication?: InstructionApplication;
       readonly undoAssignment?: true;
@@ -3781,6 +3790,9 @@ const make = Effect.gen(function* () {
         toStage: extra.toStage ?? null,
         body: extra.body ?? null,
         ...(extra.sourceThreadId === undefined ? {} : { sourceThreadId: extra.sourceThreadId }),
+        ...(extra.runId === undefined ? {} : { runId: extra.runId }),
+        ...(extra.admission === undefined ? {} : { admission: extra.admission }),
+        ...(extra.failedThreadId === undefined ? {} : { failedThreadId: extra.failedThreadId }),
         head: extra.head ?? null,
         ...(extra.assignmentWake === undefined ? {} : { assignmentWake: extra.assignmentWake }),
       },
@@ -9963,7 +9975,13 @@ const make = Effect.gen(function* () {
         const latest =
           compactRunId === undefined
             ? yield* Effect.result(threads.latestRun(existing))
-            : yield* Effect.result(threads.compactRun(existing, compactRunId));
+            : yield* Effect.result(
+                threads
+                  .compactRun(existing, compactRunId)
+                  .pipe(
+                    Effect.map((run) => (run === null ? null : { ...run, runId: compactRunId })),
+                  ),
+              );
         // A failed read or the original failure is not proof that maintenance
         // finished; wait rather than silently abandon the thread.
         if (latest._tag === "Failure") {
@@ -9992,6 +10010,8 @@ const make = Effect.gen(function* () {
             fromStage: card.stage,
             toStage: "todo",
             body: `${FRESH_START}: compaction failed`,
+            failedThreadId: existing,
+            runId: latest.success.runId,
           });
           destination.expectedCard = yield* saveDispatchCard(fresh);
           yield* kick;
@@ -11951,6 +11971,7 @@ const make = Effect.gen(function* () {
     next: KanbanCard,
     options: {
       readonly flagReason?: string;
+      readonly failedThreadId?: ThreadId;
       readonly notice?: string;
       readonly head?: string | null;
     },
@@ -11968,6 +11989,9 @@ const make = Effect.gen(function* () {
           options.flagReason === undefined ? "comment" : "flagged",
           {
             body: options.flagReason ?? Retries.reviewGateBuildEvent(reviewGateBuild),
+            ...(options.failedThreadId === undefined
+              ? {}
+              : { failedThreadId: options.failedThreadId }),
             ...(options.flagReason === undefined
               ? {}
               : { fromStage: before.stage, toStage: next.stage }),
@@ -12156,6 +12180,7 @@ const make = Effect.gen(function* () {
         fromStage: card.stage,
         toStage: again.stage,
         body: Retries.NO_VERDICT_RESTARTED_EVENT,
+        failedThreadId: threadId,
       });
       yield* saveCard(again);
       yield* kick;
@@ -12172,6 +12197,7 @@ const make = Effect.gen(function* () {
     if (Retries.gateRefusedVerdict(next, yield* store.cardEvents(card.id)) !== null) {
       yield* saveReviewGateState(card, next, {
         flagReason: reason,
+        failedThreadId: threadId,
         notice: Briefs.workerFlaggedText(next, reason),
       });
       yield* kick;
@@ -12181,6 +12207,7 @@ const make = Effect.gen(function* () {
       fromStage: card.stage,
       toStage: next.stage,
       body: reason,
+      failedThreadId: threadId,
     });
     yield* saveCard(next);
     yield* kick;
@@ -12582,6 +12609,9 @@ const make = Effect.gen(function* () {
         fromStage: current.stage,
         toStage: next.stage,
         body: `${reason}\nRun: ${startTimeout.runId}`,
+        runId: startTimeout.runId,
+        failedThreadId: threadId,
+        ...(startTimeout.admission === undefined ? {} : { admission: startTimeout.admission }),
       });
       yield* saveCard(next);
     }
@@ -12687,6 +12717,11 @@ const make = Effect.gen(function* () {
       return next;
     });
     const failure = lastFailure.success;
+    const failureEvent = {
+      failedThreadId: threadId,
+      ...(failure?.runId == null ? {} : { runId: failure.runId }),
+      ...(failure?.admission === undefined ? {} : { admission: failure.admission }),
+    };
     if (failure?.code === "restart_admission_timeout") {
       if (failure.runId == null) {
         yield* Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(threadId));
@@ -12699,6 +12734,7 @@ const make = Effect.gen(function* () {
           runId: failure.runId,
           reason: failure.message,
           restartAdmission: true,
+          ...(failure.admission === undefined ? {} : { admission: failure.admission }),
         },
         at,
       );
@@ -13174,6 +13210,7 @@ const make = Effect.gen(function* () {
                   ? ` [compact-run ${compactSent.success}]`
                   : ""
               }`,
+              ...failureEvent,
             });
             yield* saveCard(compacting);
             continue;
@@ -13216,6 +13253,7 @@ const make = Effect.gen(function* () {
               fromStage: entry.stage,
               toStage: "todo",
               body: `${FRESH_START}: ${failure.message}`,
+              ...failureEvent,
             });
             yield* saveCard(fresh);
             continue;
@@ -13266,6 +13304,7 @@ const make = Effect.gen(function* () {
               fromStage: entry.stage,
               toStage: "todo",
               body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
+              ...failureEvent,
             });
             yield* saveCard(next);
             continue;
@@ -13274,6 +13313,7 @@ const make = Effect.gen(function* () {
             fromStage: entry.stage,
             toStage: "todo",
             body: reason,
+            ...failureEvent,
           });
           yield* saveCard(next);
           yield* noteDiscussion(
@@ -13350,6 +13390,7 @@ const make = Effect.gen(function* () {
           fromStage: card.stage,
           toStage: "needs_review",
           body: `${FRESH_START}: ${failure.message}`,
+          ...failureEvent,
         });
         yield* saveCard(fresh);
         yield* kick;
@@ -13384,6 +13425,7 @@ const make = Effect.gen(function* () {
           fromStage: card.stage,
           toStage: waiting.stage,
           body: `${Retries.RETRYING_EVENT}: ${failure.message}`,
+          ...failureEvent,
         });
         yield* saveCard(waiting);
         yield* kick;
@@ -13401,6 +13443,7 @@ const make = Effect.gen(function* () {
         fromStage: card.stage,
         toStage: next.stage,
         body: reason,
+        ...failureEvent,
       });
       yield* saveCard(next);
       yield* noteDiscussion(
@@ -17248,6 +17291,7 @@ const make = Effect.gen(function* () {
     threadId: ThreadId,
     card: KanbanCard,
     observe = false,
+    takeAtOnce = false,
   ) {
     let capacity: Effect.Success<ReturnType<typeof takeCapacity>> | undefined;
     return yield* Effect.gen(function* () {
@@ -17275,6 +17319,7 @@ const make = Effect.gen(function* () {
         slots: capacity.slots,
         pools: capacity.pools,
         nowMs: yield* nowMillis,
+        takeAtOnce,
       });
       if (!check.ok)
         return yield* failWith(
@@ -17425,7 +17470,9 @@ const make = Effect.gen(function* () {
   });
 
   // The card is checked as a draft first, so a refused take leaves nothing
-  // behind for the dispatcher to start twice.
+  // behind for the dispatcher to start twice. A card the caller's own thread
+  // takes here carries the caller's subtasks as its whole plan (no packet step
+  // in front of them), so that plan's open step is never a reason to refuse it.
   const createForThread: KanbanServiceShape["createForThread"] = (threadId, input, assignment) =>
     guardDeferred(
       "card.createForThread",
@@ -17500,7 +17547,7 @@ const make = Effect.gen(function* () {
           const actor: KanbanActor = assignment?.actor ?? { _tag: "thread", threadId };
           yield* refuseTwin(thread.board.id, fields, actor);
           const draft = yield* draftCard(thread.board.id, fields, actor);
-          yield* checkTake(thread, threadId, draft);
+          yield* checkTake(thread, threadId, draft, false, assignment === undefined);
           return { thread, fields, draft, actor };
         }).pipe(
           Effect.mapError((cause) => {

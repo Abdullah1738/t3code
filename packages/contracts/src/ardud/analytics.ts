@@ -182,6 +182,23 @@ const GeneralEvent = Schema.Struct({
   boardId: Schema.optionalKey(Id),
   cardId: Schema.optionalKey(Id),
   discussionId: Schema.optionalKey(Id),
+  restartAdmission: Schema.optionalKey(
+    Schema.Struct({
+      sourceRunId: DerivedId,
+      runId: Schema.optionalKey(DerivedId),
+      classification: Label,
+      queuedAtMs: Measurement,
+      waitedMs: Measurement,
+      positionAtEntry: Measurement,
+      position: Measurement,
+      total: Measurement,
+      maxQueueDepth: Measurement,
+      active: Measurement,
+      maxActive: Measurement,
+      loaded: Schema.Boolean,
+      rule: Schema.optionalKey(Schema.Literals(["no_progress", "absolute_backstop", "wall_time"])),
+    }),
+  ),
   threadId: Schema.optionalKey(DerivedId),
   durationMs: Schema.optionalKey(Measurement),
   phase: Schema.optionalKey(Label),
@@ -303,6 +320,21 @@ const GeneralEvent = Schema.Struct({
   props: Schema.optionalKey(
     Schema.Struct({
       ...RuntimeSampleProps,
+      total: Schema.optionalKey(Measurement),
+      distinctCwds: Schema.optionalKey(Measurement),
+      maxPerSecond: Schema.optionalKey(Measurement),
+      windowMs: Schema.optionalKey(Measurement),
+      overflow: Schema.optionalKey(Measurement),
+      top: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            operation: Label,
+            subcommand: Label,
+            cwdHash: Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/)),
+            count: Measurement,
+          }),
+        ).check(Schema.isMaxLength(20)),
+      ),
       on: Schema.optionalKey(Label),
       until: Schema.optionalKey(Timestamp),
       script: Schema.optionalKey(Label),
@@ -644,6 +676,35 @@ export const AnalyticsRollup = Schema.Struct({
   total: Measurement,
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
+  restartAdmission: Schema.optionalKey(
+    Schema.Struct({
+      scope: Schema.Literal("server-wide"),
+      groupBy: Schema.Literal("boot-hour"),
+      loadedTimeShare: Schema.Null,
+      basis: Schema.String.check(Schema.isMaxLength(160)),
+      overflow: Measurement,
+      groups: Schema.Array(
+        Schema.Struct({
+          bootId: Id,
+          hour: Label,
+          maxQueueDepth: Measurement,
+          admissions: Measurement,
+          failuresByRule: Schema.Record(Label, Measurement),
+          maxActiveObserved: Measurement,
+          maxActive: Measurement,
+          loadedObservations: Measurement,
+          observations: Measurement,
+          wait: Schema.Struct({
+            count: Measurement,
+            p50Ms: Schema.NullOr(Measurement),
+            p90Ms: Schema.NullOr(Measurement),
+            maxMs: Schema.NullOr(Measurement),
+            approximate: Schema.Boolean,
+          }),
+        }),
+      ),
+    }),
+  ),
   textGenerationOverflow: Schema.optionalKey(Measurement),
   textGeneration: Schema.optionalKey(
     Schema.Array(

@@ -13,6 +13,7 @@ import { type DesktopSnapShotEvent, DEFAULT_CLIENT_SETTINGS } from "@t3tools/con
 import * as DesktopAssets from "../app/DesktopAssets.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import { makeComponentLogger } from "../app/DesktopObservability.ts";
+import * as DesktopQuit from "../app/DesktopQuit.ts";
 import * as DesktopState from "../app/DesktopState.ts";
 import * as ElectronMenu from "../electron/ElectronMenu.ts";
 import { getDesktopUrl } from "../electron/ElectronProtocol.ts";
@@ -655,7 +656,9 @@ export const make = Effect.gen(function* () {
       // released so its remaining repeats cannot reach the next app.
       concealWindow: () => concealPendingQuitWindow(window),
       quit: () => {
-        void runPromise(electronApp.quit);
+        void runPromise(
+          DesktopQuit.record({ trigger: "menu" }).pipe(Effect.andThen(electronApp.quit)),
+        );
       },
     });
     window.webContents.on("before-input-event", (event, input) => {
