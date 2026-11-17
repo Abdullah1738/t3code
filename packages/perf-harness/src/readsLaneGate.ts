@@ -56,23 +56,24 @@ export const readsLaneWorkload = {
 const Effect = await import("effect/Effect");
 const Fiber = await import("effect/Fiber");
 const Layer = await import("effect/Layer");
+const Data = await import("effect/Data");
+const Logger = await import("effect/Logger");
 const SqlClient = await import("effect/sql/SqlClient");
 const NodeServices = await import("@effect/platform-node/NodeServices");
-const NodeSqliteClient = (await import("@t3tools/shared/nodeSqliteClient")) as Record<
-  string,
-  unknown
-> &
-  typeof import("@t3tools/shared/nodeSqliteClient");
+const NodeSqliteClient = await import("@t3tools/shared/nodeSqliteClient");
 const Sqlite = await import("../../../apps/server/src/persistence/Sqlite.ts");
 const Projection = await import("../../../apps/server/src/orchestration-v2/ProjectionStore.ts");
 const { ThreadId } = await import("@t3tools/contracts");
 const { percentiles } = await import("./metrics.ts");
 
-type Eff<A> = import("effect/Effect").Effect<A, unknown, unknown>;
-const foreground: <A>(effect: Eff<A>) => Eff<A> =
+class ReadsLaneGateError extends Data.TaggedError("ReadsLaneGateError")<{
+  readonly message: string;
+}> {}
+
+const foreground = <A, E, R>(effect: import("effect/Effect").Effect<A, E, R>) =>
   typeof NodeSqliteClient.foregroundReads === "function"
-    ? (NodeSqliteClient.foregroundReads as <A>(effect: Eff<A>) => Eff<A>)
-    : (effect) => effect;
+    ? NodeSqliteClient.foregroundReads(effect)
+    : effect;
 const hasLanes = typeof NodeSqliteClient.foregroundReads === "function";
 
 const fixture = JSON.parse(
@@ -124,6 +125,15 @@ const layer = Projection.layer.pipe(
   Layer.provideMerge(NodeServices.layer),
 );
 
+// Keep the gate's plain stderr progress lines while logging through Effect.
+const progressLogger = Logger.make(({ message }) =>
+  Array.isArray(message) ? console.error(...message) : console.error(message),
+);
+const progress = (message: string) =>
+  Effect.logError(message).pipe(
+    Effect.provideService(Logger.CurrentLoggers, new Set([progressLogger])),
+  );
+
 const program = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const store = yield* Projection.ProjectionStoreV2;
@@ -131,7 +141,7 @@ const program = Effect.gen(function* () {
   const tracing = process.env.READS_GATE_TRACE === "1";
   const trace = (event: string) =>
     tracing ? console.error(`[${label}] ${Math.round(performance.now())} ${event}`) : undefined;
-  const time = <A>(effect: Eff<A>, name = "op") =>
+  const time = <A, E, R>(effect: import("effect/Effect").Effect<A, E, R>, name = "op") =>
     Effect.suspend(() => {
       const start = performance.now();
       trace(`start ${name}`);
@@ -145,8 +155,15 @@ const program = Effect.gen(function* () {
   // `readOnly` (Orchestrator.ts getShellSnapshot / getThreadSnapshotWindow /
   // getThreadSnapshot / getThreadShell); WS RPCs and environment HTTP add
   // `foregroundReads` on the candidate.
-  const ro = NodeSqliteClient.readOnly as <A>(effect: Eff<A>) => Eff<A>;
-  const run: Record<string, () => Eff<unknown>> = {
+  const ro = NodeSqliteClient.readOnly;
+  const run: Record<
+    string,
+    () => import("effect/Effect").Effect<
+      unknown,
+      | import("../../../apps/server/src/orchestration-v2/ProjectionStore.ts").ProjectionStoreV2Error
+      | import("effect/sql/SqlError").SqlError
+    >
+  > = {
     shellPage: () => foreground(ro(store.getShellSnapshot({ location: "active", limit: 501 }))),
     threadWindow: () => foreground(ro(store.getThreadSnapshotWindow(thread, { rowLimit: 200 }))),
     threadSnapshot: () => foreground(ro(store.getThreadSnapshot(thread))),
@@ -156,15 +173,17 @@ const program = Effect.gen(function* () {
   };
   const cycle = (phase: string) =>
     Effect.forEach(
-      Object.keys(run),
-      (probe) =>
+      Object.entries(run),
+      ([probe, read]) =>
         time(
-          run[probe]!().pipe(
+          read().pipe(
             Effect.timeoutOrElse({
               duration: readsLaneWorkload.probeTimeoutMs,
               orElse: () =>
                 Effect.fail(
-                  new Error(`probe timed out after ${readsLaneWorkload.probeTimeoutMs} ms`),
+                  new ReadsLaneGateError({
+                    message: `probe timed out after ${readsLaneWorkload.probeTimeoutMs} ms`,
+                  }),
                 ),
             }),
           ),
@@ -183,7 +202,7 @@ const program = Effect.gen(function* () {
       Object.entries(run).map(([name, f]) => time(f(), `warm.${name}`)),
       { concurrency: "unbounded" },
     );
-  yield* Effect.sync(() => console.error(`[${label}] warmed t=${Math.round(performance.now())}ms`));
+  yield* progress(`[${label}] warmed t=${Math.round(performance.now())}ms`);
   yield* sql`CREATE TABLE IF NOT EXISTS gate_scratch (id INTEGER PRIMARY KEY, body TEXT NOT NULL)`;
   const holderTransaction = sql
     .withTransaction(
@@ -194,7 +213,7 @@ const program = Effect.gen(function* () {
     )
     .pipe(NodeSqliteClient.readOnly);
   const holderIdleMs = yield* time(holderTransaction, "holder.alone");
-  yield* Effect.sync(() => console.error(`[${label}] holder alone ${Math.round(holderIdleMs)}ms`));
+  yield* progress(`[${label}] holder alone ${Math.round(holderIdleMs)}ms`);
   sample("idle-start");
   for (let i = 0; i < readsLaneWorkload.idleCycles; i++) yield* cycle("idle");
   sample("idle-end");
@@ -276,13 +295,7 @@ const started = new Date().toISOString();
 const keepAlive = setInterval(() => undefined, 1000);
 let result: { holderIdleMs: number; checkpoint: unknown };
 try {
-  result = (await Effect.runPromise(
-    Effect.scoped(program).pipe(Effect.provide(layer)) as import("effect/Effect").Effect<
-      { holderIdleMs: number; checkpoint: unknown },
-      unknown,
-      never
-    >,
-  )) as { holderIdleMs: number; checkpoint: unknown };
+  result = await Effect.runPromise(Effect.scoped(program).pipe(Effect.provide(layer)));
 } finally {
   clearInterval(keepAlive);
   NodeFS.rmSync(home, { recursive: true, force: true });

@@ -15,7 +15,11 @@ import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 import { ProjectionStoreThreadNotFoundError } from "../orchestration-v2/ProjectionStore.ts";
 import type { CallerRow } from "../orchestration-v2/ProjectionStore.ts";
 import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
-import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
+import {
+  parentTaskCancellationRequest,
+  restartInterrupted,
+  stalledSummary,
+} from "../orchestration-v2/delegatedTaskProgress.ts";
 import {
   AnalyticsEvent,
   CommandId,
@@ -2310,7 +2314,11 @@ const make = Effect.gen(function* () {
           "nodes",
           "turnItems",
         ],
-        { messageRoles: ["user"], turnItemTypes: ["error"], omitSettledLeafNodes: true },
+        {
+          messageRoles: ["user"],
+          turnItemTypes: ["error", "run_interrupt_request"],
+          omitSettledLeafNodes: true,
+        },
         { projectionOnly: true },
       )
       .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure), (effect) =>
@@ -2594,6 +2602,13 @@ const make = Effect.gen(function* () {
       childRunId: childRun?.id ?? null,
       childNodeId: task.id,
       status,
+      ...(restartInterrupted({ status, cancelReason: cancellation?.cancelReason }) &&
+      parentTaskCancellationRequest(resultRun?.id, childControls.turnItems) === undefined &&
+      task.completionDelivery?.state !== "disposed" &&
+      currentRun === undefined &&
+      !hasPendingChildRuns(childControls, childRun)
+        ? { resumable: true, resumeThreadId: task.childThreadId }
+        : {}),
       ...(cancellation?.cancelReason === undefined
         ? {}
         : { cancelReason: cancellation.cancelReason }),

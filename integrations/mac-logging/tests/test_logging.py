@@ -156,6 +156,7 @@ class LoggingTests(unittest.TestCase):
 
     def test_cve_entrypoint_and_fix_success_failure_no_commands(self):
         cve=load('cve_test',REPO/'integrations/cve-sweep/cve-sweep')
+        cve.STATE=str(self.root/'cve-state')
         report=dict(findings=[dict(kind='npm',severity='HIGH',name='pkg',version='1.0')],errors=[],actions=[dict(ok=True)])
         with patch.object(cve,'scan',return_value=report), patch.object(cve,'REPORTS',str(self.root/'reports')), \
              patch.object(cve,'HOLD_FILE',str(self.root/'hold.txt')), \
@@ -301,6 +302,7 @@ class LoggingTests(unittest.TestCase):
 
     def test_cve_owner_and_browser_action_forms(self):
         cve=load('cve_forms',REPO/'integrations/cve-sweep/cve-sweep')
+        cve.STATE=str(self.root/'cve-state')
         for finding in [dict(kind='electron',severity='MODERATE'),dict(kind='macos-update',severity='MODERATE'),
                         dict(kind='npm',name='node',severity='LOW')]:
             self.assertTrue(cve.needs_owner(finding,{'node'}))
@@ -314,6 +316,7 @@ class LoggingTests(unittest.TestCase):
 
     def test_all_cve_action_formats_retain_identity_and_versions(self):
         cve=load('cve_all_actions',REPO/'integrations/cve-sweep/cve-sweep')
+        cve.STATE=str(self.root/'cve-state')
         findings=[dict(name='pkg',version='1.0'),dict(name='@scope/pkg',version='1.0'),
                   dict(name='brew-a',version='1.1'),dict(name='brew-b',version='1.2'),
                   dict(path='/fixture/cache with space',version='1.3'),
