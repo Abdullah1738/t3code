@@ -15,12 +15,18 @@ plist="$HOME/Library/LaunchAgents/$label.plist"
 
 mode=install
 with_agent=0
+reload_flags=()
+reload_helper="$pkg/../local-helpers/libexec/opencode-reload/opencode_reload.py"
+[[ -f "$reload_helper" ]] || reload_helper="$HOME/.local/libexec/opencode-reload/opencode_reload.py"
 for arg in "$@"; do
   case "$arg" in
-    --check) mode=check ;;
-    --flighty-python) mode=flighty-python ;;
+    --allow-reload) reload_flags+=(--allow-reload) ;;
+    --check|--dry-run|--flighty-python)
+      [[ $mode == install ]] || { print -u2 'choose --check, --dry-run or --flighty-python'; exit 2; }
+      mode="${arg#--}"
+      ;;
     --with-agent) with_agent=1 ;;
-    *) print -u2 "usage: install.zsh [--check | --flighty-python] [--with-agent]"; exit 2 ;;
+    *) print -u2 "usage: install.zsh [--check | --dry-run | --flighty-python] [--with-agent] [--allow-reload]"; exit 2 ;;
   esac
 done
 
@@ -76,6 +82,19 @@ bootstrap_job() {
   fi
 }
 
+# Only scratch files may be written until all deterministic checks pass.
+preflight_dir=$(mktemp -d "${TMPDIR:-/tmp}/harness-homes-preflight.XXXXXX")
+trap 'rm -rf "$preflight_dir"' EXIT
+[[ -r "$reload_helper" ]] || { print -u2 "missing reload helper: install local-helpers first"; exit 1; }
+"$py" "$pkg/shared/install_preflight.py" "$preflight_dir/opencode.jsonc" --baseline "$preflight_dir/original.jsonc"
+opencode_config=$("$py" -c 'import sys; sys.path.insert(0, sys.argv[1]); import generate_homes as g; print(g.opencode_config_path(g.load_manifest(), None))' "$pkg")
+"$py" "$reload_helper" --installer harness-homes --dry-run --pair "$preflight_dir/opencode.jsonc" \
+  "$opencode_config" >"$preflight_dir/reload-preview"
+"$py" "$pkg/shared/flighty_python.py" --dry-run
+if [[ $mode == dry-run ]]; then
+  cat "$preflight_dir/reload-preview"
+  exit
+fi
 "$py" "$pkg/shared/flighty_python.py"
 
 backup_dir=$(mktemp -d "${TMPDIR:-/tmp}/harness-homes-install.XXXXXX")
@@ -93,9 +112,9 @@ for agent in "${agents[@]}"; do
     touch "$backup_dir/$agent.loaded"
   fi
 done
-opencode_config=$("$py" -c 'import sys; sys.path.insert(0, sys.argv[1]); import generate_homes as g; print(g.opencode_config_path(g.load_manifest(), None))' "$pkg")
-install -m 0600 "$opencode_config" "$backup_dir/opencode.jsonc"
+install -m 0600 "$preflight_dir/original.jsonc" "$backup_dir/opencode.jsonc"
 
+native_homes_written=0
 finish_install() {
   local install_status=$?
   trap - EXIT
@@ -109,11 +128,20 @@ finish_install() {
     else
       rm -f "$dst/manifest.json" || recovery_failed=1
     fi
-    install -m 0600 "$backup_dir/opencode.jsonc" "$opencode_config.restore" && \
-      mv -f "$opencode_config.restore" "$opencode_config" || recovery_failed=1
+    # Equal bytes alone do not prove this invocation wrote them.
+    if [[ -f "$preflight_dir/replaced.json" ]] && \
+       ! cmp -s "$backup_dir/opencode.jsonc" "$opencode_config" && \
+       cmp -s "$preflight_dir/opencode.jsonc" "$opencode_config"; then
+      "$py" "$reload_helper" --installer harness-homes-rollback "${reload_flags[@]}" \
+        --pair "$backup_dir/opencode.jsonc" "$opencode_config" \
+        --expect-before "$preflight_dir/opencode.jsonc" "$opencode_config" \
+        --owned-by "$preflight_dir/replaced.json" || recovery_failed=1
+    fi
     for agent in "${agents[@]}"; do
       if [[ -f "$backup_dir/$agent.plist" ]]; then
-        install -m 0644 "$backup_dir/$agent.plist" "$HOME/Library/LaunchAgents/$agent.plist" || recovery_failed=1
+        if ! cmp -s "$backup_dir/$agent.plist" "$HOME/Library/LaunchAgents/$agent.plist"; then
+          install -m 0644 "$backup_dir/$agent.plist" "$HOME/Library/LaunchAgents/$agent.plist" || recovery_failed=1
+        fi
         if [[ -f "$backup_dir/$agent.loaded" ]]; then
           bootstrap_job "gui/$(id -u)" "$HOME/Library/LaunchAgents/$agent.plist" || recovery_failed=1
         fi
@@ -121,13 +149,14 @@ finish_install() {
         rm -f "$HOME/Library/LaunchAgents/$agent.plist" || recovery_failed=1
       fi
     done
-    if [[ -f "$backup_dir/package/manifest.json" ]]; then
+    if (( native_homes_written )) && [[ -f "$backup_dir/package/manifest.json" ]]; then
       "$py" "$dst/generate_homes.py" generate || recovery_failed=1
     fi
     print -u2 "Install failed; previous package/config/jobs restoration attempted (recovery failures: $recovery_failed). Backup: $backup_dir"
   else
     rm -rf "$backup_dir"
   fi
+  rm -rf "$preflight_dir"
   exit "$install_status"
 }
 trap finish_install EXIT
@@ -145,7 +174,7 @@ rsync --copy-unsafe-links -ac --itemize-changes \
 for server in flighty inbody; do
   shared_label="com.ardud.shared-mcp-$server"
   shared_plist="$HOME/Library/LaunchAgents/$shared_label.plist"
-  install -m 0644 "$pkg/launchd/$shared_label.plist" "$shared_plist"
+  cmp -s "$pkg/launchd/$shared_label.plist" "$shared_plist" || install -m 0644 "$pkg/launchd/$shared_label.plist" "$shared_plist"
   bootout_job "gui/$(id -u)/$shared_label"
   bootstrap_job "gui/$(id -u)" "$shared_plist" || exit $?
 done
@@ -166,15 +195,27 @@ done
   print -u2 "Shared MCP startup failed; configs were not switched"
   exit 1
 }
-"$py" "$pkg/shared/opencode.py"
-install -m 0644 "$pkg/manifest.json" "$dst/manifest.json.new"
-mv -f "$dst/manifest.json.new" "$dst/manifest.json"
-"$py" "$dst/generate_homes.py" generate
-"$py" "$dst/generate_homes.py" check
+if ! cmp -s "$pkg/manifest.json" "$dst/manifest.json"; then
+  install -m 0644 "$pkg/manifest.json" "$dst/manifest.json.new"
+  mv -f "$dst/manifest.json.new" "$dst/manifest.json"
+fi
+native_homes_written=1
+"$py" "$dst/generate_homes.py" generate --opencode-config "$preflight_dir/opencode.jsonc"
+"$py" "$dst/generate_homes.py" check --opencode-config "$preflight_dir/opencode.jsonc"
 
 if (( with_agent )); then
-  install -m 0644 "$pkg/launchd/$label.plist" "$plist"
+  cmp -s "$pkg/launchd/$label.plist" "$plist" || install -m 0644 "$pkg/launchd/$label.plist" "$plist"
   bootout_job "gui/$(id -u)/$label"
   bootstrap_job "gui/$(id -u)" "$plist" || exit $?
   print "loaded $label"
 fi
+
+# The only watched write comes after validation and service startup have passed.
+# A concurrent config edit invalidates the staged migration; never restore over it.
+cmp -s "$backup_dir/opencode.jsonc" "$opencode_config" || {
+  print -u2 "OpenCode config changed during installation; rerun to preserve that edit"
+  exit 1
+}
+"$py" "$reload_helper" --installer harness-homes "${reload_flags[@]}" \
+  --pair "$preflight_dir/opencode.jsonc" "$opencode_config" \
+  --expect-before "$preflight_dir/original.jsonc" "$opencode_config" --receipt "$preflight_dir/replaced.json"

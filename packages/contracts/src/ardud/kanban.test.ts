@@ -47,6 +47,8 @@ import {
 } from "./kanban.ts";
 import { KanbanCardDetail } from "./kanbanRpc.ts";
 
+const decodeSubtask = Schema.decodeUnknownSync(KanbanSubtask);
+
 type CardPatch = Partial<Omit<KanbanCard, "blockedBy">> & { readonly blockedBy?: string[] };
 
 function card(id: string, patch: CardPatch = {}): KanbanCard {
@@ -567,6 +569,103 @@ describe("kanbanHeldUpBy", () => {
       });
       expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
     }
+  });
+
+  it.each([
+    "Land: rebase on master, fast-forward and push master",
+    "fast-forward master to the PR head",
+    "fast forward master to the PR head",
+    "MERGE into main",
+    "Rebase; land it",
+    "Rebase: land it",
+    "Rebase, land it",
+    "Rebase. land it",
+    "Rebase and land it",
+    "Rebase then fast-forward it",
+  ])("holds for an unmarked landing action: %s", (text) => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask(text)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+  });
+
+  it.each([
+    "After the install, check the blocker's merge subtask",
+    "Check the landing subtask",
+    "Check whether it landed",
+    "landing after review",
+    "landed on master",
+    "deploy after fast-forward completes",
+  ])("does not guess a landing action from a mention: %s", (text) => {
+    const blocker = card("b", { stage: "completed", subtasks: [evaluatorSubtask(text)] });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it.each(["work", "review", "evaluator", "script"] as const)(
+    "holds for an explicitly marked %s subtask, but never for an explicit false",
+    (owner) => {
+      const marked = { ...evaluatorSubtask("Ship it"), owner, holdsDependents: true };
+      const blocker = card("b", { stage: "completed", subtasks: [marked] });
+      expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+      const optedOut = {
+        ...blocker,
+        subtasks: [{ ...marked, text: mergeText, holdsDependents: false }],
+      };
+      expect(kanbanHeldUpBy(waiter, byId(optedOut))).toBeUndefined();
+      const unmarked = { ...blocker, subtasks: [{ ...evaluatorSubtask(mergeText), owner }] };
+      expect(kanbanHeldUpBy(waiter, byId(unmarked)) === unmarked).toBe(
+        owner === "evaluator" || owner === "script",
+      );
+    },
+  );
+
+  it.each(["done", "skipped"] as const)("releases a %s marked subtask", (state) => {
+    const blocker = card("b", {
+      stage: "completed",
+      subtasks: [{ ...evaluatorSubtask("Ship it"), state, holdsDependents: true }],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it.each(["deployed", "verified"] as const)(
+    "does not hold a %s blocker even when marked",
+    (stage) => {
+      const blocker = card("b", {
+        stage,
+        subtasks: [{ ...evaluatorSubtask("Ship it"), holdsDependents: true }],
+      });
+      expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+    },
+  );
+
+  it("holds a marked completed blocker even on its dependent's thread", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-w" as never,
+      subtasks: [{ ...evaluatorSubtask("Ship it"), holdsDependents: true }],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+  });
+
+  it.each([true, undefined])("release wording holds only when marked (%s)", (holdsDependents) => {
+    const blocker = card("b", {
+      stage: "completed",
+      subtasks: [
+        {
+          ...evaluatorSubtask("Host release via #99, then live read-back"),
+          ...(holdsDependents === undefined ? {} : { holdsDependents }),
+        },
+      ],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(holdsDependents ? blocker : undefined);
+  });
+
+  it("decodes a stored subtask without a hold mark without adding one", () => {
+    const decoded = decodeSubtask(evaluatorSubtask("Ship it"));
+    expect(decoded.holdsDependents).toBeUndefined();
+    expect(decoded).not.toHaveProperty("holdsDependents");
   });
 
   it("doesn't hold a waiter on a completed blocker with only a deploy step open", () => {

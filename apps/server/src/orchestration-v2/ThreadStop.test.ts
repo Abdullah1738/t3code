@@ -863,7 +863,16 @@ it.effect("a run Stop reached cannot delegate or start a watch, even after it en
       commandId: CommandId.make("cancel-queued"),
       threadId,
       runId: queued.id,
+      reason: "card_stop",
+      detail: "Card stopped before provider launch.",
     });
+    const cancelled = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+      (candidate) => candidate.id === queued.id,
+    )!;
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(cancelled.startedAt, null);
+    assert.equal(cancelled.cancelReason, "card_stop");
+    assert.equal(cancelled.cancelDetail, "Card stopped before provider launch.");
     yield* projections.apply({
       id: EventId.make("event:stop-barrier:interrupt-request"),
       type: "turn-item.updated",
@@ -1047,6 +1056,7 @@ it.effect.each(["thread.stop", "run.interrupt"] as const)(
       const stopped = yield* orchestrator.getThreadProjection(threadId);
       const interrupted = stopped.runs.find((run) => run.id === queued!.id)!;
       assert.equal(interrupted.status, "interrupted");
+      assert.equal(interrupted.cancelReason, "user_stop");
       assert.equal(DateTime.toEpochMillis(interrupted.completedAt!), DateTime.toEpochMillis(now));
       yield* orchestrator.dispatch({
         type: "message.dispatch",

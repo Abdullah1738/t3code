@@ -107,15 +107,21 @@ def check(box: str, run: str, *, claim: bool = True, timeout: float = SSH_TIMEOU
     return Result('started', pid=wrapper_pid)
 
 
-def settle(con, row, result: Result, reason: str, *, until: float | None = None, foreign: bool = False) -> None:
+def settle(con, row, result: Result, reason: str, *, until: float | None = None, foreign: bool = False,
+           role: str = 'wait') -> None:
     """End the row, retaining a separate reservation whenever execution is still possible."""
     rid, box = row['run_id'], row['box_id']
     code = result.code
     if result.code is not None:
-        from .runs import do_pulls
+        from .runs import settle_pulls
         pulls = json.loads(row['pulls'] or '[]')
         if pulls:
-            do_pulls(box, dict(row), pulls, until=until, foreign=foreign)
+            if foreign:
+                if not settle_pulls(rid, role, until=until, foreign=True):
+                    return
+            else:
+                from .pulls import wait
+                wait(rid, role, until=until)
         from .runs import settled_steps_code
         code = settled_steps_code(row, code, locked=True, until=until)
     from .runs import claim_terminal_log, emit_terminal, save_run_state, state_warning, terminal_result
@@ -134,7 +140,10 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None,
                                  (('done' if code == 0 else 'failed'), None))
             elif result.verdict == 'fenced':
                 from .runs import BACKGROUND_RUN_ENV
-                pending = row['mode'] == 'bg' and os.environ.get(BACKGROUND_RUN_ENV) == rid
+                from . import home
+                pending = (row['mode'] == 'bg' and os.environ.get(BACKGROUND_RUN_ENV) == rid) or (
+                    row['mode'] == 'fg' and os.environ.get(home.RETURNED_HOME_ENV)
+                    and home.PRE_START.get() == rid and row['client_pid'] == os.getpid())
                 status, error = ('starting' if pending else 'lost'), f'{reason}; never started, nothing ran'
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{rid}', 'fenced'))
             else:
@@ -164,6 +173,15 @@ def settle(con, row, result: Result, reason: str, *, until: float | None = None,
         if code is not None and row['mode'] == 'bg':
             from .misc import _catch_up_finished
             _catch_up_finished(con, rid, budget=10 if until is None else max(0, until-now()))
+        if row['box_id'] and code is not None:
+            from . import native_crash, common
+            from .misc import _raw_log
+            current = con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
+            if current and current['status'] != 'killed' and native_crash.settle(
+                    current, code, _raw_log(common.LOGS_DIR / f'{rid}.log')):
+                con.execute("UPDATE runs SET status='infra' WHERE run_id=? AND status!='killed'", (rid,))
+        from .box_disk import hand_back
+        hand_back(con, con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone(), until=until)
         event(con, box, 'start_settled', f'{rid} {status} exit={code}: {error or reason}')
     except sqlite3.Error as error:
         state_warning(rid, code, error)

@@ -14,7 +14,9 @@ import {
   ThreadId,
   TurnItemId,
   type OrchestrationV2Run,
+  type OrchestrationV2ThreadProjection,
   type OrchestrationV2AssistantPhase,
+  type OrchestrationV2Notification,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
@@ -23,6 +25,7 @@ import {
   endRunlessProviderTurns,
   makeSubagentConversationArtifacts,
   subagentResultForRun,
+  delegatedTaskResultRun,
 } from "./subagentProjection.ts";
 
 const now = DateTime.makeUnsafe("2026-11-05T17:52:25Z");
@@ -43,6 +46,22 @@ const run: OrchestrationV2Run = {
   checkpointId: null,
   contextHandoffId: null,
 };
+type Message = OrchestrationV2ThreadProjection["messages"][number];
+const makeMessage = (overrides: Partial<Message> & Pick<Message, "runId">): Message => ({
+  id: run.userMessageId,
+  threadId: run.threadId,
+  createdBy: "agent",
+  creationSource: "server",
+  nodeId: null,
+  role: "user",
+  text: "Background work completed",
+  phase: "unknown",
+  attachments: [],
+  streaming: false,
+  createdAt: now,
+  updatedAt: now,
+  ...overrides,
+});
 const cases: ReadonlyArray<{
   finish: string | null | undefined;
   phase: OrchestrationV2AssistantPhase;
@@ -291,3 +310,139 @@ it.effect("preserves attached, already ended, already emitted and live-owned tur
     assert.deepEqual(repaired.payload.completedAt, now);
   }),
 );
+
+it.each([
+  "single",
+  "wake",
+  "cancelled",
+  "foreign",
+  "foreign_then_wake",
+  "monitor",
+  "unstarted",
+  "rolled_back",
+  "active_tagged",
+  "latest_tagged",
+] as const)("selects a delegated task's result run: %s", (scenario) => {
+  const taskId = NodeId.make("result-task");
+  const tagged = { ...run, delegatedTaskId: taskId };
+  const later = {
+    ...run,
+    id: RunId.make("wake"),
+    ordinal: 2,
+    status:
+      scenario === "cancelled"
+        ? ("cancelled" as const)
+        : scenario === "active_tagged"
+          ? ("running" as const)
+          : scenario === "rolled_back"
+            ? ("rolled_back" as const)
+            : ("completed" as const),
+    ...(scenario === "foreign" || scenario === "foreign_then_wake"
+      ? { delegatedTaskId: NodeId.make("other-task") }
+      : scenario === "latest_tagged" || scenario === "active_tagged"
+        ? { delegatedTaskId: taskId }
+        : {}),
+    startedAt: scenario === "unstarted" ? null : now,
+  };
+  const projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages"> = {
+    runs:
+      scenario === "single"
+        ? [tagged]
+        : scenario === "foreign_then_wake"
+          ? [tagged, later, { ...run, id: RunId.make("foreign-wake"), ordinal: 3 }]
+          : [tagged, later],
+    messages:
+      scenario === "monitor"
+        ? [
+            makeMessage({
+              runId: later.id,
+              notification: {
+                source: { kind: "monitor" },
+                outcome: "completed",
+                summary: "Background work completed",
+              },
+            }),
+          ]
+        : [],
+  };
+  assert.equal(
+    delegatedTaskResultRun(projection, taskId)?.id,
+    ["wake", "cancelled", "latest_tagged", "active_tagged"].includes(scenario)
+      ? later.id
+      : tagged.id,
+  );
+});
+
+it.each([
+  { source: "command", status: "cancelled", selected: true },
+  { source: "subagent", status: "cancelled", selected: true },
+  { source: "delegated_task", status: "cancelled", selected: true },
+  { source: "background_task", status: "cancelled", selected: true },
+  { source: "system", status: "cancelled", selected: false },
+  { source: "monitor", status: "cancelled", selected: false },
+  { source: undefined, status: "cancelled", selected: false },
+  { source: "command", status: "completed", selected: false },
+  { source: "command", status: "failed", selected: false },
+  { source: "command", status: "interrupted", selected: false },
+  { source: "command", status: "rolled_back", selected: false },
+] as const)("selects an unstarted $status continuation from $source: $selected", (entry) => {
+  const taskId = NodeId.make("result-task");
+  const tagged = { ...run, delegatedTaskId: taskId };
+  const later = {
+    ...run,
+    id: RunId.make("wake"),
+    ordinal: 2,
+    status: entry.status,
+    startedAt: null,
+  };
+  const source: OrchestrationV2Notification["source"] | undefined =
+    entry.source === "delegated_task"
+      ? { kind: entry.source, taskIds: [taskId] }
+      : entry.source === undefined
+        ? undefined
+        : { kind: entry.source };
+  const messages =
+    source === undefined
+      ? []
+      : [
+          makeMessage({
+            id: later.userMessageId,
+            runId: later.id,
+            notification: { source, outcome: "completed", summary: "Background work completed" },
+          }),
+        ];
+  const projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages"> = {
+    runs: [tagged, later],
+    messages,
+  };
+  assert.equal(
+    delegatedTaskResultRun(projection, taskId)?.id,
+    entry.selected ? later.id : tagged.id,
+  );
+  assert.equal(
+    delegatedTaskResultRun(
+      { ...projection, runs: [tagged, { ...later, delegatedTaskId: NodeId.make("other-task") }] },
+      taskId,
+    )?.id,
+    tagged.id,
+  );
+  assert.equal(
+    delegatedTaskResultRun(
+      {
+        ...projection,
+        runs: [
+          tagged,
+          {
+            ...run,
+            id: RunId.make("foreign"),
+            ordinal: 2,
+            delegatedTaskId: NodeId.make("other-task"),
+          },
+          { ...later, ordinal: 3 },
+        ],
+      },
+      taskId,
+    )?.id,
+    tagged.id,
+  );
+});

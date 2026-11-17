@@ -232,7 +232,8 @@ export const layerWithOptions = (
               threadId: request.threadId,
               ordinal: projection.messages.length + 1,
             }));
-          const commandId = CommandId.make(`provider-continuation:${messageId}`);
+          const commandId =
+            request.commandId ?? CommandId.make(`provider-continuation:${messageId}`);
           const dispatch = threads.dispatch({
             type: "message.dispatch",
             commandId,

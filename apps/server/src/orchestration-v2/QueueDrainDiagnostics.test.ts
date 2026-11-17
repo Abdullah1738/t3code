@@ -1,15 +1,18 @@
 import { assert, it } from "@effect/vitest";
-import { RunId, type AnalyticsEvent } from "@t3tools/contracts";
+import { RunId, AnalyticsEvent } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as QueueDrainDiagnostics from "./QueueDrainDiagnostics.ts";
 
+const decodeRow = Schema.decodeUnknownEffect(AnalyticsEvent, { onExcessProperty: "error" });
+
 it.effect("limits each thread and reason independently and expires the limit", () => {
   const rows: AnalyticsEvent[] = [];
   return Effect.gen(function* () {
-    const skipped = yield* QueueDrainDiagnostics.make;
+    const { skipped } = yield* QueueDrainDiagnostics.make;
     const input = {
       threadId: "thread:one",
       reason: "usage_limit",
@@ -51,7 +54,7 @@ it.effect("limits each thread and reason independently and expires the limit", (
 
 it.effect("an analytics failure cannot fail queue processing", () =>
   Effect.gen(function* () {
-    const skipped = yield* QueueDrainDiagnostics.make;
+    const { skipped } = yield* QueueDrainDiagnostics.make;
     yield* skipped({
       threadId: "thread:one",
       reason: "no_eligible",
@@ -61,4 +64,50 @@ it.effect("an analytics failure cannot fail queue processing", () =>
   }).pipe(
     Effect.provide(Layer.mock(Analytics.Analytics)({ record: () => Effect.die("writer down") })),
   ),
+);
+
+it.effect.each([
+  ["restart_admission_timeout", "restart_admission_timeout"],
+  ["provider timed out", "unknown"],
+  ["provider\ttimed_out", "unknown"],
+  ["provider_error!", "unknown"],
+  ["provider_error…", "unknown"],
+  ["e".repeat(160), "e".repeat(160)],
+  ["e".repeat(161), "unknown"],
+] as const)(
+  "records one schema-safe terminal outcome for failure code %s",
+  ([failureCode, expectedCode]) => {
+    const rows: AnalyticsEvent[] = [];
+    return Effect.gen(function* () {
+      const { terminal } = yield* QueueDrainDiagnostics.make;
+      const input = {
+        threadId: "thread:one",
+        failedRunId: RunId.make("run:failed"),
+        failureCode,
+        outcome: { reason: "pending_continuation" },
+      };
+      yield* terminal(input);
+      yield* terminal(input);
+      assert.lengthOf(rows, 1);
+      yield* decodeRow(rows[0]);
+      assert.deepInclude(rows[0]!, {
+        kind: "orchestration.never_started_terminal_drain",
+        threadId: input.threadId,
+      });
+      assert.deepEqual(rows[0]!.props, {
+        failedRunId: input.failedRunId,
+        failureCode: expectedCode,
+        reason: "pending_continuation",
+      });
+    }).pipe(
+      Effect.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            Effect.sync(() => {
+              rows.push(row);
+            }),
+        }),
+      ),
+    );
+  },
 );

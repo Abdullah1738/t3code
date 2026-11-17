@@ -51,7 +51,11 @@ def connect(acct, timeout=60):
         m = imaplib.IMAP4_SSL(cfg["host"], timeout=timeout)
         m.login(cfg["user"], pw)
         return m
-    return mail_oauth.xoauth2_connect(acct, cfg["host"], cfg["user"], timeout=timeout)
+    try:
+        return mail_oauth.xoauth2_connect(acct, cfg["host"], cfg["user"], timeout=timeout,
+                                         lock_timeout=store.LOCK_WAIT_SECONDS)
+    except mail_oauth.RefreshLockTimeout as e:
+        raise store.LockTimeout(e.waited) from e
 
 
 @timing.timed("fetch")
@@ -126,7 +130,7 @@ class Pool:
             c = connect(self.acct)
             self.local.conn = c
             self.local.folder = None
-            with self.lock:
+            with store.waiting(self.lock):
                 self.conns.append(c)
         if self.local.folder != folder:
             self.local.folder = None
@@ -181,7 +185,7 @@ def _fetch_raw(pool, folder, uids):
         pool.drop()
         if attempt == 2:
             raise err
-        common.log(f"{pool.acct}/{folder}: fetch retry ({err})")
+        timing.log(f"{pool.acct}/{folder}: fetch retry ({err})")
         time.sleep(RETRY_SLEEP * (attempt + 1))
 
 
@@ -191,12 +195,12 @@ def _fetch_chunk(pool, acct, folder, uv, uids):
     except Rejected as e:
         # One bad message must not stall the folder: fetch the chunk one UID at a time.
         if len(uids) == 1:
-            with _BAD_LOCK:
+            with store.waiting(_BAD_LOCK):
                 key = (acct, folder, uv, uids[0])
                 BAD[key] = BAD.get(key, 0) + 1
-            common.log(f"{acct}/{folder}: uid {uids[0]} rejected ({e}); skipped this pass")
+            timing.log(f"{acct}/{folder}: uid {uids[0]} rejected ({e}); skipped this pass")
             return []
-        common.log(f"{acct}/{folder}: chunk rejected ({e}); fetching {len(uids)} UIDs one by one")
+        timing.log(f"{acct}/{folder}: chunk rejected ({e}); fetching {len(uids)} UIDs one by one")
         items = []
         for u in uids:
             items.extend(_fetch_chunk(pool, acct, folder, uv, [u]))
@@ -237,17 +241,48 @@ def _sync_folder(db, pool, ex, acct, folder, stats, stop):
     prefix = f"{folder}:{uv}:"
     if st.get("uidvalidity") not in (None, uv):
         old = f"{folder}:{st['uidvalidity']}:"
+        old_ids = store.known_ext_ids(db, "email", acct, old)
+        stats["known_listed"] = True
         with store.writing(db):
-            stats["deleted"] += store.mark_deleted(db, "email", acct, store.known_ext_ids(db, "email", acct, old))
-        common.log(f"{acct}/{folder}: UIDVALIDITY changed {st['uidvalidity']} -> {uv}, refetching")
+            store.set_state(db, key, {k: v for k, v in st.items() if k != "max_uid"})
+        stats["deleted"] += store.reconcile(db, "email", acct, gone=old_ids)
+        timing.log(f"{acct}/{folder}: UIDVALIDITY changed {st['uidvalidity']} -> {uv}, refetching")
         st = {}
-    server = search_uids(c, "ALL")
-    known = {int(x[len(prefix):]) for x in store.known_ext_ids(db, "email", acct, prefix)}
-    with _BAD_LOCK:
+    server = set(search_uids(c, "ALL"))
+    max_uid = st.get("max_uid")
+    pending = set(st.get("pending_uids", ()))
+    unlisted = set(st.get("unlisted_uids", ()))
+    candidates = {u for u in server if max_uid is not None and u > max_uid}
+    back = store.deleted_ext_ids(db, "email", acct, prefix) & {f"{prefix}{u}" for u in server}
+    # Previously listed failures already contribute to stored EXISTS, even above max_uid.
+    new_count = len(candidates - pending)
+    # A returning deleted UID can hide an expunge at the same EXISTS count.
+    known_listed = not (st.get("uidvalidity") == uv and max_uid is not None and not back
+                        and not (unlisted & server)
+                        and len(server) == exists == st.get("exists", 0) + new_count)
+    if known_listed:
+        stats["known_listed"] = True
+        known = {int(x[len(prefix):]) for x in store.known_ext_ids(db, "email", acct, prefix)}
+        candidates = server
+        max_uid = max(known, default=0)
+    else:
+        # Failed fetches can leave holes below max_uid; BAD_LIMIT lasts only until restart.
+        candidates |= pending & server
+        known = {int(x[len(prefix):]) for x in store.existing_ext_ids(
+            db, "email", acct, (f"{prefix}{u}" for u in candidates))} if candidates else set()
+    with store.waiting(_BAD_LOCK):
         skipped = {u for (a, f, v, u), n in BAD.items() if (a, f, v) == (acct, folder, uv) and n >= BAD_LIMIT}
-    missing = sorted(set(server) - known - skipped)
+    # Unarchived failures have no deleted row to flag their return after a transient listing.
+    unlisted = (unlisted | pending) - server - known
+    pending = candidates - known
+    missing = sorted(pending - skipped)
+    if missing or ("max_uid" in st and known_listed):
+        # Chunk writes commit separately: a stop or failure must force reconciliation on retry.
+        with store.writing(db):
+            store.set_state(db, key, {**{k: v for k, v in st.items() if k != "max_uid"},
+                                     "pending_uids": sorted(pending), "unlisted_uids": sorted(unlisted)})
     if missing:
-        common.log(f"{acct}/{folder}: {len(server)} on server, {len(missing)} to fetch")
+        timing.log(f"{acct}/{folder}: {len(server)} on server, {len(missing)} to fetch")
     chunks = [missing[i:i + CHUNK] for i in range(0, len(missing), CHUNK)]
     done = 0
     for i in range(0, len(chunks), 20):
@@ -255,28 +290,28 @@ def _sync_folder(db, pool, ex, acct, folder, stats, stop):
             return False
         for items in ex.map(timing.worker(lambda ch: _fetch_chunk(pool, acct, folder, uv, ch)), chunks[i:i + 20]):
             # One short write per chunk so the lock is never held while waiting on the network.
-            with store.writing(db):
-                for it in items:
-                    stats[store.upsert(db, it)] += 1
+            store.upsert_many(db, items, stats)
+            archived = {int(item["ext_id"][len(prefix):]) for item in items}
+            pending -= archived
+            max_uid = max(max_uid, max(archived, default=0))
             done += len(items)
         if len(missing) > 1000:
-            common.log(f"{acct}/{folder}: fetched {done}/{len(missing)}")
+            timing.log(f"{acct}/{folder}: fetched {done}/{len(missing)}")
+    # Only trust deletions when the listing agrees with EXISTS; never trust an empty listing.
+    gone = known - server if known_listed and len(server) == exists and (server or not known) else set()
+    stats["deleted"] += store.reconcile(db, "email", acct, {f"{prefix}{u}" for u in gone}, back)
+    state = {"uidvalidity": uv, "exists": exists, "last_ok": int(time.time()),
+             "pending_uids": sorted(pending), "unlisted_uids": sorted(unlisted)}
+    # An incomplete listing must not become the baseline for the next deletion check.
+    if len(server) == exists and (server or not known):
+        state["max_uid"] = max_uid
     with store.writing(db):
-        # Deletions: only trust the listing when it agrees with the server's message count, and
-        # never read an empty listing as "everything was deleted".
-        if len(server) == exists and (server or not known):
-            gone = known - set(server)
-            if gone:
-                stats["deleted"] += store.mark_deleted(db, "email", acct, {f"{prefix}{u}" for u in gone})
-        back = store.deleted_ext_ids(db, "email", acct, prefix) & {f"{prefix}{u}" for u in server}
-        if back:
-            store.undelete(db, "email", acct, back)
-        store.set_state(db, key, {"uidvalidity": uv, "exists": exists, "last_ok": int(time.time())})
+        store.set_state(db, key, state)
     return True
 
 
 def sync(acct, db, stop=None):
-    stats = {"added": 0, "updated": 0, "same": 0, "deleted": 0}
+    stats = {"added": 0, "updated": 0, "same": 0, "deleted": 0, "known_listed": False}
     pool = Pool(acct)
     ex = ThreadPoolExecutor(WORKERS.get(acct, 2))
     try:
@@ -290,9 +325,11 @@ def sync(acct, db, stop=None):
                 if not _sync_folder(db, pool, ex, acct, folder, stats, stop):
                     complete = False
                     break
+            except (store.LockTimeout, subprocess.TimeoutExpired):
+                raise
             except (OSError, imaplib.IMAP4.error, RuntimeError) as e:
                 # One unreadable folder (or a connection dropped while idle) must not stop the rest.
-                common.log(f"{acct}/{folder}: skipped this pass ({type(e).__name__}: {e})")
+                timing.log(f"{acct}/{folder}: skipped this pass ({type(e).__name__}: {e})")
                 pool.drop()
                 complete = False
         if complete:

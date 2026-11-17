@@ -88,6 +88,7 @@ it.effect.each([
     Layer.provide(
       Layer.mergeAll(
         finalization,
+        Layer.mock(EffectOutbox.EffectOutboxV2)({ get: () => Effect.succeed(Option.none()) }),
         projections,
         Layer.mock(EventSink.EventSinkV2)({}),
         McpSessionRegistryTestkit.layer,

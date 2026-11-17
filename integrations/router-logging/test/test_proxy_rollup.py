@@ -35,6 +35,24 @@ class ProxyRollupTests(unittest.TestCase):
             self.assertIsNone(result['proxy'][0]['durationMs'])
             self.assertEqual(result['proxy'][0]['clientAbortRate'], 1)
 
+    def test_attempts_and_identity_across_old_and_new_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            props = [
+                dict(model='a', client='codex', clientState='aborted', keyId='0123456789abcdef', status=499, attempts=3, ttfbMs=20),
+                dict(model='a', client='codex', clientState='completed', keyId='0123456789abcdef', status=200, attempts=1, ttfbMs=1),
+                dict(model='a', client='curl', status=499, keyId='none', attempts=1),
+                dict(model='b', client='aborted', attempts=6, ttfbMs=100),
+                dict(model='b', client='other', status=499, keyId={'bad': 1}, attempts=True, ttfbMs=-1),
+            ]
+            rows = [dict(tool='9router', kind='error', name='proxy.request', props=dict(route='/v1/responses', stream=True, **p)) for p in props]
+            (Path(tmp) / '2026-11-15.ndjson').write_text('\n'.join(map(json.dumps, rows)))
+            result = rollup('2026-11-15', tmp)['proxySummary']
+            self.assertEqual(result['byModel'], [dict(model='a', count=3, aborted=2, clientAbortRate=2/3), dict(model='b', count=2, aborted=2, clientAbortRate=1)])
+            self.assertEqual(result['abortsByClient'], dict(codex=1, curl=1, unknown=1, other=1))
+            self.assertEqual(result['abortsByKeyId'], {'0123456789abcdef': 1, 'none': 1, 'unknown': 2})
+            self.assertEqual(result['attemptsHistogram'], {'1': 2, '3': 1, '6': 1})
+            self.assertEqual(result['abortTtfbMs'], dict(p50=20, p95=100, max=100))
+
 
 if __name__ == '__main__':
     unittest.main()

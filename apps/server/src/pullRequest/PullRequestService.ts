@@ -407,7 +407,7 @@ function isProviderUnusable(error: PullRequestProviderError): boolean {
 }
 
 function providerDetail(error: PullRequestProviderError): string {
-  if (!isProviderUnusable(error)) return error.detail;
+  if (!isProviderUnusable(error) || error.provider === "forgejo") return error.detail;
   return (
     pullRequestProviderRequirement(
       error.provider,
@@ -420,6 +420,7 @@ function toUnavailableError(error: PullRequestProviderError): PullRequestUnavail
   return new PullRequestUnavailableError({
     reason: error.reason === "missing-tool" ? "cli-missing" : "cli-unauthenticated",
     provider: error.provider,
+    ...(error.provider === "forgejo" ? { detail: error.detail } : {}),
     cause: error,
   });
 }

@@ -1,8 +1,10 @@
 """Synthetic history contracts; no account, network or Keychain access."""
 import datetime as dt
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 import unittest
 import urllib.parse
@@ -14,14 +16,15 @@ import noon_vertical_reads as vertical
 
 
 class History(unittest.TestCase):
-    def test_changed_status_on_repeated_scoped_card_cannot_corroborate_charge(self):
+    def test_changed_status_on_repeated_scoped_card_cannot_advance_snapshot_or_release_hold(self):
         source = Path(__file__).resolve().parents[2] / 'robob-watch/checks/money-cases'
         with patch.object(sys, 'path', [str(source), *sys.path]):
             import charges
+            import marketplace
             import order_lookup
         order = 'NTEST1'
         at = dt.datetime(2026, 11, 1, 12, tzinfo=dt.timezone.utc)
-        charge = {'merchant': 'noon', 'amount': '12.34', 'currency': 'AED'}
+        charge = {'merchant': 'noon', 'amount': '99.99', 'currency': 'AED'}
         manifest = {'orderNr': order, 'createdAt': at.isoformat(),
                     'shippingAddress': {}, 'trackActions': {}, 'shippingPreferences': {},
                     'metadata': {'pageRefreshSec': None}, 'payment': {},
@@ -40,7 +43,16 @@ class History(unittest.TestCase):
                     'unknown', 'future_status', 'Delivered', 'delivered'):
             for use_cache in (False, True):
                 for scope in ('item', 'shipment'):
-                    with self.subTest(raw=raw, cached=use_cache, scope=scope):
+                    with self.subTest(raw=raw, cached=use_cache, scope=scope), tempfile.TemporaryDirectory() as scratch, \
+                            patch.object(sys, 'path', [str(source), *sys.path]):
+                        data = Path(scratch)
+                        walked_at = (at + dt.timedelta(days=1)).isoformat()
+                        snapshot = dict(marketplace.empty(), complete=True, walked_at=walked_at,
+                                        orders={'HELD': {'createdAt': at.isoformat(), 'delivered': False}})
+                        if use_cache:
+                            snapshot['orders'][order] = {'createdAt': at.isoformat(), 'delivered': True}
+                        (data / 'marketplace-placements.json').write_text(json.dumps(snapshot))
+                        (data / 'order-details.json').write_text(json.dumps([cached] if use_cache else []))
                         first = self.page(order, True, 'cursor-one')
                         second = self.page(order, False, None)
                         second['data'][0]['status']['highStatusCode'] = raw
@@ -48,26 +60,30 @@ class History(unittest.TestCase):
                             del first['data'][0]['itemNr']
                             del second['data'][0]['itemNr']
                         with patch.object(core, 'verified_session', return_value={}), \
+                                patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(data / 'logs')}), \
                                 patch.object(core, 'request', side_effect=[{'data': []}, first, second]), \
                                 patch.object(vertical, '_headers', return_value={}), \
                                 patch.object(vertical, '_read', return_value=manifest), \
                                 patch.object(core, 'load', side_effect=AssertionError('unexpected Keychain read')), \
                                 patch.object(core.urllib.request, 'build_opener',
                                              side_effect=AssertionError('unexpected network read')):
+                            stats = marketplace.refresh(data, Path(__file__).resolve().parents[1])
+                        self.assertEqual((stats['pages'], stats['fetched']), (2, 0 if use_cache else 1))
+                        self.assertEqual(stats['result'], 'invalid_paging')
+                        snapshot, reason = marketplace.load(data)
+                        self.assertIsNone(reason)
+                        self.assertEqual(snapshot['walked_at'], walked_at)
+                        self.assertIn('HELD', snapshot['orders'])
+                        with patch.object(core, 'request', side_effect=AssertionError('snapshot must not read network')):
                             result = order_lookup.native('noon', str(Path(__file__).resolve().parents[1]),
-                                                         services=('marketplace',), cache=[cached] if use_cache else [])
+                                services=('marketplace',), cache=order_lookup.load_cache(data / 'order-details.json'),
+                                snapshot=snapshot)
                         lane = result['lanes']['marketplace']
-                        self.assertEqual((lane['pages'], lane['fetched'], lane['cached']),
-                                         (2, 0 if use_cache else 1, 1 if use_cache else 0))
-                        self.assertFalse(lane['exhaustive'])
-                        self.assertIsNone(lane['covered_from'])
-                        if raw == 'delivered':
-                            self.assertEqual(charges.order_receipt(charge, at, at,
-                                lookup=lambda *a, **kw: result)['verdict'], 'receipt')
-                        else:
-                            with self.assertRaises(charges.Lookup):
-                                charges.order_receipt(charge, at, at, lookup=lambda *a, **kw: result)
-                            self.assertEqual(result['orders'], [])
+                        self.assertEqual((lane['pages'], lane['fetched'], lane['cached']), (0, 0, 1))
+                        self.assertIn(at.isoformat(), lane['hold_times'])
+                        with self.assertRaises(charges.SourceLimit) as exc:
+                            charges.order_receipt(charge, at, at, lookup=lambda *a, **kw: result)
+                        self.assertEqual(exc.exception.kinds, ['marketplace_hold'])
 
     def test_separate_zone_is_required_for_legacy_wall_time(self):
         for value, zone, expected in (

@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from offbox_lib.startup_health import starting_phase, wait_seconds
+from offbox_lib.startup_health import starting_phase, wait_seconds, accepting_health
 from offbox_lib.health_reachability import tcp_connects, slow_probe_seconds, slow_down_seconds
 
 HOME = Path.home()
@@ -166,13 +166,26 @@ def health_facts(data):
         return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
     # boot_id is the kernel's (it changes when the box restarts); boatd_uptime_s is boatd's own, when sent.
-    return {"mode": clean(data.get("mode"), 20), "reasons": [clean(r) for r in reasons[:8]],
+    disk = dict(data.get('disk')) if isinstance(data.get('disk'), dict) else {}
+    for flag in ('disk_low', 'disk_full'):
+        if data.get(flag):
+            disk[flag] = True
+    facts = {"mode": clean(data.get("mode"), 20), "reasons": [clean(r) for r in reasons[:8]],
             "pool": clean(pool.get("state"), 20), "mdraid": clean(mdraid.get("state"), 20),
             "boot_id": clean(data.get("boot_id"), 64), "version": clean(data.get("version"), 40),
             "uptime_s": number("uptime_s"), "boatd_uptime_s": number("boatd_uptime_s"),
             "starting": bool(starting_phase(data)), "phase": clean(starting_phase(data)),
             "startedAt": number("startedAt"), "snapshot_age_s": number("snapshot_age_s"),
             "refresh_stage": clean(data.get("refresh_stage"))}
+    facts["degraded"] = data.get("degraded") is True
+    if isinstance(data.get("loops"), dict):
+        facts["loops"] = {name: {"stalled": value.get("stalled") is True,
+                                  "last_ok": value.get("last_ok"), "problem": clean(value.get("problem"), 300)}
+                          for name, value in data["loops"].items()
+                          if name in ("reaper", "sampler") and isinstance(value, dict)}
+    if disk:
+        facts['disk'] = {k: disk[k] for k in ('level', 'disk_low', 'disk_full', 'filesystems', 'sampled_at') if k in disk}
+    return facts
 
 
 def check_health(url, timeout=None):
@@ -199,9 +212,12 @@ def check_health(url, timeout=None):
     if not isinstance(data, dict):
         return {"ok": False, "error": "bad_json", "health": {}}
     facts = health_facts(data)
-    if data.get("ok") is not True:
+    storage = facts.get('disk') or {}
+    if data.get('disk_full') or storage.get('disk_full') or storage.get('level') == 'full':
+        return {'ok': False, 'error': 'disk_full', 'health': facts}
+    if not accepting_health(data):
         return {"ok": False, "error": "not_ok", "health": facts}
-    return {"ok": True, "error": "", "health": facts}
+    return {"ok": True, "error": "disk_low" if data.get('disk_low') or storage.get('disk_low') else "", "health": facts}
 
 
 def _run(args, timeout):
@@ -366,7 +382,7 @@ def backend_view(state):
             "bad_streak": state["bad_streak"], "last_check": state["last_check"], "last_ok": state["last_ok"],
             "reason": state["reason"] if down else "",
             "outage_id": (state.get("outage") or {}).get("id", "") if down else "",
-            "degraded": list(state.get("degraded") or []), "last_outcome": state.get("last_verdict"),
+            "degraded": list(state.get("degraded") or []), "disk": state.get("disk") or {}, "last_outcome": state.get("last_verdict"),
             "class": state.get("last_class"), "last_answer": state.get("last_answer"), "boot_id": (state.get("last_ok_health") or {}).get("boot_id"), "slow_since": state.get("slow_since"),
             "flaps_today": state.get("flaps_today", {})}
 
@@ -432,6 +448,7 @@ def step(state, obs, now):
     sooner than MIN_SPACING_S after the last one changes nothing: one blip seen twice is still one blip.
     """
     check, mac = obs["check"], obs["mac"]
+    state['disk'] = (check.get('health') or {}).get('disk') or state.get('disk') or {}
     events = []
     daily = flap_counts(state, now, events)
     last = state.get("last_tick")
@@ -452,10 +469,12 @@ def step(state, obs, now):
     state["last_start"] = now
 
     health = check.get("health") or {}
-    phase = starting_phase(health)
+    phase = starting_phase(health) if check.get('error') != 'disk_full' else None
     if check["ok"] or phase:
         state["last_answer"] = now
     classification = check.get("class", "good" if check["ok"] else "hard")
+    if check.get("error") == "disk_full":
+        classification = "hard"
     state["last_class"] = classification
     if check["ok"]:
         state.pop("transient_since", None)
@@ -507,6 +526,15 @@ def step(state, obs, now):
         state.update(state="home_down" if state.pop("starting_from_down", False) else "home_up", since=now)
 
     if check["ok"]:
+        if "loops" in health:
+            alerts = state.setdefault("loop_alerts", {})
+            stalled = {name: value for name, value in health["loops"].items() if value.get("stalled")}
+            for name in list(alerts):
+                if name not in stalled:
+                    events.append(f"loop_recovered loop={name} duration_s={now - alerts.pop(name)['at']:.1f}")
+            for name, value in stalled.items():
+                alerts.setdefault(name, {"at": int(now), "sent": False,
+                    "text": f"Home offbox is degraded: {value.get('problem') or name + ' stalled'}. It still accepts runs."})
         verdict = "good"
         health = check.get("health") or {}
         state["good_streak"] += 1
@@ -695,6 +723,36 @@ def reconcile(state, url, effects, now, verdict, dry_run=False, note=lambda text
     With dry_run nothing is called and nothing is marked done: the actions are what a real tick would do.
     """
     actions = []
+    storage = state.get('disk') or {}
+    if storage.get('disk_low') or storage.get('disk_full'):
+        alert = state.get('disk_alert')
+        if alert is None:
+            bad = next((r for r in storage.get('filesystems', []) if r.get('level') in ('full', 'low')), {})
+            detail = f"{bad.get('free_bytes', 0) / 1024**3:.1f} GiB free on {bad.get('filesystem', 'pool')}"
+            alert = {'at': int(now), 'sent': False, 'text': f'Home offbox disk is low: {detail}. Snapshot cleanup needs attention.'}
+            if not dry_run:
+                state['disk_alert'] = alert
+        key = f"offbox-home-disk:{alert['at']}"
+        if not alert['sent']:
+            if dry_run:
+                actions.append({'action': 'telegram-disk-low', 'would': 'send', 'key': key, 'text': alert['text']})
+            else:
+                ok = effects.telegram(alert['text'], key)
+                actions.append({'action': 'telegram-disk-low', 'ok': ok, 'key': key})
+                alert['sent'] = ok
+    elif storage.get('level') == 'ok':
+        state.pop('disk_alert', None)
+    if verdict == "good":
+        for name, alert in state.get("loop_alerts", {}).items():
+            if not alert["sent"]:
+                key = f"offbox-home-degraded:{name}:{alert['at']}"
+                if dry_run:
+                    actions.append({"action": "telegram-loop-degraded", "would": "send", "key": key, "text": alert["text"]})
+                else:
+                    ok = effects.telegram(alert["text"], key)
+                    alert["sent"] = ok
+                    actions.append({"action": "telegram-loop-degraded", "ok": ok, "key": key})
+                    note(f"action=telegram-loop-degraded ok={ok} key={key}")
     if state["state"] in ("home_slow", "home_starting"):
         return actions
     outage = state.get("outage")
@@ -760,7 +818,7 @@ def reconcile(state, url, effects, now, verdict, dry_run=False, note=lambda text
     alerts = state.setdefault("degraded_alerts", {})
     for key in [k for k, v in alerts.items() if now - v.get("at", 0) > 7 * 86400]:
         del alerts[key]
-    reasons = state.get("degraded") or []
+    reasons = [r for r in state.get("degraded") or [] if not r.startswith('disk_') and not re.match(r"(?:reaper|sampler) has not completed a pass for ", r)]
     if verdict == "good" and reasons:
         key = degraded_key(reasons)
         record = alerts.get(key)
@@ -795,6 +853,7 @@ def tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac_
     import toollog
     if configured_url(Path(sdir) if sdir is not None else state_dir()) is not None:
         toollog.rollup_previous()
+        toollog.rollup_today()
     return _tick(sdir, dry_run, clock, check, mac, effects, tcp, retry)
 
 
@@ -822,7 +881,9 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
         if boot:
             state["observed_boot_id"] = boot
         classification = "good" if result["ok"] else "hard"
-        if changed:
+        if result.get("error") == "disk_full":
+            classification = "hard"
+        elif changed:
             result.update(ok=False, error="boot_changed")
             classification = "hard"
             # Observe the new identity once; subsequent healthy checks can recover normally.
@@ -836,18 +897,24 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
             result["slow_ms"] = round((time.monotonic() - slow_began) * 1000, 1)
             latency_ms += result["slow_ms"]
             retry_boot = (result.get("health") or {}).get("boot_id")
-            if previous_boot and retry_boot and retry_boot != previous_boot:
+            if result.get("error") == "disk_full":
+                classification = "hard"
+            elif previous_boot and retry_boot and retry_boot != previous_boot:
                 result.update(ok=False, error="boot_changed")
                 state["observed_boot_id"] = retry_boot
                 classification = "hard"
             elif result["ok"]:
                 classification = "good"
-            elif starting_phase(result.get("health")):
+            elif result.get("error") != "disk_full" and starting_phase(result.get("health")):
                 classification = "starting"
             elif result.get("error") != "timeout":
                 classification = "hard"
         if facts.get("peer_online") is False and not result["ok"]:
             classification = "hard"
+        if result["ok"] and (result.get("health") or {}).get("degraded"):
+            classification = "degraded"
+        if result.get("error") == "disk_low" and classification != "degraded":
+            classification = "disk_low"
         result.update(ms=round(latency_ms, 1), **{"class": classification})
         failures = read_client_failures(sdir, state.get("failures_seen") or now - 900)
         verdict, events = step(state, {"check": result, "mac": facts, "client_failures": failures}, max(now, clock()))
@@ -865,6 +932,9 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
                   f" error={clean(result.get('error'))}"
                   f" snapshot_age_s={(result.get('health') or {}).get('snapshot_age_s')}"
                   f" refresh_stage={clean((result.get('health') or {}).get('refresh_stage'))}")
+        if classification == "degraded":
+            stalled = [name for name, value in (health.get("loops") or {}).items() if value.get("stalled")]
+            fields += " loop=" + ",".join(sorted(stalled))
         if "slow_ms" in result:
             fields += f" slow_ms={result['slow_ms']}"
         log(sdir, ("check-good" if result["ok"] else "check-fail") + fields
@@ -877,7 +947,7 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
                             "last_good_boatd_uptime_s": (state.get("last_ok_health") or {}).get("boatd_uptime_s"),
                             "errorClass": result.get("error"), **health})
         for event in events:
-            if event.startswith(("state=home_", "startup_ready", "flap ", "flap-summary ")):
+            if event.startswith(("state=home_", "startup_ready", "loop_recovered ", "flap ", "flap-summary ")):
                 log(sdir, event)
                 if event.startswith("flap-summary "):
                     toollog.emit("backend", "backend.home_flaps_daily", props=dict(

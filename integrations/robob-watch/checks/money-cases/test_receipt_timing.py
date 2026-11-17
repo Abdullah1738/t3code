@@ -5,6 +5,7 @@ import json
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_cases import Base, at, finder, nobody, mc
@@ -69,8 +70,32 @@ class ReceiptTiming(Base):
         timing = ch.receipt_timing(stats)
         self.assertEqual((stats['msgs_calls'], timing['msgs_timeouts'], timing['msgs_p50_ms']), (4, 1, 100))
         self.assertEqual(timing['msgs_by_kind'], dict(receipt=dict(count=2, ms=200),
-            order=dict(count=1, ms=100), other=dict(count=1, ms=100)))
+            order=dict(count=1, ms=100), refund=dict(count=0, ms=0), history=dict(count=0, ms=0),
+            other=dict(count=1, ms=100)))
         self.assertNotIn('private-query', json.dumps(timing))
+
+    def test_cpu_and_concurrency_diagnostics_are_numeric_and_sources_are_fixed(self):
+        stats = {'msgs_calls': 0}
+        def usage(*args):
+            usage.cpu += 0.05
+            return SimpleNamespace(ru_utime=usage.cpu, ru_stime=0)
+        usage.cpu = 0
+        def archive(argv, **kwargs):
+            if argv[-1] == 'outer':
+                ch.msgs(['PRIVATE', 'nested'], None, 2, stats=stats)
+            return subprocess.CompletedProcess(argv, 0, '', '')
+        with patch.object(ch.resource, 'getrusage', usage), patch.object(ch.subprocess, 'run', archive):
+            for kind in ('refunds', 'history'):
+                with ch.step_timing(stats, kind):
+                    ch.msgs(['PRIVATE', 'outer'], None, 2, stats=stats)
+        result = ch.receipt_timing(stats)
+        self.assertEqual(result['msgs_cpu_ms'], 400)
+        self.assertEqual(result['msgs_concurrent_max'], 2)
+        for kind in ('refund', 'history'):
+            self.assertEqual(result['msgs_by_kind'][kind]['count'], 2)
+        self.assertEqual([row['concurrent'] for row in stats['_msgs_calls']], [1, 0, 1, 0])
+        self.assertFalse(ch._MSGS_ACTIVE)
+        self.assertNotIn('PRIVATE', json.dumps(result))
 
     def test_stale_or_foreign_timing_frames_do_not_classify_new_calls(self):
         stats = {'msgs_calls': 0}
@@ -166,7 +191,7 @@ class ReceiptTiming(Base):
         def follow(*args, stats, **kwargs):
             stats.update(_msgs_samples_ms=[100, 200, 300], msgs_timeouts=1,
                          msgs_by_kind={'receipt': {'count': 3, 'ms': 600}},
-                         receipt_result={'none': 1})
+                         msgs_cpu_ms=123, msgs_concurrent_max=1, receipt_result={'none': 1})
             return []
         with patch.object(mc, 'follow', follow), contextlib.redirect_stderr(io.StringIO()):
             mc.run_check(self.wd, 'receipt-stats', self.data, self.root, at('2026-11-15T12:00'), finder(), nobody)
@@ -178,4 +203,7 @@ class ReceiptTiming(Base):
             self.assertEqual((target['msgs_timeouts'], target['msgs_p50_ms']), (1, 200))
             self.assertEqual(target['msgs_by_kind']['receipt'], {'count': 3, 'ms': 600})
             self.assertEqual(target['receipt_result']['none'], 1)
+            self.assertEqual(target['msgs_cpu_ms'], 123)
+            self.assertEqual(target['msgs_concurrent_max'], 1)
+            self.assertNotIn('_msgs_calls', target)
             self.assertNotIn('_msgs_samples_ms', target)

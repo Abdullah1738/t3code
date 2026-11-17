@@ -66,8 +66,17 @@ export function loadConfig(env = process.env) {
     models: Object.keys(FALLBACK_MODELS),
     // Command that must exit 0 before any request leaves for Venice (Mullvad
     // egress check). Cached for egressCheckTtlMs. Empty = no check.
-    egressCheck: env.VENICE_X402_EGRESS_CHECK || '',
+    egressCheck: env.VENICE_X402_EGRESS_CHECK ?? 'builtin', // 'builtin' = in-process checks (lib/egress.mjs); '' disables
+    mullvadState: env.VENICE_MULLVAD_STATE || '/usr/local/var/venice-mullvad/state.json',
     egressCheckTtlMs: num(env.VENICE_X402_EGRESS_CHECK_TTL_S, 300) * 1000,
+    // While the tunnel fails over (2-4 min when a transport gets blocked), hold
+    // requests and re-check every egressPollMs instead of failing them at once.
+    egressWaitMs: num(env.VENICE_X402_EGRESS_WAIT_S, 300) * 1000,
+    egressPollMs: num(env.VENICE_X402_EGRESS_POLL_S, 5) * 1000,
+    // Connection failures and 502/503/504/52x before any byte reaches the client
+    // are retried (attempts in total), waiting for egress between attempts.
+    upstreamAttempts: num(env.VENICE_X402_UPSTREAM_ATTEMPTS, 5),
+    retryDelayMs: num(env.VENICE_X402_RETRY_DELAY_S, 3) * 1000,
     maxConcurrent: num(env.VENICE_X402_MAX_CONCURRENT, 4),
     baseRpc: env.VENICE_X402_BASE_RPC || 'https://mainnet.base.org',
   };

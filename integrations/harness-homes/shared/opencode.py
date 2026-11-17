@@ -1,4 +1,5 @@
 """Migrate only shared MCP entries, preserving surrounding OpenCode JSONC."""
+import argparse
 import json
 import re
 import sys
@@ -70,17 +71,30 @@ def patch(text, entries):
     return text
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--allow-reload', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
+    args = parser.parse_args(argv)
     manifest = gh.load_manifest()
     path = Path(gh.opencode_config_path(manifest, None))
-    original = path.read_text()
-    updated = patch(original, remote_entries(manifest))
-    if updated != original:
-        # Owner-approved installation only. Private backup is the way back.
-        backup = str(path) + ".before-shared-mcp"
-        if not Path(backup).exists():
-            gh.Writer(False).file(backup, original.encode(), 0o600)
-        gh.Writer(False).file(str(path), updated.encode(), 0o600)
+    original = path.read_bytes()
+    updated = patch(original.decode(), remote_entries(manifest))
+    if updated.encode() != original:
+        import tempfile
+        helper = Path(__file__).resolve().parents[2] / 'local-helpers/libexec/opencode-reload'
+        if not helper.is_dir():
+            helper = Path.home() / '.local/libexec/opencode-reload'
+        sys.path.insert(0, str(helper))
+        import opencode_reload
+        with tempfile.TemporaryDirectory(prefix='shared-mcp-config-') as tmp:
+            staged = Path(tmp) / 'opencode.jsonc'
+            staged.write_text(updated)
+            baseline = Path(tmp) / 'original.jsonc'
+            baseline.write_bytes(original)
+            opencode_reload.apply('harness-homes-shared-mcp', [(staged, path)],
+                                  allow_reload=args.allow_reload, dry_run=args.dry_run,
+                                  expected_before=[(baseline, path)])
 
 
 if __name__ == "__main__":

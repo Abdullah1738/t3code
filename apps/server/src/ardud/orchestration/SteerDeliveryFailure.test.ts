@@ -227,6 +227,7 @@ const executorLayer = (
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProviderControl.ProviderTurnControlServiceV2)({ steer }),
+        Layer.mock(EffectOutbox.EffectOutboxV2)({ get: () => Effect.succeed(Option.none()) }),
         Layer.mock(ProviderSessions.ProviderSessionManagerV2)({}),
         Layer.mock(ProviderStart.ProviderTurnStartServiceV2)({}),
         Layer.mock(CheckpointRollback.CheckpointRollbackServiceV2)({}),
@@ -465,6 +466,9 @@ it.effect.each([
       let providerCalls = 0;
       let bookkeepingCalls = 0;
       let failedReschedule = false;
+      // Restart recovery claims the accepted effect once without executing it.
+      const executions =
+        EffectWorker.DEFAULT_MAX_ACCEPTED_ATTEMPTS - (recovery === "restart" ? 1 : 0);
       const projectionFails = stage.startsWith("projection");
       const failure = stage.endsWith("defect")
         ? Effect.die(bookkeepingFailure)
@@ -483,7 +487,7 @@ it.effect.each([
             Effect.suspend(() => {
               if (projectionFails) {
                 bookkeepingCalls += 1;
-                if (!eventuallySucceeds || bookkeepingCalls < 5) return failure;
+                if (!eventuallySucceeds || bookkeepingCalls < executions) return failure;
               }
               return projections
                 .getThreadRecords(id, fields, filter)
@@ -494,13 +498,12 @@ it.effect.each([
               assert.equal(command.type, "notification.delivery.accept");
               if (!projectionFails) {
                 bookkeepingCalls += 1;
-                if (!eventuallySucceeds || bookkeepingCalls < 5) return failure;
+                if (!eventuallySucceeds || bookkeepingCalls < executions) return failure;
               }
               return Effect.succeed({ sequence: 1, storedEvents: [] });
             }),
         },
       );
-      const executions = recovery === "restart" ? 4 : 5;
       for (let attempt = 1; attempt <= executions; attempt += 1) {
         // A fresh executor each attempt excludes process-local acceptance caches.
         const layer = EffectWorker.layerWithOptions({ workerId: "acceptance-test" }).pipe(

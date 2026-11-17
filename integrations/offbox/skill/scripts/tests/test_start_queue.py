@@ -297,6 +297,7 @@ class ResumeQueueTests(Isolated):
                 patch.object(lease, '_bring_up'), patch.object(lease, 'ensure_ttl'), \
                 patch.object(lease.ssh_sync, 'close_master'), patch.object(self.clock.time, 'sleep', sleep), \
                 patch.object(runs.Runner, 'start', start), patch.object(fallback, 'run_local') as local, \
+                patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stdout(io.StringIO()):
             thread = threading.Thread(target=grower)
             thread.start()
@@ -609,7 +610,8 @@ class ResumeQueueTests(Isolated):
                 retained=self.con.execute("SELECT 1 FROM kv WHERE k='create_unanswered:repo'").fetchone()
                 self.assertEqual(bool(retained),ambiguous and operation!='resume')
 
-    def test_archived_bring_up_retry_preserves_contention_types(self):
+    @patch.dict(os.environ, {"OFFBOX_BACKEND": "boat"})
+    def test_boat_archived_bring_up_retry_preserves_contention_types(self):
         self.box('cold','stopped',member=True)
         for error in (allocation.Busy('held'),allocation.Fenced('sibling unresolved'),lease.ResumeUnresolved('own unknown')):
             with self.subTest(error=type(error).__name__):
@@ -625,7 +627,8 @@ class ResumeQueueTests(Isolated):
                 if isinstance(error,(allocation.Busy,allocation.Fenced)):
                     self.assertIs(cm.exception,error)
 
-    def test_deferred_archived_retry_keeps_two_send_bound(self):
+    @patch.dict(os.environ, {"OFFBOX_BACKEND": "boat"})
+    def test_boat_deferred_archived_retry_keeps_two_send_bound(self):
         self.box('cold','stopped',member=True)
         bring_calls=[]
         name='allocation-'+hashlib.sha256(b'repo').hexdigest()[:20]

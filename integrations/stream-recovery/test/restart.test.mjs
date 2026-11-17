@@ -10,6 +10,7 @@ import {
 } from '../lib/detect.mjs';
 import { restartScan, RESTART_SETTLE_MS, RESTART_RESUME_WINDOW_MS } from '../lib/restartwatch.mjs';
 import { fixture as logFixture } from '../../router-logging/test/support.mjs';
+import { assertScanProps } from './scan-props.mjs';
 
 // Fixtures modelled on the 15 Oct 18:17Z restart (statev2 rows, OpenCode messages).
 const T0 = Date.parse('2026-10-15T18:17:44.747Z');
@@ -158,7 +159,7 @@ function fakeIo({ subs = [], delegated = [], runs = [], threads, later = {}, oc 
     OC_URL: 'http://oc',
     assertReplicaFresh: () => {},
     assertThreadInReplica: () => {},
-    serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
+    loadStallState: () => ({ stalls: {} }), serverRuntime: () => ({ pid: 81615, procStartMs: Date.parse('2026-10-15T18:16:17Z'), readyMs: Date.parse('2026-10-15T18:17:53.316Z') }),
     openCodeRuntime: () => null,
     restartRunsSince: () => runs,
     restartNoteRun: () => null,
@@ -407,7 +408,7 @@ test('stall-watch interrupts are not treated as lost delegated tasks', async () 
       { ses: 'ses_stalled', action: 'opencode', interruptedAt: T0 },
       { threadId: row.child_thread_id, action: 'robob', interruptedAt: T0 },
     ]) {
-      const report = await restartScan(scanArgs({ handled: {}, servers: [], stalls: { stall } }, { db }), io);
+      const report = await restartScan(scanArgs({ handled: {}, servers: [] }, { db }), { ...io, loadStallState: () => ({ stalls: { stall } }) });
       assert.equal(report.length, 0);
     }
     assert.equal(calls.send.length + calls.telegram.length, 0);
@@ -545,7 +546,7 @@ test('an ahead delegated child defers its initial parent note while another pare
   assert.equal(calls.telegram.length, 0);
   const row = rows().find(row => row.name === 'restart.scan');
   assert.equal(row.ok, true);
-  assert.deepEqual(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
+  assertScanProps(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
 });
 
 for (const target of ['parent', 'child']) test(`a late ${target} deferral leaves its tasks pending and recovers another parent`, async t => {
@@ -586,7 +587,7 @@ for (const target of ['parent', 'child']) test(`a late ${target} deferral leaves
     assert.deepEqual(calls.send.map(call => call.threadId), ['batch','healthy']);
     const row = rows().filter(row => row.name === 'restart.scan').at(-1);
     assert.equal(row.ok, true);
-    assert.deepEqual(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
+    assertScanProps(row.props, {deferredThreads:1,maxThreadAheadMs:1_500});
   }
   blocked = null;
   await restartScan(scanArgs(state, {now:T0+100_000}), io);
@@ -746,7 +747,7 @@ test('cancels from the stall watch interrupting a session are not a restart', as
   const subs = [sub('a', 'x', 0), sub('b', 'y', 10), sub('c', 'z', 20)];
   const stalls = Object.fromEntries(['a', 'b', 'c'].map((k) => [`st-${k}`, { ses: `ses_${k}`, action: 'opencode', interruptedAt: T0 - 2_000 }]));
   const { io, calls } = fakeIo({ subs, threads: {} });
-  const report = await restartScan(scanArgs({ handled: {}, servers: [], stalls }), io);
+  const report = await restartScan(scanArgs({ handled: {}, servers: [] }), { ...io, loadStallState: () => ({ stalls }) });
   assert.equal(report.length, 0);
   assert.equal(calls.telegram.length, 0);
 });
@@ -1045,6 +1046,8 @@ test('held queues drop only stale coordination pulses and keep old owner message
   assert.deepEqual(calls.commands.map((c) => [c.type, c.runId]), [
     ['queued-run.cancel', 'run:20'], ['queue.resume', undefined],
   ]);
+  assert.equal(calls.commands[0].reason, 'superseded');
+  assert.match(calls.commands[0].detail, /Stale coordination pulse/);
   assert.match(calls.send[0].text, /run:20, queued/);
   assert.match(calls.send[0].text, /held 3 queued message/);
   assert.equal(result.results[0].queueOk, true);

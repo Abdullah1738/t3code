@@ -1,6 +1,7 @@
 import type { KanbanActor, KanbanCard, KanbanWait, PullRequestCheck } from "@t3tools/contracts";
 import { KANBAN_WAIT_CHECK_FAILURES, KANBAN_WAIT_LIMIT_MS } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
+import * as DateTime from "effect/DateTime";
 
 import { poolThreads } from "./rules.ts";
 import type { KanbanThreadPr } from "./threads.ts";
@@ -323,6 +324,43 @@ describe("the board's own checks, through the check contract", () => {
       to: "evaluator",
     });
   });
+
+  it.each(["done", "skipped"] as const)(
+    "card: accepts a marked Completed target and wakes when %s",
+    (state) => {
+      const step = {
+        ...subtask("evaluator", "Host release via #99, then live read-back"),
+        holdsDependents: true,
+      };
+      const blocker = card(190, { stage: "completed", subtasks: [step] });
+      const dependent = card(189, { stage: "todo" });
+      const request: WaitRequest = {
+        on: "card",
+        card: blocker,
+        note: "Wait for host release and read-back",
+      };
+      expect(checkWait(dependent, request, evaluator, NOW, true)).toMatchObject({ ok: true });
+      const waiting = { ...dependent, wait: newWait(request, evaluator, AT) };
+      const known = (target: KanbanCard) => facts({ cards: new Map([[target.id, target]]) });
+      expect(answer(waiting, known(blocker))).toEqual(hold);
+      expect(resolveWait(waiting, known(blocker), ctx, AT)._tag).toBe("hold");
+      const finished = { ...blocker, subtasks: [{ ...step, state }] };
+      expect(answer(waiting, known(finished))).toEqual({
+        result: "wake",
+        note: "Card #190 is done",
+      });
+      const ended = resolveWait(waiting, known(finished), ctx, AT);
+      expect(ended).toMatchObject({ _tag: "end" });
+      if (ended._tag === "end") expect(ended.card).not.toHaveProperty("wait");
+      expect(
+        checkWait(dependent, { ...request, card: finished }, evaluator, NOW, true),
+      ).toMatchObject({ ok: false });
+      const unmarked = { ...blocker, subtasks: [subtask("evaluator", step.text)] };
+      expect(
+        checkWait(dependent, { ...request, card: unmarked }, evaluator, NOW, true),
+      ).toMatchObject({ ok: false });
+    },
+  );
 
   it.each([
     ["working", null, [], false],
@@ -1343,11 +1381,11 @@ describe("checkWait", () => {
     activeRole: "work",
   });
 
-  it("keeps CI on watch_pull_request", () => {
-    expect(reason(running, request({ on: "ci" }), worker, true)).toContain(
+  it.each(["ci", "push", "merge"] as const)("keeps %s on watch_pull_request", (on) => {
+    expect(reason(running, request({ on }), worker, true)).toContain(
       "Waiting on CI for a PR: call watch_pull_request",
     );
-    expect(checkWait(running, request({ on: "ci" }), worker, NOW, true)).toMatchObject({
+    expect(checkWait(running, request({ on }), worker, NOW, true)).toMatchObject({
       ok: false,
       code: "denied",
       denyReason: "active_worker_cannot_wait",
@@ -1355,8 +1393,6 @@ describe("checkWait", () => {
   });
 
   it.each([
-    { on: "merge" },
-    { on: "push", sinceHead: "abc123" },
     { on: "time", until: "2026-11-11T12:00:00.000Z" },
     { on: "card", card: card(2) },
     { on: "script", script: { name: "check", found: [{ name: "check", enabled: true }] } },
@@ -1368,16 +1404,11 @@ describe("checkWait", () => {
   });
 
   it.each([
-    { patch: { note: " " }, error: "needs a one-line note" },
-    { patch: { pr: OTHER_PR }, error: "has no pull request" },
-    { patch: { pr: null }, error: "say which pull request" },
-    { patch: { on: "push", sinceHead: null }, error: "a push wait needs head" },
-    { patch: { on: "time", until: "2027-01-10T11:00:00.000Z" }, error: "more than 30 days" },
+    { patch: { on: "time", note: " " }, error: "needs a one-line note" },
+    { patch: { on: "time", until: "2027-01-10T11:00:00.000Z" }, error: "at most 24 hours" },
     { patch: { on: "time", until: null }, error: "a time wait needs until" },
     { patch: { on: "card", card: null }, error: "say which card" },
-    { patch: { on: "owner_go", ask: null }, error: "ask it first" },
     { patch: { on: "script", script: null }, error: "a script wait names" },
-    { patch: { on: "ci", pr: null }, error: "say which pull request" },
   ] satisfies { patch: Partial<WaitRequest>; error: string }[])(
     "validates the own worker's wait: $error",
     ({ patch, error }) => {
@@ -1390,7 +1421,7 @@ describe("checkWait", () => {
     expect(
       reason(
         { ...running, stalled: { by: owner, at: AT as never, reason: "stop" } },
-        request(),
+        request({ on: "time", until: "2026-11-11T12:00:00.000Z" }),
         worker,
         true,
       ),
@@ -1418,10 +1449,33 @@ describe("checkWait", () => {
   });
 
   it("defers even when the thread view lags the worker's live tool call", () => {
-    expect(checkWait(running, request(), worker, NOW, true, false)).toEqual({
+    expect(
+      checkWait(
+        running,
+        request({ on: "time", until: "2026-11-11T12:00:00.000Z" }),
+        worker,
+        NOW,
+        true,
+        false,
+      ),
+    ).toEqual({
       ok: true,
       deferredUntilTurnEnds: true,
     });
+  });
+
+  it.each([
+    { ahead: 1, ok: true },
+    { ahead: 24 * 60 * 60 * 1000, ok: true },
+    { ahead: 24 * 60 * 60 * 1000 + 1, ok: false },
+  ])("bounds a worker time wait at $ahead ms", ({ ahead, ok }) => {
+    const until = DateTime.formatIso(DateTime.makeUnsafe(NOW + ahead));
+    const result = checkWait(running, request({ on: "time", until }), worker, NOW);
+    expect(result.ok).toBe(ok);
+    if (!result.ok) expect(result.reason).toContain("at most 24 hours");
+    expect(checkWait(running, request({ on: "time", until }), evaluator, NOW, true, false).ok).toBe(
+      true,
+    );
   });
 
   it.each(["time", "ci", "card"] as const)(
@@ -1525,9 +1579,11 @@ describe("checkWait", () => {
     });
     expect(reason(asked, go("q1"))).toBe("ok");
     expect(reason(asked, go(null))).toBe("invalid: say which open question: q1");
-    expect(checkWait({ ...running, asks: asked.asks }, go("q1"), worker, NOW, true)).toEqual({
-      ok: true,
-      deferredUntilTurnEnds: true,
+    expect(checkWait({ ...running, asks: asked.asks }, go("q1"), worker, NOW, true)).toMatchObject({
+      ok: false,
+      code: "denied",
+      denyReason: "active_worker_cannot_wait",
+      reason: expect.stringContaining("card_ask"),
     });
   });
 

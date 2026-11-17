@@ -32,7 +32,7 @@ NO_INTERNET = dict(ONLINE, online=False, internet=False, internet_detail="1.1.1.
 GOOD = {"mode": "ok", "reasons": [], "pool": "ONLINE", "mdraid": "ok", "boot_id": "boot-a", "version": "1.0",
         "uptime_s": 86400, "boatd_uptime_s": 86000}
 BACKEND_KEYS = {"state", "since", "good_streak", "bad_streak", "last_check", "last_ok", "reason", "outage_id",
-                "degraded", "last_outcome", "class", "last_answer", "boot_id", "slow_since", "flaps_today"}
+                "degraded", "disk", "last_outcome", "class", "last_answer", "boot_id", "slow_since", "flaps_today"}
 
 
 class FakeEffects:
@@ -479,6 +479,35 @@ class StateMachineTests(Base):
         sim.tick(ok=False)
         self.assertEqual(len([item for item in sim.fx.sent if ":down:" in item["request_id"]]), 1)
 
+    def test_loop_stall_alert_dedupes_changing_age_and_logs_recovery(self):
+        sim = Sim(self)
+        for age in (180, 240, 5400):
+            problem = f"reaper has not completed a pass for {age} s (disk I/O error)"
+            health = dict(GOOD, degraded=True, mode="degraded", reasons=[problem],
+                          loops={"reaper": {"stalled": True, "problem": problem}})
+            result = sim.tick(health=health)
+            self.assertEqual((result["state"], result["bad_streak"]), ("home_up", 0))
+        self.assertEqual(len(sim.fx.telegrams), 1)
+        self.assertIn("offbox-home-degraded:reaper:", sim.fx.telegrams[0]["key"])
+        self.assertEqual(sim.fx.created, [])
+        self.assertIn("class=degraded", sim.log())
+        self.assertIn("loop=reaper", sim.log())
+        sim.tick(health=dict(GOOD, loops={"reaper": {"stalled": False}}))
+        self.assertIn("loop_recovered loop=reaper", sim.log())
+        sim.tick(health=health)
+        self.assertEqual(len(sim.fx.telegrams), 2)
+
+    def test_loop_alert_retry_keeps_key_and_original_text(self):
+        sim = Sim(self)
+        sim.fx.fail.add("telegram")
+        for age in (180, 240):
+            problem = f"sampler has not completed a pass for {age} s (disk)"
+            sim.tick(health=dict(GOOD, mode="degraded", degraded=True, reasons=[problem],
+                                loops={"sampler": {"stalled": True, "problem": problem}}))
+            sim.fx.fail.clear()
+        self.assertEqual(len(sim.fx.telegrams), 1)
+        self.assertIn("180 s", sim.fx.telegrams[0]["text"])
+
     def test_degraded_but_serving(self):
         sim = Sim(self)
         degraded = dict(GOOD, mode="degraded", reasons=["pool DEGRADED", "mdraid degraded"])
@@ -708,6 +737,20 @@ def serve(case, route):
 
 
 class HttpTests(Base):
+    def test_degraded_health_is_serving_even_if_ok_false_but_hard_failures_win(self):
+        body = {"ok": False, "degraded": True, "mode": "degraded", "reasons": [],
+                "loops": {"sampler": {"stalled": True, "problem": "sampler stalled", "last_ok": 100}}}
+        _, base = serve(self, lambda *args: (200, body))
+        url = base + "/api/v1"
+        result = hm.check_health(url)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["health"]["loops"]["sampler"]["stalled"])
+        body["disk_full"] = True
+        self.assertEqual(hm.check_health(url)["error"], "disk_full")
+        del body["disk_full"]
+        body["reasons"] = ["incus is not answering"]
+        self.assertFalse(hm.check_health(url)["ok"])
+
     def test_health_check_against_a_real_socket(self):
         answers = {}
         server, base = serve(self, lambda method, path, body: answers["next"])
@@ -720,7 +763,7 @@ class HttpTests(Base):
         self.assertEqual((result["ok"], result["error"]), (True, ""))
         self.assertEqual(result["health"], {"mode": "ok", "reasons": [], "pool": "ONLINE", "mdraid": "ok",
                                             "boot_id": "b-1", "version": "0.3", "uptime_s": 123,
-                                            "boatd_uptime_s": 45, "starting": False, "phase": "", "startedAt": None, "snapshot_age_s": None, "refresh_stage": ""})
+                                            "boatd_uptime_s": 45, "starting": False, "phase": "", "startedAt": None, "snapshot_age_s": None, "refresh_stage": "", "degraded": False})
         del full["boatd_uptime_s"]   # not in the contract: fine without it
         self.assertIsNone(hm.check_health(url)["health"]["boatd_uptime_s"])
         seen = server.seen[-1]

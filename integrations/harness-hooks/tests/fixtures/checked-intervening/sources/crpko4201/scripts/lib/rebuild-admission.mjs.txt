@@ -1,0 +1,250 @@
+import { kafkaClientModes } from "./rebuild-kafka-client-cohort.mjs";
+import { fileURLToPath } from "node:url";
+import { checkStartPaths, inventoryRows } from "../check-rebuild-start-paths.mjs";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
+import { proveProducerHold } from "./clickhouse-native-init-producer-hold.mjs";
+import { invalidateAutomationObservation, observeAutomationDrain, readAutomationFence, readDeploymentSnapshot, requireIdleFleetDeployments } from "./rebuild-automation-idle.mjs";
+import { readIngestorAuthority } from "./ingestor-operation-authority.mjs";
+import { nativeInitResetFenceName } from "./native-init-reset-fence.mjs";
+
+const root = new URL("../../", import.meta.url);
+export const latchName = env => `/crpko/${typeof env === "string" ? env : env.env}/rebuild/producer-hold`;
+export const loadCohort = () => JSON.parse(readFileSync(new URL("plan/rebuild/producer-cohort.dev.v1.json", root)));
+export const loadStartPaths = () => { const inventory = JSON.parse(readFileSync(new URL("plan/rebuild/start-paths.v1.json", root))); return { ...inventory, paths: inventoryRows(inventory) }; };
+export const cohortSha256 = () => createHash("sha256").update(readFileSync(new URL("plan/rebuild/producer-cohort.dev.v1.json", root))).digest("hex");
+export const producerModes = () => [...new Set([...loadCohort().producers.flatMap(p => p.modes.filter(m => m !== "lambda-publisher").map(m => `${p.binary}-${m.replaceAll("_", "-")}`)), "ws-gateway-streamer"])];
+export function refuse(code, detail) { throw Object.assign(new Error(`${code}: ${detail}`), { code }); }
+export function environment(value = "dev") {
+  if (typeof value === "object") {
+    if (!value || Array.isArray(value) || typeof value.env !== "string" || !/^[a-z][a-z0-9-]*$/.test(value.env)
+      || typeof value.account_id !== "string" || !/^\d{12}$/.test(value.account_id)
+      || typeof value.region !== "string" || !/^[a-z]{2}-[a-z]+-\d$/.test(value.region)) refuse("HOLD_TARGET_INVALID", "environment identity required");
+    return value;
+  }
+  if (typeof value !== "string" || !/^[a-z][a-z0-9-]*$/.test(value)) refuse("HOLD_TARGET_INVALID", "invalid environment name");
+  const config = JSON.parse(readFileSync(new URL(`config/environments/${value}.json`, root)));
+  if (config?.environment !== value) refuse("HOLD_TARGET_INVALID", "environment configuration identity differs from its name");
+  return environment({ env: config.environment, account_id: config.aws?.accountId, region: config.aws?.region });
+}
+export function awsReader(target, { profile = process.env.AWS_PROFILE } = {}) {
+  target = environment(target);
+  return args => {
+    const result = spawnSync("aws", [...args, "--region", target.region, ...(profile ? ["--profile", profile] : []), "--cli-connect-timeout", "5", "--cli-read-timeout", "15", "--output", "json"], { encoding: "utf8", timeout: 25000, maxBuffer: 32 * 1024 * 1024, env: { ...process.env, AWS_MAX_ATTEMPTS: "1", AWS_PAGER: "", AWS_IGNORE_CONFIGURED_ENDPOINT_URLS: "true" } });
+    if (result.error || result.status !== 0) {
+      if (!result.error && args[0] === "ssm" && args[1] === "get-command-invocation"
+        && /^(?:aws: \[ERROR\]: )?An error occurred \(InvocationDoesNotExist\) when calling the GetCommandInvocation operation(?: \(reached max retries: \d+\))?:/m.test(result.stderr ?? "")) {
+        refuse("InvocationDoesNotExist", "command invocation not yet visible");
+      }
+      const missing = /\(ParameterNotFound\)/.test(result.stderr ?? "");
+      refuse(missing ? "ParameterNotFound" : "HOLD_READ_FAILED", missing ? "parameter absent" : "AWS request failed");
+    }
+    return JSON.parse(result.stdout);
+  };
+}
+function checkLatch(value, target) {
+  if (value?.schema !== "crpko.rebuild-producer-hold.v1" || value.env !== target.env || value.account_id !== target.account_id || value.region !== target.region) refuse("HOLD_TARGET_MISMATCH", "latch identity differs from caller");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value.installation_id ?? "") || value.cohort_sha256 !== cohortSha256() || typeof value.created_by !== "string" || !value.created_by.trim() || typeof value.created_at !== "string" || !/^\d{4}-\d{2}-\d{2}T/.test(value.created_at) || !Number.isFinite(Date.parse(value.created_at))) refuse("HOLD_LATCH_INVALID", "latch fields or cohort digest invalid");
+  return value;
+}
+export function validateLatchValue(env, value) { return checkLatch(value, environment(env)); }
+export function readLatch(env, { ssm = awsReader(env) } = {}) {
+  const target = environment(env), name = latchName(target);
+  let response;
+  try { response = ssm(["ssm", "get-parameter", "--name", name]); }
+  catch (error) { if ((error.code === "ParameterNotFound" || error.name === "ParameterNotFound" || error.message === "ParameterNotFound") || /\(ParameterNotFound\)/.test(error.message)) return null; throw error; }
+  const p = response?.Parameter;
+  if (p?.Name !== name || p.Type !== "String" || typeof p.Value !== "string") refuse("HOLD_LATCH_UNREADABLE", "parameter identity or value unavailable");
+  let value;
+  try { value = JSON.parse(p.Value); } catch { refuse("HOLD_LATCH_UNREADABLE", "invalid JSON"); }
+  return checkLatch(value, target);
+}
+export function createLatch(env, value, { ssm = awsReader(env) } = {}) {
+  const target = environment(env);
+  checkLatch(value, target);
+  const identical = existing => {
+    if (JSON.stringify(Object.keys(existing).sort().map(k => [k, existing[k]])) !== JSON.stringify(Object.keys(value).sort().map(k => [k, value[k]]))) refuse("HOLD_LATCH_CONFLICT", "existing latch differs; reconcile installation");
+    return existing;
+  };
+  const current = readLatch(target, { ssm });
+  if (current) return identical(current);
+  try { ssm(["ssm", "put-parameter", "--name", latchName(target), "--type", "String", "--value", JSON.stringify(value), "--no-overwrite"]); }
+  catch (error) {
+    // Reconcile create races and an unknown write response, never overwrite.
+    const observed = readLatch(target, { ssm });
+    if (!observed) throw error;
+    return identical(observed);
+  }
+  const observed = readLatch(target, { ssm });
+  if (!observed) refuse("HOLD_LATCH_UNREADABLE", "create readback absent");
+  return identical(observed);
+}
+export function requireOperationLatch(env, operation, installationId, { ssm = awsReader(env) } = {}) {
+  const target = environment(env), saved = operation?.producer_hold;
+  validateLatchValue(target, saved);
+  if (saved.installation_id !== installationId) refuse("HOLD_LATCH_CONFLICT", "installation differs from the saved operation");
+  const current = readLatch(target, { ssm });
+  if (!current) refuse("HOLD_LATCH_REQUIRED", "reset requires the saved producer latch");
+  if (!isDeepStrictEqual(current, saved)) refuse("HOLD_LATCH_CONFLICT", "producer latch differs from the saved operation");
+  return current;
+}
+export function requireResetIdle(env, { ssm = awsReader(env) } = {}) {
+  const target = environment(env), seenTokens = new Set(), seenNames = new Set(), parameters = [];
+  if (target.env !== "dev") refuse("HOLD_TARGET_INVALID", "native reset admission is dev only");
+  let token;
+  do {
+    const result = ssm(["ssm", "get-parameters-by-path", "--path", `/crpko/${target.env}/release-private-gates/operations`, "--recursive", "--no-paginate", ...(token ? ["--next-token", token] : [])]);
+    if (!Array.isArray(result?.Parameters)) refuse("HOLD_READ_FAILED", "operation inventory unavailable");
+    for (const parameter of result.Parameters) {
+      if (typeof parameter?.Name !== "string" || !parameter.Name || seenNames.has(parameter.Name)) refuse("HOLD_READ_FAILED", "operation inventory identity invalid");
+      seenNames.add(parameter.Name);
+      parameters.push(parameter);
+    }
+    token = result.NextToken;
+    if (token !== undefined && (typeof token !== "string" || !token || seenTokens.has(token))) refuse("HOLD_READ_FAILED", "operation pagination invalid");
+    if (token) seenTokens.add(token);
+  } while (token !== undefined);
+  const reservationPrefix = `${nativeInitResetFenceName}/scopes/`;
+  const hash = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+  const uuid = value => typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
+  for (const parameter of parameters) {
+    const fence = parameter.Name === nativeInitResetFenceName;
+    const suffix = parameter.Name.startsWith(reservationPrefix) ? parameter.Name.slice(reservationPrefix.length) : null;
+    if (!fence && !hash(suffix)) refuse("REBUILD_OPERATION_HELD", "operation record remains");
+    if (parameter.Type !== "String" || typeof parameter.Value !== "string") refuse("HOLD_READ_FAILED", "reset metadata unreadable");
+    let record;
+    try { record = JSON.parse(parameter.Value); } catch { refuse("HOLD_READ_FAILED", "reset metadata unreadable"); }
+    if (!record || typeof record !== "object" || Array.isArray(record) || !hash(record.scope_sha256) || !hash(record.execution_host) || !uuid(record.claim_id)
+      || record.operation_id !== `reset-${createHash("sha256").update(JSON.stringify([record.scope_sha256, record.execution_host])).digest("hex")}`) refuse("HOLD_READ_FAILED", "reset metadata identity invalid");
+    if (fence) {
+      if (record.schema !== "crpko.native-init-reset-fence.v1" || record.state !== "clear") refuse("REBUILD_OPERATION_HELD", "native reset fence is unresolved");
+      if (Object.keys(record).some(key => !["schema", "state", "scope_sha256", "execution_host", "claim_id", "operation_id", "target", "send_id"].includes(key))
+        || record.target !== "/crpko/dev/release-private-gates/operations/clickhouse-ingestor" || !uuid(record.send_id)) refuse("HOLD_READ_FAILED", "reset fence completion invalid");
+    } else if (record.scope_sha256 !== suffix || Object.keys(record).sort().join(",") !== "claim_id,execution_host,operation_id,scope_sha256") {
+      refuse("HOLD_READ_FAILED", "reset scope reservation invalid");
+    }
+  }
+  try {
+    const result = ssm(["ssm", "get-parameter", "--name", `/crpko/${target.env}/rebuild/producer-restoration`]);
+    if (!result?.Parameter) refuse("HOLD_READ_FAILED", "restoration readback unavailable");
+    refuse("REBUILD_RESTORATION_HELD", "restoration record remains");
+  } catch (error) { if (error.code !== "ParameterNotFound" && error.name !== "ParameterNotFound" && error.message !== "ParameterNotFound" && !/\(ParameterNotFound\)/.test(error.message)) throw error; }
+  const authority = readIngestorAuthority(ssm);
+  if (!authority && parameters.length) refuse("REBUILD_OPERATION_HELD", "reset metadata has no authority");
+  if (authority && (authority.phase !== "clear" || authority.main_hash !== null || authority.send_id !== null || authority.target !== null)) refuse("REBUILD_OPERATION_HELD", "ingestor authority is held or unresolved");
+}
+export function refuseUnderLatch(env, deps) {
+  if (readLatch(env, deps)) refuse("REBUILD_PRODUCER_HELD", "start path unavailable during rebuild");
+}
+export function holdVariables(latch) {
+  return latch ? { rebuild_producer_hold: true, dev_backoffice_bootstrap_hold: true, dev_kafka_consumer_hold: true, registry_publisher_stream_enabled: false } : {};
+}
+const allResources = module => [...(module?.resources ?? []), ...(module?.child_modules ?? []).flatMap(allResources)];
+export function validateHoldPlan(plan, { latch, mode = "ordinary", pathClass } = {}) {
+  if (mode === "restoration") refuse("RESTORATION_NOT_IMPLEMENTED", "guarded restoration is unavailable");
+  if (mode !== "ordinary") refuse("HOLD_MODE_INVALID", "unknown admission mode");
+  if (!latch) return { required: false };
+  checkLatch(latch, environment(latch));
+  if (!plan || plan.errored || !Array.isArray(plan.resource_changes) || plan.deferred_changes?.length || plan.action_invocations?.length) refuse("HOLD_PLAN_INVALID", "complete plan JSON required");
+  for (const [key, expected] of Object.entries(holdVariables(latch))) if (plan.variables?.[key]?.value !== expected) refuse("HOLD_PLAN_VARIABLE", key);
+  const consumers = kafkaClientModes();
+  const modes = [...new Set([...producerModes(), ...consumers])], prefix = `crpko-${latch.env}-`;
+  const producer = v => typeof v === "string" && modes.some(m => v === m || v.endsWith(`/${prefix}${m}`) || v === `${prefix}${m}` || (m === "kafka-history-archiver" && v.endsWith(`/${m}`)));
+  const rows = plan.resource_changes.filter(r => r.mode !== "data");
+  const check = (r, v, unknown = {}) => {
+    const fail = detail => refuse("HOLD_PLAN_UNSAFE", `${r.address}: ${detail}`);
+    if (pathClass === "capacity" && r.type === "aws_ecs_service") fail("capacity plan contains ECS service");
+    if (pathClass === "task-definitions" && (r.type === "aws_ecs_service" || r.type.startsWith("aws_appautoscaling_") || r.type === "aws_lambda_event_source_mapping")) fail("task definition plan contains runtime resource");
+    const auroraSync = r.type === "aws_lambda_function" && (/(?:^|\.)module\.aurora_credential_sync(?:\[[^\]]+\])?\.aws_lambda_function\.sync(?:\[[^\]]+\])?$/.test(r.address ?? "")
+      || [v?.function_name, r.change?.before?.function_name].includes(`${prefix}aurora-credential-sync`));
+    if (auroraSync) {
+      if (r.change && (!Array.isArray(r.change.actions) || r.change.actions.includes("delete"))) fail("credential sync deletion or replacement exposes the concurrency fence");
+      if (!unknown || typeof unknown !== "object" || Array.isArray(unknown)) fail("credential sync unknown values are malformed");
+      if (!v || v.reserved_concurrent_executions !== 0 || unknown.reserved_concurrent_executions) fail("credential sync concurrency must stay zero and known");
+    }
+    if (!v) return;
+    const consumerAddress = /module\.(?:kafbat_ui|kafka_history_archiver)(?:\[[^\]]+\])?\.aws_ecs_service\./.test(r.address ?? "");
+    const consumer = value => typeof value === "string" && consumers.some(m => value === m || value === `${prefix}${m}` || value.endsWith(`/${prefix}${m}`) || (m === "kafka-history-archiver" && value.endsWith(`/${m}`)));
+    if (r.type === "aws_ecs_service" && (consumerAddress || consumer(r.change?.before?.name)) && (v.desired_count !== 0 || unknown.desired_count)) fail("consumer desired count above zero or unknown");
+    if (r.type.startsWith("aws_appautoscaling_") && consumer(r.change?.before?.resource_id)) {
+      if (r.type === "aws_appautoscaling_scheduled_action") fail("consumer scheduled action");
+      if (r.type === "aws_appautoscaling_target" && (v.min_capacity !== 0 || v.max_capacity !== 0 || unknown.min_capacity || unknown.max_capacity)) fail("consumer scaling above zero or unknown");
+    }
+    if (r.type === "aws_ecs_service" && unknown.name) fail("service identity unknown");
+    const key = r.address?.match(/\["([^"\n]+)"\]$/)?.[1];
+    if (r.type === "aws_appautoscaling_target") {
+      if (unknown.resource_id || typeof v.resource_id !== "string") fail("scaling identity unknown");
+      if (producer(v.resource_id) || producer(key)) if (v.min_capacity !== 0 || v.max_capacity !== 0 || unknown.min_capacity || unknown.max_capacity) fail("Kafka client scaling above zero or unknown");
+    }
+    if (r.type === "aws_ecs_service" && (producer(v.name) || producer(key))) if (v.desired_count !== 0 || unknown.desired_count) fail("Kafka client desired count above zero or unknown");
+    if (r.type === "aws_appautoscaling_scheduled_action" && (producer(v.resource_id) || unknown.resource_id)) fail("Kafka client scheduled action");
+    if (r.type === "aws_lambda_event_source_mapping" && (v.enabled !== false || unknown.enabled)) fail("event source mapping must stay disabled");
+    if (r.type === "aws_scheduler_schedule" && /aurora_credential_sync.*(?:secret_rotation|hourly_reconcile)|clickhouse_retention_refresh/.test(r.address) && (v.state !== "DISABLED" || unknown.state)) fail("schedule must stay disabled");
+    if (r.type === "aws_cloudwatch_event_rule" && /aurora_credential_sync.*(?:secret_rotation|hourly_reconcile)|clickhouse_retention_refresh/.test(r.address) && (v.state !== "DISABLED" || unknown.state)) fail("EventBridge rule must stay disabled");
+    if (r.type === "aws_ecs_task_definition" && /venue_router_release_controller/.test(r.address)) fail("router controller must be disabled");
+  };
+  for (const row of rows) check(row, row.change?.after, row.change?.after_unknown);
+  for (const row of allResources(plan.planned_values?.root_module)) if (row.mode !== "data") check(row, row.values);
+  return { required: true, checked: rows.length };
+}
+export function producerHold(env, { awsJson = awsReader(env), scan = () => checkStartPaths(fileURLToPath(root)), ...deps } = {}) {
+ try {
+  const target = environment(env), latch = readLatch(target, { ssm: awsJson });
+  if (!latch) refuse("HOLD_LATCH_REQUIRED", "producer proof needs the rebuild latch");
+  if (typeof scan !== "function" || scan().length) refuse("HOLD_PATH_UNCLASSIFIED", "start-path scan required and must have no gaps");
+  const fence = { target, awsJson, readLatch: () => readLatch(target, { ssm: awsJson }), expectedLatch: latch };
+  const generation = observeAutomationDrain({ ...fence, ...(Object.hasOwn(deps, "now") ? { now: deps.now } : {}), ...(Object.hasOwn(deps, "sleep") ? { sleep: deps.sleep } : {}) });
+  if (readAutomationFence(fence) !== generation) refuse("HOLD_AUTOMATION_DRIFT", "credential sync configuration changed before fleet proof");
+  const deployments = readDeploymentSnapshot({ target, awsJson });
+  const proof = proveProducerHold({ ...deps, awsJson, env: target.env, inventory: [...loadCohort().producers, { binary: "ws-gateway", modes: ["streamer"] }] });
+  const targets = awsJson(["application-autoscaling", "describe-scalable-targets", "--service-namespace", "ecs"]).ScalableTargets;
+  const actions = awsJson(["application-autoscaling", "describe-scheduled-actions", "--service-namespace", "ecs"]).ScheduledActions;
+  if (!Array.isArray(targets) || !Array.isArray(actions)) refuse("HOLD_READ_FAILED", "scaling inventory unavailable");
+  const resources = new Set(proof.services.map(s => `service/crpko-${target.env}/${s}`));
+  if (targets.some(t => resources.has(t.ResourceId) && (t.MinCapacity !== 0 || t.MaxCapacity !== 0)) || actions.some(a => resources.has(a.ResourceId))) refuse("HOLD_SCALING_ACTIVE", "producer scaling or scheduled action remains");
+  const schedules = awsJson(["scheduler", "list-schedules"]).Schedules;
+  const rules = awsJson(["events", "list-rules"]).Rules;
+  if (!Array.isArray(schedules) || !Array.isArray(rules)) refuse("HOLD_READ_FAILED", "schedule inventory unavailable");
+  if ([...schedules, ...rules].some(s => s.Name?.startsWith(`crpko-${target.env}-`) && /aurora-credential-(?:secret|hourly)|clickhouse-retention-refresh/.test(s.Name) && s.State !== "DISABLED")) refuse("HOLD_SCHEDULE_ACTIVE", "environment schedule remains enabled");
+  // Refused runners can reuse a producer service family or own a separate
+  // family without TOPIC WRITE ACLs. Query both even after deregistration.
+  const idleFamilies = new Set([...proof.services, ...["venue-router-release-controller", "backoffice-registry-catalog",
+    "backoffice-registry-history-adoption", "backoffice-registry-recovery",
+    "clickhouse-retention-refresh", "registry-resync", "registry-effective-control"].map(name => `crpko-${target.env}-${name}`)]);
+  for (const family of idleFamilies) {
+    const code = family.endsWith("-venue-router-release-controller") ? "HOLD_CONTROLLER_ACTIVE" : "HOLD_TASK_ACTIVE";
+    for (const status of ["RUNNING", "STOPPED"]) {
+      let token;
+      const tokens = new Set(), arns = new Set();
+      do {
+        const page = awsJson(["ecs", "list-tasks", "--cluster", `crpko-${target.env}`, "--family", family,
+          "--desired-status", status, "--no-paginate", ...(token ? ["--next-token", token] : [])]);
+        if (!Array.isArray(page.taskArns) || new Set(page.taskArns).size !== page.taskArns.length || page.taskArns.some(a => typeof a !== "string" || !a || arns.has(a))) refuse("HOLD_READ_FAILED", `${family}: task inventory incomplete`);
+        for (const arn of page.taskArns) arns.add(arn);
+        // ECS desired RUNNING also includes tasks whose lastStatus is PENDING.
+        if (status === "RUNNING" && arns.size) refuse(code, `${family}: task not idle`);
+        token = page.nextToken;
+        if (token !== undefined && (typeof token !== "string" || !token || tokens.has(token))) refuse("HOLD_READ_FAILED", `${family}: invalid pagination`);
+        tokens.add(token);
+      } while (token);
+      const tasks = [...arns];
+      for (let i = 0; i < tasks.length; i += 100) {
+        const batch = tasks.slice(i, i + 100);
+        const result = awsJson(["ecs", "describe-tasks", "--cluster", `crpko-${target.env}`, "--tasks", ...batch]);
+        if (!Array.isArray(result.tasks) || !Array.isArray(result.failures) || result.failures.length || result.tasks.length !== batch.length
+          || new Set(result.tasks.map(t => t.taskArn)).size !== batch.length
+          || result.tasks.some(t => !batch.includes(t.taskArn) || t.lastStatus !== "STOPPED")) refuse(code, `${family}: task running, draining or unproven`);
+      }
+    }
+  }
+  requireIdleFleetDeployments({ target, awsJson, services: proof.services });
+  if (readAutomationFence(fence) !== generation) refuse("HOLD_AUTOMATION_DRIFT", "credential sync configuration changed during fleet proof");
+  if (readDeploymentSnapshot({ target, awsJson }) !== deployments) refuse("HOLD_DEPLOYMENT_DRIFT", "deployment inventory changed during fleet proof");
+  return { latch, ...proof };
+ } catch (error) {
+  invalidateAutomationObservation(awsJson);
+  throw error;
+ }
+}

@@ -6,6 +6,8 @@ import {
   ProviderInstanceId,
   ProjectId,
   ThreadId,
+  type KanbanBoard,
+  type KanbanSubtask,
   type KanbanCard,
   type KanbanCardEvent,
   type KanbanOwnerAsk,
@@ -24,6 +26,7 @@ import type { SlotEvent } from "../store/KanbanStore.ts";
 
 import * as Activity from "./activity.ts";
 import * as Rules from "./rules.ts";
+import { boardReleaseSummary } from "./boardReplies.ts";
 
 const opus = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/claude-opus-5-5" };
 const sonnet = { instanceId: ProviderInstanceId.make("opencode"), model: "opus/claude-sonnet-5-5" };
@@ -394,6 +397,193 @@ describe("rollup", () => {
     ]);
   });
 
+  it("separates open notices and answer latency from decisions", () => {
+    const mixed = card("mixed", {
+      asks: [
+        ask("notice", t("23:00"), { kind: "notice", respond: { ack: true } }),
+        ask("old-notice", t("16:00"), { kind: "notice", respond: { ack: true } }),
+        ask("approve", t("10:00"), { kind: "approve", blocking: true }),
+        ask("pick", t("20:00"), { kind: "pick" }),
+        ask("answered-notice", t("01:00"), {
+          kind: "notice",
+          closedAt: t("09:00"),
+          answer: { verdict: "ack", by: { _tag: "owner" }, at: t("09:00") },
+        }),
+        ask("answered-pick", t("09:00"), {
+          kind: "pick",
+          blocking: true,
+          closedAt: "2026-11-12T09:00:20.000Z",
+          answer: { verdict: "picked", by: { _tag: "owner" }, at: "2026-11-12T09:00:20.000Z" },
+        }),
+        ask("legacy", t("21:00"), { respond: { ack: true } }),
+        ask("dropped", t("23:30"), { kind: "approve", closedAt: t("23:40") }),
+      ],
+    });
+    const run = Activity.rollup({ window, cards: [mixed], events: [], threads: [], pools: [] });
+    expect(run.asks).toMatchObject({
+      open: 3,
+      openNotices: 2,
+      answered: 2,
+      closedWithoutAnswer: 1,
+    });
+    expect(run.asks.openOver6h).toEqual({
+      count: 1,
+      items: [{ card: 1, ask: "approve", askedAt: "2026-11-12T10:00Z", hours: 14, blocking: true }],
+    });
+    expect(run.asks.noticesOver6h).toEqual({ count: 1 });
+    expect(run.asks.answerMinutesByKind).toEqual({
+      notice: { count: 1, p50: 480, p90: 480, max: 480 },
+      pick: { count: 1, p50: 0, p90: 0, max: 0 },
+    });
+    expect(run.asks.answerMinutesByBlocking).toEqual({
+      blocking: { count: 1, p50: 0, p90: 0, max: 0 },
+      async: { count: 1, p50: 480, p90: 480, max: 480 },
+    });
+    // Retains the existing rounded minutes and nearest-rank percentiles overall.
+    expect(run.asks.answerMinutes).toEqual({ p50: 480, p90: 480, max: 480 });
+    expect(run.asks.answeredItems.map(({ kind, blocking }) => [kind, blocking])).toEqual([
+      ["notice", undefined],
+      ["pick", true],
+    ]);
+    expect(run.asks.others.items.map(({ id, kind }) => [id, kind])).toEqual([
+      ["legacy", undefined],
+      ["pick", "pick"],
+      ["approve", "approve"],
+      ["dropped", "approve"],
+      ["notice", "notice"],
+      ["old-notice", "notice"],
+    ]);
+    expect(run.asks.others.items[0]).not.toHaveProperty("kind");
+  });
+
+  it.each([undefined, "question", "custom", "constructor", "__proto__"])(
+    "groups answered kind %s without inferring it from respond",
+    (kind) => {
+      const answered = ask("answered", t("01:00"), {
+        ...(kind !== undefined ? { kind } : {}),
+        respond: { ack: true },
+        closedAt: t("01:20"),
+        answer: { verdict: "ack", by: { _tag: "owner" }, at: t("01:20") },
+      });
+      const run = Activity.rollup({
+        window,
+        cards: [card("kinds", { asks: [answered] })],
+        events: [],
+        threads: [],
+        pools: [],
+      });
+      expect(run.asks.answerMinutesByKind).toEqual({
+        [kind ?? "question"]: { count: 1, p50: 20, p90: 20, max: 20 },
+      });
+      expect(run.asks.answerMinutesByBlocking.blocking).toEqual({
+        count: 0,
+        p50: null,
+        p90: null,
+        max: null,
+      });
+      expect(run.asks.answerMinutesByBlocking.async).toEqual({
+        count: 1,
+        p50: 20,
+        p90: 20,
+        max: 20,
+      });
+    },
+  );
+
+  it("a notice-only board has no open decisions and ignores settled open notices", () => {
+    const notice = ask("notice", before, { kind: "notice", respond: { ack: true } });
+    const run = Activity.rollup({
+      window,
+      cards: [
+        card("notice", { asks: [notice] }),
+        card("settled", { settledAt: before, asks: [notice] }),
+      ],
+      events: [],
+      threads: [],
+      pools: [],
+    });
+    expect(run.asks.open).toBe(0);
+    expect(run.asks.openNotices).toBe(1);
+    expect(run.asks.openOver6h).toEqual({ count: 0, items: [] });
+    expect(run.asks.noticesOver6h).toEqual({ count: 1 });
+    expect(run.asks.answerMinutesByKind).toEqual({});
+  });
+
+  it("keeps open decisions ahead of newer notices when the list is capped", () => {
+    const notices = Array.from({ length: 160 }, (_, index) =>
+      ask(`notice-${index}`, t("23:00"), { kind: "notice" }),
+    );
+    const run = Activity.rollup({
+      window,
+      cards: [
+        card("capped", { asks: [...notices, ask("decision", t("01:00"), { kind: "approve" })] }),
+      ],
+      events: [],
+      threads: [],
+      pools: [],
+    });
+    expect(run.asks.others.more).toBeGreaterThan(0);
+    expect(run.asks.others.items[0]?.id).toBe("decision");
+    expect(run.asks.open).toBe(1);
+    expect(run.asks.openNotices).toBe(160);
+    expect(JSON.stringify(run).length).toBeLessThan(50_000);
+  });
+
+  it.each([
+    {
+      form: "ordinary repeated",
+      kinds: Array.from({ length: 300 }, (_, i) => ["notice", "pick", "custom"][i % 3]!),
+      cappedKinds: false,
+    },
+    {
+      form: "many long distinct",
+      kinds: Array.from({ length: 300 }, (_, i) => `kind-${i}-${"k".repeat(128)}`),
+      cappedKinds: true,
+    },
+    {
+      form: "JSON-escaped distinct",
+      kinds: Array.from({ length: 300 }, (_, i) => `kind-${i}-${'"\\'.repeat(64)}`),
+      cappedKinds: true,
+    },
+    { form: "one oversized", kinds: ["k".repeat(50_000)], cappedKinds: true },
+  ])("bounds the kind breakdown with $form names", ({ kinds, cappedKinds }) => {
+    const counts = new Map<string, number>();
+    const asks = kinds.map((kind, index) => {
+      counts.set(kind, (counts.get(kind) ?? 0) + 1);
+      return ask(`q${index}`, t("01:00"), {
+        kind,
+        closedAt: t("02:00"),
+        answer: { verdict: "done", by: { _tag: "owner" }, at: t("02:00") },
+      });
+    });
+    const run = Activity.rollup({
+      window,
+      cards: [card("kinds", { asks })],
+      events: [],
+      threads: [],
+      pools: [],
+    });
+    expect(JSON.stringify({ activity: { boardId: "board-robob", ...run } }).length).toBeLessThan(
+      50_000,
+    );
+    expect(run.asks.answered).toBe(kinds.length);
+    expect(run.asks.answerMinutes).toEqual({ p50: 60, p90: 60, max: 60 });
+    expect(run.asks.answerMinutesByBlocking.async).toEqual({
+      count: kinds.length,
+      p50: 60,
+      p90: 60,
+      max: 60,
+    });
+    expect(
+      Object.keys(run.asks.answerMinutesByKind).length + (run.asks.answerMinutesByKindMore ?? 0),
+    ).toBe(counts.size);
+    for (const [kind, summary] of Object.entries(run.asks.answerMinutesByKind)) {
+      expect(summary).toEqual({ count: counts.get(kind), p50: 60, p90: 60, max: 60 });
+    }
+    if (cappedKinds) expect(run.asks.answerMinutesByKindMore).toBeGreaterThan(0);
+    else expect(run.asks).not.toHaveProperty("answerMinutesByKindMore");
+  });
+
   it("adds up time in each stage, the parked card included", () => {
     // #1: 01:00-03:00, 04:15-05:00, 06:01-08:00 working; #2 the whole day.
     expect(result.stages.hours.working?.hours).toBeCloseTo(2 + 0.75 + 119 / 60 + 24, 1);
@@ -415,7 +605,7 @@ describe("rollup", () => {
   });
 
   it("puts run failures on the model of the thread that failed", () => {
-    expect(result.failures).toEqual({
+    expect(result.failures).toMatchObject({
       count: 1,
       byKind: { stalled: 1 },
       byPool: { [Rules.poolKey(opus)]: { count: 1, reasons: ["provider boom"] } },
@@ -449,7 +639,16 @@ describe("rollup", () => {
     const stuckRun = Activity.rollup({ ...input, cards: [...input.cards, stuck] });
     expect(stuckRun.stages.withoutThread).toEqual({
       count: 1,
-      items: [{ card: 7, stage: "in_review", since: "2026-11-11T08:00Z" }],
+      byReason: { none: 1 },
+      none: {
+        count: 1,
+        items: [
+          { card: 7, stage: "in_review", since: "2026-11-11T08:00Z", reason: "none", hours: 40 },
+        ],
+      },
+      items: [
+        { card: 7, stage: "in_review", since: "2026-11-11T08:00Z", reason: "none", hours: 40 },
+      ],
     });
     expect(stuckRun.pools.used).toEqual(result.pools.used);
     // Its time still counts as time in review.
@@ -764,7 +963,13 @@ describe("rollup", () => {
       expect(text).not.toContain(words);
   });
 
-  it("stays small: a busy day of 300 cards fits one call", () => {
+  it.each([
+    { form: "short per-card", askId: "q1", allAnswers: true },
+    { form: "UUID", askId: "12345678-1234-4234-8234-123456789012", allAnswers: false },
+    { form: "prefixed UUID", askId: "ask-12345678-1234-4234-8234-123456789012", allAnswers: false },
+    { form: "long opaque", askId: "x".repeat(512), allAnswers: false },
+    { form: "JSON-escaped", askId: 'q"\\'.repeat(128), allAnswers: false },
+  ])("stays small: 300 cards with $form ask IDs fit one call", ({ askId, allAnswers }) => {
     const cards: Array<KanbanCard> = [];
     const events: Array<KanbanCardEvent> = [];
     for (let index = 0; index < 300; index++) {
@@ -776,7 +981,8 @@ describe("rollup", () => {
           stage: "working",
           reviewRound: 3,
           asks: [
-            ask("q1", t("01:00"), {
+            ask(askId, t("01:00"), {
+              kind: index % 2 === 0 ? "notice" : "pick",
               closedAt: t("02:00"),
               answer: { verdict: "approve", by: { _tag: "owner" }, at: t("02:00") },
             }),
@@ -790,10 +996,23 @@ describe("rollup", () => {
       );
     }
     const big = Activity.rollup({ window, cards, events, threads: [], pools });
-    expect(JSON.stringify(big).length).toBeLessThan(60_000);
+    expect(JSON.stringify({ activity: { boardId: "board-robob", ...big } }).length).toBeLessThan(
+      50_000,
+    );
     expect(big.asks.answered).toBe(300);
-    // Every ask answered in the window is listed, however long the day.
-    expect(big.asks.answeredItems).toHaveLength(300);
+    expect(big.asks.answeredItems.length + (big.asks.answeredItemsMore ?? 0)).toBe(300);
+    expect(big.asks.answeredItems.length).toBeGreaterThan(0);
+    expect(big.asks.answeredItems.every((row) => row.id === askId)).toBe(true);
+    if (allAnswers) {
+      expect(big.asks.answeredItems).toHaveLength(300);
+      expect(big.asks).not.toHaveProperty("answeredItemsMore");
+    } else expect(big.asks.answeredItemsMore).toBeGreaterThan(0);
+    expect(big.asks.answerMinutes).toEqual({ p50: 60, p90: 60, max: 60 });
+    expect(big.asks.answerMinutesByKind).toEqual({
+      notice: { count: 150, p50: 60, p90: 60, max: 60 },
+      pick: { count: 150, p50: 60, p90: 60, max: 60 },
+    });
+    expect(big.asks.answerMinutesByBlocking.async.count).toBe(300);
     expect(big.stalls.count).toBe(300);
     expect(big.reviews.rounds).toBe(300);
   });
@@ -1209,7 +1428,13 @@ it.effect("digest reads only the newest assistant item and leaves ordinary views
           title: "Digest",
           pullRequests: [],
         } as never),
-      getThreadRecords: (_id, fields, filter) => {
+      getThreadRecords: (_id, fields, filter, options) => {
+        expect(options).toEqual({ projectionOnly: true });
+        if (!fields.includes("turnItems")) {
+          expect(fields).toEqual(["runs", "subagents"]);
+          expect(filter).toEqual({ latestRunOnly: true, pendingBackgroundTasksOnly: true });
+          return Effect.succeed({ runs: runRecords, subagents: [] } as never);
+        }
         expect(fields).toEqual(["runs", "turnItems"]);
         expect(filter).toEqual({ turnItemTypes: ["assistant_message"], recentTurnItemLimit: 1 });
         reads++;
@@ -1363,6 +1588,27 @@ it("a shared worker's persisted cards still supply flags when its origin is miss
     new Map([["shared", [claimed.id]]]),
   );
   expect(rows[0]!).toMatchObject({ threadId: "shared", card: 2, flags: ["run_failed", "stalled"] });
+});
+
+describe("pool change activity", () => {
+  it("shows only changes in the window, with exact time, slots and actor", () => {
+    const change = {
+      at: t("12:00"),
+      poolKey: "codex/sol#xhigh",
+      fromSlots: 2,
+      toSlots: 1,
+      op: "set",
+      actorKind: "evaluator",
+      actorId: "thread-1",
+    } as const;
+    const read = { ...input, poolChanges: [change, { ...change, at: window.until }] };
+    expect(Activity.rollup(read).poolChanges.items).toEqual([change]);
+    expect(
+      Activity.rollup({ ...read, window: { since: t("13:00"), until: window.until } }).poolChanges
+        .items,
+    ).toEqual([]);
+    expect(Activity.rollup(input).poolChanges.items).toEqual([]);
+  });
 });
 
 describe("ledger pool activity", () => {
@@ -2024,4 +2270,1160 @@ describe("ledger pool activity", () => {
     expect(result.queueWait[pool]).toEqual([0, 1, 1]);
     expect(result.queueWait[other]).toBeUndefined();
   });
+});
+
+describe("queued current-state rollup", () => {
+  const board: KanbanBoard = {
+    id: KanbanBoardId.make("b1"),
+    slug: "queued",
+    name: "Queued",
+    icon: null,
+    iconImage: null,
+    defaultProjectId: null,
+    managerModel: sonnet,
+    evaluatorModel: opus,
+    defaultCardModel: opus,
+    reviewChains: [{ name: "Default", steps: [opus] }],
+    defaultReviewChain: "Default",
+    standingApprovals: [],
+    instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+    setup: null,
+    pause: null,
+    createdAt: before,
+    nightlyReview: null,
+    archivedAt: null,
+  };
+  const pools = [{ key: Rules.poolKey(opus), model: opus, slots: 1 }];
+  it("keeps current queued rows even when they never moved in the window", () => {
+    const holder = card("held", {
+      number: 44,
+      stage: "working",
+      activeRole: "work",
+      activePool: Rules.poolKey(opus),
+      activeThreadId: ThreadId.make("held"),
+    });
+    const review = card("review", {
+      number: 42,
+      priority: 4,
+      stage: "needs_review",
+      analyticsStageEnteredAt: t("10:00"),
+    });
+    const todo = card("todo", { number: 47, priority: 3, analyticsStageEnteredAt: t("12:00") });
+    const waiting = card("waiting", {
+      number: 48,
+      movedAt: t("20:00"),
+      wait: { ...waitOn, at: t("20:00") },
+    });
+    const result = Activity.rollup({
+      board,
+      window,
+      cards: [holder, todo, waiting, review],
+      pools,
+      threads: [],
+      events: [],
+    });
+    expect(result.stages.queued.items[0]!.held).toEqual(result.holders.items[0]!.holders);
+    expect(result.stages.queued.items[0]!.held?.[0]).toMatchObject({
+      card: 44,
+      stage: "working",
+      openStep: "none",
+      heldSince: before,
+    });
+    expect(result.stages.queued).toMatchObject({
+      count: 3,
+      byReason: { pool_full: 2, "wait:ci": 1 },
+      items: [
+        {
+          card: 42,
+          stage: "needs_review",
+          role: "review",
+          hours: 14,
+          reason: "pool_full",
+          pool: Rules.poolKey(opus),
+          rank: 1,
+          ahead: { count: 0, items: [] },
+          held: [{ card: 44, role: "work" }],
+        },
+        { card: 47, hours: 12, reason: "pool_full", rank: 2, ahead: { count: 1, items: [42] } },
+        { card: 48, hours: 4, reason: "wait:ci" },
+      ],
+    });
+    expect(result.stages.queuedOver6h).toMatchObject({
+      count: 2,
+      items: [{ card: 42 }, { card: 47 }],
+    });
+    expect(JSON.stringify(result.stages.queued)).not.toContain('"title"');
+    expect(JSON.stringify(result.stages.queued)).not.toContain('"prompt"');
+  });
+  it("uses live reservations and masked dispatch pools separately from history", () => {
+    const todo = card("todo");
+    const read = { board, window, cards: [todo], pools, threads: [], events: [] };
+    expect(Activity.rollup(read).stages.queued.items[0]?.reason).toBe("would_start");
+    expect(
+      Activity.rollup({ ...read, holds: new Map([["reserved", Rules.poolKey(opus)]]) }).stages
+        .queued.items[0]?.reason,
+    ).toBe("pool_full");
+    expect(
+      Activity.rollup({ ...read, dispatchPools: pools.map((pool) => ({ ...pool, slots: 0 })) })
+        .stages.queued.items[0]?.reason,
+    ).toBe("no_pool");
+  });
+  it("measures gates and stage ages at the requested window end", () => {
+    const todo = card("retry", { movedAt: t("03:00") });
+    const read = {
+      board,
+      cards: [todo],
+      pools,
+      threads: [],
+      events: [],
+      assignmentWakeRetries: new Map([
+        [todo.id, { movedAt: todo.movedAt, attempts: 1, retryAt: Date.parse(t("12:00")) }],
+      ]),
+    };
+    const before = Activity.rollup({ ...read, window: { ...window, until: t("11:00") } });
+    expect(before.stages.queued.items[0]).toMatchObject({ reason: "retry_backoff", hours: 8 });
+    const after = Activity.rollup({ ...read, window: { ...window, until: t("14:00") } });
+    expect(after.stages.queued.items[0]).toMatchObject({ reason: "would_start", hours: 11 });
+    expect(after.stages.queuedOver6h.count).toBe(1);
+  });
+
+  it("caps both queued lists while retaining full counts", () => {
+    const cards = Array.from({ length: 200 }, (_, i) => card(`q${i}`, { number: i + 1 }));
+    const result = Activity.rollup({ board, window, cards, pools, threads: [], events: [] });
+    expect(result.stages.queued.count).toBe(200);
+    expect(result.stages.queued.items.length).toBeLessThan(200);
+    expect(result.stages.queued.byReason).toEqual({ would_start: 1, pool_full: 199 });
+    expect(result.stages.queuedOver6h.count).toBe(200);
+    expect(result.stages.queuedOver6h.items.length).toBeLessThan(200);
+  });
+});
+
+const activityBoard: KanbanBoard = {
+  id: KanbanBoardId.make("b1"),
+  slug: "test",
+  name: "Test",
+  icon: null,
+  iconImage: null,
+  defaultProjectId: null,
+  managerModel: opus,
+  evaluatorModel: sonnet,
+  defaultCardModel: opus,
+  reviewChains: [{ name: "Default", steps: [sonnet] }],
+  defaultReviewChain: "Default",
+  standingApprovals: [],
+  instructions: { modelRouting: "", reviewerRouting: "", escalation: "" },
+  setup: null,
+  pause: null,
+  createdAt: before,
+  nightlyReview: null,
+  archivedAt: null,
+};
+
+it.each([false, true])(
+  "activity retains the latest five receipts and current window outside its event window (historical: %s)",
+  (historical) => {
+    const board: KanbanBoard = {
+      ...activityBoard,
+      standingApprovals: [
+        {
+          id: "sa",
+          gate: "deploy",
+          minIntervalHours: 4,
+          quote: "Release under the standing rule",
+          sourceThreadId: "owner",
+          saidAt: before,
+          approvedAsk: { cardId: "source", askId: "q1" },
+          recordedAt: before,
+          recordedBy: "evaluator",
+          revokedAt: null,
+          revokedBy: null,
+          revokeReason: null,
+        },
+      ],
+      releaseLedger: Array.from({ length: 7 }, (_, i) => ({
+        boardId: activityBoard.id,
+        cardId: KanbanCardId.make(`release-${i}`),
+        cardNumber: i + 1,
+        subtaskId: "s1",
+        service: "robob",
+        at: t(`0${i}:00`),
+        critical: null,
+        approvalId: "sa",
+      })),
+    };
+    const reporting = historical
+      ? {
+          ...board,
+          releaseLedger: board.releaseLedger!.slice(0, -1),
+          historicalReleaseLedger: board.releaseLedger!.slice(-1),
+        }
+      : board;
+    const release = boardReleaseSummary(reporting, t("08:00"));
+    const result = Activity.rollup({
+      window: { since: t("01:00"), until: t("02:00") },
+      currentAt: t("08:00"),
+      board: reporting,
+      release,
+      cards: [],
+      events: [],
+      pools: [],
+      threads: [],
+    });
+    expect(result.releaseLedger).toEqual(board.releaseLedger!.slice(-5));
+    expect(result.nextReleaseWindowAt).toBe(t("10:00"));
+    expect(result.nextReleaseWindowByService).toEqual({ robob: t("10:00") });
+    expect(boardReleaseSummary(reporting, t("10:00")).nextReleaseWindowAt).toBeNull();
+  },
+);
+const subtask = (
+  owner: KanbanSubtask["owner"],
+  patch: Partial<KanbanSubtask> = {},
+): KanbanSubtask => ({
+  id: owner,
+  step: 1,
+  text: "Finish",
+  owner,
+  createdAt: before,
+  state: "open",
+  note: null,
+  doneBy: null,
+  doneAt: null,
+  ...patch,
+});
+const flag = (reason: string, by: KanbanCard["createdBy"] = { _tag: "owner" }) => ({
+  reason,
+  by,
+  at: before,
+});
+
+// Newer stuck cards must remain visible next to older intentionally parked cards.
+describe("without-thread reasons", () => {
+  const blocker = card("blocker");
+  const step = [subtask("evaluator"), subtask("script")];
+  const candidates = [
+    card("wait", { number: 1, wait: waitOn, asks: [ask("q", before, { blocking: true })] }),
+    card("ask", {
+      number: 2,
+      asks: [ask("q", before, { blocking: true })],
+      blockedBy: [blocker.id],
+    }),
+    card("blocked", { number: 3, blockedBy: [blocker.id], priority: 5 }),
+    card("backlog", { number: 4, priority: 5, subtasks: step }),
+    card("evaluator", { number: 5, subtasks: step, stalled: flag("Stopped") }),
+    card("failed", { number: 6, stalled: flag("Run failed: timeout") }),
+    card("flagged", { number: 7, stalled: flag("Stopped") }),
+    card("refused", {
+      number: 8,
+      stalled: flag("Review verdict refused: stale", { _tag: "system", component: "dispatcher" }),
+    }),
+    card("none", { number: 9, movedAt: t("20:00") }),
+    card("expired", {
+      number: 10,
+      movedAt: t("21:00"),
+      wait: { ...waitOn, expiredAt: t("22:00") },
+    }),
+  ].map((row) => ({ ...row, stage: "working" as const }));
+
+  it("reports reasons in precedence order, full counts and independently listed none items", () => {
+    const run = Activity.rollup({
+      window,
+      cards: [...candidates, blocker],
+      events: [],
+      threads: [],
+      pools,
+      board: activityBoard,
+    });
+    const section = run.stages.withoutThread;
+    expect(section.byReason).toEqual({
+      "wait:ci": 1,
+      owner_ask: 1,
+      blocked: 1,
+      backlog: 1,
+      evaluator_step: 1,
+      "stalled:run_failed": 1,
+      "stalled:flagged": 1,
+      "stalled:verdict_refused": 1,
+      none: 2,
+    });
+    expect(section.count).toBe(10);
+    expect(section.items.map((row) => row.card)).toEqual([9, 10, 1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(section.none).toEqual({
+      count: 2,
+      items: [
+        { card: 9, stage: "working", since: "2026-11-12T20:00Z", reason: "none", hours: 4 },
+        {
+          card: 10,
+          stage: "working",
+          since: "2026-11-12T21:00Z",
+          reason: "none",
+          hours: 3,
+          expiredWait: "ci",
+        },
+      ],
+    });
+  });
+
+  it.each(["push", "merge", "ci", "card", "time", "owner_go", "script"] as const)(
+    "keeps an open %s wait ahead of an ask, but lets an expired wait expose it",
+    (on) => {
+      const waiting = card(on, {
+        stage: "working",
+        wait: { ...waitOn, on },
+        asks: [ask("q", before, { blocking: true })],
+      });
+      const read = (row: KanbanCard) =>
+        Activity.rollup({ window, cards: [row], events: [], threads: [], pools }).stages
+          .withoutThread.items[0];
+      expect(read(waiting)?.reason).toBe(`wait:${on}`);
+      expect(read({ ...waiting, wait: { ...waitOn, on, expiredAt: t("22:00") } })).toMatchObject({
+        reason: "owner_ask",
+        expiredWait: on,
+      });
+    },
+  );
+
+  it.each([
+    ["closed ask", { asks: [ask("q", before, { blocking: true, closedAt: t("01:00") })] }],
+    ["nonblocking ask", { asks: [ask("q", before)] }],
+    ["stale wait", { movedAt: t("01:00"), wait: waitOn }],
+    ["missing blocker", { blockedBy: [KanbanCardId.make("missing")] }],
+    ["mixed worker step", { subtasks: [...step, subtask("work")] }],
+    ["review step", { subtasks: [subtask("review")] }],
+    ["no open steps", { subtasks: [subtask("evaluator", { state: "done" })] }],
+    ["pending findings", { subtasks: step, reviewFindingsPending: true }],
+    ["old note", { wakeNote: "Review findings: fix this" }],
+  ] satisfies Array<[string, Partial<KanbanCard>]>)(
+    "does not hide a stuck card behind %s",
+    (_, patch) => {
+      const row = card("stuck", { stage: "working", ...patch });
+      expect(Activity.withoutThreadReason(row, { byId: new Map([[row.id, row]]), pools })).toBe(
+        "none",
+      );
+    },
+  );
+
+  it.each([
+    ["Run failed: timeout", "owner", "run_failed"],
+    ["Reviewer stopped without a verdict", "system", "run_failed"],
+    ["Reviewer stopped without a verdict", "owner", "flagged"],
+    ["Review verdict refused: stale", "system", "verdict_refused"],
+    ["Review verdict refused: stale", "owner", "flagged"],
+    ["Stopped", "system", "flagged"],
+  ] as const)("shares the stall category for %s by %s", (reason, actor, kind) => {
+    const by =
+      actor === "system"
+        ? { _tag: "system" as const, component: "dispatcher" }
+        : { _tag: "owner" as const };
+    const row = card("stall", { stage: "working", stalled: flag(reason, by) });
+    expect(Activity.withoutThreadReason(row, { byId: new Map(), pools })).toBe(`stalled:${kind}`);
+  });
+
+  it.each(["evaluator", "script"] as const)("reuses the %s-only step rule", (owner) => {
+    const row = card(owner, { stage: "working", subtasks: [subtask(owner)] });
+    expect(Activity.withoutThreadReason(row, { byId: new Map(), pools })).toBe("evaluator_step");
+  });
+
+  it("uses board pause keep lists and the current review model's paused pool", () => {
+    const row = card("pause", { stage: "in_review" });
+    const paused = {
+      ...activityBoard,
+      pause: { keep: [], reason: "Hold", by: "owner" as const, at: before },
+    };
+    const context = { byId: new Map(), pools, board: paused };
+    expect(Activity.withoutThreadReason(row, context)).toBe("paused");
+    expect(
+      Activity.withoutThreadReason(row, {
+        ...context,
+        board: { ...paused, pause: { ...paused.pause, keep: [row.id] } },
+      }),
+    ).toBe("none");
+    expect(
+      Activity.withoutThreadReason(row, {
+        ...context,
+        board: activityBoard,
+        pools: pools.map((pool) => ({ ...pool, slots: pool.model === sonnet ? 0 : pool.slots })),
+      }),
+    ).toBe("paused");
+  });
+
+  it("uses the queued-card backlog reason for priority 5", () => {
+    const row = card("backlog", { priority: 5 });
+    const context = { byId: new Map(), pools, board: activityBoard };
+    expect(
+      Activity.rollup({
+        window,
+        cards: [row],
+        events: [],
+        threads: [],
+        pools,
+        board: activityBoard,
+      }).stages.queued.items[0]?.reason,
+    ).toBe("backlog");
+    expect(Activity.withoutThreadReason({ ...row, stage: "working" }, context)).toBe("backlog");
+  });
+
+  it("does not call a multi-model worker paused while an alternative pool is open", () => {
+    const row = card("alternatives", {
+      stage: "working",
+      models: [
+        { model: opus, weight: 2 },
+        { model: sonnet, weight: 1 },
+      ],
+    });
+    const context = {
+      byId: new Map(),
+      pools: pools.map((pool) => ({ ...pool, slots: pool.model === opus ? 0 : pool.slots })),
+    };
+    expect(Activity.withoutThreadReason(row, context)).toBe("none");
+    expect(
+      Activity.withoutThreadReason({ ...row, workThreadId: ThreadId.make("pinned") }, context),
+    ).toBe("paused");
+    expect(Activity.withoutThreadReason(row, { ...context, pools: [] })).toBe("none");
+  });
+
+  it.each(["completed", "deployed", "verified"] as const)(
+    "follows the dispatcher's %s blocker settlement and pending merge rules",
+    (stage) => {
+      const dependency = { ...blocker, stage };
+      const row = card("waiting", { stage: "working", blockedBy: [dependency.id] });
+      const reason = (dep: KanbanCard) =>
+        Activity.withoutThreadReason(row, { byId: new Map([[dep.id, dep]]), pools });
+      expect(reason(dependency)).toBe("none");
+      expect(
+        reason({ ...dependency, subtasks: [subtask("evaluator", { text: "Merge into main" })] }),
+      ).toBe(stage === "completed" ? "blocked" : "none");
+    },
+  );
+
+  it("caps the unexplained list separately and preserves counts for omitted rows", () => {
+    const parked = Array.from({ length: 170 }, (_, index) =>
+      card(`parked${index}`, { number: index, stage: "working", wait: waitOn }),
+    );
+    const stuck = Array.from({ length: 170 }, (_, index) =>
+      card(`stuck${index}`, { number: index + 200, stage: "in_review", movedAt: t("23:00") }),
+    );
+    const section = Activity.rollup({
+      window,
+      cards: [...parked, ...stuck],
+      events: [],
+      threads: [],
+      pools,
+    }).stages.withoutThread;
+    expect(section.count).toBe(340);
+    expect(section.byReason).toEqual({ "wait:ci": 170, none: 170 });
+    expect(section.none.count).toBe(170);
+    expect(section.none.items.length).toBeLessThan(170);
+    expect(section.none.items.length + (section.none.more ?? 0)).toBe(170);
+    expect(section.items.length + (section.more ?? 0)).toBe(340);
+    expect(section.items.every((row) => row.reason === "none")).toBe(true);
+    expect(section.none.items).toEqual(section.items);
+  });
+});
+
+const reviewPr = (state: KanbanCard["links"][number]["state"]): KanbanCard["links"][number] => ({
+  kind: "pr",
+  url: "https://github.com/example/repo/pull/1",
+  label: null,
+  state,
+  checkedAt: before,
+});
+
+describe("detached review state", () => {
+  it.each(["work", "review", "evaluator", "script"] as const)(
+    "uses the dispatcher's remaining-step check for a later %s step",
+    (owner) => {
+      const row = card("review", {
+        stage: "in_review",
+        reviewStep: 1,
+        subtasks: [subtask("evaluator"), subtask(owner, { id: "later", step: 2 })],
+      });
+      const context = { byId: new Map(), pools, board: activityBoard };
+      expect(Activity.withoutThreadReason(row, context)).toBe(
+        owner === "evaluator" || owner === "script" ? "evaluator_step" : "none",
+      );
+      expect(
+        Activity.withoutThreadReason(
+          {
+            ...row,
+            subtasks: row.subtasks.map((item) =>
+              item.id === "later" ? { ...item, state: "done" } : item,
+            ),
+          },
+          context,
+        ),
+      ).toBe("evaluator_step");
+    },
+  );
+
+  const cases = [
+    {
+      name: "unfinished evaluator step",
+      step: 0,
+      chain: 1,
+      owners: ["evaluator"],
+      pr: "open",
+      reason: "none",
+    },
+    {
+      name: "unfinished script step",
+      step: 0,
+      chain: 1,
+      owners: ["script"],
+      pr: "open",
+      reason: "none",
+    },
+    {
+      name: "unfinished mixed evaluator/script step",
+      step: 0,
+      chain: 1,
+      owners: ["evaluator", "script"],
+      pr: "merged",
+      reason: "none",
+    },
+    {
+      name: "unfinished unplanned review",
+      step: 0,
+      chain: 1,
+      owners: [],
+      pr: "open",
+      reason: "none",
+    },
+    {
+      name: "only first of two reviewers finished",
+      step: 1,
+      chain: 2,
+      owners: ["evaluator"],
+      pr: "open",
+      reason: "none",
+    },
+    {
+      name: "both reviewers finished",
+      step: 2,
+      chain: 2,
+      owners: ["evaluator"],
+      pr: "open",
+      reason: "wait:merge",
+    },
+    {
+      name: "finished unplanned review with open PR",
+      step: 1,
+      chain: 1,
+      owners: [],
+      pr: "open",
+      reason: "wait:merge",
+    },
+    {
+      name: "merge takes precedence over evaluator step",
+      step: 1,
+      chain: 1,
+      owners: ["evaluator"],
+      pr: "open",
+      reason: "wait:merge",
+    },
+    {
+      name: "merged PR with evaluator step",
+      step: 1,
+      chain: 1,
+      owners: ["evaluator"],
+      pr: "merged",
+      reason: "evaluator_step",
+    },
+    {
+      name: "closed PR with script step",
+      step: 1,
+      chain: 1,
+      owners: ["script"],
+      pr: "closed",
+      reason: "evaluator_step",
+    },
+    {
+      name: "merged PR without next step",
+      step: 1,
+      chain: 1,
+      owners: [],
+      pr: "merged",
+      reason: "none",
+    },
+    {
+      name: "closed PR without next step",
+      step: 1,
+      chain: 1,
+      owners: [],
+      pr: "closed",
+      reason: "none",
+    },
+    { name: "no PR", step: 1, chain: 1, owners: [], pr: "absent", reason: "none" },
+    { name: "context-only PR state", step: 1, chain: 1, owners: [], pr: null, reason: "none" },
+  ] satisfies Array<{
+    name: string;
+    step: number;
+    chain: number;
+    owners: Array<KanbanSubtask["owner"]>;
+    pr: KanbanCard["links"][number]["state"] | "absent";
+    reason: string;
+  }>;
+  it.each(cases)("$name", ({ step, chain, owners, pr, reason }) => {
+    const row = card("review", {
+      stage: "in_review",
+      reviewStep: step,
+      subtasks: owners.map((owner) => subtask(owner)),
+      links: pr === "absent" ? [] : [reviewPr(pr)],
+    });
+    const board = {
+      ...activityBoard,
+      reviewChains: [{ name: "Default", steps: Array.from({ length: chain }, () => sonnet) }],
+    };
+    const section = Activity.rollup({ window, cards: [row], events: [], threads: [], pools, board })
+      .stages.withoutThread;
+    expect(section.items[0]?.reason).toBe(reason);
+    expect(section.byReason).toEqual({ [reason]: 1 });
+    expect(section.none.count).toBe(reason === "none" ? 1 : 0);
+  });
+
+  const pending = card("pending", { stage: "in_review", links: [reviewPr("open")] });
+  const outcome = Rules.applyReviewResult(pending, 1, "clear");
+  const reviewed = {
+    ...pending,
+    stage: outcome.stage,
+    reviewStep: outcome.reviewStep,
+    reviewRound: outcome.reviewRound,
+  };
+  it("recognizes the implicit merge wait left by a clear review", () => {
+    expect(reviewed.stage).toBe("in_review");
+    expect(reviewed.wait).toBeUndefined();
+    const read = (row: KanbanCard) =>
+      Activity.withoutThreadReason(row, { byId: new Map(), pools, board: activityBoard });
+    expect(read(reviewed)).toBe("wait:merge");
+    expect(read({ ...reviewed, asks: [ask("q", before, { blocking: true })] })).toBe("wait:merge");
+    expect(
+      read({
+        ...reviewed,
+        links: [
+          reviewPr("merged"),
+          { ...reviewPr("open"), url: "https://github.com/example/repo/pull/2" },
+        ],
+      }),
+    ).toBe("wait:merge");
+  });
+
+  it.each(["push", "merge", "ci", "card", "time", "owner_go", "script"] as const)(
+    "does not recreate an expired %s wait as an implicit merge wait",
+    (on) => {
+      const read = (row: KanbanCard) =>
+        Activity.rollup({
+          window,
+          cards: [row],
+          events: [],
+          threads: [],
+          pools,
+          board: activityBoard,
+        }).stages.withoutThread;
+      expect(read({ ...reviewed, wait: { ...waitOn, on } }).items[0]?.reason).toBe(`wait:${on}`);
+      const expired = { ...reviewed, wait: { ...waitOn, on, expiredAt: t("22:00") } };
+      expect(read(expired).items[0]).toMatchObject({ reason: "none", expiredWait: on });
+      expect(read(expired).none.count).toBe(1);
+      expect(
+        read({ ...expired, asks: [ask("q", before, { blocking: true })] }).items[0],
+      ).toMatchObject({ reason: "owner_ask", expiredWait: on });
+    },
+  );
+});
+
+describe("detached shared-worker timing", () => {
+  it.each(["secondary", "primary", null])(
+    "uses workThreadId when the worker's primary cardId is %s",
+    (primaryId) => {
+      const worker = thread("shared-worker", "primary", "work", opus, before, t("06:00"));
+      const row = card("secondary", { number: 9, stage: "working", workThreadId: worker.threadId });
+      const section = Activity.rollup({
+        window,
+        cards: [row],
+        events: [],
+        pools,
+        threads: [{ ...worker, cardId: primaryId === null ? null : KanbanCardId.make(primaryId) }],
+      }).stages.withoutThread;
+      expect(section.items).toEqual([
+        { card: 9, stage: "working", since: "2026-11-12T06:00Z", reason: "none", hours: 18 },
+      ]);
+    },
+  );
+
+  it("keeps the review role separate from an ended shared worker", () => {
+    const worker = thread("worker", "primary", "work", opus, before, t("06:00"));
+    const reviewer = thread("reviewer", "secondary", "review", sonnet, before, t("16:00"));
+    const row = card("secondary", {
+      stage: "in_review",
+      workThreadId: worker.threadId,
+      reviewThreadId: reviewer.threadId,
+    });
+    const section = Activity.rollup({
+      window,
+      cards: [row],
+      events: [],
+      threads: [worker, reviewer],
+      pools,
+    }).stages.withoutThread;
+    expect(section.items[0]).toMatchObject({ since: "2026-11-12T16:00Z", hours: 8 });
+  });
+});
+
+describe("#1776 current pool holders", () => {
+  const pool = Rules.poolKey(opus);
+  const held = card("private holder title", {
+    number: 76,
+    stage: "working",
+    activeThreadId: ThreadId.make("thread-12345678"),
+    activePool: pool,
+    activeRole: "work",
+    analyticsStageEnteredAt: t("00:30"),
+  });
+  const slot = (id: number, threadId: string, at: string, poolKey = pool): SlotEvent => ({
+    id,
+    boardId: "b1",
+    threadId,
+    poolKey,
+    cardId: null,
+    kind: "take",
+    at,
+    why: "start",
+  });
+  const run = (patch: Partial<Activity.RollupInput> = {}) =>
+    Activity.rollup({
+      window,
+      pools: [{ key: pool, model: opus, slots: 1 }],
+      cards: [held],
+      events: [],
+      threads: [],
+      slotHistory: { recordedSince: before, events: [slot(1, held.activeThreadId!, t("01:00"))] },
+      ...patch,
+    });
+  const tasks = (owners: Array<KanbanCard["subtasks"][number]["owner"]>) =>
+    owners.map((owner, i) => ({
+      id: `s${i}`,
+      step: 1,
+      owner,
+      text: "Private task",
+      state: "open" as const,
+      createdAt: before,
+      note: null,
+      doneBy: null,
+      doneAt: null,
+    }));
+
+  it("shows review-only work on a held slot using the ledger take and no card text", () => {
+    const result = run({ cards: [{ ...held, subtasks: tasks(["review"]) }] });
+    expect(result.holders.items).toEqual([
+      {
+        pool,
+        slots: 1,
+        holders: [
+          {
+            card: 76,
+            role: "work",
+            stage: "working",
+            thread: "12345678",
+            heldSince: t("01:00"),
+            heldForH: 23,
+            openStep: "review",
+            turn: "unknown",
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(result)).not.toContain("private holder title");
+    expect(JSON.stringify(result)).not.toContain("Private task");
+  });
+
+  it.each([
+    { owners: [], expected: "none" },
+    { owners: ["work"], expected: "work" },
+    { owners: ["review"], expected: "review" },
+    { owners: ["evaluator"], expected: "evaluator" },
+    { owners: ["script"], expected: "script" },
+    { owners: ["evaluator", "script"], expected: "evaluator" },
+    { owners: ["review", "work"], expected: "work" },
+  ] as const)("reuses step-owner rules for $owners", ({ owners, expected }) => {
+    const result = run({ cards: [{ ...held, subtasks: tasks([...owners]) }] });
+    expect(result.holders.items[0]!.holders[0]!.openStep).toBe(expected);
+  });
+
+  it("keeps a hold with no matching card, including an unknown start", () => {
+    const result = run({ cards: [], holds: new Map([[held.activeThreadId!, pool]]) });
+    expect(result.holders.items[0]!.holders[0]).toEqual({
+      card: null,
+      role: "work",
+      stage: null,
+      thread: "12345678",
+      heldSince: t("01:00"),
+      heldForH: 23,
+      openStep: "none",
+      turn: "unknown",
+    });
+    expect(
+      run({
+        cards: [],
+        holds: new Map([["orphan", pool]]),
+        slotHistory: { events: [], recordedSince: null },
+      }).holders.items[0]!.holders[0],
+    ).toMatchObject({ heldSince: null, heldForH: null });
+  });
+
+  it("falls back to the card's stage entry for a take before the window", () => {
+    const result = run({
+      slotHistory: { events: [slot(1, held.activeThreadId!, before)], recordedSince: before },
+    });
+    expect(result.holders.items[0]!.holders[0]).toMatchObject({
+      heldSince: t("00:30"),
+      heldForH: 23.5,
+    });
+  });
+
+  it("includes zero-slot, empty and removed pools without losing holders", () => {
+    const other = Rules.poolKey(sonnet);
+    const result = run({
+      pools: [
+        { key: pool, model: opus, slots: 0 },
+        { key: other, model: sonnet, slots: 0 },
+      ],
+      holds: new Map([["orphan", "removed"]]),
+    });
+    expect(result.holders.items.find((row) => row.pool === pool)).toMatchObject({
+      slots: 0,
+      holders: [{ card: 76 }],
+    });
+    expect(result.holders.items.find((row) => row.pool === other)).toEqual({
+      pool: other,
+      slots: 0,
+      holders: [],
+    });
+    expect(result.holders.items.find((row) => row.pool === "removed")).toMatchObject({
+      slots: 0,
+      holders: [{ card: null }],
+    });
+  });
+
+  it("counts a batched thread once and uses the same final card as dispatcher diagnostics", () => {
+    const result = run({
+      cards: [held, { ...held, number: 77, activeRole: "review", stage: "in_review" }],
+    });
+    expect(result.holders.items[0]!.holders).toHaveLength(1);
+    expect(result.holders.items[0]!.holders[0]).toMatchObject({
+      card: 77,
+      role: "review",
+      stage: "in_review",
+    });
+  });
+
+  it("sorts oldest first and lists only 50 of 60 holders", () => {
+    const cards = Array.from({ length: 60 }, (_, i) => ({
+      ...held,
+      id: KanbanCardId.make(`c${i}`),
+      number: i + 1,
+      activeThreadId: ThreadId.make(`thread-${String(i).padStart(8, "0")}`),
+    }));
+    const events = cards.map((card, i) =>
+      slot(i + 1, card.activeThreadId!, t(`00:${String(i).padStart(2, "0")}`)),
+    );
+    const result = run({
+      cards: cards.toReversed(),
+      slotHistory: { events: events.toReversed(), recordedSince: before },
+    });
+    expect(result.holders.items[0]!.holders).toHaveLength(50);
+    expect(result.holders.items[0]!.more).toBe(10);
+    expect(result.holders.items[0]!.holders.map((row) => row.card)).toEqual(
+      Array.from({ length: 50 }, (_, i) => i + 1),
+    );
+  });
+
+  it("keeps holder details within the shared page budget across many pools", () => {
+    const cards = Array.from({ length: 600 }, (_, i) => ({
+      ...held,
+      id: KanbanCardId.make(`c${i}`),
+      number: i + 1,
+      activeThreadId: ThreadId.make(`thread-${i}`),
+      activePool: `pool-${i % 12}`,
+    }));
+    const result = run({ cards, pools: [] });
+    expect(JSON.stringify(result).length).toBeLessThan(49_000);
+    expect(result.holders.items.length).toBeGreaterThan(0);
+    expect(result.holders.items.every((row) => row.holders.length + (row.more ?? 0) === 50)).toBe(
+      true,
+    );
+    expect(result.holders.items.length + (result.holders.more ?? 0)).toBe(12);
+  });
+
+  it("uses a current take and clock when reporting holders for a historical activity window", () => {
+    const currentAt = "2026-11-14T12:00:00.000Z";
+    const takeAt = "2026-11-14T10:00:00.000Z";
+    const result = run({ currentAt, currentSlots: [slot(2, held.activeThreadId!, takeAt)] });
+    expect(result.holders.items[0]!.holders[0]).toMatchObject({ heldSince: takeAt, heldForH: 2 });
+  });
+});
+
+describe("failure detail rows", () => {
+  it.each([
+    { name: "primary before end", primary: true, endedAt: "2026-11-12T01:00:00.001Z" },
+    { name: "primary at end", primary: true, endedAt: t("01:00") },
+    { name: "primary after end", primary: true, endedAt: "2026-11-12T00:59:59.999Z" },
+    { name: "carried before end", primary: false, endedAt: "2026-11-12T01:00:00.001Z" },
+    { name: "carried at end", primary: false, endedAt: t("01:00") },
+    { name: "carried after end", primary: false, endedAt: "2026-11-12T00:59:59.999Z" },
+  ])("keeps the persisted failure source for $name", ({ primary, endedAt }) => {
+    const result = Activity.rollup({
+      window,
+      cards: [card("failed", { workThreadId: ThreadId.make("replacement") })],
+      threads: [
+        thread("failed-thread", primary ? "failed" : "primary", "work", sonnet, before, endedAt),
+        thread("replacement", "failed", "work", opus, before),
+      ],
+      events: [
+        {
+          ...event("failed", t("01:00"), "flagged", "working", "working", "Run failed: crash"),
+          failedThreadId: ThreadId.make("failed-thread"),
+        },
+      ],
+      pools: [],
+    });
+    expect(result.failures.rows[0]).toMatchObject({
+      threadId: "failed-thread",
+      role: "work",
+      pool: Rules.poolKey(sonnet),
+    });
+  });
+
+  it.each([
+    { name: "known reviewer after stage change", role: "review", stage: "needs_review" },
+    { name: "known worker despite review stage", role: "work", stage: "in_review" },
+  ] as const)("uses source role and model for $name", ({ role, stage }) => {
+    const result = Activity.rollup({
+      window,
+      cards: [card("failed")],
+      threads: [thread("source", "failed", role, sonnet, before, t("00:59"))],
+      events: [
+        {
+          ...event("failed", t("01:00"), "flagged", stage, stage, "Run failed: crash"),
+          failedThreadId: ThreadId.make("source"),
+        },
+      ],
+      pools: [],
+    });
+    expect(result.failures.rows[0]).toMatchObject({
+      threadId: "source",
+      role,
+      pool: Rules.poolKey(sonnet),
+    });
+  });
+
+  it.each([
+    {
+      name: "persisted id without a link",
+      persisted: true,
+      linked: false,
+      endedAt: null,
+      expected: "source",
+    },
+    { name: "legacy live link", persisted: false, linked: true, endedAt: null, expected: "source" },
+    {
+      name: "legacy ended link",
+      persisted: false,
+      linked: true,
+      endedAt: t("00:59"),
+      expected: null,
+    },
+    { name: "legacy missing link", persisted: false, linked: false, endedAt: null, expected: null },
+  ])("handles $name", ({ persisted, linked, endedAt, expected }) => {
+    const result = Activity.rollup({
+      window,
+      cards: [card("failed")],
+      threads: linked ? [thread("source", "failed", "work", sonnet, before, endedAt)] : [],
+      events: [
+        {
+          ...event("failed", t("01:00"), "flagged", "working", "working", "Run failed: crash"),
+          ...(persisted ? { failedThreadId: ThreadId.make("source") } : {}),
+        },
+      ],
+      pools: [],
+    });
+    expect(result.failures.rows[0]?.threadId).toBe(expected);
+  });
+
+  it("names each card and failed thread, repeats, role and pool without changing aggregates", () => {
+    const cards = [card("first", { number: 4476 }), card("second", { number: 1939 })];
+    const threads = [
+      thread("work-one", "first", "work", opus, before),
+      thread("review-two", "second", "review", sonnet, before),
+    ];
+    const events = [
+      event("first", t("01:00"), "moved", "working", "todo", "Run failed, retrying once: boom"),
+      event("second", t("02:00"), "flagged", "in_review", "in_review", "Run failed: crash"),
+      event("first", t("03:00"), "flagged", "working", "working", "Run failed: again"),
+    ];
+    const failures = Activity.rollup({ window, cards, threads, events, pools: [] }).failures;
+    expect(failures.byPool).toEqual({
+      [Rules.poolKey(opus)]: { count: 2, reasons: ["boom", "again"] },
+      [Rules.poolKey(sonnet)]: { count: 1, reasons: ["crash"] },
+    });
+    expect(
+      failures.rows.map(({ card, kind, role, pool, threadId, repeat }) => ({
+        card,
+        kind,
+        role,
+        pool,
+        threadId,
+        repeat,
+      })),
+    ).toEqual([
+      {
+        card: 4476,
+        kind: "stalled",
+        role: "work",
+        pool: Rules.poolKey(opus),
+        threadId: "work-one",
+        repeat: 2,
+      },
+      {
+        card: 1939,
+        kind: "stalled",
+        role: "review",
+        pool: Rules.poolKey(sonnet),
+        threadId: "review-two",
+        repeat: 1,
+      },
+      {
+        card: 4476,
+        kind: "retried",
+        role: "work",
+        pool: Rules.poolKey(opus),
+        threadId: "work-one",
+        repeat: 2,
+      },
+    ]);
+    expect(JSON.stringify(failures.rows)).not.toContain('"title"');
+  });
+  it("renders structured bound facts and leaves old events readable", () => {
+    const admission = {
+      queuedAtMs: Date.parse(t("00:00")),
+      waitedMs: 1800000,
+      positionAtFailure: 8,
+      totalAtFailure: 34,
+      rule: "no_progress" as const,
+    };
+    const old = event(
+      "first",
+      t("01:00"),
+      "flagged",
+      "working",
+      "working",
+      "Run failed: The restart admission queue never released this run (waited 30 min)",
+    );
+    const fresh = {
+      ...event("first", t("02:00"), "flagged", "working", "working", old.body),
+      admission,
+    };
+    const result = Activity.rollup({
+      window,
+      cards: [card("first")],
+      events: [old, fresh],
+      threads: [],
+      pools: [],
+    });
+    expect(result.failures.rows.map((row) => row.admission)).toEqual([admission, null]);
+    expect(result.failures.rows[0]?.threadId).toBeNull();
+    expect(result.restartAdmission).toMatchObject({
+      scope: "server-wide",
+      source: "analytics_read",
+      section: "restartAdmission",
+      days: ["2026-11-12"],
+      boardFailures: [1],
+    });
+  });
+  it("keeps the latest 50 of 60 failures and says how many remain", () => {
+    const events = Array.from({ length: 60 }, (_, i) =>
+      event(
+        "first",
+        DateTime.formatIso(DateTime.makeUnsafe(Date.parse(t("00:00")) + i * 1000)),
+        "flagged",
+        "working",
+        "working",
+        "Run failed: " + "x".repeat(200),
+      ),
+    );
+    const result = Activity.rollup({
+      window,
+      cards: [card("first")],
+      events,
+      threads: [],
+      pools: [],
+    });
+    expect(result.failures.rows).toHaveLength(50);
+    expect(result.failures.more).toBe(10);
+    expect(result.failures.rows[0]?.at).toBe(events.at(-1)?.at);
+    expect(result.failures.rows.every((row) => row.repeat === 60 && row.reason.length <= 120)).toBe(
+      true,
+    );
+    expect(JSON.stringify(result).length).toBeLessThanOrEqual(49000);
+  });
+});
+
+it("reports current idle evaluator stalls even with no events inside the window", () => {
+  const lastEventAt = "2026-11-08T00:00:00.000Z";
+  const idle = card("idle-evaluator", {
+    number: 1768,
+    stage: "completed",
+    updatedAt: window.until,
+    subtasks: [
+      {
+        id: "s7",
+        step: 3,
+        owner: "evaluator",
+        text: "Next",
+        state: "open",
+        createdAt: before,
+        doneAt: null,
+        doneBy: null,
+        note: null,
+      },
+    ],
+  });
+  const input: Activity.RollupInput = {
+    window,
+    cards: [idle],
+    events: [],
+    pools: [],
+    idleEvaluatorBoard: { id: idle.boardId, standingApprovals: [] },
+    lastEventAtByCard: new Map([[idle.id, lastEventAt]]),
+    threads: [thread("idle-thread", idle.id, "evaluator", opus, lastEventAt)],
+  };
+  const run = Activity.rollup(input);
+  expect(run.stalls.byKind).toEqual({ idle_evaluator: 1 });
+  expect(run.stalls.items).toEqual([
+    expect.objectContaining({
+      kind: "idle_evaluator",
+      card: 1768,
+      stage: "completed",
+      step: 3,
+      openEvaluatorSubtasks: ["s7"],
+      lastEventAt,
+      evaluatorThreadAlive: true,
+      idleHours:
+        Math.round(((Date.parse(window.until) - Date.parse(lastEventAt)) / 3_600_000) * 10) / 10,
+    }),
+  ]);
+  const closed = Activity.rollup({
+    ...input,
+    threads: input.threads.map((link) => ({ ...link, endedAt: window.until })),
+  });
+  expect(closed.stalls.items[0]!.evaluatorThreadAlive).toBe(false);
+  const big = Activity.rollup({
+    ...input,
+    cards: Array.from({ length: 500 }, (_, number) => ({
+      ...idle,
+      number,
+      id: KanbanCardId.make(`idle-${number}`),
+      updatedAt: lastEventAt,
+    })),
+  });
+  expect(big.stalls.byKind.idle_evaluator).toBe(500);
+  expect(big.stalls.more).toBeGreaterThan(0);
+  expect(JSON.stringify(big).length).toBeLessThan(50_000);
 });

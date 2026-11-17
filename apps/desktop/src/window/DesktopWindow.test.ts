@@ -1,7 +1,11 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
-import { DesktopSnapShotId } from "@t3tools/contracts";
+import {
+  DEFAULT_CLIENT_SETTINGS,
+  DesktopSnapShotId,
+  type QuitConfirmationMode,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -16,6 +20,11 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as Electron from "electron";
 import * as NodeEvents from "node:events";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Read the synchronous quit writer's files at the app.quit boundary.
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The quit writer uses Node paths, including in Windows fixtures on Linux.
+import * as NodePath from "node:path";
 import { vi } from "vite-plus/test";
 
 vi.mock("electron", async (importOriginal) => ({
@@ -96,6 +105,12 @@ import * as DesktopServerExposure from "../backend/DesktopServerExposure.ts";
 import * as DesktopWindow from "./DesktopWindow.ts";
 import * as PreviewManager from "../preview/Manager.ts";
 import * as PreviewPasskeys from "../preview/Passkeys.ts";
+import {
+  QUIT_DOUBLE_PRESS_MS,
+  QUIT_HOLD_DURATION_MS,
+  QUIT_HOLD_RELEASE_GRACE_MS,
+  type QuitHoldKeyInput,
+} from "./QuitHold.ts";
 
 const environmentInput = {
   dirname: "/repo/apps/desktop/dist-electron",
@@ -276,6 +291,10 @@ function layerTest(input: {
   readonly previewZoomReapplies?: number[];
   readonly onReveal?: (window: Electron.BrowserWindow) => void;
   readonly focusedWindow?: Electron.BrowserWindow;
+  readonly platform?: NodeJS.Platform;
+  readonly logDir?: string;
+  readonly confirmQuit?: QuitConfirmationMode;
+  readonly quit?: Effect.Effect<void>;
 }) {
   let desktopSettings = input.desktopSettings ?? DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS;
   const layerDesktopAppSettings = Layer.succeed(DesktopAppSettings.DesktopAppSettings, {
@@ -345,12 +364,28 @@ function layerTest(input: {
           recordMetrics: () => Effect.void,
           shutdown: Effect.void,
         }),
-        layerDesktopEnvironment,
+        Layer.effect(
+          DesktopEnvironment.DesktopEnvironment,
+          Effect.map(DesktopEnvironment.DesktopEnvironment, (environment) => ({
+            ...environment,
+            platform: input.platform ?? environment.platform,
+            logDir: input.logDir ?? environment.logDir,
+          })),
+        ).pipe(Layer.provide(layerDesktopEnvironment)),
         layerDesktopAppSettings,
-        layerDesktopClientSettings,
+        input.confirmQuit === undefined
+          ? layerDesktopClientSettings
+          : Layer.mock(DesktopClientSettings.DesktopClientSettings)({
+              get: Effect.succeedSome({
+                ...DEFAULT_CLIENT_SETTINGS,
+                confirmQuit: input.confirmQuit,
+              }),
+            }),
         layerDesktopServerExposure,
         DesktopState.layer,
-        layerElectronApp,
+        input.quit === undefined
+          ? layerElectronApp
+          : Layer.mock(ElectronApp.ElectronApp)({ quit: input.quit }),
         Layer.succeed(ElectronMenu.ElectronMenu, {
           setApplicationMenu: () => Effect.void,
           showContextMenu: () => Effect.succeedNone,
@@ -570,6 +605,7 @@ describe("DesktopWindow", () => {
         Layer.mock(DesktopLinuxUrlHandler.DesktopLinuxUrlHandler)({ register: Effect.void }),
         Layer.mock(DesktopShellEnvironment.DesktopShellEnvironment)({
           installIntoProcess: Effect.succeed(true),
+          pathHydration: { source: "none", probes: [] },
         }),
         Layer.succeed(DesktopPreReadyPlatform.DesktopPreReadyElectronOptions, {
           linux: null,
@@ -896,6 +932,131 @@ describe("DesktopWindow", () => {
           assert.equal(yield* Ref.get(createCount), 3);
         }).pipe(Effect.provide(layer));
       }),
+  );
+
+  it.effect.each(
+    (["darwin", "linux", "win32"] as const).flatMap((platform) =>
+      (
+        [
+          { path: "direct", mode: "direct", quits: 1 },
+          { path: "hold Q release", mode: "hold", quits: 1 },
+          { path: "hold modifier release", mode: "hold", quits: 1 },
+          { path: "hold quiet", mode: "hold", quits: 1 },
+          { path: "double press", mode: "double-click", quits: 1 },
+          { path: "double press in hold mode", mode: "hold", quits: 1 },
+          { path: "cancelled hold", mode: "hold", quits: 0 },
+          { path: "expired double press", mode: "double-click", quits: 0 },
+          { path: "other shortcut", mode: "direct", quits: 0 },
+        ] as const
+      ).map((scenario) => ({ ...scenario, platform })),
+    ),
+  )("attributes $platform $path only when it commits a quit", (scenario) =>
+    Effect.gen(function* () {
+      const logDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "robob-quit-shortcut-"));
+      const quitLog = NodePath.join(logDir, "desktop-quits.ndjson");
+      const handoff = NodePath.join(logDir, "desktop-last-quit.json");
+      const quit = vi.fn(() =>
+        NodeFS.existsSync(quitLog) ? JSON.parse(NodeFS.readFileSync(quitLog, "utf8")) : undefined,
+      );
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          vi.useRealTimers();
+          NodeFS.rmSync(logDir, { recursive: true, force: true });
+        }),
+      );
+      yield* TestClock.setTime(Math.ceil(performance.timeOrigin) + 10_000);
+      yield* Effect.gen(function* () {
+        const fakeWindow = makeFakeBrowserWindow();
+        const createCount = yield* Ref.make(0);
+        const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+        const layer = layerTest({
+          window: fakeWindow.window,
+          createCount,
+          mainWindow,
+          platform: scenario.platform,
+          logDir,
+          confirmQuit: scenario.mode,
+          quit: Effect.sync(() => {
+            quit();
+          }),
+        });
+        yield* Effect.gen(function* () {
+          const desktopWindow = yield* DesktopWindow.DesktopWindow;
+          yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+          const beforeInput = fakeWindow.webContentsListeners.get("before-input-event");
+          assert.isDefined(beforeInput);
+          vi.useFakeTimers();
+          vi.setSystemTime(Math.ceil(performance.timeOrigin) + 10_000);
+          NodeFS.writeFileSync(
+            NodePath.join(logDir, "desktop-quit-request.json"),
+            JSON.stringify({
+              at: Math.ceil(performance.timeOrigin),
+              targetPid: process.pid,
+              requesterPid: 42,
+              initiator: "watchdog",
+              reason: "overload-restart",
+            }),
+          );
+          yield* Effect.promise(async () => {
+            const preventDefault = vi.fn();
+            const input: QuitHoldKeyInput = {
+              type: "keyDown",
+              key: scenario.path === "other shortcut" ? "w" : "q",
+              meta: scenario.platform === "darwin",
+              control: scenario.platform !== "darwin",
+              alt: false,
+              shift: false,
+              isAutoRepeat: false,
+            };
+            const send = async (overrides: Partial<QuitHoldKeyInput> = {}) => {
+              beforeInput!({ preventDefault }, { ...input, ...overrides });
+              await vi.advanceTimersByTimeAsync(0);
+            };
+            await send();
+            if (scenario.path !== "direct") assert.equal(quit.mock.calls.length, 0);
+            if (scenario.path.startsWith("hold")) {
+              for (let elapsed = 0; elapsed < QUIT_HOLD_DURATION_MS; elapsed += 100) {
+                await vi.advanceTimersByTimeAsync(100);
+                await send({ isAutoRepeat: true });
+              }
+              assert.equal(quit.mock.calls.length, 0);
+              assert.isFalse(NodeFS.existsSync(quitLog));
+              if (scenario.path === "hold Q release") await send({ type: "keyUp" });
+              if (scenario.path === "hold modifier release") {
+                await send({
+                  type: "keyUp",
+                  key: scenario.platform === "darwin" ? "Meta" : "Control",
+                  meta: false,
+                  control: false,
+                });
+              }
+              await vi.advanceTimersByTimeAsync(QUIT_HOLD_RELEASE_GRACE_MS);
+            } else if (scenario.path.startsWith("double press")) {
+              await send({ type: "keyUp" });
+              await vi.advanceTimersByTimeAsync(QUIT_DOUBLE_PRESS_MS - 100);
+              await send();
+            } else if (scenario.path === "cancelled hold") {
+              await send({ type: "keyUp" });
+              await vi.advanceTimersByTimeAsync(QUIT_HOLD_DURATION_MS + QUIT_HOLD_RELEASE_GRACE_MS);
+            } else if (scenario.path === "expired double press") {
+              await vi.advanceTimersByTimeAsync(QUIT_DOUBLE_PRESS_MS);
+            }
+            assert.equal(quit.mock.calls.length, scenario.quits);
+            assert.equal(NodeFS.existsSync(quitLog), scenario.quits === 1);
+            assert.equal(NodeFS.existsSync(handoff), scenario.quits === 1);
+            if (scenario.quits === 1) {
+              // Read at app.quit, before Electron can exit or emit before-quit.
+              const record = quit.mock.results[0]!.value;
+              assert.equal(record.trigger, "menu");
+              assert.equal(record.initiator, "menu/user");
+              assert.isUndefined(record.restartReason);
+              assert.deepEqual(JSON.parse(NodeFS.readFileSync(handoff, "utf8")), record);
+            }
+            assert.equal(preventDefault.mock.calls.length > 0, scenario.path !== "other shortcut");
+          });
+        }).pipe(Effect.provide(layer));
+      });
+    }).pipe(Effect.scoped),
   );
 
   it.effect("blocks only repeated Cmd+W input before it reaches the native window menu", () =>

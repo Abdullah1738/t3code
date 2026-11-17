@@ -100,7 +100,7 @@ live connection or in a caller's transaction. From an **offline snapshot**, gene
 structural plan with:
 
 ```bash
-node scripts/explain-sql.ts /snapshots/statev2.sqlite /evidence/server.trace.ndjson FINGERPRINT \
+node apps/server/scripts/explain-sql.ts /snapshots/statev2.sqlite /evidence/server.trace.ndjson FINGERPRINT \
   ardud_archive=/snapshots/archive.sqlite ardud_base=/snapshots/base.sqlite
 ```
 

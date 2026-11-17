@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import {
   AnalyticsEvent,
+  AnalyticsRollup,
   RunUsageEvent,
   AnalyticsIngestInput,
   AnalyticsReadInput,
@@ -49,6 +50,26 @@ describe("analytics ingest contract", () => {
     ).toThrow();
     expect(() => decodeEvent({ ...input, props: { ...input.props, head: "private" } })).toThrow();
   });
+  it.each(["host_reboot", "quarantine_max_age"])(
+    "accepts desktop lease recovery reason %s",
+    (reason) => {
+      expect(
+        decodeEvent({
+          ts: event.ts,
+          kind: "desktop_lease.transition",
+          surface: "server",
+          route: "desktop-lease",
+          ticket: "ticket-1",
+          taskId: "task-1",
+          mode: "native",
+          from: "quarantined",
+          to: "finished",
+          reason,
+          age_ms: 1000,
+        }),
+      ).toMatchObject({ reason, kind: "desktop_lease.transition" });
+    },
+  );
   it("accepts MCP filters and rejects unhashed request ids", () => {
     const call = { ...event, kind: "mcp.call", clientRequestId: "a".repeat(64) };
     expect(decodeEvent(call).clientRequestId).toBe("a".repeat(64));
@@ -131,6 +152,10 @@ const usage = {
 it("requires the metadata-only usage schema and preserves null measurements", () => {
   const decodeUsage = Schema.decodeUnknownSync(RunUsageEvent, { onExcessProperty: "error" });
   expect(decodeUsage(usage)).toEqual(usage);
+  expect(Object.hasOwn(decodeUsage(usage), "cancelReason")).toBe(false);
+  const cancelled = { ...usage, endReason: "cancelled", cancelReason: "server_shutdown" };
+  expect(decodeUsage(cancelled)).toEqual(cancelled);
+  expect(() => decodeUsage({ ...cancelled, cancelReason: "unclassified" })).toThrow();
   for (const key of ["prompt", "message", "text", "toolArgs", "toolOutput", "output"]) {
     expect(() => decodeUsage({ ...usage, [key]: "private" })).toThrow();
   }
@@ -190,6 +215,22 @@ it.each([
   expect(Schema.decodeUnknownSync(RunUsageEvent)({ ...usage, model }).model).toBe(model);
 });
 
+it.each(["live_thread", "steer", "start", "none"] as const)(
+  "#1603 post-routing target %s is retained without message content",
+  (target) => {
+    const row = {
+      ...event,
+      kind: "kanban.post_routing",
+      outcome: "ok",
+      props: { actor: "script", seq: 39, target, phase: "routed" },
+    };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(() =>
+      decodeEvent({ ...row, props: { ...row.props, target: "arbitrary text" } }),
+    ).toThrow();
+  },
+);
+
 it.each(["started", "reused", "merged", "queued_spawn_cap"] as const)(
   "#1490 accepts evaluator outcome %s and bounded attribution labels",
   (outcome) => {
@@ -211,3 +252,112 @@ it.each(["started", "reused", "merged", "queued_spawn_cap"] as const)(
       expect(() => decodeEvent({ ...row, [field]: "private words" })).toThrow();
   },
 );
+
+it("decodes detached outcomes additively and rejects raw request ids", () => {
+  const old = { ...event, kind: "mcp.call", tool: "delegate_task", outcome: "timeout" };
+  expect(decodeEvent(old)).toEqual(old);
+  for (const outcome of ["committed", "failed", "capped"] as const) {
+    const row = {
+      ...old,
+      kind: "mcp.detached",
+      outcome,
+      lateMs: 1234,
+      afterCap: true,
+      clientRequestId: "a".repeat(64),
+    };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(() => decodeEvent({ ...row, clientRequestId: "raw-request-id" })).toThrow();
+    expect(() => decodeEvent({ ...row, lateMs: -1 })).toThrow();
+  }
+  expect(
+    Schema.is(AnalyticsRollup.fields.mcpCalls)([
+      {
+        tool: "delegate_task",
+        hour: "2026-11-13T00:00:00.000Z",
+        build: "test",
+        bootId: "boot",
+        count: 1,
+        p50Ms: 10000,
+        p95Ms: 10000,
+        maxMs: 10000,
+        approximate: false,
+        failures: 1,
+        failureRate: 1,
+        outcomes: { timeout: 1 },
+        savedCounts: { unknown: 1 },
+        reasonClasses: {},
+        invalidFields: {},
+        errors: [],
+        failedThenRetried: 0,
+        retrySucceeded: 0,
+      },
+    ]),
+  ).toBe(true);
+});
+
+it("decodes runtime samples with exact model ids and bounded hourly rollups", () => {
+  const row = {
+    ts: event.ts,
+    kind: "server.runtime_sample",
+    surface: "server",
+    route: "server",
+    props: {
+      runningTurns: {
+        total: 1,
+        byProvider: { "custom:provider[2]": 1 },
+        byModel: { "cx/gpt-6.1-sol[1m]": 1, other: 0 },
+      },
+      runningByOrigin: {
+        boardWork: 0,
+        boardReview: 0,
+        boardEvaluator: 0,
+        delegatedChild: 0,
+        scheduledTask: 0,
+        other: 1,
+      },
+      providerSessions: { codex: 1 },
+      host: { load1: 12, load5: 10, load15: 8, rssMiB: 900, heapUsedMiB: 500 },
+      sampleMs: 0.25,
+    },
+  };
+  expect(decodeEvent(row)).toEqual(row);
+  const retry = {
+    ts: event.ts,
+    kind: "provider.retry",
+    surface: "server",
+    route: "provider",
+    threadId: "thread:watcher",
+    props: {
+      runId: "run:watcher",
+      provider: "claudeAgent",
+      model: "claude-sonnet-5-5",
+      attempt: 2,
+      maxRetries: 10,
+      errorMessage: "Request timed out.",
+      waitSinceResponseMs: 300000,
+    },
+  };
+  const guard = {
+    ...retry,
+    kind: "provider.guard_interrupt",
+    props: { ...retry.props, guardFiredDuringRetry: true },
+  };
+  for (const sample of [row, retry, guard]) expect(decodeEvent(sample)).toEqual(sample);
+  expect(() => decode({ events: [row] })).toThrow();
+  expect(() => decodeEvent({ ...row, props: { ...row.props, sampleMs: -1 } })).toThrow();
+  const hour = {
+    hour: "00",
+    samples: 60,
+    runningTurnsMax: 5,
+    runningTurnsAvg: 2.5,
+    queuedRunsMax: null,
+    load1Max: 12,
+    sampleMsMax: 0.4,
+  };
+  expect(
+    Schema.is(AnalyticsRollup.fields.runtimeSamples)(Array.from({ length: 24 }, () => hour)),
+  ).toBe(true);
+  expect(
+    Schema.is(AnalyticsRollup.fields.runtimeSamples)(Array.from({ length: 25 }, () => hour)),
+  ).toBe(false);
+});

@@ -54,13 +54,41 @@ An ambiguous outcome is never retried.
 
 ## Mullvad egress gate
 
-`bin/egress-check` must exit 0 before anything is sent to Venice (cached
-5 min). It needs `venice.ai` and `api.venice.ai` to resolve into the
+The egress gate must pass before anything is sent to Venice (cached 5 min).
+It runs in-process (`lib/egress.mjs`, `VENICE_X402_EGRESS_CHECK=builtin`, the
+default): on 16 Nov the Mac sat at load ~150 after a reboot and the old spawned
+script (`bin/egress-check`, kept for manual use and as a command option) could
+not finish in 30 s, so a healthy tunnel was refused. The in-process check takes
+~0.1-0.4 s at load 100. It needs `venice.ai` and `api.venice.ai` to resolve into the
 venice-mullvad tunnel's fake range (198.18.0.0/15), the tunnel daemon to
 report healthy, and Cloudflare's `venice.ai/cdn-cgi/trace` IP to equal the
-tunnel's Mullvad exit IP. If any check fails, the request is refused with 503
-`egress_unverified`. Tunnel: `~/Documents/assistant/venice-mullvad`. Run
+tunnel's Mullvad exit IP. While the check fails the request is held and the
+check re-run every 5 s for up to 5 min (`VENICE_X402_EGRESS_WAIT_S`), because a
+tunnel failover after a blocked transport takes 2-4 min. Only then is it
+refused with 503 `egress_unverified`. Each failure is logged as `egress_failed`
+with the check's reason. Tunnel: `~/Documents/assistant/venice-mullvad`. Run
 `bin/egress-check -v` to see why it fails.
+
+## Resilience (16 Nov 2026)
+
+The proxy kept dropping when the Mullvad tunnel failed over: UAE networks cut
+WireGuard-over-UDP after 20-30 min and the daemon needed minutes to move to
+another transport. Requests failed at once (`egress_unverified`, `fetch failed`).
+
+- Connection failures and 502/503/504/52x from Venice are retried before any
+  byte reaches the client (5 attempts, `VENICE_X402_UPSTREAM_ATTEMPTS`), with a
+  growing delay and a fresh egress check (and wait) before each resend.
+  A resend after a reset may be billed twice by Venice (cents per request).
+- A client that disconnects aborts the upstream call (`client_closed`).
+- Logged causes: `upstream_retry`, `egress_failed`, `egress_recovered`,
+  `proxy_error` (with the socket cause, e.g. `fetch failed (ECONNRESET)`).
+- Both LaunchAgents run as `ProcessType` Standard, not Background: under load
+  (~150 after the 16 Nov reboot) macOS starved the Background proxy so badly that
+  a restart sat 6+ min compiling modules, its egress script was SIGKILLed at 30 s
+  and the guard stopped running.
+- `com.ardud.venice-x402-guard` (every 60 s, `bin/venice-ensure`) re-bootstraps
+  or kickstarts the proxy when nothing listens on the port. `install.zsh`
+  installs both agents.
 
 ## Commands
 

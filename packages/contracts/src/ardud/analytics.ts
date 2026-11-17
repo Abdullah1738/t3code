@@ -1,6 +1,8 @@
+import { McpReasonClass, McpInvalidField, McpRefusedAt } from "./mcpReasonClass.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
+import { OrchestrationV2CancelReason } from "../orchestrationV2.ts";
 
 const Timestamp = Schema.String.check(
   Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
@@ -10,7 +12,7 @@ const Timestamp = Schema.String.check(
   }),
 );
 
-// Metadata only. Deliberately no arbitrary property bag or free-form text fields.
+// Metadata only, apart from the bounded provider diagnostic below.
 const Label = Schema.String.check(
   Schema.isMaxLength(160),
   Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+-]*$/),
@@ -66,7 +68,31 @@ const McpOutcome = Schema.Literals([
   "interrupted",
   "interrupted_by_shutdown",
 ]);
-const McpPhase = Schema.Literals(["caller", "dispatch", "result", "handler"]);
+const McpPhase = Schema.Literals([
+  "caller",
+  "dispatch",
+  "result",
+  "handler",
+  "lane_wait",
+  "query",
+  "render",
+]);
+// Pool identities include custom model slugs and provider suffixes such as [1m].
+const PoolKey = Schema.String.check(
+  Schema.isMaxLength(4608),
+  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+!~'()*[\],=-]*$/),
+);
+const PoolChangeFields = {
+  poolKey: PoolKey,
+  fromPoolKey: Schema.optionalKey(PoolKey),
+  fromSlots: Schema.NullOr(Measurement),
+  toSlots: Schema.NullOr(Measurement),
+  op: Schema.Literals(["set", "add", "remove", "replace", "auto_zero"]),
+  actorKind: Schema.Literals(["evaluator", "owner", "script", "system"]),
+  actorId: Schema.NullOr(DerivedId),
+};
+export const KanbanPoolChange = Schema.Struct({ at: Timestamp, ...PoolChangeFields });
+export type KanbanPoolChange = typeof KanbanPoolChange.Type;
 export const EvaluatorTrigger = Schema.Literals([
   "owner_answer",
   "card_ask",
@@ -101,6 +127,8 @@ export const EvaluatorOutcome = Schema.Literals([
 ]);
 export type EvaluatorOutcome = typeof EvaluatorOutcome.Type;
 export const EvaluatorReuseMissReason = Schema.Literals([
+  "duplicate",
+  "stale_reminder",
   "no_card_reuse_scope",
   "no_candidates",
   "all_candidates_rejected",
@@ -114,7 +142,8 @@ export const EvaluatorReuseMissReason = Schema.Literals([
   "legacy_queue",
 ]);
 export type EvaluatorReuseMissReason = typeof EvaluatorReuseMissReason.Type;
-const EventOutcome = Schema.Union([McpOutcome, EvaluatorOutcome]);
+const DetachedOutcome = Schema.Literals(["committed", "failed", "capped"]);
+const EventOutcome = Schema.Union([McpOutcome, EvaluatorOutcome, DetachedOutcome]);
 export const EvaluatorPurposeKind = Schema.Literals([
   "discussion",
   "nightly",
@@ -127,6 +156,40 @@ export const EvaluatorPurposeKind = Schema.Literals([
   "request",
   "unknown",
 ]);
+// Provider instance/model ids may include punctuation excluded from routing labels.
+const RuntimeCounts = Schema.Record(Schema.String.check(Schema.isMaxLength(512)), Measurement);
+const RuntimeSampleProps = {
+  runningTurns: Schema.optionalKey(
+    Schema.Struct({
+      total: Measurement,
+      byProvider: RuntimeCounts,
+      byModel: RuntimeCounts,
+    }),
+  ),
+  runningByOrigin: Schema.optionalKey(
+    Schema.Struct({
+      boardWork: Measurement,
+      boardReview: Measurement,
+      boardEvaluator: Measurement,
+      delegatedChild: Measurement,
+      scheduledTask: Measurement,
+      other: Measurement,
+    }),
+  ),
+  queuedRuns: Schema.optionalKey(Measurement),
+  providerSessions: Schema.optionalKey(RuntimeCounts),
+  host: Schema.optionalKey(
+    Schema.Struct({
+      load1: Measurement,
+      load5: Measurement,
+      load15: Measurement,
+      rssMiB: Measurement,
+      heapUsedMiB: Measurement,
+      eventLoopLagP99Ms: Schema.optionalKey(Measurement),
+    }),
+  ),
+};
+
 const GeneralEvent = Schema.Struct({
   ts: Timestamp,
   kind: Label.check(Schema.makeFilter((kind) => kind !== "run.usage")),
@@ -135,14 +198,67 @@ const GeneralEvent = Schema.Struct({
   boardId: Schema.optionalKey(Id),
   cardId: Schema.optionalKey(Id),
   discussionId: Schema.optionalKey(Id),
+  restartAdmission: Schema.optionalKey(
+    Schema.Struct({
+      sourceRunId: DerivedId,
+      runId: Schema.optionalKey(DerivedId),
+      classification: Label,
+      queuedAtMs: Measurement,
+      waitedMs: Measurement,
+      positionAtEntry: Measurement,
+      position: Measurement,
+      total: Measurement,
+      maxQueueDepth: Measurement,
+      active: Measurement,
+      maxActive: Measurement,
+      loaded: Schema.Boolean,
+      rule: Schema.optionalKey(Schema.Literals(["no_progress", "absolute_backstop", "wall_time"])),
+    }),
+  ),
   threadId: Schema.optionalKey(DerivedId),
   durationMs: Schema.optionalKey(Measurement),
+  phase: Schema.optionalKey(Label),
+  waitedMs: Schema.optionalKey(Measurement),
+  lateMs: Schema.optionalKey(Measurement),
+  afterCap: Schema.optionalKey(Schema.Boolean),
+  detachedOutcomeWake: Schema.optionalKey(
+    Schema.Literals([
+      "sent",
+      "sent_after_restart",
+      "suppressed_retry_saved",
+      "suppressed_definite",
+    ]),
+  ),
   tool: Schema.optionalKey(Label),
   build: Schema.optionalKey(Label),
   bootId: Schema.optionalKey(Id),
   startedAt: Schema.optionalKey(Timestamp),
   committed: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
   taskId: Schema.optionalKey(DerivedId),
+  ticket: Schema.optionalKey(DerivedId),
+  mode: Schema.optionalKey(Schema.Literals(["native", "cua-driver"])),
+  from: Schema.optionalKey(Label),
+  to: Schema.optionalKey(Label),
+  age_ms: Schema.optionalKey(Measurement),
+  parentThreadId: Schema.optionalKey(DerivedId),
+  parentRunId: Schema.optionalKey(DerivedId),
+  noticeMessageId: Schema.optionalKey(DerivedId),
+  noticeKind: Schema.optionalKey(
+    Schema.Literals(["finished", "failed", "stopped", "mixed", "unknown"]),
+  ),
+  children: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        childTaskId: DerivedId,
+        status: Label,
+        terminalAt: Schema.NullOr(Timestamp),
+        delayMs: Schema.NullOr(Measurement),
+      }),
+    ),
+  ),
+  oldStatus: Schema.optionalKey(Label),
+  newStatus: Schema.optionalKey(Label),
+  reason: Schema.optionalKey(Label),
   callerThreadId: Schema.optionalKey(DerivedId),
   callerRole: Schema.optionalKey(McpCallerRole),
   callerKind: Schema.optionalKey(McpCallerKind),
@@ -159,6 +275,9 @@ const GeneralEvent = Schema.Struct({
   ),
   cardStage: Schema.optionalKey(Label),
   denyReason: Schema.optionalKey(McpDenyReason),
+  reasonClass: Schema.optionalKey(McpReasonClass),
+  invalidField: Schema.optionalKey(McpInvalidField),
+  refusedAt: Schema.optionalKey(McpRefusedAt),
   replyStage: Schema.optionalKey(Label),
   replyPhases: Schema.optionalKey(McpReplyPhases),
   requestTiming: Schema.optionalKey(
@@ -229,26 +348,76 @@ const GeneralEvent = Schema.Struct({
   ),
   props: Schema.optionalKey(
     Schema.Struct({
+      ...RuntimeSampleProps,
+      total: Schema.optionalKey(Measurement),
+      distinctCwds: Schema.optionalKey(Measurement),
+      maxPerSecond: Schema.optionalKey(Measurement),
+      windowMs: Schema.optionalKey(Measurement),
+      overflow: Schema.optionalKey(Measurement),
+      top: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            operation: Label,
+            subcommand: Label,
+            cwdHash: Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/)),
+            count: Measurement,
+          }),
+        ).check(Schema.isMaxLength(20)),
+      ),
+      on: Schema.optionalKey(Label),
+      until: Schema.optionalKey(Timestamp),
+      script: Schema.optionalKey(Label),
       number: Schema.optionalKey(Measurement),
       from: Schema.optionalKey(Label),
       to: Schema.optionalKey(Label),
       actor: Schema.optionalKey(
         Schema.Literals(["owner", "thread", "evaluator", "script", "system"]),
       ),
+      seq: Schema.optionalKey(Measurement),
+      target: Schema.optionalKey(Schema.Literals(["live_thread", "steer", "start", "none"])),
       msInPrevStage: Schema.optionalKey(Measurement),
       round: Schema.optionalKey(Measurement),
       chain: Schema.optionalKey(Label),
       verdict: Schema.optionalKey(Schema.Literals(["clear", "feedback"])),
       head: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[0-9a-f]{7,40}$/))),
-      action: Schema.optionalKey(Schema.Literals(["set", "clear"])),
+      action: Schema.optionalKey(
+        Schema.Literals(["set", "clear", "resumed", "restarted", "failed"]),
+      ),
+      effort: Schema.optionalKey(Label),
+      lastProgressKind: Schema.optionalKey(Label),
+      lastProgressTool: Schema.optionalKey(Label),
+      silentSeconds: Schema.optionalKey(Measurement),
+      attempt: Schema.optionalKey(Schema.NullOr(Measurement)),
+      maxRetries: Schema.optionalKey(Schema.NullOr(Measurement)),
+      // Provider diagnostics are required to explain retries; never include tool or prompt bodies.
+      errorMessage: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2000))),
+      waitSinceResponseMs: Schema.optionalKey(Measurement),
+      guardFiredDuringRetry: Schema.optionalKey(Schema.Boolean),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
+      cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
+      runId: Schema.optionalKey(DerivedId),
+      attemptId: Schema.optionalKey(DerivedId),
+      stage: Schema.optionalKey(Label),
+      outcome: Schema.optionalKey(Label),
+      retryCount: Schema.optionalKey(Measurement),
+      discoveryMs: Schema.optionalKey(Schema.NullOr(Measurement)),
+      attachmentsMs: Schema.optionalKey(Schema.NullOr(Measurement)),
+      sdkOpenMs: Schema.optionalKey(Schema.NullOr(Measurement)),
+      mcpRegistrationMs: Schema.optionalKey(Schema.NullOr(Measurement)),
+      sdkAcceptMs: Schema.optionalKey(Schema.NullOr(Measurement)),
       model: Schema.optionalKey(Label),
       provider: Schema.optionalKey(Label),
       operation: Schema.optionalKey(Label),
       exitCode: Schema.optionalKey(Schema.Int),
       kind: Schema.optionalKey(Label),
       ageMs: Schema.optionalKey(Measurement),
+      slot: Schema.optionalKey(Schema.Literals(["take", "release"])),
+      why: Schema.optionalKey(Label),
+      held: Schema.optionalKey(Schema.Boolean),
+      holdsSlot: Schema.optionalKey(Schema.Boolean),
+      carried: Schema.optionalKey(Measurement),
+      candidateCount: Schema.optionalKey(Measurement),
       used: Schema.optionalKey(Measurement),
       slots: Schema.optionalKey(Measurement),
       waiting: Schema.optionalKey(Measurement),
@@ -262,25 +431,111 @@ const GeneralEvent = Schema.Struct({
       readerAcquireMs: Schema.optionalKey(Measurement),
       readerQueryMs: Schema.optionalKey(Measurement),
       readerStatements: Schema.optionalKey(Measurement),
+      serializationMs: Schema.optionalKey(Measurement),
+      requestId: Schema.optionalKey(
+        Schema.String.check(Schema.isPattern(/^[A-Za-z0-9._:-]{1,64}$/)),
+      ),
+      itemCount: Schema.optionalKey(Measurement),
+      itemsTotal: Schema.optionalKey(Measurement),
+      responseBytes: Schema.optionalKey(Measurement),
+      readerHolders: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            holder: Label,
+            holdMs: Measurement,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
+      readerTimings: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            waitMs: Measurement,
+            queryMs: Measurement,
+            statements: Measurement,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
+      replyAdmissions: Schema.optionalKey(
+        Schema.Array(
+          Schema.Struct({
+            lane: Label,
+            waitMs: Measurement,
+            runMs: Measurement,
+            acquired: Schema.Boolean,
+          }),
+        ).check(Schema.isMaxLength(8)),
+      ),
       span: Schema.optionalKey(Label),
       errorTag: Schema.optionalKey(Label),
       code: Schema.optionalKey(Label),
       boardId: Schema.optionalKey(Id),
       cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
       saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+      foundBy: Schema.optionalKey(
+        Schema.Literals(["subagents", "receipt", "request_key_recovery", "none"]),
+      ),
+      notFoundReason: Schema.optionalKey(
+        Schema.Literals([
+          "non_canonical_id",
+          "never_saved",
+          "not_a_delegation_id",
+          "other_thread",
+          "not_a_delegation_command",
+          "accepted",
+          "rejected",
+          "pending",
+          "abandoned",
+          "missing_child_thread",
+        ]),
+      ),
+      idCanonical: Schema.optionalKey(Schema.Boolean),
+      commandId: Schema.optionalKey(DerivedId),
+      taskId: Schema.optionalKey(DerivedId),
+      receiptState: Schema.optionalKey(Schema.Literal("accepted")),
+      missingLookup: Schema.optionalKey(Schema.Literals(["subagents", "child_thread_id"])),
+      dispatchFenceRecovered: Schema.optionalKey(Schema.Boolean),
+      idShape: Schema.optionalKey(
+        Schema.Literals(["task_id", "thread_id", "child_thread_id", "empty", "other"]),
+      ),
       cause: Schema.optionalKey(
         Schema.Literals(["client_disconnect", "shutdown", "deadline", "stop", "unknown"]),
       ),
       waitMs: Schema.optionalKey(Measurement),
       originKind: Schema.optionalKey(Label),
-      poolKey: Schema.optionalKey(Label),
+      poolKey: Schema.optionalKey(PoolKey),
+      fromPoolKey: Schema.optionalKey(PoolKey),
+      fromSlots: Schema.optionalKey(PoolChangeFields.fromSlots),
+      toSlots: Schema.optionalKey(PoolChangeFields.toSlots),
+      op: Schema.optionalKey(PoolChangeFields.op),
+      actorKind: Schema.optionalKey(PoolChangeFields.actorKind),
+      actorId: Schema.optionalKey(PoolChangeFields.actorId),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
+      itemKind: Schema.optionalKey(Label),
+      openToolSince: Schema.optionalKey(Timestamp),
+      effectId: Schema.optionalKey(DerivedId),
+      effectType: Schema.optionalKey(Label),
+      commandType: Schema.optionalKey(Label),
+      failedRunId: Schema.optionalKey(DerivedId),
+      startedRunId: Schema.optionalKey(DerivedId),
+      failureCode: Schema.optionalKey(Label),
       headRunId: Schema.optionalKey(DerivedId),
       headOrdinal: Schema.optionalKey(Measurement),
       queuedCount: Schema.optionalKey(Measurement),
       heldCount: Schema.optionalKey(Measurement),
       phase: Schema.optionalKey(Label),
+      threadList: Schema.optionalKey(
+        Schema.Struct({
+          phase: Schema.Literals(["caller", "project", "candidates", "shell", "render"]),
+          batchCount: Measurement,
+          candidateRows: Measurement,
+          elapsedMs: Measurement,
+          readerWaitMs: Measurement,
+          queryMs: Measurement,
+        }),
+      ),
       subSteps: Schema.optionalKey(
         Schema.Array(Schema.Struct({ subStep: Label, ms: Measurement })).check(
           Schema.isMaxLength(3),
@@ -322,9 +577,17 @@ const GeneralEvent = Schema.Struct({
       ),
       hasBatchKey: Schema.optionalKey(Schema.Boolean),
       openAsksAtCreation: Schema.optionalKey(Measurement),
+      openNoticesAtCreation: Schema.optionalKey(Measurement),
       answeredVia: Schema.optionalKey(Schema.Literals(["single", "batch", "free_text"])),
       status: Schema.optionalKey(Measurement),
       count: Schema.optionalKey(Measurement),
+      database: Schema.optionalKey(Label),
+      connection: Schema.optionalKey(Label),
+      lane: Schema.optionalKey(Label),
+      sqlFingerprint: Schema.optionalKey(Label),
+      failures: Schema.optionalKey(Measurement),
+      readBytes: Schema.optionalKey(Measurement),
+      sampleMs: Schema.optionalKey(Measurement),
       bytes: Schema.optionalKey(Measurement),
       p50Ms: Schema.optionalKey(Measurement),
       p95Ms: Schema.optionalKey(Measurement),
@@ -369,6 +632,7 @@ export const RunUsageEvent = Schema.Struct({
   wallMs: Schema.NullOr(Measurement),
   turnCount: Measurement,
   endReason: Schema.Literals(["completed", "failed", "interrupted", "cancelled"]),
+  cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
   usageStatus: Schema.Literals(["complete", "partial", "unavailable"]),
   reviewRound: TokenCount,
 });
@@ -459,6 +723,35 @@ export const AnalyticsRollup = Schema.Struct({
   total: Measurement,
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
+  restartAdmission: Schema.optionalKey(
+    Schema.Struct({
+      scope: Schema.Literal("server-wide"),
+      groupBy: Schema.Literal("boot-hour"),
+      loadedTimeShare: Schema.Null,
+      basis: Schema.String.check(Schema.isMaxLength(160)),
+      overflow: Measurement,
+      groups: Schema.Array(
+        Schema.Struct({
+          bootId: Id,
+          hour: Label,
+          maxQueueDepth: Measurement,
+          admissions: Measurement,
+          failuresByRule: Schema.Record(Label, Measurement),
+          maxActiveObserved: Measurement,
+          maxActive: Measurement,
+          loadedObservations: Measurement,
+          observations: Measurement,
+          wait: Schema.Struct({
+            count: Measurement,
+            p50Ms: Schema.NullOr(Measurement),
+            p90Ms: Schema.NullOr(Measurement),
+            maxMs: Schema.NullOr(Measurement),
+            approximate: Schema.Boolean,
+          }),
+        }),
+      ),
+    }),
+  ),
   textGenerationOverflow: Schema.optionalKey(Measurement),
   textGeneration: Schema.optionalKey(
     Schema.Array(
@@ -472,6 +765,19 @@ export const AnalyticsRollup = Schema.Struct({
         ...LatencyFields,
       }),
     ),
+  ),
+  runtimeSamples: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        hour: Label,
+        samples: Measurement,
+        runningTurnsMax: Measurement,
+        runningTurnsAvg: Measurement,
+        queuedRunsMax: Schema.NullOr(Measurement),
+        load1Max: Measurement,
+        sampleMsMax: Measurement,
+      }),
+    ).check(Schema.isMaxLength(24)),
   ),
   errorCounts: Schema.Record(Label, Measurement),
   controlRoutes: Schema.optionalKey(
@@ -546,6 +852,30 @@ export const AnalyticsRollup = Schema.Struct({
       ...LatencyFields,
     }),
   ),
+  dbStatementFamilies: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        database: Label,
+        connection: Label,
+        lane: Label,
+        fingerprint: Label,
+        family: Label,
+        calls: Measurement,
+        totalMs: Measurement,
+        maxMs: Measurement,
+        returnedRows: Measurement,
+        failures: Measurement,
+      }),
+    ),
+  ),
+  processDiskRead: Schema.optionalKey(
+    Schema.Struct({
+      readBytes: Measurement,
+      sampleMs: Measurement,
+      samples: Measurement,
+      unavailableSamples: Measurement,
+    }),
+  ),
   longTasksByRoute: Schema.Array(
     Schema.Struct({
       route: Label,
@@ -613,10 +943,11 @@ export const AnalyticsRollup = Schema.Struct({
       ),
       openAsksAsOf: Schema.NullOr(Timestamp),
       incompleteAskSnapshots: Measurement,
+      poolChanges: Schema.optionalKey(Schema.Array(KanbanPoolChange)),
       poolUtilisation: Schema.Array(
         Schema.Struct({
           hour: Label,
-          poolKey: Label,
+          poolKey: PoolKey,
           samples: Measurement,
           used: Measurement,
           slots: Measurement,
@@ -664,14 +995,31 @@ export const AnalyticsRollup = Schema.Struct({
       failureRate: Measurement,
       outcomes: Schema.Record(Label, Measurement),
       savedCounts: Schema.Record(Label, Measurement),
+      reasonClasses: Schema.Record(Label, Measurement),
+      invalidFields: Schema.Record(Label, Measurement),
+      notFoundReasons: Schema.optionalKey(Schema.Record(Label, Measurement)),
+      foundByCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
+      idShapeCounts: Schema.optionalKey(Schema.Record(Label, Measurement)),
       errors: Schema.Array(
         Schema.Struct({ errorTag: Label, errorPhase: McpPhase, count: Measurement }),
       ),
       failedThenRetried: Measurement,
       retrySucceeded: Measurement,
+      dispatchTimeouts: Schema.optionalKey(
+        Schema.Struct({
+          committed: Measurement,
+          failed: Measurement,
+          capped: Measurement,
+          noOutcome: Measurement,
+        }),
+      ),
     }),
   ),
-  mcpOverflow: Schema.Struct({ groups: Measurement, retryAttempts: Measurement }),
+  mcpOverflow: Schema.Struct({
+    groups: Measurement,
+    retryAttempts: Measurement,
+    detachedOutcomes: Schema.optionalKey(Measurement),
+  }),
 });
 export type AnalyticsRollup = typeof AnalyticsRollup.Type;
 export const AnalyticsReadResult = Schema.Struct({

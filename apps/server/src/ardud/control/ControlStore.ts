@@ -83,6 +83,10 @@ export interface ControlStoreShape {
     },
     ControlStoreError
   >;
+  readonly hasCompactedEvents: (
+    afterSequence: number,
+    throughSequence: number,
+  ) => Effect.Effect<boolean, ControlStoreError>;
   readonly getOrigin: (threadId: string) => Effect.Effect<string | null, ControlStoreError>;
   readonly getOrigins: (
     threadIds: ReadonlyArray<string>,
@@ -125,6 +129,10 @@ export interface ControlStoreShape {
    * runtime request. A superset of what the shell calls active, read from
    * the partial recovery indexes so listings skip the full shell snapshot.
    */
+  readonly pageLiveThreadIds: (
+    cursor: string | null,
+    limit: number,
+  ) => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
   readonly liveThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
   /** Threads with a pending runtime request (approval or user input). */
   readonly pendingRequestThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
@@ -220,6 +228,19 @@ export const make = Effect.gen(function* () {
     )
   `.pipe(Effect.mapError(fail("ensure-opencode-import")));
     }),
+  );
+
+  const hasCompactedEvents = Effect.fn("ControlStore.hasCompactedEvents")(
+    function* (afterSequence: number, throughSequence: number) {
+      const table =
+        yield* sql`SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_compacted_events' AND type = 'table'`;
+      if (table.length === 0) return false;
+      const rows = yield* sql`SELECT 1 FROM ardud_history_compacted_events
+      WHERE sequence > ${afterSequence} AND sequence <= ${throughSequence} LIMIT 1`;
+      return rows.length > 0;
+    },
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-compacted-events")),
   );
 
   const getOrigins: ControlStoreShape["getOrigins"] = (threadIds) =>
@@ -390,6 +411,21 @@ export const make = Effect.gen(function* () {
         return out;
       }),
       Effect.mapError(fail("read-native-sessions")),
+    );
+
+  const pageLiveThreadIds: ControlStoreShape["pageLiveThreadIds"] = (cursor, limit) =>
+    sql<{ readonly thread_id: string }>`
+      SELECT thread_id FROM orchestration_v2_projection_runs INDEXED BY ardud_recovery_live_threads_idx
+        WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+          AND thread_id > ${cursor ?? ""}
+        UNION
+        SELECT thread_id FROM orchestration_v2_projection_runtime_requests
+        WHERE status = 'pending' AND thread_id > ${cursor ?? ""}
+      ORDER BY thread_id ASC LIMIT ${limit}
+    `.pipe(
+      NodeSqliteClient.readOnly,
+      Effect.map((rows) => rows.map((row) => row.thread_id)),
+      Effect.mapError(fail("page-live-threads")),
     );
 
   const liveThreadIds: ControlStoreShape["liveThreadIds"] = () =>
@@ -773,6 +809,7 @@ export const make = Effect.gen(function* () {
   );
 
   return ControlStore.of({
+    hasCompactedEvents,
     userMessagesSince,
     lastAssistant,
     changeMarkers,
@@ -788,6 +825,7 @@ export const make = Effect.gen(function* () {
     nativeSessionIds,
     nativeBindings,
     liveThreadIds,
+    pageLiveThreadIds,
     pendingRequestThreadIds,
     pendingRequestRecords,
   });

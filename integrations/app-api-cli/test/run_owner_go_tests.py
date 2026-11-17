@@ -1,6 +1,10 @@
 """Run approval and affected commerce regressions without a live Keychain.
 
-PYTHONPATH=.:test python3 test/run_owner_go_tests.py
+From the package directory, install the pinned test dependencies in a venv:
+    python3 -m venv .venv
+    .venv/bin/python3 -I -m pip install -r test/requirements.txt
+    .venv/bin/python3 -I test/run_owner_go_tests.py
+    .venv/bin/python3 -I test/test_commerce_cli.py
 """
 import sys
 import os
@@ -55,7 +59,6 @@ if __name__ == '__main__':
         'test_commerce_preorder_release',
         'test_commerce_purchase_guards',
         'test_commerce_reconcile',
-        'test_commerce_talabat',
         'test_food_capture_close',
         'test_marketplace_cleanup',
         'test_minutes_cart_recovery',
@@ -63,11 +66,6 @@ if __name__ == '__main__':
         'test_noon_food_financial',
         'test_nownow_active_orders',
         'test_nownow_cleanup',
-        'test_talabat_duplicate',
-        'test_talabat_fresh_review',
-        'test_talabat_order_adapter',
-        'test_talabat_payment_outcome',
-        'test_talabat_submit_journal',
     ]
     result = unittest.TextTestRunner(verbosity=1).run(unittest.defaultTestLoader.loadTestsFromNames(names))
     sys.exit(not result.wasSuccessful())

@@ -44,7 +44,7 @@ class NativeOrdersTest(unittest.TestCase):
 
     def test_stage_changes_deduplicate(self):
         state = {'primed': True, 'status': 'placed'}
-        cfg = {'registered_at': tracker.stamp(100)}
+        cfg = {'app': 'noon', 'order': 'I123', 'registered_at': tracker.stamp(100)}
         result = {'status': 'preparing', 'errors': []}
         first = tracker.transition(result, state, cfg, 101)
         self.assertEqual(first[0]['kind'], 'stage_change')
