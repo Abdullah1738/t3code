@@ -1,3 +1,8 @@
+import {
+  completedToolFilter,
+  needsPartialResult,
+  delegatedPartialResult,
+} from "../ardud/orchestration/delegatedPartialResult.ts";
 import * as NodeUtil from "node:util";
 import * as MessageEditObservation from "./messageEditObservation.ts";
 import * as EvaluatorAnalytics from "../ardud/kanban/engine/evaluatorAnalytics.ts";
@@ -12591,6 +12596,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           turnItemTypes: ["assistant_message", "error"],
         },
       );
+      const lastTool = needsPartialResult({ ...childRun, status: outcome })
+        ? (yield* projectionStore.getThreadRecords(
+            childThreadId,
+            ["turnItems"],
+            completedToolFilter(childRun),
+          )).turnItems[0]
+        : undefined;
       const childProjection = {
         ...childControls,
         messages: childResult.messages,
@@ -12650,7 +12662,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
       const now = yield* DateTime.now;
       const partialResult = subagentResultForRun(childProjection, { ...childRun, status: outcome });
-      const result =
+      const baseResult =
         childRun.delegatedTaskStall === undefined
           ? partialResult
           : {
@@ -12662,6 +12674,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   : partialResult.text,
               ),
             };
+      const result = {
+        ...baseResult,
+        text: delegatedPartialResult(
+          baseResult.text,
+          { ...childRun, status: outcome },
+          lastTool,
+          latestRootProviderFailure(childRun, childProjection.turnItems)?.message,
+        ),
+      };
       const parentRun =
         task.runId === null
           ? undefined

@@ -12,7 +12,7 @@ const Timestamp = Schema.String.check(
   }),
 );
 
-// Metadata only. Deliberately no arbitrary property bag or free-form text fields.
+// Metadata only, apart from the bounded provider diagnostic below.
 const Label = Schema.String.check(
   Schema.isMaxLength(160),
   Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+-]*$/),
@@ -379,6 +379,12 @@ const GeneralEvent = Schema.Struct({
       lastProgressKind: Schema.optionalKey(Label),
       lastProgressTool: Schema.optionalKey(Label),
       silentSeconds: Schema.optionalKey(Measurement),
+      attempt: Schema.optionalKey(Schema.NullOr(Measurement)),
+      maxRetries: Schema.optionalKey(Schema.NullOr(Measurement)),
+      // Provider diagnostics are required to explain retries; never include tool or prompt bodies.
+      errorMessage: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2000))),
+      waitSinceResponseMs: Schema.optionalKey(Measurement),
+      guardFiredDuringRetry: Schema.optionalKey(Schema.Boolean),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
       cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),

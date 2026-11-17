@@ -1,3 +1,4 @@
+import * as ProviderRetryAnalytics from "../../ardud/analytics/ProviderRetry.ts";
 import * as CodexRetainedState from "../../ardud/orchestration/CodexRetainedState.ts";
 import {
   backgroundCommandWakeCommandId,
@@ -1246,6 +1247,7 @@ function codexUsageLimitError(
 }
 
 interface ActiveCodexTurnContext {
+  analyticsLastResponseAt?: DateTime.Utc;
   readonly promptAcceptedAt?: DateTime.Utc;
   closedCommandItemIds?: ReadonlySet<string>;
   completedCommandItemIds?: Set<string>;
@@ -1946,6 +1948,7 @@ export interface CodexAdapterV2Options {
 export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
   adapterOptions: CodexAdapterV2Options,
 ) {
+  const recordRetry = yield* ProviderRetryAnalytics.makeRecorder();
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const { clientFactory, crypto, fileSystem, idAllocator, serverConfig } = adapterOptions;
   const continuationRequests = adapterOptions.continuationRequests;
@@ -2278,6 +2281,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           context: ActiveCodexTurnContext,
           updatedAt: DateTime.Utc,
         ) {
+          context.analyticsLastResponseAt = updatedAt;
           const providerRetry = yield* Ref.modify(providerRetries, (current) => {
             const retry = current.get(context.providerTurnId);
             if (retry === undefined) {
@@ -2750,6 +2754,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               completedAt,
               updatedAt: completedAt,
               type: "command_execution",
+              toolResultIncomplete: true,
               input: tracked.command,
               ...(tracked.aggregatedOutput === undefined
                 ? {}
@@ -2890,6 +2895,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               driver: CODEX_PROVIDER,
               turnItem: {
                 ...artifacts.turnItem,
+                toolResultIncomplete: true,
                 status,
                 completedAt,
                 updatedAt: completedAt,
@@ -4056,6 +4062,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             completedAt,
             updatedAt,
             type: "command_execution",
+            toolResultIncomplete: false,
             input: item.command,
             ...(item.aggregatedOutput === null || item.aggregatedOutput === undefined
               ? {}
@@ -4239,6 +4246,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               completedAt,
               updatedAt,
               type: "dynamic_tool",
+              toolResultIncomplete: false,
               ...projection,
             };
             return { node, turnItem };
@@ -5107,6 +5115,21 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   : "provider_error",
               category: codexFailureCategory(code, payload.error.codexErrorInfo),
               retryable: true,
+            });
+            yield* recordRetry({
+              kind: "provider.retry",
+              threadId: context.projectionThreadId,
+              runId: context.projectionRunId ?? context.input.runId,
+              provider: adapterOptions.instanceId,
+              model:
+                context.subagent === null
+                  ? context.input.modelSelection.model
+                  : (context.subagent.task.modelSelection?.model ??
+                    context.subagent.task.model ??
+                    "unknown"),
+              retry,
+              errorMessage: failure.message,
+              lastResponseAt: context.analyticsLastResponseAt ?? context.startedAt,
             });
             const itemOrdinal =
               previous?.itemOrdinal ??

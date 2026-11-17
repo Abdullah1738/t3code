@@ -14,6 +14,7 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
+  AnalyticsEvent,
   CheckpointId,
   CodexSettings,
   EnvironmentId,
@@ -79,11 +80,13 @@ import * as ProviderReplayHarness from "../testkit/ProviderReplayHarness.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
+import * as Analytics from "../../ardud/analytics/Analytics.ts";
 import * as Sink from "effect/Sink";
 import { mapCodexModelCapabilities } from "../../provider/CodexProvider.ts";
 import { makeReplayServerConfig, withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
 import * as CodexAdapterV2Testkit from "./CodexAdapterV2.testkit.ts";
 
+const decodeRetryAnalytics = Schema.decodeUnknownSync(AnalyticsEvent);
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const replayTranscriptJson = Schema.fromJsonString(CodexReplay.CodexAppServerReplayTranscript);
 const encodeReplayTranscriptJson = Schema.encodeEffect(replayTranscriptJson);
@@ -6634,6 +6637,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
   it.effect("resolves retryable app-server errors on resumed provider activity", () =>
     Effect.scoped(
       Effect.gen(function* () {
+        const rows: AnalyticsEvent[] = [];
         const scenario = "codex-provider-api-retry";
         const nativeThreadId = `native-${scenario}-thread`;
         const nativeTurnId = `native-${scenario}-turn`;
@@ -6727,7 +6731,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             },
           ],
         });
-        const harness = yield* makeCodexReplayHarness(transcript);
+        const harness = yield* makeCodexReplayHarness(transcript).pipe(
+          Effect.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => {
+                  rows.push(decodeRetryAnalytics(event));
+                }),
+            }),
+          ),
+        );
         const now = yield* DateTime.now;
         yield* harness.runtime.startTurn(
           makeCodexTestTurnInput({
@@ -6740,6 +6753,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         );
         yield* awaitUntil(() => harness.terminalEvents().length === 1, "Codex retry recovery");
 
+        assert.lengthOf(rows, 1);
+        assert.equal(rows[0]!.threadId, harness.threadId);
+        assert.equal(rows[0]!.props?.model, CODEX_TEST_MODEL_SELECTION.model);
         const retryItems = harness.events.flatMap((event) =>
           event.type === "turn_item.updated" &&
           event.turnItem.type === "error" &&
@@ -11775,6 +11791,31 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       }),
       {
         type: "emit_inbound",
+        label: "item/completed/wait",
+        frame: {
+          method: "item/completed",
+          params: {
+            item: {
+              type: "commandExecution",
+              id: "finished-offbox-wait",
+              command: "offbox wait run-finished",
+              cwd: "/workspace",
+              processId: null,
+              source: "unifiedExecStartup",
+              status: "completed",
+              commandActions: [{ type: "unknown", command: "offbox wait run-finished" }],
+              aggregatedOutput: "exit 0 /logs/finished-wait.log",
+              exitCode: 0,
+              durationMs: 1,
+            },
+            threadId: FAILED_NATIVE_THREAD,
+            turnId: FAILED_NATIVE_TURN,
+            completedAtMs: 1782622440400,
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
         label: "item/started/command",
         frame: {
           method: "item/started",
@@ -11788,7 +11829,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               source: "unifiedExecStartup",
               status: "inProgress",
               commandActions: [{ type: "unknown", command: FAILED_COMMAND }],
-              aggregatedOutput: null,
+              aggregatedOutput: "partial progress",
               exitCode: null,
               durationMs: null,
             },
@@ -11833,7 +11874,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             text: FAILED_PROMPT,
           }),
         );
-        yield* awaitUntil(() => harness.terminalEvents().length === 1, "failed terminal");
+        yield* harness.firstTerminal;
         assert.equal(harness.terminalEvents()[0]?.status, "failed");
 
         const terminalIndex = harness.events.findIndex((event) => event.type === "turn.terminal");
@@ -11845,6 +11886,28 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             event.turnItem.status === "failed",
         );
         assert.isAtLeast(failedCommandIndex, 0);
+        const cleanup = harness.events[failedCommandIndex]!;
+        assert.equal(cleanup.type, "turn_item.updated");
+        if (cleanup.type !== "turn_item.updated" || cleanup.turnItem.type !== "command_execution")
+          return;
+        assert.equal(cleanup.turnItem.output, "partial progress");
+        assert.isTrue(cleanup.turnItem.toolResultIncomplete);
+        const finished = harness.events.find(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "command_execution" &&
+            event.turnItem.status === "completed" &&
+            event.turnItem.input === "offbox wait run-finished",
+        );
+        assert.equal(finished?.type, "turn_item.updated");
+        if (
+          finished?.type !== "turn_item.updated" ||
+          finished.turnItem.type !== "command_execution"
+        )
+          return;
+        assert.isFalse(finished.turnItem.toolResultIncomplete);
+        assert.equal(finished.turnItem.output, "exit 0 /logs/finished-wait.log");
+        assert.equal(finished.turnItem.exitCode, 0);
         assert.isAbove(
           terminalIndex,
           failedCommandIndex,
@@ -12648,6 +12711,91 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       childTurnCompleted(RESUME_CHILD_TURN_2),
     ],
   });
+
+  it.effect.each([
+    { name: "reported child model", model: "gpt-6-astra" },
+    { name: "missing child model", model: null },
+  ])("attributes native child retries to $name", ({ model }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const rows: AnalyticsEvent[] = [];
+        const retryRecorded = yield* Deferred.make<void>();
+        const modelReported = yield* Deferred.make<void>();
+        const transcript = {
+          ...resumeSubagentTranscript,
+          entries: resumeSubagentTranscript.entries.flatMap((entry) =>
+            !("label" in entry) || entry.label !== `turn/started/${RESUME_CHILD_TURN_1}`
+              ? [entry]
+              : [
+                  entry,
+                  {
+                    type: "emit_inbound" as const,
+                    label: "child-retry",
+                    frame: {
+                      method: "error",
+                      params: {
+                        threadId: RESUME_CHILD_THREAD,
+                        turnId: RESUME_CHILD_TURN_1,
+                        willRetry: true,
+                        error: {
+                          message: "Reconnecting... 2/5",
+                          additionalDetails: "The response stream disconnected.",
+                          codexErrorInfo: {
+                            responseStreamDisconnected: { httpStatusCode: 529 },
+                          },
+                        },
+                      },
+                    },
+                  },
+                ],
+          ),
+        };
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          (event) =>
+            event.type === "subagent.updated" && event.subagent.model === model
+              ? Deferred.succeed(modelReported, undefined)
+              : Effect.void,
+          undefined,
+          (threadId) => Effect.succeed({ thread: { id: threadId }, model }),
+          undefined,
+          undefined,
+          undefined,
+          (method) => (method === "error" ? Deferred.await(modelReported) : Effect.void),
+        ).pipe(
+          Effect.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => rows.push(decodeRetryAnalytics(event))).pipe(
+                  Effect.andThen(Deferred.succeed(retryRecorded, undefined)),
+                ),
+            }),
+          ),
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("child-retry-model"),
+            text: RESUME_PROMPT,
+          }),
+        );
+        yield* Deferred.await(retryRecorded);
+        assert.lengthOf(rows, 1);
+        assert.equal(rows[0]!.kind, "provider.retry");
+        assert.notEqual(rows[0]!.threadId, harness.threadId);
+        assert.equal(rows[0]!.props?.model, model ?? "unknown");
+        assert.equal(rows[0]!.props?.attempt, 2);
+        assert.equal(rows[0]!.props?.maxRetries, 5);
+        assert.equal(rows[0]!.props?.errorMessage, "The response stream disconnected.");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
 
   it.effect.each([
     { name: "current Codex Sol", model: "gpt-6-sol" },

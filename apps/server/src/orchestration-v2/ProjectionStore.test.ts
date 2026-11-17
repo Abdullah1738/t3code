@@ -44,6 +44,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { liveColumns } from "../ardud/persistence/historyArchiveSql.ts";
+import { completedToolFilter } from "../ardud/orchestration/delegatedPartialResult.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
@@ -1820,6 +1821,7 @@ const openToolsSurviveRunSnapshot = (testCase: (typeof openToolSnapshotCases)[nu
       id: TurnItemId.make("snapshot:new-mcp"),
       type: "dynamic_tool" as const,
       toolName: "example.wait",
+      output: "partial progress from open MCP tool",
       startedAt: DateTime.add(run.requestedAt, { minutes: 1 }),
     };
     yield* updateRun(run);
@@ -1828,10 +1830,23 @@ const openToolsSurviveRunSnapshot = (testCase: (typeof openToolSnapshotCases)[nu
     const snapshot = yield* readRun();
     assert.lengthOf(Object.keys(snapshot.openTools ?? {}), 2);
     if (testCase.change === "complete-command" || testCase.change === "complete-all") {
-      yield* updateItem({ ...command, status: "completed", completedAt: run.requestedAt });
+      yield* updateItem({
+        ...command,
+        status: "completed",
+        completedAt: run.requestedAt,
+        toolResultIncomplete: false,
+        output: "exit 0 /logs/finished-wait.log",
+        exitCode: 0,
+      });
     }
     if (testCase.change === "complete-all") {
-      yield* updateItem({ ...mcp, status: "completed", completedAt: mcp.startedAt });
+      yield* updateItem({
+        ...mcp,
+        status: "completed",
+        completedAt: mcp.startedAt,
+        toolResultIncomplete: false,
+        output: "MCP wait finished",
+      });
     }
     if (testCase.change === "interrupt") {
       yield* updateItem({ ...command, type: "run_interrupt_request", message: "board stop" });
@@ -1852,6 +1867,31 @@ const openToolsSurviveRunSnapshot = (testCase: (typeof openToolSnapshotCases)[nu
     assert.deepEqual((yield* readRun()).openTools, expected);
     if (testCase.change === "complete-command") {
       assert.deepEqual(Object.keys(expected ?? {}), [encodeURIComponent(mcp.id)]);
+    }
+    if (testCase.change === "complete-command" || testCase.change === "complete-all") {
+      for (const [index, tool] of [command, mcp].entries()) {
+        yield* updateItem({
+          ...tool,
+          id: TurnItemId.make(`snapshot:cleanup:${index}`),
+          ordinal: command.ordinal + 2 + index,
+          status: index === 0 ? "completed" : "failed",
+          toolResultIncomplete: true,
+          output: "partial progress retained by cleanup",
+          completedAt: DateTime.add(mcp.startedAt, { minutes: 1 + index }),
+          updatedAt: DateTime.add(mcp.startedAt, { minutes: 1 + index }),
+        });
+      }
+      const records = yield* store.getThreadRecords(
+        threadId,
+        ["turnItems"],
+        completedToolFilter(run),
+      );
+      assert.lengthOf(records.turnItems, 1);
+      assert.equal(
+        records.turnItems[0]!.id,
+        testCase.change === "complete-all" ? mcp.id : command.id,
+      );
+      assert.equal((yield* readRun()).openTools?.[encodeURIComponent(command.id)], undefined);
     }
   });
 
@@ -9417,4 +9457,240 @@ it.effect("SQL client shell omits idle subagents but keeps live ones and their c
     }
     assert.deepEqual(paged, [...expected].toSorted());
   }).pipe(Effect.provide(layerTest)),
+);
+
+const toolResultCases = [
+  {
+    name: "command completed empty",
+    tool: { type: "command_execution", input: "command", status: "completed" },
+    selected: true,
+  },
+  {
+    name: "command failed output",
+    tool: {
+      type: "command_execution",
+      input: "command",
+      status: "failed",
+      output: "command failed",
+    },
+    selected: true,
+  },
+  {
+    name: "command explicit result",
+    tool: {
+      type: "command_execution",
+      input: "command",
+      status: "failed",
+      output: "failed",
+      toolResultIncomplete: false,
+    },
+    selected: true,
+  },
+  ...(["completed", "failed"] as const).map((status) => ({
+    name: `command explicit ${status} without output or exit code`,
+    tool: {
+      type: "command_execution" as const,
+      input: "command",
+      status,
+      toolResultIncomplete: false,
+    },
+    selected: true,
+  })),
+  {
+    name: "command failed empty output",
+    tool: { type: "command_execution", input: "command", status: "failed", output: "" },
+    selected: true,
+  },
+  {
+    name: "command failed exit code",
+    tool: { type: "command_execution", input: "command", status: "failed", exitCode: 1 },
+    selected: true,
+  },
+  {
+    name: "command cleanup failure",
+    tool: { type: "command_execution", input: "command", status: "failed" },
+    selected: false,
+  },
+  ...(["completed", "failed"] as const).flatMap((status) =>
+    ["", "partial progress"].map((output) => ({
+      name: `command cleanup ${status} with ${output ? "partial" : "empty"} output`,
+      tool: {
+        type: "command_execution" as const,
+        input: "unfinished",
+        status,
+        output,
+        toolResultIncomplete: true,
+      },
+      selected: false,
+    })),
+  ),
+  {
+    name: "MCP completed empty",
+    tool: { type: "dynamic_tool", toolName: "mcp__test", input: null, status: "completed" },
+    selected: true,
+  },
+  {
+    name: "MCP failed output",
+    tool: {
+      type: "dynamic_tool",
+      toolName: "mcp__test",
+      input: null,
+      status: "failed",
+      output: "tool failed",
+    },
+    selected: true,
+  },
+  {
+    name: "MCP failed null result",
+    tool: {
+      type: "dynamic_tool",
+      toolName: "mcp__test",
+      input: null,
+      status: "failed",
+      output: null,
+    },
+    selected: true,
+  },
+  {
+    name: "MCP explicit result",
+    tool: {
+      type: "dynamic_tool",
+      toolName: "mcp__test",
+      input: null,
+      status: "failed",
+      output: null,
+      toolResultIncomplete: false,
+    },
+    selected: true,
+  },
+  ...(["completed", "failed"] as const).map((status) => ({
+    name: `MCP explicit ${status} without output`,
+    tool: {
+      type: "dynamic_tool" as const,
+      toolName: "mcp__test",
+      input: null,
+      status,
+      toolResultIncomplete: false,
+    },
+    selected: true,
+  })),
+  {
+    name: "MCP cleanup failure",
+    tool: { type: "dynamic_tool", toolName: "mcp__test", input: null, status: "failed" },
+    selected: false,
+  },
+  ...["Action required", "Unsupported ACP update: timeline_update"].map((toolName) => ({
+    name: `synthetic ACP notice ${toolName}`,
+    tool: {
+      type: "dynamic_tool" as const,
+      toolName,
+      input: {},
+      status: "completed" as const,
+      toolResultIncomplete: true,
+    },
+    selected: false,
+  })),
+  ...(["completed", "failed"] as const).flatMap((status) =>
+    [null, "partial progress"].map((output) => ({
+      name: `MCP cleanup ${status} with ${output === null ? "null" : "partial"} output`,
+      tool: {
+        type: "dynamic_tool" as const,
+        toolName: "mcp__unfinished",
+        input: null,
+        status,
+        output,
+        toolResultIncomplete: true,
+      },
+      selected: false,
+    })),
+  ),
+] as const;
+const selectCompletedToolResult = Effect.fn("test.selectCompletedToolResult")(function* (
+  scenario: (typeof toolResultCases)[number],
+) {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const threadId = yield* addRolledBackRecoveryCandidate(`tool-result:${scenario.name}`);
+  const run = (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!;
+  const now = yield* DateTime.now;
+  const base = {
+    threadId,
+    runId: run.id,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    title: null,
+    startedAt: now,
+    completedAt: now,
+    updatedAt: now,
+  };
+  const earlier = TurnItemId.make("earlier-result");
+  const latest = TurnItemId.make("latest-result");
+  for (const payload of [
+    {
+      ...base,
+      id: earlier,
+      ordinal: 2,
+      type: "command_execution" as const,
+      input: "offbox wait",
+      status: "completed" as const,
+      output: "exit 0 /logs/finished-wait.log",
+      exitCode: 0,
+    },
+    {
+      ...base,
+      id: latest,
+      ordinal: 3,
+      completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 1),
+      ...scenario.tool,
+    },
+  ]) {
+    yield* store.apply({
+      id: EventId.make(`event:${payload.id}`),
+      type: "turn-item.updated",
+      threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload,
+    });
+  }
+  const selected = yield* store.getThreadRecords(threadId, ["turnItems"], completedToolFilter(run));
+  assert.lengthOf(selected.turnItems, 1);
+  assert.equal(selected.turnItems[0]!.id, scenario.selected ? latest : earlier);
+  if ("toolResultIncomplete" in scenario.tool && scenario.tool.toolResultIncomplete) {
+    for (const [index, output] of [undefined, "", "late actual tool result"].entries()) {
+      yield* store.apply({
+        id: EventId.make(`late-actual-result:${index}`),
+        type: "turn-item.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: {
+          ...base,
+          ...scenario.tool,
+          id: latest,
+          ordinal: 3,
+          toolResultIncomplete: false,
+          status: "failed",
+          output,
+          completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 2 + index),
+        },
+      });
+      const late = yield* store.getThreadRecords(threadId, ["turnItems"], completedToolFilter(run));
+      const item = late.turnItems[0]!;
+      assert.equal(item.id, latest);
+      assert.equal(
+        item.type === "command_execution" || item.type === "dynamic_tool" ? item.output : undefined,
+        output,
+      );
+    }
+  }
+});
+
+it.effect.each(toolResultCases)("SQL last tool result: $name", (scenario) =>
+  selectCompletedToolResult(scenario).pipe(Effect.provide(layerTest)),
+);
+it.effect.each(toolResultCases)("memory last tool result: $name", (scenario) =>
+  selectCompletedToolResult(scenario).pipe(Effect.provide(ProjectionStore.layerMemory)),
 );
