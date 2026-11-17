@@ -27,6 +27,7 @@ import common  # noqa: E402
 import mailparse  # noqa: E402
 import search  # noqa: E402
 import store  # noqa: E402
+from search_timing import SearchTiming  # noqa: E402
 import timing  # noqa: E402
 
 MAIL_EVERY = 180
@@ -95,32 +96,45 @@ def _search_query(args):
 
 
 def cmd_search(args):
-    db = store.connect(readonly=True)
-    q = _search_query(args)
-    t = time.time()
+    metrics = SearchTiming()
+    db = None
+    outcome = "error"
     try:
-        rows = search.run(db, q, limit=args.n, sort="date" if args.date else "rank",
-                          include_junk=args.junk, dedupe=not args.all_copies)
-    except search.QueryError as e:
-        sys.exit(f"msgs: {e}")
-    counts = search.chat_counts(db, rows)
-    if args.json:
-        for r in rows:
-            d = row_json(r)
-            if r["source"] == "whatsapp" and r["conv"] in counts:
-                d["chat_messages"] = counts[r["conv"]]
-                d["stub"] = counts[r["conv"]] <= search.STUB_MAX
-            print(json.dumps(d, ensure_ascii=False))
-    else:
-        for r in rows:
-            print_hit(r)
-        for conv, n in counts.items():
-            if n > search.STUB_MAX:
-                continue
-            name = next((r["conv_name"] for r in rows if r["conv"] == conv and r["conv_name"]), None) or conv
-            print(f'note: WhatsApp chat "{name}" has only {n} message(s) on this Mac; the rest is on the phone. '
-                  f"Fetch older history: wa read {conv} --more 2", file=sys.stderr)
-        print(f"-- {len(rows)} hit(s) in {time.time() - t:.2f}s", file=sys.stderr)
+        with metrics.stage("connect"):
+            db = store.connect(readonly=True)
+        q = _search_query(args)
+        t = time.time()
+        try:
+            rows = search.run(db, q, limit=args.n, sort="date" if args.date else "rank",
+                              include_junk=args.junk, dedupe=not args.all_copies, metrics=metrics)
+        except search.QueryError as e:
+            sys.exit(f"msgs: {e}")
+        with metrics.stage("chat_counts"):
+            counts = search.chat_counts(db, rows)
+        with metrics.stage("format"):
+            if args.json:
+                for r in rows:
+                    d = row_json(r)
+                    if r["source"] == "whatsapp" and r["conv"] in counts:
+                        d["chat_messages"] = counts[r["conv"]]
+                        d["stub"] = counts[r["conv"]] <= search.STUB_MAX
+                    print(json.dumps(d, ensure_ascii=False))
+            else:
+                for r in rows:
+                    print_hit(r)
+                for conv, n in counts.items():
+                    if n > search.STUB_MAX:
+                        continue
+                    name = next((r["conv_name"] for r in rows if r["conv"] == conv and r["conv_name"]), None) or conv
+                    print(f'note: WhatsApp chat "{name}" has only {n} message(s) on this Mac; the rest is on the phone. '
+                          f"Fetch older history: wa read {conv} --more 2", file=sys.stderr)
+                print(f"-- {len(rows)} hit(s) in {time.time() - t:.2f}s", file=sys.stderr)
+        outcome = "ok"
+    finally:
+        if db is not None:
+            with metrics.stage("close"):
+                db.close()
+        metrics.emit(outcome)
 
 
 def _get(db, ident):

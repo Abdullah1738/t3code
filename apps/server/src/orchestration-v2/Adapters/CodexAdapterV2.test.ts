@@ -14,6 +14,7 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
+  AnalyticsEvent,
   CheckpointId,
   CodexSettings,
   EnvironmentId,
@@ -62,6 +63,7 @@ import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { TestClock } from "effect/testing";
 import * as Tracer from "effect/Tracer";
@@ -74,15 +76,19 @@ import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEve
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectWorker from "../EffectWorker.ts";
 import * as Orchestrator from "../Orchestrator.ts";
+import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
+import * as ProviderSessionManager from "../ProviderSessionManager.ts";
 import * as ProviderReplayHarness from "../testkit/ProviderReplayHarness.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
+import * as Analytics from "../../ardud/analytics/Analytics.ts";
 import * as Sink from "effect/Sink";
 import { mapCodexModelCapabilities } from "../../provider/CodexProvider.ts";
 import { makeReplayServerConfig, withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
 import * as CodexAdapterV2Testkit from "./CodexAdapterV2.testkit.ts";
 
+const decodeRetryAnalytics = Schema.decodeUnknownSync(AnalyticsEvent);
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const replayTranscriptJson = Schema.fromJsonString(CodexReplay.CodexAppServerReplayTranscript);
 const encodeReplayTranscriptJson = Schema.encodeEffect(replayTranscriptJson);
@@ -2118,6 +2124,20 @@ describe("CodexAdapterV2 session initialize", () => {
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
 
+  it.effect("marks native background work as ending with the app-server", () =>
+    Effect.gen(function* () {
+      const session = yield* openReplaySession(
+        makeCodexReplayTranscript({ scenario: "process-owned-work", entries: [] }),
+      );
+      assert.isTrue(session.runtime.backgroundTasksEndWithProcess);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   it.effect.each([
     "success",
     "invalid",
@@ -3486,45 +3506,85 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     ),
   );
 
-  it.effect("unsubscribes from the native thread when it is unloaded", () =>
-    Effect.gen(function* () {
-      const nativeThreadId = "unload-thread";
-      const preamble = codexReplayPreamble({
-        nativeThreadId,
-        nativeTurnId: "unused",
-        prompt: "unused",
+  it.effect.each(["unsubscribed", "notSubscribed", "notLoaded"] as const)(
+    "logs unsubscribe status %s separately from native closure",
+    (status) => {
+      const logs: Array<unknown> = [];
+      const logger = Logger.make(({ message }) => {
+        logs.push(message);
       });
-      const transcript = makeCodexReplayTranscript({
-        scenario: "unload-thread",
-        entries: [
-          ...preamble.slice(0, 5),
-          {
-            type: "expect_outbound",
-            label: "thread/unsubscribe",
-            frame: { id: 3, method: "thread/unsubscribe", params: { threadId: nativeThreadId } },
-          },
-          {
-            type: "emit_inbound",
-            label: "thread/unsubscribe",
-            frame: { id: 3, result: { status: "unsubscribed" } },
-          },
-        ],
-      });
-      const requests: Array<string> = [];
-      const harness = yield* makeCodexReplayHarness(
-        transcript,
-        () => Effect.void,
-        (method) => Effect.sync(() => requests.push(method)),
+      return Effect.gen(function* () {
+        const nativeThreadId = "unload-thread";
+        const preamble = codexReplayPreamble({
+          nativeThreadId,
+          nativeTurnId: "unused",
+          prompt: "unused",
+        });
+        const transcript = makeCodexReplayTranscript({
+          scenario: "unload-thread",
+          entries: [
+            ...preamble.slice(0, 5),
+            {
+              type: "expect_outbound",
+              label: "thread/unsubscribe",
+              frame: { id: 3, method: "thread/unsubscribe", params: { threadId: nativeThreadId } },
+            },
+            {
+              type: "emit_inbound",
+              label: "thread/unsubscribe",
+              frame: { id: 3, result: { status } },
+            },
+            {
+              type: "expect_outbound",
+              frame: { id: 4, method: "thread/unsubscribe", params: { threadId: nativeThreadId } },
+            },
+            {
+              type: "emit_inbound",
+              frame: { method: "thread/closed", params: { threadId: nativeThreadId } },
+            },
+            { type: "emit_inbound", frame: { id: 4, result: { status: "notLoaded" } } },
+          ],
+        });
+        const requests: Array<string> = [];
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          () => Effect.void,
+          (method) => Effect.sync(() => requests.push(method)),
+        );
+        assert.isDefined(harness.runtime.unloadThread);
+        yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
+        assert.deepEqual(requests, ["initialize", "thread/start", "thread/unsubscribe"]);
+        const lifecycleLogs = () =>
+          logs
+            .filter(Array.isArray)
+            .filter(
+              (message) =>
+                message[0] === "codex.thread-unsubscribe" || message[0] === "codex.thread-closed",
+            );
+        assert.lengthOf(lifecycleLogs(), 1);
+        assert.include(lifecycleLogs()[0]![1], {
+          nativeThreadId,
+          threadId: harness.threadId,
+          status,
+        });
+        yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
+        assert.deepEqual(
+          lifecycleLogs().map((message) => message[0]),
+          ["codex.thread-unsubscribe", "codex.thread-closed", "codex.thread-unsubscribe"],
+        );
+        assert.include(lifecycleLogs()[1]![1], { nativeThreadId });
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            Logger.layer([logger], { mergeWithExisting: false }),
+          ),
+        ),
       );
-      assert.isDefined(harness.runtime.unloadThread);
-      yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
-      assert.deepEqual(requests, ["initialize", "thread/start", "thread/unsubscribe"]);
-    }).pipe(
-      Effect.scoped,
-      Effect.provide(
-        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
-      ),
-    ),
+    },
   );
 
   it.effect("lists every loaded native thread across pages and deduplicates ids", () =>
@@ -4853,7 +4913,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         }
         yield* harness.awaitInputEnd;
         yield* Deferred.succeed(processExited, undefined);
-        yield* Effect.yieldNow;
+        yield* harness.firstTerminal;
         assert.lengthOf(harness.terminalEvents(), 1, "Process EOF left the native turn active");
       }).pipe(
         Effect.scoped,
@@ -4921,7 +4981,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* Fiber.interrupt(recoveryWait);
       yield* harness.awaitInputEnd;
       yield* Deferred.succeed(processExited, undefined);
-      yield* Effect.yieldNow;
+      yield* harness.firstTerminal;
       assert.lengthOf(
         harness.terminalEvents(),
         1,
@@ -6593,6 +6653,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
   it.effect("resolves retryable app-server errors on resumed provider activity", () =>
     Effect.scoped(
       Effect.gen(function* () {
+        const rows: AnalyticsEvent[] = [];
         const scenario = "codex-provider-api-retry";
         const nativeThreadId = `native-${scenario}-thread`;
         const nativeTurnId = `native-${scenario}-turn`;
@@ -6686,7 +6747,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             },
           ],
         });
-        const harness = yield* makeCodexReplayHarness(transcript);
+        const harness = yield* makeCodexReplayHarness(transcript).pipe(
+          Effect.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => {
+                  rows.push(decodeRetryAnalytics(event));
+                }),
+            }),
+          ),
+        );
         const now = yield* DateTime.now;
         yield* harness.runtime.startTurn(
           makeCodexTestTurnInput({
@@ -6699,6 +6769,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         );
         yield* awaitUntil(() => harness.terminalEvents().length === 1, "Codex retry recovery");
 
+        assert.lengthOf(rows, 1);
+        assert.equal(rows[0]!.threadId, harness.threadId);
+        assert.equal(rows[0]!.props?.model, CODEX_TEST_MODEL_SELECTION.model);
         const retryItems = harness.events.flatMap((event) =>
           event.type === "turn_item.updated" &&
           event.turnItem.type === "error" &&
@@ -8408,6 +8481,111 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),
       ),
+  );
+
+  it.effect.each([
+    ["cell", "thread"],
+    ["session", "thread"],
+    ["empty", "thread"],
+    ["cell", "scope"],
+    ["session", "scope"],
+    ["empty", "scope"],
+  ] as const)("retains Codex unread state until the idle cap (%j)", ([kind, unload]) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const retainedOutput =
+          kind === "cell"
+            ? "Script running with cell ID g2142:27\nOutput:\n"
+            : JSON.stringify({ chunk_id: "chunk", session_id: 90878, output: "" });
+        const transcript = makeCodexReplayTranscript({
+          scenario: `codex-retained-${kind}`,
+          entries: [
+            ...codexReplayPreamble({
+              nativeThreadId: BG_NATIVE_THREAD,
+              nativeTurnId: BG_NATIVE_TURN,
+              prompt: BG_PROMPT,
+            }),
+            ...(kind === "empty"
+              ? []
+              : [
+                  {
+                    type: "emit_inbound" as const,
+                    label: "raw yielded output",
+                    frame: {
+                      method: "rawResponseItem/completed",
+                      params: {
+                        threadId: BG_NATIVE_THREAD,
+                        turnId: BG_NATIVE_TURN,
+                        item: {
+                          type: "custom_tool_call_output",
+                          call_id: "outer-exec",
+                          output: retainedOutput,
+                        },
+                      },
+                    },
+                  },
+                ]),
+            backgroundExecTranscript.entries.at(-2)!,
+            {
+              type: "expect_outbound",
+              label: "unsubscribe",
+              frame: {
+                id: 4,
+                method: "thread/unsubscribe",
+                params: { threadId: BG_NATIVE_THREAD },
+              },
+            },
+            {
+              type: "emit_inbound",
+              label: "closed",
+              frame: { method: "thread/closed", params: { threadId: BG_NATIVE_THREAD } },
+            },
+            {
+              type: "emit_inbound",
+              label: "unsubscribed",
+              frame: { id: 4, result: { status: "notSubscribed" } },
+            },
+          ],
+        });
+        const sessionScope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+          Scope.close(scope, Exit.void),
+        );
+        const harness = yield* makeCodexReplayHarness(transcript).pipe(
+          Effect.provideService(Scope.Scope, sessionScope),
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("retained-state"),
+            text: BG_PROMPT,
+          }),
+        );
+        yield* harness.firstTerminal;
+        assert.equal(
+          yield* harness.runtime.holdsWorkForThread!(harness.providerThread),
+          kind !== "empty",
+        );
+        yield* TestClock.adjust("31 minutes");
+        assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+        if (unload === "thread")
+          yield* harness.runtime.unloadThread!({ providerThread: harness.providerThread });
+        yield* Scope.close(sessionScope, Exit.void);
+        assert.lengthOf(harness.continuationRequests, kind === "empty" ? 0 : 1);
+        if (kind !== "empty") {
+          const detail = harness.continuationRequests[0]!.detail;
+          assert.include(detail, kind === "cell" ? "g2142:27" : "90878");
+          assert.include(detail, "may or may not have run");
+          assert.equal(harness.continuationRequests[0]!.delivery, "message_text");
+          assert.equal(harness.continuationRequests[0]!.threadId, harness.threadId);
+        }
+      }),
+    ).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
   );
 
   const backgroundStopCases = [true, false, "still_running", "thread_unloaded"] as const;
@@ -11629,6 +11807,31 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       }),
       {
         type: "emit_inbound",
+        label: "item/completed/wait",
+        frame: {
+          method: "item/completed",
+          params: {
+            item: {
+              type: "commandExecution",
+              id: "finished-offbox-wait",
+              command: "offbox wait run-finished",
+              cwd: "/workspace",
+              processId: null,
+              source: "unifiedExecStartup",
+              status: "completed",
+              commandActions: [{ type: "unknown", command: "offbox wait run-finished" }],
+              aggregatedOutput: "exit 0 /logs/finished-wait.log",
+              exitCode: 0,
+              durationMs: 1,
+            },
+            threadId: FAILED_NATIVE_THREAD,
+            turnId: FAILED_NATIVE_TURN,
+            completedAtMs: 1782622440400,
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
         label: "item/started/command",
         frame: {
           method: "item/started",
@@ -11642,7 +11845,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               source: "unifiedExecStartup",
               status: "inProgress",
               commandActions: [{ type: "unknown", command: FAILED_COMMAND }],
-              aggregatedOutput: null,
+              aggregatedOutput: "partial progress",
               exitCode: null,
               durationMs: null,
             },
@@ -11687,7 +11890,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             text: FAILED_PROMPT,
           }),
         );
-        yield* awaitUntil(() => harness.terminalEvents().length === 1, "failed terminal");
+        yield* harness.firstTerminal;
         assert.equal(harness.terminalEvents()[0]?.status, "failed");
 
         const terminalIndex = harness.events.findIndex((event) => event.type === "turn.terminal");
@@ -11699,6 +11902,28 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             event.turnItem.status === "failed",
         );
         assert.isAtLeast(failedCommandIndex, 0);
+        const cleanup = harness.events[failedCommandIndex]!;
+        assert.equal(cleanup.type, "turn_item.updated");
+        if (cleanup.type !== "turn_item.updated" || cleanup.turnItem.type !== "command_execution")
+          return;
+        assert.equal(cleanup.turnItem.output, "partial progress");
+        assert.isTrue(cleanup.turnItem.toolResultIncomplete);
+        const finished = harness.events.find(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "command_execution" &&
+            event.turnItem.status === "completed" &&
+            event.turnItem.input === "offbox wait run-finished",
+        );
+        assert.equal(finished?.type, "turn_item.updated");
+        if (
+          finished?.type !== "turn_item.updated" ||
+          finished.turnItem.type !== "command_execution"
+        )
+          return;
+        assert.isFalse(finished.turnItem.toolResultIncomplete);
+        assert.equal(finished.turnItem.output, "exit 0 /logs/finished-wait.log");
+        assert.equal(finished.turnItem.exitCode, 0);
         assert.isAbove(
           terminalIndex,
           failedCommandIndex,
@@ -12502,6 +12727,333 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       childTurnCompleted(RESUME_CHILD_TURN_2),
     ],
   });
+
+  it.effect.each(["thread", "binding", "parent node", "parent task", "child root"] as const)(
+    "recovers a native child released after publishing its %s",
+    (boundary) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          // Native replay timestamps must precede the release's virtual clock.
+          yield* TestClock.setTime(1782622445000);
+          const fs = yield* FileSystem.FileSystem;
+          const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-native-init-" });
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          for (const args of [
+            ["init", "--quiet"],
+            [
+              "-c",
+              "user.name=Test",
+              "-c",
+              "user.email=test@example.com",
+              "commit",
+              "--allow-empty",
+              "--quiet",
+              "-m",
+              "Initial commit",
+            ],
+          ]) {
+            assert.equal(
+              Number(yield* spawner.exitCode(ChildProcess.make("git", args, { cwd }))),
+              0,
+            );
+          }
+          const transcript = makeCodexReplayTranscript({
+            scenario: `native-init-${boundary.replaceAll(" ", "-")}`,
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId: RESUME_NATIVE_THREAD,
+                nativeTurnId: RESUME_NATIVE_TURN,
+                prompt: RESUME_PROMPT,
+              }),
+              {
+                type: "emit_inbound",
+                label: "spawn native child",
+                frame: {
+                  method: "item/completed",
+                  params: {
+                    threadId: RESUME_NATIVE_THREAD,
+                    turnId: RESUME_NATIVE_TURN,
+                    item: {
+                      type: "subAgentActivity",
+                      id: "native-init-spawn",
+                      kind: "started",
+                      agentThreadId: RESUME_CHILD_THREAD,
+                      agentPath: "/root/init_agent",
+                    },
+                  },
+                },
+              },
+            ],
+          });
+          const localTranscript = yield* decodeReplayTranscriptJson(
+            (yield* encodeReplayTranscriptJson(transcript)).replaceAll(
+              yield* encodeStringJson("/workspace"),
+              yield* encodeStringJson(cwd),
+            ),
+          );
+          const childId = (yield* IdAllocator.IdAllocatorV2).derive.threadFromProviderThread({
+            driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+            nativeThreadId: RESUME_CHILD_THREAD,
+          });
+          const parentId = ThreadId.make("native-init-parent");
+          const atBoundary = (event: ProviderAdapter.ProviderAdapterV2Event) => {
+            switch (boundary) {
+              case "thread":
+                return event.type === "app_thread.created" && event.appThread.id === childId;
+              case "binding":
+                return (
+                  event.type === "provider_thread.updated" &&
+                  event.providerThread.appThreadId === childId
+                );
+              case "parent node":
+                return (
+                  event.type === "node.updated" &&
+                  event.node.kind === "subagent" &&
+                  event.node.threadId === parentId
+                );
+              case "parent task":
+                return (
+                  event.type === "subagent.updated" && event.subagent.childThreadId === childId
+                );
+              case "child root":
+                return (
+                  event.type === "node.updated" &&
+                  event.node.kind === "root_turn" &&
+                  event.node.threadId === childId
+                );
+            }
+          };
+          const registry = Layer.effect(
+            ProviderAdapterRegistry.ProviderAdapterRegistryV2,
+            Effect.gen(function* () {
+              const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
+              return {
+                ...registry,
+                get: (id: ProviderInstanceId) =>
+                  registry.get(id).pipe(
+                    Effect.map((adapter) => ({
+                      ...adapter,
+                      openSession: (input: Parameters<typeof adapter.openSession>[0]) =>
+                        adapter.openSession(input).pipe(
+                          Effect.map((runtime) => ({
+                            ...runtime,
+                            events: runtime.events.pipe(
+                              Stream.rechunk(1),
+                              Stream.takeUntil(atBoundary),
+                              Stream.concat(Stream.never),
+                            ),
+                          })),
+                        ),
+                    })),
+                  ),
+              };
+            }),
+          ).pipe(Layer.provide(CodexAdapterV2Testkit.layer({ transcript: localTranscript })));
+          yield* Effect.gen(function* () {
+            const engine = yield* Orchestrator.OrchestratorV2;
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+            yield* engine.dispatch({
+              type: "thread.create",
+              commandId: CommandId.make("native-init-create"),
+              threadId: parentId,
+              projectId: ProjectId.make("native-init-project"),
+              title: "Native initialization",
+              modelSelection: CODEX_TEST_MODEL_SELECTION,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: cwd,
+              createdBy: "user",
+              creationSource: "web",
+            });
+            const persisted = yield* engine.streamDomainEvents.pipe(
+              Stream.filter((event) => {
+                switch (boundary) {
+                  case "thread":
+                    return event.type === "thread.created" && event.threadId === childId;
+                  case "binding":
+                    return (
+                      event.type === "provider-thread.updated" &&
+                      event.payload.appThreadId === childId
+                    );
+                  case "parent node":
+                    return (
+                      event.type === "node.updated" &&
+                      event.payload.kind === "subagent" &&
+                      event.threadId === parentId
+                    );
+                  case "parent task":
+                    return (
+                      event.type === "subagent.updated" && event.payload.childThreadId === childId
+                    );
+                  case "child root":
+                    return (
+                      event.type === "node.updated" &&
+                      event.payload.kind === "root_turn" &&
+                      event.threadId === childId
+                    );
+                }
+              }),
+              Stream.runHead,
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* engine.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make("native-init-start"),
+              threadId: parentId,
+              messageId: MessageId.make("native-init-message"),
+              text: RESUME_PROMPT,
+              attachments: [],
+              createdBy: "user",
+              creationSource: "web",
+              dispatchMode: { type: "start_immediately" },
+            });
+            yield* worker.drain();
+            yield* Fiber.join(persisted);
+            const parent = yield* engine.getThreadProjection(parentId);
+            const child = yield* engine.getThreadProjection(childId);
+            const now = yield* DateTime.now;
+            assert.isFalse(
+              parent.providerTurns.some(
+                (turn) => turn.startedAt !== null && DateTime.isGreaterThan(turn.startedAt, now),
+              ),
+            );
+            const providerSessionId = parent.providerThreads.find(
+              (binding) => binding.id === parent.runs[0]?.providerThreadId,
+            )?.providerSessionId;
+            if (providerSessionId == null)
+              return yield* Effect.die("The started run must own a provider session.");
+            assert.equal((yield* sessions.get(providerSessionId))._tag, "Some");
+            if (boundary === "child root") {
+              assert.lengthOf(child.providerThreads, 1);
+              assert.isTrue(parent.subagents.some((task) => task.childThreadId === childId));
+              assert.equal(child.nodes[0]?.status, "running");
+              assert.lengthOf(child.providerTurns, 0);
+            }
+            yield* sessions.release({
+              providerSessionId,
+              reason: "runtime_error",
+            });
+            assert.equal((yield* sessions.get(providerSessionId))._tag, "None");
+            yield* worker.drain();
+            const after = yield* engine.getThreadProjection(childId);
+            assert.isFalse(
+              after.nodes.some((node) => ["pending", "running", "waiting"].includes(node.status)),
+            );
+            assert.lengthOf(after.providerTurns, 0);
+            const owner = yield* engine.getThreadProjection(parentId);
+            assert.isFalse(
+              owner.subagents.some(
+                (task) =>
+                  task.childThreadId === childId &&
+                  ["pending", "running", "waiting"].includes(task.status),
+              ),
+            );
+            assert.isFalse(
+              owner.nodes.some(
+                (node) =>
+                  node.kind === "subagent" &&
+                  ["pending", "running", "waiting"].includes(node.status),
+              ),
+            );
+          }).pipe(
+            Effect.provide(
+              ProviderReplayHarness.layerWithRegistry(
+                { name: `native-init-${boundary}`, runtimePolicyOverride: { cwd } },
+                registry,
+                { runEffectWorker: false },
+              ),
+            ),
+          );
+        }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, IdAllocator.layer))),
+      ),
+  );
+
+  it.effect.each([
+    { name: "reported child model", model: "gpt-6-astra" },
+    { name: "missing child model", model: null },
+  ])("attributes native child retries to $name", ({ model }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const rows: AnalyticsEvent[] = [];
+        const retryRecorded = yield* Deferred.make<void>();
+        const modelReported = yield* Deferred.make<void>();
+        const transcript = {
+          ...resumeSubagentTranscript,
+          entries: resumeSubagentTranscript.entries.flatMap((entry) =>
+            !("label" in entry) || entry.label !== `turn/started/${RESUME_CHILD_TURN_1}`
+              ? [entry]
+              : [
+                  entry,
+                  {
+                    type: "emit_inbound" as const,
+                    label: "child-retry",
+                    frame: {
+                      method: "error",
+                      params: {
+                        threadId: RESUME_CHILD_THREAD,
+                        turnId: RESUME_CHILD_TURN_1,
+                        willRetry: true,
+                        error: {
+                          message: "Reconnecting... 2/5",
+                          additionalDetails: "The response stream disconnected.",
+                          codexErrorInfo: {
+                            responseStreamDisconnected: { httpStatusCode: 529 },
+                          },
+                        },
+                      },
+                    },
+                  },
+                ],
+          ),
+        };
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          (event) =>
+            event.type === "subagent.updated" && event.subagent.model === model
+              ? Deferred.succeed(modelReported, undefined)
+              : Effect.void,
+          undefined,
+          (threadId) => Effect.succeed({ thread: { id: threadId }, model }),
+          undefined,
+          undefined,
+          undefined,
+          (method) => (method === "error" ? Deferred.await(modelReported) : Effect.void),
+        ).pipe(
+          Effect.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (event) =>
+                Effect.sync(() => rows.push(decodeRetryAnalytics(event))).pipe(
+                  Effect.andThen(Deferred.succeed(retryRecorded, undefined)),
+                ),
+            }),
+          ),
+        );
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("child-retry-model"),
+            text: RESUME_PROMPT,
+          }),
+        );
+        yield* Deferred.await(retryRecorded);
+        assert.lengthOf(rows, 1);
+        assert.equal(rows[0]!.kind, "provider.retry");
+        assert.notEqual(rows[0]!.threadId, harness.threadId);
+        assert.equal(rows[0]!.props?.model, model ?? "unknown");
+        assert.equal(rows[0]!.props?.attempt, 2);
+        assert.equal(rows[0]!.props?.maxRetries, 5);
+        assert.equal(rows[0]!.props?.errorMessage, "The response stream disconnected.");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
 
   it.effect.each([
     { name: "current Codex Sol", model: "gpt-6-sol" },

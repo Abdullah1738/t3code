@@ -12,7 +12,7 @@ const Timestamp = Schema.String.check(
   }),
 );
 
-// Metadata only. Deliberately no arbitrary property bag or free-form text fields.
+// Metadata only, apart from the bounded provider diagnostic below.
 const Label = Schema.String.check(
   Schema.isMaxLength(160),
   Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+-]*$/),
@@ -77,6 +77,22 @@ const McpPhase = Schema.Literals([
   "query",
   "render",
 ]);
+// Pool identities include custom model slugs and provider suffixes such as [1m].
+const PoolKey = Schema.String.check(
+  Schema.isMaxLength(4608),
+  Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+!~'()*[\],=-]*$/),
+);
+const PoolChangeFields = {
+  poolKey: PoolKey,
+  fromPoolKey: Schema.optionalKey(PoolKey),
+  fromSlots: Schema.NullOr(Measurement),
+  toSlots: Schema.NullOr(Measurement),
+  op: Schema.Literals(["set", "add", "remove", "replace", "auto_zero"]),
+  actorKind: Schema.Literals(["evaluator", "owner", "script", "system"]),
+  actorId: Schema.NullOr(DerivedId),
+};
+export const KanbanPoolChange = Schema.Struct({ at: Timestamp, ...PoolChangeFields });
+export type KanbanPoolChange = typeof KanbanPoolChange.Type;
 export const EvaluatorTrigger = Schema.Literals([
   "owner_answer",
   "card_ask",
@@ -211,6 +227,11 @@ const GeneralEvent = Schema.Struct({
   startedAt: Schema.optionalKey(Timestamp),
   committed: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
   taskId: Schema.optionalKey(DerivedId),
+  ticket: Schema.optionalKey(DerivedId),
+  mode: Schema.optionalKey(Schema.Literals(["native", "cua-driver"])),
+  from: Schema.optionalKey(Label),
+  to: Schema.optionalKey(Label),
+  age_ms: Schema.optionalKey(Measurement),
   parentThreadId: Schema.optionalKey(DerivedId),
   parentRunId: Schema.optionalKey(DerivedId),
   noticeMessageId: Schema.optionalKey(DerivedId),
@@ -358,6 +379,12 @@ const GeneralEvent = Schema.Struct({
       lastProgressKind: Schema.optionalKey(Label),
       lastProgressTool: Schema.optionalKey(Label),
       silentSeconds: Schema.optionalKey(Measurement),
+      attempt: Schema.optionalKey(Schema.NullOr(Measurement)),
+      maxRetries: Schema.optionalKey(Schema.NullOr(Measurement)),
+      // Provider diagnostics are required to explain retries; never include tool or prompt bodies.
+      errorMessage: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2000))),
+      waitSinceResponseMs: Schema.optionalKey(Measurement),
+      guardFiredDuringRetry: Schema.optionalKey(Schema.Boolean),
       reasonClass: Schema.optionalKey(Label),
       errorClass: Schema.optionalKey(Label),
       cancelReason: Schema.optionalKey(OrchestrationV2CancelReason),
@@ -469,7 +496,13 @@ const GeneralEvent = Schema.Struct({
       ),
       waitMs: Schema.optionalKey(Measurement),
       originKind: Schema.optionalKey(Label),
-      poolKey: Schema.optionalKey(Label),
+      poolKey: Schema.optionalKey(PoolKey),
+      fromPoolKey: Schema.optionalKey(PoolKey),
+      fromSlots: Schema.optionalKey(PoolChangeFields.fromSlots),
+      toSlots: Schema.optionalKey(PoolChangeFields.toSlots),
+      op: Schema.optionalKey(PoolChangeFields.op),
+      actorKind: Schema.optionalKey(PoolChangeFields.actorKind),
+      actorId: Schema.optionalKey(PoolChangeFields.actorId),
       key: Schema.optionalKey(Label),
       reason: Schema.optionalKey(Label),
       itemKind: Schema.optionalKey(Label),
@@ -902,10 +935,11 @@ export const AnalyticsRollup = Schema.Struct({
       ),
       openAsksAsOf: Schema.NullOr(Timestamp),
       incompleteAskSnapshots: Measurement,
+      poolChanges: Schema.optionalKey(Schema.Array(KanbanPoolChange)),
       poolUtilisation: Schema.Array(
         Schema.Struct({
           hour: Label,
-          poolKey: Label,
+          poolKey: PoolKey,
           samples: Measurement,
           used: Measurement,
           slots: Measurement,

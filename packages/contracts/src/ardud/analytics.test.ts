@@ -301,6 +301,28 @@ it("decodes runtime samples with exact model ids and bounded hourly rollups", ()
     },
   };
   expect(decodeEvent(row)).toEqual(row);
+  const retry = {
+    ts: event.ts,
+    kind: "provider.retry",
+    surface: "server",
+    route: "provider",
+    threadId: "thread:watcher",
+    props: {
+      runId: "run:watcher",
+      provider: "claudeAgent",
+      model: "claude-sonnet-5-5",
+      attempt: 2,
+      maxRetries: 10,
+      errorMessage: "Request timed out.",
+      waitSinceResponseMs: 300000,
+    },
+  };
+  const guard = {
+    ...retry,
+    kind: "provider.guard_interrupt",
+    props: { ...retry.props, guardFiredDuringRetry: true },
+  };
+  for (const sample of [row, retry, guard]) expect(decodeEvent(sample)).toEqual(sample);
   expect(() => decode({ events: [row] })).toThrow();
   expect(() => decodeEvent({ ...row, props: { ...row.props, sampleMs: -1 } })).toThrow();
   const hour = {

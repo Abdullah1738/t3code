@@ -3476,7 +3476,102 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         hasPendingBackgroundWork,
       };
     });
+  const decodeRetryAnalytics = Schema.decodeUnknownSync(AnalyticsEvent, {
+    onExcessProperty: "error",
+  });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect("records every API retry and the fenced no-response guard fire", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const rows: AnalyticsEvent[] = [];
+        const analytics = Layer.mock(Analytics.Analytics)({
+          record: (event) =>
+            Effect.sync(() => {
+              rows.push(decodeRetryAnalytics(event));
+            }),
+        });
+        const h = yield* makeWakeHarnessWithOptions({
+          close: (queue) => Queue.shutdown(queue),
+        }).pipe(Effect.provide(analytics));
+        const input = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("retry-analytics-attempt"),
+          text: "Wait for the build.",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(input);
+        for (const attempt of [1, 2]) {
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "api_retry",
+              attempt,
+              max_retries: 10,
+              retry_delay_ms: 1000,
+              error_status: 502,
+              error: "server_error",
+              uuid: `00000000-0000-4000-8000-00000000060${attempt}`,
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* Queue.take(h.retryReceipts);
+          yield* TestClock.adjust("1 minute");
+        }
+        yield* TestClock.adjust("3 minutes");
+        assert.isTrue(
+          yield* h.runtime.checkRetryHealth!({
+            runId: input.runId,
+            attemptId: input.attemptId,
+            noResponseBudgetMs: 300000,
+            flapLimit: 20,
+          }),
+        );
+        const events = rows.filter(
+          (event) => event.kind === "provider.retry" || event.kind === "provider.guard_interrupt",
+        );
+        assert.deepEqual(
+          events.map((event) => event.kind),
+          ["provider.retry", "provider.retry", "provider.guard_interrupt"],
+        );
+        assert.deepEqual(
+          events.map((event) => event.props?.attempt),
+          [1, 2, 2],
+        );
+        assert.deepEqual(
+          events.map((event) => event.props?.waitSinceResponseMs),
+          [0, 60000, 300000],
+        );
+        for (const event of events) {
+          assert.equal(event.threadId, input.threadId);
+          assert.equal(event.props?.runId, input.runId);
+          assert.equal(event.props?.provider, "claudeAgent");
+          assert.equal(event.props?.model, input.modelSelection.model);
+          assert.equal(event.props?.maxRetries, 10);
+          assert.include(event.props!.errorMessage!, "502");
+        }
+        assert.isTrue(events[2]!.props?.guardFiredDuringRetry);
+        assert.isFalse(
+          yield* h.runtime.checkRetryHealth!({
+            runId: input.runId,
+            attemptId: input.attemptId,
+            noResponseBudgetMs: 300000,
+            flapLimit: 20,
+          }),
+        );
+        assert.lengthOf(
+          rows.filter((event) => event.kind === "provider.guard_interrupt"),
+          1,
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
 
   it.effect("keeps the current Claude wake caller live before continuation admission", () =>
     Effect.scoped(
@@ -5813,6 +5908,83 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect.each(
+    ["Bash", "mcp__test__empty"].flatMap((toolName) =>
+      ["", []].map((content) => ({ toolName, content })),
+    ),
+  )(
+    "retains completion evidence for failed $toolName with empty content $content",
+    ({ toolName, content }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("empty-failed-tool"),
+            text: "Run the tool.",
+            attachments: [],
+          }),
+        );
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "assistant",
+            uuid: "empty-tool-start",
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              id: "empty-tool-start",
+              model: "claude-opus-5-5",
+              content: [
+                { type: "tool_use", id: "empty-tool", name: toolName, input: { command: "false" } },
+              ],
+            },
+          }),
+        );
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "user",
+            uuid: "empty-tool-result",
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              role: "user",
+              content: [
+                { type: "tool_result", tool_use_id: "empty-tool", is_error: true, content },
+              ],
+            },
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "empty-tool-terminal", result: "Done" }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const last = harness.events.findLast(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === "empty-tool",
+        );
+        assert.equal(last?.type, "turn_item.updated");
+        if (last?.type !== "turn_item.updated") return;
+        const item = last.turnItem;
+        assert.equal(item.type, toolName === "Bash" ? "command_execution" : "dynamic_tool");
+        if (item.type !== "command_execution" && item.type !== "dynamic_tool") return;
+        assert.equal(item.status, "failed");
+        assert.isFalse(item.toolResultIncomplete);
+        if (item.type === "command_execution") {
+          assert.equal(item.output, typeof content === "string" ? undefined : "[]");
+          assert.isUndefined(item.exitCode);
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   it.effect.each(["cancelled", "denied", "permission_denied", undefined])(
     "preserves native tool non-execution metadata %s without inferring a denial from text",
     (kind) =>
@@ -5870,9 +6042,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           const failed = items.findLast((item) => item.nativeItemRef?.nativeId === "tool-error")!;
           assert.equal(failed.status, kind === "cancelled" ? "cancelled" : "failed");
           assert.equal(failed.toolNonExecutionKind, kind);
+          assert.isFalse(failed.toolResultIncomplete);
           const ok = items.findLast((item) => item.nativeItemRef?.nativeId === "tool-ok")!;
           assert.equal(ok.status, "completed");
           assert.equal(ok.toolNonExecutionKind, undefined);
+          assert.isFalse(ok.toolResultIncomplete);
           const node = harness.events.findLast(
             (event) =>
               event.type === "node.updated" && event.node.nativeItemRef?.nativeId === "tool-error",
@@ -6039,6 +6213,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.equal(
           bash?.type === "turn_item.updated" ? bash.turnItem.status : undefined,
           "failed",
+        );
+        assert.isTrue(
+          bash?.type === "turn_item.updated" && bash.turnItem.type === "command_execution"
+            ? bash.turnItem.toolResultIncomplete
+            : false,
         );
       }).pipe(
         Effect.scoped,
@@ -11873,37 +12052,80 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         }).pipe(Effect.scoped, Effect.provide(layers)),
     );
 
-    it.effect("fails stalled compaction after five minutes without SDK progress", () =>
-      Effect.gen(function* () {
-        const closed = yield* Deferred.make<void>();
-        const h = yield* start({ close: () => Deferred.succeed(closed, undefined) });
-        yield* h.offerAndWait(compacting);
-        yield* TestClock.adjust("4 minutes");
-        yield* h.offerAndWait(
-          claudeSdkFrame({
-            type: "system",
-            subtype: "informational",
-            content: "Still working",
-            level: "info",
-            uuid: "compaction-progress",
-            session_id: WAKE_NATIVE_SESSION,
-          }),
-        );
-        yield* TestClock.adjust("4 minutes");
-        assert.isEmpty(h.terminalEvents());
-        yield* TestClock.adjust("1 minute");
-        yield* Effect.yieldNow;
-        assert.lengthOf(h.terminalEvents(), 1);
-        const terminal = yield* Queue.take(h.terminalReceipts);
-        assert.equal(terminal.status, "failed");
-        assert.equal(terminal.failure?.code, "compaction_no_progress");
-        assert.equal(terminal.failure?.message, "Claude compaction made no progress for 5 min.");
-        assert.equal(compactions(h.events).at(-1)?.status, "failed");
-        assert.equal(compactions(h.events).at(-1)?.summary, terminal.failure?.message);
-        yield* Deferred.await(closed);
-        yield* h.offerAndWait(makeResultFrame({ uuid: "late-result", result: "Too late." }));
-        assert.lengthOf(h.terminalEvents(), 1);
-      }).pipe(Effect.scoped, Effect.provide(layers)),
+    it.effect.each([false, true])(
+      "records one stalled-compaction guard fire during retry=%s",
+      (duringRetry) =>
+        Effect.gen(function* () {
+          const rows: AnalyticsEvent[] = [];
+          const closed = yield* Deferred.make<void>();
+          const h = yield* start({ close: () => Deferred.succeed(closed, undefined) }).pipe(
+            Effect.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    rows.push(decodeRetryAnalytics(event));
+                  }),
+              }),
+            ),
+          );
+          yield* h.offerAndWait(compacting);
+          if (duringRetry) {
+            yield* h.offerAndWait(
+              claudeSdkFrame({
+                type: "system",
+                subtype: "api_retry",
+                attempt: 2,
+                max_retries: 10,
+                retry_delay_ms: 1000,
+                error_status: 502,
+                error: "server_error",
+                uuid: "compaction-retry",
+                session_id: WAKE_NATIVE_SESSION,
+              }),
+            );
+            yield* Queue.take(h.retryReceipts);
+          }
+          yield* TestClock.adjust("4 minutes");
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "informational",
+              content: "Still working",
+              level: "info",
+              uuid: "compaction-progress",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* TestClock.adjust("4 minutes");
+          assert.isEmpty(h.terminalEvents());
+          yield* TestClock.adjust("1 minute");
+          yield* Effect.yieldNow;
+          assert.lengthOf(h.terminalEvents(), 1);
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          assert.equal(terminal.failure?.code, "compaction_no_progress");
+          assert.equal(terminal.failure?.message, "Claude compaction made no progress for 5 min.");
+          assert.equal(compactions(h.events).at(-1)?.status, "failed");
+          assert.equal(compactions(h.events).at(-1)?.summary, terminal.failure?.message);
+          const guards = rows.filter((event) => event.kind === "provider.guard_interrupt");
+          assert.lengthOf(guards, 1);
+          assert.equal(guards[0]!.threadId, h.threadId);
+          assert.equal(guards[0]!.props?.runId, h.input.runId);
+          assert.equal(guards[0]!.props?.provider, h.input.modelSelection.instanceId);
+          assert.equal(guards[0]!.props?.model, h.input.modelSelection.model);
+          assert.equal(guards[0]!.props?.attempt, duringRetry ? 2 : null);
+          assert.equal(guards[0]!.props?.maxRetries, duringRetry ? 10 : null);
+          assert.equal(guards[0]!.props?.errorMessage, terminal.failure?.message);
+          assert.equal(guards[0]!.props?.waitSinceResponseMs, 9 * 60_000);
+          assert.equal(guards[0]!.props?.guardFiredDuringRetry, duringRetry);
+          yield* Deferred.await(closed);
+          yield* h.offerAndWait(makeResultFrame({ uuid: "late-result", result: "Too late." }));
+          assert.lengthOf(h.terminalEvents(), 1);
+          assert.lengthOf(
+            rows.filter((event) => event.kind === "provider.guard_interrupt"),
+            1,
+          );
+        }).pipe(Effect.scoped, Effect.provide(layers)),
     );
   });
 

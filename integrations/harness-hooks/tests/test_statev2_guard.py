@@ -30,6 +30,15 @@ SCRIPT = "live-database-script"
 UNRESOLVED = "live-database-script-unresolved"
 
 
+def assert_verdict(test, command, cwd, expected):
+    rule, reason = guard.classify_detail(command, str(cwd))
+    test.assertEqual(rule, expected)
+    if expected is None:
+        test.assertIsNone(reason)
+    else:
+        test.assertTrue(reason)
+
+
 # Reviewed @aikidosec/safe-chain 1.5.29 startup bytes; never executed here.
 SAFE_CHAIN_INIT_POSIX = r'''if [ -n "${BASH_SOURCE[0]:-}" ]; then
     _sc_script_path="${BASH_SOURCE[0]}"
@@ -1269,17 +1278,54 @@ class GuardTests(unittest.TestCase):
                     with self.subTest(command=command):
                         self.assertIsNotNone(guard.classify(command, str(self.root)))
 
+    def test_loop_cwd_enclosing_remote_pwd_script_proof(self):
+        safe = self.write('repeat/arm.py', 'print(1)')
+        self.write('repeat/sub/arm.py', 'print(1)')
+        self.write('repeat/sub/sub/arm.py', 'print(1)')
+        deep = self.write('repeat/sub/sub/sub/arm.py', f'open({LIVE!r}).read()')
+        variable_safe = self.write('variable/arm.py', 'print(1)')
+        variable_target = self.write('variable/sub/arm.py', f'open({LIVE!r}).read()')
+        loop = 'for j in 1 2 3; do cd sub; done'
+        cases = [
+            (safe.parent, loop, deep, safe),
+            (safe.parent, 'case 1 in 1) { ' + loop + '; };; esac', deep, safe),
+            (safe.parent, 'if true; then { ' + loop + '; }; fi', deep, safe),
+            (variable_safe.parent, 'd=sub; cd "$d"', variable_target, variable_safe),
+        ]
+        for cwd, prefix, target, safe_script in cases:
+            with self.subTest(target=str(target)):
+                self.assertEqual(guard.classify('python3 -I ' + shlex.quote(str(target)), str(cwd)), SCRIPT)
+            for pwd in ['$PWD', '${PWD}']:
+                script = 'python3 -I "' + pwd + '/arm.py"'
+                local = prefix + '; ' + script
+                argv = prefix + '; offbox run -- ' + script
+                for command in [local, argv, 'offbox run -- ' + shlex.quote(local),
+                                'offbox run -- ' + shlex.quote(argv)]:
+                    with self.subTest(command=command):
+                        self.assertEqual(guard.classify(command, str(cwd)), UNRESOLVED)
+                absolute = prefix + '; python3 -I ' + shlex.quote(str(safe_script))
+                absolute_argv = prefix + '; offbox run -- python3 -I ' + shlex.quote(str(safe_script))
+                recovery = prefix + '; cd ' + shlex.quote(str(cwd)) + '; offbox run -- ' + script
+                unchanged = prefix.replace('cd sub', ':').replace('cd "$d"', ':') + '; offbox run -- ' + script
+                for command in [absolute, absolute_argv, 'offbox run -- ' + shlex.quote(absolute),
+                                'offbox run -- ' + shlex.quote(absolute_argv), recovery,
+                                'offbox run -- ' + shlex.quote(recovery), unchanged,
+                                'offbox run -- ' + shlex.quote(unchanged)]:
+                    with self.subTest(command=command):
+                        self.assertEqual(guard.classify_detail(command, str(cwd)), (None, None))
+
     def test_mktemp_109_offbox_flags(self):
         setup = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.py"', 'print(1)')
         for flags in ['--git', '--fresh', '--no-sync', '--no-retry', '--template python',
                       '--template=python', '--base warm', '--base=warm', '--pull tmp/out', '--pull=tmp/out']:
             with self.subTest(flags=flags):
                 self.assertIsNone(self.classify(setup + 'offbox run ' + flags + ' -- python3 "$d/x.py"'))
-        # Unsupported flags retain the baseline payload scan without gaining
-        # caller proofs or the exact fixture-invocation exception.
-        for flags in ['--env FOO=bar', '--unknown']:
-            self.assertEqual(self.classify(setup + 'offbox run ' + flags + ' -- python3 "$d/x.py"'), UNRESOLVED)
-            self.assertEqual(self.classify('offbox run ' + flags + ' -- python3 tmp/live.py'), SCRIPT)
+        # Environment flags can prove an on-disk fixture invocation, but
+        # retain the separate caller-heredoc exception's narrower boundary.
+        for flags in ['--env FOO=bar', '--env=FOO=bar', '--env PYTHONPATH=/tmp/x', '--unknown']:
+            with self.subTest(flags=flags):
+                self.assertEqual(self.classify(setup + 'offbox run ' + flags + ' -- python3 "$d/x.py"'), UNRESOLVED)
+                self.assertEqual(self.classify('offbox run ' + flags + ' -- python3 tmp/live.py'), SCRIPT)
         for flags in ['--pull tmp/out', '--pull=tmp/out']:
             command = setup + 'offbox run ' + flags + ' -- true; python3 "$d/x.py"'
             rule, cause = guard.classify_detail(command, str(self.root))
@@ -3815,6 +3861,150 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             with self.subTest(source=source):
                 self.assertEqual(self.classify('bash tmp/fixture.sh'), expected)
 
+    def recall94_fixture(self):
+        fixture = Path(__file__).with_name('fixtures') / 'recall94/test_backup_replica.sh'
+        target = 'integrations/memory-system/tests/test_backup_replica.sh'
+        self.write(target, fixture.read_text())
+        self.write('live.sh', 'cat "$HOME/.robob/userdata/statev2.sqlite"\n')
+        return target
+
+    def test_recall94_fixture_offbox_options_and_env_prefixes(self):
+        target = self.recall94_fixture()
+        commands = [
+            f'bash {target}',
+            f'offbox run -- bash {target}',
+            f'offbox run --bg -- bash {target}',
+            f'offbox run --no-fallback -- bash {target}',
+            f'offbox run --bg --no-fallback -- bash {target}',
+            f'offbox run --remote --no-fallback -- bash {target}',
+            f'offbox run --size xlarge --include tmp/x --bg -- bash {target}',
+            f'offbox run --env=CI=1 --no-fallback -- bash {target}',
+            f'RECALL_TOOL_LOG_DIR=$(mktemp -d) bash {target}',
+            f'RECALL_TOOL_LOG_DIR=/tmp/x bash {target}',
+            f'A=1 B=$(mktemp -d -t foo.XXXXXX) bash {target}',
+            f'env RECALL_TOOL_LOG_DIR=/tmp/x bash {target}',
+            f'offbox run --bg -- RECALL_TOOL_LOG_DIR=$(mktemp -d) bash {target}',
+            f'X=1 offbox run --bg -- env Y=2 bash {target}',
+            f'X="$(mktemp -d foo.XXXXXX)" bash {target}',
+        ]
+        for flag in ('--fresh', '--no-sync', '--git', '--bg', '--no-fallback', '--remote', '--no-retry'):
+            commands.append(f'offbox run {flag} -- bash {target}')
+        for flag, value in (('--size', 'xlarge'), ('--template', 'default'), ('--base', 'fixture'),
+                            ('--env', 'CI=1'), ('--pull', 'tmp/x'), ('--include', 'tmp/x')):
+            for separator in (' ', '='):
+                commands.append(f'offbox run {flag}{separator}{value} -- bash {target}')
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_recall94_prefixes_keep_live_reads_and_uncertain_proofs_denied(self):
+        target = self.recall94_fixture()
+        live = "sqlite3 ~/.robob/userdata/statev2.sqlite 'select 1'"
+        commands = [
+            f'offbox run --no-fallback -- {live}',
+            f'offbox run --bg --remote -- {live}',
+            f'offbox run --bg --no-fallback -- bash live.sh',
+            'X=$(mktemp -d) bash live.sh', 'X=/tmp/x bash live.sh',
+            f'X=$(mktemp -d) {live}',
+            f'PATH=/tmp/x:$PATH bash {target}',
+            f'offbox run --env=PATH=/tmp/x:$PATH -- bash {target}',
+            f'X=$(cat ~/.robob/userdata/statev2.sqlite) bash {target}',
+            f'env -i X=1 bash {target}',
+            f'offbox run --bogus-flag -- bash {target}',
+            f'offbox run --step "bash {target}" -- true',
+            f'D=$(mktemp -d); X=$D bash {target}',
+        ]
+        for flags in ('--fresh', '--no-sync', '--git', '--bg', '--no-fallback', '--remote', '--no-retry',
+                      '--size xlarge', '--template=default', '--base warm', '--env CI=1',
+                      '--env=CI=1', '--pull tmp/x', '--include=tmp/x', '--unknown'):
+            commands.extend((f'offbox run {flags} -- {live}', f'offbox run {flags} -- bash live.sh'))
+        commands.extend((f'offbox run --step {shlex.quote(live)}',
+                         f'offbox run --step={shlex.quote(live)} -- true'))
+        for name in ('BASH_ENV', 'ENV', 'SHELLOPTS', 'BASHOPTS', 'PS4', 'IFS', 'PATH', 'CDPATH',
+                     'HOME', 'PROMPT_COMMAND', 'GLOBIGNORE', 'BASH_XTRACEFD', 'BASH_FUNC_x',
+                     'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'PYTHONPATH', 'ZDOTDIR'):
+            for wrapper in ('', 'env ', 'offbox run --bg -- '):
+                commands.append(f'{wrapper}{name}=/tmp/x bash {target}')
+            for separator in (' ', '='):
+                commands.append(f'offbox run --env{separator}{name}=/tmp/x -- bash {target}')
+        for value in ('$(mktemp -u)', '$(mktemp -d -u)', '$(mktemp -d >out)',
+                      '$(mktemp -d <input)', '$(mktemp -d; echo /tmp)',
+                      '$(mktemp -d "$HOME/x.XXXXXX")', '$(echo /tmp)', '`mktemp -d`', '$UNPROVED'):
+            commands.append(f'X={value} bash {target}')
+        for flag in ('--size', '--template', '--base', '--env', '--pull', '--include'):
+            commands.extend((f'offbox run {flag} -- bash {target}',
+                             f'offbox run {flag}= -- bash {target}'))
+        for command in commands:
+            with self.subTest(command=command):
+                rule, reason = guard.classify_detail(command, str(self.root))
+                self.assertIsNotNone(rule)
+                self.assertTrue(reason)
+                if rule == SCRIPT:
+                    self.assertRegex(reason, r'\.sh:\d+')
+
+    def test_recall94_offbox_payload_walker_fails_closed(self):
+        for arguments in ('--size', '--size --', '--size=', '--bg=1 --', '--unknown --',
+                          '--step echo --', '--step=echo --', '--env BASH_ENV=/tmp/x --'):
+            words = ['offbox', 'run', *shlex.split(arguments)]
+            with self.subTest(arguments=arguments):
+                self.assertIsNone(guard._offbox_payload(words))
+                if '--' in words:
+                    self.assertEqual(guard._offbox_payload(words, known_only=False), words[words.index('--') + 1:])
+
+    def test_recall94_fixture_invocation_rejects_shell_operators(self):
+        target = self.recall94_fixture()
+        for name in ('PATH', 'LD_PRELOAD'):
+            for separator in (';', '; ', ' ; ', '\n', '&&', '&& ', '||', '|| ', '&', '& ', '|', '| '):
+                command = f'X=1{separator}{name}=/tmp/x bash {target}'
+                commands = (command,
+                            f'offbox run --bg --no-fallback -- {command}',
+                            f'X=1{separator}{name}=/tmp/x offbox run --bg -- bash {target}',
+                            f'offbox run --bg -- {shlex.quote(command)}')
+                for wrapped in commands:
+                    with self.subTest(name=name, separator=separator, command=wrapped):
+                        rule, reason = guard.classify_detail(wrapped, str(self.root))
+                        self.assertIsNotNone(rule)
+                        self.assertTrue(reason)
+        for operator in (';', ';;', ';&', ';;&', '\n', '&&', '||', '&', '|', '|&', '(', ')', '{', '}',
+                         '<', '>', '<<', '>>', '<<<', '<>', '>&', '<&', '>|'):
+            for command in (f'X=1{operator}Y=2 bash {target}',
+                            f'offbox run --bg -- X=1{operator}Y=2 bash {target}'):
+                with self.subTest(operator=operator, command=command):
+                    self.assertEqual(guard._fixture_invocation(command), [])
+
+    def test_recall94_fixture_invocation_keeps_quoted_punctuation_literal(self):
+        target = self.recall94_fixture()
+        for operator in (';', '&', '|', '&&', '||', '(', ')', '{', '}', '<', '>', '\n'):
+            for quote in ("'", '"'):
+                for value in (operator, '1' + operator + 'PATH=/tmp/x'):
+                    assignment = f'X={quote}{value}{quote}'
+                    for wrapper in ('', 'env ', 'offbox run --bg -- ', 'offbox run --env '):
+                        command = f'{wrapper}{assignment} bash {target}'
+                        if wrapper == 'offbox run --env ':
+                            command = f'{wrapper}{assignment} -- bash {target}'
+                        with self.subTest(operator=operator, quote=quote, command=command):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        for operator in (';', '&', '|', '(', ')', '{', '}', '<', '>'):
+            assignment = f'X=1\\{operator}PATH=/tmp/x'
+            for wrapper in ('', 'env ', 'offbox run --bg -- '):
+                with self.subTest(operator=operator, wrapper=wrapper):
+                    self.assertEqual(guard.classify_detail(f'{wrapper}{assignment} bash {target}', str(self.root)), (None, None))
+
+    def test_recall94_fixture_invocation_boundary_newlines(self):
+        target = self.recall94_fixture()
+        for prefix in ('', '\n', '\n \t\n', '# comment\n'):
+            for suffix in ('\n', '\n \t\n', ' # comment\n'):
+                for wrapper in ('', 'X=1 ', 'X=$(mktemp -d) ', 'env X=1 ', 'offbox run --bg -- '):
+                    command = f'{prefix}{wrapper}bash {target}{suffix}'
+                    with self.subTest(prefix=prefix, suffix=suffix, wrapper=wrapper):
+                        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+        for wrapper in ('', 'offbox run --bg -- '):
+            command = f'\n{wrapper}X=1\nPATH=/tmp/x bash {target}\n'
+            with self.subTest(wrapper=wrapper):
+                rule, reason = guard.classify_detail(command, str(self.root))
+                self.assertIsNotNone(rule)
+                self.assertTrue(reason)
+
     def test_mktemp_fixture_plain_subpaths(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
         original = backup.read_text()
@@ -4420,9 +4610,9 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
         for label, source, search_path, expected, shell in isolated_source_cases.fixture_tool_cases(self.root):
             self.write('tmp/fixture.sh', source)
             with self.subTest(case=label, path=search_path), patch.dict(os.environ, {'PATH':search_path}):
-                self.assertEqual(guard.classify_detail(shell + ' tmp/fixture.sh', str(self.root)), (expected, None))
+                assert_verdict(self, shell + ' tmp/fixture.sh', self.root, expected)
                 if label.startswith('path-'):
-                    self.assertEqual(guard.classify_detail(shell + ' tmp/backup.sh', str(self.root)), (expected, None))
+                    assert_verdict(self, shell + ' tmp/backup.sh', self.root, expected)
 
     def test_backup_command_shapes_and_edited_copies(self):
         backup = Path(__file__).resolve().parents[3] / 'integrations/memory-system/tests/test_backup_replica.sh'
@@ -5280,13 +5470,11 @@ class ConfigDirectoryDatabaseNamesTests(unittest.TestCase):
         script.write_text(source)
         for argv in args:
             with self.subTest(argv=argv):
-                self.assertEqual(guard.classify_detail(f'bun {shlex.quote(str(script))} {argv}', str(self.root)),
-                                 (expected, None))
+                assert_verdict(self, f'bun {shlex.quote(str(script))} {argv}', self.root, expected)
         for command in ("node - <<'JS'\n" + source + 'JS',
                         'bash -c ' + shlex.quote("node - <<'JS'\n" + source + 'JS')):
             with self.subTest(command=command):
-                self.assertEqual(guard.classify_detail(command, str(self.root)),
-                                 (READ if expected else None, None))
+                assert_verdict(self, command, self.root, READ if expected else None)
 
     def test_bridge_deny_lists_with_open_import(self):
         self.assert_source(self.deny_list())
@@ -5347,14 +5535,13 @@ class ConfigDirectoryDatabaseNamesTests(unittest.TestCase):
                                 (stdin, READ), ('bash -c ' + shlex.quote(stdin), READ))
                     for command, expected in commands:
                         with self.subTest(operand=operand, transform=transform, command=command):
-                            self.assertEqual(guard.classify_detail(command, str(self.root)), (expected, None))
+                            assert_verdict(self, command, self.root, expected)
             for operand in operands:
                 for use in ('new DatabaseSync(`${process.env.D}/${path.basename(foreign)}`);',
                             'eval("new DatabaseSync(path.join(process.env.D, path.basename(foreign)))");'):
                     source = imports + f'const foreign = {operand};\n' + use + '\n'
                     with self.subTest(operand=operand, use=use):
-                        self.assertEqual(guard.classify_detail("node - <<'JS'\n" + source + 'JS', str(self.root)),
-                                         (READ, None))
+                        assert_verdict(self, "node - <<'JS'\n" + source + 'JS', self.root, READ)
 
     def test_config_deny_list_unknown_consumers(self):
         for consumer in (
@@ -5398,7 +5585,7 @@ class ConfigDirectoryDatabaseNamesTests(unittest.TestCase):
                 ('env D=/Users/ardud/.robob/userdata bash -c ' + shlex.quote(stdin), READ),
             ):
                 with self.subTest(command=command):
-                    self.assertEqual(guard.classify_detail(command, str(self.root)), (expected, None))
+                    assert_verdict(self, command, self.root, expected)
 
     def test_config_deny_list_overridden_membership(self):
         for receiver in ('Array.prototype', 'Array["prototype"]', 'Object.getPrototypeOf([])'):
@@ -5500,12 +5687,12 @@ class ConfigDirectoryDatabaseNamesTests(unittest.TestCase):
             script.write_text(source)
             for cwd in roots:
                 with self.subTest(operand=operand, cwd=cwd):
-                    self.assertEqual(guard.classify_detail('node ' + shlex.quote(str(script)), str(cwd)), (SCRIPT, None))
+                    assert_verdict(self, 'node ' + shlex.quote(str(script)), cwd, SCRIPT)
                     stdin = "node - <<'JS'\n" + source + 'JS'
-                    self.assertEqual(guard.classify_detail(stdin, str(cwd)), (READ, None))
-                    self.assertEqual(guard.classify_detail('bash -c ' + shlex.quote(stdin), str(cwd)), (READ, None))
+                    assert_verdict(self, stdin, cwd, READ)
+                    assert_verdict(self, 'bash -c ' + shlex.quote(stdin), cwd, READ)
             with self.subTest(operand=operand, cwd='isolated'):
-                self.assertEqual(guard.classify_detail('node ' + shlex.quote(str(script)), str(self.root)), (SCRIPT, None))
+                assert_verdict(self, 'node ' + shlex.quote(str(script)), self.root, SCRIPT)
 
 
 class LiveDatabaseGuardTests(unittest.TestCase):

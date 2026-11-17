@@ -13,6 +13,8 @@ import {
   STALE_MS,
   type AcquireResult,
   type Caller,
+  type DesktopLeaseOptions,
+  type LeaseTransition,
 } from "./DesktopLease.ts";
 
 const dirs: string[] = [];
@@ -22,18 +24,25 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) NodeFS.rmSync(dir, { recursive: true, force: true });
 });
 
-function setup() {
+function setup(options: Pick<DesktopLeaseOptions, "holderTurnActive"> = {}) {
+  const transitions: LeaseTransition[] = [];
   const dir = NodeFS.mkdtempSync(NodePath.join(process.cwd(), ".desktop-lease-test-"));
   dirs.push(dir);
   const filename = NodePath.join(dir, "lease.sqlite");
   let now = 1_750_000_000_000;
   const open = () => {
-    const store = new DesktopLease({ filename, now: () => now });
+    const store = new DesktopLease({
+      filename,
+      now: () => now,
+      ...options,
+      recordTransition: (event) => transitions.push(event),
+    });
     stores.push(store);
     return store;
   };
   return {
     dir,
+    transitions,
     filename,
     open,
     addTime: (ms: number) => {
@@ -346,9 +355,193 @@ describe("desktop lease", () => {
       conflict(() => store.callStart(intruder, "unauthorized"));
     }
     conflict(() => store.heartbeat(caller("2"), queued.ticket));
-    conflict(() => store.release(caller("2"), queued.ticket));
+    conflict(() => store.release(caller("1"), queued.ticket));
     expect(store.status().queue.map(({ ticket }) => ticket)).toEqual([queued.ticket]);
     expect(store.callStart(caller("1"), "unauthorized").lease?.ticket).toBe(held.ticket);
+  });
+
+  it("withdraws only an exact queued owner and keeps terminal releases idempotent", () => {
+    const { open, transitions } = setup();
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    const queued = store.acquire(caller("2"), request("2"));
+    const next = store.acquire(caller("3"), request("3"));
+    for (const intruder of [
+      caller("3"),
+      { ...caller("2"), rootThreadId: "other" },
+      { ...caller("2"), robobThreadId: "other" },
+    ]) {
+      conflict(() => store.release(intruder, queued.ticket));
+    }
+    const withdrawn = store.release(caller("2"), queued.ticket);
+    expect(withdrawn.queue.map((row) => row.ticket)).toEqual([next.ticket]);
+    expect(store.release(caller("2"), queued.ticket)).toEqual(withdrawn);
+    expect(store.acquire(caller("2"), request("2")).state).toBe("cancelled");
+    const finished = store.release(caller("1"), held.ticket);
+    expect(store.release(caller("1"), held.ticket)).toEqual(finished);
+    conflict(() => store.release(caller("2"), held.ticket));
+    expect(store.acquire(caller("3"), request("3")).state).toBe("held");
+    expect(transitions).toEqual([
+      {
+        ticket: queued.ticket,
+        taskId: "task-2",
+        mode: "native",
+        from: "queued",
+        to: "cancelled",
+        reason: "queued_withdrawn",
+        age_ms: 0,
+      },
+    ]);
+  });
+
+  it.each([false, true, "unknown"] as const)(
+    "recovers quarantine only with a known idle holder (%s)",
+    (active) => {
+      const roots: string[] = [];
+      const { open, addTime, filename, transitions } = setup({
+        holderTurnActive: (root) => {
+          roots.push(root);
+          return active;
+        },
+      });
+      const store = open();
+      const held = store.acquire(caller("1"), request("1"));
+      store.callStart(caller("1"), "hung");
+      store.callStart(caller("1"), "also-hung");
+      addTime(QUIET_MS);
+      const quarantined = store.status();
+      expect(quarantined.lease).toMatchObject({
+        state: "quarantined",
+        openCallId: "also-hung",
+        quarantinedAt: "2025-06-15T15:16:40.000Z",
+      });
+      const queued = store.acquire(caller("2"), request("2"));
+      pollFor(addTime, QUIET_MS - 1, () => store.acquire(caller("2"), request("2")));
+      expect(store.status().lease?.state).toBe("quarantined");
+      expect(roots).toEqual([]);
+      addTime(1);
+      const result = store.acquire(caller("2"), request("2"));
+      expect(roots).toEqual(["root-1"]);
+      if (active === false) {
+        expect(result).toMatchObject({ ticket: queued.ticket, state: "held" });
+        expect(store.release(caller("1"), held.ticket).lease?.ticket).toBe(queued.ticket);
+        const db = new NodeSqlite.DatabaseSync(filename);
+        try {
+          expect(
+            db
+              .prepare(
+                "SELECT evidence, request_state FROM ardud_desktop_requests WHERE ticket = ?",
+              )
+              .get(held.ticket),
+          ).toEqual({
+            evidence:
+              "auto-reconciled: holder root-1 has no running turn; open call also-hung started 2025-06-15T15:06:40.000Z",
+            request_state: "finished",
+          });
+          expect(db.prepare("SELECT state, ended_at FROM ardud_desktop_calls").all()).toEqual([
+            { state: "failed", ended_at: 1750001200000 },
+            { state: "failed", ended_at: 1750001200000 },
+          ]);
+        } finally {
+          db.close();
+        }
+        conflict(() => store.callEnd("hung", "completed"));
+        expect(store.callEnd("hung", "failed").lease?.ticket).toBe(queued.ticket);
+        expect(transitions.map((event) => event.reason)).toEqual([
+          "open_call_timeout",
+          "auto_reconciled",
+        ]);
+      } else {
+        expect(result.state).toBe("queued");
+        expect(store.status().lease).toEqual(quarantined.lease);
+        store.reconcile(held.ticket, "operator checked");
+        expect(transitions.map((event) => event.reason)).toEqual([
+          "open_call_timeout",
+          "manual_reconciled",
+        ]);
+      }
+      store.status();
+      expect(transitions).toHaveLength(2);
+    },
+  );
+
+  it("records queue expiry once, including when advancing precedes a rejected heartbeat", () => {
+    const { open, addTime, transitions } = setup();
+    const store = open();
+    const held = store.acquire(caller("1"), request("1"));
+    const queued = store.acquire(caller("2"), request("2"));
+    addTime(STALE_MS);
+    conflict(() => store.heartbeat(caller("2"), held.ticket));
+    store.status();
+    store.release(caller("2"), queued.ticket);
+    expect(transitions).toEqual([
+      {
+        ticket: queued.ticket,
+        taskId: "task-2",
+        mode: "native",
+        from: "queued",
+        to: "cancelled",
+        reason: "queue_expired",
+        age_ms: STALE_MS,
+      },
+    ]);
+  });
+
+  it("keeps auto-reconciliation final when call-end itself reaches the recovery deadline", () => {
+    const { open, addTime, transitions } = setup({ holderTurnActive: () => false });
+    const store = open();
+    store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "hung");
+    addTime(QUIET_MS);
+    store.status();
+    addTime(QUIET_MS);
+    conflict(() => store.callEnd("hung", "completed"));
+    expect(store.status().lease).toBeNull();
+    expect(store.callEnd("hung", "failed").lease).toBeNull();
+    expect(transitions.map((event) => event.reason)).toEqual([
+      "open_call_timeout",
+      "auto_reconciled",
+    ]);
+  });
+
+  it("discards transition observations when storage work rolls back", () => {
+    const { open, addTime, transitions } = setup({
+      holderTurnActive: () => {
+        throw new Error("lookup unavailable");
+      },
+    });
+    const store = open();
+    store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "hung");
+    addTime(QUIET_MS);
+    store.status();
+    store.acquire(caller("2"), request("2"));
+    addTime(QUIET_MS);
+    expect(() => store.status()).toThrow("lookup unavailable");
+    expect(transitions.map((event) => event.reason)).toEqual(["open_call_timeout"]);
+  });
+
+  it("dates a legacy quarantine from migration only once", () => {
+    const { open, addTime, filename } = setup({ holderTurnActive: () => false });
+    const store = open();
+    store.acquire(caller("1"), request("1"));
+    store.callStart(caller("1"), "hung");
+    addTime(QUIET_MS);
+    store.status();
+    const db = new NodeSqlite.DatabaseSync(filename);
+    try {
+      db.exec("ALTER TABLE ardud_desktop_requests DROP COLUMN quarantined_at");
+    } finally {
+      db.close();
+    }
+    addTime(QUIET_MS);
+    const migrated = open();
+    const at = migrated.status().lease!.quarantinedAt;
+    expect(at).toBe("2025-06-15T15:26:40.000Z");
+    addTime(QUIET_MS - 1);
+    expect(open().status().lease?.quarantinedAt).toBe(at);
+    addTime(1);
+    expect(migrated.status().lease).toBeNull();
   });
 
   it("retries only a started admission on the current held ticket", () => {

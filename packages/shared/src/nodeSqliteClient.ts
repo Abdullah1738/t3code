@@ -3113,8 +3113,11 @@ const make = Effect.fn("makeWithDatabase")(function* (
   let lastWriterActivity = 0;
   let maintenanceAbort: AbortController | undefined;
   let writerDemand = 0;
-  const withWriterDemand = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    Effect.acquireUseRelease(
+  const withWriterDemand = <A, E, R>(effect: Effect.Effect<A, E, R>) => {
+    // Memory connections cannot run maintenance. Keep their synchronous statements
+    // free of maintenance bookkeeping and its extra scheduler yield points.
+    if (connection.maintenance === undefined) return effect;
+    return Effect.acquireUseRelease(
       Effect.sync(() => {
         writerDemand++;
         lastWriterActivity = performance.now();
@@ -3127,6 +3130,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           lastWriterActivity = performance.now();
         }),
     );
+  };
   const readers = Boolean(options.readerWorker) && isFileDatabase;
   // All slots pin their WAL snapshots under one lock, so an archive mover sees one gate.
   const snapshotLock =

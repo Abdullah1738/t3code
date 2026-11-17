@@ -462,6 +462,7 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     _offbox_manifest=$(_offbox_inventory "$_offbox_stage/go") || _offbox_fail 'archive inventory failed'
     printf 'offbox-go-tree-v1 %s %s\n' "$_offbox_version" "$_offbox_manifest" > "$_offbox_stage/go/.offbox-manifest" || _offbox_fail 'cannot write official tree manifest'
     _offbox_valid "$_offbox_stage/go" || _offbox_fail 'archive verification failed; GOROOT untouched'
+    sudo -n chown -R --no-dereference root:root "$_offbox_stage/go" || _offbox_fail 'cannot set replacement tree ownership'
     _offbox_tree_id=$(stat -c '%d:%i' "$_offbox_stage/go") || _offbox_fail 'cannot identify replacement tree'
     [ ! -e "$_offbox_stage/old" ] && [ ! -L "$_offbox_stage/old" ] || _offbox_fail 'backup destination exists'
     sudo -n mv -T -- /usr/local/go "$_offbox_stage/old" || _offbox_fail 'GOROOT backup rename failed'
@@ -482,6 +483,35 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
 ) || {
   if [ "${_offbox_needs_go:-1}" = 1 ]; then echo offbox-setup-failed >&2; exit 97; fi
 }'''.replace('@GO_ARCHIVE_CURL_LIMITS@', GO_ARCHIVE_CURL_LIMITS)
+
+# Old base images imported uid 1001 from the Node archive. Leave user-installed files alone,
+# and never follow npm/corepack symlinks or recurse through shared /usr/local directories.
+NODE_OWNER_REPAIR = r'''(
+  _offbox_bin_uid=$(stat -c %u /usr/local/bin 2>/dev/null) || exit 0
+  [ "$_offbox_bin_uid" != 0 ] && [ -e /usr/local/bin/node ] || exit 0
+  _offbox_node_paths=()
+  for _offbox_path in /usr/local/bin/{node,npm,npx,corepack} /usr/local/lib/node_modules \
+    /usr/local/include/node /usr/local/share/doc/node /usr/local/share/man/man1/node.1 \
+    /usr/local/{CHANGELOG.md,LICENSE,README.md}; do
+    # find -P protects leaf links, but the kernel follows links in starting-path ancestors.
+    _offbox_parent=${_offbox_path%/*}
+    while [ -n "$_offbox_parent" ] && [ "$_offbox_parent" != / ]; do
+      [ ! -L "$_offbox_parent" ] || exit 0
+      _offbox_parent=${_offbox_parent%/*}
+    done
+    if [ -e "$_offbox_path" ] || [ -L "$_offbox_path" ]; then _offbox_node_paths+=("$_offbox_path"); fi
+  done
+  _offbox_fixed=$(
+    sudo -n find -P "${_offbox_node_paths[@]}" -uid 1001 \
+      -exec chown --no-dereference root:root -- {} + -print &&
+    sudo -n find -P /usr/local/{lib,include,share} -maxdepth 0 -uid 1001 \
+      -exec chown --no-dereference root:root -- {} + -print &&
+    # The bin owner is the completion marker; a partial repair must remain retryable.
+    sudo -n find -P /usr/local/bin -maxdepth 0 -uid 1001 \
+      -exec chown --no-dereference root:root -- {} + -print
+  ) 2>/dev/null || exit 0
+  [ -z "$_offbox_fixed" ] || echo 'offbox: repaired /usr/local ownership (Node archive uid 1001 -> root)' >&2
+) || true'''
 
 # boat.dev (28 Oct 2026) runs /usr/local/bin/sync-docker-firewall after dockerd starts (docker.service.d drop-in).
 # Boxes resumed from older snapshots can lack it, and systemd then kills dockerd (203/EXEC). Never fails the run.
@@ -1605,6 +1635,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               'echo "offbox: disk-space probe failed (exit $__obprobe_rc); the command runs without disk evidence" >&2; }',
               userns.setup(api.BACKEND, box_id),
               SQLITE_SETUP,
+              NODE_OWNER_REPAIR,
               DOCKER_REPAIR,
               LDCACHE_REPAIR,
               CACHE_OWNER_REPAIR.replace('__OFFBOX_BOX__', shlex.quote(box_id)),

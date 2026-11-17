@@ -71,6 +71,8 @@ import { COMPACT_READ_CHARS } from "../../compactRead.ts";
 import * as McpBoardReplies from "../engine/mcpBoardReplies.ts";
 import * as ReplyBuilders from "../../http/ReplyBuilders.ts";
 import { KanbanToolkit } from "./tools.ts";
+import { boardInputErrorHint } from "./inputErrors.ts";
+import { ASK_LIMITS } from "../engine/asks.ts";
 import { ModelBody } from "../http.ts";
 
 // Writes check the caller is the thread's live provider; the fake runs on codex.
@@ -8127,48 +8129,209 @@ it.effect("a work thread's card_create numbers the packet first in its gated rep
   }).pipe(Effect.provide(layer));
 });
 
-it.effect("a work thread's card_create with assignToSelf takes its own plan", () => {
-  const { layer, running } = fakeThreads();
+it.effect.each([false, true])(
+  "a work thread's card_create with assignToSelf takes its own plan (ids=%s)",
+  (explicit) => {
+    const { layer, running } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "worker-self-gates",
+        name: "Worker self gates",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+      running.add(worker);
+      const created = yield* call(worker, "card_create", {
+        title: "Worker follow-up self",
+        prompt: "Follow-up",
+        assignToSelf: true,
+        subtasks: [
+          { ...(explicit ? { id: "s1" } : {}), step: 1, text: "Implement", owner: "work" },
+          { ...(explicit ? { id: "s2" } : {}), step: 2, text: "Review", owner: "review" },
+          {
+            ...(explicit ? { id: "s3" } : {}),
+            step: 3,
+            text: "Deploy the helper",
+            owner: "evaluator",
+          },
+        ],
+      });
+      assert.isFalse(created.isError, created.text);
+      // The caller's own plan is the whole plan: no packet step in front of it.
+      assert.deepStrictEqual(created.structured.gated, [
+        { id: "s3", gate: "deploy", source: "guessed" },
+      ]);
+      const card = yield* decodeKanbanCard(created.structured.card);
+      assert.deepStrictEqual(
+        card.subtasks.map(({ id, step, text }) => [id, step, text]),
+        [
+          ["s1", 1, "Implement"],
+          ["s2", 2, "Review"],
+          ["s3", 3, "Deploy the helper"],
+        ],
+      );
+      assert.strictEqual(card.subtaskSeq, 3);
+      assert.strictEqual(card.workThreadId, worker);
+      assert.strictEqual(card.stage, "working");
+      const bare = yield* call(worker, "card_create", {
+        title: "Worker follow-up bare",
+        prompt: "Follow-up",
+        assignToSelf: true,
+      });
+      assert.isFalse(bare.isError, bare.text);
+      assert.deepStrictEqual((yield* decodeKanbanCard(bare.structured.card)).subtasks, []);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each(["evaluator", "worker", "forThread"] as const)(
+  "card_create with explicit ids through %s keeps allocated ids in its reply",
+  (route) => {
+    const { layer, running } = fakeThreads(undefined, undefined, undefined, undefined, undefined, {
+      findExisting: true,
+      send: () => Effect.succeed("assignment-run"),
+    });
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "create-ids",
+        name: "Create ids",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+      running.add(worker);
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+      const created = yield* call(route === "worker" ? worker : evaluator, "card_create", {
+        title: "Numbered follow-up",
+        prompt: "Follow-up",
+        ...(route === "forThread" ? { forThread: worker } : {}),
+        subtasks: [
+          { id: "s1", step: 1, text: "Implement", owner: "work" },
+          { id: "s2", step: 2, text: "Review", owner: "review" },
+          { id: "s3", step: 3, text: "Deploy the helper", owner: "evaluator" },
+        ],
+      });
+      assert.isFalse(created.isError, created.text);
+      const card = yield* decodeKanbanCard(created.structured.card);
+      const offset = route === "worker" ? 1 : 0;
+      assert.deepStrictEqual(
+        card.subtasks.map(({ id, step, text }) => [id, step, text]),
+        [
+          ...(offset ? [["s1", 1, PACKET_SUBTASK]] : []),
+          [`s${1 + offset}`, 1 + offset, "Implement"],
+          [`s${2 + offset}`, 2 + offset, "Review"],
+          [`s${3 + offset}`, 3 + offset, "Deploy the helper"],
+        ],
+      );
+      assert.strictEqual(card.subtaskSeq, 3 + offset);
+      assert.deepStrictEqual(created.structured.gated, [
+        { id: `s${3 + offset}`, gate: "deploy", source: "guessed" },
+      ]);
+      if (route === "forThread") assert.strictEqual(card.workThreadId, worker);
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect.each(["assignToSelf", "worker", "evaluator"] as const)(
+  "card_create bad ids through %s refuse without saving",
+  (route) => {
+    const { layer, running } = fakeThreads();
+    return Effect.gen(function* () {
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* kanban.ensureBoard({
+        slug: "bad-create-ids",
+        name: "Bad create ids",
+        defaultProjectId: ProjectId.make("project-1"),
+      });
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      const origin = yield* kanban.createCard(
+        board.id,
+        { title: "Origin", prompt: "Origin" },
+        owner,
+      );
+      yield* kanban.dispatchNow;
+      const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+      running.add(worker);
+      const evaluator = yield* kanban.startEvaluator(board.id, { kind: "check" });
+      const before = yield* kanban.cards(board.id);
+      for (const ids of [
+        ["s1", "s1"],
+        [" s1 ", "s1"],
+        ["foo"],
+        ["S1"],
+        ["s0"],
+        ["s01"],
+        ["s 1"],
+        ["s"],
+        ["1"],
+        ["s1x"],
+      ]) {
+        const refused = yield* call(route === "evaluator" ? evaluator : worker, "card_create", {
+          title: "Refused numbered card",
+          prompt: "Must not be saved",
+          assignToSelf: route === "assignToSelf",
+          subtasks: ids.map((id) => ({ id, text: "Implement", owner: "work" })),
+        });
+        assert.isTrue(refused.isError, refused.text);
+        assert.include(
+          refused.text,
+          ids.length === 2 ? "subtask s1 is listed twice" : "is not a subtask id; use s1, s2, ...",
+        );
+        assert.notInclude(refused.text, "Missions board invalid");
+        assert.deepStrictEqual(yield* kanban.cards(board.id), before);
+      }
+    }).pipe(Effect.provide(layer));
+  },
+);
+
+it.effect("a script's card_create shifts explicit ids past its packet", () => {
+  const { layer } = fakeThreads();
   return Effect.gen(function* () {
     const kanban = yield* KanbanService.KanbanService;
     const board = yield* kanban.ensureBoard({
-      slug: "worker-self-gates",
-      name: "Worker self gates",
-      defaultProjectId: ProjectId.make("project-1"),
+      slug: "script-create-ids",
+      name: "Script create ids",
+      defaultProjectId: null,
     });
-    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
-    const origin = yield* kanban.createCard(
+    const card = yield* kanban.createCard(
       board.id,
-      { title: "Origin", prompt: "Origin" },
-      owner,
+      {
+        title: "Script follow-up",
+        prompt: "Follow-up",
+        subtasks: [
+          { id: "s1", step: 1, text: "Implement", owner: "work" },
+          { id: "s2", step: 2, text: "Review", owner: "review" },
+          { id: "s3", step: 3, text: "Read back", owner: "evaluator" },
+        ],
+      },
+      { _tag: "script", scriptId: KanbanScriptId.make("script-one") },
     );
-    yield* kanban.dispatchNow;
-    const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
-    running.add(worker);
-    const created = yield* call(worker, "card_create", {
-      title: "Worker follow-up self",
-      prompt: "Follow-up",
-      assignToSelf: true,
-      subtasks: [{ text: "Deploy the helper", owner: "evaluator" }],
-    });
-    assert.isFalse(created.isError, created.text);
-    // The caller's own plan is the whole plan: no packet step in front of it.
-    assert.deepStrictEqual(created.structured.gated, [
-      { id: "s1", gate: "deploy", source: "guessed" },
-    ]);
-    const card = yield* decodeKanbanCard(created.structured.card);
     assert.deepStrictEqual(
       card.subtasks.map(({ id, step, text }) => [id, step, text]),
-      [["s1", 1, "Deploy the helper"]],
+      [
+        ["s1", 1, PACKET_SUBTASK],
+        ["s2", 2, "Implement"],
+        ["s3", 3, "Review"],
+        ["s4", 4, "Read back"],
+      ],
     );
-    assert.strictEqual(card.workThreadId, worker);
-    const bare = yield* call(worker, "card_create", {
-      title: "Worker follow-up bare",
-      prompt: "Follow-up",
-      assignToSelf: true,
-    });
-    assert.isFalse(bare.isError, bare.text);
-    assert.deepStrictEqual((yield* decodeKanbanCard(bare.structured.card)).subtasks, []);
+    assert.strictEqual(card.subtaskSeq, 4);
+    assert.deepStrictEqual((yield* kanban.card(card.id)).card.subtasks, card.subtasks);
   }).pipe(Effect.provide(layer));
 });
 
@@ -12418,3 +12581,263 @@ it.effect(
     }).pipe(Effect.provide(fake.layer));
   },
 );
+
+it.effect("board tool schemas retain nested ask shapes and describe them with examples", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    type Node = {
+      type?: string;
+      description?: string;
+      properties?: Record<string, Node>;
+      anyOf?: Node[];
+      items?: Node;
+      enum?: unknown[];
+    };
+    const branch = (node: Node | undefined, type: string): Node => {
+      if (node?.type === type) return node;
+      for (const child of node?.anyOf ?? []) {
+        const found = branch(child, type);
+        if (found.type === type) return found;
+      }
+      return {};
+    };
+    const schema = (name: string) => {
+      const registered = server.tools.find(({ tool }) => tool.name === name);
+      assert.isDefined(registered, name);
+      return registered!.tool.inputSchema as Node;
+    };
+    for (const name of ["card_ask", "card_ask_change", "discussion_post", "discussion_create"]) {
+      const blocks = schema(name).properties!.blocks!;
+      const array = branch(blocks, "array");
+      assert.include(JSON.stringify(blocks), "whose `_tag` field names its kind");
+      assert.include(
+        JSON.stringify(blocks),
+        '\\"_tag\\":\\"md\\",\\"text\\":\\"Line count went from 120 to 4\\"',
+      );
+      assert.isAtLeast(array.items?.anyOf?.length ?? 0, 7);
+      assert.isTrue(
+        array.items!.anyOf!.some((node) => node.properties?._tag?.enum?.includes("md")),
+      );
+    }
+    const ask = schema("card_ask");
+    const action = branch(ask.properties!.action, "object");
+    assert.include(JSON.stringify(ask.properties!.action), "evidence (a list of strings");
+    assert.include(JSON.stringify(ask.properties!.action), `at most ${ASK_LIMITS.evidence}`);
+    const evidence = branch(action.properties!.evidence, "array");
+    assert.strictEqual(evidence.items?.type, "string");
+    const respond = branch(ask.properties!.respond, "object");
+    const verdict = respond.properties!.verdict!;
+    assert.strictEqual(branch(verdict, "boolean").type, "boolean");
+    assert.strictEqual(branch(verdict, "object").properties!.approve!.anyOf![0]!.type, "string");
+    assert.include(
+      JSON.stringify(ask.properties!.respond),
+      '\\"approve\\":\\"Deploy\\",\\"reject\\":\\"Don\'t deploy\\"',
+    );
+    for (const field of ["options", "draft", "change", "changes", "respond"]) {
+      assert.include(JSON.stringify(ask.properties![field]), "Example:", field);
+    }
+    for (const field of ["verdict", "choose", "fields", "edit", "task", "ack"]) {
+      assert.include(JSON.stringify(respond.properties![field]), "Example:", field);
+    }
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("card_ask decode errors name nested paths and shapes without saving or coercing", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "ask-shapes",
+      name: "Ask shapes",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      { prompt: "Shape checks", title: "Shape checks" },
+      owner,
+    );
+    const thread = ThreadId.make("thread-evaluator");
+    const base = { card: `#${card.number}`, question: "Proceed with this change?" };
+    const cases = [
+      {
+        input: { blocks: [{ type: "md", text: "x" }] },
+        path: "blocks[0]",
+        hint: "use `_tag`, not `type`",
+        example: '{"_tag":"md","text":"…"}',
+      },
+      {
+        input: { action: { summary: "x", evidence: "y" } },
+        path: "action.evidence",
+        hint: "list of strings",
+        example: '["CI green on abc123"]',
+      },
+      {
+        input: { action: { summary: "x", evidence: [7] } },
+        path: "action.evidence",
+        hint: "list of strings",
+        example: '["CI green on abc123"]',
+      },
+      {
+        input: { respond: { verdict: "approve" } },
+        path: "respond.verdict",
+        hint: "is true or",
+        example: '{"approve":"…","reject":"…"}',
+      },
+      {
+        input: { respond: { verdict: { approve: 7 } } },
+        path: "respond.verdict",
+        hint: "is true or",
+        example: '{"approve":"…","reject":"…"}',
+      },
+      // Offbox #180's actual failure: verdict:true accompanied string evidence.
+      {
+        input: { action: { summary: "x", evidence: "y" }, respond: { verdict: true } },
+        path: "action.evidence",
+        hint: "list of strings",
+        example: '["CI green on abc123"]',
+      },
+    ];
+    for (const row of cases) {
+      const error = yield* call(thread, "card_ask", { ...base, ...row.input }).pipe(Effect.flip);
+      assert.strictEqual(error.code, -32602);
+      assert.include(error.message, row.path);
+      assert.include(error.message, row.hint);
+      assert.include(error.message, row.example);
+      assert.lengthOf((yield* kanban.card(card.id)).card.asks, 0);
+    }
+    const action = yield* call(thread, "card_ask", {
+      ...base,
+      action: { summary: "x", evidence: ["y"] },
+      respond: { verdict: true },
+      blocks: [{ _tag: "md", text: "x" }],
+    });
+    assert.isFalse(action.isError, action.text);
+    const nonAction = yield* call(thread, "card_ask", {
+      ...base,
+      question: "Approve the direction?",
+      respond: { verdict: true },
+    });
+    assert.isFalse(nonAction.isError, nonAction.text);
+    const asks = (yield* kanban.card(card.id)).card.asks;
+    assert.lengthOf(asks, 2);
+    assert.deepStrictEqual(asks[0]!.action?.evidence, ["y"]);
+    assert.deepStrictEqual(asks[1]!.respond?.verdict, {});
+    const change = yield* call(thread, "card_ask_change", {
+      card: base.card,
+      ask: "q1",
+      revisionNote: "Correct evidence",
+      action: { summary: "x", evidence: "y" },
+    }).pipe(Effect.flip);
+    assert.include(change.message, "action.evidence is a list of strings");
+    for (const [name, target] of [
+      ["discussion_post", { card: base.card }],
+      ["discussion_create", { title: "Shapes" }],
+    ] as const) {
+      const discussion = yield* call(thread, name, {
+        boardId: board.id,
+        ...target,
+        blocks: [{ type: "md", text: "x" }],
+      }).pipe(Effect.flip);
+      assert.include(discussion.message, "blocks[0]");
+      assert.include(discussion.message, "use `_tag`, not `type`");
+    }
+    const nullable = yield* call(thread, "card_ask", {
+      ...base,
+      action: { summary: "Nullable evidence", evidence: null },
+      respond: { verdict: { approve: null, reject: null } },
+    });
+    assert.isFalse(nullable.isError, nullable.text);
+    const disabled = yield* call(thread, "card_ask", {
+      ...base,
+      action: { summary: "No buttons" },
+      respond: { verdict: false },
+    });
+    assert.isFalse(disabled.isError, disabled.text);
+    const validVerdictAndBadEvidence = yield* call(thread, "card_ask", {
+      ...base,
+      action: { summary: "x", evidence: "y" },
+      respond: { verdict: { approve: null } },
+    }).pipe(Effect.flip);
+    assert.include(validVerdictAndBadEvidence.message, "action.evidence is a list of strings");
+    assert.notInclude(validVerdictAndBadEvidence.message, "respond.verdict is true or");
+  }).pipe(Effect.provide(layer));
+});
+
+it("board input hints leave valid nullable fields and tagged block errors to the decoder", () => {
+  const blockCases = [
+    { _tag: "html", html: "x" },
+    { _tag: "image", url: "https://example.com/proof.png" },
+    { _tag: "md", text: 7 },
+    {
+      _tag: "attachment",
+      attachment: {
+        type: "file",
+        id: "file-1",
+        name: "x.txt",
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        source: null,
+      },
+    },
+  ];
+  for (const block of blockCases) {
+    assert.isUndefined(boardInputErrorHint("card_ask", { blocks: [block] }));
+  }
+  for (const verdict of [
+    true,
+    false,
+    null,
+    {},
+    { approve: null },
+    { approve: "Deploy", reject: null },
+  ]) {
+    assert.isUndefined(boardInputErrorHint("card_ask", { respond: { verdict } }));
+  }
+  for (const evidence of [null, [], ["CI green"]]) {
+    assert.isUndefined(boardInputErrorHint("card_ask", { action: { summary: "x", evidence } }));
+  }
+});
+
+it.effect("card_ask description examples make valid asks", () => {
+  const { layer } = fakeThreads();
+  return Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "ask-examples",
+      name: "Examples",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    const card = yield* kanban.createCard(
+      board.id,
+      { prompt: "Examples", title: "Examples" },
+      owner,
+    );
+    const registered = server.tools.find(({ tool }) => tool.name === "card_ask")!.tool.inputSchema;
+    type Node = { description?: string; anyOf?: Node[]; properties?: Record<string, Node> };
+    const description = (node: Node): string =>
+      node.description ?? node.anyOf?.map(description).find(Boolean) ?? "";
+    const parseExample = (node: Node): unknown => {
+      const text = description(node).split("Example: ")[1];
+      assert.isDefined(text);
+      for (let end = 1; end <= text!.length; end++) {
+        try {
+          return JSON.parse(text!.slice(0, end));
+        } catch {
+          /* The example may be followed by more prose. */
+        }
+      }
+      throw new Error("Missing JSON example");
+    };
+    for (const field of ["blocks", "options", "draft", "action", "change", "changes", "respond"]) {
+      const example = parseExample((registered as Node).properties![field]!);
+      const result = yield* call(ThreadId.make("thread-evaluator"), "card_ask", {
+        card: card.id,
+        question: "Approve the proposed change?",
+        [field]: example,
+      });
+      assert.isFalse(result.isError, `${field}: ${result.text}`);
+    }
+  }).pipe(Effect.provide(layer));
+});

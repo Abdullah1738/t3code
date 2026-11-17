@@ -1,3 +1,8 @@
+import {
+  completedToolFilter,
+  needsPartialResult,
+  delegatedPartialResult,
+} from "../ardud/orchestration/delegatedPartialResult.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { resolveCallerRuntime } from "./callerCredential.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
@@ -2443,14 +2448,39 @@ const make = Effect.gen(function* () {
       messages: [...childControls.messages, ...resultRecords.messages],
       turnItems: [...childControls.turnItems, ...resultRecords.turnItems],
     };
-    const resultText = (run: OrchestrationV2Run) => {
+    const stoppedTools = new Map(
+      yield* Effect.forEach(
+        childControls.runs.filter(
+          (run) =>
+            resultRunIds.includes(run.id) &&
+            needsPartialResult({ ...run, status: runOutcome(run) }),
+        ),
+        Effect.fn("OrchestratorMcpService.readPartialTool")(function* (run: OrchestrationV2Run) {
+          const records = yield* threadManagement
+            .getThreadRecords(task.childThreadId!, ["turnItems"], completedToolFilter(run), {
+              projectionOnly: true,
+            })
+            .pipe(NodeSqliteClient.foregroundReads, Effect.mapError(threadManagementFailure));
+          return [run.id, records.turnItems[0]] as const;
+        }),
+      ),
+    );
+    const resultText = (source: OrchestrationV2Run) => {
+      const run = { ...source, status: runOutcome(source) };
       const partial = subagentResultForRun(childProjection, run);
-      return run.delegatedTaskStall === undefined
-        ? partial.text
-        : stalledSummary(
-            run.delegatedTaskStall,
-            partial.messageId === null && partial.turnItemId === null ? null : partial.text,
-          );
+      const text =
+        run.delegatedTaskStall === undefined
+          ? partial.text
+          : stalledSummary(
+              run.delegatedTaskStall,
+              partial.messageId === null && partial.turnItemId === null ? null : partial.text,
+            );
+      return delegatedPartialResult(
+        text,
+        run,
+        stoppedTools.get(run.id),
+        latestRootProviderFailure(run, childProjection.turnItems)?.message,
+      );
     };
     const projectedResult =
       summaryRun !== undefined && isTerminalTaskStatus(status)

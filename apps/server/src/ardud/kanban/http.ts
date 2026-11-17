@@ -525,6 +525,7 @@ export const kanbanRouteLayer = HttpRouter.addAll(
         const model = yield* modelOf(input.model, apply);
         return yield* service.setPool(board.id, model, input.slots, {
           replaces: input.replaces,
+          actor: { actorKind: "owner", actorId: null },
         });
       }),
     );
