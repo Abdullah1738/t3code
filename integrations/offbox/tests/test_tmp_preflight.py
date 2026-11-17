@@ -3,7 +3,7 @@ import io
 import json
 import shlex
 import subprocess
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 if __package__:
     from .test_boatd import Base, boatd

@@ -3,7 +3,7 @@
 # Puts itself in its own cgroup (/sys/fs/cgroup/boatd/<pid>) so the host can measure and kill exactly this run,
 # then runs /run/boatd/<pid>.sh as `user` through bash, like boat.dev did. stdout/stderr pass straight through.
 set -u
-pid="$1"; cwd="${2:-/home/user}"
+pid="$1"; cwd="${2:-/home/user}"; attempt="${3:-1}"
 receipt="/run/boatd/$pid.receipt"
 # The lock identifies initialization even before a complete PID record exists. A dead owner releases it.
 exec 9> "/run/boatd/$pid.lock" || exit 126
@@ -16,13 +16,23 @@ trap 'rc=$?; printf "%s\n" "$rc" > "$receipt/exit.tmp"; mv "$receipt/exit.tmp" "
 printf '%s %s\n' "$$" "$(awk '{print $22}' /proc/$$/stat)" > "$receipt/pid.tmp" || exit 126
 mv "$receipt/pid.tmp" "$receipt/pid" || exit 126
 cg=/sys/fs/cgroup/boatd
+joined=false
 if [ -w /sys/fs/cgroup ]; then
   mkdir -p "$cg" 2>/dev/null && {
     # Children of boatd/ get the controllers we measure. Harmless if one isn't delegated.
     for c in memory cpu io pids; do echo "+$c" > "$cg/cgroup.subtree_control" 2>/dev/null; done
-    mkdir -p "$cg/$pid" 2>/dev/null && echo $$ > "$cg/$pid/cgroup.procs" 2>/dev/null
+    if mkdir -p "$cg/$pid" 2>/dev/null && echo $$ > "$cg/$pid/cgroup.procs" 2>/dev/null; then
+      joined=true
+    fi
   }
 fi
+(set -C; printf '{"pid":%s,"time":%s,"attempt":%s,"cgroup_joined":%s}\n' \
+  "$$" "$(date +%s)" "$attempt" "$joined" > "/run/boatd/$pid.$attempt.started") 2>/dev/null || {
+  echo 'boatd-wrap: start marker unavailable; command not dispatched' >&2
+  exit 126
+}
+# Keep an attempt-specific receipt even if the client wrapper cannot write its own exit file.
+trap 'exit 143' TERM
 [ -d "$cwd" ] || cwd=/home/user
 cd "$cwd" || cd /home/user
 # /etc/environment (offbox cache env etc.), as PAM would have read it; PATH stays ours.

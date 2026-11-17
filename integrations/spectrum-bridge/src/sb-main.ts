@@ -1,3 +1,5 @@
+import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
+import { readFileSync } from "node:fs";
 import { toolError, toolLog, type LogLine } from "./toollog.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 /**
@@ -7,6 +9,7 @@ import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
 import { chmod, mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { agentPolicyPath } from "./agent-policy.ts";
 import { accessPath, accessReloader, emptyAccess } from "./access.ts";
 import { createApi } from "./api.ts";
 import { startAppsServer } from "./apps.ts";
@@ -16,14 +19,14 @@ import { alertSkillPath, skillPath, stateRoot, telegramBridgeSocket, type Config
 import { Delivery } from "./delivery.ts";
 import { ReplyGapMonitor } from "./reply-gap.ts";
 import { checkReply, readReplyRules } from "./replyCheck.ts";
-import { sendblueErrorKey, type Line, type LineEvent } from "./line.ts";
+import { chatKey, sendblueErrorKey, type Line, type LineEvent } from "./line.ts";
 import { acquireLock } from "./lock.ts";
 import type { ChatBackend } from "./openchamber.ts";
 import type { Photon } from "./photon.ts";
 import { publish } from "./publish.ts";
 import { RobobBackend, retireUnresolvedRoute } from "./robob.ts";
 import { Router } from "./router.ts";
-import { ChatRegistry, createSbApi, optOutHealth, type ChatCore } from "./runtime.ts";
+import { ChatRegistry, createAgentBus, createSbApi, optOutHealth, type ChatCore } from "./runtime.ts";
 import { runIngress } from "./sb-ingress.ts";
 import { sbTransport } from "./sb-transport.ts";
 import { cardPreviewImage } from "./card-preview.ts";
@@ -38,7 +41,7 @@ import { Sendblue } from "./sendblue.ts";
 import { Store } from "./store.ts";
 import { chatDbSwipes } from "./swipe.ts";
 import { transcribe } from "./stt.ts";
-import { notificationAccepted, socketPost, telegramOutlet } from "./telegram-fallback.ts";
+import { fenceOwnerAlert, notificationAccepted, socketPost, telegramOutlet } from "./telegram-fallback.ts";
 
 export type MainIo = {
   log: (event: string, code?: string) => void;
@@ -46,7 +49,7 @@ export type MainIo = {
   removeStaleSocket: (path: string) => Promise<void>;
 };
 
-type Parts = { router: Router; delivery: Delivery; replyGap: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend: ChatBackend; busy: boolean };
+type Parts = { remote?: RemoteBox; router?: Router; delivery?: Delivery; replyGap?: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend?: ChatBackend; busy: boolean };
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -207,6 +210,18 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const groupJudge = jevJudge();
   const swipes = chatDbSwipes();
   const build = (chat: ChatCore): Parts => {
+    const remoteConfig = remoteBoxConfig(config, chat.info.slug);
+    if (remoteConfig) {
+      const remote = new RemoteBox(remoteConfig, chat.store, { log, ownerAlert: fenceOwnerAlert(telegramBridgeSocket),
+        active: () => {
+          try { const live = JSON.parse(readFileSync(join(stateRoot, "config.json"), "utf8"));
+            return remoteBoxConfig(live, "moni")?.epoch === remoteConfig.epoch; } catch { return false; }
+        },
+        notice: async (id, text) => { await remote.send(hash(`notice:${id}`), text, undefined, observed, chat.info.key); },
+      });
+      chat.remote = remote;
+      return { remote, api: async () => Response.json({ error: "This chat lives on its box" }, { status: 403 }), busy: false };
+    }
     const isOwner = chat.info.kind === "owner";
     const chatBackend = !isOwner && backend instanceof RobobBackend
       ? backend.forChat(`chats/${chat.info.slug}`, chat.info.title) : backend;
@@ -217,7 +232,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
       medsFold: {},
-      transcribe: input => transcribe(input), notifyFailure: notifyFailedInbound, log, context: chat.context,
+      transcribe: input => transcribe(input), notifyUnanswered: outlet.notify, notifyFailure: notifyFailedInbound, log, context: chat.context,
       ...(chat.info.kind === "group" ? { groupJudge } : {}),
       swipes: { find: swipes, line: config.sendblueNumber ?? "" },
     });
@@ -250,8 +265,14 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const replyGap = new ReplyGapMonitor(chat.store, { chat: chat.info.slug, notify: outlet.notify });
     return { router, delivery, replyGap, api: chatApi, backend: chatBackend, busy: false };
   };
-  registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build });
+  registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build, backend: kind });
   registry.restore();
+  if (remoteBoxConfig(config, "moni") && !registry.bySlugName("moni")) {
+    const person = access.people.find(person => person.name.toLowerCase() === "moni");
+    if (!person?.addresses[0]) throw new Error("Remote Moni chat requires its access entry");
+    const chat = registry.open(chatKey.dm(person.addresses[0]));
+    if (chat.info.slug !== "moni") throw new Error("Remote Moni chat identity mismatch");
+  }
   const chats = registry;
 
   // Scoped third parties: grants in guests.json, audit in guests-audit.jsonl (guests.ts).
@@ -275,7 +296,9 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     note: async (address, text) => { await post("/notify", { source: "iMessage bridge", severity: "info", text, dedupeKey: `sb-guest:${address}` }); },
   });
 
+  const agentBus = createAgentBus(chats, log, agentPolicyPath(accessFile));
   api = createSbApi({
+    agentBus,
     registry: chats, line, accessPath: accessFile, enabled: ready, reloadAccess: refreshAccess, guests: guestDesk, shares,
     health: () => {
       const backendOk = Date.now() - health.backendLastOk < 60_000;
@@ -291,6 +314,13 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     },
   });
 
+  const remoteCallback = chats.bySlugName("moni")?.parts.remote;
+  const callbackServer = remoteCallback ? Bun.serve({ hostname: "127.0.0.1", port: remoteCallback.config.callbackPort,
+    maxRequestBodySize: 28 * 1024 * 1024,
+    fetch: createSbApi({ registry: chats, line, agentBus, accessPath: accessFile, enabled: ready, health: () => ({}) }, remoteCallback),
+  }) : undefined;
+  process.once("exit", () => callbackServer?.stop(true));
+
   // Unknown senders: one Telegram note per address, so the owner can allow them.
   const note = async (address: string, text: string) => {
     await post("/notify", { source: "iMessage bridge", severity: "info", text, dedupeKey: `sb-note:${address}` });
@@ -299,7 +329,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const ingress = runIngress({
     line: observed, owner: config.owner, ownerStore, access: async () => access,
     sink: chats.sink(note, () => config.enabled, message => guestDesk.unknown(message),
-      (chat, input) => { void acknowledgeReceived(chat.store, chat.context, input).catch((caughtError) => { toolError("sb-main", "sb-main.catch7", caughtError); return log("receipt-ack-failed"); }); }), log,
+      (chat, input) => { if (chat.remote) return; void acknowledgeReceived(chat.store, chat.context, input).catch((caughtError) => { toolError("sb-main", "sb-main.catch7", caughtError); return log("receipt-ack-failed"); }); }), log,
     notify: (text, key) => outlet.notify("attention", text, key),
   }, abort.signal);
 
@@ -309,9 +339,15 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     let routeCheckedAt = 0;
     let flightsCheckedAt = 0;
     let sharesSweptAt = Date.now();
+    let agentsSweptAt = 0;
     while (!stopping) {
       void toolLog.tick();
       await refreshAccess();
+      if (ready() && Date.now() - agentsSweptAt >= 30_000) {
+        agentsSweptAt = Date.now();
+        try { agentBus.sweep(); }
+        catch (error) { toolError("sb-main", "agent-bus.sweep", error); log("agent-sweep-failed"); }
+      }
       if (Date.now() - sharesSweptAt >= 30_000) {
         sharesSweptAt = Date.now();
         void shares.sweep().catch((caughtError) => { toolError("sb-main", "sb-main.catch8", caughtError); return log("share-sweep-failed"); });
@@ -328,7 +364,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
         routeCheckedAt = Date.now();
         for (const chat of chats.all()) {
           const chatBackend = chat.parts.backend;
-          if (!(chatBackend instanceof RobobBackend) || chat.parts.router.status().activeTurn) continue;
+          if (!(chatBackend instanceof RobobBackend) || chat.parts.router?.status().activeTurn) continue;
           if (await retireUnresolvedRoute(chat.store, chatBackend).catch((caughtError) => { toolError("sb-main", "sb-main.catch11", caughtError); return false; })) log("route-unresolved-retired");
         }
       }
@@ -341,20 +377,24 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       await sleep(1_000);
     }
   }
+  const unansweredTimer = setInterval(() => {
+    if (ready()) for (const chat of chats.all()) void chat.parts.router?.checkUnanswered().catch(error => toolError("sb-main", "unanswered.check", error));
+  }, 60_000);
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
-      void chat.parts.delivery.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
-      if (ready()) void chat.parts.router.checkCompletion();
-      if (ready()) void chat.parts.replyGap.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });
-      if (ready()) void chat.parts.router.checkInboundLatency().catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
+      if (chat.parts.remote) { if (ready()) void chat.parts.remote.tick(); continue; }
+      void chat.parts.delivery?.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
+      if (ready()) void chat.parts.router?.checkCompletion();
+      if (ready()) void chat.parts.replyGap?.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });
+      if (ready()) void chat.parts.router?.checkInboundLatency().catch((caughtError) => { toolError("sb-main", "sb-main.catch14", caughtError); return log("inbound-latency-check-failed"); });
       if (ready() && !chat.parts.busy) {
         chat.parts.busy = true;
         const revision = chat.revision;
-        void chat.parts.router.tick().then(() => {
+        void chat.parts.router!.tick().then(() => {
           if (revision === chat.revision && seen.synchronized) chat.controlsPending = false;
         }, (caughtError) => { toolError("sb-main", "sb-main.catch15", caughtError); return log("router-tick-failed"); }).finally(() => { chat.parts.busy = false; });
       }
-      if (ready()) void chat.parts.router.checkFailedInbound().catch((caughtError) => { toolError("sb-main", "sb-main.catch16", caughtError); return log("failed-inbound-check-failed"); });
+      if (ready()) void chat.parts.router?.checkFailedInbound().catch((caughtError) => { toolError("sb-main", "sb-main.catch16", caughtError); return log("failed-inbound-check-failed"); });
     }
   }, 1_000);
   const stop = async () => {
@@ -363,6 +403,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     abort.abort();
     clearInterval(timer);
+    clearInterval(unansweredTimer);
     await server.stop(true);
     await apps?.stop().catch((caughtError) => { toolError("sb-main", "sb-main.catch17", caughtError);});
     await shares.stopAll().catch((caughtError) => { toolError("sb-main", "sb-main.catch18", caughtError);});

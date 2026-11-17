@@ -6,6 +6,7 @@ import { archiveFilename } from "../ardud/persistence/historyArchiveSql.ts";
 import * as NodeV8 from "node:v8";
 
 import { RotatingFileSink } from "@t3tools/shared/logging";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -46,6 +47,8 @@ export interface EventLoopReadings {
   >;
   readonly rssBytes: number;
   readonly heapUsedBytes: number;
+  readonly heapTotalBytes: number;
+  readonly externalBytes: number;
   readonly gc: {
     readonly count: number;
     readonly totalMs: number;
@@ -154,6 +157,8 @@ export const makeNodeSampler = Effect.gen(function* () {
       },
       rssBytes: memory.rss,
       heapUsedBytes: memory.heapUsed,
+      heapTotalBytes: memory.heapTotal,
+      externalBytes: memory.external,
       elapsedMs: nextSampledAt - sampledAt,
       sampledAt: DateTime.formatIso(
         DateTime.makeUnsafe(NodePerfHooks.performance.timeOrigin + nextSampledAt),
@@ -231,11 +236,28 @@ export const layerWith = (
         ),
       );
       let heapUsedMbPrev = 0;
+      let nextMemoryLogAt = 0;
       const tick = Effect.gen(function* () {
         const readings = yield* sample;
         const previousHeap = heapUsedMbPrev;
         heapUsedMbPrev = Math.round(readings.heapUsedBytes / 1024 / 1024);
         yield* recordGauges(readings);
+        const now = yield* Clock.currentTimeMillis;
+        if (now >= nextMemoryLogAt) {
+          nextMemoryLogAt = now + 60_000;
+          const memory = {
+            pid: process.pid,
+            uptimeSeconds: Math.round(process.uptime()),
+            rss: readings.rssBytes,
+            heapUsed: readings.heapUsedBytes,
+            heapTotal: readings.heapTotalBytes,
+            external: readings.externalBytes,
+            heapLimit: heapLimitBytes,
+          };
+          yield* Effect.logInfo("server memory", memory).pipe(
+            Effect.withSpan("server.memory", { root: true, attributes: memory }),
+          );
+        }
         yield* sampleSockets;
         const archiveWalBytes = yield* sampleArchiveWalBytes;
         if (

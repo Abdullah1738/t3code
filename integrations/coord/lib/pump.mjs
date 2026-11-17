@@ -96,7 +96,7 @@ export const queueApi = {
   },
   cancel: (cfg, threadId, runId) =>
     // A rejected command id stays rejected, so each attempt gets its own.
-    rpc(cfg, 'orchestration.dispatchCommand', { type: 'queued-run.cancel', commandId: `coord:supersede:${runId}:${clock.now()}`, threadId, runId }),
+    rpc(cfg, 'orchestration.dispatchCommand', { type: 'queued-run.cancel', commandId: `coord:supersede:${runId}:${clock.now()}`, threadId, runId, reason: 'superseded', detail: 'Coordination wake superseded.' }),
 };
 
 // A queued run the pump created: its message id is the send commandId built from a `coord:` clientRequestId,

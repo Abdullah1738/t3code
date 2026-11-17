@@ -59,7 +59,7 @@ const assertRefusal = (
     assert.strictEqual(refusal.text, NOT_OWNER_DEVICE_MESSAGE, where);
     return;
   }
-  assert.isUndefined(refusal.reason, where);
+  assert.strictEqual(refusal.reason, "role_not_allowed", where);
   assert.include(refusal.text, "Only the owner does this", where);
   if (caller._tag === "component") {
     assert.include(refusal.text, `the ${caller.component} component's session`, where);

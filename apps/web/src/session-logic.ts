@@ -1000,17 +1000,18 @@ export function deriveTimelineEntriesFromVisibleTurnItemsWithState(
   if (previous === null || !shallow(input.attachmentUrlById, previous.input.attachmentUrlById)) {
     return { input, entries };
   }
-  const previousMessages = new Map(
-    previous.entries.flatMap((entry) =>
-      entry.kind === "message" ? [[entry.id, entry] as const] : [],
-    ),
-  );
+  const previousEntries = new Map(previous.entries.map((entry) => [entry.id, entry]));
   return {
     input,
     entries: entries.map((entry) => {
+      const before = previousEntries.get(entry.id);
+      if (entry.kind === "work" && entry.entry.projectedItem !== undefined) {
+        if (before?.kind !== "work" || before.entry.projectedItem !== entry.entry.projectedItem)
+          return entry;
+        return before.attempt === entry.attempt ? before : { ...entry, entry: before.entry };
+      }
       if (entry.kind !== "message" || entry.projectedItem === undefined) return entry;
-      const before = previousMessages.get(entry.id);
-      if (before?.projectedItem !== entry.projectedItem) return entry;
+      if (before?.kind !== "message" || before.projectedItem !== entry.projectedItem) return entry;
       return before.attempt === entry.attempt ? before : { ...entry, message: before.message };
     }),
   };

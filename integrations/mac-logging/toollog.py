@@ -2,6 +2,7 @@
 import datetime as dt
 import fcntl
 import json
+import ipaddress
 import math
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import re
 import uuid
 
 RUN_ID = uuid.uuid4().hex
+VOLUME_THREAD_ID = re.compile(r'(?:thread:project:[^\s:]+:)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 CAP_BYTES = 50 * 1024 * 1024
 # Explicit schema: unknown keys and nested payloads cannot enter a log by accident.
@@ -35,9 +37,12 @@ FAILURE_STAGES = {'admission', 'stage', 'repo', 'disk', 'replica', 'verify', 'fi
                   'restic', 'prune', 'dropbox', 'manifest', 'unknown'}
 NUMBERS.update(('durationMs', 'childrenMeasured', 'childrenPartial', 'childrenRemaining', 'bytesMeasured'))
 NUMBERS.update(('probeTimeouts', 'secondsInProbeTimeouts', 'probeAllowanceMedianS', 'allowanceS'))
+NUMBERS.update(('cpuS', 'loadAvg1Start', 'loadAvg1End', 'loadAvg1Max', 'cpuSecondsDu',
+                'wallSecondsDu', 'firstAttempts', 'firstAttemptTimeouts', 'secondsWasted'))
 NUMBERS.update(('timeouts', 'secondsInTimeouts', 'childrenDescended', 'partsMeasured',
                 'childrenWithPartsInProgress', 'partsDone', 'partsTotal', 'partsFreshnessS'))
 NUMBERS.update(('loadPerCore', 'lastSuccessAgeS', 'deferredCount'))
+NUMBERS.update(('sentBytes', 'dbBytes', 'stageAgeS'))
 BACKUP_PROGRAMS = {'bash', 'zsh', 'sh', 'python', 'python3', 'restic', 'launchd',
                    'Robob', 'codex', 'claude', 'opencode', 'node', 'sleep', 'unknown'}
 BACKUP_ARGS = {'memory_backup.sh', 'health_backup.sh', 'backup_control.py', 'redact_lock.py',
@@ -212,25 +217,39 @@ def memory_fields(values, event):
 
 
 def cpu_fields(values):
-    from cpu_labels import janitor_redact
+    from cpu_labels import janitor_redact, SystemFamily, SECRET_LABEL, command_label
     result = {}
     numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
                'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb',
-               'skippedLines', 'badLines', 'lines', 'exiting'}
+               'skippedLines', 'badLines', 'lines', 'exiting', 'systemCpuPct',
+               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS',
+               'unattributedCpuPct', 'spawned', 'exited', 'uid', 'perMinute',
+               'childCpuPct', 'childReadable', 'childUnreadable', 'childUncertainParents',
+               'lostParents', 'unattributedAfterChildrenPct', 'observedSpawnsLowerBound',
+               'observedSpawnsPerMinuteLowerBound'}
 
     def number(value):
         return finite_number(value) and 0 <= value <= 1e15
 
-    def label(value, limit):
+    def label(value, limit, encoded=False):
+        def bounded(text):
+            text = ''.join(c if c.isprintable() else ' ' for c in text)[:limit]
+            # Records serialize with ensure_ascii: one Unicode character can
+            # cost up to twelve bytes, so bound the encoded label too.
+            while encoded and len(json.dumps(text))-2 > limit:
+                text = text[:-1]
+            return text
         if not isinstance(value, str):
             return None
+        if isinstance(value, SystemFamily) and '/' not in value and not SECRET_LABEL.search(value):
+            return bounded(str(value))
         try:
             value = janitor_redact(value)
         except (ImportError, OSError):
             return None
         if SECRET.search(value) or '/Users/' in value or '/home/' in value or value.startswith(('/', '~')):
             return '[redacted]'
-        return ''.join(c if c.isprintable() else ' ' for c in value)[:limit]
+        return bounded(value)
 
     for key, value in (values or {}).items():
         if key in numeric and (value is None or number(value)):
@@ -239,31 +258,212 @@ def cpu_fields(values):
             result[key] = value
         elif key == 'badLine':
             result[key] = label(value, 200)
-        elif key in ('failure', 'hintError') and (value is None or value in MEMORY_ERRORS):
+        elif key == 'kernelTaskTime' and isinstance(value, str) and re.fullmatch(r'[0-9:.\-]{1,32}', value):
+            result[key] = value
+        elif key == 'kernelTaskSkipped' and value == 'rate':
+            result[key] = value
+        elif key in ('failure', 'hintError', 'systemCpuError', 'commandError', 'threadError', 'kernelTaskError') and (value is None or value in MEMORY_ERRORS):
             result[key] = value
         elif key == 'load' and (value is None or isinstance(value, list)):
             result[key] = None if value is None else [n for n in value[:3] if number(n)]
-        elif key in ('top', 'families') and isinstance(value, list):
+        elif key in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily', 'childCpu',
+                     'childCpuFamilies', 'childCoverage', 'observedSpawnsByParent') and isinstance(value, list):
             result[key] = []
-            for proc in value[:20 if key == 'top' else 15]:
+            for proc in value[:{'top': 20, 'families': 15, 'spawnedFamilies': 8, 'runnableThreadsByFamily': 8,
+                               'childCpu': 10, 'childCpuFamilies': 10, 'childCoverage': 64,
+                               'observedSpawnsByParent': 10}[key]]:
                 if not isinstance(proc, dict):
                     continue
-                keys = ('pid', 'ppid', 'family', 'hint', 'cpuS', 'cpuPct', 'rssMb', 'etime') if key == 'top' else ('family', 'count', 'cpuPct', 'rssMb')
+                keys = (('pid', 'ppid', 'family', 'parentFamily', 'state', 'hint', 'cpuS', 'cpuPct', 'rssMb', 'etime', 'cmd', 'parentCmd')
+                        if key == 'top' else ('family', 'count', 'cpuPct', 'parentFamily')
+                        if key == 'spawnedFamilies' else ('family', 'count')
+                        if key == 'runnableThreadsByFamily' else ('pid', 'ppid', 'family', 'parentFamily', 'cpuPct')
+                        if key == 'childCpu' else ('family', 'parentFamily', 'cpuPct')
+                        if key == 'childCpuFamilies' else ('uid', 'reason', 'count')
+                        if key == 'childCoverage' else ('pid', 'family', 'count', 'perMinute')
+                        if key == 'observedSpawnsByParent' else ('family', 'count', 'cpuPct', 'rssMb'))
                 clean = {}
                 for field in keys:
                     item = proc.get(field)
                     if field in numeric and number(item):
                         clean[field] = item
-                    elif field in ('family', 'hint'):
-                        clean[field] = label(item, 40 if field == 'family' else 72)
+                    elif field == 'reason' and item in ('permission', 'exited', 'identity', 'unavailable', 'timeout'):
+                        clean[field] = item
+                    elif field in ('family', 'parentFamily', 'hint'):
+                        clean[field] = label(item, 72 if field == 'hint' else 64,
+                                             encoded=key in ('childCpu', 'childCpuFamilies'))
+                    elif field in ('cmd', 'parentCmd') and field in proc:
+                        clean[field] = command_label(item) if isinstance(item, str) else None
+                    elif field == 'state' and isinstance(item, str) and re.fullmatch(r'[A-Za-z?+<>-]{1,16}', item):
+                        clean[field] = item
                     elif field == 'etime' and isinstance(item, str) and re.fullmatch(r'\d+(?:-\d+)?(?::\d+){1,2}', item):
                         clean[field] = item[:32]
                 result[key].append(clean)
     return result
 
 
+def u_text(value, limit):
+    if not isinstance(value, str):
+        return None
+    if SECRET.search(value):
+        return '[redacted]'
+    return ''.join(c if c.isprintable() else ' ' for c in value)[:limit]
+
+
+def u_episode_fields(values):
+    if not isinstance(values, dict):
+        return {}
+    if any(not finite_number(values.get(k)) or not 0 <= values[k] <= 1e15
+           for k in ('start', 'lastSeen', 'peakCount')):
+        return {}
+    end = values.get('end')
+    if end is not None and (not finite_number(end) or not values['lastSeen'] <= end <= 1e15):
+        return {}
+    if values['start'] > values['lastSeen']:
+        return {}
+    result = {k: values[k] for k in ('start', 'lastSeen', 'peakCount')}
+    result['end'] = end
+    result['emptySamples'] = min(3, max(0, values.get('emptySamples', 0))) if type(values.get('emptySamples')) is int else 0
+    volumes, comms = values.get('volumes', []), values.get('topComms', [])
+    result['volumes'] = [u_text(v, 128) for v in volumes[:15] if isinstance(v, str)] if isinstance(volumes, list) else []
+    result['topComms'] = []
+    for proc in comms[:10] if isinstance(comms, list) else []:
+        if (isinstance(proc, dict) and isinstance(proc.get('comm'), str)
+                and type(proc.get('count')) is int and proc['count'] >= 0):
+            result['topComms'].append(dict(comm=u_text(proc['comm'], 80), count=proc['count']))
+    return result
+
+
+def u_sample_fields(values):
+    if not isinstance(values, dict):
+        return {}
+    result = {}
+    if values.get('failure') in ('timeout', 'exit', 'parse', 'unavailable'):
+        result['failure'] = values['failure']
+    for key in ('count', 'lsofStuck'):
+        if type(values.get(key)) is int and values[key] >= 0:
+            result[key] = values[key]
+    comms = values.get('byComm')
+    if isinstance(comms, dict):
+        result['byComm'] = {}
+        for comm, n in sorted(((c, n) for c, n in comms.items() if isinstance(c, str) and type(n) is int and n >= 0),
+                              key=lambda p: (-p[1], p[0]))[:50]:
+            label = u_text(comm, 80)
+            result['byComm'][label] = result['byComm'].get(label, 0)+n
+    procs = values.get('procs')
+    if isinstance(procs, list):
+        result['procs'] = []
+        for proc in procs[:15]:
+            if not isinstance(proc, dict):
+                continue
+            if any(not finite_number(proc.get(k)) or proc[k] < 0 for k in ('pid', 'ppid', 'ageS', 'cpuS')):
+                continue
+            if any(type(proc[k]) is not int for k in ('pid', 'ppid')):
+                continue
+            clean = {k: proc[k] for k in ('pid', 'ppid', 'ageS', 'cpuS')}
+            for key, limit in (('parentComm', 80), ('parentArgs', 200), ('stat', 16),
+                               ('comm', 80), ('args', 200), ('volume', 128)):
+                clean[key] = u_text(proc.get(key), limit)
+            result['procs'].append(clean)
+    callers = values.get('lsofCallers')
+    if isinstance(callers, list):
+        result['lsofCallers'] = []
+        for caller in callers[:5]:
+            if (isinstance(caller, dict) and all(type(caller.get(k)) is int and caller[k] >= 0 for k in ('parentPid', 'n'))):
+                result['lsofCallers'].append(dict(parentPid=caller['parentPid'], n=caller['n'],
+                                                 parentArgs=u_text(caller.get('parentArgs'), 200)))
+    if isinstance(values.get('episode'), dict):
+        result['episode'] = u_episode_fields(values['episode'])
+    return result
+
+
 def safe_fields(values, event=None):
-    if event == 'cpu.sample':
+    if event == 'scan.volume_crawl':
+        result = {}
+        for key, value in (values or {}).items():
+            if key in ('pid', 'ppid', 'argvOmitted') and type(value) is int and 0 <= value <= 2147483647:
+                result[key] = value
+            elif key in ('elapsedS', 'cpuPct') and (value is None or finite_number(value) and value >= 0):
+                result[key] = value
+            elif key in ('cwd', 'threadId') and (value is None or isinstance(value, str)):
+                limit = 512 if key == 'threadId' else 2048
+                if value is None or (len(json.dumps(value)) <= limit
+                        and (key != 'threadId' or VOLUME_THREAD_ID.fullmatch(value))):
+                    result[key] = value
+                else:
+                    result[key] = None
+                    result['stringsOmitted'] = result.get('stringsOmitted', 0)+1
+            elif key == 'argv' and isinstance(value, list):
+                paths, size, omitted = [], 0, 0
+                for path in value:
+                    if not isinstance(path, str):
+                        continue
+                    encoded = len(json.dumps(path)) + 1
+                    if encoded > 2048 or size+encoded > 6000:
+                        omitted += 1
+                    else:
+                        paths.append(path)
+                        size += encoded
+                result[key] = paths
+                if omitted:
+                    result['argvOmitted'] = omitted
+            elif key == 'parentChain' and isinstance(value, list):
+                result[key] = [dict(pid=p['pid'], name=(p['name'] if len(json.dumps(p['name'])) <= 128 else '[omitted]'))
+                               for p in value[:4] if isinstance(p, dict) and type(p.get('pid')) is int
+                               and 0 <= p['pid'] <= 2147483647 and isinstance(p.get('name'), str)]
+        return result
+    if event and event.startswith('tailnet.'):
+        result = {}
+        for key, value in (values or {}).items():
+            if key == 'backendState' and value in ('Running', 'Stopped', 'NeedsLogin', 'NeedsMachineAuth', 'Starting', 'NoState', 'Unknown'):
+                result[key] = value
+            elif key in ('statusError', 'extensionError', 'homeProbeError', 'selfHttpsError') and value in (None, 'timeout', 'exit', 'parse', 'unavailable'):
+                result[key] = value
+            elif key in ('up', 'selfOnline', 'timedOut', 'homeReachable', 'confirmedDown', 'selfHttpsReachable') and (value is None or type(value) is bool):
+                result[key] = value
+            elif key in ('tailscaleIPsCount', 'exitCode', 'extensionPid', 'notUpChecks') and (value is None or type(value) is int):
+                result[key] = value
+            elif key in ('outcome', 'cliOutcome') and value in ('up', 'down', 'unknown'):
+                result[key] = value
+            elif key in ('cliMs', 'statusDurationMs', 'loadAvg1', 'outageStart') and (value is None or finite_number(value) and value >= 0):
+                result[key] = value
+            elif key == 'confirmedBy' and value in (None, 'home_tcp', 'peer_tcp', 'self_https'):
+                result[key] = value
+            elif key == 'suppressed' and type(value) is int and value >= 0:
+                result[key] = value
+            elif key == 'confirmProbes' and isinstance(value, dict):
+                result[key] = {}
+                for host, probe in list(value.items())[:2]:
+                    if not isinstance(host, str):
+                        continue
+                    try:
+                        address = ipaddress.ip_address(host)
+                    except ValueError:
+                        continue
+                    if address not in ipaddress.ip_network('100.64.0.0/10'):
+                        continue
+                    if (not isinstance(probe, dict) or type(probe.get('ok')) is not bool
+                            or probe.get('error') not in (None, 'timeout', 'exit', 'unavailable')
+                            or not finite_number(probe.get('ms')) or probe['ms'] < 0
+                            or type(probe.get('port')) is not int or not 1 <= probe['port'] <= 65535):
+                        continue
+                    result[key][host] = {k: probe[k] for k in ('port', 'ok', 'error', 'ms')}
+            elif key == 'extensionPids' and (value is None or isinstance(value, str) and re.fullmatch(r'[0-9 ]{1,180}', value)):
+                result[key] = value
+        return result
+    if event == 'proc.u_parse':
+        result = {}
+        if isinstance(values, dict):
+            if type(values.get('skippedRows')) is int and values['skippedRows'] >= 0:
+                result['skippedRows'] = values['skippedRows']
+            if isinstance(values.get('firstBadRow'), str):
+                result['firstBadRow'] = u_text(values['firstBadRow'], 200)
+        return result
+    if event == 'proc.u_sample':
+        return u_sample_fields(values)
+    if event == 'proc.u_episode':
+        return u_episode_fields(values)
+    if event in ('cpu.sample', 'cpu.spike'):
         return cpu_fields(values)
     if event == 'disk.clone_wedge':
         result = {k: v for k, v in disk_wait_fields(values).items()
@@ -365,15 +565,49 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
             if lines:
                 message = '[redacted]' if SECRET.search(lines[0]) else lines[0][:300]
         row['error'] = dict(tag=error_tag, message=message)
-    if name == 'cpu.sample':
-        # 1440 bounded lines/day stay below 12 MB, even with hostile labels.
-        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > 8192:
+    if name == 'scan.volume_crawl':
+        paths = row.get('props', {}).get('argv', [])
+        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > 8192 and len(paths) > 1:
+            paths.pop()
+            row['props']['argvOmitted'] = row['props'].get('argvOmitted', 0)+1
+        if len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > 8192:
+            row['props'] = {k: v for k, v in row.get('props', {}).items()
+                            if k in ('pid', 'ppid', 'elapsedS', 'cpuPct')}
+            row['props']['detailOmitted'] = True
+    if name in ('cpu.sample', 'cpu.spike'):
+        # Leave room for 240 spike lines and the other jobs in the daily file.
+        limit = 7000 if name == 'cpu.sample' else 8192
+        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > limit:
             props = row['props']
-            key = 'top' if props.get('top') else 'families'
+            key = next((k for k in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily',
+                                    'childCoverage', 'observedSpawnsByParent',
+                                    'childCpuFamilies', 'childCpu') if props.get(k)), None)
             if not props.get(key):
                 break
             props[key].pop()
             props[key+'Omitted'] = props.get(key+'Omitted', 0)+1
+    if name in ('proc.u_sample', 'proc.u_episode'):
+        # At most 23.6 MB/day even when every minute has a wedge and Unicode argv.
+        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > 16384:
+            props = row['props']
+            # Keep one process row ahead of optional aggregate detail, so a
+            # once-daily umount marker always corresponds to a written row.
+            key = 'procs' if len(props.get('procs', [])) > 1 else next(
+                (k for k in ('byComm', 'lsofCallers') if props.get(k)), None)
+            target = props
+            if key is None:
+                target = props.get('episode', props)
+                key = next((k for k in ('volumes', 'topComms') if target.get(k)), None)
+            if key is None:
+                key = 'procs' if props.get('procs') else None
+                target = props
+            if key is None:
+                break
+            if isinstance(target[key], dict):
+                target[key].pop(next(reversed(target[key])))
+            else:
+                target[key].pop()
+            target[key+'Omitted'] = target.get(key+'Omitted', 0)+1
     return row
 
 

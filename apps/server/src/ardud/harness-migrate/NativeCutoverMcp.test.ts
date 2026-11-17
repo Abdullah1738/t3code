@@ -1,3 +1,6 @@
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import * as ProviderSessionManager from "../../orchestration-v2/ProviderSessionManager.ts";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
 import {
@@ -157,6 +160,9 @@ it.effect.each(["claudeAgent", "codex", "codex-cu"])(
     }).pipe(
       Effect.provide(
         McpHttpServer.layerOrchestratorToolkit.pipe(
+          Layer.provide(McpProviderSessions.layer),
+          Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
+          Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
           Layer.provideMerge(McpServer.McpServer.layer),
           Layer.provide(NodeCrypto.layer),
           Layer.provide(

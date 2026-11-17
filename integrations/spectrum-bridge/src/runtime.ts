@@ -1,3 +1,8 @@
+import { markReactionAnswered } from "./unanswered.ts";
+import type { RemoteBox } from "./remote-box.ts";
+import { RemoteRequestError } from "./remote-box.ts";
+import { validId } from "./remote-protocol.ts";
+import type { BackendKind } from "./backend.ts";
 import { messageLengthError } from "./message-length.ts";
 import { toolError, toolLog } from "./toollog.ts";
 /**
@@ -21,11 +26,14 @@ import { getSecretRequest, type SecretDeps } from "./secrets.ts";
 import { SHARE_ROUTES, shareRoute, type Shares } from "./share.ts";
 import { sessionMatches } from "./session.ts";
 import { Store } from "./store.ts";
+import { agentPolicyPath, validNotifyId, validNotifyText } from "./agent-policy.ts";
+import { AGENT_BUS_WAKE_PREFIX, AgentBus, validAgentRequestId, validAnswerStatus, type AgentAnswerReceipt } from "./agent-bus.ts";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
 export type ChatCore = {
   info: ChatInfo;
+  remote?: RemoteBox;
   store: Store;
   /** Owner: the bridge state root. Others: chats/<slug>, so secret values never mix between chats. */
   stateRoot: string;
@@ -53,6 +61,7 @@ export type RegistryOptions<P> = {
   stateRoot: string;
   access: () => Access;
   build: (chat: ChatCore) => P;
+  backend?: BackendKind;
   now?: () => number;
 };
 
@@ -94,7 +103,7 @@ export class ChatRegistry<P> {
 
   /** The chat whose current route is this session (route id or id@generation). */
   forSession(sessionId: string): Chat<P> | undefined {
-    return this.all().find(chat => sessionMatches(chat.store.get<{ id: string; generation: number } | null>("route"), sessionId));
+    return this.all().find(chat => chat.remote ? chat.remote.sessionId === sessionId : sessionMatches(chat.store.get<{ id: string; generation: number } | null>("route"), sessionId));
   }
 
   open(key: ChatKey, groupName?: string): Chat<P> {
@@ -130,12 +139,14 @@ export class ChatRegistry<P> {
             const id = (input as { id?: unknown }).id;
             if (typeof id !== "string") return false;
             // Same as Photon ingest: the router's quiet window counts from arrival, not from the sender's clock.
-            const created = chat.store.acceptInbound(id, { ...(input as object), receivedAt: this.now() });
+            const payload = { ...(input as object), receivedAt: this.now() };
+            const created = chat.remote ? chat.remote.accept(id, payload) : chat.store.acceptInbound(id, payload);
             if (created) {
               const message = input as { attachments?: { totalBytes?: number }[]; sentAt?: number; logSource?: string };
               toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: chat.info.slug, messageId: id },
                 props: { bytesKnown: !message.attachments?.length || message.attachments.every(a => (a.totalBytes ?? 0) > 0), attachmentCount: message.attachments?.length ?? 0, attachmentBytes: (message.attachments ?? []).reduce((n, a) => n + (a.totalBytes ?? 0), 0),
-                  receiveLagMs: Math.max(0, this.now() - (message.sentAt ?? this.now())), source: message.logSource === "backfill" ? "backfill" : "live" } }));
+                  receiveLagMs: Math.max(0, this.now() - (message.sentAt ?? this.now())), source: message.logSource === "backfill" ? "backfill" : "live",
+                  backend: chat.remote ? "remote-box" : this.options.backend ?? "unknown" } }));
               this.touch(chat); received?.(chat, input);
             }
             return created;
@@ -153,9 +164,11 @@ export class ChatRegistry<P> {
   }
 
   /** Machine input for a chat's agent (owner decisions, questions from other chats). Deduped by key. */
-  wake(chat: Chat<P>, text: string, dedupeKey: string): { id: string; created: boolean } {
-    const id = `wake:${hash(dedupeKey)}`;
-    const created = chat.store.acceptInbound(id, { id, text, attachments: [], isAudioMessage: false, receivedAt: this.now() });
+  wake(chat: Chat<P>, text: string, dedupeKey: string, metadata: { agentAnswer?: AgentAnswerReceipt; agentBus?: boolean } = {}): { id: string; created: boolean } {
+    const id = `${metadata.agentBus ? AGENT_BUS_WAKE_PREFIX : "wake:"}${hash(dedupeKey)}`;
+    const payload = { id, text, attachments: [], isAudioMessage: false, receivedAt: this.now(),
+      ...(metadata.agentAnswer ? { agentAnswer: metadata.agentAnswer } : {}) };
+    const created = chat.remote ? chat.remote.accept(id, payload, metadata.agentAnswer, "wake") : chat.store.acceptInbound(id, payload);
     if (created) this.touch(chat);
     return { id, created };
   }
@@ -211,6 +224,7 @@ type Handler = (request: Request) => Promise<Response>;
 
 export type SbApiOptions<P extends { api: Handler }> = {
   registry: ChatRegistry<P>;
+  agentBus?: AgentBus;
   line: Line;
   accessPath: string;
   enabled: () => boolean;
@@ -252,17 +266,59 @@ const askText = (from: ChatInfo, question: string) =>
 const relayText = (body: string) =>
   `[Relayed from the owner's chat, not typed by anyone here. Act on it and tell this chat what happened if they need to know.]\n${body}`;
 
+const isAdmin = <P>(chat: Chat<P>) => chat.info.kind === "dm"
+  && chat.context.roleOf(chatKey.target(chat.info.key)).role === "admin";
+const adminGroup = <P>(caller: Chat<P> | undefined, target: Chat<P> | undefined) => caller !== undefined
+  && isAdmin(caller) && target !== undefined && target.info.kind === "group"
+  && target.store.hasInboundFrom([chatKey.target(caller.info.key), ...(caller.info.person?.addresses ?? [])]);
+
+export function createAgentBus<P>(registry: ChatRegistry<P>, log: (event: string, code?: string) => void = () => {}, policyPath?: string): AgentBus {
+  return new AgentBus({
+    db: registry.owner.store.db,
+    forSession: id => registry.forSession(id)?.info,
+    bySlug: slug => registry.bySlugName(slug)?.info,
+    policyPath,
+    groupMembers: info => {
+      const chat = registry.bySlugName(info.slug);
+      return chat ? [...new Set(chat.store.groupAudience().map(address => chat.context.roleOf(address).name))] : [];
+    },
+    deliver: (target, text, key, receipt) => {
+      const chat = registry.bySlugName(target.slug);
+      if (!chat) throw new Error("Agent target unavailable");
+      registry.wake(chat, text, key, { agentAnswer: receipt, agentBus: true });
+    },
+    receipt: (target, key) => {
+      const chat = registry.bySlugName(target.slug);
+      if (chat?.remote) return chat.remote.receipt(`${AGENT_BUS_WAKE_PREFIX}${hash(key)}`);
+      const row = chat?.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(`${AGENT_BUS_WAKE_PREFIX}${hash(key)}`);
+      const receipt = row ? (JSON.parse(row.payload) as { agentAnswer?: AgentAnswerReceipt }).agentAnswer : undefined;
+      return receipt && validAnswerStatus(receipt.status) && Number.isSafeInteger(receipt.at)
+        && Number.isSafeInteger(receipt.chars) && receipt.chars >= 0 ? receipt : undefined;
+    },
+    log,
+  });
+}
+
 /**
  * The bridge socket in Sendblue mode. `sessionId` picks the calling chat; Photon-era routes are
  * forwarded unchanged to that chat's own API, and the multi-chat routes are handled here.
  */
-export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>): Handler {
+export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>, remotePrincipal?: RemoteBox, operation?: { id: string; fingerprint: string }): Handler {
   const { registry } = options;
+  const bus = options.agentBus ?? createAgentBus(registry, undefined, agentPolicyPath(options.accessPath));
   const reply = (status: number, body: unknown) => Response.json(body, { status });
   const result = (outcome: SbApiResult) => reply(outcome.status, outcome.body);
   const pendingOptIns = new Set<string>();
+  const invokeBus = (perform: () => SbApiResult) => operation ? bus.once(operation.id, operation.fingerprint, perform) : perform();
 
   return async request => {
+    if (remotePrincipal) {
+      const chat = registry.bySlugName("moni");
+      if (!chat || chat.remote !== remotePrincipal) return reply(403, { error: "Forbidden" });
+      if (!options.enabled()) return reply(503, { error: "Bridge unavailable" });
+      return remotePrincipal.callback(request, { line: options.line, chat: chat.info.key,
+        bus: (path, body, id, fingerprint) => createSbApi(options, undefined, { id, fingerprint })(new Request(`http://bridge${path}`, { method: "POST", body: JSON.stringify(body) })) });
+    }
     const path = new URL(request.url).pathname;
     try {
       if (request.method === "GET") {
@@ -309,9 +365,8 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         if (caller.info.kind !== "owner") throw new HttpError(403, "Only the owner's chat can do this");
       };
       // An admin's own chat may post in groups the admin has written in; everything else cross-chat stays owner-only.
-      const adminCaller = caller !== undefined && caller.info.kind === "dm" && caller.context.roleOf(chatKey.target(caller.info.key)).role === "admin";
-      const adminGroup = (chat: Chat<P> | undefined) => adminCaller && caller !== undefined && chat !== undefined && chat.info.kind === "group"
-        && chat.store.hasInboundFrom([chatKey.target(caller.info.key), ...(caller.info.person?.addresses ?? [])]);
+      const adminCaller = caller !== undefined && isAdmin(caller);
+      const callerAdminGroup = (chat: Chat<P> | undefined) => adminGroup(caller, chat);
       const live = () => { if (!options.enabled()) throw new HttpError(503, "Bridge is not ready"); };
       /** `--chat <slug>`: only the owner's agent may ask after someone else's location. */
       const locationTarget = (chat: unknown): ChatInfo | undefined => {
@@ -331,6 +386,55 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
       });
 
       switch (path) {
+        case "/notify-rule": {
+          only(body, ["sessionId", "action", "text", "id"]);
+          live();
+          if (!text(sessionId, 200)) throw new HttpError(400, "Invalid request");
+          ownerOnly(false);
+          if (body.action === "add" ? !validNotifyText(body.text) || body.id !== undefined
+            : body.action === "rm" ? !validNotifyId(body.id) || body.text !== undefined
+            : body.action !== "list" || body.id !== undefined || body.text !== undefined) throw new HttpError(400, "Invalid request");
+          return result(bus.notifyRules({ sessionId, action: body.action as "add" | "rm" | "list",
+            ...(typeof body.text === "string" ? { text: body.text } : {}), ...(typeof body.id === "number" ? { id: body.id } : {}) }));
+        }
+        case "/agent-ask": {
+          only(body, ["sessionId", "to", "text", "dedupeKey", "parent"]);
+          live();
+          if (!text(sessionId, 200) || !text(body.to, 100) || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(body.to)
+            || !text(body.text, 12_000) || !text(body.dedupeKey, 200)
+            || (body.parent !== undefined && !validAgentRequestId(body.parent))) throw new HttpError(400, "Invalid request");
+          return result(invokeBus(() => bus.ask({ sessionId, to: body.to as string, text: body.text as string, dedupeKey: body.dedupeKey as string,
+            ...(typeof body.parent === "string" ? { parent: body.parent } : {}) })));
+        }
+        case "/agent-answer": {
+          only(body, ["sessionId", "request", "text", "status"]);
+          live();
+          if (!text(sessionId, 200) || !validAgentRequestId(body.request)
+            || !text(body.text, 12_000) || (body.status !== undefined && !validAnswerStatus(body.status))) throw new HttpError(400, "Invalid request");
+          return result(invokeBus(() => bus.answer({ sessionId, request: body.request as string, text: body.text as string, status: body.status as import("./agent-bus.ts").AnswerStatus | undefined })));
+        }
+        case "/remote-events":
+        case "/remote-resolve": {
+          only(body, path === "/remote-events" ? ["sessionId", "chat", "after"] : ["sessionId", "chat", "id", "state"]);
+          ownerOnly(false);
+          live();
+          if (body.chat !== "moni" || path === "/remote-events" && body.after !== undefined && !validId(body.after)
+            || path === "/remote-resolve" && (!validId(body.id) || !["done", "pending"].includes(String(body.state)))) throw new HttpError(400, "Invalid request");
+          const remote = registry.bySlugName("moni")?.remote;
+          if (!remote) throw new HttpError(409, "Moni's chat is not on its box");
+          try {
+            return reply(200, path === "/remote-events" ? await remote.events(body.after as string | undefined) : await remote.resolve(body.id as string, body.state as "done" | "pending"));
+          } catch (error) {
+            if (error instanceof RemoteRequestError && error.status === 409) throw new HttpError(409, "Event is not interrupted/attachment-failed");
+            throw new HttpError(502, "Box request failed");
+          }
+        }
+        case "/agent-requests": {
+          only(body, ["sessionId"]);
+          live();
+          if (!text(sessionId, 200)) throw new HttpError(400, "Invalid request");
+          return result(bus.requests(sessionId));
+        }
         case "/app": {
           if (request.headers.has("origin")) throw new HttpError(403, "Forbidden");
           only(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "updateOf", "previewPage", "to", "dedupeKey", "sessionId"]);
@@ -343,6 +447,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           }
           const target = registry.bySlugName(to);
           if (!target) throw new HttpError(404, "Unknown chat");
+          if (target.remote) throw new HttpError(403, "Use agent-ask to reach this chat on its box");
           if (target.info.kind === "group") throw new HttpError(422, GROUP_APP_REFUSAL);
           const id = `app:${hash(`${target.info.slug}:${dedupeKey}`)}`;
           let created: boolean;
@@ -353,13 +458,14 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         }
         case "/send": {
           only(body, ["text", "to", "dedupeKey", "sessionId"]);
-          if (!adminGroup(typeof body.to === "string" ? registry.bySlugName(body.to) : undefined)) ownerOnly(false);
+          if (!callerAdminGroup(typeof body.to === "string" ? registry.bySlugName(body.to) : undefined)) ownerOnly(false);
           live();
           const { to, dedupeKey } = body;
           if (typeof body.text === "string" && body.text.length > 12_000) throw new HttpError(400, messageLengthError(body.text, 12_000));
           if (!text(body.text, 12_000) || !text(to, 100) || !text(dedupeKey, 200)) throw new HttpError(400, "Invalid request");
           const target = registry.bySlugName(to);
           if (!target) throw new HttpError(404, "Unknown chat");
+          if (target.remote) throw new HttpError(403, "Use agent-ask to reach this chat on its box");
           const id = `send:${hash(`${target.info.slug}:${dedupeKey}`)}`;
           let created: boolean;
           try { created = target.store.enqueue({ id, kind: "conversation", text: body.text }); }
@@ -385,10 +491,11 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           const { target, kind } = body;
           if (!text(target, 200) || RESERVED_TARGET.test(target) || typeof kind !== "string"
             || !(TAPBACKS.includes(kind) || singleEmoji(kind))) throw new HttpError(400, "Invalid request");
-          const inbound = registry.all().some(chat =>
+          const inbound = registry.all().find(chat =>
             chat.store.db.query<{ id: string }, [string]>("SELECT id FROM inbound WHERE id = ?").get(target));
           if (!inbound) throw new HttpError(403, "Forbidden");
           await options.line.react(target, kind);
+          markReactionAnswered(inbound.store, target);
           return reply(200, { id: `reaction:${hash(target + kind)}` });
         }
         case "/location-request": {
@@ -415,7 +522,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           if (body.chat !== undefined) {
             if (!text(body.chat, 100) || !/^[a-z0-9][a-z0-9._-]{0,99}$/.test(body.chat)) throw new HttpError(400, "Invalid request");
             const target = registry.bySlugName(body.chat);
-            if (!adminGroup(target)) ownerOnly(false);
+            if (!callerAdminGroup(target)) ownerOnly(false);
             if (!target) throw new HttpError(404, "Unknown chat");
             chat = target;
           }
@@ -542,7 +649,7 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
         case "/chats": {
           only(body, ["sessionId"]);
           if (!adminCaller) ownerOnly(true);
-          return reply(200, { chats: (adminCaller ? registry.all().filter(chat => adminGroup(chat)) : registry.all()).map(chat => ({
+          return reply(200, { chats: (adminCaller ? registry.all().filter(chat => callerAdminGroup(chat)) : registry.all()).map(chat => ({
             slug: chat.info.slug, title: chat.info.title, kind: chat.info.kind,
             ...(registry.lastActivity(chat) === undefined ? {} : { lastActivityAt: registry.lastActivity(chat) }),
           })) });

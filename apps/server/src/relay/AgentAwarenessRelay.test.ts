@@ -188,6 +188,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
       Effect.sync(() => shellReads.push(threadId)).pipe(
         Effect.andThen(options.readShell?.(threadId) ?? Ref.get(currentShell)),
       ),
+    pageActiveThreadIds: () => Effect.die("unused pageActiveThreadIds"),
     listActiveThreadIds: () => Effect.die("unused listActiveThreadIds"),
     getShellSnapshot: () =>
       Effect.sync(() => {
@@ -218,6 +219,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
     isProviderInstanceEnabledForProject: unused,
     hasReceipt: unused,
     getDelegationCommandState: unused,
+    requestCancelOnArrival: unused,
     getCommandReceipt: unused,
     findMcpThreadCreations: unused,
     waitForThread: unused,

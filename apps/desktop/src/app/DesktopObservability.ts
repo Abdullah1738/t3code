@@ -50,7 +50,10 @@ export interface DesktopBackendOutputLogShape {
     chunk: Uint8Array,
   ) => Effect.Effect<void>;
   readonly persistFailureSnapshot: (input: { readonly details: string }) => Effect.Effect<void>;
-  readonly persistFailure: (input: { readonly details: string }) => Effect.Effect<void>;
+  readonly persistFailure: (input: {
+    readonly details: string;
+    readonly annotations?: DesktopLogAnnotations;
+  }) => Effect.Effect<void>;
   readonly discardSession: Effect.Effect<void>;
 }
 
@@ -462,7 +465,12 @@ const makeBackendOutputLogShape = (
         const exporterDecoder = new TextDecoder();
         let exporterLine = "";
         const writeFailure = Effect.fn("desktop.observability.backendOutput.writeFailure")(
-          function* (session: BackendOutputSession, details: string) {
+          function* (
+            session: BackendOutputSession,
+            details: string,
+            annotations?: DesktopLogAnnotations,
+          ) {
+            yield* Effect.annotateCurrentSpan(annotations ?? {});
             yield* writeBackendChildLogRecord(logFile, {
               message: "backend child process failure output start",
               level: "ERROR",
@@ -496,6 +504,7 @@ const makeBackendOutputLogShape = (
                 instanceId: id,
                 phase: "END",
                 details: sanitizeLogValue(details),
+                ...annotations,
               },
             });
           },
@@ -554,10 +563,10 @@ const makeBackendOutputLogShape = (
             }
           }),
           persistFailure: Effect.fn("desktop.observability.backendOutput.persistFailure")(
-            function* ({ details }) {
+            function* ({ details, annotations }) {
               const session = yield* Ref.modify(sessionRef, (current) => [current, Option.none()]);
               if (Option.isNone(session)) return;
-              yield* writeFailure(session.value, details);
+              yield* writeFailure(session.value, details, annotations);
             },
           ),
           discardSession: Ref.set(sessionRef, Option.none()),

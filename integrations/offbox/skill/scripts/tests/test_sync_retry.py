@@ -251,7 +251,7 @@ class PushResumeTests(Isolated):
         row = rn.start()
         self.assertEqual(row['remote_dir'], 'w/caller-abcdef')
         self.assertIs(row['_guard'], self.guard)
-        self.resume.assert_called_once_with(unittest.mock.ANY, 'box', common.RUN_TTL_S, None, retry=True)
+        self.resume.assert_called_once_with(unittest.mock.ANY, 'box', common.RUN_TTL_S, None, retry=True, watch=unittest.mock.ANY)
         self.bring_up.assert_called_once()
         self.assertEqual(self.push.call_count, 2)
         self.assertEqual(self.put_file.call_count, 2)

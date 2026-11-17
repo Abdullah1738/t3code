@@ -182,6 +182,177 @@ class TriageLoggingTests(unittest.TestCase):
         self.assertEqual(t.read_json(fixture.wd / 'cursor.json')['pending'], {})
         self.assertEqual(self.logs.read_text(), 'not a directory')
 
+    def test_unexpected_auth_is_logged_with_safe_metadata_and_never_sent(self):
+        fixture = self.fixture(fast_fixtures.DeliveryTests)
+        for n, (sender, text, kind, label) in enumerate((
+            ('Bank', 'Your verification code is 123456.', 'otp', 'an inbox sender'),
+            ('WHOOP', 'Your verification code is 123 456.', 'otp', 'WHOOP'),
+            ('Claude', 'Your secure link to Claude: https://example.test/auth?token=fixture', 'signin_link', 'Claude'),
+        )):
+            with self.subTest(kind=kind, label=label):
+                msg = fast_fixtures.item(sender, text, id=f'imsg:auth-{n}')
+                before = len(self.rows('fastpath.auth_logged'))
+                fixture.run_items([msg])
+                event, = self.rows('fastpath.auth_logged')[before:]
+                self.assertEqual(event['props'], {'source': 'sms', 'senderLabel': label, 'authKind': kind})
+                self.assertEqual(event['ids']['item'], hashlib.sha256(msg['id'].encode()).hexdigest()[:24])
+                decision, = self.decisions(msg['id'])
+                self.assertEqual((decision['props']['class'], decision['props']['routed']), ('otp', 'logged'))
+                self.assertEqual(fixture.notifications(), [])
+        for secret in ('123456', '123 456', 'example.test', 'token=fixture'):
+            self.assertNotIn(secret, json.dumps(self.rows()))
+
+    def test_expected_auth_stays_ignored_and_stale_auth_is_logged_only(self):
+        fixture = self.fixture(fast_fixtures.DeliveryTests)
+        t.atomic(fixture.data / 'inflight-actions.json', [{'sender': 'bank', 'at': 990}])
+        msg = fast_fixtures.item('Bank', 'Your verification code is 123456.')
+        fixture.run_items([msg])
+        decision, = self.decisions(msg['id'])
+        self.assertEqual((decision['props']['class'], decision['props']['routed']), ('otp', 'ignored'))
+        self.assertEqual(self.rows('fastpath.auth_logged'), [])
+        t.atomic(fixture.wd / 'cursor.json', {'initialized_at': 900, 'cursors': {}, 'pending': {
+            'mail:fund:1:1': {'kind': 'auth', 'text': 'Security: a sign-in link from Claude', 'at': 1000,
+                            'auth_identity': {'sender': 'support@anthropic.com', 'account': 'fund', 'ts': 1000}}}})
+        fixture.run_items([])
+        event, = self.rows('fastpath.auth_logged')
+        self.assertEqual(event['props'], {'source': 'mail', 'senderLabel': 'Claude', 'authKind': 'signin_link'})
+        self.assertEqual(t.read_json(fixture.wd / 'cursor.json')['pending'], {})
+        self.assertEqual(fixture.notifications(), [])
+
+    def test_collected_expected_mail_otps_keep_issuance_evidence_after_redaction(self):
+        fixture = self.fixture(fast_fixtures.DeliveryTests)
+        actions = [{'sender': 'support@whoop.com', 'account': 'fund', 'at': 990}]
+        t.atomic(fixture.data / 'inflight-actions.json', actions)
+        cases = (
+            ('unspaced', 'Notice', 'Your verification code is 123456.'),
+            ('spaced', 'Notice', 'Your verification code is 123 456.'),
+            ('alphanumeric', 'Notice', 'Your verification code is A1B2C3.'),
+            ('subject', 'Verification code: 123456', 'Use this to sign in.'),
+        )
+        for n, (shape, subject, body) in enumerate(cases, 1):
+            with self.subTest(shape=shape):
+                raw = (f'From: support@whoop.com\r\nSubject: {subject}\r\nContent-Type: text/plain\r\n\r\n{body}').encode()
+                with patch.object(t, 'fetch_verified', return_value=[(n, '', raw)]):
+                    msg, _ = t.mail_record(None, None, 'fund', 1,
+                        (n, '01-Jan-1970 00:16:40 +0000', raw.split(b'\r\n\r\n')[0]), 0, 1001,
+                        {'seen': [], 'rules': [], 'fast': True, 'actions': actions})
+                self.assertIsNone(msg['hard_alert'])
+                self.assertIs(msg['auth_issued'], True)
+                self.assertFalse(t.fastpath.issued_auth(msg['subject'] + ' ' + msg['preview']))
+                fixture.run_items([msg])
+                decision, = self.decisions(msg['id'])
+                self.assertEqual((decision['props']['class'], decision['props']['routed']), ('otp', 'ignored'))
+        self.assertEqual(self.rows('fastpath.auth_logged'), [])
+        self.assertEqual(fixture.notifications(), [])
+
+    def test_pending_auth_preserves_expected_decision_for_otp_and_link(self):
+        fixture = self.fixture(fast_fixtures.DeliveryTests)
+        cases = (
+            ('matching', {'sender': 'bank', 'account': 'fund', 'at': 990}, True),
+            ('wrong sender', {'sender': 'other', 'account': 'fund', 'at': 990}, False),
+            ('wrong account', {'sender': 'bank', 'account': 'gmail', 'at': 990}, False),
+            ('future action', {'sender': 'bank', 'account': 'fund', 'at': 1001}, False),
+            ('expired action', {'sender': 'bank', 'account': 'fund', 'at': 399}, False),
+            ('no identity', {'sender': 'bank', 'account': 'fund', 'at': 990}, False),
+        )
+        for what in ('an OTP', 'a sign-in link'):
+            for shape, action, expected in cases:
+                with self.subTest(kind=what, shape=shape):
+                    item_id = 'mail:fund:1:' + str(len(self.rows()))
+                    identity = None if shape == 'no identity' else {'sender': 'Bank', 'account': 'fund', 'ts': 1000}
+                    t.atomic(fixture.data / 'inflight-actions.json', [action])
+                    t.atomic(fixture.wd / 'cursor.json', {'initialized_at': 900, 'cursors': {}, 'pending': {
+                        item_id: {'kind': 'auth', 'text': f'Security: {what} from your bank',
+                                  'at': 1000, 'auth_identity': identity}}})
+                    before = len(self.rows('fastpath.auth_logged'))
+                    fixture.run_items([])
+                    decision, = self.decisions(item_id)
+                    self.assertEqual((decision['props']['class'], decision['props']['routed']),
+                                     ('otp', 'ignored' if expected else 'logged'))
+                    self.assertEqual(len(self.rows('fastpath.auth_logged')) - before, int(not expected))
+                    self.assertEqual(t.read_json(fixture.wd / 'cursor.json')['pending'], {})
+        self.assertEqual(fixture.notifications(), [])
+
+    def test_collected_expected_mail_links_keep_issuance_evidence_after_redaction(self):
+        fixture = self.fixture(fast_fixtures.DeliveryTests)
+        actions = [{'sender': 'support@anthropic.com', 'account': 'fund', 'at': 990}]
+        t.atomic(fixture.data / 'inflight-actions.json', actions)
+        cases = (
+            ('plain', 'text/plain', 'Your secure link to Claude: https://example.test/private'),
+            ('HTML', 'text/html', '<a href="https://example.test/private">Sign in</a>'),
+            ('multipart', 'multipart/alternative; boundary=fixture',
+             '--fixture\r\nContent-Type: text/plain\r\n\r\nClick below.\r\n'
+             '--fixture\r\nContent-Type: text/html\r\n\r\n<a href="https://example.test/private">Sign in</a>\r\n--fixture--'),
+        )
+        helper = types.SimpleNamespace(html_to_text=lambda _: 'Sign in')
+        for n, (shape, mime, body) in enumerate(cases, 1):
+            with self.subTest(shape=shape):
+                raw = (f'From: support@anthropic.com\r\nSubject: Sign in\r\nContent-Type: {mime}\r\n\r\n{body}').encode()
+                with patch.object(t, 'fetch_verified', return_value=[(n, '', raw)]):
+                    msg, _ = t.mail_record(None, helper, 'fund', 1,
+                        (n, '01-Jan-1970 00:16:40 +0000', raw.split(b'\r\n\r\n')[0]), 0, 1001,
+                        {'seen': [], 'rules': [], 'fast': True, 'actions': actions})
+                self.assertIsNone(msg['hard_alert'])
+                self.assertFalse(t.fastpath.issued_auth(msg['subject'] + ' ' + msg['preview']))
+                self.assertNotIn('example.test', json.dumps(msg))
+                fixture.run_items([msg])
+                decision, = self.decisions(msg['id'])
+                self.assertEqual((decision['props']['class'], decision['props']['routed']), ('otp', 'ignored'))
+        self.assertEqual(self.rows('fastpath.auth_logged'), [])
+        self.assertEqual(fixture.notifications(), [])
+
+    def test_collected_expected_imessage_links_stay_ignored(self):
+        fixture = self.fixture(fast_fixtures.DeliveryTests)
+        actions = [{'sender': 'claude', 'at': 990}]
+        t.atomic(fixture.data / 'inflight-actions.json', actions)
+        cases = ('Your secure link to Claude: https://example.test/private',
+                 'Sign in: https://example.test/private. This link expires in 10 minutes.')
+        path = fixture.root / 'Library/Messages/chat.db'
+        path.parent.mkdir(parents=True)
+        triage_fixtures.chat_db(path, [(n, 10, 'Claude', 1000, 0, {'text': body})
+                                     for n, body in enumerate(cases, 1)], {10: ['Claude']})
+        with patch.object(t, 'HOME', fixture.root), \
+             patch.object(t, 'settings', return_value={'excluded_imessage_chat_ids': [], 'excluded_imessage_identifiers': []}):
+            result = t.collect_imessage(0, 1001, fast={'actions': actions})
+        self.assertEqual(len(result['items']), len(cases))
+        for msg in result['items']:
+            self.assertIsNone(msg['hard_alert'])
+            self.assertNotIn('example.test', json.dumps(msg))
+            fixture.run_items([msg])
+            decision, = self.decisions(msg['id'])
+            self.assertEqual((decision['props']['class'], decision['props']['routed']), ('otp', 'ignored'))
+        self.assertEqual(self.rows('fastpath.auth_logged'), [])
+        self.assertEqual(fixture.notifications(), [])
+
+    def test_collected_expected_imessage_otps_keep_issuance_evidence_after_redaction(self):
+        fixture = self.fixture(fast_fixtures.DeliveryTests)
+        actions = [{'sender': 'bank', 'at': 990}]
+        t.atomic(fixture.data / 'inflight-actions.json', actions)
+        cases = (
+            ('unspaced', '', 'Your verification code is 123456.'),
+            ('spaced', '', 'Your verification code is 123 456.'),
+            ('alphanumeric', '', 'Your verification code is A1B2C3.'),
+            ('subject', 'Verification code: 123456', 'Use this to sign in.'),
+        )
+        path = fixture.root / 'Library/Messages/chat.db'
+        path.parent.mkdir(parents=True)
+        triage_fixtures.chat_db(path, [(n, 10, 'Bank', 1000, 0, {'subject': subject, 'text': body})
+                                     for n, (_, subject, body) in enumerate(cases, 1)], {10: ['Bank']})
+        with patch.object(t, 'HOME', fixture.root), \
+             patch.object(t, 'settings', return_value={'excluded_imessage_chat_ids': [], 'excluded_imessage_identifiers': []}):
+            result = t.collect_imessage(0, 1001, fast={'actions': actions})
+        self.assertEqual(len(result['items']), len(cases))
+        for (shape, _, _), msg in zip(cases, result['items']):
+            with self.subTest(shape=shape):
+                self.assertIsNone(msg['hard_alert'])
+                self.assertIs(msg['auth_issued'], True)
+                self.assertFalse(t.fastpath.issued_auth(msg['subject'] + ' ' + msg['preview']))
+                fixture.run_items([msg])
+                decision, = self.decisions(msg['id'])
+                self.assertEqual((decision['props']['class'], decision['props']['routed']), ('otp', 'ignored'))
+        self.assertEqual(self.rows('fastpath.auth_logged'), [])
+        self.assertEqual(fixture.notifications(), [])
+
     def test_mail_helper_success_exit_and_timeout_never_log_args_or_output(self):
         payload = {'now': time.time(), 'private': 'private mail payload'}
         good = {'items': [], 'cursor': {}, 'drops': {}, 'scanned': 0}
@@ -193,12 +364,12 @@ class TriageLoggingTests(unittest.TestCase):
                               return_value=outcome):
                 if isinstance(outcome, Exception):
                     with self.assertRaises(subprocess.TimeoutExpired):
-                        t.run_mail('icloud', {**payload, 'fast': True})
+                        t.run_mail_fetch('icloud', {**payload, 'fast': True})
                 elif outcome.returncode:
                     with self.assertRaises(RuntimeError):
-                        t.run_mail('icloud', payload)
+                        t.run_mail_fetch('icloud', payload)
                 else:
-                    self.assertEqual(t.run_mail('icloud', payload), good)
+                    self.assertEqual(t.run_mail_fetch('icloud', payload), good)
         rows = self.rows('helper.run')
         self.assertEqual([row['ok'] for row in rows], [True, False, False])
         self.assertEqual(rows[-1]['props'], {'outcome': 'timeout', **t.stderr_cause('private stderr', True)})

@@ -13,6 +13,7 @@ import { type DesktopSnapShotEvent, DEFAULT_CLIENT_SETTINGS } from "@t3tools/con
 import * as DesktopAssets from "../app/DesktopAssets.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import { makeComponentLogger } from "../app/DesktopObservability.ts";
+import * as DesktopQuit from "../app/DesktopQuit.ts";
 import * as DesktopState from "../app/DesktopState.ts";
 import * as ElectronMenu from "../electron/ElectronMenu.ts";
 import { getDesktopUrl } from "../electron/ElectronProtocol.ts";
@@ -410,7 +411,7 @@ export const make = Effect.gen(function* () {
       return Option.none();
     }
 
-    yield* rendererHistory.register(window.webContents, { surface: "main" });
+    yield* rendererHistory.register(window.webContents, { surface: "main" }, window);
     if (environment.platform === "darwin") {
       window.setAutoHideCursor(false);
     }
@@ -655,7 +656,9 @@ export const make = Effect.gen(function* () {
       // released so its remaining repeats cannot reach the next app.
       concealWindow: () => concealPendingQuitWindow(window),
       quit: () => {
-        void runPromise(electronApp.quit);
+        void runPromise(
+          DesktopQuit.record({ trigger: "menu" }).pipe(Effect.andThen(electronApp.quit)),
+        );
       },
     });
     window.webContents.on("before-input-event", (event, input) => {
@@ -927,7 +930,7 @@ export const make = Effect.gen(function* () {
       yield* electronWindow.destroyAll;
       return;
     }
-    yield* rendererHistory.register(splash.webContents, { surface: "splash" });
+    yield* rendererHistory.register(splash.webContents, { surface: "splash" }, splash);
     yield* Ref.set(splashWindowRef, Option.some(splash));
     splash.once("closed", () => {
       void runPromise(Ref.set(splashWindowRef, Option.none()));

@@ -13,10 +13,27 @@ describe("T3 orchestration provider instructions", () => {
     assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "ordinary top-level T3 conversations");
     assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "Never use them merely");
     assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "cross-provider");
-    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "call `delegate_task` again");
     assert.include(
       T3_CODE_ORCHESTRATION_INSTRUCTIONS,
-      "Do not use `t3_thread_send` on `childThreadId`",
+      "Start the first round with `delegate_task`",
+    );
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "role `review`");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "`<card>-precommit-review`");
+    assert.include(
+      T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+      "send later rounds with `t3_thread_send` to the same `childThreadId`",
+    );
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, 'with `mode:"queue"`');
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "retain its returned `taskId`");
+    assert.include(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "its completion wakes the parent");
+    assert.include(
+      T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+      "Start a new child only if the previous child failed, was cancelled, or its model must change",
+    );
+    assert.notInclude(T3_CODE_ORCHESTRATION_INSTRUCTIONS, "call `delegate_task` again");
+    assert.notInclude(
+      T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+      "not the target for starting another delegated review round",
     );
   });
 

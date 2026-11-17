@@ -15,6 +15,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStreamText";
 import type { SourceControlProviderContext } from "@t3tools/source-control-core/server/SourceControlProvider";
+import { isMissingExecutable } from "@t3tools/source-control-core/server/discovery";
 
 const encodeApiBody = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
@@ -34,7 +35,11 @@ export class ForgejoCliError extends Schema.TaggedError<ForgejoCliError>()("Forg
   ),
   httpStatus: Schema.optional(Schema.Int),
   cause: Schema.optional(Schema.Defect()),
-}) {}
+}) {
+  override get message(): string {
+    return this.detail;
+  }
+}
 
 export const ForgejoLoginSchema = Schema.Struct({
   name: Schema.String,
@@ -229,18 +234,19 @@ export const make = Effect.gen(function* () {
             new ForgejoCliError({
               command: input.command ?? "tea",
               cwd: input.cwd,
-              ...(input.command === "fj" ? {} : { cause }),
-              ...(cause._tag === "VcsProcessSpawnError"
+              // fj exit output can contain credentials; spawn errors contain no CLI output.
+              ...(input.command === "fj" && cause._tag !== "VcsProcessSpawnError" ? {} : { cause }),
+              ...(isMissingExecutable(cause)
                 ? { reason: "missing-cli" as const }
                 : cause._tag === "VcsProcessExitError" && cause.failureKind === "authentication"
                   ? { reason: "authentication" as const }
                   : {}),
               detail:
                 cause._tag === "VcsProcessSpawnError"
-                  ? "Install Forgejo CLI (`fj` 0.6 or later) or Gitea CLI (`tea` 0.16 or later) and retry."
+                  ? `Could not start \`${input.command ?? "tea"}\`. Check that it is installed and available on the server PATH, and that the working directory exists.`
                   : cause._tag === "VcsProcessExitError" && cause.failureKind === "authentication"
-                    ? "Authenticate this server with `fj auth login`, `fj auth add-token`, or `tea login add`."
-                    : "Forgejo CLI command failed.",
+                    ? `Authentication with \`${input.command ?? "tea"}\` failed. Authenticate this server with that CLI.`
+                    : `Forgejo CLI command \`${input.command ?? "tea"}\` failed.`,
             }),
         ),
       );
@@ -550,12 +556,19 @@ export const make = Effect.gen(function* () {
         path: remote?.path ?? "",
       };
     const schemeRemoteUrl = remote?.ssh ? input.context?.provider.baseUrl : remoteUrl;
+    const requestedHost = input.host ?? input.context?.requestedHost;
+    const targetHost = requestedHost ?? remote?.host ?? "the selected Forgejo host";
+    const forHost = (error: ForgejoCliError) =>
+      new ForgejoCliError({
+        ...error,
+        ...(error.cause === undefined ? {} : { cause: error.cause }),
+        detail: `${error.detail} Host: ${targetHost}.`,
+      });
     const fjLogins = yield* listLogins({
       cwd: input.cwd,
       command: "fj",
       ...(schemeRemoteUrl ? { remoteUrl: schemeRemoteUrl } : {}),
-    });
-    const requestedHost = input.host ?? input.context?.requestedHost;
+    }).pipe(Effect.mapError(forHost));
     const matchHostOnly = hostOnly || (!!input.host && !remote?.path);
     const selectLogin = (logins: ReturnType<typeof parseForgejoLogins>) =>
       remote
@@ -564,6 +577,7 @@ export const make = Effect.gen(function* () {
           (new Set(logins.map((item) => item.name)).size === 1 ? logins[0] : undefined));
     let login = selectLogin(fjLogins);
     let command: "fj" | "tea" = "fj";
+    let fjFailure: ForgejoCliError | undefined;
     if (
       !login &&
       fjLogins.some(
@@ -580,28 +594,45 @@ export const make = Effect.gen(function* () {
           command: "fj",
           cwd: input.cwd,
           reason: "authentication",
-          detail: "Multiple fj logins match this repository. Specify its full server URL.",
+          detail: `Multiple fj logins match ${targetHost}. Specify its full server URL.`,
         });
-      if (available.failure.reason !== "missing-cli") return yield* available.failure;
+      if (available.failure.reason !== "missing-cli") return yield* forHost(available.failure);
     }
     if (login) {
       const auth = yield* authenticateFj(input.cwd, login).pipe(Effect.result);
       if (Result.isFailure(auth)) {
-        if (auth.failure.reason === "missing-cli") login = undefined;
-        else return yield* auth.failure;
+        if (auth.failure.reason === "missing-cli") {
+          fjFailure = auth.failure;
+          login = undefined;
+        } else return yield* forHost(auth.failure);
       }
     }
     if (!login) {
       command = "tea";
-      login = selectLogin(yield* listLogins({ cwd: input.cwd, command: "tea" }));
+      const tea = yield* listLogins({ cwd: input.cwd, command: "tea" }).pipe(Effect.result);
+      if (Result.isFailure(tea)) {
+        if (tea.failure.reason !== "missing-cli") return yield* forHost(tea.failure);
+        if (fjFailure) return yield* forHost(fjFailure);
+        const available = yield* execute({ command: "fj", cwd: input.cwd, args: ["version"] }).pipe(
+          Effect.result,
+        );
+        if (Result.isFailure(available)) return yield* forHost(available.failure);
+        return yield* new ForgejoCliError({
+          command: "fj",
+          cwd: input.cwd,
+          reason: "authentication",
+          detail: `No fj login matches ${targetHost}; \`tea\` is unavailable. Authenticate with \`fj --host <server-url> auth login\` or \`fj --host <server-url> auth add-token\`.`,
+          cause: tea.failure,
+        });
+      }
+      login = selectLogin(tea.success);
     }
     if (!login)
       return yield* new ForgejoCliError({
         command: "tea",
         cwd: input.cwd,
         reason: "authentication",
-        detail:
-          "No matching Forgejo login. Use `fj auth login`, `fj auth add-token`, or `tea login add` for this server; choose a default when multiple tea accounts match.",
+        detail: `No matching fj or tea login for ${targetHost}. Use \`fj auth login\`, \`fj auth add-token\`, or \`tea login add\`; choose a default when multiple tea accounts match.`,
       });
     if (hostOnly)
       return { command, login: login.name, repository: "", baseUrl: login.url.replace(/\/+$/, "") };

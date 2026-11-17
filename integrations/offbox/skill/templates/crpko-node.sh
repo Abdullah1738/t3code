@@ -22,9 +22,11 @@ done
 nvm use default >/dev/null
 
 sudo apt-get update -qq
-sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq rsync zsh openjdk-21-jre-headless >/dev/null
+sudo apt-get install -y -qq --no-install-recommends build-essential python3 jq rsync zsh openjdk-21-jdk-headless >/dev/null
 sudo apt-get install -y -qq --no-install-recommends watchman >/dev/null || true
 sudo update-alternatives --set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java
+sudo update-alternatives --set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac
+javac -version 2>&1 | grep -q '^javac 21\.' || { echo 'offbox template: javac 21 missing' >&2; exit 1; }
 sudo apt-get clean
 
 sudo tee /etc/sysctl.d/90-offbox-inotify.conf >/dev/null <<'EOF'

@@ -26,6 +26,7 @@ export function resolveAttachmentReferences(
     return canonical === undefined
       ? Effect.fail(
           new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
             message: "Attachments must be pending uploads or already belong to the target thread.",
           }),
@@ -66,6 +67,7 @@ export const layer = McpToolAccess.toLayer(
         Effect.gen(function* () {
           if (uploadOwners.get(input.attachmentId)?.owner !== (yield* uploadOwner)) {
             return yield* new OrchestratorMcpFailure({
+              reason: "invalid_args",
               code: "invalid_request",
               message: "Only the caller that prepared a pending upload can discard it.",
             });
@@ -82,6 +84,7 @@ export const layer = McpToolAccess.toLayer(
             const { caller, projection } = yield* readThread(input.threadId, ["messages"]);
             if (projection.thread.archivedAt !== null)
               return yield* new OrchestratorMcpFailure({
+                reason: "invalid_args",
                 code: "invalid_request",
                 message: "Unarchive the target thread before sending attachments.",
               });

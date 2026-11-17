@@ -11,7 +11,6 @@ import {
   type ThreadLinkedPullRequest,
 } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
-import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
@@ -25,6 +24,7 @@ import * as Stream from "effect/Stream";
 
 import * as GitManager from "../git/GitManager.ts";
 import * as ProjectStore from "./ProjectStore.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
 import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import { forkParked } from "../serverActivation.ts";
@@ -106,6 +106,7 @@ export const make = Effect.gen(function* () {
   const repositoryIdentities = yield* RepositoryIdentityResolver.RepositoryIdentityResolver;
   const crypto = yield* Crypto.Crypto;
   const fileSystem = yield* FileSystem.FileSystem;
+  const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
   const pendingBackfill = new Map<ThreadId, number>();
 
   const finishBackfill = (threads: ReadonlyArray<Pick<OrchestrationV2ThreadShell, "id">>) => {
@@ -120,22 +121,32 @@ export const make = Effect.gen(function* () {
     }
   };
 
-  const readThreadSnapshot = ({ threadId, backfill }: RefreshRequest) =>
-    threadId === null
-      ? orchestrator
-          .getShellSnapshot({
-            location: "active",
-            unsettledOnly: !(backfill || pendingBackfill.size > 0),
-            pullRequestCandidatesOnly: true,
-          })
-          .pipe(NodeSqliteClient.readOnly)
-      : Effect.gen(function* () {
-          // Read the sequence first. The thread is then at least this new, so a
-          // sync guarded by the sequence is rejected rather than missing a change.
-          const snapshotSequence = yield* orchestrator.getThreadEventSequence(threadId);
-          const thread = yield* orchestrator.getThreadShell(threadId);
-          return { snapshotSequence, threads: thread === null ? [] : [thread] };
-        });
+  const readThreadSnapshot = Effect.fn("ThreadPullRequestServiceV2.readThreadSnapshot")(function* ({
+    threadId,
+    backfill,
+  }: RefreshRequest) {
+    const snapshot = yield* projectionStore.getPullRequestSyncSnapshot({
+      ...(threadId === null ? {} : { threadId }),
+      unsettledOnly: threadId === null && !backfill,
+    });
+    if (threadId !== null || backfill || pendingBackfill.size === 0) return snapshot;
+    // Retry only the settled threads still awaiting startup discovery. A single
+    // failed lookup must not make every minute re-read all settled history.
+    const retries = yield* Effect.forEach([...pendingBackfill.keys()], (id) =>
+      projectionStore.getPullRequestSyncSnapshot({ threadId: id, unsettledOnly: false }),
+    );
+    return {
+      snapshotSequence: snapshot.snapshotSequence,
+      threads: [
+        ...new Map(
+          [...snapshot.threads, ...retries.flatMap((s) => s.threads)].map((thread) => [
+            thread.id,
+            thread,
+          ]),
+        ).values(),
+      ],
+    };
+  });
 
   const synchronize = Effect.fn("ThreadPullRequestServiceV2.synchronize")(function* (
     request: RefreshRequest,
@@ -348,7 +359,7 @@ export const make = Effect.gen(function* () {
         ),
       // Wide enough that a sweep's GitHub branch lookups reach the GitHub provider together and share one
       // GraphQL document, instead of one `gh pr list` per branch.
-      { concurrency: 32, discard: true },
+      { concurrency: 4, discard: true },
     );
   });
 

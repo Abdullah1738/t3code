@@ -1,10 +1,12 @@
 """Restart recovery with missing host runners and retained guest processes."""
 import json
+import contextlib
 import os
 from pathlib import Path
 import subprocess
 import fcntl
 import select
+import threading
 from unittest.mock import patch
 
 if __package__:
@@ -14,6 +16,203 @@ else:
 
 
 class RestartReceipts(Base):
+    def test_exit_first_observed_by_kill_drain_beats_only_the_synthetic_fallback(self):
+        for code in (0,7,141,143):
+            for held in (False,True):
+                with self.subTest(code=code,held=held):
+                    b=self.box(bid=f'bx_late_receipt_{code}_{held}'); p=self.cmd(b)
+                    boatd.write_json(boatd.cmd_dir(b)/f'{p}.context.json', {})
+                    if held:
+                        boatd.write_json(boatd.result_path(b,p),dict(attempt=1,status='exited',exit_code=23,
+                                         started_at=100,ended_at=110,guest_owned=True))
+                    boatd.stage_kill(self.con,b,p,False)
+                    with self.guest_files(b,p) as receipt:
+                        (receipt/'out').write_bytes(b'last output\n')
+                        def cleanup(c):
+                            (receipt/'exit').write_text(str(code))
+                            return dict(cleanup='clean',leftover_killed=0,remaining=0)
+                        with patch.object(boatd,'cleanup_run',side_effect=cleanup):
+                            boatd.restore_kill_result(self.con,self.status(b,p),{})
+                    row=self.status(b,p)
+                    saved=boatd.read_result(b,p,1)
+                    self.assertEqual((row['status'],row['exit_code']),('exited',23 if held else code))
+                    self.assertFalse(saved.get('synthetic_kill'))
+                    self.assertFalse(json.loads(row['metrics']).get('kill_synthetic'))
+                    self.assertEqual((boatd.cmd_dir(b)/f'{p}.out').read_bytes(),b'last output\n')
+                    if held: self.assertEqual(row['ended_at'],110)
+
+    def test_guest_probe_holds_result_lock_through_cursor_checkpoint(self):
+        b=self.box(); p=self.cmd(b); c=dict(self.status(b,p))
+        entered,release=threading.Event(),threading.Event()
+        errors=[]
+        def execute(*args,**kwargs):
+            entered.set()
+            if not release.wait(10): raise AssertionError('probe was not released')
+            return subprocess.CompletedProcess([],0,b'{"state":"alive","stdout":"b25jZQ=="}')
+        def probe():
+            try: boatd.guest_command(c)
+            except BaseException as error: errors.append(error)
+        with patch.object(boatd,'ct_exec',side_effect=execute):
+            thread=threading.Thread(target=probe); thread.start()
+            try:
+                self.assertTrue(entered.wait(10),'probe did not start')
+                with (boatd.cmd_dir(b)/f'{p}.settle.lock').open('a') as owner:
+                    with self.assertRaises(BlockingIOError): fcntl.flock(owner,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            finally:
+                release.set(); thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors,[])
+        self.assertEqual((boatd.cmd_dir(b)/f'{p}.out').read_bytes(),b'once')
+        self.assertEqual(json.loads((boatd.cmd_dir(b)/f'{p}.cursor.json').read_text()),[4,0])
+        boatd.stage_kill(self.con,b,p,False)
+        boatd.restore_kill_result(self.con,self.status(b,p),{})
+        with patch.object(boatd,'guest_command',side_effect=AssertionError('probe after exit')):
+            boatd.follow_guest(self.con,c)
+
+    def test_legacy_receipts_hold_unknown_cleanup_and_stop_signal_leftovers(self):
+        for direct in (False,True):
+            for code in (0,7,141,143):
+                for pids in (None,[],[129844]):
+                    with self.subTest(direct=direct,code=code,pids=pids):
+                        b=self.box(bid=f'bx_legacy_cleanup_{direct}_{code}_{pids}'); p=self.cmd(b)
+                        view=dict(readable=True,pids=pids,box_rc=code,marker={'pid':42},join_verified=pids is not None)
+                        self.f.guests[b,p]={'state':'exited','exit_code':code,'legacy':True} if direct else {'state':'gone'}
+                        cleanup=dict(cleanup='unknown' if pids is None else 'stopped' if pids else 'clean',
+                                     leftover_killed=None if pids is None else len(pids),remaining=None if pids is None else 0)
+                        with patch.object(boatd,'command_probe',return_value=view), \
+                                patch.object(boatd,'_cg_pids',return_value=pids or []), \
+                                patch.object(boatd,'cleanup_run',return_value=cleanup) as clean:
+                            boatd.settle_cmd(self.con,self.status(b,p))
+                        waiting=pids is None or (pids and code < 128)
+                        if waiting:
+                            self.assertEqual((self.status(b,p)['status'],self.status(b,p)['exit_code']),('running',None))
+                            self.assertTrue(boatd.commands_busy(self.con,b))
+                            self.assertTrue(boatd.held_runs(self.con,b))
+                            with patch.object(boatd,'command_probe',return_value={**view,'pids':[]}), \
+                                    patch.object(boatd,'cleanup_run',return_value=dict(cleanup='clean',leftover_killed=0,remaining=0)):
+                                boatd.settle_cmd(self.con,self.status(b,p))
+                        elif pids and code > 128:
+                            clean.assert_called_once()
+                        row=self.status(b,p)
+                        self.assertEqual((row['status'],row['exit_code']),
+                                         ('interrupted',94) if code > 128 else ('exited',code))
+
+    @contextlib.contextmanager
+    def guest_files(self, box, pid, *, alive=False, code=None):
+        root = self.tmp / box
+        receipt = root / f'{pid}.receipt'
+        receipt.mkdir(parents=True)
+        if alive:
+            ticks = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+            (receipt / 'pid').write_text(f'{os.getpid()} {ticks}')
+        if code is not None:
+            (receipt / 'exit').write_text(str(code))
+        def execute(box, command, **kw):
+            return subprocess.run(['bash', '-c', command.replace('/run/boatd', str(root))],
+                                  input=kw.get('input'), capture_output=True, check=True, timeout=10)
+        with patch.object(boatd, 'ct_exec', side_effect=execute):
+            yield receipt
+
+    def test_missing_follower_is_replaced_after_spawn_failure_or_follower_death(self):
+        for failed_spawn in (False, True):
+            with self.subTest(failed_spawn=failed_spawn):
+                b = self.box(bid=f'bx_follower_{failed_spawn}'); p = self.cmd(b)
+                with self.guest_files(b, p, alive=True) as receipt:
+                    (receipt / 'out').write_bytes(b'before restart\n')
+                    self.f.spawn_error = 'systemd unavailable' if failed_spawn else None
+                    if failed_spawn:
+                        with self.assertRaises(boatd.Fail): boatd.settle_cmd(self.con, self.status(b, p))
+                    else:
+                        self.assertEqual(boatd.settle_cmd(self.con, self.status(b, p)), 'reattached')
+                    self.f.spawn_error = None
+                    self.f.active_units.clear()
+                    # Include an old interruption field so a modern result cannot enter legacy recovery.
+                    saved = boatd.read_result(b, p, 1)
+                    saved['interruption'] = json.loads(self.status(b, p)['metrics'])['interruption']
+                    boatd.write_json(boatd.result_path(b, p), saved)
+                    (receipt / 'out').write_bytes(b'before restart\nafter follower loss\n')
+                    self.assertEqual(boatd.settle_cmd(self.con, self.status(b, p)), 'reattached')
+                    self.assertTrue(self.f.active_units)
+                    self.f.active_units.clear()
+                    (receipt / 'out').write_bytes(b'before restart\nafter follower loss\nfinished\n')
+                    (receipt / 'exit').write_text('7')
+                    self.assertEqual(boatd.settle_cmd(self.con, self.status(b, p)), 'exited-while-down')
+                self.assertEqual(self.status(b, p)['exit_code'], 7)
+                self.assertEqual((boatd.cmd_dir(b) / f'{p}.out').read_bytes(),
+                                 b'before restart\nafter follower loss\nfinished\n')
+                self.assertFalse([c for c in self.f.calls if c[0] == 'exec' and 'nohup' in c[-1]])
+
+    def test_gone_and_exited_commands_drain_all_retained_stdout_and_stderr(self):
+        for code in (None, 7):
+            with self.subTest(code=code):
+                b = self.box(bid=f'bx_drain_{code}'); p = self.cmd(b)
+                output, error = b'x' * (2 * 262144 + 91), b'e' * (3 * 262144 + 17)
+                with self.guest_files(b, p, code=code) as receipt:
+                    (receipt / 'out').write_bytes(output)
+                    (receipt / 'err').write_bytes(error)
+                    # Either the reaper or an existing follower must finish the same drain.
+                    if code is None:
+                        boatd.settle_cmd(self.con, self.status(b, p))
+                    else:
+                        boatd.follow_guest(self.con, self.status(b, p))
+                self.assertEqual(self.status(b, p)['exit_code'], 94 if code is None else code)
+                self.assertEqual((boatd.cmd_dir(b) / f'{p}.out').read_bytes(), output)
+                self.assertTrue((boatd.cmd_dir(b) / f'{p}.err').read_bytes().startswith(error))
+
+    def test_kill_drains_output_and_keeps_a_real_exit_that_arrived_first(self):
+        for code in (None, 0, 7):
+            with self.subTest(code=code):
+                b = self.box(bid=f'bx_kill_drain_{code}'); p = self.cmd(b)
+                boatd.write_json(boatd.cmd_dir(b) / f'{p}.context.json', {})
+                output, error = b'x' * 300000, b'e' * 600000
+                with self.guest_files(b, p, code=code) as receipt:
+                    (receipt / 'out').write_bytes(output)
+                    (receipt / 'err').write_bytes(error)
+                    boatd.stage_kill(self.con, b, p, False)
+                    cleanup = dict(cleanup='clean', leftover_killed=0, remaining=0, box_rc=code)
+                    with patch.object(boatd, 'cleanup_run', return_value=cleanup):
+                        boatd.follow_guest(self.con, self.status(b, p))
+                self.assertEqual(self.status(b, p)['exit_code'], 143 if code is None else code)
+                self.assertEqual((boatd.cmd_dir(b) / f'{p}.out').read_bytes(), output)
+                self.assertEqual((boatd.cmd_dir(b) / f'{p}.err').read_bytes(), error)
+
+    def test_kill_drain_incus_error_keeps_the_row_until_output_can_be_read(self):
+        b = self.box(); p = self.cmd(b)
+        boatd.write_json(boatd.cmd_dir(b) / f'{p}.context.json', {})
+        boatd.stage_kill(self.con, b, p, False)
+        cleanup = dict(cleanup='clean', leftover_killed=0, remaining=0)
+        with patch.object(boatd, 'cleanup_run', return_value=cleanup):
+            with patch.object(boatd, 'ct_exec', side_effect=boatd.Fail(500, 'incus_failed', 'Incus is shutting down')):
+                with self.assertRaises(boatd.Fail): boatd.follow_guest(self.con, self.status(b, p))
+            self.assertEqual((self.status(b, p)['status'], self.status(b, p)['exit_code']), ('running', None))
+            self.assertTrue(boatd.commands_busy(self.con, b))
+            with self.guest_files(b, p) as receipt:
+                (receipt / 'out').write_bytes(b'last output\n')
+                boatd.follow_guest(self.con, self.status(b, p))
+        self.assertEqual(self.status(b, p)['exit_code'], 143)
+        self.assertEqual((boatd.cmd_dir(b) / f'{p}.out').read_bytes(), b'last output\n')
+
+    def test_legacy_signal_receipts_keep_transport_interruption_classification(self):
+        for direct_client_receipt in (False, True):
+            for code in (0, 7, 141, 143):
+                with self.subTest(client=direct_client_receipt, code=code):
+                    b = self.box(bid=f'bx_legacy_{direct_client_receipt}_{code}'); p = self.cmd(b)
+                    view = dict(readable=True, pids=[], box_rc=code, marker={'pid':42, 'cgroup_joined':True})
+                    self.f.guests[b, p] = {'state':'exited', 'exit_code':code, 'legacy':True} if direct_client_receipt else {'state':'gone'}
+                    with patch.object(boatd, 'command_probe', return_value=view):
+                        boatd.settle_cmd(self.con, self.status(b, p))
+                    row = self.status(b, p)
+                    self.assertEqual((row['status'], row['exit_code']),
+                                     ('interrupted', 94) if code in (141, 143) else ('exited', code))
+                    if code in (141, 143):
+                        info = json.loads(row['metrics'])['interruption']
+                        self.assertEqual((info['box_rc'], info['cleanup'], info['retry']), (code, 'clean', False))
+        # A detached wrapper's own receipt is independent of an Incus stream's signal exit.
+        b = self.box(bid='bx_modern_sigpipe'); p = self.cmd(b)
+        self.f.guests[b, p] = {'state':'exited', 'exit_code':141}
+        boatd.settle_cmd(self.con, self.status(b, p))
+        self.assertEqual((self.status(b, p)['status'], self.status(b, p)['exit_code']), ('exited', 141))
+
     def test_wrapper_killed_after_claim_releases_initialization_ownership(self):
         root=self.tmp/'guest-crashed-init'; root.mkdir()
         os.mkfifo(root/'gate')

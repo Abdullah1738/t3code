@@ -1,15 +1,23 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import { expect, it } from "@effect/vitest";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- isolated loopback MCP integration.
 import * as NodeHttp from "node:http";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { HttpRouter } from "effect/http";
 import { makeHttpSocketTelemetry } from "../ardud/http/HttpSocketTelemetry.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import {
   AnalyticsEvent,
   CommandId,
+  NodeId,
+  RunId,
+  type OrchestrationV2Run,
+  type OrchestrationV2Subagent,
   EnvironmentId,
   OrchestratorMcpFailure,
+  PullRequestUnavailableError,
   ProviderInstanceId,
   ThreadId,
   PreviewAutomationError,
@@ -37,6 +45,7 @@ import * as Scope from "effect/Scope";
 import * as TestClock from "effect/testing/TestClock";
 import * as Queue from "effect/Queue";
 import * as Tracer from "effect/Tracer";
+import * as DateTime from "effect/DateTime";
 import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -45,18 +54,39 @@ import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import * as Analytics from "../ardud/analytics/Analytics.ts";
 import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpCall from "../ardud/analytics/McpCall.ts";
+import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
+import * as BoundedReadDeadline from "./BoundedReadDeadline.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
-import { PullRequestWatchTimeoutError } from "./toolkits/pullRequests/tools.ts";
+import {
+  PullRequestToolTimeoutError,
+  PullRequestWatchTimeoutError,
+  PullRequestWatchUnavailableError,
+} from "./toolkits/pullRequests/tools.ts";
 import * as Testkit from "./McpToolAccess.testkit.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+import { CommandReceiptStoreReadError } from "../orchestration-v2/CommandReceiptStore.ts";
+import { OrchestratorProjectionError } from "../orchestration-v2/Orchestrator.ts";
 import { callIdentifiers } from "../ardud/analytics/McpCall.ts";
 import * as McpDeadline from "./McpDeadline.ts";
 import { readCallerIdentity } from "./callerIdentity.ts";
+import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
+import { OrchestratorToolkit } from "./toolkits/orchestrator/tools.ts";
+import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ProjectService from "../project/ProjectService.ts";
+import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import { BoardsDatabase } from "../ardud/persistence/BoardsDatabase.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as WikiReadTiming from "../ardud/analytics/WikiReadTiming.ts";
 
 it("hashes retry ids deterministically within their caller identity", () => {
   const first = callIdentifiers(
@@ -96,6 +126,8 @@ const client = McpSchema.McpServerClient.of({
 const ProbeFailure = Schema.Union([
   OrchestratorMcpFailure,
   PullRequestWatchTimeoutError,
+  PullRequestWatchUnavailableError,
+  PullRequestToolTimeoutError,
   KanbanError,
   PreviewAutomationError,
   McpCapabilityUnavailableError,
@@ -124,8 +156,537 @@ const probe = (name: string) =>
     }),
   );
 const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent);
+const decodeAnalyticsEventSync = Schema.decodeUnknownSync(AnalyticsEvent);
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
 const isAnalyticsEvent = Schema.is(AnalyticsEvent);
+
+const lookupParent = ThreadId.make("caller-ledger");
+const lookupChild = ThreadId.make("private-child");
+const lookupCommand = CommandId.make(
+  "command:mcp:delegate-task:env-ledger:caller-ledger:private%3A%2525%2F%C3%A9",
+);
+const lookupId = IdAllocator.derive.delegatedTaskNode({ commandId: lookupCommand });
+const copiedLookupId = NodeId.make(`node:delegated-task:${encodeURIComponent(lookupId.slice(20))}`);
+const lookupCases = [
+  { name: "normal hit", hit: true, foundBy: "subagents", saved: true },
+  { name: "acknowledgement", hit: true, ack: true, foundBy: "subagents", saved: true },
+  { name: "late projection", late: true, foundBy: "subagents", saved: true },
+  {
+    name: "request key recovery",
+    hit: true,
+    id: copiedLookupId,
+    foundBy: "request_key_recovery",
+    saved: true,
+    canonical: false,
+  },
+  { name: "unsaved", reason: "never_saved", saved: false },
+  {
+    name: "accepted receipt",
+    state: "accepted",
+    cancelRegistration: "cancel_pending",
+    reason: "accepted",
+    foundBy: "receipt",
+    saved: true,
+  },
+  {
+    name: "rejected receipt",
+    state: "rejected",
+    reason: "rejected",
+    foundBy: "receipt",
+    saved: true,
+  },
+  { name: "pending", state: "pending", cancelRegistration: "cancel_pending", reason: "pending" },
+  {
+    name: "legacy pending without owner evidence",
+    id: IdAllocator.derive.delegatedTaskNode({
+      commandId: CommandId.make("command:mcp:credential:delegate-task:private"),
+    }),
+    state: "pending",
+    reason: "non_canonical_id",
+    canonical: false,
+  },
+  { name: "abandoned", state: "abandoned", reason: "abandoned" },
+  { name: "copied miss", id: copiedLookupId, reason: "non_canonical_id", canonical: false },
+  {
+    name: "not a delegation id",
+    id: NodeId.make("private-unknown"),
+    reason: "not_a_delegation_id",
+    canonical: false,
+    shape: "other",
+  },
+  {
+    name: "invalid escape",
+    id: NodeId.make("node:delegated-task:%ZZ"),
+    reason: "not_a_delegation_id",
+    canonical: false,
+    shape: "other",
+  },
+  {
+    name: "foreign caller",
+    id: IdAllocator.derive.delegatedTaskNode({
+      commandId: CommandId.make("command:mcp:delegate-task:env-ledger:private-other:private"),
+    }),
+    reason: "non_canonical_id",
+    canonical: false,
+  },
+  {
+    name: "foreign receipt",
+    state: "accepted",
+    foreign: true,
+    reason: "other_thread",
+    canonical: false,
+  },
+  {
+    name: "wrong command receipt",
+    state: "accepted",
+    wrongCommand: true,
+    reason: "not_a_delegation_command",
+    canonical: false,
+  },
+  {
+    name: "missing child",
+    hit: true,
+    noChild: true,
+    reason: "missing_child_thread",
+    foundBy: "subagents",
+    saved: true,
+  },
+  ...(["pending", "accepted"] as const).map(
+    (state) =>
+      ({
+        name: `missing child with ${state} receipt`,
+        cancelRegistration: "cancel_pending",
+        hit: true,
+        noChild: true,
+        state,
+        reason: "missing_child_thread",
+        foundBy: "subagents",
+        saved: true,
+      }) as const,
+  ),
+  ...(["pending", "accepted"] as const).flatMap((state) =>
+    (["not_pending", "capacity"] as const).flatMap((cancelRegistration) =>
+      [false, true].map((noChild) => ({
+        name: `${state} receipt, missing child ${noChild}, cancel registration ${cancelRegistration}`,
+        state,
+        cancelRegistration,
+        ...(noChild ? { hit: true, noChild: true } : {}),
+        reason: noChild ? ("missing_child_thread" as const) : state,
+        foundBy: noChild
+          ? ("subagents" as const)
+          : state === "accepted"
+            ? ("receipt" as const)
+            : ("none" as const),
+        saved: noChild || state === "accepted" ? true : ("unknown" as const),
+      })),
+    ),
+  ),
+  ...[
+    "thread:project:private:uuid",
+    `thread:delegated-task:${lookupId.slice(20)}`,
+    "019f3baa-87de-7d51-ae17-d80a8d6a6b45",
+    "019F3BAA-87DE-7D51-AE17-D80A8D6A6B45",
+  ].map(
+    (id) =>
+      ({
+        name: `thread shape ${id.slice(0, 20)}`,
+        id,
+        shape: "thread_id",
+        reason: "not_a_delegation_id",
+        canonical: false,
+      }) as const,
+  ),
+  {
+    name: "known child thread",
+    id: lookupChild,
+    hit: true,
+    shape: "child_thread_id",
+    reason: "not_a_delegation_id",
+    canonical: false,
+  },
+  { name: "empty input", id: "", shape: "empty", invalid: true },
+  { name: "blank input", id: "   ", shape: "empty", invalid: true },
+  {
+    name: "missing child receipt failure",
+    hit: true,
+    noChild: true,
+    receiptError: true,
+    foundBy: "subagents",
+    saved: true,
+    error: "orchestration_error",
+  },
+  {
+    name: "missing child receipt timeout",
+    hit: true,
+    noChild: true,
+    pause: "receipt",
+    finish: "timeout",
+    foundBy: "subagents",
+    saved: true,
+    error: "partial_result",
+  },
+  {
+    name: "cancel interrupted on second read",
+    hit: true,
+    cancel: true,
+    pause: "cancel_read",
+    finish: "interrupt",
+    foundBy: "subagents",
+    saved: true,
+  },
+  {
+    name: "cancel fails on second read",
+    hit: true,
+    cancel: true,
+    pause: "cancel_read",
+    finish: "error",
+    foundBy: "subagents",
+    saved: true,
+    error: "orchestration_error",
+  },
+  {
+    name: "shutdown after projection hit",
+    hit: true,
+    pause: "child",
+    finish: "shutdown",
+    foundBy: "subagents",
+    saved: true,
+  },
+  {
+    name: "shutdown after recovery hit",
+    hit: true,
+    id: copiedLookupId,
+    pause: "child",
+    finish: "shutdown",
+    foundBy: "request_key_recovery",
+    canonical: false,
+    saved: true,
+  },
+] as const;
+
+it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
+  Effect.gen(function* () {
+    const rows = yield* Queue.unbounded<AnalyticsEvent>();
+    const blocked = yield* Deferred.make<void>();
+    const acknowledged = yield* Deferred.make<void>();
+    const parent = Testkit.idleThreadProjection(Testkit.liveThreadShell(lookupParent));
+    const child = {
+      ...Testkit.idleThreadProjection(Testkit.liveThreadShell(lookupChild)),
+      runs:
+        "cancel" in testCase
+          ? [
+              {
+                id: RunId.make("private-run"),
+                threadId: lookupChild,
+                delegatedTaskId: lookupId,
+                ordinal: 1,
+                status: "running",
+                activeAttemptId: null,
+                startedAt: DateTime.makeUnsafe(0),
+                completedAt: null,
+              } as OrchestrationV2Run,
+            ]
+          : [],
+    };
+    const task = {
+      id: lookupId,
+      threadId: lookupParent,
+      origin: "app_owned",
+      childThreadId: "noChild" in testCase ? null : lookupChild,
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      model: "gpt-5",
+      result: "cancel" in testCase ? null : "private result",
+      status: "cancel" in testCase ? "running" : "completed",
+      completionDelivery: { state: "ack" in testCase ? "pending" : "acknowledged" },
+    } as OrchestrationV2Subagent;
+    let parentReads = 0;
+    let acknowledgements = 0;
+    let stopped = false;
+    const cancelRequests: CommandId[] = [];
+    const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
+      getCallerRow: (id) => Effect.succeed(Testkit.liveThreadShell(id)),
+      getThreadShell: (id) => Effect.succeed(Testkit.liveThreadShell(id)),
+      getThreadProjection: () => Effect.succeed({ ...parent, subagents: [task] }),
+      stopDelegatedTasks: () => Effect.void,
+      requestCancelOnArrival: (commandId) =>
+        Effect.sync(() => {
+          cancelRequests.push(commandId);
+          return "cancelRegistration" in testCase ? testCase.cancelRegistration : "not_pending";
+        }),
+      getThreadRecords: (id) => {
+        if (
+          "pause" in testCase &&
+          ((testCase.pause === "child" && id === lookupChild) ||
+            (testCase.pause === "cancel_read" && stopped && id === lookupParent))
+        )
+          return Deferred.succeed(blocked, undefined).pipe(
+            Effect.andThen(
+              testCase.finish === "error"
+                ? Effect.fail(
+                    new OrchestratorProjectionError({
+                      threadId: id,
+                      cause: new Error("private"),
+                    }),
+                  )
+                : Effect.never,
+            ),
+          );
+        return Effect.succeed(
+          id === lookupParent
+            ? {
+                ...parent,
+                subagents:
+                  "hit" in testCase || ("late" in testCase && parentReads++ > 0) ? [task] : [],
+              }
+            : child,
+        );
+      },
+      getDelegationCommandState: () => {
+        if ("receiptError" in testCase)
+          return Effect.fail(new CommandReceiptStoreReadError({ commandId: lookupCommand }));
+        if ("pause" in testCase && testCase.pause === "receipt")
+          return Deferred.succeed(blocked, undefined).pipe(Effect.andThen(Effect.never));
+        const status = "state" in testCase ? testCase.state : "never_saved";
+        return Effect.succeed(
+          status === "accepted" || status === "rejected"
+            ? {
+                commandId: lookupCommand,
+                threadId: "foreign" in testCase ? lookupChild : lookupParent,
+                commandType:
+                  "wrongCommand" in testCase ? "thread.create" : "delegated_task.request",
+                acceptedAt: DateTime.makeUnsafe(0),
+                resultSequence: 0,
+                status,
+                error: null,
+              }
+            : status === "abandoned"
+              ? {
+                  status,
+                  elapsedSeconds: 10,
+                  reason: "timeout",
+                  at: DateTime.makeUnsafe(0),
+                }
+              : { status },
+        );
+      },
+      dispatch: (command) =>
+        Effect.sync(() => {
+          acknowledgements++;
+          if (command.type === "thread.stop") stopped = true;
+          return { sequence: 1, storedEvents: [] };
+        }).pipe(Effect.tap(() => Deferred.succeed(acknowledged, undefined))),
+    });
+    const service = OrchestratorMcpService.layer.pipe(
+      Layer.provide(McpProviderSessions.layer),
+      Layer.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          threads,
+          ServerSettings.layerTest(),
+          Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+          Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({}),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        ),
+      ),
+    );
+    const toolkit = Toolkit.make(
+      OrchestratorToolkit.tools.task_status,
+      OrchestratorToolkit.tools.task_cancel,
+    );
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        task_status: McpToolAccess.readsAsCaller(({ taskId }) =>
+          Effect.gen(function* () {
+            const scope = yield* McpInvocationContext.McpInvocationContext;
+            return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).taskStatus(
+              scope,
+              taskId,
+            );
+          }),
+        ),
+        task_cancel: McpToolAccess.actsAsCaller((input) =>
+          Effect.gen(function* () {
+            const scope = yield* McpInvocationContext.McpInvocationContext;
+            return yield* (yield* OrchestratorMcpService.OrchestratorMcpService).cancelTask(
+              scope,
+              input,
+            );
+          }),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provideMerge(McpCallLedger.layer),
+      Layer.provide(service),
+      Layer.provide(threads),
+      Layer.provide(invocation),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call" ? Queue.offer(rows, row).pipe(Effect.asVoid) : Effect.void,
+          flush: Effect.void,
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const names =
+        "cancel" in testCase
+          ? ["task_cancel"]
+          : "reason" in testCase || "invalid" in testCase
+            ? ["task_status", "task_cancel"]
+            : ["task_status"];
+      for (const name of names) {
+        const creating =
+          name === "task_status" && "reason" in testCase && testCase.reason === "pending";
+        const recordMissing =
+          "state" in testCase &&
+          testCase.state === "accepted" &&
+          !("foreign" in testCase) &&
+          !("wrongCommand" in testCase);
+        const cancelRegistration =
+          !recordMissing && name === "task_cancel" && "cancelRegistration" in testCase
+            ? testCase.cancelRegistration
+            : undefined;
+        const cancelPending = cancelRegistration === "cancel_pending";
+        const cancelCapacity = cancelRegistration === "capacity";
+        const call = server
+          .callTool({ name, arguments: { taskId: "id" in testCase ? testCase.id : lookupId } })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+        const response = yield* Effect.gen(function* () {
+          if ("invalid" in testCase) {
+            const exit = yield* call.pipe(Effect.exit);
+            expect(Exit.isFailure(exit)).toBe(true);
+            return undefined;
+          }
+          if (!("pause" in testCase)) return yield* call;
+          const pending = yield* call.pipe(Effect.forkChild);
+          yield* Deferred.await(blocked);
+          if (testCase.finish === "timeout") {
+            yield* TestClock.adjust("10 seconds");
+            return yield* Fiber.join(pending);
+          }
+          if (testCase.finish === "error") return yield* Fiber.join(pending);
+          if (testCase.finish === "shutdown") yield* (yield* McpCallLedger.McpCallLedger).shutdown;
+          yield* Fiber.interrupt(pending);
+          return undefined;
+        });
+        const row = yield* Queue.take(rows);
+        expect(row).toMatchObject({
+          tool: name,
+          saved: "saved" in testCase ? testCase.saved : "unknown",
+          props: {
+            ...("invalid" in testCase
+              ? {}
+              : {
+                  foundBy: "foundBy" in testCase ? testCase.foundBy : "none",
+                  idCanonical: "canonical" in testCase ? testCase.canonical : true,
+                }),
+            idShape: "shape" in testCase ? testCase.shape : "task_id",
+            ...("reason" in testCase ? { notFoundReason: testCase.reason } : {}),
+          },
+        });
+        expect(row.errorTag).toBe(
+          cancelPending
+            ? undefined
+            : cancelCapacity
+              ? "task_not_cancellable"
+              : "reason" in testCase
+                ? recordMissing
+                  ? "task_record_missing"
+                  : creating
+                    ? "task_creating"
+                    : "task_not_found"
+                : "error" in testCase
+                  ? testCase.error
+                  : "invalid" in testCase
+                    ? "invalid_request"
+                    : undefined,
+        );
+        if ("pause" in testCase)
+          expect(row.outcome).toBe(
+            testCase.finish === "shutdown"
+              ? "interrupted_by_shutdown"
+              : testCase.finish === "timeout"
+                ? "timeout"
+                : testCase.finish === "error"
+                  ? "error"
+                  : "interrupted",
+          );
+        expect(isAnalyticsEvent(row)).toBe(true);
+        if (recordMissing) {
+          expect(row.props).toMatchObject({
+            commandId: lookupCommand,
+            taskId: lookupId,
+            receiptState: "accepted",
+            missingLookup: "noChild" in testCase ? "child_thread_id" : "subagents",
+          });
+        } else
+          expect(JSON.stringify(row.props)).not.toMatch(/private|command:|node:|clientRequestId/);
+        if (!("reason" in testCase)) expect(row.props).not.toHaveProperty("notFoundReason");
+        if ("reason" in testCase) {
+          expect(row.outcome).toBe(cancelPending ? "ok" : "error");
+          expect(row.props?.code).toBe(
+            cancelPending
+              ? "unknown"
+              : cancelCapacity
+                ? "task_not_cancellable"
+                : recordMissing
+                  ? "task_record_missing"
+                  : creating
+                    ? "task_creating"
+                    : "task_not_found",
+          );
+          expect(row.reasonClass).toBe(
+            cancelPending
+              ? undefined
+              : creating || cancelCapacity || recordMissing
+                ? "other"
+                : "not_found",
+          );
+          if (cancelPending) {
+            expect(response?.isError).not.toBe(true);
+            expect(response?.structuredContent).toMatchObject({
+              taskId: lookupId,
+              status: "cancel_pending",
+            });
+            continue;
+          }
+          if (cancelCapacity) {
+            expect(response?.isError).toBe(true);
+            expect(response?.structuredContent).toMatchObject({ code: "task_not_cancellable" });
+            continue;
+          }
+          const text = JSON.stringify(response);
+          const threadShape =
+            "shape" in testCase &&
+            (testCase.shape === "thread_id" || testCase.shape === "child_thread_id");
+          expect(text.includes("This looks like a thread id (childThreadId).")).toBe(threadShape);
+          expect(text).toContain(
+            threadShape
+              ? "Use t3_thread_read for the child thread."
+              : "Expected the taskId returned by delegate_task.",
+          );
+          expect(text).not.toContain("id" in testCase ? testCase.id : lookupId);
+          expect(text.includes("No delegated task has this id.")).toBe(!creating && !recordMissing);
+          if (creating) expect(row.props?.code).toBe("task_creating");
+        }
+      }
+      expect(cancelRequests).toEqual(
+        "cancelRegistration" in testCase && testCase.state === "pending" ? [lookupCommand] : [],
+      );
+      if ("ack" in testCase) {
+        yield* Deferred.await(acknowledged);
+        expect(acknowledgements).toBe(1);
+      }
+    }).pipe(Effect.provide(registration));
+  }),
+);
 
 it.effect.each(["provider", "oauth"] as const)(
   "%s auth and dispatch are separate from handler duration, including caller_unresolved",
@@ -352,6 +913,73 @@ it.effect(
         });
       }),
     ),
+);
+
+it.effect("freezes the timed-out read stage before response delivery and late cleanup", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const cleaned = yield* Deferred.make<void>();
+    const settled = yield* Deferred.make<void>();
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = probe("t3_thread_read");
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        t3_thread_read: McpToolAccess.reads(() =>
+          ThreadReadMetrics.read(
+            "timeline",
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.uninterruptible,
+            ),
+          ).pipe(Effect.ensuring(Deferred.succeed(cleaned, undefined))),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(Testkit.liveThreadsLayer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+          flush: Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      const pending = yield* server.callTool({ name: "t3_thread_read", arguments: args }).pipe(
+        Effect.provideService(McpSchema.McpServerClient, client),
+        Effect.provideService(McpResponseDelivery.McpResponseDelivery, {
+          settled: Deferred.await(settled),
+          closeReason: "unknown",
+          snapshot: () => ({ responseDelivery: "finished", responseElapsedMs: 46_000 }),
+        }),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(McpDeadline.READ_TIMEOUT);
+      const result = yield* Fiber.join(pending);
+      expect(result.isError).toBe(true);
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(cleaned);
+      expect(yield* Deferred.isDone(recorded)).toBe(false);
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.succeed(settled, undefined);
+      const row = yield* Deferred.await(recorded);
+      expect(row).toMatchObject({
+        outcome: "timeout",
+        errorTag: "ThreadReadTimeoutError",
+        durationMs: 45_000,
+        responseElapsedMs: 46_000,
+        threadReadStages: [{ stage: "timeline", durationMs: 45_000, completed: false }],
+      });
+    }).pipe(Effect.provide(registration));
+  }),
 );
 
 it.effect.each(["finished", "closed"] as const)(
@@ -655,7 +1283,26 @@ const boot = {
   cause: new Error("private error"),
 };
 const typedFailures = [
+  ...(
+    [
+      "link_pull_request",
+      "unlink_pull_request",
+      "list_thread_pull_requests",
+      "write_pull_request_guides",
+      "read_pull_request_guide",
+    ] as const
+  ).map((tool) => ({
+    error: new PullRequestToolTimeoutError({ tool, saved: "unknown" }),
+    outcome: "timeout",
+  })),
   { error: new PullRequestWatchTimeoutError({ saved: "unknown" }), outcome: "timeout" },
+  {
+    error: new PullRequestWatchUnavailableError({
+      host: "github.com",
+      cause: new PullRequestUnavailableError({ reason: "cli-missing" }),
+    }),
+    outcome: "refused",
+  },
   { error: new PreviewAutomationTimeoutError(browserRequest), outcome: "timeout" },
   {
     error: new PreviewAutomationRecordingDeadlineExpiredError({
@@ -747,7 +1394,7 @@ const outcomeCases = [
     input: args,
   })),
   ...typedFailures.map(({ error, outcome }) => ({
-    name: `typed-${error._tag}-${"reason" in error ? error.reason : ""}`,
+    name: `typed-${error._tag}-${"reason" in error ? error.reason : "tool" in error ? error.tool : ""}`,
     handle: Effect.fail(error),
     expected: { outcome, errorTag: outcome === "error" ? "Failure" : error._tag },
     input: args,
@@ -836,6 +1483,104 @@ it.effect.each(outcomeCases)(
         );
         expect(yield* decodeEvent(row)).toEqual(row);
       }).pipe(Effect.provide(registration));
+    }),
+);
+
+const wikiLaneCases = (["caller", "body"] as const).flatMap((stage) =>
+  (["foreground", "background", "writer"] as const).flatMap((routedLane) =>
+    (["success", "timeout", "disconnect"] as const).flatMap((ending) =>
+      (["linked", "unlinked"] as const).map((callerResult) => ({
+        stage,
+        routedLane,
+        ending,
+        callerResult,
+      })),
+    ),
+  ),
+);
+it.effect.each(wikiLaneCases)(
+  "wiki_read emits routed $stage lane $routedLane on $ending with $callerResult caller",
+  ({ stage, routedLane, ending, callerResult }) =>
+    Effect.gen(function* () {
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const toolkit = probe("wiki_read");
+      const handler = Effect.gen(function* () {
+        expect(yield* NodeSqliteClient.ReaderLane).toBe("foreground");
+        const start = yield* NodeSqliteClient.ReaderWaitStartedObserver;
+        const acquired = yield* NodeSqliteClient.ReaderWaitObserver;
+        const read = (phase: "caller" | "body") =>
+          WikiReadTiming.step(
+            phase,
+            Effect.gen(function* () {
+              const lane = phase === stage ? routedLane : "foreground";
+              const finish = start?.("foreground");
+              finish?.(lane, false);
+              if (phase === "caller") yield* TestClock.adjust("5 millis");
+              if (phase === stage) {
+                yield* Deferred.succeed(entered, undefined);
+                if (ending !== "success") yield* Deferred.await(release);
+              }
+              if (lane !== "writer") acquired?.(phase === "caller" ? 5 : 0, lane);
+              finish?.(lane, true);
+              return phase === "caller" && callerResult === "unlinked"
+                ? null
+                : { boardId: "board-robob" };
+            }),
+          );
+        yield* read("caller");
+        yield* read("body");
+        return { pages: [] };
+      });
+      const registration = McpHttpServer.toolkitRegistration(
+        toolkit,
+        McpToolAccess.toLayer(toolkit, {
+          wiki_read: McpToolAccess.reads(() => handler),
+        }),
+      ).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(BoardsDatabase)({ ready: Effect.void, path: "/synthetic/boards.sqlite" }),
+        ),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const pending = yield* server
+          .callTool({ name: "wiki_read", arguments: args })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.forkChild);
+        yield* Deferred.await(entered);
+        if (ending === "timeout") yield* TestClock.adjust("20 seconds");
+        if (ending === "disconnect") {
+          yield* TestClock.adjust("100 millis");
+          yield* Fiber.interrupt(pending);
+        } else yield* Fiber.join(pending);
+        const row = yield* Deferred.await(recorded);
+        expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+          tool: "wiki_read",
+          outcome: ending === "success" ? "ok" : ending === "timeout" ? "timeout" : "interrupted",
+          callerResolved:
+            callerResult === "linked" && !(stage === "caller" && ending !== "success"),
+          callerResolveMs:
+            stage === "caller" && ending !== "success" ? (ending === "timeout" ? 20000 : 105) : 5,
+          callerReaderLane: stage === "caller" ? routedLane : "foreground",
+          readerLane: ending !== "success" || stage === "body" ? routedLane : "foreground",
+          ...(ending === "success"
+            ? {}
+            : { phase: stage, waitedMs: ending === "timeout" ? 20000 : 105 }),
+          ...(ending === "timeout" ? { props: { phase: stage } } : {}),
+        });
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(registration));
     }),
 );
 
@@ -950,7 +1695,8 @@ it.effect("records resolved caller identity and a saved write whose reply fails"
         errorPhase: "result",
         callerResolved: true,
         readerLane: "identity",
-        props: { phase: "caller" },
+        callerReaderLane: "identity",
+        props: { phase: "ack" },
       });
     }).pipe(Effect.provide(registration));
   }),
@@ -1009,6 +1755,7 @@ it.effect.each(["caller", "dispatch"] as const)("records the real %s deadline", 
         errorTag: stage === "caller" ? "caller_unresolved" : "delegation_timeout",
         errorPhase: stage,
         callerResolved: stage !== "caller",
+        ...(stage === "caller" ? { callerRole: "none", callerKind: "unknown" } : {}),
         callerResolveMs: stage === "caller" ? 10_000 : 0,
         durationMs: 10_000,
         readerLane: "identity",
@@ -1303,14 +2050,20 @@ it.effect("card_next records interrupted calls with caller and duration", () =>
   }),
 );
 
-it.effect.each(["lookup.target", "waiting"] as const)(
-  "records thread wait stage %s beside its reader lane",
-  (waitStage) =>
+it.effect.each([
+  { waitStage: "lookup.target", callerLane: "identity" },
+  { waitStage: "waiting", callerLane: "identity" },
+  { waitStage: "lookup.target", callerLane: "background" },
+  { waitStage: "waiting", callerLane: "background" },
+] as const)(
+  "thread wait $waitStage preserves $callerLane caller lane after handler lane changes",
+  ({ waitStage, callerLane }) =>
     Effect.gen(function* () {
       const recorded = yield* Deferred.make<AnalyticsEvent>();
+      let shellReads = 0;
       const toolkit = probe("t3_thread_wait");
       const handlers = McpToolAccess.toLayer(toolkit, {
-        t3_thread_wait: McpToolAccess.reads(() =>
+        t3_thread_wait: McpToolAccess.actsAsCaller(() =>
           Effect.gen(function* () {
             const context = yield* Effect.serviceOption(McpCall.McpCall);
             if (context._tag === "None") return yield* Effect.die("Missing MCP analytics context");
@@ -1325,7 +2078,22 @@ it.effect.each(["lookup.target", "waiting"] as const)(
       });
       const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
         Layer.provideMerge(McpServer.McpServer.layer),
-        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(ThreadManagement.ThreadManagementService)({
+            getCallerRow: (id) =>
+              Effect.succeed(
+                Testkit.liveThreadShell(
+                  id,
+                  callerLane === "background" ? { activeRunId: null } : {},
+                ),
+              ),
+            getThreadShell: (id) =>
+              Effect.sync(() => {
+                shellReads++;
+                return Testkit.liveThreadShell(id);
+              }),
+          }),
+        ),
         Layer.provide(
           Layer.mock(Analytics.Analytics)({
             record: (event) =>
@@ -1342,14 +2110,646 @@ it.effect.each(["lookup.target", "waiting"] as const)(
           .callTool({ name: "t3_thread_wait", arguments: args })
           .pipe(Effect.provideService(McpSchema.McpServerClient, client));
         const row = yield* Deferred.await(recorded);
+        expect(shellReads).toBe(callerLane === "background" ? 1 : 0);
         expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
           tool: "t3_thread_wait",
           outcome: "timeout",
           waitStage,
           waitLookupMs: 600,
-          readerLane: waitStage === "waiting" ? "background" : "foreground",
+          callerReaderLane: callerLane,
+          readerLane: callerLane,
           errorTag: waitStage === "waiting" ? "wait_timeout" : "lookup_timeout",
         });
       }).pipe(Effect.provide(registration));
     }),
+);
+
+const provenanceCases = [
+  {
+    name: "card thread",
+    origin: "card",
+    own: true,
+    role: "work",
+    kind: "board_thread",
+    number: 4336,
+  },
+  {
+    name: "legacy run origin",
+    origin: "legacy",
+    own: false,
+    role: "work",
+    kind: "delegated_child",
+    number: 4336,
+  },
+  ...(["work", "review", "evaluator", "discussion"] as const).map((role) => ({
+    name: `explicit subagent of ${role}`,
+    origin: "subagent" as const,
+    own: false,
+    role,
+    kind: "delegated_child" as const,
+    number: 4336,
+  })),
+  {
+    name: "ordinary fork",
+    origin: "fork",
+    own: false,
+    role: "none",
+    kind: "plain_thread",
+    number: null,
+  },
+  {
+    name: "explicit root",
+    origin: "root",
+    own: false,
+    role: "none",
+    kind: "plain_thread",
+    number: null,
+  },
+  {
+    name: "ordinary fork with own card",
+    origin: "fork",
+    own: true,
+    role: "work",
+    kind: "board_thread",
+    number: 4339,
+  },
+] as const;
+
+it.effect.each([
+  ...provenanceCases.map((scenario) => ({ ...scenario, tool: "delegate_task" as const })),
+  { ...provenanceCases[0], name: "card thread with read timings", tool: "t3_thread_read" as const },
+])("attributes $tool: $name", (scenario) =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = probe(scenario.tool);
+    const handlers = McpToolAccess.toLayer(toolkit, {
+      [scenario.tool]: McpToolAccess.actsAsCaller(() =>
+        scenario.tool === "t3_thread_read"
+          ? ThreadReadMetrics.read("shell", TestClock.adjust(7).pipe(Effect.as({ ok: true })))
+          : McpCall.failedPhase("dispatch").pipe(Effect.andThen(failure("delegation_timeout"))),
+      ),
+    });
+    const callerId = ThreadId.make("caller-ledger");
+    const parentId = ThreadId.make("card-parent");
+    const shell = Testkit.liveThreadShell(callerId);
+    const { lineage, ...legacyCaller } = shell;
+    const explicitLineage =
+      scenario.origin === "fork" || scenario.origin === "subagent"
+        ? ({
+            parentThreadId: parentId,
+            rootThreadId: parentId,
+            relationshipToParent: scenario.origin,
+          } as const)
+        : lineage;
+    const forkedFrom =
+      scenario.origin === "card"
+        ? null
+        : { type: "run" as const, threadId: parentId, runId: shell.activeRunId! };
+    const callerRow = {
+      ...(scenario.origin === "legacy" ? legacyCaller : { ...shell, lineage: explicitLineage }),
+      forkedFrom,
+    };
+    const cachedCard = (number: number) => ({
+      boardId: "board-crpko",
+      cardId: `card-${number}`,
+      cardNumber: number,
+      cardStage: "working",
+      callerRole: scenario.role === "none" ? ("work" as const) : scenario.role,
+    });
+    const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(
+        Layer.mock(ThreadManagement.ThreadManagementService)({
+          getCallerRow: () => Effect.succeed(callerRow),
+          getThreadShell: () => Effect.succeed({ ...shell, lineage: explicitLineage, forkedFrom }),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(KanbanService)({
+          attachmentPath: () => null,
+          callerAnalytics: (id) =>
+            id === parentId
+              ? cachedCard(4336)
+              : id === callerId && scenario.own
+                ? cachedCard(scenario.number!)
+                : { callerRole: "none" as const, callerKind: "plain_thread" as const },
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      yield* server
+        .callTool({ name: scenario.tool, arguments: args })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+      const row = yield* Deferred.await(recorded);
+      expect(row).toMatchObject({
+        callerRole: scenario.role,
+        callerKind: scenario.kind,
+        ...(scenario.tool === "t3_thread_read"
+          ? {
+              outcome: "ok",
+              callerReaderLane: "identity",
+              readerLane: "identity",
+              readerWaitMs: 0,
+              queryMs: 0,
+              renderMs: 0,
+              inFlightAtStart: { session: 1, overall: 1 },
+              threadReadStages: [
+                { stage: "shell", durationMs: 7, completed: true, readerWaitMs: 0, queryMs: 0 },
+              ],
+            }
+          : { errorTag: "delegation_timeout" }),
+      });
+      expect(row.callerCardNumber).toBe(scenario.number ?? undefined);
+      expect(row.cardNumber).toBe(scenario.number ?? undefined);
+      expect(row.callerCardStage).toBe(scenario.number === null ? undefined : "working");
+      if (scenario.number !== null)
+        expect(row).toMatchObject({
+          boardId: "board-crpko",
+          cardId: `card-${scenario.number}`,
+          cardStage: "working",
+        });
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect("retains a fixed denial reason after the toolkit encodes the failure", () =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = probe("reason_probe");
+    const handlers = McpToolAccess.toLayer(toolkit, {
+      reason_probe: McpToolAccess.reads(() =>
+        Effect.fail(
+          new OrchestratorMcpFailure({
+            code: "capability_denied",
+            reason: "subtask_not_in_current_step",
+            message: "private refusal body",
+          }),
+        ),
+      ),
+    });
+    const registration = McpHttpServer.toolkitRegistration(toolkit, handlers).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+      Layer.provide(Testkit.liveThreadsLayer),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      yield* server
+        .callTool({ name: "reason_probe", arguments: args })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client));
+      const row = yield* Deferred.await(recorded);
+      expect(row).toMatchObject({
+        errorTag: "capability_denied",
+        denyReason: "subtask_not_in_current_step",
+        outcome: "refused",
+      });
+      expect(JSON.stringify(row)).not.toContain("private refusal body");
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect("the canonical target replaces caller attribution and survives dependency reads", () =>
+  Effect.gen(function* () {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      phase: "handler",
+      readerLane: "foreground",
+      saved: "unknown",
+      cardId: "caller-card",
+      cardNumber: 4336,
+      callerCardNumber: 4336,
+      callerCardStage: "working",
+    };
+    yield* McpCall.resolvedContext({
+      boardId: "board-crpko",
+      id: "target-card",
+      number: 4339,
+      stage: "in_review",
+    }).pipe(Effect.provideService(McpCall.McpCall, state));
+    yield* McpCall.resolvedContext({
+      boardId: "board-crpko",
+      id: "dependency-card",
+      number: 4343,
+      stage: "todo",
+    }).pipe(Effect.provideService(McpCall.McpCall, state));
+    expect(state).toMatchObject({
+      cardId: "target-card",
+      cardNumber: 4339,
+      cardStage: "in_review",
+      callerCardNumber: 4336,
+      callerCardStage: "working",
+    });
+  }),
+);
+
+it.effect.each([false, true])(
+  "records the final outcome after a recovered dispatch fence (waitTimedOut=%s)",
+  (waitTimedOut) =>
+    Effect.gen(function* () {
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: "unknown",
+      };
+      yield* McpCall.failedPhase("dispatch").pipe(Effect.provideService(McpCall.McpCall, state));
+      yield* McpCall.dispatchFenceRecovered.pipe(Effect.provideService(McpCall.McpCall, state));
+      yield* McpCall.setSaved(true).pipe(Effect.provideService(McpCall.McpCall, state));
+      const result = McpCall.callOutcome(
+        Exit.succeed(
+          new McpSchema.CallToolResult({
+            content: [],
+            structuredContent: { taskId: "task", waitTimedOut },
+          }),
+        ),
+        state,
+      );
+      expect(result).toMatchObject({
+        outcome: waitTimedOut ? "timeout" : "ok",
+        saved: true,
+        props: { dispatchFenceRecovered: true },
+      });
+      expect(result.errorTag).toBe(waitTimedOut ? "wait_timeout" : undefined);
+      expect(result.errorPhase).toBe(waitTimedOut ? "result" : undefined);
+      expect(() =>
+        decodeAnalyticsEventSync({
+          ts: "2026-11-16T00:00:00.000Z",
+          kind: "mcp.call",
+          surface: "server",
+          route: "mcp",
+          ...result,
+        }),
+      ).not.toThrow();
+    }),
+);
+
+it("does not take refusal metadata from a successful result body", () => {
+  const state: McpCall.McpCall["Service"] = {
+    callerResolved: true,
+    callerResolveMs: 0,
+    readerLane: "foreground",
+    phase: "handler",
+    saved: "unknown",
+  };
+  const result = McpCall.callOutcome(
+    Exit.succeed(
+      new McpSchema.CallToolResult({
+        content: [],
+        structuredContent: { code: "invalid_request", reason: "invalid_args" },
+      }),
+    ),
+    state,
+  );
+  expect(result.outcome).toBe("ok");
+  expect(state.denyReason).toBeUndefined();
+});
+
+it.each([
+  ["work", "board_thread"],
+  ["review", "delegated_child"],
+] as const)("caller_unresolved preserves known %s caller context", (callerRole, callerKind) => {
+  const state: McpCall.McpCall["Service"] = {
+    callerResolved: false,
+    callerResolveMs: 10000,
+    readerLane: "foreground",
+    phase: "caller",
+    saved: "unknown",
+    callerRole,
+    callerKind,
+    callerCardNumber: 4336,
+    callerCardStage: "working",
+  };
+  const result = McpCall.callOutcome(
+    Exit.fail(
+      new OrchestratorMcpFailure({ code: "caller_unresolved", message: "Caller lookup timed out" }),
+    ),
+    state,
+  );
+  expect(result).toMatchObject({ outcome: "timeout", errorTag: "caller_unresolved" });
+  expect(state).toMatchObject({
+    callerRole,
+    callerKind,
+    callerCardNumber: 4336,
+    callerCardStage: "working",
+  });
+});
+
+it.effect.each([
+  {
+    name: "mixed union",
+    input: { title: "ok", stage: "todo", choice: 42 },
+    reasonClass: "bad_type",
+    invalidField: "choice",
+  },
+  {
+    name: "nullable enum",
+    input: { title: "ok", stage: "todo", nullableStage: "invalid" },
+    reasonClass: "bad_enum",
+    invalidField: "nullableStage",
+  },
+  {
+    name: "nullable type",
+    input: { title: "ok", stage: "todo", optionalText: 42 },
+    reasonClass: "bad_type",
+    invalidField: "optionalText",
+  },
+  {
+    name: "union missing key",
+    input: { title: "ok", stage: "todo", objectChoice: {} },
+    reasonClass: "missing_required",
+    invalidField: "objectChoice",
+  },
+  { name: "missing", input: {}, reasonClass: "missing_required", invalidField: "title" },
+  {
+    name: "enum",
+    input: { title: "private", stage: "private stage" },
+    reasonClass: "bad_enum",
+    invalidField: "stage",
+  },
+  {
+    name: "type",
+    input: { title: 42, stage: "todo" },
+    reasonClass: "bad_type",
+    invalidField: "title",
+  },
+  {
+    name: "length",
+    input: { title: "private text too long", stage: "todo" },
+    reasonClass: "too_long",
+    invalidField: "title",
+  },
+  {
+    name: "items",
+    input: { title: "ok", stage: "todo", subtasks: ["private a", "private b"] },
+    reasonClass: "too_many",
+    invalidField: "subtasks",
+  },
+])("schema refusal $name retains only the declared field and issue class", (scenario) =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = Toolkit.make(
+      Tool.make("card_create", {
+        parameters: Schema.Struct({
+          title: Schema.String.check(Schema.isMaxLength(8)),
+          stage: Schema.Literals(["todo", "working"]),
+          choice: Schema.optionalKey(
+            Schema.Union([Schema.String, Schema.Struct({ label: Schema.String })]),
+          ),
+          nullableStage: Schema.optionalKey(Schema.NullOr(Schema.Literals(["todo", "working"]))),
+          optionalText: Schema.optionalKey(Schema.NullOr(Schema.String)),
+          objectChoice: Schema.optionalKey(
+            Schema.Union([Schema.Struct({ label: Schema.String }), Schema.String]),
+          ),
+          subtasks: Schema.optionalKey(Schema.Array(Schema.String).check(Schema.isMaxLength(1))),
+        }),
+        success: Schema.Unknown,
+        failure: OrchestratorMcpFailure,
+        failureMode: "return",
+      }),
+    );
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        card_create: McpToolAccess.reads(() =>
+          Effect.die("schema validation must precede handler"),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+              : Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+      Layer.provide(Testkit.liveThreadsLayer),
+    );
+    yield* Effect.gen(function* () {
+      const server = yield* McpServer.McpServer;
+      yield* server
+        .callTool({ name: "card_create", arguments: scenario.input })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.exit);
+      const row = yield* Deferred.await(recorded);
+      expect(row).toMatchObject({
+        reasonClass: scenario.reasonClass,
+        invalidField: scenario.invalidField,
+        saved: false,
+      });
+      expect(JSON.stringify(row)).not.toContain("private");
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect(
+  "a refused write after a commit retains saved true and drops undeclared field names",
+  () =>
+    Effect.gen(function* () {
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        boardWrite: true,
+        saved: false,
+        inputKeys: new Set(["title"]),
+      };
+      yield* Effect.gen(function* () {
+        yield* SavedWrite.committing;
+        yield* SavedWrite.committed();
+        const error = new OrchestratorMcpFailure({
+          code: "invalid_request",
+          message: "private",
+          reasonClass: "conflict",
+          invalidField: "private_value",
+        });
+        yield* McpCall.handlerFailure(Cause.fail(error));
+        const row = McpCall.callOutcome(Exit.fail(error), state);
+        expect(row.saved).toBe(true);
+        expect(state.refusedAt).toBe("post_write");
+        expect(state.reasonClass).toBe("conflict");
+        expect(state.invalidField).toBeUndefined();
+      }).pipe(Effect.provideService(McpCall.McpCall, state));
+    }),
+);
+
+it.each([true, false, null] as const)(
+  "board-write reply timeout keeps receipt saved=%s",
+  (saved) => {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "result",
+      boardWrite: true,
+      saved: false,
+      replyFailure: "reply_timeout",
+      refusedAt: "pre_lock",
+    };
+    const row = McpCall.callOutcome(
+      Exit.succeed(
+        new McpSchema.CallToolResult({
+          isError: true,
+          content: [],
+          structuredContent: { saved },
+        }),
+      ),
+      state,
+    );
+    expect(row.saved).toBe(saved === null ? "unknown" : saved);
+    expect(state.reasonClass).toBe("reply_timeout");
+    expect(state.refusedAt).toBe(saved === true ? "post_write" : "pre_lock");
+  },
+);
+
+it.effect("a recovered admission clears its refusal stage before a later committed timeout", () =>
+  Effect.gen(function* () {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+      boardWrite: true,
+      saved: false,
+      refusedAt: "pre_lock",
+    };
+    yield* McpCall.writeAdmitted().pipe(Effect.provideService(McpCall.McpCall, state));
+    expect(state.refusedAt).toBeUndefined();
+    yield* SavedWrite.committed().pipe(Effect.provideService(McpCall.McpCall, state));
+    state.replyFailure = "reply_timeout";
+    McpCall.callOutcome(
+      Exit.fail(new OrchestratorMcpFailure({ code: "invalid_request", message: "private" })),
+      state,
+    );
+    expect(state.refusedAt).toBe("post_write");
+  }),
+);
+
+it.effect("records a late detached create with the original HTTP call's correlation metadata", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const callRow = yield* Deferred.make<AnalyticsEvent>();
+    const detachedRow = yield* Deferred.make<AnalyticsEvent>();
+    const toolkit = probe("delegate_task");
+    const registration = McpHttpServer.toolkitRegistration(
+      toolkit,
+      McpToolAccess.toLayer(toolkit, {
+        delegate_task: McpToolAccess.reads(() =>
+          McpDeadline.withDeadline(
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as({ taskId: "created-task" }),
+            ),
+            {
+              code: "delegation_timeout",
+              threadId: ThreadId.make("caller-ledger"),
+              stage: "dispatch",
+              onTimeout: "detach",
+              requestKey: args.clientRequestId,
+            },
+          ),
+        ),
+      }),
+    ).pipe(
+      Layer.provideMerge(McpServer.McpServer.layer),
+      Layer.provide(Testkit.liveThreadsLayer),
+      Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (row) =>
+            row.kind === "mcp.call"
+              ? Deferred.succeed(callRow, row).pipe(Effect.asVoid)
+              : row.kind === "mcp.detached"
+                ? Deferred.succeed(detachedRow, row).pipe(Effect.asVoid)
+                : Effect.void,
+        }),
+      ),
+      Layer.provideMerge(invocation),
+    );
+    yield* Effect.gen(function* () {
+      const pending = yield* (yield* McpServer.McpServer)
+        .callTool({ name: "delegate_task", arguments: args })
+        .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("10 seconds");
+      expect((yield* Fiber.join(pending)).isError).toBe(true);
+      const call = yield* Deferred.await(callRow);
+      yield* TestClock.adjust("3 seconds");
+      yield* Deferred.succeed(release, undefined);
+      const detached = yield* Deferred.await(detachedRow);
+      expect(detached).toMatchObject({
+        kind: "mcp.detached",
+        outcome: "committed",
+        lateMs: 3000,
+        tool: call.tool,
+        startedAt: call.startedAt,
+        bootId: call.bootId,
+        build: call.build,
+        clientRequestId: call.clientRequestId,
+        callerThreadId: call.callerThreadId,
+      });
+      expect(JSON.stringify(detached)).not.toContain(args.clientRequestId);
+      yield* decodeAnalyticsEvent(detached);
+    }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect.each([
+  {
+    name: "typed failure",
+    cause: Cause.fail(
+      new OrchestratorMcpFailure({ code: "orchestration_error", message: "Cleanup failed." }),
+    ),
+  },
+  { name: "defect", cause: Cause.die(new Error("Cleanup failed.")) },
+])("read deadline wins over a late cleanup $name before analytics serialization", ({ cause }) =>
+  Effect.gen(function* () {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "background",
+      readOnly: true,
+      phase: "handler",
+      saved: "unknown",
+    };
+    yield* Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const pending = yield* BoundedReadDeadline.withDeadline(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        () => ({ phase: "handler", waitedMs: 20000 }),
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("20 seconds");
+      const reply = yield* Fiber.join(pending);
+      // The detached handler can report cleanup failure before the ledger builds its row.
+      yield* McpCall.handlerFailure(cause);
+      expect(McpCall.callOutcome(Exit.succeed(reply), state)).toMatchObject({
+        outcome: "timeout",
+        errorTag: "TimeoutError",
+      });
+      expect(state.boundedRead).toEqual({ phase: "handler", waitedMs: 20000 });
+    }).pipe(Effect.provideService(McpCall.McpCall, state));
+  }),
 );

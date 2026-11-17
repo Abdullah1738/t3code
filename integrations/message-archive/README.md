@@ -51,8 +51,9 @@ Nothing is written while the SSD is unmounted; the daemon waits for it.
 LaunchAgent `com.ardud.message-archive` runs `msgs daemon`: chats every 30 s,
 mail every 3 min, a full chat pass every 6 h and a full relist of the Gmail API
 accounts daily.
-A failing source logs `<source>: ERROR ...` and backs off up to 1 h, then
-retries. Log: `~/.local/share/message-archive/logs/daemon.log`.
+A failing source logs `<source>: ERROR ...` and backs off up to 10 min. Lock
+contention logs `LOCK_GIVEUP`; contention and token-command timeouts retry at
+the normal source interval. Log: `~/.local/share/message-archive/logs/daemon.log`.
 
 The memory-system health check (`msgs` in `health_check.py`, every 15 min)
 sends a Telegram alert when the archive's last good iMessage pass hasn't
@@ -72,8 +73,8 @@ Settings (Abdullah does that), followed by
 
 ## Tests and deploy
 
-Tests: `/opt/homebrew/opt/python@3.14/bin/python3.14 tests/test_archive.py`
-(temporary paths, no real data).
+Tests: `/opt/homebrew/opt/python@3.14/bin/python3.14 -m unittest discover -s tests -p 'test_*.py' -v`
+(temporary paths, no real data). On older Pythons, tests that need `compression.zstd` skip.
 
 Deploy: `integrations/deploy.zsh message-archive`, then
 `launchctl kickstart -k gui/$(id -u)/com.ardud.message-archive`.

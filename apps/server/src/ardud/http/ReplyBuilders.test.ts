@@ -4,9 +4,13 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as ReplyBuilders from "./ReplyBuilders.ts";
 
-it.effect.each(["agent", "interactive"] as const)(
+it.effect.each([
+  ["agent", 2],
+  ["interactive", 2],
+  ["controlRead", 1],
+] as const)(
   "%s bounds builders and releases permits after failure or interruption",
-  (lane) =>
+  ([lane, permits]) =>
     Effect.gen(function* () {
       const ready = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
@@ -18,7 +22,7 @@ it.effect.each(["agent", "interactive"] as const)(
           active++;
           peak = Math.max(peak, active);
           started++;
-          if (started === 2) yield* Deferred.succeed(ready, undefined);
+          if (started === permits) yield* Deferred.succeed(ready, undefined);
           yield* Deferred.await(release).pipe(Effect.ensuring(Effect.sync(() => active--)));
         }),
         lane,
@@ -30,10 +34,10 @@ it.effect.each(["agent", "interactive"] as const)(
         ),
       );
       yield* Deferred.await(ready);
-      expect(started).toBe(2);
+      expect(started).toBe(permits);
       yield* Deferred.succeed(release, undefined);
       yield* Fiber.join(burst);
-      expect(peak).toBe(2);
+      expect(peak).toBe(permits);
       yield* ReplyBuilders.bounded(Effect.fail("failed"), lane).pipe(Effect.ignore);
       const held = yield* Deferred.make<void>();
       const interrupted = yield* Effect.forkChild(

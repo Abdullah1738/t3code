@@ -14,6 +14,8 @@ import {
   type ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
+import { recordServerAnalytics } from "../observability/RpcInstrumentation.ts";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -217,6 +219,10 @@ export interface EventSinkV2Shape {
     readonly threadId?: ThreadId;
     readonly afterSequence?: number;
     readonly eventType?: OrchestrationV2DomainEvent["type"];
+    /** Pure selection applied to replay and live before projection or retention. */
+    readonly filter?: (stored: OrchestrationV2StoredEvent) => boolean;
+    /** Runs after catch-up, before live delivery, to reject incomplete retained history. */
+    readonly verifyReplay?: (throughSequence: number) => Effect.Effect<void, unknown>;
     /** Bound RPC subscribers; internal workers must not drop their subscription under load. */
     readonly bounded?: boolean;
   }) => Stream.Stream<OrchestrationV2StoredEvent, EventSinkV2Error>;
@@ -271,6 +277,7 @@ const layerBase: Layer.Layer<
   EventSinkV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const analytics = yield* Effect.serviceOption(Analytics.Analytics);
     const commandReceipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
     const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
     const eventStore = yield* EventStore.EventStoreV2;
@@ -437,6 +444,9 @@ const layerBase: Layer.Layer<
               }),
         ),
         Effect.ensuring(Effect.suspend(() => (holdsLane ? publishLane.release(1) : Effect.void))),
+        // An expiring start cancels its own worker. Once committed, its terminal
+        // events must still reach queue promotion and the other subscribers.
+        Effect.uninterruptible,
       );
     });
 
@@ -1169,6 +1179,34 @@ const layerBase: Layer.Layer<
           }),
         (result) =>
           Effect.gen(function* () {
+            const executing = yield* EffectOutbox.ExecutingEffect;
+            if (
+              executing !== undefined &&
+              result.cancelledEffectIds.some((effectId) => effectId === executing.id)
+            ) {
+              const request = executing.request;
+              const runId = "runId" in request ? request.runId : undefined;
+              const props = {
+                effectId: executing.id,
+                effectType: request.type,
+                commandType: input.commandType,
+                ...(runId === undefined ? {} : { runId }),
+              };
+              yield* Effect.logInfo("effect_outbox.self_cancellation_deferred", {
+                threadId: input.threadId,
+                runId,
+                ...props,
+              });
+              if (Option.isSome(analytics))
+                yield* recordServerAnalytics(analytics.value, {
+                  ts: DateTime.formatIso(yield* DateTime.now),
+                  surface: "server",
+                  route: "orchestration",
+                  kind: "effect_outbox.self_cancellation_deferred",
+                  threadId: input.threadId,
+                  props,
+                });
+            }
             yield* effectOutbox.signalCancellations(result.cancelledEffectIds);
             if (result.committed && input.effects.length > 0) {
               yield* effectOutbox.notifyAvailable(input.effects.length);
@@ -1342,14 +1380,20 @@ const layerBase: Layer.Layer<
       const afterSequence = input?.afterSequence ?? 0;
       const matches = (stored: OrchestrationV2StoredEvent) =>
         (input?.threadId === undefined || stored.event.threadId === input.threadId) &&
-        (input?.eventType === undefined || stored.event.type === input.eventType);
+        (input?.eventType === undefined || stored.event.type === input.eventType) &&
+        (input?.filter?.(stored) ?? true);
       const replay = (throughSequence: number) =>
         catchUp({
           afterSequence,
           throughSequence,
           ...(input?.threadId === undefined ? {} : { threadId: input.threadId }),
           ...(input?.eventType === undefined ? {} : { eventType: input.eventType }),
-        }).pipe(Stream.filter(matches));
+        }).pipe(
+          Stream.filter(matches),
+          Stream.concat(
+            Stream.drain(Stream.fromEffect(input?.verifyReplay?.(throughSequence) ?? Effect.void)),
+          ),
+        );
       return Stream.unwrap(
         Effect.gen(function* () {
           let pubsub = liveEvents;

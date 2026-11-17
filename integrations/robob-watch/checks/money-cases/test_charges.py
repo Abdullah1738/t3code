@@ -4,6 +4,7 @@ from collections import Counter
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import http.server
 import threading
@@ -26,6 +27,46 @@ TZ = ch.TZ
 def summary(text, **extra):
     return {'role': 'user', 'messageId': text, 'text': text, 'createdAt': '2026-10-24T00:10:00.000Z',
             'createdBy': 'user', 'creationSource': 'web', 'automated': False, 'inboundMessageId': None, **extra}
+
+
+class ReadOnlySearchCache(unittest.TestCase):
+    def test_closed_search_reads_cache_but_never_saves_in_read_only_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / 'msgs-searches.json'
+            cache.write_text('{}\n')
+            binary = root / 'msgs'
+            binary.write_text('#!/bin/sh\nexit 0\n')
+            binary.chmod(0o700)
+            before = cache.read_bytes(), cache.stat().st_mtime_ns
+            memo = {('msgs_cache',): cache, ('write_cache',): False}
+            with patch.object(ch, 'MSGS', str(binary)):
+                self.assertEqual(ch.search('receipt', '2026-10-23', until='2026-10-24', memo=memo), [])
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), before)
+                self.assertEqual(ch.search('receipt', '2026-10-23', until='2026-10-24',
+                                           memo={('msgs_cache',): cache}, write_cache=False), [])
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), before)
+                ch.search('receipt', '2026-10-23', until='2026-10-24', memo={('msgs_cache',): cache})
+                self.assertNotEqual(cache.read_bytes(), before[0])
+                saved = cache.read_bytes(), cache.stat().st_mtime_ns
+                with patch.object(ch, 'msgs', side_effect=AssertionError('cache miss')):
+                    self.assertEqual(ch.search('receipt', '2026-10-23', until='2026-10-24', memo=memo), [])
+                self.assertEqual((cache.read_bytes(), cache.stat().st_mtime_ns), saved)
+
+
+    def test_owner_cache_default_path_is_read_only_even_when_corrupt_or_missing(self):
+        for content in ('{}\n', '{bad json', None):
+            with self.subTest(content=content), ControlServer([summary('owner words')]) as server:
+                cache = Path(server.tmp.name) / 'owner-texts.json'
+                if content is not None:
+                    cache.write_text(content)
+                before = (cache.read_bytes(), cache.stat().st_mtime_ns) if cache.exists() else None
+                with patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(Path(server.tmp.name) / 'logs'),
+                                             'TOOLLOG_ROOT': str(Path(server.tmp.name) / 'logs')}):
+                    rows = ch.owner_texts(at('2026-10-24T03:00'), at('2026-10-24T05:00'), write_cache=False)
+                self.assertEqual(len(rows), 1)
+                after = (cache.read_bytes(), cache.stat().st_mtime_ns) if cache.exists() else None
+                self.assertEqual(after, before)
 
 
 class ControlServer:
@@ -250,9 +291,14 @@ class AlertText(unittest.TestCase):
                         patch.object(ch, 'card_owner', return_value='abdullah'):
                     for _ in range(2):
                         errors = []
+                        limits = []
                         self.assertIsNone(ch.found(charge, now, now, said=lambda *a, **kw: [],
-                                                   errors=errors, memo=memo))
-                        self.assertIn('orders: noon orders: lookup unavailable or incomplete', errors)
+                                                   errors=errors, memo=memo, limits=limits))
+                        if isinstance(result, Exception):
+                            self.assertIn('orders: noon orders: lookup unavailable or incomplete', errors)
+                        else:
+                            self.assertEqual(errors, [])
+                            self.assertEqual(limits[0]['kinds'], ['marketplace_stale'])
                     self.assertEqual(lookup.call_count, 1)
                     ch.found(charge, now, now, said=lambda *a, **kw: [], memo={})
                     self.assertEqual(lookup.call_count, 2)
@@ -337,7 +383,7 @@ class Finder:
     def split(query):
         # Groups are separated where two quoted terms meet without an OR between them.
         groups, cur, prev = [], [], None
-        for tok in query.split(' '):
+        for tok in re.findall(r'"[^"]*"|\S+', query):
             if tok == 'OR':
                 prev = 'OR'
                 continue
@@ -360,6 +406,246 @@ CHARGE = ch.parse('Purchase of EUR 12.34 with Credit Card ending 1111 at ACME * 
 
 def read(row, deadline=None):
     return f"{row.get('subject', '')}\n{row.get('body', '')}"
+
+
+class ReceiptVariants(unittest.TestCase):
+    def setUp(self):
+        for name, replacement in [('show', read), ('card_owner', lambda charge: 'abdullah')]:
+            mock = patch.object(ch, name, replacement)
+            mock.start()
+            self.addCleanup(mock.stop)
+
+    def explain(self, merchant, amount, body, sender, *, pending=False, minutes=30,
+                subject=None, receipt_ok=None):
+        charge = dict(CHARGE, merchant=merchant, currency='AED', amount=amount, pending=pending)
+        row = dict(id=7, ts=ts('2026-10-24T12:00') + minutes * 60, sender=sender,
+                   subject=subject or f'Your receipt from {merchant}', body=body)
+        return ch.explain(charge, at('2026-10-24T12:00'), at('2026-10-27T12:00'),
+                          find=Finder([row]), said=nobody, receipt_ok=receipt_ok)
+
+    def test_uber_pending_total_and_explicit_wait_fee(self):
+        for hold, total, wait in [('201.03', '200.94', None), ('77.45', '106.25', '28.80'),
+                                  ('73.46', '84.77', '11.31')]:
+            with self.subTest(hold=hold):
+                body = f'Uber receipt\nTotal AED {total}'
+                if wait:
+                    body += f'\nWait Time\n\nAED {wait}'
+                self.assertEqual(self.explain('UBER * PENDING', hold, body, 'Uber <receipts@uber.com>',
+                                             pending=True)['verdict'], 'receipt')
+
+    def test_uber_tolerance_is_one_percent_capped_at_one_dirham(self):
+        for hold, total, expected in [('100.00', '99.00', 'receipt'), ('100.00', '98.99', 'ask'),
+                                       ('50.00', '49.50', 'receipt'), ('50.00', '49.49', 'ask'),
+                                       ('201.03', '199.99', 'ask'), ('44.81', '80.48', 'ask')]:
+            with self.subTest(hold=hold, total=total):
+                self.assertEqual(self.explain('UBER * PENDING', hold, f'Uber receipt\nTotal AED {total}',
+                                             'Uber <receipts@uber.com>', pending=True)['verdict'], expected)
+
+    def test_uber_requires_pending_merchant_sender_window_and_total(self):
+        for changes in [dict(pending=False), dict(merchant='OTHER * PENDING'),
+                        dict(sender='Other <receipts@other.example>'),
+                        dict(sender='Uber <receipts@uber.com.other.example>'),
+                        dict(minutes=-1), dict(minutes=121), dict(body='Uber receipt\nFare AED 200.94'),
+                        dict(body='Uber receipt\nTotal AED 200.94\nTotal AED 50.00'),
+                        dict(body='Uber receipt\nTotal EUR 200.94')]:
+            with self.subTest(changes=changes):
+                options = dict(merchant='UBER * PENDING', amount='201.03', pending=True,
+                               body='Uber receipt\nTotal AED 200.94', sender='Uber <receipts@uber.com>')
+                self.assertEqual(self.explain(**{**options, **changes})['verdict'], 'ask')
+
+    def test_aed_usd_receipts_need_the_brand_and_plausible_paid_total(self):
+        for merchant, sender in [('BOAT.DEV', 'Boat <receipts@stripe.example>'),
+                                  ('BOAT.DEV', 'Boat.dev <receipts@stripe.example>'),
+                                  ('BROWSER USE INC', 'Browser Use <receipts@stripe.example>'),
+                                  ('BROWSER USE INC', 'Browser Use Inc. <receipts@stripe.example>')]:
+            for paid, expected in [('50.00', 'receipt'), ('25.00', 'ask'), ('100.00', 'ask')]:
+                with self.subTest(merchant=merchant, paid=paid):
+                    self.assertEqual(self.explain(merchant, '190.47', f'Amount paid ${paid}', sender,
+                                                 subject=f'Your receipt from {sender.split(" <")[0]}')['verdict'], expected)
+
+    def test_fx_never_uses_another_merchants_receipt_or_a_bare_number(self):
+        for body, sender, subject in [
+                ('Amount paid $50.00', 'Other <receipts@other.example>', 'Your receipt from Other'),
+                ('Boat plan $50.00', 'Boat <news@boat.example>', 'Boat upgrade'),
+                ('Boat invoice: total $50.00', 'Boat <receipts@stripe.example>', 'Boat invoice'),
+                ('Boat receipt: Amount paid 50.00', 'Boat <receipts@stripe.example>', 'Boat receipt'),
+                ('Boat receipt: Amount paid EUR 50.00', 'Boat <receipts@stripe.example>', 'Boat receipt'),
+                ('Boat receipt: Amount paid $50.00\nAmount paid $25.00', 'Boat <receipts@stripe.example>', 'Boat receipt'),
+                ('Browser invoice: use credits. Amount paid $50.00', 'Other <receipts@other.example>', 'Dev invoice'),
+                ('Boat receipt: Amount paid $50.00', 'Other <receipts@other.example>', 'Other receipt'),
+                ('Boat receipt: Amount paid $50.00', 'Other <receipts@other.example>', 'Receipt for Boat equipment'),
+                ('Boat receipt: Amount paid $50.00', 'Boat Tours <receipts@tours.example>', 'Boat Tours receipt'),
+        ]:
+            for merchant in ['BOAT.DEV', 'BROWSER USE INC']:
+                with self.subTest(merchant=merchant, body=body, subject=subject):
+                    self.assertEqual(self.explain(merchant, '190.47', body, sender, subject=subject)['verdict'], 'ask')
+
+    def test_usd_markup_edges_and_recurring_receipt_window(self):
+        for amount, minutes, expected in [('183.62', 30, 'receipt'), ('183.61', 30, 'ask'),
+                                          ('190.97', 30, 'receipt'), ('190.98', 30, 'ask'),
+                                          ('190.47', -121, 'ask'), ('190.47', 2161, 'ask')]:
+            with self.subTest(amount=amount, minutes=minutes):
+                self.assertEqual(self.explain('BOAT.DEV', amount, 'Amount paid $50.00',
+                                             'Boat <receipts@stripe.example>', minutes=minutes)['verdict'], expected)
+
+    def test_paid_amount_forms_are_currency_bound(self):
+        forms = [('Amount paid $50.00', '50'), ('Amount paid:\nUSD 50.00', '50'),
+                 ('Amount paid\n50.00 USD', '50'), ('Amount paid $1,234.50', '1234.50'),
+                 ('Amount paid $50', '50'), ('Amount paid $50.001', None),
+                 ('Amount paid -$50.00', None), ('Amount paid 50 items', None),
+                 ('Amount paid EUR 50.00', None)]
+        for text, expected in forms:
+            with self.subTest(text=text):
+                self.assertEqual(ch.labelled_money(text, 'amount paid', 'USD'),
+                                 {ch.Decimal(expected)} if expected else set())
+
+    def test_receipt_veto_and_source_errors_remain_closed(self):
+        self.assertEqual(self.explain('BOAT.DEV', '190.47', 'Amount paid $50.00',
+                                     'Boat <receipts@stripe.example>', receipt_ok=lambda *a: False)['verdict'], 'ask')
+        for name in ['show', 'search']:
+            with self.subTest(source=name), patch.object(ch, name, side_effect=ch.Lookup('unavailable')):
+                charge = dict(CHARGE, merchant='BOAT.DEV', currency='AED', amount='190.47', pending=False)
+                options = {} if name == 'search' else dict(find=Finder([
+                    dict(id=7, ts=ts('2026-10-24T12:30'), sender='Boat', body='Boat receipt Amount paid $50.00')]))
+                result = ch.explain(charge, at('2026-10-24T12:00'), at('2026-10-27T12:00'), said=nobody, **options)
+                self.assertEqual(result['verdict'], 'unverified')
+
+    def test_justlife_completion_without_priced_receipt_does_not_explain_a_charge(self):
+        self.assertEqual(self.explain('Justlife', '110.90', 'Justlife booking completed',
+                                     'Justlife <booking@justlife.example>', subject='Booking completed')['verdict'], 'ask')
+
+    def test_variant_searches_leave_the_read_budget_for_relevant_mail(self):
+        for merchant, amount, sender, body, pending in [
+                ('UBER * PENDING', '201.03', 'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', True),
+                ('BROWSER USE INC', '190.47', 'Browser Use <receipts@stripe.example>', 'Amount paid $50.00', False)]:
+            with self.subTest(merchant=merchant):
+                row = dict(id=7, ts=ts('2026-10-24T12:30'), sender=sender,
+                           subject=f'Your receipt from {merchant}', body=body)
+                noise = [dict(id=100 + i, ts=ts('2026-10-25T10:00') + i,
+                              sender=sender if pending else 'Other <news@other.example>',
+                              subject='Uber receipt' if pending else 'View in browser: use credits',
+                              body=f'Unrelated notice {i}') for i in range(20)]
+                charge = dict(CHARGE, merchant=merchant, currency='AED', amount=amount, pending=pending)
+                result = ch.explain(charge, at('2026-10-24T12:00'), at('2026-10-27T12:00'),
+                                    find=Finder(noise + [row]), said=nobody)
+                self.assertEqual(result['verdict'], 'receipt')
+
+    def test_a_later_exact_uber_receipt_keeps_the_existing_window(self):
+        self.assertEqual(self.explain('UBER * PENDING', '201.03', 'Uber receipt\nAED 201.03',
+                                     'Uber <receipts@uber.com>', pending=True, minutes=700)['verdict'], 'receipt')
+
+    def test_variant_noise_cannot_block_an_exact_receipt(self):
+        observed = at('2026-10-24T12:00')
+        for merchant, brand, pending in [('BOAT.DEV', 'Boat', False),
+                                         ('BROWSER USE INC', 'Browser Use', False),
+                                         ('UBER * PENDING', 'Uber', True)]:
+            noise = [dict(id=100 + i, ts=(observed + dt.timedelta(minutes=6 + i)).timestamp(),
+                          sender=brand, subject=f'{brand} usage notice', body=f'Usage update {i}')
+                     for i in range(ch.RECEIPT_READS + 1)]
+            charge = dict(CHARGE, merchant=merchant, currency='AED', amount='190.47', pending=pending)
+            for match in ['merchant', 'card']:
+                with self.subTest(merchant=merchant, match=match):
+                    row = dict(id=7, ts=(observed + dt.timedelta(minutes=5)).timestamp(),
+                               sender=brand if match == 'merchant' else 'Payment processor',
+                               subject='Your receipt', body='Paid AED 190.47' +
+                               (f' to {brand}' if match == 'merchant' else ' with card 1111'))
+                    result = ch.explain(charge, observed, observed + dt.timedelta(days=3),
+                                        find=Finder(noise + [row]), said=nobody)
+                    self.assertEqual((result['verdict'], result.get('msgs')), ('receipt', 7))
+
+    def test_a_body_seen_by_exact_search_can_still_prove_a_variant(self):
+        self.assertEqual(self.explain('BOAT.DEV', '190.47',
+                                     'Boat receipt\n190.47 credits\nAmount paid $50.00',
+                                     'Boat <receipts@stripe.example>')['verdict'], 'receipt')
+
+    def test_whole_aed_variants_survive_broad_merchant_noise(self):
+        observed = at('2026-10-24T12:00')
+        forms = [('BOAT.DEV', '190.00', 'Boat <receipts@stripe.example>', False,
+                  'Amount paid $50.00', 'Terraform dev notice'),
+                 ('BROWSER USE INC', '190.00', 'Browser Use <receipts@stripe.example>', False,
+                  'Amount paid $50.00', 'View in browser: use credits'),
+                 ('UBER * PENDING', '200.00', 'Uber <receipts@uber.com>', True,
+                  'Total AED 199.50', 'Uber usage notice')]
+        for merchant, amount, sender, pending, body, noise_subject in forms:
+            for form, paid in [('variant', body), ('exact', f'Paid AED {amount}')]:
+                row = dict(id=7, ts=(observed + dt.timedelta(minutes=30)).timestamp(), sender=sender,
+                           subject=f'Your receipt from {merchant}', body=paid)
+                noise = [dict(id=100 + i, ts=(observed + dt.timedelta(hours=12, seconds=i)).timestamp(),
+                              sender='Other <notice@other.example>', subject=noise_subject,
+                              body=f'Unrelated notice {i}') for i in range(ch.RECEIPT_READS + 1)]
+                with self.subTest(merchant=merchant, form=form):
+                    charge = dict(CHARGE, merchant=merchant, currency='AED', amount=amount, pending=pending)
+                    result = ch.explain(charge, observed, observed + dt.timedelta(days=3),
+                                        find=Finder(noise + [row]), said=nobody)
+                    self.assertEqual((result['verdict'], result.get('msgs')), ('receipt', 7))
+
+    def test_rejected_receipt_copies_only_consume_one_body_read(self):
+        observed = at('2026-10-24T12:00')
+        charge = dict(CHARGE, merchant='BOAT.DEV', currency='AED', amount='190.47', pending=False)
+        notice = dict(id=8, ts=(observed + dt.timedelta(minutes=40)).timestamp(),
+                      sender='Boat', subject='Boat usage notice', body='Boat plan AED 190.47')
+        copies = [dict(notice, id=100 + i, subject='Your Boat receipt',
+                       ts=(observed + dt.timedelta(minutes=20, seconds=i)).timestamp())
+                  for i in range(ch.RECEIPT_READS + 1)]
+        row = dict(notice, id=7, ts=(observed + dt.timedelta(minutes=5)).timestamp(),
+                   subject='Your Boat receipt', body='Boat payment AED 190.47')
+
+        def shown(row, deadline=None):
+            return f'Subject: {row["subject"]}\n\n{row["body"]}'
+
+        result = ch.receipt(charge, observed, observed + dt.timedelta(days=3),
+                            find=Finder([notice] + copies + [row]), read=shown,
+                            receipt_ok=lambda candidate, text: candidate['id'] == 7)
+        self.assertEqual(result['id'], 7)
+
+    def test_whole_aed_exact_receipts_keep_existing_paths(self):
+        for merchant, brand, pending, minutes, named in [
+                ('BOAT.DEV', 'Boat', False, 30, True),
+                ('BROWSER USE INC', 'Browser Use', False, 30, True),
+                ('UBER * PENDING', 'Uber', True, 30, True),
+                ('UBER * PENDING', 'Uber', True, 700, True),
+                ('BOAT.DEV', 'Boat', False, 5, False)]:
+            with self.subTest(merchant=merchant, minutes=minutes, named=named):
+                body = f'{brand} receipt AED 190.00' if named else 'Receipt AED 190.00 paid with card 1111'
+                self.assertEqual(self.explain(merchant, '190.00', body,
+                                             brand if named else 'Payment processor',
+                                             subject='Receipt', pending=pending, minutes=minutes)['verdict'], 'receipt')
+
+    def test_decimal_variants_survive_both_exact_search_noise_paths(self):
+        observed = at('2026-10-24T12:00')
+        for merchant, sender, pending, body, named_noise in [
+                ('BOAT.DEV', 'Boat <receipts@stripe.example>', False, 'Amount paid $50.00', 'Terraform dev'),
+                ('BROWSER USE INC', 'Browser Use <receipts@stripe.example>', False,
+                 'Amount paid $50.00', 'View in browser: use credits'),
+                ('UBER * PENDING', 'Uber <receipts@uber.com>', True, 'Total AED 190.40', 'Uber later trip')]:
+            charge = dict(CHARGE, merchant=merchant, currency='AED', amount='190.47', pending=pending)
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=5)).timestamp(), sender=sender,
+                       subject=f'Your receipt from {merchant}', body=body)
+            for path in ['merchant', 'card']:
+                noise = [dict(id=100 + i, ts=(observed + dt.timedelta(
+                    hours=12 if path == 'merchant' else 0, minutes=6, seconds=i)).timestamp(),
+                    sender='Other <notice@other.example>', subject=named_noise if path == 'merchant' else 'Usage',
+                    body=f'190.47 credits remaining, update {i}') for i in range(ch.RECEIPT_READS + 1)]
+                for veto in [False, True]:
+                    with self.subTest(merchant=merchant, path=path, veto=veto):
+                        result = ch.explain(charge, observed, observed + dt.timedelta(days=3),
+                                            find=Finder(noise + [row]), said=nobody,
+                                            receipt_ok=(lambda *args: False) if veto else None)
+                        self.assertEqual(result['verdict'], 'unverified' if veto else 'receipt')
+                        if not veto:
+                            self.assertEqual(result['msgs'], 7)
+
+    def test_variant_read_allowance_is_bounded(self):
+        observed = at('2026-10-24T12:00')
+        charge = dict(CHARGE, merchant='BOAT.DEV', currency='AED', amount='190.47', pending=False)
+        row = dict(id=7, ts=(observed + dt.timedelta(minutes=5)).timestamp(),
+                   sender='Boat <receipts@stripe.example>', subject='Boat receipt', body='Amount paid $50.00')
+        noise = [dict(row, id=100 + i, ts=(observed + dt.timedelta(minutes=6, seconds=i)).timestamp(),
+                      subject='Boat usage', body=f'Usage update {i}') for i in range(ch.RECEIPT_READS + 1)]
+        result = ch.explain(charge, observed, observed + dt.timedelta(days=3),
+                            find=Finder(noise + [row]), said=nobody)
+        self.assertEqual(result['verdict'], 'unverified')
+        self.assertIn('read limit reached', str(result['errors']))
 
 
 class Explain(unittest.TestCase):
@@ -734,6 +1020,85 @@ class OwnerTexts(unittest.TestCase):
     def message_calls(self, server):
         return [(path, params) for path, params, _ in server.calls if path.endswith('/messages')]
 
+    def test_one_slow_request_is_capped_and_other_progress_is_saved(self):
+        threads = [{'threadId': tid, 'title': 'App'} for tid in ('slow', 'a', 'b')]
+        with ControlServer(threads=threads, stall='/slow/messages') as server:
+            stats = Counter()
+            started = time.monotonic()
+            with self.assertRaisesRegex(ch.Lookup, r'incomplete \(2 of 3 threads\)'):
+                self.read(stats=stats)
+            elapsed = time.monotonic() - started
+            self.assertGreater(elapsed, ch.OWNER_REQUEST_TIMEOUT - 0.2)
+            self.assertLess(elapsed, ch.OWNER_REQUEST_TIMEOUT + 0.7)
+            self.assertEqual(stats['owner_timeouts'], 1)
+            self.assertEqual(stats['owner_threads_fetched'], 2)
+            self.assertEqual(stats['owner_result'], 'incomplete')
+            self.assertEqual(stats['owner_cache_size'], 2)
+            cache = json.loads((Path(server.tmp.name) / 'owner-texts.json').read_text())
+            self.assertEqual(set(cache), {'a', 'b'})
+            self.assertGreaterEqual(stats['owner_fetch_ms_max'], 2800)
+
+    def test_stalled_list_counts_attempt_and_reports_list_failed(self):
+        with ControlServer(stall='/threads'):
+            stats = Counter()
+            with self.assertRaises(ch.Lookup):
+                self.read(stats=stats)
+            self.assertEqual(stats['owner_result'], 'list_failed')
+            self.assertEqual(stats['owner_list_pages'], 1)
+            self.assertEqual(stats['owner_queries'], 1)
+            self.assertEqual(stats['owner_timeouts'], 1)
+            self.assertGreaterEqual(stats['owner_list_ms'], 2800)
+            self.assertEqual(stats['owner_threads_fetched'], 0)
+
+    def test_ninety_five_threads_converge_with_ten_changes_per_call(self):
+        until = at('2026-10-24T05:00')
+        since = until - dt.timedelta(days=7)
+        threads = [{'threadId': str(n), 'title': 'Private title never in stats',
+                    'updatedAt': ch.iso(until - dt.timedelta(hours=n))} for n in range(95)]
+        with ControlServer(threads=threads) as server:
+            for n in range(95):
+                server.rows[str(n)] = [summary('Private text never in stats', messageId=str(n))]
+            for call, (fresh, needed, fetched, result) in enumerate((
+                    (0, 95, 62, 'incomplete'), (52, 43, 43, 'ok'), (85, 10, 10, 'ok'))):
+                if call:
+                    for thread in server.threads[:10]:
+                        thread['updatedAt'] = ch.iso(until + dt.timedelta(minutes=call))
+                server.calls.clear()
+                stats = Counter()
+                if result == 'incomplete':
+                    with self.assertRaises(ch.Lookup):
+                        ch.owner_texts(since, until, stats=stats)
+                else:
+                    self.assertEqual(len(ch.owner_texts(since, until, stats=stats)), 95)
+                self.assertEqual(stats['owner_result'], result)
+                self.assertEqual(stats['owner_list_pages'], 2)
+                self.assertEqual(stats['owner_threads_selected'], 95)
+                self.assertEqual(stats['owner_threads_fresh'], fresh)
+                self.assertEqual(stats['owner_threads_needed'], needed)
+                self.assertEqual(stats['owner_threads_fetched'], fetched)
+                self.assertEqual(stats['owner_queries'], fetched + 2)
+                self.assertLessEqual(stats['owner_queries'], 64)
+                self.assertEqual(stats['owner_timeouts'], 0)
+                self.assertEqual(stats['owner_cache_size'], 62 if not call else 95)
+                self.assertEqual(len(self.message_calls(server)), fetched)
+                self.assertNotIn('Private', json.dumps(stats))
+                self.assertNotIn('test-secret', json.dumps(stats))
+
+    def test_cold_and_changed_threads_share_the_request_limit(self):
+        threads = [{'threadId': str(n), 'title': 'App',
+                    'updatedAt': ch.iso(at('2026-10-24T05:00') - dt.timedelta(minutes=n))}
+                   for n in range(95)]
+        with ControlServer(threads=threads) as server:
+            with self.assertRaises(ch.Lookup):
+                self.read()
+            for thread in server.threads[:10]:
+                thread['updatedAt'] = '2026-10-24T02:00:00Z'
+            server.calls.clear()
+            with patch.object(ch, 'OWNER_REQUEST_LIMIT', 8), self.assertRaises(ch.Lookup):
+                self.read()
+            fetched = {path.split('/')[-2] for path, _ in self.message_calls(server)}
+            self.assertEqual(fetched, {'62', '63', '64', '0', '1', '2'})
+
     def test_changed_threads_reconcile_mutations_missing_from_strict_deltas(self):
         cases = [
             ('redacted', [summary('[REDACTED]', messageId='old')], ['[REDACTED]']),
@@ -972,7 +1337,7 @@ class OwnerTexts(unittest.TestCase):
         save = ch.save_owner_cache
         def late(*args):
             result = save(*args)
-            clock[0] += 5
+            clock[0] += ch.OWNER_BUDGET + 1
             return result
         with ControlServer([summary('owner')]), patch.object(ch.time, 'time', lambda: clock[0]), \
                 patch.object(ch, 'save_owner_cache', late), self.assertRaisesRegex(ch.Lookup, 'out of time'):
@@ -1150,10 +1515,16 @@ class OwnerTexts(unittest.TestCase):
         run = ch.subprocess.run
         def stuck(*args, **kwargs):
             return run(['/usr/bin/python3', '-I', '-c', 'import time; time.sleep(10)'], **kwargs)
-        started = time.time()
-        with patch.object(ch.subprocess, 'run', side_effect=stuck), self.assertRaises(ch.Lookup):
-            ch.control_get(('http://127.0.0.1', 'test-secret-never-print'), '/threads', {}, started + 1.2)
-        self.assertLess(time.time() - started, 2.2)
+        for budget in (1.2, 10):
+            with self.subTest(budget=budget), ControlServer() as server:
+                stats = Counter()
+                started = time.monotonic()
+                with patch.object(ch.subprocess, 'run', side_effect=stuck), self.assertRaises(ch.Lookup):
+                    ch.control_get(ch.control_config(), '/threads', {}, time.time() + budget, stats)
+                self.assertLess(time.monotonic() - started, min(budget, ch.OWNER_REQUEST_TIMEOUT) + 0.7)
+                self.assertEqual(stats['owner_timeouts'], 1)
+                self.assertEqual(stats['owner_queries'], 1)
+                self.assertEqual(stats['owner_list_pages'], 1)
 
     def test_twenty_threads_fit_the_cap_with_at_most_six_concurrent_requests(self):
         threads = [{'threadId': str(n), 'title': 'App'} for n in range(20)]
@@ -1370,6 +1741,105 @@ class SearchOutput(unittest.TestCase):
             got = ch.search('Apple', '2026-11-01')
         self.assertEqual([r['id'] for r in got], [1, 2])
         self.assertEqual(got[0]['snip'], rows[0]['snip'])
+
+
+class MarketplaceProof(unittest.TestCase):
+    def test_freshness_hold_edges_and_positive_precedence(self):
+        charges = ch
+        import order_lookup
+        at = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(merchant='noon', amount='12.34', currency='AED')
+        for minutes, walked, expected in ((0, 16, 'marketplace_hold'), (15, 15, 'marketplace_hold'),
+                (-15, 15, 'marketplace_hold'), (16, 15, None), (-16, 15, None),
+                (0, 14, 'marketplace_stale'), (16, 14, 'marketplace_stale')):
+            with self.subTest(minutes=minutes, walked=walked):
+                result = {'orders': [], 'complete': True, 'lanes': {
+                    name: {'exhaustive': True} for name in order_lookup.LANES}}
+                result['lanes']['marketplace'].update(
+                    walked_at=(at + dt.timedelta(minutes=walked)).isoformat(),
+                    hold_times=[(at + dt.timedelta(minutes=minutes)).isoformat()])
+                reader = lambda *a, **kw: result
+                if expected:
+                    with self.assertRaises(charges.SourceLimit) as exc:
+                        charges.order_receipt(charge, at, at, lookup=reader)
+                    self.assertEqual(exc.exception.kinds, [expected])
+                else:
+                    self.assertIsNone(charges.order_receipt(charge, at, at, lookup=reader))
+                result['orders'] = [dict(order='N1', placed_at=at.isoformat(), total='12.34', currency='AED', status='delivered')]
+                self.assertEqual(charges.order_receipt(charge, at, at, lookup=reader)['verdict'], 'receipt')
+                result['orders'][0]['status'] = 'cancelled'
+                if expected:
+                    with self.assertRaises(charges.SourceLimit):
+                        charges.order_receipt(charge, at, at, lookup=reader)
+                else:
+                    self.assertIsNone(charges.order_receipt(charge, at, at, lookup=reader))
+
+
+class LimitReasons(unittest.TestCase):
+    def test_order_limits_keep_exception_types_and_first_blocker(self):
+        when = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(merchant='noon', amount='12.34', currency='AED')
+        for name in ch.order_lookup.LANES:
+            for stop, kind in ((None, 'lane_uncovered'), ('covered', 'lane_uncovered'),
+                               ('end_of_history', 'lane_uncovered'), ('unproven_paging', 'lane_uncovered'),
+                               ('slice_out', 'lane_slice_out'), ('list_error', 'lane_error'),
+                               ('reader_error', 'lane_error'), ('detail_error', 'lane_error'),
+                               ('snapshot_missing', 'lane_error')):
+                for page_one in (False, True):
+                    with self.subTest(lane=name, stop=stop, page_one=page_one):
+                        result = {'orders': [], 'complete': False, 'lanes': {
+                            lane: {'exhaustive': True} for lane in ch.order_lookup.LANES}}
+                        result['lanes']['marketplace']['walked_at'] = (when + ch.SAME_TIME).isoformat()
+                        result['lanes'][name].update(exhaustive=False, covered_from=when.isoformat(),
+                            stop_reason=stop, limit='page-1 history only' if page_one else None)
+                        with self.assertRaises(ch.Lookup) as exc:
+                            ch.order_receipt(charge, when, when, lookup=lambda *a, **kw: result)
+                        self.assertEqual(type(exc.exception), ch.SourceLimit if page_one else ch.Lookup)
+                        self.assertEqual(exc.exception.reason, kind + ':' + name)
+        for kind in ('marketplace_hold', 'marketplace_stale'):
+            self.assertEqual(ch.SourceLimit('private', [kind]).reason, kind)
+        self.assertEqual(ch.SourceLimit('private', ['food_page_1', 'marketplace_hold']).reason,
+                         'lane_uncovered:food')
+        with self.assertRaises(ch.SourceLimit) as exc:
+            ch.order_receipt({**charge, 'merchant': 'careem'}, when, when,
+                lookup=lambda *a, **kw: (_ for _ in ()).throw(
+                    ch.order_lookup.SourceLimit(ch.order_lookup.BINDING_LIMIT)))
+        self.assertEqual(exc.exception.reason, 'source_limit:ORDER_LIST_HOST_BINDING_UNVERIFIED')
+        self.assertEqual(ch.SourceLimit('private', ['private-id']).reason, 'other')
+        self.assertEqual(ch.Lookup('private', 'private-id').reason, 'other')
+
+    def test_marketplace_checks_precede_lane_gaps_and_first_lane_wins(self):
+        when = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(merchant='noon', amount='12.34', currency='AED')
+        result = {'orders': [], 'complete': False, 'lanes': {
+            lane: {'exhaustive': False, 'stop_reason': 'slice_out'} for lane in ch.order_lookup.LANES}}
+        result['lanes']['marketplace']['hold_times'] = [when.isoformat()]
+        def check(reason, error_class):
+            with self.assertRaises(error_class) as exc:
+                ch.order_receipt(charge, when, when, lookup=lambda *a, **kw: result)
+            self.assertEqual(exc.exception.reason, reason)
+        check('marketplace_stale', ch.SourceLimit)
+        result['lanes']['marketplace']['walked_at'] = (when + ch.SAME_TIME).isoformat()
+        check('marketplace_hold', ch.SourceLimit)
+        result['lanes']['marketplace']['hold_times'] = []
+        check('lane_slice_out:minutes', ch.Lookup)
+        result['orders'] = [dict(order='N1', placed_at=when.isoformat(), total='12.34', currency='AED')]
+        self.assertEqual(ch.order_receipt(charge, when, when, lookup=lambda *a, **kw: result)['verdict'], 'receipt')
+
+    def test_receipt_timeout_is_first_even_when_order_is_limited(self):
+        when = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(kind='charge', merchant='noon', amount='12.34', currency='AED', card='1111')
+        for failure, reason in ((ch.Lookup('receipt lookup over time'), 'receipt_out_of_time'),
+                                (ch.Lookup('private', 'msgs_timeout'), 'msgs_timeout')):
+            with self.subTest(reason=reason), patch.object(ch, 'receipt', side_effect=failure), \
+                    patch.object(ch, 'order_receipt', side_effect=ch.SourceLimit('private', ['marketplace_hold'])), \
+                    patch.object(ch, 'card_owner', return_value='abdullah'), \
+                    patch.object(ch, 'owner_said', return_value=None):
+                result = ch.explain(charge, when, when)
+            self.assertEqual(result['verdict'], 'unverified')
+            self.assertTrue(result['errors'])
+            self.assertEqual(result['limit_reason'], reason)
+            self.assertEqual(result['limits'][0]['reason'], 'marketplace_hold')
 
 
 if __name__ == '__main__':

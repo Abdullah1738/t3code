@@ -98,10 +98,10 @@ test("cause classes never retain arbitrary codes, messages or unapproved fields"
     [new DOMException(secret, "TimeoutError"), "timeout"],
     [new SyntaxError(secret), "decode"],
     [{ causeClass: "timeout", message: secret }, "timeout"],
-    [{ status: 0, code: secret, name: secret, causeClass: secret }, "unknown"],
-    [{ status: 999, code: "SECRET_TOKEN" }, "unknown"],
-    [undefined, "unknown"],
-    [Object.defineProperty({}, "status", { get() { throw new Error(secret); } }), "unknown"],
+    [{ status: 0, code: secret, name: secret, causeClass: secret }, "unclassified"],
+    [{ status: 999, code: "SECRET_TOKEN" }, "unclassified"],
+    [undefined, "non_error"],
+    [Object.defineProperty({}, "status", { get() { throw new Error(secret); } }), "unclassified"],
   ] as const;
   for (const [error] of cases) toolError("telegram", "fixture.failed", { directory: secret }, error);
   expect(rows(dir).map(row => row.props.cause)).toEqual(cases.map(([, cause]) => cause));
@@ -109,4 +109,21 @@ test("cause classes never retain arbitrary codes, messages or unapproved fields"
   toolLog({ component: "telegram", kind: "error", name: "fixture.props", props: { cause: secret, path: secret, url: secret, token: secret, message: secret } });
   expect(rows(dir).at(-1).props).toBeUndefined();
   expect(readFileSync(join(dir, `${day()}.ndjson`), "utf8")).not.toContain(secret);
+});
+
+
+test("stream end logs allow only lifecycle fields and obey the existing event cap", () => {
+  const dir = fixture();
+  toolLog({ component: "telegram", kind: "event", name: "tg.robob.streamEnd",
+    props: { kind: "errorFrame", connectedMs: 85, code: "replica_lag", title: "PRIVATE_TITLE", threadId: "PRIVATE_ID", payload: "PRIVATE_PAYLOAD" } });
+  expect(rows(dir)[0].props).toEqual({ kind: "errorFrame", connectedMs: 85, code: "replica_lag" });
+  toolLog({ component: "telegram", kind: "event", name: "tg.robob.streamEnd", props: { kind: "PRIVATE_KIND", connectedMs: -1, code: "PRIVATE_CODE" } });
+  expect(rows(dir)[1]).not.toHaveProperty("props");
+  expect(JSON.stringify(rows(dir))).not.toContain("PRIVATE_");
+  const file = join(dir, `${day()}.ndjson`), cap = 50 * 1024 * 1024 + 1;
+  truncateSync(file, cap);
+  toolLog({ component: "telegram", kind: "event", name: "tg.robob.streamEnd", props: { kind: "clean", connectedMs: 85, code: "none" } });
+  const tail = readFileSync(file).subarray(cap).toString();
+  expect(tail).toContain('"name":"log.cap"');
+  expect(tail).not.toContain("tg.robob.streamEnd");
 });

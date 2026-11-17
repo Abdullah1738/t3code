@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { EnvironmentId, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  ProviderInstanceId,
+  ProviderSessionId,
+  ThreadId,
+} from "@t3tools/contracts";
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -10,6 +17,7 @@ import * as ThreadManagementService from "../../orchestration-v2/ThreadManagemen
 import * as ContextResetService from "./ContextResetService.ts";
 
 const threadId = ThreadId.make("thread-context-reset-test");
+const runtimeId = ProviderSessionId.make("runtime-context-reset-test");
 const projectId = ProjectId.make("project-context-reset-test");
 
 const makeScope = (options: {
@@ -58,6 +66,10 @@ interface HarnessOptions {
   readonly archived?: boolean;
   readonly detachDies?: boolean;
   readonly interruptFails?: boolean;
+  readonly detached?: boolean;
+  readonly noProviderThread?: boolean;
+  readonly credential?: "missing" | "replaced" | "foreign_thread" | "foreign_instance" | "unbound";
+  readonly replaceWhileQueuing?: boolean;
 }
 
 const subagentRecord = (fixture: SubagentFixture, index: number) => ({
@@ -92,18 +104,24 @@ const makeHarness = (options: HarnessOptions = {}) => {
         ...(options.subagentStatus === undefined ? [] : [{ status: options.subagentStatus }]),
         ...(options.subagents ?? []),
       ].map(subagentRecord),
-      providerThreads: [
-        {
-          id: "provider-thread-active",
-          pendingBackgroundTasks: [
-            ...Array.from({ length: options.pendingBackgroundTasks ?? 0 }, (_, index) => ({
-              taskId: `task-${index}`,
-              kind: "command",
-            })),
-            ...(options.roster ?? []).map((task) => ({ kind: "subagent", ...task })),
+      providerSessions: options.detached ? [] : [{ id: runtimeId }],
+      providerThreads: options.noProviderThread
+        ? []
+        : [
+            {
+              id: "provider-thread-active",
+              appThreadId: threadId,
+              providerInstanceId: ProviderInstanceId.make("opencode"),
+              providerSessionId: runtimeId,
+              pendingBackgroundTasks: [
+                ...Array.from({ length: options.pendingBackgroundTasks ?? 0 }, (_, index) => ({
+                  taskId: `task-${index}`,
+                  kind: "command",
+                })),
+                ...(options.roster ?? []).map((task) => ({ kind: "subagent", ...task })),
+              ],
+            },
           ],
-        },
-      ],
     }),
   );
   const sendToThread = vi.fn((input: ThreadManagementService.ThreadManagementSendInput) => {
@@ -129,7 +147,31 @@ const makeHarness = (options: HarnessOptions = {}) => {
       ? Effect.fail({ _tag: "InterruptFailed", message: "interrupt failed" } as const)
       : Effect.succeed({ type: "no_active_run" });
   });
+  const credentialLayer = Layer.mock(McpProviderSessions.McpProviderSessions)({
+    read: () =>
+      Effect.succeed(
+        options.credential === "missing"
+          ? undefined
+          : {
+              environmentId: makeScope({}).environmentId,
+              threadId: options.credential === "foreign_thread" ? ThreadId.make("other") : threadId,
+              providerInstanceId: ProviderInstanceId.make(
+                options.credential === "foreign_instance" ? "other" : "opencode",
+              ),
+              providerSessionId:
+                options.credential === "replaced" ||
+                (options.replaceWhileQueuing && sent.length > 0)
+                  ? "new-credential"
+                  : "provider-session-context-reset-test",
+              ...(options.credential === "unbound" ? {} : { runtimeProviderSessionId: runtimeId }),
+              endpoint: "http://127.0.0.1/mcp",
+              authorizationHeader: "Bearer test-only",
+              browserToolsAvailable: false,
+            },
+      ),
+  });
   const layer = ContextResetService.layer.pipe(
+    Layer.provide(credentialLayer),
     Layer.provide(
       Layer.mock(ThreadManagementService.ThreadManagementService)({
         getThreadRecords,
@@ -141,7 +183,7 @@ const makeHarness = (options: HarnessOptions = {}) => {
     ),
     Layer.provide(NodeServices.layer),
   );
-  return { calls, commandIds, sent, layer };
+  return { calls, commandIds, sent, dispatch, layer };
 };
 
 const reset = (
@@ -154,11 +196,50 @@ const reset = (
   });
 
 describe("ContextResetService", () => {
+  it.effect.each(["missing", "replaced", "foreign_thread", "foreign_instance", "unbound"] as const)(
+    "refuses %s credentials before queuing or stopping work",
+    (credential) => {
+      const harness = makeHarness({ credential, subagentStatus: "running" });
+      return Effect.gen(function* () {
+        const error = yield* Effect.flip(reset(makeScope({}), { cancelBackgroundWork: true }));
+        expect(error.code).toBe("provider_unavailable");
+        expect(error.message).toContain("stale or revoked");
+        expect(harness.calls).toEqual([]);
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
+  it.effect.each([false, true])(
+    "reports a missing attachment without dispatching detach (no provider thread: %s)",
+    (noProviderThread) => {
+      const harness = makeHarness({ detached: true, noProviderThread });
+      return Effect.gen(function* () {
+        const result = yield* reset(makeScope({}));
+        expect(harness.calls).toEqual(["send"]);
+        expect(result.note).toContain("no session was ended");
+        expect(result.note).not.toContain("Context reset scheduled");
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
+  it.effect("does not detach a replacement credential issued while queuing the note", () => {
+    const harness = makeHarness({ replaceWhileQueuing: true });
+    return Effect.gen(function* () {
+      const result = yield* reset(makeScope({}));
+      expect(harness.calls).toEqual(["send"]);
+      expect(result.note).toContain("could not be ended");
+      expect(result.note).not.toContain("Context reset scheduled");
+    }).pipe(Effect.provide(harness.layer));
+  });
+
   it.effect("queues the note on a fresh provider thread, then ends the current session", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
       const result = yield* reset(makeScope({}));
       expect(harness.calls).toEqual(["send", "provider-session.detach"]);
+      expect(harness.dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ providerSessionId: runtimeId }),
+      );
       expect(harness.sent[0]).toMatchObject({
         threadId,
         projectId,

@@ -3,7 +3,10 @@
 #   bash install-host.sh            # packages, ZFS pool, state datasets, Incus, firewall, boatd service, timers
 #   bash install-host.sh image      # (re)build the offbox-base image from base-image.sh
 #   bash install-host.sh tmp-profile # only configure /tmp for future box starts; no service restarts
+#   bash install-host.sh scratch-disk # prepare per-box /tmp parent and enable new-box disks; no restart
+#   bash install-host.sh scratch-disk-undo # disable new-box disks; retain existing disk lifecycle
 #   bash install-host.sh update-policy # config and pending-restart writer only; no service restart
+#   bash install-host.sh cpu-priority # relative control-plane CPU weights only; no restart
 #   bash install-host.sh cpu-admission # save old admission value and configure CPU backpressure; no restart
 #   bash install-host.sh cpu-admission-undo # restore the saved admission value; no restart
 # Everything that must outlive an OS reinstall is on the pool: boatd's state (dataset offbox/boatd at
@@ -19,8 +22,35 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 MGMT_ASSETS=$HERE
 [ -f "$MGMT_ASSETS/offbox_mgmt_sshd_config" ] || MGMT_ASSETS=$HERE/../skill/templates/home
+SQLITE_ASSET=$HERE/sqlite.sh
+[ -f "$SQLITE_ASSET" ] || SQLITE_ASSET=$HERE/../skill/templates/tools/sqlite.sh
+FETCH_ASSET=$(dirname "$SQLITE_ASSET")/fetch.sh
 POOL=offbox
 export DEBIAN_FRONTEND=noninteractive
+
+cpu_priority() {
+  local units_dir=${SYSTEMD_UNIT_DIR:-/etc/systemd/system} unit section weight target temporary
+  # Incus payloads are root cgroups, so service weights alone cannot escape system.slice's share.
+  for unit in system.slice boatd.service tailscaled.service ssh.service incus.service boatd-cmd-.service; do
+    section=Service
+    weight=1000
+    [ "$unit" != system.slice ] || section=Slice
+    [ "$unit" != boatd-cmd-.service ] || weight=100
+    target="$units_dir/$unit.d/90-offbox-cpu-priority.conf"
+    mkdir -p "$(dirname "$target")"
+    temporary=$(mktemp "${target}.XXXXXX")
+    printf '[%s]\nCPUWeight=%s\n' "$section" "$weight" > "$temporary"
+    chmod 0644 "$temporary"
+    if cmp -s "$temporary" "$target"; then rm -f "$temporary"; else mv -f "$temporary" "$target"; fi
+  done
+  systemctl daemon-reload
+  # Reapply to active cgroups now, without moving units, restarting services or imposing quotas.
+  for unit in system.slice boatd.service tailscaled.service ssh.service incus.service; do
+    systemctl set-property --runtime "$unit" CPUWeight=1000
+  done
+}
+
+if [ "${1:-}" = cpu-priority ]; then cpu_priority; exit 0; fi
 
 if [ "${1:-}" = cpu-admission ] || [ "${1:-}" = cpu-admission-undo ]; then
   python3 - "${BOATD_ETC:-/etc/boatd}" "$1" <<'PY'
@@ -103,7 +133,52 @@ tmp_profile() {
   fi
 }
 
+disk_reservations() {
+  local dataset minimum current
+  # Separate datasets need their own guaranteed space. 2 GiB covers boatd's
+  # observed 0.5 GiB DB/WAL; 8 GiB covers Incus's 2.8 GiB state plus growth.
+  for spec in "boatd:2147483648" "incus-var:8589934592"; do
+    dataset="$POOL/${spec%%:*}"
+    minimum=${spec#*:}
+    current=$(zfs get -Hp -o value reservation "$dataset")
+    case "$current" in
+      none) current=0 ;;
+      ''|*[!0-9]*) echo "invalid reservation on $dataset: $current" >&2; return 1 ;;
+    esac
+    if [ "$current" -lt "$minimum" ]; then
+      zfs set "reservation=$minimum" "$dataset"
+    fi
+  done
+}
+
+if [ "${1:-}" = disk-reservations ]; then disk_reservations; exit 0; fi
+
 if [ "${1:-}" = tmp-profile ]; then tmp_profile; exit 0; fi
+
+scratch_disk() {
+  python3 - "$HERE" "${BOATD_ETC:-/etc/boatd}" "$POOL" "${1:-enable}" <<'PY'
+import json, os, pathlib, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+from boatd_tmp import Scratch
+root = pathlib.Path(sys.argv[2])
+p = root / 'config.json'
+c = json.loads(p.read_text())
+enabled = sys.argv[4] != 'disable'
+if enabled:
+    Scratch({'zpool': sys.argv[3]}, None).prepare_parent()
+c['scratch_disk'] = enabled
+with tempfile.NamedTemporaryFile(mode='w', dir=root, prefix='config.json.', delete=False) as f:
+    temporary = f.name
+    json.dump(c, f, indent=1)
+    f.write('\n')
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(temporary, p)
+print(f'scratch_disk={enabled}; takes effect when boatd next loads its config; no boxes changed')
+PY
+}
+if [ "${1:-}" = scratch-disk ]; then scratch_disk; exit 0; fi
+if [ "${1:-}" = scratch-disk-undo ]; then scratch_disk disable; exit 0; fi
 
 image() {
   incus delete --force offbox-build 2>/dev/null || true
@@ -111,6 +186,8 @@ image() {
   for _ in $(seq 60); do incus exec offbox-build -- systemctl is-system-running 2>/dev/null | grep -qE 'running|degraded' && break; sleep 1; done
   incus file push "$HERE/boatd-wrap" offbox-build/usr/local/sbin/boatd-wrap --mode 0755
   incus file push "$HERE/base-image.sh" offbox-build/root/base-image.sh --mode 0700
+  incus file push "$SQLITE_ASSET" offbox-build/root/offbox-sqlite.sh --mode 0700
+  incus file push "$FETCH_ASSET" offbox-build/root/fetch.sh --mode 0600
   incus file push "$MGMT_ASSETS/offbox-mgmt-ssh.service" offbox-build/root/offbox-mgmt-ssh.service --mode 0644
   incus file push "$MGMT_ASSETS/offbox_mgmt_sshd_config" offbox-build/root/offbox_mgmt_sshd_config --mode 0600
   incus file push "$MGMT_ASSETS/offbox-ssh-runtime.conf" offbox-build/root/offbox-ssh-runtime.conf --mode 0644
@@ -269,6 +346,8 @@ else
   state_ds "$POOL/incus-var" /var/lib/incus "Incus state"
 fi
 if mountpoint -q /var/lib/incus; then
+  disk_reservations
+
   # Incus must never start on the bare directory under the mount point (it would create an empty world on the
   # OS disk): with the pool away it stays down, boatd says why in /health, and starts it once the pool is back.
   for u in incus.service incus.socket incus-startup.service incus-user.service incus-user.socket; do
@@ -381,6 +460,8 @@ systemctl restart incus  # re-adds its own NAT/DHCP rules after the flush
 install -d -m 700 /etc/boatd
 mkdir -p /opt/boatd
 install -m 0755 "$HERE/boatd.py" /opt/boatd/boatd.py
+install -m 0644 "$HERE/boatd_disk.py" /opt/boatd/boatd_disk.py
+install -m 0644 "$HERE/boatd_tmp.py" /opt/boatd/boatd_tmp.py
 install -m 0755 "$HERE/boatd-wrap" /opt/boatd/boatd-wrap
 install -m 0644 "$MGMT_ASSETS/offbox_mgmt_sshd_config" /opt/boatd/offbox_mgmt_sshd_config
 tool_log="$HERE/toollog.py"
@@ -389,6 +470,7 @@ install -m 0644 "$tool_log" /opt/boatd/toollog.py
 disk_space="$HERE/offbox_disk_space.py"
 [ -f "$disk_space" ] || disk_space="$HERE/../skill/scripts/offbox_disk_space.py"
 install -m 0644 "$disk_space" /opt/boatd/offbox_disk_space.py
+install -m 0644 "$HERE/boatd_memory.py" /opt/boatd/boatd_memory.py
 printf '#!/bin/sh\nexec /usr/bin/python3 /opt/boatd/boatd.py "$@"\n' > /usr/local/sbin/boatd
 chmod 0755 /usr/local/sbin/boatd
 # Settings this script owns are set; anything else already in config.json (owners, retention, sizes) is kept.
@@ -401,12 +483,13 @@ except (OSError, ValueError):
     c = {}
 c.update(listen=sys.argv[1], ssh_host=sys.argv[1], port=c.get("port", 8443), zpool=sys.argv[2],
          state_dataset=sys.argv[2] + "/boatd")
-c.setdefault("cpu_pressure_limit", 50)
+c.setdefault("cpu_pressure_limit", 0)
 with open(p + ".tmp", "w") as f:
     json.dump(c, f, indent=1)
 os.replace(p + ".tmp", p)
 os.chmod(p, 0o600)
 PY
+scratch_disk
 install -m 0644 "$HERE/boatd.service" /etc/systemd/system/boatd.service
 
 # ---- timers: snapshots of the person boxes (retention numbers: RETENTION in boatd.py, or "retention" in
@@ -458,7 +541,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-systemctl daemon-reload
+cpu_priority
 systemctl enable boatd >/dev/null
 systemctl enable --now boatd-snap-hourly.timer boatd-snap-daily.timer boatd-snap-weekly.timer boatd-scrub.timer >/dev/null
 systemctl restart boatd

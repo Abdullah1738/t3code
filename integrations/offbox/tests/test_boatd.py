@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SERVER = Path(__file__).resolve().parents[1] / "server"
 spec = importlib.util.spec_from_file_location("boatd", SERVER / "boatd.py")
@@ -70,6 +70,9 @@ class Fakes:
         elif args[:1] == ("query",) and "/snapshots" in args[1]:
             name = args[1].split("/")[3]
             out = json.dumps(self.snapshots.get(name, [])).encode()
+        elif args[:1] == ('query',) and args[1].startswith('/1.0/instances/'):
+            bid = args[1].split('/')[3].replace('-', '_')
+            out = json.dumps({'config': {'user.offbox.provision': bid}}).encode()
         elif args[:2] == ("config", "device"):
             out = b"ssh\n"
         p = subprocess.CompletedProcess(args, rc, out, b"refused" if rc else b"")
@@ -101,10 +104,12 @@ class Base(unittest.TestCase):
         self.addCleanup(log_env.stop)
         self.saved = {k: getattr(boatd, k) for k in (
             "VAR", "ETC", "CMDS", "DB_PATH", "ADMIT_LOCK", "incus", "_sh", "spawn_runner", "unit_active",
-            "ct_running", "_wait_boot", "boot_id", "mem_available", "provision", "log")}
+            "ct_running", "_wait_boot", "boot_id", "mem_available", "provision", "log", "CG_ROOT")}
         self.addCleanup(lambda: [setattr(boatd, k, v) for k, v in self.saved.items()])
         boatd.VAR, boatd.ETC = self.tmp / "var", self.tmp / "etc"
         boatd.CMDS, boatd.DB_PATH, boatd.ADMIT_LOCK = boatd.VAR / "cmds", boatd.VAR / "boatd.db", boatd.VAR / "admit.lock"
+        boatd.CG_ROOT = self.tmp / 'cgroups'
+        boatd.CG_ROOT.mkdir()
         boatd.ETC.mkdir(parents=True)
         self.f = Fakes()
         boatd.incus, boatd._sh, boatd.spawn_runner = self.f.incus, self.f._sh, self.f.spawn_runner
@@ -114,14 +119,33 @@ class Base(unittest.TestCase):
         boatd.boot_id = lambda: "boot-2"
         boatd.log = lambda msg: None
         boatd.load_cfg()
+        # Host storage is faked alongside Incus; focused scratch tests exercise its actual lifecycle.
+        storage = Mock()
+        storage.start.side_effect = lambda bid: boatd.incus('start', boatd.ct(bid), timeout=300)
+        scratch_host = patch.object(boatd, 'scratch', return_value=storage)
+        scratch_host.start()
+        self.addCleanup(scratch_host.stop)
         # Resource inputs are explicit in admission tests, independent of the test runner's host.
         boatd.CFG["cpu_pressure_limit"] = 0
+        memory_input = patch.object(boatd.boatd_memory, 'meminfo', return_value={'MemTotal': 1000 * 2**30})
+        memory_input.start()
+        self.addCleanup(memory_input.stop)
+        for target, values in ((boatd.STATE, {"loops": {}}), (boatd.LOOP_SPECS, {}), (boatd.LOOP_THREADS, {})):
+            fixture = patch.dict(target, values, clear=target is not boatd.STATE)
+            fixture.start()
+            self.addCleanup(fixture.stop)
         boatd.READY.clear()
         boatd._HEALTH.update(ts=0.0, v=None)
+        boatd._HEALTH_REFRESH.update(stage="idle", since=None, timings={})
         boatd._ZPOOL = "offbox/incus"
         boatd.init_db()
         self.con = boatd.db()
         self.addCleanup(self.con.close)
+        # The host fixtures have readable, empty run groups. Transport tests override this probe.
+        probe = patch.object(boatd, 'command_probe', return_value={
+            'readable': True, 'pids': [], 'box_rc': None, 'stopped': True})
+        probe.start()
+        self.addCleanup(probe.stop)
 
     def box(self, bid="bx_aaaaaaaa", state="ready", owner="ardud", running=True, **kw):
         t = boatd.now()
@@ -167,6 +191,7 @@ class Logging(Base):
     def test_memory_admission_logs_queue_before_wait(self):
         b = self.box()
         pid = self.cmd(b, status='queued')
+        self.cmd(b, pid=1002, status='running')
         with patch.object(boatd, 'mem_available', return_value=0), patch.object(boatd.time, 'sleep', side_effect=RuntimeError('stop fixture wait')):
             with self.assertRaises(RuntimeError): boatd.admit(self.con,b,pid,'k',io.BytesIO())
         row = self.rows('run.queue')[0]
@@ -380,6 +405,49 @@ class ReconcileBoxes(Base):
 
 
 class Queue(Base):
+    def test_cpu_admission_defaults_off_when_config_has_no_limit(self):
+        (boatd.ETC / "config.json").write_text('{}')
+        boatd.CFG["cpu_pressure_limit"] = 50
+        self.assertEqual(boatd.admission_cpu_limit(), 0)
+
+    def test_one_hour_never_bypasses_admission_even_when_cpu_check_is_off(self):
+        for limit in (0, 50, None):
+            for blocked in ("fifo", "memory", "cap"):
+                with self.subTest(limit=limit, blocked=blocked):
+                    clock = [10000.0]
+                    waits = []
+                    def wait(_):
+                        self.assertEqual(self.status(b, q)["status"], "queued")
+                        waits.append(clock[0])
+                        if len(waits) == 1:
+                            clock[0] += 3600
+                        elif len(waits) == 2:
+                            clock[0] += 1
+                        elif len(waits) == 3:
+                            (boatd.cmd_dir(b) / f"{q}.kill").touch()
+                        else:
+                            self.fail("admission did not stop after cancellation")
+                    with patch.object(boatd, "now", side_effect=lambda: clock[0]), \
+                         patch.object(boatd, "mem_available", return_value=0 if blocked == "memory" else 500 * 2**30), \
+                         patch.object(boatd, "psi", return_value=0), \
+                         patch.object(boatd.time, "sleep", side_effect=wait):
+                        b = self.box(bid="bx_escape")
+                        earlier_status = "queued" if blocked == "fifo" else "running"
+                        earlier = self.cmd(b, pid=1001, status=earlier_status, age=200)
+                        q = self.cmd(b, pid=1002, status="queued", age=100)
+                        boatd.CFG["max_running"] = 1 if blocked == "cap" else 0
+                        (boatd.ETC / "config.json").write_text(json.dumps({"cpu_pressure_limit": limit}))
+                        queued_s = boatd.admit(self.con, b, q, "k", io.BytesIO())
+                    self.assertEqual(queued_s, 3601)
+                    self.assertEqual(waits[:2], [10000, 13600])
+                    self.assertEqual(len(waits), 3)
+                    self.assertEqual(self.status(b, q)["status"], "queued")
+                    self.assertEqual(self.status(b, q)["started_at"], None)
+                    self.assertEqual(self.status(b, earlier)["status"], earlier_status)
+                    self.con.execute("DELETE FROM commands WHERE box_id=?", (b,))
+                    self.con.execute("DELETE FROM boxes WHERE id=?", (b,))
+                    (boatd.cmd_dir(b) / f"{q}.kill").unlink(missing_ok=True)
+
     def test_last_admission_lookup_stays_bounded_as_history_grows(self):
         self.assertIsNone(boatd.last_admission(self.con))
         self.con.execute("BEGIN")
@@ -415,6 +483,7 @@ class Queue(Base):
     def test_installer_undo_releases_an_existing_cpu_waiter(self):
         b = self.box()
         q = self.cmd(b, status="queued")
+        self.cmd(b, pid=1002, status="running")
         boatd.CFG["cpu_pressure_limit"] = 50
         (boatd.ETC / "config.json").write_text('{"cpu_pressure_limit":50}')
         (boatd.ETC / "config.json.before-117").write_text('{}')
@@ -436,6 +505,8 @@ class Queue(Base):
             with self.subTest(pressure=pressure):
                 b = self.box(bid="bx_cpuqueue")
                 q = self.cmd(b, status="queued")
+                self.cmd(b, pid=1002, status="running", age=200)
+                self.con.execute("UPDATE commands SET started_at=1 WHERE pid=1002")
                 boatd.CFG["cpu_pressure_limit"] = 50
                 err = io.BytesIO()
                 reading = [pressure]
@@ -502,6 +573,7 @@ class Queue(Base):
         self.assertEqual(self.status(b, second)["started_at"] - self.status(b, first)["started_at"], 10)
 
     def test_long_wait_never_bypasses_memory_cap_or_fifo(self):
+        boatd.CFG["cpu_pressure_limit"] = 50
         for blocked in ("memory", "cap", "fifo"):
             with self.subTest(blocked=blocked):
                 b = self.box(bid="bx_longqueue")
@@ -593,6 +665,7 @@ class Queue(Base):
         boatd.mem_available = lambda: 1 * 2**30
         b = self.box()
         q = self.cmd(b, status="queued")
+        self.cmd(b, pid=1002, status="running")
         self.assertFalse(self.admit_now(b, q))
 
     def test_retry_interrupted_must_be_asked_for(self):
@@ -703,6 +776,7 @@ class Http(Base):
                 b = self.box("bx_same" if same_box else "bx_exec")
                 queued_box = b if same_box else self.box("bx_queued")
                 queued_pid = self.cmd(queued_box, status="queued")
+                self.cmd(queued_box, pid=1002, status="running")
                 entered, release = threading.Event(), threading.Event()
                 errors = []
                 def hold_admission(_):
@@ -719,7 +793,7 @@ class Http(Base):
                         con.close()
                 def process(args, **kw):
                     kw["stdout"].write(b"ready\n")
-                    return subprocess.CompletedProcess(args, 0)
+                    return unittest.mock.Mock(wait=unittest.mock.Mock(return_value=0))
                 def spawn(bid, pid, attempt):
                     boatd.run_cmd(bid, pid)
                 stack.enter_context(patch.object(boatd, "load_cfg"))
@@ -794,10 +868,12 @@ class Http(Base):
 
     def test_health_needs_no_token_and_carries_no_box_or_owner_data(self):
         self.make_box("moni")
+        boatd.health(fresh=True)
         st, d = self.call(None, "GET", "/health")
         self.assertEqual(st, 200)
-        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
-                                 "restartPending", "running", "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
+        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "degraded", "disk", "disk_full", "disk_low", "host", "loops", "mdraid", "mode", "ok", "phase", "pool", "problem", "queue", "reasons",
+                                     "refresh_stage", "refresh_stage_ms", "refresh_timings_ms", "restartPending", "running", "snapshot_age_s",
+                                     "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
         self.assertNotIn("moni", json.dumps(d))
         self.assertNotIn("bx_", json.dumps(d))
 
@@ -1131,7 +1207,7 @@ unused devices: <none>
         started = []
 
         class NoThread:
-            def __init__(self, target=None, args=(), daemon=None):
+            def __init__(self, target=None, args=(), daemon=None, name=None):
                 self.target, self.args = target, args
 
             def start(self):
@@ -1206,6 +1282,69 @@ class Retention(Base):
         self.assertEqual(kinds, ["daily", "hourly", "hourly"])
         with self.assertRaises(boatd.Fail):
             boatd.snap_rotate(self.con, "yearly")
+
+
+
+
+class HealthSnapshot(Base):
+    def test_http_snapshot_does_not_wait_for_locked_or_stalled_refresh(self):
+        boatd.READY.set()
+        boatd.health(fresh=True)
+        boatd._HEALTH["ts"] = boatd.now() - 75
+        boatd._HEALTH_REFRESH.update(stage="incus", since=0)
+        boatd._HEALTH_LOCK.acquire()
+        try:
+            with patch.object(boatd, "_sh", side_effect=AssertionError("request must not refresh")):
+                health = boatd.health()
+        finally:
+            boatd._HEALTH_LOCK.release()
+        self.assertTrue(health["ok"])
+        self.assertGreaterEqual(health["snapshot_age_s"], 75)
+        self.assertEqual(health["refresh_stage"], "incus")
+        boatd.READY.clear()
+        boatd.STATE["problem"] = "reconciling runs and boxes after start"
+        health = boatd.health()
+        self.assertTrue(health["starting"])
+        self.assertEqual(health["phase"], "reconciling runs and boxes after start")
+
+    def test_host_pressure_is_fresh_even_when_health_snapshot_is_stale_or_missing(self):
+        proc = {"/proc/loadavg": "131.25 112.50 115.75 193/10000 1\n",
+                "/proc/pressure/cpu": "some avg10=83.42 avg60=81.0 avg300=79.0 total=1\n",
+                "/proc/pressure/io": "some avg10=35.20 avg60=30.0 avg300=25.0 total=1\n"}
+        read_text = Path.read_text
+
+        def read(path, *args, **kwargs):
+            if str(path) in proc:
+                return proc[str(path)]
+            return read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", read), patch.object(boatd.os, "cpu_count", return_value=32):
+            boatd._HEALTH.update(ts=0, v=None)
+            self.assertEqual(boatd.health()["host"], {"loadavg": [131.25, 112.5, 115.75], "cores": 32,
+                                                     "cpu_some_avg10": 83.42, "io_some_avg10": 35.2})
+            boatd.health(fresh=True)
+            proc["/proc/loadavg"] = "1 2 3 1/100 1"
+            with patch.object(boatd, "_sh", side_effect=AssertionError("host read must not spawn")):
+                self.assertEqual(boatd.health()["host"]["loadavg"], [1, 2, 3])
+
+    def test_missing_and_malformed_host_metrics_stay_unknown(self):
+        for value in (OSError(), "", "oops", "nan inf -1", "1 2"):
+            with self.subTest(value=value):
+                def read(path, *args, **kwargs):
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+                with patch.object(Path, "read_text", read), patch.object(boatd.os, "cpu_count", return_value=None):
+                    self.assertEqual(boatd.host_pressure(), {"loadavg": None, "cores": None,
+                                                           "cpu_some_avg10": None, "io_some_avg10": None})
+        for value in ("nan", "inf", "-1", "101"):
+            with self.subTest(psi=value), patch.object(Path, "read_text", return_value=f"some avg10={value} total=1"):
+                self.assertIsNone(boatd.psi("cpu"))
+
+    def test_slow_stage_logs_what_waited(self):
+        with patch.object(boatd.time, "monotonic", side_effect=[10, 12]), patch.object(boatd, "log") as log:
+            self.assertEqual(boatd.health_stage("incus", lambda: 7), 7)
+        self.assertIn("stage=incus ms=2000.0", log.call_args.args[0])
 
 
 if __name__ == "__main__":

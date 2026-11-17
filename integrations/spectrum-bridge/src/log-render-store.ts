@@ -42,9 +42,15 @@ export function recordRenderCounts(root: string, line: LogLine): void {
 }
 
 export function renderCounts(root: string, day: string): { count: number; lines: LogLine[] } {
-  let db: Database | undefined;
+  let db: Database;
   try {
     db = openCounters(root, day, false);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { count: 0, lines: [] };
+    throw error;
+  }
+  try {
+    db.exec("PRAGMA busy_timeout = 1000");
     const rows = db.query<{ component: string; cardKind: string; chat: string; ms: number; count: number }, []>(
       "SELECT component, cardKind, chat, ms, count FROM bins ORDER BY component, cardKind, chat, ms").all();
     const groups = new Map<string, LogLine>();
@@ -62,6 +68,5 @@ export function renderCounts(root: string, day: string): { count: number; lines:
       count += row.count;
     }
     return { count, lines: [...groups.values()] };
-  } catch { return { count: 0, lines: [] }; }
-  finally { db?.close(); }
+  } finally { db.close(); }
 }

@@ -20,13 +20,16 @@ import {
   ProviderOptionSelection,
   TrimmedNonEmptyString,
 } from "@t3tools/contracts";
+import { ExactEdits } from "../engine/exactEdits.ts";
 import { Tool, Toolkit } from "effect/ai";
 import * as Schema from "effect/Schema";
+import * as Context from "effect/Context";
 
 import * as McpInvocationContext from "../../../mcp/McpInvocationContext.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import { KanbanService } from "../engine/KanbanService.ts";
+import { ASK_LIMITS } from "../engine/asks.ts";
 import { MAX_SUBTASKS, MAX_TEXT } from "../engine/subtasks.ts";
 import { MAX_BATCH } from "../engine/rules.ts";
 import { WAITS_ENGINE_WIRED } from "../engine/waits.ts";
@@ -103,7 +106,7 @@ const SubtasksInput = describe(
       id: Schema.optional(
         describe(
           TrimmedNonEmptyString,
-          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is; omit id for a new subtask.",
+          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is. An s<N> id the card does not have yet creates a new subtask with that id (text and owner required); omit id to let the board number a new subtask.",
         ),
       ),
       step: Schema.optional(
@@ -155,9 +158,15 @@ const SubtasksInput = describe(
           "For a script's subtask: the name of the board script that does it. Left out on a new or edited entry, any script on the board can. An id alone keeps its stored binding; done and skipped subtasks keep theirs.",
         ),
       ),
+      holdsDependents: Schema.optional(
+        describe(
+          Schema.Boolean,
+          "true on the step that lands the work where dependents need it (merge, land, fast-forward, push): a Completed card's dependents wait until it's done. false: never holds. Left out: guessed from the text (merge/land/fast-forward).",
+        ),
+      ),
     }),
-  ),
-  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id; open ones left out go, done ones stay.`,
+  ).check(Schema.isMaxLength(MAX_SUBTASKS)),
+  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id or with a new s<N> id; open ones left out go, done ones stay.`,
 );
 
 const LinkInput = Schema.Struct({
@@ -165,14 +174,40 @@ const LinkInput = Schema.Struct({
   label: Schema.optional(Schema.String),
 });
 
+const BLOCKS_DESCRIPTION =
+  'Each block is an object whose `_tag` field names its kind (all shown keys are required, even where null is allowed): md {text}, collapse {title, text}, html {html, title: string|null, height: positive integer|null}, image {url, alt: string|null}, attachment {attachment: {type: "image"|"file", id, name, mimeType, sizeBytes}}, card {cardId}; attachment id comes from t3_attachment_prepare_upload. Example: [{"_tag":"md","text":"Line count went from 120 to 4"},{"_tag":"image","url":"https://example.com/proof.png","alt":"Result"}]';
+
 const BlocksInput = {
   text: Schema.optional(describe(Schema.String, "Markdown message (shortcut for one md block).")),
   blocks: Schema.optional(
     describe(
       Schema.Array(KanbanBlockInput),
-      'Rich blocks, each with _tag: md {text}, collapse {title, text}, html {html, title, height}, choice {id, style "poll"|"pick", question, options [{id,label}], multi}, card {cardId}, image {url, alt}, attachment {attachment: {type image|file, id, name, mimeType, sizeBytes}} (the id comes from t3_attachment_prepare_upload).',
+      `${BLOCKS_DESCRIPTION} Also accepts choice {id, style: "poll"|"pick", question, options: [{id, label}], multi}.`,
     ),
   ),
+};
+
+// MCP supplies its own decode options and strips excess keys before handlers run.
+// Keep the declared keys at registration so the raw payload can be checked first.
+export class KanbanArgumentKeys extends Context.Service<
+  KanbanArgumentKeys,
+  ReadonlyArray<string>
+>()("t3/ardud/kanban/tools/tools/KanbanArgumentKeys") {}
+
+export const argumentFailure = (name: string, allowed: ReadonlyArray<string>, input: unknown) => {
+  if (typeof input !== "object" || input === null) return;
+  const unknown = Object.keys(input).filter((key) => !allowed.includes(key));
+  if (unknown.length === 0) return;
+  const hint =
+    allowed.includes("card") &&
+    unknown.some((key) => ["id", "cardId", "card_id", "number", "cardNumber"].includes(key))
+      ? ' Did you mean "card"? Pass card: "<card id>" or "#4421".'
+      : "";
+  return new OrchestratorMcpFailure({
+    code: "invalid_request",
+    reason: "invalid_args",
+    message: `${name} has no argument${unknown.length === 1 ? "" : "s"} ${unknown.map((key) => JSON.stringify(key)).join(", ")}. Allowed: ${allowed.join(", ") || "(none)"}.${hint}`,
+  });
 };
 
 const tool = <
@@ -197,6 +232,7 @@ const tool = <
     failureMode: "return",
     dependencies,
   })
+    .annotate(KanbanArgumentKeys, Object.keys(parameters))
     .annotate(Tool.Title, title)
     .annotate(Tool.Readonly, flags.readonly)
     .annotate(Tool.Destructive, flags.destructive ?? false)
@@ -206,7 +242,7 @@ const tool = <
 const BoardGet = tool(
   "board_get",
   "Read the board",
-  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread; each page stays under 50,000 characters. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
+  "Compact Missions board: settings/instructions, goals, pools, groups, live thread states, unread counts and a page of card number/title/stage/owner/model/short status. No card descriptions, prompts, event histories, goal stories or wiki bodies; use card_get and wiki_read for detail. Default 200 cards, max 500. Every page stays under 50,000 characters and can hold fewer cards than limit when rows are large; follow board.page.nextAfter with after while hasMore. With since, only cards active since then (an event, or an open or touched ask), one short row each: stage changes, review verdicts, run failures, stall, asks with asked/answered times; no settings, groups or unread. boardId defaults to the board identified by this thread; when ambiguous, pass one of the candidate board ids in the error.",
   {
     boardId: BoardRef,
     after: Schema.optional(
@@ -227,7 +263,7 @@ const BoardGet = tool(
 const BoardActivity = tool(
   "board_activity",
   "Board activity rollup",
-  "A board's activity in a window (default the last 24 hours, at most 72): every ask answered in the window with asked/answered times and minutes to answer (p50/p90/max), open asks and asks open over 6 hours, review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator starts (new threads; evaluatorWakes is a compatibility alias), cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Card numbers only, no titles or text. Read from the cards' stored history; long lists other than the answered asks are cut and say how many more.",
+  "A board's activity in a window (default the last 24 hours, at most 72; since/until accept ISO timestamps or relative times now-24h, 24h, 3d): asks answered in the window with asked/answered times and minutes to answer (p50/p90/max), open counts asks that need an answer; open notices are counted in openNotices. Answer times are also split by kind (missing kind is question) and blocking, with separate counts for decisions and notices open over 6 hours; review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls by kind and how long they lasted (byKind counts; idle_evaluator includes currently idle completed/deployed evaluator steps with card, stage, step, openEvaluatorSubtasks, idleHours, lastEventAt and evaluatorThreadAlive, even before a flag), run failures by kind and model plus newest-first failures.rows (at most 50, more gives omitted count) with card number, kind, role, pool, threadId, runId, time, reason, repeat count and structured restart-admission wait/queue/rule when available; restartAdmission points to the server-wide analytics_read rollup by UTC day (read section restartAdmission without board/card/kind filters), with this board's failed card numbers; threads started, restarts and evaluator starts (new threads; evaluatorWakes is a compatibility alias), cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. withoutThread adds reason, hours and byReason counts: wait:<kind>, owner_ask, blocked, backlog, paused, evaluator_step, stalled:<kind>, or none (stuck); expired waits carry expiredWait and none has its own capped list. pool_full is reported only for queued cards. Queued todo/needs_review cards include why they wait (pool full with rank, cards ahead and slot holders, blocked, waiting, and other dispatch gates), plus those queued over 6 hours. The holders section lists current slot holders per pool, with stage, held time and open-step owner (at most 50 per pool). Card numbers only, no titles or text. Read from the cards' stored history. Lists are shortened to fit 50,000 characters and say how many more; answeredItems stays an array, with answeredItemsMore when some are omitted; an oversized kind breakdown reports omitted groups in answerMinutesByKindMore.",
   {
     boardId: BoardRef,
     since: Schema.optional(
@@ -265,7 +301,7 @@ const CardSearch = tool(
 const CardGet = tool(
   "card_get",
   "Read a card",
-  'One card with its latest 20 events (moves, edits, comments, review verdicts), eventsTotal, a cursor for older ones (olderEvents) and every thread it has had. Pass events {before: olderEvents, limit} to page back, or "all" for every event (it can be more than your client accepts). The card itself is never trimmed; a reply stays under 60,000 characters by leaving out its oldest events.',
+  'One card with its latest 20 events (moves, edits, comments, review verdicts), eventsTotal, a cursor for older ones (olderEvents) and every thread it has had. Pass events {before: olderEvents, limit} to page back, or "all" for every event (it can be more than your client accepts). With before, the reply carries only the card\'s id, number, title, stage and boardId, without the full card or threads. Pages leave out oldest events to fit 60,000 characters; a full card and threads can exceed this on the first read. A single oversized event is skipped with a note; "all" returns it. Follow olderEvents until null, even after an empty page. card accepts an id or #number; omit it for your own card.',
   {
     card: Schema.optional(CardRef),
     boardId: BoardRef,
@@ -282,9 +318,12 @@ const CardGet = tool(
     ),
   },
   {
-    card: Record,
+    card: describe(
+      Record,
+      "Full card on the first read; only id, number, title, stage and boardId with events.before.",
+    ),
     events: Records,
-    threads: Records,
+    threads: Schema.optional(Records),
     eventsTotal: NonNegativeInt,
     olderEvents: Schema.NullOr(NonNegativeInt),
     note: Schema.optional(Schema.String),
@@ -295,7 +334,7 @@ const CardGet = tool(
 const CardUpdate = tool(
   "card_update",
   "Update your card",
-  "Work threads may update only their assigned cards; evaluators use card_edit. Change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
+  "Work threads may update only their assigned cards; evaluators use card_edit. Change the card description, attach links (PRs, Linear, any URL; added by URL, existing links stay) or add a comment. Attach every PR before moving to needs_review and link it to your thread (link_pull_request): the card completes only when your thread's PRs are merged or closed. A PR link your thread didn't link is context and doesn't hold the card. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -310,7 +349,7 @@ const CardUpdate = tool(
 const CardMove = tool(
   "card_move",
   "Move a card",
-  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed. A move clears its wait unless keepWait is true or it moves to completed/deployed with open evaluator/script subtasks; the result reports keep/clear.",
+  "Work threads may move only their assigned cards; review threads use card_review_result. Evaluators change card fields with card_edit. Work thread: move your card to needs_review when the work is done (a reviewer starts), including from todo when you are its own work thread and no thread is attached, or to needs_owner with the question when you need the owner. Evaluators: any stage except working and in_review, which the dispatcher owns; completed and deployed only once the card's review passed. A move clears its wait unless keepWait is true or it moves to completed/deployed with open evaluator/script subtasks; the result reports keep/clear. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -358,43 +397,69 @@ const AskFieldInput = Schema.Struct({
   block: Schema.optional(Schema.Finite),
 });
 
-const AskRespondInput = Schema.Struct({
+export const AskRespondInput = Schema.Struct({
   verdict: Schema.optional(
-    Schema.Union([
-      Schema.Boolean,
-      Schema.Struct({
-        approve: Schema.optional(Schema.String),
-        reject: Schema.optional(Schema.String),
-      }),
-    ]),
+    describe(
+      Schema.Union([
+        Schema.Boolean,
+        Schema.Struct({
+          approve: Schema.optional(Schema.String),
+          reject: Schema.optional(Schema.String),
+        }),
+      ]),
+      'true or an object with optional approve/reject (string button labels); false removes verdict buttons. Example: {"approve":"Deploy","reject":"Don\'t deploy"}.',
+    ),
   ),
   choose: Schema.optional(
-    Schema.Union([
-      Schema.Boolean,
-      Schema.Struct({
-        multi: Schema.optional(Schema.Boolean),
-        min: Schema.optional(Schema.Finite),
-        max: Schema.optional(Schema.Finite),
-      }),
-    ]),
+    describe(
+      Schema.Union([
+        Schema.Boolean,
+        Schema.Struct({
+          multi: Schema.optional(Schema.Boolean),
+          min: Schema.optional(Schema.Finite),
+          max: Schema.optional(Schema.Finite),
+        }),
+      ]),
+      'true or an object with optional multi (boolean), min/max (numbers) for picks from options; false removes picks. Example: {"multi":true,"min":1,"max":2}.',
+    ),
   ),
-  fields: Schema.optional(Schema.Array(AskFieldInput)),
-  edit: Schema.optional(Schema.Union([Schema.Boolean, Schema.String])),
+  fields: Schema.optional(
+    describe(
+      Schema.Array(AskFieldInput),
+      `A list of at most ${ASK_LIMITS.fields} objects with label (string), optional id/hint/unit (strings), type (text, longtext, number, date, datetime, toggle, select, rank, file, custom or secret), required/multi (booleans), default (JSON), min/max/maxFiles/block (numbers), accepts (list of strings) and options (list of strings or {id?: string, label: string}); custom uses block as the html block index, secret returns a one-use secretRef (24h, this thread only), and file returns a path. Example: [{"id":"reason","label":"Reason","type":"text","required":true},{"id":"scope","label":"Scope","type":"select","options":["Dev",{"id":"prod","label":"Production"}]}].`,
+    ),
+  ),
+  edit: Schema.optional(
+    describe(
+      Schema.Union([Schema.Boolean, Schema.String]),
+      'true or "draft" to edit the draft; requires draft, and false removes editing. Example: "draft".',
+    ),
+  ),
   task: Schema.optional(
-    Schema.Struct({
-      steps: Schema.optional(
-        Schema.Array(
-          Schema.Union([
-            Schema.String,
-            Schema.Struct({ text: Schema.String, link: Schema.optional(Schema.String) }),
-          ]),
+    describe(
+      Schema.Struct({
+        steps: Schema.optional(
+          Schema.Array(
+            Schema.Union([
+              Schema.String,
+              Schema.Struct({ text: Schema.String, link: Schema.optional(Schema.String) }),
+            ]),
+          ),
         ),
-      ),
-      proof: Schema.optional(Schema.String),
-    }),
+        proof: Schema.optional(Schema.String),
+      }),
+      `An object with optional steps (at most ${ASK_LIMITS.taskSteps} strings or {text: string, link?: string}) and proof (id of a required response field); he answers done or couldn't. Example: {"steps":["Check CI",{"text":"Review","link":"https://example.com/pr"}],"proof":"reason"}.`,
+    ),
   ),
-  ack: Schema.optional(Schema.Boolean),
+  ack: Schema.optional(
+    describe(
+      Schema.Boolean,
+      "true makes a notice with no other response parts; it cannot block. Example: true.",
+    ),
+  ),
 });
+
+const ASK_ACTION_DESCRIPTION = `An object with summary (string), optional command/target/undo/then (strings), and evidence (a list of strings, at most ${ASK_LIMITS.evidence}, each at most ${ASK_LIMITS.evidenceLine} characters); then says what you do once it is done. Example: {"summary":"Merge PR #512","evidence":["CI green on abc123","review passed"]}.`;
 
 /** What an asker writes on an ask beyond the question; card_ask_change edits the same fields. */
 const AskFieldsInput = {
@@ -427,7 +492,7 @@ const AskFieldsInput = {
           }),
         ]),
       ),
-      "Answers to pick from: a label, or {label, detail: what it is, consequence: what happens once picked, recommended: true on yours, block: index in blocks of the picture or page that shows it}. With kind rank: the items he puts in order.",
+      `A list of at most ${ASK_LIMITS.options} strings or objects with label (string), optional id/detail/consequence (strings), recommended (boolean), approves (list of existing subtask ids), and block (index of an existing block); with kind rank these are the items to order. Example: [{"id":"merge","label":"Merge","detail":"CI passed","recommended":true,"consequence":"Ships next release"}].`,
     ),
   ),
   multi: Schema.optional(
@@ -440,7 +505,7 @@ const AskFieldsInput = {
         format: Schema.optional(AskFormat),
         target: Schema.optional(Schema.String),
       }),
-      'The exact text you will post or send, and where (target, e.g. "comment on PR #512").',
+      'An object with text (string), optional format ("markdown" or "text") and target (string) for the exact text to post or send. Example: {"text":"Ready to merge.","format":"markdown","target":"comment on PR #512"}.',
     ),
   ),
   action: Schema.optional(
@@ -453,25 +518,25 @@ const AskFieldsInput = {
         undo: Schema.optional(Schema.String),
         then: Schema.optional(Schema.String),
       }),
-      "What you will do, the command, where, the proof it is ready, how to undo it, and what you do once it is done (then).",
+      ASK_ACTION_DESCRIPTION,
     ),
   ),
   change: Schema.optional(
     describe(
       AskChangeInput,
-      "A text being replaced (a tool description, a rule): what it is, the full text before and after.",
+      'An object with label, before and after (strings) for a text being replaced, plus optional format ("markdown" or "text"). Example: {"label":"Tool description","before":"Old text","after":"New text","format":"text"}.',
     ),
   ),
   changes: Schema.optional(
     describe(
       Schema.Array(AskChangeInput),
-      "Several texts replaced together, one {label, before, after} each (at most 8), e.g. one per file.",
+      `A list of at most ${ASK_LIMITS.changes} change objects, each with label/before/after (strings) and optional format ("markdown" or "text"). Example: [{"label":"Tool description","before":"Old text","after":"New text"}].`,
     ),
   ),
   respond: Schema.optional(
     describe(
       AskRespondInput,
-      'What he gives back, when it is more than the ask already implies (a draft implies edit + verdict, an action or change a verdict, options a pick, a bare question free text). Parts combine; each adds to the implied ones, false drops one. verdict: true or {approve, reject} for your own button labels ("Deploy" / "Don\'t deploy"). choose: {min, max} picks from options. fields (at most 8): [{id, label, type, required, hint, default}] with type text | longtext | number {unit, min, max} | date | datetime | toggle | select {options, multi} | rank {options} | file {accepts: ["image/*", ".csv"], maxFiles} | custom {block: index of the html block whose page produces the JSON value}. A secret {type: "secret"} is typed in a private field of the app and never stored: its answer gives you a one-use secretRef (24h, this thread only) to pass where a tool takes one. edit: true lets him edit your draft. task: {steps: ["...", {text, link}], proof: a field id he must fill when done}; he answers done or couldn\'t. ack: true makes it a notice (nothing else, never blocking). His values come back to you as "label: value" lines; a file as its path.',
+      `An object adding response parts to those implied by the ask (draft: edit + verdict, action/change: verdict, options: choose, bare question: free text); verdict, choose and edit accept false to remove that part, choose needs options, and edit needs a draft. Shapes (combine only the parts you need): {"verdict":{"approve":"Deploy","reject":"Don't deploy"},"choose":{"multi":false,"min":1,"max":1},"fields":[{"id":"reason","label":"Reason","type":"text"}],"edit":true,"task":{"steps":["Check CI",{"text":"Review","link":"https://example.com/pr"}],"proof":"reason"},"ack":false}; verdict also accepts true; Example: {"verdict":true}.`,
     ),
   ),
   to: Schema.optional(
@@ -495,7 +560,7 @@ const AskFieldsInput = {
   blocks: Schema.optional(
     describe(
       Schema.Array(KanbanBlockInput),
-      "Evidence shown inside the ask, in order (at most 12, 8 of them images or files): md {text}, collapse {title, text}, html {html, title, height}, image {url, alt}, attachment {attachment: {type image|file, id, name, mimeType, sizeBytes}} (id from t3_attachment_prepare_upload), card {cardId}. No choice blocks: answers go in options.",
+      `Evidence shown inside the ask, in order (at most ${ASK_LIMITS.blocks}, ${ASK_LIMITS.attachments} of them images or files); each image needs non-empty alt text, and answers go in options rather than choice blocks. ${BLOCKS_DESCRIPTION}`,
     ),
   ),
 };
@@ -520,7 +585,7 @@ const CardAsk = tool(
 const CardAskChange = tool(
   "card_ask_change",
   "Change an open ask",
-  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may block or drop asks in todo (blocking moves the card to Needs Owner) and needs_owner.',
+  'Change an open ask (q1, q2... on the card). Pass the fields to replace (question, title, context, options, draft, action, changes, respond...) with revisionNote saying what changed: he sees it as updated and it is his turn again. blocks replaces the evidence shown with it ([] removes it). Do this when he replied that the ask was unclear. Or pass action: "block" makes an async ask blocking, "drop" removes one no longer needed, "return" (evaluators) gives an ask that is with you back to him. A work thread changes only its own card\'s asks; while no thread is attached, its own work thread may block or drop asks in todo (blocking moves the card to Needs Owner) and needs_owner. card accepts an id or #number; omit it for your own card.',
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -529,7 +594,7 @@ const CardAskChange = tool(
     blocking: Schema.optional(
       describe(
         Schema.Boolean,
-        "true makes an async ask blocking. A blocking ask can't be made async.",
+        "true makes an async ask blocking. false is accepted only on an ask that is already async (no change); a blocking ask can't be made async.",
       ),
     ),
     revisionNote: Schema.optional(describe(Schema.String, "One line: what you changed and why.")),
@@ -540,18 +605,18 @@ const CardAskChange = tool(
           Schema.Literals(["block", "drop", "return"]),
           ...AskActionInput.schema.members,
         ]),
-        'An operation ("block", "drop" or "return"), or the new action body of an action ask.',
+        `An operation ("block", "drop" or "return"), or a new action body. ${ASK_ACTION_DESCRIPTION}`,
       ),
     ),
   },
-  { card: Record, warning: Schema.optional(Schema.String) },
+  { card: Record, warning: Schema.optional(Schema.String), note: Schema.optional(Schema.String) },
   { readonly: false },
 );
 
 const CardAskAnswer = tool(
   "card_ask_answer",
   "Decide a handed ask",
-  'Evaluators only: decide an ask that is with you (the owner handed it over, or it was asked to you; you are told either way). Whoever asked hears it as the answer, marked as decided by you for him. If only he can decide, give it to him with card_ask_change action "return" instead.',
+  'Evaluators only: decide an ask that is with you (the owner handed it over, or it was asked to you; you are told either way). Whoever asked hears it as the answer, marked as decided by you for him. If only he can decide, give it to him with card_ask_change action "return" instead. card accepts an id or #number; omit it for your own card.',
   {
     card: Schema.optional(CardRef),
     ask: Schema.String,
@@ -585,7 +650,7 @@ const CardAskAnswer = tool(
 const CardFlag = tool(
   "card_flag",
   "Flag a card stalled",
-  "Mark a card stalled with the reason (missing access, broken environment, waiting on something outside the board), or clear the flag with stalled false. A stalled card gives up its slot and returns from work or review to its queue.",
+  "Mark a card stalled with the reason (missing access, broken environment, waiting on something outside the board), or clear the flag with stalled false. A stalled card gives up its slot and returns from work or review to its queue. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -599,7 +664,7 @@ const CardFlag = tool(
 const BoardStandingApproval = tool(
   "board_standing_approval",
   "Standing deploy approval",
-  "Evaluators only: grant a board standing deploy approval from a closed owner-approved ask naming every requested board slug. The ask may be on any board (use its card id). Quote the owner's words and source thread/time. Replaces active records, retaining history. Any evaluator can revoke with a reason. Returns open release asks to drop with card_ask_change; never answers them. Money, secret and ownerOnly steps still need on-card approval.",
+  "Evaluators only: grant a board standing deploy approval from a closed owner-approved ask naming every requested board slug. The ask may be on any board (use its card id). Quote the owner's words and source thread/time. Replaces active records, retaining history. Any evaluator can revoke with a reason. Returns open release asks to drop with card_ask_change; never answers them. Money, secret and ownerOnly steps still need on-card approval. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     action: Schema.Literals(["grant", "revoke"]),
@@ -619,10 +684,11 @@ const BoardStandingApproval = tool(
 const CardWait = tool(
   "card_wait",
   "Say what a card waits on",
-  "Set the one thing a card waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only. A worker can set a wait on its own card while running; it takes effect when the turn ends, so end the turn right after. For a PR's CI, call watch_pull_request and end the turn instead." +
+  "Set the one thing a card waits for, as data the board shows and checks, instead of writing \"waiting for the dev to push\" in a comment, a subtask or a stalled flag. on: push (new commits on pr; the reviewed commit is taken from the card's last review unless you pass head), merge (pr merged), ci (checks on pr finish), card (waitsOn is done), time (until passes), owner_go (the owner answers open question ask; ask it first with card_ask, and use a blocking card_ask instead when nothing can go on without him). When none of those fit (a Linear issue reaching a state, a deploy landing, a reply from a person), a board script can be the check: on script with script, the name of an enabled script on this board, and args for what it should look at. pr must be a PR link on the card: attach a parent or base PR with links first. One wait per card: a new one replaces the old, and takes over a stalled flag you could clear. When it ends the board clears it, logs why and wakes whoever acts next in the card's stage (wakeRole to choose; new commits on a card in review wake its reviewer for a fresh review); a wait that outlasts its limit (push 3d, merge 2d, ci 3h, card 7d, script 7d, owner_go 2d, or your until) shows the card as stuck. Several things to wait for: set the first, set the next when woken. clear:true removes it. Card threads use it on their own cards only. A worker in Working can park its own card while running with on: time (until required, at most 24 hours ahead), script, or card. Set it as your last act and end the turn; it survives turn end. Clear it if a durable watcher, offbox result or another wake reaches you first. Workers cannot use push, merge, ci or owner_go while Working: use watch_pull_request for PR waits, or card_ask for the owner's answer." +
     (WAITS_ENGINE_WIRED
       ? ""
-      : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner."),
+      : " Not live yet: the wait is saved and shown, but the board does not end it or wake anyone until its tick checks waits, so keep your own check; it is accepted on cards in in_review, completed, deployed and needs_owner.") +
+    " card accepts an id or #number; omit it for your own card.",
   {
     card: Schema.optional(CardRef),
     on: Schema.optional(describe(KanbanWaitKind, "What it waits on. Required unless clear.")),
@@ -645,7 +711,7 @@ const CardWait = tool(
     until: Schema.optional(
       describe(
         TrimmedNonEmptyString,
-        "time: when it ends (ISO 8601, at most 30 days ahead). Other kinds: your own deadline, after which the card shows as stuck.",
+        "time: when it ends (ISO 8601, at most 24 hours ahead for a Working worker parking itself, otherwise 30 days). Other kinds: your own deadline, after which the card shows as stuck.",
       ),
     ),
     head: Schema.optional(
@@ -699,7 +765,7 @@ const CardReviewResult = tool(
 const DiscussionPost = tool(
   "discussion_post",
   "Post in a discussion",
-  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. With ask (q1...), the message is a reply on that open ask of the card: the ask stays open and it is the owner's turn again. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice.",
+  "Post a message in a discussion. Pass discussionId, or card for that card's discussion. Defaults to your card's discussion (card threads) or your own discussion (discussion evaluators). This is the only way the owner sees your replies. With ask (q1...), the message is a reply on that open ask of the card: the ask stays open and it is the owner's turn again. If it fails with 'Board busy' or 'Not saved', nothing was saved and the same call can be repeated; an identical repeat within 10 minutes is not saved twice. card accepts an id or #number; omit it for your own card.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     boardId: BoardRef,
@@ -719,7 +785,7 @@ const DiscussionPost = tool(
 const DiscussionRead = tool(
   "discussion_read",
   "Read a discussion",
-  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB, or with limit up to that many and about 50,000 characters. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post.",
+  "Messages of a discussion, newest last, with answers to polls and picks: the latest ones (after afterSeq / before beforeSeq when given), up to 200 and about 1 MB, or with limit up to that many and about 50,000 characters. When older ones were left out, earlierBefore is set: read again with beforeSeq. seq reads one message in full. Defaults like discussion_post. card accepts an id or #number; omit it for your own card.",
   {
     discussionId: Schema.optional(TrimmedNonEmptyString),
     boardId: BoardRef,
@@ -794,6 +860,12 @@ const CardCreate = tool(
         "Work threads: take the card yourself now. It runs on your model and project.",
       ),
     ),
+    forThread: Schema.optional(
+      describe(
+        TrimmedNonEmptyString,
+        "Evaluators: give the new card to this existing work thread on the board (it keeps its context); no other thread can take it.",
+      ),
+    ),
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
     priority: Schema.optional(
@@ -840,13 +912,21 @@ const CardNext = tool(
 const CardEdit = tool(
   "card_edit",
   "Edit a card",
-  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list.",
+  "Evaluators: change any card field. Links are added by URL and removeLinks takes them off by URL (both in one call replace a link); blockedBy replaces the list. Replacing prompt or subtasks requires basedOn from the updatedAt you read; on conflict, card_get again, merge, and retry. promptEdits / subtaskEdits: exact find-and-replace on the prompt / open subtask texts; each oldString must appear exactly count times (default 1) in the text as left by the edits before it; all apply or none do. Not with prompt / subtasks in the same call.",
   {
     boardId: BoardRef,
     card: CardRef,
     title: Schema.optional(Schema.String),
     description: Schema.optional(Schema.String),
     prompt: Schema.optional(Schema.String),
+    promptEdits: Schema.optional(ExactEdits),
+    subtaskEdits: Schema.optional(ExactEdits),
+    basedOn: Schema.optional(
+      describe(
+        Schema.String,
+        "updatedAt from your last card_get/card_create/card_edit result; required when replacing prompt or subtasks.",
+      ),
+    ),
     priority: Schema.optional(
       describe(
         KanbanPriority,
@@ -872,7 +952,7 @@ const CardEdit = tool(
 const SubtaskDone = tool(
   "subtask_done",
   "Mark a subtask",
-  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. Unless standing deploy approval covers it, a gated subtask needs the owner's answer on an ask naming its id; a refusal says which ask is missing. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate. Evaluators may skip a deploy-, money- or secret-gated evaluator or script step without the owner's answer when the note gives the reason (10–300 characters); Abdullah gets a notice, and marking it done still needs his OK.",
+  "Mark a card subtask done (with a short note on what was done) or skipped (with why). Workers mark the worker's subtasks of their own card, in the step the card is on; the review's are ticked when it passes. Evaluators mark any, and can set one open again. Doing a subtask follows the board's other rules: a message that needs the owner's approval still goes to him first, and the subtask stays open until it's sent. Unless standing deploy approval covers it, a gated subtask needs the owner's answer on an ask naming its id; a refusal says which ask is missing. With a standing approval live, keep deploy steps worded honestly; don't reword them to dodge the gate. Evaluators may skip a deploy-, money- or secret-gated evaluator or script step without the owner's answer when the note gives the reason (10–300 characters); Abdullah gets a notice, and marking it done still needs his OK. card accepts an id or #number; omit it for your own card.",
   {
     boardId: BoardRef,
     card: Schema.optional(CardRef),
@@ -885,7 +965,7 @@ const SubtaskDone = tool(
     releasedAt: Schema.optional(
       describe(
         IsoDateTime,
-        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window.",
+        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window; use it for any step that records a release that already happened, including a second card's step for the same release.",
       ),
     ),
   },
@@ -896,12 +976,15 @@ const SubtaskDone = tool(
 const CardThread = tool(
   "card_thread",
   "Steer, stop, wake or reset a card thread",
-  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it.",
+  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it. Steer and wake require non-blank text and an open worker step or pending review findings, unless a reviewer is attached. message is an alias for text; if both are supplied, they must match.",
   {
     boardId: BoardRef,
     card: CardRef,
     action: Schema.Literals(["steer", "stop", "wake", "reset"]),
     text: Schema.optional(Schema.String),
+    message: Schema.optional(
+      describe(Schema.String, "Alias for text; if both are supplied, they must match."),
+    ),
   },
   { card: Record },
   { readonly: false, destructive: true },
@@ -1018,15 +1101,7 @@ const WikiWrite = tool(
     slug: TrimmedNonEmptyString,
     title: Schema.optional(RawBoardText),
     body: Schema.optional(Schema.String),
-    edits: Schema.optional(
-      Schema.Array(
-        Schema.Struct({
-          oldString: Schema.String.check(Schema.isMinLength(1)),
-          newString: Schema.String,
-          count: Schema.optional(PositiveInt),
-        }),
-      ).check(Schema.isMinLength(1), Schema.isMaxLength(50)),
-    ),
+    edits: Schema.optional(ExactEdits),
   },
   { page: Record },
   { readonly: false },
@@ -1063,6 +1138,11 @@ const ReportBug = tool(
   },
   {
     appendedTo: Schema.optional(TrimmedNonEmptyString),
+    callerVerified: Schema.optional(Schema.Boolean),
+    callerUnverifiedReason: Schema.optional(
+      Schema.Literals(["caller_unresolved", "parent_not_active"]),
+    ),
+    message: Schema.optional(Schema.String),
     deduped: Schema.optional(Schema.Boolean),
     candidates: Schema.optional(Records),
     threadId: Schema.optional(TrimmedNonEmptyString),
@@ -1101,6 +1181,25 @@ const EvaluatorStart = tool(
     queueId: Schema.optional(Schema.Number),
   },
   { readonly: false },
+);
+
+const EvaluatorStatus = tool(
+  "evaluator_status",
+  "Look up an evaluator request",
+  "Read back an evaluator_start or report_bug using exactly one returned queueId or threadId. Returns its queue state, evaluator thread and cards it filed or updated, including retitled or settled cards and duplicates recorded on existing cards.",
+  {
+    boardId: BoardRef,
+    queueId: Schema.optional(PositiveInt),
+    threadId: Schema.optional(TrimmedNonEmptyString),
+  },
+  {
+    saved: Schema.Boolean,
+    queued: Schema.Boolean,
+    queueId: Schema.optional(Schema.Number),
+    threadId: Schema.optional(TrimmedNonEmptyString),
+    cards: Records,
+  },
+  { readonly: true },
 );
 
 const SetupDone = tool(
@@ -1176,5 +1275,6 @@ export const KanbanToolkit = Toolkit.make(
   WikiWrite,
   BoardOpen,
   EvaluatorStart,
+  EvaluatorStatus,
   ReportBug,
 );

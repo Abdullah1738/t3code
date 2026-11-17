@@ -252,7 +252,19 @@ export function applyOrchestrationV2ProjectionEvent(
       return { ...projection, thread: event.payload };
     case "run.created":
     case "run.updated": {
-      const next = { ...base, runs: upsertEntity(base.runs, event.payload) };
+      const current = base.runs.find((run) => run.id === event.payload.id);
+      const payload =
+        current?.cancelReason !== undefined &&
+        (event.payload.cancelReason === undefined ||
+          event.payload.cancelReason === "provider_cancelled" ||
+          event.payload.cancelReason === "provider_interrupted")
+          ? {
+              ...event.payload,
+              cancelReason: current.cancelReason,
+              cancelDetail: current.cancelDetail,
+            }
+          : event.payload;
+      const next = { ...base, runs: upsertEntity(base.runs, payload) };
       return { ...next, visibleTurnItems: activeVisibleTurnItems(next) };
     }
     case "run.background-work-cancelled":
@@ -285,6 +297,23 @@ export function applyOrchestrationV2ProjectionEvent(
     case "provider-session.detached":
       return {
         ...base,
+        runs:
+          event.payload.cancelReason === undefined
+            ? base.runs
+            : base.runs.map((run) =>
+                ["preparing", "starting", "running", "waiting"].includes(run.status) &&
+                base.providerThreads.some(
+                  (thread) =>
+                    thread.id === run.providerThreadId &&
+                    thread.providerSessionId === event.payload.providerSessionId,
+                )
+                  ? {
+                      ...run,
+                      cancelReason: event.payload.cancelReason,
+                      cancelDetail: event.payload.reason?.slice(0, 500),
+                    }
+                  : run,
+              ),
         providerSessions: base.providerSessions.filter(
           (session) => session.id !== event.payload.providerSessionId,
         ),
@@ -330,6 +359,26 @@ export function applyOrchestrationV2ProjectionEvent(
       };
     }
     case "turn-item.updated": {
+      const request = event.payload;
+      const runs =
+        request.type === "run_interrupt_request" && request.cancelReason !== undefined
+          ? base.runs.map((run) =>
+              run.id === request.runId &&
+              (!(run.status === "cancelled" || run.status === "interrupted") ||
+                run.cancelReason === undefined ||
+                run.cancelReason === "provider_cancelled" ||
+                run.cancelReason === "provider_interrupted")
+                ? {
+                    ...run,
+                    cancelReason: request.cancelReason,
+                    cancelDetail:
+                      request.message === "Interrupt requested"
+                        ? undefined
+                        : request.message.slice(0, 500),
+                  }
+                : run,
+            )
+          : base.runs;
       // Streamed updates land on the newest items, so search from the end.
       let itemIndex = projection.turnItems.length - 1;
       while (itemIndex >= 0 && projection.turnItems[itemIndex]!.id !== event.payload.id) {
@@ -340,12 +389,12 @@ export function applyOrchestrationV2ProjectionEvent(
         itemIndex === -1 &&
         shouldDropMissingPartialTurnItem(projection, event.payload, latestLocalTurnOrdinal)
       ) {
-        return projection;
+        return runs === base.runs ? projection : { ...projection, runs };
       }
       const turnItems = [...projection.turnItems];
       if (itemIndex === -1) turnItems.push(event.payload);
       else turnItems[itemIndex] = event.payload;
-      const next = { ...base, turnItems };
+      const next = { ...base, runs, turnItems };
       // Only interrupt requests can change another item's visibility. Streaming
       // text/tool updates must not recheck every row against every run.
       const previous = itemIndex === -1 ? undefined : projection.turnItems[itemIndex];

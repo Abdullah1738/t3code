@@ -169,6 +169,7 @@ export const layerExecutor: Layer.Layer<
                           runId: run.id,
                           expectedAttemptId: run.activeAttemptId,
                           deadline: error.deadline,
+                          admission: error.admission,
                         });
                       })
                     : threads.recoverDelegatedTask(effect.threadId, sourceRunId),
@@ -230,6 +231,25 @@ export const layerExecutor: Layer.Layer<
                 ),
               ),
             );
+          case "notification.delivery.accept":
+            return threads
+              .dispatch({
+                type: "notification.delivery.accept",
+                commandId: effect.commandId,
+                threadId: effect.threadId,
+                messageId: effect.request.messageId,
+              })
+              .pipe(
+                Effect.asVoid,
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "provider-turn.start": {
             const startRequest = effect.request;
             return Effect.gen(function* () {
@@ -270,6 +290,7 @@ export const layerExecutor: Layer.Layer<
                       runId: run.id,
                       expectedAttemptId: run.activeAttemptId,
                       deadline: error.deadline,
+                      admission: error.admission,
                     });
                   }),
               }),
@@ -915,17 +936,23 @@ const isOrchestrationEffectWorkerError = Schema.is(OrchestrationEffectWorkerErro
 export interface OrchestrationEffectWorkerV2Shape {
   readonly awaitWork: Effect.Effect<void>;
   readonly awaitControlWork: Effect.Effect<void>;
+  readonly awaitStartWork: Effect.Effect<void>;
   readonly runOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runThreadOnce?: (
     threadId: ThreadId,
   ) => Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runRecoveryOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly runControlOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
+  readonly runStartOnce: Effect.Effect<boolean, OrchestrationEffectWorkerError>;
   readonly nextClaimableAt: Effect.Effect<
     Option.Option<DateTime.Utc>,
     OrchestrationEffectWorkerError
   >;
   readonly nextControlClaimableAt: Effect.Effect<
+    Option.Option<DateTime.Utc>,
+    OrchestrationEffectWorkerError
+  >;
+  readonly nextStartClaimableAt: Effect.Effect<
     Option.Option<DateTime.Utc>,
     OrchestrationEffectWorkerError
   >;
@@ -937,10 +964,14 @@ export class OrchestrationEffectWorkerV2 extends Context.Service<
   OrchestrationEffectWorkerV2Shape
 >()("t3/orchestration-v2/EffectWorker/OrchestrationEffectWorkerV2") {}
 
+// Accepted input needs more time to commit bookkeeping than the provider send budget.
+export const DEFAULT_MAX_ACCEPTED_ATTEMPTS = 10;
+
 export interface OrchestrationEffectWorkerOptions {
   readonly workerId?: string;
   readonly leaseDurationMs?: number;
   readonly maxAttempts?: number;
+  readonly maxAcceptedAttempts?: number;
 }
 
 export const layerWithOptions = (
@@ -958,6 +989,13 @@ export const layerWithOptions = (
       const workerId = options.workerId ?? `orchestration-v2:${process.pid}`;
       const leaseDurationMs = Math.max(1, options.leaseDurationMs ?? 30_000);
       const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
+      const maxAcceptedAttempts = Math.max(
+        maxAttempts,
+        options.maxAcceptedAttempts ?? DEFAULT_MAX_ACCEPTED_ATTEMPTS,
+      );
+      const isAcceptance = (effect: EffectOutbox.OrchestrationEffectV2) =>
+        effect.request.type === "notification.delivery.accept" ||
+        (effect.request.type === "provider-turn.steer" && effect.request.providerAccepted === true);
       const wasCancelled = (effectId: string) =>
         outbox.get(effectId).pipe(
           Effect.map(
@@ -974,39 +1012,41 @@ export const layerWithOptions = (
       ) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.void
-          : outbox
-              .retry({
-                effectId: effect.id,
-                workerId,
-                error: refundAttempt
-                  ? "Resuming after restart"
-                  : `Worker failed before settling the claimed effect: ${Cause.pretty(cause)}`,
-                delayMs: 0,
-                steerAccepted:
-                  effect.request.type === "provider-turn.steer" &&
-                  effect.request.providerAccepted === true,
-                refundAttempt,
-              })
-              .pipe(
-                Effect.flatMap((requeued) =>
-                  requeued
-                    ? Effect.logWarning("Requeued effect after unexpected worker failure", {
-                        effectId: effect.id,
-                        effectType: effect.request.type,
-                      })
-                    : Effect.logWarning("Could not requeue effect after worker lost its lease", {
-                        effectId: effect.id,
-                        effectType: effect.request.type,
-                      }),
-                ),
-                Effect.catchCause((requeueCause) =>
-                  Effect.logError("Failed to requeue effect after unexpected worker failure", {
-                    effectId: effect.id,
-                    effectType: effect.request.type,
-                    error: Cause.pretty(requeueCause),
-                  }),
-                ),
-              );
+          : !refundAttempt && isAcceptance(effect) && effect.attemptCount >= maxAcceptedAttempts
+            ? terminalizeClaim(effect, cause)
+            : outbox
+                .retry({
+                  effectId: effect.id,
+                  workerId,
+                  error: refundAttempt
+                    ? "Resuming after restart"
+                    : `Worker failed before settling the claimed effect: ${Cause.pretty(cause)}`,
+                  delayMs: 0,
+                  steerAccepted:
+                    effect.request.type === "provider-turn.steer" &&
+                    effect.request.providerAccepted === true,
+                  refundAttempt,
+                })
+                .pipe(
+                  Effect.flatMap((requeued) =>
+                    requeued
+                      ? Effect.logWarning("Requeued effect after unexpected worker failure", {
+                          effectId: effect.id,
+                          effectType: effect.request.type,
+                        })
+                      : Effect.logWarning("Could not requeue effect after worker lost its lease", {
+                          effectId: effect.id,
+                          effectType: effect.request.type,
+                        }),
+                  ),
+                  Effect.catchCause((requeueCause) =>
+                    Effect.logError("Failed to requeue effect after unexpected worker failure", {
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      error: Cause.pretty(requeueCause),
+                    }),
+                  ),
+                );
       const terminalizeClaim = (
         effect: EffectOutbox.OrchestrationEffectV2,
         cause: Cause.Cause<unknown>,
@@ -1016,32 +1056,26 @@ export const layerWithOptions = (
           .fail({
             effectId: effect.id,
             workerId,
-            error: `Worker failed to settle a process-bound effect after execution started: ${Cause.pretty(cause)}`,
+            error: `Worker failed to settle an effect after execution started: ${Cause.pretty(cause)}`,
           })
           .pipe(
             Effect.flatMap((failed) =>
               failed
-                ? Effect.logError("Terminalized process-bound effect after settlement failure", {
+                ? Effect.logError("Terminalized effect after settlement failure", {
                     effectId: effect.id,
                     effectType: effect.request.type,
                   })
-                : Effect.logWarning(
-                    "Could not terminalize process-bound effect after worker lost its lease",
-                    {
-                      effectId: effect.id,
-                      effectType: effect.request.type,
-                    },
-                  ),
+                : Effect.logWarning("Could not terminalize effect after worker lost its lease", {
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                  }),
             ),
             Effect.catchCause((failCause) =>
-              Effect.logError(
-                "Failed to terminalize process-bound effect after settlement failure",
-                {
-                  effectId: effect.id,
-                  effectType: effect.request.type,
-                  error: Cause.pretty(failCause),
-                },
-              ),
+              Effect.logError("Failed to terminalize effect after settlement failure", {
+                effectId: effect.id,
+                effectType: effect.request.type,
+                error: Cause.pretty(failCause),
+              }),
             ),
           );
       };
@@ -1057,26 +1091,43 @@ export const layerWithOptions = (
 
       // The worker probes for work repeatedly, including when the outbox is empty.
       const runOnce = Effect.fnUntraced(
-        function* (excludeRestartContinuations = false, controlLane = false, threadId?: ThreadId) {
+        function* (
+          excludeRestartContinuations = false,
+          lane: "general" | "control" | "start" = "general",
+          threadId?: ThreadId,
+        ) {
+          if (lane === "start") {
+            // Idle lane probes must not queue write claims behind useful work.
+            // The claim remains authoritative if another worker wins after this read.
+            const next = yield* outbox.nextStartClaimableAt;
+            if (
+              Option.isNone(next) ||
+              DateTime.toEpochMillis(next.value) > DateTime.toEpochMillis(yield* DateTime.now)
+            )
+              return false;
+          }
           const claimExit = yield* Effect.exit(
             outbox.claimNext({
               workerId,
               ...(threadId === undefined ? {} : { threadId }),
               leaseDurationMs,
               excludeRestartContinuations,
-              ...(controlLane
+              ...(lane === "control"
                 ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES }
-                : threadId !== undefined
-                  ? {
-                      onlyEffectTypes: [
-                        "provider-runtime.continue",
-                        "provider-turn.start",
-                      ] as const,
-                    }
-                  : {}),
+                : lane === "start"
+                  ? { onlyEffectTypes: EffectOutbox.START_LANE_EFFECT_TYPES }
+                  : threadId !== undefined
+                    ? {
+                        onlyEffectTypes: [
+                          "provider-runtime.continue",
+                          "provider-turn.start",
+                        ] as const,
+                      }
+                    : {}),
             }),
           );
           yield* increment(orchestrationEffectClaimsTotal, {
+            lane,
             result: Exit.isFailure(claimExit)
               ? "error"
               : Option.isNone(claimExit.value)
@@ -1121,9 +1172,16 @@ export const layerWithOptions = (
           }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
           if (cancelledBeforeExecution) return true;
 
+          // Accepted input cannot be resent; give its bookkeeping a separate bounded budget.
+          const acceptance = isAcceptance(effect);
           const execution = executor
-            .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
-            .pipe(Effect.as("executed" as const));
+            .execute(effect, {
+              willRetry: effect.attemptCount < (acceptance ? maxAcceptedAttempts : maxAttempts),
+            })
+            .pipe(
+              Effect.provideService(EffectOutbox.ExecutingEffect, effect),
+              Effect.as("executed" as const),
+            );
           const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
             Effect.ensuring(outbox.clearCancellation(effect.id)),
           );
@@ -1187,7 +1245,8 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
+            : effect.attemptCount >=
+                (acceptance || acceptedSteer ? maxAcceptedAttempts : maxAttempts)
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
@@ -1213,7 +1272,7 @@ export const layerWithOptions = (
         (
           effect,
           _excludeRestartContinuations?: boolean,
-          _controlLane?: boolean,
+          _lane?: "general" | "control" | "start",
           _threadId?: ThreadId,
         ) =>
           effect.pipe(
@@ -1228,10 +1287,12 @@ export const layerWithOptions = (
       return OrchestrationEffectWorkerV2.of({
         awaitWork: outbox.awaitAvailable,
         awaitControlWork: outbox.awaitControlAvailable,
+        awaitStartWork: outbox.awaitStartAvailable,
         runOnce: runOnce(),
-        runThreadOnce: (threadId) => runOnce(false, false, threadId),
+        runThreadOnce: (threadId) => runOnce(false, "general", threadId),
         runRecoveryOnce: runOnce(true),
-        runControlOnce: runOnce(false, true),
+        runControlOnce: runOnce(false, "control"),
+        runStartOnce: runOnce(false, "start"),
         nextClaimableAt: outbox.nextClaimableAt.pipe(
           Effect.mapError(
             (cause) =>
@@ -1242,6 +1303,11 @@ export const layerWithOptions = (
           ),
         ),
         nextControlClaimableAt: outbox.nextControlClaimableAt.pipe(
+          Effect.mapError(
+            (cause) => new OrchestrationEffectWorkerError({ operation: "next-claimable", cause }),
+          ),
+        ),
+        nextStartClaimableAt: outbox.nextStartClaimableAt.pipe(
           Effect.mapError(
             (cause) => new OrchestrationEffectWorkerError({ operation: "next-claimable", cause }),
           ),
@@ -1262,11 +1328,13 @@ export const layer = layerWithOptions();
 export interface OrchestrationEffectDaemonOptions {
   readonly concurrency?: number;
   readonly controlLaneConcurrency?: number;
+  readonly startLaneConcurrency?: number;
   readonly livenessPollIntervalMs?: number;
 }
 
 const DEFAULT_EFFECT_WORKER_CONCURRENCY = 4;
 const DEFAULT_CONTROL_LANE_CONCURRENCY = 1;
+const DEFAULT_START_LANE_CONCURRENCY = 10;
 const DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS = 30_000;
 
 export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions = {}) =>
@@ -1282,6 +1350,11 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       const controlLaneConcurrency = Number.isFinite(requestedControlConcurrency)
         ? Math.max(0, Math.floor(requestedControlConcurrency))
         : DEFAULT_CONTROL_LANE_CONCURRENCY;
+      const requestedStartConcurrency =
+        options.startLaneConcurrency ?? DEFAULT_START_LANE_CONCURRENCY;
+      const startLaneConcurrency = Number.isFinite(requestedStartConcurrency)
+        ? Math.max(0, Math.floor(requestedStartConcurrency))
+        : DEFAULT_START_LANE_CONCURRENCY;
       const requestedLivenessPollIntervalMs =
         options.livenessPollIntervalMs ?? DEFAULT_EFFECT_WORKER_LIVENESS_POLL_INTERVAL_MS;
       const livenessPollIntervalMs = Number.isFinite(requestedLivenessPollIntervalMs)
@@ -1290,9 +1363,30 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
       // Post-commit notifications are the low-latency path. `availableAt` is the
       // durable retry schedule, and the long liveness poll only recovers from a
       // missed in-process notification or work inserted by another process.
-      const runWorker = Effect.fn("EffectWorker.runWorker")(function* (controlLane: boolean) {
+      const runWorker = Effect.fn("EffectWorker.runWorker")(function* (
+        lane: "general" | "control" | "start",
+      ) {
+        const run =
+          lane === "start"
+            ? worker.runStartOnce
+            : lane === "control"
+              ? worker.runControlOnce
+              : worker.runOnce;
+        const next =
+          lane === "start"
+            ? worker.nextStartClaimableAt
+            : lane === "control"
+              ? worker.nextControlClaimableAt
+              : worker.nextClaimableAt;
+        const awaitWork =
+          lane === "start"
+            ? worker.awaitStartWork
+            : lane === "control"
+              ? worker.awaitControlWork
+              : worker.awaitWork;
+        yield* Effect.annotateCurrentSpan("lane", lane);
         while (true) {
-          const outcome = yield* (controlLane ? worker.runControlOnce : worker.runOnce).pipe(
+          const outcome = yield* run.pipe(
             Effect.map((worked) => (worked ? ("worked" as const) : ("idle" as const))),
             Effect.catchCause((cause) =>
               Effect.logWarning("Orchestration effect worker failed", cause).pipe(
@@ -1312,9 +1406,7 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             continue;
           }
 
-          const nextClaimableAt = yield* (
-            controlLane ? worker.nextControlClaimableAt : worker.nextClaimableAt
-          ).pipe(
+          const nextClaimableAt = yield* next.pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning(
                 "Failed to read the next orchestration effect deadline",
@@ -1331,9 +1423,7 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
             },
           });
           yield* Effect.raceFirst(
-            (controlLane ? worker.awaitControlWork : worker.awaitWork).pipe(
-              Effect.as("notified" as const),
-            ),
+            awaitWork.pipe(Effect.as("notified" as const)),
             Effect.sleep(Duration.millis(sleepMs)).pipe(Effect.as("scheduled" as const)),
           );
         }
@@ -1341,8 +1431,9 @@ export const runDaemonWithOptions = (options: OrchestrationEffectDaemonOptions =
 
       return yield* Effect.all(
         [
-          ...Array.from({ length: concurrency }, () => runWorker(false)),
-          ...Array.from({ length: controlLaneConcurrency }, () => runWorker(true)),
+          ...Array.from({ length: concurrency }, () => runWorker("general")),
+          ...Array.from({ length: controlLaneConcurrency }, () => runWorker("control")),
+          ...Array.from({ length: startLaneConcurrency }, () => runWorker("start")),
         ],
         {
           concurrency: "unbounded",
