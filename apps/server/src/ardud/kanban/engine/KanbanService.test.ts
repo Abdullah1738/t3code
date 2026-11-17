@@ -49940,6 +49940,125 @@ it.effect.each(["attachment", "abandonment"] as const)(
     }),
 );
 
+it.effect.each(
+  (["completed", "deployed"] as const).flatMap((stage) =>
+    (["direct", "queued"] as const).flatMap((path) =>
+      (["timeout", "transport", "acknowledgement", null] as const).flatMap((reason) =>
+        [false, true].map((restart) => ({ stage, path, reason, restart })),
+      ),
+    ),
+  ),
+)(
+  "unconfirmed idle evaluator holds direct and queued backstops ($stage, $path, $reason, restart=$restart)",
+  ({ stage, path, reason, restart }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Unconfirmed idle evaluator",
+            prompt: "Finish",
+            subtasks: [{ owner: "evaluator", text: "Finish" }],
+          },
+          owner,
+        );
+        yield* store.putCard({ ...card, stage });
+        yield* TestClock.adjust("7 hours");
+        if (path === "queued") {
+          for (let index = 0; index < 12; index++)
+            yield* kanban.submitEvaluator(
+              board.id,
+              { kind: "request", text: `Capacity ${index}` },
+              { forceNew: true },
+            );
+          for (const id of (yield* Ref.get(fake.threads)).keys()) yield* setArchived(fake, id);
+          yield* kanban.tick;
+          const sql = yield* SqlClient.SqlClient;
+          assert.lengthOf(
+            yield* sql`SELECT id FROM ardud_kanban_evaluator_queue WHERE job_key LIKE 'idle-evaluator:%' AND done_at IS NULL`,
+            1,
+          );
+        }
+        const evaluator = ThreadId.make("uncertain-idle-evaluator");
+        yield* Ref.update(fake.threads, (all) =>
+          new Map(all).set(evaluator, {
+            title: "Evaluator",
+            model: board.evaluatorModel,
+            messages: [],
+            running: false,
+            archived: false,
+          }),
+        );
+        yield* store.putThreadLink({
+          threadId: evaluator,
+          boardId: board.id,
+          cardId: card.id,
+          role: "evaluator",
+          purpose: "discussion",
+          discussionId: null,
+          model: board.evaluatorModel,
+          startedAt: card.createdAt,
+          endedAt: null,
+          paused: null,
+        });
+        if (reason !== null)
+          fake.failures.set(
+            evaluator,
+            makeProviderFailure({
+              cause: new ProviderPromptAcceptanceError({
+                driver: ProviderDriverKind.make("opencode"),
+                serverOrigin: "http://opencode.test",
+                reason,
+                budgetSeconds: 60,
+              }),
+            }),
+          );
+        const before = yield* Ref.get(fake.threads);
+        const messages = new Map([...before].map(([id, thread]) => [id, [...thread.messages]]));
+        const check = Effect.gen(function* () {
+          const service = yield* KanbanService.KanbanService;
+          yield* service.ready;
+          yield* TestClock.adjust("7 hours");
+          yield* service.tick;
+          const after = yield* Ref.get(fake.threads);
+          if (reason === null) {
+            assert.isTrue(
+              after.size > messages.size ||
+                [...after].some(
+                  ([id, thread]) => thread.messages.length > (messages.get(id)?.length ?? 0),
+                ),
+            );
+            return;
+          }
+          assert.deepEqual([...after.keys()], [...messages.keys()]);
+          for (const [id, thread] of after) assert.deepEqual(thread.messages, messages.get(id));
+          assert.isNull((yield* service.card(card.id)).card.stalled);
+          if (path === "queued") {
+            const sql = yield* SqlClient.SqlClient;
+            assert.lengthOf(
+              yield* sql`SELECT id FROM ardud_kanban_evaluator_queue WHERE job_key LIKE 'idle-evaluator:%' AND done_at IS NULL`,
+              1,
+            );
+          }
+          fake.failures.delete(evaluator);
+          yield* service.tick;
+          const reconciled = yield* Ref.get(fake.threads);
+          assert.isTrue(
+            reconciled.size > messages.size ||
+              [...reconciled].some(
+                ([id, thread]) => thread.messages.length > (messages.get(id)?.length ?? 0),
+              ),
+          );
+        });
+        yield* restart ? check.pipe(Effect.provide(Layer.fresh(KanbanService.layer))) : check;
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect.each([
   "live evaluator",
   "intervening activity",
