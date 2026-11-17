@@ -1281,37 +1281,43 @@ export const make = Effect.gen(function* () {
     // Keyed by (cwd, branch) only: the upstream ref changing (e.g. a first
     // `push -u`) must not orphan the fallback value for the same branch.
     const branchKey = `${cwd}\u0000${details.branch}`;
-    const discovery = yield* repositoryDiscovery.read(cwd, details.branch);
-    const cacheKey = prLookupCacheKey(cwd, { ...details, discoverySignature: discovery.signature });
-    if (refreshMissingPullRequest) {
-      const cached = yield* Cache.getOption(prLookupCache, cacheKey).pipe(
-        Effect.orElseSucceed(() => Option.none()),
-      );
-      if (Option.isSome(cached) && cached.value.latest === null) {
-        yield* Cache.invalidate(prLookupCache, cacheKey);
-      }
-    }
-    return yield* getPrLookup(cacheKey).pipe(
-      Effect.map(({ latest, headContext }) => {
-        if (!latest) return { pr: null, headContext };
-        // Merged/closed matches are usually reverse-merge history, not the thread's PR context.
-        if (details.isDefaultBranch && latest.state !== "open") {
-          return { pr: null, headContext };
+    return yield* Effect.gen(function* () {
+      const discovery = yield* repositoryDiscovery.read(cwd, details.branch);
+      const cacheKey = prLookupCacheKey(cwd, {
+        ...details,
+        discoverySignature: discovery.signature,
+      });
+      if (refreshMissingPullRequest) {
+        const cached = yield* Cache.getOption(prLookupCache, cacheKey).pipe(
+          Effect.orElseSucceed(() => Option.none()),
+        );
+        if (Option.isSome(cached) && cached.value.latest === null) {
+          yield* Cache.invalidate(prLookupCache, cacheKey);
         }
-        return { pr: toStatusPr(latest), headContext };
-      }),
-      Effect.tap(({ pr, headContext }) =>
-        Effect.sync(() =>
-          rememberLastKnownPr(branchKey, {
-            pr,
-            upstreamRef: details.upstreamRef,
-            headBranch: headContext.headBranch,
-            remoteName: headContext.remoteName,
-            headRemoteUrlKey: headContext.headRemoteUrlKey,
-          }),
+      }
+      return yield* getPrLookup(cacheKey).pipe(
+        Effect.map(({ latest, headContext }) => {
+          if (!latest) return { pr: null, headContext };
+          // Merged/closed matches are usually reverse-merge history, not the thread's PR context.
+          if (details.isDefaultBranch && latest.state !== "open") {
+            return { pr: null, headContext };
+          }
+          return { pr: toStatusPr(latest), headContext };
+        }),
+        Effect.tap(({ pr, headContext }) =>
+          Effect.sync(() =>
+            rememberLastKnownPr(branchKey, {
+              pr,
+              upstreamRef: details.upstreamRef,
+              headBranch: headContext.headBranch,
+              remoteName: headContext.remoteName,
+              headRemoteUrlKey: headContext.headRemoteUrlKey,
+            }),
+          ),
         ),
-      ),
-      Effect.map(({ pr }) => pr),
+        Effect.map(({ pr }) => pr),
+      );
+    }).pipe(
       Effect.catch((error) => {
         const fallback = lastKnownPrByBranchKey.get(branchKey)?.pr
           ? resolveLookupHeadContext(cwd, details).pipe(
@@ -1323,6 +1329,9 @@ export const make = Effect.gen(function* () {
                   headRemoteUrlKey: headContext.headRemoteUrlKey,
                 }),
               ),
+              // Metadata failures must not fail the remote-status refresh, and
+              // an unverified identity cannot safely retain the previous PR.
+              Effect.orElseSucceed(() => null),
             )
           : Effect.succeed(null);
         return Effect.logWarning("PR lookup failed.").pipe(

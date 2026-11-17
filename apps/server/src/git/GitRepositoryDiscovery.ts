@@ -41,6 +41,9 @@ export class GitRepositoryDiscovery extends Context.Service<
 >()("t3/git/GitRepositoryDiscovery") {}
 
 const CAPACITY = 2_048;
+// Like listRefs, this scans the whole repository; seven fields exceed the
+// default command budget even at 12,000 ordinary remote-tracking refs.
+const REFS_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 const encodeSignature = Schema.encodeSync(
   Schema.fromJsonString(Schema.Array(Schema.Array(Schema.String))),
 );
@@ -377,6 +380,7 @@ export const make = Effect.gen(function* () {
           const output = yield* git.execute({
             operation: "GitRepositoryDiscovery.refs",
             cwd,
+            maxOutputBytes: REFS_MAX_OUTPUT_BYTES,
             args: [
               "for-each-ref",
               "--format=%(refname)%00%(objectname)%00%(upstream:short)%00%(upstream:remotename)%00%(upstream:remoteref)%00%(symref)%00%(upstream)",

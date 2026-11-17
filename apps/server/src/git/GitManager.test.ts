@@ -731,6 +731,10 @@ function makeManager(input?: {
   serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   setupScriptRunner?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"];
   gitConfigReads?: string[];
+  gitExecute?: (
+    input: GitVcsDriver.ExecuteGitInput,
+    execute: GitVcsDriver.GitVcsDriver["Service"]["execute"],
+  ) => ReturnType<GitVcsDriver.GitVcsDriver["Service"]["execute"]>;
   gitCommands?: string[];
   environment?: NodeJS.ProcessEnv;
   gitSpawnGate?: {
@@ -787,22 +791,27 @@ function makeManager(input?: {
         }),
       ).pipe(Layer.provide(NodeServices.layer))
     : Layer.empty;
-  const gitVcsDriver = input?.gitConfigReads
-    ? Layer.effect(
-        GitVcsDriver.GitVcsDriver,
-        GitVcsDriver.make.pipe(
-          Effect.map((service) =>
-            GitVcsDriver.GitVcsDriver.of({
-              ...service,
-              readConfigValue: (cwd, key) =>
-                Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
-                  Effect.andThen(service.readConfigValue(cwd, key)),
-                ),
-            }),
+  const gitVcsDriver =
+    input?.gitConfigReads || input?.gitExecute
+      ? Layer.effect(
+          GitVcsDriver.GitVcsDriver,
+          GitVcsDriver.make.pipe(
+            Effect.map((service) =>
+              GitVcsDriver.GitVcsDriver.of({
+                ...service,
+                execute: (request) =>
+                  input.gitExecute
+                    ? input.gitExecute(request, service.execute)
+                    : service.execute(request),
+                readConfigValue: (cwd, key) =>
+                  Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
+                    Effect.andThen(service.readConfigValue(cwd, key)),
+                  ),
+              }),
+            ),
           ),
-        ),
-      )
-    : GitVcsDriver.layer;
+        )
+      : GitVcsDriver.layer;
   const layerVcsDriver = (watchesGitSpawns ? Layer.fresh(gitVcsDriver) : gitVcsDriver).pipe(
     Layer.provide(layerGitDriverSpawner),
     Layer.provideMerge(VcsProcess.layer),
@@ -1333,6 +1342,170 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       yield* manager.invalidateStatus(repoDir);
       yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/shared-pr" });
       expect(gitCommands.filter((command) => command.startsWith("config "))).toHaveLength(2);
+    }),
+  );
+
+  it.effect.each([
+    { label: "small", count: 1_000, suffix: "branch" },
+    { label: "12,000 refs", count: 12_000, suffix: "branch" },
+    { label: "long names", count: 12_000, suffix: "branch-" + "x".repeat(180) },
+    { label: "UTF-8 names", count: 12_000, suffix: "branch-" + "界".repeat(60) },
+    { label: "over 16 MiB", count: 12_000, suffix: "segment/".repeat(180) + "branch" },
+  ])("batched discovery supports $label through branch PR and remote status", (row) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const repoDir = yield* makeTempDir("t3code-large-discovery-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/large"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/large"]);
+      const oid = (yield* runGit(repoDir, ["rev-parse", "HEAD"])).stdout.trim();
+      const names = Array.from(
+        { length: row.count },
+        (_, index) => `refs/remotes/origin/feature/${row.suffix}-${String(index).padStart(5, "0")}`,
+      ).sort();
+      yield* fs.writeFileString(
+        NodePath.join(repoDir, ".git", "packed-refs"),
+        "# pack-refs with: sorted\n" + names.map((name) => `${oid} ${name}\n`).join(""),
+      );
+      const discoveryBytes: number[] = [];
+      const { manager, ghCalls } = yield* makeManager({
+        ghScenario: {
+          prListByHeadSelector: {
+            "feature/large": encodeCliJson([
+              {
+                number: 395,
+                title: "Large refs",
+                url: "https://github.com/pingdotgg/codething-mvp/pull/395",
+                baseRefName: "main",
+                headRefName: "feature/large",
+                state: "OPEN",
+                updatedAt: "2026-11-17T00:00:00Z",
+              },
+            ]),
+          },
+        },
+        gitExecute: (input, execute) =>
+          execute(input).pipe(
+            Effect.tap((result) =>
+              Effect.sync(() => {
+                if (input.operation === "GitRepositoryDiscovery.refs")
+                  discoveryBytes.push(new TextEncoder().encode(result.stdout).byteLength);
+              }),
+            ),
+          ),
+      });
+      if (row.label === "over 16 MiB") {
+        const error = yield* manager
+          .branchPullRequest({ cwd: repoDir, branch: "feature/large" })
+          .pipe(Effect.match({ onSuccess: () => null, onFailure: (error) => error }));
+        expect(error).toMatchObject({
+          _tag: "GitCommandError",
+          operation: "GitRepositoryDiscovery.refs",
+        });
+        expect(
+          yield* manager.remoteStatus({ cwd: repoDir }, { refreshUpstream: false }),
+        ).toMatchObject({
+          hasUpstream: true,
+          aheadCount: 0,
+          behindCount: 0,
+          pr: null,
+        });
+        expect(discoveryBytes).toEqual([]);
+        expect(ghCalls).toEqual([]);
+        yield* fs.writeFileString(
+          NodePath.join(repoDir, ".git", "packed-refs"),
+          "# pack-refs with: sorted\n",
+        );
+        expect(
+          (yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/large" }))?.number,
+        ).toBe(395);
+        return;
+      }
+      const pr = yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/large" });
+      expect(pr?.number).toBe(395);
+      expect(discoveryBytes).toHaveLength(1);
+      if (row.count === 12_000) expect(discoveryBytes[0]).toBeGreaterThan(1_000_000);
+      else expect(discoveryBytes[0]).toBeLessThan(1_000_000);
+      expect(
+        (yield* manager.remoteStatus({ cwd: repoDir }, { refreshUpstream: false }))?.pr?.number,
+      ).toBe(395);
+      yield* TestClock.adjust("5 minutes");
+      expect(
+        (yield* manager.branchPullRequest({ cwd: repoDir, branch: "feature/large" }))?.number,
+      ).toBe(395);
+      expect(discoveryBytes).toHaveLength(1);
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(2);
+    }),
+  );
+
+  it.effect.each([
+    { operation: "config", failure: "limit" },
+    { operation: "refs", failure: "limit" },
+    { operation: "config", failure: "truncated" },
+    { operation: "refs", failure: "truncated" },
+  ])("remote status survives $operation discovery $failure and recovers", (row) =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-discovery-failure-");
+      yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/discovery-failure"]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/discovery-failure"]);
+      let failing = true;
+      let rejected = 0;
+      const { manager, ghCalls } = yield* makeManager({
+        ghScenario: {
+          prListByHeadSelector: {
+            "feature/discovery-failure": encodeCliJson([
+              {
+                number: 395,
+                title: "Discovery recovers",
+                url: "https://github.com/pingdotgg/codething-mvp/pull/395",
+                baseRefName: "main",
+                headRefName: "feature/discovery-failure",
+                state: "OPEN",
+                updatedAt: "2026-11-17T00:00:00Z",
+              },
+            ]),
+          },
+        },
+        gitExecute: (input, execute) =>
+          Effect.suspend(() => {
+            if (!failing || input.operation !== `GitRepositoryDiscovery.${row.operation}`)
+              return execute(input);
+            rejected++;
+            return row.failure === "limit"
+              ? Effect.fail(
+                  new GitCommandError({
+                    operation: input.operation,
+                    cwd: input.cwd,
+                    command: "git",
+                    detail: "Git output exceeded its byte budget.",
+                  }),
+                )
+              : Effect.succeed({ ...fakeGhOutput("partial"), stdoutTruncated: true });
+          }),
+      });
+      const read = manager.remoteStatus({ cwd: repoDir }, { refreshUpstream: false });
+      expect(yield* read).toMatchObject({
+        hasUpstream: true,
+        aheadCount: 0,
+        behindCount: 0,
+        pr: null,
+      });
+      expect(rejected).toBeGreaterThan(0);
+      expect(ghCalls).toHaveLength(0);
+      failing = false;
+      yield* manager.invalidateStatus(repoDir);
+      expect((yield* read)?.pr?.number).toBe(395);
+      failing = true;
+      yield* manager.invalidateStatus(repoDir);
+      // A previous PR must not leak through when its current repository identity
+      // cannot be verified. Neither the lookup nor its fallback may fail status.
+      expect((yield* read)?.pr).toBeNull();
     }),
   );
 
