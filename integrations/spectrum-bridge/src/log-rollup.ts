@@ -1,8 +1,9 @@
 import type { LogLine } from "./toollog.ts";
 import { callName, percentiles } from "./log-calls.ts";
+import { createRobobLinkAggregation } from "./log-robob-link.ts";
 import { createChainAggregation } from "./log-chains.ts";
 
-export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>, renderLines: LogLine[] = []) {
+export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: AsyncIterable<LogLine>, renderLines: LogLine[] = [], requestedDay?: string) {
   const countsByName: Record<string, number> = Object.create(null);
   const countsByKind: Record<string, number> = { event: 0, perf: 0, error: 0 };
   const durations = new Map<string, Map<number, number>>();
@@ -13,6 +14,8 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const represented = new Set<string>();
   const individualCalls: LogLine[] = [];
   const chainAggregation = createChainAggregation();
+  const robobLink = createRobobLinkAggregation();
+  let day = requestedDay;
   const firstReplies = new Map<number, number>();
   const alerts = new Set<string>();
   let overdue = 0, requeued_by_watchdog = 0, answered_late = 0;
@@ -65,7 +68,9 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     observeError(line);
   }
   for await (const line of lines) {
+    day ??= line.ts.slice(0, 10);
     recordedRows++;
+    robobLink.accept(line);
     chainAggregation.accept(line);
     if (line.name === "inbound.overdue") overdue++;
     if (line.name === "inbound.watchdog_requeued") requeued_by_watchdog++;
@@ -90,7 +95,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     consume({ ...line, name: "card.render", renders: undefined }, line.renders.count, line.renders.count, 0, line.renders.histogram);
   }
   // Later days complete this day's receipts without moving their event counts into this day.
-  if (laterLines) for await (const line of laterLines) chainAggregation.accept(line, true);
+  if (laterLines) for await (const line of laterLines) { chainAggregation.accept(line, true); robobLink.accept(line); }
   // Slow/failed rows remain readable, but their batch histogram already counts them.
   for (const line of individualCalls) {
     if (!line.ids?.callBatchId || !represented.has(`${line.ids.callBatchId}\0${callName(line)}`)) consume(line);
@@ -106,7 +111,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
       ...(stats.histogram.size ? { durationMs: percentiles(stats.histogram) } : {}),
     };
   }
-  return { overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: percentiles(firstReplies), total, recordedRows, countsByName, countsByKind, ok, failed,
+  return { robob_link: robobLink.summary(day), overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: percentiles(firstReplies), total, recordedRows, countsByName, countsByKind, ok, failed,
     okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countsByKind.error + failedCalls) / total : 0,
     durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
     topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20), chains: chainAggregation.summary(),

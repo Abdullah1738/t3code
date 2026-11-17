@@ -265,7 +265,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const replyGap = new ReplyGapMonitor(chat.store, { chat: chat.info.slug, notify: outlet.notify });
     return { router, delivery, replyGap, api: chatApi, backend: chatBackend, busy: false };
   };
-  registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build });
+  registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build, backend: kind });
   registry.restore();
   if (remoteBoxConfig(config, "moni") && !registry.bySlugName("moni")) {
     const person = access.people.find(person => person.name.toLowerCase() === "moni");

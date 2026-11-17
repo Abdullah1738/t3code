@@ -2,6 +2,7 @@ import { markReactionAnswered } from "./unanswered.ts";
 import type { RemoteBox } from "./remote-box.ts";
 import { RemoteRequestError } from "./remote-box.ts";
 import { validId } from "./remote-protocol.ts";
+import type { BackendKind } from "./backend.ts";
 import { messageLengthError } from "./message-length.ts";
 import { toolError, toolLog } from "./toollog.ts";
 /**
@@ -60,6 +61,7 @@ export type RegistryOptions<P> = {
   stateRoot: string;
   access: () => Access;
   build: (chat: ChatCore) => P;
+  backend?: BackendKind;
   now?: () => number;
 };
 
@@ -143,7 +145,8 @@ export class ChatRegistry<P> {
               const message = input as { attachments?: { totalBytes?: number }[]; sentAt?: number; logSource?: string };
               toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: chat.info.slug, messageId: id },
                 props: { bytesKnown: !message.attachments?.length || message.attachments.every(a => (a.totalBytes ?? 0) > 0), attachmentCount: message.attachments?.length ?? 0, attachmentBytes: (message.attachments ?? []).reduce((n, a) => n + (a.totalBytes ?? 0), 0),
-                  receiveLagMs: Math.max(0, this.now() - (message.sentAt ?? this.now())), source: message.logSource === "backfill" ? "backfill" : "live" } }));
+                  receiveLagMs: Math.max(0, this.now() - (message.sentAt ?? this.now())), source: message.logSource === "backfill" ? "backfill" : "live",
+                  backend: chat.remote ? "remote-box" : this.options.backend ?? "unknown" } }));
               this.touch(chat); received?.(chat, input);
             }
             return created;

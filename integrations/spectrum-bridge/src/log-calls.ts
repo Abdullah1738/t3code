@@ -82,7 +82,7 @@ export function createCallAggregation(processRunId: string) {
     }
     return lines;
   }
-  function accept(line: LogLine, explicitRun: boolean): LogLine[] {
+  function accept(line: LogLine, explicitRun: boolean, keepDetail = true): LogLine[] {
     const output: LogLine[] = [];
     if (day && day !== line.ts.slice(0, 10)) output.push(...flush());
     day = line.ts.slice(0, 10);
@@ -105,6 +105,9 @@ export function createCallAggregation(processRunId: string) {
         let group = groups.get(runId);
         if (!group) {
           group = { ids: { ...(runId === processRunId ? {} : line.ids), runId, callBatchId: randomUUID() }, ts: line.ts, calls: new Map() };
+          delete group.ids.requestId;
+          delete group.ids.serverRequestId;
+          delete group.ids.outageId;
           groups.set(runId, group);
         }
         group.ts = line.ts;
@@ -125,7 +128,7 @@ export function createCallAggregation(processRunId: string) {
           const key = `${runId}\0${name}`;
           const timestamps = (slowRows.get(key) ?? []).filter(time => time > at - SLOW_WINDOW_MS);
           slowRows.set(key, timestamps);
-          if (timestamps.length >= SLOW_ROW_LIMIT) { stats.suppressedSlow++; return output; }
+          if (timestamps.length >= SLOW_ROW_LIMIT && line.props?.linkRecovery !== true) { stats.suppressedSlow++; return output; }
           timestamps.push(at);
         }
       }
@@ -135,7 +138,7 @@ export function createCallAggregation(processRunId: string) {
       if (thread && active.get(thread)?.runId === line.ids?.runId) active.delete(thread);
     }
     if (line.name === "bridge.stop") { output.push(...flush()); active.clear(); slowRows.clear(); }
-    output.push(line);
+    if (keepDetail || line.name !== "turn.robob_call") output.push(line);
     return output;
   }
   return { accept, flush, ids };

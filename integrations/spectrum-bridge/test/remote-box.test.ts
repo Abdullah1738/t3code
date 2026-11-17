@@ -14,6 +14,8 @@ import { captureLogs } from "./log-fixture.ts";
 import { fenceOwnerAlert, notificationAccepted } from "../src/telegram-fallback.ts";
 import { createApi as createTelegramApi } from "../../telegram-bridge/src/api.ts";
 import { Store as TelegramStore } from "../../telegram-bridge/src/store.ts";
+import { toolLog } from "../src/toollog.ts";
+import { summarizeLog } from "../src/log-rollup.ts";
 const roots: string[] = [], closes: (() => void)[] = [];
 afterEach(() => { closes.splice(0).forEach(f => f()); roots.splice(0).forEach(p => rmSync(p, { recursive: true, force: true })); });
 function setup() {
@@ -416,6 +418,34 @@ test("scoped API rejects owner routes, missing tokens, forged identities and cro
   const request = await api(s.request("/agent-ask", { to: "owner", text: "question", dedupeKey: "one", operationId: opaqueId("ask") }));
   expect(request.status).toBe(202);
 });
+test("Moni remote-box receipt and delivered reply never wait on a local Robob outage", async () => {
+  const s = setup(), ownerStore = new Store(join(s.mac, "owner.sqlite")); closes.push(() => ownerStore.close());
+  const key = chatKey.dm("+15555550199");
+  const registry = new ChatRegistry({ owner: "+15555550123", ownerStore, stateRoot: s.mac, line: s.line, backend: "robob",
+    access: () => ({ people: [{ name: "Moni", role: "admin", addresses: ["+15555550199"] }], groups: [] }),
+    build: chat => { if (chat.info.slug === "moni") chat.remote = s.remote; return {}; } });
+  const moni = registry.open(key); closes.push(() => moni.store.close());
+  const call = (ok: boolean) => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok, durationMs: 10,
+    props: { method: "GET", route: "/threads/:id/messages", ...(ok ? {} : { linkCause: "ECONNREFUSED" }), failureFormat: "single" } });
+  const rows = await captureLogs(async () => {
+    call(true);
+    for (let i = 0; i < 3; i++) call(false);
+    try {
+      const sink = registry.sink(async () => {}).acceptInto(key, undefined, "+15555550199");
+      expect(sink.accept({ id: "remote-inbound", text: "PRIVATE_MONI_MESSAGE", attachments: [] })).toBe(true);
+      expect(await s.remote.send(opaqueId("remote-reply"), "PRIVATE_MONI_REPLY", undefined, s.line, key)).toMatchObject({ handle: "sent" });
+    } finally { call(true); }
+  });
+  expect(rows.find(row => row.name === "msg.received")?.props?.backend).toBe("remote-box");
+  expect(rows.some(row => row.name === "moni-reply-sent")).toBe(true);
+  expect(rows.find(row => row.name === "robob.link_up")?.link).toMatchObject({ inboundReceivedDuringOutage: 0, inboundAnsweredAfter: 0, inboundAnsweredDuringOutage: 0 });
+  const rollup = await summarizeLog((async function* () { yield* rows; })());
+  expect(rollup.robob_link.messagesWaiting).toBe(0);
+  expect(rollup.robob_link.outages).toHaveLength(1);
+  expect(rollup.robob_link.outages[0]).toMatchObject({ inboundReceivedDuringOutage: 0, inboundAnsweredAfter: 0, inboundAnsweredDuringOutage: 0 });
+  expect(JSON.stringify(rows)).not.toContain("PRIVATE_MONI_");
+});
+
 test("callback send dedupe and ambiguous-send reconciliation store metadata only", async () => {
   const s = setup(); const secret = randomUUID(); let sends = 0;
   s.line.sendText = async () => { sends++; return { handle: "sent" }; };
