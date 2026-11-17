@@ -1738,3 +1738,116 @@ it.effect(
       assert.isBelow(JSON.stringify(section).length, 50000);
     }).pipe(Effect.provide(NodeServices.layer)),
 );
+
+it.effect("reads a day of runtime samples by kind within the default response cap", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    const samples = Array.from({ length: 1440 }, (_, minute) =>
+      event({
+        ts: `${day}T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`,
+        kind: "server.runtime_sample",
+        surface: "server",
+        route: "server",
+        props: {
+          runningTurns: { total: 3, byProvider: { codex: 3 }, byModel: { sol: 3, other: 0 } },
+          runningByOrigin: {
+            boardWork: 1,
+            boardReview: 0,
+            boardEvaluator: 0,
+            delegatedChild: 1,
+            scheduledTask: 0,
+            other: 1,
+          },
+          providerSessions: { codex: 1 },
+          host: { load1: 12, load5: 10, load15: 8, rssMiB: 900, heapUsedMiB: 500 },
+          sampleMs: 0.25,
+        },
+      }),
+    );
+    yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe(`${day}T23:59:59.000Z`)));
+    for (const sample of samples) yield* analytics.record(sample);
+    yield* analytics.record(event({ kind: "unrelated.event" }));
+    yield* analytics.flush;
+    const reply = yield* analytics.read({ day, kind: "server.runtime_sample" });
+    assert.equal(reply.rollup.total, 1440);
+    assert.equal(reply.rollup.kindCounts["server.runtime_sample"], 1440);
+    assert.isBelow(JSON.stringify(reply).length, 50_000);
+    const rows = yield* readSamples(analytics, { day, kind: "server.runtime_sample" });
+    // Existing analytics reads retain a bounded latest-500 sample window for each kind.
+    assert.equal(rows.length, 500);
+    assert.isTrue(rows.every((row) => row.kind === "server.runtime_sample"));
+    assert.equal(rows[0]!.props!.runningTurns!.total, 3);
+    const hourly = yield* analytics.read({
+      day,
+      kind: "server.runtime_sample",
+      section: "runtimeSamples",
+    });
+    assert.equal(hourly.rows!.length, 24);
+    assert.isBelow(JSON.stringify(hourly).length, 50_000);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("persists restart-admission facts and exposes their server-wide section", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    const restartAdmission = {
+      sourceRunId: "run:source:ordinal:3",
+      runId: "run:next:ordinal:4",
+      classification: "continuation",
+      queuedAtMs: Date.parse(ts) - 1000,
+      waitedMs: 1000,
+      positionAtEntry: 12,
+      position: 1,
+      total: 3,
+      maxQueueDepth: 12,
+      active: 1,
+      maxActive: 4,
+      loaded: false,
+    };
+    yield* analytics.record(
+      event({
+        kind: "restart.admission.admitted",
+        surface: "server",
+        route: "restart-pacing",
+        threadId: "thread:admitted",
+        bootId: "boot",
+        restartAdmission,
+      }),
+    );
+    yield* analytics.record(
+      event({
+        kind: "restart.admission.failed",
+        surface: "server",
+        route: "restart-pacing",
+        threadId: "thread:failed",
+        bootId: "boot",
+        restartAdmission: {
+          ...restartAdmission,
+          sourceRunId: "run:failed:ordinal:3",
+          rule: "no_progress",
+        },
+      }),
+    );
+    yield* analytics.flush;
+    const result = yield* analytics.read({ day });
+    assert.deepEqual(result.rollup.restartAdmission?.groups[0]?.wait, {
+      count: 1,
+      p50Ms: 1000,
+      p90Ms: 1000,
+      maxMs: 1000,
+      approximate: false,
+    });
+    assert.deepEqual(result.rollup.restartAdmission?.groups[0]?.failuresByRule, { no_progress: 1 });
+    const samples = yield* readSamples(analytics, { day, kind: "restart.admission.failed" });
+    assert.deepEqual(samples[0]?.restartAdmission, {
+      ...restartAdmission,
+      sourceRunId: "run:failed:ordinal:3",
+      rule: "no_progress",
+    });
+    const section = yield* analytics.read({ day, section: "restartAdmission" });
+    assert.strictEqual(section.section, "restartAdmission");
+    assert.isNotEmpty(section.rows);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

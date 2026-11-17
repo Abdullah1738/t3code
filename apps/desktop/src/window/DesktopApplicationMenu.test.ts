@@ -7,6 +7,7 @@ import * as Layer from "effect/Layer";
 import type * as Electron from "electron";
 
 import * as ElectronApp from "../electron/ElectronApp.ts";
+import * as DesktopState from "../app/DesktopState.ts";
 import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronMenu from "../electron/ElectronMenu.ts";
 import * as DesktopApplicationMenu from "./DesktopApplicationMenu.ts";
@@ -119,6 +120,7 @@ const configureMenu = (
         Layer.provideMerge(layerDesktopUpdates),
         Layer.provideMerge(layerElectronDialog),
         Layer.provideMerge(layerElectronApp),
+        Layer.provideMerge(DesktopState.layer),
         Layer.provideMerge(
           DesktopEnvironment.layer({ ...environmentInput, ...environment }).pipe(
             Layer.provide(Layer.mergeAll(NodeServices.layer, DesktopConfig.layerTest({}))),
@@ -156,7 +158,7 @@ describe("DesktopApplicationMenu", () => {
         "Hide Robob",
       );
       assert.equal(
-        applicationMenu.submenu.find((item) => item.role === "quit")?.label,
+        applicationMenu.submenu.find((item) => item.accelerator === "CmdOrCtrl+Q")?.label,
         "Quit Robob",
       );
     }),

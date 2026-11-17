@@ -33,9 +33,8 @@ class BackgroundDu:
             raise PassStopped()
         # Own the process group, including the exec wrappers. Inherit the flock
         # so even SIGKILL of Python cannot let hourly du overlap a surviving du.
-        # 14 Nov diag: utility 0.014–1.239 s; -b 0.019–2.624 s (warm-cache
-        # samples, no reproduced stall). Do not apply Darwin's -b I/O policy.
-        command = ['/usr/bin/nice', '-n', '10', '/usr/sbin/taskpolicy', '-c', 'utility', *command]
+        command = ['/usr/bin/nice', '-n', '10', '/usr/sbin/taskpolicy', '-c', 'utility',
+                   '-d', 'throttle', *command]
         process = subprocess.Popen(command, start_new_session=True,
                                    pass_fds=(self.lock_fd,), stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=kwargs.get('text', False),
@@ -95,7 +94,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
             emit('disk', 'event', 'disk.deep.end', props=dict(duMode='links', skipReason='lock_held',
                  timeouts=0, secondsInTimeouts=0, probeTimeouts=0, secondsInProbeTimeouts=0,
                  probeAllowanceMedianS=0, childrenDescended=0, partsMeasured=0,
-                 spawnPolicy='nice-10-utility'))
+                 spawnPolicy='nice-10-utility-io-throttle'))
             return
         state = jobs.read_state('disk-inventory')
         cursor = state.get('deepNextRoot')
@@ -163,7 +162,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                         probeTimeouts=metrics['probeTimeouts'], secondsInProbeTimeouts=metrics['secondsInProbeTimeouts'],
                         probeAllowanceMedianS=statistics.median(metrics['probeAllowances']) if metrics['probeAllowances'] else 0,
                         childrenDescended=len(metrics['childrenDescended']), partsMeasured=metrics['partsMeasured'],
-                        spawnPolicy='nice-10-utility', partsFreshnessS=jobs.INVENTORY_PARTS_FRESH_S)
+                        spawnPolicy='nice-10-utility-io-throttle', partsFreshnessS=jobs.INVENTORY_PARTS_FRESH_S)
 
         emit('disk', 'event', 'disk.deep.start', props=props())
         runner = run if run is not None else BackgroundDu(stopped, wall_deadline, lock_fd)

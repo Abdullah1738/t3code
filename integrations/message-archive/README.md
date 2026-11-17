@@ -73,8 +73,8 @@ Settings (Abdullah does that), followed by
 
 ## Tests and deploy
 
-Tests: `/opt/homebrew/opt/python@3.14/bin/python3.14 tests/test_archive.py`
-(temporary paths, no real data).
+Tests: `/opt/homebrew/opt/python@3.14/bin/python3.14 -m unittest discover -s tests -p 'test_*.py' -v`
+(temporary paths, no real data). On older Pythons, tests that need `compression.zstd` skip.
 
 Deploy: `integrations/deploy.zsh message-archive`, then
 `launchctl kickstart -k gui/$(id -u)/com.ardud.message-archive`.

@@ -88,6 +88,17 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const parentLookup = yield* SavedWrite.reportLookupObserver;
   const call = yield* Effect.serviceOption(McpCall);
   let slowSubSteps: ReadonlyArray<SavedWrite.SubStep> = [];
+  let wholeCallReported = false;
+  const reportSubSteps = (steps: ReadonlyArray<SavedWrite.SubStep>, wholeCall = false) => {
+    // A whole-call collection already includes the holds; do not count them twice.
+    if (wholeCallReported && !wholeCall) return;
+    wholeCallReported ||= wholeCall;
+    slowSubSteps = [...(wholeCall ? [] : slowSubSteps), ...steps]
+      .sort((a, b) => b.ms - a.ms)
+      .slice(0, 3);
+    span.attribute("kanban.reply.sub_steps", slowSubSteps);
+    if (call._tag === "Some") call.value.replySubSteps = slowSubSteps;
+  };
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
   let unverifiedReporter: SavedWrite.UnverifiedReporterReason | undefined;
@@ -256,11 +267,8 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
         };
       },
     }),
-    Effect.provideService(SavedWrite.subStepReporter, (steps) => {
-      slowSubSteps = [...slowSubSteps, ...steps].sort((a, b) => b.ms - a.ms).slice(0, 3);
-      span.attribute("kanban.reply.sub_steps", slowSubSteps);
-      if (call._tag === "Some") call.value.replySubSteps = slowSubSteps;
-    }),
+    Effect.provideService(SavedWrite.subStepReporter, reportSubSteps),
+    Effect.provideService(SavedWrite.callSubStepReporter, (steps) => reportSubSteps(steps, true)),
     Effect.provideService(
       BoardLocks.writeWaitMs,
       timingOnly ? yield* BoardLocks.writeWaitMs : ADMISSION_BUDGET_MS,

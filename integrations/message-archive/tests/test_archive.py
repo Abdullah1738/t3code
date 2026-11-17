@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import sqlite3
 import sys
@@ -22,6 +23,11 @@ import mailparse  # noqa: E402
 import search  # noqa: E402
 import store  # noqa: E402
 import whatsapp_sync  # noqa: E402
+
+try:
+    HAS_ZSTD = importlib.util.find_spec("compression.zstd") is not None
+except ImportError:
+    HAS_ZSTD = False
 
 
 def typedstream(text):
@@ -78,6 +84,7 @@ class MailParseTest(unittest.TestCase):
         self.assertEqual(p["body"], "Order #42\nThanks")
         self.assertEqual(p["attachments"], "invoice.pdf")
 
+    @unittest.skipUnless(HAS_ZSTD, "needs Python 3.14+ compression.zstd")
     def test_raw_roundtrip(self):
         rel = mailparse.raw_path("icloud", 1792389600, "INBOX:1:5")
         self.assertTrue(rel.startswith("icloud/2026/10/"))
@@ -85,6 +92,7 @@ class MailParseTest(unittest.TestCase):
         mailparse.save_raw(rel, self.RAW)
         self.assertEqual(mailparse.load_raw(rel), self.RAW)
 
+    @unittest.skipUnless(HAS_ZSTD, "needs Python 3.14+ compression.zstd")
     def test_empty_raw_file_is_rewritten(self):
         rel = mailparse.raw_path("icloud", 1792389600, "INBOX:1:6")
         full = os.path.join(mailparse.common.MAIL_DIR, rel)
@@ -92,6 +100,13 @@ class MailParseTest(unittest.TestCase):
         open(full, "wb").close()  # what a power cut can leave behind
         mailparse.save_raw(rel, self.RAW)
         self.assertEqual(mailparse.load_raw(rel), self.RAW)
+
+    def test_raw_storage_without_zstd_names_required_interpreter(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(mailparse.common, "MAIL_DIR", root), \
+                patch.dict(sys.modules, {"compression": None}):
+            with self.assertRaisesRegex(RuntimeError, r"Python 3\.14\+ \(compression\.zstd\)") as raised:
+                mailparse.save_raw("icloud/message.eml.zst", self.RAW)
+        self.assertIn("/opt/homebrew/opt/python@3.14/bin/python3.14", str(raised.exception))
 
     def test_8bit_headers_and_odd_charsets(self):
         raw = ("From: a@x.com\r\nSubject: hi\r\nMessage-ID: <r\u00e9sum\u00e9@x>\r\nMIME-Version: 1.0\r\n"
@@ -544,6 +559,7 @@ class MailSyncTest(unittest.TestCase):
     def rows(self, acct):
         return {r["ext_id"]: r for r in self.db.execute("SELECT * FROM items WHERE account=?", (acct,))}
 
+    @unittest.skipUnless(HAS_ZSTD, "needs Python 3.14+ compression.zstd")
     def test_imap_skips_bad_message_and_bad_folder(self):
         server = {"folders": {"INBOX": {u: _eml(u) for u in range(1, 8)}, "Broken": {}, "Archive": {9: _eml(9)}},
                   "bad_uids": {3}, "unselectable": {"Broken"}}
@@ -572,6 +588,7 @@ class MailSyncTest(unittest.TestCase):
         finally:
             imap_sync.connect = old
 
+    @unittest.skipUnless(HAS_ZSTD, "needs Python 3.14+ compression.zstd")
     def test_gmail_skips_bad_message_and_undeletes(self):
         import base64
         listing = ["m1", "m2", "m3"]

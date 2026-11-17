@@ -14,7 +14,7 @@ const MAX_MS = 86_400_000;
 export const SLOW_CALL_MS = 5_000;
 const SLOW_WINDOW_MS = 600_000;
 const SLOW_ROW_LIMIT = 20;
-export type CallStats = { count: number; ok: number; failed: number; p50: number; p95: number; max: number; histogram: [number, number][]; suppressedSlow?: number };
+export type CallStats = { count: number; ok: number; failed: number; p50: number; p95: number; max: number; histogram: [number, number][]; suppressedSlow?: number; singleFailures?: number };
 export type CallSummary = Record<string, CallStats>;
 
 export function callName(line: LogLine): string | undefined {
@@ -50,11 +50,12 @@ export function cleanCalls(value: unknown): CallSummary | undefined {
     if (count !== stats.ok! + stats.failed!) continue;
     result[name] = { count, ok: stats.ok!, failed: stats.failed!, ...percentiles(histogram), histogram: [...histogram] };
     if (Number.isSafeInteger(stats.suppressedSlow) && stats.suppressedSlow! >= 0 && stats.suppressedSlow! <= stats.ok!) result[name]!.suppressedSlow = stats.suppressedSlow;
+    if (Number.isSafeInteger(stats.singleFailures) && stats.singleFailures! >= 0 && stats.singleFailures! <= stats.failed!) result[name]!.singleFailures = stats.singleFailures;
   }
   if (Object.keys(result).length) return result;
 }
 
-type Group = { ids: Record<string, string>; ts: string; calls: Map<string, { ok: number; failed: number; histogram: Map<number, number>; suppressedSlow: number }> };
+type Group = { ids: Record<string, string>; ts: string; calls: Map<string, { ok: number; failed: number; histogram: Map<number, number>; suppressedSlow: number; singleFailures: number }> };
 
 export function createCallAggregation(processRunId: string) {
   const active = new Map<string, { runId: string; messageId?: string }>();
@@ -73,7 +74,7 @@ export function createCallAggregation(processRunId: string) {
       if (runId && key !== runId) continue;
       const calls: CallSummary = {};
       for (const [name, stats] of group.calls) calls[name] = {
-        count: stats.ok + stats.failed, ok: stats.ok, failed: stats.failed,
+        count: stats.ok + stats.failed, ok: stats.ok, failed: stats.failed, singleFailures: stats.singleFailures,
         ...percentiles(stats.histogram), histogram: [...stats.histogram],
         ...(stats.suppressedSlow ? { suppressedSlow: stats.suppressedSlow } : {}),
       };
@@ -111,8 +112,10 @@ export function createCallAggregation(processRunId: string) {
           groups.set(runId, group);
         }
         group.ts = line.ts;
-        const stats = group.calls.get(name) ?? { ok: 0, failed: 0, histogram: new Map<number, number>(), suppressedSlow: 0 };
+        const stats = group.calls.get(name) ?? { ok: 0, failed: 0, histogram: new Map<number, number>(), suppressedSlow: 0, singleFailures: 0 };
         if (line.ok) stats.ok++; else stats.failed++;
+        // Diagnostics may be suppressed during an outage; keep their rate numerator in the summary.
+        if (!line.ok && line.props?.failureFormat === "single") stats.singleFailures++;
         // Millisecond bins merge exactly across turns and days without keeping raw fast calls.
         const ms = Math.round(line.durationMs);
         stats.histogram.set(ms, (stats.histogram.get(ms) ?? 0) + 1);

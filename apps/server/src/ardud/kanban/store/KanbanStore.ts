@@ -290,6 +290,10 @@ export interface KanbanStoreShape {
     cardIds: ReadonlyArray<KanbanCardId>,
     beforeId: number,
   ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
+  /** Latest event on each unsettled completed/deployed card, using the card-event index. */
+  readonly evaluatorStepEvents: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<KanbanCardEvent>, KanbanStoreError>;
   readonly activityHistory: (
     boardId: KanbanBoardId,
     window: { readonly since: string; readonly until: string },
@@ -506,7 +510,12 @@ const make = Effect.gen(function* () {
   // metadata only after that enclosing operation succeeds, including bulk writes.
   const observeCallerWrites: KanbanStoreShape["observeCallerWrites"] = Effect.fnUntraced(
     function* (effect) {
-      if ((yield* callerWrites) !== undefined) return yield* effect;
+      const pending = yield* callerWrites;
+      if (pending !== undefined) {
+        const start = pending.length;
+        // A caught savepoint failure must not publish its rolled-back metadata at the outer commit.
+        return yield* effect.pipe(Effect.onError(() => Effect.sync(() => pending.splice(start))));
+      }
       const updates: Array<() => void> = [];
       const parent = yield* NodeSqliteClient.TransactionCommitObserver;
       const apply = () => {
@@ -1401,6 +1410,28 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const evaluatorStepEvents: KanbanStoreShape["evaluatorStepEvents"] = (boardId) =>
+    runRead(
+      "read evaluator step events",
+      Effect.flatMap(
+        sql<IdJsonRow>`
+        SELECT e.id, e.json FROM ardud_kanban_cards c
+        JOIN ardud_kanban_card_events e ON e.id = (
+          SELECT MAX(id) FROM ardud_kanban_card_events INDEXED BY ardud_kanban_card_events_card WHERE card_id = c.id
+        )
+        WHERE c.board_id = ${boardId} AND c.stage IN ('completed', 'deployed')
+          AND json_extract(c.json, '$.settledAt') IS NULL
+      `,
+        (rows) =>
+          Effect.forEach(rows, (row) =>
+            Effect.map(
+              CardEvent.decode(row.json),
+              (event) => ({ ...event, id: Number(row.id) }) as KanbanCardEvent,
+            ),
+          ),
+      ),
+    );
+
   const activityHistory: KanbanStoreShape["activityHistory"] = (boardId, window) =>
     runRead(
       "read activity boundary history",
@@ -2135,6 +2166,7 @@ const make = Effect.gen(function* () {
     pendingInstructionApplications,
     cardEvents,
     boardEvents,
+    evaluatorStepEvents,
     activityHistory,
     lastTransitions,
     goals,

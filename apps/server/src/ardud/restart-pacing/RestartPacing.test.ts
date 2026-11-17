@@ -9,9 +9,17 @@ import * as ThreadManagementService from "../../orchestration-v2/ThreadManagemen
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
 import * as EventSink from "../../orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
+import * as Orchestrator from "../../orchestration-v2/Orchestrator.ts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { CommandId, RunId, ThreadId, type ServerSettingsError } from "@t3tools/contracts";
+import {
+  CommandId,
+  RunId,
+  ThreadId,
+  type AnalyticsEvent,
+  type OrchestrationV2ServerCommand,
+  type ServerSettingsError,
+} from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Option from "effect/Option";
 import * as EffectOutbox from "../../orchestration-v2/EffectOutbox.ts";
@@ -27,12 +35,15 @@ import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Queue from "effect/Queue";
 import * as TestClock from "effect/testing/TestClock";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as RestartPacing from "./RestartPacing.ts";
 import * as RestartPacingState from "./RestartPacingState.ts";
 import type { RestartSource } from "./RestartPacingState.ts";
 import { makeRestartLoad } from "./RestartLoad.ts";
+import * as Analytics from "../analytics/Analytics.ts";
+import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 
 const source = (id: number): RestartSource => ({
   threadId: ThreadId.make(`thread:${id}`),
@@ -168,6 +179,271 @@ const harness = <E = never>(
     },
   };
 };
+
+it.effect(
+  "admission analytics retains queue observations and emits once through start retries",
+  () => {
+    const h = harness({ maxActive: 1, spacingMs: 20_000 });
+    const first = source(1);
+    const waiter = { ...source(2), classification: "recovered-queue" as const };
+    const later = source(3);
+    const replacementRunId = RunId.make("run:replacement");
+    h.runSources.set(replacementRunId, waiter);
+    return Effect.gen(function* () {
+      const events = yield* Queue.unbounded<AnalyticsEvent>();
+      const analytics = Layer.mock(Analytics.Analytics)({
+        record: (event) => Queue.offer(events, event).pipe(Effect.asVoid),
+      });
+      yield* Effect.gen(function* () {
+        const pacing = yield* RestartPacing.RestartPacing;
+        yield* pacing.register(first);
+        yield* pacing.register(waiter);
+        assert.isAbove(yield* pacing.acquireRun(waiter.threadId, replacementRunId, "start:2"), 0);
+        yield* pacing.register(later);
+        yield* TestClock.adjust("10 seconds");
+        assert.isAbove(yield* pacing.acquireRun(waiter.threadId, replacementRunId, "start:2"), 0);
+        assert.equal(yield* Queue.size(events), 0);
+
+        assert.equal(yield* pacing.acquire(first), 0);
+        assert.equal((yield* Queue.take(events)).kind, "restart.admission.admitted");
+        yield* pacing.dispatched(first);
+        yield* TestClock.adjust("10 seconds");
+        assert.isAbove(yield* pacing.acquireRun(waiter.threadId, replacementRunId, "start:2"), 0);
+        assert.equal(yield* Queue.size(events), 0);
+        yield* TestClock.adjust("10 seconds");
+        assert.equal(yield* pacing.acquireRun(waiter.threadId, replacementRunId, "start:2"), 0);
+        const event = yield* Queue.take(events);
+        assert.equal(event.kind, "restart.admission.admitted");
+        assert.equal(event.ts, DateTime.formatIso(DateTime.makeUnsafe(30_000)));
+        assert.equal(event.surface, "server");
+        assert.equal(event.route, "restart-pacing");
+        assert.equal(event.threadId, waiter.threadId);
+        assert.equal(event.bootId, "boot:admission");
+        assert.deepEqual("restartAdmission" in event ? event.restartAdmission : undefined, {
+          sourceRunId: waiter.sourceRunId,
+          runId: replacementRunId,
+          classification: "recovered-queue",
+          queuedAtMs: 0,
+          waitedMs: 30_000,
+          positionAtEntry: 2,
+          position: 1,
+          total: 2,
+          maxQueueDepth: 3,
+          active: 1,
+          maxActive: 1,
+          loaded: false,
+        });
+
+        assert.equal(yield* pacing.acquireRun(waiter.threadId, replacementRunId, "start:2"), 0);
+        yield* pacing.releaseRun(waiter.threadId, replacementRunId, "start:2", true);
+        h.cancelled.add(later.sourceRunId);
+        yield* TestClock.adjust("20 seconds");
+        assert.equal(yield* pacing.acquireRun(waiter.threadId, replacementRunId, "start:2"), 0);
+        yield* Effect.yieldNow;
+        assert.equal(yield* Queue.size(events), 0);
+      }).pipe(
+        Effect.provide(
+          h.layer.pipe(
+            Layer.provide(analytics),
+            Layer.provide(
+              Layer.mock(StartupPhaseLog.StartupPhaseLog)({
+                start: () => undefined,
+                end: () => undefined,
+                snapshot: () => ({
+                  bootId: "boot:admission",
+                  pid: 1,
+                  phases: [],
+                  droppedRecords: 0,
+                  persistenceFailed: false,
+                }),
+              }),
+            ),
+          ),
+        ),
+      );
+    });
+  },
+);
+
+it.effect(
+  "admission failure emits once across expiry commit retries, never on waiting ticks",
+  () => {
+    const h = harness({ maxActive: 1, spacingMs: 0 });
+    h.setLoad(2);
+    const waiter = source(2);
+    h.runSources.set(waiter.sourceRunId, waiter);
+    return Effect.gen(function* () {
+      const events = yield* Queue.unbounded<AnalyticsEvent>();
+      yield* Effect.gen(function* () {
+        const pacing = yield* RestartPacing.RestartPacing;
+        for (const entry of [source(1), waiter, source(3)]) yield* pacing.register(entry);
+        for (const advance of [0, 15_000, 30_000, 60_000]) {
+          yield* TestClock.adjust(advance);
+          assert.isAbove(
+            yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId, "start:expired"),
+            0,
+          );
+          assert.equal(yield* Queue.size(events), 0);
+        }
+        yield* TestClock.adjust(RestartPacing.RESTART_ADMISSION_TIMEOUT_MS - 105_000);
+        const commands: Array<Extract<OrchestrationV2ServerCommand, { type: "run.start-expire" }>> =
+          [];
+        const executor = yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+          Effect.provide(
+            EffectWorker.layerExecutor.pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  Layer.mock(RunFinalizationService.RunFinalizationService)({}),
+                  Layer.mock(CheckpointRollbackService.CheckpointRollbackServiceV2)({}),
+                  Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+                  Layer.mock(ProviderTurnControlService.ProviderTurnControlServiceV2)({}),
+                  Layer.mock(RuntimeRequestService.RuntimeRequestServiceV2)({}),
+                  Layer.mock(ThreadTitleRegenerationService.ThreadTitleRegenerationService)({}),
+                  Layer.mock(McpSessionRegistry.McpSessionRegistry)({}),
+                  Layer.mock(EventSink.EventSinkV2)({}),
+                  Layer.mock(ProjectionStore.ProjectionStoreV2)({
+                    getThreadRecords: () =>
+                      Effect.succeed({
+                        runs: [{ id: waiter.sourceRunId, activeAttemptId: null }],
+                      } as never),
+                  }),
+                  Layer.mock(ThreadManagementService.ThreadManagementService)({
+                    dispatch: (command) =>
+                      Effect.gen(function* () {
+                        assert.equal(command.type, "run.start-expire");
+                        if (command.type !== "run.start-expire") return yield* Effect.die(command);
+                        commands.push(command);
+                        if (commands.length === 1)
+                          return yield* new Orchestrator.OrchestratorDispatchError({
+                            commandId: command.commandId,
+                            commandType: command.type,
+                            cause: "expiry commit failed",
+                          });
+                        return { sequence: 0, storedEvents: [] };
+                      }),
+                  }),
+                  ServerSettings.layerTest(),
+                  Layer.mock(ProviderTurnStartService.ProviderTurnStartServiceV2)({
+                    start: () => Effect.die("expired restart must never reach the provider"),
+                  }),
+                ),
+              ),
+            ),
+          ),
+        );
+        const at = DateTime.formatIso(yield* DateTime.now);
+        const effect: EffectOutbox.OrchestrationEffectV2 = {
+          id: "start:expired",
+          commandId: CommandId.make("command:expired"),
+          threadId: waiter.threadId,
+          request: { type: "provider-turn.start", runId: waiter.sourceRunId },
+          status: "running",
+          attemptCount: 1,
+          availableAt: at,
+          leaseOwner: "test-worker",
+          leaseExpiresAt: at,
+          createdAt: at,
+          updatedAt: at,
+          completedAt: null,
+          lastError: null,
+        };
+        assert.isTrue(Exit.isFailure(yield* executor.execute(effect).pipe(Effect.exit)));
+        assert.lengthOf(commands, 1);
+        assert.deepEqual(commands[0]!.admission, {
+          queuedAtMs: 0,
+          waitedMs: RestartPacing.RESTART_ADMISSION_TIMEOUT_MS,
+          positionAtFailure: 2,
+          totalAtFailure: 3,
+          rule: "no_progress",
+        });
+        const event = yield* Queue.take(events);
+        assert.equal(event.kind, "restart.admission.failed");
+        assert.equal(event.threadId, waiter.threadId);
+        assert.isUndefined(event.bootId);
+        assert.deepEqual("restartAdmission" in event ? event.restartAdmission : undefined, {
+          sourceRunId: waiter.sourceRunId,
+          runId: waiter.sourceRunId,
+          classification: "continuation",
+          queuedAtMs: 0,
+          waitedMs: RestartPacing.RESTART_ADMISSION_TIMEOUT_MS,
+          positionAtEntry: 2,
+          position: 2,
+          total: 3,
+          maxQueueDepth: 3,
+          active: 0,
+          maxActive: 1,
+          loaded: true,
+          rule: "no_progress",
+        });
+        yield* executor.execute(effect);
+        assert.lengthOf(commands, 2);
+        assert.equal(commands[1]!.commandId, commands[0]!.commandId);
+        assert.equal(
+          DateTime.toEpochMillis(commands[1]!.deadline),
+          RestartPacing.RESTART_ADMISSION_TIMEOUT_MS,
+        );
+        assert.equal(commands[1]!.admission?.queuedAtMs, 0);
+        assert.equal(commands[1]!.admission?.rule, "no_progress");
+        assert.isAbove(
+          yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId, "start:new-resume"),
+          0,
+        );
+        h.cancelled.add(source(1).sourceRunId);
+        h.cancelled.add(source(3).sourceRunId);
+        h.setLoad(0);
+        yield* TestClock.adjust("10 seconds");
+        assert.equal(
+          yield* pacing.acquireRun(waiter.threadId, waiter.sourceRunId, "start:new-resume"),
+          0,
+        );
+        yield* Effect.yieldNow;
+        assert.equal(yield* Queue.size(events), 0);
+      }).pipe(
+        Effect.provide(
+          h.layer.pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) => Queue.offer(events, event).pipe(Effect.asVoid),
+              }),
+            ),
+          ),
+        ),
+      );
+    });
+  },
+);
+
+it.effect.each(["blocked", "defect"] as const)(
+  "a %s analytics recorder cannot hold the next admission",
+  (mode) => {
+    const h = harness({ maxActive: 1, spacingMs: 20_000 });
+    return Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      yield* Effect.gen(function* () {
+        const pacing = yield* RestartPacing.RestartPacing;
+        assert.equal(yield* pacing.acquire(source(1)), 0);
+        yield* Deferred.await(entered);
+        yield* pacing.dispatched(source(1));
+        yield* TestClock.adjust("20 seconds");
+        assert.equal(yield* pacing.acquire(source(2)), 0);
+        assert.equal(yield* Clock.currentTimeMillis, 20_000);
+      }).pipe(
+        Effect.provide(
+          h.layer.pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: () =>
+                  Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(mode === "blocked" ? Effect.never : Effect.die("recorder")),
+                  ),
+              }),
+            ),
+          ),
+        ),
+      );
+    });
+  },
+);
 
 it.effect(
   "50 waiters share one settings materialization per pass and no projection reads while held",
@@ -1224,12 +1500,14 @@ it.effect.each([
 
 it.effect("a delayed first admission pass cannot reset the position progress window", () => {
   const h = harness({ maxActive: 4, spacingMs: 0 });
-  h.setLoad(2);
   return Effect.gen(function* () {
     const pacing = yield* RestartPacing.RestartPacing;
     const waiter = source(100);
     yield* pacing.register(waiter);
-    yield* TestClock.adjust("25 minutes");
+    // Keep the load hold below its cap while the first admission pass is delayed.
+    yield* TestClock.adjust("15 minutes");
+    h.setLoad(2);
+    yield* TestClock.adjust("10 minutes");
     assert.isAbove(yield* pacing.acquire(waiter), 0);
     yield* TestClock.adjust("4 minutes");
     const newcomer = source(1);
@@ -1249,6 +1527,16 @@ it.effect("the absolute backstop expires a source even while both progress clock
   h.setLoad(2);
   const messages: string[] = [];
   const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+  const events: AnalyticsEvent[] = [];
+  const recorded = Deferred.makeUnsafe<AnalyticsEvent>();
+  const analytics = Layer.mock(Analytics.Analytics)({
+    record: (event) =>
+      Effect.gen(function* () {
+        events.push(event);
+        if (event.restartAdmission?.sourceRunId === source(100).sourceRunId)
+          yield* Deferred.succeed(recorded, event);
+      }),
+  });
   return Effect.gen(function* () {
     const pacing = yield* RestartPacing.RestartPacing;
     const queued = Array.from({ length: 100 }, (_, id) => source(id + 1));
@@ -1263,15 +1551,50 @@ it.effect("the absolute backstop expires a source even while both progress clock
       assert.isAbove(yield* pacing.acquire(waiter), 0);
     }
     yield* TestClock.adjust(90_000);
+    const failure = yield* pacing.acquire(waiter).pipe(Effect.flip);
+    assert.instanceOf(failure, RestartPacing.RestartAdmissionTimeoutError);
+    assert.deepEqual(failure.admission, {
+      queuedAtMs: 0,
+      waitedMs: 7_200_000,
+      positionAtFailure: 21,
+      totalAtFailure: 21,
+      rule: "absolute_backstop",
+    });
+    const event = yield* Deferred.await(recorded);
+    assert.equal(event.kind, "restart.admission.failed");
+    assert.deepEqual(event.restartAdmission, {
+      sourceRunId: waiter.sourceRunId,
+      classification: "continuation",
+      queuedAtMs: 0,
+      waitedMs: 7_200_000,
+      positionAtEntry: 100,
+      position: 21,
+      total: 21,
+      maxQueueDepth: 100,
+      active: 0,
+      maxActive: 4,
+      loaded: false,
+      rule: "absolute_backstop",
+    });
     assert.instanceOf(
       yield* pacing.acquire(waiter).pipe(Effect.flip),
       RestartPacing.RestartAdmissionTimeoutError,
+    );
+    yield* Effect.yieldNow;
+    assert.lengthOf(
+      events.filter((event) => event.restartAdmission?.sourceRunId === waiter.sourceRunId),
+      1,
     );
     const failed = messages.findLast((row) => row.includes("restart-pacing.bound_failed"));
     assert.include(failed!, '"rule":"absolute_backstop"');
     assert.include(failed!, '"waitedMs":7200000');
   }).pipe(
-    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+    Effect.provide(
+      Layer.merge(
+        h.layer.pipe(Layer.provide(analytics)),
+        Logger.layer([logger], { mergeWithExisting: false }),
+      ),
+    ),
   );
 });
 
@@ -1449,6 +1772,13 @@ it.effect.each([
     const failure = yield* Fiber.join(admitting);
     assert.instanceOf(failure, RestartPacing.RestartAdmissionTimeoutError);
     assert.equal(DateTime.toEpochMillis(failure.deadline), deadline);
+    assert.deepEqual(failure.admission, {
+      queuedAtMs: 0,
+      waitedMs: deadline + 24_000,
+      positionAtFailure: 1,
+      totalAtFailure: 1,
+      rule,
+    });
     const failed = messages.findLast((row) => row.includes("restart-pacing.bound_failed"));
     assert.include(failed!, `"rule":"${rule}"`);
     assert.include(failed!, `"waitedMs":${deadline + 24_000}`);
@@ -2007,9 +2337,9 @@ it.effect(
   },
 );
 
-it.effect(
-  "ten durable waiters drain at twenty second spacing, including sleeping successors",
-  () => {
+it.effect.each(["held", "settles-after-5s"] as const)(
+  "twelve durable waiters respect spacing and capacity when startup is %s",
+  (settlement) => {
     const h = harness({ maxActive: 4, spacingMs: 20_000 });
     const starts: number[] = [];
     const executor = Layer.effect(
@@ -2032,7 +2362,7 @@ it.effect(
                   deferMs: delay,
                 });
               starts.push(yield* Clock.currentTimeMillis);
-              yield* pacing.releaseRun(effect.threadId, effect.request.runId, effect.id);
+              h.running.add(effect.request.runId);
             }).pipe(
               Effect.mapError((cause) =>
                 EffectWorker.isOrchestrationEffectExecutionError(cause)
@@ -2051,15 +2381,19 @@ it.effect(
       const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
       const outbox = yield* EffectOutbox.EffectOutboxV2;
       const pacing = yield* RestartPacing.RestartPacing;
+      const freedSlotWake = yield* Deferred.make<void>();
       h.wakeWith((input) =>
-        outbox
-          .wakeRestartEffect(input.effectId!)
-          .pipe(
-            Effect.mapError((cause) => new RestartPacingState.RestartPacingStateError({ cause })),
+        outbox.wakeRestartEffect(input.effectId!).pipe(
+          Effect.mapError((cause) => new RestartPacingState.RestartPacingStateError({ cause })),
+          Effect.tap((woken) =>
+            woken && input.sourceRunId === source(4).sourceRunId
+              ? Deferred.succeed(freedSlotWake, undefined)
+              : Effect.void,
           ),
+        ),
       );
       const began = yield* Clock.currentTimeMillis;
-      for (let id = 0; id < 10; id++) {
+      for (let id = 0; id < 12; id++) {
         const input = source(id);
         h.runSources.set(input.sourceRunId, input);
         yield* pacing.register({ ...input, effectId: `drain:${id}` });
@@ -2073,15 +2407,42 @@ it.effect(
         ]);
       }
       yield* worker.drain();
-      for (let count = 1; count < 10; count++) {
+      assert.deepEqual(starts, [began]);
+      if (settlement === "held") {
+        for (let count = 1; count < 4; count++) {
+          yield* TestClock.adjust(20_000);
+          yield* worker.drain();
+          assert.equal(starts.length, count + 1);
+        }
         yield* TestClock.adjust(20_000);
         yield* worker.drain();
-        assert.equal(starts.length, count + 1);
+        assert.deepEqual(
+          starts.map((at) => at - began),
+          [0, 20_000, 40_000, 60_000],
+        );
+        h.running.delete(source(0).sourceRunId);
+        yield* pacing.releaseRun(source(0).threadId, source(0).sourceRunId, "drain:0");
+        yield* Deferred.await(freedSlotWake);
+        yield* worker.drain();
+        assert.equal(starts.length, 5);
+        assert.equal(starts[4]! - began, 80_000);
+      } else {
+        for (let id = 0; id < 11; id++) {
+          yield* TestClock.adjust(5_000);
+          h.running.delete(source(id).sourceRunId);
+          yield* pacing.releaseRun(source(id).threadId, source(id).sourceRunId, `drain:${id}`);
+          yield* TestClock.adjust(14_999);
+          yield* worker.drain();
+          assert.equal(starts.length, id + 1);
+          yield* TestClock.adjust(1);
+          yield* worker.drain();
+          assert.equal(starts.length, id + 2);
+        }
+        assert.deepEqual(
+          starts.map((at) => at - began),
+          Array.from({ length: 12 }, (_, i) => i * 20_000),
+        );
       }
-      assert.deepEqual(
-        starts.map((at) => at - began),
-        Array.from({ length: 10 }, (_, i) => i * 20_000),
-      );
     }).pipe(
       Effect.provide(
         EffectWorker.layer.pipe(
@@ -2096,6 +2457,66 @@ it.effect(
     );
   },
 );
+
+it.effect("a load-held head wakes when load recovers before its durable retry", () => {
+  const h = harness();
+  h.setLoad(2);
+  const wakes: number[] = [];
+  h.wakeWith(() =>
+    Clock.currentTimeMillis.pipe(
+      Effect.tap((at) => Effect.sync(() => wakes.push(at))),
+      Effect.as(true),
+    ),
+  );
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    const input = { ...source(1), effectId: "load:head" };
+    assert.equal(yield* pacing.acquire(input), 15_000);
+    yield* TestClock.adjust(15_000);
+    assert.equal(yield* pacing.acquire(input), 30_000);
+    yield* TestClock.adjust(30_000);
+    assert.equal(yield* pacing.acquire(input), 60_000);
+    assert.deepEqual(wakes, []);
+    h.setLoad(0);
+    yield* TestClock.adjust(15_000);
+    assert.lengthOf(wakes, 1);
+    assert.isAtMost(wakes[0]!, 60_000);
+    assert.equal(yield* pacing.acquire(input), 0);
+  }).pipe(Effect.provide(h.layer));
+});
+
+it.effect("admissions report each run's own load hold and exclude time under low load", () => {
+  const h = harness({ spacingMs: 0 });
+  h.setLoad(2);
+  const messages: string[] = [];
+  const logger = Logger.make(({ message }) => messages.push(JSON.stringify(message)));
+  return Effect.gen(function* () {
+    const pacing = yield* RestartPacing.RestartPacing;
+    yield* pacing.acquire(source(1));
+    yield* TestClock.adjust(29_999);
+    h.setLoad(0);
+    yield* TestClock.adjust(1);
+    yield* pacing.acquire(source(1));
+    yield* pacing.release(source(1));
+    yield* TestClock.adjust(29_999);
+    h.setLoad(2);
+    yield* TestClock.adjust(1);
+    yield* pacing.acquire(source(1));
+    yield* pacing.acquire(source(2));
+    yield* TestClock.adjust(29_999);
+    h.setLoad(0);
+    yield* TestClock.adjust(1);
+    assert.equal(yield* pacing.acquire(source(1)), 0);
+    assert.equal(yield* pacing.acquire(source(2)), 0);
+    const admissions = messages.filter((message) => message.includes("restart-pacing.admitted"));
+    assert.lengthOf(admissions, 3);
+    assert.include(admissions[0]!, '"loadHoldMs":30000');
+    assert.include(admissions[1]!, '"loadHoldMs":60000');
+    assert.include(admissions[2]!, '"loadHoldMs":30000');
+  }).pipe(
+    Effect.provide(Layer.merge(h.layer, Logger.layer([logger], { mergeWithExisting: false }))),
+  );
+});
 
 it.effect("a successor replaces its thread's source in place and retires old retries", () => {
   const h = harness({ spacingMs: 0 });

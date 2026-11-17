@@ -22,7 +22,7 @@ OTHER = 'Sun Nov 15 10:20:30 2026'
 
 
 def line(pid=1, cpu_time='0:01.23', start=START, etime='02:00', command='/usr/bin/node', state='R+', rss=2048):
-    return f'{pid} 0 {cpu_time} {rss} {state} {start} {etime} {command}\n'
+    return f'{pid} 0 {cpu_time} {rss} {state} {start} {etime} 501 {command}\n'
 
 
 class CpuTests(unittest.TestCase):
@@ -34,6 +34,9 @@ class CpuTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.calls = []
+        children = patch.object(cpu, 'rusage_reader', side_effect=OSError('unavailable'))
+        children.start()
+        self.addCleanup(children.stop)
         load = patch.object(cpu.os, 'getloadavg', return_value=(1, 1, 1))
         load.start()
         self.addCleanup(load.stop)
@@ -64,6 +67,9 @@ class CpuTests(unittest.TestCase):
     def spike_runner(self, text=None, args=None, thread_failure=False):
         normal = self.runner(text=text)
         def run(argv, **kwargs):
+            if argv[0] == '/usr/bin/top':
+                self.assertEqual(kwargs['timeout'], 5)
+                return SimpleNamespace(returncode=0, stdout='PID %CPU TIME\n0 0.0 06:18:29\nPID %CPU TIME\n0 1.5 06:18:30\n')
             if argv[:3] == ['/bin/ps', '-ww', '-o']:
                 self.calls.append(argv)
                 return SimpleNamespace(returncode=0, stdout=args or f'1 {START} /sbin/launchd\n')
@@ -85,7 +91,8 @@ class CpuTests(unittest.TestCase):
         ticks = cpu.host_ticks(host_statistics, 7)
         props = dict(baseline=False, totalCpuPct=500)
         result = cpu.system_cpu(ticks, dict(ticks=[100, 100, 200, 0]), props, 16)
-        self.assertEqual(result, dict(systemCpuPct=800, userPct=640, sysPct=160, unattributedCpuPct=300))
+        self.assertEqual(result, dict(systemCpuPct=800, userPct=480, sysPct=160, nicePct=160,
+                                      idlePct=800, unattributedCpuPct=300))
         self.assertEqual(cpu.system_cpu(ticks, {}, props, 16), {})
         self.assertEqual(cpu.system_cpu(ticks, dict(ticks=ticks), dict(props, baseline=True), 16), {})
         self.assertEqual(cpu.system_cpu(ticks, dict(ticks=[100, 100, 200, 0]), dict(props, totalCpuPct=900), 16)['unattributedCpuPct'], 0)
@@ -167,11 +174,59 @@ class CpuTests(unittest.TestCase):
             props = toollog.cpu_fields(dict(top=[dict(family=label, parentFamily=label)]))
             self.assertEqual(props['top'][0]['family'], Path(real).name)
             self.assertEqual(props['top'][0]['parentFamily'], Path(real).name)
-        for comm in ('/Users/ardud/private/tool', '/home/test/tool',
-                     str(Path.home())+'/tool', '/usr/bin/sk-private-key', '/System/secret=private'):
+        for comm in ('/usr/bin/sk-private-key', '/System/secret=private'):
             with self.subTest(comm=comm):
                 label = cpu_labels.family(comm)
                 self.assertEqual(label, '[redacted]')
+
+    def test_home_and_system_family_basename_matrix_at_logger_boundary(self):
+        home = '/Users/tester'
+        cases = [
+            ('nvm node', home+'/.nvm/versions/node/v26.2.0/bin/node', 'node'),
+            ('local tool', home+'/.local/bin/offbox', 'offbox'),
+            ('agent browser', home+'/.nvm/versions/node/v26.13.1/lib/node_modules/agent-browser/bin/agent-browser', 'agent-browser'),
+            ('ssh mux', 'ssh: '+home+'/.local/share/offbox/cm/abc [mux]', 'ssh'),
+            ('claude', home+'/.robob/harness-cli/claude/current/bin/claude', 'claude'),
+            ('bun', home+'/.bun/bin/bun', 'bun'),
+            ('home Python', home+'/.local/bin/python3.9', 'python'),
+            ('Linux home', '/home/tester/.local/bin/node', 'node'),
+            ('current home', str(Path.home())+'/.local/bin/bun', 'bun'),
+            ('tilde home', '~/.local/bin/python3.9', 'python'),
+            ('home bundle executable', home+'/private.app/Contents/MacOS/node', 'node'),
+            ('secret directory', home+'/ghp_private-token/node', 'node'),
+            ('system extension', '/Library/SystemExtensions/D48C98D4-DA18-4029-9DFF-49EF981973AB/'
+             'io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/'
+             'io.tailscale.ipn.macsys.network-extension', 'io.tailscale.ipn.macsys.network-extension'),
+            ('Cryptex helper', '/System/Cryptexes/App/System/Library/CoreServices/SafeHelper.app/Contents/MacOS/SafeHelper', 'SafeHelper'),
+            ('system application', '/System/Applications/Safe.app/Contents/MacOS/Safe', 'Safe'),
+            # These two names themselves match the existing password guard.
+            ('Passwords helper', '/System/Cryptexes/App/System/Library/CoreServices/'
+             'PasswordManagerBrowserExtensionHelper.app/Contents/MacOS/PasswordManagerBrowserExtensionHelper', '[redacted]'),
+            ('Passwords', '/System/Applications/Passwords.app/Contents/MacOS/Passwords', '[redacted]'),
+        ]
+        for form, comm, expected in cases:
+            with self.subTest(form=form):
+                label = cpu_labels.family(comm)
+                self.assertEqual(label, expected)
+                props = toollog.cpu_fields(dict(top=[dict(family=label, parentFamily=label)],
+                                               families=[dict(family=label, count=1)]))
+                self.assertEqual(props['top'][0]['family'], expected)
+                self.assertEqual(props['top'][0]['parentFamily'], expected)
+                self.assertEqual(props['families'][0]['family'], expected)
+                self.assertNotIn('/Users/', json.dumps(props))
+                self.assertNotIn('tester', json.dumps(props))
+
+    def test_secret_home_basenames_remain_redacted(self):
+        for name in ('a1'*20, 'ghp_private-token', 'github_pat_private', 'sk-private-key',
+                     'xoxb-private', 'password=private', 'cookie=private',
+                     'otp=654321', '4242424242424242', 'mds'+'a1'*20):
+            with self.subTest(name=name):
+                label = cpu_labels.family('/Users/tester/.local/bin/'+name)
+                self.assertIn('redacted', label.lower())
+                props = toollog.cpu_fields(dict(top=[dict(family=label, parentFamily=label)]))
+                self.assertNotIn(name, json.dumps(props))
+        with patch('cpu_labels.janitor_redact', side_effect=ImportError):
+            self.assertEqual(cpu_labels.family('/Users/tester/bin/python3.9'), '[redacted]')
 
     def test_spike_threshold_cap_reset_and_optional_failure(self):
         for load, expected in ((32, 0), (32.001, 1)):
@@ -223,6 +278,68 @@ class CpuTests(unittest.TestCase):
         self.assertLessEqual(len(encoded), 8192)
         self.assertLess(len(record['props']['top']), 15)
         self.assertIn('topOmitted', record['props'])
+
+    def test_kernel_rate_limit_persists_across_quiet_samples_and_midnight(self):
+        now = 1_800_000_000
+        run = self.spike_runner()
+        top = []
+        def counted(argv, **kwargs):
+            if argv[0] == '/usr/bin/top':
+                top.append(argv)
+            return run(argv, **kwargs)
+        for offset, load, count, skipped in ((0, 40, 1, False), (60, 40, 1, True),
+                (120, 1, 1, False), (299, 40, 1, True), (300, 40, 2, False)):
+            with self.subTest(offset=offset), patch.object(cpu.time, 'time', return_value=now+offset), \
+                    patch.object(cpu.os, 'getloadavg', return_value=(load, 1, 1)):
+                value = cpu.sample(counted, ticks_read=lambda: [1]*4)
+                self.assertEqual(len(top), count)
+                self.assertEqual(value.get('kernelTaskSkipped') == 'rate', skipped)
+                self.assertEqual(value['kernelTaskPct'], None if load == 1 or skipped else 1.5)
+        state = cpu.read_state('cpu')
+        state['spikeDay'] = 'previous-day'
+        cpu.save_state('cpu', state)
+        with patch.object(cpu.time, 'time', return_value=now+301), \
+                patch.object(cpu.os, 'getloadavg', return_value=(40, 1, 1)):
+            cpu.sample(counted, ticks_read=lambda: [1]*4)
+        self.assertEqual(len(top), 2)
+        self.assertEqual(self.events()[-1]['props']['kernelTaskSkipped'], 'rate')
+        self.assertEqual(cpu.read_state('cpu')['kernelTaskAt'], now+300)
+
+    def test_kernel_failure_and_clock_rollback_consume_cooldown(self):
+        now = 1_800_000_000
+        run = self.spike_runner()
+        calls = []
+        def failed(argv, **kwargs):
+            if argv[0] == '/usr/bin/top':
+                calls.append(argv)
+                raise subprocess.TimeoutExpired(argv, 5)
+            return run(argv, **kwargs)
+        with patch.object(cpu.os, 'getloadavg', return_value=(40, 1, 1)):
+            for offset in (0, 60, -60, 0, 240):
+                with patch.object(cpu.time, 'time', return_value=now+offset):
+                    cpu.sample(failed, ticks_read=lambda: [1]*4)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(cpu.read_state('cpu')['kernelTaskAt'], now+240)
+
+    def test_rusage_reader_precedes_inventory_and_identity_failures_are_visible(self):
+        import errno
+        order = []
+        run = self.runner()
+        def reader_factory():
+            order.append('reader')
+            def read(pid):
+                raise OSError(errno.ESTALE, 'identity')
+            return read
+        def runner(argv, **kwargs):
+            if argv == cpu.PS:
+                order.append('inventory')
+            return run(argv, **kwargs)
+        props = cpu.sample(runner, reader_factory=reader_factory)
+        self.assertEqual(order[:2], ['reader', 'inventory'])
+        self.assertEqual(props['childReadable'], 0)
+        self.assertEqual(props['childCoverage'], [dict(uid=501, reason='identity', count=1)])
+        self.assertEqual(self.events()[-1]['props']['childCoverage'], props['childCoverage'])
+
 
     def test_thread_layout_and_missing_parent_commands(self):
         rows = cpu.parse_ps(line(pid=1, command='/sbin/launchd'))

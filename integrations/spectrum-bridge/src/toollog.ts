@@ -17,6 +17,7 @@ import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./l
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
   durationMs?: number; ok?: boolean; ids?: Record<string, string>; props?: Record<string, string | number | boolean>;
+  alreadyLogged?: boolean;
   link?: RobobLink;
   site?: string;
   error?: { tag: string } & ErrorDetail;
@@ -51,6 +52,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   const line: LogLine = { ts, tool: "imessage", component: entry.component, kind: entry.kind, name: entry.name };
   if (typeof entry.durationMs === "number" && Number.isFinite(entry.durationMs) && entry.durationMs >= 0) line.durationMs = entry.durationMs;
   if (typeof entry.ok === "boolean") line.ok = entry.ok;
+  if (entry.name === "bridge.catch" && entry.kind === "error" && entry.alreadyLogged === true) line.alreadyLogged = true;
   const ids: Record<string, string> = runId ? { runId } : {};
   for (const [key, value] of Object.entries(entry.ids ?? {})) {
     // Correlation ids are UUIDs; arbitrary server header text must never become a log field.
@@ -420,9 +422,25 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
 export const toolLog = createToolLog({ defer: true });
 /** Cooperative read yielding is expected control flow, not a backend failure. */
 export const completionReady = Symbol("completionReady");
+// Keep correlation on the error identity without mutating or serializing caller-owned errors.
+const loggedFailures = new WeakMap<object, string>();
+export function markLoggedFailure(error: unknown, requestId: string): void {
+  if (error !== null && typeof error === "object") loggedFailures.set(error, requestId);
+}
+function loggedRequestId(error: unknown): string | undefined {
+  const seen = new Set<object>();
+  while (error !== null && typeof error === "object" && !seen.has(error)) {
+    const requestId = loggedFailures.get(error);
+    if (requestId) return requestId;
+    seen.add(error);
+    try { error = "cause" in error ? error.cause : undefined; } catch { return; }
+  }
+}
 export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"], props?: LogLine["props"]): void {
   if (cause === completionReady) return;
-  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids, props, error: { tag, cause } });
+  const requestId = loggedRequestId(cause);
+  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids: { ...ids, ...(requestId ? { requestId } : {}) }, props,
+    ...(requestId ? { alreadyLogged: true } : {}), error: { tag, cause } });
 }
 export function cardKind(value: string): string {
   // Generator names only; captions, query values and health data never enter the log.

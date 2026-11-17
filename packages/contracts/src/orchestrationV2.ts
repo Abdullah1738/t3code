@@ -606,6 +606,7 @@ export const OrchestrationV2Run = Schema.Struct({
   rootNodeId: Schema.NullOr(NodeId),
   activeAttemptId: Schema.NullOr(RunAttemptId),
   status: OrchestrationV2RunStatus,
+  failure: Schema.optional(Schema.suspend(() => OrchestrationV2ProviderFailure)),
   cancelReason: Schema.optional(OrchestrationV2CancelReason),
   cancelDetail: Schema.optional(CancelDetail),
   queuePosition: Schema.optional(Schema.NullOr(PositiveInt)),
@@ -631,6 +632,16 @@ export const OrchestrationV2Run = Schema.Struct({
   ),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
   lastActivityAt: Schema.optional(Schema.DateTimeUtc),
+  /** Projection-owned running tools; lifecycle snapshots must not replace this map. */
+  openTools: Schema.optional(
+    Schema.Record(
+      Schema.String,
+      Schema.Struct({
+        kind: Schema.Literals(["command_execution", "dynamic_tool"]),
+        since: IsoDateTime,
+      }),
+    ),
+  ),
   restartCancelledBackgroundWork: Schema.optional(
     Schema.Array(OrchestrationV2RestartCancelledBackgroundWork),
   ),
@@ -1412,6 +1423,16 @@ export const OrchestrationV2ProviderFailureCategory = Schema.Literals([
 export type OrchestrationV2ProviderFailureCategory =
   typeof OrchestrationV2ProviderFailureCategory.Type;
 
+export const OrchestrationV2RestartAdmissionFailure = Schema.Struct({
+  queuedAtMs: NonNegativeInt,
+  waitedMs: NonNegativeInt,
+  positionAtFailure: NonNegativeInt,
+  totalAtFailure: NonNegativeInt,
+  rule: Schema.Literals(["no_progress", "absolute_backstop"]),
+});
+export type OrchestrationV2RestartAdmissionFailure =
+  typeof OrchestrationV2RestartAdmissionFailure.Type;
+
 /**
  * Producers must redact credentials before constructing this value.
  */
@@ -1420,6 +1441,7 @@ export const OrchestrationV2ProviderFailure = Schema.Struct({
   message: OrchestrationV2ProviderFailureMessage,
   code: Schema.NullOr(OrchestrationV2ProviderFailureCode),
   retryable: Schema.NullOr(Schema.Boolean),
+  admission: Schema.optional(OrchestrationV2RestartAdmissionFailure),
   claudeAccess: Schema.optional(
     Schema.Struct({
       status: Schema.NullOr(Schema.Number),
@@ -3308,6 +3330,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
     runId: RunId,
     expectedAttemptId: Schema.NullOr(RunAttemptId),
     deadline: Schema.DateTimeUtc,
+    admission: Schema.optional(OrchestrationV2RestartAdmissionFailure),
     nativeEvidence: Schema.optional(
       Schema.Struct({
         runId: RunId,

@@ -9,6 +9,7 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationV2ProviderSession,
+  type OrchestrationV2Run,
   OrchestrationV2ProviderSessionJson,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
@@ -1611,6 +1612,296 @@ it.effect(
 
 it.effect("memory projection keeps restart-cancelled work through a stale run.updated", () =>
   restartCancelledWorkSurvivesStaleRunUpdate.pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+const openToolsFollowLifecycle = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const threadId = yield* addRolledBackRecoveryCandidate("open-tools");
+  const before = yield* store.getThreadProjection(threadId);
+  const run = { ...before.runs[0]!, status: "running" as const, completedAt: null };
+  const first = before.turnItems[0]!;
+  let seq = 0;
+  const updateRun = (payload: typeof run | OrchestrationV2Run) =>
+    store.apply({
+      id: EventId.make(`open-tools:run:${++seq}`),
+      type: "run.updated",
+      threadId,
+      occurredAt: run.requestedAt,
+      payload,
+    });
+  const updateItem = (payload: OrchestrationV2TurnItem) =>
+    store.apply({
+      id: EventId.make(`open-tools:item:${++seq}`),
+      type: "turn-item.updated",
+      threadId,
+      occurredAt: payload.updatedAt,
+      payload,
+    });
+  const tools = () =>
+    store
+      .getThreadRecords(threadId, ["runs"], { runIds: [run.id] })
+      .pipe(Effect.map((records) => records.runs[0]!.openTools ?? {}));
+  yield* updateRun(run);
+  const command = {
+    threadId,
+    runId: run.id,
+    nodeId: run.rootNodeId,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: first.ordinal + 1,
+    title: "Blocking wait",
+    updatedAt: run.requestedAt,
+    id: TurnItemId.make('tool:"quoted.id"'),
+    type: "command_execution" as const,
+    input: "offbox wait job",
+    status: "running" as const,
+    startedAt: DateTime.makeUnsafe("2099-11-09T10:00:00Z"),
+    completedAt: null,
+  };
+  const mcp = {
+    ...command,
+    id: TurnItemId.make("tool:mcp"),
+    type: "dynamic_tool" as const,
+    toolName: "example.wait",
+    startedAt: DateTime.makeUnsafe("2099-11-09T10:01:00Z"),
+  };
+  yield* updateItem(command);
+  yield* updateItem(mcp);
+  yield* updateItem({
+    ...command,
+    id: TurnItemId.make("reasoning"),
+    type: "reasoning",
+    text: "Thinking",
+    streaming: true,
+  });
+  const expected = {
+    [encodeURIComponent(command.id)]: {
+      kind: "command_execution",
+      since: "2099-11-09T10:00:00.000Z",
+    },
+    [encodeURIComponent(mcp.id)]: { kind: "dynamic_tool", since: "2099-11-09T10:01:00.000Z" },
+  };
+  assert.deepEqual(yield* tools(), expected);
+  yield* updateRun(run);
+  yield* updateItem({ ...command, updatedAt: DateTime.makeUnsafe("2099-11-09T10:30:00Z") });
+  assert.deepEqual(yield* tools(), expected);
+  yield* updateItem({ ...command, status: "completed" });
+  assert.deepEqual(Object.values(yield* tools()), [expected[encodeURIComponent(mcp.id)]]);
+  yield* updateItem({ ...mcp, type: "run_interrupt_request", message: "board stop" });
+  assert.deepEqual(yield* tools(), {});
+  yield* updateItem(command);
+  for (const status of [
+    "completed",
+    "interrupted",
+    "failed",
+    "cancelled",
+    "rolled_back",
+  ] as const) {
+    yield* updateRun({ ...run, status, completedAt: run.requestedAt });
+    yield* updateItem(mcp);
+    assert.deepEqual(yield* tools(), {});
+    yield* updateRun(run);
+    yield* updateItem(command);
+  }
+  const queries: string[] = [];
+  const record: Statement.Transformer = (statement) => {
+    queries.push(statement.compile()[0]);
+    return Effect.succeed(statement);
+  };
+  yield* tools().pipe(Effect.provideService(Statement.CurrentTransformer, record));
+  assert.isFalse(
+    queries.some((query) =>
+      /FROM (?:ardud_history_turn_items|orchestration_v2_projection_turn_items)/.test(query),
+    ),
+  );
+});
+
+it.effect("memory projection tracks open tools across completion, interrupt and recovery", () =>
+  openToolsFollowLifecycle.pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+it.effect("SQL projection tracks open tools across completion, interrupt and recovery", () =>
+  openToolsFollowLifecycle.pipe(Effect.provide(layerTest)),
+);
+
+const openToolSnapshotCases = [
+  ...(["preparing", "queued", "starting", "running", "waiting"] as const).map((status) => ({
+    name: `${status}: populated snapshot after one tool completes`,
+    status,
+    change: "complete-command" as const,
+    snapshotTools: "populated" as const,
+  })),
+  ...(["completed", "interrupted", "failed", "cancelled", "rolled_back"] as const).map(
+    (status) => ({
+      name: `${status}: populated snapshot with tools still open`,
+      status,
+      change: "none" as const,
+      snapshotTools: "populated" as const,
+    }),
+  ),
+  {
+    name: "running: populated snapshot after all tools complete",
+    status: "running",
+    change: "complete-all",
+    snapshotTools: "populated",
+  },
+  {
+    name: "running: populated snapshot after interrupt request",
+    status: "running",
+    change: "interrupt",
+    snapshotTools: "populated",
+  },
+  {
+    name: "running: empty snapshot while a newer tool remains open",
+    status: "running",
+    change: "complete-command",
+    snapshotTools: "empty",
+  },
+  {
+    name: "running: omitted tools while a newer tool remains open",
+    status: "running",
+    change: "complete-command",
+    snapshotTools: "omitted",
+  },
+] satisfies ReadonlyArray<{
+  name: string;
+  status: OrchestrationV2Run["status"];
+  change: "complete-command" | "complete-all" | "interrupt" | "none";
+  snapshotTools: "populated" | "empty" | "omitted";
+}>;
+
+const openToolsSurviveRunSnapshot = (testCase: (typeof openToolSnapshotCases)[number]) =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = yield* addRolledBackRecoveryCandidate("open-tools-snapshot");
+    const before = yield* store.getThreadProjection(threadId);
+    const run = { ...before.runs[0]!, status: "running" as const, completedAt: null };
+    let seq = 0;
+    const updateRun = (payload: OrchestrationV2Run) =>
+      store.apply({
+        id: EventId.make(`snapshot:run:${++seq}`),
+        type: "run.updated",
+        threadId,
+        occurredAt: run.requestedAt,
+        payload,
+      });
+    const updateItem = (payload: OrchestrationV2TurnItem) =>
+      store.apply({
+        id: EventId.make(`snapshot:item:${++seq}`),
+        type: "turn-item.updated",
+        threadId,
+        occurredAt: payload.updatedAt,
+        payload,
+      });
+    const readRun = () =>
+      store
+        .getThreadRecords(threadId, ["runs"], { runIds: [run.id] })
+        .pipe(Effect.map((records) => records.runs[0]!));
+    const command = {
+      id: TurnItemId.make("snapshot:old-command"),
+      threadId,
+      runId: run.id,
+      nodeId: run.rootNodeId,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: before.turnItems[0]!.ordinal + 1,
+      title: "Blocking wait",
+      type: "command_execution" as const,
+      input: "offbox wait old-job",
+      status: "running" as const,
+      startedAt: run.requestedAt,
+      updatedAt: run.requestedAt,
+      completedAt: null,
+    };
+    const mcp = {
+      ...command,
+      id: TurnItemId.make("snapshot:new-mcp"),
+      type: "dynamic_tool" as const,
+      toolName: "example.wait",
+      output: "partial progress from open MCP tool",
+      startedAt: DateTime.add(run.requestedAt, { minutes: 1 }),
+    };
+    yield* updateRun(run);
+    yield* updateItem(command);
+    yield* updateItem(mcp);
+    const snapshot = yield* readRun();
+    assert.lengthOf(Object.keys(snapshot.openTools ?? {}), 2);
+    if (testCase.change === "complete-command" || testCase.change === "complete-all") {
+      yield* updateItem({
+        ...command,
+        status: "completed",
+        completedAt: run.requestedAt,
+        toolResultIncomplete: false,
+        output: "exit 0 /logs/finished-wait.log",
+        exitCode: 0,
+      });
+    }
+    if (testCase.change === "complete-all") {
+      yield* updateItem({
+        ...mcp,
+        status: "completed",
+        completedAt: mcp.startedAt,
+        toolResultIncomplete: false,
+        output: "MCP wait finished",
+      });
+    }
+    if (testCase.change === "interrupt") {
+      yield* updateItem({ ...command, type: "run_interrupt_request", message: "board stop" });
+    }
+    const authoritativeTools = (yield* readRun()).openTools;
+    const { openTools: _snapshotTools, ...withoutTools } = snapshot;
+    yield* updateRun({
+      ...withoutTools,
+      ...(testCase.snapshotTools === "populated"
+        ? { openTools: snapshot.openTools ?? {} }
+        : testCase.snapshotTools === "empty"
+          ? { openTools: {} }
+          : {}),
+      status: testCase.status,
+      completedAt: testCase.change === "none" ? run.requestedAt : null,
+    });
+    const expected = testCase.change === "none" ? {} : authoritativeTools;
+    assert.deepEqual((yield* readRun()).openTools, expected);
+    if (testCase.change === "complete-command") {
+      assert.deepEqual(Object.keys(expected ?? {}), [encodeURIComponent(mcp.id)]);
+    }
+    if (testCase.change === "complete-command" || testCase.change === "complete-all") {
+      for (const [index, tool] of [command, mcp].entries()) {
+        yield* updateItem({
+          ...tool,
+          id: TurnItemId.make(`snapshot:cleanup:${index}`),
+          ordinal: command.ordinal + 2 + index,
+          status: index === 0 ? "completed" : "failed",
+          toolResultIncomplete: true,
+          output: "partial progress retained by cleanup",
+          completedAt: DateTime.add(mcp.startedAt, { minutes: 1 + index }),
+          updatedAt: DateTime.add(mcp.startedAt, { minutes: 1 + index }),
+        });
+      }
+      const records = yield* store.getThreadRecords(
+        threadId,
+        ["turnItems"],
+        completedToolFilter(run),
+      );
+      assert.lengthOf(records.turnItems, 1);
+      assert.equal(
+        records.turnItems[0]!.id,
+        testCase.change === "complete-all" ? mcp.id : command.id,
+      );
+      assert.equal((yield* readRun()).openTools?.[encodeURIComponent(command.id)], undefined);
+    }
+  });
+
+it.effect.each(openToolSnapshotCases)(
+  "memory projection replaces snapshot tools: $name",
+  (testCase) =>
+    openToolsSurviveRunSnapshot(testCase).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+it.effect.each(openToolSnapshotCases)("SQL projection replaces snapshot tools: $name", (testCase) =>
+  openToolsSurviveRunSnapshot(testCase).pipe(Effect.provide(layerTest)),
 );
 
 const backgroundThreadUpdatesKeepTimestamp = Effect.gen(function* () {

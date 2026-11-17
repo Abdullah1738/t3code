@@ -1185,18 +1185,23 @@ const makeRoutes = Effect.gen(function* () {
                 : fail("internal", errorDetail(cause)),
             ),
           );
-        return json({
-          ok: true,
-          total: page.total,
-          messages: page.messages.map(({ message, ...thread }) => ({
-            ...messageSummary(message),
-            ...thread,
-          })),
-          nextCursor:
-            page.next === null
-              ? null
-              : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
-        });
+        yield* ControlRequestAnalytics.items(page.messages.length, page.total);
+        return yield* ControlRequestAnalytics.encoding(
+          Effect.sync(() =>
+            json({
+              ok: true,
+              total: page.total,
+              messages: page.messages.map(({ message, ...thread }) => ({
+                ...messageSummary(message),
+                ...thread,
+              })),
+              nextCursor:
+                page.next === null
+                  ? null
+                  : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
+            }),
+          ),
+        );
       }).pipe(NodeSqliteClient.foregroundReads),
       "controlRead",
     );
@@ -1231,6 +1236,7 @@ const makeRoutes = Effect.gen(function* () {
       }).pipe(NodeSqliteClient.foregroundReads),
       "controlRead",
     );
+    yield* ControlRequestAnalytics.items(page.messages.length, page.total);
     return yield* encoded({
       ok: true,
       threadId,

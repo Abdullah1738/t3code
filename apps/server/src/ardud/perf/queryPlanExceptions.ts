@@ -2,92 +2,92 @@
 export const queryPlanExceptions = [
   {
     route: "shell.selection",
-    queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
+    queryHash: "1dab1c416ebe0419680fec03ec0acfbe22326eb010e44df7c7caf57371b5985a",
     pattern: "^SCAN t USING INDEX ardud_recovery_active_threads_idx$",
     reason:
-      "The existing full active-shell fallback now scans the narrower active-ID partial index instead of the primary key. Its query and sorting are unchanged; recovery itself uses a bounded indexed range.",
+      "The existing full active-shell fallback now scans the narrower active-ID partial index instead of the primary key. Its query and sorting are unchanged; recovery itself uses a bounded indexed range. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.client-selection",
-    queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
+    queryHash: "11788b147c0090844a688326eb0322fd0a8be4671ea82a5bfa6b490664b55200",
     pattern: "^SCAN t USING INDEX ardud_recovery_active_threads_idx$",
     reason:
-      "The existing full client-shell fallback now scans the narrower active-ID partial index instead of the primary key. Its query and sorting are unchanged; recovery itself uses a bounded indexed range.",
+      "The existing full client-shell fallback now scans the narrower active-ID partial index instead of the primary key. Its query and sorting are unchanged; recovery itself uses a bounded indexed range. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.selection",
-    queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
+    queryHash: "1dab1c416ebe0419680fec03ec0acfbe22326eb010e44df7c7caf57371b5985a",
     pattern: "^SCAN\\ t\\ USING\\ INDEX\\ sqlite_autoindex_orchestration_v2_projection_threads_1$",
     reason:
-      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.selection",
-    queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
+    queryHash: "1dab1c416ebe0419680fec03ec0acfbe22326eb010e44df7c7caf57371b5985a",
     pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
     reason:
-      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.selection",
-    queryHash: "2ae357a3818c0e5fb4e0dff3177b6ce326a1c2318a2b57bb8349de773f250f73",
+    queryHash: "1dab1c416ebe0419680fec03ec0acfbe22326eb010e44df7c7caf57371b5985a",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
     historyTables: [
       "ardud_archive.ardud_turn_items",
       "ardud_base.orchestration_v2_projection_turn_items",
     ],
     reason:
-      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.client-selection",
-    queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
+    queryHash: "11788b147c0090844a688326eb0322fd0a8be4671ea82a5bfa6b490664b55200",
     pattern: "^SCAN\\ t\\ USING\\ INDEX\\ sqlite_autoindex_orchestration_v2_projection_threads_1$",
     reason:
-      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.client-selection",
-    queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
+    queryHash: "11788b147c0090844a688326eb0322fd0a8be4671ea82a5bfa6b490664b55200",
     pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
     reason:
-      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.client-selection",
-    queryHash: "cee0d1252df0831198bb09470f638d1abd3c7b0e7a69b297b537354377530164",
+    queryHash: "11788b147c0090844a688326eb0322fd0a8be4671ea82a5bfa6b490664b55200",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
     historyTables: [
       "ardud_archive.ardud_turn_items",
       "ardud_base.orchestration_v2_projection_turn_items",
     ],
     reason:
-      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "The M0 shell derivation (same as shell.selection) with idle subagents dropped through the live-run partial indexes. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.recent-page",
-    queryHash: "a95dd95f396ba7995c675ecca4467e4613f88c3c9c58b03d1f0fab3bd4c9acfd",
+    queryHash: "e76691c2f75495212f76b6c068cd9588910bcc90c491b87e523a7b19462189d0",
     pattern: "^SCAN\\ t\\ USING\\ INDEX\\ ardud_v2_threads_updated_idx$",
     reason:
-      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.recent-page",
-    queryHash: "a95dd95f396ba7995c675ecca4467e4613f88c3c9c58b03d1f0fab3bd4c9acfd",
+    queryHash: "e76691c2f75495212f76b6c068cd9588910bcc90c491b87e523a7b19462189d0",
     pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
     reason:
-      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "shell.recent-page",
-    queryHash: "a95dd95f396ba7995c675ecca4467e4613f88c3c9c58b03d1f0fab3bd4c9acfd",
+    queryHash: "e76691c2f75495212f76b6c068cd9588910bcc90c491b87e523a7b19462189d0",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
     historyTables: [
       "ardud_archive.ardud_turn_items",
       "ardud_base.orchestration_v2_projection_turn_items",
     ],
     reason:
-      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "The M0 shell derivation (same as shell.selection) read in index order, newest first: the scan stops at the page limit and the sorts are the per-row subqueries'. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "sweep.threads-with-pull-requests",
@@ -99,21 +99,21 @@ export const queryPlanExceptions = [
   },
   {
     route: "board.thread-state",
-    queryHash: "569234241364e03255371b2a0c6dc0d1559655d9af8509b143cabee0b8c39fa6",
+    queryHash: "14679415f6aab949da62cee93cf53f8856167190ca3c47a2b0b75981488909d4",
     pattern: "^USE\\ TEMP\\ B\\-TREE\\ FOR\\ ORDER\\ BY$",
     reason:
-      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "board.thread-state",
-    queryHash: "569234241364e03255371b2a0c6dc0d1559655d9af8509b143cabee0b8c39fa6",
+    queryHash: "14679415f6aab949da62cee93cf53f8856167190ca3c47a2b0b75981488909d4",
     pattern: "^Interactive\\ query\\ references\\ history/archive$",
     historyTables: [
       "ardud_archive.ardud_turn_items",
       "ardud_base.orchestration_v2_projection_turn_items",
     ],
     reason:
-      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card",
+      "Existing M0 shell derivation; replace with indexed materialized views in M1/M3. re-reviewed #1607: SQL changed by #1543 444ac4bb0d; plan diff in card. Re-reviewed #1814: d1a400173d only adds whitespace from optional MCP clauses; the full EXPLAIN plan is identical.",
   },
   {
     route: "discussion.messages",

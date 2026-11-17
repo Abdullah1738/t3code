@@ -198,7 +198,7 @@ class DatabaseContention(Isolated):
             with self.subTest(code=code), patch.object(common, 'DB_TIMEOUT', .01), \
                     patch.object(runs.Runner, 'start', start), patch.object(runs.Runner, 'stream', return_value=None), \
                     patch.object(runs, 'recover_lost_exit', return_value=(code, "the box's exit file")), \
-                    patch.object(runs, 'do_pulls') as pull, patch.object(runs, 'go_std_glitch'), \
+                    patch('offbox_lib.pulls.wait', side_effect=sqlite3.OperationalError('database is locked')) as pull, patch.object(runs, 'go_std_glitch'), \
                     contextlib.redirect_stderr(io.StringIO()) as stderr:
                 args = self.args('--pull', 'artifact')
                 self.assertEqual(runs.run_remote(args, self.me), code)

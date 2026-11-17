@@ -88,7 +88,10 @@ export interface KanbanThreadView {
   /** When the current run started, or null when no run is active. */
   readonly runStartedAt: string | null;
   readonly lastActivityAt: string | null;
+  readonly openToolSince?: string | null;
+  readonly openToolKind?: string | null;
   readonly runId?: string | null;
+  readonly latestRunId?: string | null;
   readonly runRequestedAt?: string | null;
   readonly runMessageId?: string | null;
   readonly runStatus?: string | null;
@@ -526,6 +529,14 @@ const make = Effect.gen(function* () {
       );
       const started = shell.activityRunStartedAt;
       const activity = run?.lastActivityAt;
+      const oldestTool = Object.values(run?.openTools ?? {}).reduce<{
+        kind: string;
+        since: string;
+      } | null>(
+        (oldest, tool) =>
+          oldest === null || Date.parse(tool.since) < Date.parse(oldest.since) ? tool : oldest,
+        null,
+      );
       return {
         threadId: shell.id,
         projectId: shell.projectId,
@@ -543,6 +554,9 @@ const make = Effect.gen(function* () {
             : started
               ? DateTime.formatIso(started)
               : null,
+        latestRunId: latest?.id ?? null,
+        openToolSince: oldestTool?.since ?? null,
+        openToolKind: oldestTool?.kind ?? null,
         runId,
         runRequestedAt: run ? DateTime.formatIso(run.requestedAt) : null,
         runMessageId: run?.userMessageId ?? null,
@@ -619,7 +633,8 @@ const make = Effect.gen(function* () {
         const run = latestExecutedRun(records.runs);
         const failure =
           latestRootProviderFailure(run, records.turnItems) ??
-          rootRuntimeLoss(run, records.turnItems);
+          rootRuntimeLoss(run, records.turnItems) ??
+          (run?.status === "failed" ? (run.failure ?? null) : null);
         // A failed run can leave no error item on its root node; it still counts as failed.
         if (failure === null && run?.status === "failed") {
           return {

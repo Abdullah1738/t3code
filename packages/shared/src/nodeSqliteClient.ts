@@ -5,6 +5,9 @@ export type { StatementCompletion } from "./nodeSqliteStatementStats.ts";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeUtil from "node:util";
 import * as NodeWorkerThreads from "node:worker_threads";
+import * as NodeSea from "node:sea";
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- IPC and acknowledged SIGKILL interrupt SQLite inside its native call.
+import * as NodeChildProcess from "node:child_process";
 
 import * as Cache from "effect/Cache";
 import * as Clock from "effect/Clock";
@@ -375,6 +378,11 @@ export interface SqliteStatementObserver {
 /** Metadata only: neither SQL, bindings, database paths nor causes cross this boundary. */
 export const StatementObserver = Context.Reference<SqliteStatementObserver | undefined>(
   "@t3tools/shared/nodeSqliteClient/StatementObserver",
+  { defaultValue: () => undefined },
+);
+/** Notification immediately before SQLite enters a maintenance statement. */
+export const IndexBuildStarted = Context.Reference<(() => void) | undefined>(
+  "@t3tools/shared/nodeSqliteClient/IndexBuildStarted",
   { defaultValue: () => undefined },
 );
 const observingStatement = Context.Reference(
@@ -1610,6 +1618,79 @@ const makeWriterSetup = () => {
 type WriterConnection = Connection & {
   readonly ensure: Effect.Effect<void, SqlError>;
   readonly release: Effect.Effect<void>;
+  readonly maintenance?: (statement: string, signal: AbortSignal) => Effect.Effect<void, SqlError>;
+};
+
+// A separate process can be stopped inside SQLite's synchronous CREATE INDEX.
+// Worker.terminate cannot interrupt native SQLite, so it cannot protect commands.
+const maintenanceProcess = (source: string, workerData: Record<string, unknown>) => {
+  const bootstrap = `
+    const threads = require('node:worker_threads');
+    require('node:os').setPriority(10);
+    const { EventEmitter } = require('node:events');
+    const port = new EventEmitter();
+    port.postMessage = value => process.send(value);
+    port.close = () => process.disconnect();
+    process.once('disconnect', () => process.exit(0));
+    process.once('message', ({ source, data }) => {
+      data.cancelled = new SharedArrayBuffer(4);
+      threads.workerData = data;
+      threads.parentPort = port;
+      process.on('message', request => {
+        request.cancellation = new SharedArrayBuffer(4);
+        port.emit('message', request);
+      });
+      // An orphan must not keep the database writer locked after a server crash.
+      new threads.Worker(\`setInterval(() => {
+        try { process.kill(\${process.ppid}, 0); }
+        catch { process.kill(process.pid, 'SIGKILL'); }
+      }, 1000)\`, { eval: true }).unref();
+      new Function('require', source)(require);
+    });
+  `;
+  const sea = NodeSea.isSea();
+  const child = NodeChildProcess.spawn(
+    process.execPath,
+    sea ? ["__sqlite-reader"] : ["-e", bootstrap],
+    {
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      serialization: "advanced",
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+    },
+  );
+  let stopped = false;
+  const exited = new Promise<number>((resolve) => {
+    child.once("exit", (code) => {
+      stopped = true;
+      resolve(code ?? 1);
+    });
+    child.once("error", () => {
+      if (child.pid === undefined) {
+        stopped = true;
+        resolve(1);
+      }
+    });
+  });
+  const input = { source, data: { ...workerData, cancelled: undefined } };
+  child.send(sea ? { bootstrap, data: input } : input);
+  return {
+    on: child.on.bind(child),
+    ref: () => {
+      child.ref();
+      child.channel?.ref();
+    },
+    unref: () => {
+      child.unref();
+      child.channel?.unref();
+    },
+    postMessage: (message: Record<string, unknown>) => {
+      if (child.connected) child.send({ ...message, cancellation: undefined });
+    },
+    terminate: () => {
+      if (!stopped) child.kill("SIGKILL");
+      return exited;
+    },
+  };
 };
 
 // Each worker is one transaction generation. Replacement happens only after its
@@ -2154,15 +2235,21 @@ const makeWriterSession = Effect.fnUntraced(function* (
   statementObserver: SqliteStatementObserver | undefined,
   statementMetrics: boolean,
   setup: ReturnType<typeof makeWriterSetup>,
+  maintenanceSignal?: AbortSignal,
 ) {
   const statementStats = yield* StatementStats;
+  const indexBuildStarted = yield* IndexBuildStarted;
   const failed = (cause: unknown, message: string, operation: string) =>
     new SqlError({ reason: classifyError(cause, message, operation, options, "writer") });
   const cancelledBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   const runFork = Effect.runForkWith(yield* Effect.context<never>());
-  const worker = yield* Effect.try({
+  const acquireWorker = Effect.try({
     try: () =>
-      new NodeWorkerThreads.Worker(writerWorkerSource, {
+      (maintenanceSignal === undefined
+        ? (source: string, config: NodeWorkerThreads.WorkerOptions) =>
+            new NodeWorkerThreads.Worker(source, config)
+        : (source: string, config: NodeWorkerThreads.WorkerOptions) =>
+            maintenanceProcess(source, config.workerData))(writerWorkerSource, {
         eval: true,
         workerData: {
           filename: options.filename,
@@ -2187,6 +2274,11 @@ const makeWriterSession = Effect.fnUntraced(function* (
       }),
     catch: (cause) => failed(cause, "Failed to open database", "open"),
   });
+  // Cancellation can arrive immediately after spawn, before protocol listeners
+  // exist. Register an awaited kill while acquisition is still uninterruptible.
+  const worker = yield* maintenanceSignal === undefined
+    ? acquireWorker
+    : Effect.acquireRelease(acquireWorker, (worker) => Effect.promise(() => worker.terminate()));
   type Reply = WriterSetupReply & {
     readonly id: number;
     readonly committed?: boolean;
@@ -2258,6 +2350,18 @@ const makeWriterSession = Effect.fnUntraced(function* (
         );
         return;
       }
+      if (
+        maintenanceSignal !== undefined &&
+        "type" in reply &&
+        reply.type === "pre-begin" &&
+        reply.reason === "sqlite_begin"
+      ) {
+        try {
+          indexBuildStarted?.();
+        } catch {
+          /* Observation cannot change execution. */
+        }
+      }
       if ("type" in reply && reply.type === "checkpoint-warning") {
         runFork(
           Effect.logWarning(
@@ -2306,6 +2410,18 @@ const makeWriterSession = Effect.fnUntraced(function* (
   );
   worker.on("error", (error) => stop(error.message));
   worker.on("exit", (code) => stop(`SQLite writer exited (${code}); outcome may be unknown`));
+  if (maintenanceSignal !== undefined) {
+    const abort = () => {
+      void worker.terminate();
+    };
+    maintenanceSignal.addEventListener("abort", abort, { once: true });
+    // An admission abort must wake startup through the exit listener as well as
+    // reap the child, or the writer permit waits for the startup deadline.
+    if (maintenanceSignal.aborted) abort();
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => maintenanceSignal.removeEventListener("abort", abort)),
+    );
+  }
 
   const request: (
     input: Partial<ReaderRequest> & {
@@ -2455,7 +2571,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
                   ),
                 }),
             id,
-            preBegin: preBegin !== undefined,
+            preBegin: preBegin !== undefined || maintenanceSignal !== undefined,
             cancellation: cancellation.buffer,
             safeIntegers: Boolean(Context.get(fiber.context, Client.SafeIntegers)),
           };
@@ -2472,6 +2588,9 @@ const makeWriterSession = Effect.fnUntraced(function* (
         // Retain the permit until the worker confirms it skipped or finished SQL.
         return Effect.promise(() => {
           preBegin?.phase("cancellation_ack");
+          // IPC cannot share the request's cancellation buffer. Kill the native
+          // call here: waiting for its reply before the scope closes can deadlock.
+          if (maintenanceSignal !== undefined) return worker.terminate().then(() => acknowledged);
           Atomics.store(cancellation, 0, 1);
           try {
             // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node workers do not accept a target origin.
@@ -2629,6 +2748,19 @@ const makeWriter = Effect.fnUntraced(function* (
   ).pipe(Effect.uninterruptible);
   return identity<WriterConnection>({
     ensure,
+    maintenance: (statement, signal) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const isolated = yield* makeWriterSession(
+            { ...options, checkpointWorkerStart: undefined },
+            statementObserver,
+            statementMetrics,
+            setup,
+            signal,
+          );
+          yield* isolated.connection.executeUnprepared(statement, [], undefined);
+        }),
+      ),
     release: Effect.suspend(() => session.release),
     execute: (sql, params, transform) =>
       Effect.suspend(() => session.connection.execute(sql, params, transform)),
@@ -2978,6 +3110,27 @@ const make = Effect.fn("makeWithDatabase")(function* (
 
   const semaphore = yield* Semaphore.make(1);
   const connection = yield* makeConnection;
+  let lastWriterActivity = 0;
+  let maintenanceAbort: AbortController | undefined;
+  let writerDemand = 0;
+  const withWriterDemand = <A, E, R>(effect: Effect.Effect<A, E, R>) => {
+    // Memory connections cannot run maintenance. Keep their synchronous statements
+    // free of maintenance bookkeeping and its extra scheduler yield points.
+    if (connection.maintenance === undefined) return effect;
+    return Effect.acquireUseRelease(
+      Effect.sync(() => {
+        writerDemand++;
+        lastWriterActivity = performance.now();
+        maintenanceAbort?.abort();
+      }),
+      () => effect,
+      () =>
+        Effect.sync(() => {
+          writerDemand--;
+          lastWriterActivity = performance.now();
+        }),
+    );
+  };
   const readers = Boolean(options.readerWorker) && isFileDatabase;
   // All slots pin their WAL snapshots under one lock, so an archive mover sees one gate.
   const snapshotLock =
@@ -3295,7 +3448,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
                         ),
                       ),
                 );
-          return Effect.onExit(acquire, (exit) =>
+          const useTarget = Effect.onExit(acquire, (exit) =>
             Effect.sync(() => {
               if (started || !traced || span?._tag !== "Span") return;
               const wait = acquired(target, clock, start);
@@ -3310,6 +3463,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
               span.attribute("db.reader.acquire_wait_ms", wait.lockWaitMs);
             }),
           );
+          return target.name === "writer" ? withWriterDemand(useTarget) : useTarget;
         }),
       );
       if (requestFiber.getRef(ReaderWaitObserver) === undefined) return borrow;
@@ -3329,7 +3483,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
     const finishWait = reportReaderWaitStarted(requestFiber);
     const acquireReader = Effect.flatMap(route(), (target) => {
       finishWait?.(target.lane ?? "writer", false);
-      return Effect.uninterruptibleMask((restore) => {
+      const useTarget = Effect.uninterruptibleMask((restore) => {
         const fiber = Fiber.getCurrent()!;
         const scope = Context.getUnsafe(fiber.context, Scope.Scope);
         const pending = pendingForClient(fiber);
@@ -3374,7 +3528,14 @@ const make = Effect.fn("makeWithDatabase")(function* (
             Scope.addFinalizer(
               scope,
               (target.name === "writer" ? connection.release : Effect.void).pipe(
-                Effect.ensuring(target.lock.release(1)),
+                Effect.ensuring(
+                  Effect.andThen(
+                    Effect.sync(() => {
+                      if (target.name === "writer") lastWriterActivity = performance.now();
+                    }),
+                    target.lock.release(1),
+                  ),
+                ),
                 Effect.andThen(
                   Effect.suspend(() => {
                     const held = holdMs(clock, granted);
@@ -3404,6 +3565,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
           target.connection,
         );
       });
+      return target.name === "writer" ? withWriterDemand(useTarget) : useTarget;
     });
     if (requestFiber.getRef(ReaderWaitObserver) === undefined) return acquireReader;
     return acquireReader.pipe(
@@ -3456,6 +3618,51 @@ const make = Effect.fn("makeWithDatabase")(function* (
     transformRows,
   });
   const withTransaction = client.withTransaction;
+  maintenanceWriters.set(client, (statement, idleMs, onStart) =>
+    Effect.suspend(() => {
+      const busy = () => writerDemand > 0 || performance.now() - lastWriterActivity < idleMs;
+      if (connection.maintenance === undefined || busy()) return Effect.succeed(Option.none());
+      return semaphore
+        .withPermitsIfAvailable(1)(
+          Effect.acquireUseRelease(
+            Effect.sync(() => {
+              // Taking the permit may yield. Recheck queued demand and install
+              // its abort target in the same synchronous step before any work.
+              if (busy()) return Option.none<AbortController>();
+              const controller = new AbortController();
+              maintenanceAbort = controller;
+              return Option.some(controller);
+            }),
+            (controller) =>
+              Option.isNone(controller)
+                ? Effect.succeed(Option.none<boolean>())
+                : Effect.andThen(
+                    onStart(controller.value.signal),
+                    Effect.suspend(() =>
+                      controller.value.signal.aborted
+                        ? Effect.void
+                        : connection.maintenance!(statement, controller.value.signal),
+                    ),
+                  ).pipe(
+                    Effect.map(() => Option.some(!controller.value.signal.aborted)),
+                    Effect.catch((error) =>
+                      controller.value.signal.aborted
+                        ? Effect.succeed(Option.some(false))
+                        : Effect.fail(error),
+                    ),
+                  ),
+            (controller) =>
+              Effect.sync(() => {
+                if (Option.isSome(controller)) {
+                  controller.value.abort();
+                  maintenanceAbort = undefined;
+                }
+              }),
+          ),
+        )
+        .pipe(Effect.map(Option.flatten));
+    }),
+  );
   return Object.assign(client, {
     withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       Effect.withFiber((fiber) =>
@@ -3545,3 +3752,22 @@ const make = Effect.fn("makeWithDatabase")(function* (
 
 export const layer = (config: SqliteClientConfig): Layer.Layer<Client.SqlClient, SqlError> =>
   Layer.effect(Client.SqlClient, make(config)).pipe(Layer.provide(Reactivity.layer));
+
+const maintenanceWriters = new WeakMap<
+  Client.SqlClient,
+  (
+    statement: string,
+    idleMs: number,
+    onStart: (signal: AbortSignal) => Effect.Effect<void>,
+  ) => Effect.Effect<Option.Option<boolean>, SqlError>
+>();
+
+// None = writer busy/recently used; false = preempted. Never enqueue behind commands.
+export const idleIndexBuild = (
+  sql: Client.SqlClient,
+  statement: string,
+  idleMs = 60_000,
+  onStart: (signal: AbortSignal) => Effect.Effect<void> = () => Effect.void,
+) =>
+  maintenanceWriters.get(sql)?.(statement, idleMs, onStart) ??
+  Effect.succeed(Option.none<boolean>());

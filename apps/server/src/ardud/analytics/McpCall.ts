@@ -21,7 +21,14 @@ type ThreadReadStage = NonNullable<AnalyticsEvent["threadReadStages"]>[number];
 type MutableThreadReadStage = { -readonly [K in keyof ThreadReadStage]: ThreadReadStage[K] };
 type TaskLookup = Pick<
   NonNullable<AnalyticsEvent["props"]>,
-  "foundBy" | "notFoundReason" | "idCanonical" | "idShape"
+  | "foundBy"
+  | "notFoundReason"
+  | "idCanonical"
+  | "idShape"
+  | "commandId"
+  | "taskId"
+  | "receiptState"
+  | "missingLookup"
 >;
 
 export class McpCall extends Context.Service<
@@ -502,9 +509,7 @@ export function callOutcome(
     props: {
       ...taskLookup,
       ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
-      ...((code === "task_not_found" || code === "task_creating") && notFoundReason !== undefined
-        ? { notFoundReason }
-        : {}),
+      ...(notFoundReason === undefined ? {} : { notFoundReason }),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
       ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
       code:
