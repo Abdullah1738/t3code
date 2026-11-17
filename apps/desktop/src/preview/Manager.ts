@@ -1839,7 +1839,11 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
     ) {
       return yield* new PreviewWebContentsNotFoundError({ tabId, webContentsId });
     }
-    yield* rendererHistory.register(wc, { surface: "preview", tabId });
+    yield* rendererHistory.register(
+      wc,
+      { surface: "preview", tabId },
+      Option.getOrUndefined(mainWindow),
+    );
     const attached = yield* Ref.get(attachedRef);
     const annotationTheme = yield* Ref.get(annotationThemeRef);
     const currentAttachment = attached.get(webContentsId);
@@ -1985,7 +1989,11 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
   const prepareWebview = Effect.fn("PreviewManager.prepareWebview")(function* (
     wc: Electron.WebContents,
   ) {
-    yield* rendererHistory.register(wc, { surface: "preview" });
+    yield* rendererHistory.register(
+      wc,
+      { surface: "preview" },
+      Option.getOrUndefined(yield* Ref.get(mainWindowRef)),
+    );
     const webContentsId = wc.id;
     wc.once("destroyed", () => {
       runFork(detachControlSession(webContentsId));
@@ -2997,10 +3005,14 @@ const makeNativeOperations = Effect.fn("PreviewManager.makeOperations")(function
               },
             }),
         );
-        yield* rendererHistory.register(pictureInPictureWindow.webContents, {
-          surface: "picture-in-picture",
-          tabId,
-        });
+        yield* rendererHistory.register(
+          pictureInPictureWindow.webContents,
+          {
+            surface: "picture-in-picture",
+            tabId,
+          },
+          pictureInPictureWindow,
+        );
         const initializationScope = yield* Scope.fork(parentScope, "sequential");
         const ready = yield* Deferred.make<void, PreviewManagerError>();
         const session: PictureInPictureSession = {
