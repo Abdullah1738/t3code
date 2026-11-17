@@ -12991,6 +12991,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
+    // A missing acknowledgement cannot prove that preparation did not admit this input.
+    // Keep the claimed generation until acceptance or a definite rejection is reconciled.
+    if (deliveryRun.failure?.code?.startsWith("provider_prompt_acceptance_") === true) return;
+
     const now = yield* DateTime.now;
     const nextTaskStates = new Map<
       OrchestrationV2Subagent["id"],

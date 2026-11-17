@@ -5595,6 +5595,23 @@ const make = Effect.gen(function* () {
     },
   );
 
+  const idleEvaluatorAcceptanceHeld = Effect.fn("KanbanService.idleEvaluatorAcceptanceHeld")(
+    function* (card: KanbanCard) {
+      const links = yield* cardEvaluatorLinks(card);
+      const owner = links.findLast(
+        (link) => link.role === "evaluator" && link.cardId === card.id && link.endedAt === null,
+      );
+      // A healthy current owner supersedes historical candidates, just as for discussion nudges.
+      const ids = owner ? [owner.threadId] : (yield* cardEvaluatorCandidates(card)).ids;
+      for (const id of ids) {
+        if (!(yield* isBoardEvaluator(id, card.boardId))) continue;
+        const failure = yield* threads.findLastFailure(id);
+        if (failure !== null && Rules.isUnconfirmedPromptAcceptance(failure)) return true;
+      }
+      return false;
+    },
+  );
+
   const appendSighting = Effect.fn("KanbanService.appendSighting")(function* (
     card: KanbanCard,
     text: string,
@@ -6284,6 +6301,7 @@ const make = Effect.gen(function* () {
             )
           )
             return;
+          if (yield* locks.outside(idleEvaluatorAcceptanceHeld(facts.card))) return;
         }
         const observed = row.job_key !== wanted ? yield* postRoutingTarget : undefined;
         if (
@@ -15097,6 +15115,7 @@ const make = Effect.gen(function* () {
                     // Only an accepted delivery starts the six-hour escalation clock.
                     const delivered = yield* locks.outside(
                       Effect.gen(function* () {
+                        if (yield* idleEvaluatorAcceptanceHeld(current)) return false;
                         const evaluator = links.findLast(
                           (link) => link.role === "evaluator" && link.endedAt === null,
                         );
