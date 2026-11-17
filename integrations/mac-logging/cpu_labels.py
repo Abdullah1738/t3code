@@ -4,7 +4,8 @@ import re
 import shlex
 import sys
 
-SYSTEM_ROOTS = ('/System/', '/usr/libexec/', '/usr/sbin/', '/usr/bin/', '/sbin/', '/Library/Apple/')
+SYSTEM_ROOTS = ('/System/', '/usr/libexec/', '/usr/sbin/', '/usr/bin/', '/sbin/',
+                '/Library/Apple/', '/Library/SystemExtensions/')
 SECRET_LABEL = re.compile(r'(?i)(password|secret|credential|token[=: ]|cookie|bearer |sk-|ghp_|github_pat_|xox[baprs]-)')
 
 
@@ -28,16 +29,29 @@ def janitor_redact(value):
 
 
 def family(command):
-    if ('/Users/' in command or '/home/' in command or str(Path.home()) in command
-            or command.startswith('~') or SECRET_LABEL.search(command)):
-        return '[redacted]'
+    from toollog import SECRET
+
+    if command.startswith('ssh: ') and command.endswith(' [mux]'):
+        return 'ssh'
+    home = ('/Users/' in command or '/home/' in command or str(Path.home()) in command
+            or command.startswith('~'))
     name = Path(command).name
+    if SECRET_LABEL.search(name) or SECRET.search(name):
+        return '[redacted]'
+    system = command.startswith(SYSTEM_ROOTS) and '..' not in Path(command).parts and not home
+    if not system:
+        try:
+            name = janitor_redact(name)
+        except (ImportError, OSError):
+            return '[redacted]'
     if re.fullmatch(r'[Pp]ython(?:\d+(?:\.\d+)*)?', name):
         return 'python'
     if name.startswith('mds'):
         return 'mds*'
-    if command.startswith(SYSTEM_ROOTS) and '..' not in Path(command).parts:
+    if system:
         return SystemFamily(name)
+    if home:
+        return name
     # Nested helper bundles have their own basename (including Renderer/GPU).
     bundle = re.findall(r'/([^/]+)\.app/', command)
     try:

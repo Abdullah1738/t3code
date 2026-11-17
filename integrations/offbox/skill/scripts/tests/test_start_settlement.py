@@ -172,6 +172,7 @@ class StartPaths(Isolated):
         with patch.object(api, 'cmd_start', return_value={'processId': 1001, 'commandId': 'cmd-own'}), \
                 patch.object(api, 'get', return_value={'state': 'running'}), \
                 patch.object(lease, 'ensure_ttl'), contextlib.redirect_stdout(io.StringIO()), \
+                patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cli.cmd_run(a, self.me), 0)
         row = self.con.execute('SELECT * FROM runs ORDER BY rowid DESC LIMIT 1').fetchone()
@@ -433,7 +434,7 @@ class RecoveryPaths(ShellChecks):
         for route in ('wait','reap'):
             path = route + '.txt'
             self.con.execute("UPDATE runs SET status='starting',exit_code=NULL,end_at=NULL,remote_dir='w/r', "
-                             "rel_cwd='.',local_cwd=?,pulls=? WHERE run_id='run-dead'",
+                             "rel_cwd='.',local_cwd=?,pulls=?,pull_state=NULL,pull_owner=NULL,pull_summary=NULL WHERE run_id='run-dead'",
                              (self.tmp.name, '["' + path + '"]'))
             self.con.commit()
             def pull(box,remote,rel,path,dest,**opts):

@@ -159,11 +159,12 @@ def resume_inflight(con, box_id):
 
 
 def abandoned_resumes(con, key, box_id=None):
+    from . import unfit
     rows = con.execute("SELECT l.box_id FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                        "WHERE l.repo_key=? AND l.state IN ('running','stopped') AND l.box_id<>? "
                        "AND COALESCE(l.note,'') NOT LIKE ?",
                        (key, box_id or '', BOX_WEDGED_NOTE + '%')).fetchall()
-    return [r for r in rows if not resume_inflight(con, r['box_id'])]
+    return [r for r in rows if unfit.available(con, r['box_id']) and not resume_inflight(con, r['box_id'])]
 
 
 class Unresolved(OffboxError):
@@ -234,7 +235,8 @@ def guard(box_id=None, recover_create=False, reconcile=False, lock_wait=None):
                 raise Busy(f"another caller is starting a box for {key}") from e
     try:
         check_queue()
-        if not queued and (wait > 0 or said) and time.monotonic() >= end:
+        # A zero lock budget still permits one immediate acquisition, regardless of the ordinary pool wait.
+        if not queued and lock_wait != 0 and (wait > 0 or said) and time.monotonic() >= end:
             raise pool.PoolBusyError(f"repository pool busy for {key}: allocation queue timed out; nothing ran")
     except BaseException:
         lock.__exit__(None, None, None)

@@ -5,6 +5,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Logger from "effect/Logger";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
@@ -208,6 +209,90 @@ describe("runProcess", () => {
       expect(error).not.toHaveProperty("args");
       expect(error).not.toHaveProperty("resolvedArgs");
       expect(error.message).not.toContain("secret-token-value");
+    }),
+  );
+
+  it.effect.each([
+    {
+      platform: "darwin",
+      executable: "fj",
+      pathKey: "PATH",
+      path: "/test/bin:/usr/bin",
+      defect: false,
+    },
+    {
+      platform: "linux",
+      executable: "fj",
+      pathKey: "PATH",
+      path: "/test/bin:/usr/bin",
+      defect: true,
+    },
+    {
+      platform: "win32",
+      executable: "C:\\Tools\\fj.cmd",
+      pathKey: "PATH",
+      path: "C:\\Tools;C:\\Windows",
+      defect: false,
+    },
+    {
+      platform: "win32",
+      executable: "C:\\Tools\\fj.bat",
+      pathKey: "Path",
+      path: "C:\\Tools;C:\\Windows",
+      defect: false,
+    },
+    {
+      platform: "win32",
+      executable: "C:\\Tools\\fj.exe",
+      pathKey: "path",
+      path: "C:\\Tools;C:\\Windows",
+      defect: false,
+    },
+    {
+      platform: "win32",
+      executable: undefined,
+      pathKey: "PATH",
+      path: "C:\\Tools;C:\\Windows",
+      defect: false,
+    },
+  ] as const)("logs ENOENT without exposing arguments: %s", (scenario) =>
+    Effect.gen(function* () {
+      const messages: unknown[] = [];
+      const spawner = makeSpawner((command) => {
+        if (scenario.executable?.match(/\.(cmd|bat)$/)) {
+          expect(command.options.shell).toBe(true);
+          expect(command.command).toContain("secret-argument");
+        }
+        return scenario.defect
+          ? Effect.die(Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" }))
+          : Effect.fail(
+              PlatformError.systemError({
+                _tag: "NotFound",
+                module: "ChildProcess",
+                method: "spawn",
+              }),
+            );
+      });
+      yield* runWith(spawner)({
+        command: "fj",
+        args: ["secret-argument"],
+        env: { [scenario.pathKey]: scenario.path },
+      }).pipe(
+        Effect.flip,
+        Effect.provideService(HostProcess.Platform, scenario.platform),
+        Effect.provideService(HostProcess.Environment, {}),
+        Effect.provideService(SpawnExecutableResolution, () => scenario.executable),
+        Effect.provide(
+          Logger.layer([
+            Logger.make(({ message }) => {
+              messages.push(message);
+            }),
+          ]),
+        ),
+      );
+      expect(messages).toEqual([
+        ["process spawn ENOENT", { command: "fj", path: scenario.path, pathEntryCount: 2 }],
+      ]);
     }),
   );
 

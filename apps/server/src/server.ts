@@ -4,6 +4,8 @@ import * as McpAvailability from "./ardud/analytics/McpAvailability.ts";
 import * as AnalyticsDatabase from "./observability/AnalyticsDatabase.ts";
 import { layerServerAnalyticsErrors } from "./observability/RpcInstrumentation.ts";
 import * as OwnerAnalytics from "./ardud/analytics/Analytics.ts";
+import * as RuntimeSampler from "./ardud/analytics/RuntimeSampler.ts";
+import * as GitExecRate from "./vcs/GitExecRate.ts";
 import * as ThreadRedaction from "./ardud/redaction/ThreadRedaction.ts";
 import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
 import { redactionRouteLayer } from "./ardud/redaction/http.ts";
@@ -610,6 +612,11 @@ const layerProviderInstallationRefresh = Layer.effectDiscard(
   }),
 );
 
+const layerKanban = ArdudKanbanLive.pipe(
+  Layer.provide(KanbanWaitPrsLayer.pipe(Layer.provide(layerPullRequestService))),
+  StartupPhaseLog.withStartupLayer("server.kanban"),
+);
+
 const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   AgentAwarenessRelay.layer,
   HeldHooksWaker.layer,
@@ -662,11 +669,8 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   ReplayMarkers.layer,
   ArdudOpenCodeImportLive.pipe(StartupPhaseLog.withStartupLayer("server.opencode-import")),
   // ardud: missions board
-  ArdudKanbanLive.pipe(
-    // Reads the pull requests board waits point at; the board picks it up when present.
-    Layer.provide(KanbanWaitPrsLayer.pipe(Layer.provide(layerPullRequestService))),
-    StartupPhaseLog.withStartupLayer("server.kanban"),
-  ),
+  RuntimeSampler.layerScheduled.pipe(Layer.provide(layerKanban)),
+  layerKanban,
   ReadonlyReplica.layer.pipe(StartupPhaseLog.withStartupLayer("server.readonly-replica")),
   BackupSnapshot.layer.pipe(StartupPhaseLog.withStartupLayer("server.backup-snapshot")),
   Layer.effectDiscard(ProjectSettingsOverrideSweep.sweep).pipe(
@@ -1188,10 +1192,16 @@ const layerMakeServer = Layer.unwrap(
         Layer.provide(McpCallLedger.layer),
         Layer.provide(McpAvailability.layer),
         Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
+        Layer.provide(AnalyticsDatabase.layerStatementStats),
         Layer.provide(LargeReplyLog.layer),
         Layer.provide(ReplyBuilders.layer),
         Layer.provideMerge(FetchHttpClient.layer),
         Layer.provide(VcsProcess.layer),
+        Layer.provide(
+          GitExecRate.layer.pipe(
+            Layer.provide(OwnerAnalytics.layer.pipe(Layer.provide(layerPersistence))),
+          ),
+        ),
         Layer.provideMerge(AgentScopeLive.layer),
         Layer.provideMerge(ProviderProcessRegistry.layer),
       )

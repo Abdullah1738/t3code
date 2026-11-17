@@ -265,6 +265,7 @@ const makeWorld = (
   const threadsLayer = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: () => Effect.succeed(null),
       view,
@@ -1042,6 +1043,49 @@ it.effect("card: the worker starts when the card it waited on is done", () =>
   ),
 );
 
+it.effect.each(["done", "skipped"] as const)(
+  "card: a Completed target holds through its marked release until %s",
+  (state) =>
+    inWorld((world) =>
+      Effect.gen(function* () {
+        const { kanban, store, board } = yield* setup;
+        const created = yield* placed(board, "Host release", { stage: "completed" });
+        const step: KanbanCard["subtasks"][number] = {
+          id: "s1",
+          step: 1,
+          owner: "evaluator",
+          state: "open",
+          text: "Host release via #99, then live read-back",
+          holdsDependents: true,
+          note: null,
+          doneBy: null,
+          doneAt: null,
+        };
+        yield* store.putCard({ ...created, subtasks: [step] });
+        const dependent = yield* placed(board, "Resume after release");
+        yield* kanban.waitCard(
+          dependent.id,
+          {
+            on: "card",
+            card: created.id,
+            note: "Needs the host release",
+            wakeRole: "work",
+          },
+          owner,
+        );
+        yield* kanban.tick;
+        assert.isDefined((yield* cardOf(dependent.id)).wait);
+        assert.strictEqual(world.cardThreads(), 0);
+        yield* store.putCard({ ...(yield* cardOf(created.id)), subtasks: [{ ...step, state }] });
+        yield* kanban.tick;
+        const woken = yield* cardOf(dependent.id);
+        assert.isUndefined(woken.wait);
+        assert.strictEqual(woken.activeRole, "work");
+        assert.include(briefOf(world, woken), `Card #${created.number} is done`);
+      }),
+    ),
+);
+
 it.effect.each(["work", "review", "evaluator"] as const)(
   "cross-board card waits hold and wake %s",
   (wakeRole) =>
@@ -1082,6 +1126,7 @@ it.effect.each(["work", "review", "evaluator"] as const)(
         assert.isUndefined(woken.wait);
         if (wakeRole === "evaluator") {
           yield* world.waitForTold(dependent.id);
+          yield* world.waitForTold(sibling.id);
           assert.isAbove(world.toldEvaluator(`Card #${target.number}`), 0);
           assert.strictEqual(woken.boardId, board.id);
         } else {

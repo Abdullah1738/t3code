@@ -213,6 +213,8 @@ describe("control archive-if-idle", () => {
             code: "not_idle",
             reason: "running",
             message: "Thread thread-busy has a running run.",
+            retrySafe: true,
+            holder: { threadId: "thread-busy", runId: null, status: "running" },
           },
         });
       }),

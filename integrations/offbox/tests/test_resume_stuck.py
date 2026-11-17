@@ -200,14 +200,14 @@ class ResumeStuckTests(Isolated):
 
         def get(box_id):
             elapsed = self.clock.t - t0
-            state = 'archived' if elapsed < 2 else 'resuming' if elapsed < 300 else 'running'
+            state = 'archived' if elapsed < 2 else 'resuming' if elapsed < 240 else 'running'
             return self.state(box_id, state)
 
         with patch.object(api, 'get', side_effect=get):
             got = pool.acquire(self.me)
         try:
             self.assertEqual(got['box_id'], 'slow')
-            self.assertGreaterEqual(self.clock.t - t0, 300)
+            self.assertGreaterEqual(self.clock.t - t0, 240)
             self.assertEqual(len(self.resumes), 1)
             self.assertFalse(self.events('slow', 'resume_resent'))
             self.assertFalse(self.events('slow', 'resume_stuck'))

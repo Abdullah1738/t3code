@@ -41,7 +41,7 @@ import { Sendblue } from "./sendblue.ts";
 import { Store } from "./store.ts";
 import { chatDbSwipes } from "./swipe.ts";
 import { transcribe } from "./stt.ts";
-import { notificationAccepted, socketPost, telegramOutlet } from "./telegram-fallback.ts";
+import { fenceOwnerAlert, notificationAccepted, socketPost, telegramOutlet } from "./telegram-fallback.ts";
 
 export type MainIo = {
   log: (event: string, code?: string) => void;
@@ -212,7 +212,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const build = (chat: ChatCore): Parts => {
     const remoteConfig = remoteBoxConfig(config, chat.info.slug);
     if (remoteConfig) {
-      const remote = new RemoteBox(remoteConfig, chat.store, { log,
+      const remote = new RemoteBox(remoteConfig, chat.store, { log, ownerAlert: fenceOwnerAlert(telegramBridgeSocket),
         active: () => {
           try { const live = JSON.parse(readFileSync(join(stateRoot, "config.json"), "utf8"));
             return remoteBoxConfig(live, "moni")?.epoch === remoteConfig.epoch; } catch { return false; }
@@ -232,7 +232,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const router = new Router(chat.store, chatBackend, transport as unknown as ConstructorParameters<typeof Router>[2], {
       ...config, chatGuid: chat.info.key, skillPath, alertSkillPath, alertSocketPath: telegramBridgeSocket,
       medsFold: {},
-      transcribe: input => transcribe(input), notifyFailure: notifyFailedInbound, log, context: chat.context,
+      transcribe: input => transcribe(input), notifyUnanswered: outlet.notify, notifyFailure: notifyFailedInbound, log, context: chat.context,
       ...(chat.info.kind === "group" ? { groupJudge } : {}),
       swipes: { find: swipes, line: config.sendblueNumber ?? "" },
     });
@@ -265,7 +265,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     const replyGap = new ReplyGapMonitor(chat.store, { chat: chat.info.slug, notify: outlet.notify });
     return { router, delivery, replyGap, api: chatApi, backend: chatBackend, busy: false };
   };
-  registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build });
+  registry = new ChatRegistry<Parts>({ line, owner: config.owner, ownerStore, stateRoot, access: () => access, build, backend: kind });
   registry.restore();
   if (remoteBoxConfig(config, "moni") && !registry.bySlugName("moni")) {
     const person = access.people.find(person => person.name.toLowerCase() === "moni");
@@ -377,6 +377,9 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
       await sleep(1_000);
     }
   }
+  const unansweredTimer = setInterval(() => {
+    if (ready()) for (const chat of chats.all()) void (chat.parts.remote ?? chat.parts.router)?.checkUnanswered().catch(error => toolError("sb-main", "unanswered.check", error));
+  }, 60_000);
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
       if (chat.parts.remote) { if (ready()) void chat.parts.remote.tick(); continue; }
@@ -400,6 +403,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     toolLog.capture(() => toolLog.write({ component: "process", kind: "event", name: "bridge.stop" }));
     abort.abort();
     clearInterval(timer);
+    clearInterval(unansweredTimer);
     await server.stop(true);
     await apps?.stop().catch((caughtError) => { toolError("sb-main", "sb-main.catch17", caughtError);});
     await shares.stopAll().catch((caughtError) => { toolError("sb-main", "sb-main.catch18", caughtError);});

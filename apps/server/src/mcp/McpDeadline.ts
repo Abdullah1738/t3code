@@ -1,4 +1,5 @@
-import { OrchestratorMcpFailure, type ThreadId } from "@t3tools/contracts";
+import { OrchestratorMcpFailure, type ThreadId, type AnalyticsEvent } from "@t3tools/contracts";
+import type { DetachedDelegationOutcome } from "../orchestration-v2/ThreadManagementService.ts";
 import * as Clock from "effect/Clock";
 import type * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -35,6 +36,10 @@ export const waitingOn = Effect.fnUntraced(function* <A, E, R>(
 });
 
 type DetachedOperation = {
+  readonly onDetachedOutcome?: (
+    outcome: DetachedDelegationOutcome,
+  ) => Effect.Effect<AnalyticsEvent["detachedOutcomeWake"]>;
+  readonly startedAt: bigint;
   readonly onTimeout: "detach";
   readonly requestKey?: string;
   readonly taskId?: string;
@@ -63,6 +68,17 @@ export const awaitInterruptibly = Effect.fn("McpDeadline.awaitInterruptibly")(fu
   ) {
     const firedAt = detached.deadline.firedAt;
     const now = yield* Clock.monotonicTimeNanos;
+    const wake =
+      outcome !== "capped" && detached.onDetachedOutcome !== undefined
+        ? yield* detached.onDetachedOutcome({
+            outcome,
+            elapsedSeconds: Math.round(Number(now - detached.startedAt) / 1_000_000_000),
+            stage: Option.isSome(wait) ? wait.value.wait : "dispatch/threadManagement.dispatch",
+            ...(cause === undefined ? {} : { reason: delegationCreateFailure(cause) }),
+          })
+        : undefined;
+    if (wake !== undefined)
+      yield* Effect.annotateCurrentSpan("t3.delegate.detached_outcome_wake", wake);
     yield* Effect.logInfo("MCP detached operation finished", {
       outcome,
       timedOut: firedAt !== undefined,
@@ -76,7 +92,12 @@ export const awaitInterruptibly = Effect.fn("McpDeadline.awaitInterruptibly")(fu
           }),
       ...(outcome === "capped" ? { cancellationPending: true } : capped ? { afterCap: true } : {}),
     });
-    if (firedAt === undefined || Option.isNone(analytics) || identity === undefined) return;
+    if (
+      (firedAt === undefined && wake !== "sent") ||
+      Option.isNone(analytics) ||
+      identity === undefined
+    )
+      return;
     const ts = yield* Clock.currentTimeMillis;
     // Analytics must never hold up a detached commit, even during writer failure or shutdown.
     yield* Effect.suspend(() =>
@@ -111,7 +132,8 @@ export const awaitInterruptibly = Effect.fn("McpDeadline.awaitInterruptibly")(fu
             }
           : {}),
         outcome,
-        lateMs: Math.max(0, Number(now - firedAt) / 1_000_000),
+        ...(wake === undefined ? {} : { detachedOutcomeWake: wake }),
+        lateMs: Math.max(0, Number(now - (firedAt ?? now)) / 1_000_000),
         ...(cause === undefined ? {} : { props: interruptionProps(cause) }),
         ...(capped && outcome !== "capped" ? { afterCap: true } : {}),
       }),
@@ -120,9 +142,14 @@ export const awaitInterruptibly = Effect.fn("McpDeadline.awaitInterruptibly")(fu
   // A create owns its lifetime after the waiter leaves, including client disconnects.
   const pending = yield* Effect.forkDetach(
     effect.pipe(
-      Effect.onExit((exit) =>
-        exit._tag === "Success" ? logOutcome("committed") : logOutcome("failed", exit.cause),
-      ),
+      Effect.onExit((exit) => {
+        const report =
+          exit._tag === "Success" ? logOutcome("committed") : logOutcome("failed", exit.cause);
+        // The caller's grace read may still be deciding whether it can return a definite receipt.
+        return detached.onDetachedOutcome === undefined
+          ? report
+          : report.pipe(Effect.forkDetach, Effect.asVoid);
+      }),
     ),
   );
   yield* Fiber.await(pending).pipe(
@@ -151,6 +178,7 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
     readonly requestKey?: string;
     readonly taskId?: string;
     readonly onTimeout?: "detach";
+    readonly onDetachedOutcome?: NonNullable<DetachedOperation["onDetachedOutcome"]>;
   },
 ) {
   const startedAt = yield* Clock.monotonicTimeNanos;
@@ -164,7 +192,9 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
     (operation) =>
       awaitInterruptibly(
         operation,
-        input.onTimeout === "detach" ? { ...input, onTimeout: "detach", deadline } : undefined,
+        input.onTimeout === "detach"
+          ? { ...input, onTimeout: "detach", deadline, startedAt }
+          : undefined,
       ),
     Effect.provideService(PendingWait, pending),
     Effect.timeoutOrElse({

@@ -196,6 +196,7 @@ echo "watchman $*" >> "$FIX/calls"
 ''')
         with patch.object(runs, 'WATCH_REPAIR', fx.script), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                 patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs, 'GO_REPAIR', ':'), \
+                patch.object(runs.quint_tools, 'block', return_value=':'), \
                 patch.object(runs.userns, 'setup', return_value=':'):
             script = runs.remote_script('w/repo', '.', ['echo USER_COMMAND; exit 3'], None, 'watch-test')
         result = fx.run(script)

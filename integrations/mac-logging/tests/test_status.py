@@ -53,7 +53,8 @@ class StatusTests(unittest.TestCase):
         self.write('disk.sample', NOW - dt.timedelta(minutes=1), False)
         result = self.report()
         self.assertEqual(result['missingJobs'], [])
-        self.assertEqual({row['status'] for row in result['jobs'].values()}, {'OK'})
+        self.assertEqual({row['status'] for row in result['jobs'].values()}, {'OK', 'PENDING'})
+        self.assertEqual(result['jobs']['disk.ssd_read_probe']['status'], 'PENDING')
         row = result['jobs']['disk.sample']
         self.assertEqual(row['lastSeen'], '2026-11-15T11:59:00.000Z')
         self.assertFalse(row['lastOk'])
@@ -121,16 +122,18 @@ class StatusTests(unittest.TestCase):
             self.write(key, ok=False)
         result = self.report()
         self.assertEqual(result['missingJobs'], [])
-        self.assertTrue(all(row['lastOk'] is False for row in result['jobs'].values()))
+        self.assertTrue(all(row['lastOk'] is False for row in result['jobs'].values()
+                            if row['status'] != 'PENDING'))
         path = self.root / '2026-11-15.ndjson'
         path.write_text('')
         result = self.report()
-        self.assertEqual(set(result['missingJobs']), set(status.CADENCES))
+        self.assertEqual(set(result['missingJobs']), set(status.CADENCES) - {'disk.ssd_read_probe'})
         self.assertEqual(result['missingFiles'], ['2026-11-14.ndjson'])
         path.unlink()
         result = self.report()
         self.assertEqual(result['missingFiles'], ['2026-11-14.ndjson', '2026-11-15.ndjson'])
-        self.assertTrue(all(row['status'] == 'SILENT' for row in result['jobs'].values()))
+        self.assertTrue(all(row['status'] == 'SILENT' for key, row in result['jobs'].items()
+                            if key != 'disk.ssd_read_probe'))
         self.assertEqual(list(self.root.iterdir()), [])  # status never writes, even on missing inputs.
 
     def test_timestamp_forms(self):
@@ -228,8 +231,8 @@ class StatusTests(unittest.TestCase):
 
         cli = subprocess.run([sys.executable, str(HERE / 'status.py'), '--json',
                               '--now', '2026-11-15T23:59:00Z'], capture_output=True, text=True)
-        self.assertEqual(cli.returncode, 0, cli.stderr)
         result = json.loads(cli.stdout)
+        self.assertEqual(cli.returncode, 0 if result['ok'] else 1, cli.stderr)
         self.assertEqual(result['malformed'], len(overflowing))
         self.assertEqual(set(result['jobs']), set(status.CADENCES))
         self.assertEqual(result['missingJobs'], [])
@@ -248,7 +251,8 @@ class StatusTests(unittest.TestCase):
         result = self.report()
         self.assertEqual(result['malformed'], len(bad) + 1)
         self.assertEqual(result['missingJobs'], [])
-        self.assertTrue(all(row['lines'] == 1 for row in result['jobs'].values()))
+        self.assertTrue(all(row['lines'] == 1 for row in result['jobs'].values()
+                            if row['status'] != 'PENDING'))
 
     def test_gap_since_and_silence_boundaries(self):
         for hours, expected in [(2, 'OK'), (2.001, 'LATE'), (36, 'LATE'), (36.001, 'SILENT')]:
@@ -267,30 +271,84 @@ class StatusTests(unittest.TestCase):
         self.write('disk.sample', NOW + dt.timedelta(minutes=1))
         self.assertIsNone(self.report()['jobs']['disk.sample']['lastSeen'])
 
-    def test_cli_frozen_json_text_and_failure_exit_zero(self):
+    def test_cli_frozen_json_text_and_failure_exit_nonzero(self):
         self.seed({'disk.sample': NOW - dt.timedelta(hours=6), 'backup.run:health': None})
         for args in (['--json'], []):
             result = subprocess.run([sys.executable, str(HERE / 'status.py'), '--now', status.stamp(NOW), *args],
                                     capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.returncode, 1)
             if args:
                 report = json.loads(result.stdout)
                 self.assertEqual(report['missingJobs'], ['disk.sample', 'backup.run:health'])
             else:
                 self.assertIn('LATE', result.stdout)
                 self.assertIn('SILENT', result.stdout)
-        for args in (['--now', 'invalid', '--json'], ['--unknown'], ['--now'], ['--help']):
+        for args, code in ((['--now', 'invalid', '--json'], 1), (['--unknown'], 2),
+                           (['--now'], 2), (['--help'], 0)):
             with self.subTest(args=args):
                 result = subprocess.run([sys.executable, str(HERE / 'status.py'), *args], capture_output=True, text=True)
-                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.returncode, code)
                 self.assertNotIn('Traceback', result.stderr)
         with patch.object(status, 'read_days', side_effect=RuntimeError('private')):
             self.assertEqual(self.report()['error'], 'status.unavailable')
         with patch.object(status.Path, 'open', side_effect=PermissionError):
             self.assertEqual(len(self.report()['readErrors']), 2)
         with patch('sys.stdout', new_callable=io.StringIO) as output:
-            self.assertEqual(status.main(['--now', 'bad', '--json']), 0)
+            self.assertEqual(status.main(['--now', 'bad', '--json']), 1)
             self.assertEqual(json.loads(output.getvalue())['error'], 'status.unavailable')
+
+    def test_launchd_failure_makes_fresh_jobs_non_ok_in_json_and_text(self):
+        self.seed()
+        for state in ('loaded', 'not-loaded', 'unknown'):
+            for args in (['--json'], []):
+                with self.subTest(state=state, args=args):
+                    calls = []
+
+                    def runner(command, **kwargs):
+                        calls.append((command, kwargs))
+                        if command[-1].endswith('/com.abdullah.mac-cpu'):
+                            if state == 'unknown':
+                                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+                            if state == 'not-loaded':
+                                return subprocess.CompletedProcess(command, 113, '', 'Could not find service "com.abdullah.mac-cpu" in domain for user gui: 501')
+                        return subprocess.CompletedProcess(command, 0, 'state = not running', '')
+
+                    with patch.object(status.subprocess, 'run', side_effect=runner), \
+                         patch('sys.stdout', new_callable=io.StringIO) as output:
+                        code = status.main(['--now', status.stamp(NOW), *args])
+                    self.assertEqual(code, 0 if state == 'loaded' else 1)
+                    self.assertEqual([call[0] for call in calls], [
+                        ['/bin/launchctl', 'print', 'gui/%d/%s' % (os.getuid(), label)]
+                        for label in status.LAUNCHD_LABELS])
+                    self.assertTrue(all(call[1] == dict(capture_output=True, text=True, timeout=2)
+                                        for call in calls))
+                    if args:
+                        result = json.loads(output.getvalue())
+                        self.assertEqual(result['missingJobs'], [])
+                        self.assertEqual(result['launchd']['com.abdullah.mac-cpu'], state)
+                        self.assertEqual(result['ok'], state == 'loaded')
+                    else:
+                        self.assertIn('com.abdullah.mac-cpu', output.getvalue())
+                        self.assertIn(state, output.getvalue())
+                        self.assertEqual(output.getvalue().splitlines()[-1],
+                                         'ok: %s' % json.dumps(state == 'loaded'))
+
+    def test_cpu_45_minute_gap_is_late_even_when_agents_are_loaded(self):
+        self.seed({'cpu.sample': NOW - dt.timedelta(minutes=45)})
+        with patch.object(status, 'launchd_status', return_value=dict.fromkeys(status.LAUNCHD_LABELS, 'loaded')):
+            result = status.live_report(NOW, self.root)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['missingJobs'], ['cpu.sample'])
+        self.assertEqual(result['jobs']['cpu.sample']['status'], 'LATE')
+        self.assertEqual(result['jobs']['cpu.sample']['gapMaxMin'], 3)
+
+    def test_log_read_failure_still_reports_launchd(self):
+        with patch.object(status, 'read_days', side_effect=OSError), \
+             patch.object(status, 'launchd_status', return_value=dict.fromkeys(status.LAUNCHD_LABELS, 'loaded')):
+            result = status.live_report(NOW, self.root)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error'], 'status.unavailable')
+        self.assertEqual(set(result['launchd'].values()), {'loaded'})
 
     def test_rollup_jobs_at_day_end_preserve_old_fields(self):
         self.write('disk.sample', NOW, durationMs=42)
@@ -302,7 +360,8 @@ class StatusTests(unittest.TestCase):
         old = dict(day='2026-11-15', tool='mac', total=1, countsByName={'disk.sample': 1},
                    countsByKind={'perf': 1}, outcomes=1, okRate=1, errorRate=0, failedRate=0,
                    durationMs={'disk.sample': dict(p50=42, p95=42, max=42)}, malformed=1,
-                   topErrors=[], diskTooling=dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None))
+                   topErrors=[], uEpisodes=[],
+                   diskTooling=dict(probes=0, timeouts=0, maxDurationMs=None, latestBlockedIn=None))
         old.update(backup={key: dict(memory=0, health=0, other=0)
                            for key in ('skipped_runs', 'ok_runs', 'failed_runs')},
                    diskInventory=dict(scans=0, rootsOk=0, rootsPartial=0, rootsTimeout=0, rootsDenied=0, scanMs=0),
@@ -323,7 +382,7 @@ class StatusTests(unittest.TestCase):
         (self.root / '2026-11-14.ndjson').write_bytes(source.read_bytes())
         cli = subprocess.run([sys.executable, str(HERE / 'status.py'), '--json',
                               '--now', '2026-11-14T19:29:00Z'], capture_output=True, text=True)
-        self.assertEqual(cli.returncode, 0, cli.stderr)
+        self.assertEqual(cli.returncode, 1, cli.stderr)
         result = json.loads(cli.stdout)
         daily = rollup('2026-11-14', self.root)
         for jobs_view in (result, daily):
@@ -396,6 +455,34 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(row['status'], 'OK')
         self.assertFalse(row['lastOk'])
 
+    def test_ssd_probe_cadence_loaded_fresh_late_silent_and_failed_rows(self):
+        now = dt.datetime(2026, 11, 17, 12, tzinfo=UTC)
+        cases = [
+            ('fresh', 1, True, 'OK', True),
+            ('deadline', 3, True, 'OK', True),
+            ('late', 3+1/60, True, 'LATE', False),
+            ('silent', None, True, 'SILENT', False),
+            ('failed-row', 1, False, 'OK', True),
+        ]
+        for name, age, outcome, expected, live_ok in cases:
+            with self.subTest(name=name):
+                root = self.root/name
+                root.mkdir()
+                with patch.object(self, 'root', root):
+                    for key in status.CADENCES:
+                        if key != 'disk.ssd_read_probe':
+                            self.write(key, now-dt.timedelta(minutes=1))
+                    if age is not None:
+                        self.write('disk.ssd_read_probe', now-dt.timedelta(minutes=age), outcome)
+                    with patch.object(status, 'launchd_status', return_value=dict.fromkeys(status.LAUNCHD_LABELS, 'loaded')):
+                        result = status.live_report(now, self.root)
+                row = result['jobs']['disk.ssd_read_probe']
+                self.assertEqual(row['status'], expected)
+                self.assertEqual(row['gapMaxMin'], 3)
+                self.assertEqual(row['lastOk'], outcome if age is not None else None)
+                self.assertEqual(result['ok'], live_ok)
+                self.assertEqual(result['missingJobs'], [] if live_ok else ['disk.ssd_read_probe'])
+
     def test_tailnet_three_minute_cadence_and_failed_check_liveness(self):
         self.seed()
         self.assertEqual(self.report(NOW + dt.timedelta(minutes=2))['jobs']['tailnet.sample']['status'], 'OK')
@@ -455,3 +542,55 @@ class StatusTests(unittest.TestCase):
                 self.assertEqual(len(lines), 1)
                 self.assertEqual(json.loads(lines[0])['name'], 'log.missing_day')
                 self.assertEqual(json.loads(lines[0])['props']['source'], '2026-11-15')
+
+
+class LaunchdStatusTests(unittest.TestCase):
+    def test_launchctl_outcomes_and_bounded_report_only_commands(self):
+        cases = [
+            ('loaded-idle', subprocess.CompletedProcess([], 0, 'state = not running', ''), 'loaded'),
+            ('loaded-running', subprocess.CompletedProcess([], 0, 'state = running', ''), 'loaded'),
+            ('missing', subprocess.CompletedProcess([], 113, '', 'Bad request.\nCould not find service "example" in domain for user gui: 501'), 'not-loaded'),
+            ('domain-missing', subprocess.CompletedProcess([], 125, '', 'Could not find domain'), 'unknown'),
+            ('permission', subprocess.CompletedProcess([], 1, '', 'Operation not permitted'), 'unknown'),
+            ('unrecognized-exit', subprocess.CompletedProcess([], 113, '', ''), 'unknown'),
+            ('timeout', subprocess.TimeoutExpired('launchctl', 2), 'unknown'),
+            ('unavailable', FileNotFoundError('private path'), 'unknown'),
+        ]
+        for name, outcome, expected in cases:
+            with self.subTest(name=name):
+                calls = []
+
+                def runner(command, **kwargs):
+                    calls.append((command, kwargs))
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+
+                states = status.launchd_status(runner, uid=123)
+                self.assertEqual(states, dict.fromkeys(status.LAUNCHD_LABELS, expected))
+                self.assertEqual([c[0] for c in calls], [
+                    ['/bin/launchctl', 'print', 'gui/123/' + label]
+                    for label in status.LAUNCHD_LABELS])
+                self.assertTrue(all(c[1] == dict(capture_output=True, text=True, timeout=2)
+                                    for c in calls))
+
+    def test_one_timeout_does_not_hide_other_labels(self):
+        outcomes = iter([subprocess.TimeoutExpired('launchctl', 2),
+                         subprocess.CompletedProcess([], 113, '', 'Could not find service')]
+                        + [subprocess.CompletedProcess([], 0, '', '')
+                           for _ in status.LAUNCHD_LABELS[2:]])
+
+        def runner(*args, **kwargs):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        self.assertEqual(list(status.launchd_status(runner, uid=123).values()),
+                         ['unknown', 'not-loaded'] + ['loaded'] * (len(status.LAUNCHD_LABELS)-2))
+
+    def test_historical_rollup_does_not_probe_live_launchd(self):
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(status.subprocess, 'run', side_effect=AssertionError('live probe')):
+            result = rollup('2026-11-15', Path(root))
+        self.assertNotIn('launchd', result)

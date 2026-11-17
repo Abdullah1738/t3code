@@ -165,7 +165,8 @@ class CacheOwnerRepairTests(unittest.TestCase):
                 with patch.multiple(runs, SQLITE_SETUP=':', DOCKER_REPAIR=':', LDCACHE_REPAIR=':', GO_REPAIR=':'), \
                         patch.object(runs.userns, 'setup', return_value=':'):
                     script = runs.remote_script('w/repo', '.', ['cat "$FIX/owners.json"; exit 7'],
-                                                None, 'run-test', steps=steps, box_id='bx_test')
+                                                None, 'run-test', steps=steps, box_id='bx_test',
+                                                repo_root=self.fx.home / 'w/repo')
                 result = self.fx.run(script)
                 self.assertEqual(result.returncode, 7)
                 self.assertIn('{}', result.stdout)

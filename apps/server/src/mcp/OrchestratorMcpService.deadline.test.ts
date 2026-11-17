@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -101,6 +102,8 @@ it.effect.each([
           logs.push(message);
         });
         const snapshot = sql.withTransaction(sql`SELECT * FROM entries`).pipe(
+          // This case exercises cleanup for a reader that cannot acknowledge cancellation.
+          Effect.uninterruptible,
           SqliteClient.readOnly,
           Effect.mapError(
             (cause) => new Orchestrator.OrchestratorProjectionError({ threadId: parent, cause }),
@@ -225,7 +228,10 @@ it.effect.each([
           return completed;
         }).pipe(
           Effect.provide([
-            OrchestratorMcpService.layer.pipe(Layer.provide(dependencies)),
+            OrchestratorMcpService.layer.pipe(
+              Layer.provide(McpProviderSessions.layer),
+              Layer.provide(dependencies),
+            ),
             Logger.layer([logger], { mergeWithExisting: false }),
           ]),
         );
@@ -278,6 +284,7 @@ it.effect.each([
           Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
             getByCommandId: (readCommandId) =>
               Effect.gen(function* () {
+                if (readCommandId === `delegation-lost:${commandId}`) return Option.none();
                 reads.push(readCommandId);
                 assert.equal(readCommandId, commandId);
                 if (reads.length === 2) {
@@ -355,6 +362,13 @@ it.effect.each([
           assert.equal(error.code, "task_not_found");
           assert.include(error.message, "This delegation was never saved.");
         }
-      }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+      }).pipe(
+        Effect.provide(
+          OrchestratorMcpService.layer.pipe(
+            Layer.provide(McpProviderSessions.layer),
+            Layer.provide(dependencies),
+          ),
+        ),
+      );
     }),
 );

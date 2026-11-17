@@ -295,6 +295,24 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(msg['hard_alert']['kind'], 'auth')
         self.assertNotIn('secret', msg['hard_alert']['text'])
 
+    def test_auth_mail_runs_prefilter_but_sim_login_and_debit_bypass_it(self):
+        for sender, text, kind in (
+            ('Bank', 'Your verification code is 123456.', 'auth'),
+            ('du', 'Your SIM card has been swapped.', 'sim'),
+            ('Google', 'New sign-in on Windows', 'login'),
+            ('Mashreq', 'Purchase of AED 1000 with your card ending 9546 at SHOP.', 'debit'),
+        ):
+            with self.subTest(kind=kind):
+                raw = ('From: ' + sender + '\r\nSubject: Notice\r\nContent-Type: text/plain\r\n\r\n' + text).encode()
+                with patch.object(t, 'fetch_verified', return_value=[(1, '', raw)]), \
+                     patch.object(t, 'prefilter', return_value='learned_noise') as prefilter:
+                    msg, reason = t.mail_record(None, None, 'fund', 1,
+                        (1, '01-Jan-1970 00:16:40 +0000', raw.split(b'\r\n\r\n')[0]), 0, 1001,
+                        {'seen': [], 'rules': [], 'fast': True, 'actions': []})
+                self.assertEqual(msg['hard_alert']['kind'], kind)
+                self.assertEqual(reason, 'learned_noise' if kind == 'auth' else None)
+                self.assertEqual(prefilter.call_count, 1 + int(kind == 'auth'))
+
 
 class DeliveryTests(unittest.TestCase):
     def setUp(self):
@@ -351,16 +369,15 @@ if sys.argv[1] == 'send':
     def notifications(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()] if self.calls.exists() else []
 
-    def test_spaced_otp_unexpected_alerts_once_and_expected_stays_batch(self):
-        for n, code in enumerate(('123 456', '123\u00a0456', '12 34 56', '1234 5678')):
+    def test_spaced_and_unspaced_otp_are_log_only_and_expected_stays_batch(self):
+        for n, code in enumerate(('123456', '123 456', '123\u00a0456', '12 34 56', '1234 5678')):
             with self.subTest(code=code):
                 msg = item('Bank', f'Your verification code is {code}. Do not share it.', id=f'imsg:spaced{n}')
                 before = len(self.notifications())
                 self.run_items([msg])
                 self.run_items([msg])
-                self.assertEqual(len(self.notifications()) - before, 2)
-                for call in self.notifications()[before:]:
-                    self.assertNotIn(code, next(a.split('=', 1)[1] for a in call if a.startswith('--text=')))
+                self.assertEqual(len(self.notifications()) - before, 0)
+                self.assertEqual(t.read_json(self.wd / 'cursor.json')['pending'], {})
         with patch.object(t.time, 'time', return_value=990):
             t.expect_auth('Bank')
         before = len(self.notifications())
@@ -376,7 +393,7 @@ if sys.argv[1] == 'send':
             self.run_items([msg])
             self.assertEqual(len(self.notifications()) - before, 2)
 
-    def test_button_mail_collects_and_alerts_once_without_persisting_target(self):
+    def test_button_mail_collects_without_alerting_or_persisting_target(self):
         helper = types.SimpleNamespace(html_to_text=lambda value: re.sub(r'<[^>]+>', ' ', value))
         for n, (mime, body, bulk, expected) in enumerate((
             ('text/html', '<p>Click the button below to securely sign in to Claude. This link expires in 15 minutes.</p>'
@@ -399,7 +416,8 @@ if sys.argv[1] == 'send':
                 before = len(self.notifications())
                 self.run_items([msg])
                 self.run_items([msg])
-                self.assertEqual(len(self.notifications()) - before, 0 if bulk or expected else 2)
+                self.assertEqual(len(self.notifications()) - before, 0)
+                self.assertNotIn('https:', json.dumps(t.read_json(self.wd / 'cursor.json')))
         for call in self.notifications():
             self.assertNotIn('fixture', next(a.split('=', 1)[1] for a in call if a.startswith('--text=')))
 
@@ -449,17 +467,18 @@ if sys.argv[1] == 'send':
                 before = len(self.notifications())
                 self.run_items([msg])
                 self.run_items([msg])
-                self.assertEqual(len(self.notifications()) - before, 2)
+                self.assertEqual(len(self.notifications()) - before, 0)
                 for call in self.notifications()[before:]:
                     self.assertNotIn('fixture', next(a.split('=', 1)[1] for a in call if a.startswith('--text=')))
 
-    def test_each_class_sends_both_channels_once_and_leaves_batch_state_unchanged(self):
+    def test_sim_login_and_debit_send_both_once_and_auth_is_log_only(self):
         rows = [item(sender, text, id=f'imsg:{n}') for n, (sender, text, kind) in enumerate(CORPUS) if kind]
         before = (self.live / 'cursor.json').read_bytes()
         for row in rows:
             self.run_items([row])
             self.run_items([row])
-        self.assertEqual(len(self.notifications()), 2 * len(rows))
+        alerted = sum(kind in ('sim', 'login', 'debit') for _, _, kind in CORPUS)
+        self.assertEqual(len(self.notifications()), 2 * alerted)
         self.assertEqual((self.live / 'cursor.json').read_bytes(), before)
         for a in self.notifications():
             if a[0] == 'send':
@@ -472,6 +491,149 @@ if sys.argv[1] == 'send':
         t.atomic(self.data / 'inflight-actions.json', [{'sender': 'whoop', 'at': 990}])
         self.run_items([item('WHOOP', 'Your sign-in code is 123456'), item('Mashreq', 'Purchase of AED 999 with your card ending 9546 at SHOP.')])
         self.assertEqual(self.notifications(), [])
+
+    def test_pending_auth_is_dropped_without_delivery(self):
+        for identity in (None, {'sender': 'Bank', 'ts': 1000}):
+            with self.subTest(identity=identity):
+                t.atomic(self.wd / 'cursor.json', {'initialized_at': 900, 'cursors': {}, 'pending': {
+                    'imsg:old-auth': {'kind': 'auth', 'text': 'Security: an OTP from your bank',
+                                     'at': 1000, 'auth_identity': identity}}})
+                self.run_items([])
+                self.assertEqual(t.read_json(self.wd / 'cursor.json')['pending'], {})
+                self.assertEqual(self.notifications(), [])
+
+    def test_normal_urgent_auth_uses_generic_text(self):
+        for text in ('Your verification code is 123456.', 'Your secure link to Claude: [link]'):
+            with self.subTest(text=text):
+                hit = {**item('Bank', text), 'urgency': 'urgent', 'reason': 'Security: review this account update'}
+                with patch.object(t, 'chat_down', return_value=(True, 'fixture')), \
+                     patch.object(t, 'send_urgent', return_value=1001) as send:
+                    t.urgent_alerts({}, {'hits': [hit]}, self.live, 1001)
+                sent = send.call_args.args[1]
+                self.assertIn('review this account update', sent)
+                self.assertNotIn('no matching in-flight action', sent)
+                self.assertNotIn('Check sessions and rotate', sent)
+                self.assertNotIn('123456', sent)
+
+    def test_normal_urgent_auth_does_not_retry_legacy_fastpath_text(self):
+        for where in ('pending', 'text', 'telegram_text', 'imessage_text'):
+            with self.subTest(where=where):
+                hit = {**item('Bank', 'Your verification code is 123456.'),
+                       'urgency': 'urgent', 'reason': 'Security: review this account update'}
+                text = t.fastpath.classify(hit)['text']
+                state = {'telegram_pending': {hit['id']: {'text': text}}} if where == 'pending' else {}
+                ledger = {} if where == 'pending' else {hit['id']: {where: text}}
+                t.atomic(self.live / 'urgent-delivery.json', ledger)
+                with patch.object(t, 'chat_down', return_value=(True, 'fixture')), \
+                     patch.object(t, 'send_urgent', return_value=1001) as send:
+                    t.urgent_alerts(state, {'hits': [hit]}, self.live, 1001)
+                send.assert_not_called()
+                self.assertNotIn(hit['id'], state.get('telegram_pending', {}))
+
+    def test_legacy_auth_payload_is_blocked_after_normal_mail_redaction(self):
+        # Shape table covers issuance evidence that survives, is redacted or is hidden in HTML.
+        cases = (
+            ('OTP unspaced', 'Notice', 'text/plain', 'Your verification code is 123456.'),
+            ('OTP spaced', 'Notice', 'text/plain', 'Your verification code is 123 456.'),
+            ('OTP alphanumeric', 'Notice', 'text/plain', 'Your verification code is A1B2C3.'),
+            ('OTP subject', 'Verification code: 123456', 'text/plain', 'Use this to sign in.'),
+            ('magic plain', 'Sign in', 'text/plain', 'Your secure link to Claude: https://example.test/private'),
+            ('magic HTML', 'Sign in', 'text/html', '<a href="https://example.test/private">Sign in</a>'),
+            ('magic multipart', 'Sign in', 'multipart/alternative; boundary=fixture',
+             '--fixture\r\nContent-Type: text/plain\r\n\r\nClick below.\r\n'
+             '--fixture\r\nContent-Type: text/html\r\n\r\n<a href="https://example.test/private">Sign in</a>\r\n--fixture--'),
+        )
+        helper = types.SimpleNamespace(html_to_text=lambda value: re.sub(r'<[^>]+>', ' ', value))
+        for shape, subject, mime, body in cases:
+            for where in ('pending', 'text', 'telegram_text', 'imessage_text'):
+                with self.subTest(shape=shape, where=where):
+                    raw = (f'From: support@anthropic.com\r\nSubject: {subject}\r\nContent-Type: {mime}\r\n\r\n{body}').encode()
+                    with patch.object(t, 'fetch_verified', return_value=[(1, '', raw)]):
+                        msg, _ = t.mail_record(None, helper, 'fund', 1,
+                            (1, '01-Jan-1970 00:16:40 +0000', raw.split(b'\r\n\r\n')[0]), 0, 1001,
+                            {'seen': [], 'rules': []})
+                    if shape in ('OTP unspaced', 'OTP spaced', 'OTP alphanumeric', 'magic HTML', 'magic multipart'):
+                        self.assertIsNone(t.fastpath.classify(msg))
+                    hit = {**msg, 'urgency': 'urgent', 'reason': 'Security: review this account update'}
+                    what = 'a sign-in link' if shape.startswith('magic') else 'an OTP'
+                    text = f'Security: {what} from Claude; no matching in-flight action in the last 10 minutes.'
+                    state = {'telegram_pending': {hit['id']: {'text': text}}} if where == 'pending' else {}
+                    ledger = {} if where == 'pending' else {hit['id']: {where: text}}
+                    t.atomic(self.live / 'urgent-delivery.json', ledger)
+                    with patch.object(t, 'chat_down', return_value=(True, 'fixture')), \
+                         patch.object(t, 'send_urgent', return_value=1001) as send:
+                        t.urgent_alerts(state, {'hits': [hit]}, self.live, 1001)
+                    send.assert_not_called()
+                    self.assertNotIn(hit['id'], state.get('telegram_pending', {}))
+
+    def test_normal_batch_filters_auth_and_does_not_skip_old_fastpath_delivery(self):
+        t.atomic(self.wd / 'watcher.json', {'id': 'inbox-triage-fastpath', 'paused': False})
+        t.atomic(self.live / 'cursor.json', {'initialized_at': 900, 'cursors': {}, 'queue': []})
+        auth = item('Bank', 'Your verification code is 123456.', ts=t.time.time() - 60)
+        t.atomic(self.live / 'urgent-delivery.json', {auth['id']: {'telegram': 1000, 'imessage': 1000}})
+        result = {'imessage': {'cursor': 9001, 'items': [auth], 'drops': {}, 'scanned': 1}}
+        with patch.dict(os.environ, {'WATCH_DIR': str(self.live)}), \
+             patch.object(t, 'collect', return_value=(result, {})), \
+             patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+             patch.object(t, 'payment_checks', return_value=({}, None)), \
+             patch.object(t, 'renewal_checks', return_value=({}, None)), \
+             patch.object(t, 'charge_checks', return_value=({}, set(), None)), \
+             patch.object(t, 'handled', return_value=({}, {})), \
+             patch.object(t, 'build_context', return_value={}), \
+             patch.object(t, 'prefilter', wraps=t.prefilter) as prefilter, \
+             patch.object(t, 'classify_batch', return_value=([], {'cost_usd': 0})) as classify, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(t.run(types.SimpleNamespace(dry_run_hours=None, report=None)), 0)
+        self.assertTrue(any(call.args[0]['id'] == auth['id'] for call in prefilter.call_args_list))
+        self.assertEqual([row['id'] for row in classify.call_args.args[0]], [auth['id']])
+
+    def test_redacted_auth_mail_with_legacy_login_delivery_reaches_normal_classifier(self):
+        cases = (
+            ('OTP unspaced', 'Notice', 'text/plain', 'Your verification code is 123456.'),
+            ('OTP spaced', 'Notice', 'text/plain', 'Your verification code is 123 456.'),
+            ('OTP alphanumeric', 'Notice', 'text/plain', 'Your verification code is A1B2C3.'),
+            ('OTP subject', 'Verification code: 123456', 'text/plain', 'Use this to sign in.'),
+            ('magic plain', 'Sign in', 'text/plain', 'Your secure link to Google: https://example.test/private'),
+            ('magic HTML', 'Sign in', 'text/html', '<a href="https://example.test/private">Sign in</a>'),
+            ('magic multipart', 'Sign in', 'multipart/alternative; boundary=fixture',
+             '--fixture\r\nContent-Type: text/plain\r\n\r\nNew sign-in on Windows. Click below.\r\n'
+             '--fixture\r\nContent-Type: text/html\r\n\r\n<a href="https://example.test/private">Sign in</a>\r\n--fixture--'),
+        )
+        now = t.time.time()
+        internal = t.dt.datetime.fromtimestamp(now - 60, t.dt.timezone.utc).strftime('%d-%b-%Y %H:%M:%S %z')
+        helper = types.SimpleNamespace(html_to_text=lambda value: re.sub(r'<[^>]+>', ' ', value))
+        t.atomic(self.wd / 'watcher.json', {'id': 'inbox-triage-fastpath', 'paused': False})
+        for shape, subject, mime, body in cases:
+            for field in ('text', 'telegram_text', 'imessage_text'):
+                with self.subTest(shape=shape, field=field):
+                    prefix = '' if shape == 'magic multipart' else 'New sign-in on Windows. '
+                    raw = (f'From: Google\r\nSubject: {subject}\r\nContent-Type: {mime}\r\n\r\n{prefix}{body}').encode()
+                    record = (1, internal, raw.split(b'\r\n\r\n')[0])
+                    with patch.object(t, 'fetch_verified', return_value=[(1, '', raw)]):
+                        fast, _ = t.mail_record(None, helper, 'fund', 1, record, 0, now,
+                                               {'seen': [], 'rules': [], 'fast': True})
+                        normal, _ = t.mail_record(None, helper, 'fund', 1, record, 0, now,
+                                                 {'seen': [], 'rules': []})
+                    original = (t.fastpath.classify({**normal, 'subject': subject, 'preview': body})
+                                if shape == 'OTP subject' else fast['hard_alert'])
+                    self.assertEqual(original['kind'], 'auth')
+                    self.assertEqual(t.fastpath.classify(normal)['kind'], 'auth' if shape == 'magic plain' else 'login')
+                    t.atomic(self.live / 'cursor.json', {'initialized_at': now - 300, 'cursors': {}, 'queue': []})
+                    t.atomic(self.live / 'urgent-delivery.json', {normal['id']: {
+                        'telegram': now - 30, 'imessage': now - 30, field: original['text']}})
+                    result = {'fund': {'cursor': {'uid': 1, 'validity': 1}, 'items': [normal], 'drops': {}, 'scanned': 1}}
+                    with patch.dict(os.environ, {'WATCH_DIR': str(self.live)}), \
+                         patch.object(t, 'collect', return_value=(result, {})), \
+                         patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+                         patch.object(t, 'payment_checks', return_value=({}, None)), \
+                         patch.object(t, 'renewal_checks', return_value=({}, None)), \
+                         patch.object(t, 'charge_checks', return_value=({}, set(), None)), \
+                         patch.object(t, 'handled', return_value=({}, {})), \
+                         patch.object(t, 'build_context', return_value={}), \
+                         patch.object(t, 'classify_batch', return_value=([], {'cost_usd': 0})) as classify, \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(t.run(types.SimpleNamespace(dry_run_hours=None, report=None)), 0)
+                    self.assertEqual([row['id'] for row in classify.call_args.args[0]], [normal['id']])
 
     def test_failed_initial_collection_recovers_from_saved_time_without_rebaselining(self):
         # A brand-new installation has no inherited collector state.
@@ -729,7 +891,7 @@ if sys.argv[1] == 'send':
         from subprocess import TimeoutExpired
         with patch.object(t.subprocess, 'run', side_effect=TimeoutExpired('mail', 12)) as run:
             with self.assertRaises(TimeoutExpired):
-                t.run_mail('gmail', {'fast': True})
+                t.run_mail_fetch('gmail', {'fast': True})
         self.assertEqual(run.call_count, 1)
         self.assertLessEqual(run.call_args.kwargs['timeout'], 12)
 

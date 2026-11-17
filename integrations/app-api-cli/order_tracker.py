@@ -1810,6 +1810,19 @@ def main(argv=None, _locked=False):
     if argv[:1] == ['can-report']:
         from order_receipts import can_report
         proof = can_report(argv[1]) if len(argv) == 2 else {'ok': False, 'error': 'usage: order-watch can-report ORDER_ID'}
+        try:
+            refusal = {None: 'none', 'invalid order id': 'invalid_id',
+                       'order not registered or id ambiguous': 'not_registered',
+                       'invalid tracker registration': 'invalid_registration',
+                       'tracker not running or payment still held': 'not_running_or_held',
+                       'usage: order-watch can-report ORDER_ID': 'usage'}[proof.get('error')]
+            toollog.emit('order-watch', 'order_watch.can_report', ok=bool(proof['ok']),
+                         ids={'watcher': proof.get('tracker')},
+                         props={'outcome': 'success' if proof['ok'] else 'refused', 'refusal': refusal,
+                                'untrackable': bool(proof.get('untrackable')),
+                                'eta_given': proof.get('eta') not in (None, 'no ETA given')})
+        except Exception:
+            pass
         print(json.dumps(proof))
         return 0 if proof['ok'] else 1
     if '--merchant' in argv or '--email-receipt' in argv or '--untrackable' in argv:
@@ -2019,7 +2032,7 @@ def main(argv=None, _locked=False):
                        f'Run order-watch remove --app {app} --order {args.order} {shlex.join(merchant_args(cfg))} only to stop tracking early. Item/shipment-scoped evidence (Amazon or noon marketplace) proves only that part: say package/item, and verify all shipments before closing. whole_order_complete=false is never a whole-order completion. '
                        'Amazon aftercare is scoped return/refund/cancellation evidence, not a fresh arrival or whole-order cancellation: do not remove tracking or initiate any return/refund/cancellation from it. Historical package evidence is not a new arrival. '
                        'On candidate delivered, verify or ask Abdullah before removing. '
-                       'Use existing read-only evidence first; no phone UI while priority-hold is present.')
+                       'Use existing read-only evidence first; no phone UI while `ph hold status --json` shows present true.')
             command = shlex.join([sys.executable, str(Path(__file__).resolve()), 'check', '--app', app, '--order', args.order,
                                   *merchant_args(cfg)])
             # For native apps, add writes watcher.json, then primes one real check (robob-watch

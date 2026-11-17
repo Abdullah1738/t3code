@@ -123,14 +123,7 @@ export const assertTargetWithinLimits = (
  */
 export function assertLiveCaller({ caller, scope }: Caller) {
   if (caller === undefined) return Effect.void;
-  return OrchestrationMcp.isLiveCallerShell(caller, scope.thread?.providerInstanceId)
-    ? Effect.void
-    : Effect.fail(
-        new OrchestratorMcpFailure({
-          code: "parent_not_active",
-          message: "The calling provider no longer owns an active thread run.",
-        }),
-      );
+  return OrchestrationMcp.assertLiveCallerShell(caller, scope.thread);
 }
 
 export const assertFullAccess = (context: Caller, message: string) =>
