@@ -976,7 +976,9 @@ async function imessageReceipt(text: string, key: string): Promise<ImessageResul
     with acceptance as (select value from kv where key='api:send:${id}'),
     identity as (select coalesce((select json_extract(value,'$.operationId') from acceptance),'${id}') as id)
     select json_object('saved',(select value from acceptance),
-      'payload',outbox.payload,'state',outbox.state,'attempts',outbox.attempts,'providerId',outbox.providerId,
+      'operationId',identity.id,'payload',outbox.payload,'state',outbox.state,'attempts',outbox.attempts,'providerId',outbox.providerId,
+      'checkpoints',(select json_group_object(key,value) from kv
+        where key >= 'chunk:'||identity.id||':' and key < 'chunk:'||identity.id||';'),
       'route',(select value from kv where key='route'),
       'fenced',exists(select 1 from kv where key in ('cancelledSend:${id}','cancelledSend:'||identity.id)),
       'attempted',exists(select 1 from kv where key in ('firstAttempt:'||identity.id,'sendAmbiguous:'||identity.id,'sent-at:'||identity.id))
@@ -985,7 +987,8 @@ async function imessageReceipt(text: string, key: string): Promise<ImessageResul
   if (!receipt.ok) return { ok: false, out: "bridge delivery lookup failed" };
   try {
     const row = JSON.parse(receipt.out) as { saved: string | null;
-      payload: string | null; state: string | null; attempts: number | null; providerId: string | null;
+      operationId: string; payload: string | null; state: string | null; attempts: number | null; providerId: string | null;
+      checkpoints: string | Record<string, string>;
       route: string | null; fenced: number; attempted: number };
     if (!row.saved) return;
     const saved = JSON.parse(row.saved) as { spec?: string };
@@ -994,11 +997,23 @@ async function imessageReceipt(text: string, key: string): Promise<ImessageResul
       return { ok: false, out: "bridge acceptance content mismatch" };
     }
     if (!row.payload) return { ok: false, out: "bridge accepted operation missing" };
-    const payload = JSON.parse(row.payload) as { kind?: string; sessionId?: string; generation?: number };
+    const payload = JSON.parse(row.payload) as { kind?: string; sessionId?: string; generation?: number; text?: string;
+      attachment?: unknown; poll?: unknown; app?: unknown };
     if (payload.kind !== "conversation" || payload.sessionId !== spec.sessionId || payload.generation !== spec.generation) {
       return { ok: false, out: "bridge accepted operation mismatch" };
     }
     if (row.state === "sent") return { ok: true, out: "bridge delivery confirmed" };
+    if (row.state === "cancelled" && typeof payload.text === "string" && !payload.attachment && !payload.poll && !payload.app) {
+      // Rotation can cancel after transport acceptance but before markSent. Use
+      // Delivery's exact formatter: a folded or multipart text needs every chunk.
+      const { BUBBLE_CHARS, formatText, splitFormatted } = await import("../../spectrum-bridge/src/formatting.ts");
+      const chunks = splitFormatted(formatText(payload.text.trim() ? payload.text : ""), BUBBLE_CHARS);
+      const checkpoints = typeof row.checkpoints === "string" ? JSON.parse(row.checkpoints) as Record<string, string> : row.checkpoints;
+      if (chunks.length && chunks.every((_, index) => {
+        const saved = checkpoints[`chunk:${row.operationId}:${index}`];
+        return saved !== undefined && (JSON.parse(saved) as { accepted?: unknown } | null)?.accepted === true;
+      })) return { ok: true, out: "bridge delivery checkpoints confirmed" };
+    }
     const route = row.route ? JSON.parse(row.route) as { id?: string; generation?: number } | null : null;
     if (row.state === "cancelled" && row.attempts === 0 && row.providerId === null && !row.fenced && !row.attempted
       && typeof payload.generation === "number" && typeof payload.sessionId === "string"

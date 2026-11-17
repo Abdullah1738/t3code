@@ -7,6 +7,7 @@ import { createApi } from "../../spectrum-bridge/src/api.ts";
 import { Delivery } from "../../spectrum-bridge/src/delivery.ts";
 import { Store } from "../../spectrum-bridge/src/store.ts";
 import { TransportError, type Photon } from "../../spectrum-bridge/src/photon.ts";
+import { BUBBLE_CHARS } from "../../spectrum-bridge/src/formatting.ts";
 
 const sandboxes: string[] = [];
 const cleanups: (() => void)[] = [];
@@ -93,7 +94,7 @@ function fixture(opted = true, extra: Record<string, unknown> = {}) {
   return { root, bridgeDB, state, define, tick, resume, execute, calls, accepted, events, rotate };
 }
 
-function realBridgeFixture(maxFailures = 1) {
+function realBridgeFixture(maxFailures = 1, foldText?: (text: string) => Promise<string>) {
   const f = fixture(true, { max_consecutive_failures: maxFailures });
   const store = new Store(f.bridgeDB);
   store.set("route", { id: "ses_owner", generation: 1 });
@@ -104,7 +105,7 @@ function realBridgeFixture(maxFailures = 1) {
   const delivery = new Delivery(store, transport, { projectScope: "owner-alert-test", enabled: () => true,
     chatGuid: () => "iMessage;-;+15555550123", sleep: async () => {} });
   const api = createApi({ store, photon: { async react() {} }, router: () => undefined,
-    chatGuid: () => "iMessage;-;+15555550123", enabled: () => true, health: () => ({ ok: true }) });
+    chatGuid: () => "iMessage;-;+15555550123", enabled: () => true, health: () => ({ ok: true }), foldText });
   const responses: number[] = [];
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const response = await api(request); responses.push(response.status); return response;
@@ -177,8 +178,14 @@ test.each(["sent", "pending", "sending", "uncertain", "failed", "missing", "manu
   expect(f.state().owner_imessage_episodes[0].delivery_key).toBeUndefined();
 }, 10_000);
 
-test.each(["accepted", "ambiguous"])("real bridge cancellation after an %s transport attempt never resends", async outcome => {
-  const f = realBridgeFixture(); await f.tick(0);
+test.each(["pause", "failing", "recovered"].flatMap(kind => ["accepted", "ambiguous"].map(outcome => ({ kind, outcome }))))(
+  "real bridge $outcome $kind checkpoint survives route cancellation without resending", async ({ kind, outcome }) => {
+  const f = realBridgeFixture(kind === "failing" ? 0 : 1); await f.tick(0);
+  if (kind === "failing") await f.tick(15);
+  if (kind === "recovered") {
+    await f.delivery.tick(); await f.tick(16);
+    f.define({ check: "true" }); f.resume(); await f.tick(18);
+  }
   const send = f.transport.sendText;
   f.transport.sendText = async input => {
     const result = await send(input);
@@ -187,13 +194,101 @@ test.each(["accepted", "ambiguous"])("real bridge cancellation after an %s trans
     return result;
   };
   await f.delivery.tick();
+  const operation = f.operations().at(-1)!;
+  expect(operation).toMatchObject({ state: "cancelled", attempts: 1 });
+  expect(f.store.get(`chunk:${operation.id}:0`)).toEqual(outcome === "accepted"
+    ? { accepted: true, providerId: `test-${kind === "recovered" ? 2 : 1}` } : undefined);
+  f.transport.sendText = send;
+  await f.tick(20); await f.tick(22);
+  if (kind !== "recovered") {
+    expect(f.state().owner_imessage_episodes[0].sent).toBe(outcome === "accepted" ? true : undefined);
+    f.define({ check: "true" }); f.resume(); await f.tick(24);
+    await f.delivery.tick(); await f.tick(26); await f.tick(28);
+  }
+  expect(f.texts).toHaveLength(outcome === "accepted" || kind === "recovered" ? 2 : 1);
+  expect(f.texts[0]).toContain(kind === "failing" ? "is FAILING" : "is paused");
+  if (outcome === "accepted") {
+    expect(f.texts[1]).toContain("is running again");
+    expect(f.state().owner_imessage_episodes).toBeUndefined();
+  } else expect(f.state().owner_imessage_episodes).toHaveLength(1);
+  expect(f.calls().filter(args => args[0] === "send")).toHaveLength(outcome === "accepted" || kind === "recovered" ? 2 : 1);
+}, 15_000);
+
+test.each(["first", "last"])("real bridge confirms only fully checkpointed multipart alerts when rotation hits the %s chunk", async chunk => {
+  const f = realBridgeFixture(1, async text => text.includes("is paused") ? "x".repeat(BUBBLE_CHARS * 2 + 1) : text);
+  await f.tick(0);
+  const send = f.transport.sendText;
+  f.transport.sendText = async input => {
+    const result = await send(input);
+    if (f.texts.length === (chunk === "first" ? 1 : 3)) f.rotate("ses_new_owner", 2);
+    return result;
+  };
+  await f.delivery.tick();
   expect(f.operations()[0]).toMatchObject({ state: "cancelled", attempts: 1 });
   await f.tick(2); await f.tick(4);
-  expect(f.texts).toHaveLength(1);
+  expect(f.state().owner_imessage_episodes[0].sent).toBe(chunk === "last" ? true : undefined);
+  f.transport.sendText = send;
+  f.define({ check: "true" }); f.resume(); await f.tick(6);
+  await f.delivery.tick(); await f.tick(8); await f.tick(10);
+  expect(f.texts).toHaveLength(chunk === "last" ? 4 : 1);
+  expect(f.calls().filter(args => args[0] === "send")).toHaveLength(chunk === "last" ? 2 : 1);
+  if (chunk === "last") expect(f.state().owner_imessage_episodes).toBeUndefined();
+}, 15_000);
+
+test.each([
+  { name: "boundary", text: "x".repeat(BUBBLE_CHARS), chunks: 1 },
+  { name: "boundary plus one", text: "x".repeat(BUBBLE_CHARS + 1), chunks: 2 },
+  { name: "unicode", text: "𝒙".repeat(BUBBLE_CHARS), chunks: 1 },
+  { name: "formatted", text: `**${"x".repeat(BUBBLE_CHARS)}**`, chunks: 1 },
+])("real bridge checkpoint confirmation uses Delivery's $name chunking", async ({ text, chunks }) => {
+  const f = realBridgeFixture(1, async () => text); await f.tick(0);
+  const send = f.transport.sendText;
+  f.transport.sendText = async input => {
+    const result = await send(input);
+    if (f.texts.length === chunks) f.rotate("ses_new_owner", 2);
+    return result;
+  };
+  await f.delivery.tick(); await f.tick(2); await f.tick(4);
+  expect(f.texts).toHaveLength(chunks);
+  expect(f.state().owner_imessage_episodes[0].sent).toBe(true);
   expect(f.calls().filter(args => args[0] === "send")).toHaveLength(1);
-  expect(f.state().owner_imessage_episodes[0].sent).toBeUndefined();
-  expect(f.state().owner_imessage_episodes[0].delivery_key).toBeUndefined();
 }, 10_000);
+
+test.each(["missing", "false", "truthy string", "wrong index", "wrong operation", "provider only"])(
+  "real bridge %s checkpoint evidence cannot confirm an ambiguous send", async evidence => {
+  const f = realBridgeFixture(); await f.tick(0);
+  const id = f.operations()[0]!.id;
+  f.store.outboxState(id, "sending"); f.rotate("ses_new_owner", 2); f.store.outboxState(id, "cancelled");
+  if (evidence !== "missing") f.store.set(`chunk:${evidence === "wrong operation" ? "different" : id}:${evidence === "wrong index" ? 1 : 0}`,
+    evidence === "provider only" ? { providerId: "test-1" } : { accepted: evidence === "truthy string" ? "true" : evidence !== "false" });
+  await f.tick(2); f.define({ check: "true" }); f.resume(); await f.tick(4); await f.tick(6);
+  expect(f.state().owner_imessage_episodes[0].sent).toBeUndefined();
+  expect(f.calls().filter(args => args[0] === "send")).toHaveLength(1);
+  expect(f.texts).toHaveLength(0);
+}, 10_000);
+
+test("real bridge reconciles accepted checkpoints on the receipt's aliased operation before recovery", async () => {
+  const f = realBridgeFixture(); await f.tick(0);
+  const id = f.operations()[0]!.id, alias = "early-reply";
+  const original = f.store.getOperation(id)!;
+  f.store.enqueue({ id: alias, kind: "conversation", text: original.text,
+    sessionId: original.sessionId, generation: original.generation });
+  f.store.outboxState(id, "cancelled");
+  f.store.set(`api:send:${id}`, { ...f.store.get<{ spec: string }>(`api:send:${id}`)!, operationId: alias });
+  const send = f.transport.sendText;
+  f.transport.sendText = async input => { const result = await send(input); f.rotate("ses_new_owner", 2); return result; };
+  await f.delivery.tick();
+  expect(f.store.getOperation(alias)?.state).toBe("cancelled");
+  expect(f.store.get(`chunk:${alias}:0`)).toMatchObject({ accepted: true });
+  f.transport.sendText = send;
+  // Resume before the runner has reconciled the successful initial delivery.
+  f.define({ check: "true" }); f.resume(); await f.tick(2); await f.tick(4);
+  await f.delivery.tick(); await f.tick(6); await f.tick(8);
+  expect(f.texts).toHaveLength(2);
+  expect(f.texts[1]).toContain("is running again");
+  expect(f.state().owner_imessage_episodes).toBeUndefined();
+  expect(f.calls().filter(args => args[0] === "send")).toHaveLength(2);
+}, 15_000);
 
 test("real bridge repeated route cancellations advance a durable key without duplicate delivery", async () => {
   const f = realBridgeFixture(); await f.tick(0);
