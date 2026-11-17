@@ -105,7 +105,7 @@ const SubtasksInput = describe(
       id: Schema.optional(
         describe(
           TrimmedNonEmptyString,
-          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is; omit id for a new subtask.",
+          "Existing s<N> id from card_get. Listed alone it keeps that subtask as it is. An s<N> id the card does not have yet creates a new subtask with that id (text and owner required); omit id to let the board number a new subtask.",
         ),
       ),
       step: Schema.optional(
@@ -164,8 +164,8 @@ const SubtasksInput = describe(
         ),
       ),
     }),
-  ),
-  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id; open ones left out go, done ones stay.`,
+  ).check(Schema.isMaxLength(MAX_SUBTASKS)),
+  `At most ${MAX_SUBTASKS} subtasks, each at most ${MAX_TEXT} characters. The card's plan, in order: the work, its review and everything after (merge, deploy, telling whoever asked, updating tickets, a read-back). Leave out steps that aren't needed. On card_edit it replaces the plan: list existing ids to keep them (an id alone keeps it unchanged; done and skipped ones can't be rewritten), add new entries without an id or with a new s<N> id; open ones left out go, done ones stay.`,
 );
 
 const LinkInput = Schema.Struct({
@@ -259,7 +259,7 @@ const BoardGet = tool(
 const BoardActivity = tool(
   "board_activity",
   "Board activity rollup",
-  "A board's activity in a window (default the last 24 hours, at most 72): asks answered in the window with asked/answered times and minutes to answer (p50/p90/max), open counts asks that need an answer; open notices are counted in openNotices. Answer times are also split by kind (missing kind is question) and blocking, with separate counts for decisions and notices open over 6 hours; review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls and how long they lasted, run failures (stalled, retried, fresh thread, reviewer without verdict) by kind and model, threads started, restarts and evaluator starts (new threads; evaluatorWakes is a compatibility alias), cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. Queued todo/needs_review cards include why they wait (pool full with rank, cards ahead and slot holders, blocked, waiting, and other dispatch gates), plus those queued over 6 hours. Card numbers only, no titles or text. Read from the cards' stored history. Lists are shortened to fit 50,000 characters and say how many more; answeredItems stays an array, with answeredItemsMore when some are omitted; an oversized kind breakdown reports omitted groups in answerMinutesByKindMore.",
+  "A board's activity in a window (default the last 24 hours, at most 72; since/until accept ISO timestamps or relative times now-24h, 24h, 3d): asks answered in the window with asked/answered times and minutes to answer (p50/p90/max), open counts asks that need an answer; open notices are counted in openNotices. Answer times are also split by kind (missing kind is question) and blocking, with separate counts for decisions and notices open over 6 hours; review rounds and verdicts per card, hours in each stage with dwell median/p95/max and the longest spans, open cards in one stage over 24 hours, stalls by kind and how long they lasted (byKind counts; idle_evaluator includes currently idle completed/deployed evaluator steps with card, stage, step, openEvaluatorSubtasks, idleHours, lastEventAt and evaluatorThreadAlive, even before a flag), run failures by kind and model plus newest-first failures.rows (at most 50, more gives omitted count) with card number, kind, role, pool, threadId, runId, time, reason, repeat count and structured restart-admission wait/queue/rule when available; restartAdmission points to the server-wide analytics_read rollup by UTC day (read section restartAdmission without board/card/kind filters), with this board's failed card numbers; threads started, restarts and evaluator starts (new threads; evaluatorWakes is a compatibility alias), cards left in working or in_review with no thread, and an estimate of pool slots held per hour per model next to each pool's slots. withoutThread adds reason, hours and byReason counts: wait:<kind>, owner_ask, blocked, backlog, paused, evaluator_step, stalled:<kind>, or none (stuck); expired waits carry expiredWait and none has its own capped list. pool_full is reported only for queued cards. Queued todo/needs_review cards include why they wait (pool full with rank, cards ahead and slot holders, blocked, waiting, and other dispatch gates), plus those queued over 6 hours. The holders section lists current slot holders per pool, with stage, held time and open-step owner (at most 50 per pool). Card numbers only, no titles or text. Read from the cards' stored history. Lists are shortened to fit 50,000 characters and say how many more; answeredItems stays an array, with answeredItemsMore when some are omitted; an oversized kind breakdown reports omitted groups in answerMinutesByKindMore.",
   {
     boardId: BoardRef,
     since: Schema.optional(
@@ -935,7 +935,7 @@ const SubtaskDone = tool(
     releasedAt: Schema.optional(
       describe(
         IsoDateTime,
-        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window.",
+        "When the restart actually happened, for ticking a release after the fact; it records that time and does not start a new window; use it for any step that records a release that already happened, including a second card's step for the same release.",
       ),
     ),
   },
@@ -946,7 +946,7 @@ const SubtaskDone = tool(
 const CardThread = tool(
   "card_thread",
   "Steer, stop, wake or reset a card thread",
-  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it. Steer and wake require non-blank text. message is an alias for text; if both are supplied, they must match.",
+  "Evaluators: steer the card's live thread with text, stop it (the card keeps its place; move it if needed), wake its last work thread with text, or reset it: the card drops its threads and its next run starts on a fresh one, with text as a note for it. Steer and wake require non-blank text and an open worker step or pending review findings, unless a reviewer is attached. message is an alias for text; if both are supplied, they must match.",
   {
     boardId: BoardRef,
     card: CardRef,

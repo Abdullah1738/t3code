@@ -1,6 +1,7 @@
 """A deliberate kill remains a terminal command result across every client settlement path."""
 import contextlib
 import io
+import json
 from pathlib import Path
 import sqlite3
 import sys
@@ -10,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from offbox_lib import api, cli, common, lease, misc, reap, runs
+from offbox_lib import api, cli, common, lease, misc, pulls, reap, runs
 from test_capacity import Isolated
 from test_wait_lock import Clock
 
@@ -45,6 +46,11 @@ class KilledResultTests(Isolated):
         a = cli.build_parser().parse_args(['run', '--step', 'one', '--step', 'two', '--step', 'three'])
         a.steps = a.step
         a.pull = list(pulls)
+        if pulls:
+            self.con.execute("UPDATE runs SET pulls=?,pull_state='pending',pull_owner=NULL,pull_summary=NULL",
+                             (json.dumps(list(pulls)),))
+            self.con.commit()
+            (common.LOGS_DIR / 'run-kill.pulls.jsonl').unlink(missing_ok=True)
         rn = SimpleNamespace(run_id='run-kill', box='bx_test', pid=7, started=True,
                              root=Path(self.me['repo_root']), log_path=self.path, recovered_code=None,
                              remote_code=None, start=lambda: None, stream=stream or (lambda: None))
@@ -56,6 +62,128 @@ class KilledResultTests(Isolated):
         self.assertNotIn('steps incomplete', text)
         self.assertNotIn('process was lost', text)
         self.assertNotIn('infra failure', text)
+
+    def test_merge_kill_during_pull_retains_receipt_and_box_reservation(self):
+        self.con.execute("UPDATE runs SET pulls='[\"reports\"]',pull_state='pending'")
+        self.con.commit()
+        observed = {}
+
+        def while_pulling(box, row, paths, **options):
+            self.assertEqual(self.row()['pull_state'], 'running')
+            observed['kill_return'] = misc.kill_run('run-kill')
+            saved = common.read_json(common.LOGS_DIR / 'run-kill.state.json', {})
+            observed['receipt'] = saved.get('status'), saved.get('exit_code')
+            # A later reader must see the receipt without freeing a box still serving this pull.
+            killed = runs.killed_result('run-kill', row=self.row())
+            observed['known_exit'] = killed['exit_code'] if killed is not None else None
+            observed['reservation'] = lease.active_runs(self.con, 'bx_test')
+            observed['status'] = self.row()['status']
+            return dict(files=1, bytes=8, conflicts=0, errors=0)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(runs, 'do_pulls', side_effect=while_pulling))
+            stack.enter_context(patch.object(api, 'cmd_kill', return_value={}))
+            stack.enter_context(patch.object(api, 'cmd_status', return_value={
+                'running': False, 'status': 'exited', 'exitCode': 143}))
+            emitted = stack.enter_context(patch.object(runs, 'emit_terminal'))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.assertTrue(pulls.settle('run-kill', 'refresh'))
+            self.assertEqual(observed['kill_return'], 0)
+            self.assertEqual(observed['receipt'], ('killed', 143))
+            self.assertEqual(observed['known_exit'], 143)
+            self.assertEqual(observed['reservation'], 1)
+            self.assertEqual(observed['status'], 'running')
+            emitted.assert_not_called()
+            # Missing step receipts or wrapper exit 137 cannot erase the confirmed kill.
+            self.assertEqual(runs.finish('run-kill', 137, catch_up=False,
+                                        bookkeeping=False, reclaim_tmp=False), 143)
+            self.assert_killed()
+            self.assertEqual(self.row()['pull_state'], 'done')
+            self.assertEqual(lease.active_runs(self.con, 'bx_test'), 0)
+            emitted.assert_called_once()
+
+    def test_merge_deferred_kill_is_promoted_when_wait_finishes_pulls(self):
+        self.con.execute("UPDATE runs SET pulls='[\"reports\"]',pull_state='running'")
+        self.con.commit()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            self.assertEqual(runs.finish('run-kill', 143, 'killed', catch_up=False), 143)
+            self.assertEqual(self.row()['status'], 'running')
+            # The first owner died before publication; the next wait completes its pending artifacts.
+            self.con.execute("UPDATE runs SET pull_state='pending'")
+            self.con.commit()
+            transfer = stack.enter_context(patch.object(runs, 'do_pulls', return_value=dict(
+                files=1, bytes=8, conflicts=0, errors=0)))
+            self.assertEqual(misc._settled(self.row()), 143)
+            self.assert_killed()
+            self.assertEqual(self.row()['pull_state'], 'done')
+            transfer.assert_called_once()
+
+    def test_merge_active_pull_does_not_replace_known_natural_exit_with_kill(self):
+        for code in (0, 17):
+            with self.subTest(code=code), contextlib.redirect_stderr(io.StringIO()):
+                self.con.execute("UPDATE runs SET status=?,exit_code=?,pull_state='running'",
+                                 ('done' if code == 0 else 'failed', code))
+                self.con.commit()
+                self.assertEqual(runs.finish('run-kill', 143, 'killed', catch_up=False,
+                                            bookkeeping=False, reclaim_tmp=False), code)
+                self.assertEqual(runs.restore_run_state(self.row())['exit_code'], code)
+
+    def test_merge_kill_confirmed_after_pull_overrides_stale_signal_exit(self):
+        for previous in (137, 143):
+            with self.subTest(previous=previous):
+                for suffix in ('state.json', 'pulls.jsonl'):
+                    (common.LOGS_DIR / ('run-kill.' + suffix)).unlink(missing_ok=True)
+                self.con.execute("UPDATE runs SET status='failed',exit_code=?,step_count=0,"
+                                 "pulls='[\"reports\"]',pull_state='pending',pull_owner=NULL,pull_summary=NULL",
+                                 (previous,))
+                self.con.commit()
+                original_wait = pulls.wait
+
+                def confirm_after_pull(*args, **kwargs):
+                    result = original_wait(*args, **kwargs)
+                    self.assertEqual(self.row()['pull_state'], 'done')
+                    self.assertEqual(runs.finish('run-kill', 143, 'killed', catch_up=False,
+                                                bookkeeping=False, reclaim_tmp=False), 143)
+                    return result
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(pulls, 'wait', side_effect=confirm_after_pull))
+                    transfer = stack.enter_context(patch.object(runs, 'do_pulls', return_value=dict(
+                        files=1, bytes=8, conflicts=0, errors=0)))
+                    stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                    result = misc._settled(self.row())
+                    self.assert_killed()
+                    transfer.assert_called_once()
+                    self.assertEqual(result, 143)
+
+    def test_merge_settled_kill_retains_143_after_pull_bookkeeping_failure(self):
+        self.killed()
+        self.con.execute("UPDATE runs SET pulls='[\"reports\"]',pull_state='pending'")
+        self.con.commit()
+        output = io.StringIO()
+        with patch.object(runs, 'do_pulls', side_effect=sqlite3.OperationalError('fixture pull bookkeeping failure')), \
+                contextlib.redirect_stderr(output):
+            try:
+                result = misc._settled(self.row())
+            except sqlite3.Error as error:
+                result = str(error)
+            self.assertEqual(result, 143)
+        self.assert_killed()
+        self.assertIn('artifact pull after offbox kill failed', output.getvalue())
+        self.assertIn('killed by offbox kill', output.getvalue())
+
+    def test_merge_settled_kill_still_reports_pull_wait_timeout(self):
+        self.killed()
+        self.con.execute("UPDATE runs SET pulls='[\"reports\"]',pull_state='pending'")
+        self.con.commit()
+        error = common.OffboxError('fixture pull deadline', code=common.EXIT_WAIT_TIMEOUT)
+        with patch.object(pulls, 'wait', side_effect=error), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(common.OffboxError) as raised:
+                misc._settled(self.row(), until=1001)
+        self.assertEqual(raised.exception.code, common.EXIT_WAIT_TIMEOUT)
+        self.assert_killed()
 
     def test_attached_killed_row_returns_143_on_both_backends(self):
         for backend in ('boat', 'server'):
@@ -260,14 +388,16 @@ class KilledResultTests(Isolated):
     def test_killed_foreground_preserves_artifact_pulls_and_the_kill_exit(self):
         self.killed()
         for failure in (None, common.OffboxError('pull disconnected')):
-            with self.subTest(failure=failure), patch.object(runs, 'do_pulls', side_effect=failure) as pull, \
+            with self.subTest(failure=failure), patch.object(runs, 'do_pulls', side_effect=failure,
+                    return_value=dict(files=0, bytes=0, conflicts=0, errors=0)) as pull, \
                     contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(self.foreground(pulls=['reports']), 143)
                 self.assertEqual(pull.call_args.args[0], 'bx_test')
                 self.assertEqual(pull.call_args.args[2], ['reports'])
                 self.assert_output(err.getvalue())
                 if failure:
-                    self.assertIn('artifact pull after offbox kill failed', err.getvalue())
+                    self.assertIn('pulls: failed', err.getvalue())
+                    self.assertEqual(self.row()['pull_state'], 'failed')
 
     def test_saved_kill_without_pull_metadata_still_returns_143_during_db_outage(self):
         runs.save_run_state('run-kill', status='killed', exit_code=143, end_at=1000)

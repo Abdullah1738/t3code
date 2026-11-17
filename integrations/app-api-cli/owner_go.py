@@ -140,10 +140,20 @@ class Ledger:
         when = timestamp(at)
         if when > now or not 0 < hours <= 24:
             raise ApprovalError('future approval or lifetime outside 0..24 hours')
+        expires = when + dt.timedelta(hours=hours)
+        if expires <= now:
+            toollog.emit('owner-go', 'record.refused', kind='error', ok=False,
+                         ids={'vendorId': vendor, 'itemId': item},
+                         props={'reason': 'expired_at_write', 'amountMinor': amount,
+                                'currency': currency, 'hours': hours, 'at': when.isoformat(),
+                                'expiresAt': expires.isoformat()}, error='OWNER_GO_INVALID')
+            raise ApprovalError(f'approval already expired at {expires.isoformat()} '
+                                f'(quote at {when.isoformat()}, lifetime {hours}h); '
+                                'get a fresh yes from the owner')
         data = terms(vendor, item, amount, currency, recurring)
         with self.events(True) as (_, stream):
             return self.append(stream, 'record', now, **data, quote=text(quote), source=text(source),
-                               at=when.isoformat(), expires_at=(when + dt.timedelta(hours=hours)).isoformat())
+                               at=when.isoformat(), expires_at=expires.isoformat())
 
     def verify(self, *, vendor, item, amount, currency=None, recurring=None, now=None):
         now = now or dt.datetime.now(UTC)

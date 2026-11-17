@@ -148,9 +148,9 @@ class IOTests(unittest.TestCase):
         for value in ['Robob',guard.EXECUTABLE+' Helper','python script Robob',guard.EXECUTABLE+'-old']:
             self.assertFalse(guard.robob_present(' 12 '+value))
     def test_clean_background_open(self):
-        with patch.dict(os.environ,{'BUN_INSPECT':'1','TMUX':'x'}),patch('guard.subprocess.run') as run:
+        with patch.dict(os.environ,{'BUN_INSPECT':'1','TMUX':'x'}),patch('guard.time.time',return_value=10000),patch('guard.subprocess.run') as run:
             guard.reopen(Path('/fake'));args,kw=run.call_args
-            self.assertEqual(args[0],['/usr/bin/open','-g','-a',guard.APP]);self.assertEqual(set(kw['env']),{'HOME','USER','PATH'});self.assertEqual(kw['cwd'],'/')
+            self.assertEqual(args[0],['/usr/bin/open','-g','-a',guard.APP,'--env','ROBOB_LAUNCH_INITIATOR=guard:10000000']);self.assertEqual(set(kw['env']),{'HOME','USER','PATH'});self.assertEqual(kw['cwd'],'/')
     def test_notification_failure(self):
         with patch('guard.subprocess.run',side_effect=subprocess.TimeoutExpired('bun',30)) as run:
             self.assertFalse(guard.notify(Path('/fake'),'key',dict(kind='crash-loop',at=10000)))

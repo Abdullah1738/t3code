@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import { expect, it } from "@effect/vitest";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- isolated loopback MCP integration.
@@ -57,6 +58,7 @@ import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
 import * as SavedWrite from "../ardud/kanban/engine/savedWrite.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
+import * as BoundedReadDeadline from "./BoundedReadDeadline.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import {
@@ -82,6 +84,9 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { BoardsDatabase } from "../ardud/persistence/BoardsDatabase.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import * as WikiReadTiming from "../ardud/analytics/WikiReadTiming.ts";
 
 it("hashes retry ids deterministically within their caller identity", () => {
   const first = callIdentifiers(
@@ -151,6 +156,7 @@ const probe = (name: string) =>
     }),
   );
 const decodeAnalyticsEvent = Schema.decodeEffect(AnalyticsEvent);
+const decodeAnalyticsEventSync = Schema.decodeUnknownSync(AnalyticsEvent);
 const args = { clientRequestId: "private retry id", boardId: "board-robob", card: "#1301" };
 const isAnalyticsEvent = Schema.is(AnalyticsEvent);
 
@@ -177,6 +183,7 @@ const lookupCases = [
   {
     name: "accepted receipt",
     state: "accepted",
+    cancelRegistration: "cancel_pending",
     reason: "accepted",
     foundBy: "receipt",
     saved: true,
@@ -188,7 +195,16 @@ const lookupCases = [
     foundBy: "receipt",
     saved: true,
   },
-  { name: "pending", state: "pending", reason: "pending" },
+  { name: "pending", state: "pending", cancelRegistration: "cancel_pending", reason: "pending" },
+  {
+    name: "legacy pending without owner evidence",
+    id: IdAllocator.derive.delegatedTaskNode({
+      commandId: CommandId.make("command:mcp:credential:delegate-task:private"),
+    }),
+    state: "pending",
+    reason: "non_canonical_id",
+    canonical: false,
+  },
   { name: "abandoned", state: "abandoned", reason: "abandoned" },
   { name: "copied miss", id: copiedLookupId, reason: "non_canonical_id", canonical: false },
   {
@@ -235,6 +251,36 @@ const lookupCases = [
     foundBy: "subagents",
     saved: true,
   },
+  ...(["pending", "accepted"] as const).map(
+    (state) =>
+      ({
+        name: `missing child with ${state} receipt`,
+        cancelRegistration: "cancel_pending",
+        hit: true,
+        noChild: true,
+        state,
+        reason: "missing_child_thread",
+        foundBy: "subagents",
+        saved: true,
+      }) as const,
+  ),
+  ...(["pending", "accepted"] as const).flatMap((state) =>
+    (["not_pending", "capacity"] as const).flatMap((cancelRegistration) =>
+      [false, true].map((noChild) => ({
+        name: `${state} receipt, missing child ${noChild}, cancel registration ${cancelRegistration}`,
+        state,
+        cancelRegistration,
+        ...(noChild ? { hit: true, noChild: true } : {}),
+        reason: noChild ? ("missing_child_thread" as const) : state,
+        foundBy: noChild
+          ? ("subagents" as const)
+          : state === "accepted"
+            ? ("receipt" as const)
+            : ("none" as const),
+        saved: noChild || state === "accepted" ? true : ("unknown" as const),
+      })),
+    ),
+  ),
   ...[
     "thread:project:private:uuid",
     `thread:delegated-task:${lookupId.slice(20)}`,
@@ -356,11 +402,17 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
     let parentReads = 0;
     let acknowledgements = 0;
     let stopped = false;
+    const cancelRequests: CommandId[] = [];
     const threads = Layer.mock(ThreadManagement.ThreadManagementService)({
       getCallerRow: (id) => Effect.succeed(Testkit.liveThreadShell(id)),
       getThreadShell: (id) => Effect.succeed(Testkit.liveThreadShell(id)),
       getThreadProjection: () => Effect.succeed({ ...parent, subagents: [task] }),
       stopDelegatedTasks: () => Effect.void,
+      requestCancelOnArrival: (commandId) =>
+        Effect.sync(() => {
+          cancelRequests.push(commandId);
+          return "cancelRegistration" in testCase ? testCase.cancelRegistration : "not_pending";
+        }),
       getThreadRecords: (id) => {
         if (
           "pause" in testCase &&
@@ -425,6 +477,7 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
         }).pipe(Effect.tap(() => Deferred.succeed(acknowledged, undefined))),
     });
     const service = OrchestratorMcpService.layer.pipe(
+      Layer.provide(McpProviderSessions.layer),
       Layer.provide(
         Layer.mergeAll(
           NodeServices.layer,
@@ -489,6 +542,19 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
             ? ["task_status", "task_cancel"]
             : ["task_status"];
       for (const name of names) {
+        const creating =
+          name === "task_status" && "reason" in testCase && testCase.reason === "pending";
+        const recordMissing =
+          "state" in testCase &&
+          testCase.state === "accepted" &&
+          !("foreign" in testCase) &&
+          !("wrongCommand" in testCase);
+        const cancelRegistration =
+          !recordMissing && name === "task_cancel" && "cancelRegistration" in testCase
+            ? testCase.cancelRegistration
+            : undefined;
+        const cancelPending = cancelRegistration === "cancel_pending";
+        const cancelCapacity = cancelRegistration === "capacity";
         const call = server
           .callTool({ name, arguments: { taskId: "id" in testCase ? testCase.id : lookupId } })
           .pipe(Effect.provideService(McpSchema.McpServerClient, client));
@@ -526,13 +592,21 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
           },
         });
         expect(row.errorTag).toBe(
-          "reason" in testCase
-            ? "task_not_found"
-            : "error" in testCase
-              ? testCase.error
-              : "invalid" in testCase
-                ? "invalid_request"
-                : undefined,
+          cancelPending
+            ? undefined
+            : cancelCapacity
+              ? "task_not_cancellable"
+              : "reason" in testCase
+                ? recordMissing
+                  ? "task_record_missing"
+                  : creating
+                    ? "task_creating"
+                    : "task_not_found"
+                : "error" in testCase
+                  ? testCase.error
+                  : "invalid" in testCase
+                    ? "invalid_request"
+                    : undefined,
         );
         if ("pause" in testCase)
           expect(row.outcome).toBe(
@@ -545,9 +619,49 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
                   : "interrupted",
           );
         expect(isAnalyticsEvent(row)).toBe(true);
-        expect(JSON.stringify(row.props)).not.toMatch(/private|command:|node:|clientRequestId/);
+        if (recordMissing) {
+          expect(row.props).toMatchObject({
+            commandId: lookupCommand,
+            taskId: lookupId,
+            receiptState: "accepted",
+            missingLookup: "noChild" in testCase ? "child_thread_id" : "subagents",
+          });
+        } else
+          expect(JSON.stringify(row.props)).not.toMatch(/private|command:|node:|clientRequestId/);
         if (!("reason" in testCase)) expect(row.props).not.toHaveProperty("notFoundReason");
         if ("reason" in testCase) {
+          expect(row.outcome).toBe(cancelPending ? "ok" : "error");
+          expect(row.props?.code).toBe(
+            cancelPending
+              ? "unknown"
+              : cancelCapacity
+                ? "task_not_cancellable"
+                : recordMissing
+                  ? "task_record_missing"
+                  : creating
+                    ? "task_creating"
+                    : "task_not_found",
+          );
+          expect(row.reasonClass).toBe(
+            cancelPending
+              ? undefined
+              : creating || cancelCapacity || recordMissing
+                ? "other"
+                : "not_found",
+          );
+          if (cancelPending) {
+            expect(response?.isError).not.toBe(true);
+            expect(response?.structuredContent).toMatchObject({
+              taskId: lookupId,
+              status: "cancel_pending",
+            });
+            continue;
+          }
+          if (cancelCapacity) {
+            expect(response?.isError).toBe(true);
+            expect(response?.structuredContent).toMatchObject({ code: "task_not_cancellable" });
+            continue;
+          }
           const text = JSON.stringify(response);
           const threadShape =
             "shape" in testCase &&
@@ -559,8 +673,13 @@ it.effect.each(lookupCases)("records task lookup metadata: $name", (testCase) =>
               : "Expected the taskId returned by delegate_task.",
           );
           expect(text).not.toContain("id" in testCase ? testCase.id : lookupId);
+          expect(text.includes("No delegated task has this id.")).toBe(!creating && !recordMissing);
+          if (creating) expect(row.props?.code).toBe("task_creating");
         }
       }
+      expect(cancelRequests).toEqual(
+        "cancelRegistration" in testCase && testCase.state === "pending" ? [lookupCommand] : [],
+      );
       if ("ack" in testCase) {
         yield* Deferred.await(acknowledged);
         expect(acknowledgements).toBe(1);
@@ -1367,6 +1486,104 @@ it.effect.each(outcomeCases)(
     }),
 );
 
+const wikiLaneCases = (["caller", "body"] as const).flatMap((stage) =>
+  (["foreground", "background", "writer"] as const).flatMap((routedLane) =>
+    (["success", "timeout", "disconnect"] as const).flatMap((ending) =>
+      (["linked", "unlinked"] as const).map((callerResult) => ({
+        stage,
+        routedLane,
+        ending,
+        callerResult,
+      })),
+    ),
+  ),
+);
+it.effect.each(wikiLaneCases)(
+  "wiki_read emits routed $stage lane $routedLane on $ending with $callerResult caller",
+  ({ stage, routedLane, ending, callerResult }) =>
+    Effect.gen(function* () {
+      const recorded = yield* Deferred.make<AnalyticsEvent>();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const toolkit = probe("wiki_read");
+      const handler = Effect.gen(function* () {
+        expect(yield* NodeSqliteClient.ReaderLane).toBe("foreground");
+        const start = yield* NodeSqliteClient.ReaderWaitStartedObserver;
+        const acquired = yield* NodeSqliteClient.ReaderWaitObserver;
+        const read = (phase: "caller" | "body") =>
+          WikiReadTiming.step(
+            phase,
+            Effect.gen(function* () {
+              const lane = phase === stage ? routedLane : "foreground";
+              const finish = start?.("foreground");
+              finish?.(lane, false);
+              if (phase === "caller") yield* TestClock.adjust("5 millis");
+              if (phase === stage) {
+                yield* Deferred.succeed(entered, undefined);
+                if (ending !== "success") yield* Deferred.await(release);
+              }
+              if (lane !== "writer") acquired?.(phase === "caller" ? 5 : 0, lane);
+              finish?.(lane, true);
+              return phase === "caller" && callerResult === "unlinked"
+                ? null
+                : { boardId: "board-robob" };
+            }),
+          );
+        yield* read("caller");
+        yield* read("body");
+        return { pages: [] };
+      });
+      const registration = McpHttpServer.toolkitRegistration(
+        toolkit,
+        McpToolAccess.toLayer(toolkit, {
+          wiki_read: McpToolAccess.reads(() => handler),
+        }),
+      ).pipe(
+        Layer.provideMerge(McpServer.McpServer.layer),
+        Layer.provide(Testkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(BoardsDatabase)({ ready: Effect.void, path: "/synthetic/boards.sqlite" }),
+        ),
+        Layer.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              event.kind === "mcp.call"
+                ? Deferred.succeed(recorded, event).pipe(Effect.asVoid)
+                : Effect.void,
+          }),
+        ),
+        Layer.provideMerge(invocation),
+      );
+      yield* Effect.gen(function* () {
+        const server = yield* McpServer.McpServer;
+        const pending = yield* server
+          .callTool({ name: "wiki_read", arguments: args })
+          .pipe(Effect.provideService(McpSchema.McpServerClient, client), Effect.forkChild);
+        yield* Deferred.await(entered);
+        if (ending === "timeout") yield* TestClock.adjust("20 seconds");
+        if (ending === "disconnect") {
+          yield* TestClock.adjust("100 millis");
+          yield* Fiber.interrupt(pending);
+        } else yield* Fiber.join(pending);
+        const row = yield* Deferred.await(recorded);
+        expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+          tool: "wiki_read",
+          outcome: ending === "success" ? "ok" : ending === "timeout" ? "timeout" : "interrupted",
+          callerResolved:
+            callerResult === "linked" && !(stage === "caller" && ending !== "success"),
+          callerResolveMs:
+            stage === "caller" && ending !== "success" ? (ending === "timeout" ? 20000 : 105) : 5,
+          callerReaderLane: stage === "caller" ? routedLane : "foreground",
+          readerLane: ending !== "success" || stage === "body" ? routedLane : "foreground",
+          ...(ending === "success"
+            ? {}
+            : { phase: stage, waitedMs: ending === "timeout" ? 20000 : 105 }),
+          ...(ending === "timeout" ? { props: { phase: stage } } : {}),
+        });
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(registration));
+    }),
+);
+
 it.effect.each(["caller", "records"] as const)(
   "preserves the %s phase when a status read returns partial",
   (stage) =>
@@ -2144,6 +2361,48 @@ it.effect("the canonical target replaces caller attribution and survives depende
   }),
 );
 
+it.effect.each([false, true])(
+  "records the final outcome after a recovered dispatch fence (waitTimedOut=%s)",
+  (waitTimedOut) =>
+    Effect.gen(function* () {
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: "unknown",
+      };
+      yield* McpCall.failedPhase("dispatch").pipe(Effect.provideService(McpCall.McpCall, state));
+      yield* McpCall.dispatchFenceRecovered.pipe(Effect.provideService(McpCall.McpCall, state));
+      yield* McpCall.setSaved(true).pipe(Effect.provideService(McpCall.McpCall, state));
+      const result = McpCall.callOutcome(
+        Exit.succeed(
+          new McpSchema.CallToolResult({
+            content: [],
+            structuredContent: { taskId: "task", waitTimedOut },
+          }),
+        ),
+        state,
+      );
+      expect(result).toMatchObject({
+        outcome: waitTimedOut ? "timeout" : "ok",
+        saved: true,
+        props: { dispatchFenceRecovered: true },
+      });
+      expect(result.errorTag).toBe(waitTimedOut ? "wait_timeout" : undefined);
+      expect(result.errorPhase).toBe(waitTimedOut ? "result" : undefined);
+      expect(() =>
+        decodeAnalyticsEventSync({
+          ts: "2026-11-16T00:00:00.000Z",
+          kind: "mcp.call",
+          surface: "server",
+          route: "mcp",
+          ...result,
+        }),
+      ).not.toThrow();
+    }),
+);
+
 it("does not take refusal metadata from a successful result body", () => {
   const state: McpCall.McpCall["Service"] = {
     callerResolved: true,
@@ -2454,5 +2713,43 @@ it.effect("records a late detached create with the original HTTP call's correlat
       expect(JSON.stringify(detached)).not.toContain(args.clientRequestId);
       yield* decodeAnalyticsEvent(detached);
     }).pipe(Effect.provide(registration));
+  }),
+);
+
+it.effect.each([
+  {
+    name: "typed failure",
+    cause: Cause.fail(
+      new OrchestratorMcpFailure({ code: "orchestration_error", message: "Cleanup failed." }),
+    ),
+  },
+  { name: "defect", cause: Cause.die(new Error("Cleanup failed.")) },
+])("read deadline wins over a late cleanup $name before analytics serialization", ({ cause }) =>
+  Effect.gen(function* () {
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: true,
+      callerResolveMs: 0,
+      readerLane: "background",
+      readOnly: true,
+      phase: "handler",
+      saved: "unknown",
+    };
+    yield* Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const pending = yield* BoundedReadDeadline.withDeadline(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        () => ({ phase: "handler", waitedMs: 20000 }),
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("20 seconds");
+      const reply = yield* Fiber.join(pending);
+      // The detached handler can report cleanup failure before the ledger builds its row.
+      yield* McpCall.handlerFailure(cause);
+      expect(McpCall.callOutcome(Exit.succeed(reply), state)).toMatchObject({
+        outcome: "timeout",
+        errorTag: "TimeoutError",
+      });
+      expect(state.boundedRead).toEqual({ phase: "handler", waitedMs: 20000 });
+    }).pipe(Effect.provideService(McpCall.McpCall, state));
   }),
 );

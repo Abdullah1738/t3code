@@ -15,9 +15,12 @@ class Pass:
     def __init__(self, source):
         self.source = source
         self.started = time.monotonic()
+        self.last_activity = self.started
         self.lock = threading.Lock()
         self.phases = {}
+        self.thread_phases = {}
         self.rows = 0
+        self.lock_hold_secs = 0.0
         self.slowest = {"sql": None, "ms": 0.0, "rows": 0}
 
     @contextlib.contextmanager
@@ -29,13 +32,34 @@ class Pass:
             if p[0] == 0:
                 p[1] = time.monotonic()
             p[0] += 1
+            thread = threading.get_ident()
+            self.thread_phases.setdefault(thread, []).append(name)
         try:
             yield
         finally:
             with self.lock:
+                stack = self.thread_phases[thread]
+                stack.pop()
+                if not stack:
+                    del self.thread_phases[thread]
                 p[0] -= 1
                 if p[0] == 0:
                     p[2] += time.monotonic() - p[1]
+
+    def thread_phase(self, thread):
+        with self.lock:
+            stack = self.thread_phases.get(thread, ())
+            return stack[-1] if stack else None
+
+    def active_phase(self):
+        # Called by the daemon watchdog; phase sections never perform I/O under this mutex.
+        with self.lock:
+            return next((name for name in ("parse", "fetch", "db_read", "db_write", "lock_wait")
+                         if self.phases.get(name, [0])[0]), "sync")
+
+    def held(self, seconds):
+        with self.lock:
+            self.lock_hold_secs = max(self.lock_hold_secs, seconds)
 
     def statement(self, sql, seconds, rows, returned):
         with self.lock:
@@ -49,6 +73,7 @@ class Pass:
             return {"secs": round(time.monotonic() - self.started, 3),
                     **{name + "_secs": round(self.phases.get(name, [0, 0, 0])[2], 3)
                        for name in ("lock_wait", "fetch", "parse", "db_read", "db_write")},
+                    "lock_hold_secs": round(self.lock_hold_secs, 3),
                     "rows_read": self.rows, "slow_sql": slow}
 
 
@@ -60,6 +85,13 @@ def phase(name):
     else:
         with metrics.phase(name):
             yield
+
+
+def log(message):
+    common.log(message)
+    metrics = CURRENT.get()
+    if metrics:
+        metrics.last_activity = time.monotonic()
 
 
 def timed(name):
@@ -87,11 +119,12 @@ def worker(fn):
 
 
 @contextlib.contextmanager
-def write_lock(lock):
+def write_lock(lock, timeout=None):
     start = time.monotonic()
     with phase("lock_wait"):
-        lock.acquire()
-    waited = time.monotonic() - start
+        lock.acquire() if timeout is None else lock.acquire(timeout=timeout)
+    acquired = time.monotonic()
+    waited = acquired - start
     try:
         if waited > 60:
             metrics = CURRENT.get()
@@ -99,6 +132,9 @@ def write_lock(lock):
         with phase("db_write"):
             yield
     finally:
+        metrics = CURRENT.get()
+        if metrics:
+            metrics.held(time.monotonic() - acquired)
         lock.release()
 
 

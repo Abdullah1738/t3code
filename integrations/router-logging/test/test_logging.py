@@ -102,6 +102,30 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(rows[1]['error']['message'], 'REPLICA_UNAVAILABLE')
         self.assertEqual(rows[2]['error']['message'], 'REPLICA_UNAVAILABLE')
 
+    def test_200_mib_cap_boundaries_preserve_errors(self):
+        self.assertEqual(toollog.CAP, 200 * 1024 * 1024)
+        for offset in (-1, 0, 1):
+            with self.subTest(offset=offset):
+                root = self.root / str(offset)
+                root.mkdir(parents=True)
+                day = dt.datetime.now(dt.timezone.utc).date().isoformat()
+                path = root / (day + '.ndjson')
+                with path.open('wb') as out:
+                    out.truncate(toollog.CAP + offset)
+                with patch.dict(os.environ, ROUTER_LOG_DIR=str(root)):
+                    toollog.emit('test', 'fixture.first')
+                    self.assertEqual((root / ('.cap-' + day)).exists(), offset >= 0)
+                    toollog.emit('test', 'fixture.dropped')
+                    toollog.emit('test', 'fixture.dropped')
+                    toollog.emit('test', 'fixture.error', kind='error', error={'tag': 'http_502'})
+                with path.open('rb') as source:
+                    source.seek(toollog.CAP + offset)
+                    tail = source.read(4096).decode()
+                self.assertEqual(tail.count('log.cap'), 1)
+                self.assertEqual('fixture.first' in tail, offset < 0)
+                self.assertNotIn('fixture.dropped', tail)
+                self.assertIn('fixture.error', tail)
+
     def test_rollup_fixture_and_cli(self):
         self.root.mkdir()
         rows = [dict(tool='9router', name='img.result', kind='perf', ok=True, durationMs=n) for n in range(1, 101)]
@@ -285,7 +309,7 @@ finally:
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertEqual(result.stdout, '')
                 self.assertEqual(result.stderr, 'genimg: route=9router cx/gpt-image-2; ' + message.rstrip() + '\n')
-                row = self.rows()[-1]
+                row = [row for row in self.rows() if row['name'] == 'img.result'][-1]
                 self.assertEqual(row['name'], 'img.result')
                 self.assertIs(row['ok'], False)
                 self.assertEqual(row['error'], {'tag': tag, 'message': tag})
@@ -301,7 +325,7 @@ finally:
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertEqual(result.stdout, '')
                 self.assertEqual(result.stderr, 'genimg: route=9router cx/gpt-image-2; error 502: ' + body.decode()[:500] + '\n')
-                self.assertEqual(self.rows()[-1]['error'], {'tag': 'http_502_not_entitled', 'message': 'http_502_not_entitled'})
+                self.assertEqual([row for row in self.rows() if row['name'] == 'img.result'][-1]['error'], {'tag': 'http_502_not_entitled', 'message': 'http_502_not_entitled'})
         log = ''.join(p.read_text() for p in self.root.glob('*.ndjson'))
         self.assertNotIn('SECRETBODY', log)
         self.assertNotIn('private prompt', log)
@@ -313,10 +337,12 @@ finally:
         self.assertEqual(result.stderr, 'genimg: route=9router cx/gpt-image-2\n')
         self.assertEqual(result.stdout, str(path) + '\n')
         self.assertEqual(path.read_bytes(), b'hello')
-        rows = self.rows()
+        all_rows = self.rows()
+        rows = [row for row in all_rows if row['component'] == 'image']
         self.assertEqual([r['name'] for r in rows], ['img.request', 'img.result', 'img.write'])
         self.assertTrue(all(r['ok'] for r in rows[1:]))
-        self.assertNotIn('private prompt', json.dumps(rows))
+        self.assertNotIn('private prompt', json.dumps(all_rows))
+        self.assertEqual([row['name'] for row in all_rows if row['component'] == 'logger'], ['log.volume'])
 
     def test_image_write_paths(self):
         args = ['genimg', 'private prompt', str(Path(self.tmp.name)/'out.png'), '--route', '9router']

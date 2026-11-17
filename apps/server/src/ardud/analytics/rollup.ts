@@ -231,8 +231,36 @@ function finishBreakdown(groups: Map<string, Breakdown>) {
 export const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
 
 export const makeAccumulator = () => ({
+  runtimeSamples: new Map<
+    string,
+    {
+      hour: string;
+      samples: number;
+      runningTurnsMax: number;
+      runningTurnsSum: number;
+      queuedRunsMax: number | null;
+      load1Max: number;
+      sampleMsMax: number;
+    }
+  >(),
   total: 0,
   invalidLines: 0,
+  restartAdmissionOverflow: 0,
+  restartAdmission: new Map<
+    string,
+    {
+      bootId: string;
+      hour: string;
+      maxQueueDepth: number;
+      admissions: number;
+      failuresByRule: Record<string, number>;
+      maxActiveObserved: number;
+      maxActive: number;
+      loadedObservations: number;
+      observations: number;
+      waits: Durations;
+    }
+  >(),
   kinds: new Map<string, number>(),
   textGenerationOverflow: 0,
   textGeneration: new Map<
@@ -266,6 +294,22 @@ export const makeAccumulator = () => ({
   mcpCodes: new Map<string, Breakdown>(),
   mcpReplyTimeouts: new Map<string, Breakdown>(),
   dbSpans: new Map<string, Breakdown>(),
+  dbStatements: new Map<
+    string,
+    {
+      database: string;
+      connection: string;
+      lane: string;
+      fingerprint: string;
+      family: string;
+      calls: number;
+      totalMs: number;
+      maxMs: number;
+      returnedRows: number;
+      failures: number;
+    }
+  >(),
+  processDiskRead: { readBytes: 0, sampleMs: 0, samples: 0, unavailableSamples: 0 },
   rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
   longTasks: new Map<
     string,
@@ -538,6 +582,71 @@ export function accumulate(
   }
   // Related follow-ups inform a filtered call view without becoming selected events or samples.
   if (correlationOnly) return;
+  if (
+    event.kind === "server.runtime_sample" &&
+    event.props?.runningTurns &&
+    event.props.host &&
+    event.props.sampleMs !== undefined
+  ) {
+    const hour = event.ts.slice(11, 13);
+    const row = target.runtimeSamples.get(hour) ?? {
+      hour,
+      samples: 0,
+      runningTurnsMax: 0,
+      runningTurnsSum: 0,
+      queuedRunsMax: null,
+      load1Max: 0,
+      sampleMsMax: 0,
+    };
+    row.samples++;
+    row.runningTurnsMax = Math.max(row.runningTurnsMax, event.props.runningTurns.total);
+    row.runningTurnsSum += event.props.runningTurns.total;
+    if (event.props.queuedRuns !== undefined)
+      row.queuedRunsMax = Math.max(row.queuedRunsMax ?? 0, event.props.queuedRuns);
+    row.load1Max = Math.max(row.load1Max, event.props.host.load1);
+    row.sampleMsMax = Math.max(row.sampleMsMax, event.props.sampleMs);
+    target.runtimeSamples.set(hour, row);
+  }
+  const admission = event.restartAdmission;
+  if (
+    admission &&
+    (event.kind === "restart.admission.admitted" || event.kind === "restart.admission.failed")
+  ) {
+    const bootId = event.bootId ?? "unknown";
+    const hour = event.ts.slice(0, 13) + "Z";
+    const key = JSON.stringify([bootId, hour]);
+    let group = target.restartAdmission.get(key);
+    if (!group && target.restartAdmission.size >= MAX_GROUPS) target.restartAdmissionOverflow++;
+    else {
+      if (!group) {
+        group = {
+          bootId,
+          hour,
+          maxQueueDepth: 0,
+          admissions: 0,
+          failuresByRule: {},
+          maxActiveObserved: 0,
+          maxActive: 0,
+          loadedObservations: 0,
+          observations: 0,
+          waits: durations(),
+        };
+        target.restartAdmission.set(key, group);
+      }
+      group.observations++;
+      group.loadedObservations += Number(admission.loaded);
+      group.maxQueueDepth = Math.max(group.maxQueueDepth, admission.maxQueueDepth, admission.total);
+      group.maxActiveObserved = Math.max(group.maxActiveObserved, admission.active);
+      group.maxActive = Math.max(group.maxActive, admission.maxActive);
+      if (event.kind === "restart.admission.admitted") {
+        group.admissions++;
+        addDuration(group.waits, admission.waitedMs);
+      } else {
+        const rule = admission.rule ?? "unknown";
+        group.failuresByRule[rule] = (group.failuresByRule[rule] ?? 0) + 1;
+      }
+    }
+  }
   boardAccumulate(target, event);
   target.total++;
   if ("runId" in event) accumulateUsage(target.usage, event);
@@ -651,6 +760,55 @@ export function accumulate(
       },
       event,
     );
+  }
+
+  if (event.kind === "db.statement.summary") {
+    const props = event.props;
+    if (props?.count !== undefined && props.totalMs !== undefined && props.maxMs !== undefined) {
+      const labels = {
+        database: props.database ?? "unknown",
+        connection: props.connection ?? "unknown",
+        lane: props.lane ?? "unknown",
+        fingerprint: props.sqlFingerprint ?? "unknown",
+        family: props.key ?? "unknown",
+      };
+      const identity = JSON.stringify(labels);
+      const key =
+        target.dbStatements.has(identity) || target.dbStatements.size < 512 ? identity : OTHER;
+      let row = target.dbStatements.get(key);
+      if (!row) {
+        row = {
+          ...(key === OTHER
+            ? {
+                database: "other",
+                connection: "other",
+                lane: "other",
+                fingerprint: "other",
+                family: "other",
+              }
+            : labels),
+          calls: 0,
+          totalMs: 0,
+          maxMs: 0,
+          returnedRows: 0,
+          failures: 0,
+        };
+        target.dbStatements.set(key, row);
+      }
+      row.calls += props.count;
+      row.totalMs += props.totalMs;
+      row.maxMs = Math.max(row.maxMs, props.maxMs);
+      row.returnedRows += props.resultCount ?? 0;
+      row.failures += props.failures ?? 0;
+    }
+  }
+  if (event.kind === "db.process.disk_read") {
+    const props = event.props;
+    if (props?.readBytes !== undefined && props.sampleMs !== undefined) {
+      target.processDiskRead.readBytes += props.readBytes;
+      target.processDiskRead.sampleMs += props.sampleMs;
+      target.processDiskRead.samples++;
+    } else target.processDiskRead.unavailableSamples++;
   }
 
   if (event.kind === "performance.long-task-summary") {
@@ -864,11 +1022,12 @@ export function accumulate(
   }
 }
 
-export function summarize(values: Durations): AnalyticsLatency {
+function durationPercentile(values: Durations) {
   const sorted = values.histogram
     ? [...values.histogram].sort(([a], [b]) => a - b)
     : values.exact.toSorted((a, b) => a - b).map((value) => [value, 1] as const);
-  const percentile = (quantile: number): number | null => {
+
+  return (quantile: number): number | null => {
     const rank = Math.ceil(values.count * quantile);
     let seen = 0;
     for (const [key, count] of sorted) {
@@ -881,6 +1040,10 @@ export function summarize(values: Durations): AnalyticsLatency {
     }
     return null;
   };
+}
+
+export function summarize(values: Durations): AnalyticsLatency {
+  const percentile = durationPercentile(values);
   return {
     count: values.count,
     p50Ms: percentile(0.5),
@@ -986,6 +1149,35 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    runtimeSamples: [...target.runtimeSamples.values()]
+      .map(({ runningTurnsSum, ...row }) => ({
+        ...row,
+        runningTurnsAvg: runningTurnsSum / row.samples,
+      }))
+      .sort((a, b) => a.hour.localeCompare(b.hour)),
+    restartAdmission: {
+      scope: "server-wide",
+      groupBy: "boot-hour",
+      loadedTimeShare: null,
+      basis:
+        "Terminal-hour cohorts; admission waits only. Depth: run lifetime maximum. Active/load: terminal samples. Read without board/card/kind filters.",
+      overflow: target.restartAdmissionOverflow,
+      groups: [...target.restartAdmission.values()]
+        .map(({ waits, ...group }) => {
+          const percentile = durationPercentile(waits);
+          return {
+            ...group,
+            wait: {
+              count: waits.count,
+              p50Ms: percentile(0.5),
+              p90Ms: percentile(0.9),
+              maxMs: waits.count ? waits.max : null,
+              approximate: waits.histogram !== undefined,
+            },
+          };
+        })
+        .sort((a, b) => a.hour.localeCompare(b.hour) || a.bootId.localeCompare(b.bootId)),
+    },
     evaluatorOutcomes: [...target.evaluatorOutcomes.values()].sort((a, b) =>
       JSON.stringify(a).localeCompare(JSON.stringify(b)),
     ),
@@ -1074,6 +1266,8 @@ export function finishRollup(
         ...context,
       })),
     ),
+    dbStatementFamilies: [...target.dbStatements.values()].sort((a, b) => b.totalMs - a.totalMs),
+    processDiskRead: { ...target.processDiskRead },
     dbSlowBySpan: finishBreakdown(target.dbSpans).map((row) => ({
       span: String(row.labels.span),
       key: String(row.labels.key),

@@ -1,20 +1,47 @@
 import type { ThreadId } from "@t3tools/contracts";
 import type * as SqlClient from "effect/sql/SqlClient";
+import * as Effect from "effect/Effect";
+
+export const readThreadIndexAvailability = Effect.fn("readThreadIndexAvailability")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  const rows = yield* sql<{ schema_name: string; name: string }>`
+    SELECT 'main' AS schema_name, name FROM main.sqlite_schema
+      WHERE name IN ('ardud_thread_read_queued_idx', 'ardud_thread_read_interrupt_result_idx', 'ardud_thread_read_interrupt_request_idx')
+    UNION ALL SELECT 'ardud_archive', name FROM ardud_archive.sqlite_schema
+      WHERE name IN ('ardud_thread_read_queued_idx', 'ardud_thread_read_interrupt_result_idx', 'ardud_thread_read_interrupt_request_idx')`;
+  return {
+    main: rows.filter((row) => row.schema_name === "main").length === 3,
+    ardud_archive: rows.filter((row) => row.schema_name === "ardud_archive").length === 3,
+  };
+});
 
 // Counts already follow hot/delta/base shadowing transactionally. Only cancelled
 // inputs and legacy superseded interrupts need item-level visibility corrections.
-export const threadReadCount = (sql: SqlClient.SqlClient, threadId: ThreadId) => {
+export const threadReadCount = (
+  sql: SqlClient.SqlClient,
+  threadId: ThreadId,
+  indexes = { main: false, ardud_archive: false },
+) => {
   const branches = [
     {
       table: sql`main.orchestration_v2_projection_turn_items`,
       winner: sql`1`,
-      queued: sql`INDEXED BY ardud_thread_read_queued_idx`,
-      interrupted: sql`INDEXED BY ardud_thread_read_interrupt_result_idx`,
+      queued: indexes.main
+        ? sql`INDEXED BY ardud_thread_read_queued_idx`
+        : sql`INDEXED BY orchestration_v2_projection_turn_items_thread_run_idx`,
+      interrupted: indexes.main
+        ? sql`INDEXED BY ardud_thread_read_interrupt_result_idx`
+        : sql`INDEXED BY orchestration_v2_projection_turn_items_thread_run_idx`,
     },
     {
       table: sql`ardud_archive.ardud_turn_items`,
-      queued: sql`INDEXED BY ardud_thread_read_queued_idx`,
-      interrupted: sql`INDEXED BY ardud_thread_read_interrupt_result_idx`,
+      queued: indexes.ardud_archive
+        ? sql`INDEXED BY ardud_thread_read_queued_idx`
+        : sql`INDEXED BY ardud_turn_items_run_idx`,
+      interrupted: indexes.ardud_archive
+        ? sql`INDEXED BY ardud_thread_read_interrupt_result_idx`
+        : sql`INDEXED BY ardud_turn_items_run_idx`,
       winner: sql`NOT EXISTS (SELECT 1 FROM main.orchestration_v2_projection_turn_items hot
         WHERE hot.turn_item_id = i.turn_item_id)`,
     },

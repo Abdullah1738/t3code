@@ -201,7 +201,7 @@ def clean_environment(home):
 
 
 def reopen(home):
-    subprocess.run(["/usr/bin/open", "-g", "-a", APP], env=clean_environment(home),
+    subprocess.run(["/usr/bin/open", "-g", "-a", APP, "--env", f"ROBOB_LAUNCH_INITIATOR=guard:{int(time.time() * 1000)}"], env=clean_environment(home),
                    cwd="/", stdin=subprocess.DEVNULL, capture_output=True, check=True, timeout=20)
 
 

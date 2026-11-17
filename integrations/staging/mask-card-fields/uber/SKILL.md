@@ -290,10 +290,12 @@ The sections below are phone fallback instructions, not the default route.
   id=ub__menu_view_button, and Account/Wallet show up in the bottom tabs.
 
 ## Fast plans (plan + jevrun, built 4–5 Oct 2026; deterministic, 0 Jev calls, $0)
-Take your OWN hold first (`set -o noclobber; echo "<your session id>" > ~/.local/share/phone-lock/priority-hold`),
-export `PHONE_HOLD_OWNER` = exactly those contents for every `ph` call and runner,
-and remove the hold at the end only if it still matches. Exit 5 means yield;
-never retry in a loop or delete another task's claim. Use `ph lease status` to check.
+Take your own hold with `ph hold acquire --token <session-id>` and export
+`PHONE_HOLD_OWNER=<session-id>` for every `ph` call and runner. Release it with
+`ph hold release`, including on cancellation or failure. ph refreshes it on every
+call; use `ph hold refresh` through long OTP/reply waits. ph archives it after
+its agent exits or 30 minutes without a refresh. Check `ph hold status`.
+Exit 5 means yield; never loop or delete another task's claim.
 `R="perl -e 'alarm 90; exec @ARGV' ~/.local/android/venv/bin/python -u ~/.config/opencode/skills/productivity/android-phone/scripts/jevrun.py"`,
 `P=~/.config/opencode/skills/productivity/android-phone/plans`. jevrun blocks taps on Choose Lux/Comfort/…,
 Book trip, Unconfirm/Cancel trip, tips, star ratings, and ids order_selection_request_button /

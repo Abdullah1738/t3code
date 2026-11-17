@@ -91,7 +91,7 @@ test("lease waits for the router HTTP round trip even while runner and callback 
   expect((await lease()).status).toBe(503); await runner.tick(); expect(calls).toBe(0); expect(runner.active()).toBe(false);
   healthy = true; expect((await lease()).status).toBe(200); await runner.tick(); expect(calls).toBe(1);
   runner.enqueue(opaqueId("after-router-loss"), { text: "next" }); healthy = false;
-  expect((await lease()).status).toBe(503); expect(runner.active()).toBe(false);
+  expect((await lease()).status).toBe(503); expect(runner.active()).toBe(true);
   await runner.tick(); expect(calls).toBe(1);
   healthy = true; expect((await lease()).status).toBe(200); await runner.tick(); expect(calls).toBe(2);
   runner.pause(); server.stop(true); expect((await lease()).status).toBe(503); expect(runner.active()).toBe(false);
@@ -121,20 +121,53 @@ test.each(["unavailable", "throws", "expires"])("router readiness %s at admissio
   }); clean.push(() => runner.db.close());
   const lease = () => runner.handle(new Request("http://box/lease", { method: "POST", headers: { authorization: `Bearer ${config.token}` }, body: JSON.stringify({ boxId: config.boxId, epoch: config.epoch }) }));
   expect((await lease()).status).toBe(200); runner.enqueue(opaqueId("admission-router"), { text: "turn" });
-  healthy = false; await runner.tick(); expect(calls).toBe(0); expect(runner.active()).toBe(false);
+  healthy = false; await runner.tick(); expect(calls).toBe(0); expect(runner.active()).toBe(kind !== "expires");
   expect(runner.db.query<{ state: string }, []>("SELECT state FROM inbox").get()!.state).toBe("pending");
   healthy = true; expect((await lease()).status).toBe(200); await runner.tick(); expect(calls).toBe(1);
 });
 
-test.each(["unavailable", "throws"])("failed callback readiness %s revokes the previous lease", async kind => {
-  const dir = root(); let healthy = true;
+test.each(["unavailable", "throws"])("failed callback readiness %s preserves the current lease until expiry", async kind => {
+  const dir = root(); let healthy = true, now = 0;
   const config = { root: dir, boxId: "bx_test", epoch: "test", token: "t".repeat(32), callbackToken: "c".repeat(32), callbackUrl: "http://box", privateKey: "unused", system: "system" };
-  const runner = new BoxRunner(config, { run: async () => "NO_REPLY" }, { modelReady: async () => true, callbackReady: async () => {
+  const runner = new BoxRunner(config, { run: async () => "NO_REPLY" }, { now: () => now, modelReady: async () => true, callbackReady: async () => {
     if (healthy) return true; if (kind === "throws") throw new Error(); return false;
   } }); clean.push(() => runner.db.close());
   const lease = () => runner.handle(new Request("http://box/lease", { method: "POST", headers: { authorization: `Bearer ${config.token}` }, body: JSON.stringify({ boxId: config.boxId, epoch: config.epoch }) }));
   expect((await lease()).status).toBe(200); expect(runner.active()).toBe(true); healthy = false;
-  expect((await lease()).status).toBe(503); expect(runner.active()).toBe(false);
+  now = 19_999; expect((await lease()).status).toBe(503); expect(runner.active()).toBe(true);
+  now = 20_000; expect(runner.active()).toBe(false);
+});
+
+test.each(["router", "callback"])("one failed %s renewal cannot abort a healthy active turn", async target => {
+  const dir = root(); let now = 0, healthy = true, finish!: () => void, began!: () => void;
+  const started = new Promise<void>(resolve => { began = resolve; });
+  const completed = new Promise<void>(resolve => { finish = resolve; }); let signal: AbortSignal | undefined;
+  const config = { root: dir, boxId: "bx_test", epoch: "test", token: "t".repeat(32), callbackToken: "c".repeat(32), callbackUrl: "http://box", privateKey: "unused", system: "system" };
+  const runner = new BoxRunner(config, { run: async input => { signal = input.signal; began(); await completed; return "NO_REPLY"; } }, {
+    now: () => now, modelReady: async () => target !== "router" || healthy,
+    callbackReady: async () => target !== "callback" || healthy, fetch: async () => Response.json({ accepted: true }),
+  }); clean.push(() => runner.db.close());
+  const lease = () => runner.handle(new Request("http://box/lease", { method: "POST", headers: { authorization: `Bearer ${config.token}` }, body: JSON.stringify({ boxId: config.boxId, epoch: config.epoch }) }));
+  await lease(); runner.enqueue(opaqueId("healthy-turn"), { text: "synthetic" }); const turn = runner.tick(); await started;
+  now = 5000; healthy = false; expect((await lease()).status).toBe(503); await runner.tick();
+  expect(signal!.aborted).toBe(false); expect(runner.active()).toBe(true);
+  healthy = true; now = 10_000; expect((await lease()).status).toBe(200);
+  now = 20_001; await runner.tick(); expect(signal!.aborted).toBe(false);
+  finish(); await turn; expect(runner.db.query<{ state: string }, []>("SELECT state FROM inbox").get()!.state).toBe("done");
+});
+
+test("a stale failed callback probe cannot revoke a newer successful renewal", async () => {
+  const dir = root(); let now = 0, fail!: (ready: boolean) => void, entered!: () => void, slow = false;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const config = { root: dir, boxId: "bx_test", epoch: "test", token: "t".repeat(32), callbackToken: "c".repeat(32), callbackUrl: "http://box", privateKey: "unused", system: "system" };
+  const runner = new BoxRunner(config, { run: async () => "NO_REPLY" }, { now: () => now, callbackReady: () => {
+    if (!slow) return Promise.resolve(true); entered(); return new Promise<boolean>(resolve => { fail = resolve; });
+  } }); clean.push(() => runner.db.close());
+  const lease = () => runner.handle(new Request("http://box/lease", { method: "POST", headers: { authorization: `Bearer ${config.token}` }, body: JSON.stringify({ boxId: config.boxId, epoch: config.epoch }) }));
+  await lease(); slow = true; const older = lease(); await waiting;
+  slow = false; now = 10_000; expect((await lease()).status).toBe(200);
+  fail(false); expect((await older).status).toBe(503);
+  now = 20_001; expect(runner.active()).toBe(true); now = 30_000; expect(runner.active()).toBe(false);
 });
 
 test("missing, empty or unsafe router keys keep turns pending, emit one fixed code and never start a harness", async () => {

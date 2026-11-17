@@ -1,3 +1,5 @@
+import * as McpSessionRegistry from "./McpSessionRegistry.ts";
+import * as McpSessionRegistryTestkit from "./McpSessionRegistry.testkit.ts";
 import { expectJsonRoundTrip } from "./McpJson.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
@@ -91,7 +93,7 @@ import { delegatedTaskRun, hasPendingChildRuns } from "./OrchestratorMcpService.
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const layerOrchestratorToolkit = McpHttpServer.layerOrchestratorToolkit.pipe(
-  Layer.provide(McpProviderSessions.layer),
+  Layer.provideMerge(McpSessionRegistryTestkit.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -109,6 +111,7 @@ const successfulContent = (result: McpSchema.CallToolResult, call: string) => {
 
 const parentThreadId = ThreadId.make("thread:mcp-orchestrator-parent");
 const projectId = ProjectId.make("project:mcp-orchestrator");
+const foreignProjectId = ProjectId.make("project:mcp-foreign");
 const codexInstanceId = ProviderInstanceId.make("codex");
 const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
 const codexModel = "gpt-5.4";
@@ -784,8 +787,17 @@ describe("orchestrator MCP toolkit", () => {
               Layer.mock(ProjectService.ProjectService)({
                 getById: (id) =>
                   Effect.succeed(
-                    id === projectId
-                      ? Option.some({ id, defaultModelSelection: null } as never)
+                    id === projectId || id === foreignProjectId
+                      ? Option.some({
+                          id,
+                          title: id === projectId ? "MCP project" : "Foreign project",
+                          workspaceRoot: cwd,
+                          defaultModelSelection: null,
+                          scripts: [],
+                          createdAt: "2026-07-01T09:00:00.000Z",
+                          updatedAt: "2026-07-01T09:00:00.000Z",
+                          deletedAt: null,
+                        })
                       : Option.none(),
                   ),
               }),
@@ -839,12 +851,22 @@ describe("orchestrator MCP toolkit", () => {
             const parentRun = parent.runs[0];
             expect(parentRun?.status).toBe("running");
 
+            const credential = (yield* (yield* McpSessionRegistry.McpSessionRegistry).issue({
+              threadId: parentThreadId,
+              providerInstanceId: codexInstanceId,
+            })).config;
+            yield* (yield* McpProviderSessions.McpProviderSessions).set({
+              ...credential,
+              runtimeProviderSessionId: parent.providerThreads.find(
+                (thread) => thread.id === parentRun!.providerThreadId,
+              )!.providerSessionId!,
+            });
             const invocation: McpInvocationContext.McpInvocationScope = {
               environmentId: EnvironmentId.make("environment:mcp-orchestrator"),
-              requestNamespace: parent.providerSessions[0]!.id,
+              requestNamespace: credential.providerSessionId,
               thread: {
                 threadId: parentThreadId,
-                providerSessionId: parent.providerSessions[0]!.id,
+                providerSessionId: credential.providerSessionId,
                 providerInstanceId: codexInstanceId,
               },
               client: undefined,
@@ -2923,7 +2945,7 @@ describe("orchestrator MCP toolkit", () => {
               creationSource: "web",
               commandId: CommandId.make("command:mcp-foreign-project:create"),
               threadId: foreignThreadId,
-              projectId: ProjectId.make("project:mcp-foreign"),
+              projectId: foreignProjectId,
               title: "Foreign project thread",
               modelSelection: codexSelection,
               runtimeMode: "full-access",
@@ -2954,7 +2976,7 @@ describe("orchestrator MCP toolkit", () => {
               title: "Renamed from another project",
             });
             const foreignListCall = yield* invoke("t3_thread_list", {
-              projectId: "project:mcp-foreign",
+              projectId: foreignProjectId,
             });
             const foreignListed = yield* decodeThreadListResult(
               successfulContent(foreignListCall, "foreignListCall"),
@@ -4225,14 +4247,26 @@ describe("orchestrator MCP toolkit", () => {
               (event) =>
                 event.type === "provider-turn.updated" && event.payload.status === "running",
             );
-            const approvalCaller = yield* orchestrator.getThreadProjection(approvalParentId);
+            const approvalCredential = (yield* (yield* McpSessionRegistry.McpSessionRegistry).issue(
+              {
+                threadId: approvalParentId,
+                providerInstanceId: codexInstanceId,
+              },
+            )).config;
+            const approvalParentRecords = yield* orchestrator.getThreadProjection(approvalParentId);
+            yield* (yield* McpProviderSessions.McpProviderSessions).set({
+              ...approvalCredential,
+              runtimeProviderSessionId: approvalParentRecords.providerThreads.find(
+                (thread) => thread.id === approvalParentRecords.thread.activeProviderThreadId,
+              )!.providerSessionId!,
+            });
             const approvalScope = {
               ...invocation,
-              requestNamespace: approvalCaller.providerSessions[0]!.id,
+              requestNamespace: approvalCredential.providerSessionId,
               thread: {
                 ...invocation.thread!,
                 threadId: approvalParentId,
-                providerSessionId: approvalCaller.providerSessions[0]!.id,
+                providerSessionId: approvalCredential.providerSessionId,
               },
             };
             const delegateApproval = invokeAs(approvalScope, "delegate_task", {
@@ -4590,13 +4624,23 @@ describe("orchestrator MCP toolkit", () => {
               ),
             );
 
+          const credential = (yield* (yield* McpSessionRegistry.McpSessionRegistry).issue({
+            threadId: parentThreadId,
+            providerInstanceId: codexInstanceId,
+          })).config;
           const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+          yield* (yield* McpProviderSessions.McpProviderSessions).set({
+            ...credential,
+            runtimeProviderSessionId: parent.providerThreads.find(
+              (thread) => thread.id === parent.thread.activeProviderThreadId,
+            )!.providerSessionId!,
+          });
           const invocation: McpInvocationContext.McpInvocationScope = {
             environmentId: EnvironmentId.make("environment:mcp-replay"),
-            requestNamespace: parent.providerSessions[0]!.id,
+            requestNamespace: credential.providerSessionId,
             thread: {
               threadId: parentThreadId,
-              providerSessionId: parent.providerSessions[0]!.id,
+              providerSessionId: credential.providerSessionId,
               providerInstanceId: codexInstanceId,
             },
             client: undefined,

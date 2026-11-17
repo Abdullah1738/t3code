@@ -170,6 +170,7 @@ export const layerExecutor: Layer.Layer<
                           runId: run.id,
                           expectedAttemptId: run.activeAttemptId,
                           deadline: error.deadline,
+                          admission: error.admission,
                         });
                       })
                     : threads.recoverDelegatedTask(effect.threadId, sourceRunId),
@@ -231,6 +232,25 @@ export const layerExecutor: Layer.Layer<
                 ),
               ),
             );
+          case "notification.delivery.accept":
+            return threads
+              .dispatch({
+                type: "notification.delivery.accept",
+                commandId: effect.commandId,
+                threadId: effect.threadId,
+                messageId: effect.request.messageId,
+              })
+              .pipe(
+                Effect.asVoid,
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "provider-turn.start": {
             const startRequest = effect.request;
             return Effect.gen(function* () {
@@ -271,6 +291,7 @@ export const layerExecutor: Layer.Layer<
                       runId: run.id,
                       expectedAttemptId: run.activeAttemptId,
                       deadline: error.deadline,
+                      admission: error.admission,
                     });
                   }),
               }),
@@ -1150,8 +1171,13 @@ export const layerWithOptions = (
           }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
           if (cancelledBeforeExecution) return true;
 
+          // Accepted input cannot be resent; keep its durable bookkeeping retryable until it commits.
+          const acceptance =
+            effect.request.type === "notification.delivery.accept" ||
+            (effect.request.type === "provider-turn.steer" &&
+              effect.request.providerAccepted === true);
           const execution = executor
-            .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
+            .execute(effect, { willRetry: acceptance || effect.attemptCount < maxAttempts })
             .pipe(
               Effect.provideService(EffectOutbox.ExecutingEffect, effect),
               Effect.as("executed" as const),
@@ -1223,7 +1249,7 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : uncertainSteer || effect.attemptCount >= maxAttempts
+            : !acceptance && !acceptedSteer && (uncertainSteer || effect.attemptCount >= maxAttempts)
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

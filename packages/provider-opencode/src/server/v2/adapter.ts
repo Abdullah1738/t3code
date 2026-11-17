@@ -3630,7 +3630,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       state: ThreadState,
       turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
     ) {
-      const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+      const mcpSession = yield* McpProviderSessions.readForRuntime(
+        mcpSessions,
+        turnInput.threadId,
+        input.providerSessionId,
+        OPENCODE_PROVIDER,
+      );
       // state.directory follows session.moved, so the server goes where the agent moved the session.
       const directory = state.directory;
       const name = yield* mcpServerNameFor(turnInput.threadId);

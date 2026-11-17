@@ -9702,7 +9702,10 @@ it.effect.each([
   }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
 );
 
-const createDeadlineThread = Effect.fn("test.createDeadlineThread")(function* (suffix: string) {
+const createDeadlineThread = Effect.fn("test.createDeadlineThread")(function* (
+  suffix: string,
+  delegated = false,
+) {
   const engine = yield* Orchestrator.OrchestratorV2;
   const threadId = ThreadId.make(`start-deadline-${suffix}`);
   yield* engine.dispatch({
@@ -9719,6 +9722,41 @@ const createDeadlineThread = Effect.fn("test.createDeadlineThread")(function* (s
     branch: null,
     worktreePath: process.cwd(),
   });
+  if (delegated) {
+    const { thread } = yield* engine.getThreadProjection(threadId);
+    yield* engine.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make(`${threadId}:create-parent`),
+      threadId: ThreadId.make(`${threadId}:parent`),
+      createdBy: "user",
+      creationSource: "web",
+      projectId: thread.projectId,
+      title: "Deadline parent",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: process.cwd(),
+    });
+    yield* (yield* EventSink.EventSinkV2).write({
+      events: [
+        {
+          id: EventId.make(`${threadId}:lineage`),
+          type: "thread.created",
+          threadId,
+          occurredAt: yield* DateTime.now,
+          payload: {
+            ...thread,
+            lineage: {
+              parentThreadId: ThreadId.make(`${threadId}:parent`),
+              rootThreadId: ThreadId.make(`${threadId}:parent`),
+              relationshipToParent: "subagent",
+            },
+          },
+        },
+      ],
+    });
+  }
   for (let i = 0; i < 3; i++) {
     yield* engine.dispatch({
       type: "message.dispatch",
@@ -9749,6 +9787,145 @@ const layerDeadlineBoards = Layer.effect(
 const layerDeadlineTest = layerTestWithContinuation().pipe(
   Layer.provide(layerDeadlineBoards),
   Layer.provide(Layer.succeed(RestartPacing.RestartLoad, () => 0)),
+);
+
+it.effect.each(
+  (["top-level", "delegated"] as const).flatMap((shape) =>
+    (["live", "recovery"] as const).flatMap((path) =>
+      (["active", "previous"] as const).map((attempt) => ({ shape, path, attempt })),
+    ),
+  ),
+)("start deadline counts projected output for $shape/$path/$attempt attempt", (row) =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const guard = yield* RunStartDeadline.RunStartDeadline;
+    const { threadId, projection } = yield* createDeadlineThread(
+      `projected-output-${row.shape}-${row.path}-${row.attempt}`,
+      row.shape === "delegated",
+    );
+    const now = yield* DateTime.now;
+    const deadline = DateTime.makeUnsafe(DateTime.toEpochMillis(now) + PROVIDER_START_TIMEOUT_MS);
+    const run = {
+      ...projection.runs[0]!,
+      status: "running" as const,
+      startedAt: now,
+      providerStartDeadlineAt: deadline,
+      ...(row.shape === "delegated" ? { delegatedTaskId: NodeId.make(`${threadId}:task`) } : {}),
+    };
+    const admission = {
+      id: EventId.make(`${threadId}:admitted`),
+      type: "run.updated" as const,
+      threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload: { ...run, status: "starting" as const },
+    };
+    yield* sink.write({ events: [admission] });
+    if (row.path === "live") yield* guard.handle(admission);
+    const running = { ...admission, id: EventId.make(`${threadId}:running`), payload: run };
+    yield* sink.write({ events: [running] });
+    if (row.path === "live") yield* guard.handle(running);
+    const turnId = ProviderTurnId.make(`${threadId}:turn`);
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make(`${threadId}:registered`),
+          type: "provider-turn.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            id: turnId,
+            providerThreadId: run.providerThreadId!,
+            nodeId: run.rootNodeId!,
+            runAttemptId:
+              row.attempt === "active" ? run.activeAttemptId : RunAttemptId.make(`${threadId}:old`),
+            nativeTurnRef: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              nativeId: "local",
+              strength: "strong",
+            },
+            ordinal: 1,
+            status: "running",
+            startedAt: now,
+            completedAt: null,
+          },
+        },
+        {
+          id: EventId.make(`${threadId}:output`),
+          type: "turn-item.updated",
+          threadId,
+          runId: run.id,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`${threadId}:output`),
+            type: "reasoning",
+            threadId,
+            runId: run.id,
+            nodeId: run.rootNodeId!,
+            providerThreadId: run.providerThreadId!,
+            providerTurnId: turnId,
+            nativeItemRef: {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              nativeId: "thinking",
+              strength: "strong",
+            },
+            parentItemId: null,
+            ordinal: 1,
+            status: "running",
+            title: null,
+            startedAt: now,
+            completedAt: null,
+            updatedAt: now,
+            text: "Working on the prompt",
+            streaming: true,
+          },
+        },
+      ],
+    });
+    if (row.path === "recovery") yield* guard.recover();
+    const dispatch = vi.spyOn(engine, "dispatch");
+    yield* Effect.gen(function* () {
+      yield* TestClock.adjust(PROVIDER_START_TIMEOUT_MS);
+      yield* guard.check();
+      assert.equal(
+        dispatch.mock.calls.filter(([command]) => command.type === "run.start-expire").length,
+        row.attempt === "active" ? 0 : 1,
+      );
+      const after = yield* engine.getThreadProjection(threadId);
+      assert.equal(after.runs[0]?.status, row.attempt === "active" ? "running" : "failed");
+      assert.isUndefined(after.providerTurns[0]?.promptAcceptedAt);
+    }).pipe(Effect.ensuring(Effect.sync(() => dispatch.mockRestore())));
+  }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
+);
+
+it.effect("start deadline retries an unreadable acceptance projection before expiring", () =>
+  Effect.gen(function* () {
+    const engine = yield* Orchestrator.OrchestratorV2;
+    const sink = yield* EventSink.EventSinkV2;
+    const guard = yield* RunStartDeadline.RunStartDeadline;
+    const { threadId, projection } = yield* createDeadlineThread("acceptance-read-failure");
+    const now = yield* DateTime.now;
+    const run = { ...projection.runs[0]!, providerStartDeadlineAt: now };
+    const admission = {
+      id: EventId.make(`${threadId}:admitted`),
+      type: "run.updated" as const,
+      threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload: run,
+    };
+    yield* sink.write({ events: [admission] });
+    yield* guard.handle(admission);
+    const read = vi
+      .spyOn(engine, "getThreadRecords")
+      .mockReturnValueOnce(Effect.fail(new Orchestrator.OrchestratorProjectionError({ threadId })));
+    yield* guard.check().pipe(Effect.ensuring(Effect.sync(() => read.mockRestore())));
+    assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "starting");
+    yield* guard.check();
+    assert.equal((yield* engine.getThreadProjection(threadId)).runs[0]?.status, "failed");
+  }).pipe(Effect.provide(Layer.fresh(layerDeadlineTest))),
 );
 
 it.effect.each([
@@ -10576,6 +10753,16 @@ it.effect.each(["ordinary", "orphan", "queued source"] as const)(
       const deadline = DateTime.makeUnsafe(
         DateTime.toEpochMillis(yield* DateTime.now) + RestartPacing.RESTART_ADMISSION_TIMEOUT_MS,
       );
+      const admission =
+        ownership === "orphan"
+          ? undefined
+          : {
+              queuedAtMs: DateTime.toEpochMillis(yield* DateTime.now),
+              waitedMs: RestartPacing.RESTART_ADMISSION_TIMEOUT_MS,
+              positionAtFailure: 4,
+              totalAtFailure: 9,
+              rule: "no_progress" as const,
+            };
       yield* TestClock.adjust(`${RestartPacing.RESTART_ADMISSION_TIMEOUT_MS} millis`);
       const promoted = yield* Deferred.make<void>();
       yield* engine.streamDomainEvents.pipe(
@@ -10597,6 +10784,7 @@ it.effect.each(["ordinary", "orphan", "queued source"] as const)(
         runId: run.id,
         expectedAttemptId: run.activeAttemptId,
         deadline,
+        ...(admission === undefined ? {} : { admission }),
       });
       yield* Deferred.await(drained);
       const terminalRows = rows.filter(
@@ -10630,6 +10818,15 @@ it.effect.each(["ordinary", "orphan", "queued source"] as const)(
       assert.equal(after.runs[1]?.status, ownership !== "orphan" ? "starting" : "queued");
       if (ownership !== "orphan") assert.isUndefined(after.runs[1]?.providerStartDeadlineAt);
       assert.equal(after.runs[2]?.status, "queued");
+      const failureItem = after.turnItems.find(
+        (item) => item.type === "error" && item.failure.code === "restart_admission_timeout",
+      );
+      assert.isDefined(failureItem);
+      assert.equal(failureItem?.type, "error");
+      if (failureItem?.type === "error") {
+        assert.deepEqual(failureItem.failure.admission, admission);
+        assert.deepEqual(after.runs[0]?.failure, failureItem.failure);
+      }
       assert.isTrue(
         after.turnItems.some(
           (item) =>

@@ -610,6 +610,10 @@ export interface RunExecutionServiceV2StartRootRunInput {
     ProjectionStoreV2Error
   >;
   readonly shouldFinalizeRun?: () => Effect.Effect<boolean, ProjectionStoreV2Error>;
+  readonly loadRunSettlement?: () => Effect.Effect<
+    Pick<OrchestrationV2Run, "status" | "completedAt"> | undefined,
+    ProjectionStoreV2Error
+  >;
   readonly loadDelegatedTask?: DelegatedTaskRecoveryService.LoadDelegatedTask;
   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
   readonly loadRunInterruptReason?: () => Effect.Effect<string | undefined>;
@@ -865,7 +869,7 @@ export const layer: Layer.Layer<
             }
           }
           yield* input.deferUsage;
-          return;
+          return false;
         }
         const allocateEventId = () => idAllocator.allocate.event({ threadId: input.run.threadId });
         const open = input.openRunOwnedSubagents ?? emptyOpenRunOwnedSubagentProjection();
@@ -1069,9 +1073,10 @@ export const layer: Layer.Layer<
         }).pipe(Effect.uninterruptible);
         if (!committed) {
           yield* input.deferUsage;
-          return;
+          return false;
         }
         yield* input.refreshAfterTurn;
+        return true;
       },
     );
 
@@ -1361,6 +1366,7 @@ export const layer: Layer.Layer<
         const startupFailurePending = yield* Ref.make(false);
         const shutdownCleanupDeadline = yield* Deferred.make<Cause.Cause<unknown>>();
         const rootRunFinalized = yield* Ref.make(false);
+        const rootFinalizationOwned = yield* Ref.make(false);
         const providerThreadOwnerLost = yield* Ref.make(false);
         const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
         const activeChildSubagents = yield* Ref.make<ReadonlyMap<NodeId, ThreadId>>(new Map());
@@ -1519,7 +1525,7 @@ export const layer: Layer.Layer<
           }
           const providerThread = yield* currentProviderThread;
           const openSubagents = yield* Ref.get(openRunOwnedSubagents);
-          yield* writeFinalRunEvents({
+          const committed = yield* writeFinalRunEvents({
             loadRunCancelMetadata: input.loadRunCancelMetadata,
             deferUsage: deferUsage(),
             recordUsage,
@@ -1555,6 +1561,7 @@ export const layer: Layer.Layer<
           }).pipe(
             Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           );
+          yield* Ref.set(rootFinalizationOwned, committed);
           if (isRunOwnedSubagentTerminalStatus(terminal.status) && !childTurnsContinue(terminal)) {
             yield* Ref.set(openRunOwnedSubagents, emptyOpenRunOwnedSubagentProjection());
           }
@@ -1788,8 +1795,9 @@ export const layer: Layer.Layer<
         const nativeEndConfirmed = shouldStopProviderEventIngestion;
         const nativeEndObserved = yield* Deferred.make<void>();
         let orphanRecovery: Fiber.Fiber<void, ProviderAdapter.ProviderAdapterV2Error> | undefined;
+        let externallySettled = false;
         const stopOrphanedProviderTurn = Effect.fn("RunExecutionService.stopOrphanedProviderTurn")(
-          function* (providerThread: OrchestrationV2ProviderThread) {
+          function* (providerThread: OrchestrationV2ProviderThread, settled = false) {
             let attempts = 0;
             let providerTurnId: ProviderTurnId | null = null;
             let lastCause: unknown = "provider turn id not yet observed";
@@ -1800,39 +1808,49 @@ export const layer: Layer.Layer<
                   return true;
                 attempts++;
                 providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
-                const current = yield* (input.shouldFinalizeRun?.() ?? Effect.succeed(true)).pipe(
-                  Effect.timeout("10 seconds"),
-                  Effect.exit,
-                );
+                const current = yield* (
+                  settled
+                    ? Effect.succeed(true)
+                    : (input.shouldFinalizeRun?.() ?? Effect.succeed(true))
+                ).pipe(Effect.timeout("10 seconds"), Effect.exit);
                 if (Exit.isSuccess(current) && !current.value) return true;
                 if (Exit.isFailure(current)) {
                   lastCause = current.cause;
-                } else if (providerTurnId === null) {
+                } else if (
+                  providerTurnId === null &&
+                  input.session.interruptStartingRun === undefined
+                ) {
                   lastCause = "provider turn id not yet observed";
                 } else {
-                  const stop = yield* input.session
-                    .interruptTurn({
-                      providerThread,
-                      providerTurnId,
-                      requestRuntimeRestart: false,
-                      stopBackgroundWork: false,
-                    })
-                    .pipe(
-                      Effect.catchTags({
-                        ProviderAdapterTurnNotActiveError: () =>
-                          Effect.logInfo(
-                            "orchestration V2 orphaned provider turn already stopped",
-                            {
-                              runId: input.run.id,
-                              threadId: input.run.threadId,
-                              providerTurnId,
-                              reason: "turn no longer active",
-                            },
-                          ),
-                      }),
-                      Effect.timeout("30 seconds"),
-                      Effect.exit,
-                    );
+                  // External settlement leaves no owner for this turn's background
+                  // work. Permit thread shutdown when native Stop is unconfirmed.
+                  const stopTurn =
+                    providerTurnId === null
+                      ? input.session.interruptStartingRun!({
+                          providerThread,
+                          runId: input.run.id,
+                          attemptId: input.attempt.id,
+                          stopBackgroundWork: settled,
+                        })
+                      : input.session.interruptTurn({
+                          providerThread,
+                          providerTurnId,
+                          requestRuntimeRestart: false,
+                          stopBackgroundWork: settled,
+                        });
+                  const stop = yield* stopTurn.pipe(
+                    Effect.catchTags({
+                      ProviderAdapterTurnNotActiveError: () =>
+                        Effect.logInfo("orchestration V2 orphaned provider turn already stopped", {
+                          runId: input.run.id,
+                          threadId: input.run.threadId,
+                          providerTurnId,
+                          reason: "turn no longer active",
+                        }),
+                    }),
+                    Effect.timeout("30 seconds"),
+                    Effect.exit,
+                  );
                   if (Exit.isSuccess(stop)) {
                     yield* Ref.set(orphanStopConfirmed, true);
                     return true;
@@ -1883,6 +1901,45 @@ export const layer: Layer.Layer<
                     ),
               ),
             ),
+        );
+        const stopIfRunSettled = Effect.fn("RunExecutionService.stopIfRunSettled")(function* (
+          settlement: Pick<OrchestrationV2Run, "status" | "completedAt"> | undefined,
+        ) {
+          if (
+            settlement === undefined ||
+            !["interrupted", "failed", "completed", "cancelled", "rolled_back"].includes(
+              settlement.status,
+            )
+          )
+            return false;
+          externallySettled = true;
+          // Drop output after external settlement: accepting it would present
+          // an unowned turn as live work. The native transcript retains the audit.
+          yield* Effect.logWarning("orchestration V2 provider item after run settlement", {
+            threadId: input.run.threadId,
+            runId: input.run.id,
+            ordinal: input.run.ordinal,
+            providerTurnId: (yield* Ref.get(eventRouting)).rootProviderTurnId,
+            status: settlement.status,
+            secondsSinceSettlement:
+              settlement.completedAt === null
+                ? null
+                : Math.max(
+                    0,
+                    (DateTime.toEpochMillis(yield* DateTime.now) -
+                      DateTime.toEpochMillis(settlement.completedAt)) /
+                      1000,
+                  ),
+          });
+          yield* stopOrphanedProviderTurn(yield* currentProviderThread, true);
+          return true;
+        });
+        // Held text has no write to fence. Bound its read cost across token chunks;
+        // delivered output always uses the transactional run guard below. A terminal
+        // can cross external settlement, so it invalidates that cached ownership.
+        const heldRunSettlement = yield* Effect.cachedWithTTL(
+          input.loadRunSettlement?.() ?? Effect.succeed(undefined),
+          "1 second",
         );
         let observedRootTurn: OrchestrationV2ProviderTurn | undefined;
         const providerEventFiber = yield* eventSubscription.events.pipe(
@@ -1964,8 +2021,6 @@ export const layer: Layer.Layer<
           Stream.tap(({ event, accepted }) =>
             Effect.gen(function* () {
               if (!accepted) return;
-              yield* observeFirstToken(event);
-              yield* usage.observe(event);
               yield* observeNativeLifecycle(event);
               const rootTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
               if (
@@ -2034,6 +2089,12 @@ export const layer: Layer.Layer<
                 yield* Ref.set(terminalEvent, event);
               }
               let storedEventCount = 0;
+              const guardRunActivity =
+                input.loadRunSettlement !== undefined &&
+                // A native terminal can arrive after external cancellation.
+                // Only our committed finalization permits trailing background output.
+                !(yield* Ref.get(rootFinalizationOwned)) &&
+                event.type !== "turn.terminal";
               const deliveredEvent = filterAssistantEvent(
                 event.type === "provider_turn.updated" &&
                   event.providerTurn.id === rootTurnId &&
@@ -2042,6 +2103,16 @@ export const layer: Layer.Layer<
                   : event,
                 DateTime.toEpochMillis(yield* DateTime.now),
               );
+              if (
+                guardRunActivity &&
+                deliveredEvent === null &&
+                (yield* stopIfRunSettled(
+                  yield* (yield* Ref.get(rootTerminalSeen))
+                    ? input.loadRunSettlement!()
+                    : heldRunSettlement,
+                ))
+              )
+                return;
               if (deliveredEvent) {
                 const rootTerminalAlreadySeen = yield* Ref.get(rootTerminalSeen);
                 const isRootProviderThreadUpdate =
@@ -2060,27 +2131,41 @@ export const layer: Layer.Layer<
                     runId: input.run.id,
                     nodeId: input.rootNode.id,
                     event: deliveredEvent,
-                    ...(isRootProviderThreadUpdate
-                      ? rootTerminalAlreadySeen
-                        ? {
-                            writeIfProviderThreadOwner: {
-                              providerThreadId: input.providerThread.id,
-                              runId: input.run.id,
-                              activeAttemptId: input.attempt.id,
-                              expectedLastRunOrdinal: input.run.ordinal,
-                            },
-                          }
-                        : {
-                            writeIfRunCurrent: {
-                              runId: input.run.id,
-                              activeAttemptId: input.attempt.id,
-                              expectedStatus: "running" as const,
-                            },
-                          }
-                      : {}),
+                    ...(guardRunActivity
+                      ? {
+                          writeIfRunCurrent: {
+                            runId: input.run.id,
+                            activeAttemptId: input.attempt.id,
+                            expectedStatus: "running" as const,
+                          },
+                        }
+                      : isRootProviderThreadUpdate
+                        ? rootTerminalAlreadySeen
+                          ? {
+                              writeIfProviderThreadOwner: {
+                                providerThreadId: input.providerThread.id,
+                                runId: input.run.id,
+                                activeAttemptId: input.attempt.id,
+                                expectedLastRunOrdinal: input.run.ordinal,
+                              },
+                            }
+                          : {
+                              writeIfRunCurrent: {
+                                runId: input.run.id,
+                                activeAttemptId: input.attempt.id,
+                                expectedStatus: "running" as const,
+                              },
+                            }
+                        : {}),
                   }),
                 );
                 storedEventCount = storedEvents.length;
+                if (
+                  guardRunActivity &&
+                  storedEventCount === 0 &&
+                  (yield* stopIfRunSettled(yield* input.loadRunSettlement!()))
+                )
+                  return;
                 if (
                   isRootProviderThreadUpdate &&
                   rootTerminalAlreadySeen &&
@@ -2116,6 +2201,8 @@ export const layer: Layer.Layer<
                   yield* Ref.set(latestProviderThread, event.providerThread);
                 }
               }
+              yield* observeFirstToken(event);
+              yield* usage.observe(event);
               if (
                 event.type === "turn_item.updated" &&
                 event.turnItem.providerTurnId === (yield* Ref.get(eventRouting)).rootProviderTurnId
@@ -2163,7 +2250,9 @@ export const layer: Layer.Layer<
               if (yield* agentTurnsSettled) yield* endPreviewActivity;
             }),
           ),
-          Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
+          Stream.takeUntilEffect(() =>
+            externallySettled ? Effect.succeed(true) : shouldStopProviderEventIngestion,
+          ),
           Stream.runDrain,
           // Interrupt a blocked write as well as a blocked event pull when cleanup expires.
           Effect.raceFirst(
@@ -2174,6 +2263,7 @@ export const layer: Layer.Layer<
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>
             Effect.gen(function* () {
+              if (externallySettled) return;
               const failure = yield* Ref.get(ingestionFailure);
               if (failure !== null) return yield* Effect.failCause(failure);
               const terminal = yield* Ref.get(terminalEvent);

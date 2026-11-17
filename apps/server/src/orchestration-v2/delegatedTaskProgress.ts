@@ -55,6 +55,7 @@ export function silentRecoveryStillSafe(
   const at = DateTime.toEpochMillis(DateTime.makeUnsafe(recovery.lastProgressAt));
   if (
     run.delegatedTaskStallRecovery !== undefined ||
+    run.transientRecovery !== undefined ||
     run.activeAttemptId !== recovery.attemptId ||
     progressBlockers(projection, run.id) ||
     latestQualifyingProgress(projection, run.id) > at
@@ -77,11 +78,9 @@ export function silentRecoveryStillSafe(
   );
 }
 
-export function supportsSilentRecovery(
-  driver: string | undefined,
-  phase: "post_tool" | "first_event",
-): boolean {
-  return driver === "codex" || (driver === "claudeAgent" && phase === "first_event");
+export function supportsSilentRecovery(driver: string | undefined): boolean {
+  // Claude's retry-health path owns native evidence, query fencing and network recovery.
+  return driver === "codex";
 }
 
 type ProgressProjection = Pick<

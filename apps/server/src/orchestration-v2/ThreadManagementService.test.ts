@@ -47,6 +47,7 @@ import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { McpCall } from "../ardud/analytics/McpCall.ts";
 import { idleThreadProjection, liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { DispatchModeLimit, type DispatchModeRefusal } from "./DispatchModeLimit.ts";
 
@@ -491,6 +492,7 @@ it.effect.each([
         service.sendToThread({ ...input, commandId: CommandId.make(`fresh:${mode}`) }),
       );
       expect(fresh).toBeInstanceOf(ThreadManagementService.ThreadManagementNoSteerableRunError);
+      expect(fresh).toMatchObject({ holder: { threadId, runId, status: "completed" } });
       archived = true;
       const archivedRetry = yield* service.sendToThread(input);
       expect(archivedRetry.message).toEqual(first.message);
@@ -2218,6 +2220,232 @@ it.effect("reports a delegation queued behind a receipt-read fence as pending", 
       yield* Fiber.join(creating);
     }).pipe(Effect.provide(layerTest));
   }),
+);
+
+it.effect.each(
+  [true, false].flatMap((saved) =>
+    (["old_first", "new_first"] as const).map((cleanupOrder) => ({ saved, cleanupOrder })),
+  ),
+)(
+  "retains a cancel across paired same-id failures (saved=$saved, cleanup=$cleanupOrder)",
+  ({ saved, cleanupOrder }) =>
+    Effect.gen(function* () {
+      const parent = ThreadId.make("parent:paired-failure");
+      const commandId = CommandId.make("command:paired-failure");
+      const entered = yield* Deferred.make<void>();
+      const failFirst = yield* Deferred.make<void>();
+      const retryEntered = yield* Deferred.make<void>();
+      const retryCommit = yield* Deferred.make<void>();
+      const oldReadEntered = yield* Deferred.make<void>();
+      const oldReadRelease = yield* Deferred.make<void>();
+      const newReadEntered = yield* Deferred.make<void>();
+      const newReadRelease = yield* Deferred.make<void>();
+      const acceptedAt = yield* DateTime.now;
+      let accepted = false;
+      let attempts = 0;
+      let backgroundReads = 0;
+      let cancelCalls = 0;
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest(),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+            Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+              getByCommandId: () =>
+                Effect.gen(function* () {
+                  const snapshot = accepted
+                    ? Option.some({
+                        commandId,
+                        threadId: parent,
+                        commandType: "delegated_task.request",
+                        acceptedAt,
+                        resultSequence: 1,
+                        status: "accepted" as const,
+                        error: null,
+                      })
+                    : Option.none();
+                  if ((yield* NodeSqliteClient.ReaderLane) === "background") {
+                    backgroundReads++;
+                    yield* Deferred.succeed(
+                      backgroundReads === 1 ? oldReadEntered : newReadEntered,
+                      undefined,
+                    );
+                    yield* Deferred.await(
+                      backgroundReads === 1 ? oldReadRelease : newReadRelease,
+                    );
+                  }
+                  return snapshot;
+                }),
+            }),
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(parent))),
+              dispatch: () =>
+                Effect.gen(function* () {
+                  attempts++;
+                  if (attempts === 1) {
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(failFirst);
+                  } else {
+                    yield* Deferred.succeed(retryEntered, undefined);
+                    yield* Deferred.await(retryCommit);
+                    // A masked commit can save before interruption reaches dispatch.
+                    accepted = saved;
+                  }
+                  return yield* new Orchestrator.OrchestratorDispatchError({
+                    commandId,
+                    commandType: "delegated_task.request",
+                    cause: "interrupted create",
+                  });
+                }),
+            }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const command = {
+          type: "delegated_task.request" as const,
+          commandId,
+          parentThreadId: parent,
+          parentRunId: RunId.make("run:paired-failure"),
+          parentNodeId: NodeId.make("node:paired-failure"),
+          task: "Review",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          createdBy: "agent" as const,
+          creationSource: "mcp" as const,
+        };
+        const first = yield* service.dispatch(command).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        expect(
+          yield* service.requestCancelOnArrival(commandId, {
+            reason: "unwanted",
+            onArrival: () =>
+              Effect.sync(() => {
+                cancelCalls++;
+              }),
+          }),
+        ).toBe("cancel_pending");
+        const retry = yield* service.dispatch(command).pipe(Effect.forkChild);
+        yield* TestClock.adjust("0 millis");
+        expect(attempts).toBe(1);
+        yield* Deferred.succeed(failFirst, undefined);
+        yield* Fiber.await(first);
+        yield* Deferred.await(oldReadEntered);
+        yield* Deferred.await(retryEntered);
+        // The older absent snapshot stays paused while the queued retry settles.
+        yield* Deferred.succeed(retryCommit, undefined);
+        yield* Fiber.await(retry);
+        yield* Deferred.await(newReadEntered);
+        yield* Deferred.succeed(
+          cleanupOrder === "old_first" ? oldReadRelease : newReadRelease,
+          undefined,
+        );
+        yield* TestClock.adjust("0 millis");
+        yield* Deferred.succeed(
+          cleanupOrder === "old_first" ? newReadRelease : oldReadRelease,
+          undefined,
+        );
+        yield* TestClock.adjust("0 millis");
+        expect(accepted).toBe(saved);
+        expect(cancelCalls).toBe(saved ? 1 : 0);
+      }).pipe(Effect.provide(layerTest));
+    }),
+);
+
+it.effect(
+  "bounds cancel-on-arrival without evicting acknowledged cancels and runs follow-ups outside locks",
+  () =>
+    Effect.gen(function* () {
+      const parent = ThreadId.make("parent:cancel-capacity");
+      const entered = yield* Effect.forEach(Array.from({ length: 501 }), () =>
+        Deferred.make<void>(),
+      );
+      const release = yield* Deferred.make<void>();
+      const followUp = yield* Deferred.make<void>();
+      const finishFollowUp = yield* Deferred.make<void>();
+      let calls = 0;
+      const layerTest = ThreadManagementService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            ServerSettings.layerTest(),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
+            Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+              getByCommandId: () => Effect.succeed(Option.none()),
+            }),
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              getThreadRecords: () => Effect.succeed(idleThreadProjection(liveThreadShell(parent))),
+              dispatch: (command) =>
+                Deferred.succeed(
+                  entered[Number(command.commandId.split(":").at(-1))]!,
+                  undefined,
+                ).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as({ sequence: 1, storedEvents: [] }),
+                ),
+            }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const command = (index: number) => ({
+          type: "delegated_task.request" as const,
+          commandId: CommandId.make(`command:cancel-capacity:${index}`),
+          parentThreadId: parent,
+          parentRunId: RunId.make("run:cancel-capacity"),
+          parentNodeId: NodeId.make("node:cancel-capacity"),
+          task: "Review",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "full-access" as const,
+          interactionMode: "default" as const,
+          createdBy: "agent" as const,
+          creationSource: "mcp" as const,
+        });
+        const input = {
+          reason: "test",
+          onArrival: () =>
+            Effect.gen(function* () {
+              calls++;
+              // Re-enter the same key: a follow-up under the state lock would deadlock.
+              expect(
+                yield* service.requestCancelOnArrival(command(0).commandId, {
+                  reason: "again",
+                  onArrival: () => Effect.void,
+                }),
+              ).toBe("not_pending");
+              yield* Deferred.succeed(followUp, undefined);
+              yield* Deferred.await(finishFollowUp);
+              return yield* Effect.die("follow-up failure cannot fail create");
+            }),
+        };
+        const creating = [];
+        for (let index = 0; index <= 500; index++) {
+          const fiber = yield* service.dispatch(command(index)).pipe(Effect.forkChild);
+          creating.push(fiber);
+          yield* Deferred.await(entered[index]!);
+          expect(
+            yield* service.requestCancelOnArrival(
+              command(index).commandId,
+              index === 0 ? input : { reason: "test", onArrival: () => Effect.void },
+            ),
+          ).toBe(index === 500 ? "capacity" : "cancel_pending");
+        }
+        expect(yield* service.requestCancelOnArrival(command(0).commandId, input)).toBe(
+          "cancel_pending",
+        );
+        for (const fiber of creating.slice(1)) yield* Fiber.interrupt(fiber);
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(followUp);
+        yield* Fiber.join(creating[0]!);
+        expect(calls).toBe(1);
+        yield* Deferred.succeed(finishFollowUp, undefined);
+        // The interrupted creates freed capacity; retrying one does not retain an old cancel.
+        yield* service.dispatch(command(1));
+        expect(calls).toBe(1);
+      }).pipe(Effect.provide(layerTest));
+    }),
 );
 
 it.effect("bounds failed delegation diagnostics and forgets them on service restart", () =>

@@ -57,16 +57,50 @@ def command(a, me: dict) -> int:
         if isinstance(error, api.ApiError):
             metadata = api.command_metadata(error.data)
         if isinstance(error, api.ApiError) and error.status == 408 and error.api_code == "command_timeout":
+            data = error.data if isinstance(error.data, dict) else {}
+            pid, queue_ms, run_ms = (metadata.get(key) for key in ("pid", "queueMs", "runMs"))
+            if run_ms is not None and run_ms > 0:
+                outcome = "stopped"
+                outcome_line = (f"it started and was stopped after {run_ms / 1000:.1f}s; any side effects up to then "
+                                "may have happened, and it will not run again.")
+            elif queue_ms is not None:
+                outcome = "never_started"
+                outcome_line = "it never started; the server cancelled it and it will not run later."
+            else:
+                outcome = "cancelled_old_server"
+                outcome_line = ("the server cancels timed-out commands, so it will not run later; "
+                                f"check with offbox ssh {box_id} if a partial run matters.")
             if a.json:
-                print(json.dumps(error.data, indent=1))
+                envelope = {**data, "offbox": {
+                    "code": "command_timeout", "box": box_id, "timeoutSeconds": timeout, "pid": pid,
+                    "queueMs": int(queue_ms) if queue_ms is not None else None,
+                    "runMs": int(run_ms) if run_ms is not None else None,
+                    "killed": metadata.get("killed"), "outcome": outcome,
+                }}
+                common.out(json.dumps(envelope, indent=1))
             else:
                 for stream, target in (("stdout", sys.stdout), ("stderr", sys.stderr)):
-                    value = error.data.get(stream, "")
+                    value = data.get(stream, "")
                     if isinstance(value, str):
                         target.write(value)
-            pid = metadata.get("pid", "unknown")
+            timings = []
+            if queue_ms is not None:
+                timings.append(f"waited {queue_ms / 1000:.1f}s in the server's run queue")
+            if run_ms is not None:
+                timings.append(f"ran {run_ms / 1000:.1f}s")
+            if timings:
+                if metadata.get("killed"):
+                    timings.append("killed")
+                detail = (f"server command {pid}: " if pid is not None else "") + ", ".join(timings)
+            else:
+                detail = (f"server command {pid}" if pid is not None else
+                          "the server sent no command id or timings: the home server is older than the exec queue fix")
             common.say(f"offbox exec: command ran past --timeout {timeout}s on {box_id} "
-                       f"(server command {pid}); nothing fell back locally")
+                       f"({detail}); nothing fell back locally")
+            if queue_ms is not None and queue_ms >= timeout * 500:
+                common.say("offbox exec: the command was waiting behind other runs on the home server, not running; "
+                           f"retry, or use offbox ssh {box_id} '<cmd>' for a quick read.")
+            common.say(f"offbox exec: {outcome_line}")
         elif isinstance(error, api.ApiError) and error.status == 404:
             common.say(f"box not found on the {backend} backend: {box_id}; exec has no local fallback")
         else:
