@@ -18,7 +18,9 @@ const errnoCodes = new Set(Object.keys(constants.errno));
 const signals = new Set(Object.keys(constants.signals));
 const values: Record<string, readonly string[]> = {
   severity: ["info", "attention", "error"], outcome: ["fire", "no_change", "fail", "timeout", "busy"],
-  source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored"],
+  source: ["mail", "sms", "bank", "charge"], routed: ["board", "chat", "ignored", "logged"],
+  authKind: ["otp", "signin_link"],
+  senderLabel: ["Emirates NBD", "Emirates Islamic", "Mashreq", "ADCB", "Wio", "Apple", "Google", "WHOOP", "Claude", "Virgin", "e&", "du", "your bank", "an inbox sender"],
   class: ["urgent", "today", "info", "noise", "candidate", "charge", "bank", "security", "otp", "unknown", "fail_open", "deduped"],
   action: ["create", "queue", "cancel", "snooze", "sent", "retry", "check", "wake", "notify", "send", "coalesce", "conflict", "expire", "pause", "remove", "cap", "resume"],
   state: ["pending", "sending", "sent", "uncertain", "cancelled", "failed", "scheduled", "queued", "done", "expired", "paused", "active"],
