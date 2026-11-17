@@ -136,6 +136,42 @@ class ToolLogTests(unittest.TestCase):
                 expected = ([] if not has_catch else [('control.catch1', 1)]) + ([] if shape in {'legacy', 'summary_only'} else [('control.request_failed', 1)])
                 self.assertEqual([(item['tag'], item['count']) for item in result['topErrorTags']], expected)
 
+    def test_imessage_already_logged_catches_preserve_volume_without_failure_diagnostics(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True, exist_ok=True)
+        for tag in ['control.request_failed', 'control.invalid_json']:
+            for aggregate in [False, True]:
+                for marker in [True, False, None, 'true', 1]:
+                    with self.subTest(tag=tag, aggregate=aggregate, marker=marker):
+                        request = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                                   'durationMs': 25, 'ids': {'callBatchId': 'batch'},
+                                   'props': {'method': 'GET', 'route': '/threads/:id', 'failureFormat': 'single'},
+                                   'error': {'tag': tag, 'name': 'TimeoutError', 'causeKey': 'TimeoutError'}}
+                        catch = {'component': 'router', 'kind': 'error', 'name': 'bridge.catch', 'ok': False,
+                                 'alreadyLogged': marker, 'error': {'tag': 'router.catch1', 'name': 'TimeoutError',
+                                                                 'causeKey': 'prompt_acceptance_probe'}}
+                        rows = [request, catch]
+                        if aggregate:
+                            rows.append({'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                                         'ids': {'callBatchId': 'batch'},
+                                         'calls': {'thread': {'ok': 0, 'failed': 1, 'histogram': [[25, 1]]}}})
+                        path = directory / (self.day + '.ndjson')
+                        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                        result = toollog.rollup('imessage', self.day)
+                        deduped = marker is True
+                        self.assertEqual((result['total'], result['recordedRows']), (2, len(rows)))
+                        self.assertEqual(result['dedupedFailures'], int(deduped))
+                        self.assertEqual(result['failedCount'], 1 if deduped else 2)
+                        self.assertEqual(result['errorRate'], .5 if deduped else 1)
+                        self.assertEqual(result['countsByName'], {'turn.robob_call': 1, 'bridge.catch': 1})
+                        self.assertEqual(result['countsByKind'], {'perf': 1, 'error': 1})
+                        self.assertEqual([item['tag'] for item in result['topErrorTags']],
+                                         [tag] if deduped else [tag, 'router.catch1'])
+                        self.assertEqual([item['tag'] for item in result['topCauses']],
+                                         [tag] if deduped else [tag, 'router.catch1'])
+                        self.assertEqual(result['byComponent']['router']['bridge.catch']['failed'], 0 if deduped else 1)
+                        self.assertEqual(len(path.read_text().splitlines()), len(rows))
+
     def test_imessage_rollup_summary_appended_after_read_is_never_double_counted(self):
         directory = toollog.board_dir('imessage')
         directory.mkdir(parents=True)

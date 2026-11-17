@@ -339,6 +339,7 @@ The operational setup and private credential handling remain in the local
 directory when changing the bridge.
 
 Tool-log rollups refresh at turn end, hourly, and after the UTC day changes.
+Catch rows marked `alreadyLogged: true` retain their context and request ID but count only toward row volume and `dedupedFailures`, leaving failure rates and top causes to the original request.
 `notice.reply` records each completion-notice run's handling path, outcome,
 enqueued reply count and sealed-wake flag, with chat/run ids and no message text.
 Read today's saved rollup with:

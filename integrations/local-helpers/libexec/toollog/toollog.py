@@ -571,8 +571,11 @@ def rollup(board, day, top_n=20):
     start = day_start.timestamp()
     total = oks = failed = errors = observed = 0
     single_failures = 0
+    deduped_failures = 0
     def observe_error(row, line_number, weight=1):
         nonlocal single_failures
+        if board == 'imessage' and row.get('alreadyLogged') is True:
+            return
         request_failure = (board == 'imessage' and row.get('component') == 'robob' and row.get('name') == 'turn.robob_call'
                            and row.get('kind') == 'perf' and row.get('ok') is False)
         single = (row.get('props') or {}).get('failureFormat') == 'single'
@@ -640,10 +643,15 @@ def rollup(board, day, top_n=20):
                 unrecognized_sampled |= refusal_weight > 1
         row_ok = row['_rollup_ok'] if aggregate else weight * (row.get('ok') is True)
         row_failed = row['_rollup_failed'] if aggregate else weight * (row.get('ok') is False)
+        already_logged = board == 'imessage' and row.get('alreadyLogged') is True
+        if already_logged:
+            if kind == 'error' or row_failed:
+                deduped_failures += weight
+            row_failed = 0
         observed += row_ok + row_failed
         oks += row_ok
         failed += row_failed
-        errors += weight * (kind == 'error')
+        errors += weight * (kind == 'error' and not already_logged)
         duration = row.get('durationMs')
         values = row['_rollup_histogram'] if aggregate else ([(duration, weight)]
             if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0 else [])
@@ -804,6 +812,7 @@ def rollup(board, day, top_n=20):
             merchant: {**poll, 'failureShare': poll['failed'] / poll['count']}
             for merchant, poll in sorted(poll_counts.items())}
     if board == 'imessage':
+        result['dedupedFailures'] = deduped_failures
         result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count}
                                for (tag, cause), count in sorted(causes.items(), key=lambda x: (-x[1], x[0]))[:20]]
         result['cardRenderFailures'] = dict(sorted(render_failures.items()))
