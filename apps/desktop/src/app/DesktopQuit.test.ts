@@ -15,6 +15,7 @@ const files = vi.hoisted(() => ({
   existsSync: vi.fn(() => false),
   statSync: vi.fn(() => ({ size: 256 * 1024 })),
   renameSync: vi.fn(),
+  writeFileSync: vi.fn(),
 }));
 vi.mock("node:fs", async (original) => ({ ...(await original()), ...files }));
 
@@ -49,7 +50,15 @@ describe("DesktopQuit", () => {
       const [file, line] = files.appendFileSync.mock.calls[0]!;
       assert.equal(file, "/logs/desktop-quits.ndjson");
       const record = JSON.parse(line);
-      assert.deepEqual(record, { ...trigger, at: record.at, pid: process.pid });
+      assert.containsAllKeys(record, [
+        ...Object.keys(trigger),
+        "at",
+        "pid",
+        "initiator",
+        "osShutdownInProgress",
+      ]);
+      assert.equal(record.trigger, trigger.trigger);
+      assert.equal(record.pid, process.pid);
       assert.isTrue(Number.isFinite(Date.parse(record.at)));
     }).pipe(Effect.provide(layer)),
   );
@@ -76,6 +85,7 @@ describe("DesktopQuit", () => {
       yield* DesktopQuit.record({ trigger: "before-quit" });
       assert.deepEqual(files.renameSync.mock.calls, [
         ["/logs/desktop-quits.ndjson", "/logs/desktop-quits.ndjson.1"],
+        [`/logs/desktop-last-quit.json.${process.pid}.tmp`, "/logs/desktop-last-quit.json"],
       ]);
     }).pipe(Effect.provide(layer)),
   );

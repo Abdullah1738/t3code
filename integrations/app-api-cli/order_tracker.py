@@ -1810,6 +1810,19 @@ def main(argv=None, _locked=False):
     if argv[:1] == ['can-report']:
         from order_receipts import can_report
         proof = can_report(argv[1]) if len(argv) == 2 else {'ok': False, 'error': 'usage: order-watch can-report ORDER_ID'}
+        try:
+            refusal = {None: 'none', 'invalid order id': 'invalid_id',
+                       'order not registered or id ambiguous': 'not_registered',
+                       'invalid tracker registration': 'invalid_registration',
+                       'tracker not running or payment still held': 'not_running_or_held',
+                       'usage: order-watch can-report ORDER_ID': 'usage'}[proof.get('error')]
+            toollog.emit('order-watch', 'order_watch.can_report', ok=bool(proof['ok']),
+                         ids={'watcher': proof.get('tracker')},
+                         props={'outcome': 'success' if proof['ok'] else 'refused', 'refusal': refusal,
+                                'untrackable': bool(proof.get('untrackable')),
+                                'eta_given': proof.get('eta') not in (None, 'no ETA given')})
+        except Exception:
+            pass
         print(json.dumps(proof))
         return 0 if proof['ok'] else 1
     if '--merchant' in argv or '--email-receipt' in argv or '--untrackable' in argv:

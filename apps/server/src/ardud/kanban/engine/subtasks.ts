@@ -12,6 +12,7 @@ import {
   type KanbanAskOption,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanCardEvent,
   type KanbanOwnerAsk,
   type KanbanSubtask,
   type KanbanStandingApproval,
@@ -464,11 +465,14 @@ const optionScopeIds = (
 const approvalQualifier =
   /\b(?:if|unless|after|before|once|when|pending|first|then|not|no|[a-z]+n[’']t|dont|never|cannot|without|except|only|instead)\b/i;
 
+export const optionLabelRefusesApproval = (label: string) =>
+  isNegativeOption(label) || approvalQualifier.test(label);
+
 export const optionApprovalIds = (
   card: Pick<KanbanCard, "subtasks">,
   option: Pick<KanbanAskOption, "label" | "approves">,
 ): ReadonlyArray<string> | undefined => {
-  if (isNegativeOption(option.label) || approvalQualifier.test(option.label)) return undefined;
+  if (optionLabelRefusesApproval(option.label)) return undefined;
   if (option.approves !== undefined) {
     if (!isNegativeChoice(option.label)) return option.approves;
     // Exact action targets can contain refusal words, such as an "on-hold build".
@@ -878,7 +882,7 @@ export const approvalProblem = (
       service === undefined
         ? `; set service on ${subtask.id} (card_edit) so only releases of the same service count`
         : "";
-    return `card #${card.number} ${subtask.id} (interrupting${service ? `, ${service}` : ""}) is inside the ${window.hours} h release window: last ${service ? `${service} ` : ""}release ${source}#${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override${guidance}`;
+    return `card #${card.number} ${subtask.id} (interrupting${service ? `, ${service}` : ""}) is inside the ${window.hours} h release window: last ${service ? `${service} ` : ""}release ${source}#${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override${guidance}; if this step records release #${window.last.cardNumber} that already happened, tick it with releasedAt: "${window.last.at}" (or the real restart time); it is recorded then and starts no new window`;
   }
   let reason: string;
   if (!latest || !answer) {
@@ -1394,6 +1398,7 @@ export function checkMark(
   role: SubtaskRole,
   note: string | null,
   scriptName: string | null = null,
+  correctingRelease = false,
 ): MarkCheck {
   const subtask = card.subtasks.find((candidate) => candidate.id === id);
   if (!subtask)
@@ -1402,7 +1407,10 @@ export function checkMark(
       denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (subtask.state === state)
+  if (
+    subtask.state === state &&
+    !(correctingRelease && role === "evaluator" && subtask.interrupting && state === "done")
+  )
     return {
       ok: false,
       denyReason: "subtask_state_unchanged",
@@ -1542,8 +1550,35 @@ export const markSubtask = (
         };
   });
 
-export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
-  const current = kanbanOpenStep(card);
+export function reviewRoundStartedAt(events: ReadonlyArray<KanbanCardEvent>, reviewStep: number) {
+  let remaining = reviewStep;
+  let startedAt: string | undefined;
+  // Dispatch retries and later reviewers belong to the same round until its
+  // passed chain steps are exhausted; a final verdict or return to work ends it.
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]!;
+    if (event.kind === "review") {
+      if (remaining === 0 || event.body !== "clear" || event.toStage !== "needs_review") break;
+      remaining--;
+    } else if (event.kind === "moved" && event.toStage === "in_review") {
+      startedAt = event.at;
+    } else if (event.toStage === "todo" || event.toStage === "working") {
+      break;
+    }
+  }
+  // Incomplete legacy history cannot establish a whole-round cutoff.
+  return remaining === 0 ? startedAt : undefined;
+}
+
+export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">, roundStartedAt?: string) {
+  // Without a known start, older callers keep judging the plan as it stands.
+  const startedAt = roundStartedAt === undefined ? undefined : Date.parse(roundStartedAt);
+  const subtasks = card.subtasks.map((subtask) =>
+    startedAt !== undefined && subtask.doneAt !== null && Date.parse(subtask.doneAt) > startedAt
+      ? { ...subtask, state: "open" as const }
+      : subtask,
+  );
+  const current = kanbanOpenStep({ subtasks });
   if (current === null) return [];
   const open = card.subtasks.filter(
     (subtask) => subtask.owner === "review" && subtask.state === "open",
@@ -1552,7 +1587,7 @@ export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
   // Unfinished work in the current step can already have been reviewed, but
   // future work must get its turn before its review can pass.
   if (
-    card.subtasks.some(
+    subtasks.some(
       (subtask) =>
         subtask.owner === "work" &&
         subtask.state === "open" &&
@@ -1569,8 +1604,9 @@ export function passReview(
   card: Pick<KanbanCard, "subtasks">,
   by: KanbanActor,
   at: string,
+  roundStartedAt?: string,
 ): ReadonlyArray<KanbanSubtask> {
-  const ids = new Set(reviewSubtasksToPass(card).map((subtask) => subtask.id));
+  const ids = new Set(reviewSubtasksToPass(card, roundStartedAt).map((subtask) => subtask.id));
   return card.subtasks.map((subtask) =>
     ids.has(subtask.id)
       ? { ...subtask, state: "done", note: "Review passed", doneBy: by, doneAt: at }

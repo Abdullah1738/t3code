@@ -24,6 +24,10 @@ import * as ElectronPowerMonitor from "../electron/ElectronPowerMonitor.ts";
 import * as DesktopTelemetryPublisher from "./DesktopTelemetryPublisher.ts";
 import * as DesktopRendererHistory from "./DesktopRendererHistory.ts";
 
+const decodeHistoryEvent = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Struct({ event: Schema.String })),
+);
+
 const layerHistory = Layer.succeed(DesktopRendererHistory.DesktopRendererHistory, {
   register: () => Effect.void,
   recordMetrics: () => Effect.void,
@@ -566,15 +570,22 @@ describe("DesktopRendererHistory", () => {
           writeFile: (filePath, bytes, options) =>
             fileSystem.writeFile(filePath, bytes, options).pipe(
               Effect.tap(() =>
-                decodeRecord(new TextDecoder().decode(bytes).trim()).pipe(
+                decodeHistoryEvent(new TextDecoder().decode(bytes).trim()).pipe(
                   Effect.orDie,
-                  Effect.flatMap((record) =>
-                    Effect.sync(() => {
-                      persisted.push(record);
-                      if (milestone?.matches(record)) {
-                        Deferred.doneUnsafe(milestone.written, Effect.succeed(record));
-                      }
-                    }),
+                  Effect.flatMap(({ event }) =>
+                    event === "hour"
+                      ? Effect.void
+                      : decodeRecord(new TextDecoder().decode(bytes).trim()).pipe(
+                          Effect.orDie,
+                          Effect.flatMap((record) =>
+                            Effect.sync(() => {
+                              persisted.push(record);
+                              if (milestone?.matches(record)) {
+                                Deferred.doneUnsafe(milestone.written, Effect.succeed(record));
+                              }
+                            }),
+                          ),
+                        ),
                   ),
                 ),
               ),
@@ -609,7 +620,7 @@ describe("DesktopRendererHistory", () => {
             matches: (row) => row.event === "sample" && row.webContentsId === 2,
             written: sampled,
           };
-          yield* TestClock.adjust(Duration.seconds(30));
+          yield* TestClock.adjust(Duration.minutes(2));
           yield* history.recordMetrics(metrics);
           const sample = yield* Deferred.await(sampled);
           assert.equal(sample.rendererPid, 7_002);
@@ -644,7 +655,7 @@ describe("DesktopRendererHistory", () => {
             matches: (row) => row.event === "sample" && row.webContentsId === 2,
             written: replacementSampled,
           };
-          yield* TestClock.adjust(Duration.seconds(30));
+          yield* TestClock.adjust(Duration.minutes(2));
           yield* history.recordMetrics(metrics);
           assert.equal((yield* Deferred.await(replacementSampled)).rendererCreationTimeMs, 700_300);
 
@@ -678,7 +689,7 @@ describe("DesktopRendererHistory", () => {
           const afterDestroy = yield* Deferred.make<Record>();
           milestone = { matches: (row) => row.event === "sample", written: afterDestroy };
           const previousCount = persisted.length;
-          yield* TestClock.adjust(Duration.seconds(30));
+          yield* TestClock.adjust(Duration.minutes(2));
           yield* history.recordMetrics(metrics);
           assert.equal((yield* Deferred.await(afterDestroy)).webContentsId, 1);
           assert.isFalse(persisted.slice(previousCount).some((row) => row.webContentsId === 2));

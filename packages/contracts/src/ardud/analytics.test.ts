@@ -265,10 +265,57 @@ it("decodes detached outcomes additively and rejects raw request ids", () => {
         failureRate: 1,
         outcomes: { timeout: 1 },
         savedCounts: { unknown: 1 },
+        reasonClasses: {},
+        invalidFields: {},
         errors: [],
         failedThenRetried: 0,
         retrySucceeded: 0,
       },
     ]),
   ).toBe(true);
+});
+
+it("decodes runtime samples with exact model ids and bounded hourly rollups", () => {
+  const row = {
+    ts: event.ts,
+    kind: "server.runtime_sample",
+    surface: "server",
+    route: "server",
+    props: {
+      runningTurns: {
+        total: 1,
+        byProvider: { "custom:provider[2]": 1 },
+        byModel: { "cx/gpt-6.1-sol[1m]": 1, other: 0 },
+      },
+      runningByOrigin: {
+        boardWork: 0,
+        boardReview: 0,
+        boardEvaluator: 0,
+        delegatedChild: 0,
+        scheduledTask: 0,
+        other: 1,
+      },
+      providerSessions: { codex: 1 },
+      host: { load1: 12, load5: 10, load15: 8, rssMiB: 900, heapUsedMiB: 500 },
+      sampleMs: 0.25,
+    },
+  };
+  expect(decodeEvent(row)).toEqual(row);
+  expect(() => decode({ events: [row] })).toThrow();
+  expect(() => decodeEvent({ ...row, props: { ...row.props, sampleMs: -1 } })).toThrow();
+  const hour = {
+    hour: "00",
+    samples: 60,
+    runningTurnsMax: 5,
+    runningTurnsAvg: 2.5,
+    queuedRunsMax: null,
+    load1Max: 12,
+    sampleMsMax: 0.4,
+  };
+  expect(
+    Schema.is(AnalyticsRollup.fields.runtimeSamples)(Array.from({ length: 24 }, () => hour)),
+  ).toBe(true);
+  expect(
+    Schema.is(AnalyticsRollup.fields.runtimeSamples)(Array.from({ length: 25 }, () => hour)),
+  ).toBe(false);
 });

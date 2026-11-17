@@ -45,7 +45,13 @@ def configure_fixture(root, backend):
     lease.ensure_ttl = lambda *args: _publish(root / 'ttl', 'extended')
     api.get = lambda *args: {'state': 'running'}
     lease.touch = lease.idle_ttl = lambda *args: None
-    lease.auto_size = lambda *args: ('large', '')
+    if os.environ.get('OFFBOX_TEST_REQUESTED_SIZE'):
+        a.size = os.environ['OFFBOX_TEST_REQUESTED_SIZE']
+        a.cmd = ['true']
+        if sys.argv[1:2] == ['_bg-queue']:
+            lease.auto_size = lambda *args: (_ for _ in ()).throw(AssertionError('child recomputed size'))
+    else:
+        lease.auto_size = lambda *args: ('large', '')
     runs.Runner._log_pool = lambda *args: None
     runs.Runner._prepare_box = lambda *args: None
     runs._keep_ttl = lambda *args: contextlib.nullcontext()
@@ -64,6 +70,8 @@ def configure_fixture(root, backend):
         runs.Runner.register_pending = aged
 
     def acquire(*args, **kwargs):
+        if os.environ.get('OFFBOX_TEST_REQUESTED_SIZE'):
+            _publish(root / 'acquired-size', kwargs['size'])
         _publish(root / 'waiting', str(os.getpid()))
         with common.file_lock('fixture-slot', timeout=15):
             outcome = os.environ.get('OFFBOX_TEST_QUEUE_OUTCOME')
@@ -77,7 +85,7 @@ def configure_fixture(root, backend):
             if outcome == 'settled':
                 with contextlib.closing(common.db()) as con:
                     con.execute("UPDATE runs SET status='killed',exit_code=130 WHERE run_id=?", (kwargs['run_id'],))
-            return dict(box_id='box-fake', size='large', remote_dir='repo')
+            return dict(box_id='box-fake', size=kwargs.get('size') or 'large', remote_dir='repo')
 
     def start(box, command, *, meta, **kwargs):
         with (root / 'starts').open('a') as stream:
@@ -86,6 +94,9 @@ def configure_fixture(root, backend):
 
     pool.acquire = acquire
     api.cmd_start = start
+    api.cmd_attach = lambda *args, **kw: iter([dict(type='stderr',
+        data=f'{runs.COMMAND_STARTED_MARKER} {os.environ[runs.BACKGROUND_RUN_ENV]}\n')])
+    runs._ttl_keeper = lambda *args: None
     return a, me
 
 
@@ -109,6 +120,8 @@ def fixture(root, bg, backend):
     if masked:
         _publish(root / 'mask-restored', str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
     _publish(root / 'returned', str(code))
+    if os.environ.get('OFFBOX_TEST_RETURN'):
+        return
     while True:
         if masked:
             time.sleep(.01)
@@ -763,6 +776,7 @@ class BackgroundRetryTests(Isolated):
                     patch.object(outage, 'wait_for_capacity', side_effect=lambda *a: (waiting(), None)) as capacity_retry, \
                     patch.object(outage, 'CAPACITY_RETRY_S', 0), patch.object(api, 'get', return_value={'state': 'running'}), \
                     patch.object(lease, 'ensure_ttl'), contextlib.redirect_stdout(io.StringIO()), \
+                    patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                     contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(runs.background_client(a, self.me), 0)
             self.assertEqual(attempts, ['run-retry', 'run-retry'])
@@ -828,6 +842,7 @@ class BackgroundFailoverTests(Isolated):
                 patch.object(home, '_forward_background') as forward, patch.object(os, 'execve') as execute, \
                 patch.object(runs.Runner, 'start', start), patch.object(outage, 'wait_until_up', side_effect=waiting) as wait, \
                 patch.object(api, 'get', return_value={'state': 'running'}), patch.object(lease, 'ensure_ttl'), \
+                patch.object(runs,'follow',return_value=runs._COMMAND_RUNNING), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(runs.background_client(a, self.me), 0)
         self.assertEqual(attempts, ['run-stays-home', 'run-stays-home'])

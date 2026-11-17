@@ -1,4 +1,5 @@
 import { normalizeSql, sqlFingerprint } from "./sqlDiagnostics.ts";
+import { StatementStats, recordStatementCompletion } from "./nodeSqliteStatementStats.ts";
 // @effect-diagnostics nodeBuiltinImport:off -- private SQLite reader process transport.
 import * as NodeUtil from "node:util";
 import * as Context from "effect/Context";
@@ -202,7 +203,9 @@ export const makeAuthReader = Effect.fnUntraced(function* (
   options: SqliteClientConfig,
   awaitStartup: (started: Promise<ReaderStartup>) => Effect.Effect<ReaderStartup> = (started) =>
     Effect.promise(() => started),
+  lane: "auth" | "identity" | "reserved" = "reserved",
 ) {
+  const statementStats = yield* StatementStats;
   const failed = (cause: unknown, message: string, operation: string) => {
     annotateSqliteError(
       cause,
@@ -436,6 +439,16 @@ export const makeAuthReader = Effect.fnUntraced(function* (
       const request = pending.get(reply.id);
       if (request === undefined) return;
       pending.delete(reply.id);
+      if (statementStats !== undefined && reply.executionMs !== undefined)
+        recordStatementCompletion(statementStats, {
+          database: options.filename,
+          connection: "reserved",
+          lane,
+          sql: request.sql,
+          executionMs: reply.executionMs,
+          rows: "rows" in reply && Array.isArray(reply.rows) ? reply.rows.length : 0,
+          failed: "error" in reply,
+        });
       dispatch();
       if (!("error" in reply)) {
         if (/^\s*BEGIN\b/i.test(request.sql)) snapshotStartedAt = performance.now();

@@ -16,6 +16,7 @@ import * as ElectronTheme from "../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopState from "./DesktopState.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
+import { registerMacQuitContext } from "../electron/MacQuitContext.ts";
 
 export class DesktopLifecycleRelaunchError extends Schema.TaggedError<DesktopLifecycleRelaunchError>()(
   "DesktopLifecycleRelaunchError",
@@ -198,6 +199,14 @@ export const make = DesktopLifecycle.of({
     const electronTheme = yield* ElectronTheme.ElectronTheme;
     const environment = yield* DesktopEnvironment.DesktopEnvironment;
     const context = yield* Effect.context<DesktopLifecycleRegistrationServices>();
+    if (environment.platform === "darwin") {
+      const release = yield* Effect.tryPromise(() =>
+        registerMacQuitContext(() => {
+          Effect.runSyncWith(context)(DesktopQuit.record({ trigger: "os-shutdown" }));
+        }),
+      ).pipe(Effect.catch(() => Effect.succeed(() => {})));
+      yield* Effect.addFinalizer(() => Effect.sync(release));
+    }
     const runEffect = Effect.runPromiseWith(context);
     let quitAllowed = false;
     let updaterQuitAllowed = false;

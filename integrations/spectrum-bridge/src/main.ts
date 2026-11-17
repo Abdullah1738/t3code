@@ -223,7 +223,7 @@ async function main(): Promise<void> {
         let complete = false;
         for await (const event of photon.catchUp(store.get<number>("photonCursor"))) {
           if (stopping) break;
-          if (ingest(store, event, config.owner, config.enabled)) {
+          if (ingest(store, event, config.owner, config.enabled, kind)) {
             ingressRevision++;
             controlsPending = true;
             chatGuid = store.get<string>("chatGuid");

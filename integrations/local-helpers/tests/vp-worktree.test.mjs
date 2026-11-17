@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { test } from "node:test";
 
 const shim = fileURLToPath(new URL("../bin/vp", import.meta.url));
@@ -38,6 +38,7 @@ function fixture(t, nativeModules) {
   const main = path.join(temporary, "main");
   const wt = path.join(temporary, "work tree");
   fs.mkdirSync(main);
+  const state = path.join(temporary, "state");
   const git = (...args) => {
     const r = spawnSync("git", ["-C", main, ...args], { encoding: "utf8" });
     assert.equal(r.status, 0, r.stderr);
@@ -67,9 +68,18 @@ function fixture(t, nativeModules) {
     return {
       main,
       wt,
-      run: (args, cwd = wt) => spawnSync(shim, args, { cwd, encoding: "utf8" }),
+      run: (args, cwd = wt) =>
+        spawnSync(shim, args, {
+          cwd,
+          encoding: "utf8",
+          env: { ...process.env, XDG_STATE_HOME: state },
+        }),
       native: (args, cwd = main) =>
-        spawnSync(path.join(main, "node_modules/.bin/vp"), args, { cwd, encoding: "utf8" }),
+        spawnSync(path.join(main, "node_modules/.bin/vp"), args, {
+          cwd,
+          encoding: "utf8",
+          env: { ...process.env, XDG_STATE_HOME: state },
+        }),
     };
   }
   fs.mkdirSync(path.join(main, "node_modules/.bin"), { recursive: true });
@@ -115,6 +125,8 @@ function fixture(t, nativeModules) {
   `,
   );
 
+  fs.mkdirSync(path.join(main, "node_modules/vite-plus/bin"));
+  fs.writeFileSync(path.join(main, "node_modules/vite-plus/bin/vp"), "fixture");
   const fake = path.join(main, "node_modules/.bin/vp");
   fs.writeFileSync(
     fake,
@@ -128,7 +140,11 @@ function fixture(t, nativeModules) {
     { mode: 0o755 },
   );
   function run(args, cwd = wt, env = {}) {
-    return spawnSync(shim, args, { cwd, encoding: "utf8", env: { ...process.env, ...env } });
+    return spawnSync(shim, args, {
+      cwd,
+      encoding: "utf8",
+      env: { ...process.env, XDG_STATE_HOME: state, ...env },
+    });
   }
   function routed(args, cwd = wt) {
     const r = run(args, cwd);
@@ -140,7 +156,7 @@ function fixture(t, nativeModules) {
     assert.equal(fs.existsSync(result.args[2]), false, "temporary config cleaned up");
     return result;
   }
-  return { main, wt, run, routed, fake };
+  return { main, wt, run, routed, fake, state };
 }
 
 test("fmt uses worktree-root patterns; lint uses main cwd and absolute paths", (t) => {
@@ -679,6 +695,8 @@ test("unsafe or ambiguous argument forms refuse with an offbox hint", (t) => {
 test("local vp wins, preserves cwd, argv, and exit status", (t) => {
   const f = fixture(t);
   fs.mkdirSync(path.join(f.wt, "node_modules/.bin"), { recursive: true });
+  fs.mkdirSync(path.join(f.wt, "node_modules/vite-plus/bin"), { recursive: true });
+  fs.writeFileSync(path.join(f.wt, "node_modules/vite-plus/bin/vp"), "fixture");
   fs.copyFileSync(f.fake, path.join(f.wt, "node_modules/.bin/vp"));
   const nested = path.join(f.wt, "src");
   fs.mkdirSync(nested);
@@ -708,7 +726,11 @@ test("runs with only a minimal PATH and HOME", (t) => {
   const r = spawnSync(shim, ["fmt", "a.ts"], {
     cwd: f.wt,
     encoding: "utf8",
-    env: { HOME: path.dirname(f.main), PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin` },
+    env: {
+      XDG_STATE_HOME: f.state,
+      HOME: path.dirname(f.main),
+      PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`,
+    },
   });
   assert.equal(r.status, 0, r.stderr);
 });
@@ -1177,3 +1199,211 @@ for (const state of ["missing path", "empty directory", "missing package main"])
     }
   });
 }
+
+function eventRows(f) {
+  return fs
+    .readFileSync(path.join(f.state, "vp-shim/events.jsonl"), "utf8")
+    .trim()
+    .split("\n")
+    .map(JSON.parse);
+}
+
+function breakToolchain(directory) {
+  fs.rmSync(path.join(directory, "node_modules/vite-plus/bin"), { recursive: true });
+  fs.symlinkSync("missing-store/bin", path.join(directory, "node_modules/vite-plus/bin"));
+}
+
+test("dangling walk-up target falls back to toolchain copy with one outcome row", (t) => {
+  const f = toolchainFixture(t);
+  breakToolchain(f.main);
+  fs.symlinkSync(path.join(f.main, "node_modules"), path.join(f.wt, "node_modules"));
+  const result = f.run(["fmt", "--check", "a.ts"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /skipping local checkout.*vite-plus\/bin\/vp does not resolve/);
+  assert.match(result.stderr, /offbox run -- pnpm install --frozen-lockfile/);
+  assert.equal(JSON.parse(result.stdout).cwd, f.wt);
+  const rows = eventRows(f);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].event, "dangling-toolchain");
+  assert.equal(rows[0].outcome, "ran");
+  assert.equal(rows[0].candidate, "toolchain copy");
+  assert.equal(rows[0].exitCode, 0);
+  assert.equal(rows[0].cwd, f.wt);
+  assert.equal(rows[0].skipped[0].reason, "dangling-vite-plus");
+  assert.equal(rows[0].reasons[0].diagnosis, null);
+  assert.equal(fs.statSync(path.join(f.state, "vp-shim/events.jsonl")).mode & 0o777, 0o600);
+});
+
+test("all candidate targets dangling refuses clearly and logs every skip", (t) => {
+  const f = toolchainFixture(t);
+  breakToolchain(f.main);
+  breakToolchain(f.copy);
+  const result = f.run(["fmt", "--check", "a.ts"]);
+  assert.equal(result.status, 127);
+  assert.match(result.stderr, /skipping toolchain copy/);
+  assert.match(result.stderr, /skipping main checkout/);
+  assert.match(result.stderr, /run offbox run -- vp fmt/);
+  const [row] = eventRows(f);
+  assert.equal(row.outcome, "refused");
+  assert.equal(row.candidate, null);
+  assert.equal(row.exitCode, 127);
+  assert.equal(row.skipped.length, 2);
+});
+
+test("logs child failures and refusals without argv, rotates, and tolerates unwritable state", (t) => {
+  const f = fixture(t);
+  assert.equal(f.run(["fmt", "private-file.ts"], f.wt, { FAKE_EXIT: "23" }).status, 23);
+  const [row] = eventRows(f);
+  assert.equal(row.outcome, "ran");
+  assert.equal(row.exitCode, 23);
+  assert.equal(row.command, "fmt");
+  assert.ok(!JSON.stringify(row).includes("private-file"));
+  assert.ok(row.durationMs >= 0);
+  assert.equal(f.run(["test", "private-argument"]).status, 127);
+  assert.equal(eventRows(f).at(-1).outcome, "refused");
+  f.run(["fmt", "a.ts"], f.wt, { VP_SHIM_LOG_MAX_BYTES: "1" });
+  assert.ok(fs.existsSync(path.join(f.state, "vp-shim/events.jsonl.1")));
+  const blocked = path.join(f.state, "file");
+  fs.writeFileSync(blocked, "file");
+  const result = f.run(["fmt", "a.ts"], f.wt, { XDG_STATE_HOME: blocked, FAKE_EXIT: "19" });
+  assert.equal(result.status, 19);
+  assert.ok(!result.stderr.includes("EEXIST"));
+});
+
+test(
+  "native: dangling main fallback formats a dependencyless worktree's own Vite config",
+  { skip: !process.env.VP_TEST_NODE_MODULES },
+  (t) => {
+    const f = fixture(t, process.env.VP_TEST_NODE_MODULES);
+    const copy = path.join(path.dirname(f.main), "native-toolchain");
+    fixtureGit(f.main, "update-ref", "refs/remotes/origin/main", "HEAD");
+    fixtureGit(f.main, "worktree", "add", "-q", "--detach", copy, "origin/main");
+    fs.symlinkSync(process.env.VP_TEST_NODE_MODULES, path.join(copy, "node_modules"));
+    fixtureGit(f.main, "config", "vp.toolchain", copy);
+    fs.unlinkSync(path.join(f.main, "node_modules/vite-plus"));
+    fs.symlinkSync("missing-store/vite-plus", path.join(f.main, "node_modules/vite-plus"));
+    fs.writeFileSync(
+      path.join(f.wt, "vite.config.ts"),
+      'import {defineConfig} from "vite-plus"; import {defineProject} from "vite-plus/test/config"; export default defineConfig({fmt:{semi:false},test:defineProject({})});\n',
+    );
+    fs.writeFileSync(path.join(f.wt, "a.ts"), "export const a = 1\n");
+    const result = f.run(["fmt", "--check", "a.ts"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /All matched files use the correct format/);
+    assert.ok(!fs.existsSync(path.join(f.wt, "node_modules")));
+  },
+);
+
+test("direct dispatch and shared-install refusals each log one result", (t) => {
+  const f = fixture(t);
+  assert.equal(f.run(["--version"], f.main, { FAKE_EXIT: "7" }).status, 7);
+  let rows = eventRows(f);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].command, "other");
+  assert.equal(rows[0].candidate, null);
+  assert.equal("selectedPath" in rows[0], false);
+  assert.equal(rows[0].outcome, "ran");
+  assert.equal(rows[0].exitCode, 7);
+  fs.symlinkSync(path.join(f.main, "node_modules"), path.join(f.wt, "node_modules"));
+  assert.equal(f.run(["install"]).status, 1);
+  rows = eventRows(f);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].outcome, "refused");
+  assert.equal(rows[1].exitCode, 1);
+  assert.equal(rows[1].reasons[0].reason, "shared-dependencies");
+});
+
+for (const borrowed of [false, true]) {
+  test(`cancellation forwards SIGTERM and logs 143 (${borrowed ? "borrowed" : "direct"})`, async (t) => {
+    const f = fixture(t);
+    fs.writeFileSync(
+      f.fake,
+      `#!${process.execPath}\nconsole.log(process.pid); setInterval(() => {}, 1000);\n`,
+    );
+    const child = spawn(shim, ["fmt", "a.ts"], {
+      cwd: borrowed ? f.wt : f.main,
+      env: { ...process.env, XDG_STATE_HOME: f.state },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    t.after(() => {
+      if (child.exitCode === null) child.kill("SIGKILL");
+    });
+    let toolPid;
+    await new Promise((resolve, reject) => {
+      let output = "";
+      child.stdout.on("data", (chunk) => {
+        output += chunk;
+        if (output.includes("\n") && !toolPid) {
+          toolPid = Number(output.trim());
+          child.kill("SIGTERM");
+        }
+      });
+      child.on("error", reject);
+      child.on("close", (code) => {
+        try {
+          assert.equal(code, 143);
+          assert.ok(toolPid);
+          assert.throws(() => process.kill(toolPid, 0), { code: "ESRCH" });
+          const rows = eventRows(f);
+          assert.equal(rows.length, 1);
+          assert.equal(rows[0].outcome, "ran");
+          assert.equal(rows[0].exitCode, 143);
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+  });
+}
+
+test("a child signal keeps its shell exit status", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(f.fake, `#!${process.execPath}\nprocess.kill(process.pid, "SIGTERM");\n`);
+  assert.equal(f.run(["fmt", "a.ts"], f.main).status, 143);
+  assert.equal(eventRows(f)[0].exitCode, 143);
+});
+
+test("cancellation during borrowed config preparation records one refused outcome", async (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(
+    path.join(f.wt, "vite.config.ts"),
+    "console.log(`preparing:${process.pid}`); await new Promise(() => setInterval(() => {}, 1000)); export default {fmt:{},lint:{}};\n",
+  );
+  const child = spawn(shim, ["fmt", "a.ts"], {
+    cwd: f.wt,
+    env: { ...process.env, XDG_STATE_HOME: f.state },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(() => {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  });
+  let workerPid;
+  await new Promise((resolve, reject) => {
+    let output = "";
+    child.stdout.on("data", (chunk) => {
+      output += chunk;
+      const match = output.match(/preparing:(\d+)\n/);
+      if (match && !workerPid) {
+        workerPid = Number(match[1]);
+        child.kill("SIGTERM");
+      }
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      try {
+        assert.equal(code, 143);
+        assert.ok(workerPid);
+        assert.throws(() => process.kill(workerPid, 0), { code: "ESRCH" });
+        const rows = eventRows(f);
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].outcome, "refused");
+        assert.equal(rows[0].exitCode, 143);
+        assert.ok(!output.includes('"config":'));
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+});

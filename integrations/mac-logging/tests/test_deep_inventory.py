@@ -364,7 +364,7 @@ class DeepInventoryTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired) as error:
                 runner(['/usr/bin/du','-skl','/fixture/child'],timeout=600,text=True)
             self.assertEqual(error.exception.stdout,'1\t/fixture/child\n')
-            self.assertEqual(popen.call_args.args[0][:6],['/usr/bin/nice','-n','10','/usr/sbin/taskpolicy','-c','utility'])
+            self.assertEqual(popen.call_args.args[0][:8],['/usr/bin/nice','-n','10','/usr/sbin/taskpolicy','-c','utility','-d','throttle'])
             self.assertEqual(popen.call_args.kwargs['pass_fds'],(42,))
             kill.assert_called_once_with(12345,signal.SIGKILL)
 
@@ -374,7 +374,7 @@ class BackgroundProcessTests(unittest.TestCase):
         popen=subprocess.Popen
         processes=[]
         def spawn(command,**kwargs):
-            process=popen(command[6:],**kwargs)
+            process=popen(command[8:],**kwargs)
             processes.append(process)
             return process
         with tempfile.TemporaryDirectory() as directory:

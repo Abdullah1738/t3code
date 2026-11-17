@@ -27,6 +27,9 @@ import {
   type ProviderSessionId,
   ThreadId,
 } from "@t3tools/contracts";
+import * as ContextResetService from "../ardud/context-reset/ContextResetService.ts";
+import * as Orchestrator from "./Orchestrator.ts";
+import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
 import { liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
@@ -2889,6 +2892,10 @@ it.effect("ProviderSessionManagerV2 records provider session and turn metrics", 
         modelSelection,
         runtimePolicy,
       });
+      assert.deepEqual(yield* manager.runtimeSnapshot!(), {
+        turns: [],
+        providerSessions: { codex: 1 },
+      });
       yield* runtime.startTurn({
         appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
         threadId,
@@ -2908,6 +2915,10 @@ it.effect("ProviderSessionManagerV2 records provider session and turn metrics", 
         modelSelection,
         runtimePolicy,
       });
+      assert.deepEqual(yield* manager.runtimeSnapshot!(), {
+        turns: [{ threadId, provider: modelSelection.instanceId, model: modelSelection.model }],
+        providerSessions: { codex: 1 },
+      });
       yield* runtime.interruptTurn({
         providerThread,
         providerTurnId: idAllocator.derive.providerTurn({
@@ -2916,6 +2927,7 @@ it.effect("ProviderSessionManagerV2 records provider session and turn metrics", 
         }),
       });
       yield* manager.close(providerSessionId);
+      assert.deepEqual(yield* manager.runtimeSnapshot!(), { turns: [], providerSessions: {} });
 
       const snapshots = yield* Metric.snapshot;
       const has = (id: string, attributes: Readonly<Record<string, string>>) =>
@@ -9293,6 +9305,260 @@ it.effect.each([
       }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
     }).pipe(
       Effect.provide(layerTest({ state, idleTimeoutMs: 60_000, mcpRegistryLayer: registryLayer })),
+    );
+  }).pipe(Effect.provide(layerTestMcpRegistry)),
+);
+
+it.effect.each([
+  "current",
+  "replaced",
+  "replaced_same_runtime",
+  "revoked",
+  "foreign_instance",
+  "detached",
+] as const)("context reset detaches the real manager-issued caller runtime: %s", (identity) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const database = SqlitePersistence.layerMemory;
+    const eventStoreLayer = EventStore.layer.pipe(Layer.provide(database));
+    const registry = yield* McpSessionRegistry.McpSessionRegistry;
+    const registryLayer = Layer.succeed(McpSessionRegistry.McpSessionRegistry, registry);
+    const runtimeLayer = ProviderReplayHarness.layerWithRegistry(
+      { name: "context-reset-real-issuer" },
+      Layer.unwrap(
+        makeProviderAdapter(state).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
+      ),
+      {
+        databaseLayer: database,
+        configureMcp: true,
+        mcpRegistryLayer: registryLayer,
+        runEffectWorker: false,
+      },
+    );
+    yield* Effect.gen(function* () {
+      const engine = yield* Orchestrator.OrchestratorV2;
+      const events = yield* EventStore.EventStoreV2;
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const credentials = yield* McpProviderSessions.McpProviderSessions;
+      const sink = yield* EventSink.EventSinkV2;
+      const ids = yield* IdAllocator.IdAllocatorV2;
+      const threadId = ThreadId.make("context-reset-real-issuer");
+      const now = yield* DateTime.now;
+      const runtimeId = yield* ids.allocate.providerSession({
+        threadId,
+        providerInstanceId: modelSelection.instanceId,
+      });
+      yield* sink.write({
+        events: [yield* makeThreadCreatedEvent({ idAllocator: ids, threadId, now })],
+      });
+      yield* manager.open({
+        threadId,
+        providerSessionId: runtimeId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const credential = (yield* credentials.read(threadId))!;
+      const scope = (yield* registry.resolve(
+        credential.authorizationHeader.replace(/^Bearer\s+/, ""),
+      ))!;
+      assert.isDefined(scope);
+      assert.notEqual(scope.thread.providerSessionId, runtimeId);
+      const providerThread = makeProviderThread({
+        idAllocator: ids,
+        threadId,
+        providerSessionId: runtimeId,
+        now,
+      });
+      const runId = ids.derive.run({ threadId, ordinal: 1 });
+      yield* sink.write({
+        events: [
+          {
+            id: yield* ids.allocate.event({ threadId }),
+            threadId,
+            occurredAt: now,
+            type: "provider-thread.updated",
+            payload: providerThread,
+          },
+          {
+            id: yield* ids.allocate.event({ threadId }),
+            threadId,
+            occurredAt: now,
+            type: "run.created",
+            payload: {
+              id: runId,
+              threadId,
+              ordinal: 1,
+              providerInstanceId: modelSelection.instanceId,
+              modelSelection,
+              providerThreadId: providerThread.id,
+              userMessageId: yield* ids.allocate.message({ threadId, ordinal: 1 }),
+              rootNodeId: ids.derive.rootNode({ runId }),
+              activeAttemptId: null,
+              status: "running",
+              requestedAt: now,
+              startedAt: now,
+              completedAt: null,
+              checkpointId: null,
+              contextHandoffId: null,
+            },
+          },
+        ],
+      });
+      let callerScope = scope;
+      let expectedAttachedRuntime = runtimeId;
+      if (identity === "replaced") {
+        expectedAttachedRuntime = yield* ids.allocate.providerSession({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* manager.open({
+          threadId,
+          providerSessionId: expectedAttachedRuntime,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* sink.write({
+          events: [
+            {
+              id: yield* ids.allocate.event({ threadId }),
+              threadId,
+              occurredAt: now,
+              type: "provider-thread.updated",
+              payload: { ...providerThread, providerSessionId: expectedAttachedRuntime },
+            },
+          ],
+        });
+        assert.isUndefined(
+          yield* registry.resolve(credential.authorizationHeader.replace(/^Bearer\s+/, "")),
+        );
+      }
+      if (identity === "replaced_same_runtime") {
+        yield* registry.revokeThread(threadId);
+        const replacement = yield* registry.issue({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        yield* credentials.set({ ...replacement.config, runtimeProviderSessionId: runtimeId });
+      }
+      if (identity === "revoked") {
+        yield* registry.revokeThread(threadId);
+        yield* credentials.clear(threadId);
+      }
+      if (identity === "foreign_instance") {
+        const foreign = yield* registry.issue({
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("other"),
+        });
+        callerScope = (yield* registry.resolve(
+          foreign.config.authorizationHeader.replace(/^Bearer\s+/, ""),
+        ))!;
+      }
+      if (identity === "detached") {
+        yield* engine.dispatch({
+          type: "provider-session.detach",
+          commandId: CommandId.make("already-detached"),
+          threadId,
+          providerSessionId: runtimeId,
+        });
+      }
+      const afterSequence = yield* events.latestSequence({ threadId });
+      const readDetachedEvents = events
+        .read({ threadId, afterSequence, eventType: "provider-session.detached" })
+        .pipe(Stream.runCollect);
+      const commands: string[] = [];
+      let queuedNotes = 0;
+      const resetLayer = ContextResetService.layer.pipe(
+        Layer.provide(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: engine.getThreadRecords,
+            sendToThread: (input) =>
+              Effect.gen(function* () {
+                const dispatch = yield* engine.dispatch({
+                  type: "message.dispatch",
+                  commandId: input.commandId,
+                  threadId: input.threadId,
+                  messageId: input.messageId,
+                  text: input.text,
+                  attachments: input.attachments,
+                  dispatchMode: { type: "queue_after_active" },
+                  ...(input.contextReset === true ? { contextReset: true } : {}),
+                  createdBy: input.createdBy,
+                  creationSource: input.creationSource,
+                });
+                queuedNotes += 1;
+                const projection = yield* engine.getThreadProjection(threadId);
+                const message = projection.messages.find(
+                  (message) => message.id === input.messageId,
+                )!;
+                const run = projection.runs.find((run) => run.id === message.runId)!;
+                assert.equal(run.status, "queued");
+                assert.isTrue(run.contextReset);
+                return {
+                  dispatch,
+                  projection,
+                  message,
+                  run,
+                  turnItem: null,
+                  delivery: "queued" as const,
+                };
+              }),
+            dispatch: (command) => {
+              if (command.type === "provider-session.detach")
+                commands.push(command.providerSessionId);
+              return engine.dispatch(command);
+            },
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const reset = yield* ContextResetService.ContextResetService;
+        const call = reset.reset(callerScope, { note: "resume note" });
+        if (identity !== "current" && identity !== "detached") {
+          const error = yield* Effect.flip(call);
+          assert.equal(error.code, "provider_unavailable");
+          assert.equal(queuedNotes, 0);
+          assert.deepEqual(commands, []);
+          assert.equal((yield* readDetachedEvents).length, 0);
+          assert.isTrue(
+            (yield* engine.getThreadProjection(threadId)).providerSessions.some(
+              (session) => session.id === expectedAttachedRuntime,
+            ),
+          );
+          return;
+        }
+        const result = yield* call;
+        assert.equal(queuedNotes, 1);
+        if (identity === "detached") {
+          assert.deepEqual(commands, []);
+          assert.equal((yield* readDetachedEvents).length, 0);
+          assert.include(result.note, "no session was ended");
+          assert.notInclude(result.note, "Context reset scheduled");
+          return;
+        }
+        assert.deepEqual(
+          { commands, note: result.note },
+          {
+            commands: [runtimeId],
+            note: "Context reset scheduled. Your current turn ends now; a fresh session starts with the resume note as its only context. Do not do any more work in this turn.",
+          },
+        );
+        const detachedEvents = yield* readDetachedEvents;
+        assert.equal(detachedEvents.length, 1);
+        assert.equal(detachedEvents[0]?.event.type, "provider-session.detached");
+        if (detachedEvents[0]?.event.type === "provider-session.detached")
+          assert.equal(detachedEvents[0].event.payload.providerSessionId, runtimeId);
+        assert.isFalse(
+          (yield* engine.getThreadProjection(threadId)).providerSessions.some(
+            (session) => session.id === runtimeId,
+          ),
+        );
+      }).pipe(Effect.provide(resetLayer));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(runtimeLayer, IdAllocator.layer, eventStoreLayer).pipe(
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
     );
   }).pipe(Effect.provide(layerTestMcpRegistry)),
 );

@@ -814,12 +814,18 @@ def inventory_parts(entry, run, deadline, cache, checkpoint, entries, listed, me
     return False
 
 
+def disk_throttle(command):
+    # Disk policy only: background scheduling (-b) can stall at high load.
+    return (['/usr/sbin/taskpolicy', '-d', 'throttle', *command]
+            if sys.platform == 'darwin' else command)
+
+
 def directory_inventory(paths=None, run=subprocess.run, deadline=None):
     started = time.monotonic()
     with inventory_lock() as acquired:
         if acquired is not False:
             def locked_run(command, **kwargs):
-                return run(command, pass_fds=(acquired,), **kwargs)
+                return run(disk_throttle(command), pass_fds=(acquired,), **kwargs)
             return _directory_inventory(paths, locked_run, deadline)
         previous = read_state('disk-inventory')
         roots = list(DIRECTORY_ROOTS if paths is None else paths)

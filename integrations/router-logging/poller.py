@@ -165,8 +165,16 @@ def poll(get=None, root=None, now=None):
         except FileNotFoundError:
             state = {}
         yesterday = (now.date() - dt.timedelta(days=1)).isoformat()
-        if (now.hour > 0 or now.minute >= 5) and not rollup_complete(root / ('rollup-' + yesterday + '.json')):
+        if (now.hour > 0 or now.minute >= 5) and (state.get('finalizedDay') != yesterday or not rollup_complete(root / ('rollup-' + yesterday + '.json'))):
             rollup(yesterday, root, now=now)
+            state['finalizedDay'] = yesterday
+            save_state(state_path, state)
+            emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
+        hour = now.strftime('%Y-%m-%dT%H')
+        if state.get('rollupHour') != hour:
+            rollup(now.date().isoformat(), root, now=now)
+            state['rollupHour'] = hour
+            save_state(state_path, state)
             emit('poller', 'log.rollup', kind='perf', ok=True, durationMs=(time.monotonic() - start) * 1000)
         get = get or Router().get
         providers = get('/api/providers')
@@ -174,7 +182,6 @@ def poll(get=None, root=None, now=None):
         seen = snapshot(providers, logs, state.get('seen', {}), now)
         state['seen'] = seen
         save_state(state_path, state)
-        hour = now.strftime('%Y-%m-%dT%H')
         if state.get('spendHour') != hour:
             # This endpoint supplies today's cumulative cost, not hourly buckets.
             # Keep the real per-connection cost as an hourly snapshot; never call it hourly spend.

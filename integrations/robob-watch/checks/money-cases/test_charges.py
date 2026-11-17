@@ -1775,5 +1775,72 @@ class MarketplaceProof(unittest.TestCase):
                     self.assertIsNone(charges.order_receipt(charge, at, at, lookup=reader))
 
 
+class LimitReasons(unittest.TestCase):
+    def test_order_limits_keep_exception_types_and_first_blocker(self):
+        when = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(merchant='noon', amount='12.34', currency='AED')
+        for name in ch.order_lookup.LANES:
+            for stop, kind in ((None, 'lane_uncovered'), ('covered', 'lane_uncovered'),
+                               ('end_of_history', 'lane_uncovered'), ('unproven_paging', 'lane_uncovered'),
+                               ('slice_out', 'lane_slice_out'), ('list_error', 'lane_error'),
+                               ('reader_error', 'lane_error'), ('detail_error', 'lane_error'),
+                               ('snapshot_missing', 'lane_error')):
+                for page_one in (False, True):
+                    with self.subTest(lane=name, stop=stop, page_one=page_one):
+                        result = {'orders': [], 'complete': False, 'lanes': {
+                            lane: {'exhaustive': True} for lane in ch.order_lookup.LANES}}
+                        result['lanes']['marketplace']['walked_at'] = (when + ch.SAME_TIME).isoformat()
+                        result['lanes'][name].update(exhaustive=False, covered_from=when.isoformat(),
+                            stop_reason=stop, limit='page-1 history only' if page_one else None)
+                        with self.assertRaises(ch.Lookup) as exc:
+                            ch.order_receipt(charge, when, when, lookup=lambda *a, **kw: result)
+                        self.assertEqual(type(exc.exception), ch.SourceLimit if page_one else ch.Lookup)
+                        self.assertEqual(exc.exception.reason, kind + ':' + name)
+        for kind in ('marketplace_hold', 'marketplace_stale'):
+            self.assertEqual(ch.SourceLimit('private', [kind]).reason, kind)
+        self.assertEqual(ch.SourceLimit('private', ['food_page_1', 'marketplace_hold']).reason,
+                         'lane_uncovered:food')
+        with self.assertRaises(ch.SourceLimit) as exc:
+            ch.order_receipt({**charge, 'merchant': 'careem'}, when, when,
+                lookup=lambda *a, **kw: (_ for _ in ()).throw(
+                    ch.order_lookup.SourceLimit(ch.order_lookup.BINDING_LIMIT)))
+        self.assertEqual(exc.exception.reason, 'source_limit:ORDER_LIST_HOST_BINDING_UNVERIFIED')
+        self.assertEqual(ch.SourceLimit('private', ['private-id']).reason, 'other')
+        self.assertEqual(ch.Lookup('private', 'private-id').reason, 'other')
+
+    def test_marketplace_checks_precede_lane_gaps_and_first_lane_wins(self):
+        when = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(merchant='noon', amount='12.34', currency='AED')
+        result = {'orders': [], 'complete': False, 'lanes': {
+            lane: {'exhaustive': False, 'stop_reason': 'slice_out'} for lane in ch.order_lookup.LANES}}
+        result['lanes']['marketplace']['hold_times'] = [when.isoformat()]
+        def check(reason, error_class):
+            with self.assertRaises(error_class) as exc:
+                ch.order_receipt(charge, when, when, lookup=lambda *a, **kw: result)
+            self.assertEqual(exc.exception.reason, reason)
+        check('marketplace_stale', ch.SourceLimit)
+        result['lanes']['marketplace']['walked_at'] = (when + ch.SAME_TIME).isoformat()
+        check('marketplace_hold', ch.SourceLimit)
+        result['lanes']['marketplace']['hold_times'] = []
+        check('lane_slice_out:minutes', ch.Lookup)
+        result['orders'] = [dict(order='N1', placed_at=when.isoformat(), total='12.34', currency='AED')]
+        self.assertEqual(ch.order_receipt(charge, when, when, lookup=lambda *a, **kw: result)['verdict'], 'receipt')
+
+    def test_receipt_timeout_is_first_even_when_order_is_limited(self):
+        when = dt.datetime(2026, 11, 10, 12, tzinfo=dt.timezone.utc)
+        charge = dict(kind='charge', merchant='noon', amount='12.34', currency='AED', card='1111')
+        for failure, reason in ((ch.Lookup('receipt lookup over time'), 'receipt_out_of_time'),
+                                (ch.Lookup('private', 'msgs_timeout'), 'msgs_timeout')):
+            with self.subTest(reason=reason), patch.object(ch, 'receipt', side_effect=failure), \
+                    patch.object(ch, 'order_receipt', side_effect=ch.SourceLimit('private', ['marketplace_hold'])), \
+                    patch.object(ch, 'card_owner', return_value='abdullah'), \
+                    patch.object(ch, 'owner_said', return_value=None):
+                result = ch.explain(charge, when, when)
+            self.assertEqual(result['verdict'], 'unverified')
+            self.assertTrue(result['errors'])
+            self.assertEqual(result['limit_reason'], reason)
+            self.assertEqual(result['limits'][0]['reason'], 'marketplace_hold')
+
+
 if __name__ == '__main__':
     unittest.main()

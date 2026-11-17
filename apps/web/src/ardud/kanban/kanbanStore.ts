@@ -1,6 +1,6 @@
 import { paintActionValue } from "@t3tools/client-runtime/ardud/kanban";
 import { useAtomValue } from "@effect/atom-react";
-import { useEffect, useMemo, useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 
 import type {
   KanbanBoardSummary,
@@ -12,7 +12,6 @@ import type {
   KanbanWikiPage,
 } from "@t3tools/contracts";
 import {
-  boardThreadIds,
   createAtomKanbanTransport,
   createKanbanClient,
   type KanbanRequestTag,
@@ -73,7 +72,7 @@ export function useBoards(): ReadonlyArray<KanbanBoardSummary> | undefined {
 
 /** Threads the boards started, archived boards too, for thread lists to leave out. */
 export function useBoardThreadIds(): ReadonlySet<string> {
-  return boardThreadIds(useStore(kanban.boards));
+  return useStore(kanban.boardThreads) ?? new Set();
 }
 
 /** The board that started a thread, or undefined for threads a board did not start. */
@@ -149,7 +148,7 @@ export function useKanbanPermission(tag: KanbanRequestTag): boolean {
 }
 
 export function useKanbanPermissionStatus(tag: KanbanRequestTag) {
-  const status = useMemo(() => kanban.permissionStatus(tag), [tag]);
+  const status = kanban.permissionStatus(tag);
   return useAtomValue(status);
 }
 

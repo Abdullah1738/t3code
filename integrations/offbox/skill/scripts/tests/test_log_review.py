@@ -55,7 +55,8 @@ class LoggingReview(Isolated):
             clock['now']+=600
             return {'ok':True,'files':2,'received':10}
         with patch.object(runs,'now',side_effect=lambda:clock['now']), patch.object(ssh_sync,'pull',side_effect=pull):
-            runs.do_pulls('bx_fixture',row,['artifact'])
+            self.con.execute('UPDATE runs SET pulls=? WHERE run_id=?', ('["artifact"]', row['run_id']))
+            runs.settle_pulls(row['run_id'], 'fg')
             runs.finish(row['run_id'],0,bookkeeping=False)
         unknown=self.command_row('run-unknown','fg',44)
         with patch.object(runs,'now',return_value=7200): runs.finish(unknown['run_id'],0,bookkeeping=False)
