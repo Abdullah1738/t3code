@@ -15,7 +15,9 @@ from jobs import read_state, save_state, state_path
 from toollog import emit, finite_number, cpu_fields
 from volume_crawls import volume_crawls
 
-PS = ['/bin/ps', '-ww', '-axo', 'pid=,ppid=,time=,rss=,state=,lstart=,etime=,uid=,comm=,args=SCAN_ARGV']
+# Keep comm last: Darwin truncates it when another column follows, changing
+# established CPU families and disabling interpreter hints.
+PS = ['/bin/ps', '-ww', '-axo', 'pid=,ppid=,time=,rss=,state=,lstart=,etime=,uid=,comm=']
 SPIKES_PER_DAY = 240
 
 
@@ -297,16 +299,19 @@ def parse_ps(text, diagnostics=None):
     total = bad = 0
     first_bad = None
     args_column = None
+    tool_column = None
     for line in text.splitlines():
-        if line.strip() == 'SCAN_ARGV':
+        if line.split() in (['SCAN_ARGV'], ['SCAN_TOOL', 'SCAN_ARGV']):
             args_column = line.index('SCAN_ARGV')
+            tool_column = line.index('SCAN_TOOL') if 'SCAN_TOOL' in line else None
             continue
         if not line.strip():
             continue
         total += 1
         try:
             args = line[args_column:].strip() if args_column is not None else ''
-            parts = (line[:args_column] if args_column is not None else line).split(None, 12)
+            metadata_end = tool_column if tool_column is not None else args_column
+            parts = (line[:metadata_end] if metadata_end is not None else line).split(None, 12)
             if len(parts) != 13:
                 raise ValueError()
             pid, ppid, rss, uid = int(parts[0]), int(parts[1]), int(parts[3]), int(parts[11])
@@ -320,7 +325,8 @@ def parse_ps(text, diagnostics=None):
                 comm = comm[1:-1]
             rows.append(dict(pid=pid, ppid=ppid, uid=uid, cpuS=seconds(parts[2]), rssMb=rss/1024,
                              state=parts[4], start=start, etime=parts[10], elapsedS=seconds(parts[10]), family=family(comm),
-                             comm=comm, args=args))
+                             comm=comm, args=args,
+                             tool=line[tool_column:args_column].strip() if tool_column is not None else os.path.basename(comm)))
             seen.add(pid)
         except (ValueError, OverflowError, ProbeError):
             bad += 1

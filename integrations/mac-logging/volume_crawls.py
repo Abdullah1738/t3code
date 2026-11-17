@@ -1,9 +1,11 @@
 """Attribute long metadata crawls from the CPU sampler's existing ps snapshot."""
 import os
+import json
 from pathlib import Path
 import re
-import shlex
 import subprocess
+import sys
+import time
 
 from toollog import emit, finite_number, VOLUME_THREAD_ID
 
@@ -48,6 +50,12 @@ BOOL_OPTIONS = {
 SHORT_BOOL = {'rg': set('nNHuUaisSwxFPlLcqo0zv'), 'fd': set('gHILhipals0uqF'),
               'du': set('aHLPchklmrsx'), 'ncdu': set('xqer012'), 'dust': set('rhfsbPpRt')}
 FIND_FLAGS = set('EHLPXdsx')
+MAX_CANDIDATES = 32
+
+
+def exec_end(args, start):
+    # fd owns everything up to a literal semicolon or the end of argv.
+    return args.index(';', start)+1 if ';' in args[start:] else len(args)
 
 
 def find_paths(args):
@@ -94,7 +102,10 @@ def search_paths(tool, args):
             after_options = True
         elif not after_options and arg.startswith('-') and arg != '-':
             option, equal, value = arg.partition('=')
-            if tool == 'fd' and option in ('--search-path', '--base-directory'):
+            if tool == 'fd' and option in ('-x', '-X', '--exec', '--exec-batch'):
+                i = exec_end(args, i+1)
+                continue
+            elif tool == 'fd' and option in ('--search-path', '--base-directory'):
                 if not equal:
                     if i+1 >= len(args):
                         return None
@@ -117,6 +128,9 @@ def search_paths(tool, args):
                 # Walk bundles so -nrVALUE and -nePATTERN retain correct arity.
                 for offset, flag in enumerate(arg[1:], 1):
                     short = '-'+flag
+                    if tool == 'fd' and flag in ('x', 'X'):
+                        i = exec_end(args, i+1)-1
+                        break
                     if tool == 'rg' and short in ('-e', '-f'):
                         explicit_pattern = True
                         i += offset == len(arg)-1
@@ -144,15 +158,11 @@ def search_paths(tool, args):
     return [os.path.join(base, p) for p in paths] if base is not None else paths
 
 
-def thread_identity(proc):
+def thread_identity(proc, words):
     """Only t3ctl's identity operand is evidence; inline shell/query text isn't."""
-    try:
-        words = shlex.split(proc.get('args', ''))
-    except ValueError:
-        return None
     if not words:
         return None
-    name = Path(proc.get('comm', '')).name
+    name = proc.get('tool') or Path(proc.get('comm', '')).name
     if name in ('node', 'bun') and len(words) > 1 and Path(words[1]).name == 't3ctl.mjs':
         words = words[1:]
     elif name != 't3ctl':
@@ -209,30 +219,64 @@ def cwd_snapshot(pids, run):
         return {}
 
 
+def argv_snapshot(rows, run):
+    command = [sys.executable, '-I', str(Path(__file__).with_name('process_argv.py')),
+               *[str(p['pid']) for p in rows]]
+    try:
+        result = run(command, capture_output=True, text=True, timeout=2)
+        if result.returncode or len(result.stdout) > 1048576:
+            return {}
+        values = json.loads(result.stdout)
+        found = {}
+        for proc in rows:
+            value = values.get(str(proc['pid'])) if isinstance(values, dict) else None
+            if not isinstance(value, dict):
+                continue
+            words = value.get('argv')
+            start = int(time.mktime(time.strptime(proc['start'], '%a %b %d %H:%M:%S %Y')))
+            if (value.get('startS') == start and value.get('ppid') == proc['ppid']
+                    and value.get('uid') == proc['uid']
+                    and isinstance(value.get('executable'), str)
+                    and Path(value['executable']).name == (proc.get('tool') or Path(proc['comm']).name)
+                    and isinstance(words, list) and 1 <= len(words) <= 4096
+                    and all(isinstance(w, str) and '\0' not in w for w in words)):
+                found[proc['pid']] = value
+        return found
+    except (OSError, UnicodeError, ValueError, OverflowError, subprocess.TimeoutExpired):
+        return {}
+
+
 def volume_crawls(rows, previous, now, run, home=None):
     home = str(Path.home()) if home is None else home
     candidates = []
     by_pid = {p['pid']: p for p in rows}
     for proc in rows:
-        tool = Path(proc.get('comm', '')).name
+        tool = proc.get('tool') or Path(proc.get('comm', '')).name
         # ps's exiting rows have reset counters/argv and cannot be attributed.
-        if tool not in TOOLS or proc['state'].startswith('?') or not proc.get('args'):
+        if tool not in TOOLS or proc['state'].startswith('?'):
             continue
         if proc['elapsedS'] >= 30:
             candidates.append(proc)
     if not candidates:
         return
+    # Rotate a bounded batch under a process storm so later PIDs get a turn.
+    offset = (int(now)//60*MAX_CANDIDATES) % len(candidates)
+    candidates = (candidates[offset:]+candidates[:offset])[:MAX_CANDIDATES]
+    selected = {p['pid']: p for p in candidates}
+    for proc in candidates:
+        parent = proc
+        for _ in range(4):
+            parent = by_pid.get(parent['ppid'])
+            if parent is None:
+                break
+            selected[parent['pid']] = parent
+    vectors = argv_snapshot(list(selected.values()), run)
     cwds = cwd_snapshot([p['pid'] for p in candidates], run)
     for proc in candidates:
-        tool = Path(proc['comm']).name
-        try:
-            args = proc['args']
-            # ps does not shell-quote argv. Strip the known executable first so
-            # a binary path containing spaces is not mistaken for operands.
-            tail = args[len(proc['comm']):] if args.startswith(proc['comm']+' ') else None
-            words = shlex.split(tail) if tail is not None else shlex.split(args)[1:]
-        except ValueError:
+        tool = proc.get('tool') or Path(proc['comm']).name
+        if proc['pid'] not in vectors:
             continue
+        words = vectors[proc['pid']]['argv'][1:]
         cwd = cwds.get(proc['pid'])
         operands = search_paths(tool, words)
         if operands is None:
@@ -248,9 +292,9 @@ def volume_crawls(rows, previous, now, run, home=None):
             if parent is None or parent['pid'] in seen:
                 break
             seen.add(parent['pid'])
-            chain.append(dict(pid=parent['pid'], name=Path(parent.get('comm', '')).name))
+            chain.append(dict(pid=parent['pid'], name=parent.get('tool') or Path(parent.get('comm', '')).name))
             if thread_id is None:
-                thread_id = thread_identity(parent)
+                thread_id = thread_identity(parent, vectors.get(parent['pid'], {}).get('argv', []))
         old = previous.get('processes')
         old = old if isinstance(old, dict) else {}
         prior = old.get(str(proc['pid']))
@@ -264,5 +308,5 @@ def volume_crawls(rows, previous, now, run, home=None):
         # Paths only: search patterns, inline expressions and option values are
         # not filesystem attribution data. Paths themselves remain verbatim.
         emit('scan', 'event', 'scan.volume_crawl', props=dict(pid=proc['pid'], ppid=proc['ppid'],
-             parentChain=chain, argv=[proc['comm'], *[p for p in paths if p is not None]],
+             parentChain=chain, argv=[vectors[proc['pid']]['executable'], *[p for p in paths if p is not None]],
              cwd=cwd, elapsedS=proc['elapsedS'], cpuPct=pct, threadId=thread_id))

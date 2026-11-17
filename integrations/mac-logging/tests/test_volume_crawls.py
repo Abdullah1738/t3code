@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -15,17 +16,29 @@ import cpu
 import jobs
 import toollog
 import volume_crawls as scans
+import process_argv
 
 START = 'Mon Nov 16 12:00:00 2026'
 HOME = '/Users/ardud'
 THREAD = 'thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:9f8eac7c-6e27-4c74-afd7-5f97f8e5ae5e'
+VECTORS = {}
+ARGV_READ = scans.argv_snapshot
 
 
-def fixture(command='/usr/bin/rg', args='rg --files /Volumes/ExternalSSD', state='S', age='01:00'):
+def remember(command, args):
+    # String literals are test shorthand only. ps renders the resulting vector
+    # without quoting; the separate kernel fixture preserves its boundaries.
+    words = shlex.split(args) if isinstance(args, str) else args
+    raw = ' '.join(words)
+    VECTORS[command, raw] = words
+    return raw
+
+
+def fixture(command='/usr/bin/rg', args='rg --files /Volumes/ExternalSSD', state='S', age='01:00', tool=None):
     # Exactly the header and fixed-column padding produced by Darwin ps.
     prefix = f'50 20 0:02.00 2048 {state} {START} {age} 501 {command}'
-    offset = 180
-    return ' '*offset+'SCAN_ARGV\n'+prefix.ljust(offset)+args+'\n'
+    tool = Path(command).name.strip('()') if tool is None else tool
+    return ' '*160+'SCAN_TOOL'.ljust(20)+'SCAN_ARGV\n'+prefix.ljust(160)+tool.ljust(20)+remember(command,args)+'\n'
 
 
 class VolumeCrawlTests(unittest.TestCase):
@@ -36,6 +49,12 @@ class VolumeCrawlTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.calls = []
+        VECTORS.clear()
+        read = patch.object(scans,'argv_snapshot',side_effect=lambda rows,run:
+                            {p['pid']:dict(argv=VECTORS[p['comm'],p['args']],executable=p['comm']) for p in rows
+                             if (p['comm'],p['args']) in VECTORS})
+        self.vector_read = read.start()
+        self.addCleanup(read.stop)
 
     def run_lsof(self, argv, **kwargs):
         self.calls.append((argv, kwargs))
@@ -57,8 +76,8 @@ class VolumeCrawlTests(unittest.TestCase):
     def test_root_and_parent_chain_and_cpu_delta(self):
         rows = cpu.parse_ps(fixture())
         for pid, ppid in [(20, 10), (10, 1), (1, 0)]:
-            rows.append(dict(rows[0],pid=pid,ppid=ppid,comm='/bin/zsh',args='zsh'))
-        rows[1].update(comm='/usr/bin/node',args='node /source/t3ctl.mjs wait '+THREAD)
+            rows.append(dict(rows[0],pid=pid,ppid=ppid,comm='/bin/zsh',tool='zsh',args='zsh'))
+        rows[1].update(comm='/usr/bin/node',tool='node',args=remember('/usr/bin/node',['node','/source/t3ctl.mjs','wait',THREAD]))
         previous = dict(at=60,processes={'50':dict(start=START,cpuS=1)})
         scans.volume_crawls(rows, previous, 120, self.run_lsof, HOME)
         event = self.events()[0]
@@ -304,7 +323,7 @@ class VolumeCrawlTests(unittest.TestCase):
         for comm,args,expected in cases:
             with self.subTest(comm=comm,args=args),patch.object(scans,'emit') as emit:
                 rows=cpu.parse_ps(fixture())
-                rows.append(dict(rows[0],pid=20,ppid=1,comm=comm,args=args))
+                rows.append(dict(rows[0],pid=20,ppid=1,comm=comm,tool=Path(comm).name,args=remember(comm,args)))
                 scans.volume_crawls(rows,{},120,self.run_lsof,HOME)
                 self.assertEqual(emit.call_args.kwargs['props']['threadId'],expected)
 
@@ -328,9 +347,201 @@ class VolumeCrawlTests(unittest.TestCase):
                     with self.subTest(prefix=prefix,cwd=cwd),patch.object(scans,'emit') as emit:
                         argv=prefix+['-name','private-query','-exec','echo','/Volumes/Other',';']
                         self.assertEqual(scans.search_paths('find',argv),[root])
-                        text=fixture('/usr/bin/find','find '+shlex.join(argv))
+                        text=fixture('/usr/bin/find',['find',*argv])
                         run=lambda *a,**kw:SimpleNamespace(returncode=0,stdout='p50\nfcwd\nn'+cwd+'\n')
                         scans.volume_crawls(cpu.parse_ps(text),{},120,run,HOME)
                         self.assertEqual(emit.called,hit)
                         if hit:
                             self.assertEqual(emit.call_args.kwargs['props']['argv'],['/usr/bin/find',root])
+
+    def test_unquoted_ps_cannot_supply_argument_boundaries(self):
+        cases=[(['rg','-e','prefix private-value','/Volumes/ExternalSSD'],True),
+               (['rg','-e','prefix /Volumes/ExternalSSD','src/'],False),
+               (['rg','prefix /Volumes/ExternalSSD','src/'],False),
+               (['rg','-eprefix private-value','/Volumes/ExternalSSD'],True),
+               (['rg','--regexp=prefix private-value','/Volumes/ExternalSSD'],True),
+               (['rg','-e',"apostrophe' and back\\slash",'/Volumes/ExternalSSD'],True),
+               (['rg','-e','','/Volumes/ExternalSSD'],True),
+               (['rg','--files','/Volumes/ExternalSSD/a folder'],True)]
+        for words,hit in cases:
+            with self.subTest(words=words),patch.object(scans,'emit') as emit:
+                raw=fixture(args=words)
+                self.assertIn(' '.join(words),raw)
+                run=lambda *a,**kw:SimpleNamespace(returncode=0,stdout='p50\nfcwd\nn/Volumes/ExternalSSD/t3code-fork/repo\n')
+                scans.volume_crawls(cpu.parse_ps(raw),{},120,run,HOME)
+                self.assertEqual(emit.called,hit)
+                if hit:
+                    self.assertEqual(emit.call_args.kwargs['props']['argv'],['/usr/bin/rg',words[-1]])
+        # Identical ps bytes can represent different vectors. With no kernel
+        # vector even a simple-looking explicit root must fail closed.
+        rows=cpu.parse_ps(fixture(args=['rg','-e','prefix private-value','/Volumes/ExternalSSD']))
+        self.vector_read.side_effect=lambda *a,**kw:{}
+        with patch.object(scans,'emit') as emit:
+            scans.volume_crawls(rows,{},120,self.run_lsof,HOME)
+            emit.assert_not_called()
+
+    def test_truncated_comm_uses_kernel_tool_and_executable(self):
+        words=['/opt/homebrew/bin/rg','--files','/Volumes/ExternalSSD']
+        rows=cpu.parse_ps(fixture(command='/opt/homebrew/b',args=words,tool='rg'))
+        self.assertEqual(rows[0]['tool'],'rg')
+        self.vector_read.side_effect=lambda *a,**kw:{50:dict(argv=words,executable=words[0])}
+        with patch.object(scans,'emit') as emit:
+            scans.volume_crawls(rows,{},120,self.run_lsof,HOME)
+            self.assertEqual(emit.call_args.kwargs['props']['argv'],[words[0],words[-1]])
+
+    def test_full_comm_last_preserves_cpu_families_and_hints(self):
+        self.assertTrue(cpu.PS[-1].endswith('comm='))
+        commands=[('/opt/homebrew/Cellar/node/28.0.0/bin/node','node'),
+                  ('/opt/homebrew/Cellar/python@3.15/libexec/bin/python3.15','python'),
+                  ('/opt/homebrew/Cellar/bun/1.5.0/bin/bun','bun'),
+                  ('/Applications/Long App.app/Contents/Frameworks/Long App Helper.app/Contents/MacOS/Long App Helper','Long App Helper')]
+        for command,expected in commands:
+            with self.subTest(command=command):
+                text=f'50 20 0:02.00 2048 S {START} 01:00 501 {command}\n'
+                rows=cpu.parse_ps(text)
+                self.assertEqual(rows[0]['comm'],command)
+                self.assertEqual(rows[0]['family'],expected)
+                previous=dict(at=60,processes={'50':dict(start=START,cpuS=1)})
+                props,state=cpu.deltas(rows,previous,120)
+                self.assertEqual(props['top'][0]['family'],expected)
+                self.assertEqual(props['families'][0]['family'],expected)
+                children,_=cpu.child_snapshot(rows,reader=lambda pid:dict(start=1,ownS=2,childS=0))
+                self.assertEqual(children['50']['family'],expected)
+                calls=[]
+                def run(argv,**kwargs):
+                    calls.append(argv)
+                    return SimpleNamespace(returncode=0,stdout=f'50 {START} {command} /Volumes/ExternalSSD/repo/job.py\n')
+                cpu.hints(props['top'],rows,run)
+                self.assertEqual(bool(calls),expected in ('node','python','bun'))
+                if calls:
+                    self.assertEqual(props['top'][0]['hint'],'repo/job.py')
+
+    def test_fd_execution_clause_class(self):
+        for flag in ('-x','-X','--exec','--exec-batch','-Hx','--exec=echo'):
+            for root,hit in [('/Volumes/ExternalSSD',True),
+                             ('/Volumes/ExternalSSD/repo/src',False)]:
+                for resumed in (False,True):
+                    words=['fd','-H','.',root,flag,'echo','{}','/Volumes/Other','--hidden']
+                    if resumed:
+                        words+=[';','--color','never']
+                    with self.subTest(flag=flag,root=root,resumed=resumed),patch.object(scans,'emit') as emit:
+                        self.assertEqual(scans.search_paths('fd',words[1:]),[root])
+                        scans.volume_crawls(cpu.parse_ps(fixture('/usr/bin/fd',words)),{},120,self.run_lsof,HOME)
+                        self.assertEqual(emit.called,hit)
+                        if hit:
+                            self.assertEqual(emit.call_args.kwargs['props']['argv'],['/usr/bin/fd',root])
+            for root in ('/Volumes/ExternalSSD','src/'):
+                words=['fd',flag,'echo','{}',';','.',root]
+                with self.subTest(flag=flag,resumed_root=root):
+                    self.assertEqual(scans.search_paths('fd',words[1:]),[root])
+
+    def test_bounded_kernel_vector_snapshot_class(self):
+        rows=cpu.parse_ps(fixture())
+        vector=dict(ppid=20,uid=501,startS=int(time.mktime(time.strptime(START,'%a %b %d %H:%M:%S %Y'))),
+                    executable='/usr/bin/rg',argv=['rg','-e','prefix private-value','/Volumes/ExternalSSD'])
+        for changes in ({},{'ppid':99},{'uid':0},{'startS':1},{'executable':'/bin/sh'},
+                        {'argv':['rg','bad\0value']},{'argv':[]}):
+            with self.subTest(changes=changes):
+                calls=[]
+                def run(argv,**kwargs):
+                    calls.append((argv,kwargs))
+                    return SimpleNamespace(returncode=0,stdout=json.dumps({'50':dict(vector,**changes)}))
+                found=ARGV_READ(rows,run)
+                self.assertEqual(bool(found),not changes)
+                if found:
+                    self.assertEqual(found[50]['argv'],vector['argv'])
+                self.assertEqual(calls[0][1]['timeout'],2)
+                self.assertEqual(calls[0][0][1],'-I')
+        for run in (lambda *a,**kw:SimpleNamespace(returncode=1,stdout=''),
+                    lambda *a,**kw:SimpleNamespace(returncode=0,stdout='x'*1048577),
+                    lambda *a,**kw:SimpleNamespace(returncode=0,stdout='bad json'),
+                    lambda *a,**kw:(_ for _ in ()).throw(subprocess.TimeoutExpired('argv',2))):
+            self.assertEqual(ARGV_READ(rows,run),{})
+
+    def test_ps_and_kernel_vector_flow_without_quoted_fixture(self):
+        words=['rg','-e','prefix private-value','/Volumes/ExternalSSD']
+        text=fixture(args=words)
+        start=int(time.mktime(time.strptime(START,'%a %b %d %H:%M:%S %Y')))
+        calls=[]
+        def run(argv,**kwargs):
+            calls.append(argv)
+            if argv==cpu.PS:
+                return SimpleNamespace(returncode=0,stdout=text)
+            if argv[0]=='/usr/sbin/lsof':
+                return SimpleNamespace(returncode=0,stdout='p50\nfcwd\nn/Volumes/ExternalSSD\n')
+            self.assertTrue(argv[2].endswith('/process_argv.py'))
+            return SimpleNamespace(returncode=0,stdout=json.dumps({'50':dict(
+                argv=words,executable='/usr/bin/rg',startS=start,ppid=20,uid=501)}))
+        with patch.object(scans,'argv_snapshot',wraps=ARGV_READ),patch.object(cpu,'hints',return_value=None),patch.object(cpu.os,'getloadavg',return_value=(0,0,0)):
+            cpu.sample(run=run,ticks_read=lambda:(1,2,3,4),children_read=lambda *a,**kw:({},{}),reader_factory=lambda:False)
+        self.assertEqual(len(calls),3)
+        self.assertEqual(calls.count(cpu.PS),1)
+        self.assertEqual(self.events()[0]['props']['argv'],['/usr/bin/rg','/Volumes/ExternalSSD'])
+        self.assertNotIn('private-value',json.dumps(self.events()))
+        self.assertNotIn('private-value',json.dumps(jobs.read_state('cpu')))
+
+
+class KernelArgvTests(unittest.TestCase):
+    def blob(self,argv,executable='/usr/bin/rg'):
+        header=os.fsencode(executable)+b'\0'
+        header+=b'\0'*((-len(header))%8)
+        return (len(argv).to_bytes(4,sys.byteorder,signed=True)+header+
+                b'\0'.join(os.fsencode(a) for a in argv)+b'\0'+b'PRIVATE_ENV=do-not-emit\0')
+
+    def test_nul_vectors_preserve_boundary_class_and_exclude_environment(self):
+        for args in (['rg','-e','prefix private-value','/Volumes/ExternalSSD'],
+                     ['rg','-e',"quote' slash\\",'/Volumes/ExternalSSD/a folder'],
+                     ['rg','-e','','/Volumes/ExternalSSD'],['rg','--files','/Volumes/ExternalSSD/界']):
+            with self.subTest(args=args):
+                executable,words=process_argv.decode_args(self.blob(args))
+                self.assertEqual(executable,'/usr/bin/rg')
+                self.assertEqual(words,args)
+                self.assertNotIn('PRIVATE_ENV',json.dumps(words))
+        for data in (b'',b'\0'*10,(4097).to_bytes(4,sys.byteorder)+b'\0'*30,
+                     self.blob(['rg'])[:17],b'x'*(process_argv.MAX_BYTES+1)):
+            with self.subTest(size=len(data)),self.assertRaises(ValueError):
+                process_argv.decode_args(data)
+
+    def test_leading_empty_argv_class_preserves_environment_boundary(self):
+        # Cross every executable-path alignment with leading, interior and
+        # trailing empty arguments. None may consume the environment sentinel.
+        for length in range(8):
+            executable='/usr/bin/tool'+'x'*length
+            for argv in (['','/Volumes/ExternalSSD'],['','','/Volumes/ExternalSSD'],
+                         [''],['','',''],['du','','/Volumes/ExternalSSD','']):
+                with self.subTest(length=length,argv=argv):
+                    data=self.blob(argv,executable)
+                    exe,words=process_argv.decode_args(data)
+                    self.assertEqual((exe,words),(executable,argv))
+                    identity=lambda pid:(pid,20,501,1234,500)
+                    values=process_argv.collect([50],lambda pid:process_argv.read_process(pid,identity,lambda pid:data))
+                    self.assertNotIn('PRIVATE_ENV',json.dumps(values))
+
+    def test_identity_race_and_read_failure_class(self):
+        identity=(50,20,501,1234,500)
+        for after in (identity,(50,20,501,1235,500),(50,20,501,1234,501),
+                      (50,21,501,1234,500)):
+            with self.subTest(after=after):
+                states=iter([identity,after])
+                if after==identity:
+                    value=process_argv.read_process(50,lambda pid:next(states),lambda pid:self.blob(['rg']))
+                    self.assertEqual(value['argv'],['rg'])
+                else:
+                    with self.assertRaises(ValueError):
+                        process_argv.read_process(50,lambda pid:next(states),lambda pid:self.blob(['rg']))
+        def read(pid):
+            if pid==1:
+                raise PermissionError('denied')
+            if pid==2:
+                raise ProcessLookupError('exited')
+            return dict(argv=['rg','--files','/Volumes/ExternalSSD'])
+        self.assertEqual(set(process_argv.collect([1,2,3],read)),{'3'})
+
+    def test_per_tick_pid_and_output_bounds(self):
+        calls=[]
+        def read(pid):
+            calls.append(pid)
+            return dict(argv=['rg','x'*20000])
+        result=process_argv.collect(list(range(1000)),read)
+        self.assertEqual(len(calls),process_argv.MAX_PIDS)
+        self.assertLessEqual(len(json.dumps(result).encode()),process_argv.MAX_OUTPUT)

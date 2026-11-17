@@ -618,7 +618,7 @@ prune snapshots and send alerts.
 
 ## Volume crawl attribution
 
-The minute CPU snapshot also supplies argv to `scan.volume_crawl` for `du`,
+The minute CPU snapshot selects candidates for `scan.volume_crawl` for `du`,
 `rg`, `find`, `fd`, `ncdu` and `dust` alive for at least 30 seconds. It matches
 filesystem operands resolving to `/`, a volume root, the home directory, or an
 immediate child of ExternalSSD. Implicit operands use cwd; explicit operands
@@ -626,7 +626,17 @@ are resolved before classification. `rg -n foo src/` from a repo cwd is scoped;
 from `/Volumes/ExternalSSD` it names an immediate child and qualifies. A single
 `lsof -a -d cwd -p … -Fn` call has a two-second timeout for all candidates;
 missing cwd still permits attribution from absolute operands. `?` exiting
-processes are skipped. No extra full ps snapshot or environment dump runs.
+processes are skipped. A separate two-second helper reads NUL-delimited
+Darwin `KERN_PROCARGS2` vectors for at most 32 candidates and four ancestors
+each. Candidate batches rotate if there are more. Reads have 256 KiB per-PID
+and 1 MiB total output limits. `proc_pidinfo` identity must match before/after
+the read and the original ps start-second, UID, PPID and executable name.
+Unreadable, changed or oversized vectors skip classification; flattened ps
+text is never reparsed as argv. No extra ps snapshot or environment dump runs.
+The metadata snapshot keeps full `comm` last so Darwin does not truncate the
+existing CPU family labels and interpreter hints. Native reads require LP64;
+the executable path's pointer-aligned boundary locates the first argument,
+preserving leading empty arguments without consuming environment entries.
 
 Records retain PID, PPID, up to four ancestor PID/name pairs, cwd, elapsed
 seconds and CPU percent from matching consecutive process identities (null on
@@ -643,10 +653,11 @@ are bounded. Unknown option arity skips classification instead of guessing
 filesystem operands.
 The existing day cap and retention apply.
 Ncdu import mode is excluded because it reads an inventory rather than crawling.
+Fd execution clauses are excluded through their literal semicolon terminator
+or argv end; fd options and scan roots after a terminator are still parsed.
 
-Darwin ps renders argv without argument boundaries. Quoted fixture operands
-can be parsed, but unquoted paths containing spaces or shell quoting characters
-can remain ambiguous; this event is attribution evidence, never authority to
-kill or throttle a PID. A process may exit between ps and lsof. Missing cwd
+Argument vectors retain spaces, quotes, backslashes and empty operands.
+This event is attribution evidence, never authority to kill or throttle a PID.
+A process may exit between the argv read and lsof. Missing cwd
 prevents classification of relative operands. Crawls shorter than 30 seconds
 or wholly between minute samples are outside this detector's coverage.
