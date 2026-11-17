@@ -266,6 +266,22 @@ export const makeAccumulator = () => ({
   mcpCodes: new Map<string, Breakdown>(),
   mcpReplyTimeouts: new Map<string, Breakdown>(),
   dbSpans: new Map<string, Breakdown>(),
+  dbStatements: new Map<
+    string,
+    {
+      database: string;
+      connection: string;
+      lane: string;
+      fingerprint: string;
+      family: string;
+      calls: number;
+      totalMs: number;
+      maxMs: number;
+      returnedRows: number;
+      failures: number;
+    }
+  >(),
+  processDiskRead: { readBytes: 0, sampleMs: 0, samples: 0, unavailableSamples: 0 },
   rpcs: new Map<string, Durations & { totalWaitMs: number; outcomes: Map<string, number> }>(),
   longTasks: new Map<
     string,
@@ -651,6 +667,55 @@ export function accumulate(
       },
       event,
     );
+  }
+
+  if (event.kind === "db.statement.summary") {
+    const props = event.props;
+    if (props?.count !== undefined && props.totalMs !== undefined && props.maxMs !== undefined) {
+      const labels = {
+        database: props.database ?? "unknown",
+        connection: props.connection ?? "unknown",
+        lane: props.lane ?? "unknown",
+        fingerprint: props.sqlFingerprint ?? "unknown",
+        family: props.key ?? "unknown",
+      };
+      const identity = JSON.stringify(labels);
+      const key =
+        target.dbStatements.has(identity) || target.dbStatements.size < 512 ? identity : OTHER;
+      let row = target.dbStatements.get(key);
+      if (!row) {
+        row = {
+          ...(key === OTHER
+            ? {
+                database: "other",
+                connection: "other",
+                lane: "other",
+                fingerprint: "other",
+                family: "other",
+              }
+            : labels),
+          calls: 0,
+          totalMs: 0,
+          maxMs: 0,
+          returnedRows: 0,
+          failures: 0,
+        };
+        target.dbStatements.set(key, row);
+      }
+      row.calls += props.count;
+      row.totalMs += props.totalMs;
+      row.maxMs = Math.max(row.maxMs, props.maxMs);
+      row.returnedRows += props.resultCount ?? 0;
+      row.failures += props.failures ?? 0;
+    }
+  }
+  if (event.kind === "db.process.disk_read") {
+    const props = event.props;
+    if (props?.readBytes !== undefined && props.sampleMs !== undefined) {
+      target.processDiskRead.readBytes += props.readBytes;
+      target.processDiskRead.sampleMs += props.sampleMs;
+      target.processDiskRead.samples++;
+    } else target.processDiskRead.unavailableSamples++;
   }
 
   if (event.kind === "performance.long-task-summary") {
@@ -1074,6 +1139,8 @@ export function finishRollup(
         ...context,
       })),
     ),
+    dbStatementFamilies: [...target.dbStatements.values()].sort((a, b) => b.totalMs - a.totalMs),
+    processDiskRead: { ...target.processDiskRead },
     dbSlowBySpan: finishBreakdown(target.dbSpans).map((row) => ({
       span: String(row.labels.span),
       key: String(row.labels.key),

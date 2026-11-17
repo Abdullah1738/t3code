@@ -7217,12 +7217,27 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ),
             );
             if (starting.stopped) return yield* Effect.interrupt;
-            yield* registerRootTurn({
-              turnInput,
-              nativeTurnId: started.turn.id,
-              startedAt: codexTimestamp(started.turn.startedAt),
-              waitForNativeStart: started.turn.startedAt === null,
-            });
+            yield* turnTerminalizationPermit.withPermits(1)(
+              Effect.gen(function* () {
+                // turn/started can announce and finish a turn before this reply.
+                // Keep the terminal fence atomic with registration and finalization.
+                if (
+                  endedProviderTurns.has(
+                    idAllocator.derive.providerTurn({
+                      driver: CODEX_PROVIDER,
+                      nativeTurnId: started.turn.id,
+                    }),
+                  )
+                )
+                  return;
+                yield* registerRootTurn({
+                  turnInput,
+                  nativeTurnId: started.turn.id,
+                  startedAt: codexTimestamp(started.turn.startedAt),
+                  waitForNativeStart: started.turn.startedAt === null,
+                });
+              }),
+            );
           },
           (effect, turnInput) =>
             effect.pipe(Effect.ensuring(clearNativeTurnStart(turnInput).pipe(Effect.ignore))),

@@ -127,6 +127,12 @@ export function cardEvents(
       kind: label(ask.kind ?? "question"),
       blocking: ask.blocking,
       createdAt: ask.at,
+      ...(ask.timing?.openAsksAtCreation === undefined
+        ? {}
+        : { openAsksAtCreation: ask.timing.openAsksAtCreation }),
+      ...(ask.timing?.openNoticesAtCreation === undefined
+        ? {}
+        : { openNoticesAtCreation: ask.timing.openNoticesAtCreation }),
     };
     if (ask.closedAt === null && (!old || old.closedAt !== null))
       events.push({ ...common, kind: "kanban.ask_opened", props });

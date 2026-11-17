@@ -2200,9 +2200,29 @@ it.effect(
         card: quiet.number,
         reason: "pool_full",
       });
-      assert.deepEqual(activity.stages.queued.items[0]?.held, [
-        { card: busy.number, role: "work" },
-      ]);
+      const holders = (
+        rollup.structured.activity as {
+          holders: {
+            items: Array<{
+              holders: Array<{
+                card: number;
+                role: string;
+                stage: string;
+                openStep: string;
+                turn: string;
+              }>;
+            }>;
+          };
+        }
+      ).holders;
+      assert.deepEqual(activity.stages.queued.items[0]?.held, holders.items[0]?.holders);
+      assert.deepInclude(holders.items[0]?.holders[0], {
+        card: busy.number,
+        role: "work",
+        stage: "working",
+        openStep: "none",
+        turn: "unknown",
+      });
       assert.strictEqual(activity.boardId, board.id);
       assert.strictEqual(activity.cards.active, 1);
       assert.strictEqual(activity.asks.answered, 1);
@@ -6478,6 +6498,8 @@ it.effect.each(["card_move", "card_review_result"] as const)(
         yield* kanban.postToCard(card.id, owner, [{ _tag: "md", text: "Prepare the handoff" }]);
         yield* kanban.dispatchNow;
         const worker = (yield* kanban.card(card.id)).card.workThreadId!;
+        // Keep the worker active so completing its last subtask does not auto-advance it.
+        if (tool === "card_move") fake.running.add(worker);
         yield* kanban.markSubtask(
           card.id,
           "s1",
@@ -6513,6 +6535,8 @@ it.effect.each(["card_move", "card_review_result"] as const)(
             yield* Deferred.await(resume);
           });
         warnings.length = 0;
+        if (tool === "card_move")
+          assert.strictEqual((yield* kanban.card(card.id)).card.stage, "working");
         const request = yield* call(
           caller,
           tool,
@@ -6520,7 +6544,14 @@ it.effect.each(["card_move", "card_review_result"] as const)(
             ? { card: card.id, to: "needs_review", note: "Saved race" }
             : { verdict: "clear", head: "27a1b1e0" },
         ).pipe(Effect.forkChild);
-        yield* Deferred.await(held);
+        yield* Deferred.await(held).pipe(
+          Effect.timeout("5 seconds"),
+          Effect.catchTags({
+            TimeoutError: () =>
+              Effect.die(new Error(`${tool}: missing saved event or no post-commit thread read`)),
+          }),
+          TestClock.withLive,
+        );
         yield* kanban.updateBoard(board.id, { name: "Changed concurrently" });
         yield* Deferred.succeed(resume, undefined);
         const result = yield* Fiber.join(request);
@@ -11656,3 +11687,58 @@ it.effect.each(["legacy review", "legacy todo", "saved timeout", "saved error"] 
       }).pipe(Effect.provide(fake.layer.pipe(Layer.provide(sink))));
     }),
 );
+
+it.effect("board_activity explains detached cards using the already loaded board pause", () => {
+  const { layer, running } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const store = yield* KanbanStore.KanbanStore;
+    const board = yield* kanban.ensureBoard({
+      slug: "activity-reasons",
+      name: "Activity",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const work = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(work.id)).card.activeThreadId!;
+    running.add(worker);
+    const parked = yield* kanban.createCard(board.id, { prompt: "Parked" }, owner);
+    yield* store.putCard({ ...parked, stage: "working", activeThreadId: null });
+    yield* store.addCardEvent({
+      cardId: parked.id,
+      at: parked.movedAt,
+      actor: owner,
+      kind: "moved",
+      fromStage: "todo",
+      toStage: "working",
+      body: null,
+      head: null,
+    });
+    yield* store.putBoard({
+      ...board,
+      pause: { reason: "Hold", keep: [work.id], at: board.createdAt, by: "owner" },
+    });
+    yield* TestClock.adjust(Duration.minutes(1));
+    const response = yield* call(worker, "board_activity", {});
+    assert.isFalse(response.isError, response.text);
+    const activity = response.structured.activity as {
+      stages: {
+        withoutThread: {
+          count: number;
+          byReason: Record<string, number>;
+          none: { count: number };
+          items: Array<{ card: number; reason: string; hours: number }>;
+        };
+      };
+    };
+    assert.strictEqual(activity.stages.withoutThread.count, 1);
+    assert.deepEqual(activity.stages.withoutThread.byReason, { paused: 1 });
+    assert.strictEqual(activity.stages.withoutThread.none.count, 0);
+    assert.deepEqual(
+      activity.stages.withoutThread.items.map(({ card, reason }) => ({ card, reason })),
+      [{ card: parked.number, reason: "paused" }],
+    );
+    assert.isAtLeast(activity.stages.withoutThread.items[0]!.hours, 0);
+  }).pipe(Effect.provide(layer));
+});

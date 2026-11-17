@@ -27,6 +27,7 @@ DELEGATION_REASONS = {'NO_STANDING_DELEGATION', 'DUPLICATE_DELEGATED_RECORD',
     'BUS_REQUEST_STALE', 'BUS_UNREADABLE', 'INVALID_LIFETIME', 'UNSUPPORTED_DELEGATION',
     'DELEGATED_RECORD_INVALID'}
 _NAMES = {
+    'record.refused',
     'delegate.created', 'delegate.revoked', 'delegated_record.created', 'delegated_record.refused',
     'moni_go.bus_checked', 'moni_go.bus_refused',
     'cmd.start', 'cmd.end', 'cmd.error', 'guard.refused', 'payment.may_have_sent',
@@ -38,13 +39,13 @@ _NAMES = {
     'case.open', 'case.update', 'case.close', 'case.reopen', 'case.corroborate',
     'question.ask', 'check.run', 'cache_reset', 'marketplace.refresh',
     'order_watch.item_drop_check', 'order_watch.can_report',
-    'collector.hold_seen', 'collector.hold_stale', 'collector.hold_cleared', 'collector.hold_alert_sent',
+    'collector.hold_seen', 'collector.hold_cleared',
 }
 _ENUMS = {
     'route': {'cdp', 'phone', 'unspecified'},
     'field': {'card_name', 'card_number', 'card_expiry', 'card_cvc'},
     'cardNickname': {'Marriott', 'MashreqNoon', 'Skywards', 'Mashreq'},
-    'reason': DELEGATION_REASONS,
+    'reason': DELEGATION_REASONS | {'expired_at_write'},
     'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage'},
     'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
@@ -609,7 +610,7 @@ def _fields(props):
                            and math.isfinite(v) and 0 <= v <= 10**12}
         elif key in {'consecutive_failures', 'poll_interval_s'} and type(value) is int and 0 <= value <= 10**12:
             result[key] = value
-        elif key == 'last_success_at' and (value is None or (type(value) is str and re.fullmatch(
+        elif key in {'at', 'expiresAt', 'last_success_at'} and (value is None or (type(value) is str and re.fullmatch(
                 r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})', value))):
             result[key] = value
         elif key in {'baseline_count', 'row_count', 'absent_count', 'emitted_count'} and type(value) is int and 0 <= value <= 10**9:
@@ -628,7 +629,7 @@ def _ids(values):
     # Hash even syntactically valid IDs: input IDs can themselves contain a PAN/OTP.
     return {key: hashlib.sha256(str(value).encode()).hexdigest()[:16]
             for key, value in (values or {}).items()
-            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher', 'vendorId', 'cardId'} and type(value) in (str, int) and value != ''}
+            if key in {'flowId', 'orderId', 'caseId', 'requestId', 'delegationId', 'watcher', 'vendorId', 'itemId', 'cardId'} and type(value) in (str, int) and value != ''}
 
 
 def _noon_lane(order):
@@ -676,14 +677,20 @@ def emit(component, name, *, kind='event', duration_ms=None, ok=None, ids=None, 
                 # Run triggers are constructed here, never accepted from props.
                 row['props'].update(_caller_fields(props.get('caller'), props.get('trigger')))
             if component == 'order-watch' and name.startswith('collector.hold_'):
+                age = props.get('age_s')
+                comm = props.get('agent_comm')
                 row['props'] = {
-                    'owner': props.get('owner')[:120] if type(props.get('owner')) is str else None,
-                    'reason': props.get('reason') if props.get('reason') in {
-                        'hold_older_than_60m', 'lease_expired', 'holder_pid_dead', 'lease_live',
-                        'no_matching_lease_within_bound', 'hold_absent'} else None,
-                    'age_s': props.get('age_s') if type(props.get('age_s')) is int
-                             and props['age_s'] >= 0 else None,
+                    'age_s': age if type(age) in (int, float) and math.isfinite(age) and age >= 0 else None,
+                    'holder_alive': props.get('holder_alive') if type(props.get('holder_alive')) is bool else None,
+                    'agent_comm': comm if isinstance(comm, str) and re.fullmatch(r'[A-Za-z0-9_.+-]{1,80}', comm) else None,
                 }
+                failure = props.get('error')
+                if isinstance(failure, str) and (failure in {
+                        'ph timed out', 'invalid ph status', 'FileNotFoundError', 'PermissionError',
+                        'OSError', 'IsADirectoryError', 'NotADirectoryError', 'JSONDecodeError',
+                        'UnicodeDecodeError', 'ValueError', 'UnicodeError'}
+                        or re.fullmatch(r'ph exited -?[0-9]{1,3}', failure)):
+                    row['props']['error'] = failure
         if error is not None:
             code = tag(error)
             detail = cause or context.get('failure') or context.get('last') or _cause(error)

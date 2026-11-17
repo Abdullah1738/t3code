@@ -2796,6 +2796,92 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       };
     });
 
+  it.effect.each(
+    (["completed", "failed", "interrupted"] as const).flatMap((status) =>
+      (["before-terminal", "after-terminal"] as const).map((reply) => [status, reply] as const),
+    ),
+  )("keeps an announced turn terminal after its start reply (%s, %s)", ([status, reply]) =>
+    Effect.gen(function* () {
+      const nativeThreadId = "late-reply-thread";
+      const nativeTurnId = "late-reply-turn";
+      const prompt = "Work the card.";
+      const registered = yield* Deferred.make<void>();
+      const preamble = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt });
+      const startReply = preamble[6]!;
+      if (startReply.type !== "emit_inbound") throw new Error("Missing replay start reply");
+      const harness = yield* makeCodexReplayHarness(
+        makeCodexReplayTranscript({
+          scenario: `late-start-reply-${status}-${reply}`,
+          entries: [
+            ...preamble.slice(0, -2),
+            preamble[7]!,
+            ...(status === "interrupted"
+              ? [
+                  {
+                    type: "expect_outbound" as const,
+                    frame: {
+                      id: 4,
+                      method: "turn/interrupt",
+                      params: { threadId: nativeThreadId, turnId: nativeTurnId },
+                    },
+                  },
+                  { type: "emit_inbound" as const, frame: { id: 4, result: {} } },
+                ]
+              : []),
+            ...(reply === "before-terminal" ? [startReply] : []),
+            {
+              type: "emit_inbound",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status }),
+                },
+              },
+            },
+            ...(reply === "after-terminal" ? [{ ...startReply, afterMs: 1000 }] : []),
+          ],
+        }),
+        (event) =>
+          event.type === "provider_turn.updated" && event.providerTurn.status === "running"
+            ? Deferred.succeed(registered, undefined)
+            : Effect.void,
+      );
+      const start = yield* harness.runtime
+        .startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("late-start-reply"),
+            text: prompt,
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(registered);
+      const providerTurnId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+        driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+        nativeTurnId,
+      });
+      const stopInput = { providerThread: harness.providerThread, providerTurnId };
+      if (status === "interrupted") yield* harness.runtime.interruptTurn(stopInput);
+      yield* harness.firstTerminal;
+      if (reply === "after-terminal") yield* TestClock.adjust("1 second");
+      yield* Fiber.join(start);
+      // A late reply must also leave Stop idempotent: no active context or second RPC.
+      yield* harness.runtime.interruptTurn(stopInput);
+      const statuses = harness.events.flatMap((event) =>
+        event.type === "provider_turn.updated" ? [event.providerTurn.status] : [],
+      );
+      assert.deepEqual(statuses, ["running", status]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   it.effect.each(["supported", "unsupported", "invalid"] as const)(
     "delivers native history with %s app-server protocol",
     (response) =>

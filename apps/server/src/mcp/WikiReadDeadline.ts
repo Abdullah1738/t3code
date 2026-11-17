@@ -1,24 +1,9 @@
 import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
-import * as Schema from "effect/Schema";
-import * as Option from "effect/Option";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
-import { McpSchema } from "effect/ai";
 import { McpCall } from "../ardud/analytics/McpCall.ts";
 import * as WikiReadTiming from "../ardud/analytics/WikiReadTiming.ts";
-import * as McpDeadline from "./McpDeadline.ts";
-
-export class WikiReadTimeoutError extends Schema.TaggedError<WikiReadTimeoutError>()(
-  "WikiReadTimeoutError",
-  {
-    phase: Schema.String,
-    waitedMs: Schema.Number,
-  },
-) {
-  override get message(): string {
-    return `wiki_read timed out during ${this.phase}. Retry the same read.`;
-  }
-}
+import * as BoundedReadDeadline from "./BoundedReadDeadline.ts";
 
 export const withDeadline = Effect.fn("WikiReadDeadline.bound")(function* <A, E, R>(
   operation: Effect.Effect<A, E, R>,
@@ -70,12 +55,17 @@ export const withDeadline = Effect.fn("WikiReadDeadline.bound")(function* <A, E,
       const previous = phase;
       phase = next;
       if (next === "caller") callerStarted = elapsed();
-      return (succeeded) => {
+      return ({ succeeded, resolved }) => {
         if (closed) return;
+        // An interrupted step must retain its phase before outer scopes unwind.
+        if (!succeeded) {
+          freeze();
+          return;
+        }
         account();
         if (next === "caller" && state !== undefined && callerStarted !== undefined) {
           state.callerResolveMs += elapsed() - callerStarted;
-          state.callerResolved = succeeded;
+          state.callerResolved = resolved;
           callerStarted = undefined;
         }
         phase = previous;
@@ -112,36 +102,10 @@ export const withDeadline = Effect.fn("WikiReadDeadline.bound")(function* <A, E,
       parentStatement?.(sample);
     }),
   );
-  // Freeze before cancelling the waiter; interruption unwinds phase scopes.
-  const timer = Effect.sleep("20 seconds").pipe(
-    Effect.tap(() => Effect.sync(freeze)),
-    Effect.as(Option.none()),
-  );
-  const expired = Effect.fn("WikiReadDeadline.expired")(() =>
-    Effect.sync(() => {
-      const error = new WikiReadTimeoutError({ phase, waitedMs: elapsed() });
-      if (state !== undefined) {
-        state.handlerErrorTag = error._tag;
-        state.handlerOutcome = "timeout";
-        state.phase =
-          phase === "admission" ? "lane_wait" : phase === "caller" ? "caller" : "handler";
-      }
-      return new McpSchema.CallToolResult({
-        isError: true,
-        content: [{ type: "text", text: error.message }],
-        structuredContent: {
-          _tag: error._tag,
-          message: error.message,
-          phase: error.phase,
-          waitedMs: error.waitedMs,
-          retryable: true,
-        },
-      });
-    }),
-  );
-  const result = yield* McpDeadline.awaitInterruptibly(work).pipe(
-    Effect.asSome,
-    Effect.raceFirst(timer),
+  return yield* BoundedReadDeadline.withDeadline(work, () => {
+    freeze();
+    return { phase, waitedMs: elapsed() };
+  }).pipe(
     Effect.ensuring(
       Effect.suspend(() => {
         freeze();
@@ -151,6 +115,4 @@ export const withDeadline = Effect.fn("WikiReadDeadline.bound")(function* <A, E,
       }),
     ),
   );
-  if (Option.isSome(result)) return result.value;
-  return yield* expired();
 });

@@ -309,7 +309,7 @@ finally:
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertEqual(result.stdout, '')
                 self.assertEqual(result.stderr, 'genimg: route=9router cx/gpt-image-2; ' + message.rstrip() + '\n')
-                row = self.rows()[-1]
+                row = [row for row in self.rows() if row['name'] == 'img.result'][-1]
                 self.assertEqual(row['name'], 'img.result')
                 self.assertIs(row['ok'], False)
                 self.assertEqual(row['error'], {'tag': tag, 'message': tag})
@@ -325,7 +325,7 @@ finally:
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertEqual(result.stdout, '')
                 self.assertEqual(result.stderr, 'genimg: route=9router cx/gpt-image-2; error 502: ' + body.decode()[:500] + '\n')
-                self.assertEqual(self.rows()[-1]['error'], {'tag': 'http_502_not_entitled', 'message': 'http_502_not_entitled'})
+                self.assertEqual([row for row in self.rows() if row['name'] == 'img.result'][-1]['error'], {'tag': 'http_502_not_entitled', 'message': 'http_502_not_entitled'})
         log = ''.join(p.read_text() for p in self.root.glob('*.ndjson'))
         self.assertNotIn('SECRETBODY', log)
         self.assertNotIn('private prompt', log)
@@ -337,10 +337,12 @@ finally:
         self.assertEqual(result.stderr, 'genimg: route=9router cx/gpt-image-2\n')
         self.assertEqual(result.stdout, str(path) + '\n')
         self.assertEqual(path.read_bytes(), b'hello')
-        rows = self.rows()
+        all_rows = self.rows()
+        rows = [row for row in all_rows if row['component'] == 'image']
         self.assertEqual([r['name'] for r in rows], ['img.request', 'img.result', 'img.write'])
         self.assertTrue(all(r['ok'] for r in rows[1:]))
-        self.assertNotIn('private prompt', json.dumps(rows))
+        self.assertNotIn('private prompt', json.dumps(all_rows))
+        self.assertEqual([row['name'] for row in all_rows if row['component'] == 'logger'], ['log.volume'])
 
     def test_image_write_paths(self):
         args = ['genimg', 'private prompt', str(Path(self.tmp.name)/'out.png'), '--route', '9router']

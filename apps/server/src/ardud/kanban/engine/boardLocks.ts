@@ -73,6 +73,7 @@ interface Operation {
   boardId: string | undefined;
   waiting: { readonly target: WaitingOn; readonly started: number } | undefined;
   stale: boolean;
+  readonly staleFences: Array<string>;
   committed: boolean;
   sideEffect: boolean;
   readonly dependencies: Map<string, Map<string, number>>;
@@ -124,6 +125,10 @@ const readHoldBudgetMs = Context.Reference<number | undefined>("KanbanBoardReadH
 export const admissionObserver = Context.Reference<
   (detail: Effect.Effect<string>, fiberId: number) => () => void
 >("KanbanBoardAdmissionObserver", { defaultValue: () => () => () => {} });
+export const staleObserver = Context.Reference<
+  (detail: { readonly reruns: number; readonly fences: ReadonlyArray<string> }) => void
+>("KanbanBoardStaleObserver", { defaultValue: () => () => {} });
+
 const DISPATCH_READ_HOLD_MS = 2_000;
 
 export const MAY_HAVE_APPLIED =
@@ -200,15 +205,20 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
       ? `${parent?._tag === "Span" ? parent.name : nearest.name} (${nearest.attributes.get("serial.queue") ?? "serial"})`
       : nearest.name;
   });
+  const holdSteps = new Map<number, SavedWrite.SubStepCollection>();
+  const holderAt = (holder: Holder, now: number) => ({
+    ...holder,
+    cardId: holder.cardId ?? null,
+    heldForMs: Math.max(0, now - holder.acquiredAtMs),
+    ...(now - holder.acquiredAtMs >= LONG_HOLD_MS && holdSteps.has(holder.fiberId)
+      ? { subSteps: holdSteps.get(holder.fiberId)!.snapshot() }
+      : {}),
+  });
   const holdersAt = (now: number) =>
     [
       ...[...boards.values()].flatMap((board) => [...board.holders.values()]),
       ...[...migrationHolders.values()].filter((holder) => holder.mode === "exclusive"),
-    ].map((holder) => ({
-      ...holder,
-      cardId: holder.cardId ?? null,
-      heldForMs: Math.max(0, now - holder.acquiredAtMs),
-    }));
+    ].map((holder) => holderAt(holder, now));
   const waitingOn = (boardId: string, lock: Holder["lock"], cardId?: string) => ({
     boardId,
     lock,
@@ -222,11 +232,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
             holder.lock === target.lock &&
             (target.lock !== "card" || holder.cardId === target.cardId),
         )
-    ).map((holder) => ({
-      ...holder,
-      cardId: holder.cardId ?? null,
-      heldForMs: Math.max(0, now - holder.acquiredAtMs),
-    }));
+    ).map((holder) => holderAt(holder, now));
   const recordHold = Effect.fnUntraced(function* (
     holder: Holder,
     waiters: number,
@@ -515,8 +521,10 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           const finish = primary
             ? (yield* SavedWrite.subStepObserver)?.hold(op.fiberId)
             : undefined;
+          if (finish) holdSteps.set(op.fiberId, finish);
           return primary
             ? Effect.suspend(() => recordHold(holder, board.waiters, finish)).pipe(
+                Effect.ensuring(Effect.sync(() => holdSteps.delete(op.fiberId))),
                 Effect.andThen(release),
               )
             : release;
@@ -603,9 +611,16 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         const expected = seen.get(boardId);
         const scoped = op.scopes.get(boardId);
         if (scoped || !reconcile) {
-          if (!scoped && expected !== undefined && expected !== version(held)) op.stale = true;
+          if (!scoped && expected !== undefined && expected !== version(held)) {
+            op.stale = true;
+            op.staleFences.push(`board:${boardId}:${expected}->${version(held)}`);
+          }
           for (const [key, value] of op.dependencies.get(boardId) ?? []) {
-            if ((board.resources.get(key) ?? 0) !== value) op.stale = true;
+            const actual = board.resources.get(key) ?? 0;
+            if (actual !== value) {
+              op.stale = true;
+              op.staleFences.push(`resource:${key}:${value}->${actual}`);
+            }
           }
         } else {
           // The explicit continuation validates its inputs under this new snapshot.
@@ -642,6 +657,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           boardId: undefined,
           waiting: undefined,
           stale: false,
+          staleFences: [],
           committed: false,
           sideEffect: false,
           dependencies: new Map(),
@@ -686,21 +702,30 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
               ),
             ),
           ),
-          Effect.catchCause((cause) => {
-            const defect = cause.reasons.find((reason) => reason._tag === "Die")?.defect;
-            return defect instanceof BoardStateChanged &&
-              !(defect instanceof BoardReadBudgetExceeded) &&
-              !defect.committed &&
-              !op.committed &&
-              !op.sideEffect &&
-              attempt < policy.reruns
-              ? restore(
-                  policy.backoffMs > 0
-                    ? Effect.sleep(policy.backoffMs * 2 ** attempt)
-                    : Effect.void,
-                ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy, op.label)))
-              : Effect.failCause(cause);
-          }),
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              const defect = cause.reasons.find((reason) => reason._tag === "Die")?.defect;
+              const canRetry =
+                defect instanceof BoardStateChanged &&
+                !(defect instanceof BoardReadBudgetExceeded) &&
+                !defect.committed &&
+                !op.committed &&
+                !op.sideEffect &&
+                attempt < policy.reruns;
+              if (defect instanceof BoardStateChanged)
+                (yield* staleObserver)({
+                  reruns: attempt + (canRetry ? 1 : 0),
+                  fences: op.staleFences,
+                });
+              return yield* canRetry
+                ? restore(
+                    policy.backoffMs > 0
+                      ? Effect.sleep(policy.backoffMs * 2 ** attempt)
+                      : Effect.void,
+                  ).pipe(Effect.andThen(run(effect, cardId, attempt + 1, replay, policy, op.label)))
+                : Effect.failCause(cause);
+            }),
+          ),
           Effect.ensuring(Effect.sync(() => stopObserving?.())),
         );
       }),
@@ -962,9 +987,14 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     // Only the metadata persistence is marked; publication and its follow-ups keep normal conflicts.
     dispatchMetadata: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(Effect.provideService(dispatchMetadata, true)),
-    step: <A, E, R>(effect: Effect.Effect<A, E, R>, cardId?: string, operationLabel?: string) =>
+    step: <A, E, R>(
+      effect: Effect.Effect<A, E, R>,
+      cardId?: string,
+      operationLabel?: string,
+      reruns = 2,
+    ) =>
       run(effect, cardId, 0, undefined, undefined, operationLabel).pipe(
-        Effect.provideService(retryPolicy, { reruns: 2, backoffMs: 10 }),
+        Effect.provideService(retryPolicy, { reruns, backoffMs: 10 }),
       ),
     access,
     outside,

@@ -5,6 +5,7 @@ import * as McpCallLedger from "../ardud/analytics/McpCallLedger.ts";
 import * as McpResponseDelivery from "../ardud/http/McpResponseDelivery.ts";
 import * as ThreadReadDeadline from "./ThreadReadDeadline.ts";
 import * as WikiReadDeadline from "./WikiReadDeadline.ts";
+import * as BoundedReadDeadline from "./BoundedReadDeadline.ts";
 import * as WikiReadTiming from "../ardud/analytics/WikiReadTiming.ts";
 import * as StartupPhaseLog from "../ardud/observability/StartupPhaseLog.ts";
 import { bootId } from "../ardud/fast-install/report.ts";
@@ -1372,6 +1373,10 @@ const withToolAnalytics =
                         ...callState.requestTiming,
                         ...(totalMs === undefined ? {} : { totalMs }),
                         ...outcome,
+                        ...(callState.boundedRead !== undefined &&
+                        (outcome.outcome === "timeout" || outcome.outcome === "interrupted")
+                          ? callState.boundedRead
+                          : {}),
                         ...(Option.isSome(delivery) ? delivery.value.snapshot() : {}),
                         props: {
                           ...outcome.props,
@@ -1445,6 +1450,7 @@ const withToolAnalytics =
                     const measuredReadTool =
                       LARGE_READ_TOOLS.has(options.tool.name) || options.tool.name === "wiki_read";
                     let phase: "lane" | "readiness" | "handler" = "lane";
+                    const clock = yield* Clock.Clock;
                     let phaseStarted = yield* Clock.monotonicTimeNanos;
                     const readStarted = phaseStarted;
                     const timings = { readinessWaitMs: 0, laneWaitMs: 0, handlerMs: 0 };
@@ -1547,7 +1553,8 @@ const withToolAnalytics =
                               advance("readiness").pipe(
                                 Effect.andThen(
                                   options.tool.name === "t3_thread_read" ||
-                                    options.tool.name === "wiki_read"
+                                    BOARD_READ_TOOLS.has(options.tool.name) ||
+                                    options.tool.name === "list_scheduled_tasks"
                                     ? // Keep the permit outside the detached waiter so masked cleanup
                                       // cannot retain admission after the read deadline or disconnect.
                                       McpDeadline.awaitInterruptibly(call)
@@ -1586,31 +1593,13 @@ const withToolAnalytics =
                         ? ThreadReadDeadline.withDeadline(completed)
                         : options.tool.name === "wiki_read"
                           ? WikiReadDeadline.withDeadline(completed)
-                          : options.tool.name === "list_scheduled_tasks"
-                            ? McpDeadline.awaitInterruptibly(completed).pipe(
-                                Effect.timeoutOrElse({
-                                  duration: "20 seconds",
-                                  orElse: Effect.fn("McpHttpServer.scheduledReadBusy")(
-                                    function* () {
-                                      const now = yield* Clock.monotonicTimeNanos;
-                                      return new McpSchema.CallToolResult({
-                                        isError: true,
-                                        content: [
-                                          {
-                                            type: "text",
-                                            text: "Robob is busy; nothing was read. Retry the same call.",
-                                          },
-                                        ],
-                                        structuredContent: {
-                                          reason: "server_busy",
-                                          phase,
-                                          waitedMs: Number(now - readStarted) / 1e6,
-                                        },
-                                      });
-                                    },
-                                  ),
-                                }),
-                              )
+                          : BOARD_READ_TOOLS.has(options.tool.name) ||
+                              options.tool.name === "list_scheduled_tasks"
+                            ? BoundedReadDeadline.withDeadline(completed, () => ({
+                                phase,
+                                waitedMs:
+                                  Number(clock.monotonicTimeNanosUnsafe() - readStarted) / 1e6,
+                              }))
                             : completed;
                     const protectedRead = SavedBoardReply.TIMED_TOOLS.has(options.tool.name)
                       ? SavedBoardReply.protect(boundedRead, options.tool.name)

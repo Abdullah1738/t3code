@@ -3266,6 +3266,22 @@ export function claudeFailureCategory(input: {
   return "unknown";
 }
 
+function claudeTranscriptErrorCategory(
+  error: ClaudeApiErrorTranscript.ApiErrorCause,
+  hadSuccessfulResponse: boolean,
+): OrchestrationV2ProviderFailureCategory {
+  const category = claudeFailureCategory({
+    apiErrorStatus: error.status,
+    noResponse: ClaudeApiErrorTranscript.isNetworkApiError(error),
+    hadSuccessfulResponse,
+    text: error.formatted,
+  });
+  return category === "transient" &&
+    !ClaudeApiErrorTranscript.isTransientApiError(error, hadSuccessfulResponse)
+    ? "unknown"
+    : category;
+}
+
 function providerFailureFromResult(
   message: SDKResultMessage,
   completedAt: DateTime.Utc,
@@ -3586,6 +3602,8 @@ interface ActiveClaudeTurnContext {
   compaction: Extract<OrchestrationV2TurnItem, { type: "compaction" }> | null;
   compactionWatchdogStop: Deferred.Deferred<void> | null;
   lastSdkMessageAt: number;
+  readonly retryHealth: { since: number; frames: number; seenResponse: boolean; retrying: boolean };
+
   readonly ignoredTaskIds: Set<string>;
   readonly announcedUsageLimits: Set<string>;
   authenticationFailureMessage: string | undefined;
@@ -3594,6 +3612,12 @@ interface ActiveClaudeTurnContext {
   sessionRefused: boolean | undefined;
   realApiStatus: number | null | undefined;
   latestApiFailure: OrchestrationV2ProviderFailure | undefined;
+  // Synthetic model errors may wrap a native failure that is not readable yet.
+  latestApiFailureSynthetic: boolean;
+  // Cause classification survives a failed transcript read; access routing needs the latest frame.
+  latestApiFailureStatus: number | null | undefined;
+  // Cause display can advance while unrecovered permanent evidence still forbids replay.
+  retryRecoveryBlocked: boolean;
   // Latest root API error, cleared when an error-free root assistant response recovers.
   latestApiFailureCategory: OrchestrationV2ProviderFailureCategory | undefined;
   /** The CLI refused this turn with no fallback model (model_refusal_no_fallback): a content filter, not a usage limit. */
@@ -3631,6 +3655,23 @@ interface ActiveClaudeTurnContext {
   nativeWakeStarted: boolean;
   gatedFramesBeforeEcho: number;
   readonly heldRootFrames: Array<SDKMessage>;
+}
+
+function claudeAccessEvidence(
+  context: ActiveClaudeTurnContext,
+  status: number | null,
+  category: OrchestrationV2ProviderFailureCategory | undefined,
+) {
+  const refused =
+    context.sessionRefused === true ||
+    context.refusalMessage !== undefined ||
+    category === "content_filter";
+  return {
+    status,
+    beforeResponse: !context.responseReceived,
+    refusalFree: context.sessionRefused === false && !refused,
+    refused,
+  };
 }
 
 interface ActiveClaudeProviderRetry {
@@ -4535,6 +4576,27 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 ? {}
                 : { promptAcceptedAt: context.promptAcceptedAt }),
             },
+          });
+        });
+
+        const readTurnApiError = Effect.fn("ClaudeAdapterV2.readTurnApiError")(function* (
+          context: ActiveClaudeTurnContext,
+          since: number,
+        ) {
+          const configured = adapterOptions.environment.CLAUDE_CONFIG_DIR?.trim();
+          const configDir = configured
+            ? path.resolve(session.cwd, configured)
+            : path.join(yield* HostProcess.HomeDirectory, ".claude");
+          return yield* ClaudeApiErrorTranscript.readLastApiError({
+            configDir,
+            filePath: path.join(
+              configDir,
+              "projects",
+              session.cwd.replace(/[^a-zA-Z0-9]/g, "-"),
+              `${context.nativeThreadId}.jsonl`,
+            ),
+            sessionId: context.nativeThreadId,
+            since,
           });
         });
 
@@ -8121,14 +8183,44 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             return;
           }
           yield* trackClaudeGoal({ nativeThreadId: liveQuery.nativeThreadId, context, message });
+          const frameTime = yield* DateTime.now;
+
+          if (
+            message.type === "user" &&
+            message.parent_tool_use_id == null &&
+            Array.isArray(message.message.content) &&
+            message.message.content.some((block) => block.type === "tool_result")
+          ) {
+            // A finished tool starts a new request, which can hang before the CLI emits any retry.
+            context.retryHealth.since = DateTime.toEpochMillis(frameTime);
+            context.retryHealth.seenResponse = false;
+            context.retryHealth.retrying = false;
+          }
 
           if (message.type === "stream_event" && !message.parent_tool_use_id) {
             const event = message.event;
-            if (event.type === "message_start" || event.type === "content_block_start") {
+            if (
+              [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "message_delta",
+                "ping",
+              ].includes(event.type)
+            ) {
+              context.retryHealth.since = DateTime.toEpochMillis(frameTime);
+              context.retryHealth.seenResponse = true;
+              context.retryHealth.retrying = false;
               context.responseReceived = true;
               context.realApiStatus = null;
-              yield* completeProviderRetry(context, now);
+              context.latestApiFailure = undefined;
+              context.latestApiFailureSynthetic = false;
+              context.latestApiFailureStatus = undefined;
+              context.latestApiFailureCategory = undefined;
+              context.retryRecoveryBlocked = false;
+              yield* completeProviderRetry(context, frameTime);
             }
+            if (event.type === "content_block_stop") context.retryHealth.frames = 0;
             const reasoning = context.reasoning;
             if (event.type === "message_start") {
               reasoning.messageId = event.message.id;
@@ -8501,17 +8593,66 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
 
           if (message.type === "system" && message.subtype === "api_retry") {
+            const fallback = providerFailureFromApiRetry(message, context.hadSuccessfulResponse);
+            const permanentSdkStatus =
+              message.error_status !== null &&
+              message.error_status >= 400 &&
+              message.error_status < 500 &&
+              (message.error_status !== 404 || !context.hadSuccessfulResponse);
+            // Health checks can run while native I/O waits; publish authoritative SDK evidence first.
+            if (
+              permanentSdkStatus ||
+              (fallback.category !== "transient" && fallback.category !== "unknown")
+            ) {
+              context.retryRecoveryBlocked = true;
+              context.latestApiFailure = fallback;
+              context.latestApiFailureSynthetic = false;
+              context.latestApiFailureCategory = fallback.category;
+              context.latestApiFailureStatus = message.error_status;
+              context.realApiStatus = message.error_status;
+            }
             const updatedAt = yield* DateTime.now;
             const previous = (yield* Ref.get(providerRetries)).get(context.providerTurnId);
+            context.retryHealth.retrying = true;
+            context.retryHealth.frames++;
+            const native =
+              message.error === "unknown" || message.error_status === null
+                ? yield* readTurnApiError(context, context.retryHealth.since)
+                : undefined;
+            // A transcript read can yield to Stop or a replacement query.
+            if ((yield* Ref.get(queryContext)) !== liveQuery || liveQuery.stopping) return;
+            if (
+              native !== undefined &&
+              ClaudeApiErrorTranscript.isPermanentApiError(native, context.hadSuccessfulResponse)
+            )
+              context.retryRecoveryBlocked = true;
             const retry: OrchestrationV2ProviderRetry = {
-              attempt: Math.max(1, Math.trunc(message.attempt)),
-              maxAttempts: Math.max(1, Math.trunc(message.max_retries)),
-              retryDelayMs: Math.max(0, Math.trunc(message.retry_delay_ms)),
+              attempt: Math.max(1, Math.trunc(native?.retryAttempt ?? message.attempt)),
+              maxAttempts: Math.max(1, Math.trunc(native?.maxRetries ?? message.max_retries)),
+              retryDelayMs: Math.max(0, Math.trunc(native?.retryInMs ?? message.retry_delay_ms)),
             };
-            const failure = providerFailureFromApiRetry(message, context.hadSuccessfulResponse);
+            const preservedFailure =
+              native === undefined && message.error === "unknown" && message.error_status === null
+                ? (context.latestApiFailure ?? previous?.failure)
+                : undefined;
+            const failure =
+              preservedFailure ??
+              (native === undefined || permanentSdkStatus
+                ? fallback
+                : makeProviderFailure({
+                    ...fallback,
+                    resetAt: fallback.resetAt ?? null,
+                    message: `${native.formatted} — retry ${retry.attempt}/${retry.maxAttempts}${native.source ? ` (${native.source})` : ""}, next in ${Math.ceil((retry.retryDelayMs ?? 0) / 1000)} s`,
+                    category: claudeTranscriptErrorCategory(native, context.hadSuccessfulResponse),
+                  }));
             context.latestApiFailureCategory = failure.category;
             context.latestApiFailure = failure;
-            context.realApiStatus = message.error_status ?? null;
+            if (preservedFailure === undefined) context.latestApiFailureSynthetic = false;
+            const status = permanentSdkStatus
+              ? message.error_status
+              : (native?.status ?? message.error_status ?? null);
+            if (preservedFailure === undefined) context.latestApiFailureStatus = status;
+            context.realApiStatus = status;
             const itemOrdinal =
               previous?.itemOrdinal ??
               (yield* resolveItemOrdinal(context, `terminal-failure:${context.providerTurnId}`));
@@ -8552,8 +8693,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             if (message.parent_tool_use_id === null) {
               if (message.error === undefined) {
                 if (message.message.model !== "<synthetic>") {
+                  context.retryHealth.since = DateTime.toEpochMillis(now);
+                  context.retryHealth.frames = 0;
+                  context.retryHealth.seenResponse = true;
+                  context.retryHealth.retrying = false;
                   context.hadSuccessfulResponse = true;
                   context.responseReceived = true;
+                  context.retryRecoveryBlocked = false;
                   context.realApiStatus = null;
                   const models =
                     successfulModelsByNativeThread.get(context.nativeThreadId) ?? new Set<string>();
@@ -8561,32 +8707,111 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   successfulModelsByNativeThread.set(context.nativeThreadId, models);
                 }
                 context.latestApiFailure = undefined;
+                context.latestApiFailureSynthetic = false;
+                context.latestApiFailureStatus = undefined;
                 context.latestApiFailureCategory = undefined;
                 yield* completeProviderRetry(context, now);
               } else {
-                context.latestApiFailureCategory = claudeFailureCategory({
+                const category = claudeFailureCategory({
                   retryError: message.error,
                   hadSuccessfulResponse: context.hadSuccessfulResponse,
                 });
                 const status = Reflect.get(message, "api_error_status");
+                const syntheticModelError =
+                  message.error === "model_not_found" &&
+                  (typeof status !== "number" || status === 404);
+                // The CLI can synthesize this frame without emitting an SDK retry first.
+                if (
+                  syntheticModelError &&
+                  (context.latestApiFailure === undefined || context.latestApiFailureSynthetic)
+                ) {
+                  const native = yield* readTurnApiError(context, context.retryHealth.since);
+                  if ((yield* Ref.get(queryContext)) !== liveQuery || liveQuery.stopping) return;
+                  if (native !== undefined) {
+                    const nativeCategory = claudeTranscriptErrorCategory(
+                      native,
+                      context.hadSuccessfulResponse,
+                    );
+                    context.latestApiFailure = makeProviderFailure({
+                      class: "provider_error",
+                      category: nativeCategory,
+                      code:
+                        native.status === undefined
+                          ? "api_error_transport"
+                          : `api_error_${native.status}`,
+                      message: native.formatted,
+                    });
+                    context.latestApiFailureCategory = nativeCategory;
+                    context.latestApiFailureSynthetic = false;
+                    context.latestApiFailureStatus = native.status ?? null;
+                    context.realApiStatus = native.status ?? null;
+                    if (
+                      ClaudeApiErrorTranscript.isPermanentApiError(
+                        native,
+                        context.hadSuccessfulResponse,
+                      )
+                    )
+                      context.retryRecoveryBlocked = true;
+                  }
+                }
+                const preservePreviousFailure =
+                  context.latestApiFailure !== undefined &&
+                  (syntheticModelError ||
+                    (typeof status !== "number" &&
+                      !context.latestApiFailureSynthetic &&
+                      ClaudeApiErrorTranscript.isPermanentApiError(
+                        {
+                          formatted: context.latestApiFailure.message,
+                          ...(context.latestApiFailureStatus == null
+                            ? {}
+                            : { status: context.latestApiFailureStatus }),
+                        },
+                        context.hadSuccessfulResponse,
+                      ) &&
+                      (category === "transient" || category === "unknown")));
+                if (
+                  !preservePreviousFailure &&
+                  !syntheticModelError &&
+                  ((typeof status === "number" &&
+                    status >= 400 &&
+                    status < 500 &&
+                    (status !== 404 || !context.hadSuccessfulResponse)) ||
+                    [
+                      "auth_expired",
+                      "quota",
+                      "config",
+                      "model_invalid",
+                      "context_exhausted",
+                    ].includes(category))
+                )
+                  context.retryRecoveryBlocked = true;
                 if (
                   message.error !== "model_not_found" ||
                   (typeof status === "number" && status !== 404)
                 ) {
                   context.realApiStatus = typeof status === "number" ? status : null;
                 }
-                context.latestApiFailure =
-                  message.error === "model_not_found" && context.latestApiFailure !== undefined
-                    ? context.latestApiFailure
-                    : makeProviderFailure({
-                        category: context.latestApiFailureCategory,
-                        class: "provider_error",
-                        code: typeof status === "number" ? `api_error_${status}` : message.error,
-                        message:
-                          context.hadSuccessfulResponse && message.error === "model_not_found"
-                            ? `Claude upstream returned ${typeof status === "number" ? status : "model_not_found"} after successful responses in this session.`
+                context.latestApiFailure = preservePreviousFailure
+                  ? context.latestApiFailure
+                  : makeProviderFailure({
+                      category,
+                      class: "provider_error",
+                      code: typeof status === "number" ? `api_error_${status}` : message.error,
+                      message:
+                        context.hadSuccessfulResponse && message.error === "model_not_found"
+                          ? `Claude upstream returned ${typeof status === "number" ? status : "model_not_found"} after successful responses in this session.`
+                          : message.error === "unknown"
+                            ? message.message.content
+                                .filter((block) => block.type === "text")
+                                .map((block) => block.text)
+                                .join("\n") || "Claude API unknown."
                             : `Claude API ${typeof status === "number" ? `${status} ` : ""}${message.error}.`,
-                      });
+                    });
+                context.latestApiFailureCategory = context.latestApiFailure?.category;
+                if (!preservePreviousFailure) {
+                  context.latestApiFailureStatus = typeof status === "number" ? status : null;
+                  context.latestApiFailureSynthetic = syntheticModelError;
+                }
               }
             }
             // `<synthetic>` frames (usage limits, sign-in errors, /goal status)
@@ -9284,24 +9509,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ? null
               : providerFailureFromResult(message, completedAt, failureHint, usageLimited);
             const apiExhausted = message.terminal_reason === "api_error";
-            const configDir = adapterOptions.environment.CLAUDE_CONFIG_DIR?.trim();
-            const transcriptError = apiExhausted
-              ? yield* ClaudeApiErrorTranscript.readLastApiError({
-                  configDir: configDir
-                    ? path.resolve(session.cwd, configDir)
-                    : path.join(yield* HostProcess.HomeDirectory, ".claude"),
-                  filePath: path.join(
-                    configDir
-                      ? path.resolve(session.cwd, configDir)
-                      : path.join(yield* HostProcess.HomeDirectory, ".claude"),
-                    "projects",
-                    session.cwd.replace(/[^a-zA-Z0-9]/g, "-"),
-                    `${context.nativeThreadId}.jsonl`,
-                  ),
-                  sessionId: context.nativeThreadId,
-                  since: DateTime.toEpochMillis(context.startedAt),
-                })
-              : undefined;
+            const transcriptError =
+              turnFailure !== null
+                ? yield* readTurnApiError(context, context.retryHealth.since)
+                : undefined;
             const transcriptFailure =
               transcriptError === undefined
                 ? undefined
@@ -9312,17 +9523,44 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       transcriptError.status === undefined
                         ? "api_error_transport"
                         : `api_error_${transcriptError.status}`,
-                    category: claudeFailureCategory({
-                      apiErrorStatus: transcriptError.status,
-                      noResponse: transcriptError.status === undefined,
-                      hadSuccessfulResponse: context.hadSuccessfulResponse,
-                      text: transcriptError.formatted,
-                    }),
+                    category: claudeTranscriptErrorCategory(
+                      transcriptError,
+                      context.hadSuccessfulResponse,
+                    ),
                   });
             const latestFailure = context.latestApiFailure;
             const retryFailure = (yield* Ref.get(providerRetries)).get(
               context.providerTurnId,
             )?.failure;
+            // Access errors can arrive after the native transcript already advanced.
+            // Keep its current cause visible, but conflicting access evidence cannot authorize replay.
+            const conflictingAccessCause =
+              message.subtype === "success" &&
+              message.api_error_status === 404 &&
+              transcriptError !== undefined &&
+              context.latestApiFailureStatus != null &&
+              [401, 403, 429].includes(context.latestApiFailureStatus);
+            const cachedFailure = latestFailure ?? retryFailure;
+            const permanentSdkCause =
+              (message.terminal_reason == null || apiExhausted) &&
+              !context.latestApiFailureSynthetic &&
+              !conflictingAccessCause &&
+              (message.subtype !== "success" ||
+                message.api_error_status == null ||
+                message.api_error_status === 404) &&
+              context.latestApiFailureStatus != null &&
+              context.latestApiFailureStatus >= 400 &&
+              context.latestApiFailureStatus < 500 &&
+              (context.latestApiFailureStatus !== 404 || !context.hadSuccessfulResponse) &&
+              cachedFailure !== undefined
+                ? {
+                    ...cachedFailure,
+                    category: claudeFailureCategory({
+                      apiErrorStatus: context.latestApiFailureStatus,
+                      hadSuccessfulResponse: context.hadSuccessfulResponse,
+                    }),
+                  }
+                : undefined;
             const selectedModelAfterSuccess =
               context.hadSuccessfulResponse &&
               message.subtype === "success" &&
@@ -9337,6 +9575,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 message.api_error_status !== 404);
             const cause =
               (currentPermanentFailure ? turnFailure : undefined) ??
+              permanentSdkCause ??
               transcriptFailure ??
               (selectedModelAfterSuccess
                 ? latestFailure
@@ -9379,6 +9618,42 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     message: `Claude gave up after repeated API errors. Last error: ${lastErrorMessage}`,
                   })
                 : turnFailure;
+            const selectedCategory = (cause ?? failureWithRetryCause)?.category ?? "unknown";
+            const networkError =
+              (message.terminal_reason == null || apiExhausted) &&
+              !currentPermanentFailure &&
+              permanentSdkCause === undefined &&
+              turnFailure !== null &&
+              (selectedCategory !== "model_invalid" || context.hadSuccessfulResponse) &&
+              !["auth_expired", "quota", "config", "content_filter", "context_exhausted"].includes(
+                selectedCategory,
+              ) &&
+              (transcriptError !== undefined
+                ? ClaudeApiErrorTranscript.isNetworkApiError(transcriptError)
+                : ClaudeApiErrorTranscript.isNetworkApiError({
+                    ...(context.latestApiFailureStatus == null
+                      ? {}
+                      : { status: context.latestApiFailureStatus }),
+                    formatted: `${turnFailure.message} ${latestFailure?.message ?? ""}`,
+                  }));
+            const classifiedFailure =
+              networkError && failureWithRetryCause !== null
+                ? makeProviderFailure({
+                    ...failureWithRetryCause,
+                    resetAt: failureWithRetryCause.resetAt ?? null,
+                    category: "transient",
+                    code: "claude_network_error",
+                    retryable: true,
+                  })
+                : permanentSdkCause !== undefined && failureWithRetryCause !== null
+                  ? makeProviderFailure({
+                      ...failureWithRetryCause,
+                      category: permanentSdkCause.category ?? "unknown",
+                      code: permanentSdkCause.code,
+                      class: permanentSdkCause.class,
+                      resetAt: permanentSdkCause.resetAt ?? null,
+                    })
+                  : failureWithRetryCause;
             const resultFailure = interrupted
               ? null
               : limitedCompaction !== null
@@ -9401,7 +9676,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                         category: "content_filter",
                         message: `${context.refusalFallback.originalModel} safeguards flagged this session${context.refusalFallback.category === null ? "" : ` [${context.refusalFallback.category}]`}; the fallback model ${context.refusalFallback.fallbackModel} failed (${failureWithRetryCause?.message ?? turnFailure.message}).`,
                       })
-                    : failureWithRetryCause;
+                    : classifiedFailure;
             const currentStatus = message.subtype === "success" ? message.api_error_status : null;
             // SDK delivery can lag transcript writes. Conflicting channels cannot
             // establish which native error happened last, so they never authorize replay.
@@ -9412,28 +9687,24 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 : context.realApiStatus === undefined || context.realApiStatus === transcriptStatus
                   ? transcriptStatus
                   : null;
-            const accessEvidence = {
-              status:
-                resultFailure?.category === "context_exhausted"
-                  ? null
-                  : currentStatus != null && currentStatus !== 404
-                    ? currentStatus
-                    : latestNativeStatus,
-              beforeResponse: !context.responseReceived,
-              refusalFree:
-                context.sessionRefused === false &&
-                refusal === undefined &&
-                resultFailure?.category !== "content_filter",
-              refused:
-                context.sessionRefused === true ||
-                refusal !== undefined ||
-                resultFailure?.category === "content_filter",
-            };
+            const accessEvidence = claudeAccessEvidence(
+              context,
+              resultFailure?.category === "context_exhausted" &&
+                permanentSdkCause?.code !== "api_error_413"
+                ? null
+                : currentStatus != null && currentStatus !== 404
+                  ? currentStatus
+                  : latestNativeStatus,
+              resultFailure?.category,
+            );
             const terminalFailure =
               resultFailure === null
                 ? null
                 : {
                     ...resultFailure,
+                    ...(context.retryRecoveryBlocked || conflictingAccessCause
+                      ? { retryable: false }
+                      : {}),
                     ...(resultFailure.class === "usage_limit"
                       ? { resetAt: resetAt ?? resultFailure.resetAt ?? null }
                       : {}),
@@ -10479,6 +10750,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             providerTurnId,
             providerTurnOrdinal,
             startedAt,
+            retryHealth: {
+              since: DateTime.toEpochMillis(startedAt),
+              frames: 0,
+              seenResponse: false,
+              retrying: false,
+            },
             itemOrdinals: new Map(),
             assistant: {
               fallbackText: "",
@@ -10508,6 +10785,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             authenticationFailureMessage: undefined,
             latestApiFailureCategory: undefined,
             latestApiFailure: undefined,
+            latestApiFailureSynthetic: false,
+            latestApiFailureStatus: undefined,
+            retryRecoveryBlocked: false,
             hadSuccessfulResponse:
               successfulModelsByNativeThread
                 .get(nativeThreadId)
@@ -10786,7 +11066,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         });
 
         const interruptTurn = Effect.fn("ClaudeAdapterV2.interruptTurn")(
-          function* (turnInput: ProviderAdapter.ProviderAdapterV2InterruptInput) {
+          function* (
+            turnInput: ProviderAdapter.ProviderAdapterV2InterruptInput & {
+              readonly healthFailure?: OrchestrationV2ProviderFailure;
+            },
+          ) {
+            const failure = turnInput.healthFailure;
             const attached = yield* Ref.get(activeTurn);
             const pending = yield* Ref.get(pendingContinuation);
             const currentTurn = attached ?? pending?.context ?? null;
@@ -10850,12 +11135,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               if ((yield* Ref.get(activeTurn)) === currentTurn)
                 yield* finalizeActiveTurn({
                   context: currentTurn,
-                  status: "interrupted",
+                  status: failure === undefined ? "interrupted" : "failed",
+                  ...(failure === undefined ? {} : { failure }),
                   completedAt: yield* DateTime.now,
                 });
               return;
             }
             existing.stopping = true;
+            if (failure !== undefined)
+              yield* Ref.update(queryContext, (current) => (current === existing ? null : current));
             yield* existing.query.interrupt.pipe(
               Effect.timeout(CLAUDE_INTERRUPT_SETTLE_TIMEOUT),
               Effect.catchCause((cause) =>
@@ -10865,15 +11153,40 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 }),
               ),
             );
-            yield* existing.query.close;
-            const closed = yield* Deferred.await(existing.closed).pipe(
-              Effect.timeoutOption("10 seconds"),
-            );
+            const closed = yield* failure === undefined
+              ? existing.query.close.pipe(
+                  Effect.andThen(
+                    Deferred.await(existing.closed).pipe(Effect.timeoutOption("10 seconds")),
+                  ),
+                )
+              : existing.query.close.pipe(
+                  Effect.andThen(Deferred.await(existing.closed)),
+                  Effect.timeoutOption("10 seconds"),
+                  Effect.catchCause((cause) =>
+                    Effect.logWarning("orchestration-v2.claude-health-close-failed", {
+                      providerTurnId: currentTurn.providerTurnId,
+                      cause,
+                    }).pipe(Effect.as(Option.none())),
+                  ),
+                );
+            if (failure !== undefined) {
+              if (Option.isNone(closed))
+                yield* Effect.logWarning("orchestration-v2.claude-query-interrupt-timeout", {
+                  providerSessionId: input.providerSessionId,
+                  providerThreadId: turnInput.providerThread.id,
+                  providerTurnId: turnInput.providerTurnId,
+                });
+              yield* finalizeActiveTurnAfterQueryExit(existing, undefined, failure);
+              yield* endSubagentCallsOfClosedQuery(existing, "failed");
+              yield* Deferred.succeed(existing.closed, undefined);
+              return;
+            }
             if (Option.isSome(closed)) {
               if ((yield* Ref.get(activeTurn)) === currentTurn) {
                 yield* finalizeActiveTurn({
                   context: currentTurn,
-                  status: "interrupted",
+                  status: failure === undefined ? "interrupted" : "failed",
+                  ...(failure === undefined ? {} : { failure }),
                   completedAt: yield* DateTime.now,
                 });
               }
@@ -10896,7 +11209,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             } else if ((yield* Ref.get(activeTurn)) === currentTurn) {
               yield* finalizeActiveTurn({
                 context: currentTurn,
-                status: "interrupted",
+                status: failure === undefined ? "interrupted" : "failed",
+                ...(failure === undefined ? {} : { failure }),
                 completedAt,
               });
             }
@@ -11214,6 +11528,115 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           driver: CLAUDE_PROVIDER,
           providerSessionId: input.providerSessionId,
           providerSession: session,
+          checkRetryHealth: Effect.fn("ClaudeAdapterV2.checkRetryHealth")(function* (healthInput) {
+            return yield* turnControlLock.withPermits(1)(
+              Effect.gen(function* () {
+                const context = yield* Ref.get(activeTurn);
+                const live = yield* Ref.get(queryContext);
+                if (
+                  context === null ||
+                  live === null ||
+                  live.stopping ||
+                  !context.acceptingSteers ||
+                  context.retryRecoveryBlocked ||
+                  context.input.runId !== healthInput.runId ||
+                  context.input.attemptId !== healthInput.attemptId
+                )
+                  return false;
+                const health = context.retryHealth;
+                const now = yield* DateTime.now;
+                const budgetHit =
+                  (!health.seenResponse || health.retrying) &&
+                  DateTime.toEpochMillis(now) - health.since >= healthInput.noResponseBudgetMs;
+                if (!budgetHit && health.frames <= healthInput.flapLimit) return false;
+                const observed = { ...health };
+                const native = yield* readTurnApiError(context, health.since);
+                if (
+                  (yield* Ref.get(queryContext)) !== live ||
+                  live.stopping ||
+                  !context.acceptingSteers ||
+                  context.retryRecoveryBlocked ||
+                  health.since !== observed.since ||
+                  health.frames !== observed.frames ||
+                  health.retrying !== observed.retrying ||
+                  health.seenResponse !== observed.seenResponse
+                )
+                  return false;
+                if (
+                  native !== undefined &&
+                  ClaudeApiErrorTranscript.isPermanentApiError(
+                    native,
+                    context.hadSuccessfulResponse,
+                  )
+                ) {
+                  context.retryRecoveryBlocked = true;
+                  const category = claudeTranscriptErrorCategory(
+                    native,
+                    context.hadSuccessfulResponse,
+                  );
+                  context.latestApiFailure = makeProviderFailure({
+                    class: "provider_error",
+                    category,
+                    code:
+                      native.status === undefined
+                        ? "api_error_transport"
+                        : `api_error_${native.status}`,
+                    message: native.formatted,
+                  });
+                  context.latestApiFailureCategory = category;
+                  context.latestApiFailureSynthetic = false;
+                  context.latestApiFailureStatus = native.status ?? null;
+                  context.realApiStatus = native.status ?? null;
+                  return false;
+                }
+                const lastFailure = (yield* Ref.get(providerRetries)).get(
+                  context.providerTurnId,
+                )?.failure;
+                const resolvedSyntheticCause =
+                  context.latestApiFailureSynthetic && native !== undefined;
+                if (
+                  context.rejectedRateLimitTypes.size > 0 ||
+                  (!resolvedSyntheticCause &&
+                    ((context.latestApiFailureStatus != null &&
+                      context.latestApiFailureStatus >= 400 &&
+                      context.latestApiFailureStatus < 500 &&
+                      (context.latestApiFailureStatus !== 404 || !context.hadSuccessfulResponse)) ||
+                      (context.latestApiFailure !== undefined &&
+                        context.latestApiFailure.category !== "transient") ||
+                      (lastFailure !== undefined && lastFailure.category !== "transient"))) ||
+                  (native !== undefined &&
+                    !ClaudeApiErrorTranscript.isTransientApiError(
+                      native,
+                      context.hadSuccessfulResponse,
+                    ))
+                )
+                  return false;
+                const cause =
+                  native?.formatted ?? lastFailure?.message ?? "No HTTP response from Claude";
+                const gateway = adapterOptions.environment.ANTHROPIC_BASE_URL
+                  ? " (via ANTHROPIC_BASE_URL gateway)"
+                  : "";
+                const failure = {
+                  ...makeProviderFailure({
+                    class: "transport_error",
+                    category: "transient",
+                    code: budgetHit ? "claude_no_response_budget" : "claude_retry_flap",
+                    retryable: true,
+                    message: budgetHit
+                      ? `Claude got no response for 5 min: ${cause}${gateway}`
+                      : `Claude retried ${health.frames} times without completing a content block: ${cause}${gateway}`,
+                  }),
+                  claudeAccess: claudeAccessEvidence(context, null, "transient"),
+                };
+                yield* interruptTurn({
+                  providerThread: context.input.providerThread,
+                  providerTurnId: context.providerTurnId,
+                  healthFailure: failure,
+                });
+                return true;
+              }),
+            );
+          }),
           getModelContextWindow: (selection) =>
             resolveClaudeCatalogContextWindowTokens(BUNDLED_CLAUDE_MODEL_CATALOG, selection),
           events: Stream.fromEffectRepeat(Queue.take(events)),

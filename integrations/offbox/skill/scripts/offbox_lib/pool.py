@@ -12,7 +12,7 @@ import traceback
 from pathlib import Path
 import time
 
-from . import common, capacity, prepare, home
+from . import common, capacity, prepare, home, unfit
 from .common import (BOX_WEDGED_NOTE, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_INFRA, EXIT_LOCAL, RUN_TTL_S, SIZES, TOO_BIG_NOTE, OffboxError, db, file_lock, new_id,
                      busy, db_retry, iso, kv_get, kv_set, local_error, log, now, say, write)
 from .common import backend, owner_scoped, token_owner
@@ -346,7 +346,7 @@ RECYCLED_LIKE = RECYCLED_NOTE + '%'
 def members(con, key):
     # token_mine(): on the home server a pool only holds this token owner's boxes, even when two owners' checkouts share
     # a repository key. Another owner's box answers 404 to our token, which reads as "gone".
-    return con.execute(f"""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
+    rows = con.execute(f"""SELECT l.* FROM leases l JOIN pool_members p USING(box_id)
         WHERE p.pool_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
         AND COALESCE(l.note,'') NOT LIKE ?
@@ -354,6 +354,8 @@ def members(con, key):
         AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'
         AND NOT EXISTS (SELECT 1 FROM kv WHERE k='boot_dead:' || l.box_id)
         ORDER BY (l.state='running') DESC, l.last_used_at DESC""", (key, TOO_BIG_LIKE, DEAD_LIKE, WEDGED_LIKE, RECYCLED_LIKE)).fetchall()
+    run = (_PIN_SKIPS.get() or {}).get('run')
+    return [r for r in rows if unfit.available(con, r['box_id'], run)]
 
 
 def _source_member(con, key, source) -> bool:
@@ -396,6 +398,8 @@ def candidates(con, key, size, source, me=None):
     full = not _room(con, key)
     out = []
     for r in rows:
+        if not unfit.available(con, r['box_id'], (_PIN_SKIPS.get() or {}).get('run')):
+            continue
         if not _pin_available(con, r['box_id'], me):
             continue
         if lease.boot_dead(con, r['box_id']):
@@ -851,21 +855,24 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
     while True:
         allocation.check_queue()
         lease.cap_check()
-        pending = poll.call(lambda: con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
+        pending_rows = poll.call(lambda: con.execute("SELECT l.* FROM leases l JOIN kv k ON k.k='resume_unanswered:' || l.box_id "
                               f"WHERE l.repo_key=? AND {token_mine('l')} AND l.state IN ('running','stopped') "
-                              "AND COALESCE(l.note,'') NOT LIKE ? AND COALESCE(l.note,'') NOT LIKE 'disk-full:%' "
-                              "LIMIT 1", (key, WEDGED_LIKE)).fetchone())
-        if create_first or (pending and (pending['box_id'] in unusable or
-                                            pending_busy.get(pending['box_id'], 0) > time.monotonic())):
-            pending = None
-        if pending and not _pin_available(con, pending['box_id'], me):
-            if not allocation.resume_inflight(con, pending['box_id']):
-                _reconcile_pinned(con, pending)
-            pending = None
-        if pending and lease.boot_dead(con, pending['box_id']):
-            pending = None
-        if pending and allocation.resume_inflight(con, pending['box_id']):
-            pending = None
+                              "AND COALESCE(l.note,'') NOT LIKE ? AND COALESCE(l.note,'') NOT LIKE 'disk-full:%'",
+                              (key, WEDGED_LIKE)).fetchall())
+        pending = None
+        for candidate in (() if create_first else pending_rows):
+            candidate_id = candidate['box_id']
+            if (candidate_id in unusable or pending_busy.get(candidate_id, 0) > time.monotonic()
+                    or not unfit.available(con, candidate_id, run_id)):
+                continue
+            if not _pin_available(con, candidate_id, me):
+                if not allocation.resume_inflight(con, candidate_id):
+                    _reconcile_pinned(con, candidate)
+                continue
+            if lease.boot_dead(con, candidate_id) or allocation.resume_inflight(con, candidate_id):
+                continue
+            pending = candidate
+            break
         bid = guard = None
         def select_pending():
             nonlocal pending, bid, guard
@@ -900,7 +907,7 @@ def _acquire(con, me, size, template, base, fresh, run_id, exclude=None, waiter=
                         except OffboxError:
                             pending = None  # the sender/another reconciler owns this box; choose a peer or queue
                         else:
-                            if not _pin_available(con, bid, me):
+                            if not unfit.available(con, bid, run_id) or not _pin_available(con, bid, me):
                                 guard.__exit__(None, None, None)
                                 pending = None
                             else:

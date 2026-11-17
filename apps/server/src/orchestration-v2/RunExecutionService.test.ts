@@ -5629,6 +5629,7 @@ function captureRootRunTermination(input: {
     | "other_task"
     | "read_error";
   readonly recoveryRun?: OrchestrationV2Run["transientRecovery"];
+  readonly stallRecovery?: OrchestrationV2Run["delegatedTaskStallRecovery"];
   readonly providerStartDeadlineAt?: OrchestrationV2Run["providerStartDeadlineAt"];
   readonly responseStreamingMode?: "turn" | "paragraph";
   readonly launchRecovery?: OrchestrationV2Run["launchRecovery"];
@@ -5882,6 +5883,7 @@ function captureRootRunTermination(input: {
           startedAt: input.recordUsage ? usageStartedAt : null,
           providerInstanceId,
           transientRecovery: input.recoveryRun,
+          delegatedTaskStallRecovery: input.stallRecovery,
           providerStartDeadlineAt: input.providerStartDeadlineAt,
           launchRecovery: input.launchRecovery,
           modelSelection: { instanceId: providerInstanceId, model: input.model ?? "gpt-5.4" },
@@ -6944,6 +6946,129 @@ it.effect.each([
   }),
 );
 
+it.effect.each(
+  ["claude_no_response_budget", "claude_retry_flap", "claude_network_error"].flatMap((code) =>
+    [true, false].map((retryable) => ({ code, retryable })),
+  ),
+)(
+  "resumes a coded Claude failure once only when retryable: $code/$retryable",
+  ({ code, retryable }) =>
+    Effect.gen(function* () {
+      for (const resumed of [false, true]) {
+        const result = yield* captureRootRunTermination({
+          key: `${code}-${retryable}-${resumed}`,
+          delegated: true,
+          ...(resumed
+            ? {
+                recoveryRun: {
+                  firstError: {
+                    class: "transport_error" as const,
+                    category: "transient" as const,
+                    code,
+                    retryable: true,
+                    message: "First: Request timed out",
+                  },
+                  since: DateTime.formatIso(yield* DateTime.now),
+                },
+              }
+            : {}),
+          shouldFinalizeRun: () => Effect.succeed(true),
+          events: (ids) =>
+            Stream.make({
+              ...rootTerminalEvent(ids, "failed"),
+              status: "failed" as const,
+              failureItemOrdinal: 101,
+              threadDisposition: "reusable" as const,
+              failure: {
+                class: "transport_error" as const,
+                category: "transient" as const,
+                code,
+                retryable,
+                message: "Second: upstream connection lost",
+              },
+            }),
+        });
+        assert.lengthOf(
+          result.committedEffects.filter((effect) =>
+            effect.id.startsWith("effect:delegated-transient-resume:"),
+          ),
+          resumed || !retryable ? 0 : 1,
+        );
+        if (resumed) {
+          const errors = result.finalEvents.filter(
+            (event) => event.type === "turn-item.updated" && event.payload.type === "error",
+          );
+          assert.isTrue(
+            errors.some(
+              (event) =>
+                event.type === "turn-item.updated" &&
+                event.payload.type === "error" &&
+                event.payload.failure.message.includes("First: Request timed out") &&
+                event.payload.failure.message.includes("Second: upstream connection lost"),
+            ),
+          );
+        }
+      }
+    }),
+);
+
+it.effect.each(
+  ["claude_no_response_budget", "claude_retry_flap", "claude_network_error"].flatMap((code) =>
+    (["first_event", "post_tool"] as const).flatMap((phase) =>
+      [undefined, "Please relay: ready", "[Watcher event from build] Ready"].map((relayText) => ({
+        code,
+        phase,
+        relayText,
+      })),
+    ),
+  ),
+)(
+  "a previous silent recovery blocks coded network and relay replay: $phase/$code/$relayText",
+  ({ code, phase, relayText }) =>
+    Effect.gen(function* () {
+      const result = yield* captureRootRunTermination({
+        key: `silent-then-network-${phase}-${code}-${relayText ?? "work"}`,
+        delegated: true,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        model: "claude-haiku-5-5",
+        ...(relayText === undefined ? {} : { relayText }),
+        stallRecovery: {
+          phase,
+          lastProgressAt: DateTime.formatIso(yield* DateTime.now),
+          attemptId: null,
+        },
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make({
+            ...rootTerminalEvent(ids, "failed"),
+            status: "failed" as const,
+            failureItemOrdinal: 101,
+            threadDisposition: "reusable" as const,
+            failure: {
+              class: "transport_error" as const,
+              category: "transient" as const,
+              code,
+              retryable: true,
+              message: "Connection dropped (ECONNRESET)",
+              claudeAccess: {
+                status: null,
+                beforeResponse: true,
+                refusalFree: true,
+                refused: false,
+              },
+            },
+          }),
+      });
+      assert.isFalse(
+        result.committedEffects.some((effect) => effect.request.type === "provider-turn.start"),
+      );
+      const run = result.finalEvents.findLast((event) => event.type === "run.updated");
+      assert.equal(run?.payload.status, "failed");
+      assert.isUndefined(run?.payload.transientRecovery);
+      assert.isUndefined(run?.payload.launchRecovery);
+    }),
+);
+
 it.effect.each([
   "app_owned",
   "provider_native",
@@ -7190,6 +7315,52 @@ it.effect.each([
           assert.isAtLeast(request.retryDelayMs ?? 0, 20_000);
       }
     }),
+);
+
+it.effect.each(
+  ["[Watcher event from build] Ready", "Please relay: ready"].flatMap((relayText) =>
+    [null, 401, 403, 404, 429].map((status) => ({ relayText, status })),
+  ),
+)("honors permanent relay evidence in the outbox: $relayText/$status", ({ relayText, status }) =>
+  Effect.gen(function* () {
+    for (const delegated of [false, true]) {
+      for (const retryable of [false, true]) {
+        const result = yield* captureRootRunTermination({
+          key: `relay-veto-${relayText}-${status}-${delegated}-${retryable}`,
+          relayText,
+          delegated,
+          model: "claude-haiku-5-5",
+          providerDriver: ProviderDriverKind.make("claudeAgent"),
+          shouldFinalizeRun: () => Effect.succeed(true),
+          events: (ids) =>
+            Stream.make({
+              ...rootTerminalEvent(ids, "failed"),
+              status: "failed" as const,
+              failureItemOrdinal: 101,
+              threadDisposition: "reusable" as const,
+              failure: {
+                class: "transport_error" as const,
+                category: "transient" as const,
+                code: "claude_network_error",
+                retryable,
+                message: "Request timed out.",
+                claudeAccess: { status, beforeResponse: true, refusalFree: true, refused: false },
+              },
+            }),
+        });
+        assert.lengthOf(
+          result.committedEffects.filter((effect) => effect.request.type === "provider-turn.start"),
+          retryable ? 1 : 0,
+        );
+        if (!retryable) {
+          const run = result.finalEvents.findLast((event) => event.type === "run.updated");
+          assert.equal(run?.payload.status, "failed");
+          assert.isUndefined(run?.payload.transientRecovery);
+          assert.isUndefined(run?.payload.launchRecovery);
+        }
+      }
+    }
+  }),
 );
 
 it.effect.each([false, true])("retries an unsent relay once, refusal=%s", (refused) =>

@@ -8,8 +8,17 @@ lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
 Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
 or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
-clock (include `Z` or an explicit UTC offset). The command always exits 0,
-including invalid arguments or unreadable input; inspect the report for errors.
+cadence clock (include `Z` or an explicit UTC offset); launchd checks always
+describe the current state. The command exits 1 for overdue jobs, unreadable
+input (including invalid timestamps) or a launchd state other than `loaded`,
+and 2 for invalid option syntax.
+JSON includes an overall `ok` boolean and `launchd`, mapping each of
+`com.abdullah.mac-log-collector`, `com.abdullah.mac-deep-inventory`,
+`com.abdullah.mac-memory` and `com.abdullah.mac-cpu` to `loaded`, `not-loaded`
+or `unknown`. Each read-only `launchctl print gui/<uid>/<label>` has a two-second
+timeout (eight seconds total for four timeouts). Only an explicit
+`Could not find service` error means `not-loaded`; other failures are `unknown`.
+Status never loads or restarts agents, and does not send notifications.
 It reads the UTC day files covering the last 36 hours (three files before noon
 UTC, two from noon onward). Missing and unreadable files are listed separately.
 Malformed rows, including invalid timestamps and dates that overflow when
@@ -209,33 +218,52 @@ These events never alert or launch extra scans.
 
 `com.abdullah.mac-tailnet` invokes `collector.py --tailnet` every 60 seconds,
 independently of the hourly collector's slow disk scans. `tailnet.py` calls only
-`/Applications/Tailscale.app/Contents/MacOS/Tailscale status --json` (five-second
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale status --json` (15-second
 timeout, no socket override). It never changes Tailscale preferences or reconnects.
-`THRESHOLD_CHECKS` (3) and `PROBE_HOST` (`100.75.104.72`) are its configuration
-values. Up requires `BackendState=Running` and `Self.Online=true`; existing IPs
-and extension PIDs do not prove connectivity. Starting and CLI failures count
-as not up. The third consecutive not-up check queues one Telegram alert. A
-healthy check resets the streak and queues one recovery line for alerted outages.
-Brief outages produce no notification. Three minute checks are a sampling
-threshold, not a guarantee of three full elapsed minutes after the first failure.
+A valid Running/online response is up; explicit Stopped, NeedsLogin,
+NeedsMachineAuth, NoState, Starting or Running/offline is down. Missing or invalid
+CLI data is unknown. Unknown CLI checks probe home SSH (100.75.104.72:22) and the
+remote Mullvad de-dus-wg-102 DNS listener (100.64.1.71:53), using ordinary TCP
+connections through the Mac's Tailscale interface. Either success proves up.
+If neither responds, a read-only HTTPS request to `SELF_HTTPS_URL`
+(`https://abdullahs-macbook-pro.tailcca332.ts.net:18400/`) accepts any HTTP status
+as reachable, including application errors. Only when every probe fails can
+unknown CLI evidence count toward an outage. An unavailable probe tool leaves
+the outcome unknown and breaks the streak without claiming recovery.
+Explicit down states require `THRESHOLD_CHECKS=3` AND `THRESHOLD_SECONDS=180`;
+unknown CLI evidence requires `UNKNOWN_THRESHOLD_CHECKS=5` AND
+`UNKNOWN_THRESHOLD_SECONDS=300`. Both count and wall-clock gates apply, even
+when minute ticks bunch under load. Any up tick resets the streak. Recovery is
+sent only for an alerted outage.
 
 `state/tailnet.json` and a separate nonblocking lock preserve streaks and queued
 notification payloads across invocations. Keys and text remain identical on retry,
 including after a timeout that may have followed durable Telegram queueing.
-Recovery uses a distinct key. Unix timestamps measure outages across processes;
-monotonic time measures only one invocation's probe duration.
+Recovery uses a distinct key. The first run drops legacy unproven counters and
+pending timeout alerts, while preserving already alerted explicit-state outages.
+Unix timestamps measure outages across processes; monotonic time measures CLI
+and probe duration. The CLI timeout is 15 s, pgrep 3 s, each of two probes 6 s
+(`nc -z -G 5`), HTTPS has an 8 s curl deadline and a 9 s subprocess deadline,
+and at most one Telegram send is attempted per invocation (10 s).
+The subprocess budget is at most 49 s per run.
 
-`tailnet.sample` records backend state, online flag, IP count, CLI exit/timeout,
-extension PIDs and the result of `nc -z -G 3 <PROBE_HOST> 22` (four-second outer
-timeout, only for Running). A failed home probe never triggers a tailnet alert.
+`tailnet.sample` adds `outcome`, `cliOutcome`, `confirmedDown`, `cliMs` (also
+`statusDurationMs`), `loadAvg1`, and `confirmedBy` (`home_tcp`, `peer_tcp`,
+`self_https`, or null). Unknown CLI evidence adds `confirmProbes` (host to
+port/ok/error/ms) and, if HTTPS ran, `selfHttpsReachable` / `selfHttpsError`. Backend state,
+online flag, IP count, CLI exit/timeout and extension PIDs remain available.
+Running samples retain a home SSH probe; its failure alone never overrides a
+healthy CLI. `tailnet.cli_slow` records unknown CLI evidence resolved up by peers,
+at most once per 900 seconds, with `suppressed` counting intervening occurrences.
 `tailnet.state` and `tailnet.extension` record initial observations and changes;
+switching between successful probe sources alone does not emit a state change.
 a PID change alone is not a crash. `tailnet.alert` / `tailnet.recovery` record
 notification queue acceptance or failure. Failed sends retry next minute.
-Raw CLI output, addresses, peers, identity and notification text never enter
-these events. `mac-log-status` and daily rollups flag a missing sample after
-three minutes. The app CLI's “Skip a start command” and “Peer connection was
-rejected” logs are known harmless noise; check for `EditPrefs` and backend changes
-when verifying read-only behavior.
+Only configured probe addresses enter these events; raw CLI output, identity,
+other peers and notification text are discarded. `mac-log-status` and daily
+rollups flag a missing sample after three minutes. The app CLI's “Skip a start
+command” and “Peer connection was rejected” logs are known harmless noise;
+check for `EditPrefs` and backend changes when verifying read-only behavior.
 
 After review and merge/push, run `zsh integrations/mac-logging/install.zsh`
 (`--dry-run` first, `--check` after). The installer copies but never loads agents.
@@ -247,8 +275,9 @@ Removing the minute agent stops checks; no Tailscale change is needed.
 
 `com.abdullah.mac-cpu` runs `cpu.py` every 60 seconds at normal priority,
 through `/bin/zsh` for launchd file access. One `/bin/ps` inventory reads PID,
-parent, cumulative CPU time, RSS, state, start time and elapsed time with a
-30-second timeout. It never invokes top or changes another process.
+parent, uid, cumulative CPU time, RSS, state, start time and elapsed time with a
+30-second timeout. Normal samples never invoke top. The sampler never changes
+another process.
 
 `state/cpu.json` retains PID, start time, cumulative CPU seconds, host CPU ticks,
 the daily spike counter and Unix observation time under its own nonblocking lock. CPU seconds
@@ -273,13 +302,48 @@ sets `hintError` without losing numeric CPU evidence.
 
 `cpu.spike` captures up to 15 PIDs with parent families and redacted 160-character commands when load1 > 2× logical CPUs, plus host/unattributed CPU, observed spawn families and runnable thread counts; it is capped at 240 records/day and 8192 bytes/record, and is conditional rather than a cadence job.
 
-Host tick deltas add `systemCpuPct`, `userPct`, `sysPct` and
+Host tick deltas add `systemCpuPct`, `userPct`, `sysPct`, `nicePct`, `idlePct` and
 `unattributedCpuPct` on the same one-core=100% scale; a failed read sets
 `systemCpuError` without losing the sample. The first valid read is a baseline.
 `spawned`/`exited` compare PID + start time, and `spawnedFamilies` counts only
 new processes still visible at the next inventory. `pidAdvance` is omitted:
 long-lived high PIDs hid a real 200-process burst after allocator wrap on this Mac.
 The optional thread read has a two-second timeout.
+
+`userPct` excludes nice time; user + sys + nice is busy CPU. `kernelTaskPct`
+is null on normal samples. Spikes read the second frame of a bounded
+`top -l 2 -s 1 -pid 0` call, with `kernelTaskWindowS: 1` and cumulative
+`kernelTaskTime` for reference; failure sets `kernelTaskError`.
+The expensive read is limited to once per five minutes, including failed
+attempts, using a wall timestamp in the existing sampler state. Skipped spikes
+report null CPU with `kernelTaskSkipped: "rate"`; quiet samples retain the
+cooldown, and a clock rollback starts a fresh cooldown.
+System time also runs in other
+processes, so neither kernel_task nor sys time should be added to process CPU.
+
+Exited-child CPU comes from `proc_pid_rusage` V1, converted from Mach ticks.
+Darwin 27's `ps -S` did not include it in the fork/wait proof. `childCpu` lists
+ten parent PIDs with their family and the parent's family in `parentFamily`;
+`childCpuFamilies` groups those family pairs before truncation. `childCpuPct`
+sums all readable parent deltas, separately from `totalCpuPct`.
+The reader captures Mach time before ps; later process starts are excluded with
+coverage reason `identity`, preventing PID reuse from corrupting a baseline.
+Ancestors are read before children to avoid racing a reaping transfer.
+Old CPU of disappeared descendants is subtracted when reaping transfers their
+lifetime counters. Ambiguous transfers (including possible orphan adoption) are excluded and counted in
+`childUncertainParents`. `unattributedAfterChildrenPct` subtracts the recovered
+child CPU from the original gap, floored at zero. Baseline or unavailable child
+readings leave the total null, rather than claiming zero.
+
+`childReadable`/`childUnreadable` and `childCoverage` expose failures by uid and
+fixed reason. Other-user processes, including launchd, normally deny reads;
+if PID 1 is readable, its child CPU is labelled `orphaned-exited`.
+`lostParents` counts vanished parents known from the old tree or child counters;
+parents born and gone inside the interval remain invisible. The syscall pass
+has a 30-second budget and adds no process inventory command.
+`observedSpawnsLowerBound`, its per-minute rate and `observedSpawnsByParent`
+count new PID/start identities still present in the next snapshot. They miss
+processes that exit between snapshots and are not an exact exec counter.
 
 Hints and spike commands use the janitor's reviewed #45 `leftover_processes.redact` helper,
 loaded from the sibling source tree or the installed

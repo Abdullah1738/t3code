@@ -106,6 +106,8 @@ export class McpCall extends Context.Service<
     // Handler waits can update readerLane after caller resolution has finished.
     callerReaderLane?: string;
     readerLane: string;
+    boundedRead?: { readonly phase: string; readonly waitedMs: number };
+    readDeadlineExpired?: true;
     waitStage?: "lookup.caller" | "lookup.target" | "waiting";
     waitLookupMs?: number;
     phase: Phase;
@@ -397,12 +399,18 @@ export function callOutcome(
         : content;
   const classified = classifyFailure(error);
   // The boundary deadline wins over a detached handler's cancellation/cleanup failure.
-  const readTimeout =
+  const typedReadTimeout =
     classified?.tag === "ThreadReadTimeoutError" || classified?.tag === "WikiReadTimeoutError";
-  const code = readTimeout ? classified.tag : (state.handlerErrorTag ?? classified?.tag);
-  const typedOutcome = readTimeout
-    ? classified.outcome
-    : (state.handlerOutcome ?? classified?.outcome);
+  const code = state.readDeadlineExpired
+    ? "TimeoutError"
+    : typedReadTimeout
+      ? classified.tag
+      : (state.handlerErrorTag ?? classified?.tag);
+  const typedOutcome = state.readDeadlineExpired
+    ? "timeout"
+    : typedReadTimeout
+      ? classified.outcome
+      : (state.handlerOutcome ?? classified?.outcome);
   const inputRequired = exit._tag === "Success" && exit.value instanceof McpSchema.InputRequired;
   const failed =
     inputRequired ||
@@ -494,7 +502,9 @@ export function callOutcome(
     props: {
       ...taskLookup,
       ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
-      ...(code === "task_not_found" && notFoundReason !== undefined ? { notFoundReason } : {}),
+      ...((code === "task_not_found" || code === "task_creating") && notFoundReason !== undefined
+        ? { notFoundReason }
+        : {}),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
       ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
       code:
@@ -537,7 +547,7 @@ export function callOutcome(
                             ? "Defect"
                             : "McpToolError"))),
           errorPhase:
-            readTimeout &&
+            typedReadTimeout &&
             (error.phase === "lane_wait" || error.phase === "query" || error.phase === "render")
               ? error.phase
               : code === "caller_unresolved" ||

@@ -242,9 +242,13 @@ def entry_backend(argv: list[str]) -> str:
     if sub == "run":
         # Routing waits for a live preflight; alert hysteresis can lag behind recovery.
         return "server"
-    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec", "box"):
+    if sub in ("logs", "wait", "kill", "release", "ssh", "ports", "keep", "exec", "box", "events"):
         named = [x for x in argv if x.startswith(("run-", "bx_"))]
-        if sub == "exec":
+        if sub in ('box', 'events'):
+            from .cli import build_parser
+            a = build_parser().parse_args(argv)
+            named = [a.box_id if sub == 'box' else a.run_id]
+        elif sub == "exec":
             from .cli import parse_args
             a = parse_args(argv)
             named = a.cmd[:1] if a.cmd and a.cmd[0].startswith("bx_") else []

@@ -354,7 +354,15 @@ export type OrchestratorMcpTaskCancelInput = typeof OrchestratorMcpTaskCancelInp
 
 export const OrchestratorMcpTaskCancelResult = Schema.Struct({
   taskId: NodeId,
-  status: Schema.Literals(["cancel_requested", "completed", "failed", "cancelled", "interrupted"]),
+  status: Schema.Literals([
+    "cancel_pending",
+    "cancel_requested",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+  ]),
+  detail: Schema.optional(Schema.String),
 });
 export type OrchestratorMcpTaskCancelResult = typeof OrchestratorMcpTaskCancelResult.Type;
 
@@ -815,6 +823,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "runtime_mode_escalation_denied",
       "interaction_mode_escalation_denied",
       "task_not_found",
+      "task_creating",
       "task_not_cancellable",
       "thread_not_found",
       "run_not_found",
