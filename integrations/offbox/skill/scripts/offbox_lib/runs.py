@@ -496,6 +496,9 @@ GO_REPAIR = toolchain.INFRA_STOP + r'''# Box-local, not just client-local: SSH/m
     _offbox_tree_id=
     _offbox_cleanup() {
       _offbox_rc=$?
+      # Secondary cleanup errors must not hide a native crash from box routing.
+      _offbox_cleanup_failure_rc=97
+      [ "$_offbox_rc" != 90 ] || _offbox_cleanup_failure_rc=90
       trap - EXIT HUP INT TERM
       if (( !_offbox_installed )) && { (( _offbox_saved )) || [ ! -e /usr/local/go ]; } &&
          sudo -n test -d "$_offbox_stage/old"; then
@@ -504,20 +507,20 @@ GO_REPAIR = toolchain.INFRA_STOP + r'''# Box-local, not just client-local: SSH/m
           if [ -z "$_offbox_tree_id" ] || [ -L /usr/local/go ] ||
              [ "$(stat -c '%d:%i' /usr/local/go 2>/dev/null)" != "$_offbox_tree_id" ]; then
             echo "offbox: Go repair: destination changed; backup retained at $_offbox_stage/old" >&2
-            exit 97
+            exit "$_offbox_cleanup_failure_rc"
           fi
-          sudo -n rm -rf -- /usr/local/go || exit 97
+          sudo -n rm -rf -- /usr/local/go || exit "$_offbox_cleanup_failure_rc"
         fi
         if ! sudo -n mv -T -- "$_offbox_stage/old" /usr/local/go; then
           echo "offbox: Go repair: rollback failed; backup retained at $_offbox_stage/old" >&2
-          exit 97
+          exit "$_offbox_cleanup_failure_rc"
         fi
       fi
       # If the first rename failed, retain any partial backup for diagnosis/recovery.
       if (( !_offbox_saved )) && sudo -n test -e "$_offbox_stage/old"; then
         echo "offbox: Go repair: failed backup retained at $_offbox_stage/old" >&2
       else
-        sudo -n rm -rf -- "$_offbox_stage" || _offbox_rc=97
+        sudo -n rm -rf -- "$_offbox_stage" || _offbox_rc=$_offbox_cleanup_failure_rc
       fi
       exit "$_offbox_rc"
     }

@@ -518,6 +518,76 @@ class GoSwapTests(unittest.TestCase):
                     state = fx.state(result)
                     self.assertEqual(state['infra_reason'], 'go_inventory_crash' if expected == 90 else None)
 
+    def test_inventory_failure_status_survives_cleanup_failures(self):
+        for cleanup, at in (('stage', 2), ('stage', 4), ('installed-tree', 4),
+                            ('rollback', 4), ('destination', 4)):
+            for failure, failure_code in (('kill -SEGV $$', 90), ('exit 1', 97)):
+                for needs_go in (0, 1):
+                    with self.subTest(cleanup=cleanup, at=at, failure=failure, needs_go=needs_go), \
+                            tempfile.TemporaryDirectory() as home:
+                        fx = RepairFixture(home)
+                        fx.broken()
+                        inventory_failure = failure
+                        if cleanup == 'destination':
+                            inventory_failure = ('mv -T -- "$FAKE_GOROOT" "$FIXTURE/replaced-go"; '
+                                                 'mkdir "$FAKE_GOROOT"; touch "$FAKE_GOROOT/other-install"; ' + failure)
+                        fx.fault_inventory('sort', inventory_failure, at=at)
+                        fx.tool('sudo', '''#!/bin/bash
+shift
+if [ "$1" = rm ] && {
+  { [ "$FAIL_CLEANUP" = stage ] && [[ "$*" = *'.offbox-go.'* ]]; } ||
+  { [ "$FAIL_CLEANUP" = installed-tree ] && [ "${@: -1}" = "$FAKE_GOROOT" ]; }
+}; then
+  echo "fixture: $FAIL_CLEANUP cleanup failed" >&2
+  exit 1
+fi
+exec "$@"
+''')
+                        fx.script = f'_offbox_needs_go={needs_go}\nulimit -c 0\n' + fx.script
+                        result = fx.run(FAIL_CLEANUP=cleanup, FAIL_ROLLBACK='1' if cleanup == 'rollback' else '')
+                        expected = failure_code if needs_go else 0
+                        self.assertEqual(result.returncode, expected, result.stderr)
+                        self.assertEqual('USER_COMMAND' in result.stdout, not needs_go)
+                        self.assertIn('cannot inventory', result.stderr)
+                        if cleanup in ('stage', 'installed-tree'):
+                            self.assertIn(f'fixture: {cleanup} cleanup failed', result.stderr)
+                        else:
+                            self.assertIn('destination changed' if cleanup == 'destination' else 'rollback failed',
+                                          result.stderr)
+                        backups = list(fx.local.glob('.offbox-go.*/old'))
+                        if cleanup in ('installed-tree', 'rollback', 'destination'):
+                            self.assertEqual(len(backups), 1)
+                            self.assertTrue((backups[0] / 'go').is_dir())
+                        else:
+                            self.assertEqual(backups, [])
+                            self.assertTrue((fx.root / 'go').is_dir())
+                            self.assertEqual(len(list(fx.local.glob('.offbox-go.*'))), 1)
+                        if cleanup == 'destination':
+                            self.assertTrue((fx.root / 'other-install').is_file())
+                        state = fx.state(result)
+                        crash = needs_go and failure_code == 90
+                        self.assertEqual(state['wrapper_exit_code'], expected)
+                        self.assertEqual(state['command_exit_code'], None if crash else expected)
+                        self.assertEqual(state['infra_failure'], 'native_crash' if crash else None)
+                        self.assertEqual(state['infra_reason'], 'go_inventory_crash' if crash else None)
+
+    def test_cleanup_failure_after_successful_repair_is_setup_failure(self):
+        self.fx.broken()
+        self.fx.tool('sudo', '''#!/bin/bash
+shift
+if [ "$1" = rm ] && [[ "$*" = *'.offbox-go.'* ]]; then
+  echo 'fixture: staging cleanup failed' >&2
+  exit 1
+fi
+exec "$@"
+''')
+        result = self.fx.run()
+        self.assertEqual(result.returncode, 97, result.stderr)
+        self.assertIn('verified go1.26.9 GOROOT', result.stderr)
+        self.assertIn('fixture: staging cleanup failed', result.stderr)
+        self.assertNotIn('USER_COMMAND', result.stdout)
+        self.assertIsNone(self.fx.state(result)['infra_failure'])
+
     def test_archive_must_compile_std_even_when_go_list_would_pass(self):
         self.fx.broken()
         (self.fx.home / 'archive/build-invalid').touch()
