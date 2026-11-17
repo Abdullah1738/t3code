@@ -3,10 +3,12 @@ import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { AuthSessionId, type AuthEnvironmentScope } from "@t3tools/contracts";
+import { AnalyticsEvent, AuthSessionId, type AuthEnvironmentScope } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+import * as Analytics from "../analytics/Analytics.ts";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
@@ -14,9 +16,13 @@ import * as HttpRouter from "effect/http/HttpRouter";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
-import { DesktopLease, QUIET_MS } from "./DesktopLease.ts";
+import { DesktopLease, QUIET_MS, STALE_MS, type HolderTurnActive } from "./DesktopLease.ts";
 import * as DesktopLeaseService from "./DesktopLeaseService.ts";
 import { desktopLeaseRoutes } from "./http.ts";
+
+const decodeAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent, {
+  onExcessProperty: "error",
+});
 
 const prefix = "/api/ardud/control/desktop-lease";
 const holder = { driver: "codex", nativeId: "holder-native", agentId: "child-agent" };
@@ -26,6 +32,9 @@ const makeHarness = (
   options: {
     readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
     readonly failFirstOpen?: boolean;
+    readonly holderTurnActive?: (root: string) => HolderTurnActive;
+    readonly failRootLookup?: boolean;
+    readonly failAnalytics?: boolean;
   } = {},
 ) =>
   Effect.gen(function* () {
@@ -37,6 +46,8 @@ const makeHarness = (
     );
     const filename = NodePath.join(dir, "lease.sqlite");
     const resolvedInputs: ExecutionIdentity.ResolveInput[] = [];
+    const events: AnalyticsEvent[] = [];
+    const activityRoots: string[] = [];
     let opens = 0;
     let now = 1_750_000_000_000;
     const identity = Layer.mock(ExecutionIdentity.ExecutionIdentity)({
@@ -70,6 +81,7 @@ const makeHarness = (
     });
     const service = DesktopLeaseService.layerWithOptions({
       filename,
+      ...(options.holderTurnActive ? { holderTurnActive: options.holderTurnActive } : {}),
       now: () => now,
       factory: (storeOptions) => {
         opens++;
@@ -79,13 +91,33 @@ const makeHarness = (
     }).pipe(
       Layer.provide(identity),
       Layer.provide(
+        Layer.mock(Analytics.Analytics)({
+          record: (event) =>
+            decodeAnalyticsEvent(event).pipe(
+              Effect.orDie,
+              Effect.flatMap((decoded) =>
+                Effect.sync(() => {
+                  if (options.failAnalytics) throw new Error("analytics unavailable");
+                  events.push(decoded);
+                }),
+              ),
+            ),
+        }),
+      ),
+      Layer.provide(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
-          getRunningTurnContext: () =>
-            Effect.succeed({
+          getRunningTurnContext: (threadId) => {
+            activityRoots.push(threadId);
+            if (options.failRootLookup && threadId.startsWith("root-"))
+              return Effect.fail(
+                new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId }),
+              );
+            return Effect.succeed({
               run: undefined,
               providerThread: undefined,
               providerTurn: undefined,
-            }),
+            });
+          },
         }),
       ),
     );
@@ -137,6 +169,8 @@ const makeHarness = (
               rootThreadId: string;
               ticket: string;
               state: string;
+              quarantinedAt: string | null;
+              openCallId: string | null;
             } | null;
             status: {
               lease: {
@@ -155,6 +189,8 @@ const makeHarness = (
     return {
       request,
       resolvedInputs,
+      events: () => events.filter((event) => "ticket" in event),
+      activityRoots,
       opens: () => opens,
       filename,
       advance: (ms: number) => {
@@ -324,6 +360,214 @@ describe("desktop lease HTTP", () => {
           assert.isNull(reconciled.body.lease);
         }),
       { scopes: ["orchestration:read", "orchestration:operate", "environment:maintain"] },
+    ),
+  );
+
+  it.effect("withdraws queued owners over HTTP and records each committed transition once", () =>
+    run(({ request, events, advance }) =>
+      Effect.gen(function* () {
+        const acquired = yield* request("POST", "/acquire", {
+          ...holder,
+          taskId: "held",
+          scope: "app",
+          mode: "native",
+        });
+        const queued = yield* request("POST", "/acquire", {
+          ...other,
+          taskId: "queued",
+          scope: "app",
+          mode: "cua-driver",
+        });
+        assert.equal(
+          (yield* request("POST", "/release", { ...holder, ticket: queued.body.ticket })).status,
+          409,
+        );
+        assert.equal(
+          (yield* request("POST", "/release", { ...other, ticket: queued.body.ticket })).status,
+          200,
+        );
+        assert.equal(
+          (yield* request("POST", "/release", { ...other, ticket: queued.body.ticket })).status,
+          200,
+        );
+        assert.equal(
+          (yield* request("POST", "/acquire", {
+            ...other,
+            taskId: "queued",
+            scope: "app",
+            mode: "cua-driver",
+          })).body.state,
+          "cancelled",
+        );
+        yield* request("POST", "/acquire", {
+          ...other,
+          taskId: "expires",
+          scope: "app",
+          mode: "native",
+        });
+        advance(STALE_MS);
+        assert.equal(
+          (yield* request("POST", "/heartbeat", { ...other, ticket: acquired.body.ticket })).status,
+          409,
+        );
+        yield* request("GET", "");
+        assert.deepEqual(
+          events().map((e) => e.reason),
+          ["queued_withdrawn", "queue_expired"],
+        );
+        assert.deepEqual(
+          events().map((e) => e.kind),
+          ["desktop_lease.transition", "desktop_lease.transition"],
+        );
+        assert.equal(events()[0]?.ticket, queued.body.ticket);
+        assert.equal(events()[0]?.mode, "cua-driver");
+        assert.equal(events()[1]?.age_ms, STALE_MS);
+      }),
+    ),
+  );
+
+  it.effect.each([false, true, "unknown", "lookup_error"] as const)(
+    "preserves quarantine unless root inactivity is known (%s)",
+    (active) =>
+      run(
+        ({ request, advance, events, activityRoots }) =>
+          Effect.gen(function* () {
+            const acquired = yield* request("POST", "/acquire", {
+              ...holder,
+              taskId: "task",
+              scope: "app",
+              mode: "native",
+            });
+            yield* request("POST", "/call-start", { ...holder, toolUseId: "hung" });
+            advance(QUIET_MS);
+            const quarantined = yield* request("GET", "");
+            assert.equal(quarantined.body.lease?.state, "quarantined");
+            assert.equal(quarantined.body.lease?.openCallId, "hung");
+            assert.equal(quarantined.body.lease?.quarantinedAt, "2025-06-15T15:16:40.000Z");
+            advance(QUIET_MS - 1);
+            assert.equal((yield* request("GET", "")).body.lease?.state, "quarantined");
+            advance(1);
+            const recovered = yield* request("GET", "");
+            if (active === false) {
+              assert.isNull(recovered.body.lease);
+              assert.include(activityRoots, "root-holder-native");
+              assert.equal(
+                (yield* request("POST", "/call-end", { toolUseId: "hung", outcome: "failed" }))
+                  .status,
+                200,
+              );
+              assert.equal(
+                (yield* request("POST", "/call-end", { toolUseId: "hung", outcome: "completed" }))
+                  .status,
+                409,
+              );
+            } else {
+              assert.equal(recovered.body.lease?.state, "quarantined");
+              assert.equal(
+                (yield* request("POST", "/reconcile", {
+                  ticket: acquired.body.ticket,
+                  evidence: "operator checked",
+                })).status,
+                200,
+              );
+            }
+            yield* request("GET", "");
+            assert.deepEqual(
+              events().map((e) => e.reason),
+              ["open_call_timeout", active === false ? "auto_reconciled" : "manual_reconciled"],
+            );
+          }),
+        {
+          scopes: ["orchestration:read", "orchestration:operate", "environment:maintain"],
+          ...(active === false || active === "lookup_error"
+            ? {}
+            : { holderTurnActive: () => active }),
+          failRootLookup: active === "lookup_error",
+        },
+      ),
+  );
+
+  it.effect.each([
+    ["plain", "task-1807", "task-1807"],
+    ["spaces", "inspect settings", "inspect%20settings"],
+    ["equals", "task=1807", "task%3D1807"],
+    ["separators", "task?part=1&child#2", "task%3Fpart%3D1%26child%232"],
+    ["literal escape", "task%2F1807", "task%252F1807"],
+    ["unicode", "فحص", "%D9%81%D8%AD%D8%B5"],
+    ["controls", 'a\nb\t"\\', "a%0Ab%09%22%5C"],
+    ["nul", "a\0b", "a%00b"],
+    ["unpaired surrogate", "a\ud800b", "a%EF%BF%BDb"],
+    ["maximum ascii", "x".repeat(1024), "x".repeat(1024)],
+    [
+      "maximum unicode",
+      "漢".repeat(1024),
+      "sha256:3bc0fb40f33dab3892291cb6a0f92eb5f200afc4d5be9001f124761952db12ac",
+    ],
+  ] as const)(
+    "records one bounded transition for an accepted %s task ID",
+    ([_shape, taskId, expected]) =>
+      run(({ request, events }) =>
+        Effect.gen(function* () {
+          yield* request("POST", "/acquire", {
+            ...holder,
+            taskId: "holder",
+            scope: "app",
+            mode: "native",
+          });
+          const queued = yield* request("POST", "/acquire", {
+            ...other,
+            taskId,
+            scope: "app",
+            mode: "native",
+          });
+          assert.equal(queued.status, 200);
+          assert.equal(
+            (yield* request("POST", "/release", { ...other, ticket: queued.body.ticket })).status,
+            200,
+          );
+          assert.equal(
+            (yield* request("POST", "/release", { ...other, ticket: queued.body.ticket })).status,
+            200,
+          );
+          assert.equal(events().length, 1);
+          assert.equal(events()[0]?.taskId, expected);
+          assert.equal(events()[0]?.reason, "queued_withdrawn");
+          assert.isBelow(new TextEncoder().encode(JSON.stringify(events()[0])).length, 8192);
+        }),
+      ),
+  );
+
+  it.effect("analytics failure cannot undo a withdrawal", () =>
+    run(
+      ({ request }) =>
+        Effect.gen(function* () {
+          yield* request("POST", "/acquire", {
+            ...holder,
+            taskId: "held",
+            scope: "app",
+            mode: "native",
+          });
+          const queued = yield* request("POST", "/acquire", {
+            ...other,
+            taskId: "queued",
+            scope: "app",
+            mode: "native",
+          });
+          assert.equal(
+            (yield* request("POST", "/release", { ...other, ticket: queued.body.ticket })).status,
+            200,
+          );
+          assert.equal(
+            (yield* request("POST", "/acquire", {
+              ...other,
+              taskId: "queued",
+              scope: "app",
+              mode: "native",
+            })).body.state,
+            "cancelled",
+          );
+        }),
+      { failAnalytics: true },
     ),
   );
 
