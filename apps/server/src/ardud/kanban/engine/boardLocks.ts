@@ -977,6 +977,22 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
         yield* check(op);
       }
     }),
+    // A persisted card write also invalidates collections containing that card.
+    invalidate: Effect.fn("KanbanBoardLocks.invalidate")(function* (
+      boardId: string,
+      resource: string,
+    ) {
+      const op = yield* operation;
+      if (!op) return;
+      yield* acquire(op, boardId);
+      const board = boardOf(boardId);
+      const previous = board.resources.get(resource) ?? 0;
+      board.resources.set(resource, previous + 1);
+      for (let current: Operation | undefined = op; current; current = current.parent) {
+        const dependencies = current.dependencies.get(boardId);
+        if (dependencies?.get(resource) === previous) dependencies.set(resource, previous + 1);
+      }
+    }),
     resourceVersion: (boardId: string, resource: string) =>
       access(
         boardId,
