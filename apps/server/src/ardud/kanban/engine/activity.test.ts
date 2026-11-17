@@ -1430,7 +1430,7 @@ it.effect("digest reads only the newest assistant item and leaves ordinary views
         } as never),
       getThreadRecords: (_id, fields, filter, options) => {
         expect(options).toEqual({ projectionOnly: true });
-        if (!fields.includes("turnItems")) {
+        if (!fields.some((field) => field === "turnItems")) {
           expect(fields).toEqual(["runs", "subagents"]);
           expect(filter).toEqual({ latestRunOnly: true, pendingBackgroundTasksOnly: true });
           return Effect.succeed({ runs: runRecords, subagents: [] } as never);
