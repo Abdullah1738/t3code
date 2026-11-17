@@ -655,7 +655,7 @@ it.effect.each(
       },
       {
         state: "accepted",
-        message: "This delegation was saved; its task projection is catching up.",
+        message: "This delegation was saved; its task record is missing.",
       },
       { state: "rejected", message: "This delegation was rejected: Parent run ended." },
     ] as const
@@ -699,18 +699,18 @@ it.effect.each(
         }
         const error = yield* operation.pipe(Effect.flip);
         const creating =
-          name === "status" &&
-          (state === "pending" || state === "accepted") &&
-          !message.startsWith("No delegated");
-        assert.equal(error.code, creating ? "task_creating" : "task_not_found");
+          name === "status" && state === "pending" && !message.startsWith("No delegated");
+        const recordMissing = state === "accepted" && !message.startsWith("No delegated");
+        assert.equal(
+          error.code,
+          recordMissing ? "task_record_missing" : creating ? "task_creating" : "task_not_found",
+        );
         assert.include(error.message, message);
-        if (creating) assert.notInclude(error.message, "No delegated task has this id.");
+        if (creating || recordMissing)
+          assert.notInclude(error.message, "No delegated task has this id.");
         else assert.isTrue(error.message.startsWith("No delegated task has this id."));
       }
-      assert.deepEqual(
-        cancelRequests,
-        ownCommand && (state === "pending" || state === "accepted") ? [commandId] : [],
-      );
+      assert.deepEqual(cancelRequests, ownCommand && state === "pending" ? [commandId] : []);
     }).pipe(
       Effect.provide(
         layer({
