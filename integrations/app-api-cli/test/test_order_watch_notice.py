@@ -23,24 +23,6 @@ import order_tracker as t
 import order_watch_receipt as receipt
 
 
-# Talabat was retired by the owner on 2026-11-07 (talabat_retired.py). These tests use
-# the old Talabat lane to exercise shared guards (card, pause, Moni go, chat, --for), so
-# the retirement gate is switched off inside this test process only; the gate itself is
-# covered by test_talabat_retired.
-import talabat_retired as _talabat_retired
-from unittest.mock import patch as _retired_patch
-_retired_gate = _retired_patch.object(_talabat_retired, 'requested', return_value=False)
-
-
-def setUpModule():
-    _retired_gate.start()
-
-
-def tearDownModule():
-    _retired_gate.stop()
-
-
-
 def sent_text(args):
     (text,) = [a[len('--text='):] for a in args if a.startswith('--text=')]
     return text
@@ -587,8 +569,7 @@ class LaneRegistrationTests(unittest.TestCase):
 class CLIPassThroughTests(unittest.TestCase):
     def test_every_order_lane_accepts_for_and_defaults_to_owner(self):
         import commerce_cli as cli
-        for prefix, target in ((['order', 'talabat', '--branch', '1', '--item', '2'], 'purchase_talabat'),
-                               (['order', 'minutes', '--sku', 'S'], 'order_minutes'),
+        for prefix, target in ((['order', 'minutes', '--sku', 'S'], 'order_minutes'),
                                (['order', 'nownow', '--product-code', 'P', '--store-code', 'S'], 'order_nownow'),
                                (['order', 'main', '--sku-config', 'Z'], 'order_main'),
                                (['order', 'supermall', '--sku-config', 'Z'], 'order_supermall')):
@@ -599,30 +580,6 @@ class CLIPassThroughTests(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(cli.main([*prefix, *extra]), 0)
                 self.assertEqual(lane.call_args.args[0].recipient, expected)
-
-    def test_talabat_holds_moni_text_until_payment_success(self):
-        import commerce_cli as cli
-        for state, hold in (('PAYMENT_REPORTED_SUCCESS', False), ('PAYMENT_UNKNOWN', True),
-                            ('CHALLENGE_REQUIRED', True)):
-            flow = mock.Mock(flow_id='f')
-            flow.purchase.return_value = {'state': state}
-            with self.subTest(state=state), \
-                    mock.patch.object(cli.journal, 'inspect', return_value={'order_id': '3999', 'app': 'talabat', 'vertical': 'shops'}), \
-                    mock.patch.object(cli, 'register_tracking', return_value={'watcher': 'w'}) as register:
-                args = SimpleNamespace(label='Latea: boba', recipient='moni', prepare_only=False, resume_flow=None)
-                with mock.patch('commerce_talabat.TalabatFlow', return_value=flow), \
-                        mock.patch.object(cli, 'input_items', return_value=[]), \
-                        mock.patch('talabat_basket.parse_items', return_value=()), \
-                        mock.patch.object(cli.talabat.shared, 'verticals_key', return_value='k'), \
-                        mock.patch.object(cli.journal, 'complete'), \
-                        contextlib.redirect_stdout(io.StringIO()):
-                    args.vertical, args.branch, args.apk_pool = 'restaurants', 1, 'pool'
-                    flow.prepare.return_value = {'payable_minor': 100}
-                    flow.checkout.track.return_value = {'order': '3999', 'status': 'preparing',
-                        'order_list_present': True, 'order_account_verified': True}
-                    cli.purchase_talabat(args)
-                self.assertEqual(register.call_args.kwargs['paid'], not hold)
-                self.assertEqual(register.call_args.args[2], 'moni')
 
     def test_register_tracking_adds_hold_flag_only_when_unpaid(self):
         import commerce_cli as cli
