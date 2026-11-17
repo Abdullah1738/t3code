@@ -5,14 +5,15 @@ import { Store } from "./store.ts";
 import { jsonBody, opaqueId, seal, tokenMatches, validId, type Fetch, type Sealed } from "./remote-protocol.ts";
 import type { AgentAnswerReceipt } from "./agent-bus.ts";
 import { LineError, type ChatKey, type Line } from "./line.ts";
+import { RemoteUnanswered } from "./unanswered.ts";
 
 export type RemoteBoxConfig = { kind: "remote-box"; url: string; tokenFile: string; callbackTokenFile: string;
   publicKeyFile: string; boxRouterPort?: number; macRouterPort?: number; callbackPort: number; epoch: string; boxId: string;
-  noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number };
+  noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number; wakeFenceAutoFailMs?: number };
 type Outage = { id: string; unreachableSince: number | null; reachableSince: number | null; noticeAttempted?: boolean };
 type Fence = { id: string; since: number; queuedBehind: number };
 type FenceAlert = { key: string; text: string };
-type BoxEvent = { id: string; state: string; failure: string | null; kind: "inbound" | "wake"; interruptedAt: number | null; hasSend: boolean };
+type BoxEvent = { id: string; state: string; failure: string | null; kind: "inbound" | "wake"; interruptedAt: number | null; hasSend: boolean; watcher?: string };
 export class RemoteRequestError extends Error {
   constructor(readonly status: number) { super("Box request failed"); }
 }
@@ -23,7 +24,7 @@ export function remoteBoxConfig(config: { chatBackends?: unknown }, slug: string
   if (slug !== "moni" || entry.kind !== "remote-box" || !/^http:\/\/127\.0\.0\.1:\d+$/.test(entry.url)
     || ![entry.tokenFile, entry.callbackTokenFile, entry.publicKeyFile].every(p => typeof p === "string" && p.startsWith("/"))
     || [entry.boxRouterPort, entry.macRouterPort].some(p => p !== undefined && (!Number.isInteger(p) || p < 1024 || p > 65535))
-    || [entry.noticeAfterMs, entry.outageClearMs, entry.noticeMinGapMs].some(ms => ms !== undefined && (!Number.isSafeInteger(ms) || ms < 0))
+    || [entry.noticeAfterMs, entry.outageClearMs, entry.noticeMinGapMs, entry.wakeFenceAutoFailMs].some(ms => ms !== undefined && (!Number.isSafeInteger(ms) || ms < 0))
     || !Number.isInteger(entry.callbackPort) || entry.callbackPort < 1024 || entry.callbackPort > 65535
     || !/^[a-zA-Z0-9_-]{1,64}$/.test(entry.epoch) || !/^bx_[a-zA-Z0-9]+$/.test(entry.boxId)) throw new Error("Invalid remote box configuration");
   return entry;
@@ -42,6 +43,8 @@ export class RemoteBox {
   private fenceBusy = false;
   private nextProbe = 0;
   private failures = 0;
+  private nextStateLog = 0;
+  private readonly unanswered: RemoteUnanswered;
   constructor(readonly config: RemoteBoxConfig, readonly store: Store, private readonly io: {
     fetch?: Fetch; now?: () => number; log: (event: string, code?: string) => void;
     notice: (id: string, text: string) => Promise<void>; active: () => boolean;
@@ -55,6 +58,7 @@ export class RemoteBox {
     if (this.token.length < 32 || this.callbackToken.length < 32) throw new Error("Invalid remote credentials");
     store.db.exec(`CREATE TABLE IF NOT EXISTS remote_inbox (seq INTEGER PRIMARY KEY, id TEXT UNIQUE, sealed TEXT, receipt TEXT);
       CREATE TABLE IF NOT EXISTS remote_sends (id TEXT PRIMARY KEY, at INTEGER, state TEXT, handle TEXT);`);
+    this.unanswered = new RemoteUnanswered(store, (severity, text, key) => io.ownerAlert?.(severity, text, key) ?? Promise.resolve(false));
     if (!store.db.query<{ name: string }, []>("PRAGMA table_info(remote_inbox)").all().some(c => c.name === "kind")) {
       // Old ciphertext cannot be classified on the relay. Unknown rows never cause a notice.
       store.db.exec("ALTER TABLE remote_inbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'unknown'");
@@ -69,7 +73,15 @@ export class RemoteBox {
       // Neither continuous downtime nor recovery can include time the bridge was stopped.
       outage.unreachableSince = null; outage.reachableSince = null; store.set("remoteOutage", outage);
     }
+    this.backendState();
   }
+  private backendState() {
+    this.nextStateLog = this.now() + 300_000;
+    this.emit("moni-box-backend-state", undefined, undefined, { backend: "remote-box", active: this.io.active(), busy: this.busy,
+      queuedBehind: this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n,
+      fenced: !!this.store.get("remoteFence"), count: this.failures });
+  }
+  checkUnanswered(now = this.now()): Promise<void> { return this.unanswered.check(now); }
   private emit(event: string, code?: string, durationMs?: number, props?: Record<string, string | number | boolean>) {
     this.io.log(event, props ? JSON.stringify(props) : code);
     toolLog.capture(() => toolLog.write({ component: "remote-box", kind: durationMs === undefined ? "event" : "perf",
@@ -80,8 +92,12 @@ export class RemoteBox {
   private now() { return (this.io.now ?? Date.now)(); }
   accept(id: string, input: unknown, receipt?: AgentAnswerReceipt, kind: "inbound" | "wake" = "inbound"): boolean {
     const key = opaqueId(id);
-    return this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind) VALUES (?,?,?,?)")
-      .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind).changes === 1;
+    return this.store.db.transaction(() => {
+      const created = this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind) VALUES (?,?,?,?)")
+        .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind).changes === 1;
+      if (created && kind === "inbound") this.unanswered.accept(key, this.now());
+      return created;
+    })();
   }
   receipt(id: string): AgentAnswerReceipt | undefined {
     const row = this.store.db.query<{ receipt: string | null }, [string]>("SELECT receipt FROM remote_inbox WHERE id=?").get(opaqueId(id));
@@ -107,17 +123,20 @@ export class RemoteBox {
         || !("interruptedAt" in row) || row.interruptedAt !== null && (!Number.isSafeInteger(row.interruptedAt) || Number(row.interruptedAt) < 0)
         || !("hasSend" in row) || typeof row.hasSend !== "boolean") throw new Error("Invalid box event");
       return { id: row.id, state: row.state as string, kind: row.kind as BoxEvent["kind"], interruptedAt: row.interruptedAt as number | null,
-        hasSend: row.hasSend, failure: "failure" in row && ["invalid", "unavailable", "too-large"].includes(String(row.failure)) ? String(row.failure) : null };
+        hasSend: row.hasSend, ...("watcher" in row && typeof row.watcher === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/.test(row.watcher) ? { watcher: row.watcher } : {}),
+        failure: "failure" in row && ["invalid", "unavailable", "too-large"].includes(String(row.failure)) ? String(row.failure) : null };
     });
     return { events, ...(response.remaining === undefined ? {} : { remaining: response.remaining as number, nextCursor: response.nextCursor as string }) };
   }
-  async resolve(id: string, state: "done" | "pending") {
-    const result = await this.request("/resolve", { id, state, reconciled: true });
+  async resolve(id: string, state: "done" | "pending" | "failed", autoFailMs?: number) {
+    // The runner's done tombstone is its existing terminal, no-replay resolution.
+    const result = await this.request("/resolve", { id, state: state === "failed" ? "done" : state, reconciled: true,
+      ...(autoFailMs === undefined ? {} : { autoFailMs }) });
     if (result.accepted !== true) throw new Error("Invalid box acknowledgement");
     return { accepted: true };
   }
   private async probeFence() {
-    // An interrupted turn may have used a tool. Surface the fence; only an owner reconciles it.
+    // Only a no-send wake may be retired automatically; other interrupted turns need reconciliation.
     // Probe failures are observational and must never enter the link-outage notice path.
     let events: BoxEvent[], remaining: number | undefined;
     try { ({ events, remaining } = await this.events(undefined, true)); } catch { this.emit("moni-box-events-error"); return; }
@@ -131,6 +150,18 @@ export class RemoteBox {
     const queuedBehind = remaining ?? 0;
     const fence = saved?.id === head.id ? saved : { id: head.id, since: head.interruptedAt ?? this.now(), queuedBehind: -1 };
     const ageMs = Math.max(0, this.now() - fence.since), event = head.id.slice(0, 12);
+    const autoKey = `remoteWakeAutoFail:${head.id}`;
+    if (head.kind === "wake" && !head.hasSend && ageMs >= (this.config.wakeFenceAutoFailMs ?? 600_000)) {
+      let page = await this.events(head.id);
+      while (!page.events.some(row => row.kind === "inbound") && page.nextCursor) page = await this.events(page.nextCursor);
+      if (page.events.some(row => row.kind === "inbound")) {
+        const alert = { key: `moni-box-wake-autofailed:${event}`,
+          text: `Moni's interrupted watcher wake${head.watcher ? ` (${head.watcher})` : ""} (${event}) sent nothing and was retired after ${Math.floor(ageMs / 60_000)} min; ${queuedBehind} later items can continue.` };
+        // Persist the exact notification before resolving, including an ambiguous resolve acknowledgement.
+        if (!this.store.get(autoKey)) this.store.set(autoKey, { alert, event, ageMs, queuedBehind });
+        return;
+      }
+    }
     if (queuedBehind > fence.queuedBehind) {
       fence.queuedBehind = queuedBehind;
       this.store.set("remoteFence", fence);
@@ -151,6 +182,7 @@ export class RemoteBox {
     }
   }
   async tick(): Promise<void> {
+    if (this.now() >= this.nextStateLog) this.backendState();
     if (this.busy || this.now() < this.nextProbe || !this.io.active()) return;
     this.busy = true;
     let healthy = false;
@@ -203,8 +235,31 @@ export class RemoteBox {
     // Observational requests must not hold up lease renewal, including while Telegram is stalled.
     if (healthy && !this.fenceBusy) {
       this.fenceBusy = true;
-      try { await this.probeFence(); } catch { this.emit("moni-box-events-error"); }
+      try { await this.probeFence(); await this.flushAutoFailAlerts(); } catch { this.emit("moni-box-events-error"); }
       finally { this.fenceBusy = false; }
+    }
+  }
+  private async flushAutoFailAlerts() {
+    const rows = this.store.db.query<{ key: string; value: string }, []>("SELECT key,value FROM kv WHERE key GLOB 'remoteWakeAutoFail:*'").all();
+    for (const row of rows) {
+      if (!this.io.active()) return;
+      const saved = JSON.parse(row.value) as { alert: FenceAlert; sent?: boolean; resolved?: boolean; event: string; ageMs: number; queuedBehind: number };
+      if (saved.sent) continue;
+      // An ambiguous /resolve is retried idempotently before announcing success.
+      if (!saved.resolved) {
+        try { await this.resolve(row.key.slice("remoteWakeAutoFail:".length), "failed", this.config.wakeFenceAutoFailMs ?? 600_000); }
+        catch (error) {
+          if (error instanceof RemoteRequestError && error.status === 409) this.store.db.query("DELETE FROM kv WHERE key=?").run(row.key);
+          throw error;
+        }
+        saved.resolved = true; this.store.set(row.key, saved);
+        this.store.set("remoteFence", null);
+        this.emit("moni-box-wake-autofailed", undefined, undefined, { event: saved.event, ageMs: saved.ageMs, queuedBehind: saved.queuedBehind });
+      }
+      if (!this.io.ownerAlert) continue;
+      try {
+        if (await this.io.ownerAlert("attention", saved.alert.text, saved.alert.key)) this.store.set(row.key, { ...saved, sent: true });
+      } catch { this.emit("moni-box-fence-alert-error"); }
     }
   }
   async send(id: string, text: string, mediaUrl: string | undefined, line: Line, chat: ChatKey): Promise<{ id: string; handle: string }> {
@@ -258,14 +313,17 @@ export class RemoteBox {
       if (["/share", "/unshare", "/shares"].includes(path)) return reply(200, await this.request(path, body));
       if (path === "/react") {
         if (typeof body.target !== "string" || !this.hasMessage(body.target) || typeof body.kind !== "string" || !["like", "love", "dislike", "laugh", "emphasize", "question"].includes(body.kind)) return reply(403, { error: "Forbidden" });
-        await io.line.react(body.target, body.kind); return reply(200, { accepted: true });
+        await io.line.react(body.target, body.kind); this.unanswered.answered(opaqueId(body.target), this.now()); return reply(200, { accepted: true });
       }
       if (path === "/files") {
         if (typeof body.data !== "string" || body.data.length > 28_000_000 || typeof body.name !== "string" || typeof body.mime !== "string") return reply(400, { error: "Invalid file" });
         return reply(200, { mediaUrl: await io.line.upload({ data: Buffer.from(body.data, "base64"), name: body.name, mimeType: body.mime }) });
       }
       if (!validId(body.id) || typeof body.text !== "string" || body.text.length > 12_000 || (body.mediaUrl !== undefined && (typeof body.mediaUrl !== "string" || !body.mediaUrl.startsWith("https://")))) return reply(400, { error: "Invalid send" });
-      return reply(200, await this.send(body.id, body.text, typeof body.mediaUrl === "string" ? body.mediaUrl : undefined, io.line, io.chat));
+      if (body.inboxId !== undefined && !validId(body.inboxId)) return reply(400, { error: "Invalid inbox id" });
+      const result = await this.send(body.id, body.text, typeof body.mediaUrl === "string" ? body.mediaUrl : undefined, io.line, io.chat);
+      if (validId(body.inboxId)) this.unanswered.answered(body.inboxId, this.now());
+      return reply(200, result);
     } catch (error) { this.emit("moni-runner-error", "callback"); return reply(error instanceof RemoteSendError ? error.status : 502, { error: "Operation failed" }); }
   }
 }

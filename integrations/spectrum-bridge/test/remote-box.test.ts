@@ -60,6 +60,129 @@ function setup() {
 }
 function files(root: string): string { return readdirSync(root, { withFileTypes: true }).map(e => e.isDirectory() ? files(join(root, e.name)) : readFileSync(join(root, e.name)).toString()).join(""); }
 
+test.each([
+  { kind: "wake", hasSend: false, age: 600_000, behind: "inbound", failed: true },
+  { kind: "wake", hasSend: false, age: 599_999, behind: "inbound", failed: false },
+  { kind: "inbound", hasSend: false, age: 600_000, behind: "inbound", failed: false },
+  { kind: "wake", hasSend: true, age: 600_000, behind: "inbound", failed: false },
+  { kind: "wake", hasSend: false, age: 600_000, behind: "wake", failed: false },
+  { kind: "wake", hasSend: false, age: 600_000, behind: undefined, failed: false },
+] as const)("wake autofail matrix %j", async ({ kind, hasSend, age, behind, failed }) => {
+  const s = setup(), id = opaqueId("head");
+  s.runner.enqueue(id, { kind, watcher: "homevisit", text: "PRIVATE_WAKE" });
+  s.runner.db.query("UPDATE inbox SET state='interrupted',interrupted_at=1000 WHERE id=?").run(id);
+  if (hasSend) s.runner.db.query("INSERT INTO actions(id,path,payload,state,inbox_id) VALUES (?,'/send','{}','pending',?)").run(opaqueId("sent"), id);
+  if (behind) s.remote.accept("behind", { text: "PRIVATE_DM" }, undefined, behind);
+  s.advance(age);
+  const logs = await captureLogs(async () => {
+    await s.remote.tick();
+    if (failed) { await s.runner.tick(); s.restart(); s.advance(5_000); await s.remote.tick(); }
+  });
+  const state = s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)!.state;
+  expect(state).toBe(failed ? "done" : "interrupted");
+  expect(logs.filter(l => l.name === "moni-box-wake-autofailed")).toHaveLength(failed ? 1 : 0);
+  expect(s.alerts.filter(a => a.key === `moni-box-wake-autofailed:${id.slice(0, 12)}`)).toHaveLength(failed ? 1 : 0);
+  if (failed) { expect(s.alerts.at(-1)!.text).toContain("homevisit"); expect(s.texts).toEqual(["PRIVATE_DM"]); }
+  expect(s.requests.filter(r => r.path === "/resolve")).toHaveLength(failed ? 1 : 0);
+  expect(s.notices).toHaveLength(0);
+  expect(JSON.stringify([s.alerts, s.logs, logs])).not.toContain("PRIVATE_");
+});
+
+test("a custom wake age keeps a younger wake fenced and autofails at its boundary", async () => {
+  const s = setup(), id = opaqueId("head"); s.config.wakeFenceAutoFailMs = 900_000;
+  s.remote.accept("head", { text: "wake" }, undefined, "wake"); await s.remote.tick();
+  s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  s.remote.accept("dm", { text: "dm" }); s.advance(899_999); await s.remote.tick();
+  expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)!.state).toBe("interrupted");
+  s.advance(5_000); await s.remote.tick();
+  expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)!.state).toBe("done");
+});
+
+test("autofail finds a DM past a page of wakes and retries a lost alert acknowledgement unchanged after restart", async () => {
+  const s = setup(), id = opaqueId("head");
+  s.runner.enqueue(id, { kind: "wake", text: "private" });
+  s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  for (let i = 0; i < 101; i++) s.runner.enqueue(opaqueId(`wake:${i}`), { kind: "wake", text: "private" });
+  s.runner.enqueue(opaqueId("dm"), { kind: "inbound", text: "private" });
+  let accepted = false;
+  s.ownerAlert(async (_severity, text, key) => { s.alerts.push({ text, key }); return accepted; });
+  s.advance(600_000); await s.remote.tick(); const alert = s.alerts[0];
+  s.restart(); s.advance(65_000); accepted = true; await s.remote.tick();
+  s.restart(); s.advance(65_000); await s.remote.tick();
+  expect(s.alerts).toEqual([alert, alert]);
+  expect(s.requests.filter(r => r.path === "/resolve")).toHaveLength(1);
+  expect(s.notices).toHaveLength(0);
+});
+
+test("remote fenced DM alerts once at ten minutes across restart, without requeue or plaintext", async () => {
+  const s = setup(); s.remote.accept("head", { text: "PRIVATE_HEAD" }); await s.remote.tick();
+  s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  s.remote.accept("dm", { text: "PRIVATE_DM", attachments: [{ name: "PRIVATE_FILE" }] });
+  s.advance(300_000); await s.remote.checkUnanswered();
+  expect(s.alerts).toHaveLength(0);
+  const before = s.requests.length;
+  const logs = await captureLogs(async () => {
+    s.advance(300_000); await s.remote.checkUnanswered();
+    s.restart(); s.advance(3_600_000); await s.remote.checkUnanswered(); await s.remote.checkUnanswered();
+  });
+  expect(s.alerts.filter(a => a.key === `imessage-unanswered:${opaqueId("dm")}`)).toHaveLength(1);
+  expect(s.requests).toHaveLength(before);
+  expect(logs.filter(l => l.name === "unanswered.alert")).toHaveLength(2);
+  expect(logs.find(l => l.name === "unanswered.alert")?.props?.backend).toBe("remote-box");
+  expect((await summarizeLog((async function* () { yield* logs; })())).unanswered_alerts).toBe(2);
+  expect(s.store.db.query("SELECT 1 FROM inbound").get()).toBeNull();
+  expect(files(s.mac)).not.toContain("PRIVATE_");
+});
+
+test("a wake that acquires send evidence during resolution keeps the fence", async () => {
+  const s = setup(), id = opaqueId("wake"); s.remote.accept("wake", { text: "private" }, undefined, "wake");
+  await s.remote.tick(); s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  s.remote.accept("dm", { text: "private" });
+  s.requestHook(async path => {
+    if (path === "/resolve") s.runner.db.query("INSERT OR IGNORE INTO actions(id,path,payload,state,inbox_id) VALUES (?,'/send','{}','pending',?)").run(opaqueId("late-send"), id);
+  });
+  s.advance(600_000); await s.remote.tick(); s.advance(5_000); await s.remote.tick();
+  expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)!.state).toBe("interrupted");
+  expect(s.alerts.map(a => a.key)).toEqual([`moni-box-fenced:${id.slice(0, 12)}`]);
+  expect(s.requests.filter(r => r.path === "/resolve")).toHaveLength(1);
+  expect(s.logs.some(l => l.startsWith("moni-box-wake-autofailed "))).toBe(false);
+});
+
+test("unanswered retries freeze Telegram text after a lost acknowledgement and concurrent checks across restart", async () => {
+  const s = setup(); let accepted = false;
+  s.ownerAlert(async (_severity, text, key) => { s.alerts.push({ text, key }); return accepted; });
+  s.remote.accept("dm", { text: "PRIVATE" }); s.advance(600_000);
+  await Promise.all([s.remote.checkUnanswered(), s.remote.checkUnanswered()]);
+  const original = s.alerts[0]; expect(s.alerts).toHaveLength(1);
+  s.restart(); s.advance(600_000); accepted = true; await s.remote.checkUnanswered();
+  s.restart(); s.advance(600_000); await s.remote.checkUnanswered();
+  expect(s.alerts).toEqual([original, original]);
+});
+
+test("successful attributed sends and reactions answer only their own DM; uncertain sends and notices do not", async () => {
+  const s = setup(), chat = chatKey.dm("+15555550199");
+  for (const id of ["replied", "later", "reacted", "uncertain"]) s.remote.accept(id, { text: "PRIVATE" });
+  const io = { line: s.line, chat, bus: async () => Response.json({}) };
+  const body = { id: opaqueId("reply"), inboxId: opaqueId("replied"), text: "reply" };
+  expect((await s.remote.callback(s.request("/send", body), io)).status).toBe(200);
+  expect((await s.remote.callback(s.request("/send", body), io)).status).toBe(200);
+  expect((await s.remote.callback(s.request("/react", { target: "reacted", kind: "like" }), io)).status).toBe(200);
+  const broken = { ...io, line: { ...s.line, sendText: async () => { throw new Error("uncertain"); } } };
+  expect((await s.remote.callback(s.request("/send", { id: opaqueId("broken"), inboxId: opaqueId("uncertain"), text: "reply" }), broken)).status).toBe(502);
+  await s.remote.send(opaqueId("notice"), "offline", undefined, s.line, chat);
+  s.restart(); s.advance(600_000); await s.remote.checkUnanswered();
+  expect(s.alerts.map(a => a.key).sort()).toEqual(["later", "uncertain"].map(id => `imessage-unanswered:${opaqueId(id)}`).sort());
+});
+
+test("remote backend state is logged at construction and every five minutes even while inactive", async () => {
+  const logs = await captureLogs(async () => {
+    const s = setup(); s.rollback(); await s.remote.tick(); s.advance(299_999); await s.remote.tick();
+    s.advance(1); await s.remote.tick(); s.restart();
+  });
+  const states = logs.filter(l => l.name === "moni-box-backend-state");
+  expect(states).toHaveLength(3); expect(states.map(l => l.props?.active)).toEqual([true, false, false]);
+});
+
 test.each(["inbound", "wake"] as const)("%s fence logs and alerts once across ticks and restart; growth logs again and resolve clears once", async kind => {
   const s = setup(), id = opaqueId("fenced"), canary = "PRIVATE_FENCE_CANARY";
   s.remote.accept("fenced", { text: canary }, undefined, kind);
@@ -383,7 +506,7 @@ test("legacy sends seed the cap and unclassified ciphertext cannot trigger a not
   expect(s.logs.join()).toContain("moni-notice-suppressed rate-limited"); expect(s.notices).toHaveLength(0);
 });
 
-test.each(["noticeAfterMs", "outageClearMs", "noticeMinGapMs"])("%s validates duration shapes", field => {
+test.each(["noticeAfterMs", "outageClearMs", "noticeMinGapMs", "wakeFenceAutoFailMs"])("%s validates duration shapes", field => {
   const s = setup();
   for (const value of [null, true, "120000", -1, 0.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
     expect(() => remoteBoxConfig({ chatBackends: { moni: { ...s.config, [field]: value } } }, "moni")).toThrow();
@@ -427,6 +550,8 @@ test("Moni remote-box receipt and delivered reply never wait on a local Robob ou
   const moni = registry.open(key); closes.push(() => moni.store.close());
   const call = (ok: boolean) => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok, durationMs: 10,
     props: { method: "GET", route: "/threads/:id/messages", ...(ok ? {} : { linkCause: "ECONNREFUSED" }), failureFormat: "single" } });
+  // A prior test can leave the process-wide logger inside an outage. Recover it outside this fixture.
+  call(true); toolLog.flush(); await toolLog.settled();
   const rows = await captureLogs(async () => {
     call(true);
     for (let i = 0; i < 3; i++) call(false);
