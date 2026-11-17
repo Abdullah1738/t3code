@@ -4268,6 +4268,189 @@ it.effect("fails the run when its event stream ends without a root terminal", ()
   }),
 );
 
+it.effect.each(
+  (["interrupted", "failed", "completed", "cancelled", "rolled_back"] as const).flatMap((status) =>
+    (["command", "held-text", "message", "node"] as const).flatMap((kind) =>
+      (["before-terminal", "unowned-terminal", "rejected-terminal"] as const).map((phase) => ({
+        status,
+        kind,
+        phase,
+      })),
+    ),
+  ),
+)(
+  "drops late activity and stops the exact provider turn of an externally $status run ($kind, $phase)",
+  ({ status, kind, phase }) =>
+    Effect.gen(function* () {
+      const stops: ProviderTurnId[] = [];
+      const logs: unknown[] = [];
+      const now = yield* DateTime.now;
+      let guarded = false;
+      let settled = phase === "before-terminal";
+      const result = yield* captureRootRunTermination({
+        key: `late-settled:${status}`,
+        shouldFinalizeRun: () => Effect.succeed(phase === "rejected-terminal"),
+        rejectTerminalWrite: phase === "rejected-terminal",
+        loadRunSettlement: () =>
+          Effect.succeed({
+            status: settled ? status : "running",
+            completedAt: settled ? now : null,
+          }),
+        responseStreamingMode: "turn",
+        events: (ids) => {
+          const event = backgroundTurnItemEvent(ids, "command_execution", "running", 1);
+          if (event.type !== "turn_item.updated") throw new Error("Expected turn item");
+          const item = {
+            ...event.turnItem,
+            id: TurnItemId.make(`${event.turnItem.id}:held`),
+            type: "assistant_message" as const,
+            text: "Still working",
+            streaming: true,
+          };
+          const late =
+            kind === "command"
+              ? event
+              : kind === "held-text"
+                ? { ...event, turnItem: item }
+                : kind === "message"
+                  ? {
+                      type: "message.updated" as const,
+                      driver,
+                      message: {
+                        id: MessageId.make("late-message"),
+                        threadId: ids.threadId,
+                        runId: ids.runId,
+                        role: "assistant" as const,
+                        text: "Finished",
+                        streaming: false,
+                      },
+                    }
+                  : {
+                      type: "node.updated" as const,
+                      driver,
+                      node: {
+                        id: ids.rootNodeId,
+                        threadId: ids.threadId,
+                        runId: ids.runId,
+                        kind: "command_execution",
+                        status: "running",
+                      },
+                    };
+          const lateEvents = Stream.make(
+            late,
+            late,
+          ) as Stream.Stream<ProviderAdapter.ProviderAdapterV2Event>;
+          return phase === "before-terminal"
+            ? lateEvents
+            : Stream.make(event).pipe(
+                Stream.concat(
+                  Stream.fromEffect(
+                    Effect.sync(() => {
+                      settled = true;
+                      return rootTerminalEvent(ids, "completed");
+                    }),
+                  ),
+                ),
+                Stream.concat(lateEvents),
+              );
+        },
+        ingestNormalized: (input) =>
+          Effect.sync(() => {
+            if (input.event.type !== "turn.terminal")
+              guarded = input.writeIfRunCurrent?.expectedStatus === "running";
+            return [];
+          }),
+        interruptTurn: (input) =>
+          Effect.sync(() => {
+            assert.isTrue(input.stopBackgroundWork);
+            stops.push(input.providerTurnId);
+          }),
+      }).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make(({ message }) => {
+              logs.push(message);
+            }),
+          ]),
+        ),
+      );
+      assert.equal(guarded, kind !== "held-text" || phase !== "before-terminal");
+      assert.deepEqual(stops, [`provider-turn:late-settled:${status}`]);
+      assert.isEmpty(result.written);
+      assert.isEmpty(result.observed);
+      assert.isTrue(result.previewActivityEnded);
+      assert.lengthOf(
+        logs.filter((m) => String(m).includes("provider item after run settlement")),
+        1,
+      );
+      const warning = logs
+        .flatMap((entry) => (Array.isArray(entry) ? entry : [entry]))
+        .find(
+          (entry) =>
+            typeof entry === "object" && entry !== null && "secondsSinceSettlement" in entry,
+        );
+      assert.deepInclude(warning, {
+        threadId: `thread:late-settled:${status}`,
+        runId: `run:late-settled:${status}`,
+        ordinal: 1,
+        providerTurnId: `provider-turn:late-settled:${status}`,
+        secondsSinceSettlement: 0,
+      });
+    }),
+);
+
+it.effect("stops a settled run by exact attempt when late activity precedes its turn id", () =>
+  Effect.gen(function* () {
+    const stops: string[] = [];
+    const result = yield* captureRootRunTermination({
+      key: "late-before-turn-id",
+      unobservedProviderTurn: true,
+      shouldFinalizeRun: () => Effect.succeed(false),
+      loadRunSettlement: () => Effect.succeed({ status: "interrupted", completedAt: null }),
+      events: (ids) => Stream.make(backgroundTurnItemEvent(ids, "command_execution", "running", 1)),
+      interruptStartingRun: (input) =>
+        Effect.sync(() => {
+          assert.isTrue(input.stopBackgroundWork);
+          stops.push(`${input.runId}:${input.attemptId}`);
+        }),
+      interruptTurn: () => Effect.die("No provider turn id is available"),
+    });
+    assert.deepEqual(stops, ["run:late-before-turn-id:attempt:late-before-turn-id"]);
+    assert.isEmpty(result.written);
+    assert.isEmpty(result.observed);
+  }),
+);
+
+it.effect("keeps confirmed background completions after the root run settles", () =>
+  Effect.gen(function* () {
+    let settled = false;
+    const items: string[] = [];
+    yield* captureRootRunTermination({
+      key: "confirmed-completion",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      loadRunSettlement: () =>
+        Effect.succeed({ status: settled ? "completed" : "running", completedAt: null }),
+      onTerminalRun: Effect.sync(() => {
+        settled = true;
+      }),
+      events: (ids) =>
+        Stream.make(
+          backgroundTurnItemEvent(ids, "command_execution", "running", 1),
+          rootTerminalEvent(ids, "completed"),
+          backgroundTurnItemEvent(ids, "command_execution", "completed", 2),
+        ),
+      ingestNormalized: ({ event }) =>
+        Effect.sync(() => {
+          if (event.type === "turn_item.updated") items.push(event.turnItem.status);
+          return [];
+        }),
+      interruptTurn: () =>
+        Effect.die("Confirmed background completion must not interrupt the turn"),
+    });
+    assert.deepEqual(items, ["running", "completed"]);
+  }),
+);
+
 // ardud (9 Nov): a failed projection read failed the run while the Claude turn
 // kept running unread, and the next send was refused as "previous turn is
 // still running". A failed run must stop its provider turn.
@@ -5460,6 +5643,7 @@ function captureRootRunTermination(input: {
   readonly rejectRecoveryWrite?: boolean;
   readonly loadDelegatedTask?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadDelegatedTask"];
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
+  readonly loadRunSettlement?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRunSettlement"];
   readonly rejectTerminalWriteForAttempt?: RunAttemptId;
   readonly runStart?: (
     start: Effect.Effect<void, RunExecutionService.RunExecutionServiceV2Error>,
@@ -5767,6 +5951,9 @@ function captureRootRunTermination(input: {
           ? {}
           : { loadDelegatedTask: input.loadDelegatedTask }),
         shouldFinalizeRun: input.shouldFinalizeRun,
+        ...(input.loadRunSettlement === undefined
+          ? {}
+          : { loadRunSettlement: input.loadRunSettlement }),
         loadRunCancelMetadata:
           input.loadCancelMetadata ?? (() => Effect.succeed(input.cancelMetadata)),
         ...(input.durableRefusal === undefined && input.refusalRead === undefined

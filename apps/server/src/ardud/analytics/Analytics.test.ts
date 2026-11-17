@@ -1738,3 +1738,67 @@ it.effect(
       assert.isBelow(JSON.stringify(section).length, 50000);
     }).pipe(Effect.provide(NodeServices.layer)),
 );
+
+it.effect("persists restart-admission facts and exposes their server-wide section", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    const restartAdmission = {
+      sourceRunId: "run:source:ordinal:3",
+      runId: "run:next:ordinal:4",
+      classification: "continuation",
+      queuedAtMs: Date.parse(ts) - 1000,
+      waitedMs: 1000,
+      positionAtEntry: 12,
+      position: 1,
+      total: 3,
+      maxQueueDepth: 12,
+      active: 1,
+      maxActive: 4,
+      loaded: false,
+    };
+    yield* analytics.record(
+      event({
+        kind: "restart.admission.admitted",
+        surface: "server",
+        route: "restart-pacing",
+        threadId: "thread:admitted",
+        bootId: "boot",
+        restartAdmission,
+      }),
+    );
+    yield* analytics.record(
+      event({
+        kind: "restart.admission.failed",
+        surface: "server",
+        route: "restart-pacing",
+        threadId: "thread:failed",
+        bootId: "boot",
+        restartAdmission: {
+          ...restartAdmission,
+          sourceRunId: "run:failed:ordinal:3",
+          rule: "no_progress",
+        },
+      }),
+    );
+    yield* analytics.flush;
+    const result = yield* analytics.read({ day });
+    assert.deepEqual(result.rollup.restartAdmission?.groups[0]?.wait, {
+      count: 1,
+      p50Ms: 1000,
+      p90Ms: 1000,
+      maxMs: 1000,
+      approximate: false,
+    });
+    assert.deepEqual(result.rollup.restartAdmission?.groups[0]?.failuresByRule, { no_progress: 1 });
+    const samples = yield* readSamples(analytics, { day, kind: "restart.admission.failed" });
+    assert.deepEqual(samples[0]?.restartAdmission, {
+      ...restartAdmission,
+      sourceRunId: "run:failed:ordinal:3",
+      rule: "no_progress",
+    });
+    const section = yield* analytics.read({ day, section: "restartAdmission" });
+    assert.strictEqual(section.section, "restartAdmission");
+    assert.isNotEmpty(section.rows);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

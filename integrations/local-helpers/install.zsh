@@ -411,7 +411,7 @@ smoke sh -n "$HOME/.local/bin/himalaya-heal"
 smoke sh -n "$HOME/.local/bin/mirage-beacon-keepalive"
 smoke sh -n "$lib/mirage/restart.sh"
 smoke sh -n "$HOME/.local/bin/vp"
-for f in worktree.mjs config-snapshot.mjs toolchain-state.mjs toolchain; do smoke node --check "$lib/vp/$f"; done
+for f in child.mjs launcher.mjs events.mjs worktree.mjs config-snapshot.mjs toolchain-state.mjs toolchain; do smoke node --check "$lib/vp/$f"; done
 smoke sh -c 'cd / && "$1" --version >/dev/null 2>&1; [ "$?" = 127 ]' sh "$HOME/.local/bin/vp"
 smoke zsh -n "$HOME/.local/share/lydia-ticks/tunnel.sh"
 for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health robob-read-watchdog quint; do

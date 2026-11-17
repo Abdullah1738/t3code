@@ -132,7 +132,7 @@ class SizeSubmissionTests(Isolated):
         self.con.execute("INSERT INTO runs(run_id,cmd,size) VALUES ('old','true','large')")
         self.con.execute('ALTER TABLE runs ADD COLUMN unrelated TEXT')
         self.con.execute("UPDATE runs SET unrelated='keep'")
-        for version in (6, 7):
+        for version in (6, 7, 8):
             with self.subTest(version=version):
                 self.con.execute('ALTER TABLE runs DROP COLUMN requested_size')
                 self.con.execute('ALTER TABLE runs DROP COLUMN size_note')

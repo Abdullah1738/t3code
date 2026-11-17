@@ -40,6 +40,9 @@ export const startTimeoutOf = (event: OrchestrationV2DomainEvent) =>
     ? {
         runId: event.payload.runId,
         reason: event.payload.failure.message,
+        ...(event.payload.failure.admission === undefined
+          ? {}
+          : { admission: event.payload.failure.admission }),
         ...(event.payload.failure.code === "restart_admission_timeout"
           ? { restartAdmission: true }
           : {}),

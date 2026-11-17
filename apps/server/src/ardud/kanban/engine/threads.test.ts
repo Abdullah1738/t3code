@@ -402,6 +402,49 @@ it.effect(
     }),
 );
 
+it.effect.each(["failed", "completed"] as const)(
+  "persisted admission failure is available without an error item only while the run is %s",
+  (status) => {
+    const threadId = ThreadId.make("thread-admission-failure");
+    const runId = RunId.make("run-admission-failure");
+    const model = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" };
+    const failure = {
+      class: "provider_error" as const,
+      code: "restart_admission_timeout",
+      message: "The restart admission queue never released this run (waited 30 min).",
+      retryable: null,
+      admission: {
+        queuedAtMs: 0,
+        waitedMs: 30 * 60_000,
+        positionAtFailure: 2,
+        totalAtFailure: 3,
+        rule: "no_progress" as const,
+      },
+    };
+    const management = Layer.mock(ThreadManagementService.ThreadManagementService)({
+      getThreadRecords: () =>
+        Effect.succeed({
+          runs: [{ id: runId, status, modelSelection: model, failure }],
+          turnItems: [],
+        } as never),
+    });
+    return Effect.gen(function* () {
+      const threads = yield* KanbanThreads;
+      expect(yield* threads.findLastFailure(threadId)).toEqual(
+        status === "failed" ? { ...failure, runId, model } : null,
+      );
+    }).pipe(
+      Effect.provide(
+        layer.pipe(
+          Layer.provide(management),
+          Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          Layer.provide(Sqlite.layerMemory),
+        ),
+      ),
+    );
+  },
+);
+
 it.effect.each(["first", "second", "missing", "completed", "none"] as const)(
   "active model reads the recorded run instead of a next-turn selection (%s)",
   (active) =>

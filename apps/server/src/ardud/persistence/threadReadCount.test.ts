@@ -6,6 +6,7 @@ import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Sqlite from "../../persistence/Sqlite.ts";
 import { HISTORY_TABLES, historyViewSql, liveColumns } from "./historyArchiveSql.ts";
+import { threadReadIndexes } from "./threadReadIndexes.ts";
 import { threadReadCount } from "./threadReadCount.ts";
 
 const tiers = [
@@ -14,11 +15,18 @@ const tiers = [
   ["ardud_base", "orchestration_v2_projection_turn_items"],
 ] as const;
 
-it.live("bounds visibility corrections to indexed candidates or affected base runs", () =>
+it.live.each([false, true])("bounds visibility corrections with sparse indexes=%s", (indexed) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const [query, parameters] =
-      sql`SELECT ${threadReadCount(sql, ThreadId.make("t"))} AS count`.compile();
+      sql`SELECT ${threadReadCount(sql, ThreadId.make("t"), { main: indexed, ardud_archive: indexed })} AS count`.compile();
+    if (indexed) {
+      for (const statement of [
+        ...threadReadIndexes("main", "orchestration_v2_projection_turn_items"),
+        ...threadReadIndexes("ardud_archive", "ardud_turn_items"),
+      ])
+        yield* sql.unsafe(statement);
+    }
     const indexes = yield* Effect.forEach(tiers, ([schema, table]) =>
       sql.unsafe<{ sql: string }>(
         `SELECT sql FROM ${schema}.sqlite_schema WHERE type = 'index'
@@ -153,7 +161,7 @@ it.live("bounds visibility corrections to indexed candidates or affected base ru
             );
             assert.isAtMost(
               result.visited,
-              schema === "ardud_base" ? affected * 4 + 32 : 32,
+              schema === "ardud_base" || !indexed ? affected * 4 + 32 : 32,
               `${schema} ${state} ${size}: unrelated tool rows evaluated`,
             );
             visits.push(result.visited);
@@ -168,7 +176,11 @@ it.live("bounds visibility corrections to indexed candidates or affected base ru
               }),
             );
           }
-          if (layout === "small run" || schema !== "ardud_base" || state === "completed") {
+          if (
+            layout === "small run" ||
+            (indexed && schema !== "ardud_base") ||
+            state === "completed"
+          ) {
             assert.equal(
               visits[0],
               visits[1],
