@@ -17,6 +17,7 @@ import functools
 import hashlib
 import importlib.machinery
 import importlib.util
+import imaplib
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,9 @@ import sqlite3
 import subprocess
 import sys
 import time
+import threading
+import types
+import urllib.error
 import urllib.request
 
 # robob-watch test copies the watcher into scratch, while helpers stay installed.
@@ -68,7 +72,7 @@ HEALTH_TRANSIENT_ESCALATE = 3 * 3600
 # check starts its last item, the classifier must answer, and the late check starts its last
 # item. One item can still wait ~7 s on a locked store (WhatsApp's LID lookup has a 5 s busy
 # timeout); LATE_BY leaves room for that and the commits.
-EARLY_BY, CLASSIFY_BY, LATE_BY = 32, 44, 46
+EARLY_BY, CLASSIFY_BY, LATE_BY = 24, 48, 49
 # Card alerts are checked against receipts and his own threads by money-cases first, until
 # CHARGE_BY seconds into a run. A fresh charge alert waits CHARGE_SETTLE for a receipt sent with
 # it; one the budget never reached stops waiting after CHARGE_STALL and goes to the classifier.
@@ -82,7 +86,13 @@ MODEL = 'anthropic/claude-haiku-5.5'
 PREFS_LIMIT = 12000
 INPUT_USD = 0.10 / 1_000_000
 OUTPUT_USD = 0.50 / 1_000_000
-MAX_BATCH = 64
+MAX_BATCH = 16
+MAIL_CHUNK = 8
+MAIL_LIMIT = 32
+CLASSIFIER_MIN_SECONDS = 8
+CLASSIFIER_DEFER_SECONDS = 15 * 60
+CLASSIFIER_DEFER_RUNS = 3
+CLASSIFIER_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 PAGE = 500  # chat rows per collector call; a live run carries on from its cursor next tick
 REPLAY_PAGES = 40
 APPLE_EPOCH = 978307200
@@ -849,14 +859,153 @@ def mail_record(M, mail, account, validity, record, cutoff, now, request):
     return item, None if item.get('hard_alert') else prefilter(item, now, request['rules'])
 
 
+class MailAuthRejected(RuntimeError):
+    pass
+
+
+def mail_credentials(account, refresh=False):
+    mail = load_module('triage_mail_credentials', HOME / '.local/bin/mailsearch')
+    if account == 'icloud':
+        return mail.secret([mail.KC_READ, 'himalaya-icloud', 'himalaya'], 15)
+    oauth = mail.mail_oauth
+    if refresh:
+        # The shared refresh() kills ortie after 30s. Keep its serialization here,
+        # but let the detached writer finish even after the watcher's wait expires.
+        state = Path(oauth.STATE_DIR)
+        state.mkdir(parents=True, exist_ok=True)
+        with (state / f'{account}.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            response = subprocess.run([oauth.ORTIE, '-a', account, 'token', 'refresh'],
+                                      capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                      timeout=None)
+            if response.returncode:
+                raise RuntimeError(f'credential refresh failed (rc={response.returncode})')
+            return oauth.get_token(account, timeout=None)
+    # ortie may refresh during token show. The parent bounds its wait; no nested
+    # subprocess timer may kill a refresh halfway through its credential write.
+    return mail.mail_oauth.get_token(account, timeout=None)
+
+
+def credential_guard_path(account):
+    wd = Path(os.environ.get('WATCH_DIR', Path(__file__).resolve().parent)).resolve()
+    root = LIVE if wd in (LIVE.resolve(), (LIVE.parent / 'inbox-triage-fastpath').resolve()) else wd
+    # Separate from mail_oauth's refresh lock: an inherited copy would self-deadlock it.
+    return root / f'credential-{account}.lock'
+
+
+def cached_mail_credential(account, seconds):
+    if account == 'icloud':
+        return None
+    try:
+        mail = load_module('triage_cached_credentials', HOME / '.local/bin/mailsearch')
+        response = subprocess.run([mail.mail_oauth.KC_READ, f'ortie-{account}'],
+                                  capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                  timeout=min(seconds, 2))
+        blob = json.loads(response.stdout) if response.returncode == 0 else {}
+        # Leave enough validity for the fetch; this read never invokes ortie or a refresh.
+        if float(blob.get('issued_at', 0)) + float(blob.get('expires_in', 0)) > time.time() + 60:
+            token = blob.get('access_token')
+            return token if isinstance(token, str) and token.strip() else None
+    except Exception:
+        return None
+
+
+def prepare_mail_credentials(account, seconds, diagnostics=None, *, refresh=False):
+    # The runner kills its entire process group. A refresh must survive that too,
+    # not just the narrower mail-worker timeout. Only the wait is bounded here.
+    command = [sys.executable, str(Path(__file__).resolve()), '--mail-credentials', account]
+    if refresh:
+        command.append('--refresh-mail-credentials')
+    path = credential_guard_path(account)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('a+') as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            guard.seek(0)
+            try:
+                started = json.load(guard)['started_at']
+            except (ValueError, KeyError, TypeError):
+                started = path.stat().st_mtime
+            if diagnostics is not None:
+                diagnostics['credential_inflight_age_s'] = max(0, round(time.time() - started))
+            # A token already rejected by IMAP must not be reused just because it
+            # has time left. Wait for the in-flight writer on a later tick instead.
+            cached = cached_mail_credential(account, seconds) if not refresh else None
+            if cached:
+                return cached
+            raise RuntimeError('refresh_inflight') from None
+        guard.seek(0)
+        guard.truncate()
+        json.dump({'started_at': time.time()}, guard)
+        guard.flush()
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, text=True, start_new_session=True,
+                                   pass_fds=(guard.fileno(),))
+        try:
+            output, _ = process.communicate(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            # The child retains the guard until it finishes, even if this watcher dies.
+            def finish():
+                process.communicate()
+            threading.Thread(target=finish, daemon=True).start()
+            raise TimeoutError('credential wait expired; refresh continues in isolated session') from None
+    if process.returncode or not output.strip():
+        raise RuntimeError(f'credential command failed (rc={process.returncode})')
+    return output.strip()
+
+
+def mail_auth_transport(factory, *args, **kwargs):
+    connection = factory(*args, **kwargs)
+    authenticate = connection.authenticate
+    def auth(*args, **kwargs):
+        try:
+            return authenticate(*args, **kwargs)
+        except imaplib.IMAP4.abort:
+            # abort subclasses IMAP4.error; the shared helper otherwise treats a
+            # dropped AUTH connection as a rejected token and asks for a refresh.
+            raise ConnectionAbortedError('IMAP connection aborted during AUTH') from None
+    connection.authenticate = auth
+    return connection
+
+
 def mail_worker(account, request):
-    # Subprocess isolation enforces a total wall-clock budget, including auth heals.
-    deadline = time.monotonic() + (10 if request.get('fast') else 15)
+    deadline = time.monotonic() + (7 if request.get('fast') else 10)
     mail = load_module('triage_mailsearch', HOME / '.local/bin/mailsearch')
+    # Credentials only cross stdin. No refresh-capable command runs in this process.
+    credential = request['credential']
+    mail.secret = lambda *_: credential
+    if account != 'icloud':
+        oauth = mail.mail_oauth
+        oauth.get_token = lambda *_: credential
+        def refresh_outside_fetch(*_, **__):
+            if request.get('credential_refreshed'):
+                # The parent already refreshed once. Let the helper continue its
+                # remaining frontend attempts without starting another refresh.
+                return False
+            raise MailAuthRejected('IMAP authentication rejected; isolated refresh required')
+        oauth.refresh = refresh_outside_fetch
+        oauth.imaplib = types.SimpleNamespace(**vars(oauth.imaplib))
+        oauth.imaplib.IMAP4_SSL = functools.partial(mail_auth_transport, oauth.imaplib.IMAP4_SSL)
+        oauth._PinnedIMAP = functools.partial(mail_auth_transport, oauth._PinnedIMAP)
     now, cursor = request['now'], request.get('cursor')
     since = request.get('since')
+    progress = {'account': account, 'cursor_before': cursor, 'stage': 'connect', 'result': None}
+    def save(stage, result=None):
+        progress['stage'] = stage
+        progress['stage_elapsed_ms'] = round((time.monotonic() - stage_started) * 1000)
+        if result is not None:
+            progress['result'] = copy.deepcopy(result)
+        if request.get('progress_path'):
+            atomic(Path(request['progress_path']), progress)
+    stage_started = time.monotonic()
+    save('connect')
+    connect_start = time.monotonic()
     M = mail.connect(account, 7)
+    progress['connect_ms'] = round((time.monotonic() - connect_start) * 1000)
+    stage_started = time.monotonic()
     try:
+        save('fetch')
         checked(*M.select('INBOX', readonly=True), 'select INBOX')
         validity = int(M.response('UIDVALIDITY')[1][0])
         next_uid = int(M.response('UIDNEXT')[1][0])
@@ -873,41 +1022,48 @@ def mail_worker(account, request):
             if low >= next_uid:
                 return {'items': [], 'cursor': cursor, 'drops': {}, 'scanned': 0}
             found = checked(*M.uid('SEARCH', 'UID', f'{low}:{next_uid - 1}'), 'search')
-            uids = sorted(int(u) for u in (found[0] or b'').split() if int(u) >= low)
+            uids = sorted(int(u) for u in (found[0] or b'').split() if low <= int(u) < next_uid)
             cutoff = request['initialized_at']
-        # Continue large bursts next tick, with no silent truncation.
-        uids = uids[:120] if since is None else uids
+        uids = uids[:MAIL_LIMIT] if since is None else uids
         out, drops, dropped = [], collections.Counter(), []
+        completed, last_uid = 0, (cursor['uid'] if cursor and not reset else 0)
+        def result(partial=None):
+            return {'items': out, 'cursor': {'validity': validity, 'uid': last_uid},
+                    'drops': dict(drops), 'dropped': dropped, 'scanned': completed, 'partial': partial}
         if not uids:
-            return {'items': [], 'cursor': {'validity': validity, 'uid': next_uid - 1}, 'drops': {}, 'scanned': 0}
+            last_uid = next_uid - 1
+            return result()
         fields = '(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE MESSAGE-ID LIST-UNSUBSCRIBE PRECEDENCE)])'
-        records = fetch_verified(M, uids, fields)
-        completed, last_uid, partial = 0, (cursor['uid'] if cursor and not reset else 0), None
-        for record in sorted(records, key=lambda r: r[0]):
-            if completed and time.monotonic() >= deadline:
-                partial = 'time budget; completed prefix saved'
-                break
+        for offset in range(0, len(uids), MAIL_CHUNK):
+            chunk = uids[offset:offset + MAIL_CHUNK]
             try:
-                if hasattr(M, 'sock'):
-                    M.sock.settimeout(max(1, min(7, deadline - time.monotonic())))
-                item, reason = mail_record(M, mail, account, validity, record, cutoff, now, request)
-            except Exception as e:
-                log_failure('mail.record_failed')
-                if not completed:
+                if completed and time.monotonic() >= deadline:
+                    raise TimeoutError('mail fetch budget exceeded')
+                records = fetch_verified(M, chunk, fields)
+                for record in sorted(records, key=lambda r: r[0]):
+                    if completed and time.monotonic() >= deadline:
+                        raise TimeoutError('mail fetch budget exceeded')
+                    if hasattr(M, 'sock'):
+                        M.sock.settimeout(max(1, min(7, deadline - time.monotonic())))
+                    item, reason = mail_record(M, mail, account, validity, record, cutoff, now, request)
+                    if reason:
+                        drops[reason] += 1
+                        dropped.append([f'mail:{account}:{validity}:{record[0]}', reason])
+                    elif item:
+                        out.append(item)
+                    completed += 1
+                    last_uid = record[0]
+                # fetch_verified confirms every missing UID was expunged before this advance.
+                last_uid = chunk[-1]
+                save('fetch', result())
+            except Exception as error:
+                if not completed and progress['result'] is None:
                     raise
-                partial = f'{type(e).__name__}: {clean(str(e), 160)}; completed prefix saved'
-                break
-            if reason:
-                drops[reason] += 1
-                dropped.append([f'mail:{account}:{validity}:{record[0]}', reason])
-            elif item:
-                out.append(item)
-            completed += 1
-            last_uid = record[0]
-        return {'items': out, 'cursor': {'validity': validity, 'uid': last_uid if partial else max(uids)},
-                'drops': dict(drops), 'dropped': dropped, 'scanned': completed, 'partial': partial}
+                partial = f'{type(error).__name__}: {clean(str(error), 100)}; completed prefix queued'
+                save('fetch', result(partial))
+                return result(partial)
+        return result()
     finally:
-        # Close the socket locally; LOGOUT need not consume another server round trip.
         try:
             M.shutdown()
         except OSError:
@@ -915,8 +1071,81 @@ def mail_worker(account, request):
 
 
 def run_mail(account, request):
+    started = time.monotonic()
+    deadline = started + (14 if request.get('fast') else 22)
+    info = {'account': account, 'fetched': 0, 'cursor_before': request.get('cursor'),
+            'cursor_after': request.get('cursor'), 'elapsed_ms': 0, 'credential_ms': 0,
+            'credential_error': None, 'credential_inflight_age_s': None,
+            'credential_refresh_attempts': 0,
+            'timed_out': False, 'stage': 'credential', 'connect_ms': None}
+    payload = dict(request)
+    wd = Path(os.environ.get('WATCH_DIR', Path(__file__).resolve().parent))
+    path = wd / f'mail-progress-{account}.json' if request.get('since') is None else None
+    if path:
+        payload['progress_path'] = str(path)
+    def saved():
+        record = read_json(path, {}) if path else {}
+        return record if record.get('cursor_before') == request.get('cursor') else {}
+    def complete(result):
+        info.update(fetched=result['scanned'], cursor_after=result['cursor'],
+                    elapsed_ms=round((time.monotonic()-started)*1000))
+        result['mail_progress'] = info
+        return result
+    def credentials(refresh=False):
+        info['stage'] = 'credential'
+        credential_start = time.monotonic()
+        try:
+            remaining = deadline - credential_start
+            if remaining <= 0:
+                raise TimeoutError('mail credential budget exceeded')
+            payload['credential'] = prepare_mail_credentials(
+                account, min(5 if request.get('fast') else 8, remaining), info, refresh=refresh)
+        except Exception as error:
+            info['credential_error'] = ('refresh_inflight' if str(error) == 'refresh_inflight' else
+                                        f'{type(error).__name__}: {clean(str(error), 160)}')
+            raise
+        finally:
+            info['credential_ms'] += round((time.monotonic()-credential_start)*1000)
+        info['stage'] = 'connect'
+    try:
+        old = saved()
+        if old.get('result'):
+            info.update(stage='recovered', credential_ms=0)
+            return complete(old['result'])
+        credentials()
+        try:
+            result = run_mail_fetch(account, payload, deadline=deadline)
+        except MailAuthRejected:
+            info['credential_refresh_attempts'] = 1
+            credentials(refresh=True)
+            payload['credential_refreshed'] = True
+            result = run_mail_fetch(account, payload, deadline=deadline)
+        record = saved()
+        info.update(stage='fetch', connect_ms=record.get('connect_ms'), fetch_ms=record.get('stage_elapsed_ms'))
+        info['timed_out'] = any(marker in (result.get('partial') or '').lower()
+                                for marker in ('timeout', 'timed out', 'time budget'))
+        return complete(result)
+    except Exception as error:
+        info['timed_out'] = isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) or getattr(error, 'timed_out', False)
+        record = saved()
+        if info['stage'] != 'credential':
+            info.update(stage=record.get('stage', info['stage']), connect_ms=record.get('connect_ms'),
+                        stage_elapsed_ms=max(0, round((time.monotonic()-started)*1000)
+                                             - info['credential_ms'] - (record.get('connect_ms', 0)
+                                               if record.get('stage') == 'fetch' else 0)))
+            if record.get('result'):
+                result = record['result']
+                result['partial'] = f'{type(error).__name__}: {clean(str(error), 100)}; completed prefix queued'
+                return complete(result)
+        info['elapsed_ms'] = round((time.monotonic()-started)*1000)
+        error.mail_progress = info
+        raise
+
+
+def run_mail_fetch(account, request, *, deadline=None):
     # Accounts run concurrently; a retry shares this budget, rather than adding 22s.
-    deadline = time.monotonic() + (12 if request.get('fast') else 25)
+    fetch_deadline = time.monotonic() + (9 if request.get('fast') else 14)
+    deadline = min(deadline, fetch_deadline) if deadline is not None else fetch_deadline
     command = [sys.executable, str(Path(__file__).resolve()), '--mail-worker', account]
     payload = json.dumps(request)
     for attempt in range(2):
@@ -924,17 +1153,20 @@ def run_mail(account, request):
         if remaining <= 0:
             raise TimeoutError('mail collector budget exceeded')
         try:
-            p = run_helper('mail-worker', command, input=payload, text=True, capture_output=True,
-                           timeout=min(22, remaining))
+            p = run_helper('mail-worker:' + account, command, input=payload, text=True, capture_output=True,
+                           timeout=min(12, remaining))
         except subprocess.TimeoutExpired as e:
-            error = e
+            raise e
         else:
             if not p.returncode:
                 # A completed prefix is already useful; never discard it to retry.
                 return json.loads(p.stdout)
             message = p.stderr.strip()[-180:] or 'mail collector failed'
+            if message.startswith('MailAuthRejected:'):
+                raise MailAuthRejected('IMAP authentication rejected; isolated refresh required')
             error = RuntimeError(message)
             text = message.lower()
+            error.timed_out = any(marker in text for marker in ('timeouterror:', 'timeout:', 'timed out'))
             permanent = any(marker in text for marker in (
                 'invalid credentials', 'authenticationfailed', 'authentication failed',
                 'authenticate failed', 'login failed', 'xoauth2 failed', 'invalid_grant',
@@ -953,6 +1185,11 @@ def run_mail(account, request):
             ))
             if permanent or not transient:
                 raise error
+        progress = read_json(Path(request['progress_path']), {}) if request.get('progress_path') else {}
+        if progress.get('cursor_before') == request.get('cursor') and progress.get('result'):
+            result = progress['result']
+            result['partial'] = f'{type(error).__name__}: {clean(str(error), 100)}; completed prefix queued'
+            return result
         if attempt or request.get('fast') or time.monotonic() >= deadline:
             raise error
 
@@ -1232,7 +1469,7 @@ def classify(items, context):
                'response_format': {'type': 'json_object'},
                'messages': [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': json.dumps({'current_context': context, 'items': payload_items}, ensure_ascii=False, separators=(',', ':'))}]}
     key = (HOME / '.config/opencode/openrouter-key').read_text().strip()
-    req = urllib.request.Request('https://openrouter.ai/api/v1/chat/completions', data=json.dumps(request).encode(),
+    req = urllib.request.Request(CLASSIFIER_ENDPOINT, data=json.dumps(request).encode(),
                                  headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json', 'X-OpenRouter-Title': 'inbox-triage'})
     with urllib.request.urlopen(req, timeout=18) as response:
         result = json.load(response)
@@ -1259,51 +1496,88 @@ class ClassifierDeadline(BaseException):
     error wrapping can't catch it and carry on past the budget."""
 
 
+def deferred_stats(items, now):
+    ages = [max(0, now - i['classifier_deferred_at']) for i in items
+            if isinstance(i.get('classifier_deferred_at'), (int, float))]
+    return {'deferred_count': len(ages), 'oldest_deferred_age_s': round(max(ages, default=0))}
+
+
+def defer_classifier_items(items, now):
+    expired = []
+    for item in items:
+        first = item.setdefault('classifier_deferred_at', now)
+        item['classifier_deferred_runs'] = item.get('classifier_deferred_runs', 0) + 1
+        if now - first >= CLASSIFIER_DEFER_SECONDS or item['classifier_deferred_runs'] >= CLASSIFIER_DEFER_RUNS:
+            expired.append({'id': item['id'], 'reason': 'Classifier unavailable; manually review', 'urgency': 'info'})
+    return expired
+
+
 def classify_batch(items, context, seconds=20):
-    """One classifier call under a wall-clock budget. On any failure every item goes to
-    manual review instead; there is no retry or second LLM call."""
-    started = time.perf_counter()
-    def unavailable(error, cost):
-        log_failure('classifier.timeout' if error == 'TimeoutError' else 'classifier.failed')
-        tool_log({'component': 'triage', 'kind': 'perf', 'name': 'triage.classify', 'ok': False,
-                  'durationMs': (time.perf_counter() - started) * 1000, 'ids': log_ids(),
-                  'props': {'class': 'fail_open', 'count': len(items)}})
-        # cost_usd None: a timed-out HTTP request may still be billed.
-        return ([{'id': i['id'], 'reason': 'Classifier unavailable; manually review', 'urgency': 'info'} for i in items],
-                {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': cost, 'classifier_error': error})
-    if seconds < 1:
-        return unavailable('TimeoutError', 0)
-    armed = True
-    def classify_deadline(*_):
-        if armed:
-            raise ClassifierDeadline('classifier wall-clock budget exceeded')
-    previous_handler = signal.signal(signal.SIGALRM, classify_deadline)
+    started = time.monotonic()
+    deadline = started + max(0, seconds)
+    budget_ms = round(max(0, seconds) * 1000)
+    attempts, causes = 0, []
+    def metadata():
+        return {'classifier_elapsed_ms': round((time.monotonic()-started)*1000),
+                'classifier_attempts': attempts, 'classifier_budget_ms': budget_ms,
+                'classifier_endpoint': CLASSIFIER_ENDPOINT,
+                'classifier_causes': causes}
+    if seconds < CLASSIFIER_MIN_SECONDS:
+        # Keep these candidates in the durable queue. A busy collector is not evidence
+        # that the endpoint failed, and manual-review floods do not help the owner.
+        return [], {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0,
+                    'classifier_deferred': True, **metadata()}
+    def alarm(*_):
+        raise ClassifierDeadline('classifier attempt deadline')
+    previous_handler = signal.signal(signal.SIGALRM, alarm)
     try:
-        try:
-            # Armed inside the try: the deadline can fire before the first line of classify.
-            # It fires again every second in case something on the way swallows it.
-            signal.setitimer(signal.ITIMER_REAL, seconds, 1)
-            result = classify(items, context)
-        finally:
-            armed = False
-            signal.setitimer(signal.ITIMER_REAL, 0)
-        tool_log({'component': 'triage', 'kind': 'perf', 'name': 'triage.classify', 'ok': True,
-                  'durationMs': (time.perf_counter() - started) * 1000, 'ids': log_ids(),
-                  'props': {'count': len(items)}})
-        return result
-    except ClassifierDeadline:
-        return unavailable('TimeoutError', None)
-    except Exception as e:
-        return unavailable(type(e).__name__, None)
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining < 1:
+                break
+            attempts += 1
+            attempt_start = time.monotonic()
+            allowance = min(12, remaining / 2) if attempt == 0 else remaining
+            try:
+                signal.setitimer(signal.ITIMER_REAL, allowance, 1)
+                hits, meta = classify(items, context)
+                if causes:
+                    meta['cost_usd'] = None
+                return hits, {**meta, **metadata()}
+            except (ClassifierDeadline, Exception) as error:
+                cause = ('deadline' if isinstance(error, ClassifierDeadline) else
+                         'socket_timeout' if isinstance(error, TimeoutError) else
+                         f'http_status={error.code}' if isinstance(error, urllib.error.HTTPError) else
+                         f'url_error={type(error.reason).__name__}' if isinstance(error, urllib.error.URLError) else
+                         type(error).__name__)
+                causes.append({'attempt': attempts, 'cause': cause,
+                               'elapsed_ms': round((time.monotonic()-attempt_start)*1000)})
+                retry = isinstance(error, (ClassifierDeadline, TimeoutError, urllib.error.URLError))
+                if isinstance(error, urllib.error.HTTPError):
+                    retry = error.code in (408, 429) or error.code >= 500
+                if not retry:
+                    break
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
     finally:
-        armed = False
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous_handler)
+    meta = metadata()
+    cause = causes[-1]['cause'] if causes else 'budget_exhausted'
+    meta['classifier_error'] = (f'{cause}; endpoint={CLASSIFIER_ENDPOINT}; '
+                                f'elapsed_ms={meta["classifier_elapsed_ms"]}; attempts={attempts}')
+    log_failure('classifier.failed')
+    tool_log({'component': 'triage', 'kind': 'perf', 'name': 'triage.classify', 'ok': False,
+              'durationMs': meta['classifier_elapsed_ms'], 'ids': log_ids(),
+              'props': {'class': 'fail_open', 'count': len(items)}})
+    return ([{'id': i['id'], 'reason': 'Classifier unavailable; manually review', 'urgency': 'info'} for i in items],
+            {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': None, **meta})
 
 
 def log_run(wd, record):
     # scratch/test runs never mutate live logs or reports.
     root = DATA if wd.resolve() == LIVE.resolve() else wd / 'diagnostics'
+    record = {'deferred_count': 0, 'oldest_deferred_age_s': 0, **record}
     path = root / 'runs.jsonl'
     payload = (json.dumps({'at': stamp(), **record}, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
     offset = None
@@ -1663,7 +1937,7 @@ def run_fast(args):
     atomic(wd / 'cursor.json', state)
     health = send_health(state, due, wd, now)
     atomic(wd / 'cursor.json', state)
-    log_run(wd, {'fastpath': True, 'pending': len(state['pending']), 'source_errors': errors, **health,
+    log_run(wd, {'fastpath': True, 'pending': len(state['pending']), 'source_errors': errors, 'mail_accounts': {a: r['mail_progress'] for a, r in results.items() if 'mail_progress' in r}, **health,
                  'ms': round((time.time() - now) * 1000), 'cost_usd': 0})
     # Never print a wake: that can sit behind a turn or duplicate the direct notification.
     # One failed mailbox/channel must not back off or pause the other security sources.
@@ -2006,6 +2280,9 @@ def collect(state, now, watchers, rules, since=None, baseline=False, fast=None):
                     causes[source] = ('collection.partial', stderr_cause(errors[source]))
             except Exception as e:
                 errors[source] = f'{type(e).__name__}: {str(e)[:160]}'
+                if hasattr(e, 'mail_progress'):
+                    results[source] = {'items': [], 'cursor': state['cursors'].get(source),
+                                       'drops': {}, 'scanned': 0, 'mail_progress': e.mail_progress}
                 causes[source] = ('collection.failed', stderr_cause(f'{type(e).__name__}: {e}'))
         for source, (tag, cause) in causes.items():
             helper = 'mail-worker' if source in ACCOUNTS else source
@@ -2041,7 +2318,7 @@ def run(args):
         pending = bool(state.get('outbox'))
         replay = replay_outbox(state, wd, run_id)
         if replay is not None:
-            log_run(wd, {'replay': True, 'cost_usd': 0})
+            log_run(wd, {'replay': True, 'cost_usd': 0, **deferred_stats(state['queue'], now)})
             if replay:
                 print(redact_credentials(replay), flush=True)
             return 0
@@ -2049,7 +2326,8 @@ def run(args):
         # the next run collects instead of this one being killed half way.
         if pending and time.time() - now > REPLAY_SLACK:
             log_run(wd, {'replay': True, 'replay_cleared': True, 'collect_deferred': True,
-                         'ms': round((time.time() - now) * 1000), 'cost_usd': 0})
+                         'ms': round((time.time() - now) * 1000), 'cost_usd': 0,
+                         **deferred_stats(state['queue'], now)})
             return 0
     watchers, rules = active_watchers(now), noise_rules()
     results, errors = collect(state, now, watchers, rules, now - args.dry_run_hours * 3600 if dry else None, new)
@@ -2137,18 +2415,29 @@ def run(args):
     # A live run classifies one batch and leaves the rest queued for the next tick; a
     # replay has no next tick, so it classifies every candidate, a batch at a time.
     ready = sorted([i for i in state['queue'] if i['id'] not in held], key=lambda i: bool(i.get('chat_deferred')))
-    items = ready if dry else ready[:MAX_BATCH]
-    meta = {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0}
+    items = ready if dry else ([i for i in ready if not i.get('chat_deferred')][:MAX_BATCH]
+                               + [i for i in ready if i.get('chat_deferred')])
+    meta = {'model': MODEL, 'input_tokens': 0, 'output_tokens': 0, 'cost_usd': 0,
+            'classifier_elapsed_ms': 0, 'classifier_attempts': 0, 'classifier_budget_ms': 0}
     context = build_context(items, watchers, now) if items or settlement_items else {}
     if isinstance(context.get('live_work'), dict):
         settle_work(context['live_work'], settlement_items, state)
     classify_items = [i for i in items if not i.get('chat_deferred')]
     fail_open_ids = set()
+    deferred_ids = set()
     hits = [{'id': i['id'], 'reason': i['reason'], 'urgency': i['urgency']} for i in items if i.get('chat_deferred')]
     for n in range(0, len(classify_items), MAX_BATCH):
         seconds = 20 if dry else min(20, now + CLASSIFY_BY - time.time())
         got, used = classify_batch(classify_items[n:n + MAX_BATCH], context, seconds)
         hits += got
+        if used.get('classifier_deferred'):
+            batch = classify_items[n:n + MAX_BATCH]
+            deferred_ids.update(i['id'] for i in batch)
+        for key in ('classifier_elapsed_ms', 'classifier_attempts', 'classifier_budget_ms'):
+            meta[key] = meta.get(key, 0) + used.get(key, 0)
+        for key in ('classifier_endpoint', 'classifier_causes'):
+            if key in used:
+                meta[key] = used[key]
         meta['model'] = used.get('model', meta['model'])
         for k in ('input_tokens', 'output_tokens'):
             meta[k] += used.get(k, 0)
@@ -2156,6 +2445,24 @@ def run(args):
         if 'classifier_error' in used:
             fail_open_ids.update(i['id'] for i in classify_items[n:n + MAX_BATCH])
             meta['classifier_error'] = used['classifier_error']
+    attempted_ids = {i['id'] for i in items} - deferred_ids
+    pending = [i for i in ready if not i.get('chat_deferred') and i['id'] not in attempted_ids]
+    if pending:
+        # Age the entire waiting queue, including candidates beyond the batch limit.
+        # Otherwise a sustained backlog could hide those candidates behind its head.
+        expired = defer_classifier_items(pending, now)
+        expired_ids = {i['id'] for i in expired}
+        included = {i['id'] for i in items}
+        items += [i for i in pending if i['id'] in expired_ids and i['id'] not in included]
+        hits += expired
+        fail_open_ids.update(expired_ids)
+        deferred_ids = {i['id'] for i in pending} - expired_ids
+        meta['classifier_deferred'] = True
+    if meta.get('classifier_deferred') and not dry:
+        # Persist the age/run cap before late checks and delivery can use the remaining budget.
+        atomic(wd / 'cursor.json', state)
+    processed_ids = {i['id'] for i in items} - deferred_ids
+    meta.update(deferred_stats([i for i in state['queue'] if i['id'] not in processed_ids], now))
     # An unexplained card charge goes to the woken agent whatever the classifier thought of it; the agent
     # still runs money-cases ask before asking him (owner rule, nightly 2026-10-24).
     hit_ids = {h['id'] for h in hits}
@@ -2163,7 +2470,7 @@ def run(args):
              for i in items if i.get('charge_question') and i['id'] not in hit_ids]
     hit_ids = {h['id'] for h in hits}
     for item in items:
-        if item['id'] not in hit_ids:
+        if item['id'] not in hit_ids and item['id'] not in deferred_ids:
             log_decision(item, 'noise', 'ignored')
     by_id = {i['id']: i for i in items}
     selected = [{**by_id[h['id']], **h} for h in hits]
@@ -2178,7 +2485,8 @@ def run(args):
     selected = [h for h in selected if h['id'] not in gone]
     answer_errors = {**answer_errors, **late_errors}
     report = {'at': stamp(now), 'dry_run': dry, 'scanned': stats, 'dropped': dict(drops), 'candidate_count': len(items),
-              'hits': selected, 'source_errors': errors, 'usage': meta}
+              'hits': selected, 'source_errors': errors, 'usage': meta,
+              'mail_accounts': {a: r['mail_progress'] for a, r in results.items() if 'mail_progress' in r}}
     if context.get('live_work'):
         report['live_work'] = context['live_work']
     if answer_errors:
@@ -2201,7 +2509,8 @@ def run(args):
             atomic(Path(args.report), report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 1 if errors or meta.get('classifier_error') else 0
-    classified = {i['id'] for i in items}
+    classified = {i['id'] for i in items} - deferred_ids
+    classified.update(i['id'] for i in selected)
     state['queue'] = [i for i in state['queue'] if i['id'] not in classified]
     deferred = bool(urgent.get('chat_down'))
     if deferred:
@@ -2225,6 +2534,7 @@ def run(args):
         charge_error = '; '.join(filter(None, [charge_error, 'recording raised charges: ' + raised_error]))[:300]
     log_run(wd, {'initialized': new, 'scanned': stats, 'dropped': dict(drops), 'candidates': len(items),
                  'hits': len(selected), 'queued': len(state['queue']), 'source_errors': errors,
+                 'mail_accounts': {a: r['mail_progress'] for a, r in results.items() if 'mail_progress' in r},
                  **({'answer_check_errors': answer_errors} if answer_errors else {}),
                  **({'charge_check_errors': charge_error} if charge_error else {}),
                  **({'held_for_receipt': len(held)} if held else {}), **health, **urgent,
@@ -2238,6 +2548,8 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser()
     parser.add_argument('--mail-worker', choices=ACCOUNTS)
+    parser.add_argument('--mail-credentials', choices=ACCOUNTS)
+    parser.add_argument('--refresh-mail-credentials', action='store_true')
     parser.add_argument('--dry-run-hours', type=float)
     parser.add_argument('--report')
     parser.add_argument('--fast-only', action='store_true')
@@ -2247,11 +2559,19 @@ def main():
     if args.expect_auth:
         expect_auth(args.expect_auth, args.account)
         return 0
+    if args.mail_credentials:
+        if os.environ.get('ROBOB_TEST') == '1':
+            return 75
+        try:
+            print(mail_credentials(args.mail_credentials, refresh=args.refresh_mail_credentials))
+        except Exception:
+            return 1
+        return 0
     if args.mail_worker:
         def timeout(*_):
             raise TimeoutError('mail worker budget exceeded')
         signal.signal(signal.SIGALRM, timeout)
-        signal.alarm(19)
+        signal.alarm(11)
         try:
             print(json.dumps(mail_worker(args.mail_worker, json.load(sys.stdin))))
         except Exception as e:

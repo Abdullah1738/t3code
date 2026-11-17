@@ -729,7 +729,7 @@ if sys.argv[1] == 'send':
         from subprocess import TimeoutExpired
         with patch.object(t.subprocess, 'run', side_effect=TimeoutExpired('mail', 12)) as run:
             with self.assertRaises(TimeoutExpired):
-                t.run_mail('gmail', {'fast': True})
+                t.run_mail_fetch('gmail', {'fast': True})
         self.assertEqual(run.call_count, 1)
         self.assertLessEqual(run.call_args.kwargs['timeout'], 12)
 
