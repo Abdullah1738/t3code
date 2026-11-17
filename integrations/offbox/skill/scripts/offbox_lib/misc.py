@@ -1061,6 +1061,7 @@ def _preamble_first(dst, stdout_bytes, run_id):
 
 def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
     from .runs import remember_interruption
+    from . import node_version
     started = time.time()
     deadline = started + (30 if budget is None else budget)
     tmp = None
@@ -1100,6 +1101,11 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                     dst.write(chunk)
                     left -= len(chunk)
             for i, which in enumerate(('stdout', 'stderr')):
+                # An older waiter may have committed the display log without the stderr-only receipt projection.
+                # Replay that stream for metadata, retaining the existing log bytes and their delivery positions.
+                read_offset = offsets[i]
+                if i == 1:
+                    read_offset = min(read_offset, node_version.stderr_offset(path))
                 header, trimming = bytearray(), which == 'stderr'
                 snapshot = None
                 empty_pages = 0
@@ -1108,7 +1114,7 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                         return 'incomplete:timeout'
                     page_started = monotonic()
                     try:
-                        page = api.history_logs(r['box_id'], r['command_id'], which, offsets[i], deadline=deadline)
+                        page = api.history_logs(r['box_id'], r['command_id'], which, read_offset, deadline=deadline)
                     finally:
                         if stats is not None:
                             elapsed_ms = round((monotonic() - page_started) * 1000, 3)
@@ -1133,16 +1139,16 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                         deadline = started + min(180, 30 + sum(sizes) / 1_000_000)
                     data = (page.get('data') or '').encode()
                     nxt = page.get('nextOffset')
-                    nxt = offsets[i] + len(data) if nxt is None else int(nxt)
+                    nxt = read_offset + len(data) if nxt is None else int(nxt)
                     # Older home servers omit size; an empty live page can mean the command is quiet.
-                    if live and not data and nxt == offsets[i] and not page.get('done') and page.get('size') is None:
+                    if live and not data and nxt == read_offset and not page.get('done') and page.get('size') is None:
                         break
-                    if nxt <= offsets[i] and not page.get('done') and not (live and snapshot is not None and nxt >= snapshot):
-                        if not live and r['mode'] == 'bg' and not length and not data and nxt == offsets[i] and empty_pages < 2:
+                    if nxt <= read_offset and not page.get('done') and not (live and snapshot is not None and nxt >= snapshot):
+                        if not live and r['mode'] == 'bg' and not length and not data and nxt == read_offset and empty_pages < 2:
                             empty_pages += 1
                             continue
                         return 'incomplete:no progress'
-                    if nxt != offsets[i] + len(data):
+                    if nxt != read_offset + len(data):
                         return 'incomplete:invalid history offset'
                     if remote.get('lengths'):
                         # stdout matches its prefix; stderr also has the outer wrapper's PID diagnostic first.
@@ -1161,10 +1167,13 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                         chunk = payload[:max(0, expected - copied[i])]
                         digests[i].update(chunk)
                         copied[i] += len(chunk)
-                    skip = max(0, ck[which + 'Offset'] - offsets[i]) if remote else 0
+                    if i == 1:
+                        node_version.capture_stderr(path, data, read_offset)
+                    skip = max(0, ck[which + 'Offset'] - read_offset)
                     dst.write(data[skip:])
                     empty_pages = 0
-                    offsets[i] = nxt
+                    read_offset = nxt
+                    offsets[i] = max(offsets[i], nxt)
                     if live and not remote and dst.tell() >= length:
                         # Publish each validated page before fetching more: a later failure must keep this progress.
                         dst.flush()

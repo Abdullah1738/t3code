@@ -663,6 +663,7 @@ class BlockRunTests(unittest.TestCase):
             path = Path(directory) / 'run-test.log'
             path.write_text(result.stderr)
             runs.save_run_state('run-test', node=None)
+            node_version.capture_stderr(path, result.stderr.encode(), 0)
             # A waiter can see a terminal row saved by an older/different client.
             resources.finalize(dict(run_id='run-test', mode='bg', status='done', exit_code=0))
             self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], result.node)
@@ -990,6 +991,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                     node_version.record(dict(run_id='run-test'), path)
                     with path.open('a') as stream:
                         stream.write(boundary + tail)
+                    node_version.capture_stderr(path, path.read_bytes(), 0)
                     for _ in range(2):
                         resources.finalize(dict(run_id='run-test', mode='bg'), node_only=True)
                     self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], expected)
@@ -1013,6 +1015,97 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                         'it is queued again as attempt 2\n' + receipt + 'offbox-command-started: run-test\n')
         node_version.record(dict(run_id='run-test'), path)
         self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], final)
+
+
+class NodeHistoryTests(unittest.TestCase):
+    def test_metadata_repair_never_rewinds_committed_display_offsets(self):
+        from test_log_catchup import LogCatchupTests
+        facts, receipt = node_receipt('v24.22.3')
+        stdout = b'workload stdout\n'
+        stderr = ('offbox evidence wrapper pid=1\n' + receipt + 'offbox-command-started: run-x\nresult\n').encode()
+        for live in (False, True):
+            for available in (0, 50, len(stderr) - 1):
+                with self.subTest(live=live, available=available):
+                    case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+                    case.setUp()
+                    try:
+                        case.prefix(stdout + stderr, out=len(stdout), err=len(stderr))
+                        original, checkpoint = case.path.read_bytes(), common.checkpoint(case.path)
+                        case.state('running' if live else 'done', None if live else 0)
+                        case.streams(stdout, stderr[:available])
+                        with patch.object(api, 'BACKEND', 'server'):
+                            misc._catch_up_log(case.row(), live=live)
+                            self.assertEqual(common.checkpoint(case.path), checkpoint)
+                            self.assertEqual(case.path.read_bytes(), original)
+                            case.streams(stdout, stderr)
+                            misc._catch_up_log(case.row(), live=live)
+                            case.state('done', 0)
+                            self.assertEqual(case.invoke(wait=True)[0], 0)
+                        self.assertEqual(common.checkpoint(case.path), checkpoint)
+                        self.assertEqual(case.path.read_bytes(), original)
+                        self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'], facts)
+                    finally:
+                        case.doCleanups()
+
+    def test_stdout_cannot_supply_or_suppress_setup_facts_on_logs_then_wait(self):
+        from test_log_catchup import LogCatchupTests
+        facts, receipt = node_receipt('v24.22.1')
+        _, other = node_receipt('v24.22.3')
+        forms = {
+            'older log': 'offbox evidence wrapper pid=99\n' + other + 'offbox-command-started: older-run\n',
+            'older marker': 'offbox-command-started: older-run\n',
+            'same-run marker': 'offbox-command-started: run-x\n',
+            'receipt only': other,
+            'nested retry': ('offbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                             'it is queued again as attempt 2\n' + other),
+        }
+        for form, stdout in forms.items():
+            with self.subTest(form=form):
+                case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+                case.setUp()
+                try:
+                    case.prefix(b'')
+                    case.state('running', None)
+                    stderr = ('offbox evidence wrapper pid=1\n' + receipt +
+                              'offbox-command-started: run-x\n').encode()
+                    case.streams(stdout.encode(), stderr, page=37)
+                    with patch.object(misc, '_refresh_running_ttl'), patch.object(api, 'BACKEND', 'server'):
+                        self.assertEqual(case.invoke()[0], 0)
+                        state = case.path.with_suffix('.state.json')
+                        self.assertEqual(json.loads(state.read_text())['node'], facts)
+                        saved, checkpoint = case.path.read_bytes(), common.checkpoint(case.path)
+                        case.state('done', 0)
+                        self.assertEqual(case.invoke(wait=True)[0], 0)
+                        self.assertEqual(json.loads(state.read_text())['node'], facts)
+                        self.assertEqual(case.path.read_bytes(), saved)
+                        self.assertEqual(common.checkpoint(case.path), checkpoint)
+                        client = case.path.with_suffix('.client.log').read_text()
+                        self.assertEqual(client.count('offbox: node v24.22.1'), 1)
+                        self.assertNotIn('v24.22.3', client)
+                finally:
+                    case.doCleanups()
+
+    def test_old_waiter_display_log_is_repaired_only_from_stderr_history(self):
+        from test_log_catchup import LogCatchupTests
+        facts, receipt = node_receipt('v24.22.1')
+        _, other = node_receipt('v24.22.3')
+        case = LogCatchupTests('test_logs_completes_and_repeated_logs_do_not_duplicate')
+        case.setUp()
+        try:
+            stdout = (other + 'offbox-command-started: older-run\n').encode()
+            stderr = (receipt + 'offbox-command-started: run-x\n').encode()
+            case.prefix(stdout + stderr, out=len(stdout), err=len(stderr))
+            case.streams(stdout, stderr, page=37)
+            runs.save_run_state('run-x', node=None)
+            resources.finalize(dict(case.row()), node_only=True)
+            self.assertIsNone(common.read_json(case.path.with_suffix('.state.json'), {})['node'])
+            saved, checkpoint = case.path.read_bytes(), common.checkpoint(case.path)
+            self.assertEqual(case.invoke(wait=True)[0], 0)
+            self.assertEqual(common.read_json(case.path.with_suffix('.state.json'), {})['node'], facts)
+            self.assertEqual(case.path.read_bytes(), saved)
+            self.assertEqual(common.checkpoint(case.path), checkpoint)
+        finally:
+            case.doCleanups()
 
 
 class RecoveredNodeTests(_BackgroundOutputFixture):

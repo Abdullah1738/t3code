@@ -126,7 +126,7 @@ Record the Node version, manager/version, install command and the files that cho
    on PATH); offbox provisions a matching Node or stops before the command. Log `node --version`.
    Home boxes ship `/usr/local/bin/node` without `~/.nvm`; don't source `~/.nvm/nvm.sh` yourself.
    Offbox picks or provisions the repo's Node and prints `offbox: node`.
-   For an exact version, pass `OFFBOX_NODE=x.y.z`; don't hand-download Node.
+   For an exact version, pass `OFFBOX_NODE=x.y.z` (e.g. `OFFBOX_NODE=24.22.3`); don't hand-download Node.
    pnpm: `packageManager`, then CI `PNPM_VERSION` / `pnpm/action-setup` `version`. Run it explicitly pinned
    (`corepack pnpm@10 ...` for CI major 10), never a conflicting global pnpm. Check the selected manager's
    `--version` under that Node before both install and checks; select matching npm/Yarn/Bun versions too.

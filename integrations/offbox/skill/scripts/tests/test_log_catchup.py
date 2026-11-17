@@ -544,18 +544,25 @@ class LogCatchupTests(Isolated):
         self.assertEqual(common.offsets_path(self.path).read_bytes(), ck)
 
     def test_stderr_only_prefix_with_stdout_zero_and_stderr_tail(self):
+        from offbox_lib import node_version
         prefix = b'e' * 4082
         tail = b'\n' + b'x' * 53 + b'\noffbox step 2 rc=0\n'
         stdout = b'399/399 stdout\n' * 300
-        self.prefix(prefix, out=0, err=4082)
-        self.streams(stdout, prefix + tail, page=1000)
-        self.state('failed', 1)
-        self.assertEqual(self.invoke(wait=True)[0], 1)
-        self.assertEqual(self.path.read_bytes(), prefix + stdout + tail)
-        self.assertEqual(common.checkpoint(self.path),
-                         dict(stdoutOffset=len(stdout), stderrOffset=4082 + len(tail),
-                              logBytes=4082 + len(stdout) + len(tail)))
-        self.assertEqual([c.args[3] for c in self.history.call_args_list if c.args[2] == 'stderr'], [4082])
+        for metadata in (False, True):
+            with self.subTest(metadata=metadata):
+                self.prefix(prefix, out=0, err=4082)
+                if metadata:
+                    node_version.capture_stderr(self.path, prefix, 0)
+                self.streams(stdout, prefix + tail, page=1000)
+                self.history.reset_mock()
+                self.state('failed', 1)
+                self.assertEqual(self.invoke(wait=True)[0], 1)
+                self.assertEqual(self.path.read_bytes(), prefix + stdout + tail)
+                self.assertEqual(common.checkpoint(self.path),
+                                 dict(stdoutOffset=len(stdout), stderrOffset=4082 + len(tail),
+                                      logBytes=4082 + len(stdout) + len(tail)))
+                self.assertEqual([c.args[3] for c in self.history.call_args_list if c.args[2] == 'stderr'],
+                                 [4082] if metadata else [0, 1000, 2000, 3000, 4000])
 
     def test_more_than_200_pages_and_settled_follow(self):
         stdout = b'prefix\n' + b'x' * (300 * 4096)

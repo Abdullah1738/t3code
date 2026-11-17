@@ -275,7 +275,7 @@ def finalize(row, *, node_only=False):
                         and remote.is_file() and remote.stat().st_size == sum(lengths))
             if not (verified and node_version.record(row, path, source=remote, start=lengths[0],
                                                      length=lengths[1], digest=hashes[1])) and committed:
-                node_version.record(row, path)
+                node_version.record(row, path, source=path.with_suffix('.node-stderr.log'))
             if node_only or not committed:
                 return
             if 'resources' not in saved and PREFIX + run_id + ' ' not in text:

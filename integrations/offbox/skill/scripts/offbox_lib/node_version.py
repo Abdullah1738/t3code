@@ -5,6 +5,7 @@ Mirrors the reference prototype in the offbox-node-28oct board artifact (checked
 tests/test_node_version.py).
 """
 import hashlib
+import io
 import json
 import os
 import re
@@ -328,8 +329,56 @@ def validate_override(extra):
         raise OffboxError(str(error), code=99) from error
 
 
+def stderr_offset(path):
+    from .common import read_json
+    try:
+        offset = read_json(path.with_suffix('.node-stream.json'), {}).get('offset', 0)
+        return offset if type(offset) is int and offset >= 0 and path.with_suffix('.node-stderr.log').is_file() else 0
+    except Exception:
+        return 0
+
+
+def capture_stderr(path, data, offset):
+    """Keep setup lines from the authenticated stderr stream, never the merged display log."""
+    from .common import atomic_write_json, read_json
+    from .runs import COMMAND_STARTED_MARKER, STEP_RETRY
+    try:
+        progress = path.with_suffix('.node-stream.json')
+        saved = read_json(progress, {}) if offset else {}
+        if offset != saved.get('offset', 0):
+            return
+        target = path.with_suffix('.node-stderr.log')
+        tail, skipping, setup = saved.get('tail', ''), saved.get('skipping', False), saved.get('setup', True)
+        selected = []
+        with io.BytesIO(data) as stream:
+            while part := stream.readline(65536):
+                line = tail + part.decode(errors='replace')
+                complete = part.endswith(b'\n')
+                if len(line) > 65536:
+                    skipping = True
+                if complete:
+                    if not skipping:
+                        if STEP_RETRY.fullmatch(line.rstrip('\n')):
+                            setup = True
+                            selected.append(line)
+                        elif setup and line.startswith(('offbox-node: ', COMMAND_STARTED_MARKER,
+                                                        'offbox evidence wrapper ')):
+                            selected.append(line)
+                            if line.startswith(COMMAND_STARTED_MARKER):
+                                setup = False
+                    tail, skipping = '', False
+                else:
+                    tail = '' if skipping else line
+        if not offset or selected:
+            with target.open('w' if not offset else 'a') as stream:
+                stream.writelines(selected)
+        atomic_write_json(progress, dict(offset=offset + len(data), tail=tail, skipping=skipping, setup=setup))
+    except Exception:
+        pass
+
+
 def record(run, path, *, source=None, start=0, length=None, digest=None):
-    """Collect the setup receipt through committed run logs; missing diagnostics are null."""
+    """Collect a receipt from a stderr source; missing diagnostics are null."""
     from .runs import COMMAND_STARTED_MARKER, STEP_RETRY, save_run_state
     from .common import atomic_write_json, read_json
     try:

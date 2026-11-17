@@ -2754,6 +2754,8 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                             lf.flush()
                             # Commit after the flush: a holder dying in between leaves this chunk past logBytes.
                             _commit(target, out_off, err_off, lf.tell())
+                            if t == 'stderr':
+                                node_version.capture_stderr(Path(log_path or target), b, err_off - len(b))
                             if echo:
                                 delivered = lf.tell()
                             if mf:
