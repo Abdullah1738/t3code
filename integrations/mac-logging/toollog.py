@@ -395,7 +395,15 @@ def macguard_fields(values, depth=0):
     if depth > 5:
         return None
     if isinstance(values, dict):
-        return {key: macguard_fields(value, depth+1) for key, value in values.items() if key in MACGUARD_KEYS}
+        result = {}
+        for key, value in values.items():
+            if key not in MACGUARD_KEYS:
+                continue
+            if key == 'threadId' and isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9:_%./@+-]{1,1000}', value):
+                result[key] = value
+            else:
+                result[key] = macguard_fields(value, depth+1)
+        return result
     if isinstance(values, list):
         return [macguard_fields(value, depth+1) for value in values[:30]]
     if isinstance(values, str):

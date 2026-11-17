@@ -27,6 +27,8 @@ Abdullah's GUI apps (anything run from `/Applications/*.app` that isn't on the o
 
 **Memory carve-out (signal 5 only).** A process that trips signal 5 gets class D even if it is otherwise protected: an integration LaunchAgent or its children (like 9router's worker), a GUI app, an orphan, or a build or test that an agent launched. It never applies to agents/sessions, OpenCode, the Robob app tree, or macOS system processes (launchd, WindowServer, kernel_task, anything under `/System`, `/usr/libexec`, `/usr/sbin`, `/sbin`).
 
+Protect every provider, including Grok and Antigravity and their interpreter wrappers. Integration services labelled `local.ardud.*` and their children have the same protection as the integration LaunchAgents above.
+
 Never stop, kill or renice any agent or session process, or OpenCode. Never restart Robob yourself: mac-guard does that through the overload-restart. If a Robob restart was skipped, report why and what you saw. A runaway agent session: report its thread id and footprint, and change nothing.
 
 Read the evidence directory. Find what is starving Robob, act, and confirm that load, lag and memory recover. A process in R with low CPU is diagnostic evidence only, never enough to pick a victim. Use footprint including compressed pages, never RSS; MEM already includes CMPRS. Signal 5 means footprint >=16 GiB and growth >=1 GiB/min over 60 seconds, or >=48 GiB regardless of growth. Class D targets only that pid, never its supervisor. Record birth time and re-read it before any signal. Honor ~/.local/state/mac-guard/paused and MAC_GUARD_DRY_RUN=1: detect and log only, take no actions.

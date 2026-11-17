@@ -183,6 +183,8 @@ def guard_worker(runner=None):
     try:
         path = Path.home()/'.local/state/mac-guard/worker.json'
         worker = json.loads(path.read_text())
+        if not isinstance(worker, dict):
+            return 'unknown'
         tid = worker.get('threadId')
         if not tid:
             return 'unknown' if worker.get('launchUnknown') else None
@@ -192,8 +194,13 @@ def guard_worker(runner=None):
         if result.returncode:
             return 'unknown: '+tid
         body = json.loads(result.stdout)
+        if not isinstance(body, dict):
+            return 'unknown: '+tid
         thread = body.get('thread', body)
-        ended = thread.get('state') == 'idle' and thread.get('status') in ('completed', 'cancelled', 'failed', 'interrupted')
+        if not isinstance(thread, dict):
+            return 'unknown: '+tid
+        ended = (thread.get('state') == 'idle' and thread.get('status') in ('completed', 'cancelled', 'failed', 'interrupted')
+                 and not thread.get('activeRunId') and not thread.get('pendingRequests'))
         return None if ended else tid
     except FileNotFoundError:
         return None

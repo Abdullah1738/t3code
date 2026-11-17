@@ -22,9 +22,11 @@ ROBOB = '/Applications/Robob.app/Contents/MacOS/Robob'
 
 
 def proc(pid, comm='burner', ppid=1, cpu=0, args=None, state='S', **kw):
-    return dict(pid=pid, ppid=ppid, start='Mon Nov 16 00:00:00 2026', comm=comm,
+    value = dict(pid=pid, ppid=ppid, start='Mon Nov 16 00:00:00 2026', comm=comm,
                 args=args or comm, state=state, cpuS=cpu, rssMb=2, etime='02:00:00',
-                family=Path(comm).name, **kw)
+                family=Path(comm).name)
+    value.update(kw)
+    return value
 
 
 def snapshot(rows, footprints=None, load=0, pressure=1, lag=0, ticks=None):
@@ -37,6 +39,7 @@ class FakeHost:
     def __init__(self):
         self.effects = []
         self.live = {}
+        self.suspended = set()
         self.owners = {}
         self.builds = {}
         self.worker = dict(state='running')
@@ -52,6 +55,11 @@ class FakeHost:
 
     def signal(self, p, sig):
         self.effects.append(('signal', p['pid'], signal.Signals(sig).name))
+        ident = (p['pid'], p['start'])
+        if sig == signal.SIGSTOP:
+            self.suspended.add(ident)
+        elif sig == signal.SIGCONT:
+            self.suspended.discard(ident)
 
     def soften(self, p):
         self.effects.append(('soften', p['pid']))
@@ -94,11 +102,15 @@ class GuardTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.host = FakeHost()
         self.events = []
-        self.guard = m.Guard(self.host, self.root/'state', self.root/'evidence', dry=False,
-                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])))
         self.now = NOW
+        self.guard = m.Guard(self.host, self.root/'state', self.root/'evidence', dry=False,
+                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])), clock=lambda: self.now)
 
     def tick(self, rows, footprints=None, **kw):
+        rows = [dict(p) for p in rows]
+        for p in rows:
+            if (p['pid'], p['start']) in self.host.suspended:
+                p['state'] = 'T'
         self.host.live = {p['pid']: copy.deepcopy(p) for p in rows}
         result = self.guard.tick(snapshot(rows, footprints, **kw), self.now)
         self.now += 30
@@ -185,6 +197,7 @@ class GuardTests(unittest.TestCase):
 
     def test_provider_below_job_never_signalled_by_tree(self):
         rows = [proc(10, 'xcodebuild'), proc(11, 'codex', ppid=10), proc(12, 'clang', ppid=10)]
+        self.host.builds[10] = dict(detached=True, stale=True, root=10)
         for _ in range(3):
             self.tick(rows, load=200)
         self.assertFalse(any(e[1] in (10, 11) for e in self.effects('signal')))
@@ -452,6 +465,265 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(self.effects('soften'), [('soften', 10)])
         self.assertFalse(self.effects('signal'))
 
+    def test_node_app_child_kind_matrix(self):
+        # The desktop configuration identifies its node server with this flag;
+        # other node children must use D, without restarting the app.
+        for args, expected in [('node /server/bin.mjs --bootstrap-fd 3', True),
+                               ('node build.js', False), ('node tools/worker.js', False),
+                               ('node /tools/codex/bin/codex.js --bootstrap-fd 3', False)]:
+            with self.subTest(args=args):
+                rows = {1: proc(1, ROBOB), 10: proc(10, 'node', ppid=1, args=args)}
+                self.assertEqual(m.robob(rows[10], rows), expected)
+
+    def test_opencode_service_label_exempt_without_provider_name(self):
+        rows = [proc(10, 'node', args='node server.js', label='com.ardud.opencode-service'),
+                proc(20, 'node', ppid=10, args='node worker.js')]
+        for _ in range(3):
+            self.tick(rows, {20: 200}, load=200)
+        self.assertFalse(self.effects('signal'))
+        self.assertFalse(self.effects('soften'))
+        self.assertTrue(all(e['action'] == 'protected_alert' for e in self.events_named('memory_runaway')))
+
+    def test_signal_three_owner_state_matrix(self):
+        for owner in ('live', 'ended', 'unknown'):
+            with self.subTest(owner=owner):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    case.host.owners[10] = owner
+                    for _ in range(4):
+                        result = case.tick([proc(10, 'codex', state='R')], load=32)
+                    self.assertEqual(3 in result['signals'], owner == 'live')
+                    self.assertEqual(result['strain'], owner == 'live')
+                    self.assertFalse(case.effects('signal'))
+                finally:
+                    case.doCleanups()
+
+    def test_build_and_browser_evidence_matrix(self):
+        cases = [('xcodebuild', 'xcodebuild'), ('clang', 'clang'),
+                 ('node', 'node scripts/build-desktop-artifact.ts'),
+                 ('node', 'node build.js'), ('bun', 'bun scripts/test-suite.ts'),
+                 ('agent-browser-darwin-arm64', 'agent-browser-darwin-arm64')]
+        for comm, args in cases:
+            with self.subTest(comm=comm, args=args):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    for i in range(10):
+                        case.tick([proc(10, comm, args=args, cpu=i*60, etime='00:02:00')], load=200)
+                    self.assertEqual(case.effects('signal'), [])
+                    for _ in range(4):
+                        case.tick([proc(10, comm, args=args, cpu=540, etime='00:02:00')], load=200)
+                    self.assertEqual(case.effects('signal'), [])
+                finally:
+                    case.doCleanups()
+
+    def test_term_grace_from_actual_term_clock_for_a_and_d(self):
+        for cls in ('A', 'D'):
+            with self.subTest(cls=cls):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    case.guard.clock = lambda: case.now+17
+                    if cls == 'A':
+                        case.host.builds[10] = dict(detached=True, stale=True)
+                        for _ in range(3):
+                            case.tick([proc(10, 'xcodebuild')], load=200)
+                    else:
+                        case.tick([proc(10)], {10: 50})
+                    due = case.guard.pending[0]['due']
+                    self.assertEqual(due, case.now-30+27)
+                    case.guard.drain(due-1)
+                    self.assertEqual(case.effects('signal'), [('signal', 10, 'SIGTERM')])
+                    case.guard.drain(due)
+                    self.assertEqual(case.effects('signal')[-1], ('signal', 10, 'SIGKILL'))
+                finally:
+                    case.doCleanups()
+
+    def test_pause_created_during_overload_checks(self):
+        checks = self.host.checks
+        def checking():
+            (self.guard.state/'paused').touch()
+            return checks
+        with patch.object(self.host, 'overload', side_effect=checking):
+            self.tick([proc(1, ROBOB)], {1: 25})
+        self.assertFalse(self.effects('restart'))
+        self.assertFalse(self.effects('notify'))
+        self.assertFalse(self.effects('worker'))
+        self.assertEqual(self.events_named('robob_restart')[-1]['reason'], 'paused')
+
+    def restart_guard(self):
+        self.guard = m.Guard(self.host, self.root/'state', self.root/'evidence', dry=False,
+                             logger=lambda c, k, n, **kw: self.events.append((n, kw['props'])), clock=lambda: self.now)
+
+    def test_stopped_survives_restart_and_failed_resume(self):
+        for i in range(3):
+            self.tick([proc(10, 'node', args='node worker.js --token SECRET', cpu=i*60)], load=200)
+        self.assertIn(('signal', 10, 'SIGSTOP'), self.effects('signal'))
+        self.restart_guard()
+        self.tick([proc(10, 'node', args='node worker.js --token SECRET', cpu=120)], load=200)
+        self.assertNotIn(('signal', 10, 'SIGCONT'), self.effects('signal'))
+        for _ in range(9):
+            self.tick([proc(10, 'node', args='node worker.js --token SECRET', cpu=120)])
+        with patch.object(self.host, 'signal', side_effect=PermissionError(1, 'EPERM')):
+            self.tick([proc(10, 'node', args='node worker.js --token SECRET', cpu=120)])
+        self.assertEqual(len(self.guard.stopped), 1)
+        self.tick([proc(10, 'node', args='node worker.js --token SECRET', cpu=120)])
+        self.assertIn(('signal', 10, 'SIGCONT'), self.effects('signal'))
+        self.assertEqual(self.guard.stopped, [])
+
+    def test_hog_recovers_before_stop(self):
+        self.tick([proc(10)], load=200)
+        self.tick([proc(10, cpu=60)], load=200)
+        for _ in range(10):
+            self.tick([proc(10, cpu=60)], load=200)
+        self.assertEqual(self.effects('soften'), [('soften', 10)])
+        self.assertFalse(self.effects('signal'))
+
+    def test_robob_tree_below_top_twenty(self):
+        rows = [proc(100+i, '/System/Library/daemon') for i in range(20)]
+        rows += [proc(1, ROBOB), proc(2, '/Applications/Robob.app/Contents/Frameworks/Robob Helper', ppid=1)]
+        top = 'PID COMMAND MEM CMPRS\n'+''.join('%d system 30G 29G\n' % (100+i) for i in range(20))
+        top += '1 Robob 12G 10G\n2 Robob Helper 13G 11G\n'
+        sample = snapshot(rows)
+        sample['top'] = m.parse_top(top)
+        self.host.live = {p['pid']: p for p in rows}
+        self.guard.tick(sample, self.now)
+        self.assertEqual(len(self.effects('restart')), 1)
+        evidence = next(self.guard.evidence.glob('*/snapshot.json'))
+        packet = json.loads(evidence.read_text())
+        self.assertEqual(len(packet['top']), 20)
+        self.assertFalse(self.effects('signal'))
+
+    def test_worker_terminal_with_pending_work_steers(self):
+        self.tick([proc(10, 'codex')], {10: 200})
+        self.host.worker = dict(state='idle', status='completed', pendingRequests=['queued'])
+        self.tick([proc(11, 'codex')], {11: 200})
+        self.assertEqual(len(self.effects('worker')), 1)
+        self.assertEqual(len(self.effects('steer')), 1)
+
+    def test_attached_live_build_stale_metadata_kept(self):
+        self.host.owners[10] = 'live'
+        self.host.builds[10] = dict(detached=True, stale=True, root=10)
+        for _ in range(5):
+            self.tick([proc(20, 'codex'), proc(10, 'xcodebuild', ppid=20)], load=200)
+        self.assertFalse(self.effects('signal'))
+
+    def test_stop_cannot_become_class_a_stall(self):
+        self.host.owners[10] = 'ended'
+        for i in range(3):
+            self.tick([proc(10, 'xcodebuild', cpu=i*60)], load=200)
+        self.assertIn(('signal', 10, 'SIGSTOP'), self.effects('signal'))
+        for _ in range(5):
+            self.tick([proc(10, 'xcodebuild', cpu=120)], load=200)
+        self.assertNotIn(('signal', 10, 'SIGTERM'), self.effects('signal'))
+        self.tick([proc(10, 'xcodebuild', cpu=120)], load=200)
+        self.assertEqual(self.effects('signal')[-1], ('signal', 10, 'SIGTERM'))
+        self.assertEqual(self.events_named('action')[-1]['actionClass'], 'B')
+
+    def test_stop_intent_survives_interruption_during_signal(self):
+        class Interrupted(BaseException):
+            pass
+        for i in range(2):
+            self.tick([proc(10, cpu=i*60)], load=200)
+        real_signal = self.host.signal
+        def interrupt(p, sig):
+            real_signal(p, sig)
+            if sig == signal.SIGSTOP:
+                raise Interrupted()
+        with patch.object(self.host, 'signal', side_effect=interrupt), self.assertRaises(Interrupted):
+            self.tick([proc(10, cpu=120)], load=200)
+        self.restart_guard()
+        self.assertEqual(len(self.guard.stopped), 1)
+        self.assertEqual(self.guard.hogs[(10, proc(10)['start'])]['stage'], 2)
+        for _ in range(10):
+            self.tick([proc(10, cpu=120)])
+        self.assertIn(('signal', 10, 'SIGCONT'), self.effects('signal'))
+
+    def test_stop_grace_survives_restart(self):
+        for i in range(3):
+            self.tick([proc(10, cpu=i*60)], load=200)
+        stopped_at = self.guard.hogs[(10, proc(10)['start'])]['at']
+        self.restart_guard()
+        while self.now < stopped_at+180:
+            self.tick([proc(10, cpu=120)], load=200)
+            self.assertNotIn(('signal', 10, 'SIGTERM'), self.effects('signal'))
+        self.tick([proc(10, cpu=120)], load=200)
+        self.assertEqual(self.effects('signal')[-1], ('signal', 10, 'SIGTERM'))
+
+    def test_stop_failure_rolls_back_recovery_intent(self):
+        for i in range(2):
+            self.tick([proc(10, cpu=i*60)], load=200)
+        with patch.object(self.host, 'signal', side_effect=PermissionError(1, 'EPERM')):
+            self.tick([proc(10, cpu=120)], load=200)
+        self.assertFalse(self.guard.stopped)
+        self.assertEqual(self.guard.hogs[(10, proc(10)['start'])]['stage'], 1)
+        self.restart_guard()
+        self.assertFalse(self.guard.stopped)
+
+    def test_stop_interruption_delivery_table(self):
+        class Interrupted(BaseException):
+            pass
+        for delivered in (False, True):
+            with self.subTest(delivered=delivered):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    for i in range(2):
+                        case.tick([proc(10, cpu=i*60)], load=200)
+                    real_signal = case.host.signal
+                    def interrupt(p, sig):
+                        if sig != signal.SIGSTOP or delivered:
+                            real_signal(p, sig)
+                        if sig == signal.SIGSTOP:
+                            raise Interrupted()
+                    with patch.object(case.host, 'signal', side_effect=interrupt), self.assertRaises(Interrupted):
+                        case.tick([proc(10, cpu=120)], load=200)
+                    case.restart_guard()
+                    case.now += 30
+                    observed_at = case.now
+                    for _ in range(6):
+                        case.tick([proc(10, cpu=120)], load=200)
+                        self.assertNotIn(('signal', 10, 'SIGTERM'), case.effects('signal'))
+                    self.assertEqual(case.now, observed_at+180)
+                    case.tick([proc(10, cpu=120)], load=200)
+                    if delivered:
+                        self.assertEqual(case.effects('signal')[-1], ('signal', 10, 'SIGTERM'))
+                    else:
+                        self.assertFalse(case.effects('signal'))
+                        case.tick([proc(10, cpu=120)], load=200)
+                        case.guard.drain(case.now)
+                        self.assertFalse(case.effects('signal'))
+                finally:
+                    case.doCleanups()
+
+    def test_external_continue_requires_fresh_offender(self):
+        for i in range(3):
+            self.tick([proc(10, cpu=i*60)], load=200)
+        self.host.suspended.clear()
+        for _ in range(10):
+            self.tick([proc(10, cpu=120)], load=200)
+        self.assertEqual(self.effects('signal'), [('signal', 10, 'SIGSTOP')])
+        self.assertEqual(self.guard.hogs[(10, proc(10)['start'])]['stage'], 1)
+        self.restart_guard()
+        self.assertEqual(len(self.guard.stopped), 1)
+
+    def test_class_c_population_and_eligibility_table(self):
+        # The packet counts all daemons, then filters victims by ppid and age.
+        for old, attached, expected in [(11, 0, 11), (1, 10, 1), (1, 9, 0)]:
+            with self.subTest(old=old, attached=attached):
+                case = GuardTests()
+                case.setUp()
+                try:
+                    rows = [proc(10+i, 'agent-browser-darwin-arm64') for i in range(old)]
+                    rows += [proc(100+i, 'agent-browser-darwin-arm64', ppid=500, etime='00:02:00') for i in range(attached)]
+                    case.tick(rows, load=200)
+                    case.tick(rows, load=200)
+                    self.assertEqual(len(case.effects('signal')), expected)
+                    self.assertTrue(all(e[1] < 100 for e in case.effects('signal')))
+                finally:
+                    case.doCleanups()
+
 
 class PlumbingTests(unittest.TestCase):
     def test_isolated_helper_imports_reviewed_siblings(self):
@@ -489,7 +761,91 @@ class PlumbingTests(unittest.TestCase):
         self.assertEqual(value['lag'], 8)
         self.assertEqual([kw['timeout'] for argv, kw in calls if argv == m.PS], [20])
         self.assertEqual([kw['timeout'] for argv, kw in calls if argv[0] == '/usr/bin/top'], [10])
+        self.assertTrue(all('-n' not in argv for argv, _ in calls if argv[0] == '/usr/bin/top'))
         self.assertTrue(all('BUN_INSPECT' not in kw['env'] for _, kw in calls))
+
+    def test_launchagent_namespace_matrix(self):
+        for namespace in ('com.abdullah.', 'com.ardud.', 'local.ardud.'):
+            with self.subTest(namespace=namespace):
+                def run(argv, **kw):
+                    if argv == m.PS:
+                        output = '10 1 0:00.00 2048 S Mon Nov 16 00:00:00 2026 02:00:00 node\n'
+                    elif argv[0] == '/bin/launchctl':
+                        output = '10 0 '+namespace+'service\n'
+                    elif argv[0] == '/bin/ps':
+                        output = '10 Mon Nov 16 00:00:00 2026 node worker.js\n'
+                    elif argv[0] == '/usr/bin/top':
+                        output = 'PID COMMAND MEM CMPRS\n10 node 1G 0G\n'
+                    elif argv[-1] == 'vm.swapusage':
+                        output = 'total = 4G used = 0G'
+                    else:
+                        output = '1'
+                    return subprocess.CompletedProcess(argv, 0, output)
+                with patch.object(m, 'cpu_ticks', return_value=[1, 2, 3, 4]):
+                    sample = m.Host(run).collect(1)
+                parent = sample['rows'][0]
+                child = proc(20, 'node', ppid=10, args='node child.js')
+                self.assertTrue(m.protected(child, {10: parent, 20: child}))
+
+    def test_provider_wrapper_forms(self):
+        forms = [
+            ('node', 'node '+'--flag '*12+'/tools/@openai/codex/bin/codex.js'),
+            ('node', 'node --eval "require(\"provider\")"'),
+            ('bun', 'bun --eval "run()"'),
+            ('zsh', 'zsh -c "codex app-server"'),
+            ('grok', 'grok'), ('antigravity', 'antigravity'),
+            ('node', 'node /tools/grok/bin/grok.js'),
+            ('bun', 'bun /tools/antigravity/cli.js'),
+        ]
+        for comm, args in forms:
+            with self.subTest(comm=comm, args=args):
+                self.assertTrue(m.provider(proc(10, comm, args=args)))
+        self.assertFalse(m.provider(proc(10, 'node', args='node next-server')))
+
+    def test_worker_protocol_input_shapes(self):
+        forms = [None, [], 'running', 42, False, dict(thread=None), dict(thread=[])]
+        for body in forms:
+            with self.subTest(body=body):
+                run = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, json.dumps(body))
+                with self.assertRaises(ValueError):
+                    m.Host(run).worker_status('worker-1')
+        for body in [dict(state='running'), dict(thread=dict(state='running'))]:
+            run = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, json.dumps(body))
+            self.assertEqual(m.Host(run).worker_status('worker-1')['state'], 'running')
+
+    def test_ended_owner_is_revalidated_before_escalation(self):
+        import types
+        host = m.Host()
+        host.owner_deadline = m.time.monotonic()+60
+        p = proc(10, 'xcodebuild')
+        ended = dict(state='idle', status='completed', settled=True, activeRunId=None,
+                     pendingRequests=[], threadId='owner')
+        live = dict(state='running', threadId='owner')
+        fake = types.SimpleNamespace(native_binding=lambda pid: dict(T3_THREAD_ID='owner'))
+        with patch.dict(sys.modules, leftover_processes=fake), patch.object(host, 'worker_status', side_effect=[ended, live]) as status_read:
+            self.assertEqual(host.ownership(p, {10: p}, NOW)['state'], 'ended')
+            self.assertEqual(host.ownership(p, {10: p}, NOW+30)['state'], 'live')
+            self.assertEqual(status_read.call_count, 2)
+        host.owner_cache[(10, p['start'])] = (NOW, dict(state='ended', bound=True))
+        host.owner_deadline = 0
+        self.assertEqual(host.ownership(p, {10: p}, NOW+30), dict(state='unknown', bound=True))
+
+    def test_live_status_worker_protocol_table(self):
+        forms = [(None, 'unknown: owner'), ([], 'unknown: owner'),
+                 (dict(thread=None), 'unknown: owner'), (dict(thread=[]), 'unknown: owner'),
+                 (dict(state='idle', status='completed'), None),
+                 (dict(state='idle', status='completed', pendingRequests=['queued']), 'owner'),
+                 (dict(state='running'), 'owner')]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(status.Path, 'home', return_value=Path(tmp)):
+            path = Path(tmp)/'.local/state/mac-guard/worker.json'
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(dict(threadId='owner')))
+            for body, expected in forms:
+                with self.subTest(body=body):
+                    run = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, json.dumps(body))
+                    self.assertEqual(status.guard_worker(run), expected)
+            path.write_text('[]')
+            self.assertEqual(status.guard_worker(), 'unknown')
 
     def test_restart_command_exact(self):
         calls = []
@@ -530,6 +886,12 @@ class PlumbingTests(unittest.TestCase):
         self.assertEqual(row['props']['pid'], 10)
         self.assertEqual(row['props']['history'][0]['footprintGiB'], 200)
         self.assertNotIn('abc123', json.dumps(row))
+
+    def test_logger_preserves_full_worker_thread_identity(self):
+        tid = 'thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:'+'a'*120
+        row = toollog.record('mac-guard', 'event', 'macguard.worker_spawned', dt.datetime.now(dt.timezone.utc),
+                             props=dict(threadId=tid, evidence='/safe/evidence'))
+        self.assertEqual(row['props']['threadId'], tid)
 
     def test_status_guard_24h(self):
         now = dt.datetime(2026, 11, 17, 12, tzinfo=dt.timezone.utc)

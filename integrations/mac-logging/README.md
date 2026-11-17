@@ -14,16 +14,17 @@ input (including invalid timestamps) or a launchd state other than `loaded`,
 and 2 for invalid option syntax.
 JSON includes an overall `ok` boolean and `launchd`, mapping each of
 `com.abdullah.mac-log-collector`, `com.abdullah.mac-deep-inventory`,
-`com.abdullah.mac-memory` and `com.abdullah.mac-cpu` to `loaded`, `not-loaded`
+`com.abdullah.mac-memory`, `com.abdullah.mac-cpu` and `com.abdullah.mac-guard` to `loaded`, `not-loaded`
 or `unknown`. Each read-only `launchctl print gui/<uid>/<label>` has a two-second
-timeout (eight seconds total for four timeouts). Only an explicit
+timeout (ten seconds total for five timeouts). Only an explicit
 `Could not find service` error means `not-loaded`; other failures are `unknown`.
 Status never loads or restarts agents, and does not send notifications.
 It reads the UTC day files covering the last 36 hours (three files before noon
 UTC, two from noon onward). Missing and unreadable files are listed separately.
 Malformed rows, including invalid timestamps and dates that overflow when
 converted to UTC, are skipped and counted. Future timestamps are ignored.
-It makes no network calls and creates no files or locks.
+It contacts no external services and creates no files or locks. The live guard
+worker check uses one bounded local `t3ctl status` request.
 
 The single cadence table is `CADENCES` in `status.py`, with schedule sources
 beside each row. Logging applies from 13 Nov 2026 UTC. Maximum gaps are two
@@ -828,6 +829,9 @@ growth. It terminates the offending PID only, including integration workers
 and GUI apps; agents, OpenCode, Robob and macOS remain exempt. Protected
 runaways alert and call one critical responder. All signals recheck PID birth
 identity. Evidence lives in `~/.robob/board-artifacts/mac-guard/`.
+The single ten-second-bounded top read includes every process so Robob's tree
+total cannot disappear below the twenty largest holders; snapshots retain the
+top twenty plus footprint history for all matched PIDs.
 
 A Robob process crossing the growth threshold, or the app tree totaling
 >=24 GiB, requests the overload watchdog's detached `restart` subcommand.
