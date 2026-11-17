@@ -20985,12 +20985,14 @@ it.effect.each(
 it.effect.each(
   (["unrelated discussion", "explicit owner input"] as const).flatMap((delivery) =>
     (["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
-      [false, true].map((restart) => ({ delivery, reason, restart })),
+      (["card", "board"] as const).flatMap((cap) =>
+        [false, true].map((restart) => ({ delivery, reason, cap, restart })),
+      ),
     ),
   ),
 )(
-  "held evaluator reminder preserves queue progress ($delivery, $reason, restart=$restart)",
-  ({ delivery, reason, restart }) =>
+  "held evaluator reminder preserves queue progress ($delivery, $reason, $cap cap, restart=$restart)",
+  ({ delivery, reason, cap, restart }) =>
     Effect.gen(function* () {
       const fake = yield* makeFake;
       yield* Effect.gen(function* () {
@@ -21039,13 +21041,25 @@ it.effect.each(
             next.set(id, { ...next.get(id)!, quietSince: "2026-11-16T23:00:00Z" });
           return next;
         });
-        yield* sql`INSERT INTO ardud_kanban_evaluator_spawns (launch_key, board_id, card_id, at)
-          VALUES ('1725:queue-cap', ${board.id}, ${card.id}, '2026-11-17T00:16:00.000Z')`;
+        if (cap === "card") {
+          yield* sql`INSERT INTO ardud_kanban_evaluator_spawns (launch_key, board_id, card_id, at)
+            VALUES ('1725:queue-cap', ${board.id}, ${card.id}, '2026-11-17T00:16:00.000Z')`;
+        } else {
+          for (let i = 0; i < 12; i++)
+            yield* sql`INSERT INTO ardud_kanban_evaluator_queue
+              (job_key, board_id, json, created_at, started_at, done_at)
+              VALUES (${"1725:board-cap-" + i}, ${board.id}, '{}',
+                '2026-11-17T00:16:00.000Z', '2026-11-17T00:16:00.000Z', '2026-11-17T00:16:00.000Z')`;
+        }
         yield* kanban.tick;
-        const pending = yield* sql<{ job_key: string }>`SELECT job_key
+        const pending = yield* sql<{
+          job_key: string;
+          started_at: string | null;
+        }>`SELECT job_key, started_at
           FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL
           AND json_extract(json, '$.extra.trigger') = 'step_reminder'`;
         assert.lengthOf(pending, 1);
+        assert.equal(pending[0]!.started_at === null, cap === "board");
         const check = Effect.gen(function* () {
           const service = yield* KanbanService.KanbanService;
           const text = `Manual follow-up for ${delivery}`;
@@ -21059,6 +21073,7 @@ it.effect.each(
               : yield* service.createDiscussion(board.id, "Unrelated owner request", owner);
           yield* service.post(target.id, owner, [{ _tag: "md", text }]).pipe(Effect.ignore);
           yield* sql`DELETE FROM ardud_kanban_evaluator_spawns WHERE launch_key = '1725:queue-cap'`;
+          yield* sql`DELETE FROM ardud_kanban_evaluator_queue WHERE job_key LIKE '1725:board-cap-%'`;
           yield* service.tick;
           const after = yield* Ref.get(fake.threads);
           const recipient = (yield* service.discussion(target.id)).evaluatorThreadId;

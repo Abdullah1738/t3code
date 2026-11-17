@@ -6188,6 +6188,12 @@ const make = Effect.gen(function* () {
             },
           };
         }
+        if (job.purpose.kind === "discussion" && row.started_at !== null) {
+          const discussion = yield* discussionOf(KanbanDiscussionId.make(job.purpose.discussionId));
+          const { hold } = yield* reminderEvaluatorExclusions(discussion, job.extra.trigger);
+          // Spawn caps can leave a reservation without launching its evaluator.
+          if (hold !== null) return;
+        }
         // A started job may already have delivered its initial message. Recover
         // its stable launch before treating an attached evaluator as another owner.
         if (job.purpose.kind === "discussion" && row.started_at === null) {
