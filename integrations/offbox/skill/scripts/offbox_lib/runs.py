@@ -2220,17 +2220,17 @@ class Runner:
                     if pull_paths:
                         record_baseline(self.run_id, self.cwd, pull_paths, baseline)
                 self.record(sync_s=st.get("seconds"), sent_bytes=st.get("sent"))
+                save_run_state(self.run_id, **{k: st[k] for k in ssh_sync.TRACKED_SYNC_FIELDS if k in st})
+                left_out = ssh_sync.tracked_left_out_note(st)
+                if left_out:
+                    say(left_out)
                 say(f"synced {self.root.name} -> {self.box} ({st.get('files', 0)} files changed, "
                     f"{st.get('sent', 0) / 1024:.0f} KiB sent, {st.get('seconds')}s; "
-                    f"verified {st.get('verified', 0)} tracked files"
+                    f"{ssh_sync.verified_note(st)}"
                     f"{', repaired ' + str(st['repaired']) if st.get('repaired') else ''})")
                 note = ssh_sync.tracked_ignored_note(st)
                 if note:
                     say(note)
-                skipped = st.get("secret_skips", [])
-                if skipped:
-                    say(f"not synced (secret filter) though tracked by git: {', '.join(skipped[:5])}"
-                        f"{' ...' if len(skipped) > 5 else ''}. If tests need them: --include <path>")
         except common.SshHostKeyMismatch:
             raise
         except Exception as e:  # noqa: BLE001 - held until the env upload has finished, then re-raised
