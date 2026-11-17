@@ -182,6 +182,7 @@ class LoggingTests(unittest.TestCase):
         resources=[dict(id='expo:1',kind='expo',candidate=True,age_s=7200),
                    dict(id='container:local',kind='container',candidate=True,age_s=7400,image='localstack/localstack')]
         scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0,
+                  agent_browser=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False),
                   owner_calls={key: dict(count=0,p50_ms=None,p95_ms=None,max_ms=None,failures={}) for key in ('by_native','detail','recovery')}),resources=resources,candidates=[r['id'] for r in resources])
         with patch.object(watcher,'STATE_DIR',state), patch.object(janitor,'scan',return_value=scan), \
              patch.object(janitor,'act',side_effect=[(True,'done'),(False,'password=secret')]), \
@@ -282,6 +283,7 @@ class LoggingTests(unittest.TestCase):
         import janitor_watch as watcher
         resources=[dict(id='expo:1',kind='expo',candidate=True),dict(id='expo:2',kind='expo',candidate=True)]
         scan=dict(ts=0,liveness_unavailable=None,processes=dict(candidates=[],problems=[],checked=0,skipped=0,budget_skipped=0,
+                  agent_browser=dict(inventory=[],candidates=[],problems=[],actions=[],reap_enabled=False),
                   owner_calls={key: dict(count=0,p50_ms=None,p95_ms=None,max_ms=None,failures={}) for key in ('by_native','detail','recovery')}),resources=resources,candidates=['expo:1','expo:2'])
         for entry in ('cli','hourly'):
             with self.subTest(entry=entry), patch.object(janitor,'scan',return_value=scan), \
