@@ -34,6 +34,7 @@ test("fake harness replies are durably queued and callback payloads stay on the 
   const inputs: string[] = []; const s = setup({ run: async ({ text }) => { inputs.push(text); return "reply"; } });
   await s.lease(); s.runner.enqueue(opaqueId("event"), { text: "input" }); await s.runner.tick();
   expect(inputs).toEqual(["input"]); expect(s.calls.find(c => c.path.endsWith("/send"))?.body.text).toBe("reply");
+  expect(s.calls.find(c => c.path.endsWith("/send"))?.body.inboxId).toBe(opaqueId("event"));
   expect(s.runner.db.query<{ state: string }, []>("SELECT state FROM inbox").get()!.state).toBe("done");
 });
 test("Claude CLI uses the box home, router helper environment and explicit resume id", async () => {
@@ -124,6 +125,25 @@ test.each([false, true])("events expose only fence metadata with hasSend=%s; res
   expect((await s.runner.handle(s.request("/resolve", { id, state: "pending", reconciled: true }))).status).toBe(409);
   await s.runner.tick();
   expect(await (await s.runner.handle(s.request("/events", {}))).json()).toEqual({ events: [] });
+});
+
+test.each(["automatic", "manual-done", "resumed-no-reply", "resumed-replied"])("automatic retry distinguishes an automatic tombstone from %s completion", async completion => {
+  let attempts = 0;
+  const harness = { run: async () => { if (++attempts === 1) throw new Error("interrupted"); return completion === "resumed-replied" ? "reply" : "NO_REPLY"; } };
+  const s = setup(harness), id = opaqueId("wake"), dm = opaqueId("dm");
+  await s.lease(); s.runner.enqueue(id, { kind: "wake", text: "private" }); s.runner.enqueue(dm, { kind: "inbound", text: "dm" });
+  await s.runner.tick();
+  const automatic = { id, state: "done", reconciled: true, autoFailMs: 0 };
+  if (completion === "automatic") expect((await s.runner.handle(s.request("/resolve", automatic))).status).toBe(200);
+  else {
+    expect((await s.runner.handle(s.request("/resolve", { id, state: completion === "manual-done" ? "done" : "pending", reconciled: true }))).status).toBe(200);
+    if (completion !== "manual-done") await s.runner.tick();
+  }
+  if (completion === "resumed-replied") expect(s.calls.filter(c => c.path.endsWith("/send"))).toHaveLength(1);
+  const reopened = new BoxRunner(s.runner.config, harness, { callbackReady: async () => true }); clean.push(() => reopened.db.close());
+  await reopened.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  expect((await reopened.handle(s.request("/resolve", automatic))).status).toBe(completion === "automatic" ? 200 : 409);
+  expect(reopened.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)?.state).toBe("done");
 });
 
 test("legacy schema upgrades timestamp crash interruption and recognize old reply actions without exposing text", async () => {
