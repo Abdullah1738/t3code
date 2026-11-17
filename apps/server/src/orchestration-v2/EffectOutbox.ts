@@ -24,6 +24,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import { forkParked } from "../serverActivation.ts";
@@ -421,10 +422,53 @@ const rowToEffect = (row: EffectRow) =>
     })),
   );
 
+/**
+ * ardud: threads that may hold a pending run continuation, so the probe can skip
+ * the database for every other thread. Kanban calls it on each thread read
+ * (tens of thousands of times in 15 minutes) and the shared background reader
+ * queued those point reads for seconds behind heavy reads.
+ *
+ * Only `enqueue` inserts outbox rows and no update returns a settled row to
+ * pending, so once the startup seed has run, a thread without a mark has none.
+ * A mark is dropped only when the probe finds nothing, no enqueue happened
+ * during that probe, and every effect it was marked for has been seen by a
+ * statement. Until then an insert may still be uncommitted. Keyed by SQL client
+ * because KanbanThreads may build its own EffectOutbox over the same database.
+ */
+interface ContinuationMarks {
+  seeded: boolean;
+  generation: number;
+  readonly seedLock: Semaphore.Semaphore;
+  readonly threads: Map<string, { generation: number; readonly unseen: Set<string> }>;
+}
+const continuationMarksByClient = new WeakMap<object, ContinuationMarks>();
+const continuationMarksFor = (sql: object): ContinuationMarks => {
+  const existing = continuationMarksByClient.get(sql);
+  if (existing !== undefined) return existing;
+  const created: ContinuationMarks = {
+    seeded: false,
+    generation: 0,
+    seedLock: Semaphore.makeUnsafe(1),
+    threads: new Map(),
+  };
+  continuationMarksByClient.set(sql, created);
+  return created;
+};
+const markContinuation = (marks: ContinuationMarks, threadId: string, effectId: string) => {
+  const mark = marks.threads.get(threadId) ?? { generation: 0, unseen: new Set<string>() };
+  mark.generation = ++marks.generation;
+  mark.unseen.add(effectId);
+  marks.threads.set(threadId, mark);
+};
+const sawContinuation = (marks: ContinuationMarks, threadId: string, effectId: string) => {
+  marks.threads.get(threadId)?.unseen.delete(effectId);
+};
+
 export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = Layer.effect(
   EffectOutboxV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const marks = continuationMarksFor(sql);
     const available = yield* Queue.dropping<void>(64);
     const controlAvailable = yield* Queue.dropping<void>(64);
     const startAvailable = yield* Queue.dropping<void>(64);
@@ -508,18 +552,58 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         Effect.mapError((cause) => new EffectOutboxError({ operation, cause })),
       );
 
-    const pendingRunContinuation = Effect.fn("EffectOutbox.pendingRunContinuation")(
-      function* (threadId: ThreadId) {
-        const rows = yield* sql<{ effect_id: string }>`
-          SELECT effect_id FROM orchestration_v2_effect_outbox
-          WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+    const probeRunContinuation = (threadId: ThreadId) =>
+      sql<{ effect_id: string }>`
+        SELECT effect_id FROM orchestration_v2_effect_outbox
+        WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+          AND effect_type = 'provider-runtime.continue'
+          AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
+        LIMIT 1
+      `.pipe(
+        Effect.map((rows) => rows[0]?.effect_id ?? null),
+        NodeSqliteClient.readOnly,
+      );
+
+    // Rows left by an earlier process. Uses the status-led claim index; a failed
+    // seed leaves every probe on the database and is retried on the next probe.
+    const seedContinuationMarks = marks.seedLock.withPermits(1)(
+      Effect.gen(function* () {
+        if (marks.seeded) return;
+        const rows = yield* sql<{ thread_id: string; effect_id: string }>`
+          SELECT thread_id, effect_id FROM orchestration_v2_effect_outbox
+          WHERE status IN ('pending', 'running')
             AND effect_type = 'provider-runtime.continue'
             AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
-          LIMIT 1
-        `;
-        return rows[0]?.effect_id ?? null;
+        `.pipe(NodeSqliteClient.readOnly);
+        for (const row of rows) {
+          if (marks.threads.has(row.thread_id)) continue;
+          marks.threads.set(row.thread_id, { generation: ++marks.generation, unseen: new Set() });
+        }
+        marks.seeded = true;
+      }).pipe(
+        Effect.catch((cause) =>
+          Effect.logWarning("effect_outbox.continuation_seed_failed", { cause }),
+        ),
+      ),
+    );
+
+    const pendingRunContinuation = Effect.fn("EffectOutbox.pendingRunContinuation")(
+      function* (threadId: ThreadId) {
+        if (!marks.seeded) yield* seedContinuationMarks;
+        if (!marks.seeded) return yield* probeRunContinuation(threadId);
+        const mark = marks.threads.get(threadId);
+        if (mark === undefined) return null;
+        const generation = mark.generation;
+        const effectId = yield* probeRunContinuation(threadId);
+        if (effectId !== null) sawContinuation(marks, threadId, effectId);
+        else if (
+          marks.threads.get(threadId) === mark &&
+          mark.generation === generation &&
+          mark.unseen.size === 0
+        )
+          marks.threads.delete(threadId);
+        return effectId;
       },
-      NodeSqliteClient.readOnly,
       Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
     );
 
@@ -530,7 +614,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           const nowIso = DateTime.formatIso(now);
           yield* Effect.forEach(
             effects,
-            (effect) => sql`
+            (effect) => sql<{ readonly effect_id: string }>`
               INSERT INTO orchestration_v2_effect_outbox (
                 effect_id,
                 command_id,
@@ -556,7 +640,20 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
                 ${nowIso}
               )
               ON CONFLICT(effect_id) DO NOTHING
-            `,
+              RETURNING effect_id
+            `.pipe(
+              Effect.tap((inserted) =>
+                Effect.sync(() => {
+                  // Marked before commit: the probe must not miss it once it commits.
+                  if (
+                    inserted.length > 0 &&
+                    effect.request.type === "provider-runtime.continue" &&
+                    effect.request.queued !== true
+                  )
+                    markContinuation(marks, effect.threadId, effect.id);
+                }),
+              ),
+            ),
             { concurrency: 1, discard: true },
           );
           // EventSink owns the corresponding post-commit notification.
@@ -666,6 +763,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
                 AND COALESCE(json_extract(payload_json, '$.providerAccepted'), 0) = 1)
             RETURNING effect_id
           `;
+          // The update read these rows, so they are committed or settle with its transaction.
+          for (const { effect_id } of rows) sawContinuation(marks, threadId, effect_id);
           return rows.map(({ effect_id }) => effect_id);
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "cancel-unsettled", cause })),
@@ -780,6 +879,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           const rows = yield* claimStatement.pipe(Effect.withTracerEnabled(false));
           const row = rows[0];
           if (row === undefined) return Option.none();
+          if (row.effect_type === "provider-runtime.continue")
+            sawContinuation(marks, row.thread_id, row.effect_id);
           cancellationSignals.set(row.effect_id, Deferred.makeUnsafe<void>());
           return Option.some(yield* rowToEffect(row));
         },
