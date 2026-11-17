@@ -50,7 +50,11 @@ robob-watch test inbox-triage-fastpath
 A historical replay (mail, WhatsApp and iMessage) does not advance live cursors or send notifications. It reads exactly the requested window (up to 20,000 rows per chat source, and says so in `source_errors` if it stops early) and classifies every candidate, 16 at a time. The report lists every dropped id with its reason:
 
 ```sh
-/usr/bin/python3 -B triage.py --dry-run-hours 2 --report "$HOME/Documents/assistant/inbox-triage/replay.json"
+triage_replay_dir=$(mktemp -d)
+WATCH_DIR="$triage_replay_dir" TOOLLOG_DIR="$triage_replay_dir/tool-logs" \
+  /usr/bin/python3 -B triage.py --dry-run-hours 2 --report "$triage_replay_dir/replay.json"
 ```
+
+Dry runs require an explicit scratch `WATCH_DIR` and refuse the live watch directory.
 
 Usage and cost are logged per real run; empty batches have no model cost. The ordinary schedule has up to 288 checks/day, not necessarily 288 model calls. The independent fast poll makes no model calls. Review actual token/USD usage before estimating a monthly total.

@@ -33,7 +33,8 @@ class ChargeDryRunReadOnly(unittest.TestCase):
                     item = {'id': 'imsg:dry-charge', 'source': 'imessage', 'sender': 'EmiratesNBD',
                             'subject': '', 'preview': text, 'ts': charged.timestamp()}
                     before = fixtures.data_snapshot(data)
-                    with patch.object(t, 'MONEY_CASES', Path(fixtures.mc.__file__)):
+                    with patch.object(t, 'MONEY_CASES', Path(fixtures.mc.__file__)), \
+                         patch.object(t, 'archive_reads', side_effect=lambda *_: contextlib.nullcontext()):
                         reasons, held, error = t.charge_checks([item], now.timestamp(), dry=True)
                     self.assertIsNone(error)
                     self.assertEqual(held, set())
