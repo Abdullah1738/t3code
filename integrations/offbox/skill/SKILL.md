@@ -458,7 +458,7 @@ The home reaper runs only below 50% temp space free. It preserves live-held file
 
 Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UTC). Run events are `run.request`, `run.queue`, `run.lease`, `run.sync`, `run.command`, `run.pull`, `run.end`, `run.invocation` and `run.error`. Other events include `backend.failover`, `home.probe`, `pool.snapshot`, `gate.decision`, `local.override`, `ssh.setup`, `ssh.readiness`, `ssh.drop`, `ssh.put_file`, `mullvad.check`, `reaper.action`, `reaper.pass` and `cli.<command>`. Logs contain ids, counts, sizes, durations and stable error tags; command output stays in the existing per-run logs.
 
-`offbox log-rollup --day YYYY-MM-DD` writes `rollup-YYYY-MM-DD.json` beside the day file; omit `--day` for today. Monitor/reaper ticks roll up yesterday after 00:05 UTC. Logs keep 30 days; after 50 MB in a day, only errors continue. Home-server services write their own local file at the same path.
+`offbox log-rollup --day YYYY-MM-DD` writes `rollup-YYYY-MM-DD.json` beside the day file; omit `--day` for today. Rollups include `generatedAt` (UTC) and `complete`. Monitor/reaper ticks finalize yesterday after 00:05 UTC and refresh today's partial at most hourly. For nightly review, read yesterday's complete rollup plus today's partial through `generatedAt`. Logs keep 30 days; after 50 MB in a day, only errors continue. Home-server services write their own local file at the same path.
 
 ## Troubleshooting
 
