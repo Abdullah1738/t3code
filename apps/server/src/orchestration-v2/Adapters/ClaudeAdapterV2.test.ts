@@ -1,5 +1,6 @@
 import * as Analytics from "../../ardud/analytics/Analytics.ts";
-import { AnalyticsEvent } from "@t3tools/contracts";
+import { AnalyticsEvent, KanbanBoardId } from "@t3tools/contracts";
+import * as KanbanStore from "../../ardud/kanban/store/KanbanStore.ts";
 import { assertLiveCallerShell } from "../../mcp/OrchestratorMcpService.ts";
 import { liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
 import * as ProviderProcessRegistry from "../../ardud/providers/ProviderProcessRegistry.ts";
@@ -3200,6 +3201,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
 
   const makeWakeHarnessWithOptions = (options?: {
+    readonly streamFailure?: Effect.Effect<never, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly beforeOpen?: Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly cancelPendingPrompt?: (
       uuid: string,
@@ -3335,7 +3337,13 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               }
               processQueues.push(sdkMessages);
               return {
-                messages: Stream.fromQueue(sdkMessages).pipe(
+                messages: (options?.streamFailure === undefined
+                  ? Stream.fromQueue(sdkMessages)
+                  : Stream.merge(
+                      Stream.fromQueue(sdkMessages),
+                      Stream.fromEffect(options.streamFailure),
+                    )
+                ).pipe(
                   Stream.flatMap((message) =>
                     Stream.make(message).pipe(
                       Stream.concat(
@@ -3477,6 +3485,360 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect.each(["socket closed", "model unavailable", "maximum context length exceeded"])(
+    "keeps routing unchanged while recording a scrubbed Claude query cause: %s",
+    (causeMessage) =>
+      Effect.gen(function* () {
+        const stop = yield* Deferred.make<never, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>();
+        const rows: AnalyticsEvent[] = [];
+        yield* Effect.gen(function* () {
+          const h = yield* makeWakeHarnessWithOptions({ streamFailure: Deferred.await(stop) });
+          const turn = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("query-cause"),
+            text: "Continue.",
+            attachments: [],
+          });
+          yield* h.runtime.startTurn(turn);
+          const sdkError = new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+            method: "messages",
+            cause: Object.assign(
+              new Error(
+                `${causeMessage} https://router.test/v1?token=private-query Bearer private-bearer`,
+              ),
+              { code: "ECONNRESET" },
+            ),
+          });
+          yield* Deferred.fail(stop, sdkError);
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          if (terminal.status !== "failed") return;
+          const baseline = makeProviderFailure({ cause: sdkError, class: "transport_error" });
+          assert.equal(terminal.failure.message, baseline.message);
+          assert.equal(terminal.failure.code, baseline.code);
+          assert.equal(terminal.failure.category, baseline.category);
+          assert.equal(terminal.failure.claudeApiError?.errorCode, "ECONNRESET");
+          assert.include(terminal.failure.claudeApiError?.errorText ?? "", causeMessage);
+          assert.deepEqual(
+            rows.filter((row) => row.kind === "provider.claude_api_error").map((row) => row.phase),
+            ["attempt", "give_up"],
+          );
+          for (const secret of ["private-query", "private-bearer"])
+            assert.notInclude(JSON.stringify({ rows, failure: terminal.failure }), secret);
+        }).pipe(
+          Effect.provideService(
+            Analytics.Analytics,
+            Analytics.Analytics.of({
+              record: (row) =>
+                Effect.sync(() => {
+                  rows.push(row);
+                }),
+              flush: Effect.void,
+              ingest: () => Effect.void,
+              read: () => Effect.die("unused read"),
+            }),
+          ),
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each([
+    { status: 404, resume: false, recover: false, nativeStatus: 404, health: false },
+    { status: 404, resume: true, recover: false, nativeStatus: 404, health: false },
+    { status: 429, resume: false, recover: false, nativeStatus: 429, health: false },
+    { status: 503, resume: false, recover: false, nativeStatus: 503, health: false },
+    { status: 503, resume: false, recover: true, nativeStatus: 503, health: false },
+    { status: 404, resume: false, recover: false, nativeStatus: 503, health: false },
+    { status: 401, resume: false, recover: false, nativeStatus: 503, health: false },
+    { status: 503, resume: false, recover: false, nativeStatus: 503, health: true },
+  ])(
+    "records scrubbed Claude API attempts and give-up for HTTP $status resume=$resume recover=$recover native=$nativeStatus health=$health",
+    ({ status, resume, recover, nativeStatus, health }) =>
+      Effect.gen(function* () {
+        const rows: AnalyticsEvent[] = [];
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const directory = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(directory, { recursive: true });
+        const body = JSON.stringify({
+          error: {
+            type: "api_error",
+            code: `stub_${status}`,
+            message:
+              "Bearer private-bearer api_key=private-key https://route.test/v1?secret=private-query",
+          },
+        });
+        yield* Effect.gen(function* () {
+          const h = yield* makeWakeHarnessWithOptions({
+            environment: {
+              CLAUDE_CONFIG_DIR: configDir,
+              ANTHROPIC_BASE_URL: "https://user:password@router.test/v1?key=private-query",
+              ANTHROPIC_API_KEY: "private-key",
+            },
+            ...(health ? { close: Queue.shutdown } : {}),
+          });
+          const turn = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("api-diagnostics"),
+            text: "Continue.",
+            attachments: [],
+            nativeThreadHasTurns: resume,
+          });
+          yield* h.runtime.startTurn(turn);
+          yield* fs.writeFileString(
+            path.join(directory, `${WAKE_NATIVE_SESSION}.jsonl`),
+            JSON.stringify({
+              type: "system",
+              subtype: "api_error",
+              timestamp: DateTime.formatIso(yield* DateTime.now),
+              error: {
+                status: nativeStatus,
+                formatted: `API Error: ${nativeStatus} ${body.replace(`stub_${status}`, `stub_${nativeStatus}`)}`,
+              },
+              retryAttempt: 1,
+              maxRetries: 3,
+              retryInMs: 4567,
+            }) + "\n",
+          );
+          if (!health) {
+            yield* h.offerAndWait(
+              claudeSdkFrame({
+                type: "system",
+                subtype: "api_retry",
+                error: "server_error",
+                error_status: status,
+                attempt: 1,
+                max_retries: 3,
+                retry_delay_ms: 4567,
+                session_id: WAKE_NATIVE_SESSION,
+                uuid: "diagnostic-retry",
+              }),
+            );
+            const retry = yield* Queue.take(h.retryReceipts);
+            assert.deepEqual(retry.turnItem.type === "error" ? retry.turnItem.retry : undefined, {
+              attempt: 1,
+              maxAttempts: 3,
+              retryDelayMs: 4567,
+            });
+            if (recover)
+              yield* h.offerAndWait(
+                makeAssistantTextFrame({ uuid: "diagnostic-recovered", text: "Working." }),
+              );
+            yield* TestClock.adjust("3 seconds");
+            yield* Queue.offer(
+              h.sdkMessages,
+              makeResultFrame({
+                uuid: "diagnostic-final",
+                result: `API Error: ${status} ${body}`,
+                terminalReason: "api_error",
+                apiErrorStatus: status,
+                isError: true,
+              }),
+            );
+          } else {
+            yield* TestClock.adjust("5 minutes");
+            assert.isTrue(
+              yield* h.runtime.checkRetryHealth!({
+                runId: turn.runId,
+                attemptId: turn.attemptId,
+                noResponseBudgetMs: 300_000,
+                flapLimit: 20,
+              }),
+            );
+          }
+          const terminal = yield* Queue.take(h.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          if (terminal.status !== "failed") return;
+          const observed = rows.filter((row) => row.kind === "provider.claude_api_error");
+          assert.deepEqual(
+            observed.map((row) => [row.phase, row.claudeApiError?.attempt]),
+            health
+              ? [
+                  ["attempt", 1],
+                  ["give_up", 1],
+                ]
+              : [
+                  ["attempt", 1],
+                  ["attempt", recover ? 1 : 2],
+                  ["give_up", recover ? 1 : 2],
+                ],
+          );
+          for (const [index, row] of observed.entries()) {
+            assert.equal(row.threadId, turn.threadId);
+            assert.equal(row.props?.runId, turn.runId);
+            assert.equal(row.callerRole, "evaluator");
+            assert.equal(row.boardId, "robob");
+            assert.equal(row.claudeApiError?.status, status);
+            assert.equal(row.claudeApiError?.model, turn.modelSelection.model);
+            assert.equal(row.claudeApiError?.host, "router.test");
+            assert.equal(row.claudeApiError?.path, "/v1");
+            const mismatchedRetry = index === 0 && nativeStatus !== status;
+            assert.equal(
+              row.claudeApiError?.errorCode,
+              mismatchedRetry ? "server_error" : `stub_${status}`,
+            );
+            assert.equal(row.claudeApiError?.errorType, mismatchedRetry ? "unknown" : "api_error");
+            assert.equal(row.claudeApiError?.resume, resume);
+            assert.isAtMost(row.claudeApiError!.errorText.length, 200);
+            yield* Schema.decodeUnknownEffect(AnalyticsEvent, { onExcessProperty: "error" })(row);
+          }
+          assert.equal(observed.at(-1)?.durationMs, health ? 300_000 : 3000);
+          assert.deepEqual(terminal.failure.claudeApiError, observed.at(-1)?.claudeApiError);
+          for (const secret of [
+            "private-bearer",
+            "private-key",
+            "private-query",
+            "password",
+            "user:",
+            "?key",
+            "?secret",
+          ])
+            assert.notInclude(JSON.stringify(observed), secret);
+        }).pipe(
+          Effect.provide(
+            Layer.mock(KanbanStore.KanbanStore)({
+              threadLink: (threadId) =>
+                Effect.succeed({
+                  threadId: ThreadId.make(threadId),
+                  boardId: KanbanBoardId.make("robob"),
+                  cardId: null,
+                  role: "evaluator",
+                  purpose: "request",
+                  discussionId: null,
+                  model: null,
+                  startedAt: "2026-11-17T00:00:00.000Z",
+                  endedAt: null,
+                  paused: null,
+                }),
+            }),
+          ),
+          Effect.provideService(
+            Analytics.Analytics,
+            Analytics.Analytics.of({
+              record: (row) =>
+                Effect.sync(() => {
+                  rows.push(row);
+                }),
+              flush: Effect.void,
+              ingest: () => Effect.void,
+              read: () => Effect.die("unused read"),
+            }),
+          ),
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    (["error_during_execution", "success"] as const).flatMap((subtype) =>
+      [null, 404, 503].map((status) => ({ subtype, status })),
+    ),
+  )("records native API evidence for unmarked $subtype status=$status", ({ subtype, status }) =>
+    Effect.gen(function* () {
+      const rows: AnalyticsEvent[] = [];
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const configDir = yield* fs.makeTempDirectoryScoped();
+      yield* Effect.gen(function* () {
+        const h = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("unmarked-api-diagnostics"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(turn);
+        if (status !== null) {
+          const directory = path.join(configDir, "projects", "-workspace");
+          yield* fs.makeDirectory(directory, { recursive: true });
+          yield* fs.writeFileString(
+            path.join(directory, `${WAKE_NATIVE_SESSION}.jsonl`),
+            JSON.stringify({
+              type: "system",
+              subtype: "api_error",
+              timestamp: DateTime.formatIso(yield* DateTime.now),
+              error: {
+                status,
+                formatted: `API Error: ${status} ${JSON.stringify(status === 404 ? { error: "model_not_found" } : { error: { code: "stub_503", type: "api_error" } })}`,
+              },
+            }) + "\n",
+          );
+        }
+        yield* Queue.offer(
+          h.sdkMessages,
+          makeResultFrame({
+            uuid: "unmarked-api-result",
+            subtype,
+            isError: true,
+            terminalReason: null,
+            result: "Execution failed",
+            errors: ["Execution failed"],
+          }),
+        );
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        const observed = rows.filter((row) => row.kind === "provider.claude_api_error");
+        assert.equal(terminal.status, subtype === "success" ? "completed" : "failed");
+        if (terminal.status !== "failed") {
+          assert.deepEqual(
+            observed.map((row) => row.phase),
+            status === null ? [] : ["attempt"],
+          );
+          return;
+        }
+        assert.deepEqual(
+          observed.map((row) => row.phase),
+          status === null ? [] : ["attempt", "give_up"],
+        );
+        if (status === null) {
+          assert.isUndefined(terminal.failure.claudeApiError);
+        } else {
+          for (const row of observed) {
+            assert.equal(row.claudeApiError?.status, status);
+            assert.equal(
+              row.claudeApiError?.errorCode,
+              status === 404 ? "model_not_found" : "stub_503",
+            );
+            assert.equal(row.claudeApiError?.attempt, 1);
+          }
+          assert.deepEqual(terminal.failure.claudeApiError, observed.at(-1)?.claudeApiError);
+        }
+      }).pipe(
+        Effect.provideService(
+          Analytics.Analytics,
+          Analytics.Analytics.of({
+            record: (row) =>
+              Effect.sync(() => {
+                rows.push(row);
+              }),
+            flush: Effect.void,
+            ingest: () => Effect.void,
+            read: () => Effect.die("unused read"),
+          }),
+        ),
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
 
   it.effect("keeps the current Claude wake caller live before continuation admission", () =>
     Effect.scoped(

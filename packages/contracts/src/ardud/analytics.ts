@@ -1,4 +1,5 @@
 import { McpReasonClass, McpInvalidField, McpRefusedAt } from "./mcpReasonClass.ts";
+import { ClaudeApiErrorDetails } from "./claudeApiError.ts";
 import { McpDenyReason } from "./mcpDenyReason.ts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -12,7 +13,7 @@ const Timestamp = Schema.String.check(
   }),
 );
 
-// Metadata only. Deliberately no arbitrary property bag or free-form text fields.
+// Labels stay metadata-only; server Claude diagnostics carry a scrubbed, bounded excerpt.
 const Label = Schema.String.check(
   Schema.isMaxLength(160),
   Schema.isPattern(/^[a-zA-Z0-9_.:/#@%+-]*$/),
@@ -216,6 +217,8 @@ const GeneralEvent = Schema.Struct({
     }),
   ),
   threadId: Schema.optionalKey(DerivedId),
+  // Claude API diagnostics are scrubbed at the adapter boundary, before truncation.
+  claudeApiError: Schema.optionalKey(ClaudeApiErrorDetails),
   durationMs: Schema.optionalKey(Measurement),
   phase: Schema.optionalKey(Label),
   waitedMs: Schema.optionalKey(Measurement),
@@ -629,6 +632,7 @@ export const AnalyticsIngestInput = Schema.Struct({
   events: Schema.Array(
     Schema.Struct({
       ...GeneralEvent.fields,
+      claudeApiError: Schema.optionalKey(Schema.Never),
       surface: Schema.Literals(["web", "desktop", "mobile"]),
     }),
   ).check(Schema.isMinLength(1), Schema.isMaxLength(100)),
@@ -709,6 +713,17 @@ export const AnalyticsRollup = Schema.Struct({
   total: Measurement,
   invalidLines: Measurement,
   kindCounts: Schema.Record(Label, Measurement),
+  claudeApiErrors: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        status: Schema.NullOr(Schema.Number),
+        model: ModelId,
+        host: Label,
+        attempts: Measurement,
+        giveUps: Measurement,
+      }),
+    ),
+  ),
   restartAdmission: Schema.optionalKey(
     Schema.Struct({
       scope: Schema.Literal("server-wide"),

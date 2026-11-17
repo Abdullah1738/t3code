@@ -21887,6 +21887,74 @@ it.effect("a full context replaces the evaluator without a retry", () =>
   }),
 );
 
+it.effect.each([
+  {
+    status: 404,
+    code: "model_not_found",
+    category: "model_invalid" as const,
+    message: "Claude gave up after repeated API errors. Last error: HTTP 404",
+    errorText: "Model unavailable",
+  },
+  {
+    status: null,
+    code: "ECONNRESET",
+    category: "unknown" as const,
+    message: "Provider turn failed.",
+    errorText: "model unavailable",
+  },
+  {
+    status: null,
+    code: "ECONNRESET",
+    category: "unknown" as const,
+    message: "Provider turn failed.",
+    errorText: "maximum context length exceeded",
+  },
+])(
+  "Evaluator errors includes Claude diagnostics without routing on body: $errorText",
+  ({ status, code, category, message, errorText }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        const kanban = yield* KanbanService.KanbanService;
+        const { board } = yield* toyBoard;
+        const t = yield* kanban.startEvaluator(board.id, { kind: "request", text: "Look at it" });
+        const failure: OrchestrationV2ProviderFailure = {
+          class: "provider_error",
+          retryable: false,
+          category,
+          message,
+          code: status === null ? null : `api_error_${status}`,
+          claudeApiError: {
+            model: "claude-opus-5-5",
+            host: "router.test",
+            path: "/v1",
+            status,
+            errorCode: code,
+            errorType: "not_found_error",
+            errorText,
+            attempt: 2,
+            resume: false,
+          },
+        };
+        fake.failures.set(t, failure);
+        yield* kanban.turnEnded(t);
+        assert.isNull((yield* kanban.caller(t))?.paused);
+        yield* TestClock.adjust("2 minutes");
+        yield* kanban.tick;
+        fake.failures.set(t, { ...failure });
+        yield* kanban.turnEnded(t);
+        const channel = (yield* kanban.discussions(board.id)).find(
+          (d) => d.title === "Evaluator errors",
+        );
+        assert.isDefined(channel);
+        const notice = lastText(yield* kanban.messages(channel!.id));
+        for (const value of [code, "claude-opus-5-5", "router.test/v1", errorText])
+          assert.include(notice, value);
+        if (status !== null) assert.include(notice, `HTTP ${status}`);
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect("a one-shot evaluator that keeps failing is reported in Evaluator errors", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake;

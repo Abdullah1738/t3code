@@ -7,6 +7,7 @@ import {
   mcpStartupTimeoutMs,
   type McpRegistrationStatus,
 } from "../../ardud/mcp/optionalRegistration.ts";
+import * as ClaudeApiDiagnostics from "../../ardud/providers/ClaudeApiDiagnostics.ts";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
 import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
 import {
@@ -3611,6 +3612,9 @@ interface ActiveClaudeTurnContext {
   responseReceived: boolean;
   sessionRefused: boolean | undefined;
   realApiStatus: number | null | undefined;
+  apiDiagnostics?: ReturnType<typeof ClaudeApiDiagnostics.details> | undefined;
+  apiAttempt?: number;
+  apiResume?: boolean;
   latestApiFailure: OrchestrationV2ProviderFailure | undefined;
   // Synthetic model errors may wrap a native failure that is not readable yet.
   latestApiFailureSynthetic: boolean;
@@ -3700,6 +3704,7 @@ interface ActiveClaudeSubagent {
 }
 
 interface ClaudeLiveQueryContext {
+  readonly resumed: boolean;
   readonly generation: number;
   readonly nativeThreadId: string;
   readonly query: ClaudeAgentSdkQuerySession;
@@ -4101,6 +4106,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
   adapterOptions: ClaudeAdapterV2Options,
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+  const recordApiError = yield* ClaudeApiDiagnostics.makeRecorder();
   const { attachmentsDir, fileSystem, path, crypto, idAllocator, queryRunner } = adapterOptions;
   const subagentModelCatalog = scopeClaudeModelCatalog(
     BUNDLED_CLAUDE_MODEL_CATALOG,
@@ -6926,6 +6932,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly deferWorkflowTranscripts?: boolean;
         }) {
           yield* Effect.gen(function* () {
+            if (input.status === "failed" && input.failure !== undefined) {
+              const error = input.context.apiDiagnostics;
+              if (error !== undefined) {
+                yield* recordApiError({
+                  turn: input.context.input,
+                  startedAt: input.context.startedAt,
+                  error,
+                  phase: "give_up",
+                });
+                input = { ...input, failure: { ...input.failure, claudeApiError: error } };
+              }
+            }
             input.context.acceptingSteers = false;
             for (const [uuid, steer] of input.context.pendingSteers) {
               yield* Deferred.succeed(steer.settled, undefined);
@@ -7480,6 +7498,34 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const subagents = yield* Ref.get(sessionSubagentsByTaskId);
           const buffered = (yield* Ref.get(wakeBuffers)).get(closedQuery.nativeThreadId)?.messages;
           if (current === context) {
+            if (
+              !interrupted &&
+              failure === undefined &&
+              cause !== undefined &&
+              context.apiDiagnostics === undefined
+            ) {
+              const causeFields = ClaudeApiDiagnostics.queryCause(
+                cause,
+                adapterOptions.environment,
+              );
+              context.apiDiagnostics = ClaudeApiDiagnostics.details({
+                environment: adapterOptions.environment,
+                model: context.input.modelSelection.model,
+                body: causeFields.message ?? makeProviderFailure({ cause }).message,
+                errorCode: causeFields.code,
+                attempt: 1,
+                resume:
+                  context.apiResume ??
+                  context.input.nativeThreadHasTurns ??
+                  context.input.providerTurnOrdinal > 1,
+              });
+              yield* recordApiError({
+                turn: context.input,
+                startedAt: context.startedAt,
+                error: context.apiDiagnostics,
+                phase: "attempt",
+              });
+            }
             yield* finalizeActiveTurn({
               context,
               status: interrupted ? "interrupted" : "failed",
@@ -8195,6 +8241,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             context.retryHealth.since = DateTime.toEpochMillis(frameTime);
             context.retryHealth.seenResponse = false;
             context.retryHealth.retrying = false;
+            context.apiAttempt = 0;
           }
 
           if (message.type === "stream_event" && !message.parent_tool_use_id) {
@@ -8213,6 +8260,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               context.retryHealth.retrying = false;
               context.responseReceived = true;
               context.realApiStatus = null;
+              context.apiDiagnostics = undefined;
+              context.apiAttempt = 0;
               context.latestApiFailure = undefined;
               context.latestApiFailureSynthetic = false;
               context.latestApiFailureStatus = undefined;
@@ -8619,6 +8668,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               message.error === "unknown" || message.error_status === null
                 ? yield* readTurnApiError(context, context.retryHealth.since)
                 : undefined;
+            const diagnosticNative =
+              native ?? (yield* readTurnApiError(context, context.retryHealth.since));
             // A transcript read can yield to Stop or a replacement query.
             if ((yield* Ref.get(queryContext)) !== liveQuery || liveQuery.stopping) return;
             if (
@@ -8653,6 +8704,30 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               : (native?.status ?? message.error_status ?? null);
             if (preservedFailure === undefined) context.latestApiFailureStatus = status;
             context.realApiStatus = status;
+            context.apiAttempt = retry.attempt;
+            context.apiDiagnostics = ClaudeApiDiagnostics.details({
+              environment: adapterOptions.environment,
+              model: context.input.modelSelection.model,
+              status,
+              body:
+                diagnosticNative?.status == null ||
+                status == null ||
+                diagnosticNative.status === status
+                  ? (diagnosticNative?.formatted ?? failure.message)
+                  : failure.message,
+              errorCode: message.error,
+              attempt: context.apiAttempt,
+              resume:
+                context.apiResume ??
+                context.input.nativeThreadHasTurns ??
+                context.input.providerTurnOrdinal > 1,
+            });
+            yield* recordApiError({
+              turn: context.input,
+              startedAt: context.startedAt,
+              error: context.apiDiagnostics,
+              phase: "attempt",
+            });
             const itemOrdinal =
               previous?.itemOrdinal ??
               (yield* resolveItemOrdinal(context, `terminal-failure:${context.providerTurnId}`));
@@ -8706,6 +8781,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   models.add(context.input.modelSelection.model);
                   successfulModelsByNativeThread.set(context.nativeThreadId, models);
                 }
+                context.apiDiagnostics = undefined;
+                context.apiAttempt = 0;
                 context.latestApiFailure = undefined;
                 context.latestApiFailureSynthetic = false;
                 context.latestApiFailureStatus = undefined;
@@ -9697,6 +9774,41 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   : latestNativeStatus,
               resultFailure?.category,
             );
+            if (
+              !interrupted &&
+              resultFailure !== null &&
+              (apiExhausted ||
+                (currentStatus != null && currentStatus >= 400) ||
+                transcriptError !== undefined ||
+                latestFailure !== undefined ||
+                retryFailure !== undefined)
+            ) {
+              context.apiAttempt = (context.apiAttempt ?? 0) + 1;
+              context.apiDiagnostics = ClaudeApiDiagnostics.details({
+                environment: adapterOptions.environment,
+                model: context.input.modelSelection.model,
+                status: currentStatus ?? transcriptError?.status ?? context.latestApiFailureStatus,
+                body:
+                  (currentStatus == null ||
+                  transcriptError?.status == null ||
+                  transcriptError.status === currentStatus
+                    ? transcriptError?.formatted
+                    : undefined) ??
+                  (message.subtype === "success" ? message.result : message.errors.join("\n")),
+                errorCode: resultFailure.code,
+                attempt: context.apiAttempt,
+                resume:
+                  context.apiResume ??
+                  context.input.nativeThreadHasTurns ??
+                  context.input.providerTurnOrdinal > 1,
+              });
+              yield* recordApiError({
+                turn: context.input,
+                startedAt: context.startedAt,
+                error: context.apiDiagnostics,
+                phase: "attempt",
+              });
+            }
             const terminalFailure =
               resultFailure === null
                 ? null
@@ -10572,6 +10684,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           });
           const closed = yield* Deferred.make<void, never>();
           const context: ClaudeLiveQueryContext = {
+            resumed: shouldResume,
             generation: yield* Ref.modify(queryGenerations, (current) => {
               const generation = (current.get(nativeThreadId) ?? 0) + 1;
               return [generation, new Map(current).set(nativeThreadId, generation)];
@@ -10750,6 +10863,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             providerTurnId,
             providerTurnOrdinal,
             startedAt,
+            apiResume: turnInput.nativeThreadHasTurns ?? turnInput.providerTurnOrdinal > 1,
             retryHealth: {
               since: DateTime.toEpochMillis(startedAt),
               frames: 0,
@@ -10853,6 +10967,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           yield* startup.stage("mcp_registration", querySession.query.retryMcp ?? Effect.void);
           // From admission onward a timeout must never re-run preparation or claim no delivery.
           yield* startup.seal;
+          context.apiResume ||= querySession.resumed;
           turnQueries.set(context, querySession);
           const admitRecovery = Effect.gen(function* () {
             if (turnInput.automaticRecovery !== true) return;
@@ -11628,6 +11743,30 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   }),
                   claudeAccess: claudeAccessEvidence(context, null, "transient"),
                 };
+                if (
+                  context.apiDiagnostics === undefined ||
+                  (native?.retryAttempt ?? 0) > (context.apiAttempt ?? 0)
+                ) {
+                  context.apiAttempt = Math.max(1, native?.retryAttempt ?? context.apiAttempt ?? 1);
+                  context.apiDiagnostics = ClaudeApiDiagnostics.details({
+                    environment: adapterOptions.environment,
+                    model: context.input.modelSelection.model,
+                    status: native?.status ?? context.latestApiFailureStatus,
+                    body: cause,
+                    errorCode: failure.code,
+                    attempt: context.apiAttempt,
+                    resume:
+                      context.apiResume ??
+                      context.input.nativeThreadHasTurns ??
+                      context.input.providerTurnOrdinal > 1,
+                  });
+                  yield* recordApiError({
+                    turn: context.input,
+                    startedAt: context.startedAt,
+                    error: context.apiDiagnostics,
+                    phase: "attempt",
+                  });
+                }
                 yield* interruptTurn({
                   providerThread: context.input.providerThread,
                   providerTurnId: context.providerTurnId,

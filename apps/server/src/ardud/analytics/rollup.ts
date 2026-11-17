@@ -344,6 +344,10 @@ export const makeAccumulator = () => ({
     }
   >(),
   evaluatorStartsByTrigger: new Map<string, { boardId: string; trigger: string; count: number }>(),
+  claudeApiErrors: new Map<
+    string,
+    { status: number | null; model: string; host: string; attempts: number; giveUps: number }
+  >(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
@@ -611,6 +615,19 @@ export function accumulate(
   }
   // Related follow-ups inform a filtered call view without becoming selected events or samples.
   if (correlationOnly) return;
+  if (event.kind === "provider.claude_api_error" && event.claudeApiError !== undefined) {
+    const { status, model, host } = event.claudeApiError;
+    const identity = JSON.stringify([status, model, host]);
+    const key = boundedKey(target.claudeApiErrors, identity);
+    const group = target.claudeApiErrors.get(key) ?? {
+      ...(key === OTHER ? { status: null, model: OTHER, host: OTHER } : { status, model, host }),
+      attempts: 0,
+      giveUps: 0,
+    };
+    if (event.phase === "attempt") group.attempts++;
+    if (event.phase === "give_up") group.giveUps++;
+    target.claudeApiErrors.set(key, group);
+  }
   if (
     event.kind === "server.runtime_sample" &&
     event.props?.runningTurns &&
@@ -1178,6 +1195,7 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    claudeApiErrors: [...target.claudeApiErrors.values()],
     runtimeSamples: [...target.runtimeSamples.values()]
       .map(({ runningTurnsSum, ...row }) => ({
         ...row,
