@@ -26,7 +26,7 @@ done
 # A plain executable wrapper keeps imports local to the installed helper directory.
 copy_file "$here/mac-log-rollup" "$HOME/.local/bin/mac-log-rollup" 755
 copy_file "$here/mac-log-status" "$HOME/.local/bin/mac-log-status" 755
-for label in com.abdullah.mac-log-collector com.abdullah.mac-deep-inventory com.abdullah.mac-memory com.abdullah.mac-cpu com.abdullah.mac-tailnet; do
+for label in com.abdullah.mac-log-collector com.abdullah.mac-deep-inventory com.abdullah.mac-memory com.abdullah.mac-cpu com.abdullah.mac-tailnet com.abdullah.mac-ssd-read-probe; do
 if [[ $mode == install ]]; then
   /usr/bin/python3 - "$here/launchd/$label.plist" "$HOME/Library/LaunchAgents/$label.plist" <<'PY'
 from pathlib import Path

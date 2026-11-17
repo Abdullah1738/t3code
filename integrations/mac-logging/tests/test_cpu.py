@@ -792,7 +792,7 @@ class CpuTests(unittest.TestCase):
         self.assertEqual(data['ProcessType'], 'Standard')
         self.assertNotIn('Nice', data)
         self.assertNotIn('LowPriorityIO', data)
-        self.assertEqual(data['ProgramArguments'][0], '/usr/bin/python3')
+        self.assertEqual(data['ProgramArguments'][:2], ['/bin/zsh', '-c'])
         self.assertEqual(status.CADENCES['cpu.sample']['gapHours']*60, 3)
         setup = (HERE/'install.zsh').read_text()
         for text in ('cpu.py', 'cpu_labels.py', 'com.abdullah.mac-cpu'):

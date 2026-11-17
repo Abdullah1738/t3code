@@ -587,14 +587,6 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
 
 
 def main():
-    # Run first so CPU inventory/attribution cannot delay the SSD outage signal.
-    try:
-        from ssd_probe import sample as sample_ssd
-        sample_ssd()
-    except Exception:
-        emit('disk', 'event', 'disk.ssd_read_probe', ok=False,
-             props=dict(statMs=None, readMs=None, outcome='error', errno='EIO', stuckPrior=False),
-             error_tag='disk.ssd_probe_unavailable')
     try:
         from u_sample import sample as sample_u
         sample_u()

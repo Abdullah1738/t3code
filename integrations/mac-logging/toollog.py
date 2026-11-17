@@ -470,6 +470,8 @@ def safe_fields(values, event=None):
         for key, value in (values or {}).items():
             if key in ('statMs', 'readMs', 'loadavg1') and (value is None or finite_number(value) and value >= 0):
                 result[key] = value
+            elif key == 'sandboxdThreads' and (value is None or type(value) is int and value >= 0):
+                result[key] = value
             elif key == 'nice' and type(value) is int and -20 <= value <= 20:
                 result[key] = value
             elif key == 'stuckPrior' and type(value) is bool:

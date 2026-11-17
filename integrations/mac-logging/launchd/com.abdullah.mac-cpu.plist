@@ -2,8 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>Label</key><string>com.abdullah.mac-cpu</string>
-<!-- The SSD detector must retain plain launchd attribution, without zsh's FDA. -->
-<key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>__HOME__/.local/lib/mac-logging/cpu.py</string></array>
+<key>ProgramArguments</key><array><string>/bin/zsh</string><string>-c</string><string>exec /usr/bin/python3 "__HOME__/.local/lib/mac-logging/cpu.py"</string></array>
 <key>StartInterval</key><integer>60</integer>
 <key>RunAtLoad</key><true/>
 <key>ProcessType</key><string>Standard</string>

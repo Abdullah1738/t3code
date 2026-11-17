@@ -11,6 +11,9 @@ import unittest
 
 HERE=Path(__file__).resolve().parents[1]
 REPO=HERE.parents[1]
+sys.path.insert(0,str(HERE))
+import status as mac_status
+
 FAKE = r'''#!PYTHON
 import json,os,sys,time
 from pathlib import Path
@@ -164,7 +167,8 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     status=subprocess.run([str(wrapper),'--now','2026-11-15T12:00:00Z','--json'],env=env,capture_output=True,text=True,timeout=10)
     self.assertEqual(status.returncode,1,status.stderr)
     self.assertFalse(json.loads(status.stdout)['ok'])
-    self.assertEqual(len(json.loads(status.stdout)['jobs']),14)
+    self.assertEqual(set(json.loads(status.stdout)['jobs']),set(mac_status.CADENCES))
+    self.assertEqual(json.loads(status.stdout)['jobs']['disk.ssd_read_probe']['status'],'PENDING')
     self.assertIn('tailnet.sample',json.loads(status.stdout)['jobs'])
     wrapper.chmod(0o644);self.assertNotEqual(check(),0);wrapper.chmod(0o755)
     original_wrapper=wrapper.read_text()
@@ -196,7 +200,15 @@ os.execv('''+repr(executable)+''',['''+repr(executable)+''']+args)
     self.assertEqual(minute['StartInterval'],60)
     self.assertEqual(minute['ProgramArguments'],['/bin/zsh','-c',f'exec /usr/bin/python3 "{collector}" --tailnet'])
     self.assertEqual(tailnet_script.read_bytes(),(HERE/'tailnet.py').read_bytes())
-    for target in (deep_script,deep_plist,memory_script,memory_plist,tailnet_script,tailnet_plist):
+    probe_script=home/'.local/lib/mac-logging/ssd_probe.py'
+    probe_plist=home/'Library/LaunchAgents/com.abdullah.mac-ssd-read-probe.plist'
+    probe_job=plistlib.loads(probe_plist.read_bytes())
+    self.assertEqual(probe_job['StartInterval'],60)
+    self.assertEqual(probe_job['ProgramArguments'],['/bin/zsh','-fc','exec /usr/bin/python3 "$@"','--',str(probe_script),'sample'])
+    self.assertEqual(probe_job['ProcessType'],'Standard')
+    self.assertTrue(probe_job['AbandonProcessGroup'])
+    self.assertIn('com.abdullah.mac-ssd-read-probe.plist',dry_run.stdout)
+    for target in (deep_script,deep_plist,memory_script,memory_plist,tailnet_script,tailnet_plist,probe_script,probe_plist):
      saved=target.read_bytes()
      target.chmod(0o644);self.assertNotEqual(check(),0);target.chmod(0o600)
      target.write_text('stale');self.assertNotEqual(check(),0);target.write_bytes(saved)

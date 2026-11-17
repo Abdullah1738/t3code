@@ -32,6 +32,14 @@ class SSDProbeTests(unittest.TestCase):
         env = patch.dict(os.environ, TOOLLOG_DIR=str(self.root/'logs'), BUN_INSPECT='private')
         env.start()
         self.addCleanup(env.stop)
+        self.real_threads = ssd.sandboxd_threads
+        self.real_capture = ssd.capture_prompt
+        threads_patch = patch.object(ssd, 'sandboxd_threads', return_value=5)
+        self.threads = threads_patch.start()
+        self.addCleanup(threads_patch.stop)
+        capture_patch = patch.object(ssd, 'capture_prompt', return_value=None)
+        self.capture = capture_patch.start()
+        self.addCleanup(capture_patch.stop)
         self.sent = []
         self.children = []
         self.popen = subprocess.Popen
@@ -70,6 +78,8 @@ class SSDProbeTests(unittest.TestCase):
         with patch.object(ssd, 'process_type', return_value='Standard'), patch.object(ssd.os, 'nice', return_value=7):
             result = self.sample()
         self.assertEqual(result['outcome'], 'ok')
+        self.assertEqual(result['sandboxdThreads'], 5)
+        self.assertFalse((self.state_root/'ssd-launchd-read-blocked').exists())
         self.assertGreaterEqual(result['statMs'], 0)
         self.assertGreaterEqual(result['readMs'], 0)
         self.assertIsNone(result['errno'])
@@ -132,6 +142,30 @@ class SSDProbeTests(unittest.TestCase):
                 self.assertEqual(result['outcome'], 'error')
                 self.assertEqual(result['errno'], expected)
 
+    def test_permission_error_class_is_not_a_successful_read(self):
+        for name in ('EPERM', 'EACCES', 'EINTR'):
+            with self.subTest(errno=name):
+                self.state_root.mkdir(exist_ok=True)
+                state = self.state_root/'ssd-read-probe.json'
+                if state.exists():
+                    state.unlink()
+                marker = self.state_root/'ssd-launchd-read-blocked'
+                marker.unlink(missing_ok=True)
+                self.sent.clear()
+                reader = [sys.executable, '-c', ssd.READER.replace(
+                    'with open(sys.argv[1]', 'raise OSError(errno.%s, "denied")\n            with open(sys.argv[1]' % name), str(self.path)]
+                first = self.sample(reader=reader)
+                self.assertEqual(first['outcome'], 'error')
+                self.assertEqual(first['errno'], name)
+                self.assertIsNone(first['readMs'])
+                self.assertFalse(marker.exists())
+                self.sample(1, reader=reader)
+                self.assertTrue(marker.exists())
+                self.assertEqual(len(self.sent), 1)
+                self.assertEqual(self.sample(2)['outcome'], 'ok')
+                self.assertFalse(marker.exists())
+                self.assertEqual(len(self.sent), 2)
+
     def test_two_failures_alert_once_and_recovery_once_no_stdout(self):
         self.path.unlink()
         marker = self.state_root/'ssd-launchd-read-blocked'
@@ -142,7 +176,8 @@ class SSDProbeTests(unittest.TestCase):
             self.assertEqual(self.sent, [])
             self.sample(1)
             self.assertEqual(json.loads(marker.read_text()), dict(
-                since='2026-11-17T03:05:00.000000Z', lastOutcome='error', errno='ENOENT'))
+                since='2026-11-17T03:05:00.000000Z', lastOutcome='error', errno='ENOENT',
+                sandboxdThreads=5, promptingPath=None))
             self.assertEqual(len(self.sent), 1)
             self.assertEqual(self.sent[0][0], "Background jobs can't read the ExternalSSD (since 03:05Z). Don't restart Robob or other apps until this clears; a fresh start can hang. Mac Upkeep is on it.")
             self.assertIn('ssd-read-probe', self.sent[0][1])
@@ -152,7 +187,7 @@ class SSDProbeTests(unittest.TestCase):
             self.sample(3)
             self.assertFalse(marker.exists())
             self.assertEqual(len(self.sent), 2)
-            self.assertEqual(self.sent[1][0], 'Background jobs can read the ExternalSSD again.')
+            self.assertEqual(self.sent[1][0], 'Background SSD reads and sandbox approval thread count are healthy again.')
             self.sample(4)
             self.assertEqual(len(self.sent), 2)
             self.assertEqual(output.getvalue(), '')
@@ -321,28 +356,170 @@ class SSDProbeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ssd.init_probe(self.path)
 
-    def test_direct_launchd_context_and_installer_wiring(self):
-        plist = plistlib.loads((HERE/'launchd/com.abdullah.mac-cpu.plist').read_bytes())
-        self.assertEqual(plist['ProgramArguments'], ['/usr/bin/python3', '__HOME__/.local/lib/mac-logging/cpu.py'])
+    def test_independent_launchd_context_and_installer_wiring(self):
+        plist = plistlib.loads((HERE/'launchd/com.abdullah.mac-ssd-read-probe.plist').read_bytes())
+        self.assertEqual(plist['ProgramArguments'], ['/bin/zsh', '-fc', 'exec /usr/bin/python3 "$@"', '--', '__HOME__/.local/lib/mac-logging/ssd_probe.py', 'sample'])
         self.assertEqual(plist['ProcessType'], 'Standard')
         self.assertEqual(plist['StartInterval'], 60)
+        self.assertTrue(plist['AbandonProcessGroup'])
+        cpu_plist = plistlib.loads((HERE/'launchd/com.abdullah.mac-cpu.plist').read_bytes())
+        self.assertEqual(cpu_plist['ProgramArguments'][:2], ['/bin/zsh', '-c'])
+        self.assertNotIn('ssd_probe.py', cpu_plist['ProgramArguments'][-1])
         text = (HERE/'install.zsh').read_text()
+        self.assertIn('com.abdullah.mac-ssd-read-probe', text)
         self.assertIn('ssd_probe.py', text)
         self.assertIn('probe.bin', text)
 
-    def test_ssd_runs_first_and_other_samplers_survive_failure(self):
+    def test_second_probe_alert_survives_cpu_inventory_that_never_returns(self):
+        import select
+        # A real CPU entrypoint reaches inventory and never returns. The old
+        # combined job would still be active here and miss its next minute.
+        script = ("import sys,time; sys.path.insert(0, sys.argv[1]); "
+                  "import cpu,u_sample; u_sample.sample=lambda:None; "
+                  "cpu.sample=lambda:(print('inventory-blocked',flush=True),time.sleep(60)); "
+                  "cpu.main()")
+        inventory = self.popen([sys.executable, '-c', script, str(HERE)], stdout=subprocess.PIPE)
+        self.children.append(inventory)
+        self.addCleanup(inventory.stdout.close)
+        ready, _, _ = select.select([inventory.stdout], [], [], 3)
+        self.assertTrue(ready)
+        self.assertEqual(inventory.stdout.readline().strip(), b'inventory-blocked')
+        self.assertIsNone(inventory.poll())
+        real_sample = ssd.sample
+        slow_reader = [sys.executable, '-c', ssd.READER.replace('with open(sys.argv[1]', 'time.sleep(60)\n            with open(sys.argv[1]'), str(self.path)]
+        def tick():
+            return real_sample(root=self.state_root, path=self.path, now=NOW,
+                               send=self.send, timeout=.2, reader=slow_reader)
+        with patch.object(ssd, 'sample', side_effect=tick):
+            ssd.main(['sample'])
+            self.assertFalse((self.state_root/'ssd-launchd-read-blocked').exists())
+            ssd.main(['sample'])
+        self.assertIsNone(inventory.poll())
+        self.assertEqual(len(self.event()), 2)
+        self.assertTrue(self.event()[-1]['props']['stuckPrior'])
+        self.assertTrue((self.state_root/'ssd-launchd-read-blocked').exists())
+        self.assertEqual(len(self.sent), 1)
+
+    def test_jam_threshold_latches_once_despite_read_ok_and_captures_only_on_latch(self):
+        marker = self.state_root/'ssd-launchd-read-blocked'
+        self.threads.return_value = 20
+        self.capture.return_value = '/opt/homebrew/Cellar/node/26.13.0_2/bin/node'
+        first = self.sample()
+        self.assertEqual(first['outcome'], 'ok')
+        self.assertFalse(self.event()[0]['ok'])
+        self.assertFalse(marker.exists())
+        self.capture.assert_not_called()
+        self.sample(1)
+        self.assertEqual(json.loads(marker.read_text()), dict(since='2026-11-17T03:05:00.000000Z',
+            lastOutcome='jam', errno=None, sandboxdThreads=20, promptingPath=self.capture.return_value))
+        self.capture.assert_called_once()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('jam', self.sent[0][0])
+        self.assertIn('20 threads', self.sent[0][0])
+        self.sample(2)
+        self.capture.assert_called_once()
+        self.assertEqual(len(self.sent), 1)
+        self.threads.return_value = None
+        self.sample(3)
+        self.assertTrue(marker.exists())
+        self.assertEqual(len(self.sent), 1)
+        self.threads.return_value = 5
+        self.sample(4)
+        self.assertFalse(marker.exists())
+        self.assertEqual(len(self.sent), 2)
+        self.sample(5)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_thread_count_boundaries_and_missing_inventory(self):
+        for threads, cause in ((None, None), (0, None), (5, None), (19, None), (20, 'jam'), (32, 'jam'), (83, 'jam')):
+            with self.subTest(threads=threads):
+                self.assertEqual(ssd.failure_cause(dict(outcome='ok', stuckPrior=False, sandboxdThreads=threads)), cause)
+        self.assertEqual(ssd.failure_cause(dict(outcome='error', stuckPrior=False, sandboxdThreads=83)), 'error')
+
+    def test_abandoned_prompt_capture_is_once_and_does_not_delay_future_ticks(self):
+        self.threads.return_value = 32
+        command = [sys.executable, '-c', 'import time; time.sleep(60)']
+        real_bounded_capture = ssd.bounded_capture
+        def capture(argv, key, root, state, save, deadline):
+            self.assertEqual(argv, command)
+            self.assertLessEqual(deadline, time.monotonic()+15)
+            return real_bounded_capture(argv, key, root, state, save, time.monotonic()+.1)
+        with patch.object(ssd, 'PROMPT_COMMAND', command), \
+             patch.object(ssd, 'bounded_capture', side_effect=capture) as bounded, \
+             patch.object(ssd, 'capture_prompt', side_effect=self.real_capture) as prompt:
+            self.sample()
+            self.sample(1)
+            prior = self.state()['boundedChildren']['tccd-prompt']
+            self.assertTrue(ssd.alive(prior['pid']))
+            self.assertIsNone(json.loads((self.state_root/'ssd-launchd-read-blocked').read_text())['promptingPath'])
+            self.assertEqual(len(self.sent), 1)
+            self.sample(2)
+            self.assertEqual(len(self.sent), 1)
+            bounded.assert_called_once()
+            prompt.assert_called_once()
+
+    def test_real_thread_inventory_command_output_and_stuck_ps_suppression(self):
+        self.state_root.mkdir()
+        state = {}
         calls = []
-        def fail():
-            calls.append('ssd')
-            raise OSError('private')
-        with patch.object(ssd, 'sample', side_effect=fail), patch('u_sample.sample', side_effect=lambda: calls.append('u')), patch.object(cpu, 'sample', side_effect=lambda: calls.append('cpu')):
-            cpu.main()
-        self.assertEqual(calls, ['ssd', 'u', 'cpu'])
-        self.assertNotIn('private', json.dumps(self.event()))
+        def capture(argv, key, root, state, save, deadline):
+            calls.append(argv)
+            return '174\n' if key == 'sandboxd-pid' else 'HEADER\n'+'thread\n'*5
+        with patch.object(ssd, 'bounded_capture', side_effect=capture):
+            self.assertEqual(self.real_threads(self.state_root, state, lambda: None), 5)
+        self.assertEqual(calls, [['/usr/bin/pgrep', '-x', 'sandboxd'], ['/bin/ps', '-M', '-p', '174']])
+        state = {}
+        cmd = [sys.executable, '-c', 'import time; time.sleep(60)']
+        before = len(self.children)
+        started = time.monotonic()
+        self.assertIsNone(ssd.bounded_capture(cmd, 'sandboxd-threads', self.state_root, state, lambda: None,
+                                             time.monotonic()+.1))
+        self.assertLess(time.monotonic()-started, 1.1)
+        prior = state['boundedChildren']['sandboxd-threads'].copy()
+        self.assertTrue(ssd.alive(prior['pid']))
+        with patch.object(ssd, 'bounded_capture') as child:
+            self.assertIsNone(self.real_threads(self.state_root, state, lambda: None))
+            child.assert_not_called()
+        self.assertEqual(len(self.children), before+1)
+
+    def test_unavailable_sandboxd_inventory_forms(self):
+        self.state_root.mkdir()
+        for output in (None, '', '1\n2', 'not a pid'):
+            with self.subTest(output=output), patch.object(ssd, 'bounded_capture', return_value=output):
+                self.assertIsNone(self.real_threads(self.state_root, {}, lambda: None))
+        for output in (None, '', 'HEADER\n'):
+            with self.subTest(rows=output), patch.object(ssd, 'bounded_capture', side_effect=['174', output]):
+                self.assertIsNone(self.real_threads(self.state_root, {}, lambda: None))
+
+    def test_prompt_capture_command_deadline_and_last_path(self):
+        messages = [
+            dict(eventMessage='AUTHREQ_PROMPTING subject=Sub:{/old/path}Resp:{pid=1}'),
+            dict(eventMessage='other responsible_path=/ignore'),
+            dict(eventMessage='AUTHREQ_PROMPTING responsible_path=/path with spaces/bin/node, pid=2'),
+        ]
+        output = 'torn first line\n'+''.join(json.dumps(row)+'\n' for row in messages)
+        started = time.monotonic()
+        with patch.object(ssd, 'bounded_capture', return_value=output) as capture:
+            self.assertEqual(self.real_capture(self.state_root, {}, lambda: None), '/path with spaces/bin/node')
+        args = capture.call_args.args
+        self.assertEqual(args[0], ssd.PROMPT_COMMAND)
+        self.assertEqual(args[1], 'tccd-prompt')
+        self.assertGreater(args[-1], started)
+        self.assertLessEqual(args[-1], time.monotonic()+15)
+        self.assertIsNone(ssd.prompting_path('not-json\n{}\n'+json.dumps(dict(eventMessage='AUTHREQ_PROMPTING'))))
+
+    def test_generic_capture_suppresses_live_identity_and_clears_reused_pid(self):
+        self.state_root.mkdir()
+        state = dict(boundedChildren={'tccd-prompt': dict(pid=os.getpid(), birth=ssd.birth_identity(os.getpid()))})
+        command = [sys.executable, '-c', 'print("done")']
+        self.assertIsNone(ssd.bounded_capture(command, 'tccd-prompt', self.state_root, state, lambda: None, time.monotonic()+1))
+        self.assertEqual(self.children, [])
+        state['boundedChildren']['tccd-prompt']['birth'] = ['different']
+        self.assertEqual(ssd.bounded_capture(command, 'tccd-prompt', self.state_root, state, lambda: None, time.monotonic()+1), 'done\n')
 
     def test_event_sanitizer_preserves_nulls_and_drops_unknown_fields(self):
         props = dict(statMs=None, readMs=None, loadavg1=1, nice=0, processType='Standard',
-                     outcome='timeout', errno='ETIMEDOUT', stuckPrior=True)
+                     outcome='timeout', errno='ETIMEDOUT', stuckPrior=True, sandboxdThreads=None)
         self.assertEqual(toollog.safe_fields(dict(props, password='private'), 'disk.ssd_read_probe'), props)
 
 

@@ -20,6 +20,9 @@ from toollog import emit, private_dir
 
 PROBE = Path('/Volumes/ExternalSSD/.mac-upkeep/probe.bin')
 DEADLINE_S = 3
+SANDBOXD_JAM_THREADS = 20
+PROMPT_COMMAND = ['/usr/bin/log', 'show', '--last', '5m', '--style', 'ndjson',
+                  '--predicate', 'process == "tccd" AND eventMessage CONTAINS "AUTHREQ_PROMPTING"']
 # The gate lets the parent persist PID + lstart before any SSD syscall. Each
 # stage flushes separately so a stuck read still leaves its completed stat time.
 READER = '''import errno,json,os,sys,time
@@ -150,8 +153,9 @@ def probe(root, state, save, path=PROBE, timeout=DEADLINE_S, reader=None):
     save()
     output = root/'ssd-reader.out'
     with output.open('wb') as stream:
-        # mac-cpu starts directly as Python (no FDA-granted /bin/zsh). A plain
-        # child preserves the affected launchd context; shell reads hide #106.
+        # Inherit the same zsh/FDA launchd identity as guard/read-watchdog.
+        # This measures real jobs' access; sandboxdThreads detects approval jams
+        # that a granted read alone can miss (#106, evaluator decision q2).
         child = subprocess.Popen(reader or [sys.executable, '-c', READER, str(path)],
             stdin=subprocess.PIPE, stdout=stream, stderr=subprocess.DEVNULL)
     state['child'] = dict(pid=child.pid, start=None)
@@ -194,35 +198,144 @@ def probe(root, state, save, path=PROBE, timeout=DEADLINE_S, reader=None):
     return result
 
 
+def bounded_capture(argv, key, root, state, save, deadline):
+    children = state.setdefault('boundedChildren', {})
+    prior = children.get(key)
+    if prior and alive(prior['pid']):
+        current = birth_identity(prior['pid'])
+        if not prior.get('birth') or current is None or current == prior['birth']:
+            return None
+    children.pop(key, None)
+    if time.monotonic() >= deadline:
+        save()
+        return None
+    output = root/(key+'.out')
+    with output.open('wb') as stream:
+        child = subprocess.Popen(argv, stdout=stream, stderr=subprocess.DEVNULL,
+                                 env={**os.environ, 'LC_ALL': 'C'})
+    # Kernel birth identity avoids recursively invoking ps to identify ps.
+    children[key] = dict(pid=child.pid, birth=birth_identity(child.pid))
+    save()
+    if not poll_until(child, deadline):
+        return None
+    children.pop(key, None)
+    save()
+    if child.returncode != 0:
+        return None
+    with output.open('rb') as stream:
+        # A latch capture can span many log messages. Read only the tail; a
+        # partial first line is ignored by the ndjson decoder below.
+        stream.seek(0, os.SEEK_END)
+        stream.seek(max(0, stream.tell()-1024*1024))
+        return stream.read().decode('utf-8', errors='replace')
+
+
+def sandboxd_threads(root, state, save):
+    deadline = time.monotonic()+2
+    # Suppress discovery as well as ps when the preceding inventory is stuck.
+    prior = state.get('boundedChildren', {}).get('sandboxd-threads')
+    if prior and alive(prior['pid']):
+        current = birth_identity(prior['pid'])
+        if not prior.get('birth') or current is None or current == prior['birth']:
+            return None
+    try:
+        pids = bounded_capture(['/usr/bin/pgrep', '-x', 'sandboxd'], 'sandboxd-pid',
+                               root, state, save, deadline)
+        if pids is None or not re.fullmatch(r'[0-9]+', pids.strip()):
+            return None
+        rows = bounded_capture(['/bin/ps', '-M', '-p', pids.strip()], 'sandboxd-threads',
+                               root, state, save, deadline)
+        if rows is None:
+            return None
+        lines = [line for line in rows.splitlines() if line.strip()]
+        if len(lines) < 2:
+            return None
+        return len(lines)-1
+    except (OSError, ValueError):
+        return None
+
+
+def prompting_path(output):
+    latest = None
+    for line in (output or '').splitlines():
+        try:
+            row = json.loads(line)
+            message = row.get('eventMessage', '')
+            if not isinstance(message, str) or 'AUTHREQ_PROMPTING' not in message:
+                continue
+            match = re.search(r'responsible_path=(/[^,}]+)|subject=Sub:\{(/[^}]+)\}Resp:', message)
+            if match:
+                path = next(group for group in match.groups() if group is not None).strip()
+                if len(path) <= 2048 and all(c.isprintable() for c in path):
+                    latest = path
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return latest
+
+
+def capture_prompt(root, state, save):
+    try:
+        return prompting_path(bounded_capture(PROMPT_COMMAND, 'tccd-prompt', root, state, save,
+                                             time.monotonic()+15))
+    except OSError:
+        return None
+
+
+def failure_cause(result):
+    if result['outcome'] in ('timeout', 'error') or result['stuckPrior']:
+        return result['outcome']
+    threads = result.get('sandboxdThreads')
+    return 'jam' if type(threads) is int and threads >= SANDBOXD_JAM_THREADS else None
+
+
 def alert_state(result, root, state, save, now, send):
     # ~/.local/state/mac-upkeep/ssd-launchd-read-blocked is the restart-tool
     # interlock. Its consumers are owned separately by the watchdog and guard.
     marker = root/'ssd-launchd-read-blocked'
     stamp = now.isoformat(timespec='microseconds').replace('+00:00', 'Z')
     blocked = load(marker)
-    bad = result['outcome'] in ('timeout', 'error') or result['stuckPrior']
-    if bad:
+    cause = failure_cause(result)
+    if cause:
         state['failures'] = state.get('failures', 0)+1
         state.setdefault('since', blocked.get('since', stamp))
         if state['failures'] >= 2 or blocked:
-            atomic_json(marker, dict(since=state['since'], lastOutcome=result['outcome'], errno=result['errno']))
-            if not state.get('incident'):
+            active = dict(since=state['since'], lastOutcome=cause, errno=result['errno'],
+                          sandboxdThreads=result.get('sandboxdThreads'),
+                          promptingPath=state.get('promptingPath'))
+            first_latch = not state.get('incident')
+            if first_latch:
+                # Reserve before the expensive one-shot capture. An interrupted
+                # capture must never turn into another log show each minute.
                 state['incident'] = state['since']
+                state['promptingPath'] = None
                 hhmm = dt.datetime.fromisoformat(state['since'].replace('Z', '+00:00')).strftime('%H:%MZ')
+                text = ("Sandbox approval jam detected (since %s; sandboxd has %s threads). "
+                        "Don't restart Robob or other apps until this clears; a fresh start can hang. Mac Upkeep is on it." %
+                        (hhmm, result['sandboxdThreads']) if cause == 'jam' else
+                        "Background jobs can't read the ExternalSSD (since %s). Don't restart Robob or other apps until this clears; a fresh start can hang. Mac Upkeep is on it." % hhmm)
                 state.setdefault('pending', []).append(dict(
-                    key='mac-upkeep:ssd-read-probe:'+state['incident'],
-                    text="Background jobs can't read the ExternalSSD (since %s). Don't restart Robob or other apps until this clears; a fresh start can hang. Mac Upkeep is on it." % hhmm))
+                    key='mac-upkeep:ssd-read-probe:'+state['incident'], text=text))
+                save()
+            atomic_json(marker, active)
+            if first_latch:
+                state['promptingPath'] = capture_prompt(root, state, save)
+                save()
+                if state['promptingPath']:
+                    active['promptingPath'] = state['promptingPath']
+                    atomic_json(marker, active)
     else:
         state['failures'] = 0
-        if result['outcome'] == 'ok':
+        # Unknown thread inventory cannot prove recovery from an approval jam.
+        if result['outcome'] == 'ok' and result.get('sandboxdThreads') is not None:
             if blocked or state.get('incident'):
                 incident = state.get('incident', blocked.get('since'))
                 state.setdefault('pending', []).append(dict(
                     key='mac-upkeep:ssd-read-probe:'+str(incident)+':recovery',
-                    text='Background jobs can read the ExternalSSD again.'))
+                    text='Background SSD reads and sandbox approval thread count are healthy again.'))
                 marker.unlink(missing_ok=True)
             state.pop('incident', None)
             state.pop('since', None)
+            state.pop('promptingPath', None)
         elif not blocked:
             state.pop('since', None)
     # Reserve exact text and key before sending: a timeout can follow queueing.
@@ -265,7 +378,7 @@ def send_notice(text, key, root, state, save):
 
 def process_type():
     try:
-        path = Path.home()/'Library/LaunchAgents/com.abdullah.mac-cpu.plist'
+        path = Path.home()/'Library/LaunchAgents/com.abdullah.mac-ssd-read-probe.plist'
         with path.open('rb') as stream:
             return plistlib.load(stream).get('ProcessType', 'Standard')
     except (OSError, ValueError):
@@ -276,7 +389,8 @@ def sample(root=None, path=PROBE, now=None, send=None, timeout=DEADLINE_S, reade
     root = Path(root) if root is not None else Path.home()/'.local/state/mac-upkeep'
     now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
     result = dict(statMs=None, readMs=None, outcome='error', errno='EIO', stuckPrior=False,
-                  processType=process_type(), nice=os.nice(0), loadavg1=os.getloadavg()[0])
+                  processType=process_type(), nice=os.nice(0), loadavg1=os.getloadavg()[0],
+                  sandboxdThreads=None)
     try:
         private_dir(root)
         with (root/'ssd-read-probe.lock').open('a') as lock:
@@ -293,11 +407,12 @@ def sample(root=None, path=PROBE, now=None, send=None, timeout=DEADLINE_S, reade
                 result.update(probe(root, state, save, path, timeout, reader))
             except Exception as exc:
                 result.update(outcome='error', errno=errno.errorcode.get(getattr(exc, 'errno', None), 'EIO'))
+            result['sandboxdThreads'] = sandboxd_threads(root, state, save)
             alert_state(result, root, state, save, now,
                         send or (lambda text, key: send_notice(text, key, root, state, save)))
     except Exception as exc:
         result.update(outcome='error', errno=errno.errorcode.get(getattr(exc, 'errno', None), 'EIO'))
-    emit('disk', 'event', 'disk.ssd_read_probe', ok=result['outcome'] in ('ok', 'slow'), props=result, now=now)
+    emit('disk', 'event', 'disk.ssd_read_probe', ok=result['outcome'] in ('ok', 'slow') and failure_cause(result) is None, props=result, now=now)
     return result
 
 
@@ -314,13 +429,19 @@ def init_probe(path):
             raise ValueError('SSD probe file must be 4096 bytes')
 
 
-if __name__ == '__main__':
+def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=['init', 'check'])
+    parser.add_argument('operation', choices=['sample', 'init', 'check'])
     parser.add_argument('--path', type=Path, default=PROBE)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.operation == 'sample':
+        return sample()
     if args.operation == 'init':
         init_probe(args.path)
     elif args.path.stat().st_size != 4096:
         raise ValueError('SSD probe file must be 4096 bytes')
+
+
+if __name__ == '__main__':
+    main()
