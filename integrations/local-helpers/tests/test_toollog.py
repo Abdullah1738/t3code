@@ -80,22 +80,43 @@ class ToolLogTests(unittest.TestCase):
             {'component': 'delivery-renderer', 'kind': 'perf', 'name': 'card.render', 'ok': False,
              'durationMs': 20, 'props': {'failureCode': 'preview_missing'}},
         ]
-        for key in ['code.ECONNRESET', 'code.ECONNRESET', 'errno.-61', 'http.5xx', 'prompt_acceptance_probe',
-                    'PRIVATE_TOKEN', 'code.PRIVATE_TOKEN', 'code.971501234567',
-                    'errno./Users/private/PRIVATE', 'code.https://private/?token=PRIVATE']:
+        for fields in [{'code': 'ECONNRESET'}, {'code': 'ECONNRESET'}, {'errno': -61}, {'status': 503}, {},
+                       {'code': 'PRIVATE_TOKEN'}, {'code': 971501234567},
+                       {'errno': '/Users/private/PRIVATE'}, {'code': 'https://private/?token=PRIVATE'}]:
             rows.append({'kind': 'error', 'name': 'bridge.catch', 'error': {
-                'tag': 'router.catch1', 'name': 'Error', 'causeKey': key}})
+                'tag': 'router.catch1', 'name': 'Error', **fields}})
         rows.append({'kind': 'error', 'name': 'bridge.catch', 'error': {
             'tag': 'router.catch49', 'name': 'UnknownError', 'causeKey': 'background_watch'}})
         (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
         result = toollog.rollup('imessage', self.day)
-        self.assertEqual(result['topCauses'][0], {'tag': 'router.catch1', 'causeKey': 'code.ECONNRESET', 'count': 2})
+        self.assertIn({'tag': 'router.catch1', 'causeKey': 'code.ECONNRESET', 'count': 2}, result['topCauses'])
         self.assertEqual(len(result['topCauses']), 5)
         self.assertEqual(result['cardRenderFailures'], {'preview_missing': 1})
         self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['count'], 251)
         self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['failed'], 1)
         self.assertNotIn('PRIVATE', json.dumps(result))
         self.assertNotIn('971501234567', json.dumps(result))
+
+    def test_imessage_replayed_causes_match_shared_typescript_fixtures(self):
+        fixtures = Path(__file__).resolve().parents[2] / 'spectrum-bridge/test/fixtures/rollup-causes.json'
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        for fixture in json.loads(fixtures.read_text()):
+            with self.subTest(shape=fixture['name']):
+                request = fixture.get('request', False)
+                tag = 'control.request_failed' if request else fixture.get('tag', 'fixture.catch')
+                row = {'component': 'robob' if request else 'router', 'kind': 'perf' if request else 'error',
+                       'name': 'turn.robob_call' if request else 'bridge.catch', 'ok': False,
+                       'props': {**fixture.get('props', {}), **({'failureFormat': 'single'} if fixture.get('single') else {})},
+                       'error': {'tag': tag, **fixture['error']}}
+                row.update(fixture.get('row', {}))
+                for field in fixture.get('omit', []):
+                    row.pop(field, None)
+                (directory / (self.day + '.ndjson')).write_text(json.dumps(row) + '\n')
+                result = toollog.rollup('imessage', self.day)
+                expected = [{'tag': fixture.get('expectedTag', tag), 'causeKey': fixture['expected'], 'count': 1}] if fixture['expected'] else []
+                self.assertEqual(result['topCauses'], expected)
+                self.assertNotIn('PRIVATE_', json.dumps(result['topCauses']))
 
     def test_imessage_failure_formats_do_not_duplicate_legacy_diagnostics(self):
         directory = toollog.board_dir('imessage')

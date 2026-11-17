@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-import errno
 import contextlib
 import json
 import math
@@ -452,7 +451,27 @@ serviceUnavailable sharedFriendLocationNotFound sharedPlanRequired timeout token
 tokenNetwork unauthenticated unauthorized unknownSendFailure uploadRateExceeded upload_failed
 upload_url
 """.split())
-_IMESSAGE_CAUSE_CODES.update(errno.errorcode.values())
+# Bun exposes a fixed node:os errno vocabulary; Python uses host-specific names and drops aliases.
+_IMESSAGE_CAUSE_CODES.update("""
+E2BIG EACCES EADDRINUSE EADDRNOTAVAIL EAFNOSUPPORT EAGAIN EALREADY EBADF
+EBADMSG EBUSY ECANCELED ECHILD ECONNABORTED ECONNREFUSED ECONNRESET EDEADLK
+EDESTADDRREQ EDOM EDQUOT EEXIST EFAULT EFBIG EHOSTUNREACH EIDRM
+EILSEQ EINPROGRESS EINTR EINVAL EIO EISCONN EISDIR ELOOP
+EMFILE EMLINK EMSGSIZE EMULTIHOP ENAMETOOLONG ENETDOWN ENETRESET ENETUNREACH
+ENFILE ENOBUFS ENODATA ENODEV ENOENT ENOEXEC ENOLCK ENOLINK
+ENOMEM ENOMSG ENOPROTOOPT ENOSPC ENOSR ENOSTR ENOSYS ENOTCONN
+ENOTDIR ENOTEMPTY ENOTSOCK ENOTSUP ENOTTY ENXIO EOPNOTSUPP EOVERFLOW
+EPERM EPIPE EPROTO EPROTONOSUPPORT EPROTOTYPE ERANGE EROFS ESPIPE
+ESRCH ESTALE ETIME ETIMEDOUT ETXTBSY EWOULDBLOCK EXDEV
+""".split())
+_IMESSAGE_CAUSE_CODES.update('network bad_response no_handle no_media_url unsupported invalid_app_card card_preview_unavailable too_large download_failed lineFailure sendUnconfirmed'.split())
+_IMESSAGE_CODE_ALIASES = {
+    'ConnectionRefused': 'ECONNREFUSED', 'Timeout': 'ETIMEDOUT',
+    'Malformed_HTTP_Response': 'HPE_INVALID_CONSTANT', 'InvalidHTTPResponse': 'HPE_INVALID_CHUNK_SIZE',
+    'ResponseHeadersTooLarge': 'UND_ERR_HEADERS_OVERFLOW', 'InvalidContentLength': 'UND_ERR_RES_CONTENT_LENGTH_MISMATCH',
+    'ZlibError': 'Z_DATA_ERROR',
+}
+_IMESSAGE_PROVIDER_CODES = {'invalid_number', 'worker_unavailable', 'stop_opt_out', 'opted_out', '5504', 'provider_error'}
 
 
 def _imessage_cause_key(value):
@@ -470,9 +489,89 @@ def _imessage_cause_key(value):
     if re.fullmatch(r'-?(?:0|[1-9]\d{0,4})', code) and abs(int(code)) <= 65535:
         return value
     # Provider detail after an HTTP status is intentionally never copied.
-    if re.fullmatch(r'http_[1-5]\d{2}:(?:provider_error|unknown)', code):
+    if re.fullmatch(r'http_[1-5][0-9]{2}(?::(?:invalid_number|worker_unavailable|stop_opt_out|opted_out|5504|provider_error))?', code):
         return value
     return None
+
+
+def _imessage_error_code(value):
+    if type(value) in (int, float) and abs(value) <= 65535 and math.isfinite(value) and value == int(value):
+        return int(value)
+    if not isinstance(value, str):
+        return None
+    if value in _IMESSAGE_CODE_ALIASES:
+        return _IMESSAGE_CODE_ALIASES[value]
+    http = re.fullmatch(r'http_([1-5][0-9]{2})([\s\S]*)', value)
+    if http:
+        detail = http[2].removeprefix(':')
+        # Match safeLineFailureCode: provider text is reduced to a fixed vocabulary.
+        suffix = ':' + (_imessage_provider_code(detail) or 'provider_error') if detail else ''
+        return 'http_' + http[1] + suffix
+    if value in _IMESSAGE_CAUSE_CODES or re.fullmatch(r'(?:http|tokenHttp)[1-5][0-9]{2}', value):
+        return value
+    return None
+
+
+def _imessage_provider_code(value):
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    key = value.lower()
+    return 'stop_opt_out' if key == 'stop' else key if key in _IMESSAGE_PROVIDER_CODES else None
+
+
+def _imessage_replayed_cause(row):
+    # TS clean() rebuilds reduced error fields and ignores stored causeKey on replay.
+    kind = row.get('kind')
+    if kind not in ('error', 'perf', 'event') or not (kind == 'error' or row.get('name') == 'turn.robob_call' and row.get('ok') is False):
+        return None
+    for field in ('component', 'name'):
+        label = row.get(field, 'undefined')
+        label = 'null' if label is None else str(label).lower() if type(label) is bool else label
+        if not isinstance(label, str) or not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_.-]{0,99}', label):
+            return None
+    error = row.get('error') if isinstance(row.get('error'), dict) else {}
+    props = row.get('props') if isinstance(row.get('props'), dict) else {}
+    source = error.get('cause') if isinstance(error.get('cause'), dict) else {}
+    nested = source.get('cause') if isinstance(source.get('cause'), dict) else {}
+    response = source.get('response') if isinstance(source.get('response'), dict) else {}
+    tag = error.get('tag')
+    tag = '' if tag is None else tag
+    if not isinstance(tag, str):
+        return None
+    if re.match(r'^http_[1-5][0-9]{2}', tag):
+        tag = _imessage_error_code(tag)
+    elif tag.startswith('sendblue.'):
+        tag = 'sendblue.' + (_imessage_provider_code(tag[9:]) or 'async_failure')
+    tag_status = re.match(r'^http_([1-5][0-9]{2})', tag)
+    fallback_name = ('ValidationError' if tag.startswith('form.') else 'SendblueError' if tag.startswith('sendblue.')
+                     else 'HttpError' if tag_status else 'UnknownError') if isinstance(tag, str) else 'UnknownError'
+    name = source.get('name') if source.get('name') is not None else error.get('name', fallback_name)
+    name = name if isinstance(name, str) and name in _IMESSAGE_ERROR_NAMES else 'UnknownError'
+    if name not in {'Error', 'UnknownError', 'TimeoutError'}:
+        return None
+    tag = tag if re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_.:-]{0,99}', tag) else 'operation.failed'
+    fallback_code = error.get('code') if error.get('code') is not None else 'http_' + tag_status[1] if tag_status else None
+    code = next((safe for value in [source.get('code'), nested.get('code'), fallback_code]
+                 if (safe := _imessage_error_code(value)) is not None), None)
+    number = next((safe for value in [source.get('errno'), nested.get('errno'), error.get('errno')]
+                   if (safe := _imessage_error_code(value)) is not None), None)
+    if code is not None:
+        http = re.match(r'^(?:http_?|tokenHttp)([1-5])[0-9]{2}', code) if isinstance(code, str) else None
+        key = 'http.' + http[1] + 'xx' if http else f'code.{code}'
+    elif number is not None:
+        key = f'errno.{number}'
+    else:
+        fallback_status = error.get('status')
+        if fallback_status is None:
+            fallback_status = int(tag_status[1]) if tag_status else props.get('status')
+        status = next((value for value in [source.get('status'), source.get('statusCode'), response.get('status'), fallback_status]
+                       if value is not None), None)
+        if type(status) in (int, float) and 100 <= status <= 599 and math.isfinite(status) and status == int(status):
+            key = f'http.{int(status) // 100}xx'
+        else:
+            key = {'router.catch1': 'prompt_acceptance_probe', 'router.catch49': 'background_watch'}.get(tag, 'callsite_failure')
+    key = _imessage_cause_key(key)
+    return (tag, key) if key else None
 
 
 def _imessage_render_stats(row):
@@ -591,6 +690,10 @@ def rollup(board, day, top_n=20):
             single_failures += weight
         if request_failure and not single and (row.get('error') or {}).get('tag') == 'control.request_failed':
             return
+        if board == 'imessage':
+            cause = _imessage_replayed_cause(row)
+            if cause:
+                causes[cause] += weight
         tag = (row.get('error') or {}).get('tag')
         if not isinstance(tag, str):
             return
@@ -600,9 +703,6 @@ def rollup(board, day, top_n=20):
             if not isinstance(error_name, str) or error_name not in _IMESSAGE_ERROR_NAMES:
                 error_name = 'UnknownError'
             key = (tag, error_name)
-            cause = _imessage_cause_key((row.get('error') or {}).get('causeKey'))
-            if cause:
-                causes[(tag, cause)] += weight
         tags[key] += weight
         references.setdefault(key, {'file': day + '.ndjson', 'line': line_number, 'ts': row.get('ts')})
         identity = row.get('ids')
