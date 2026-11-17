@@ -545,10 +545,15 @@ def _repo_node_pin_input_safe(path):
     return stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) and info.st_nlink == 1
 
 
-def _repo_node_pin_inputs_safe(directories, home, helper, nvm, search, unchanged=None):
+def _repo_node_pin_inputs_safe(directories, home, helper, nvm, search, unchanged=None, failures=None):
     """Every file the pinned select.py can open from these cwds and environment."""
-    if not directories or any(directory is None for directory in directories):
+    def fail(reason):
+        if failures is not None:
+            failures.append(reason)
         return False
+
+    if not directories or any(directory is None for directory in directories):
+        return fail('repo-node-pin invocation cwd unproved')
     inputs = []
     starts = {start for directory in directories
               for start in (os.path.normpath(os.path.abspath(directory)), os.path.realpath(directory))}
@@ -568,6 +573,9 @@ def _repo_node_pin_inputs_safe(directories, home, helper, nvm, search, unchanged
             return [entry.path for entry in os.scandir(root)]
         except (FileNotFoundError, NotADirectoryError):
             return []
+        except OSError:
+            fail(f'repo-node-pin input directory {root} cannot be listed')
+            raise
 
     try:
         inputs += children(os.path.join(nvm, 'alias'))
@@ -576,23 +584,28 @@ def _repo_node_pin_inputs_safe(directories, home, helper, nvm, search, unchanged
         for entry in search:
             pnpm = os.path.join(entry, 'pnpm')
             if unchanged is not None and not unchanged(pnpm):
-                return False
+                return fail(f'repo-node-pin lookup {pnpm} may be changed by this command')
             if os.path.exists(pnpm):
                 inputs.append(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(pnpm))), 'package.json'))
         # select.py uses get(name, default): an empty or relative value is
         # resolved against whatever cwd the refresh runs in.
         corepack = os.environ.get('COREPACK_HOME', os.path.join(home, '.cache/node/corepack'))
         if not os.path.isabs(corepack):
-            return False
+            return fail('COREPACK_HOME: inherited path must be absolute')
         if unchanged is not None and not unchanged(corepack, descendants=True):
-            return False
+            return fail(f'repo-node-pin input {corepack} may be changed by this command')
         inputs += [os.path.join(version, 'package.json') for version in children(os.path.join(corepack, 'v1/pnpm'))]
     except OSError:
         return False
-    return all(_repo_node_pin_input_safe(path) and (unchanged is None or unchanged(path)) for path in inputs)
+    for path in inputs:
+        if not _repo_node_pin_input_safe(path):
+            return fail(f'repo-node-pin input {path} unsafe: live path, linked/non-regular file, or inaccessible identity')
+        if unchanged is not None and not unchanged(path):
+            return fail(f'repo-node-pin input {path} may be changed by this command')
+    return True
 
 
-def _inherited_startup_safe(name, directory, command=None, bindings=None, written=(), script=None, unchanged=None):
+def _inherited_startup_safe(name, directory, command=None, bindings=None, written=(), script=None, unchanged=None, failures=None):
     """Accept an inherited BASH_ENV only as this Mac's repo-node-pin wrapper.
 
     Every agent shell here inherits it from ~/.zshenv. Its init.sh evals
@@ -602,68 +615,78 @@ def _inherited_startup_safe(name, directory, command=None, bindings=None, writte
     entry the chain can add or reorder. A binding set by the command itself is
     never inherited and stays refused by callers.
     """
+    def fail(reason):
+        if failures is not None:
+            failures.append(reason)
+        return False
+
     value = os.environ.get(name, '')
     home = os.environ.get('HOME', '')
     if name != 'BASH_ENV' or not value or not home or not os.path.isabs(home) or str(Path.home()) != home:
-        return False
-    if any(other != 'BASH_ENV' and setting and STARTUP_ENV.fullmatch(other) for other, setting in os.environ.items()):
-        return False
-    if any(other.startswith('BASH_FUNC_') for other in os.environ) or os.environ.get('ZDOTDIR') or os.environ.get('CDPATH'):
-        return False
+        return fail(f'{name}: inherited startup or HOME identity unproved')
+    for other, setting in os.environ.items():
+        if other != 'BASH_ENV' and setting and STARTUP_ENV.fullmatch(other):
+            return fail(f'{other}: inherited startup environment unproved')
+    for other in os.environ:
+        if other.startswith('BASH_FUNC_') or other in {'ZDOTDIR', 'CDPATH'} and os.environ[other]:
+            return fail(f'{other}: inherited shell environment unproved')
     if bindings is not None and (bindings.get('HOME', home) != home or any(key != 'HOME' and REPO_NODE_PIN_COMMAND.search(key + '=') for key in bindings)):
-        return False
-    if command is not None and REPO_NODE_PIN_COMMAND.search(command):
-        return False
+        return fail('repo-node-pin startup binding set by this command')
+    # The shell scanner supplies a structured mutation proof. Searching its
+    # raw command mistakes an nvm executable or `git diff -- package.json`
+    # for a write; retain the conservative filter only without that proof.
+    if unchanged is None and command is not None and REPO_NODE_PIN_COMMAND.search(command):
+        return fail('repo-node-pin command inputs lack a mutation proof')
     helper = os.path.join(home, '.local/libexec/repo-node-pin')
     # Bash expands BASH_ENV before reading it.
     if not os.path.isabs(value) or re.search(r'[$`~\\]', value):
-        return False
+        return fail('BASH_ENV: path must be literal and absolute')
     real_helper = os.path.realpath(helper)
     if os.path.realpath(value) != os.path.join(real_helper, 'bash-env.sh'):
-        return False
+        return fail(f'BASH_ENV: expected {real_helper}/bash-env.sh')
     if os.environ.get('ROBOB_REPO_PREVIOUS_BASH_ENV', '') not in {'', value}:
-        return False
+        return fail('ROBOB_REPO_PREVIOUS_BASH_ENV: inherited startup unproved')
     if os.path.realpath(os.environ.get('ROBOB_REPO_NODE_HELPER') or helper) != real_helper:
-        return False
+        return fail('ROBOB_REPO_NODE_HELPER: inherited helper identity unproved')
     if (os.environ.get('ROBOB_REPO_NODE_PYTHON') or REPO_NODE_PIN_PYTHON) != REPO_NODE_PIN_PYTHON:
-        return False
+        return fail('ROBOB_REPO_NODE_PYTHON: inherited interpreter identity unproved')
     nvm = os.environ.get('NVM_DIR', os.path.join(home, '.nvm'))
     if not os.path.isabs(nvm):
-        return False
+        return fail('NVM_DIR: inherited path must be absolute')
     # Hashes describe the current disk, not pending shell writes. Include
     # directory contents that can become new imports or lookup candidates.
-    if unchanged is not None and (not unchanged(REPO_NODE_PIN_PYTHON) or
-            any(not unchanged(root, descendants=True) for root in
-                (helper, nvm, os.path.join(home, '.safe-chain'),
-                 *(os.path.join(home, managed) for managed in REPO_NODE_PIN_MANAGED)))):
-        return False
+    if unchanged is not None:
+        for root in (REPO_NODE_PIN_PYTHON, helper, nvm, os.path.join(home, '.safe-chain'),
+                     *(os.path.join(home, managed) for managed in REPO_NODE_PIN_MANAGED)):
+            if not unchanged(root, descendants=root != REPO_NODE_PIN_PYTHON):
+                return fail(f'repo-node-pin startup input {root} may be changed by this command')
     for remembered in written:
         resolved = os.path.realpath(remembered)
         if any(resolved == root or resolved.startswith(root + os.sep)
                for root in (real_helper, os.path.realpath(nvm))):
-            return False
+            return fail(f'repo-node-pin startup input {remembered} written by this command')
     sources_safe_chain = False
     for part, hashes in REPO_NODE_PIN_HASHES.items():
         if unchanged is not None and not unchanged(os.path.join(real_helper, part)):
-            return False
+            return fail(f'repo-node-pin helper {real_helper}/{part} may be changed by this command')
         try:
             with open(os.path.join(real_helper, part), 'rb') as handle:
                 info = os.fstat(handle.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SOURCE_BYTES:
-                    return False
+                    return fail(f'repo-node-pin helper {real_helper}/{part} is not a bounded regular file')
                 body = handle.read(MAX_SOURCE_BYTES + 1)
                 if hashlib.sha256(body).hexdigest() not in hashes:
-                    return False
+                    return fail(f'repo-node-pin helper {real_helper}/{part} hash does not match reviewed bytes')
                 if part == 'init.sh':
                     sources_safe_chain = body.splitlines().count(REPO_NODE_PIN_SAFE_CHAIN_SOURCE) == 1
         except OSError:
-            return False
+            return fail(f'repo-node-pin helper {real_helper}/{part} cannot be read')
     safe_chain = os.path.join(home, '.safe-chain')
     safe_chain_bin = None
     if sources_safe_chain:
         startup = os.path.join(safe_chain, 'scripts/init-posix.sh')
         if unchanged is not None and not unchanged(startup):
-            return False
+            return fail(f'repo-node-pin startup input {startup} may be changed by this command')
         failure = startup + ' does not match REPO_NODE_PIN_SAFE_CHAIN_SHA256; review and re-pin the safe-chain startup file.'
         if any(os.path.realpath(remembered) == os.path.realpath(safe_chain) or
                os.path.realpath(remembered).startswith(os.path.realpath(safe_chain) + os.sep)
@@ -692,17 +715,17 @@ def _inherited_startup_safe(name, directory, command=None, bindings=None, writte
     try:
         entries = list(os.scandir(real_helper))
     except OSError:
-        return False
+        return fail(f'repo-node-pin helper directory {real_helper} cannot be listed')
     for entry in entries:
         if entry.name == 'select.py':
             continue
         if entry.name == '__pycache__' or entry.name.endswith(('.py', '.pyc', '.so', '.pth')):
-            return False
+            return fail(f'repo-node-pin helper import {entry.path} unproved')
         try:
             if entry.is_dir() and any(os.path.lexists(os.path.join(entry.path, init)) for init in ('__init__.py', '__init__.pyc')):
-                return False
+                return fail(f'repo-node-pin helper import {entry.path} unproved')
         except OSError:
-            return False
+            return fail(f'repo-node-pin helper import {entry.path} cannot be inspected')
     # Startup prepends Node and pnpm dirs, moves managed dirs forward and drops
     # one Node entry, so no fixture tool may resolve differently in any order.
     search = list(os.get_exec_path())
@@ -713,24 +736,25 @@ def _inherited_startup_safe(name, directory, command=None, bindings=None, writte
     added = os.environ.get('_repo_node_added_node', '')
     if added:
         search.append(added)
-    if any(not os.path.isabs(entry) for entry in search):
-        return False
+    for entry in search:
+        if not os.path.isabs(entry):
+            return fail(f'repo-node-pin PATH entry {entry!r} is not absolute')
     startup_tools = ('dirname',) if safe_chain_bin is not None else ()
     for tool in (*FIXTURE_TOOLS, *startup_tools):
         trusted = {os.path.realpath(f'/bin/{tool}'), os.path.realpath(f'/usr/bin/{tool}')}
         for entry in search:
             candidate = os.path.join(entry, tool)
             if unchanged is not None and not unchanged(candidate):
-                return False
+                return fail(f'repo-node-pin lookup {candidate} may be changed by this command')
             if os.path.lexists(candidate) and os.path.realpath(candidate) not in trusted:
-                return False
+                return fail(f'repo-node-pin lookup {candidate} shadows trusted {tool}')
     # The refresh also runs after each cd. The fixture grammar allows only
     # `cd "$(dirname "$0")/.."`, and its child shells either clear the
     # environment or run `sleep`, so the script's parent is the one other cwd.
     directories = [directory]
     if script is not None and directory is not None:
         directories.append(os.path.join(directory, os.path.dirname(str(script)), '..'))
-    return _repo_node_pin_inputs_safe(directories, home, helper, nvm, search, unchanged)
+    return _repo_node_pin_inputs_safe(directories, home, helper, nvm, search, unchanged, failures)
 
 
 def _fixture_python_paths(tree, aliases, local_module):
@@ -2298,6 +2322,8 @@ def refusal_reason(rule, cause, cwd):
     if rule == "live-database-script-unresolved":
         if cause and '\nAccepted: ' in cause:
             detail, hint = cause.split('\nAccepted: ', 1)
+            if 'startup' in detail or 'repo-node-pin' in detail:
+                hint = 'Resolve the named startup input, then retry.'
             writer = re.fullmatch(r'no readable same-call heredoc writer for this script; invalidated by '
                                   r'(python3?) command at line (\d+); intervening command; '
                                   r'python: write target not literal: (.+) \([a-z0-9]+\)', detail)
@@ -2307,7 +2333,9 @@ def refusal_reason(rule, cause, cwd):
             return ("statev2 guard: this command was NOT run.\n"
                     f"Could not check {detail}. Resolved workdir: {cwd}.\nAccepted: {hint}")
         fix = "Use a literal absolute script path."
-        if cause and "unbalanced quote" in cause:
+        if cause and ('startup' in cause or 'repo-node-pin' in cause):
+            fix = "Resolve the named startup input, then retry."
+        elif cause and "unbalanced quote" in cause:
             fix = "Close the shell quote before running the command."
         elif cause and ('script source changed after its heredoc write' in cause or 'unchecked copy at script path' in cause):
             fix = "An intervening command may replace the checked source. Split source preparation and execution into separate calls."
@@ -3088,6 +3116,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     write_history = {}
     variable_written = set()
     tool_changes = set()
+    unbounded_predecessors = []
     stdin_words, stdin_bodies = _stdin or ([], {})
     if _sources is not None:
         prior_written, prior_invalidated, prior_history, prior_variable, prior_tool_changes = _sources
@@ -3466,9 +3495,16 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return _fixture_python_readonly(source, tree=tree, pathlib_reads=True, data_helpers=True)
 
     def inherited_startup_safe(name, directory, script=None):
-        return _inherited_startup_safe(name, directory, caller_command if caller_command is not None else command,
-                                       shell_values, written, script,
-                                       lambda path, **kwargs: unchanged_tool(path, directory, **kwargs))
+        nonlocal proof_failure
+        failures = []
+        safe = _inherited_startup_safe(name, directory, caller_command if caller_command is not None else command,
+                                      shell_values, written, script,
+                                      lambda path, **kwargs: unchanged_tool(path, directory, **kwargs), failures)
+        if not safe:
+            proof_failure = failures[0] if failures else f'{name}: repo-node-pin startup input unproved'
+            if None in tool_changes and unbounded_predecessors:
+                proof_failure += '; preceding ' + unbounded_predecessors[0]
+        return safe
 
     def startup_binding(name):
         return (name in {'PATH', 'IFS', 'ENV', 'BASH_ENV', 'BASHOPTS', 'SHELLOPTS', 'ZDOTDIR',
@@ -3483,7 +3519,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             proof_failure = label + ': command wrapper proof failed'
             return False
         if unsafe_bindings or 'NODE_OPTIONS' in shell_values:
-            proof_failure = label + ': shell lookup or startup proof failed'
+            proof_failure = label + ': startup binding unproved: ' + (unsafe_binding_cause or 'NODE_OPTIONS set by this command')
             return False
         if any(name.startswith('BASH_FUNC_') for name in os.environ):
             proof_failure = label + ': executable provenance or mutation proof failed'
@@ -3491,8 +3527,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         names = set(shell_values) | set(os.environ)
         for name in names:
             if name in {'BASH_ENV', 'ENV', 'ZDOTDIR', 'BASHOPTS', 'SHELLOPTS', 'CDPATH'} or name in SHELL_SPECIAL_BINDINGS or name.startswith(('LD_', 'DYLD_')):
-                if name in shell_values or os.environ.get(name) and not inherited_startup_safe(name, directory):
-                    proof_failure = label + ': shell lookup or startup proof failed'
+                if name in shell_values:
+                    proof_failure = f'{label}: startup binding {name} set by this command'
+                    return False
+                if os.environ.get(name) and not inherited_startup_safe(name, directory):
                     return False
         if not builtin and (not _trusted_fixture_tool(words[0], os.path.basename(words[0]), directory) or
                             not unchanged_tool(words[0], directory)):
@@ -4447,7 +4485,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         environment = None
         if inherit_environment:
             environment = ({name: value for name, value in shell_values.items()
-                            if STARTUP_ENV.fullmatch(name) or name in {'ZDOTDIR', 'PATH', 'IFS', 'NODE_OPTIONS'}},
+                            if STARTUP_ENV.fullmatch(name) or startup_binding(name) or
+                            REPO_NODE_PIN_COMMAND.search(name + '=')},
                            unsafe_binding_cause if unsafe_bindings else False, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
                                   _sources=(written, invalidated_written, write_history, variable_written, tool_changes),
@@ -5003,6 +5042,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         else:
             changes_scripts = True
             proof_failure = 'command wrapper proof failed'
+        if changes_scripts and None not in tool_changes and not unbounded_predecessors:
+            unbounded_predecessors.append(f'{binary_label(words)} at line {current_line}: {proof_failure}')
         # Execution alone already permits subsequent literal test targets.
         # Keep that behavior for scanned tests, version probes and npm tasks;
         # explicit redirects and filesystem commands still record destinations.
@@ -5277,7 +5318,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 else:
                     node_parse = False
                     break
-        if node_parse and not node_test and not node_runtime_options and not os.environ.get("NODE_OPTIONS") and "NODE_OPTIONS" not in shell_values:
+        if node_parse and not node_test and not node_runtime_options:
             if node_target is not None and node_target != '-':
                 # Parsing still opens the operand. Resolve aliases so an
                 # unknown token cannot stand for the live database itself.

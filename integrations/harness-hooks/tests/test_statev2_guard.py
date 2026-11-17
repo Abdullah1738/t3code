@@ -5259,6 +5259,149 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
         return ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
                 'offbox run --bg -- bash tmp/fixture.sh')
 
+    def test_repo_node_pin_node_path_parity(self):
+        self.root = self.root.resolve()
+        home, helper, environment = self.repo_node_pin()
+        node = home / '.nvm/versions/node/v26.0.0/bin/node'
+        node.chmod(0o700)
+        script = self.write('repo/scripts/x.mjs', 'console.log(1);\n')
+        repo = script.parent.parent
+        (repo / 'package.json').write_text('{"engines":{"node":">=22"}}')
+        unrelated = self.root / 'elsewhere'
+        unrelated.mkdir()
+        environment['PATH'] = str(node.parent) + os.pathsep + os.environ['PATH']
+        with patch.dict(os.environ, environment):
+            for git_kind in ('directory', 'file'):
+                git = repo / '.git'
+                git.mkdir() if git_kind == 'directory' else git.write_text('gitdir: /unused/worktree\n')
+                for cwd in (repo, script.parent, unrelated):
+                    for executable in (str(node), 'node'):
+                        for mode in ('--check ', ''):
+                            for chain in ('{}', '{} && git diff -- package.json'):
+                                for operand in (str(script), os.path.relpath(script, cwd)):
+                                    command = chain.format(shlex.quote(executable) + ' ' + mode + shlex.quote(operand))
+                                    with self.subTest(git=git_kind, cwd=cwd, command=command):
+                                        self.assertEqual(guard.classify_detail(command, str(cwd)), (None, None))
+                git.rmdir() if git.is_dir() else git.unlink()
+
+    def test_repo_node_pin_node_startup_mutations_stay_denied(self):
+        self.root = self.root.resolve()
+        home, helper, environment = self.repo_node_pin()
+        node = home / '.nvm/versions/node/v26.0.0/bin/node'
+        node.chmod(0o700)
+        script = self.write('scripts/x.mjs', 'console.log(1);\n')
+        (self.root / '.git').write_text('gitdir: /unused/worktree\n')
+        (self.root / 'package.json').write_text('{}')
+        environment['PATH'] = str(node.parent) + os.pathsep + os.environ['PATH']
+        targets = [node, node.parent / 'cat', helper / 'init.sh',
+                   home / '.safe-chain/scripts/init-posix.sh', self.root / 'package.json']
+        with patch.dict(os.environ, environment):
+            for executable in (str(node), 'node'):
+                for mode in ('--check ', ''):
+                    check = shlex.quote(executable) + ' ' + mode + shlex.quote(str(script))
+                    for target in targets:
+                        for writer in ('cp /untrusted ' + shlex.quote(str(target)) + '; ',
+                                       "cat > " + shlex.quote(str(target)) + " <<'EOF'\nchanged\nEOF\n"):
+                            with self.subTest(target=target, check=check, writer=writer):
+                                prepared = self.heredoc(str(script), 'console.log(1);') if not mode else ''
+                                rule, reason = guard.classify_detail(prepared + writer + check, str(self.root))
+                                self.assertEqual(rule, UNRESOLVED)
+                                self.assertIn('startup', reason)
+                    for prefix in ('NODE_OPTIONS=--require=/untrusted ', 'BASH_ENV=' + environment['BASH_ENV'] + ' '):
+                        with self.subTest(prefix=prefix, check=check):
+                            prepared = self.heredoc(str(script), 'console.log(1);') if not mode else ''
+                            self.assertEqual(self.classify(prepared + prefix + check), UNRESOLVED)
+            with patch.dict(os.environ, {'NODE_OPTIONS': '--require=/untrusted'}):
+                self.assertEqual(self.classify(str(node) + ' --check ' + str(script)), UNRESOLVED)
+
+    def test_repo_node_pin_startup_refusal_names_input(self):
+        self.root = self.root.resolve()
+        home, helper, environment = self.repo_node_pin()
+        node = home / '.nvm/versions/node/v26.0.0/bin/node'
+        node.chmod(0o700)
+        script = self.write('scripts/x.mjs', 'console.log(1);\n')
+        command = str(node) + ' --check ' + str(script)
+
+        def refused(extra, expected):
+            with patch.dict(os.environ, {**environment, **extra}):
+                rule, reason = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED)
+                self.assertIn(expected, reason)
+                message = guard.refusal_reason(rule, reason, str(self.root))
+                self.assertIn(expected, message)
+                self.assertNotIn('literal absolute script path', message)
+
+        refused({'PATH': '.:' + os.environ['PATH']}, "PATH entry '.' is not absolute")
+        refused({'PYTHONPATH': '/untrusted'}, 'PYTHONPATH')
+        shadow = node.parent / 'cat'
+        shadow.write_text('')
+        refused({}, str(shadow) + ' shadows trusted cat')
+        shadow.unlink()
+        package = self.root / 'package.json'
+        os.mkfifo(package)
+        refused({}, str(package) + ' unsafe')
+        package.unlink()
+        (helper / 'init.sh').write_text('changed')
+        refused({}, str(helper / 'init.sh') + ' hash does not match reviewed bytes')
+
+    def test_repo_node_pin_predecessors_remain_denied(self):
+        self.root = self.root.resolve()
+        home, helper, environment = self.repo_node_pin()
+        node = home / '.nvm/versions/node/v26.0.0/bin/node'
+        node.chmod(0o700)
+        python = self.write('unproved-bin/python3', '')
+        python.chmod(0o700)
+        environment['PATH'] = os.pathsep.join((str(node.parent), str(python.parent), os.environ['PATH']))
+        (self.root / '.git').write_text('gitdir: /unused/worktree\n')
+        (self.root / 'package.json').write_text('{}')
+        fixtures = Path(__file__).with_name('fixtures') / 'node-startup'
+        with patch.dict(os.environ, environment):
+            for row, predecessor in ((173, 'preceding python3 at line 1: python3: executable provenance'),
+                                     (775, 'preceding git at line 1: git: startup configuration unproved')):
+                command = (fixtures / f'crpko4207-row{row}.sh').read_text()
+                with self.subTest(row=row):
+                    rule, reason = guard.classify_detail(command, str(self.root))
+                    self.assertEqual(rule, UNRESOLVED)
+                    self.assertIn('startup input /opt/homebrew/bin/python3', reason)
+                    self.assertIn(predecessor, reason)
+                    message = guard.refusal_reason(rule, reason, str(self.root))
+                    self.assertIn(predecessor, message)
+                    self.assertNotIn('literal absolute script path', message)
+
+    def test_repo_node_pin_bindings_survive_offbox_boundary(self):
+        self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        (self.root / 'package.json').write_text('{}')
+        evil = self.write('tmp/evil.sh', 'printf bad > "$HOME/.robob/userdata/statev2.sqlite"\n')
+        bindings = {
+            'ROBOB_REPO_NODE_PYTHON': str(evil),
+            'ROBOB_REPO_NODE_HELPER': str(helper),
+            'ROBOB_REPO_PREVIOUS_BASH_ENV': environment['BASH_ENV'],
+            'ROBOB_REPO_NODE': '/unproved/node',
+            'ROBOB_REPO_PNPM_CLI': '/unproved/pnpm',
+            '_repo_node_added_node': '/usr/bin',
+            '_repo_node_hooked': '1',
+            '_repo_node_busy': '0',
+            '_repo_node_seen_pwd': str(self.root),
+            'COREPACK_HOME': '/unproved/corepack',
+            'NVM_DIR': str(home / '.nvm'),
+            'CDPATH': '/unproved',
+            'HOME': '/unproved',
+            'BASH_ENV': environment['BASH_ENV'],
+        }
+        with patch.dict(os.environ, environment):
+            for payload in ('offbox run -- bash tmp/fixture.sh', 'offbox run --bg -- bash tmp/fixture.sh'):
+                self.assertIsNone(self.classify(payload))
+                for name, value in bindings.items():
+                    assignment = name + '=' + shlex.quote(value)
+                    for prefix in (assignment + ' ', 'env ' + assignment + ' ', 'export ' + assignment + '; '):
+                        with self.subTest(name=name, prefix=prefix, payload=payload):
+                            self.assertIsNotNone(self.classify(prefix + payload))
+            for prefix in ('NODE_OPTIONS=--require=/unproved ', 'env NODE_OPTIONS=--require=/unproved ',
+                           'export NODE_OPTIONS=--require=/unproved; '):
+                with self.subTest(prefix=prefix):
+                    self.assertIsNotNone(self.classify(prefix + 'offbox run -- node --check tmp/x.mjs'))
+
     def test_inherited_repo_node_pin_bash_env_keeps_fixture_proof(self):
         commands = self.write_plain_subpath_fixture()
         home, helper, environment = self.repo_node_pin()
