@@ -190,6 +190,7 @@ class UsernsTests(unittest.TestCase):
                      patch.object(runs, 'CACHE_OWNER_REPAIR', ':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
                      patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'repo_setup_block', return_value=':'), \
                      patch.object(runs.containers, 'script', return_value=':'), \
+                     patch.object(runs.quint_tools, 'block', return_value=':'), \
                      patch.object(runs.node_tools, 'block', return_value=':'):
                     script = runs.remote_script('w', '.', ['echo USER_COMMAND; exit 7'], None, 'run-test', box_id='bx_ours')
                 p = f.run(f.rewrite(script))
