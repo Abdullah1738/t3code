@@ -811,6 +811,8 @@ def missing_step_count(results: list[tuple[int, int]], planned: int) -> int:
 
 
 def checked_steps_code(log_path: Path | None, planned: int, code: int | None, *, report: bool = True) -> int | None:
+    if code == common.EXIT_TOOLCHAIN and quint_tools.failed_setup(log_path):
+        return code
     missing = missing_step_count(step_results(log_path), planned)
     if missing:
         if report:
@@ -1426,6 +1428,7 @@ def settle_docker(con, run, status: str, timeout: float = 10) -> None:
     """A run that only mentioned Docker (command or manifest) and started no container loses runs.docker, so its
     box gets the ordinary idle window. Runs that didn't end normally keep it."""
     java_version.record(con, run, LOGS_DIR / (run["run_id"] + ".log"), api.BACKEND)
+    quint_tools.record(con, run, LOGS_DIR / (run["run_id"] + ".log"), api.BACKEND)
     started = time.monotonic()
     if status in ('done', 'failed', 'killed', 'lost', 'interrupted', 'infra'):
         containers.record(con, run, BOUNDED_PROCESS, timeout=timeout)
@@ -1650,7 +1653,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
                                                        repo_key=repo_key, template=template)),
               node,
-              quint_tools.block(),
+              quint_tools.block(quint_tools.trigger(repo_root or Path.cwd(), rel, argv, steps)),
               node_tools.block(rdir, repo_root),
               ('''for _offbox_tool in terraform aws ruby vector gh; do
   if [ "$_offbox_tool" = terraform ] && [ "${OFFBOX_TERRAFORM_STATE:-}" = skipped ]; then continue; fi
