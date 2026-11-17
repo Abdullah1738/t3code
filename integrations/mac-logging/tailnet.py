@@ -13,12 +13,16 @@ APP_CLI = '/Applications/Tailscale.app/Contents/MacOS/Tailscale'
 EXTENSION = 'io.tailscale.ipn.macsys.network-extension'
 THRESHOLD_CHECKS = 3
 THRESHOLD_SECONDS = 180
+UNKNOWN_THRESHOLD_CHECKS = 5
+UNKNOWN_THRESHOLD_SECONDS = 300
 STATUS_TIMEOUT = 15
 CLI_SLOW_INTERVAL = 900
 PROBE_HOST = '100.75.104.72'
 # Mullvad's de-dus-wg-102 DNS listener is remote, unlike our local userspace nodes.
 CONFIRM_PROBES = ((PROBE_HOST, 22), ('100.64.1.71', 53))
 PROBE_TIMEOUT = 6
+SELF_HTTPS_URL = 'https://abdullahs-macbook-pro.tailcca332.ts.net:18400/'
+SELF_HTTPS_TIMEOUT = 8
 STATES = {'Running', 'Stopped', 'NeedsLogin', 'NeedsMachineAuth', 'Starting', 'NoState'}
 DUBAI = dt.timezone(dt.timedelta(hours=4))
 
@@ -39,12 +43,24 @@ def probe(run, host, port):
     return dict(port=port, ok=code == 0, error=failure, ms=round((time.monotonic()-started)*1000, 3))
 
 
+def https_probe(run):
+    _, output, failure = command(['/usr/bin/curl', '-sS', '-o', '/dev/null', '-w', '%{http_code}',
+                                  '--max-time', str(SELF_HTTPS_TIMEOUT), SELF_HTTPS_URL],
+                                 SELF_HTTPS_TIMEOUT+1, run)
+    # A real HTTP response proves reachability, including an application error
+    # or a response whose body curl could not finish downloading.
+    status = output.strip()
+    reachable = len(status) == 3 and status.isascii() and status.isdigit() and 100 <= int(status) <= 599
+    return dict(ok=reachable, error=None if reachable else failure or 'parse')
+
+
 def observe(run, probe_host=PROBE_HOST, confirm_probes=CONFIRM_PROBES):
     started = time.monotonic()
     code, output, failure = command([APP_CLI, 'status', '--json'], STATUS_TIMEOUT, run)
     props = dict(backendState='Unknown', selfOnline=None, tailscaleIPsCount=None,
                  exitCode=code, timedOut=failure == 'timeout', statusError=failure,
                  cliMs=round((time.monotonic()-started)*1000, 3))
+    props.update(statusDurationMs=props['cliMs'], loadAvg1=os.getloadavg()[0], confirmedBy=None)
     if failure is None:
         try:
             data = json.loads(output)
@@ -78,8 +94,15 @@ def observe(run, probe_host=PROBE_HOST, confirm_probes=CONFIRM_PROBES):
             props.update(homeReachable=home['ok'], homeProbeError=home['error'])
         if any(p['ok'] for p in results.values()):
             props['outcome'] = 'up'
-        elif len(results) >= 2 and all(p['error'] in ('exit', 'timeout') for p in results.values()):
-            props['outcome'] = 'down'
+            props['confirmedBy'] = 'home_tcp' if home and home['ok'] else 'peer_tcp'
+        else:
+            https = https_probe(run)
+            props.update(selfHttpsReachable=https['ok'], selfHttpsError=https['error'])
+            if https['ok']:
+                props.update(outcome='up', confirmedBy='self_https')
+            elif (len(results) >= 2 and all(p['error'] in ('exit', 'timeout') for p in results.values())
+                  and https['error'] in ('exit', 'timeout', 'parse')):
+                props['outcome'] = 'down'
     elif props['backendState'] == 'Running':
         home = probe(run, probe_host, 22)
         props.update(homeReachable=home['ok'], homeProbeError=home['error'])
@@ -98,7 +121,8 @@ def notify(message, run):
     return result.returncode == 0
 
 
-def transition(state, props, now, threshold, threshold_seconds):
+def transition(state, props, now, threshold, threshold_seconds,
+               unknown_threshold, unknown_threshold_seconds):
     pending = state.setdefault('pending', [])
     outage = state.get('outage')
     if props['up']:
@@ -112,6 +136,8 @@ def transition(state, props, now, threshold, threshold_seconds):
             outage = dict(start=now, checks=0, alertQueued=False)
             state['outage'] = outage
         outage['checks'] += 1
+        if props['cliOutcome'] == 'unknown':
+            threshold, threshold_seconds = unknown_threshold, unknown_threshold_seconds
         if (outage['checks'] >= threshold and now-outage['start'] >= threshold_seconds
                 and not outage['alertQueued']):
             label = props['backendState'] if props['cliOutcome'] == 'down' else 'unreachable'
@@ -122,11 +148,10 @@ def transition(state, props, now, threshold, threshold_seconds):
             outage['key'] = 'mac-tailnet:%s:%d' % (label, outage['start'])
             since = dt.datetime.fromtimestamp(outage['start'], DUBAI).strftime('%H:%M')
             if label == 'unreachable':
-                text = ("Mac Tailscale isn't answering and tailnet peers are unreachable since %s Dubai: "
-                        'offbox, .tail and phone access to Robob are down.' % since)
-            else:
-                text = ('Mac Tailscale is %s since %s Dubai: offbox, .tail and phone access to Robob '
-                        'are down. If you turned it off on purpose, ignore this.' % (label, since))
+                label = ('unreachable (status CLI timing out)' if props['timedOut']
+                         else 'unreachable (status CLI unavailable)')
+            text = ('Mac Tailscale is %s since %s Dubai: offbox, .tail and phone access to Robob '
+                    'are down. If you turned it off on purpose, ignore this.' % (label, since))
             pending.append(dict(kind='alert', key=outage['key'], text=text))
             outage['alertQueued'] = True
     elif outage:
@@ -157,7 +182,8 @@ def explicit_outage_key(key):
 
 
 def check(run=subprocess.run, now=None, threshold=THRESHOLD_CHECKS, probe_host=PROBE_HOST,
-          confirm_probes=CONFIRM_PROBES, threshold_seconds=THRESHOLD_SECONDS):
+          confirm_probes=CONFIRM_PROBES, threshold_seconds=THRESHOLD_SECONDS,
+          unknown_threshold=UNKNOWN_THRESHOLD_CHECKS, unknown_threshold_seconds=UNKNOWN_THRESHOLD_SECONDS):
     started = time.monotonic()
     props = dict(outcome='unknown', cliOutcome='unknown', cliMs=None, confirmedDown=False, up=False)
     try:
@@ -182,11 +208,12 @@ def check(run=subprocess.run, now=None, threshold=THRESHOLD_CHECKS, probe_host=P
             previous = state.get('previous', {})
             fields = ('backendState', 'selfOnline', 'tailscaleIPsCount', 'exitCode', 'timedOut',
                       'statusError', 'outcome')
-            if not previous or any(props[k] != previous.get(k) for k in fields):
+            if (not previous or any(props[k] != previous.get(k) for k in fields)
+                    or bool(props['confirmedBy']) != bool(previous.get('confirmedBy'))):
                 emit('tailnet', 'event', 'tailnet.state', ok=props['up'], props=props)
             if not previous or props['extensionPids'] != previous.get('extensionPids'):
                 emit('tailnet', 'event', 'tailnet.extension', props=props)
-            transition(state, props, now, threshold, threshold_seconds)
+            transition(state, props, now, threshold, threshold_seconds, unknown_threshold, unknown_threshold_seconds)
             slow_event = cli_slow(state, props, now)
             state['previous'] = props.copy()
             save_state('tailnet', state)
@@ -195,7 +222,7 @@ def check(run=subprocess.run, now=None, threshold=THRESHOLD_CHECKS, probe_host=P
             emit('tailnet', 'event' if props['statusError'] is None else 'error', 'tailnet.sample',
                  ok=props['up'], duration_ms=(time.monotonic()-started)*1000, props=props,
                  error_tag='tailnet.status_failed' if props['statusError'] else None)
-            # One send caps subprocess time at 15 + 3 + 2*6 + 10 = 40 s.
+            # One send caps subprocess time at 15 + 3 + 2*6 + 9 + 10 = 49 s.
             for _ in range(min(1, len(state['pending']))):
                 message = state['pending'][0]
                 try:
