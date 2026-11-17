@@ -120,6 +120,7 @@ export class McpCall extends Context.Service<
     phase: Phase;
     saved: boolean | "unknown";
     dispatchFenceRecovered?: boolean;
+    retryPath?: "receipt_fast" | "attached_pending" | "dispatched";
     taskLookup?: TaskLookup;
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
@@ -289,6 +290,15 @@ export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
   if (call._tag === "Some" && call.value.saved !== true) call.value.saved = saved;
 });
 
+// Retry path belongs to the delegateTask span and its existing call row.
+export const setRetryPath = Effect.fnUntraced(function* (
+  retryPath: NonNullable<McpCall["Service"]["retryPath"]>,
+) {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some") call.value.retryPath = retryPath;
+  yield* Effect.annotateCurrentSpan("t3.delegate.retry_path", retryPath);
+});
+
 // Recovery belongs to the enclosing delegateTask span, not another analytics span.
 export const dispatchFenceRecovered = Effect.gen(function* () {
   const call = yield* Effect.serviceOption(McpCall);
@@ -370,6 +380,7 @@ export function callOutcome(
       errorPhase: state.phase,
       props: {
         ...taskLookup,
+        ...(state.retryPath === undefined ? {} : { retryPath: state.retryPath }),
         ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
         code: "unknown",
         ...interruptionProps(exit.cause),
@@ -508,6 +519,7 @@ export function callOutcome(
     ...(state.readOnly && state.taskLookup === undefined ? {} : { saved }),
     props: {
       ...taskLookup,
+      ...(state.retryPath === undefined ? {} : { retryPath: state.retryPath }),
       ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
       ...(notFoundReason === undefined ? {} : { notFoundReason }),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),

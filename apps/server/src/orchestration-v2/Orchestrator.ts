@@ -142,7 +142,7 @@ import {
   isNativeMaintenanceCommand,
   resolveMessageDispatchIntent,
 } from "./CommandPolicy.ts";
-import { CommandReceiptStoreV2 } from "./CommandReceiptStore.ts";
+import { type CommandReceiptV2, CommandReceiptStoreV2 } from "./CommandReceiptStore.ts";
 import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
 import {
@@ -13968,21 +13968,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     };
   });
 
-  const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
+  // Both receipt paths share reader routing, error mapping and replay behavior.
+  const readCommandReceipt = Effect.fn("orchestrationV2.dispatch.readReceipt")(function* (
     command: OrchestrationV2ServerCommand,
-    options?: OrchestratorDispatchOptions,
-  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
-    yield* Effect.annotateCurrentSpan({
-      "orchestration_v2.command_id": command.commandId,
-      "orchestration_v2.command_type": command.type,
-      "orchestration_v2.thread_id": commandThreadId(command),
-    });
-
+  ) {
     const interactive =
       command.type === "message.dispatch" || command.type === "delegated_task.request";
     const receiptRead = commandReceipts.getByCommandId(command.commandId);
     // This point lookup runs before planning/COMMIT, outside the writer transaction.
-    const existingReceipt = yield* (
+    return yield* (
       interactive ? receiptRead.pipe(NodeSqliteClient.foregroundReads) : receiptRead
     ).pipe(
       Effect.mapError(
@@ -13997,59 +13991,76 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }),
       ),
     );
+  });
 
-    if (Option.isSome(existingReceipt)) {
-      const receipt = existingReceipt.value;
-      if (receipt.status === "rejected") {
-        return yield* new OrchestratorCommandPreviouslyRejectedError({
-          commandId: command.commandId,
-          commandType: command.type,
-          detail: receipt.error ?? "Previously rejected.",
-        });
-      }
-      const dispatchThreadId = commandThreadId(command);
-      if (!canReplayCommandReceipt(receipt.threadId, dispatchThreadId)) {
-        return yield* new OrchestratorCommandIdConflictError({
-          commandId: command.commandId,
-          commandType: command.type,
-          receiptThreadId: receipt.threadId,
-          commandThreadId: dispatchThreadId,
-        });
-      }
-      const storedEvents = yield* eventSink.readByCommandId({ commandId: command.commandId }).pipe(
-        Stream.runCollect,
-        Effect.map((events): ReadonlyArray<OrchestrationV2StoredEvent> => Array.from(events)),
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorDispatchError({
-              commandId: command.commandId,
-              commandType: command.type,
-              cause,
-            }),
-        ),
-      );
-      const acknowledgement = yield* SendAcknowledgement.command;
-      if (command.type === "message.dispatch" && acknowledgement?.id === command.commandId) {
-        const snapshot = yield* loadProjectionForCommand(command, ["runs"]);
-        acknowledgement.captureRuns(snapshot.runs);
-      }
-      yield* SendAcknowledgement.replay(command.commandId, storedEvents);
-      if (command.type === "notification.delivery.accept") {
-        // Acceptance can commit before its sibling offer fails; receipt replay must finish that offer.
-        yield* mapDispatchError(command)(offerDelegatedCompletionDeliveries(command.threadId));
-      }
-      if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
-        yield* mapDispatchError(command)(
-          startNextQueuedRun(command.threadId, {
-            allowPendingContinuation: command.type === "queue.resume",
-          }),
-        );
-      }
-      return {
-        sequence: receipt.resultSequence,
-        storedEvents,
-      } satisfies OrchestratorV2DispatchResult;
+  const replayCommandReceipt = Effect.fn("orchestrationV2.dispatch.replayReceipt")(function* (
+    command: OrchestrationV2ServerCommand,
+    receipt: CommandReceiptV2,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    if (receipt.status === "rejected") {
+      return yield* new OrchestratorCommandPreviouslyRejectedError({
+        commandId: command.commandId,
+        commandType: command.type,
+        detail: receipt.error ?? "Previously rejected.",
+      });
     }
+    const dispatchThreadId = commandThreadId(command);
+    if (!canReplayCommandReceipt(receipt.threadId, dispatchThreadId)) {
+      return yield* new OrchestratorCommandIdConflictError({
+        commandId: command.commandId,
+        commandType: command.type,
+        receiptThreadId: receipt.threadId,
+        commandThreadId: dispatchThreadId,
+      });
+    }
+    const storedEvents = yield* eventSink.readByCommandId({ commandId: command.commandId }).pipe(
+      Stream.runCollect,
+      Effect.map((events): ReadonlyArray<OrchestrationV2StoredEvent> => Array.from(events)),
+      Effect.mapError(
+        (cause) =>
+          new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause,
+          }),
+      ),
+    );
+    const acknowledgement = yield* SendAcknowledgement.command;
+    if (command.type === "message.dispatch" && acknowledgement?.id === command.commandId) {
+      const snapshot = yield* loadProjectionForCommand(command, ["runs"]);
+      acknowledgement.captureRuns(snapshot.runs);
+    }
+    yield* SendAcknowledgement.replay(command.commandId, storedEvents);
+    if (command.type === "notification.delivery.accept") {
+      // Acceptance can commit before its sibling offer fails; receipt replay must finish that offer.
+      yield* mapDispatchError(command)(offerDelegatedCompletionDeliveries(command.threadId));
+    }
+    if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
+      yield* mapDispatchError(command)(
+        startNextQueuedRun(command.threadId, {
+          allowPendingContinuation: command.type === "queue.resume",
+        }),
+      );
+    }
+    return {
+      sequence: receipt.resultSequence,
+      storedEvents,
+    } satisfies OrchestratorV2DispatchResult;
+  });
+
+  const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
+    command: OrchestrationV2ServerCommand,
+    options?: OrchestratorDispatchOptions,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    yield* Effect.annotateCurrentSpan({
+      "orchestration_v2.command_id": command.commandId,
+      "orchestration_v2.command_type": command.type,
+      "orchestration_v2.thread_id": commandThreadId(command),
+    });
+
+    const existingReceipt = yield* readCommandReceipt(command);
+    if (Option.isSome(existingReceipt))
+      return yield* replayCommandReceipt(command, existingReceipt.value);
 
     if (
       command.type === "message.dispatch" ||
@@ -14535,6 +14546,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     command: OrchestrationV2ServerCommand,
     options?: OrchestratorDispatchOptions,
   ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    const checkRevoked = Effect.suspend(() =>
+      options?.isStale?.()
+        ? Effect.fail(
+            new OrchestratorCommandRejectedError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "Delivery was revoked before dispatch.",
+              revoked: true,
+            }),
+          )
+        : Effect.void,
+    );
+    // Other receipt replays can start queues or finish delivery offers; those need their lock.
+    if (command.type === "delegated_task.request" || command.type === "thread.create") {
+      yield* checkRevoked;
+      const receipt = yield* readCommandReceipt(command);
+      if (Option.isSome(receipt)) {
+        yield* checkRevoked;
+        const result = yield* replayCommandReceipt(command, receipt.value);
+        yield* checkRevoked;
+        return result;
+      }
+    }
     const dispatch = threadDispatch.withLock(
       commandThreadId(command),
       Effect.suspend(() =>

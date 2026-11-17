@@ -2753,3 +2753,41 @@ it.effect.each([
     }).pipe(Effect.provideService(McpCall.McpCall, state));
   }),
 );
+
+it.effect.each([undefined, "receipt_fast", "attached_pending", "dispatched"] as const)(
+  "records retryPath=%s on success, timeout and interruption without renaming fields",
+  (retryPath) =>
+    Effect.gen(function* () {
+      const state: McpCall.McpCall["Service"] = {
+        callerResolved: true,
+        callerResolveMs: 0,
+        readerLane: "foreground",
+        phase: "handler",
+        saved: "unknown",
+      };
+      if (retryPath !== undefined)
+        yield* McpCall.setRetryPath(retryPath).pipe(Effect.provideService(McpCall.McpCall, state));
+      for (const exit of [
+        Exit.succeed(
+          new McpSchema.CallToolResult({ content: [], structuredContent: { taskId: "task" } }),
+        ),
+        Exit.fail(
+          new OrchestratorMcpFailure({ code: "delegation_timeout", message: "Test timeout" }),
+        ),
+        Exit.interrupt(1),
+      ]) {
+        const row = McpCall.callOutcome(exit, state);
+        expect(row.props?.retryPath).toBe(retryPath);
+        if (retryPath === undefined) expect(row.props).not.toHaveProperty("retryPath");
+        expect(() =>
+          decodeAnalyticsEventSync({
+            ts: "2026-11-17T00:00:00.000Z",
+            kind: "mcp.call",
+            surface: "server",
+            route: "mcp",
+            ...row,
+          }),
+        ).not.toThrow();
+      }
+    }),
+);
