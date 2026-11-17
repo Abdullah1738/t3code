@@ -2370,6 +2370,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       END
     `;
 
+    // Tool membership comes from item events; merge-patching a snapshot would resurrect removed keys.
+    const replaceRecordedOpenTools = (payload: Statement.Fragment) => sql`
+      CASE
+        WHEN json_type(orchestration_v2_projection_runs.payload_json, '$.openTools') IS NULL
+        THEN ${payload}
+        ELSE json_set(${payload}, '$.openTools', CASE
+          WHEN excluded.status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
+            THEN json_extract(orchestration_v2_projection_runs.payload_json, '$.openTools')
+          ELSE json('{}')
+        END)
+      END
+    `;
+
     const apply: ProjectionStoreV2Shape["apply"] =
       /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
       Effect.fnUntraced(
@@ -2494,7 +2507,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 status = excluded.status,
                 requested_at = excluded.requested_at,
                 completed_at = excluded.completed_at,
-                payload_json = json_patch(json_patch(${keepRecordedRunField(
+                payload_json = ${replaceRecordedOpenTools(sql`json_patch(${keepRecordedRunField(
                   keepRecordedRunField(
                     keepRecordedRunField(
                       keepRecordedRunField(
@@ -2515,14 +2528,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                     'cancelDetail', json_extract(orchestration_v2_projection_runs.payload_json, '$.cancelDetail')
                   )
                   ELSE '{}'
-                END), CASE WHEN json_type(orchestration_v2_projection_runs.payload_json, '$.openTools') IS NOT NULL
-                  THEN json_object('openTools', CASE
-                    WHEN excluded.status IN ('preparing', 'queued', 'starting', 'running', 'waiting')
-                      THEN json_extract(orchestration_v2_projection_runs.payload_json, '$.openTools')
-                    ELSE json('{}')
-                  END)
-                  ELSE '{}'
-                END)
+                END)`)}
             `;
               break;
             }
