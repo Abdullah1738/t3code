@@ -5309,6 +5309,7 @@ const make = Effect.gen(function* () {
   const reusableEvaluator = Effect.fn("KanbanService.reusableEvaluator")(function* (
     card: KanbanCard,
     observation?: EvaluatorAnalytics.ReuseObservation,
+    excluded?: ReadonlySet<ThreadId>,
   ) {
     const { ids, links } = yield* cardEvaluatorCandidates(card);
     const now = yield* nowMillis;
@@ -5316,7 +5317,7 @@ const make = Effect.gen(function* () {
     for (const id of ids) {
       // Ordinary tool callers also have evaluator actor tags; only board links prove the role.
       if (!(yield* isBoardEvaluator(id, card.boardId))) continue;
-      if ((yield* Ref.get(evaluatorFailures)).get(id)?.state === "gone") {
+      if (excluded?.has(id) || (yield* Ref.get(evaluatorFailures)).get(id)?.state === "gone") {
         rejected.add("failed");
         continue;
       }
@@ -5340,6 +5341,31 @@ const make = Effect.gen(function* () {
             : "all_candidates_rejected";
     return null;
   });
+
+  const automaticEvaluatorReminder = (trigger: EvaluatorJob["extra"]["trigger"]) =>
+    trigger === "step_reminder" || trigger === "system_stall" || trigger === "discussion_nudge";
+
+  const reminderEvaluatorExclusions = Effect.fn("KanbanService.reminderEvaluatorExclusions")(
+    function* (discussion: KanbanDiscussion, trigger: EvaluatorJob["extra"]["trigger"]) {
+      const excluded = new Set<ThreadId>();
+      if (!automaticEvaluatorReminder(trigger))
+        return { excluded, preserveOwner: false, hold: null };
+      const card = discussion.cardId ? yield* store.card(discussion.cardId) : null;
+      const candidates = card ? (yield* cardEvaluatorCandidates(card)).ids : new Set<ThreadId>();
+      if (discussion.evaluatorThreadId !== null) candidates.add(discussion.evaluatorThreadId);
+      for (const id of candidates) {
+        if (!(yield* isBoardEvaluator(id, discussion.boardId))) continue;
+        const failure = yield* threads.findLastFailure(id);
+        if (failure === null || !Rules.isUnconfirmedPromptAcceptance(failure)) continue;
+        // An attached successor owns this discussion's delivery. An unrelated
+        // historical failure cannot hold it, but cannot receive its reminder either.
+        if (discussion.evaluatorThreadId === null || discussion.evaluatorThreadId === id)
+          return { excluded, preserveOwner: false, hold: failure.message };
+        excluded.add(id);
+      }
+      return { excluded, preserveOwner: discussion.evaluatorThreadId !== null, hold: null };
+    },
+  );
 
   const appendSighting = Effect.fn("KanbanService.appendSighting")(function* (
     card: KanbanCard,
@@ -5659,6 +5685,7 @@ const make = Effect.gen(function* () {
     // A stall wake has its own eligibility and delivery key; never merge it into an owner job.
     // Recovery bodies have independent cancellation identities. Keep them in separate
     // jobs; the queue still shares the discussion's evaluator when those jobs drain.
+    // Explicit input also keeps its own row rather than inheriting an automatic hold.
     if (
       purpose.kind === "discussion" &&
       extra.model === undefined &&
@@ -5674,6 +5701,8 @@ const make = Effect.gen(function* () {
           AND job_key NOT LIKE 'kanban-stall:%'
           AND done_at IS NULL AND started_at IS NULL AND json_extract(json, '$.extra.answer') IS NULL
           AND json_extract(json, '$.extra.recoveryPost') IS NULL
+          AND (COALESCE(json_extract(json, '$.extra.trigger'), 'legacy_queue') IN
+            ('step_reminder', 'system_stall', 'discussion_nudge')) = ${automaticEvaluatorReminder(extra.trigger) ? 1 : 0}
           AND COALESCE(json_extract(json, '$.extra.retainedDeliveryStarted'), 0) = 0
           AND COALESCE(json_extract(json, '$.extra.delivering'), 0) = 0 ORDER BY id LIMIT 1`)[0];
       if (pending && pending.job_key !== key) {
@@ -6181,6 +6210,12 @@ const make = Effect.gen(function* () {
             return;
           }
           let discussion = yield* discussionOf(KanbanDiscussionId.make(job.purpose.discussionId));
+          const { excluded, hold } = yield* reminderEvaluatorExclusions(
+            discussion,
+            job.extra.trigger,
+          );
+          // Retain this delivery for reconciliation without starving unrelated queue rows.
+          if (hold !== null) return;
           // A replacement that names its own model (a safeguard refusal moving to
           // Sol) must start fresh rather than land on the refused thread.
           const reuse: EvaluatorAnalytics.ReuseObservation = {
@@ -6190,7 +6225,11 @@ const make = Effect.gen(function* () {
             job.extra.model !== undefined
               ? null
               : row.card_id
-                ? yield* reusableEvaluator(yield* cardOf(KanbanCardId.make(row.card_id)), reuse)
+                ? yield* reusableEvaluator(
+                    yield* cardOf(KanbanCardId.make(row.card_id)),
+                    reuse,
+                    excluded,
+                  )
                 : discussion.evaluatorThreadId !== null &&
                     (yield* eligibleDiscussionEvaluator(
                       discussion.evaluatorThreadId,
@@ -6726,6 +6765,9 @@ const make = Effect.gen(function* () {
       const key = `discussion-handoff:${discussionId}:${priorId}`;
       if (handedOff.has(key)) continue;
       if ((yield* Ref.get(evaluatorFailures)).get(priorId)?.state === "gone") continue;
+      const failure = yield* threads.findLastFailure(priorId);
+      // Handoff notices submit prompts too; an uncertain prior delivery must be reconciled first.
+      if (failure !== null && Rules.isUnconfirmedPromptAcceptance(failure)) continue;
       const prior = yield* locks.outside(
         threadIo.view(priorId),
         undefined,
@@ -6785,24 +6827,11 @@ const make = Effect.gen(function* () {
       model?: ModelSelection,
     ) {
       if ((yield* boardOf(discussion.boardId)).archivedAt !== null) return discussion;
-      const trigger = yield* EvaluatorAnalytics.origin;
-      if (
-        trigger === "step_reminder" ||
-        trigger === "system_stall" ||
-        trigger === "discussion_nudge"
-      ) {
-        const card = discussion.cardId ? yield* store.card(discussion.cardId) : null;
-        const candidates = card ? (yield* cardEvaluatorCandidates(card)).ids : new Set<ThreadId>();
-        if (discussion.evaluatorThreadId !== null) candidates.add(discussion.evaluatorThreadId);
-        // Check the same candidates as reuse, before expiry can replace them. The
-        // persisted failure also guards a reminder after service recreation.
-        for (const id of candidates) {
-          if (!(yield* isBoardEvaluator(id, discussion.boardId))) continue;
-          const failure = yield* threads.findLastFailure(id);
-          if (failure !== null && Rules.isUnconfirmedPromptAcceptance(failure))
-            return yield* failWith("conflict", failure.message);
-        }
-      }
+      const { excluded, preserveOwner, hold } = yield* reminderEvaluatorExclusions(
+        discussion,
+        yield* EvaluatorAnalytics.origin,
+      );
+      if (hold !== null) return yield* failWith("conflict", hold);
       const recovery = yield* recoveryPost;
       const actorOf = (threadId: ThreadId): KanbanActor => ({ _tag: "evaluator", threadId });
       const deliverSaved = Effect.fn("KanbanService.deliverDiscussionEvaluator")(function* (
@@ -6892,7 +6921,7 @@ const make = Effect.gen(function* () {
         model !== undefined
           ? null
           : owningCard
-            ? yield* reusableEvaluator(owningCard, reuse)
+            ? yield* reusableEvaluator(owningCard, reuse, excluded)
             : originalOwner;
       if (ownerId !== null) {
         const view = yield* locks.outside(
@@ -6941,7 +6970,10 @@ const make = Effect.gen(function* () {
           (yield* eligibleDiscussionEvaluator(discussion.evaluatorThreadId, discussion.boardId))
         )
           return yield* deliverSaved(discussion, false);
-        discussion = yield* saveDiscussion({ ...discussion, evaluatorThreadId: null });
+        // Keep a healthy reminder owner until replacement admission, so a queued
+        // delivery cannot inherit an unrelated historical failure after detaching it.
+        if (!preserveOwner)
+          discussion = yield* saveDiscussion({ ...discussion, evaluatorThreadId: null });
       }
       const board = yield* boardOf(discussion.boardId);
       const card = discussion.cardId ? yield* store.card(discussion.cardId) : null;

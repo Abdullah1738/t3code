@@ -20863,6 +20863,222 @@ it.effect.each(
     }),
 );
 
+it.effect.each(
+  (["creator", "card link", "ask"] as const).flatMap((relationship) =>
+    ([null, "timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
+      ([1, 2] as const).flatMap((priority) =>
+        (["fresh", "expired"] as const).flatMap((successorAge) =>
+          [false, true].map((restart) => ({
+            relationship,
+            reason,
+            priority,
+            successorAge,
+            restart,
+          })),
+        ),
+      ),
+    ),
+  ),
+)(
+  "healthy evaluator reminders survive historical failures ($relationship, $reason, P$priority, $successorAge, restart=$restart)",
+  ({ relationship, reason, priority, successorAge, restart }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const old = yield* kanban.startEvaluator(board.id, {
+          kind: "request",
+          text: "An unrelated intake request",
+        });
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Current evaluator's work",
+            prompt: "Finish",
+            priority,
+            subtasks: [{ step: 1, owner: "evaluator", text: "Finish" }],
+          },
+          owner,
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Finish the audit" }]);
+        const current = (yield* kanban.discussion(discussion.id)).evaluatorThreadId!;
+        assert.notEqual(current, old);
+        const saved = (yield* store.card(card.id))!;
+        const at = "2026-11-17T00:00:00.000Z";
+        if (relationship === "creator")
+          yield* store.putCard({ ...saved, createdBy: { _tag: "evaluator", threadId: old } });
+        if (relationship === "card link")
+          yield* store.putThreadLink({ ...(yield* store.threadLink(old))!, cardId: card.id });
+        if (relationship === "ask")
+          yield* store.putCard({
+            ...saved,
+            asks: [
+              {
+                id: "q-old",
+                text: "Historical question",
+                blocking: false,
+                by: { _tag: "evaluator", threadId: old },
+                at,
+                closedAt: at,
+                seq: null,
+              },
+            ],
+          });
+        if (reason !== null) {
+          fake.failures.set(
+            old,
+            makeProviderFailure({
+              cause: new ProviderPromptAcceptanceError({
+                driver: ProviderDriverKind.make("opencode"),
+                serverOrigin: "http://opencode.test",
+                reason,
+                budgetSeconds: 60,
+              }),
+            }),
+          );
+          yield* kanban.turnEnded(old);
+        }
+        const before = yield* Ref.get(fake.threads);
+        const messages = [...before.get(current)!.messages];
+        const oldMessages = [...before.get(old)!.messages];
+        const messageCounts = new Map(
+          [...before].map(([id, thread]) => [id, thread.messages.length]),
+        );
+        const check = Effect.gen(function* () {
+          const service = yield* KanbanService.KanbanService;
+          yield* service.tick;
+          yield* TestClock.adjust(priority === 1 ? "16 minutes" : "61 minutes");
+          const dueAt = DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis));
+          yield* Ref.update(fake.threads, (all) => {
+            const next = new Map(all);
+            next.set(old, { ...next.get(old)!, quietSince: dueAt });
+            next.set(current, {
+              ...next.get(current)!,
+              quietSince: successorAge === "fresh" ? dueAt : "2026-11-16T23:00:00Z",
+            });
+            return next;
+          });
+          yield* service.tick;
+          const after = yield* Ref.get(fake.threads);
+          if (successorAge === "fresh") {
+            assert.equal((yield* service.discussion(discussion.id)).evaluatorThreadId, current);
+            assert.isAbove(after.get(current)!.messages.length, messages.length);
+          } else {
+            assert.isTrue(
+              after.size > before.size ||
+                [...after].some(
+                  ([id, thread]) => thread.messages.length > (messageCounts.get(id) ?? 0),
+                ),
+            );
+          }
+          if (reason !== null) assert.deepEqual(after.get(old)!.messages, oldMessages);
+        });
+        yield* restart ? check.pipe(Effect.provide(KanbanService.layer)) : check;
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(
+  (["unrelated discussion", "explicit owner input"] as const).flatMap((delivery) =>
+    (["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
+      [false, true].map((restart) => ({ delivery, reason, restart })),
+    ),
+  ),
+)(
+  "held evaluator reminder preserves queue progress ($delivery, $reason, restart=$restart)",
+  ({ delivery, reason, restart }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const sql = yield* BoardsDatabase.client;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const old = yield* kanban.startEvaluator(board.id, {
+          kind: "request",
+          text: "Historical intake evaluator",
+        });
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Queued evaluator work",
+            prompt: "Finish",
+            priority: 1,
+            subtasks: [{ step: 1, owner: "evaluator", text: "Finish" }],
+          },
+          owner,
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Finish the audit" }]);
+        const current = (yield* kanban.discussion(discussion.id)).evaluatorThreadId!;
+        yield* store.putCard({
+          ...(yield* store.card(card.id))!,
+          createdBy: { _tag: "evaluator", threadId: old },
+        });
+        const failure = makeProviderFailure({
+          cause: new ProviderPromptAcceptanceError({
+            driver: ProviderDriverKind.make("opencode"),
+            serverOrigin: "http://opencode.test",
+            reason,
+            budgetSeconds: 60,
+          }),
+        });
+        fake.failures.set(old, failure);
+        yield* kanban.turnEnded(old);
+        const oldMessages = [...(yield* Ref.get(fake.threads)).get(old)!.messages];
+        yield* kanban.tick;
+        yield* TestClock.adjust("16 minutes");
+        yield* Ref.update(fake.threads, (all) => {
+          const next = new Map(all);
+          for (const id of [old, current])
+            next.set(id, { ...next.get(id)!, quietSince: "2026-11-16T23:00:00Z" });
+          return next;
+        });
+        yield* sql`INSERT INTO ardud_kanban_evaluator_spawns (launch_key, board_id, card_id, at)
+          VALUES ('1725:queue-cap', ${board.id}, ${card.id}, '2026-11-17T00:16:00.000Z')`;
+        yield* kanban.tick;
+        const pending = yield* sql<{ job_key: string }>`SELECT job_key
+          FROM ardud_kanban_evaluator_queue WHERE done_at IS NULL
+          AND json_extract(json, '$.extra.trigger') = 'step_reminder'`;
+        assert.lengthOf(pending, 1);
+        const check = Effect.gen(function* () {
+          const service = yield* KanbanService.KanbanService;
+          const text = `Manual follow-up for ${delivery}`;
+          if (delivery === "unrelated discussion") {
+            fake.failures.set(current, { ...failure });
+            yield* service.turnEnded(current);
+          }
+          const target =
+            delivery === "explicit owner input"
+              ? discussion
+              : yield* service.createDiscussion(board.id, "Unrelated owner request", owner);
+          yield* service.post(target.id, owner, [{ _tag: "md", text }]).pipe(Effect.ignore);
+          yield* sql`DELETE FROM ardud_kanban_evaluator_spawns WHERE launch_key = '1725:queue-cap'`;
+          yield* service.tick;
+          const after = yield* Ref.get(fake.threads);
+          const recipient = (yield* service.discussion(target.id)).evaluatorThreadId;
+          assert.isNotNull(recipient);
+          assert.equal(
+            after.get(recipient!)!.messages.filter((body) => body.includes(text)).length,
+            1,
+          );
+          assert.deepEqual(after.get(old)!.messages, oldMessages);
+          if (delivery === "unrelated discussion") {
+            const held = yield* sql`SELECT id FROM ardud_kanban_evaluator_queue
+              WHERE job_key = ${pending[0]!.job_key} AND done_at IS NULL`;
+            assert.lengthOf(held, 1);
+          }
+        });
+        yield* restart ? check.pipe(Effect.provide(KanbanService.layer)) : check;
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
 it.effect(
   "an unconfirmed evaluator notice retries a failed write without replaying its prompt",
   () =>
