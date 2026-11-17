@@ -413,7 +413,10 @@ def _imessage_call_stats(row):
                   and type(pair[0]) is int and 0 <= pair[0] <= 86_400_000
                   and type(pair[1]) is int and 1 <= pair[1] <= 10_000_000]
         if sum(count for _, count in values) == oks + failures:
-            result[name] = (oks, failures, values)
+            single = stats.get('singleFailures')
+            if type(single) is not int or not 0 <= single <= failures:
+                single = None
+            result[name] = (oks, failures, values, single)
     return result
 
 
@@ -516,6 +519,7 @@ def _imessage_rollup_records(board, day):
         value = identity.get('callBatchId') if isinstance(identity, dict) else None
         return value if isinstance(value, str) else None
     represented = set()
+    represented_single_failures = set()
     pending = []
     for line, raw in _read_records(board, day):
         row = {key: value for key, value in raw.items() if not key.startswith('_rollup_')}
@@ -526,12 +530,15 @@ def _imessage_rollup_records(board, day):
             yield line, {**row, 'name': 'card.render', '_rollup_count': count, '_rollup_ok': count,
                          '_rollup_failed': 0, '_rollup_histogram': histogram}
         elif calls:
-            for name, (oks, failed, histogram) in calls.items():
+            for name, (oks, failed, histogram, single) in calls.items():
                 if batch(row) is not None:
                     represented.add((batch(row), name))
+                    if single is not None:
+                        represented_single_failures.add((batch(row), name))
                 yield line, {'ts': row.get('ts'), 'ids': row.get('ids'), 'component': 'robob', 'kind': 'perf',
                              'name': 'turn.robob_call', '_rollup_count': oks + failed,
-                             '_rollup_ok': oks, '_rollup_failed': failed, '_rollup_histogram': histogram, '_rollup_call': name}
+                             '_rollup_ok': oks, '_rollup_failed': failed, '_rollup_histogram': histogram, '_rollup_call': name,
+                             '_rollup_single_failures': single or 0}
         elif row.get('name') == 'turn.robob_call' and row.get('kind') == 'perf':
             pending.append((line, row))
             yield line, {'_rollup_skip': True}
@@ -542,7 +549,8 @@ def _imessage_rollup_records(board, day):
         if (batch(row), _imessage_call_name(row)) not in represented:
             yield line, {**row, '_rollup_deferred': True}
         elif row.get('error'):
-            yield line, {**row, '_rollup_deferred': True, '_rollup_diagnostic': True}
+            yield line, {**row, '_rollup_deferred': True, '_rollup_diagnostic': True,
+                         '_rollup_failure_counted': (batch(row), _imessage_call_name(row)) in represented_single_failures}
     for row in _imessage_shared_renders(board, day):
         yield 0, row
 
@@ -571,12 +579,15 @@ def rollup(board, day, top_n=20):
     start = day_start.timestamp()
     total = oks = failed = errors = observed = 0
     single_failures = 0
+    deduped_failures = 0
     def observe_error(row, line_number, weight=1):
         nonlocal single_failures
+        if board == 'imessage' and row.get('alreadyLogged') is True:
+            return
         request_failure = (board == 'imessage' and row.get('component') == 'robob' and row.get('name') == 'turn.robob_call'
                            and row.get('kind') == 'perf' and row.get('ok') is False)
         single = (row.get('props') or {}).get('failureFormat') == 'single'
-        if request_failure and single:
+        if request_failure and single and not row.get('_rollup_failure_counted'):
             single_failures += weight
         if request_failure and not single and (row.get('error') or {}).get('tag') == 'control.request_failed':
             return
@@ -607,6 +618,8 @@ def rollup(board, day, top_n=20):
         if board == 'imessage' and row.get('_rollup_diagnostic'):
             observe_error(row, line_number)
             continue
+        if board == 'imessage':
+            single_failures += row.get('_rollup_single_failures', 0)
         aggregate = board == 'imessage' and '_rollup_count' in row
         weight = row['_rollup_count'] if aggregate else _sample_rate(row)
         sampled |= weight > 1 and not aggregate
@@ -640,10 +653,15 @@ def rollup(board, day, top_n=20):
                 unrecognized_sampled |= refusal_weight > 1
         row_ok = row['_rollup_ok'] if aggregate else weight * (row.get('ok') is True)
         row_failed = row['_rollup_failed'] if aggregate else weight * (row.get('ok') is False)
+        already_logged = board == 'imessage' and row.get('alreadyLogged') is True
+        if already_logged:
+            if kind == 'error' or row_failed:
+                deduped_failures += weight
+            row_failed = 0
         observed += row_ok + row_failed
         oks += row_ok
         failed += row_failed
-        errors += weight * (kind == 'error')
+        errors += weight * (kind == 'error' and not already_logged)
         duration = row.get('durationMs')
         values = row['_rollup_histogram'] if aggregate else ([(duration, weight)]
             if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0 else [])
@@ -804,6 +822,7 @@ def rollup(board, day, top_n=20):
             merchant: {**poll, 'failureShare': poll['failed'] / poll['count']}
             for merchant, poll in sorted(poll_counts.items())}
     if board == 'imessage':
+        result['dedupedFailures'] = deduped_failures
         result['topCauses'] = [{'tag': tag, 'causeKey': cause, 'count': count}
                                for (tag, cause), count in sorted(causes.items(), key=lambda x: (-x[1], x[0]))[:20]]
         result['cardRenderFailures'] = dict(sorted(render_failures.items()))

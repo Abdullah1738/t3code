@@ -136,6 +136,109 @@ class ToolLogTests(unittest.TestCase):
                 expected = ([] if not has_catch else [('control.catch1', 1)]) + ([] if shape in {'legacy', 'summary_only'} else [('control.request_failed', 1)])
                 self.assertEqual([(item['tag'], item['count']) for item in result['topErrorTags']], expected)
 
+    def test_imessage_already_logged_catches_preserve_volume_without_failure_diagnostics(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True, exist_ok=True)
+        for tag in ['control.request_failed', 'control.invalid_json']:
+            for aggregate in [False, True]:
+                for marker in [True, False, None, 'true', 1]:
+                    with self.subTest(tag=tag, aggregate=aggregate, marker=marker):
+                        request = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                                   'durationMs': 25, 'ids': {'callBatchId': 'batch'},
+                                   'props': {'method': 'GET', 'route': '/threads/:id', 'failureFormat': 'single'},
+                                   'error': {'tag': tag, 'name': 'TimeoutError', 'causeKey': 'TimeoutError'}}
+                        catch = {'component': 'router', 'kind': 'error', 'name': 'bridge.catch', 'ok': False,
+                                 'alreadyLogged': marker, 'error': {'tag': 'router.catch1', 'name': 'TimeoutError',
+                                                                 'causeKey': 'prompt_acceptance_probe'}}
+                        rows = [request, catch]
+                        if aggregate:
+                            rows.append({'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                                         'ids': {'callBatchId': 'batch'},
+                                         'calls': {'thread': {'ok': 0, 'failed': 1, 'histogram': [[25, 1]]}}})
+                        path = directory / (self.day + '.ndjson')
+                        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                        result = toollog.rollup('imessage', self.day)
+                        deduped = marker is True
+                        self.assertEqual((result['total'], result['recordedRows']), (2, len(rows)))
+                        self.assertEqual(result['dedupedFailures'], int(deduped))
+                        self.assertEqual(result['failedCount'], 1 if deduped else 2)
+                        self.assertEqual(result['errorRate'], .5 if deduped else 1)
+                        self.assertEqual(result['countsByName'], {'turn.robob_call': 1, 'bridge.catch': 1})
+                        self.assertEqual(result['countsByKind'], {'perf': 1, 'error': 1})
+                        self.assertEqual([item['tag'] for item in result['topErrorTags']],
+                                         [tag] if deduped else [tag, 'router.catch1'])
+                        self.assertEqual([item['tag'] for item in result['topCauses']],
+                                         [tag] if deduped else [tag, 'router.catch1'])
+                        self.assertEqual(result['byComponent']['router']['bridge.catch']['failed'], 0 if deduped else 1)
+                        self.assertEqual(len(path.read_text().splitlines()), len(rows))
+
+    def test_imessage_suppressed_outage_details_count_from_summary_once(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        cases = [
+            ('partial_details', 6, 5, 0, False),
+            ('summary_only', 6, 0, 0, False),
+            ('all_details', 6, 6, 0, False),
+            ('reversed', 6, 5, 0, True),
+            ('legacy', 0, 5, 6, False),
+            ('mixed', 3, 5, 3, False),
+            ('old_single_summary', None, 5, 0, False),
+        ]
+        for shape, single, details, legacy, reverse in cases:
+            with self.subTest(shape=shape):
+                detail = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                          'durationMs': 25, 'ids': {'callBatchId': 'batch'},
+                          'props': {'method': 'GET', 'route': '/threads/:id/messages', 'failureFormat': 'single'},
+                          'error': {'tag': 'control.request_failed', 'name': 'TypeError'}}
+                stats = {'ok': 0, 'failed': 6, 'histogram': [[25, 6]]}
+                if single is not None:
+                    stats['singleFailures'] = single
+                rows = [{'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls', 'ids': detail['ids'],
+                         'calls': {'messages': stats}}]
+                rows += [{**detail, 'props': {**detail['props'], 'failureFormat': 'single' if index < (single if single is not None else 6) else ''}}
+                         for index in range(details)]
+                rows += [{'component': 'router', 'kind': 'error', 'name': 'bridge.catch', 'ok': False,
+                          'alreadyLogged': index >= legacy,
+                          'error': {'tag': 'control.catch1' if index < legacy else 'router.catch1', 'name': 'ControlError'}}
+                         for index in range(6)]
+                if reverse:
+                    rows.reverse()
+                (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                result = toollog.rollup('imessage', self.day)
+                self.assertEqual((result['total'], result['recordedRows']), (12, len(rows)))
+                self.assertEqual((result['failedCount'], result['dedupedFailures']), (6 + legacy, 6 - legacy))
+                self.assertEqual(result['errorRate'], ((single if single is not None else details) + legacy) / 12)
+                self.assertEqual(result['countsByName'], {'turn.robob_call': 6, 'bridge.catch': 6})
+                self.assertNotIn('router.catch1', [item['tag'] for item in result['topErrorTags']])
+
+    def test_imessage_outage_batches_without_retained_details_still_count(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        rows = []
+        for batch in range(4):
+            rows.append({'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls', 'ids': {'callBatchId': str(batch)},
+                         'calls': {'messages': {'ok': 0, 'failed': 3, 'singleFailures': 3, 'histogram': [[25, 3]]}}})
+            for index in range(3):
+                if batch * 3 + index < 5:
+                    rows.append({'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                                 'durationMs': 25, 'ids': {'callBatchId': str(batch)},
+                                 'props': {'method': 'GET', 'route': '/threads/:id/messages', 'failureFormat': 'single'},
+                                 'error': {'tag': 'control.request_failed', 'name': 'TypeError'}})
+                rows.append({'component': 'router', 'kind': 'error', 'name': 'bridge.catch', 'ok': False, 'alreadyLogged': True,
+                             'error': {'tag': 'router.catch1', 'name': 'ControlError'}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual((result['failedCount'], result['dedupedFailures'], result['total']), (12, 12, 24))
+        self.assertEqual(result['errorRate'], .5)
+        self.assertEqual([(item['tag'], item['count']) for item in result['topErrorTags']], [('control.request_failed', 5)])
+
+    def test_imessage_single_failure_count_accepts_only_bounded_integers(self):
+        for value in [None, 0, 6, -1, 7, .5, float('nan'), float('inf'), '6', True]:
+            with self.subTest(value=value):
+                stats = toollog._imessage_call_stats({'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                    'calls': {'messages': {'ok': 0, 'failed': 6, 'histogram': [[25, 6]], 'singleFailures': value}}})
+                self.assertEqual(stats['messages'][3], value if type(value) is int and 0 <= value <= 6 else None)
+
     def test_imessage_rollup_summary_appended_after_read_is_never_double_counted(self):
         directory = toollog.board_dir('imessage')
         directory.mkdir(parents=True)
