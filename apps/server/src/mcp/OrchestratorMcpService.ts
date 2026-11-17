@@ -4330,7 +4330,7 @@ const make = Effect.gen(function* () {
         const shellsById = new Map(shells.map((shell) => [shell.id, shell]));
         return {
           projectId,
-          projectTitle,
+          ...(projectTitle === undefined ? {} : { projectTitle }),
           currentThreadId: parent?.thread.id ?? null,
           threads: page.flatMap((candidate) => {
             const shell = shellsById.get(candidate.id);

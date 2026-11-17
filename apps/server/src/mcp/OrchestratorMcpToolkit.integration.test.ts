@@ -111,6 +111,7 @@ const successfulContent = (result: McpSchema.CallToolResult, call: string) => {
 
 const parentThreadId = ThreadId.make("thread:mcp-orchestrator-parent");
 const projectId = ProjectId.make("project:mcp-orchestrator");
+const foreignProjectId = ProjectId.make("project:mcp-foreign");
 const codexInstanceId = ProviderInstanceId.make("codex");
 const claudeInstanceId = ProviderInstanceId.make("claudeAgent");
 const codexModel = "gpt-5.4";
@@ -786,8 +787,17 @@ describe("orchestrator MCP toolkit", () => {
               Layer.mock(ProjectService.ProjectService)({
                 getById: (id) =>
                   Effect.succeed(
-                    id === projectId
-                      ? Option.some({ id, defaultModelSelection: null } as never)
+                    id === projectId || id === foreignProjectId
+                      ? Option.some({
+                          id,
+                          title: id === projectId ? "MCP project" : "Foreign project",
+                          workspaceRoot: cwd,
+                          defaultModelSelection: null,
+                          scripts: [],
+                          createdAt: "2026-07-01T09:00:00.000Z",
+                          updatedAt: "2026-07-01T09:00:00.000Z",
+                          deletedAt: null,
+                        })
                       : Option.none(),
                   ),
               }),
@@ -2935,7 +2945,7 @@ describe("orchestrator MCP toolkit", () => {
               creationSource: "web",
               commandId: CommandId.make("command:mcp-foreign-project:create"),
               threadId: foreignThreadId,
-              projectId: ProjectId.make("project:mcp-foreign"),
+              projectId: foreignProjectId,
               title: "Foreign project thread",
               modelSelection: codexSelection,
               runtimeMode: "full-access",
@@ -2966,7 +2976,7 @@ describe("orchestrator MCP toolkit", () => {
               title: "Renamed from another project",
             });
             const foreignListCall = yield* invoke("t3_thread_list", {
-              projectId: "project:mcp-foreign",
+              projectId: foreignProjectId,
             });
             const foreignListed = yield* decodeThreadListResult(
               successfulContent(foreignListCall, "foreignListCall"),
