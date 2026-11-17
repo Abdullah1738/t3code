@@ -293,6 +293,20 @@ const seedProject = (input: {
     }),
   );
 
+const layerWatchProject = (projectId: ProjectId) =>
+  Layer.effect(
+    ProjectionStore.ProjectionStoreV2,
+    Effect.map(ProjectionStore.ProjectionStoreV2, (projections) => ({
+      ...projections,
+      getThreadsWithPullRequests: () =>
+        projections
+          .getThreadsWithPullRequests()
+          .pipe(
+            Effect.map((threads) => threads.filter((thread) => thread.projectId === projectId)),
+          ),
+    })),
+  );
+
 const moveProject = (projectId: ProjectId, workspaceRoot: string, updatedAt: string) =>
   Effect.flatMap(ProjectStore.ProjectStoreV2, (projects) =>
     projects.apply({
@@ -2821,6 +2835,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const reactor = yield* PullRequestWatchReactor.make.pipe(
         Effect.provide(
           Layer.mergeAll(
+            layerWatchProject(projectId),
             NodeServices.layer,
             Layer.mock(PullRequestService.PullRequestService)({
               detail: () => Effect.die("host unreachable"),
@@ -2900,6 +2915,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         const reactor = yield* PullRequestWatchReactor.make.pipe(
           Effect.provide(
             Layer.mergeAll(
+              layerWatchProject(projectId),
               NodeServices.layer,
               Layer.mock(PullRequestService.PullRequestService)({
                 watchFingerprint: () => Effect.succeed(null),
@@ -3081,14 +3097,18 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         ({ messages }) => messages.flatMap((message) => message.notification?.summary ?? []),
       );
 
-      const reactor = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      const reactor = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(Layer.merge(host, layerWatchProject(projectId))),
+      );
       yield* reactor.sweep;
       yield* TestClock.adjust("10 minutes");
       yield* reactor.sweep;
       assert.deepEqual(yield* summaries, ["#12: checks passed"]);
 
       // A restart keeps nothing in memory; the watch state is all it has.
-      const restarted = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      const restarted = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(Layer.merge(host, layerWatchProject(projectId))),
+      );
       yield* restarted.sweep;
       assert.deepEqual(yield* summaries, ["#12: checks passed"]);
 
@@ -3178,7 +3198,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         orchestrator.getThreadRecords(threadId, ["messages"]),
         ({ messages }) => messages.flatMap((message) => message.notification?.summary ?? []),
       );
-      const reactor = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      const reactor = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(Layer.merge(host, layerWatchProject(projectId))),
+      );
       yield* reactor.sweep;
       assert.deepEqual(yield* summaries, []);
       assert.equal(
@@ -3201,7 +3223,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(clean?.conflictWokeFor, "aaaaaaaaaa:f77c1992e5e9");
       yield* watch(false, "stop");
       yield* watch(true, "again");
-      const restarted = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      const restarted = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(Layer.merge(host, layerWatchProject(projectId))),
+      );
       mergeability = "conflicting";
       yield* restarted.sweep;
       yield* TestClock.adjust("2 minutes");
@@ -3317,7 +3341,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         orchestrator.getThreadRecords(threadId, ["messages"]),
         ({ messages }) => messages.flatMap((message) => message.notification?.summary ?? []),
       );
-      const reactor = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      const reactor = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(Layer.merge(host, layerWatchProject(projectId))),
+      );
       yield* reactor.sweep;
       assert.deepEqual(yield* summaries, []);
       assert.equal(
@@ -3434,7 +3460,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         orchestrator.getThreadRecords(threadId, ["messages"]),
         ({ messages }) => messages.flatMap((message) => message.notification?.summary ?? []),
       );
-      const reactor = yield* PullRequestWatchReactor.make.pipe(Effect.provide(host));
+      const reactor = yield* PullRequestWatchReactor.make.pipe(
+        Effect.provide(Layer.merge(host, layerWatchProject(projectId))),
+      );
       yield* reactor.sweep;
       const ended = yield* watchOf;
       assert.isUndefined(ended?.watch);
@@ -3563,7 +3591,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           watching: on,
           link: { url: "https://github.com/pingdotgg/t3code/pull/11", source: "agent" },
         });
-      yield* watching(true, "start");
+      yield* Effect.acquireRelease(watching(true, "start"), () =>
+        watching(false, "cleanup").pipe(Effect.orDie),
+      );
 
       let headSha = "aaaaaaa";
       const ended: Array<unknown> = [];
@@ -3574,6 +3604,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const reactor = yield* PullRequestWatchReactor.make.pipe(
         Effect.provide(
           Layer.mergeAll(
+            layerWatchProject(projectId),
             NodeServices.layer,
             Layer.mock(PullRequestService.PullRequestService)({
               detail: () =>
@@ -3619,7 +3650,10 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           partial: false,
         },
       ]);
-    }),
+    }).pipe(
+      // Advancing eight hours must not replay the shared runtime's host-load sampler.
+      Effect.provide(TestClock.layer()),
+    ),
   );
 
   it.effect("with a host fingerprint, a watch reads only what moved", () =>
@@ -3648,16 +3682,48 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         branch: null,
         worktreePath: null,
       });
-      yield* orchestrator.dispatch({
-        type: "thread.pull-request.watch",
-        commandId: CommandId.make("pr-watch-fingerprint-start"),
-        threadId,
-        host: "github.com",
-        repository: "pingdotgg/t3code",
-        number: 11,
-        watching: true,
-        link: { url: "https://github.com/pingdotgg/t3code/pull/11", source: "agent" },
+      const watching = (target: ThreadId, on: boolean, id: string) =>
+        orchestrator.dispatch({
+          type: "thread.pull-request.watch",
+          commandId: CommandId.make(`pr-watch-fingerprint-${id}`),
+          threadId: target,
+          host: "github.com",
+          repository: "pingdotgg/t3code",
+          number: 11,
+          watching: on,
+          link: { url: "https://github.com/pingdotgg/t3code/pull/11", source: "agent" },
+        });
+      yield* Effect.acquireRelease(watching(threadId, true, "start"), () =>
+        watching(threadId, false, "cleanup").pipe(Effect.orDie),
+      );
+
+      // The same PR in another project reproduces a watch leaked by an earlier test.
+      const foreignProjectId = ProjectId.make("pr-watch-foreign-project");
+      const foreignThreadId = ThreadId.make("pr-watch-foreign-thread");
+      yield* seedProject({
+        projectId: foreignProjectId,
+        title: "Foreign watch",
+        workspaceRoot: "/workspace/foreign-watch",
+        defaultModelSelection: null,
+        createdAt: "2026-10-01T00:00:00.000Z",
       });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("pr-watch-foreign-create"),
+        threadId: foreignThreadId,
+        projectId: foreignProjectId,
+        title: "Foreign watch",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* Effect.acquireRelease(watching(foreignThreadId, true, "foreign-start"), () =>
+        watching(foreignThreadId, false, "foreign-cleanup").pipe(Effect.orDie),
+      );
 
       let fingerprint: { status: string; remarks: string } | "rate-limited" = {
         status: "OPEN pending",
@@ -3672,6 +3738,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const reactor = yield* PullRequestWatchReactor.make.pipe(
         Effect.provide(
           Layer.mergeAll(
+            layerWatchProject(projectId),
             NodeServices.layer,
             Layer.mock(PullRequestService.PullRequestService)({
               watchFingerprint: () =>
@@ -3781,6 +3848,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       yield* reactor.sweep;
       assert.deepEqual(reads(), { detail: 5, activity: 3 });
       assert.deepEqual(yield* summaries, ["#11: checks failed", "#11: new comments"]);
+      assert.isDefined(
+        (yield* orchestrator.getThreadShell(foreignThreadId))?.pullRequests?.[0]?.watch,
+      );
     }),
   );
 
@@ -4115,6 +4185,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const reactor = yield* PullRequestWatchReactor.make.pipe(
         Effect.provide(
           Layer.mergeAll(
+            layerWatchProject(projectId),
             NodeServices.layer,
             Layer.mock(PullRequestService.PullRequestService)({
               detail: () => Effect.succeed(detail),
