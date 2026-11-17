@@ -3851,12 +3851,34 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         except OSError:
             pass
 
-    def decode_word(value, directory, depth, quoted, checked, cwd_only=False, bodies=None):
+    def safe_mktemp_substitution(source, directory):
+        # A fresh directory cannot replace a remembered script. Keep this
+        # exception narrower than the shell grammar: no expansions or commands.
+        if unsafe_bindings or re.search(r'[^\w./\-\t \'"]', source) or any(name.startswith('BASH_FUNC_') for name in os.environ):
+            return False
+        try:
+            words = shlex.split(source)
+        except ValueError:
+            return False
+        if len(words) < 2 or words[1] != '-d':
+            return False
+        template = words[2:]
+        if template[:1] == ['-t']:
+            template = template[1:]
+            if not template:
+                return False
+        if template and (len(template) != 1 or not re.fullmatch(r'[\w./][\w./-]*', template[0])):
+            return False
+        return (_trusted_fixture_tool(words[0], 'mktemp', directory) and unchanged_tool(words[0], directory))
+
+    def decode_word(value, directory, depth, quoted, checked, cwd_only=False, bodies=None, preserve_mktemp=False):
         nonlocal conditional, uncertain_write
         for key, literal in reversed(quoted.items()):
             if key in value and key not in checked and not key.startswith('\0guard_literal_') and literal.startswith(("${", "$(", "`")) and not cwd_only:
                 checked.add(key)
                 for substitution in _substitutions(literal, shell=True):
+                    if preserve_mktemp and safe_mktemp_substitution(substitution, directory):
+                        continue
                     conditional += 1
                     uncertain_write += 1
                     try:
@@ -3914,8 +3936,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         reader_literal_words = set()
         double_words = set()
         unquoted_words = set()
+        # Prefix assignments are decoded before remember_assignment sees them.
+        # A PATH override may therefore shadow mktemp in this very substitution.
+        preserve_mktemp = not any(re.match(r'^(?:PATH|IFS|ENV|BASH_ENV|ZDOTDIR)=', word) for word in words)
         def decode(value):
-            decoded = decode_word(value, directory, depth, quoted, checked, cwd_only, bodies)
+            decoded = decode_word(value, directory, depth, quoted, checked, cwd_only, bodies, preserve_mktemp)
             reader_word = value
             for key, text in reversed(quoted.items()):
                 if key.startswith('\0guard_literal_double_'):
