@@ -1228,6 +1228,105 @@ it.each(["failed", "noOutcome"] as const)(
   },
 );
 
+it("keeps runtime, restart-admission and Git rate rollups within the combined day budget", () => {
+  const accumulator = makeAccumulator();
+  for (let minute = 0; minute < 1440; minute++) {
+    accumulate(accumulator, {
+      ts: `2026-11-13T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`,
+      kind: "server.runtime_sample",
+      surface: "server",
+      route: "server",
+      props: {
+        runningTurns: { total: minute % 60, byProvider: {}, byModel: {} },
+        ...(minute % 2 === 0 ? { queuedRuns: minute % 60 } : {}),
+        host: { load1: (minute % 60) * 2, load5: 1, load15: 1, rssMiB: 10, heapUsedMiB: 5 },
+        sampleMs: (minute % 60) / 100,
+      },
+    });
+  }
+  for (let minute = 0; minute < 1440; minute++) {
+    const at = `2026-11-13T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`;
+    accumulate(
+      accumulator,
+      event({
+        ts: at,
+        kind: "vcs.git_exec_rate",
+        props: {
+          total: 120,
+          distinctCwds: 20,
+          maxPerSecond: 10,
+          windowMs: 60_000,
+          overflow: 0,
+          top: Array.from({ length: 20 }, (_, index) => ({
+            operation: `GitManager.op${index}`,
+            subcommand: "status",
+            cwdHash: index.toString(16).padStart(16, "0"),
+            count: 6,
+          })),
+        },
+      }),
+    );
+    accumulate(
+      accumulator,
+      event({
+        ts: at,
+        kind: "restart.admission.admitted",
+        bootId: "boot-one",
+        restartAdmission: {
+          sourceRunId: `source-${minute}`,
+          classification: "continuation",
+          queuedAtMs: 0,
+          waitedMs: minute,
+          positionAtEntry: 12,
+          position: 1,
+          total: 7,
+          maxQueueDepth: 20,
+          active: 1,
+          maxActive: 4,
+          loaded: true,
+        },
+      }),
+    );
+  }
+  const rollup = finishRollup(accumulator, "2026-11-13", "2026-11-14T00:00:00.000Z");
+  assert.equal(rollup.runtimeSamples!.length, 24);
+  assert.deepEqual(rollup.runtimeSamples![0], {
+    hour: "00",
+    samples: 60,
+    runningTurnsMax: 59,
+    runningTurnsAvg: 29.5,
+    queuedRunsMax: 58,
+    load1Max: 118,
+    sampleMsMax: 0.59,
+  });
+  assert.equal(rollup.total, 4320);
+  assert.equal(rollup.kindCounts["vcs.git_exec_rate"], 1440);
+  assert.equal(rollup.kindCounts["restart.admission.admitted"], 1440);
+  assert.equal(rollup.restartAdmission!.groups.length, 24);
+  assert.equal(rollup.restartAdmission!.groups[0]!.admissions, 60);
+  assert.isBelow(JSON.stringify(rollup).length, 50_000);
+});
+
+it("does not turn an unavailable queue count into zero", () => {
+  const accumulator = makeAccumulator();
+  accumulate(accumulator, {
+    ts: "2026-11-13T12:00:00.000Z",
+    kind: "server.runtime_sample",
+    surface: "server",
+    route: "server",
+    props: {
+      runningTurns: { total: 0, byProvider: {}, byModel: {} },
+      host: { load1: 0, load5: 0, load15: 0, rssMiB: 1, heapUsedMiB: 1 },
+      sampleMs: 0.1,
+    },
+  });
+  assert.equal(
+    finishRollup(accumulator, "2026-11-13", "2026-11-14T00:00:00.000Z").runtimeSamples![0]!
+      .queuedRunsMax,
+    null,
+  );
+});
+
 describe("restart admission rollup", () => {
   const admission = (waitedMs: number, input: Partial<AnalyticsEvent> = {}): AnalyticsEvent =>
     event({

@@ -140,6 +140,40 @@ export const EvaluatorPurposeKind = Schema.Literals([
   "request",
   "unknown",
 ]);
+// Provider instance/model ids may include punctuation excluded from routing labels.
+const RuntimeCounts = Schema.Record(Schema.String.check(Schema.isMaxLength(512)), Measurement);
+const RuntimeSampleProps = {
+  runningTurns: Schema.optionalKey(
+    Schema.Struct({
+      total: Measurement,
+      byProvider: RuntimeCounts,
+      byModel: RuntimeCounts,
+    }),
+  ),
+  runningByOrigin: Schema.optionalKey(
+    Schema.Struct({
+      boardWork: Measurement,
+      boardReview: Measurement,
+      boardEvaluator: Measurement,
+      delegatedChild: Measurement,
+      scheduledTask: Measurement,
+      other: Measurement,
+    }),
+  ),
+  queuedRuns: Schema.optionalKey(Measurement),
+  providerSessions: Schema.optionalKey(RuntimeCounts),
+  host: Schema.optionalKey(
+    Schema.Struct({
+      load1: Measurement,
+      load5: Measurement,
+      load15: Measurement,
+      rssMiB: Measurement,
+      heapUsedMiB: Measurement,
+      eventLoopLagP99Ms: Schema.optionalKey(Measurement),
+    }),
+  ),
+};
+
 const GeneralEvent = Schema.Struct({
   ts: Timestamp,
   kind: Label.check(Schema.makeFilter((kind) => kind !== "run.usage")),
@@ -285,6 +319,7 @@ const GeneralEvent = Schema.Struct({
   ),
   props: Schema.optionalKey(
     Schema.Struct({
+      ...RuntimeSampleProps,
       total: Schema.optionalKey(Measurement),
       distinctCwds: Schema.optionalKey(Measurement),
       maxPerSecond: Schema.optionalKey(Measurement),
@@ -685,6 +720,19 @@ export const AnalyticsRollup = Schema.Struct({
         ...LatencyFields,
       }),
     ),
+  ),
+  runtimeSamples: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        hour: Label,
+        samples: Measurement,
+        runningTurnsMax: Measurement,
+        runningTurnsAvg: Measurement,
+        queuedRunsMax: Schema.NullOr(Measurement),
+        load1Max: Measurement,
+        sampleMsMax: Measurement,
+      }),
+    ).check(Schema.isMaxLength(24)),
   ),
   errorCounts: Schema.Record(Label, Measurement),
   controlRoutes: Schema.optionalKey(

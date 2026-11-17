@@ -2892,6 +2892,10 @@ it.effect("ProviderSessionManagerV2 records provider session and turn metrics", 
         modelSelection,
         runtimePolicy,
       });
+      assert.deepEqual(yield* manager.runtimeSnapshot!(), {
+        turns: [],
+        providerSessions: { codex: 1 },
+      });
       yield* runtime.startTurn({
         appThread: (yield* projectionStore.getThreadProjection(threadId)).thread,
         threadId,
@@ -2911,6 +2915,10 @@ it.effect("ProviderSessionManagerV2 records provider session and turn metrics", 
         modelSelection,
         runtimePolicy,
       });
+      assert.deepEqual(yield* manager.runtimeSnapshot!(), {
+        turns: [{ threadId, provider: modelSelection.instanceId, model: modelSelection.model }],
+        providerSessions: { codex: 1 },
+      });
       yield* runtime.interruptTurn({
         providerThread,
         providerTurnId: idAllocator.derive.providerTurn({
@@ -2919,6 +2927,7 @@ it.effect("ProviderSessionManagerV2 records provider session and turn metrics", 
         }),
       });
       yield* manager.close(providerSessionId);
+      assert.deepEqual(yield* manager.runtimeSnapshot!(), { turns: [], providerSessions: {} });
 
       const snapshots = yield* Metric.snapshot;
       const has = (id: string, attributes: Readonly<Record<string, string>>) =>

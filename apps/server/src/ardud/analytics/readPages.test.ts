@@ -416,3 +416,86 @@ it("pages the server-wide restartAdmission section with its schema and exact wai
     approximate: false,
   });
 });
+
+it("keeps combined runtime, restart-admission and Git rate reads inside the cap", () => {
+  const events: AnalyticsEvent[] = [];
+  for (let minute = 0; minute < 1440; minute++) {
+    const ts = `${day}T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`;
+    events.push(
+      event({
+        ts,
+        kind: "server.runtime_sample",
+        props: {
+          runningTurns: { total: 350, byProvider: { codex: 350 }, byModel: { sol: 350, other: 0 } },
+          runningByOrigin: {
+            boardWork: 50,
+            boardReview: 50,
+            boardEvaluator: 50,
+            delegatedChild: 50,
+            scheduledTask: 0,
+            other: 150,
+          },
+          providerSessions: { codex: 1 },
+          host: { load1: 60, load5: 50, load15: 40, rssMiB: 2000, heapUsedMiB: 1500 },
+          sampleMs: 0.25,
+        },
+      }),
+      event({
+        ts,
+        kind: "vcs.git_exec_rate",
+        props: {
+          total: 120,
+          distinctCwds: 20,
+          maxPerSecond: 10,
+          windowMs: 60_000,
+          overflow: 0,
+          top: Array.from({ length: 20 }, (_, index) => ({
+            operation: `GitManager.op${index}`,
+            subcommand: "status",
+            cwdHash: index.toString(16).padStart(16, "0"),
+            count: 6,
+          })),
+        },
+      }),
+      event({
+        ts,
+        kind: "restart.admission.admitted",
+        bootId: `boot-${minute % 6}`,
+        restartAdmission: {
+          sourceRunId: `source-${minute}`,
+          classification: "continuation",
+          queuedAtMs: 0,
+          waitedMs: minute,
+          positionAtEntry: 12,
+          position: 1,
+          total: 7,
+          maxQueueDepth: 20,
+          active: 1,
+          maxActive: 4,
+          loaded: true,
+        },
+      }),
+    );
+  }
+  const rollup = finish(events);
+  expect(rollup.runtimeSamples).toHaveLength(24);
+  expect(rollup.restartAdmission!.groups).toHaveLength(128);
+  expect(rollup.restartAdmission!.overflow).toBeGreaterThan(0);
+  expect(rollup.kindCounts["vcs.git_exec_rate"]).toBe(1440);
+  const pager = makeReadPager();
+  check(pager.read({ day }, rollup, events));
+  for (const section of ["runtimeSamples", "restartAdmission", "samples"] as const) {
+    let result = pager.read({ day, section, limit: 500 }, rollup, events);
+    check(result);
+    const rows = [...result.rows!];
+    let pages = 1;
+    while (result.hasMore) {
+      result = pager.resume({ day, section, limit: 500, cursor: result.cursor! })!;
+      check(result);
+      rows.push(...result.rows!);
+      expect(++pages).toBeLessThan(200);
+    }
+    expect(restore(rows)).toEqual(section === "samples" ? events : rollup[section]);
+    expect(rows.some((row) => row.truncated)).toBe(false);
+  }
+});

@@ -231,6 +231,18 @@ function finishBreakdown(groups: Map<string, Breakdown>) {
 export const durations = (): Durations => ({ count: 0, max: 0, exact: [], histogram: undefined });
 
 export const makeAccumulator = () => ({
+  runtimeSamples: new Map<
+    string,
+    {
+      hour: string;
+      samples: number;
+      runningTurnsMax: number;
+      runningTurnsSum: number;
+      queuedRunsMax: number | null;
+      load1Max: number;
+      sampleMsMax: number;
+    }
+  >(),
   total: 0,
   invalidLines: 0,
   restartAdmissionOverflow: 0,
@@ -570,6 +582,31 @@ export function accumulate(
   }
   // Related follow-ups inform a filtered call view without becoming selected events or samples.
   if (correlationOnly) return;
+  if (
+    event.kind === "server.runtime_sample" &&
+    event.props?.runningTurns &&
+    event.props.host &&
+    event.props.sampleMs !== undefined
+  ) {
+    const hour = event.ts.slice(11, 13);
+    const row = target.runtimeSamples.get(hour) ?? {
+      hour,
+      samples: 0,
+      runningTurnsMax: 0,
+      runningTurnsSum: 0,
+      queuedRunsMax: null,
+      load1Max: 0,
+      sampleMsMax: 0,
+    };
+    row.samples++;
+    row.runningTurnsMax = Math.max(row.runningTurnsMax, event.props.runningTurns.total);
+    row.runningTurnsSum += event.props.runningTurns.total;
+    if (event.props.queuedRuns !== undefined)
+      row.queuedRunsMax = Math.max(row.queuedRunsMax ?? 0, event.props.queuedRuns);
+    row.load1Max = Math.max(row.load1Max, event.props.host.load1);
+    row.sampleMsMax = Math.max(row.sampleMsMax, event.props.sampleMs);
+    target.runtimeSamples.set(hour, row);
+  }
   const admission = event.restartAdmission;
   if (
     admission &&
@@ -1112,6 +1149,12 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    runtimeSamples: [...target.runtimeSamples.values()]
+      .map(({ runningTurnsSum, ...row }) => ({
+        ...row,
+        runningTurnsAvg: runningTurnsSum / row.samples,
+      }))
+      .sort((a, b) => a.hour.localeCompare(b.hour)),
     restartAdmission: {
       scope: "server-wide",
       groupBy: "boot-hour",
