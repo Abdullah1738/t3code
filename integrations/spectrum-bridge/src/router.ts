@@ -1803,6 +1803,7 @@ export class Router {
       // Steering skips bridge rows (they wait for their own turn) but never reorders what people sent.
       // What a person typed goes ahead of watcher wakes queued before it: nobody waits behind an event they never sent.
       const sendable = (row: InboundRecord) => row.state === "pending" && !this.stuckWakeAttempted(row.id) && !this.backingOff(row.id, now)
+        && !(this.store.get(`batch-phase:${row.id}`) === "deferred-wake" && this.probeBackoff.cooling(row.id))
         && (!controlCommand((row.payload as NormalizedInbound).text) || !!this.store.get(`human-own-turn:${row.id}`));
       const leader = steer ? rows.find(row => row.state === "pending" && !synthetic(row.id))
         : rows.find(row => row.state === "pending" && resetRow(row.id))
@@ -2204,7 +2205,7 @@ export class Router {
     }).immediate();
   }
 
-  private deferBusyBatch(row: InboundRecord): void {
+  private deferBusyBatch(row: Pick<InboundRecord, "id">): void {
     if (!this.wakeBatch(row.id)) { this.unsealBatch(row.id); return; }
     this.store.db.transaction(() => {
       if (this.store.get(`batch-phase:${row.id}`) !== "preparing"
@@ -3809,7 +3810,7 @@ export class Router {
         this.landed(turn);
       }).immediate();
     } catch (error) { toolError("router", "router.catch40", error);
-      if (error === probeDeferred) return;
+      if (error === probeDeferred) { this.deferUnsentWake(turn); return; }
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }
@@ -4189,6 +4190,23 @@ export class Router {
     if (!allowed) throw probeDeferred;
   }
 
+  private deferUnsentWake(turn: Turn): void {
+    this.store.db.transaction(() => {
+      const id = turn.inboundId;
+      const live = this.store.get<Turn | null>("activeTurn");
+      if (!id || !this.wakeBatch(id) || !this.current(turn) || live?.messageId !== turn.messageId
+        || !["submitting", "unknown", "held"].includes(live.phase)
+        || this.store.get(`batch-phase:${id}`) !== "submitting"
+        || this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?").get(id)?.state !== "processing") return;
+      // The final guard refused before POST. Keep the sealed batch and all earlier admission uncertainty,
+      // but release its active slot so a person never waits behind this unsent attempt.
+      this.setTurn(null);
+      this.store.set("resendBody", null);
+      this.store.set(`batch-phase:${id}`, "preparing");
+      this.deferBusyBatch({ id });
+    }).immediate();
+  }
+
   private async sendDelivery(turn: Turn, body: ResendBody, handled: Set<string>, replay = false): Promise<void> {
     if (this.probeBackoff.cooling(body.inboundId)) return;
     if (this.expireFailedReplay(body.inboundId)) return;
@@ -4204,7 +4222,7 @@ export class Router {
         this.landed(turn);
       }).immediate();
     } catch (error) { toolError("router", "router.catch44", error);
-      if (error === probeDeferred) return;
+      if (error === probeDeferred) { this.deferUnsentWake(turn); return; }
       if (turn.inboundId) this.recordFailure(turn.inboundId, "dispatch", error, turn);
       if (this.current(turn)) await this.reconcile(turn);
     }

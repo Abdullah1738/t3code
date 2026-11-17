@@ -1264,9 +1264,11 @@ test("late failure cannot resurrect history after positive completion", async ()
 });
 
 
-test.each([
+const guardedWakePaths = [
   ["OpenChamber", "submit"], ["Robob", "submit"], ["OpenChamber", "replay"], ["Robob", "replay"],
-] as const)("%s %s alias failure during backend preparation must fence the POST", async (engine, path) => {
+] as const;
+
+function guardedWake(engine: typeof guardedWakePaths[number][0], path: typeof guardedWakePaths[number][1]) {
   const h = setup();
   const old = "wake:former-leader", member = "wake:former-member";
   h.input(old, 15 * 60_000); h.input(member, 15 * 60_000);
@@ -1318,8 +1320,15 @@ test.each([
     const robob = new RobobBackend({ chatRoot:"/Chats", client });
     h.backend.prompt = robob.prompt.bind(robob);
   }
+  return { ...h, old, member, promptKey: `prompt:${route.id}:${prompt.messageId}`, failed: () => failed,
+    recover: () => { failPreparation = false; h.backend.promptAccepted = async () => false; } };
+}
+
+test.each(guardedWakePaths)("%s %s alias failure during backend preparation must fence the POST", async (engine, path) => {
+  const h = guardedWake(engine, path);
+  const member = h.member;
   await h.router.tick();
-  expect(failed).toBe(true);
+  expect(h.failed()).toBe(true);
   expect(h.backend.prompts).toEqual([]);
   const initialAttempts = h.store.get<{ attempts: number }>(`synthetic-retry:${member}`)?.attempts;
   const budget = new ProbeBudget(h.store);
@@ -1331,9 +1340,38 @@ test.each([
     expect(h.store.get<{ attempts: number }>(`synthetic-retry:${member}`)?.attempts).toBe(initialAttempts);
     expect(h.store.get(`stuck-wake-attempt:${member}`)).toBeUndefined();
   }
-  failPreparation = false;
-  h.backend.promptAccepted = async () => false;
+  h.recover();
   setSystemTime(now + 301_000);
   await h.router.tick();
   expect(h.backend.prompts.length).toBeGreaterThan(0);
+});
+
+test.each(guardedWakePaths.flatMap(([engine, path]) => (["cooldown", "cap"] as const).map(wait => ({ engine, path, wait }))))(
+  "$engine $path unsent wake yields to a human during $wait without spending an attempt", async ({ engine, path, wait }) => {
+  const h = guardedWake(engine, path);
+  await h.router.tick();
+  expect(h.failed()).toBe(true);
+  expect(h.backend.prompts).toEqual([]);
+  expect(h.store.get("activeTurn")).toBeNull();
+  expect(h.store.get<string>(`batch-phase:${h.member}`)).toBe("deferred-wake");
+  const retry = h.store.get<Record<string, unknown>>(`synthetic-retry:${h.member}`);
+  const cooldown = h.store.get<Record<string, unknown>>(h.promptKey);
+  const budget = new ProbeBudget(h.store);
+  h.recover();
+  if (wait === "cap") {
+    setSystemTime(now + 60_000);
+    while (budget.take()) {}
+    await h.router.tick();
+    expect(h.backend.prompts).toEqual([]);
+    expect(budget.take()).toBe(false);
+  }
+  setSystemTime(now + (wait === "cooldown" ? 1_000 : 61_000));
+  h.input("typed", 0);
+  await h.router.tick();
+  expect(h.backend.prompts).toEqual([hash("typed")]);
+  expect(h.store.get<string>(`batch-phase:typed`)).toBe("accepted");
+  expect(h.store.get<Record<string, unknown>>(`synthetic-retry:${h.member}`)).toEqual(retry);
+  expect(h.store.get(`stuck-wake-attempt:${h.member}`)).toBeUndefined();
+  expect(h.store.get<Record<string, unknown>>(h.promptKey)).toEqual(cooldown);
+  expect(h.store.get<string>(`batch-phase:${h.member}`)).toBe("deferred-wake");
 });
