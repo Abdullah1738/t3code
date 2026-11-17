@@ -1,6 +1,7 @@
 """Exercise deploy.zsh against synthetic source files and an isolated HOME."""
 
 import os
+import plistlib
 from pathlib import Path
 import shlex
 import shutil
@@ -98,6 +99,26 @@ class DeployTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(calls.read_text().count("log-marker"), count)
 
+    def test_installed_robob_guard_starts_with_granted_shell(self):
+        source = self.pkg / "robob-guard"
+        (source / "scripts").mkdir(parents=True)
+        (source / "bin").mkdir()
+        (source / "bin/robob-install-hold").write_text("#!/bin/sh\nexit 0\n")
+        relative = "scripts/com.ardud.robob-guard.plist"
+        shutil.copy2(INTEGRATIONS / "robob-guard" / relative, source / relative)
+        result = self.run_deploy("robob-guard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = self.home / "Library/LaunchAgents/com.ardud.robob-guard.plist"
+        with installed.open("rb") as stream:
+            plist = plistlib.load(stream)
+        # Preserve the granted launchd entrypoint and pass script paths as argv.
+        self.assertEqual(plist["ProgramArguments"], [
+            "/bin/zsh", "-fc", 'exec /usr/bin/python3 "$@"', "--",
+            "/Users/ardud/.local/share/robob-guard/guard.py",
+        ])
+        self.assertEqual(plist["StartInterval"], 30)
+        self.assertTrue(plist["RunAtLoad"])
+
     def test_usage_returns_two_for_missing_or_unknown_name(self):
         self.enable_node_hook()
         for args in ((), ("unknown",)):
@@ -131,6 +152,8 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn("dry run:", result.stdout)
 
     def test_memory_system_reports_success_only_after_extra_installs(self):
+        # Exercise the install steps inside the outer backup fence.
+        self.env["MEMORY_DEPLOY_FENCED"] = "1"
         scripts = self.pkg / "memory-system/scripts"
         scripts.mkdir(parents=True)
         control = self.pkg / "memory-system/src/backup_control.py"
