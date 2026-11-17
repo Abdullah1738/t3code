@@ -124,6 +124,9 @@ Record the Node version, manager/version, install command and the files that cho
    then CI `setup-node`; offbox follows the CI setup-node version when the repo has no pin.
    Use an installed match on local narrow checks (e.g. put its `~/.nvm/versions/node/<version>/bin` first
    on PATH); offbox provisions a matching Node or stops before the command. Log `node --version`.
+   Home boxes ship `/usr/local/bin/node` without `~/.nvm`; don't source `~/.nvm/nvm.sh` yourself.
+   Offbox picks or provisions the repo's Node and prints `offbox: node`.
+   For an exact version, pass `OFFBOX_NODE=x.y.z`; don't hand-download Node.
    pnpm: `packageManager`, then CI `PNPM_VERSION` / `pnpm/action-setup` `version`. Run it explicitly pinned
    (`corepack pnpm@10 ...` for CI major 10), never a conflicting global pnpm. Check the selected manager's
    `--version` under that Node before both install and checks; select matching npm/Yarn/Bun versions too.
@@ -179,7 +182,8 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
   that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
-- Node version: offbox selects Node from the repo pin (`.nvmrc`/`.node-version`/`engines.node`), then the CI setup-node version, then the nvm default (or newest installed nvm Node, otherwise the box default), and prints its choice, provisioning a missing pinned version or stopping with exit 99; an open range pin (e.g. engines >=22) is narrowed to the CI setup-node version when that fits.
+- Node version: `OFFBOX_NODE=x.y.z` overrides the repo pin with an exact version; otherwise offbox selects Node from the repo pin (`.nvmrc`/`.node-version`/`engines.node`), then the CI setup-node version, then the nvm default (or newest installed nvm Node, otherwise the box default), and prints its choice, provisioning a missing pinned version or stopping with exit 99; an open range pin (e.g. engines >=22) is narrowed to the CI setup-node version when that fits.
+- `offbox ssh` shows the box default Node, not the run's; the run's Node is in `offbox: node` / state.json `node.path`. For paired runs set `OFFBOX_NODE=<x.y.z>`.
 - In JS repos, runs put the current directory's and ancestor `node_modules/.bin` directories up to the repo root first on PATH, so repo-pinned `vp`/`tsc-rs` win over global copies, including after `cd apps/server`. On a fresh checkout or box, install with the repo's package manager first (see **Install with the repo's package manager**); `vp i` itself needs vite-plus installed.
 - pnpm: repos with `pnpm-lock.yaml` use `packageManager` (including explicit pnpm 11+) > CI `PNPM_VERSION` / `pnpm/action-setup` version > lockfile compatibility (9.0 → pnpm 10; fallback never 11+). A verified package in the box-local cache supplies a PATH shim, bypassing Corepack defaults. `offbox: pnpm vX (<source>)` records the selection; activation failure exits 99. Matching installed/cached toolchains make no network requests. Downloads retry all errors twice with 20 s connect, <30 KB/s for 60 s stall, and 600 s per attempt limits.
 - Source of a new lease: `--base N` > the repo's default saved base > the repo's template > `generic`. If boat has

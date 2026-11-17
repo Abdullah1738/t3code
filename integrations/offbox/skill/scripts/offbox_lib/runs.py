@@ -66,7 +66,7 @@ RESTART_MARKER_MAX_S = 300
 # cmd_start answers that prove boat refused the command (nothing ran). Other 4xx and network errors stay ambiguous.
 REFUSED_STATUSES = (400, 401, 403, 404, 409, 413, 422, 429)
 ENV_ALLOW = ("TZ", "LANG", "LC_ALL", "GOFLAGS", "GOPROXY", "GONOSUMDB", "GOPRIVATE", "GOTOOLCHAIN", "CGO_ENABLED",
-             "NODE_OPTIONS", "NODE_ENV", "JEST_WORKERS", "FORCE_COLOR", "NO_COLOR", "PYTHONUNBUFFERED", "PYTEST_ADDOPTS",
+             "OFFBOX_NODE", "NODE_OPTIONS", "NODE_ENV", "JEST_WORKERS", "FORCE_COLOR", "NO_COLOR", "PYTHONUNBUFFERED", "PYTEST_ADDOPTS",
              "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES", "RUST_BACKTRACE", "CARGO_TERM_COLOR", "TERM")
 ENV_DENY_HINTS = ("AWS_", "TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL", "SESSION", "COOKIE", "AUTH")
 # Read from this checkout's skill root, not common.TEMPLATES_DIR: the live copy lacks the file until install.zsh runs.
@@ -1049,7 +1049,7 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
         *(["rm -f -- " + shlex.quote(script_file),
            'find "$HOME/.offbox/cmd" -name "*.sh" -mtime +2 -delete'] if script_file else []),
         'find "$HOME/.offbox/exit" \\( -name "*.rc" -o -name "*.dk" -o -name "*.pid" -o -name "*.gate" '
-        '-o -name "*.trace" -o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
+        '-o -name "*.node.json" -o -name "*.trace" -o -name "*.containers.json" -o -name "*.containers.tmp" \\) -mtime +2 -delete',
     ])
     # Filesystem calls after the preamble are just as capable of wedging as restore's flock/load. The helper
     # owns no run output descriptors and is abandoned at its deadline even if its children cannot be killed.
@@ -1530,7 +1530,7 @@ def build_env(extra: list[str]) -> tuple[dict, list[str]]:
     # Boxes have no AWS instance metadata (169.254.169.254 is blackholed); boto3 without credentials waits ~2 s per lookup.
     env = {"CI": "1", "AWS_EC2_METADATA_DISABLED": "true"}
     for k in ENV_ALLOW:
-        if os.environ.get(k):
+        if os.environ.get(k) or (k == "OFFBOX_NODE" and k in os.environ):
             env[k] = os.environ[k]
     explicit = []
     for spec in extra:
@@ -1651,9 +1651,14 @@ def _source_present(root: Path, cwd: Path) -> None:
         raise common.SourceGone(cwd) from None
 
 
+def validate_node_override(a):
+    node_version.validate_override(getattr(a, 'env', None) or [])
+
+
 class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
+        validate_node_override(a)
         self.run_id = home.take_invocation_run() or new_id("run")
         home.flush_routing(self.run_id)
         self.root = Path(me["repo_root"])
@@ -1806,7 +1811,7 @@ class Runner:
                                                                  effective=size, reason=why)))
             try:
                 save_run_state(self.run_id, resources=resources.unavailable(
-                    'not_started' if api.BACKEND == 'server' else 'boat'),
+                    'not_started' if api.BACKEND == 'server' else 'boat'), node=None,
                     **offbox_disk_space.client_metadata())
             except Exception:
                 pass
@@ -1835,7 +1840,7 @@ class Runner:
         claim = start_check.claim_id(con, self.run_id)
         env_file = f"/home/user/.offbox/env/{claim}.env"
         body = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()).encode()
-        w = node_version.want(self.root, self.cwd)
+        w = node_version.exact_override(env.get("OFFBOX_NODE")) or node_version.want(self.root, self.cwd)
         node_block = node_version.block(w)
         pm = pnpm_version.want(self.root, self.cwd)
         if pm:
@@ -3902,6 +3907,7 @@ def _run_remote(a, rn) -> int:
             admission = follow(rn.box, rn.pid, rn.log_path, echo=False, run_id=rn.run_id,
                                until_command_started=True)
             if admission is _COMMAND_RUNNING:
+                resources.finalize(dict(run_id=rn.run_id, mode='bg'), node_only=True)
                 print(rn.run_id)
                 background_wait_hint(rn.run_id)
                 say(f"started in background on {rn.box}")

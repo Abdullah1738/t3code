@@ -1,4 +1,6 @@
 """Node version pick: parser cases, repo lookup, and the real bash block (no boat calls)."""
+import contextlib
+import io
 import json
 import hashlib
 import os
@@ -6,11 +8,15 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from offbox_lib import node_version, runs  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from offbox_lib import api, base_catalog, cli, common, home, lease, misc, node_version, pool, runs, resources  # noqa: E402
+from test_capacity import Isolated
+from test_bg_empty_logs import _BackgroundOutputFixture
 
 K = node_version._key
 TOP = node_version.TOP
@@ -62,6 +68,15 @@ class WantTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def selected_label(self, wanted):
+        with tempfile.TemporaryDirectory() as home:
+            fake_nvm(home, ('v20.18.0', 'v22.13.0', 'v22.23.5', 'v24.22.1'))
+            result = subprocess.run(['bash', '-c', node_version.block(wanted)],
+                                    env={'HOME': home, 'PATH': '/usr/bin:/bin'},
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return next(line for line in result.stderr.splitlines() if line.startswith('offbox: node '))
 
     def write(self, rel, text):
         p = self.root / rel
@@ -275,7 +290,7 @@ class WantTests(unittest.TestCase):
         self.assertEqual(ranges, [(K(22), K(23))])
         self.assertEqual(label, 'package.json engines >=22, narrowed by '
                                '.github/workflows/ci.yml node-version 22 (+1 workflows)')
-        self.assertNotIn('open range', node_version.block((ranges, label)))
+        self.assertNotIn('open range', self.selected_label((ranges, label)))
 
     def test_open_range_forms_and_exclusive_bounds(self):
         self.write('.github/workflows/ci.yml', 'node-version: 22')
@@ -304,7 +319,7 @@ class WantTests(unittest.TestCase):
                     self.pkg(spec)
                     self.assertEqual(node_version.want(self.root, self.root),
                                      (node_version.parse_range(spec), f'package.json engines {spec}'))
-                    self.assertNotIn('open range', node_version.block(node_version.want(self.root, self.root)))
+                    self.assertNotIn('open range', self.selected_label(node_version.want(self.root, self.root)))
 
     def test_version_file_precedence_survives_ci(self):
         self.pkg('>=22')
@@ -327,7 +342,7 @@ class WantTests(unittest.TestCase):
                 wanted = node_version.want(self.root, self.root)
                 self.assertEqual(wanted, ([(K(22), TOP)], 'package.json engines >=22'))
                 self.assertIn('package.json engines >=22; open range, newest on this box',
-                              node_version.block(wanted))
+                              self.selected_label(wanted))
 
     def test_ci_matrix_remaining_open_is_labelled(self):
         self.pkg('>=20')
@@ -335,7 +350,7 @@ class WantTests(unittest.TestCase):
         wanted = node_version.want(self.root, self.root)
         self.assertEqual(wanted[0], [(K(20), K(21)), (K(22), K(23))])
         self.assertIn('narrowed by', wanted[1])
-        self.assertIn('open range, newest on this box', node_version.block(wanted))
+        self.assertIn('open range, newest on this box', self.selected_label(wanted))
 
     def test_want_never_raises_on_ci_lookup_failure(self):
         self.pkg('>=22')
@@ -533,14 +548,16 @@ def fake_nvm(home, versions):
 class BlockRunTests(unittest.TestCase):
     """Run remote_script with the real bash and a fake nvm tree."""
 
-    def run_block(self, engines, cmd_argv=None, steps=None, nvm=True, versions=('v22.23.2', 'v24.18.1', 'v24.21.0', 'v22.1.0-rc')):
+    def run_block(self, engines, cmd_argv=None, steps=None, nvm=True, override=None, pin=None, versions=('v22.23.2', 'v24.18.1', 'v24.21.0', 'v22.1.0-rc')):
         with tempfile.TemporaryDirectory() as home:
             repo = Path(home) / 'w/repo'
             repo.mkdir(parents=True)
             (repo / 'package.json').write_text(json.dumps({'engines': {'node': engines}}))
             if nvm:
                 fake_nvm(home, versions)
-            w = node_version.want(repo, repo)
+            if pin:
+                (repo / '.nvmrc').write_text(pin)
+            w = node_version.want(repo, repo, override=override)
             blk = node_version.block(w)
             with patch.object(runs, 'GO_REPAIR', ':'), patch.object(runs, 'DOCKER_REPAIR', ':'), \
                     patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs.userns, 'setup', return_value=':'):
@@ -552,7 +569,114 @@ class BlockRunTests(unittest.TestCase):
             curl.write_text('#!/bin/sh\nexit 18\n')
             curl.chmod(0o755)
             env = {'HOME': home, 'PATH': str(bindir) + ':/usr/bin:/bin'}
-            return subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(['bash', '-c', script], env=env, capture_output=True, text=True, timeout=60)
+            receipt = Path(home) / '.offbox/exit/run-test.node.json'
+            result.node = json.loads(receipt.read_text()) if receipt.exists() else None
+            return result
+
+    def test_caret_records_candidates_and_choice(self):
+        result = self.run_block('^24.13.1', versions=('v24.22.1', 'v24.22.3'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'v24.22.3')
+        self.assertIn('newest of 2 fitting on this box (v24.22.3, v24.22.1)', result.stderr)
+        self.assertEqual(result.node['version'], 'v24.22.3')
+        self.assertTrue(result.node['path'].endswith('/.nvm/versions/node/v24.22.3/bin/node'))
+        self.assertEqual(result.node['pin'], 'package.json engines ^24.13.1')
+        self.assertEqual(result.node['choice'], 'newest nvm')
+        self.assertEqual(result.node['candidates'], ['v24.22.3', 'v24.22.1'])
+
+    def test_exact_override_replaces_repo_pin(self):
+        for override in ('24.22.1', 'v24.22.1'):
+            with self.subTest(override=override):
+                result = self.run_block('^24.13.1', override=override, versions=('v24.22.1', 'v24.22.3'))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), 'v24.22.1')
+                self.assertIn(f'OFFBOX_NODE={override} (override)', result.stderr)
+                self.assertNotIn('newest of', result.stderr)
+                self.assertEqual(result.node['candidates'], ['v24.22.1'])
+
+    def test_exact_pin_has_no_newest_suffix(self):
+        result = self.run_block('>=22 <23', pin='22.13.0', versions=('v22.13.0', 'v22.13.1'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('newest of', result.stderr)
+        self.assertEqual(result.node['version'], 'v22.13.0')
+
+    def test_override_input_forms_fail_before_registration(self):
+        for value in ('24', '24.22', '^24.22.1', '>=24', '24.22.1-rc.1', '24.22.1+build',
+                      '', ' 24.22.1', '24.22.1\n', '024.22.1', '24.1000.0', '$(echo unsafe)'):
+            with self.subTest(value=value), patch.object(runs, 'db') as db, \
+                    patch.dict(os.environ, {'OFFBOX_NODE': value}):
+                with self.assertRaises(runs.OffboxError) as raised:
+                    runs.Runner(SimpleNamespace(env=[]), {})
+                self.assertEqual(raised.exception.code, 99)
+                self.assertIn('OFFBOX_NODE', str(raised.exception))
+                db.assert_not_called()
+                self.assertIsNone(node_version.want(Path('/missing'), Path('/missing'), override=value))
+                for explicit in (False, True):
+                    args = ['run', '--bg'] + (['--env', f'OFFBOX_NODE={value}'] if explicit else []) + ['--', 'true']
+                    a = cli.build_parser().parse_args(args)
+                    with patch.object(home, 'before_run') as preflight, patch.object(home, 'run_identity') as identity:
+                        with self.assertRaises(runs.OffboxError) as raised:
+                            cli.cmd_run(a, {})
+                        self.assertEqual(raised.exception.code, 99)
+                        preflight.assert_not_called()
+                        identity.assert_not_called()
+                    with patch.object(home, 'person_gate') as person_gate, \
+                            patch('offbox_lib.identity.whoami') as whoami, \
+                            patch.object(api, 'probe_backend') as probe, contextlib.redirect_stderr(io.StringIO()) as errors:
+                        self.assertEqual(cli.main(args), 99)
+                        self.assertIn('OFFBOX_NODE', errors.getvalue())
+                        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                        person_gate.assert_not_called()
+                        whoami.assert_not_called()
+                        probe.assert_not_called()
+                    for base in (['--base', 'warm'], ['--base=warm'], ['--bas=warm'], ['--fresh']):
+                        routed = args[:1] + base + args[1:]
+                        with patch.object(base_catalog, 'rows') as rows, patch.object(common, 'home_config') as config:
+                            with self.assertRaises(runs.OffboxError) as raised:
+                                common.entry_backend(routed)
+                            self.assertEqual(raised.exception.code, 99)
+                            rows.assert_not_called()
+                            config.assert_not_called()
+
+    def test_override_env_and_explicit_env_precedence(self):
+        with patch.dict(os.environ, {'OFFBOX_NODE': '24.22.3'}):
+            self.assertEqual(runs.build_env([])[0]['OFFBOX_NODE'], '24.22.3')
+            self.assertEqual(runs.build_env(['OFFBOX_NODE=24.22.1'])[0]['OFFBOX_NODE'], '24.22.1')
+
+    def test_record_collects_facts_and_client_label_once(self):
+        result = self.run_block('^24.13.1', versions=('v24.22.1', 'v24.22.3'))
+        with tempfile.TemporaryDirectory() as directory, patch.object(runs, 'LOGS_DIR', Path(directory)):
+            path = Path(directory) / 'run-test.log'
+            path.write_text(result.stderr)
+            for _ in range(2):
+                node_version.record({'run_id': 'run-test'}, path)
+            self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], result.node)
+            label = path.with_suffix('.client.log').read_text()
+            self.assertEqual(label.count('offbox: node'), 1)
+            self.assertIn('newest of 2 fitting', label)
+
+    def test_completed_run_metadata_collects_on_later_wait(self):
+        result = self.run_block('^24.13.1', versions=('v24.22.1', 'v24.22.3'))
+        with tempfile.TemporaryDirectory() as directory, patch.object(runs, 'LOGS_DIR', Path(directory)), \
+                patch.object(resources, 'PREFIX', 'unused-resources: '):
+            path = Path(directory) / 'run-test.log'
+            path.write_text(result.stderr)
+            runs.save_run_state('run-test', node=None)
+            # A waiter can see a terminal row saved by an older/different client.
+            resources.finalize(dict(run_id='run-test', mode='bg', status='done', exit_code=0))
+            self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], result.node)
+            self.assertIn('newest of 2 fitting', path.with_suffix('.client.log').read_text())
+
+    def test_missing_or_malformed_facts_are_null(self):
+        for body in ('', 'offbox-node: {}\n', 'offbox-node: null\n', 'offbox-node: broken{\n'):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(runs, 'LOGS_DIR', Path(directory)):
+                path = Path(directory) / 'run-test.log'
+                path.write_text(body)
+                runs.save_run_state('run-test', node=None)
+                node_version.record({'run_id': 'run-test'}, path)
+                self.assertIsNone(json.loads(path.with_suffix('.state.json').read_text())['node'])
 
     def test_range_picks_newest_fitting(self):
         r = self.run_block('>=22.13 <23')
@@ -568,7 +692,7 @@ class BlockRunTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), 'v24.22.1')
         self.assertIn('offbox: node v24.22.1 (package.json engines >=22; '
-                      'open range, newest on this box)', r.stderr)
+                      'open range, newest on this box; newest of 2 fitting on this box (v24.22.1, v22.23.5))', r.stderr)
 
     def test_no_match_stops_before_command(self):
         r = self.run_block('18', cmd_argv=['echo ran'])
@@ -590,7 +714,7 @@ class BlockRunTests(unittest.TestCase):
         self.assertEqual(r.returncode, 99)
 
 class ProvisionTests(unittest.TestCase):
-    def run_provision(self, pin='v20', engine='^20.19.0 || >=22.12.0 <23', installed=(), fail=False, retry='once', system='v24.22.1', checksum_bad=False, require_nvm=False, workflow=None, nvm_hook=''):
+    def run_provision(self, pin='v20', engine='^20.19.0 || >=22.12.0 <23', installed=(), fail=False, retry='once', system='v24.22.1', checksum_bad=False, require_nvm=False, workflow=None, nvm_hook='', override=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); repo = root / 'repo'; repo.mkdir()
             if workflow is None:
@@ -604,11 +728,11 @@ class ProvisionTests(unittest.TestCase):
             fake_nvm(tmp, installed)
             bindir = root / 'bin'; bindir.mkdir()
             node = bindir / 'node'; node.write_text(FAKE.format(v=system)); node.chmod(0o755)
-            (root / 'index.tab').write_text('version date\nv24.22.1 1\nv22.23.5 1\nv22.23.2 1\nv22.13.9 1\nv22.13.0 1\nv22.12.0 1\nv20.20.2 1\nv20.18.0 1\n')
+            (root / 'index.tab').write_text('version date\nv24.99.0 1\nv24.22.1 1\nv22.23.5 1\nv22.23.2 1\nv22.13.9 1\nv22.13.0 1\nv22.12.0 1\nv20.20.2 1\nv20.18.0 1\n')
             body = b'node archive fixture'
             (root / 'archive').write_bytes(body)
             digest = '0' * 64 if checksum_bad else hashlib.sha256(body).hexdigest()
-            (root / 'sums').write_text(''.join(f'{digest}  node-{v}-linux-x64.tar.xz\n' for v in ('v20.20.2', 'v22.13.0', 'v22.13.9', 'v22.23.2', 'v22.23.5', 'v24.22.1')))
+            (root / 'sums').write_text(''.join(f'{digest}  node-{v}-linux-x64.tar.xz\n' for v in ('v24.99.0', 'v20.20.2', 'v22.13.0', 'v22.13.9', 'v22.23.2', 'v22.23.5', 'v24.22.1')))
             (root / 'nvm-fixture.sh').write_text(r'''
 nvm_get_download_slug() { echo node-$3-linux-x64; }
 nvm_get_artifact_compression() { echo tar.xz; }
@@ -632,7 +756,7 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$HOME/index.tab" "$out" ;; */SHASUMS256.txt) cp "$HOME/sums" "$out" ;; *.tar.xz) cp "$HOME/archive" "$out" ;; *) exit 88 ;; esac
 '''); curl.chmod(0o755)
-            script = node_version.block(node_version.want(repo, repo), require_nvm=require_nvm) + '\necho COMMAND_MARKER\nnode --version'
+            script = node_version.block(node_version.want(repo, repo, override=override), require_nvm=require_nvm) + '\necho COMMAND_MARKER\nnode --version'
             result = subprocess.run(['bash', '-c', script], env={'HOME': tmp, 'PATH': f'{bindir}:/usr/bin:/bin',
                 'NVM_FAIL': str(int(fail)), 'CURL_FAIL': retry, 'OFFBOX_BOX_ID': 'bx_fixture'}, capture_output=True, text=True, timeout=15)
             count = int((root / 'count').read_text()) if (root / 'count').exists() else 0
@@ -640,6 +764,17 @@ case "$url" in */nvm.sh) cp "$HOME/nvm-fixture.sh" "$out" ;; */index.tab) cp "$H
                 self.assertFalse((root / '.nvm/versions/node/v20.20.2').exists())
                 self.assertFalse(list((root / '.nvm').glob('.offbox-stage.*')))
             return result, count
+
+    def test_missing_override_uses_verified_installer(self):
+        result, count = self.run_provision(override='24.99.0', retry='never')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('node v24.99.0 (installed: OFFBOX_NODE=24.99.0 (override))', result.stderr)
+        self.assertIn('COMMAND_MARKER', result.stdout)
+        self.assertGreater(count, 0)
+        result, _ = self.run_provision(override='24.99.0', checksum_bad=True)
+        self.assertEqual(result.returncode, 99)
+        self.assertNotIn('COMMAND_MARKER', result.stdout)
+        self.assertIn('checksum mismatch', result.stderr)
 
     def test_pin_provision_corpus(self):
         for pin, engine, installed, expected in [
@@ -726,6 +861,192 @@ class RecipeTests(unittest.TestCase):
         self.assertLess(script.index('nvm install -b'), script.index('# ---- recipe ----'))
         self.assertIn('__offbox_archive_ok()', script)
         self.assertIn('mv "$NVM_DIR/versions/node/', script)
+
+
+def node_receipt(version):
+    facts = dict(version=version, path=f'/home/user/.nvm/versions/node/{version}/bin/node',
+                 pin='package.json engines ^24.13.1', choice='newest nvm', candidates=[version])
+    return facts, 'offbox-node: ' + json.dumps(dict(facts, label=facts['pin'])) + '\n'
+
+
+class NodeCollectionTests(Isolated):
+    def test_executable_rejects_override_before_backend_routing(self):
+        scripts = Path(__file__).resolve().parents[1]
+        program = '''import runpy, sys
+sys.path.insert(0, sys.argv.pop(1))
+from offbox_lib import common
+def forbidden(*args, **kwargs):
+    raise AssertionError('backend lookup happened before Node validation')
+common.home_config = forbidden
+sys.argv[0] = sys.path[0] + '/offbox.py'
+runpy.run_path(sys.argv[0], run_name='__main__')
+'''
+        forms = ([], ['--env', 'OFFBOX_NODE=24'], ['--env=OFFBOX_NODE=24'], ['--en=OFFBOX_NODE=24'],
+                 ['--env=OFFBOX_NODE=24.22.1', '--env=OFFBOX_NODE=24'])
+        for extra in forms:
+            with self.subTest(extra=extra):
+                result = subprocess.run([sys.executable, '-I', '-c', program, str(scripts),
+                                         'run', '--base=warm', *extra, '--', 'true'],
+                                        env=dict(os.environ, OFFBOX_NODE='24'), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 99, result.stderr)
+                self.assertIn('OFFBOX_NODE must be an exact', result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_collector_skips_unchanged_log_and_handles_rewrites(self):
+        first, receipt = node_receipt('v24.22.1')
+        path = runs.LOGS_DIR / 'run-test.log'
+        path.write_text(receipt + 'offbox-command-started: run-test\n' + 'output\n' * 10000)
+        real_open, reads = Path.open, []
+        def tracked_open(p, *args, **kwargs):
+            stream = real_open(p, *args, **kwargs)
+            if p == path and args == ('rb',):
+                readline = stream.readline
+                def tracked_readline(*args):
+                    reads.append(1)
+                    return readline(*args)
+                stream.readline = tracked_readline
+            return stream
+        with patch.object(Path, 'open', tracked_open):
+            node_version.record(dict(run_id='run-test'), path)
+            self.assertEqual(len(reads), 10002)
+            node_version.record(dict(run_id='run-test'), path)
+            self.assertEqual(len(reads), 10002)
+            final, receipt = node_receipt('v24.22.3')
+            with path.open('a') as stream:
+                stream.write('offbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                             'it is queued again as attempt 2\n' + receipt + 'offbox-command-started: run-test\n')
+            node_version.record(dict(run_id='run-test'), path)
+            self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], final)
+            # Rewrites/truncation and a trailing partial line must not reuse the old attempt.
+            path.write_text(receipt[:-2])
+            node_version.record(dict(run_id='run-test'), path)
+            self.assertIsNone(json.loads(path.with_suffix('.state.json').read_text())['node'])
+            with path.open('a') as stream:
+                stream.write(receipt[-2:])
+            node_version.record(dict(run_id='run-test'), path)
+            self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], final)
+        for mutation in ('larger in-place rewrite', 'same-size rewrite', 'truncate', 'replace inode'):
+            with self.subTest(mutation=mutation):
+                _, original = node_receipt('v24.22.1')
+                prefix = 'offbox-command-started: run-test\n'
+                suffix = 'identical output suffix\n' * 1000
+                path.write_text(original + prefix + suffix)
+                node_version.record(dict(run_id='run-test'), path)
+                body = receipt + prefix + ('' if mutation == 'truncate' else suffix)
+                if mutation == 'larger in-place rewrite':
+                    body += 'larger\n'
+                if mutation == 'replace inode':
+                    replacement = path.with_suffix('.replacement')
+                    replacement.write_text(body)
+                    replacement.replace(path)
+                else:
+                    path.write_text(body)
+                node_version.record(dict(run_id='run-test'), path)
+                self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], final)
+
+    def test_background_admission_and_active_logs_collect_node(self):
+        self.box('bx', member=True)
+        a = cli.build_parser().parse_args(['run', '--bg', '--', 'echo hello'])
+        runner = runs.Runner(a, self.me)
+        first, receipt = node_receipt('v24.22.1')
+        marker = f'{runs.COMMAND_STARTED_MARKER} {runner.run_id}\n'
+        initial = 'offbox evidence wrapper pid=1\n' + receipt + marker
+        with patch.object(pool, 'acquire', return_value=dict(box_id='bx', remote_dir='w/r', size='large')), \
+                patch.object(runs.Runner, '_prepare_box', return_value=None), patch.object(runs, '_ttl_keeper'), \
+                patch.object(lease, 'touch'), patch.object(lease, 'ensure_ttl'), patch.object(lease, 'idle_ttl'), \
+                patch.object(api, 'get', return_value=dict(state='running')), \
+                patch.object(api, 'cmd_start', return_value=dict(processId=7, commandId='cmd_a')), \
+                patch.object(api, 'cmd_attach', return_value=iter([dict(type='stderr', data=initial)])), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(runs._run_remote(a, runner), 0)
+            state = runner.log_path.with_suffix('.state.json')
+            self.assertEqual(json.loads(state.read_text())['node'], first)
+            self.assertIn('offbox: node v24.22.1', runner.log_path.with_suffix('.client.log').read_text())
+            self.assertNotIn('box pressure', runner.log_path.read_text())
+            final, receipt = node_receipt('v24.22.3')
+            retained = (initial + 'offbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                        'it is queued again as attempt 2\noffbox evidence wrapper pid=2\n' + receipt + marker)
+            def history(box, cmd, which, offset, **kw):
+                data = retained if which == 'stderr' else ''
+                return dict(data=data[offset:], nextOffset=len(data), size=len(data), done=False)
+            with patch.object(api, 'history_logs', side_effect=history):
+                self.assertEqual(misc.logs(runner.run_id, False), 0)
+            self.assertEqual(json.loads(state.read_text())['node'], final)
+            self.assertIn('offbox: node v24.22.3', runner.log_path.with_suffix('.client.log').read_text())
+            self.assertNotIn('box pressure', runner.log_path.read_text())
+
+    def test_latest_attempt_replaces_receipt_and_ignores_user_output(self):
+        _, first = node_receipt('v24.22.1')
+        final, receipt = node_receipt('v24.22.3')
+        marker = 'offbox-command-started: run-test\n'
+        retry = ('offbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                 'it is queued again as attempt 2\n')
+        for boundary in (retry, retry + 'offbox evidence wrapper pid=2\n'):
+            for tail, expected in ((receipt + marker + first, final), ('', None),
+                                   ('offbox-node: {}\n' + marker, None)):
+                with self.subTest(boundary=boundary, tail=tail):
+                    path = runs.LOGS_DIR / 'run-test.log'
+                    path.write_text('offbox evidence wrapper pid=1\n' + first + marker)
+                    node_version.record(dict(run_id='run-test'), path)
+                    with path.open('a') as stream:
+                        stream.write(boundary + tail)
+                    for _ in range(2):
+                        resources.finalize(dict(run_id='run-test', mode='bg'), node_only=True)
+                    self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], expected)
+
+    def test_nested_wrapper_and_receipt_are_user_output(self):
+        facts, receipt = node_receipt('v24.22.1')
+        _, nested = node_receipt('v24.99.0')
+        path = runs.LOGS_DIR / 'run-test.log'
+        path.write_text('offbox evidence wrapper pid=1\n' + receipt + 'offbox-command-started: run-test\n' +
+                        'offbox evidence wrapper pid=2\n' + nested + 'offbox-command-started: another-run\n')
+        for _ in range(2):
+            node_version.record(dict(run_id='run-test'), path)
+        self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], facts)
+
+    def test_long_user_line_keeps_later_retry_visible(self):
+        _, first = node_receipt('v24.22.1')
+        final, receipt = node_receipt('v24.22.3')
+        path = runs.LOGS_DIR / 'run-test.log'
+        path.write_text(first + 'offbox-command-started: run-test\n' + 'x' * 131072 + '\n' +
+                        'offbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                        'it is queued again as attempt 2\n' + receipt + 'offbox-command-started: run-test\n')
+        node_version.record(dict(run_id='run-test'), path)
+        self.assertEqual(json.loads(path.with_suffix('.state.json').read_text())['node'], final)
+
+
+class RecoveredNodeTests(_BackgroundOutputFixture):
+    def test_verified_recovered_stderr_collects_for_logs_and_wait(self):
+        facts, receipt = node_receipt('v24.22.3')
+        _, forged = node_receipt('v24.99.0')
+        stdout, stderr = forged.encode(), receipt.encode()
+        self.box_get.return_value = dict(state='running')
+        self.history.side_effect = runs.OffboxError('history unavailable')
+        def ssh(argv, **kw):
+            kw['stdout'].write(stdout + stderr)
+            return subprocess.CompletedProcess(argv, 0, stderr=f'streams {len(stdout)} {len(stderr)}\n'.encode())
+        runs.save_run_state('run-x', node=None)
+        with patch.object(misc.subprocess, 'run', side_effect=ssh):
+            self.assertEqual(self.invoke()[0], 0)
+            self.assertEqual(self.invoke(wait=True)[0], 0)
+        self.assertEqual(json.loads(self.path.with_suffix('.state.json').read_text())['node'], facts)
+        label = self.path.with_suffix('.client.log').read_text()
+        self.assertEqual(label.count('offbox: node v24.22.3'), 1)
+        self.assertNotIn('v24.99.0', label)
+
+    def test_unverified_or_changed_recovered_copy_cannot_supply_facts(self):
+        _, receipt = node_receipt('v24.22.3')
+        raw = receipt.encode()
+        remote = Path(str(self.path) + '.remote')
+        self.path.write_text('')
+        remote.write_bytes(raw)
+        for meta in (dict(merged=False), dict(merged=True, lengths=[0, len(raw) + 1], hashes=['0'*64]*2),
+                     dict(merged=True, lengths=[0, len(raw)], hashes=['0'*64]*2)):
+            with self.subTest(meta=meta):
+                runs.save_run_state('run-x', node=None)
+                Path(str(self.path) + '.remote.json').write_text(json.dumps(meta))
+                resources.finalize(self.row(), node_only=True)
+                self.assertIsNone(json.loads(self.path.with_suffix('.state.json').read_text())['node'])
 
 
 if __name__ == '__main__':

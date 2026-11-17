@@ -733,6 +733,8 @@ def _catch_up_log(r, budget: float | None = None, *, locked: bool = False, live:
                 log(f"logs_fetch {r['box_id'] or '-'} {detail}")
         except OSError:
             pass
+        from . import resources
+        resources.finalize(r, node_only=True)
 
 
 def _fetch_log(r, budget, *, locked, live, lock_wait, stats) -> str:
