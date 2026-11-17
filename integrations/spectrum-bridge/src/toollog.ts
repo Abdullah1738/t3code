@@ -56,6 +56,14 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (["moni-box-fenced", "moni-box-unfenced"].includes(entry.name)) {
+      if (key === "event" && typeof value === "string" && /^[a-f0-9]{12}$/.test(value)
+        || key === "kind" && (value === "inbound" || value === "wake")
+        || key === "hasSend" && typeof value === "boolean"
+        || ["queuedBehind", "fencedMs"].includes(key) && typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+        props[key] = value; continue;
+      }
+    }
     if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if ((NUMBERS.has(key) || key === "replies" && entry.name === "notice.reply") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;

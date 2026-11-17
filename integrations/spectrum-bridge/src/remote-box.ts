@@ -10,6 +10,12 @@ export type RemoteBoxConfig = { kind: "remote-box"; url: string; tokenFile: stri
   publicKeyFile: string; boxRouterPort?: number; macRouterPort?: number; callbackPort: number; epoch: string; boxId: string;
   noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number };
 type Outage = { id: string; unreachableSince: number | null; reachableSince: number | null; noticeAttempted?: boolean };
+type Fence = { id: string; since: number; queuedBehind: number };
+type FenceAlert = { key: string; text: string };
+type BoxEvent = { id: string; state: string; failure: string | null; kind: "inbound" | "wake"; interruptedAt: number | null; hasSend: boolean };
+export class RemoteRequestError extends Error {
+  constructor(readonly status: number) { super("Box request failed"); }
+}
 export function remoteBoxConfig(config: { chatBackends?: unknown }, slug: string): RemoteBoxConfig | undefined {
   const entries = config.chatBackends as Record<string, unknown> | undefined;
   const entry = entries?.[slug] as RemoteBoxConfig | undefined;
@@ -33,11 +39,13 @@ export class RemoteBox {
   private readonly token: string;
   private readonly callbackToken: string;
   private busy = false;
+  private fenceBusy = false;
   private nextProbe = 0;
   private failures = 0;
   constructor(readonly config: RemoteBoxConfig, readonly store: Store, private readonly io: {
     fetch?: Fetch; now?: () => number; log: (event: string, code?: string) => void;
     notice: (id: string, text: string) => Promise<void>; active: () => boolean;
+    ownerAlert?: (severity: "attention", text: string, key: string) => Promise<boolean>;
   }) {
     this.sessionId = `remote:moni:${config.epoch}`;
     this.publicKey = readFileSync(config.publicKeyFile, "utf8");
@@ -62,18 +70,18 @@ export class RemoteBox {
       outage.unreachableSince = null; outage.reachableSince = null; store.set("remoteOutage", outage);
     }
   }
-  private emit(event: string, code?: string, durationMs?: number) {
-    this.io.log(event, code);
+  private emit(event: string, code?: string, durationMs?: number, props?: Record<string, string | number | boolean>) {
+    this.io.log(event, props ? JSON.stringify(props) : code);
     toolLog.capture(() => toolLog.write({ component: "remote-box", kind: durationMs === undefined ? "event" : "perf",
       name: event, ids: { chat: "moni" }, ...(durationMs === undefined ? {} : { durationMs }),
-      ...(code?.startsWith("n=") ? { props: { count: Number(code.slice(2)) } }
+      ...(props ? { props } : code?.startsWith("n=") ? { props: { count: Number(code.slice(2)) } }
         : event === "moni-notice-suppressed" && code ? { props: { reason: code } } : {}) }));
   }
   private now() { return (this.io.now ?? Date.now)(); }
   accept(id: string, input: unknown, receipt?: AgentAnswerReceipt, kind: "inbound" | "wake" = "inbound"): boolean {
     const key = opaqueId(id);
     return this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind) VALUES (?,?,?,?)")
-      .run(key, JSON.stringify(seal(this.publicKey, input)), receipt ? JSON.stringify(receipt) : null, kind).changes === 1;
+      .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind).changes === 1;
   }
   receipt(id: string): AgentAnswerReceipt | undefined {
     const row = this.store.db.query<{ receipt: string | null }, [string]>("SELECT receipt FROM remote_inbox WHERE id=?").get(opaqueId(id));
@@ -85,12 +93,67 @@ export class RemoteBox {
   async request(path: string, body: unknown): Promise<Record<string, unknown>> {
     const response = await (this.io.fetch ?? fetch)(this.config.url + path, { method: "POST", redirect: "error",
       headers: { authorization: `Bearer ${this.token}`, "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(path === "/lease" ? 12_000 : 10_000) });
-    if (!response.ok) throw new Error("Box request failed");
+    if (!response.ok) throw new RemoteRequestError(response.status);
     return jsonBody(response as unknown as Request);
+  }
+  async events(after?: string, headOnly = false): Promise<{ events: BoxEvent[]; nextCursor?: string; remaining?: number }> {
+    const response = await this.request("/events", { ...(after ? { after } : {}), ...(headOnly ? { headOnly: true } : {}) });
+    if (!Array.isArray(response.events)) throw new Error("Invalid box events");
+    if (response.remaining !== undefined && (!Number.isSafeInteger(response.remaining) || Number(response.remaining) < 1 || !validId(response.nextCursor))) throw new Error("Invalid event cursor");
+    const events = response.events.map((row: unknown): BoxEvent => {
+      if (typeof row !== "object" || row === null || !("id" in row) || !validId(row.id)
+        || !("state" in row) || !["pending", "running", "interrupted", "attachment-failed"].includes(String(row.state))
+        || !("kind" in row) || !["inbound", "wake"].includes(String(row.kind))
+        || !("interruptedAt" in row) || row.interruptedAt !== null && (!Number.isSafeInteger(row.interruptedAt) || Number(row.interruptedAt) < 0)
+        || !("hasSend" in row) || typeof row.hasSend !== "boolean") throw new Error("Invalid box event");
+      return { id: row.id, state: row.state as string, kind: row.kind as BoxEvent["kind"], interruptedAt: row.interruptedAt as number | null,
+        hasSend: row.hasSend, failure: "failure" in row && ["invalid", "unavailable", "too-large"].includes(String(row.failure)) ? String(row.failure) : null };
+    });
+    return { events, ...(response.remaining === undefined ? {} : { remaining: response.remaining as number, nextCursor: response.nextCursor as string }) };
+  }
+  async resolve(id: string, state: "done" | "pending") {
+    const result = await this.request("/resolve", { id, state, reconciled: true });
+    if (result.accepted !== true) throw new Error("Invalid box acknowledgement");
+    return { accepted: true };
+  }
+  private async probeFence() {
+    // An interrupted turn may have used a tool. Surface the fence; only an owner reconciles it.
+    // Probe failures are observational and must never enter the link-outage notice path.
+    let events: BoxEvent[], remaining: number | undefined;
+    try { ({ events, remaining } = await this.events(undefined, true)); } catch { this.emit("moni-box-events-error"); return; }
+    const saved = this.store.get<Fence | null>("remoteFence");
+    const head = events.find(row => row.state !== "attachment-failed");
+    if (saved && (head?.state !== "interrupted" || head.id !== saved.id)) {
+      this.store.set("remoteFence", null);
+      this.emit("moni-box-unfenced", undefined, undefined, { event: saved.id.slice(0, 12), fencedMs: Math.max(0, this.now() - saved.since) });
+    }
+    if (head?.state !== "interrupted") return;
+    const queuedBehind = remaining ?? 0;
+    const fence = saved?.id === head.id ? saved : { id: head.id, since: head.interruptedAt ?? this.now(), queuedBehind: -1 };
+    const ageMs = Math.max(0, this.now() - fence.since), event = head.id.slice(0, 12);
+    if (queuedBehind > fence.queuedBehind) {
+      fence.queuedBehind = queuedBehind;
+      this.store.set("remoteFence", fence);
+      this.emit("moni-box-fenced", undefined, undefined, { event, kind: head.kind, ageMs, hasSend: head.hasSend, queuedBehind });
+    }
+    const alertKey = `remoteFenceAlert:${head.id}`;
+    const savedAlert = this.store.get<true | FenceAlert>(alertKey);
+    if (this.io.ownerAlert && savedAlert !== true) {
+      const age = ageMs < 60_000 ? `${Math.floor(ageMs / 1000)}s` : `${Math.floor(ageMs / 60_000)}m`;
+      const alert = savedAlert ?? { key: `moni-box-fenced:${event}`,
+        text: `Moni's box agent is stuck on one interrupted ${head.kind} (${age}); ${queuedBehind} later messages waiting. Resolve: spectrum-bridge remote-resolve --chat moni --id ${head.id} --state done|pending --session <owner-session>` };
+      // Telegram deduplicates immutable requests. Keep the original text across retries and restarts.
+      if (!savedAlert) this.store.set(alertKey, alert);
+      try {
+        if (await this.io.ownerAlert("attention", alert.text, alert.key)) this.store.set(alertKey, true);
+        else this.emit("moni-box-fence-alert-error");
+      } catch { this.emit("moni-box-fence-alert-error"); }
+    }
   }
   async tick(): Promise<void> {
     if (this.busy || this.now() < this.nextProbe || !this.io.active()) return;
     this.busy = true;
+    let healthy = false;
     try {
       const status = await this.request("/lease", { epoch: this.config.epoch, boxId: this.config.boxId });
       if (status.boxId !== this.config.boxId || status.epoch !== this.config.epoch) throw new Error("Box identity mismatch");
@@ -114,6 +177,7 @@ export class RemoteBox {
       if (delivered) this.emit("moni-queue-delivered", `n=${delivered}`);
       this.emit("moni-queue-depth", `n=${this.store.db.query<{ n: number }, []>("SELECT count(*) n FROM remote_inbox WHERE sealed IS NOT NULL").get()!.n}`);
       this.nextProbe = this.now() + 5_000;
+      healthy = true;
     } catch {
       const saved = this.store.get<Outage | null>("remoteOutage");
       const outage: Outage = saved ?? { id: opaqueId(String(this.now())), unreachableSince: this.now(), reachableSince: null };
@@ -136,6 +200,12 @@ export class RemoteBox {
       this.nextProbe = this.now() + Math.min(60_000, 1_000 * 2 ** Math.min(++this.failures, 6));
       this.emit("moni-runner-error", "unreachable");
     } finally { this.busy = false; }
+    // Observational requests must not hold up lease renewal, including while Telegram is stalled.
+    if (healthy && !this.fenceBusy) {
+      this.fenceBusy = true;
+      try { await this.probeFence(); } catch { this.emit("moni-box-events-error"); }
+      finally { this.fenceBusy = false; }
+    }
   }
   async send(id: string, text: string, mediaUrl: string | undefined, line: Line, chat: ChatKey): Promise<{ id: string; handle: string }> {
     const row = this.store.db.query<{ at: number; state: string; handle: string }, [string]>("SELECT * FROM remote_sends WHERE id=?").get(id);

@@ -32,10 +32,36 @@ export class BoxRunner {
       CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, path TEXT, payload TEXT, result TEXT, state TEXT);
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);`);
     this.db.query("INSERT OR IGNORE INTO settings VALUES ('session',?)").run(randomUUID());
+    if (!this.db.query<{ name: string }, []>("PRAGMA table_info(inbox)").all().some(c => c.name === "interrupted_at")) this.db.exec("ALTER TABLE inbox ADD COLUMN interrupted_at INTEGER");
+    if (!this.db.query<{ name: string }, []>("PRAGMA table_info(actions)").all().some(c => c.name === "inbox_id")) {
+      this.db.transaction(() => this.db.exec(`ALTER TABLE actions ADD COLUMN inbox_id TEXT;
+        INSERT OR IGNORE INTO settings(key,value) SELECT 'legacy-send:' || id,'true' FROM inbox
+        WHERE state IN ('running','interrupted') AND EXISTS (SELECT 1 FROM actions WHERE path='/send');`))();
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS actions_inbox ON actions(inbox_id)");
     // A killed harness might already have used a tool. An operator reconciles it; never replay it automatically.
-    this.db.exec("UPDATE inbox SET state='interrupted' WHERE state='running'");
+    this.interrupt();
   }
   now() { return (this.io.now ?? Date.now)(); }
+  private interrupt() {
+    const row = this.db.query<{ id: string }, []>("SELECT id FROM inbox WHERE state='running' LIMIT 1").get();
+    this.db.query("UPDATE inbox SET state='interrupted',interrupted_at=? WHERE state='running'").run(this.now());
+    return row?.id ?? null;
+  }
+  private events(after?: string, headOnly = false) {
+    const rows = this.db.query<{ id: string; seq: number; state: string; failure: string | null; kind: "inbound" | "wake"; interruptedAt: number | null }, [string | null, number, number]>(`SELECT inbox.id,seq,state,inbox_errors.code AS failure,
+      CASE WHEN json_extract(payload,'$.kind')='wake' OR (json_extract(payload,'$.kind') IS NULL AND json_extract(payload,'$.id') LIKE 'wake:%') THEN 'wake' ELSE 'inbound' END AS kind,
+      interrupted_at AS interruptedAt FROM inbox LEFT JOIN inbox_errors ON inbox.id=inbox_errors.id
+      WHERE state!='done' AND seq>COALESCE((SELECT seq FROM inbox WHERE id=?),0) AND (?=0 OR state!='attachment-failed') ORDER BY seq LIMIT ?`).all(after ?? null, Number(headOnly), headOnly ? 1 : 100);
+    const sent = this.db.query("SELECT 1 FROM actions WHERE path='/send' AND (inbox_id=? OR id=? OR id=?) LIMIT 1");
+    // Legacy tool sends have no attribution. Conservatively flag only work interrupted at migration.
+    const legacy = this.db.query("SELECT 1 FROM settings WHERE key=?");
+    const events = rows.map(({ seq, ...row }) => ({ ...row, hasSend: !!legacy.get(`legacy-send:${row.id}`)
+      || !!sent.get(row.id, opaqueId(`reply:${row.id}:0`), opaqueId(`attachment-failed:${row.id}`)) }));
+    const last = rows.at(-1);
+    const remaining = last ? this.db.query<{ n: number }, [number]>("SELECT count(*) n FROM inbox WHERE state!='done' AND seq>?").get(last.seq)!.n : 0;
+    return { events, ...(remaining ? { nextCursor: last!.id, remaining } : {}) };
+  }
   active() { return this.now() < this.leaseUntil; }
   pause() { this.leaseUntil = 0; this.turnAbort?.abort(); }
   private async modelReady() {
@@ -50,7 +76,8 @@ export class BoxRunner {
     const existing = this.db.query<{ path: string; payload: string }, [string]>("SELECT path,payload FROM actions WHERE id=?").get(id);
     const payload = JSON.stringify(body);
     if (existing && (existing.path !== path || existing.payload !== payload)) throw new Error("Action id reused");
-    this.db.query("INSERT OR IGNORE INTO actions VALUES (?,?,?,NULL,'pending')").run(id, path, payload);
+    const running = this.db.query<{ id: string }, []>("SELECT id FROM inbox WHERE state='running' LIMIT 1").get();
+    this.db.query("INSERT OR IGNORE INTO actions(id,path,payload,result,state,inbox_id) VALUES (?,?,?,NULL,'pending',?)").run(id, path, payload, running?.id ?? null);
     await this.flush();
     const result = this.db.query<{ result: string | null }, [string]>("SELECT result FROM actions WHERE id=?").get(id)?.result;
     return result ? JSON.parse(result) : { id, pending: true };
@@ -101,8 +128,8 @@ export class BoxRunner {
           this.db.transaction(() => {
             this.db.query("UPDATE inbox SET state='attachment-failed' WHERE id=?").run(row.id);
             this.db.query("INSERT OR REPLACE INTO inbox_errors VALUES (?,?)").run(row.id, error.code);
-            this.db.query("INSERT OR IGNORE INTO actions VALUES (?,'/send',?,NULL,'pending')").run(opaqueId(`attachment-failed:${row.id}`), JSON.stringify({ text: "I couldn’t read an attachment. Please send it again." }));
-            this.db.query("INSERT OR IGNORE INTO actions VALUES (?,'/metrics',?,NULL,'pending')").run(opaqueId(`attachment-error:${row.id}`), JSON.stringify({ durationMs: Math.max(0, this.now() - started), status: "error" }));
+            this.db.query("INSERT OR IGNORE INTO actions(id,path,payload,result,state,inbox_id) VALUES (?,'/send',?,NULL,'pending',?)").run(opaqueId(`attachment-failed:${row.id}`), JSON.stringify({ text: "I couldn’t read an attachment. Please send it again." }), row.id);
+            this.db.query("INSERT OR IGNORE INTO actions(id,path,payload,result,state,inbox_id) VALUES (?,'/metrics',?,NULL,'pending',?)").run(opaqueId(`attachment-error:${row.id}`), JSON.stringify({ durationMs: Math.max(0, this.now() - started), status: "error" }), row.id);
           })();
           this.io.log?.(`attachment-${error.code}`);
           await this.flush();
@@ -122,17 +149,17 @@ export class BoxRunner {
         if (reply && reply !== "NO_REPLY" && !reply.endsWith("\nNO_REPLY")) {
           const points = Array.from(reply);
           for (let start = 0; start < points.length; start += 6000) {
-            this.db.query("INSERT OR IGNORE INTO actions VALUES (?,'/send',?,NULL,'pending')").run(opaqueId(`reply:${row.id}:${start}`), JSON.stringify({ text: points.slice(start, start + 6000).join("") }));
+            this.db.query("INSERT OR IGNORE INTO actions(id,path,payload,result,state,inbox_id) VALUES (?,'/send',?,NULL,'pending',?)").run(opaqueId(`reply:${row.id}:${start}`), JSON.stringify({ text: points.slice(start, start + 6000).join("") }), row.id);
           }
         }
         this.db.query("UPDATE inbox SET state='done' WHERE id=?").run(row.id);
-        this.db.query("INSERT OR IGNORE INTO actions VALUES (?,'/metrics',?,NULL,'pending')").run(opaqueId(`metric:${row.id}`), JSON.stringify({ durationMs: Math.max(0, this.now() - (typeof input.receivedAt === "number" ? input.receivedAt : started)) }));
+        this.db.query("INSERT OR IGNORE INTO actions(id,path,payload,result,state,inbox_id) VALUES (?,'/metrics',?,NULL,'pending',?)").run(opaqueId(`metric:${row.id}`), JSON.stringify({ durationMs: Math.max(0, this.now() - (typeof input.receivedAt === "number" ? input.receivedAt : started)) }), row.id);
       })();
       await this.flush();
       this.io.log?.("turn-done", this.now() - started);
     } catch {
-      this.db.exec("UPDATE inbox SET state='interrupted' WHERE state='running'");
-      this.db.query("INSERT OR IGNORE INTO actions VALUES (?,'/metrics',?,NULL,'pending')").run(opaqueId(`error:${started}`), JSON.stringify({ durationMs: Math.max(0, this.now() - started), status: "error" }));
+      const inboxId = this.interrupt();
+      this.db.query("INSERT OR IGNORE INTO actions(id,path,payload,result,state,inbox_id) VALUES (?,'/metrics',?,NULL,'pending',?)").run(opaqueId(`error:${started}`), JSON.stringify({ durationMs: Math.max(0, this.now() - started), status: "error" }), inboxId);
       try { await this.flush(); } catch { /* Keep metadata queued on the box until its bridge is back. */ }
       this.io.log?.("runner-error", this.now() - started);
     } finally { this.turnAbort = undefined; this.working = false; }
@@ -196,7 +223,10 @@ export class BoxRunner {
         this.enqueue(body.id, unseal(this.config.privateKey, body.sealed as Sealed));
         return reply(200, { id: body.id, accepted: true });
       }
-      if (path === "/events") return reply(200, { events: this.db.query("SELECT inbox.id,state,inbox_errors.code AS failure FROM inbox LEFT JOIN inbox_errors ON inbox.id=inbox_errors.id WHERE state!='done' ORDER BY seq LIMIT 100").all() });
+      if (path === "/events") {
+        if (body.after !== undefined && !validId(body.after) || body.headOnly !== undefined && typeof body.headOnly !== "boolean") return reply(400, { error: "Invalid event query" });
+        return reply(200, this.events(body.after as string | undefined, body.headOnly === true));
+      }
       if (path === "/resolve") {
         if (!validId(body.id) || body.reconciled !== true || !["done", "pending"].includes(String(body.state))) return reply(400, { error: "Reconcile the failed event first" });
         const id = body.id;

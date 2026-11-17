@@ -9,6 +9,11 @@ import { Store } from "../src/store.ts";
 import { BoxRunner } from "../../moni-box-runner/src/runner.ts";
 import { ChatRegistry, createAgentBus, createSbApi } from "../src/runtime.ts";
 import { chatKey, type Line } from "../src/line.ts";
+import { parseCommand } from "../src/cli.ts";
+import { captureLogs } from "./log-fixture.ts";
+import { fenceOwnerAlert, notificationAccepted } from "../src/telegram-fallback.ts";
+import { createApi as createTelegramApi } from "../../telegram-bridge/src/api.ts";
+import { Store as TelegramStore } from "../../telegram-bridge/src/store.ts";
 const roots: string[] = [], closes: (() => void)[] = [];
 afterEach(() => { closes.splice(0).forEach(f => f()); roots.splice(0).forEach(p => rmSync(p, { recursive: true, force: true })); });
 function setup() {
@@ -19,13 +24,21 @@ function setup() {
   for (const [name, value] of Object.entries({ token, callbackToken, publicKey: keys.publicKey })) writeFileSync(join(mac, name), value);
   const config: RemoteBoxConfig = { kind: "remote-box", url: "http://127.0.0.1:12345", tokenFile: join(mac, "token"), callbackTokenFile: join(mac, "callbackToken"), publicKeyFile: join(mac, "publicKey"), callbackPort: 12346, epoch: "test", boxId: "bx_test" };
   const logs: string[] = [], notices: string[] = [], texts: string[] = [];
+  const alerts: { text: string; key: string }[] = [], requests: { path: string; body: Record<string, unknown> }[] = [];
+  let eventsFail = false;
+  let requestHook: ((path: string) => Promise<void>) | undefined;
   let now = 1000, online = true, dropAck = false, active = true;
   const store = new Store(join(mac, "state.sqlite")); closes.push(() => store.close());
   const runner = new BoxRunner({ root: box, boxId: config.boxId, epoch: config.epoch, token, callbackToken, privateKey: keys.privateKey, callbackUrl: "http://127.0.0.1:12346", system: "system" }, { run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }, { now: () => now, fetch: (async () => Response.json({ epoch: "test", accepted: true })) });
   closes.push(() => runner.db.close());
   const io = { now: () => now, active: () => active,
+    ownerAlert: async (_severity: "attention", text: string, key: string): Promise<boolean> => { alerts.push({ text, key }); return true; },
     log: (name: string, code?: string) => logs.push(`${name} ${code ?? ""}`), notice: async (id: string) => { notices.push(id); },
-    fetch: (async (url, init) => { if (!online) throw new Error("private error should never be logged"); const response = await runner.handle(new Request(String(url), init));
+    fetch: (async (url, init) => { if (!online) throw new Error("private error should never be logged");
+      const path = new URL(String(url)).pathname; requests.push({ path, body: JSON.parse(String(init?.body)) });
+      await requestHook?.(path);
+      if (path === "/events" && eventsFail) return Response.json({ error: "PRIVATE_EVENTS_ERROR" }, { status: 503 });
+      const response = await runner.handle(new Request(String(url), init));
       if (String(url).endsWith("/deliver") && dropAck) { dropAck = false; throw new Error("lost ack"); } return response; }),
   } satisfies ConstructorParameters<typeof RemoteBox>[2];
   let remote = new RemoteBox(config, store, io);
@@ -33,7 +46,10 @@ function setup() {
     sendText: async () => ({ handle: "sent" }), upload: async () => "https://media.example/file", getMessage: async () => undefined,
     sendApp: async () => ({ handle: "sent" }), react: async () => {}, typing: async () => {}, read: async () => {},
     requestLocation: async () => {}, location: async () => undefined, setOptOut: async () => {}, download: async () => ({ data: new Uint8Array(), name: "", mimeType: "" }) };
-  return { root, mac, box, get remote() { return remote; }, runner, store, config, logs, notices, texts, line,
+  return { root, mac, box, get remote() { return remote; }, runner, store, config, logs, notices, texts, alerts, requests, line,
+    failEvents: () => { eventsFail = true; },
+    ownerAlert: (alert: typeof io.ownerAlert) => { io.ownerAlert = alert; },
+    requestHook: (hook: typeof requestHook) => { requestHook = hook; },
     restart: () => { const reopened = new Store(join(mac, "state.sqlite")); closes.push(() => reopened.close()); remote = new RemoteBox(config, reopened, io); },
     failNotice: () => { io.notice = async id => { notices.push(id); throw new Error("ambiguous notice"); }; },
     advance: (ms = 65_000) => { now += ms; }, offline: () => { online = false; }, online: () => { online = true; }, drop: () => { dropAck = true; }, rollback: () => { active = false; },
@@ -41,6 +57,220 @@ function setup() {
   };
 }
 function files(root: string): string { return readdirSync(root, { withFileTypes: true }).map(e => e.isDirectory() ? files(join(root, e.name)) : readFileSync(join(root, e.name)).toString()).join(""); }
+
+test.each(["inbound", "wake"] as const)("%s fence logs and alerts once across ticks and restart; growth logs again and resolve clears once", async kind => {
+  const s = setup(), id = opaqueId("fenced"), canary = "PRIVATE_FENCE_CANARY";
+  s.remote.accept("fenced", { text: canary }, undefined, kind);
+  const lines = await captureLogs(async () => {
+    await s.remote.tick();
+    // The payload kind arrived through the encrypted envelope, not a Mac-only column.
+    s.runner.db.query("UPDATE inbox SET state='interrupted',interrupted_at=1000 WHERE id=?").run(id);
+    for (let i = 0; i < 3; i++) { s.advance(5_000); await s.remote.tick(); }
+    s.restart(); s.advance(5_000); await s.remote.tick();
+    expect(s.logs.filter(l => l.startsWith("moni-box-fenced "))).toHaveLength(1);
+    expect(s.alerts).toHaveLength(1);
+    expect(s.alerts[0]!.key).toBe(`moni-box-fenced:${id.slice(0, 12)}`);
+    expect(s.alerts[0]!.text).toContain(`interrupted ${kind}`);
+    expect(s.alerts[0]!.text).toContain(`--id ${id} --state done|pending`);
+    s.remote.accept("behind", { text: canary }); s.advance(5_000); await s.remote.tick();
+    expect(s.logs.filter(l => l.startsWith("moni-box-fenced "))).toHaveLength(2);
+    expect(s.alerts).toHaveLength(1);
+    await s.remote.resolve(id, "done"); s.advance(5_000); await s.remote.tick(); s.advance(5_000); await s.remote.tick();
+    expect(s.logs.filter(l => l.startsWith("moni-box-unfenced "))).toHaveLength(1);
+    // Re-fencing the same id after explicit pending resolution must not re-alert.
+    s.runner.db.query("UPDATE inbox SET state='interrupted' WHERE id=?").run(id);
+    s.advance(5_000); await s.remote.tick(); expect(s.alerts).toHaveLength(1);
+  });
+  expect(lines.find(l => l.name === "moni-box-fenced")?.props).toEqual({ event: id.slice(0, 12), kind, ageMs: 5000, hasSend: false, queuedBehind: 0 });
+  expect(lines.find(l => l.name === "moni-box-unfenced")?.props).toEqual({ event: id.slice(0, 12), fencedMs: 30000 });
+  expect(JSON.stringify([s.logs, s.alerts, lines])).not.toContain(canary);
+  expect(s.notices).toHaveLength(0); expect(s.texts).toHaveLength(0);
+});
+
+test("an events failure never starts an outage or sends a notice, even after grace", async () => {
+  const s = setup(); s.failEvents(); s.remote.accept("waiting", { text: "PRIVATE_EVENTS_ERROR" });
+  for (let i = 0; i < 4; i++) { await s.remote.tick(); s.advance(130_000); }
+  expect(s.store.get("remoteOutage")).toBeUndefined(); expect(s.notices).toHaveLength(0); expect(s.alerts).toHaveLength(0);
+  expect(s.logs.join()).not.toContain("moni-box-down"); expect(s.logs.join()).not.toContain("PRIVATE_EVENTS_ERROR");
+});
+
+test.each([
+  ["unavailable", false], ["throws", false], ["queued without acknowledgment", false], ["queued then throws", false],
+  ["unavailable", true], ["throws", true], ["queued without acknowledgment", true], ["queued then throws", true],
+] as const)("owner alert retries %s with identical text until acknowledged (restart=%s)", async (failure, restart) => {
+  const s = setup(), id = opaqueId("fenced"), canary = "PRIVATE_ALERT_CANARY";
+  const telegram = new TelegramStore(join(s.root, "telegram.sqlite")); closes.push(() => telegram.close());
+  const api = createTelegramApi({ store: telegram, enabled: () => true, chatId: () => 123, timezone: "UTC", health: () => ({}) });
+  const statuses: number[] = [];
+  let recovered = false;
+  s.ownerAlert(async (severity, text, key) => {
+    s.alerts.push({ text, key });
+    if (!recovered && failure === "unavailable") return false;
+    if (!recovered && failure === "throws") throw new Error("PRIVATE_ALERT_ERROR");
+    const response = await api(new Request("http://telegram/notify", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ source: "iMessage bridge", severity, text, dedupeKey: key }) }));
+    statuses.push(response.status);
+    if (!recovered && failure === "queued then throws") throw new Error("PRIVATE_ALERT_ERROR");
+    return notificationAccepted(recovered ? response.status : undefined);
+  });
+  s.remote.accept("fenced", { text: canary }); await s.remote.tick();
+  s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+  s.advance(5_000); await s.remote.tick();
+  const original = s.alerts[0]!;
+  expect(s.store.get<unknown>(`remoteFenceAlert:${id}`)).toEqual(original);
+  s.remote.accept("behind", { text: canary }); s.advance(65_000); await s.remote.tick();
+  expect(s.alerts).toEqual([original, original]);
+  expect(s.store.get<unknown>(`remoteFenceAlert:${id}`)).toEqual(original);
+  // Telegram can finish sending while the bridge still has no acknowledgment.
+  for (const operation of telegram.pendingOutbox()) telegram.outboxState(operation.id, "sent", 456);
+  if (restart) s.restart();
+  recovered = true; s.advance(65_000); await s.remote.tick();
+  expect(s.alerts).toEqual([original, original, original]);
+  expect(s.store.get<unknown>(`remoteFenceAlert:${id}`)).toBe(true);
+  expect(statuses).toEqual(failure.startsWith("queued") ? [202, 200, 200] : [202]);
+  const operations = telegram.db.query<{ state: string; payload: string }, []>("SELECT state,payload FROM outbox").all();
+  expect(operations).toHaveLength(1);
+  expect(operations[0]!.state).toBe(failure.startsWith("queued") ? "sent" : "pending");
+  s.restart(); s.advance(5_000); await s.remote.tick(); s.advance(5_000); await s.remote.tick();
+  expect(s.alerts).toHaveLength(3); expect(s.notices).toHaveLength(0); expect(s.texts).toHaveLength(0);
+  expect(JSON.stringify([s.logs, s.alerts, operations])).not.toContain(canary);
+  expect(s.logs.join()).not.toContain("PRIVATE_ALERT_ERROR"); expect(s.store.get("remoteOutage")).toBeUndefined();
+});
+
+test("stalled owner alerts leave the box lease live and owner resolution available on every retry", async () => {
+  const s = setup(), id = opaqueId("fenced"), canary = "PRIVATE_SLOW_ALERT_CANARY";
+  const socket = join(s.root, "telegram.sock");
+  let release!: (response: Response) => void;
+  const stalled = new Promise<Response>(resolve => { release = resolve; });
+  const server = Bun.serve({ unix: socket, fetch: () => stalled });
+  const alert = fenceOwnerAlert(socket);
+  s.ownerAlert(async (severity, text, key) => {
+    s.alerts.push({ text, key });
+    const started = performance.now(), accepted = await alert(severity, text, key);
+    s.advance(Math.ceil(performance.now() - started));
+    return accepted;
+  });
+  try {
+    s.remote.accept("fenced", { text: canary }); await s.remote.tick();
+    for (let i = 0; i < 3; i++) {
+      s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+      s.advance(5_000); await s.remote.tick();
+      expect(s.runner.active()).toBe(true);
+      expect(await s.remote.resolve(id, i === 2 ? "done" : "pending")).toEqual({ accepted: true });
+      expect(s.store.get<unknown>(`remoteFenceAlert:${id}`)).toEqual(s.alerts[0]);
+    }
+    expect(s.alerts).toEqual([s.alerts[0], s.alerts[0], s.alerts[0]]);
+    expect(s.notices).toHaveLength(0); expect(s.store.get("remoteOutage")).toBeUndefined();
+    expect(JSON.stringify([s.logs, s.alerts])).not.toContain(canary);
+  } finally { release(Response.json({})); await server.stop(true); }
+}, 8_000);
+
+test("slow events and alerts permit concurrent lease renewals and owner resolution on repeated probes", async () => {
+  const s = setup(), id = opaqueId("fenced"), canary = "PRIVATE_SLOW_PROBE_CANARY";
+  const gate = () => {
+    let release!: () => void;
+    const promise = new Promise<void>(resolve => { release = resolve; });
+    return { promise, release };
+  };
+  s.remote.accept("fenced", { text: canary }); await s.remote.tick();
+  for (let i = 0; i < 3; i++) {
+    const events = gate(), eventsStarted = gate(), lease = gate(), leaseStarted = gate(), alert = gate(), alertStarted = gate();
+    let leases = 0;
+    s.requestHook(async path => {
+      if (path === "/events") { eventsStarted.release(); await events.promise; }
+      if (path === "/lease" && ++leases === 2) { leaseStarted.release(); await lease.promise; }
+    });
+    s.ownerAlert(async (_severity, text, key) => {
+      s.alerts.push({ text, key }); alertStarted.release(); await alert.promise; return false;
+    });
+    s.runner.db.exec("UPDATE inbox SET state='interrupted',interrupted_at=1000");
+    s.advance(5_000); const probing = s.remote.tick(); await eventsStarted.promise;
+    s.advance(5_000); const renewing = s.remote.tick(); await leaseStarted.promise;
+    // Events take 9.5s, the overlapping renewal 4.75s, and the owner alert another 1s.
+    s.advance(4_500); events.release(); await alertStarted.promise;
+    expect(s.runner.active()).toBe(true);
+    s.advance(250); lease.release(); await renewing;
+    s.advance(750); alert.release(); await probing;
+    expect(s.requests.filter(r => r.path === "/events")).toHaveLength(i + 2);
+    expect(s.runner.active()).toBe(true);
+    expect(await s.remote.resolve(id, i === 2 ? "done" : "pending")).toEqual({ accepted: true });
+    expect(s.store.get<unknown>(`remoteFenceAlert:${id}`)).toEqual(s.alerts[0]);
+  }
+  expect(s.alerts).toEqual([s.alerts[0], s.alerts[0], s.alerts[0]]);
+  expect(s.notices).toHaveLength(0); expect(s.store.get("remoteOutage")).toBeUndefined();
+  expect(JSON.stringify([s.logs, s.alerts])).not.toContain(canary);
+});
+
+test("remote commands require an owner session; resolve is reconciled and cannot replay completed work", async () => {
+  const s = setup(), ownerStore = new Store(join(s.mac, "remote-owner.sqlite")); closes.push(() => ownerStore.close());
+  const registry = new ChatRegistry({ owner: "+15555550123", ownerStore, stateRoot: s.mac, line: s.line,
+    access: () => ({ people: [{ name: "Moni", role: "admin", addresses: ["+15555550199"] }], groups: [] }),
+    build: chat => { if (chat.info.slug === "moni") chat.remote = s.remote; return { api: async () => Response.json({}) }; } });
+  registry.restore(); const moni = registry.open(chatKey.dm("+15555550199")); closes.push(() => moni.store.close());
+  ownerStore.set("route", { id: "owner-thread", generation: 1 });
+  const api = createSbApi({ registry, line: s.line, accessPath: "unused", enabled: () => true, health: () => ({}) });
+  const post = (path: string, body: unknown) => api(new Request(`http://bridge${path}`, { method: "POST", body: JSON.stringify(body) }));
+  const id = opaqueId("blocked"); s.remote.accept("blocked", { text: "PRIVATE" }); await s.remote.tick();
+  s.runner.db.exec("UPDATE inbox SET state='interrupted'");
+  for (const path of ["/remote-events", "/remote-resolve"]) {
+    for (const sessionId of [undefined, s.remote.sessionId, "stale"]) {
+      const n = s.requests.length;
+      expect((await post(path, { sessionId, chat: "moni", ...(path === "/remote-resolve" ? { id, state: "done" } : {}) })).status).toBe(sessionId === "stale" ? 409 : 403);
+      expect(s.requests).toHaveLength(n);
+    }
+  }
+  const events = parseCommand(["remote-events", "--chat", "moni", "--session", "owner-thread"]);
+  expect((await post(events.path, events.body)).status).toBe(200);
+  const resolve = parseCommand(["remote-resolve", "--chat", "moni", "--id", id, "--state", "done", "--session", "owner-thread"]);
+  expect(await (await post(resolve.path, resolve.body)).json()).toEqual({ accepted: true });
+  expect(s.requests.at(-1)).toEqual({ path: "/resolve", body: { id, state: "done", reconciled: true } });
+  const conflict = await post("/remote-resolve", { ...resolve.body, state: "pending" });
+  expect(conflict.status).toBe(409); expect(await conflict.json()).toEqual({ error: "Event is not interrupted/attachment-failed" });
+  expect(() => parseCommand(["remote-events", "--chat", "moni"])).toThrow("--session");
+  for (const [field, value] of [["chat", "owner"], ["id", id.slice(0, 12)], ["state", "running"]]) {
+    expect(() => parseCommand(["remote-resolve", "--chat", field === "chat" ? value! : "moni", "--id", field === "id" ? value! : id,
+      "--state", field === "state" ? value! : "done", "--session", "owner-thread"])).toThrow();
+  }
+  const socket = join(s.root, "cli.sock"), server = Bun.serve({ unix: socket, fetch: api });
+  const cli = async (...args: string[]) => {
+    const child = Bun.spawn([process.execPath, new URL("../src/cli.ts", import.meta.url).pathname, ...args], {
+      env: { ...process.env, SPECTRUM_BRIDGE_SOCKET: socket }, stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    return { stdout, stderr, code };
+  };
+  try {
+    expect(await cli("remote-events", "--chat", "moni", "--session", "owner-thread"))
+      .toEqual({ stdout: '{"events":[]}\n', stderr: "", code: 0 });
+    expect(await cli("remote-resolve", "--chat", "moni", "--session", "owner-thread", "--id", id, "--state", "done"))
+      .toEqual({ stdout: '{"accepted":true}\n', stderr: "", code: 0 });
+    const conflict = await cli("remote-resolve", "--chat", "moni", "--session", "owner-thread", "--id", id, "--state", "pending");
+    expect(conflict.code).toBe(1); expect(conflict.stdout).toBe(""); expect(conflict.stderr).toContain("not interrupted/attachment-failed");
+    const refused = await cli("remote-resolve", "--chat", "moni", "--session", s.remote.sessionId, "--id", id, "--state", "done");
+    expect(refused.code).toBe(1); expect(refused.stderr).toContain("Only the owner's chat");
+    s.runner.db.transaction(() => { for (let i = 0; i < 1000; i++) s.runner.enqueue(opaqueId(`cli-page:${i}`), { kind: "wake", text: "PRIVATE_LARGE_QUEUE" }); })();
+    const page = await cli("remote-events", "--chat", "moni", "--session", "owner-thread");
+    expect(page.code).toBe(0); expect(page.stderr).toBe(""); expect(page.stdout).not.toContain("PRIVATE_LARGE_QUEUE");
+    const metadata = JSON.parse(page.stdout); expect(metadata.events).toHaveLength(100); expect(metadata.remaining).toBe(900);
+    const nextPage = await cli("remote-events", "--chat", "moni", "--session", "owner-thread", "--after", metadata.nextCursor);
+    expect(nextPage.code).toBe(0); expect(JSON.parse(nextPage.stdout).events[0].id).toBe(opaqueId("cli-page:100"));
+    expect(() => parseCommand(["remote-events", "--chat", "moni", "--session", "owner-thread", "--after", "short"])).toThrow("--after");
+  } finally { await server.stop(true); }
+});
+
+test("a large fenced backlog logs its full depth even after a page of skipped attachment failures", async () => {
+  const s = setup(); await s.remote.tick();
+  s.runner.db.transaction(() => { for (let i = 0; i < 1200; i++) {
+    const id = opaqueId(`large:${i}`); s.runner.enqueue(id, { kind: "wake", text: "PRIVATE_BIG_FENCE" });
+    if (i < 150) s.runner.db.query("UPDATE inbox SET state='attachment-failed' WHERE id=?").run(id);
+    if (i === 150) s.runner.db.query("UPDATE inbox SET state='interrupted' WHERE id=?").run(id);
+  } })();
+  s.advance(5_000); await s.remote.tick();
+  const fence = JSON.parse(s.logs.find(l => l.startsWith("moni-box-fenced "))!.slice("moni-box-fenced ".length));
+  expect(fence.queuedBehind).toBe(1049); expect(fence.event).toBe(opaqueId("large:150").slice(0, 12));
+  expect(s.alerts[0]!.text).toContain("1049 later messages waiting"); expect(JSON.stringify([s.logs, s.alerts])).not.toContain("PRIVATE_BIG_FENCE");
+  expect(s.notices).toHaveLength(0);
+});
 
 test("per-chat selection is explicit, rejects other chats, preserves Robob rollback", () => {
   const s = setup(); expect(remoteBoxConfig({ chatBackends: { moni: s.config } }, "moni")).toEqual(s.config);
