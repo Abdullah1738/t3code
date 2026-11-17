@@ -16,6 +16,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { providerUserMessageText } from "./ProviderMessageText.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -433,6 +434,15 @@ export const layer: Layer.Layer<
             .pipe(
               Effect.catch((cause) =>
                 Effect.gen(function* () {
+                  // Session loss cannot establish nondelivery after an unconfirmed submission.
+                  if (makeProviderFailure({ cause }).retryable === false) {
+                    return yield* new ProviderTurnControlError({
+                      threadId: input.threadId,
+                      operation: "steer",
+                      providerTurnId: input.providerTurnId,
+                      cause,
+                    });
+                  }
                   // Release removes the runtime before its durable recovery marker commits.
                   // Compare the captured runtime too: a reopened shared ID owns different work.
                   const session = yield* sessions.get(input.providerSessionId);

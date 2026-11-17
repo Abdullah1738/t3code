@@ -539,7 +539,12 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.catch((error) =>
                   Effect.gen(function* () {
-                    if (providerAccepted) return yield* error;
+                    // Recovery reads must not replace the failure that forbids resubmission.
+                    if (
+                      providerAccepted ||
+                      makeProviderFailure({ cause: error }).retryable === false
+                    )
+                      return yield* error;
                     const sessionEnded =
                       followUpPending ||
                       ("cause" in error && isProviderSessionEndedError(error.cause)) ||
@@ -551,7 +556,6 @@ export const layerExecutor: Layer.Layer<
                       sessionEnded ||
                       ("turnEnded" in error && error.turnEnded === true && !error.turnCompleted);
                     if (
-                      makeProviderFailure({ cause: error }).retryable === false ||
                       ((!("turnCompleted" in error) || !error.turnCompleted) && !queueFollowUp) ||
                       effect.request.type !== "provider-turn.steer"
                     ) {
@@ -1355,10 +1359,10 @@ export const layerWithOptions = (
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
             : (!acceptance && !acceptedSteer && uncertainSteer) ||
-                !durableRecovery &&
-                !recoveringSteer &&
-                effect.attemptCount >=
-                  (acceptance || acceptedSteer ? maxAcceptedAttempts : maxAttempts)
+                (!durableRecovery &&
+                  !recoveringSteer &&
+                  effect.attemptCount >=
+                    (acceptance || acceptedSteer ? maxAcceptedAttempts : maxAttempts))
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

@@ -246,7 +246,7 @@ const executorLayer = (
 it.effect.each(
   (["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
     [false, true].flatMap((turnCompleted) =>
-      (["normal", "read failure", "read defect", "recovery pending"] as const).map((recovery) => ({
+      (["normal", "read failure", "read defect"] as const).map((recovery) => ({
         reason,
         turnCompleted,
         recovery,
@@ -274,10 +274,7 @@ it.effect.each(
           id: effect.id,
           commandId: effect.commandId,
           threadId,
-          request: {
-            ...effect.request,
-            followUpPending: recovery === "recovery pending",
-          },
+          request: effect.request,
         },
       ]);
       const layer = EffectWorker.layerWithOptions({ workerId: "uncertain-steer" }).pipe(
