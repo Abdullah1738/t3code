@@ -10,6 +10,7 @@ import re
 import uuid
 
 RUN_ID = uuid.uuid4().hex
+VOLUME_THREAD_ID = re.compile(r'(?:thread:project:[^\s:]+:)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 CAP_BYTES = 50 * 1024 * 1024
 # Explicit schema: unknown keys and nested payloads cannot enter a log by accident.
@@ -300,6 +301,40 @@ def cpu_fields(values):
 
 
 def safe_fields(values, event=None):
+    if event == 'scan.volume_crawl':
+        result = {}
+        for key, value in (values or {}).items():
+            if key in ('pid', 'ppid', 'argvOmitted') and type(value) is int and 0 <= value <= 2147483647:
+                result[key] = value
+            elif key in ('elapsedS', 'cpuPct') and (value is None or finite_number(value) and value >= 0):
+                result[key] = value
+            elif key in ('cwd', 'threadId') and (value is None or isinstance(value, str)):
+                limit = 512 if key == 'threadId' else 2048
+                if value is None or (len(json.dumps(value)) <= limit
+                        and (key != 'threadId' or VOLUME_THREAD_ID.fullmatch(value))):
+                    result[key] = value
+                else:
+                    result[key] = None
+                    result['stringsOmitted'] = result.get('stringsOmitted', 0)+1
+            elif key == 'argv' and isinstance(value, list):
+                paths, size, omitted = [], 0, 0
+                for path in value:
+                    if not isinstance(path, str):
+                        continue
+                    encoded = len(json.dumps(path)) + 1
+                    if encoded > 2048 or size+encoded > 6000:
+                        omitted += 1
+                    else:
+                        paths.append(path)
+                        size += encoded
+                result[key] = paths
+                if omitted:
+                    result['argvOmitted'] = omitted
+            elif key == 'parentChain' and isinstance(value, list):
+                result[key] = [dict(pid=p['pid'], name=(p['name'] if len(json.dumps(p['name'])) <= 128 else '[omitted]'))
+                               for p in value[:4] if isinstance(p, dict) and type(p.get('pid')) is int
+                               and 0 <= p['pid'] <= 2147483647 and isinstance(p.get('name'), str)]
+        return result
     if event and event.startswith('tailnet.'):
         result = {}
         for key, value in (values or {}).items():
@@ -441,6 +476,15 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
             if lines:
                 message = '[redacted]' if SECRET.search(lines[0]) else lines[0][:300]
         row['error'] = dict(tag=error_tag, message=message)
+    if name == 'scan.volume_crawl':
+        paths = row.get('props', {}).get('argv', [])
+        while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > 8192 and len(paths) > 1:
+            paths.pop()
+            row['props']['argvOmitted'] = row['props'].get('argvOmitted', 0)+1
+        if len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > 8192:
+            row['props'] = {k: v for k, v in row.get('props', {}).items()
+                            if k in ('pid', 'ppid', 'elapsedS', 'cpuPct')}
+            row['props']['detailOmitted'] = True
     if name in ('cpu.sample', 'cpu.spike'):
         # Leave room for 240 spike lines and the other jobs in the daily file.
         limit = 7000 if name == 'cpu.sample' else 8192

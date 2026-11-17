@@ -123,7 +123,9 @@ partial with no total again. Its own directory allocation is included.
 Parts do not recurse. The hourly scanner leaves parts parents and recent
 timeouts to this pass.
 The daily budget is 90 minutes; du runs under nice 10
-and utility scheduling without inherited launchd background I/O policy.
+and utility scheduling with explicit `taskpolicy -d throttle` disk I/O policy.
+The hourly du children also use `-d throttle`; scan roots, accounting and cache
+semantics are unchanged.
 Termination keeps completed rows; unfinished children remain explicit partials.
 Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
 daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
@@ -613,3 +615,38 @@ offbox run -- 'PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integra
 Tests use private temporary roots and mock commands. Never use a real upkeep
 run to test instrumentation: those jobs can remove software, kill processes,
 prune snapshots and send alerts.
+
+## Volume crawl attribution
+
+The minute CPU snapshot also supplies argv to `scan.volume_crawl` for `du`,
+`rg`, `find`, `fd`, `ncdu` and `dust` alive for at least 30 seconds. It matches
+filesystem operands resolving to `/`, a volume root, the home directory, or an
+immediate child of ExternalSSD. Implicit operands use cwd; explicit operands
+are resolved before classification. `rg -n foo src/` from a repo cwd is scoped;
+from `/Volumes/ExternalSSD` it names an immediate child and qualifies. A single
+`lsof -a -d cwd -p … -Fn` call has a two-second timeout for all candidates;
+missing cwd still permits attribution from absolute operands. `?` exiting
+processes are skipped. No extra full ps snapshot or environment dump runs.
+
+Records retain PID, PPID, up to four ancestor PID/name pairs, cwd, elapsed
+seconds and CPU percent from matching consecutive process identities (null on
+baseline). `argv` holds executable and resolved filesystem operands only;
+patterns, find expressions and option values are omitted. Paths are retained
+without the general logger's home/secret-word replacement. A parent-visible
+project/UUID thread identifier in a recognized `t3ctl` identity operand is
+retained; shell programs and query text never supply identity. It is null
+when no such operand is visible. The checked agent
+shell had no T3/ROBOB thread-id environment key. Raw argv stays out of CPU state.
+Lines are capped at 8 KiB by dropping trailing operands with `argvOmitted`.
+Oversized cwd/thread strings become null with `stringsOmitted`; parent names
+are bounded. Unknown option arity skips classification instead of guessing
+filesystem operands.
+The existing day cap and retention apply.
+Ncdu import mode is excluded because it reads an inventory rather than crawling.
+
+Darwin ps renders argv without argument boundaries. Quoted fixture operands
+can be parsed, but unquoted paths containing spaces or shell quoting characters
+can remain ambiguous; this event is attribution evidence, never authority to
+kill or throttle a PID. A process may exit between ps and lsof. Missing cwd
+prevents classification of relative operands. Crawls shorter than 30 seconds
+or wholly between minute samples are outside this detector's coverage.

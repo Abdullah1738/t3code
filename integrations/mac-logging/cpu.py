@@ -13,8 +13,9 @@ import time
 from cpu_labels import family, script_hint, command_label
 from jobs import read_state, save_state, state_path
 from toollog import emit, finite_number, cpu_fields
+from volume_crawls import volume_crawls
 
-PS = ['/bin/ps', '-axo', 'pid=,ppid=,time=,rss=,state=,lstart=,etime=,uid=,comm=']
+PS = ['/bin/ps', '-ww', '-axo', 'pid=,ppid=,time=,rss=,state=,lstart=,etime=,uid=,comm=,args=SCAN_ARGV']
 SPIKES_PER_DAY = 240
 
 
@@ -295,12 +296,17 @@ def parse_ps(text, diagnostics=None):
     seen = set()
     total = bad = 0
     first_bad = None
+    args_column = None
     for line in text.splitlines():
+        if line.strip() == 'SCAN_ARGV':
+            args_column = line.index('SCAN_ARGV')
+            continue
         if not line.strip():
             continue
         total += 1
         try:
-            parts = line.split(None, 12)
+            args = line[args_column:].strip() if args_column is not None else ''
+            parts = (line[:args_column] if args_column is not None else line).split(None, 12)
             if len(parts) != 13:
                 raise ValueError()
             pid, ppid, rss, uid = int(parts[0]), int(parts[1]), int(parts[3]), int(parts[11])
@@ -309,18 +315,19 @@ def parse_ps(text, diagnostics=None):
             if min(pid, ppid, rss, uid) < 0 or pid in seen or not re.fullmatch(r'[A-Za-z?+<>-]{1,16}', parts[4]):
                 raise ValueError()
             seconds(parts[10])
-            comm = parts[12]
+            comm = parts[12].strip()
             if comm.startswith('(') and comm.endswith(')'):
                 comm = comm[1:-1]
             rows.append(dict(pid=pid, ppid=ppid, uid=uid, cpuS=seconds(parts[2]), rssMb=rss/1024,
-                             state=parts[4], start=start, etime=parts[10], family=family(comm)))
+                             state=parts[4], start=start, etime=parts[10], elapsedS=seconds(parts[10]), family=family(comm),
+                             comm=comm, args=args))
             seen.add(pid)
         except (ValueError, OverflowError, ProbeError):
             bad += 1
             if first_bad is None:
                 # Reuse the logger's janitor redaction before truncation. Never
                 # expose raw process identifiers or home paths in diagnostics.
-                tail = line.split(None, 2)
+                tail = (line[:args_column] if args_column is not None else line).split(None, 2)
                 first_bad = cpu_fields(dict(badLine='PID PPID '+(tail[2] if len(tail) == 3 else '[incomplete]'))).get('badLine')
     diagnostics.update(skippedLines=bad)
     if not rows or bad*10 > total:
@@ -521,6 +528,7 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
             props, state = deltas(rows, previous, observed)
             props.update(churn(rows, previous, props))
             props.update(diagnostics)
+            volume_crawls(rows, previous, observed, run)
             try:
                 props['load'] = list(os.getloadavg())
             except OSError:
