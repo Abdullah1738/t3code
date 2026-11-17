@@ -994,9 +994,14 @@ export const layerWithOptions = (
           );
           for (const threadId of threadIds) {
             const projection = yield* projectionStore
-              .getThreadRecords(threadId, ["providerTurns", "nodes", "subagents", "turnItems"], {
-                turnItemStatuses: ["pending", "running", "waiting"],
-              })
+              .getThreadRecords(
+                threadId,
+                ["providerTurns", "nodes", "subagents", "turnItems", "runs"],
+                {
+                  turnItemStatuses: ["pending", "running", "waiting"],
+                  restartCleanupSessionId: input.entry.runtime.providerSessionId,
+                },
+              )
               .pipe(
                 Effect.catchTags({
                   ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
@@ -1021,6 +1026,27 @@ export const layerWithOptions = (
               },
             );
             const owned = new Set(bindings.providerThreads.map((thread) => thread.id));
+            // Restart commits the new binding before interrupting the old session.
+            // Its cleanup target preserves ownership of exactly the superseded turn.
+            const cleanupTurns = new Map(
+              projection.runs.flatMap((run) => {
+                const cleanup = run.providerRestartCleanup;
+                return cleanup?.providerSessionId === input.entry.runtime.providerSessionId
+                  ? [[cleanup.providerTurnId, cleanup.providerThreadId] as const]
+                  : [];
+              }),
+            );
+            const ownedTurns = new Set(
+              projection.providerTurns
+                .filter(
+                  (turn) =>
+                    (owned.has(turn.providerThreadId) ||
+                      cleanupTurns.get(turn.id) === turn.providerThreadId) &&
+                    (turn.startedAt === null ||
+                      !DateTime.isGreaterThan(turn.startedAt, input.releasedAt)),
+                )
+                .map((turn) => turn.id),
+            );
             if (input.entry.runtime.backgroundTasksEndWithProcess === true) {
               for (const node of projection.nodes) {
                 if (
@@ -1051,16 +1077,6 @@ export const layerWithOptions = (
             // Native Codex children use runless turns in separate threads. Capture their
             // identities now so a replacement at the same timestamp cannot be swept later.
             if (input.entry.runtime.backgroundTasksEndWithProcess === true) {
-              const ownedTurns = new Set(
-                projection.providerTurns
-                  .filter(
-                    (turn) =>
-                      owned.has(turn.providerThreadId) &&
-                      (turn.startedAt === null ||
-                        !DateTime.isGreaterThan(turn.startedAt, input.releasedAt)),
-                  )
-                  .map((turn) => turn.id),
-              );
               for (const task of projection.subagents) {
                 if (
                   task.origin === "provider_native" &&
@@ -1081,9 +1097,7 @@ export const layerWithOptions = (
             for (const turn of projection.providerTurns) {
               // A replacement can reuse the shared session id while this release drains.
               if (
-                !owned.has(turn.providerThreadId) ||
-                (turn.startedAt !== null &&
-                  DateTime.isGreaterThan(turn.startedAt, input.releasedAt)) ||
+                !ownedTurns.has(turn.id) ||
                 (turn.status !== "running" &&
                   !pendingSteers.has(turn.id) &&
                   !(

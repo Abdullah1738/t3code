@@ -928,6 +928,7 @@ export const layer: Layer.Layer<
         // the next message. The capture is enqueued with these terminal events,
         // ahead of any later run's start on this thread's effect lane.
         const finalization = {
+          preserveProviderThreadBackgroundTasks: true,
           effects:
             input.terminal.status === "completed" ||
             input.terminal.status === "interrupted" ||
@@ -1046,6 +1047,7 @@ export const layer: Layer.Layer<
               expectedStatus: input.writeIfRunCurrent.expectedStatus,
               events: finalization.events,
               effects: finalization.effects,
+              preserveProviderThreadBackgroundTasks: true,
             });
             if (!result.committed) return false;
           } else {

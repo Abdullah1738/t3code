@@ -390,6 +390,7 @@ export const layer: Layer.Layer<
           }
           const loaded = yield* load({ ...input, operation: "steer" });
           if (Option.isNone(loaded.session)) return;
+          const runtime = loaded.session.value;
           const { message, run } = loaded.context;
           if (message === undefined || run === undefined) {
             return yield* new ProviderTurnControlError({
@@ -409,7 +410,7 @@ export const layer: Layer.Layer<
               !(yield* postRecoveryPending(kanban.value, recovery.discussionId, recovery.seq)))
           )
             return;
-          yield* loaded.session.value
+          yield* runtime
             .steerTurn({
               threadId: input.threadId,
               runId: run.id,
@@ -432,6 +433,20 @@ export const layer: Layer.Layer<
             .pipe(
               Effect.catch((cause) =>
                 Effect.gen(function* () {
+                  // Release removes the runtime before its durable recovery marker commits.
+                  // Compare the captured runtime too: a reopened shared ID owns different work.
+                  const session = yield* sessions.get(input.providerSessionId);
+                  if (Option.isNone(session) || session.value !== runtime) {
+                    return yield* new ProviderTurnControlError({
+                      threadId: input.threadId,
+                      operation: "steer",
+                      providerTurnId: input.providerTurnId,
+                      cause: new ProviderSessionManager.ProviderSessionEndedError({
+                        providerSessionId: input.providerSessionId,
+                        runId: run.id,
+                      }),
+                    });
+                  }
                   const current = yield* projections.getProviderControlContext(
                     input.threadId,
                     input,

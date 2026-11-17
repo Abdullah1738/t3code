@@ -11083,6 +11083,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           for (const item of child.turnItems) {
             if (
               item.providerTurnId !== command.providerTurnId ||
+              (item.type === "subagent" && item.origin === "app_owned") ||
               !isOrchestrationV2WorkActive(item.status) ||
               emitted.some(
                 (event) => event.type === "turn-item.updated" && event.payload.id === item.id,
@@ -11110,12 +11111,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             });
           }
           for (const message of child.messages) {
-            if (
-              message.runId !== null ||
-              message.nodeId === null ||
-              !ownedNodes.has(message.nodeId) ||
-              !message.streaming
-            )
+            if (message.nodeId === null || !ownedNodes.has(message.nodeId) || !message.streaming)
               continue;
             yield* emit(
               events,
@@ -11123,6 +11119,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             )({
               type: "message.updated",
               threadId: command.threadId,
+              ...(message.runId === null ? {} : { runId: message.runId }),
               nodeId: message.nodeId,
               occurredAt: now,
               payload: { ...message, streaming: false, updatedAt: now },

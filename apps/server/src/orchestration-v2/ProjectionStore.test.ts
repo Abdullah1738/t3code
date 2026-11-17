@@ -704,6 +704,52 @@ it.effect.each([
   ["memory", ProjectionStore.layerMemory],
   ["SQL", layerTest],
 ] as const)(
+  "%s release reads retain only the original session's restart cleanup",
+  ([_kind, layer]) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("restart-cleanup-filter");
+      const first = (yield* store.getThreadProjection(threadId)).runs[0]!;
+      const now = yield* DateTime.now;
+      const original = ProviderSessionId.make("session:released");
+      const replacement = ProviderSessionId.make("session:replacement");
+      for (const [index, sessionId, completed] of [
+        [2, original, false],
+        [3, original, true],
+        [4, replacement, false],
+      ] as const) {
+        yield* store.apply({
+          id: EventId.make(`event:restart-cleanup-filter:${index}`),
+          type: "run.created",
+          threadId,
+          occurredAt: now,
+          payload: {
+            ...first,
+            id: RunId.make(`run:restart-cleanup-filter:${index}`),
+            ordinal: index,
+            providerRestartCleanup: {
+              providerSessionId: sessionId,
+              providerThreadId: ProviderThreadId.make("provider-thread:rebound"),
+              providerTurnId: ProviderTurnId.make(`turn:restart-cleanup-filter:${index}`),
+              completed,
+            },
+          },
+        });
+      }
+      const records = yield* store.getThreadRecords(threadId, ["runs"], {
+        restartCleanupSessionId: original,
+      });
+      assert.deepEqual(
+        records.runs.map((run) => run.ordinal),
+        [2, 3],
+      );
+    }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["memory", ProjectionStore.layerMemory],
+  ["SQL", layerTest],
+] as const)(
   "%s native-start reads select only the active attempt without scanning provider history",
   ([kind, layer]) =>
     Effect.gen(function* () {

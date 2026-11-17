@@ -41,6 +41,7 @@ export class OrchestrationEffectExecutionError extends Schema.TaggedError<Orches
     effectId: Schema.String,
     effectType: Schema.String,
     providerAccepted: Schema.optional(Schema.Boolean),
+    followUpPending: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
     deferMs: Schema.optional(Schema.Number),
   },
@@ -475,17 +476,21 @@ export const layerExecutor: Layer.Layer<
             const request = effect.request;
             return Effect.suspend(() => {
               let providerAccepted = request.providerAccepted === true;
-              return (
-                providerAccepted
-                  ? Effect.void
-                  : providerTurnControl.steer({
-                      threadId: effect.threadId,
-                      providerSessionId: request.providerSessionId,
-                      providerThreadId: request.providerThreadId,
-                      providerTurnId: request.providerTurnId,
-                      messageId: request.messageId,
-                    })
-              ).pipe(
+              let followUpPending = request.followUpPending === true && !providerAccepted;
+              return Effect.gen(function* () {
+                if (providerAccepted) return;
+                if (followUpPending)
+                  return yield* new ProviderSessionManager.ProviderSessionEndedError({
+                    providerSessionId: request.providerSessionId,
+                  });
+                yield* providerTurnControl.steer({
+                  threadId: effect.threadId,
+                  providerSessionId: request.providerSessionId,
+                  providerThreadId: request.providerThreadId,
+                  providerTurnId: request.providerTurnId,
+                  messageId: request.messageId,
+                });
+              }).pipe(
                 Effect.tap(() =>
                   Effect.sync(() => {
                     providerAccepted = true;
@@ -514,6 +519,7 @@ export const layerExecutor: Layer.Layer<
                   Effect.gen(function* () {
                     if (providerAccepted) return yield* error;
                     const sessionEnded =
+                      followUpPending ||
                       ("cause" in error && isProviderSessionEndedError(error.cause)) ||
                       Option.isSome(
                         yield* outbox.get(`effect:session-ended:${request.providerTurnId}`),
@@ -521,7 +527,7 @@ export const layerExecutor: Layer.Layer<
                     // A steer can commit after release captured its pending effects.
                     const queueFollowUp =
                       sessionEnded ||
-                      ("turnEnded" in error && error.turnEnded && !error.turnCompleted);
+                      ("turnEnded" in error && error.turnEnded === true && !error.turnCompleted);
                     if (
                       ((!("turnCompleted" in error) || !error.turnCompleted) && !queueFollowUp) ||
                       effect.request.type !== "provider-turn.steer"
@@ -530,6 +536,8 @@ export const layerExecutor: Layer.Layer<
                     }
                     // Board-held workers may hear a live steer but must never be woken by it.
                     if (effect.request.activeTurnOnly) return;
+                    // Once recovery owns the saved input, storage failures cannot abandon it.
+                    followUpPending = queueFollowUp;
                     const projection = yield* threads.getThreadRecords(
                       effect.threadId,
                       ["messages", "runs"],
@@ -601,7 +609,7 @@ export const layerExecutor: Layer.Layer<
                 ),
                 Effect.tapError(() =>
                   // Mailbox bookkeeping can fail after the provider accepted the input.
-                  willRetry || providerAccepted
+                  willRetry || providerAccepted || followUpPending
                     ? Effect.void
                     : SteerDeliveryFailure.persist(effect).pipe(
                         Effect.provideService(EventSink.EventSinkV2, eventSink),
@@ -621,15 +629,17 @@ export const layerExecutor: Layer.Layer<
                       effectId: effect.id,
                       effectType: effect.request.type,
                       providerAccepted,
+                      followUpPending,
                       cause,
                     }),
                 ),
                 Effect.catchDefect((cause) =>
-                  providerAccepted
+                  providerAccepted || followUpPending
                     ? new OrchestrationEffectExecutionError({
                         effectId: effect.id,
                         effectType: request.type,
-                        providerAccepted: true,
+                        providerAccepted,
+                        followUpPending,
                         cause,
                       })
                     : Effect.die(cause),
@@ -1053,6 +1063,9 @@ export const layerWithOptions = (
                 steerAccepted:
                   effect.request.type === "provider-turn.steer" &&
                   effect.request.providerAccepted === true,
+                steerFollowUpPending:
+                  effect.request.type === "provider-turn.steer" &&
+                  effect.request.followUpPending === true,
                 refundAttempt,
               })
               .pipe(
@@ -1209,7 +1222,9 @@ export const layerWithOptions = (
           // Recovery owns the last path out for work whose provider can no longer report.
           const durableRecovery =
             effect.request.type === "provider-session.reconcile-turn" ||
-            effect.request.type === "provider-session.reconcile-root";
+            effect.request.type === "provider-session.reconcile-root" ||
+            (effect.request.type === "provider-turn.steer" &&
+              effect.request.followUpPending === true);
           const execution = executor
             .execute(effect, { willRetry: durableRecovery || effect.attemptCount < maxAttempts })
             .pipe(
@@ -1242,10 +1257,22 @@ export const layerWithOptions = (
             effect.request.type === "provider-turn.steer" &&
             (effect.request.providerAccepted === true ||
               Option.exists(failure, (failure) => failure.providerAccepted === true));
-          // Acceptance must survive rescheduling, including its error-recovery path.
+          const recoveringSteer =
+            effect.request.type === "provider-turn.steer" &&
+            !acceptedSteer &&
+            (effect.request.followUpPending === true ||
+              Option.exists(failure, (failure) => failure.followUpPending === true));
+          // Delivery ownership must survive rescheduling, including its error-recovery path.
           const retryEffect =
-            acceptedSteer && effect.request.type === "provider-turn.steer"
-              ? { ...effect, request: { ...effect.request, providerAccepted: true } }
+            effect.request.type === "provider-turn.steer" && (acceptedSteer || recoveringSteer)
+              ? {
+                  ...effect,
+                  request: {
+                    ...effect.request,
+                    providerAccepted: acceptedSteer,
+                    followUpPending: recoveringSteer,
+                  },
+                }
               : effect;
 
           if (Option.isSome(failure) && failure.value.deferMs !== undefined) {
@@ -1257,6 +1284,7 @@ export const layerWithOptions = (
                 delayMs: failure.value.deferMs,
                 refundAttempt: true,
                 steerAccepted: acceptedSteer,
+                steerFollowUpPending: recoveringSteer,
               })
               .pipe(Effect.onError((cause) => requeueClaim(retryEffect, cause, true)));
             if (!deferred && !(yield* wasCancelled(effect.id)))
@@ -1279,7 +1307,7 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : !durableRecovery && effect.attemptCount >= maxAttempts
+            : !durableRecovery && !recoveringSteer && effect.attemptCount >= maxAttempts
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
@@ -1290,6 +1318,7 @@ export const layerWithOptions = (
                     error,
                     delayMs: Math.min(30_000, 100 * 2 ** Math.max(0, effect.attemptCount - 1)),
                     steerAccepted: acceptedSteer,
+                    steerFollowUpPending: recoveringSteer,
                   })
                   .pipe(Effect.onError((cause) => requeueClaim(retryEffect, cause)));
           if (!updated) {

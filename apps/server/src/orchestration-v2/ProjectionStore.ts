@@ -377,6 +377,7 @@ export interface ProjectionRecordFilter {
   readonly messageRunIds?: ReadonlyArray<RunId>;
   readonly turnItemRunIds?: ReadonlyArray<RunId | null>;
   readonly runIds?: ReadonlyArray<RunId>;
+  readonly restartCleanupSessionId?: ProviderSessionId;
   /** ardud: unfinished runs plus the newest N, instead of every run the thread ever had. */
   readonly recentRunLimit?: number;
   /** A single newest run, including when older runs are unfinished. */
@@ -3710,6 +3711,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             FROM orchestration_v2_projection_runs ${filter?.unfinishedRunsOnly ? sql`INDEXED BY orchestration_v2_projection_runs_recovery_idx` : sql``}
             WHERE thread_id = ${threadId}
               ${filter?.unfinishedRunsOnly ? sql`AND status IN ('queued','preparing','starting','running','waiting')` : sql``}
+              ${
+                filter?.restartCleanupSessionId === undefined
+                  ? sql``
+                  : sql`AND json_extract(payload_json, '$.providerRestartCleanup.providerSessionId') = ${filter.restartCleanupSessionId}`
+              }
               ${
                 filter?.runIds === undefined
                   ? sql``
@@ -8255,6 +8261,9 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               (row) =>
                 (!filter?.latestRunOnly || row.id === newest?.id) &&
                 (!filter?.currentRunOnly || row.id === current?.id) &&
+                (filter?.restartCleanupSessionId === undefined ||
+                  row.providerRestartCleanup?.providerSessionId ===
+                    filter.restartCleanupSessionId) &&
                 (!filter?.unfinishedRunsOnly || UNFINISHED_RUN_STATUSES.has(row.status)),
             ),
             runtimeRequests: projection.runtimeRequests.filter(

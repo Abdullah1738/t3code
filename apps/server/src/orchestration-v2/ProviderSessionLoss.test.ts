@@ -58,6 +58,11 @@ const sessionLoss = ({
   unstartedChild,
   retryRecovery,
   rebound,
+  cleanupOnly = false,
+  appOwned = false,
+  retrySteer = false,
+  lateRoster,
+  lastAttemptLoss = false,
 }: {
   instance: "codex" | "codex-cu" | "opencode";
   reason: Sessions.ProviderSessionReleaseReason;
@@ -81,6 +86,11 @@ const sessionLoss = ({
   unstartedChild?: "released" | "replacement" | "restarted";
   retryRecovery?: "turn" | "root";
   rebound?: "live" | "ended";
+  cleanupOnly?: boolean;
+  appOwned?: boolean;
+  retrySteer?: boolean;
+  lateRoster?: "cleared" | "new roster";
+  lastAttemptLoss?: boolean;
 }) =>
   Effect.gen(function* () {
     const allAdmitted = yield* Deferred.make<void>();
@@ -88,6 +98,13 @@ const sessionLoss = ({
     const resumeIngestion = yield* Deferred.make<void>();
     const preflight = yield* Deferred.make<void>();
     const commitSteer = yield* Deferred.make<void>();
+    const finalizing = yield* Deferred.make<void>();
+    const resumeFinalization = yield* Deferred.make<void>();
+    const finalized = yield* Deferred.make<void>();
+    const adapterEntered = yield* Deferred.make<void>();
+    const failAdapter = yield* Deferred.make<void>();
+    const markerEntered = yield* Deferred.make<void>();
+    const allowMarker = yield* Deferred.make<void>();
     const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
     const closing = yield* Deferred.make<void>();
     const finishClose = yield* Deferred.make<void>();
@@ -157,14 +174,18 @@ const sessionLoss = ({
               providerTurnId,
             }: Parameters<ProviderAdapter.ProviderAdapterV2SessionRuntime["steerTurn"]>[0]) => {
               adapterSteers++;
-              return Effect.fail(
-                new ProviderAdapter.ProviderAdapterSteerRunError({
+              return Effect.gen(function* () {
+                if (lastAttemptLoss && adapterSteers === 5) {
+                  yield* Deferred.succeed(adapterEntered, undefined);
+                  yield* Deferred.await(failAdapter);
+                }
+                return yield* new ProviderAdapter.ProviderAdapterSteerRunError({
                   driver,
                   providerThreadId: providerThread.id,
                   providerTurnId,
-                  cause: "The replacement does not own the old turn.",
-                }),
-              );
+                  cause: "The app-server transport closed before the steer completed.",
+                });
+              });
             },
           } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
         }),
@@ -437,6 +458,121 @@ const sessionLoss = ({
         targets.push({ threadId, run, attempt, root, providerThread, turn });
       }
       const target = targets[0]!;
+      const delegation =
+        appOwned || rebound !== undefined
+          ? yield* Effect.gen(function* () {
+              yield* engine.dispatch({
+                type: "delegated_task.request",
+                commandId: CommandId.make("independent-child"),
+                parentThreadId: target.threadId,
+                parentRunId: target.run.id,
+                parentNodeId: target.root.id,
+                task: "continue independently",
+                modelSelection,
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                createdBy: "agent",
+                creationSource: "mcp",
+              });
+              const parent = yield* projections.getThreadProjection(target.threadId);
+              const task = parent.subagents.find((row) => row.origin === "app_owned")!;
+              const childId = task.childThreadId!;
+              const child = yield* projections.getThreadProjection(childId);
+              const run = child.runs[0]!;
+              const attempt = child.attempts[0]!;
+              const binding = child.providerThreads.find((row) => row.id === run.providerThreadId)!;
+              const root = child.nodes.find((row) => row.id === run.rootNodeId)!;
+              const sessionId = ProviderSessionId.make("session:independent-child");
+              const turnId = ProviderTurnId.make("turn:independent-child");
+              const now = yield* DateTime.now;
+              yield* sessions.open({
+                threadId: childId,
+                providerSessionId: sessionId,
+                modelSelection,
+                runtimePolicy: {
+                  runtimeMode: "full-access",
+                  interactionMode: "default",
+                  cwd: process.cwd(),
+                },
+              });
+              yield* sink.write({
+                events: [
+                  {
+                    id: EventId.make("independent-child:binding"),
+                    type: "provider-thread.updated",
+                    threadId: childId,
+                    occurredAt: now,
+                    payload: { ...binding, providerSessionId: sessionId, status: "active" },
+                  },
+                  {
+                    id: EventId.make("independent-child:run"),
+                    type: "run.updated",
+                    threadId: childId,
+                    occurredAt: now,
+                    payload: { ...run, status: "running", startedAt: now },
+                  },
+                  {
+                    id: EventId.make("independent-child:attempt"),
+                    type: "run-attempt.updated",
+                    threadId: childId,
+                    occurredAt: now,
+                    payload: { ...attempt, status: "running", providerTurnId: turnId },
+                  },
+                  {
+                    id: EventId.make("independent-child:root"),
+                    type: "node.updated",
+                    threadId: childId,
+                    occurredAt: now,
+                    payload: { ...root, status: "running", providerTurnId: turnId },
+                  },
+                  {
+                    id: EventId.make("independent-child:turn"),
+                    type: "provider-turn.updated",
+                    threadId: childId,
+                    occurredAt: now,
+                    payload: {
+                      ...target.turn,
+                      id: turnId,
+                      nodeId: root.id,
+                      providerThreadId: binding.id,
+                      runAttemptId: attempt.id,
+                    },
+                  },
+                ],
+              });
+              return {
+                task,
+                node: parent.nodes.find((row) => row.id === task.id),
+                item: parent.turnItems.find(
+                  (row) => row.type === "subagent" && row.subagentId === task.id,
+                ),
+                child: yield* projections.getThreadProjection(childId),
+                sessionId,
+              };
+            })
+          : undefined;
+      const assertDelegation = Effect.gen(function* () {
+        if (delegation === undefined) return;
+        const parent = yield* projections.getThreadProjection(target.threadId);
+        assert.equal(delegation.item?.providerTurnId, target.turn.id);
+        assert.deepEqual(
+          parent.subagents.find((row) => row.id === delegation.task.id),
+          delegation.task,
+        );
+        assert.deepEqual(
+          parent.nodes.find((row) => row.id === delegation.task.id),
+          delegation.node,
+        );
+        assert.deepEqual(
+          parent.turnItems.find((row) => row.id === delegation.item?.id),
+          delegation.item,
+        );
+        assert.deepEqual(
+          yield* projections.getThreadProjection(delegation.child.thread.id),
+          delegation.child,
+        );
+        assert.isTrue(Option.isSome(yield* sessions.get(delegation.sessionId)));
+      });
       const acceptedCommand = {
         type: "message.dispatch" as const,
         commandId: CommandId.make("accepted-steer"),
@@ -475,84 +611,12 @@ const sessionLoss = ({
               return fiber;
             })
           : undefined;
-      if (accepted !== undefined && admitting === undefined)
+      if (accepted !== undefined && admitting === undefined && !cleanupOnly)
         yield* engine.dispatch(acceptedCommand);
-      if (rebound !== undefined) {
-        const selection = { ...modelSelection, model: "replacement-model" };
-        const switchCommandId = CommandId.make("restart-before-steer-delivery");
-        yield* engine.dispatch({
-          ...acceptedCommand,
-          commandId: switchCommandId,
-          messageId: MessageId.make("restart-before-steer-delivery"),
-          text: "switch selection",
-          modelSelection: selection,
-          dispatchMode: { type: "steer_active", targetRunId: target.run.id },
-        });
-        const restarted = yield* projections.getThreadProjection(target.threadId);
-        const binding = restarted.providerThreads.find(
-          (row) => row.id === target.providerThread.id,
-        )!;
-        const replacementSessionId = binding.providerSessionId!;
-        assert.notEqual(replacementSessionId, sessionId);
-        assert.equal(restarted.runs[0]?.status, "starting");
-        assert.equal(restarted.runs[0]?.providerRestartCleanup?.providerSessionId, sessionId);
-        assert.equal(
-          restarted.runs[0]?.providerRestartCleanup?.replacementProviderSessionId,
-          replacementSessionId,
-        );
-        yield* sessions.open({
-          threadId: target.threadId,
-          providerSessionId: replacementSessionId,
-          modelSelection: selection,
-          runtimePolicy: {
-            runtimeMode: "full-access",
-            interactionMode: "default",
-            cwd: process.cwd(),
-          },
-        });
-        if (rebound === "ended") {
-          yield* Deferred.succeed(finishClose, undefined);
-          yield* sessions.release({ providerSessionId: sessionId, reason });
-          assert.isTrue(Option.isNone(yield* sessions.get(sessionId)));
-          assert.isTrue(Option.isNone(yield* outbox.get(`effect:session-ended:${target.turn.id}`)));
-        }
-        const recorded = (yield* outbox.listByCommandId(acceptedCommand.commandId)).find(
-          (effect) => effect.request.type === "provider-turn.steer",
-        )!;
-        assert.equal(recorded.request.type, "provider-turn.steer");
-        const effect =
-          delivered && recorded.request.type === "provider-turn.steer"
-            ? { ...recorded, request: { ...recorded.request, providerAccepted: true } }
-            : recorded;
-        if (rebound === "live") {
-          const failure = yield* executor.execute(effect).pipe(Effect.flip);
-          assert.equal(failure._tag, "OrchestrationEffectExecutionError");
-        } else {
-          yield* executor.execute(effect);
-          yield* executor.execute({ ...effect, attemptCount: 2 });
-        }
-        const after = yield* projections.getThreadProjection(target.threadId);
-        const queued = after.runs.filter((run) => run.userMessageId === acceptedCommand.messageId);
-        assert.lengthOf(queued, rebound === "ended" && !activeTurnOnly && !delivered ? 1 : 0);
-        if (queued.length > 0) assert.equal(queued[0]?.status, "queued");
-        assert.lengthOf(
-          after.messages.filter((message) => message.id === acceptedCommand.messageId),
-          1,
-        );
-        assert.deepEqual(
-          after.runs.find((run) => run.id === target.run.id),
-          restarted.runs[0],
-        );
-        assert.equal(
-          after.providerThreads.find((row) => row.id === binding.id)?.providerSessionId,
-          replacementSessionId,
-        );
-        assert.isTrue(Option.isSome(yield* sessions.get(replacementSessionId)));
-        assert.equal(adapterSteers, 0);
-        return;
-      }
       if (nativeThreads) {
-        const source = (yield* projections.getThreadProjection(target.threadId)).subagents[0]!;
+        const source = (yield* projections.getThreadProjection(target.threadId)).subagents.find(
+          (task) => task.origin === "provider_native",
+        )!;
         const now = yield* DateTime.now;
         for (let depth = 0; depth < 2; depth++) {
           const threadId = ThreadId.make(`native-child:${depth}`);
@@ -763,6 +827,290 @@ const sessionLoss = ({
           ],
         });
       }
+      if (rebound !== undefined) {
+        const messageNode = {
+          ...target.root,
+          id: NodeId.make("foreground-message"),
+          kind: "assistant_message" as const,
+          parentNodeId: target.root.id,
+          providerTurnId: target.turn.id,
+          status: "running" as const,
+          checkpointScopeId: null,
+        };
+        const message = {
+          id: MessageId.make("foreground-message"),
+          threadId: target.threadId,
+          runId: target.run.id,
+          nodeId: messageNode.id,
+          role: "assistant" as const,
+          text: "partial answer",
+          phase: "unknown" as const,
+          attachments: [],
+          streaming: true,
+          createdAt: yield* DateTime.now,
+          updatedAt: yield* DateTime.now,
+          createdBy: "agent" as const,
+          creationSource: "provider" as const,
+        };
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("foreground-message:node"),
+              type: "node.updated",
+              threadId: target.threadId,
+              occurredAt: message.updatedAt,
+              payload: messageNode,
+            },
+            {
+              id: EventId.make("foreground-message:message"),
+              type: "message.updated",
+              threadId: target.threadId,
+              occurredAt: message.updatedAt,
+              payload: message,
+            },
+          ],
+        });
+        const selection = { ...modelSelection, model: "replacement-model" };
+        const switchCommandId = CommandId.make("restart-before-steer-delivery");
+        yield* engine.dispatch({
+          ...acceptedCommand,
+          commandId: switchCommandId,
+          messageId: MessageId.make("restart-before-steer-delivery"),
+          text: "switch selection",
+          modelSelection: selection,
+          dispatchMode: { type: "steer_active", targetRunId: target.run.id },
+        });
+        const restarted = yield* projections.getThreadProjection(target.threadId);
+        const binding = restarted.providerThreads.find(
+          (row) => row.id === target.providerThread.id,
+        )!;
+        const replacementSessionId = binding.providerSessionId!;
+        assert.notEqual(replacementSessionId, sessionId);
+        assert.equal(restarted.runs[0]?.status, "starting");
+        assert.equal(restarted.runs[0]?.providerRestartCleanup?.providerSessionId, sessionId);
+        assert.equal(
+          restarted.runs[0]?.providerRestartCleanup?.replacementProviderSessionId,
+          replacementSessionId,
+        );
+        yield* sessions.open({
+          threadId: target.threadId,
+          providerSessionId: replacementSessionId,
+          modelSelection: selection,
+          runtimePolicy: {
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          },
+        });
+        const replacementRootId = NodeId.make("rebound-unrelated-root");
+        const replacementTurnId = ProviderTurnId.make("rebound-unrelated-turn");
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("rebound-unrelated-root"),
+              type: "node.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: {
+                ...target.root,
+                id: replacementRootId,
+                rootNodeId: replacementRootId,
+                runId: null,
+                providerThreadId: binding.id,
+                providerTurnId: replacementTurnId,
+                status: "running",
+                startedAt: now,
+              },
+            },
+            {
+              id: EventId.make("rebound-unrelated-turn"),
+              type: "provider-turn.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: {
+                ...target.turn,
+                id: replacementTurnId,
+                nodeId: replacementRootId,
+                runAttemptId: null,
+                ordinal: 2,
+                startedAt: now,
+              },
+            },
+            {
+              id: EventId.make("replacement-message:node"),
+              type: "node.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: {
+                ...messageNode,
+                id: NodeId.make("replacement-message"),
+                providerTurnId: replacementTurnId,
+              },
+            },
+            {
+              id: EventId.make("replacement-message:message"),
+              type: "message.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: {
+                ...message,
+                id: MessageId.make("replacement-message"),
+                nodeId: NodeId.make("replacement-message"),
+              },
+            },
+          ],
+        });
+        if (rebound === "ended") {
+          yield* Deferred.succeed(finishClose, undefined);
+          yield* sessions.release({ providerSessionId: sessionId, reason });
+          assert.isTrue(Option.isNone(yield* sessions.get(sessionId)));
+          for (const turnId of [target.turn.id, "native-turn:0", "native-turn:1"]) {
+            const recovery = Option.getOrThrow(yield* outbox.get(`effect:session-ended:${turnId}`));
+            assert.equal(recovery.request.type, "provider-session.reconcile-turn");
+            yield* executor.execute(recovery);
+          }
+          assert.isTrue(
+            Option.isNone(yield* outbox.get(`effect:session-ended:${replacementTurnId}`)),
+          );
+        }
+        const recorded = (yield* outbox.listByCommandId(acceptedCommand.commandId)).find(
+          (effect) => effect.request.type === "provider-turn.steer",
+        );
+        if (cleanupOnly) assert.isUndefined(recorded);
+        else {
+          assert.isDefined(recorded);
+          const effect =
+            delivered && recorded!.request.type === "provider-turn.steer"
+              ? { ...recorded!, request: { ...recorded!.request, providerAccepted: true } }
+              : recorded!;
+          if (rebound === "live") {
+            const failure = yield* executor.execute(effect).pipe(Effect.flip);
+            assert.equal(failure._tag, "OrchestrationEffectExecutionError");
+          } else {
+            yield* executor.execute(effect);
+            yield* executor.execute({ ...effect, attemptCount: 2 });
+          }
+        }
+        const after = yield* projections.getThreadProjection(target.threadId);
+        assert.deepEqual(
+          after.messages.find((row) => row.id === message.id),
+          {
+            ...message,
+            streaming: rebound === "live",
+          },
+        );
+        assert.equal(
+          after.messages.find((row) => row.id === "replacement-message")?.streaming,
+          true,
+        );
+        assert.equal(
+          after.nodes.find((row) => row.id === "replacement-message")?.status,
+          "running",
+        );
+        yield* assertDelegation;
+        const queued = after.runs.filter((run) => run.userMessageId === acceptedCommand.messageId);
+        assert.lengthOf(
+          queued,
+          rebound === "ended" && !activeTurnOnly && !delivered && !cleanupOnly ? 1 : 0,
+        );
+        if (queued.length > 0) assert.equal(queued[0]?.status, "queued");
+        assert.lengthOf(
+          after.messages.filter((message) => message.id === acceptedCommand.messageId),
+          cleanupOnly ? 0 : 1,
+        );
+        assert.deepEqual(
+          after.runs.find((run) => run.id === target.run.id),
+          restarted.runs[0],
+        );
+        assert.deepEqual(
+          after.attempts.find((row) => row.id === restarted.runs[0]?.activeAttemptId),
+          restarted.attempts.find((row) => row.id === restarted.runs[0]?.activeAttemptId),
+        );
+        assert.deepEqual(
+          after.nodes.find((row) => row.id === restarted.runs[0]?.rootNodeId),
+          restarted.nodes.find((row) => row.id === restarted.runs[0]?.rootNodeId),
+        );
+        assert.equal(after.nodes.find((row) => row.id === target.root.id)?.status, "interrupted");
+        assert.equal(
+          after.attempts.find((row) => row.id === target.attempt.id)?.status,
+          "superseded",
+        );
+        assert.equal(
+          after.providerThreads.find((row) => row.id === binding.id)?.providerSessionId,
+          replacementSessionId,
+        );
+        assert.isTrue(Option.isSome(yield* sessions.get(replacementSessionId)));
+        assert.equal(
+          after.providerTurns.find((row) => row.id === replacementTurnId)?.status,
+          "running",
+        );
+        assert.equal(after.nodes.find((row) => row.id === replacementRootId)?.status, "running");
+        const oldStatus = rebound === "ended" ? "interrupted" : "running";
+        assert.equal(
+          after.providerTurns.find((row) => row.id === target.turn.id)?.status,
+          oldStatus,
+        );
+        for (const id of [`foreground-tool:${target.threadId}`, `remote:${target.threadId}`]) {
+          assert.equal(after.nodes.find((row) => row.id === id)?.status, oldStatus);
+        }
+        assert.equal(
+          after.turnItems.find((row) => row.id === `foreground-tool:${target.threadId}`)?.status,
+          oldStatus,
+        );
+        assert.equal(
+          after.subagents.find((row) => row.id === `remote:${target.threadId}`)?.status,
+          oldStatus,
+        );
+        assert.equal(
+          after.turnItems.find((row) => row.id === `remote-item:${target.threadId}`)?.status,
+          oldStatus,
+        );
+        for (let depth = 0; depth < 2; depth++) {
+          const child = yield* projections.getThreadProjection(
+            ThreadId.make(`native-child:${depth}`),
+          );
+          assert.equal(child.providerTurns[0]?.status, oldStatus);
+          for (const id of [`native-root:${depth}`, `native-tool:${depth}`]) {
+            assert.equal(child.nodes.find((row) => row.id === id)?.status, oldStatus);
+          }
+          assert.equal(
+            child.turnItems.find((row) => row.id === `native-item:${depth}`)?.status,
+            oldStatus,
+          );
+          assert.equal(
+            child.messages.find((row) => row.id === `native-message:${depth}`)?.streaming,
+            rebound === "live",
+          );
+          assert.equal(
+            child.runtimeRequests.find((row) => row.id === `native-request:${depth}`)?.status,
+            rebound === "ended" ? "cancelled" : "pending",
+          );
+          assert.isTrue(child.subagents.every((row) => row.status === oldStatus));
+        }
+        assert.equal(adapterSteers, 0);
+        return;
+      }
+      if (lateRoster !== undefined) {
+        const write = sink.writeIfRunCurrent;
+        const spy = vi.spyOn(sink, "writeIfRunCurrent").mockImplementation((input) =>
+          input.runId === target.run.id &&
+          input.events.some(
+            (event) => event.type === "run.updated" && event.payload.status === "failed",
+          )
+            ? Deferred.succeed(finalizing, undefined).pipe(
+                Effect.andThen(Deferred.await(resumeFinalization)),
+                Effect.andThen(write(input)),
+                Effect.tap(() => Deferred.succeed(finalized, undefined)),
+              )
+            : write(input),
+        );
+        yield* Effect.addFinalizer(() =>
+          Deferred.succeed(resumeFinalization, undefined).pipe(
+            Effect.andThen(Effect.sync(() => spy.mockRestore())),
+          ),
+        );
+      }
       if (buffered) {
         const execution = yield* RunExecution.RunExecutionServiceV2;
         const current = yield* projections.getThreadProjection(target.threadId);
@@ -918,6 +1266,94 @@ const sessionLoss = ({
           return write(input);
         });
         yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+      }
+      if (lastAttemptLoss) {
+        const steer = (yield* outbox.listByCommandId(acceptedCommand.commandId)).find(
+          (effect) => effect.request.type === "provider-turn.steer",
+        )!;
+        const claim = outbox.claimNext;
+        const claims = vi.spyOn(outbox, "claimNext").mockImplementation((input) =>
+          claim({
+            ...input,
+            threadId: target.threadId,
+            onlyEffectTypes: ["provider-turn.steer"],
+          }),
+        );
+        const write = sink.writeWithEffects;
+        const writes = vi
+          .spyOn(sink, "writeWithEffects")
+          .mockImplementation((input) =>
+            input.effects.some(
+              (effect) => effect.request.type === "provider-session.reconcile-turn",
+            )
+              ? Deferred.succeed(markerEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(allowMarker)),
+                  Effect.andThen(write(input)),
+                )
+              : write(input),
+          );
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            claims.mockRestore();
+            writes.mockRestore();
+          }),
+        );
+        yield* Effect.gen(function* () {
+          for (let attempt = 1; attempt <= 4; attempt++) {
+            assert.isTrue(yield* worker.runControlOnce);
+            const pending = Option.getOrThrow(yield* outbox.get(steer.id));
+            assert.equal(pending.status, "pending");
+            assert.equal(pending.attemptCount, attempt);
+            yield* TestClock.adjust(
+              Math.max(
+                0,
+                Date.parse(pending.availableAt) - DateTime.toEpochMillis(yield* DateTime.now),
+              ),
+            );
+          }
+          const sending = yield* worker.runControlOnce.pipe(Effect.forkScoped);
+          yield* Deferred.await(adapterEntered);
+          const releasing = yield* sessions
+            .release({ providerSessionId: sessionId, reason })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(markerEntered);
+          assert.isTrue(Option.isNone(yield* sessions.get(sessionId)));
+          assert.isTrue(Option.isNone(yield* outbox.get(`effect:session-ended:${target.turn.id}`)));
+          yield* Deferred.succeed(failAdapter, undefined);
+          assert.isTrue(yield* Fiber.join(sending));
+          const delivered = Option.getOrThrow(yield* outbox.get(steer.id));
+          assert.equal(delivered.status, "succeeded");
+          assert.equal(delivered.attemptCount, 5);
+          assert.equal(adapterSteers, 5);
+          const duringRelease = yield* projections.getThreadProjection(target.threadId);
+          assert.lengthOf(
+            duringRelease.runs.filter((run) => run.userMessageId === acceptedCommand.messageId),
+            activeTurnOnly ? 0 : 1,
+          );
+          assert.isTrue(Option.isNone(yield* outbox.get(`effect:session-ended:${target.turn.id}`)));
+          yield* Deferred.succeed(allowMarker, undefined);
+          yield* Deferred.succeed(finishClose, undefined);
+          yield* Fiber.join(releasing);
+          claims.mockRestore();
+          writes.mockRestore();
+          yield* worker.drain();
+          const after = yield* projections.getThreadProjection(target.threadId);
+          assert.equal(after.runs.find((run) => run.id === target.run.id)?.status, "interrupted");
+          assert.lengthOf(
+            after.runs.filter((run) => run.userMessageId === acceptedCommand.messageId),
+            activeTurnOnly ? 0 : 1,
+          );
+          assert.equal(Option.getOrThrow(yield* outbox.get(steer.id)).status, "succeeded");
+          assert.equal(adapterSteers, 5);
+        }).pipe(
+          Effect.ensuring(
+            Deferred.succeed(failAdapter, undefined).pipe(
+              Effect.andThen(Deferred.succeed(allowMarker, undefined)),
+              Effect.andThen(Deferred.succeed(finishClose, undefined)),
+            ),
+          ),
+        );
+        return;
       }
       const releasing = yield* sessions
         .release({ providerSessionId: sessionId, reason })
@@ -1198,6 +1634,49 @@ const sessionLoss = ({
       }
       yield* Deferred.succeed(finishClose, undefined);
       yield* Fiber.join(releasing);
+      if (lateRoster !== undefined) {
+        yield* Deferred.await(finalizing);
+        const before = yield* projections.getThreadProjection(target.threadId);
+        const current = before.providerThreads.find(
+          (thread) => thread.id === target.providerThread.id,
+        )!;
+        const expected =
+          lateRoster === "new roster" ? [{ taskId: "new-work", kind: "subagent" as const }] : [];
+        if (lateRoster === "new roster") {
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("fresh-background-roster"),
+                type: "provider-thread.updated",
+                threadId: target.threadId,
+                occurredAt: yield* DateTime.now,
+                payload: { ...current, pendingBackgroundTasks: expected },
+              },
+            ],
+          });
+        } else assert.deepEqual(current.pendingBackgroundTasks, expected);
+        yield* Deferred.succeed(resumeFinalization, undefined);
+        yield* Deferred.await(finalized);
+        const after = yield* projections.getThreadProjection(target.threadId);
+        assert.equal(after.runs.find((run) => run.id === target.run.id)?.status, "failed");
+        assert.deepEqual(
+          after.providerThreads.find((thread) => thread.id === current.id)?.pendingBackgroundTasks,
+          expected,
+        );
+        yield* worker.drain();
+        const recovered = yield* projections.getThreadProjection(target.threadId);
+        assert.deepEqual(
+          recovered.providerThreads.find((thread) => thread.id === current.id)
+            ?.pendingBackgroundTasks,
+          expected,
+        );
+        assert.notEqual(recovered.runs.find((run) => run.id === target.run.id)?.status, "running");
+        assert.notEqual(
+          recovered.providerTurns.find((turn) => turn.id === target.turn.id)?.status,
+          "running",
+        );
+        return;
+      }
       if (nativeThreads) {
         for (let depth = 0; depth < 2; depth++) {
           const marker = Option.getOrThrow(
@@ -1361,6 +1840,76 @@ const sessionLoss = ({
           },
         });
       }
+      if (retrySteer) {
+        const read = projections.getThreadRecords;
+        const claim = outbox.claimNext;
+        const claims = vi.spyOn(outbox, "claimNext").mockImplementation((input) =>
+          claim({
+            ...input,
+            threadId: target.threadId,
+            onlyEffectTypes: ["provider-turn.steer"],
+          }),
+        );
+        let failures = 0;
+        const reads = vi
+          .spyOn(projections, "getThreadRecords")
+          .mockImplementation((id, records, options) =>
+            id === target.threadId &&
+            options?.messageIds?.includes(acceptedCommand.messageId) &&
+            failures++ < 6
+              ? Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId: id,
+                    cause: "temporary saved-message read failure",
+                  }),
+                )
+              : read(id, records, options),
+          );
+        yield* Effect.gen(function* () {
+          for (let attempt = 1; attempt <= 6; attempt++) {
+            assert.isTrue(yield* worker.runControlOnce);
+            const pending = Option.getOrThrow(yield* outbox.get(steerEffect!.id));
+            assert.equal(pending.status, "pending");
+            assert.equal(pending.attemptCount, attempt);
+            assert.equal(pending.request.type, "provider-turn.steer");
+            if (pending.request.type === "provider-turn.steer")
+              assert.isTrue(pending.request.followUpPending);
+            assert.isEmpty(
+              (yield* projections.getThreadProjection(target.threadId)).runs.filter(
+                (run) => run.userMessageId === acceptedCommand.messageId,
+              ),
+            );
+            yield* TestClock.adjust(
+              Math.max(
+                0,
+                Date.parse(pending.availableAt) - DateTime.toEpochMillis(yield* DateTime.now),
+              ),
+            );
+          }
+          reads.mockRestore();
+          if (accepted === "replacement session") {
+            const claimed = yield* outbox.claimNext({
+              workerId: "previous-process",
+              threadId: target.threadId,
+              onlyEffectTypes: ["provider-turn.steer"],
+              leaseDurationMs: 30_000,
+            });
+            assert.equal(Option.getOrThrow(claimed).id, steerEffect!.id);
+          }
+          yield* outbox.reconcileAfterProcessLoss;
+          assert.equal(Option.getOrThrow(yield* outbox.get(steerEffect!.id)).status, "pending");
+          assert.isTrue(yield* worker.runControlOnce);
+          assert.equal(Option.getOrThrow(yield* outbox.get(steerEffect!.id)).status, "succeeded");
+          assert.equal(adapterSteers, 0);
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              reads.mockRestore();
+              claims.mockRestore();
+            }),
+          ),
+        );
+      }
       if (accepted !== undefined) {
         yield* executor.execute({ ...steerEffect!, attemptCount: 2 });
         yield* executor.execute({ ...steerEffect!, attemptCount: 3 });
@@ -1373,6 +1922,16 @@ const sessionLoss = ({
           current.runs.filter((run) => run.userMessageId === acceptedCommand.messageId),
           activeTurnOnly || delivered ? 0 : 1,
         );
+      }
+      yield* assertDelegation;
+      if (appOwned) {
+        const parent = yield* projections.getThreadProjection(target.threadId);
+        assert.equal(
+          parent.providerTurns.find((row) => row.id === target.turn.id)?.status,
+          "interrupted",
+        );
+        assert.notEqual(parent.runs.find((row) => row.id === target.run.id)?.status, "running");
+        return;
       }
       for (const [index, target] of targets.entries()) {
         const hasNativeWork =
@@ -1561,17 +2120,19 @@ it.effect.each([
 );
 
 it.effect.each([
-  { rebound: "ended", activeTurnOnly: false, delivered: false },
-  { rebound: "live", activeTurnOnly: false, delivered: false },
-  { rebound: "ended", activeTurnOnly: true, delivered: false },
-  { rebound: "ended", activeTurnOnly: false, delivered: true },
+  { rebound: "ended", activeTurnOnly: false, delivered: false, cleanupOnly: false },
+  { rebound: "live", activeTurnOnly: false, delivered: false, cleanupOnly: false },
+  { rebound: "ended", activeTurnOnly: true, delivered: false, cleanupOnly: false },
+  { rebound: "ended", activeTurnOnly: false, delivered: true, cleanupOnly: false },
+  { rebound: "ended", activeTurnOnly: false, delivered: false, cleanupOnly: true },
 ] as const)(
-  "handles an accepted steer after committed session rebinding ($rebound, activeTurnOnly=$activeTurnOnly, delivered=$delivered)",
+  "handles committed session rebinding ($rebound, activeTurnOnly=$activeTurnOnly, delivered=$delivered, cleanupOnly=$cleanupOnly)",
   (options) =>
     sessionLoss({
       instance: "codex-cu",
       reason: "runtime_error",
       accepted: "before recovery",
+      nativeThreads: true,
       ...options,
     }),
 );
@@ -1703,6 +2264,18 @@ it.effect.each(
     }),
 );
 
+it.effect.each(["idle_timeout", "runtime_error"] as const)(
+  "preserves an app-owned child's execution and item after parent session loss (%s)",
+  (reason) =>
+    sessionLoss({
+      instance: "codex-cu",
+      reason,
+      appOwned: true,
+      foregroundOnly: true,
+      accepted: "after recovery",
+    }),
+);
+
 it.effect.each(["turn", "root"] as const)(
   "recovers after six consecutive reconciliation read failures (%s)",
   (retryRecovery) =>
@@ -1713,5 +2286,35 @@ it.effect.each(["turn", "root"] as const)(
       terminalBeforeRelease: "completed",
       retryRecovery,
       ...(retryRecovery === "root" ? { unstartedChild: "released" as const } : {}),
+    }),
+);
+
+it.effect.each(["after recovery", "replacement session"] as const)(
+  "retains session-loss follow-up ownership after six storage failures (%s)",
+  (accepted) =>
+    sessionLoss({ instance: "codex-cu", reason: "runtime_error", accepted, retrySteer: true }),
+);
+
+it.effect.each(["cleared", "new roster"] as const)(
+  "late subscriber finalization preserves the authoritative roster (%s)",
+  (lateRoster) =>
+    sessionLoss({
+      instance: "codex-cu",
+      reason: "runtime_error",
+      nativeThreads: true,
+      buffered: "running update",
+      lateRoster,
+    }),
+);
+
+it.effect.each([false, true])(
+  "recovers the last in-flight steer before the release marker (activeTurnOnly=%s)",
+  (activeTurnOnly) =>
+    sessionLoss({
+      instance: "codex-cu",
+      reason: "runtime_error",
+      accepted: "before recovery",
+      lastAttemptLoss: true,
+      activeTurnOnly,
     }),
 );
