@@ -4,10 +4,10 @@ import { toolLog, toolError } from "./toollog.ts";
 import { StderrCause, stderrCause, type DependencyBusy } from "./cause.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export const HOME = homedir();
 export const ROOT = process.env.ROBOB_WATCH_ROOT ?? join(HOME, ".local/share/robob-watch");
@@ -632,6 +632,79 @@ export function log(id: string | null, message: string): void {
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
 
 export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number; busy?: DependencyBusy };
+const liveCheckGroups = new Map<number, Promise<void>>();
+let stoppingChecks = false;
+let shutdownInstalled = false;
+let shutdownStarted = false;
+let beforeCheckShutdown: (() => void) | undefined;
+
+export const checkGroupExit = (pgid: number): Promise<void> | undefined => liveCheckGroups.get(pgid);
+export const checkProcessTag = (id: string, run: string = randomUUID()): string => `${id}:${run}:${process.pid}`;
+
+export function installCheckShutdown(beforeShutdown?: () => void): void {
+  if (beforeShutdown) beforeCheckShutdown = beforeShutdown;
+  if (shutdownInstalled) return;
+  shutdownInstalled = true;
+  const stop = () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    beforeCheckShutdown?.();
+    void killRunningChecks().finally(() => process.exit(0));
+  };
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(signal, stop);
+  // Exit callbacks cannot await, including an imported runner's unexpected normal exit.
+  process.on("exit", () => { void killRunningChecks("SIGKILL"); });
+}
+
+function signalCheckGroup(pgid: number, signal: NodeJS.Signals): void {
+  try { process.kill(-pgid, signal); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") toolError("runner", "watch.kill_failed");
+  }
+}
+
+async function waitForChecks(closed: Promise<void>[], timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([Promise.all(closed), new Promise<void>(resolve => { timer = setTimeout(resolve, timeoutMs); })]);
+  } finally { clearTimeout(timer); }
+}
+
+function trackCheckGroup(pgid: number, child: ReturnType<typeof spawn>): void {
+  let release!: () => void;
+  liveCheckGroups.set(pgid, new Promise<void>(resolve => { release = resolve; }));
+  let watching = false;
+  const closed = () => {
+    if (watching) return;
+    watching = true;
+    // Closing the shell's pipes does not mean its redirected descendants have exited.
+    const reap = () => {
+      try { process.kill(-pgid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+          liveCheckGroups.delete(pgid);
+          release();
+          return;
+        }
+      }
+      setTimeout(reap, 25).unref();
+    };
+    reap();
+  };
+  child.once("close", closed);
+  child.once("error", closed);
+}
+
+export async function killRunningChecks(signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+  stoppingChecks = true;
+  const groups = [...liveCheckGroups];
+  for (const [pgid] of groups) signalCheckGroup(pgid, signal);
+  if (!groups.length || signal === "SIGKILL") return;
+  await waitForChecks(groups.map(([, closed]) => closed), 500);
+  for (const [pgid] of groups) if (liveCheckGroups.has(pgid)) signalCheckGroup(pgid, "SIGKILL");
+  // Let the runner reap direct children before it exits, including TERM-resistant checks.
+  await waitForChecks(groups.map(([, closed]) => closed), 250);
+}
 
 /**
  * Runs a check in its own process group so a timeout kills everything it started. The result never waits more
@@ -639,6 +712,8 @@ export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; 
  * its watcher blocked (3 Oct 2026: killed checks lingered 9+ minutes and their watchers never re-ran).
  */
 export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
+  if (stoppingChecks) return Promise.reject(new Error("Runner is shutting down"));
+  installCheckShutdown();
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
   assertMacWatcher(watcher.chat);
   const started = now();
@@ -662,7 +737,8 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
     };
     const spawnChild = (closing = extraEnv.WATCH_CLOSING ?? (loadState(watcher.id).status === "closing" ? "1" : "0")) => spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), ...(process.env.HEALTH_TOOLLOG_DIR ? { HEALTH_TOOLLOG_DIR: process.env.HEALTH_TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv, WATCH_CLOSING: closing },
+      env: { HOME, PATH, ...(process.env.TOOLLOG_DIR ? { TOOLLOG_DIR: process.env.TOOLLOG_DIR } : {}), ...(process.env.HEALTH_TOOLLOG_DIR ? { HEALTH_TOOLLOG_DIR: process.env.HEALTH_TOOLLOG_DIR } : {}), LANG: "en_US.UTF-8", WATCH_DIR: dir, WATCH_ID: watcher.id, ...testEnv(), ...(watcher.serial ? { WA_LOCKED: "1" } : {}), ...extraEnv,
+        ROBOB_WATCH_CHECK: checkProcessTag(watcher.id, extraEnv.WATCH_RUN || undefined), WATCH_CLOSING: closing },
     });
     // Admission shares the removal lock; a stale callback must never start canceled outreach.
     const child = dir === watcherDir(watcher.id) ? withRelayLock(() => {
@@ -675,6 +751,7 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       if (!current || current.paused || (extraEnv.WATCH_PENDING === "1" ? !pending : !checking(state) || current.check !== watcher.check)) throw new Error("Watcher check changed before admission");
       return spawnChild(state.status === "closing" || state.reply_handoff ? "1" : "0");
     }) : spawnChild();
+    if (child.pid) trackCheckGroup(child.pid, child);
     child.stdout!.on("data", chunk => { if (stdout.length < 200_000) stdout += chunk; });
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", (chunk: string) => { cause.add(chunk); if (stderr.length < 20_000) stderr += chunk; });
@@ -1049,13 +1126,14 @@ export function telegram(source: string, text: string, key: string, severity = "
 
 /** Env a check child gets: its own inputs plus, under a test run, the test markers and every stub override,
  * so a check that runs a helper (wa, mailsend, the bridge CLIs) hits the same guard the test set up. */
-const TEST_ENV_KEYS = ["ROBOB_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
-  "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI",
+const TEST_ENV_KEYS = ["ROBOB_TEST", "ROBOB_WATCH_TEST", "NODE_ENV", "PYTEST_CURRENT_TEST", "WA_WACLI", "WA_DRAFT_DIR", "MAILSEND_HIMALAYA",
+  "MAILSEND_DRAFT_DIR", "MAILSEND_SEND_APPROVAL", "RIDE_CARD_BRIDGE", "CONVO_CARD_BRIDGE", "ROBOB_WATCH_SPECTRUM_CLI", "SPECTRUM_BRIDGE_CONFIG",
   "ROBOB_WATCH_TELEGRAM_CLI", "ROBOB_WATCH_T3CTL", "WACLI_STORE_DIR", "SEND_APPROVAL_BRIDGE_DIR", "SEND_APPROVAL_STATE_DB",
   "ROBOB_READONLY_DB", "MONEY_CASES_STATE_DB", "TOOLLOG_DIR", "HEALTH_TOOLLOG_DIR", "ROBOB_HOME", "T3CODE_HOME", "XDG_DATA_HOME"];
 export function testEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of TEST_ENV_KEYS) if (process.env[k] !== undefined) out[k] = process.env[k]!;
+  if (resolve(ROOT) !== join(HOME, ".local/share/robob-watch")) out.ROBOB_WATCH_TEST = "1";
   return out;
 }
 
@@ -1153,7 +1231,8 @@ export function withRelayLock<T>(fn: () => T): T {
   mkdirSync(ROOT, { recursive: true, mode: 0o700 });
   const db = new Database(join(ROOT, "relay-lock.sqlite"));
   try {
-    db.exec("PRAGMA busy_timeout = 15000");
+    // SQLite's synchronous wait prevents signal handlers from cleaning up owned check groups.
+    db.exec(`PRAGMA busy_timeout = ${shutdownInstalled ? 0 : 15000}`);
     db.exec("BEGIN IMMEDIATE");
     relayLockDepth++;
     try { return fn(); } finally { relayLockDepth--; db.exec("COMMIT"); }
