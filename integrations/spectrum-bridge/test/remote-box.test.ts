@@ -763,6 +763,38 @@ test("one transport outage cannot send a second notice after its waiting episode
   expect(s.notices).toHaveLength(1); expect(s.logs).toContain("moni-notice-suppressed already-sent");
 });
 
+test.each(["fence", "router", "callback", "both", "pending", "running"].flatMap(stall =>
+  ["sent", "uncertain", "not-attempted"].map(notice => ({ stall, notice }))))(
+  "$stall stall with $notice notice preserves the reservation when transport fails", async ({ stall, notice }) => {
+    const s = setup(), head = opaqueId("transition-head");
+    if (["fence", "pending", "running"].includes(stall)) {
+      s.runner.enqueue(head, { kind: "inbound", text: "PRIVATE_TRANSITION_HEAD" });
+      s.runner.db.query("UPDATE inbox SET state=?,interrupted_at=1000 WHERE id=?").run(stall === "fence" ? "interrupted" : stall, head);
+    } else s.readiness(stall !== "router" && stall !== "both", stall !== "callback" && stall !== "both");
+    if (notice === "uncertain") s.failNotice();
+    s.remote.accept("transition-first", { text: "PRIVATE_TRANSITION" }); await s.remote.tick();
+    s.advance(notice === "not-attempted" ? 60_000 : 120_000); await s.remote.tick();
+    expect(s.notices).toHaveLength(notice === "not-attempted" ? 0 : 1);
+    expect(s.store.get("remoteOutage")).toBeUndefined();
+
+    s.offline(); s.advance(5_000); await s.remote.tick();
+    const outage = s.store.get<{ id: string }>("remoteOutage")!.id;
+    s.restart(); s.online(); s.readiness(true, true);
+    s.runner.db.query("UPDATE inbox SET state='done' WHERE id=?").run(head);
+    s.advance(65_000); await s.remote.tick(); await s.runner.tick();
+    s.advance(5_000); await s.remote.tick();
+    expect(s.store.get("remoteWaitingNotice")).toBeNull();
+    expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(outage);
+
+    s.remote.accept("transition-second", { text: "PRIVATE_TRANSITION" });
+    s.offline(); s.advance(21_600_000); await s.remote.tick();
+    expect(s.store.get<{ id: string }>("remoteOutage")!.id).toBe(outage);
+    expect(s.notices).toHaveLength(1);
+    s.restart(); s.advance(65_000); await s.remote.tick();
+    expect(s.notices).toHaveLength(1);
+    expect(JSON.stringify([s.logs, s.alerts])).not.toContain("PRIVATE_TRANSITION");
+  });
+
 
 // Readiness class: either dependency (or both) can block new work, with or without human backlog.
 test.each([

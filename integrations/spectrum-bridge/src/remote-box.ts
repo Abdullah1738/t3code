@@ -290,7 +290,9 @@ export class RemoteBox {
       healthy = true;
     } catch {
       const saved = this.store.get<Outage | null>("remoteOutage");
-      const outage: Outage = saved ?? { id: opaqueId(String(this.now())), unreachableSince: this.now(), reachableSince: null };
+      // A stall notice reserves the transport outage too, even after its waiting episode ends.
+      const outage: Outage = saved ?? { id: opaqueId(String(this.now())), unreachableSince: this.now(), reachableSince: null,
+        noticeAttempted: this.store.get<WaitingNotice | null>("remoteWaitingNotice")?.attempted === true };
       outage.unreachableSince ??= this.now(); outage.reachableSince = null;
       this.store.set("remoteOutage", outage);
       if (!saved) this.emit("moni-box-down");
