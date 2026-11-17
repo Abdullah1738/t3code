@@ -57,6 +57,7 @@ const sessionLoss = ({
   foregroundOnly = false,
   unstartedChild,
   retryRecovery,
+  rebound,
 }: {
   instance: "codex" | "codex-cu" | "opencode";
   reason: Sessions.ProviderSessionReleaseReason;
@@ -79,6 +80,7 @@ const sessionLoss = ({
   foregroundOnly?: boolean;
   unstartedChild?: "released" | "replacement" | "restarted";
   retryRecovery?: "turn" | "root";
+  rebound?: "live" | "ended";
 }) =>
   Effect.gen(function* () {
     const allAdmitted = yield* Deferred.make<void>();
@@ -102,23 +104,30 @@ const sessionLoss = ({
         supportsMultipleProviderThreadsPerSession: shared,
       },
     };
+    let adapterSteers = 0;
     const adapter = {
       instanceId,
       driver,
       getCapabilities: () => Effect.succeed(capabilities),
-      planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
-      openSession: () =>
+      planSelectionTransition: () =>
+        Effect.succeed({
+          type: rebound ? ("restart_session" as const) : ("apply_on_next_turn" as const),
+        }),
+      openSession: (
+        input: Parameters<ProviderAdapter.ProviderAdapterV2["Service"]["openSession"]>[0],
+      ) =>
         Effect.gen(function* () {
           const now = yield* DateTime.now;
+          const runtimeSessionId = input.providerSessionId;
           yield* Effect.addFinalizer(() =>
             Deferred.succeed(closing, undefined).pipe(Effect.andThen(Deferred.await(finishClose))),
           );
           return {
             instanceId,
             driver,
-            providerSessionId: sessionId,
+            providerSessionId: runtimeSessionId,
             providerSession: {
-              id: sessionId,
+              id: runtimeSessionId,
               driver,
               providerInstanceId: instanceId,
               status: "ready",
@@ -146,15 +155,17 @@ const sessionLoss = ({
             steerTurn: ({
               providerThread,
               providerTurnId,
-            }: Parameters<ProviderAdapter.ProviderAdapterV2SessionRuntime["steerTurn"]>[0]) =>
-              Effect.fail(
+            }: Parameters<ProviderAdapter.ProviderAdapterV2SessionRuntime["steerTurn"]>[0]) => {
+              adapterSteers++;
+              return Effect.fail(
                 new ProviderAdapter.ProviderAdapterSteerRunError({
                   driver,
                   providerThreadId: providerThread.id,
                   providerTurnId,
                   cause: "The replacement does not own the old turn.",
                 }),
-              ),
+              );
+            },
           } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
         }),
     } as ProviderAdapter.ProviderAdapterV2["Service"];
@@ -466,6 +477,80 @@ const sessionLoss = ({
           : undefined;
       if (accepted !== undefined && admitting === undefined)
         yield* engine.dispatch(acceptedCommand);
+      if (rebound !== undefined) {
+        const selection = { ...modelSelection, model: "replacement-model" };
+        const switchCommandId = CommandId.make("restart-before-steer-delivery");
+        yield* engine.dispatch({
+          ...acceptedCommand,
+          commandId: switchCommandId,
+          messageId: MessageId.make("restart-before-steer-delivery"),
+          text: "switch selection",
+          modelSelection: selection,
+          dispatchMode: { type: "steer_active", targetRunId: target.run.id },
+        });
+        const restarted = yield* projections.getThreadProjection(target.threadId);
+        const binding = restarted.providerThreads.find(
+          (row) => row.id === target.providerThread.id,
+        )!;
+        const replacementSessionId = binding.providerSessionId!;
+        assert.notEqual(replacementSessionId, sessionId);
+        assert.equal(restarted.runs[0]?.status, "starting");
+        assert.equal(restarted.runs[0]?.providerRestartCleanup?.providerSessionId, sessionId);
+        assert.equal(
+          restarted.runs[0]?.providerRestartCleanup?.replacementProviderSessionId,
+          replacementSessionId,
+        );
+        yield* sessions.open({
+          threadId: target.threadId,
+          providerSessionId: replacementSessionId,
+          modelSelection: selection,
+          runtimePolicy: {
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          },
+        });
+        if (rebound === "ended") {
+          yield* Deferred.succeed(finishClose, undefined);
+          yield* sessions.release({ providerSessionId: sessionId, reason });
+          assert.isTrue(Option.isNone(yield* sessions.get(sessionId)));
+          assert.isTrue(Option.isNone(yield* outbox.get(`effect:session-ended:${target.turn.id}`)));
+        }
+        const recorded = (yield* outbox.listByCommandId(acceptedCommand.commandId)).find(
+          (effect) => effect.request.type === "provider-turn.steer",
+        )!;
+        assert.equal(recorded.request.type, "provider-turn.steer");
+        const effect =
+          delivered && recorded.request.type === "provider-turn.steer"
+            ? { ...recorded, request: { ...recorded.request, providerAccepted: true } }
+            : recorded;
+        if (rebound === "live") {
+          const failure = yield* executor.execute(effect).pipe(Effect.flip);
+          assert.equal(failure._tag, "OrchestrationEffectExecutionError");
+        } else {
+          yield* executor.execute(effect);
+          yield* executor.execute({ ...effect, attemptCount: 2 });
+        }
+        const after = yield* projections.getThreadProjection(target.threadId);
+        const queued = after.runs.filter((run) => run.userMessageId === acceptedCommand.messageId);
+        assert.lengthOf(queued, rebound === "ended" && !activeTurnOnly && !delivered ? 1 : 0);
+        if (queued.length > 0) assert.equal(queued[0]?.status, "queued");
+        assert.lengthOf(
+          after.messages.filter((message) => message.id === acceptedCommand.messageId),
+          1,
+        );
+        assert.deepEqual(
+          after.runs.find((run) => run.id === target.run.id),
+          restarted.runs[0],
+        );
+        assert.equal(
+          after.providerThreads.find((row) => row.id === binding.id)?.providerSessionId,
+          replacementSessionId,
+        );
+        assert.isTrue(Option.isSome(yield* sessions.get(replacementSessionId)));
+        assert.equal(adapterSteers, 0);
+        return;
+      }
       if (nativeThreads) {
         const source = (yield* projections.getThreadProjection(target.threadId)).subagents[0]!;
         const now = yield* DateTime.now;
@@ -1473,6 +1558,22 @@ it.effect.each([
 ] as const)(
   "settles shared session loss ($instance, $reason, replacement=$replace, promotion=$promotion)",
   sessionLoss,
+);
+
+it.effect.each([
+  { rebound: "ended", activeTurnOnly: false, delivered: false },
+  { rebound: "live", activeTurnOnly: false, delivered: false },
+  { rebound: "ended", activeTurnOnly: true, delivered: false },
+  { rebound: "ended", activeTurnOnly: false, delivered: true },
+] as const)(
+  "handles an accepted steer after committed session rebinding ($rebound, activeTurnOnly=$activeTurnOnly, delivered=$delivered)",
+  (options) =>
+    sessionLoss({
+      instance: "codex-cu",
+      reason: "runtime_error",
+      accepted: "before recovery",
+      ...options,
+    }),
 );
 
 it.effect.each([

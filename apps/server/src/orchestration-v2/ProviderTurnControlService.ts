@@ -121,9 +121,32 @@ export const layer: Layer.Layer<
       if (
         providerThread === undefined ||
         providerTurn === undefined ||
-        (!targetsRecordedSession && !targetsCommittedReplacement) ||
         providerTurn.providerThreadId !== providerThread.id
       ) {
+        return yield* new ProviderTurnControlError({
+          threadId: input.threadId,
+          operation: input.operation,
+          providerTurnId: input.providerTurnId,
+          cause: "The recorded provider execution target is no longer valid.",
+        });
+      }
+      const steerSession =
+        input.operation === "steer" ? yield* sessions.get(input.providerSessionId) : undefined;
+      if (steerSession !== undefined && Option.isNone(steerSession)) {
+        return yield* new ProviderTurnControlError({
+          threadId: input.threadId,
+          operation: "steer",
+          providerTurnId: input.providerTurnId,
+          cause: new ProviderSessionManager.ProviderSessionEndedError({
+            providerSessionId: input.providerSessionId,
+            ...(context.run === undefined ? {} : { runId: context.run.id }),
+          }),
+        });
+      }
+      // A later restart can rebind this thread before an accepted steer runs.
+      // Recover the saved message if its original session ended, while keeping
+      // live adapter calls guarded by the recorded binding.
+      if (!targetsRecordedSession && !targetsCommittedReplacement) {
         return yield* new ProviderTurnControlError({
           threadId: input.threadId,
           operation: input.operation,
@@ -138,19 +161,6 @@ export const layer: Layer.Layer<
       const interruptProviderThread = targetsRecordedSession
         ? providerThread
         : { ...providerThread, providerSessionId: input.providerSessionId };
-      const steerSession =
-        input.operation === "steer" ? yield* sessions.get(input.providerSessionId) : undefined;
-      if (steerSession !== undefined && Option.isNone(steerSession)) {
-        return yield* new ProviderTurnControlError({
-          threadId: input.threadId,
-          operation: "steer",
-          providerTurnId: input.providerTurnId,
-          cause: new ProviderSessionManager.ProviderSessionEndedError({
-            providerSessionId: input.providerSessionId,
-            ...(context.run === undefined ? {} : { runId: context.run.id }),
-          }),
-        });
-      }
       if (providerTurn.status !== "running") {
         if (input.operation === "steer") {
           return yield* new ProviderTurnControlError({
