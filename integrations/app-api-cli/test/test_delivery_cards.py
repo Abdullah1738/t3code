@@ -1044,14 +1044,121 @@ class CardTests(unittest.TestCase):
             self.assertIn(json.dumps(state['url']), next(a for a in requests[0] if a.startswith('--text=')))
             c.sync(self.cfg, self.data, send=True)
             self.assertEqual(len(requests), 1)
-            # A cut after bus acceptance reconciles the request row instead of sending twice.
+            # A cut after bus acceptance replays the same key, not another wake.
             state['status'] = 'failed:bridge_request_failed'
             state['open'] = [{'args': state['send_args']}]
             state.pop('agent_request_id')
             c.atomic(path, state)
             self.assertEqual(c.sync(self.cfg, self.data, send=True)['status'], 'relayed')
             self.assertEqual(c.read(path)['agent_request_id'], c.mine(state['send_args']))
-            self.assertEqual(len(requests), 1)
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(requests[0], requests[1])
+
+    def test_bus_metadata_without_wake_recovers_only_through_the_same_key(self):
+        for failure in ('before-wake', 'after-wake'):
+            with self.subTest(failure=failure):
+                watcher = 'order-talabat-' + failure
+                cfg = {**self.cfg, 'watcher': watcher}
+                path = c.ROOT / 'cards' / (watcher + '.json')
+                requests, wakes = [], set()
+                original_bridge = c.bridge
+                def remote(args, **kw):
+                    if args[0] == 'send':
+                        raise c.BridgeError('Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box', 1)
+                    if args[0] != 'agent-ask':
+                        return original_bridge(args, **kw)
+                    requests.append(list(args))
+                    oid = c.mine(args)
+                    with sqlite3.connect(self.db('owner')) as con:
+                        con.execute('create table if not exists agent_requests (id text primary key, to_slug text, status text)')
+                        row = con.execute('select id from agent_requests where id=?', (oid,)).fetchone()
+                        con.execute('insert or ignore into agent_requests values (?, ?, ?)', (oid, 'moni', 'open'))
+                    if len(requests) == 1:
+                        if failure == 'after-wake':
+                            wakes.add(oid)
+                        raise c.BridgeError('Bridge request failed (HTTP 502): delivery unavailable', 1)
+                    wakes.add(oid)
+                    return {'id': oid, 'created': not row}
+                with patch.object(c, 'bridge', side_effect=remote):
+                    first = c.sync(cfg, self.data, send=True)
+                    self.assertEqual(first['status'], 'failed:bridge_request_failed')
+                    self.assertEqual(len(wakes), int(failure == 'after-wake'))
+                    saved = c.read(path)
+                    self.assertEqual(len(saved['open']), 1)
+                    final, retry = c.reconcile(saved['send_args'], saved)
+                    self.assertIsNone(final, 'request metadata alone is not relay acceptance')
+                    self.assertEqual(retry, requests[0])
+                    recovered = c.sync(cfg, self.data, send=True)
+                    self.assertEqual(recovered['status'], 'relayed')
+                    self.assertEqual(recovered['agent_request_id'], c.mine(requests[0]))
+                    self.assertEqual(c.read(path)['open'], [])
+                    c.sync(cfg, self.data, send=True)
+                self.assertEqual(len(requests), 2)
+                self.assertEqual(requests[0], requests[1])
+                self.assertEqual(len(wakes), 1)
+
+    def test_bus_request_status_matrix_requires_an_answer_or_same_key_ack(self):
+        args = c.relay_args(['send', '--to', 'moni', '--text=https://cards.example.com/fake/', '--session', 'fixture-session', '--key', 'delivery-card:status'])
+        with sqlite3.connect(self.db('owner')) as con:
+            con.execute('create table agent_requests (id text primary key, to_slug text, status text)')
+        for status in ('open', 'pending', 'done', 'done_late', 'declined', 'timed_out', 'unknown'):
+            with self.subTest(status=status):
+                with sqlite3.connect(self.db('owner')) as con:
+                    con.execute('insert or replace into agent_requests values (?, ?, ?)', (c.mine(args), 'moni', status))
+                holder = {'send_args': args, 'open': [{'args': args}]}
+                final, retry = c.reconcile(args, holder)
+                expected = None if status == 'open' else 'relayed' if status in ('pending', 'done', 'done_late') else 'failed:may_have_sent_check_chat'
+                self.assertEqual(final, expected)
+                self.assertEqual(retry, args)
+
+    def test_problem_notice_legacy_pending_reconciles_before_remote_fallback(self):
+        cases = [('pending', 0, 'sent'), ('sending', 1, 'sent'), ('sent', 1, 'sent'),
+                 ('uncertain', 1, 'failed:may_have_sent_check_chat'),
+                 ('cancelled', 1, 'failed:may_have_sent_check_chat'),
+                 ('failed', 0, 'relayed'), (None, 0, 'pending')]
+        for legacy in (True, False):
+            for row, attempts, expected in cases:
+                with self.subTest(legacy=legacy, row=row):
+                    key = f'order-problem:{legacy}-{row}'
+                    args = ['send', '--to', 'moni', '--session', 'fixture-session', '--key', key, '--text=fixture problem']
+                    if row:
+                        self.queue(args, row, attempts)
+                    notice = {'status': 'pending', 'chat': 'moni', 'text': 'fixture problem'}
+                    if not legacy:
+                        notice['open'] = []
+                    state = {'problem_notices': {key: notice}}
+                    cfg = {'watcher': f'fixture-problem-{legacy}-{row}'}
+                    folder = t.WATCHERS / cfg['watcher']
+                    folder.mkdir(parents=True)
+                    path = folder / 'order-tracker-state.json'
+                    def remote(call):
+                        if call[0] == 'send':
+                            raise c.BridgeError('Bridge request failed (HTTP 403): Use agent-ask to reach this chat on its box', 1)
+                        return {'id': c.mine(call), 'created': True}
+                    with patch.object(t, 'bridge_route', return_value='fixture-session'), patch.object(c, 'bridge', side_effect=remote) as bridge:
+                        t.send_problem_notices(cfg, state, path, folder)
+                        t.send_problem_notices(cfg, state, path, folder)
+                    final = 'relayed' if not legacy and row is None else expected
+                    self.assertEqual(notice['status'], final)
+                    if row in ('pending', 'sending', 'sent', 'uncertain', 'cancelled'):
+                        self.assertEqual(bridge.call_count, 0)
+                    elif legacy and row is None:
+                        self.assertEqual([call.args[0][0] for call in bridge.call_args_list], ['send', 'send'])
+                        self.assertEqual(notice['open'], [{'args': args}])
+                        self.assertEqual(notice['bridge_error']['http'], 403)
+                    else:
+                        self.assertEqual([call.args[0][0] for call in bridge.call_args_list], ['send', 'agent-ask'])
+                        self.assertEqual(notice['agent_request_id'], c.mine(notice['args']))
+
+    def test_new_notice_producers_record_no_prior_attempts_explicitly(self):
+        expensive = {}
+        t.queue_problem_notices({**self.cfg, 'total': 'AED 600'}, {'status': 'unknown', 'errors': ['offline']}, expensive, [])
+        self.assertTrue(expensive['problem_notices'])
+        self.assertTrue(all(notice['open'] == [] for notice in expensive['problem_notices'].values()))
+        unavailable = {'consecutive_failures': t.POLL_FAILURE_THRESHOLD}
+        t.queue_tracking_unavailable({**self.cfg, 'app': 'amazon'}, {'amazon_read_ok': False}, unavailable, [])
+        self.assertTrue(unavailable['problem_notices'])
+        self.assertTrue(all(notice['open'] == [] for notice in unavailable['problem_notices'].values()))
 
     def test_remote_refusal_does_not_switch_while_an_older_send_is_unanswered(self):
         args = ['send', '--to', 'moni', '--text=https://cards.example.com/old', '--session', 'fixture-session', '--key', 'old-key']

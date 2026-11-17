@@ -704,7 +704,10 @@ def ops(args):
             return None, {}
         if row[0] != slug:
             raise ValueError('bridge_bus_target_conflict')
-        return None, {ids['to']: ('maybe' if row[1] in ('declined', 'timed_out') else 'live', row[1])}
+        # The request row is committed before its wake. Only an answer proves
+        # receipt; an open row permits replay of the original idempotent ask.
+        kind = 'live' if row[1] in ('pending', 'done', 'done_late') else 'retry' if row[1] == 'open' else 'maybe'
+        return None, {ids['to']: (kind, row[1])}
     wanted = list(ids.values()) if slug == 'owner' else [ids['to']]
     con = sqlite3.connect(f'{chat_store(slug).as_uri()}?mode=ro', uri=True, timeout=2)
     try:
@@ -769,6 +772,11 @@ def reconcile(args, holder=None, field='send_args'):
             return accepted_status(args), args
         if 'maybe' in kinds:
             return 'failed:may_have_sent_check_chat', args
+        if 'retry' in kinds:
+            if any(mine(a['args']) != mine(args) for a in waiting(holder, field)):
+                return 'failed:may_have_sent_check_chat', args
+            holder['agent_request_id'] = mine(args)
+            return None, args  # Same key/text only: AgentBus.ask replays its deduped wake.
         held = {mine(a['args']): a['args'] for a in waiting(holder, field)}
         if len(held) > 1:
             return 'failed:may_have_sent_check_chat', args
@@ -880,7 +888,7 @@ def attempt(holder, field, save):
                     if 'live' in kinds:
                         holder[field] = prior['args']
                         return accepted_status(prior['args'])
-                    if 'maybe' in kinds:
+                    if kinds & {'maybe', 'retry'}:
                         return 'failed:may_have_sent_check_chat'
                     if mine(prior['args']) not in seen:
                         break

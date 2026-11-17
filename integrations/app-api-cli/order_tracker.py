@@ -184,7 +184,7 @@ def queue_problem_notices(cfg, result, state, events, now=None):
             identity.append(cfg['merchant_domain'])
         key = 'order-problem:' + hashlib.sha256(
             json.dumps(identity, separators=(',', ':')).encode()).hexdigest()
-        notices.setdefault(key, {'status': 'pending',
+        notices.setdefault(key, {'status': 'pending', 'open': [],
                                 'text': f"{cfg['app']} order {cfg['order']} (AED {total:,.2f}): {description.rstrip('.')}."})
     return [event for event in events if event['kind'] not in
             {'tracking_problem', 'problem', 'eta_elapsed', 'card_link_problem'}]
@@ -207,10 +207,10 @@ def send_problem_notices(cfg, state, path, folder):
                 if not route:
                     break
                 notice.setdefault('args', ['send', '--to', notice['chat'], '--session', route, '--key', key, '--text=' + notice['text']])
-                notice.setdefault('open', [])
-                final = None
-                if notice.get('tried'):
-                    final, notice['args'] = delivery_cards.reconcile(notice['args'], notice, 'args')
+                # Old pending notices recorded neither tried nor open. Their
+                # original send may have landed; retain that history on upgrade.
+                notice.setdefault('open', [{'args': list(notice['args'])}])
+                final, notice['args'] = delivery_cards.reconcile(notice['args'], notice, 'args')
                 if not final:
                     notice['tried'] = True
                     notice['args'][notice['args'].index('--session') + 1] = route
@@ -245,7 +245,7 @@ def queue_tracking_unavailable(cfg, result, state, events):
     key = 'order-unavailable:' + hashlib.sha256(
         json.dumps([cfg['app'], cfg['order']], separators=(',', ':')).encode()).hexdigest()
     state.setdefault('problem_notices', {}).setdefault(key, {
-        'status': 'pending', 'chat': chat,
+        'status': 'pending', 'chat': chat, 'open': [],
         'text': f"Amazon order {cfg['order']}: tracking is unavailable. I'll keep checking."})
     return events
 
