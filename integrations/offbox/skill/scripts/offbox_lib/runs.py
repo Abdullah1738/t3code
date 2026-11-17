@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence
+from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence, quint_tools
 from . import command_usage, common, containers, java_version, prune, prepare, userns
 from . import resources, box_disk, queue_lifecycle
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
@@ -1580,10 +1580,12 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
               f'cd "{cd}" || {{ echo "offbox: remote dir {cd} missing (did sync run?)" >&2; exit 97; }}',
               repo_setup_block(repo_key, rdir),
               f"_offbox_needs_go={int(usage.needs_go)}\n{GO_REPAIR}",
-              node,
-              node_tools.block(rdir, repo_root),
+              # JDK activation prepends PATH; install command precedence after runtimes.
               java_version.block(java_version.trigger(repo_root or Path.cwd(), rel, argv, steps,
                                                        repo_key=repo_key, template=template)),
+              node,
+              quint_tools.block(),
+              node_tools.block(rdir, repo_root),
               ('''for _offbox_tool in terraform aws ruby vector gh; do
   if [ "$_offbox_tool" = terraform ] && [ "${OFFBOX_TERRAFORM_STATE:-}" = skipped ]; then continue; fi
   command -v "$_offbox_tool" >/dev/null || {
@@ -2062,6 +2064,7 @@ class Runner:
             ssh_sync.put_file(self.box, env_file, body, '600', upload_timeout)
             if getattr(self, 'command_file', None):
                 ssh_sync.put_file(self.box, self.command_file, self.command_body, '600', upload_timeout)
+            quint_tools.ensure_archive(self.box)
         upload = (err, upload_files)
         tw = None
         home = api.BACKEND == "server"
