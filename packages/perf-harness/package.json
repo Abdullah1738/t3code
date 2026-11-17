@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "typecheck": "tsc-rs --noEmit",
     "test": "node --test src/*.test.ts",
     "fixture": "node src/fixture.ts",
     "compare": "node src/compare.ts"

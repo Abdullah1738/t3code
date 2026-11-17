@@ -48,10 +48,10 @@ const layer = Events.layer.pipe(
   Layer.provideMerge(Sqlite.layerFromPath(mainPath)),
   Layer.provideMerge(NodeServices.layer),
 );
-const withStore = <A>(
+const withStore = <A, E>(
   use: (
     store: (typeof Events.OrchestrationEventStore)["Service"],
-  ) => import("effect/Effect").Effect<A, unknown, never>,
+  ) => import("effect/Effect").Effect<A, E>,
 ) =>
   Effect.runPromise(
     Effect.gen(function* () {
