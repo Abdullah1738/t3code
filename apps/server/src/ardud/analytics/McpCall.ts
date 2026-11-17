@@ -5,6 +5,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   KanbanErrorCode,
   McpDenyReason,
+  McpPhase,
   OrchestratorMcpFailure,
   type AnalyticsEvent,
 } from "@t3tools/contracts";
@@ -17,6 +18,10 @@ import type * as SchemaIssue from "effect/SchemaIssue";
 import { McpSchema } from "effect/ai";
 
 type Phase = NonNullable<AnalyticsEvent["errorPhase"]>;
+const MCP_PHASES = new Set<string>(McpPhase.literals);
+const isMcpPhase = (phase: string): phase is Phase => MCP_PHASES.has(phase);
+const phaseForStage = (stage: string): Phase =>
+  stage === "records" ? "result" : isMcpPhase(stage) ? stage : "handler";
 type ThreadReadStage = NonNullable<AnalyticsEvent["threadReadStages"]>[number];
 type MutableThreadReadStage = { -readonly [K in keyof ThreadReadStage]: ThreadReadStage[K] };
 type TaskLookup = Pick<
@@ -270,18 +275,7 @@ export const resolvedContext = Effect.fnUntraced(function* (context: {
 // Every deadline already has a span; this only preserves its phase through MCP error encoding.
 export const failedPhase = Effect.fnUntraced(function* (phase: string) {
   const call = yield* Effect.serviceOption(McpCall);
-  if (call._tag === "Some")
-    call.value.phase =
-      phase === "caller" ||
-      phase === "dispatch" ||
-      phase === "result" ||
-      phase === "lane_wait" ||
-      phase === "query" ||
-      phase === "render"
-        ? phase
-        : phase === "records"
-          ? "result"
-          : "handler";
+  if (call._tag === "Some") call.value.phase = phaseForStage(phase);
 });
 
 // Dispatch owns the commit span; observing the receipt must not add per-event spans.
@@ -570,9 +564,15 @@ export function callOutcome(
               : code === "caller_unresolved" ||
                   (partial && state.phase === "caller" && !state.callerResolved)
                 ? "caller"
-                : replyTooLarge || state.replyFailure || partial || waitTimedOut || requestTimedOut
+                : replyTooLarge || state.replyFailure
                   ? "result"
-                  : state.phase,
+                  : partial
+                    ? phaseForStage(
+                        typeof content.stoppedAt === "string" ? content.stoppedAt : "result",
+                      )
+                    : waitTimedOut || requestTimedOut
+                      ? "result"
+                      : state.phase,
         }
       : {}),
   };

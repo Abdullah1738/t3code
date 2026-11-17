@@ -68,11 +68,19 @@ const McpOutcome = Schema.Literals([
   "interrupted",
   "interrupted_by_shutdown",
 ]);
-const McpPhase = Schema.Literals([
+export const McpPhase = Schema.Literals([
   "caller",
   "dispatch",
   "result",
   "handler",
+  "parent_records",
+  "child_records",
+  "catalog",
+  "request_key",
+  "receipt",
+  "settings",
+  "selection",
+  "workspace",
   "lane_wait",
   "query",
   "render",
