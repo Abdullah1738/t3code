@@ -817,6 +817,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
       "run_starting",
       "caller_unresolved",
       "delegation_timeout",
+      "delegation_uncertain",
       "ambiguous_replay",
       "provider_unavailable",
       "model_unavailable",
@@ -841,6 +842,7 @@ export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFa
     reason: Schema.optional(McpDenyReason),
     reasonClass: Schema.optionalKey(McpReasonClass),
     invalidField: Schema.optionalKey(McpInvalidField),
-    saved: Schema.optional(Schema.Boolean),
+    saved: Schema.optional(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+    taskId: Schema.optional(NodeId),
   },
 ) {}
