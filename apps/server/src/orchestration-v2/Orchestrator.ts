@@ -9994,6 +9994,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           : lostEvents
             ? `The provider accepted this run, but its events did not reach orchestration within ${PROVIDER_START_TIMEOUT_MS / 60_000} min (native session: ${command.nativeEvidence?.nativeSessionId ?? "unknown"}).`
             : `Robob could not confirm that the provider started this run within ${PROVIDER_START_TIMEOUT_MS / 60_000} min.`;
+    const failure = {
+      ...makeProviderFailure({
+        class: "provider_error",
+        code:
+          command.phase === "restart_admission"
+            ? "restart_admission_timeout"
+            : lostEvents
+              ? "provider_events_lost"
+              : PROVIDER_START_TIMEOUT_CODE,
+        ...(lostEvents ? { retryable: false } : {}),
+        message,
+      }),
+      ...(command.admission === undefined ? {} : { admission: command.admission }),
+    };
     for (const turn of projection.providerTurns.filter(
       (turn) => run.activeAttemptId !== null && turn.runAttemptId === run.activeAttemptId,
     )) {
@@ -10064,17 +10078,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         startedAt: now,
         completedAt: now,
         updatedAt: now,
-        failure: makeProviderFailure({
-          class: "provider_error",
-          code:
-            command.phase === "restart_admission"
-              ? "restart_admission_timeout"
-              : lostEvents
-                ? "provider_events_lost"
-                : PROVIDER_START_TIMEOUT_CODE,
-          ...(lostEvents ? { retryable: false } : {}),
-          message,
-        }),
+        failure,
       },
     });
     yield* emitEvent({
@@ -10082,7 +10086,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       threadId: command.threadId,
       runId: run.id,
       occurredAt: now,
-      payload: { ...run, status: "failed", completedAt: now },
+      payload: { ...run, status: "failed", completedAt: now, failure },
     });
     return {
       effectTypes: ["provider-turn.start", "provider-turn.restart"] as const,

@@ -1227,3 +1227,69 @@ it.each(["failed", "noOutcome"] as const)(
     });
   },
 );
+
+describe("restart admission rollup", () => {
+  const admission = (waitedMs: number, input: Partial<AnalyticsEvent> = {}): AnalyticsEvent =>
+    event({
+      kind: "restart.admission.admitted",
+      bootId: "boot-one",
+      restartAdmission: {
+        sourceRunId: "source-" + waitedMs,
+        classification: "continuation",
+        queuedAtMs: 0,
+        waitedMs,
+        positionAtEntry: 12,
+        position: 1,
+        total: 7,
+        maxQueueDepth: 20,
+        active: 1,
+        maxActive: 4,
+        loaded: true,
+      },
+      ...input,
+    });
+  it("reports waits, depth, active reservations and each bound rule by boot/hour", () => {
+    const target = makeAccumulator();
+    for (const waitedMs of [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000])
+      accumulate(target, admission(waitedMs));
+    for (const rule of ["no_progress", "no_progress", "absolute_backstop", "wall_time"] as const)
+      accumulate(
+        target,
+        admission(1800000, {
+          kind: "restart.admission.failed",
+          restartAdmission: {
+            ...admission(0).restartAdmission!,
+            rule,
+            waitedMs: 1800000,
+            maxQueueDepth: 34,
+            active: 2,
+          },
+        }),
+      );
+    accumulate(target, admission(50, { bootId: "boot-two" }));
+    accumulate(target, admission(80, { ts: "2026-11-13T13:00:00.000Z" }));
+    const result = finishRollup(target, "2026-11-13", ts).restartAdmission!;
+    assert.strictEqual(result.scope, "server-wide");
+    assert.strictEqual(result.loadedTimeShare, null);
+    assert.strictEqual(result.groups.length, 3);
+    assert.deepEqual(result.groups[0], {
+      bootId: "boot-one",
+      hour: "2026-11-13T12Z",
+      admissions: 10,
+      maxQueueDepth: 34,
+      maxActiveObserved: 2,
+      maxActive: 4,
+      observations: 14,
+      loadedObservations: 14,
+      failuresByRule: { no_progress: 2, absolute_backstop: 1, wall_time: 1 },
+      wait: { count: 10, p50Ms: 500, p90Ms: 900, maxMs: 1000, approximate: false },
+    });
+  });
+  it("bounds boot/hour groups and exposes overflow", () => {
+    const target = makeAccumulator();
+    for (let i = 0; i < 140; i++) accumulate(target, admission(i, { bootId: "boot-" + i }));
+    const result = finishRollup(target, "2026-11-13", ts).restartAdmission!;
+    assert.strictEqual(result.groups.length, 128);
+    assert.strictEqual(result.overflow, 12);
+  });
+});

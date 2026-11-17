@@ -10753,6 +10753,16 @@ it.effect.each(["ordinary", "orphan", "queued source"] as const)(
       const deadline = DateTime.makeUnsafe(
         DateTime.toEpochMillis(yield* DateTime.now) + RestartPacing.RESTART_ADMISSION_TIMEOUT_MS,
       );
+      const admission =
+        ownership === "orphan"
+          ? undefined
+          : {
+              queuedAtMs: DateTime.toEpochMillis(yield* DateTime.now),
+              waitedMs: RestartPacing.RESTART_ADMISSION_TIMEOUT_MS,
+              positionAtFailure: 4,
+              totalAtFailure: 9,
+              rule: "no_progress" as const,
+            };
       yield* TestClock.adjust(`${RestartPacing.RESTART_ADMISSION_TIMEOUT_MS} millis`);
       const promoted = yield* Deferred.make<void>();
       yield* engine.streamDomainEvents.pipe(
@@ -10774,6 +10784,7 @@ it.effect.each(["ordinary", "orphan", "queued source"] as const)(
         runId: run.id,
         expectedAttemptId: run.activeAttemptId,
         deadline,
+        ...(admission === undefined ? {} : { admission }),
       });
       yield* Deferred.await(drained);
       const terminalRows = rows.filter(
@@ -10807,6 +10818,15 @@ it.effect.each(["ordinary", "orphan", "queued source"] as const)(
       assert.equal(after.runs[1]?.status, ownership !== "orphan" ? "starting" : "queued");
       if (ownership !== "orphan") assert.isUndefined(after.runs[1]?.providerStartDeadlineAt);
       assert.equal(after.runs[2]?.status, "queued");
+      const failureItem = after.turnItems.find(
+        (item) => item.type === "error" && item.failure.code === "restart_admission_timeout",
+      );
+      assert.isDefined(failureItem);
+      assert.equal(failureItem?.type, "error");
+      if (failureItem?.type === "error") {
+        assert.deepEqual(failureItem.failure.admission, admission);
+        assert.deepEqual(after.runs[0]?.failure, failureItem.failure);
+      }
       assert.isTrue(
         after.turnItems.some(
           (item) =>
