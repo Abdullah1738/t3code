@@ -2984,10 +2984,13 @@ def _offbox_payload(words, *, known_only=True):
         return None
     index = 2
     while index < len(words):
-        flag, equal, _ = words[index].partition('=')
-        if flag == '--':
+        flag, equal, value = words[index].partition('=')
+        if words[index] == '--':
             return words[index + 1:]
-        if flag in {'--include', '--size', '--template', '--base', '--pull'}:
+        if flag in {'--include', '--size', '--template', '--base', '--pull', '--env'}:
+            value = value if equal else words[index + 1] if index + 1 < len(words) else ''
+            if not value or value.startswith('-') or flag == '--env' and not _safe_fixture_assignment(value):
+                return words[words.index('--', index) + 1:] if not known_only and '--' in words[index:] else None
             index += 1 if equal else 2
         elif flag in {'--bg', '--remote', '--no-fallback', '--git', '--fresh', '--no-sync', '--no-retry'} and not equal:
             index += 1
@@ -2996,6 +2999,59 @@ def _offbox_payload(words, *, known_only=True):
             # caller proof through flags that may change execution bindings.
             return words[words.index('--', index) + 1:] if not known_only and '--' in words[index:] else None
     return None
+
+
+def _safe_fixture_assignment(word):
+    match = re.fullmatch(r'([A-Za-z_]\w*)=([\s\S]*)', word)
+    if not match:
+        return False
+    name, value = match.groups()
+    if (name in {'BASH_ENV', 'ENV', 'SHELLOPTS', 'BASHOPTS', 'PS4', 'IFS', 'PATH', 'CDPATH',
+                 'HOME', 'PROMPT_COMMAND', 'GLOBIGNORE', 'ZDOTDIR'} or
+            name.startswith(('BASH_', 'LD_', 'DYLD_', 'PYTHON'))):
+        return False
+    return not re.search(r'[$`]', value) or _fresh_mktemp(value) and not re.search(r'[$`<>#\r\n]', value[2:-1])
+
+
+def _fixture_invocation(source):
+    # shlex alone splits unquoted $(mktemp -d) into two words. Reuse the
+    # walker's opaque substitutions without evaluating or trusting their body.
+    text, quoted = _quoted_punctuation(source)
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=';&|(){}\n<>')
+    lexer.whitespace = ' \t\r'
+    lexer.whitespace_split = True
+    words = list(lexer)
+    while words and re.fullmatch(r'\n+', words[0]):
+        words.pop(0)
+    while words and re.fullmatch(r'\n+', words[-1]):
+        words.pop()
+    # A later command can change lookup or startup bindings. Reject operators
+    # before stripping assignments; quoted punctuation remains ordinary data.
+    if any(re.fullmatch(r'[;&|(){}\n<>]+', word) for word in words):
+        return []
+    for key, value in reversed(quoted.items()):
+        words = [word.replace(key, value) for word in words]
+
+    def strip_environment(argv):
+        index, env_seen = 0, False
+        while index < len(argv):
+            word = argv[index]
+            if re.match(r'^[A-Za-z_]\w*=', word):
+                if not _safe_fixture_assignment(word):
+                    return []
+                index += 1
+            elif word == 'env' and not env_seen:
+                env_seen = True
+                index += 1
+                if index == len(argv) or not re.match(r'^[A-Za-z_]\w*=', argv[index]):
+                    return []
+            else:
+                break
+        return argv[index:]
+
+    words = strip_environment(words)
+    payload = _offbox_payload(words)
+    return strip_environment(payload) if payload is not None else words
 
 
 def _fresh_mktemp(value):
@@ -3989,16 +4045,15 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         # Config/foreign operand discounts cannot supply fixture evidence.
         checked = _js_fixture_source(source) if test_target is not None and not python and not shell else source
         if _source_hit(checked, directory, python, shell):
-            if test_target is not None:
-                match = _database_reference(source)
-                if match:
-                    line = source.count("\n", 0, match.start()) + 1
-                    detail = f"{location}:{line} names {_token(match[0])}."
-                    runners = {m[2] for m in re.finditer(r"\bimport\s+(?:[^;'\"]*\bfrom\s*)?(['\"])(node:test|vitest|vite-plus/test)\1", source)}
-                    if 'node:test' not in runners and runners & {'vitest', 'vite-plus/test'}:
-                        detail += f"\nRun tests through the repo runner: vp test run {shlex.quote(test_target)}."
-                    raise LiveRead(rule, detail)
-            raise LiveRead(rule)
+            match = _database_reference(source)
+            line = source.count("\n", 0, match.start()) + 1 if match else 1
+            detail = (f"{location or '<inline script>'}:{line} names {_token(match[0])}." if match else
+                      f"{location or '<inline script>'}:{line} contains a protected database read.")
+            if test_target is not None and match:
+                runners = {m[2] for m in re.finditer(r"\bimport\s+(?:[^;'\"]*\bfrom\s*)?(['\"])(node:test|vitest|vite-plus/test)\1", source)}
+                if 'node:test' not in runners and runners & {'vitest', 'vite-plus/test'}:
+                    detail += f"\nRun tests through the repo runner: vp test run {shlex.quote(test_target)}."
+            raise LiveRead(rule, detail)
 
     def migration_source(args, directory):
         source = None
@@ -4226,7 +4281,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         (node_test_files if binary == 'node' and test_target is not None else script_files).add(path)
         check_budget()
         if LIVE.search(str(path)) or LIVE.search(os.path.realpath(path)):
-            raise LiveRead("live-database-script")
+            raise LiveRead("live-database-script", f"{path}:1 is a protected live database.")
         if path in invalidated_written:
             # A known live source still gets its precise refusal. Otherwise
             # on-disk bytes cannot prove what an intervening writer will run.
@@ -4240,7 +4295,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         if stat.S_ISREG(opened.st_mode) and opened.st_size <= MAX_SOURCE_BYTES:
                             source = handle.read(MAX_SOURCE_BYTES + 1)
                             if len(source) <= MAX_SOURCE_BYTES:
-                                check_source(source.decode('utf-8', errors='replace'), directory, path.suffix == '.py')
+                                check_source(source.decode('utf-8', errors='replace'), directory, path.suffix == '.py', location=path)
             except OSError:
                 pass
             # Audit rows retain 240 characters. Put both proof sites before a
@@ -4254,12 +4309,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             redirect = re.search(r'\s+>\s+([^\s;&|<>$`]+)\s+2>&1\s*$', proof_command)
             destination = shlex.split(redirect[1]) if redirect else []
             if redirect and (len(destination) != 1 or _direct_read(['cat', destination[0]], directory)):
-                raise LiveRead('live-database-script')
+                raise LiveRead('live-database-script', f"{path}:1 has an unsafe output redirect.")
             plain = proof_command[:redirect.start()] if redirect else proof_command
-            invocation = shlex.split(plain, comments=True)
-            payload = _offbox_payload(invocation)
-            if payload is not None:
-                invocation = payload
+            invocation = _fixture_invocation(plain)
         except ValueError:
             invocation = []
         shell = (binary in {'bash', 'sh', 'zsh', 'dash', 'ksh'} and len(invocation) == 2 and
@@ -4617,8 +4669,25 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         if flag == "--directory":
                             child_directory = True
                             directory = _literal_path(value, directory)
-            elif binary == "offbox" and (payload := _offbox_payload(words, known_only=False)) is not None:
-                trusted_flags = _offbox_payload(words) is not None
+            elif binary == "offbox" and words[1:2] == ['run']:
+                options_end = words.index('--') if '--' in words else len(words)
+                for index in range(2, options_end):
+                    flag, equal, value = words[index].partition('=')
+                    if flag == '--step':
+                        step = value if equal else words[index + 1] if index + 1 < options_end else ''
+                        if not step:
+                            raise AmbiguousScript('offbox --step has no command')
+                        # Steps are shell commands, never exact-invocation
+                        # fixture proofs. Inspect them even beside a payload.
+                        scan_remote(step, directory, depth + 1, inherit_environment=True)
+                payload = _offbox_payload(words, known_only=False)
+                if payload is None:
+                    break
+                # --env is understood by the exact on-disk fixture proof,
+                # but must not expand the separate caller-heredoc exception.
+                trusted_flags = (_offbox_payload(words) is not None and
+                                 not any(word.partition('=')[0] == '--env'
+                                         for word in words[2:len(words) - len(payload)]))
                 pulls = any(word == '--pull' or word.startswith('--pull=') for word in words[2:len(words) - len(payload)])
                 words = payload
                 remote_input, remote_bodies = [], {key: bodies[key] for key in document_keys}
@@ -5582,7 +5651,10 @@ def classify_detail(command: str, cwd: str) -> tuple[str | None, str | None]:
     except AmbiguousScript as error:
         return "live-database-script-unresolved", str(error)
     except LiveRead as error:
-        return error.rule, error.detail
+        match = _database_reference(command)
+        detail = error.detail or (f"line {command.count(chr(10), 0, match.start()) + 1} names {_token(match[0])}." if match else
+                                  "Command contains a protected database read.")
+        return error.rule, detail
     return None, None
 
 

@@ -890,6 +890,54 @@ it("preserves all 25 groups until overflow requires an other row", () => {
   );
 });
 
+it("retains pool configuration changes per board alongside pool snapshots beyond sample limits", () => {
+  const target = makeAccumulator();
+  for (let index = 0; index < 501; index++)
+    accumulate(
+      target,
+      event({
+        kind: "kanban.pool_change",
+        boardId: "board-a",
+        props: {
+          poolKey: "codex/sol#xhigh",
+          fromSlots: index,
+          toSlots: index + 1,
+          op: "set",
+          actorKind: "owner",
+          actorId: null,
+        },
+      }),
+    );
+  accumulate(
+    target,
+    event({
+      kind: "kanban.pool_change",
+      boardId: "board-b",
+      props: {
+        poolKey: "codex/sol#xhigh",
+        fromSlots: 2,
+        toSlots: 0,
+        op: "auto_zero",
+        actorKind: "system",
+        actorId: null,
+      },
+    }),
+  );
+  const boards = finishRollup(target, "2026-11-13", ts).boards;
+  assert.equal(boards.find((board) => board.boardId === "board-a")!.poolChanges!.length, 501);
+  assert.deepEqual(boards.find((board) => board.boardId === "board-b")!.poolChanges, [
+    {
+      at: ts,
+      poolKey: "codex/sol#xhigh",
+      fromSlots: 2,
+      toSlots: 0,
+      op: "auto_zero",
+      actorKind: "system",
+      actorId: null,
+    },
+  ]);
+});
+
 it("groups fixed denial reasons and roles and measures each timeout phase separately", () => {
   const target = makeAccumulator();
   for (const [callerRole, denyReason] of [
