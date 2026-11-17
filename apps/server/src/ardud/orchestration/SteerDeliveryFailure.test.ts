@@ -222,13 +222,14 @@ const controlFailure = new ProviderControl.ProviderTurnControlError({
 const executorLayer = (
   steer: ProviderControl.ProviderTurnControlServiceV2Shape["steer"],
   threads: Partial<ThreadManagement.ThreadManagementService["Service"]> = {},
+  get: EffectOutbox.EffectOutboxV2Shape["get"] = () => Effect.succeed(Option.none()),
 ) =>
   EffectWorker.layerExecutor.pipe(
     Layer.provide(RestartPacingTestkit.layer),
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ProviderControl.ProviderTurnControlServiceV2)({ steer }),
-        Layer.mock(EffectOutbox.EffectOutboxV2)({ get: () => Effect.succeed(Option.none()) }),
+        Layer.mock(EffectOutbox.EffectOutboxV2)({ get }),
         Layer.mock(ProviderSessions.ProviderSessionManagerV2)({}),
         Layer.mock(ProviderStart.ProviderTurnStartServiceV2)({}),
         Layer.mock(CheckpointRollback.CheckpointRollbackServiceV2)({}),
@@ -244,11 +245,17 @@ const executorLayer = (
 
 it.effect.each(
   (["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
-    [false, true].map((turnCompleted) => ({ reason, turnCompleted })),
+    [false, true].flatMap((turnCompleted) =>
+      (["normal", "read failure", "read defect", "recovery pending"] as const).map((recovery) => ({
+        reason,
+        turnCompleted,
+        recovery,
+      })),
+    ),
   ),
 )(
-  "never replays uncertain steering ($reason, completed=$turnCompleted)",
-  ({ reason, turnCompleted }) =>
+  "never replays uncertain steering ($reason, completed=$turnCompleted, $recovery)",
+  ({ reason, turnCompleted, recovery }) =>
     Effect.gen(function* () {
       yield* seed();
       const outbox = yield* EffectOutbox.EffectOutboxV2;
@@ -261,8 +268,17 @@ it.effect.each(
       });
       let calls = 0;
       let followups = 0;
+      let recoveryReads = 0;
       yield* outbox.enqueue([
-        { id: effect.id, commandId: effect.commandId, threadId, request: effect.request },
+        {
+          id: effect.id,
+          commandId: effect.commandId,
+          threadId,
+          request: {
+            ...effect.request,
+            followUpPending: recovery === "recovery pending",
+          },
+        },
       ]);
       const layer = EffectWorker.layerWithOptions({ workerId: "uncertain-steer" }).pipe(
         Layer.provide(
@@ -289,6 +305,14 @@ it.effect.each(
                   return { sequence: 1, storedEvents: [] };
                 }),
             },
+            () =>
+              Effect.suspend(() => {
+                recoveryReads++;
+                if (recovery === "read defect") return Effect.die("recovery marker unavailable");
+                if (recovery === "read failure")
+                  return Effect.fail(new EffectOutbox.EffectOutboxError({ operation: "get" }));
+                return Effect.succeed(Option.none());
+              }),
           ),
         ),
       );
@@ -300,6 +324,7 @@ it.effect.each(
       }).pipe(Effect.provide(layer));
       assert.equal(calls, 1);
       assert.equal(followups, 0);
+      assert.equal(recoveryReads, 0);
       const saved = yield* outbox.get(effect.id);
       assert.isTrue(Option.isSome(saved));
       if (Option.isNone(saved)) return;

@@ -41,7 +41,12 @@ import * as Stream from "effect/Stream";
 
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import {
+  makeProviderFailure,
+  ProviderPromptAcceptanceError,
+} from "@t3tools/provider-core/server/failure";
+import * as Result from "effect/Result";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
@@ -493,110 +498,188 @@ it.effect.each(["confirmed", "unanswered"] as const)(
     }).pipe(Effect.scoped),
 );
 
-it.effect("steers with cited assistant quotes expanded for the provider", () =>
-  Effect.gen(function* () {
-    const now = yield* DateTime.now;
-    const threadId = ThreadId.make("thread:steer-citation");
-    const providerSessionId = ProviderSessionId.make("provider-session:steer-citation");
-    const providerTurnId = ProviderTurnId.make("provider-turn:steer-citation");
-    const attemptId = RunAttemptId.make("run-attempt:steer-citation");
-    const providerThread: OrchestrationV2ProviderThread = {
-      id: ProviderThreadId.make("provider-thread:steer-citation"),
-      driver,
-      providerInstanceId,
-      providerSessionId,
-      appThreadId: threadId,
-      ownerNodeId: null,
-      nativeThreadRef: { driver, nativeId: "native-thread:steer-citation", strength: "strong" },
-      nativeConversationHeadRef: null,
-      status: "idle",
-      firstRunOrdinal: 1,
-      lastRunOrdinal: 1,
-      handoffIds: [],
-      forkedFrom: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    const projection = makeProjection({ now, threadId, providerThread, providerTurnId, attemptId });
-    const text = `Revisit ${serializeAssistantCitation({
-      version: 1,
-      environmentId: EnvironmentId.make("environment:steer-citation"),
-      threadId,
-      messageId: MessageId.make("message:steer-citation:source"),
-      text: "Ship it on Friday.",
-      start: 0,
-      end: 18,
-      prefix: "",
-      suffix: "",
-    })}`;
-    const message = {
-      id: MessageId.make("message:steer-citation"),
-      text,
-      attachments: [],
-      createdBy: "user",
-      creationSource: "web",
-    } as unknown as OrchestrationV2ConversationMessage;
-    const steered = yield* Ref.make<ReadonlyArray<string>>([]);
-    const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
-      instanceId: providerInstanceId,
-      driver,
-      providerSessionId,
-      providerSession: {
-        id: providerSessionId,
+it.effect.each([
+  { reason: null, recovery: "live" },
+  ...(["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
+    (
+      ["live", "released", "replaced", "session read failure", "projection read failure"] as const
+    ).map((recovery) => ({ reason, recovery })),
+  ),
+])(
+  "cited steering preserves acceptance before recovery ($reason, $recovery)",
+  ({ reason, recovery }) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread:steer-citation");
+      const providerSessionId = ProviderSessionId.make("provider-session:steer-citation");
+      const providerTurnId = ProviderTurnId.make("provider-turn:steer-citation");
+      const attemptId = RunAttemptId.make("run-attempt:steer-citation");
+      const providerThread: OrchestrationV2ProviderThread = {
+        id: ProviderThreadId.make("provider-thread:steer-citation"),
         driver,
         providerInstanceId,
-        status: "running",
-        cwd: "/workspace",
-        model: modelSelection.model,
-        capabilities: CodexProviderCapabilitiesV2,
+        providerSessionId,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: { driver, nativeId: "native-thread:steer-citation", strength: "strong" },
+        nativeConversationHeadRef: null,
+        status: "idle",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
         createdAt: now,
         updatedAt: now,
-        lastError: null,
-      },
-      events: Stream.empty,
-      ensureThread: () => Effect.die("unused ensureThread"),
-      resumeThread: () => Effect.die("unused resumeThread"),
-      startTurn: () => Effect.die("unused startTurn"),
-      steerTurn: (input) => Ref.update(steered, (texts) => [...texts, input.message.text]),
-      interruptTurn: () => Effect.die("unused interruptTurn"),
-      respondToRuntimeRequest: () => Effect.die("unused respondToRuntimeRequest"),
-      readThreadSnapshot: () => Effect.die("unused readThreadSnapshot"),
-      rollbackThread: () => Effect.die("unused rollbackThread"),
-      forkThread: () => Effect.die("unused forkThread"),
-    };
-    const layerControl = ProviderTurnControlService.layer.pipe(
-      Layer.provide(
-        Layer.merge(
-          Layer.mock(ProjectionStore.ProjectionStoreV2)({
-            getProviderControlContext: () =>
-              Effect.succeed({
-                providerThread,
-                providerTurn: projection.providerTurns[0],
-                attempt: projection.attempts[0],
-                message,
-                run: { id: RunId.make("run:steer-citation") } as OrchestrationV2Run,
-              }),
-          }),
-          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
-            get: () => Effect.succeedSome(runtime),
-          }),
-        ),
-      ),
-    );
-
-    yield* Effect.gen(function* () {
-      const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
-      yield* control.steer({
+      };
+      const projection = makeProjection({
+        now,
         threadId,
-        providerSessionId,
-        providerThreadId: providerThread.id,
+        providerThread,
         providerTurnId,
-        messageId: message.id,
+        attemptId,
       });
-    }).pipe(Effect.provide(layerControl));
+      const text = `Revisit ${serializeAssistantCitation({
+        version: 1,
+        environmentId: EnvironmentId.make("environment:steer-citation"),
+        threadId,
+        messageId: MessageId.make("message:steer-citation:source"),
+        text: "Ship it on Friday.",
+        start: 0,
+        end: 18,
+        prefix: "",
+        suffix: "",
+      })}`;
+      const message = {
+        id: MessageId.make("message:steer-citation"),
+        text,
+        attachments: [],
+        createdBy: "user",
+        creationSource: "web",
+      } as unknown as OrchestrationV2ConversationMessage;
+      const steered = yield* Ref.make<ReadonlyArray<string>>([]);
+      const failure =
+        reason === null
+          ? null
+          : new ProviderPromptAcceptanceError({
+              driver: ProviderDriverKind.make("opencode"),
+              serverOrigin: "http://opencode.test",
+              reason,
+              budgetSeconds: 60,
+            });
+      let attempted = false;
+      let recoveryReads = 0;
+      const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+        instanceId: providerInstanceId,
+        driver,
+        providerSessionId,
+        providerSession: {
+          id: providerSessionId,
+          driver,
+          providerInstanceId,
+          status: "running",
+          cwd: "/workspace",
+          model: modelSelection.model,
+          capabilities: CodexProviderCapabilitiesV2,
+          createdAt: now,
+          updatedAt: now,
+          lastError: null,
+        },
+        events: Stream.empty,
+        ensureThread: () => Effect.die("unused ensureThread"),
+        resumeThread: () => Effect.die("unused resumeThread"),
+        startTurn: () => Effect.die("unused startTurn"),
+        steerTurn: (input) =>
+          Ref.update(steered, (texts) => [...texts, input.message.text]).pipe(
+            Effect.andThen(
+              Effect.suspend(() => {
+                attempted = true;
+                return failure === null
+                  ? Effect.void
+                  : Effect.fail(
+                      new ProviderAdapter.ProviderAdapterSteerRunError({
+                        driver,
+                        providerThreadId: providerThread.id,
+                        providerTurnId,
+                        cause: failure,
+                      }),
+                    );
+              }),
+            ),
+          ),
+        interruptTurn: () => Effect.die("unused interruptTurn"),
+        respondToRuntimeRequest: () => Effect.die("unused respondToRuntimeRequest"),
+        readThreadSnapshot: () => Effect.die("unused readThreadSnapshot"),
+        rollbackThread: () => Effect.die("unused rollbackThread"),
+        forkThread: () => Effect.die("unused forkThread"),
+      };
+      const layerControl = ProviderTurnControlService.layer.pipe(
+        Layer.provide(
+          Layer.merge(
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getProviderControlContext: () =>
+                Effect.suspend(() => {
+                  if (attempted) {
+                    recoveryReads++;
+                    if (recovery === "projection read failure")
+                      return Effect.fail(
+                        new ProjectionStore.ProjectionStoreReadError({ threadId }),
+                      );
+                  }
+                  return Effect.succeed({
+                    providerThread,
+                    providerTurn: projection.providerTurns[0],
+                    attempt: projection.attempts[0],
+                    message,
+                    run: { id: RunId.make("run:steer-citation") } as OrchestrationV2Run,
+                  });
+                }),
+            }),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+              get: () =>
+                Effect.suspend(() => {
+                  if (attempted) {
+                    recoveryReads++;
+                    if (recovery === "released") return Effect.succeedNone;
+                    if (recovery === "replaced") return Effect.succeedSome({ ...runtime });
+                    if (recovery === "session read failure")
+                      return Effect.fail(
+                        new ProviderSessionManager.ProviderSessionLookupError({
+                          providerSessionId,
+                        }),
+                      );
+                  }
+                  return Effect.succeedSome(runtime);
+                }),
+            }),
+          ),
+        ),
+      );
 
-    assert.deepEqual(yield* Ref.get(steered), [expandAssistantCitationsForProvider(text)]);
-  }),
+      yield* Effect.gen(function* () {
+        const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+        const result = yield* control
+          .steer({
+            threadId,
+            providerSessionId,
+            providerThreadId: providerThread.id,
+            providerTurnId,
+            messageId: message.id,
+          })
+          .pipe(Effect.result);
+        if (failure === null) assert.isTrue(Result.isSuccess(result));
+        else {
+          assert.isTrue(Result.isFailure(result));
+          if (Result.isSuccess(result)) return;
+          const persisted = makeProviderFailure({ cause: result.failure });
+          assert.equal(persisted.code, `provider_prompt_acceptance_${reason}`);
+          assert.equal(persisted.category, "transient");
+          assert.equal(persisted.retryable, false);
+          assert.equal(recoveryReads, 0);
+        }
+      }).pipe(Effect.provide(layerControl));
+
+      assert.deepEqual(yield* Ref.get(steered), [expandAssistantCitationsForProvider(text)]);
+    }),
 );
 
 it.effect.each([
