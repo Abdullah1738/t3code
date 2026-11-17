@@ -761,7 +761,9 @@ if sys.argv[1] == 'send':
 
     def test_dry_and_scratch_runs_never_send_or_change_live_files(self):
         before = (self.live / 'cursor.json').read_bytes()
-        self.assertIn('imsg:9001', self.run_items([item()], dry=True))
+        with tempfile.TemporaryDirectory() as replay, patch.dict(os.environ, {'WATCH_DIR': replay}):
+            self.assertIn('imsg:9001', self.run_items([item()], dry=True))
+            self.assertFalse((Path(replay) / 'cursor.json').exists())
         scratch = self.root / 'scratch'
         scratch.mkdir()
         with patch.dict(os.environ, {'WATCH_DIR': str(scratch)}):

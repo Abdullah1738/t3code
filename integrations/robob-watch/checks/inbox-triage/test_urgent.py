@@ -19,7 +19,9 @@ class UrgentTests(unittest.TestCase):
     def setUp(self):
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
-        self.wd = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.wd = root / 'watchers/inbox-triage'
+        self.wd.mkdir(parents=True)
         self.now = time.time()
         self.health_log, self.notify_log = self.wd / 'health-log', self.wd / 'notify-log'
         self.bridge, self.telegram = self.wd / 'bridge.py', self.wd / 'telegram.py'
@@ -203,7 +205,12 @@ sys.exit(int(os.environ.get('NOTIFY_EXIT', '0')))
         self.assertIn('already sent', event)
 
     def test_dry_and_scratch_only_record_would_send(self):
-        _, report, _ = self.run_items([self.item()], dry=True)
+        before = (self.wd / 'cursor.json').read_bytes()
+        with tempfile.TemporaryDirectory() as replay, \
+             patch.dict(os.environ, {'WATCH_DIR': replay, 'HEALTH_LOG': str(Path(replay) / 'health-log')}):
+            _, report, _ = self.run_items([self.item()], dry=True)
+            self.assertFalse((Path(replay) / 'cursor.json').exists())
+        self.assertEqual((self.wd / 'cursor.json').read_bytes(), before)
         self.assertEqual(report['telegram_would_send'], [self.item()['id']])
         self.assertEqual(self.calls(), [])
         with patch.object(t, 'LIVE', self.wd / 'other-live'):
