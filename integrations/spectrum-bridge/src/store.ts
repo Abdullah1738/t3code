@@ -7,6 +7,7 @@ const steerSourceKey = (sessionId: string, generation: number, inboundId: string
   `steer-reply-source:${createHash("sha256").update(JSON.stringify([sessionId, generation, inboundId])).digest("hex")}`;
 
 export type FileAttachment = { sha256: string; name: string; mimeType: string; size: number };
+export type ReplyAttribution = { inboundId?: string; covered?: string[] };
 export type OutboxPoll = { title: string; options: string[] };
 export type OutboxApp = {
   url: string; caption: string; subcaption?: string; trailingCaption?: string; trailingSubcaption?: string; summary?: string;
@@ -188,7 +189,15 @@ export class Store {
     ).all().map(row => ({ ...row, payload: JSON.parse(row.payload) }));
   }
 
-  enqueue(op: OutboxOperation, attribution?: { inboundId?: string }): boolean {
+  replyAttribution(sessionId?: string, generation?: number): ReplyAttribution & { covered: string[] } {
+    const turn = this.get<{ id: string; generation: number; covered?: string[]; inboundId?: string; replyInboundId?: string } | null>("activeTurn");
+    if (!turn || turn.id !== sessionId || turn.generation !== generation) return { covered: [] };
+    const root = turn.inboundId && !/^(wake:|reset:|secret:)/.test(turn.inboundId) ? turn.inboundId : undefined;
+    const members = root ? this.get<{ batchIds?: string[] }>(`batch:${root}`)?.batchIds ?? [root] : [];
+    return { inboundId: turn.replyInboundId ?? turn.inboundId, covered: [...new Set([...members, ...turn.covered ?? []])] };
+  }
+
+  enqueue(op: OutboxOperation, attribution?: ReplyAttribution): boolean {
     // Normalize property order and omit unrelated caller fields before comparing content.
     const payload = json({
       id: op.id, kind: op.kind, text: op.text, sessionId: op.sessionId,
@@ -206,6 +215,8 @@ export class Store {
       const result = this.db.query(`INSERT INTO outbox (id, payload, state) VALUES (?, ?, 'pending')
         ON CONFLICT(id) DO NOTHING`).run(op.id, payload);
       if (result.changes) {
+        if (op.kind === "conversation") this.set(`reply-covered:${op.id}`,
+          attribution?.covered ?? this.replyAttribution(op.sessionId, op.generation).covered);
         if (op.app?.updateOf) this.set(`app-latest:${op.app.updateOf}`, op.id);
         toolLog.capture(() => {
           this.set(`log-queued:${op.id}`, Date.now());
@@ -234,17 +245,20 @@ export class Store {
   /** A steer can commit before its HTTP response, so its already queued replies need the confirmed human source. */
   attributeSteeredReplies(inboundId: string, sessionId: string, generation: number, afterOutbox: number, rootInboundId?: string): void {
     const input = this.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?").get(inboundId);
-    if (!input || !rootInboundId || !/^(?:secret|wake|reset):/.test(rootInboundId)) return;
+    if (!input || !rootInboundId) return;
     // An API fold may have captured the old source before confirmation and enqueue after this transaction.
     const key = steerSourceKey(sessionId, generation, rootInboundId);
+    const priorSource = this.get<string>(key);
     if (this.get(key) === undefined) this.set(key, inboundId);
     const receivedAt = (JSON.parse(input.payload) as { receivedAt?: number }).receivedAt;
     const rows = this.db.query<{ id: string; state: string }, [number, string, number]>(
-      "SELECT id, state FROM outbox WHERE rowid > ? AND json_extract(payload, '$.sessionId') = ? AND json_extract(payload, '$.generation') = ?",
+      "SELECT id, state FROM outbox WHERE rowid > ? AND json_extract(payload, '$.kind') = 'conversation' AND json_extract(payload, '$.sessionId') = ? AND json_extract(payload, '$.generation') = ?",
     ).all(afterOutbox, sessionId, generation);
     for (const row of rows) {
       const previous = this.get<string>(`log-inbound-id:${row.id}`);
-      if (previous !== rootInboundId) continue;
+      if (previous !== undefined && previous !== rootInboundId && previous !== priorSource) continue;
+      // Outbox order cannot prove a tool send answered a steer that was not yet confirmed.
+      // Its captured coverage stays authoritative even when logging gains a better source.
       this.set(`log-inbound-id:${row.id}`, inboundId);
       if (typeof receivedAt === "number" && Number.isFinite(receivedAt)) this.set(`log-inbound-at:${row.id}`, receivedAt);
       // Health may have consumed the acceptance receipt while its source was still uncertain.
@@ -288,6 +302,8 @@ export class Store {
         state = ?, providerId = COALESCE(?, providerId) WHERE id = ?`
       ).run(state, state, providerId ?? null, id);
       if (!result.changes) throw new Error(`Unknown outbox operation: ${id}`);
+      if (state === "sent") for (const inbound of this.get<string[]>(`reply-covered:${id}`) ?? [])
+        this.db.query("UPDATE inbound SET state = 'done' WHERE id = ? AND state = 'admitted'").run(inbound);
       rememberHealthReceipt(this, id, state);
     }).immediate();
   }

@@ -415,22 +415,22 @@ test('real timer order must preserve the original id while recovering an orphan 
   await Promise.all([h.router.checkInboundLatency(), h.router.tick(), h.router.checkFailedInbound()]);
   expect(h.backend.prompts.map(p => p.id)).toEqual([hash('wake:timer')]);
 });
-test('sweep acceptance of a steer must preserve typed ownership of its watcher turn', async () => {
+test('the latency sweep leaves human work queued until its watcher turn ends', async () => {
   const h = setup('tool');
-  let entered!: () => void, release!: () => void;
-  const seen = new Promise<void>(resolve => { entered = resolve; });
-  const gate = new Promise<void>(resolve => { release = resolve; });
-  Object.assign(h.backend, { steer: async () => { entered(); await gate; return 'steered' as const; } });
+  const steers: string[] = [];
+  Object.assign(h.backend, { steer: async (_id: string, _dir: string, id: string) => { steers.push(id); return 'steered' as const; } });
   h.add('wake:active', 0); await h.router.tick();
   h.add('typed-steer', 120_000);
-  const tick = h.router.tick(); await seen;
-  h.backend.records.push({ id: hash('typed-steer'), type: 'user', text: 'typed-steer', time: { created: Date.now() } });
+  await h.router.tick();
   await h.router.checkInboundLatency();
-  release(); await tick;
+  expect(steers).toEqual([]);
+  expect(h.states().find(row => row.id === 'typed-steer')?.state).toBe('pending');
+  expect(h.backend.prompts.map(row => row.id)).toEqual([hash('wake:active')]);
   h.backend.records.push({ id: 'failure', type: 'idle', outcome: 'failed', time: { created: Date.now() } });
   await h.router.tick();
-  const controls = h.store.pendingOutbox().filter(row => row.kind === 'control').map(row => row.text);
-  expect(controls).toContain('Something went wrong on my end with that one. Mind trying again?');
+  await h.router.tick();
+  expect(h.backend.prompts.map(row => row.id)).toEqual([hash('wake:active'), hash('typed-steer')]);
+  expect(h.store.get<{ inboundId: string }>('activeTurn')?.inboundId).toBe('typed-steer');
 });
 test('a sweep replay started before six hours must stop retrying after its original horizon', async () => {
   const h = setup(); h.add('typed-expiring', (6 * 60 - 1) * 60_000); h.original('typed-expiring');
@@ -509,7 +509,9 @@ test.each(["wake:slow", "typed:slow"])("later ambiguous body survives watchdog r
   await h.router.tick();
   release(); await sweep;
   // A typed message has priority over the released wake; finish its run before checking the wake body.
-  if (!first.startsWith("wake:")) h.backend.records.push({ id: "typed-finished", type: "idle", outcome: "succeeded", time: { created: now + 60_000 } });
+  if (!first.startsWith("wake:")) h.backend.records.push(
+    { id: "typed-answer", type: "assistant", content: [{ type: "text", text: "Answered" }], finish: "stop", time: { created: now + 60_000, completed: now + 60_000 } },
+    { id: "typed-finished", type: "idle", outcome: "succeeded", time: { created: now + 60_000 } });
   setSystemTime(now + 60_000);
   await Promise.all([h.router.checkInboundLatency(), h.router.tick(), h.router.checkFailedInbound()]);
   expect(h.backend.records.find(r => r.id === hash(leader))).toMatchObject({ text: `${leader}\n${member}` });
@@ -775,7 +777,9 @@ test.each([false, true])("completion keeps uncertain steer readback and same-id 
   await h.router.tick(); await h.router.tick();
   expect(h.store.getOperation("reply:1:answer")?.state).toBe("pending");
   expect(h.logs.filter(line => line.startsWith("run-completed-seen"))).toHaveLength(1);
-  expect(h.states()).toEqual(["done", "done"]);
+  expect(h.states()).toEqual(["done", "admitted"]);
+  h.store.outboxState("reply:1:answer", "sent");
+  expect(h.states()).toEqual(["done", accepted ? "done" : "admitted"]);
   expect(h.backend.prompts.filter(id => id === hash("followup"))).toHaveLength(accepted ? 0 : 1);
   expect(h.backend.records.filter(record => record.type === "user" && record.id === hash("followup"))).toHaveLength(1);
 });
@@ -811,7 +815,7 @@ test.each([false, true])("uncertain steer with held acceptance notices and repli
     expect(h.logs.filter(line => line.startsWith("run-completed-seen"))).toHaveLength(1);
     expect(h.store.getOperation("reply:1:original-answer")?.state).toBe("pending");
     expect(h.store.get("steer-attempt:followup")).toBeDefined();
-    expect(h.states()).toEqual(["done", "processing"]);
+    expect(h.states()).toEqual(["done", "pending"]);
     expect(h.backend.prompts).toEqual([hash("first")]);
     expect(steers).toBe(1);
     expect(readbacks).toBe(1);
@@ -822,12 +826,14 @@ test.each([false, true])("uncertain steer with held acceptance notices and repli
   }
   await h.router.tick();
   expect(h.backend.prompts.filter(id => id === hash("followup"))).toHaveLength(lateAccepted ? 0 : 1);
-  expect(h.states()).toEqual(["done", "done"]);
+  expect(h.states()).toEqual(["done", "admitted"]);
   h.backend.records.push(
     { id: "followup-answer", type: "assistant", content: [{ type: "text", text: "Followup answer" }], finish: "stop", time: { created: now + 1_000, completed: now + 1_000 } },
     { id: "followup-idle", type: "idle", outcome: "succeeded", time: { created: now + 1_000 } });
   await h.router.tick(); await h.router.tick();
   expect(h.store.getOperation("reply:1:followup-answer")?.state).toBe("pending");
+  h.store.outboxState("reply:1:followup-answer", "sent");
+  expect(h.states()).toEqual(["done", "done"]);
   expect(h.logs.filter(line => line.startsWith("run-completed-seen"))).toHaveLength(2);
   expect(h.backend.records.filter(record => record.id === hash("followup"))).toHaveLength(1);
   expect(steers).toBe(1);

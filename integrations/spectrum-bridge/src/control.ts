@@ -1,4 +1,5 @@
 import { toolError, toolLog } from "./toollog.ts";
+import { controlFailureProps, type ControlFailure } from "./control-errors.ts";
 import { startTickRead } from "./tick-timing.ts";
 // Client for Robob's local control API (/api/ardud/control/*), plus the
 // mapping from its thread and request shapes onto the bridge vocabulary.
@@ -106,10 +107,20 @@ export interface ControlEventFrame {
 }
 
 export class ControlError extends Error {
-  constructor(readonly status: number, readonly code = "") {
-    // Never carry response bodies, URLs or tokens into errors.
+  reconciled = false;
+  readonly reason?: string;
+  readonly retrySafe?: boolean;
+  readonly holder?: ControlFailure["holder"];
+  constructor(readonly status: number, readonly code = "", details: ControlFailure = {}) {
     super(`Robob control request failed (HTTP ${status})`);
     this.name = "ControlError";
+    if (typeof details.reason === "string") this.reason = details.reason;
+    if (typeof details.retrySafe === "boolean") this.retrySafe = details.retrySafe;
+    if (details.holder === null) this.holder = null;
+    else if (details.holder && typeof details.holder === "object") this.holder = {
+      ...(typeof details.holder.runId === "string" || details.holder.runId === null ? { runId: details.holder.runId } : {}),
+      ...(typeof details.holder.state === "string" ? { state: details.holder.state } : {}),
+    };
   }
 }
 
@@ -189,7 +200,7 @@ export class ControlClient {
       loggingError = caughtError;
       throw new ControlError(0);
     }
-    let data: { ok?: unknown; error?: { code?: unknown } } | undefined;
+    let data: { ok?: unknown; error?: ControlFailure & { code?: unknown } } | undefined;
     try {
       data = await response.json() as typeof data;
     } catch (caughtError) {
@@ -197,7 +208,7 @@ export class ControlClient {
       if (caughtError instanceof SyntaxError) loggingTag = "control.invalid_json";
     }
     if (!response.ok || data?.ok !== true) {
-      throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "");
+      throw new ControlError(response.status || 0, typeof data?.error?.code === "string" ? data.error.code : "", data?.error);
     }
     loggingOk = true;
     return data as T;
@@ -208,7 +219,7 @@ export class ControlClient {
       toolLog.capture(() => {
       finishRead?.();
       toolLog.capture(() => toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", durationMs: performance.now() - loggingAt,
-        ok: loggingOk, ids: loggingIds, props: { method, route, ...(!loggingOk ? { failureFormat: "single" } : {}) },
+        ok: loggingOk, ids: loggingIds, props: { method, route, ...controlFailureProps(loggingError), ...(!loggingOk ? { failureFormat: "single" } : {}) },
         ...(!loggingOk ? { error: { tag: loggingTag, cause: loggingError } } : {}) }));
       });
     }

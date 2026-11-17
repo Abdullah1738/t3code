@@ -5,7 +5,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backendKind } from "../src/backend.ts";
-import { ControlClient, discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
+import { ControlClient, ControlError, discoverControlConfig, parseSse, questionFrom, type ControlMessage, type PendingRequest } from "../src/control.ts";
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, SELECTED_MODEL_ISSUE, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
 import { opencodeRunEvidence } from "../src/opencode-steps.ts";
@@ -45,7 +45,7 @@ function fakeControl() {
   const natives = new Map<string, string>();
   const calls: Call[] = [];
   /** `ignoreSettled` mimics a server from before PATCH learned `settled`. */
-  const flags = { ignoreSettled: false, recentRunsLimit: Infinity, historicalEvidence: "terminal" as "terminal" | "running" | "unknown" | "unavailable" };
+  const flags = { ignoreSettled: false, recentRunsLimit: Infinity, historicalEvidence: "terminal" as "terminal" | "running" | "unknown" | "unavailable", sendFailure: undefined as string | undefined };
   const projects = [{ projectId: "chats", title: "iMessage", workspaceRoot: "/chats" }];
   let counter = 0;
   const now = () => new Date(Date.now() + counter++).toISOString();
@@ -116,6 +116,7 @@ function fakeControl() {
       if (thread && parts[2] === "origin") { thread.origin = body.origin; return ok({ threadId: thread.threadId, origin: body.origin }); }
       if (thread && parts[2] === "interrupt") return ok({ interrupted: true });
       if (thread && parts[2] === "send") {
+        if (flags.sendFailure) return Response.json({ ok: false, error: { reason: flags.sendFailure, retrySafe: true } }, { status: 503 });
         const messageId = `${sentMessagePrefix(thread.threadId)}${encodeURIComponent(body.clientRequestId)}`;
         const running = thread.runs.find(run => run.status === "running");
         if (body.mode === "steer" && !thread.messages.some(message => message.messageId === messageId)) {
@@ -131,7 +132,7 @@ function fakeControl() {
           thread.messages.push({ messageId, runId, role: "user", text: body.text, streaming: false,
             createdBy: body.inboundId ? "user" : "system", createdAt: now(), updatedAt: now() });
         }
-        return ok({ threadId: thread.threadId, messageId, delivery: "started" });
+        return ok({ threadId: thread.threadId, messageId, delivery: "started", runId: thread.messages.find(message => message.messageId === messageId)?.runId });
       }
       if (thread && parts[2] === "requests") {
         thread.pending = thread.pending.filter(request => request.requestId !== parts[3]);
@@ -608,8 +609,7 @@ test("prompt sends channel guidance beside the text, sends the model and dedupes
   await backend.prompt(id, directory, prompt, "hello", "Be brief.");
   const sends = control.calls.filter(call => call.path.endsWith("/send"));
   expect(sends[0]!.body).toMatchObject({ mode: "auto", clientRequestId: prompt, model: "opus/claude-opus-5-5", variant: "high", providerInstanceId: "opencode" });
-  // No preference on the turn sends no model fields at all, so the thread keeps its own.
-  expect(sends[1]!.body).not.toHaveProperty("providerInstanceId");
+  expect(sends[1]!.body).toEqual(sends[0]!.body);
   // The message text is never mixed with the bridge's words (guard r3).
   expect(sends[0]!.body.text).toBe("hello");
   expect(sends[0]!.body.guidance).toBe("Be brief.");
@@ -620,6 +620,14 @@ test("prompt sends channel guidance beside the text, sends the model and dedupes
   // Robob attributed the unverified relay to the bridge; it is still the bridge's prompt.
   const records = await backend.messages(id, directory);
   expect(records).toEqual([{ id: prompt, type: "user", text: "hello", time: expect.any(Object) }]);
+});
+
+test("a new prompt without a model preference keeps the thread model", async () => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  await backend.prompt(id, directory, `msg_${"a".repeat(64)}`, "hello");
+  const send = control.calls.find(call => call.path.endsWith("/send"))!;
+  for (const field of ["providerInstanceId", "model", "variant"]) expect(send.body).not.toHaveProperty(field);
 });
 
 test("steer sends mode steer into the running run and reports a refusal when nothing is running", async () => {
@@ -664,9 +672,24 @@ test("approvals and answers carry the typed reply's inbound id only when there i
   await backend.cancelQuestion(id, "q-2", directory, "guid-no");
   const bodies = control.calls.filter(call => call.path.endsWith("/respond")).map(call => call.body);
   expect(bodies).toEqual([
-    { decision: "approve", inboundId: "guid-yes" }, { decision: "deny" },
-    { answers: { q0: "A" }, inboundId: "guid-a" }, { dismiss: true, inboundId: "guid-no" },
+    { decision: "approve", inboundId: "guid-yes", clientRequestId: expect.stringMatching(/^respond_/) }, { decision: "deny", clientRequestId: expect.stringMatching(/^respond_/) },
+    { answers: { q0: "A" }, inboundId: "guid-a", clientRequestId: expect.stringMatching(/^respond_/) }, { dismiss: true, inboundId: "guid-no", clientRequestId: expect.stringMatching(/^respond_/) },
   ]);
+});
+
+test.each(["question", "permission"])("a %s response rechecks admission after resolving its thread", async kind => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const resolve = backend.resolve.bind(backend);
+  backend.resolve = async session => { entered.resolve(); await release.promise; return resolve(session); };
+  let allowed = true;
+  const replying = kind === "question"
+    ? backend.questionReply({ id: "q-1", sessionID: id, title: "Pick", questions: [{ key: "q0", question: "Which?", header: "Pick", options: [] }] }, directory, [["A"]], "answer", () => allowed)
+    : backend.permissionReply(id, "perm-1", directory, "once", "answer", () => allowed);
+  await entered.promise; allowed = false; release.resolve();
+  expect(await replying).toBe(false);
+  expect(control.calls.filter(call => call.path.endsWith("/respond"))).toEqual([]);
 });
 
 test("records: settled runs end with an idle marker; agent-sent wakes are not owner text", () => {
@@ -813,8 +836,8 @@ test("ses_ ids resolve through by-native; requests and replies go to the control
   expect(await backend.questionReply(question!, directory, [["B"]])).toBe(true);
   const responds = control.calls.filter(call => call.path.includes("/requests/"));
   expect(responds.map(call => [call.path, call.body])).toEqual([
-    [`/threads/${id}/requests/perm-1/respond`, { decision: "deny" }],
-    [`/threads/${id}/requests/q-1/respond`, { answers: { q0: "B" } }],
+    [`/threads/${id}/requests/perm-1/respond`, { decision: "deny", clientRequestId: expect.stringMatching(/^respond_/) }],
+    [`/threads/${id}/requests/q-1/respond`, { answers: { q0: "B" }, clientRequestId: expect.stringMatching(/^respond_/) }],
   ]);
   expect(await backend.isSessionAutoAccepting("ses_old", directory)).toBe(true);
   expect(await backend.isSessionAutoAccepting("ses_unknown", directory)).toBeUndefined();
@@ -1620,7 +1643,7 @@ test("steering files: images accompany strict same-id sends without a second pro
     const files = [{ type: "file" as const, mime: "image/png", filename: "flight.png", url: "data:image/png;base64,AQID" }];
     expect(await backend.steer(id, directory, requestId, "Add these flights", "File guidance", files)).toBe("steered");
     expect(await backend.steer(id, directory, requestId, "Add these flights", "File guidance", files)).toBe("started");
-    expect(uploaded).toEqual([1, 2].map(() => ({ name: "flight.png", mimeType: "image/png", bytes })));
+    expect(uploaded).toEqual([{ name: "flight.png", mimeType: "image/png", bytes }]);
     expect(control.calls.filter(call => call.body?.clientRequestId === requestId).map(call => call.body)).toEqual([1, 2].map(() => ({
       text: "Add these flights", guidance: "File guidance", mode: "steer", clientRequestId: requestId, attachments: [attachment],
     })));
@@ -1629,6 +1652,66 @@ test("steering files: images accompany strict same-id sends without a second pro
   } finally { upload.mockRestore(); }
 });
 
+
+test.each(["auto", "steer"].flatMap(mode => ["startup_unavailable", "send_timeout"].flatMap(reason => [false, true].map(restart => ({ mode, reason, restart })))))("file retry keeps identical $mode POST through $reason (restart=$restart)", async ({ mode, reason, restart }) => {
+  let uploads = 0;
+  const bodies: unknown[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const path = new URL(request.url).pathname;
+    if (path === "/api/ardud/control/attachments") return Response.json({ ok: true, attachmentId: `file-${++uploads}`, relativeUrl: "/upload" });
+    if (path === "/upload") return new Response("");
+    if (path.endsWith("/send")) {
+      bodies.push(await request.json());
+      return bodies.length < 3 ? Response.json({ ok: false, error: { reason, retrySafe: true } }, { status: 503 })
+        : Response.json({ ok: true, delivery: "steered" });
+    }
+    return new Response("Unexpected request", { status: 500 });
+  } });
+  servers.push(server);
+  const dir = mkdtempSync(join(tmpdir(), "bridge-file-retry-")); dirs.push(dir);
+  const store = new Store(join(dir, "inbound.sqlite")); stores.push(store);
+  const makeBackend = (state: Store) => {
+    const backend = new RobobBackend({ chatRoot: "/chats", url: server.url.origin, token: "test-token" });
+    backend.trackFirstTurns(state); return backend;
+  };
+  let backend = makeBackend(store);
+  const files = [{ type: "file" as const, mime: "image/png", filename: "flight.png", url: "data:image/png;base64,AQID" }];
+  const send = () => mode === "steer" ? backend.steer("thread-test", "/chats", "msg_retry", "Flight", "Guidance", files)
+    : backend.prompt("thread-test", "/chats", "msg_retry", "Flight", "Guidance", files);
+  await expect(send()).rejects.toMatchObject({ status: 503, reason });
+  if (restart) {
+    const reopened = new Store(join(dir, "inbound.sqlite")); stores.push(reopened);
+    backend = makeBackend(reopened);
+  }
+  await expect(send()).rejects.toMatchObject({ status: 503, reason });
+  await send();
+  expect(uploads).toBe(1);
+  expect(bodies).toHaveLength(3);
+  expect(bodies).toEqual([bodies[0], bodies[0], bodies[0]]);
+  expect(bodies[0]).toMatchObject({ mode, clientRequestId: "msg_retry", attachments: [{ attachmentId: "file-1" }] });
+});
+
+test.each(["bytes", "name", "mime", "removed", "added", "order"])("file retry refuses changed %s under the same identity", async shape => {
+  const control = fakeControl(); const backend = control.backend();
+  const { id, directory } = await backend.createChat();
+  const attachment = { attachmentId: "file-1", type: "image" as const, name: "flight.png", mimeType: "image/png", sizeBytes: 3 };
+  const upload = spyOn(ControlClient.prototype, "upload").mockResolvedValue(attachment);
+  const files = [{ type: "file" as const, mime: "image/png", filename: "flight.png", url: "data:image/png;base64,AQID" },
+    { type: "file" as const, mime: "image/png", filename: "other.png", url: "data:image/png;base64,BAUG" }];
+  try {
+    await backend.steer(id, directory, "msg_file_identity", "Flight", "Guidance", files);
+    const changed = files.map(file => ({ ...file }));
+    if (shape === "bytes") changed[0]!.url = "data:image/png;base64,BAUG";
+    if (shape === "name") changed[0]!.filename = "renamed.png";
+    if (shape === "mime") changed[0]!.mime = "image/jpeg";
+    if (shape === "removed") changed.pop();
+    if (shape === "added") changed.push({ ...files[0]! });
+    if (shape === "order") changed.reverse();
+    await expect(backend.steer(id, directory, "msg_file_identity", "Flight", "Guidance", changed)).rejects.toThrow("Robob attachment retry changed");
+    expect(control.calls.filter(call => call.body?.clientRequestId === "msg_file_identity")).toHaveLength(1);
+    expect(upload).toHaveBeenCalledTimes(2);
+  } finally { upload.mockRestore(); }
+});
 
 test.each(["question", "cancel"])("steering files: %s during upload prevents the later POST", async kind => {
   const control = fakeControl(); const backend = control.backend();
@@ -1683,4 +1766,149 @@ test("steering files: incomplete family lists are unknown to admission", async (
     expect(await backend.statuses()).toEqual({});
     expect(await backend.children(id, directory)).toEqual([]);
   } finally { list.mockRestore(); }
+});
+
+
+test.each(["transport", "reader_unavailable", "server_error"].flatMap(reason => [false, true].map(restart => ({ reason, restart }))))("deferred steer refusal releases its wire mode ($reason, restart=$restart)", async ({ reason, restart }) => {
+  const { control, backend, store, router } = delegatedRouter(); backend.trackFirstTurns(store);
+  store.acceptInbound("root", { id: "root", text: "Original", attachments: [], isAudioMessage: false, receivedAt: Date.now() });
+  await router.tick();
+  const route = store.get<{ id: string }>("route")!;
+  let readable = true;
+  const thread = ControlClient.prototype.thread;
+  const read = spyOn(ControlClient.prototype, "thread").mockImplementation(async function(this: ControlClient, ...args) {
+    if (!readable) throw new Error("reader unavailable");
+    return thread.apply(this, args);
+  });
+  const request = ControlClient.prototype.request;
+  const post = spyOn(ControlClient.prototype, "request").mockImplementation(async function<T>(this: ControlClient, ...args: Parameters<ControlClient["request"]>): Promise<T> {
+    const [method, path, body] = args;
+    if (method === "POST" && path.endsWith("/send") && (body as { mode?: string })?.mode === "steer") {
+      readable = false;
+      throw new ControlError(reason === "transport" ? 0 : reason === "server_error" ? 500 : 503, "unavailable",
+        reason === "reader_unavailable" ? { reason, retrySafe: false } : {});
+    }
+    return request.apply(this, args) as Promise<T>;
+  });
+  try {
+    store.acceptInbound("human", { id: "human", text: "Follow up", attachments: [], isAudioMessage: false, receivedAt: Date.now() });
+    await router.tick();
+    expect(store.get("steer-attempt:human")).toMatchObject(reason === "server_error" ? { text: "Follow up" } : { reconcileOnly: true });
+    const activeBackend = restart ? control.backend() : backend; activeBackend.trackFirstTurns(store);
+    const activeRouter = restart ? new Router(store, activeBackend, {
+      async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+    }, { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alerts", alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 0 }) : router;
+    readable = true;
+    control.reply(route.id, "Original answered", "completed");
+    await activeRouter.tick(); await activeRouter.tick();
+    expect(control.calls.filter(call => call.path.endsWith("/send")).map(call => call.body.text)).toEqual(["Original", "Follow up"]);
+    expect(store.get("activeTurn")).toMatchObject({ inboundId: "human", phase: "running" });
+    control.reply(route.id, "Follow-up answered", "completed"); await activeRouter.tick();
+    for (const op of store.pendingOutbox()) store.outboxState(op.id, "sent");
+    expect(inbounds(store).find(row => row.id === "human")?.state).toBe("done");
+  } finally { post.mockRestore(); read.mockRestore(); }
+});
+
+test.each(["startup_unavailable", "send_timeout"])("held auto retry preserves every wire field through %s and restart", async reason => {
+  const { control, backend, store, router } = delegatedRouter(); backend.trackFirstTurns(store);
+  const start = Date.now(); setSystemTime(start);
+  control.flags.sendFailure = reason;
+  store.acceptInbound("human", { id: "human", text: "Question", source: "typed", attachments: [], isAudioMessage: false, receivedAt: start });
+  await router.tick();
+  for (const offset of [60_000, 120_000]) { setSystemTime(start + offset); await router.tick(); }
+  expect(store.get("activeTurn")).toMatchObject({ phase: "held" });
+  setSystemTime(start + 180_000); await router.tick();
+  const restartedBackend = control.backend(); restartedBackend.trackFirstTurns(store);
+  const restarted = new Router(store, restartedBackend, {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  }, { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alerts", alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 0 });
+  control.flags.sendFailure = undefined;
+  setSystemTime(start + 240_000); await restarted.tick();
+  const bodies = control.calls.filter(call => call.path.endsWith("/send")).map(call => call.body);
+  expect(bodies).toHaveLength(4);
+  expect(bodies).toEqual(bodies.map(() => bodies[0]));
+  expect(bodies[0]).toMatchObject({ mode: "auto", text: "Question", inboundId: "human" });
+  expect(store.get("activeTurn")).toMatchObject({ phase: "running" });
+});
+
+test.each([false, true].flatMap(restart => [0, 120].map(history => ({ restart, history }))))("a delegated completion racing a sealed wake keeps its reply (restart=$restart, history=$history)", async ({ restart, history }) => {
+  const { control, backend, store, router } = delegatedRouter(); backend.trackFirstTurns(store);
+  store.acceptInbound("root", { id: "root", text: "Ask a delegate", attachments: [], isAudioMessage: false, receivedAt: Date.now() });
+  await router.tick();
+  const route = store.get<{ id: string; directory: string; generation: number }>("route")!;
+  const thread = control.threads.get(route.id)!;
+  thread.driver = { instanceId: "claudeAgent", model: "claude-opus-5-5" };
+  control.reply(route.id, "Working on it", "completed"); await router.tick();
+  for (const op of store.pendingOutbox()) store.outboxState(op.id, "sent");
+  const prompt = backend.prompt.bind(backend);
+  const posting = spyOn(backend, "prompt").mockImplementation(async (...args) => {
+    const runId = `run:thread:${route.id}:ordinal:2`;
+    thread.runs.push({ runId, ordinal: 2, status: "running" });
+    const at = new Date(Date.now() + 1).toISOString();
+    thread.messages.push({ messageId: "delegated-completion", runId, role: "user", text: "Delegated task node:delegated-task:done [completed]:\nDelegate finished", streaming: false, createdBy: "agent", createdAt: at, updatedAt: at });
+    for (let index = 0; index < history; index++) thread.messages.push({
+      messageId: `progress-${index}`, runId, role: "assistant", text: "Progress", phase: "narration",
+      streaming: false, createdBy: "agent", createdAt: at, updatedAt: at,
+    });
+    control.reply(route.id, "Delegate result", "completed");
+    await prompt(...args);
+  });
+  store.acceptInbound("wake:next", { id: "wake:next", text: wakeBody(), attachments: [], isAudioMessage: false, receivedAt: Date.now() });
+  try { await router.tick(); } finally { posting.mockRestore(); }
+  expect(thread.runs.map(run => run.ordinal)).toEqual([1, 2, 3]);
+  control.reply(route.id, "NO_REPLY", "completed");
+  const activeBackend = restart ? control.backend() : backend; activeBackend.trackFirstTurns(store);
+  const activeRouter = restart ? new Router(store, activeBackend, {
+    async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); },
+  }, { owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alerts", alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 0 }) : router;
+  await activeRouter.tick(); await activeRouter.tick();
+  const replies = store.pendingOutbox().filter(op => op.kind === "conversation");
+  expect(replies.map(op => op.text)).toEqual(["Delegate result"]);
+  expect(store.get<string[]>(`reply-covered:${replies[0]!.id}`)).toEqual([]);
+  store.outboxState(replies[0]!.id, "sent"); await activeRouter.tick();
+  expect(store.pendingOutbox().filter(op => op.kind === "conversation")).toEqual([]);
+  expect(store.get("watermark")).toMatchObject({ id: `idle:${thread.runs[2]!.runId}` });
+});
+
+test.each([false, true])("a send's completion read scopes out an older failed run and its stale thread error (restart=%s)", async restart => {
+  const control = fakeControl();
+  let backend = control.backend();
+  const store = new Store(":memory:");
+  stores.push(store);
+  backend.trackFirstTurns(store);
+  const chat = await backend.createChat();
+  const old = Date.parse("2026-11-16T10:16:47Z");
+  const sent = Date.parse("2026-11-16T11:35:32Z");
+  const thread = control.threads.get(chat.id)!;
+  thread.runs.push({ runId: `run:thread:${chat.id}:ordinal:17`, ordinal: 17, status: "failed", requestedAt: new Date(old).toISOString() });
+  thread.messages.push({ messageId: "old-input", runId: thread.runs[0]!.runId, role: "user", text: "Old wake", streaming: false,
+    createdAt: new Date(old).toISOString(), updatedAt: new Date(old).toISOString() });
+  thread.lastError = "The provider could not start this turn";
+  setSystemTime(sent);
+  const prompt = `msg_${"a".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, prompt, "New wake");
+  if (restart) { backend = control.backend(); backend.trackFirstTurns(store); }
+  // A stale lastError can remain while the fresh run completes normally.
+  control.reply(chat.id, "NO_REPLY", "completed");
+  const records = await backend.messages(chat.id, chat.directory, { until: prompt, since: sent });
+  expect(records.some(record => record.id === "old-input")).toBe(true);
+  const current = records.slice(records.findIndex(record => record.id === prompt) + 1);
+  expect(current.filter(record => record.type === "idle")).toMatchObject([{ outcome: "succeeded" }]);
+  expect(current.some(record => record.type === "assistant" && record.error)).toBe(false);
+});
+
+test("an admitted steer reads the run it joined even when that run predates the steer", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  const root = `msg_${"b".repeat(64)}`;
+  const followup = `msg_${"c".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, root, "Original request");
+  const sent = Date.now() + 60_000;
+  setSystemTime(sent);
+  expect(await backend.steer(chat.id, chat.directory, followup, "Follow-up request")).toBe("steered");
+  control.reply(chat.id, "Both answered", "completed");
+  const records = await backend.messages(chat.id, chat.directory, { until: followup, since: sent });
+  expect(records.some(record => record.id === followup)).toBe(true);
+  expect(records.filter(record => record.type === "idle")).toMatchObject([{ outcome: "succeeded" }]);
 });

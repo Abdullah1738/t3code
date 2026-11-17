@@ -338,7 +338,10 @@ test.each(pendingSendStates)("send attribution survives folding: $change, failed
     if (change === "background") h.store.set("activeTurn", { ...turn, background: true });
     if (change === "replaced") {
       h.input("replacement-inbound");
-      h.store.set("activeTurn", { ...turn, inboundId: "replacement-inbound", messageId: "replacement", startedAt: Number(turn.startedAt) + 1 });
+      h.store.updateInbound("replacement-inbound", "admitted");
+      h.backend.records.push({ id: "replacement", type: "user", text: "Replacement question", time: { created: Date.now() } });
+      h.store.set("activeTurn", { ...turn, inboundId: "replacement-inbound", leaderId: "replacement-inbound",
+        covered: ["replacement-inbound"], messageId: "replacement", startedAt: Number(turn.startedAt) + 1 });
     }
     if (change === "generation") h.store.set("route", { ...h.store.get<Record<string, unknown>>("route"), generation: 2 });
     release();
@@ -349,6 +352,14 @@ test.each(pendingSendStates)("send attribution survives folding: $change, failed
       return { providerId: "delivered-fixture" };
     } }, { projectScope: "log-fixture", chat: "owner", chatGuid: () => "dm:+15555550123", enabled: () => true, sleep: async () => {} });
     await delivery.tick();
+    if (change === "replaced") {
+      const reply = h.store.db.query<{ id: string }, []>("SELECT id FROM outbox WHERE id LIKE 'send:%'").get()!;
+      expect(h.store.get<string[]>(`reply-covered:${reply.id}`)).toEqual(["typed-1"]);
+      expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id = 'replacement-inbound'").get()?.state).toBe("admitted");
+      await h.finish(["NO_REPLY"]);
+      expect(h.store.get("human-retry-prompt:replacement-inbound")).toBeString();
+      expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id = 'replacement-inbound'").get()?.state).not.toBe("done");
+    }
   });
   const replies = logs.filter(line => line.name === "reply.sent" || line.name === "reply.failed");
   if (change === "generation") expect(replies).toEqual([]);

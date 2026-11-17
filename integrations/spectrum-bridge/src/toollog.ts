@@ -12,6 +12,7 @@ import { createChainAggregation } from "./log-chains.ts";
 import { recordRenderCounts, renderCounts } from "./log-render-store.ts";
 import { cleanRenders, createRenderAggregation, renderChat } from "./log-renders.ts";
 import { cleanSite, errorDetail, logSite, causeKey, type ErrorDetail } from "./log-error.ts";
+import { CONTROL_REASONS, controlFailureProps } from "./control-errors.ts";
 
 export type LogLine = {
   ts: string; tool: "imessage"; component: string; kind: "event" | "perf" | "error"; name: string;
@@ -29,7 +30,10 @@ const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId"]);
 const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount"]);
 const ENUMS: Record<string, readonly string[]> = {
-  replyMode: ["final", "tool"], reason: ["background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal"],
+  controlReason: CONTROL_REASONS,
+  leaderKind: ["human", "wake", "reset"],
+  route: ["new_turn", "steer", "question_answer", "held_for_wake"],
+  replyMode: ["final", "tool"], reason: ["respond_failed", "steer_failed", "background_no_reply", "turn_failed", "watchdog_overdue", "background", "no_text", "already_folded", "exit", "stdout", "hook", "test_default_command", "age", "contextSize", "providerRefusal"],
   source: ["live", "backfill", "watch", "settle_preceding"], outcome: ["replied", "failed", "refused", "no_reply", "ok", "fallback", "forwarded", "quiet", "owner_typed", "incomplete"],
   cardKind: ["quick", "delivery", "ride", "nutrition", "secure_form", "other"], phase: ["start", "stop"],
   method: ["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -55,7 +59,8 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     if (key === "attempt" && typeof value === "number" && (!Number.isSafeInteger(value) || value < 1)) continue;
     if ((NUMBERS.has(key) || key === "replies" && entry.name === "notice.reply") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
-    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
+    else if ((["queued", "inboundKnown", "bytesKnown", "pendingOrders", "retrySafe"].includes(key) || key === "sealedWake" && entry.name === "notice.reply") && typeof value === "boolean") props[key] = value;
+    else if (key === "holderRunId" && typeof value === "string" && value.length <= 250 && /^[a-zA-Z0-9_:%.@-]+$/.test(value)) props[key] = value;
     else if (typeof value === "string" && ENUMS[key]?.includes(value)) props[key] = value;
     // A route template is code-owned; no query strings, ids, or URLs enter the log.
     else if (key === "route" && typeof value === "string" && /^(?:\/(?:[a-z-]+|:id))*$/.test(value)) props[key] = value;
@@ -399,7 +404,7 @@ export const toolLog = createToolLog({ defer: true });
 export const completionReady = Symbol("completionReady");
 export function toolError(component: string, tag: string, cause: unknown, ids?: LogLine["ids"], props?: LogLine["props"]): void {
   if (cause === completionReady) return;
-  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids, props, error: { tag, cause } });
+  toolLog.write({ component, kind: "error", name: "bridge.catch", ok: false, ids, props: { ...controlFailureProps(cause), ...props }, error: { tag, cause } });
 }
 export function cardKind(value: string): string {
   // Generator names only; captions, query values and health data never enter the log.

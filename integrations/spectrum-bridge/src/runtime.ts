@@ -1,4 +1,5 @@
 import type { RemoteBox } from "./remote-box.ts";
+import { markReactionAnswered } from "./inbound-routing.ts";
 import { messageLengthError } from "./message-length.ts";
 import { toolError, toolLog } from "./toollog.ts";
 /**
@@ -138,7 +139,7 @@ export class ChatRegistry<P> {
             const created = chat.remote ? chat.remote.accept(id, payload) : chat.store.acceptInbound(id, payload);
             if (created) {
               const message = input as { attachments?: { totalBytes?: number }[]; sentAt?: number; logSource?: string };
-              toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: chat.info.slug, messageId: id },
+              toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: chat.info.slug, messageId: id, inboundId: id },
                 props: { bytesKnown: !message.attachments?.length || message.attachments.every(a => (a.totalBytes ?? 0) > 0), attachmentCount: message.attachments?.length ?? 0, attachmentBytes: (message.attachments ?? []).reduce((n, a) => n + (a.totalBytes ?? 0), 0),
                   receiveLagMs: Math.max(0, this.now() - (message.sentAt ?? this.now())), source: message.logSource === "backfill" ? "backfill" : "live" } }));
               this.touch(chat); received?.(chat, input);
@@ -469,10 +470,11 @@ export function createSbApi<P extends { api: Handler }>(options: SbApiOptions<P>
           const { target, kind } = body;
           if (!text(target, 200) || RESERVED_TARGET.test(target) || typeof kind !== "string"
             || !(TAPBACKS.includes(kind) || singleEmoji(kind))) throw new HttpError(400, "Invalid request");
-          const inbound = registry.all().some(chat =>
+          const inbound = registry.all().find(chat =>
             chat.store.db.query<{ id: string }, [string]>("SELECT id FROM inbound WHERE id = ?").get(target));
           if (!inbound) throw new HttpError(403, "Forbidden");
           await options.line.react(target, kind);
+          markReactionAnswered(inbound.store, target);
           return reply(200, { id: `reaction:${hash(target + kind)}` });
         }
         case "/location-request": {

@@ -64,7 +64,7 @@ export function ingest(store: Store, event: CatchUpEvent, owner: string, enabled
           store.set("chatGuid", canonical);
           store.set("paired", true);
           accepted = store.acceptInbound(input.id, { ...input, receivedAt: Date.now() });
-          if (accepted) toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "owner", messageId: input.id },
+          if (accepted) toolLog.capture(() => toolLog.write({ component: "ingress", kind: "event", name: "msg.received", ids: { chat: "owner", messageId: input.id, inboundId: input.id },
             props: { bytesKnown: input.attachments.every(a => a.totalBytes > 0), attachmentCount: input.attachments.length, attachmentBytes: input.attachments.reduce((n, a) => n + (a.totalBytes ?? 0), 0),
               source: historical ? "backfill" : "live", receiveLagMs: Math.max(0, Date.now() - (occurredAt ?? Date.now())) } }));
         }
