@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import offbox_disk_space
+import offbox_protection
 
 import base64
 import contextlib
@@ -1269,6 +1270,18 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
             if box is None or box.get('state') in (*api.STOPPED_STATES, 'error', 'cancelled'):
                 if history_unknown:
                     return None
+                if api.BACKEND == 'server':
+                    try:
+                        with api.budget(min(5, left())):
+                            if not lease.holder_gone(box_id, run_id):
+                                return None
+                    except OffboxError:
+                        return None
+                    if record:
+                        common.event_once(con, box_id, 'lease_free', json.dumps(offbox_protection.envelope(
+                            'lease_free', 'server receipt/process probe confirmed holder gone',
+                            lease.protection(con, box_id), run_id=run_id)), 'holder_gone:' + run_id)
+                    return dict(status='lost', running=False, exitCode=None)
                 if record:
                     con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{run_id}', 'box'))
                     con.commit()
@@ -3279,6 +3292,15 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
                     log_row = claim_terminal_log(con, r)
                     if terminal_result(r):
                         con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{run_id}',))
+                    if r['box_id']:
+                        import offbox_protection
+                        snapshot = lease.protection(con, r['box_id'])
+                        held = bool(snapshot['holds'])
+                        action = 'lease_held' if held else 'lease_free'
+                        common.event_once(con, r['box_id'], action, json.dumps(offbox_protection.envelope(
+                            action, 'terminal record; liveness unconfirmed' if held else 'terminal receipt received',
+                            snapshot, run_id=run_id, exit_code=r['exit_code'], holder=r['owner'])),
+                            action + '_logged:' + run_id)
             return r
         finally:
             con.close()
@@ -3368,7 +3390,9 @@ def _background(a, me: dict) -> int:
     try:
         ready_r, ready_w = os.pipe()
         accept_r, accept_w = os.pipe()
+        import offbox_protection
         payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  caller=offbox_protection.caller(),
                                   home_wait_deadline=home.wait_budget_end(),
                                   ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
         boot_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR')}
@@ -3471,6 +3495,13 @@ def _background_queue(run_id: str, payload: dict) -> int:
     finally:
         con.close()
     os.environ[BACKGROUND_RUN_ENV] = run_id
+    import offbox_protection
+    # The adoption check above binds the payload to this worker and its durable owner.
+    # Preserve the original command's parent/thread attribution across detachment.
+    supplied = payload.get('caller') or {}
+    context = offbox_protection.request_caller(supplied, me['owner'], None)
+    context.update(actor='client:run', holder=me['owner'], run_id=run_id, worker_pid=os.getpid())
+    offbox_protection.CALLER.set(context)
     with home.wait_budget(payload.get('home_wait_deadline')):
         return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
                                  signal_mask=payload['signal_mask'], source_failure=source_failure)

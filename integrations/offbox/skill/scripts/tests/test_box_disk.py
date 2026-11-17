@@ -748,9 +748,12 @@ class BoxDiskTests(Isolated):
         box_disk.retire(self.con,'b',space(tmp=4096),'tmp',stop=False)
         with patch.object(api,'list_boxes',return_value=[dict(id='b',state=api.STOPPED_STATES[0],
                            stoppedAt='2026-10-01T00:00:00Z')]), \
-             patch.object(bases,'upkeep'),patch.object(lease,'refresh_box') as refresh:
+             patch.object(bases,'upkeep'),patch.object(lease,'refresh_box') as refresh, \
+             patch.object(bases,'keep_pin_saved',return_value=True) as saved:
             reap.reap(False)
-        refresh.assert_called_once()
+        refresh.assert_not_called()
+        saved.assert_called_once()
+        self.assertEqual(saved.call_args.args[1],'b')
         self.assertTrue(self.row('b')['note'].startswith(box_disk.NOTE))
 
     def test_lost_disk_full_retention_resume_does_not_starve_healthy_peer(self):
@@ -763,9 +766,9 @@ class BoxDiskTests(Isolated):
         with patch.dict(os.environ, {'OFFBOX_RESUME_CONFIRM_SECONDS':'0'}), \
              patch.object(lease.capacity, 'check'), \
              patch.object(api, 'resume', side_effect=api.NetworkError('resume reply lost')):
-            with self.assertRaises(lease.ResumeUnresolved):
+            with self.assertRaises(lease.PinnedLeaseError):
                 lease.refresh_box(self.con, 'bad')
-        self.assertTrue(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:bad'").fetchone())
+        self.assertFalse(self.con.execute("SELECT 1 FROM kv WHERE k='resume_unanswered:bad'").fetchone())
         def reuse(con, row, *args, **kwargs):
             self.assertEqual(row['box_id'], 'good', 'retired resumes must not enter dispatch selection')
             return dict(row)

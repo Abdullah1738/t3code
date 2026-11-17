@@ -18,6 +18,8 @@ class PinTests(Isolated):
     def setUp(self):
         super().setUp()
         self.stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('network forbidden')))
+        self.stack.enter_context(patch.object(bases, 'keep_pin_saved', return_value=True))
+        self.stack.enter_context(patch.object(lease, 'ensure_ttl', return_value=True))
         self.stack.enter_context(patch.object(lease, 'now', return_value=1000))
         self.stack.enter_context(patch.object(reap, 'now', return_value=1000))
         self.stack.enter_context(patch.object(bases, 'now', return_value=1000))
@@ -349,11 +351,13 @@ class PinTests(Isolated):
         delete_saved.assert_not_called()
         self.assertEqual(self.con.execute('SELECT count(*) FROM bases').fetchone()[0], 1)
 
-    def test_stop_404_does_not_forget_pin(self):
+    def test_stop_is_refused_before_404_and_does_not_forget_pin(self):
         self.pinned()
-        with patch.object(api, 'stop', side_effect=api.ApiError(404, 'not_found', 'missing')), \
+        with patch.object(api, 'stop', side_effect=api.ApiError(404, 'not_found', 'missing')) as stop, \
                 patch.object(api, 'get', return_value=None):
-            lease.stop_box(self.con, 'bx_kept', 'release', images=False)
+            with self.assertRaisesRegex(lease.PinnedLeaseError, 'pinned'):
+                lease.stop_box(self.con, 'bx_kept', 'release', images=False)
+        stop.assert_not_called()
         self.assert_kept()
 
     def test_deleted_pinned_box_notice_names_deletion_event(self):

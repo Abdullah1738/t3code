@@ -236,6 +236,7 @@ class PushResumeTests(Isolated):
         self.resume = self.stack.enter_context(patch.object(lease, '_resume_confirmed', return_value=(None, False)))
         self.bring_up = self.stack.enter_context(patch.object(lease, '_bring_up_resumed', return_value={'type': 'large'}))
         self.put_file = self.stack.enter_context(patch.object(ssh_sync, 'put_file'))
+        self.stack.enter_context(patch.object(runs.quint_tools, 'ensure_archive'))
         self.push = self.stack.enter_context(patch.object(ssh_sync, 'push'))
         self.stack.enter_context(patch.object(ssh_sync, 'tracked_secret_matches', return_value=[]))
         self.command = self.stack.enter_context(patch.object(api, 'cmd_start', return_value={'processId': 7}))
