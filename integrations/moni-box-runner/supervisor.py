@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,7 +25,7 @@ def log_event(event, **fields):
 
 
 @contextmanager
-def quiet_offbox():
+def quiet_offbox(stderr_fd=None):
     # The shared SSH builder inherits file descriptors; redirect those too, without changing its arguments.
     sys.stdout.flush()
     sys.stderr.flush()
@@ -32,7 +33,7 @@ def quiet_offbox():
         saved = [(fd, os.dup(fd)) for fd in (1, 2)]
         try:
             for fd, _ in saved:
-                os.dup2(sink.fileno(), fd)
+                os.dup2(stderr_fd if fd == 2 and stderr_fd is not None else sink.fileno(), fd)
             with redirect_stdout(sink), redirect_stderr(sink):
                 yield
         finally:
@@ -42,16 +43,53 @@ def quiet_offbox():
 
 
 class ReadinessError(RuntimeError):
-    def __init__(self, target, status, exception_class='HTTPError'):
+    def __init__(self, target, status, exception_class='HTTPError', phase=None):
         super().__init__('runner_readiness_failed')
         self.target, self.status, self.exception_class = target, status, exception_class
+        self.phase = phase or ('runner-paused' if target == 'runner' else target + '-http')
 
 
 def error_fields(error):
     if isinstance(error, ReadinessError):
-        return {'status': error.status, 'exception_class': error.exception_class}
+        return {'status': error.status, 'exception_class': error.exception_class, 'phase': error.phase}
     return {'status': error.code if isinstance(error, urllib.error.HTTPError) else None,
             'exception_class': type(error).__name__ if error is not None else None}
+
+
+class TunnelStderr:
+    def __init__(self, fd):
+        self.tail = b''
+        self.lock = threading.Lock()
+        def drain():
+            with os.fdopen(fd, 'rb', buffering=0) as stream:
+                while chunk := stream.read(4096):
+                    with self.lock:
+                        self.tail = (self.tail + chunk)[-2048:]
+        self.thread = threading.Thread(target=drain, daemon=True)
+        self.thread.start()
+
+    def fields(self):
+        self.thread.join(timeout=1)
+        with self.lock:
+            tail = self.tail.lower()
+        # SSH can echo remote paths, addresses or credentials. Only fixed diagnostic phrases leave memory.
+        vocabulary = {b'connection refused': 'connection-refused', b'connection timed out': 'connection-timeout',
+                      b'connection reset': 'connection-reset', b'broken pipe': 'broken-pipe',
+                      b'remote port forwarding failed': 'remote-forward-failed', b'address already in use': 'address-in-use',
+                      b'permission denied': 'permission-denied', b'host key verification failed': 'host-key-failed'}
+        return {'stderr_bytes': len(tail), 'stderr_tail': [code for phrase, code in vocabulary.items() if phrase in tail]}
+
+
+def capture_tunnel(operation):
+    read_fd, write_fd = os.pipe()
+    diagnostic = TunnelStderr(read_fd)
+    try:
+        with quiet_offbox(stderr_fd=write_fd):
+            child = operation()
+        child.moni_stderr = diagnostic
+        return child
+    finally:
+        os.close(write_fd)
 
 
 def router_ports(config):
@@ -99,6 +137,9 @@ class Supervisor:
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=5)
+            diagnostic = getattr(child, 'moni_stderr', None)
+            self.log('moni-supervisor-ssh-exit', 'ssh-child', name, self.clock(),
+                     exit_code=child.poll(), **(diagnostic.fields() if diagnostic else {}))
         return stopped
 
     def deactivate(self):
@@ -134,7 +175,8 @@ class Supervisor:
                 dead = True
                 del self._children[name]
                 self.log('moni-supervisor-reconnect', 'ssh-child', name, self.clock(),
-                         ChildProcessError(), exit_code=code)
+                         ChildProcessError(), exit_code=code,
+                         **(child.moni_stderr.fields() if hasattr(child, 'moni_stderr') else {}))
         return dead
 
     def connect(self):
@@ -166,11 +208,24 @@ class Supervisor:
             if not self.deps.active():
                 self.deactivate()
             elif self.failures % self.failure_limit == 0:
-                # A timeout cannot establish which reverse forward failed; keep model transport alive.
-                stopped = self.stop_tunnels((target,))
-                self.log('moni-supervisor-reconnect', 'runner-lease', target, started, error, stopped,
-                         latency_ms=latency_ms)
-                self.start_missing_tunnels()
+                phase = (error.phase if isinstance(error, ReadinessError)
+                         else 'ssh-transport' if isinstance(error, ConnectionRefusedError) else 'runner-http')
+                repair = phase == 'ssh-transport'
+                if target in ('router', 'callback') and phase != 'ssh-transport':
+                    # Compare the Mac endpoint before blaming its healthy SSH process.
+                    direct_started = self.clock()
+                    direct_ready = self.deps.direct_ready(target)
+                    self.log('moni-supervisor-direct-probe', 'direct-http', target, direct_started,
+                             ready=direct_ready)
+                    repair = direct_ready
+                    if not repair:
+                        self.log('moni-supervisor-router-slow' if target == 'router' else 'moni-supervisor-callback-unready',
+                                 'direct-http', target, started, error, latency_ms=latency_ms)
+                if repair:
+                    stopped = self.stop_tunnels((target,))
+                    self.log('moni-supervisor-reconnect', 'runner-lease', target, started, error, stopped,
+                             latency_ms=latency_ms)
+                    self.start_missing_tunnels()
             return False
         if not self.deps.active():
             self.deactivate()
@@ -288,14 +343,12 @@ class OffboxDeps:
     def tunnel(self, box, reverse):
         remote = self.config['boxCallbackPort'] if reverse else self.config['boxRunnerPort']
         local = self.config['callbackPort'] if reverse else int(self.config['url'].rsplit(':', 1)[1])
-        with quiet_offbox():
-            return self.ssh_sync.tunnel(box, remote, local, reverse)
+        return capture_tunnel(lambda: self.ssh_sync.tunnel(box, remote, local, reverse))
 
     def router_tunnel(self, box):
         box_port, mac_port = router_ports(self.config)
         # SSH runs on the Mac; -R binds only the box loopback and targets only this Mac loopback port.
-        with quiet_offbox():
-            return self.ssh_sync.tunnel(box, box_port, mac_port, True)
+        return capture_tunnel(lambda: self.ssh_sync.tunnel(box, box_port, mac_port, True))
 
     def post(self, base, token_file, path, body):
         token = Path(token_file).read_text().strip()
@@ -311,7 +364,7 @@ class OffboxDeps:
                 raise RuntimeError('offbox_lease_refresh_failed')
 
     def both_ready(self):
-        # /lease checks the box-to-router HTTP round trip and callback before granting the runner a lease.
+        # Readiness is reported separately; a valid call renews authority even while dependencies are slow.
         try:
             result = self.post(self.config['url'], self.config['tokenFile'], '/lease',
                                {'epoch': self.config['epoch'], 'boxId': self.config['boxId']})
@@ -327,8 +380,30 @@ class OffboxDeps:
             finally:
                 error.close()
             raise ReadinessError(target, error.code) from None
+        except urllib.error.URLError as error:
+            refused = isinstance(error.reason, ConnectionRefusedError)
+            raise ReadinessError('runner', None, type(error.reason).__name__, 'ssh-transport' if refused else 'runner-http') from None
+        except TimeoutError:
+            raise ReadinessError('runner', None, 'TimeoutError', 'runner-http') from None
         if result.get('boxId') != self.config['boxId'] or result.get('epoch') != self.config['epoch']:
             raise ReadinessError('runner', 200, 'ReadinessError')
+        for target in ('router', 'callback'):
+            if result.get(target + 'Ready') is False:
+                raise ReadinessError(target, 200, 'DependencyUnavailable')
+
+    def direct_ready(self, target):
+        try:
+            if target == 'router':
+                _, port = router_ports(self.config)
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=5) as response:
+                    return response.status == 200
+            if target == 'callback':
+                result = self.post(f"http://127.0.0.1:{self.config['callbackPort']}", self.config['callbackTokenFile'],
+                                   '/ready', {'epoch': self.config['epoch']})
+                return result.get('epoch') == self.config['epoch']
+        except (OSError, ValueError, urllib.error.URLError):
+            return False
+        return False
 
     def pause(self):
         try:
