@@ -15427,6 +15427,8 @@ const make = Effect.gen(function* () {
                     currentLink.boardId !== board.id
                   )
                     return;
+                  const failure = yield* threads.findLastFailure(link.threadId);
+                  if (failure !== null && Rules.isUnconfirmedPromptAcceptance(failure)) return;
                   views.delete(link.threadId);
                   const minutes = Math.round((now - started) / 60_000);
                   const sent = yield* threads
@@ -15733,6 +15735,9 @@ const make = Effect.gen(function* () {
                         fresh.value?.state !== "running" ||
                         fresh.value.runStartedAt !== read.value.runStartedAt
                       )
+                        continue;
+                      const failure = yield* threads.findLastFailure(evaluatorId);
+                      if (failure !== null && Rules.isUnconfirmedPromptAcceptance(failure))
                         continue;
                       views.delete(evaluatorId);
                       const minutes = Math.round(idleMs / 60_000);

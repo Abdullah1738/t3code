@@ -37518,6 +37518,7 @@ it.effect.each(
             const successor = {
               ...run,
               id: RunId.make("clean-review-successor"),
+              userMessageId: MessageId.make("clean-review-input"),
               ordinal: run.ordinal + 1,
               status: "running" as const,
               startedAt: reconciledAt,
@@ -37531,11 +37532,29 @@ it.effect.each(
               occurredAt: reconciledAt,
               payload: successor,
             });
+            yield* projections.apply({
+              id: EventId.make("steer-reminder:successor-input"),
+              type: "message.updated",
+              threadId: thread,
+              runId: successor.id,
+              occurredAt: reconciledAt,
+              payload: {
+                ...message,
+                id: successor.userMessageId,
+                runId: successor.id,
+                text: "Reconciled evaluator work",
+              },
+            });
           }
           yield* service.tick;
           const after = yield* Ref.get(fake.threads);
           assert.isTrue(
             after.size > ids.length || after.get(thread)!.messages.length > messages.length,
+          );
+          assert.isTrue(
+            [...after.values()].some((thread) =>
+              thread.messages.some((text) => text.includes("is waiting on your subtasks")),
+            ),
           );
         });
         yield* restart ? check.pipe(Effect.provide(KanbanService.layer)) : check;
