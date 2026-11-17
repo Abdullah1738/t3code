@@ -166,6 +166,17 @@ __offbox_curl -fsSL https://example.invalid/node.tar.xz -o /tmp/fixture
         self.assertIn('--set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac', body)
         self.assertIn("javac -version 2>&1 | grep -q '^javac 21\\.'", body)
 
+    def test_base_and_stack_templates_install_the_shim_interpreter(self):
+        base = TEMPLATES.parents[1] / 'server/base-image.sh'
+        paths = [base, *(TEMPLATES / (name + '.sh') for name in common.TEMPLATES)]
+        for path in paths:
+            with self.subTest(path=path.name):
+                body = path.read_text().replace('\\\n', ' ')
+                installs = re.findall(r'^\s*(?:sudo )?apt-get install\s+([^\n]+)', body, re.M)
+                self.assertTrue(any('zsh' in shlex.split(args) for args in installs), path)
+        self.assertIn("test -x /bin/zsh || { echo 'offbox base: /bin/zsh missing' >&2; exit 1; }",
+                      base.read_text())
+
     def test_java_checks_fail_template_builds_without_a_21_compiler(self):
         paths = [TEMPLATES / (name + '.sh') for name in common.TEMPLATES]
         paths.append(TEMPLATES.parents[1] / 'server/base-image.sh')

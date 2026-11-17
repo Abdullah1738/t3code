@@ -1,7 +1,9 @@
 if __package__:
-    from . import test_environment
+    from . import test_environment, code_mode_fixture, isolated_source_cases
 else:
     import test_environment
+    import code_mode_fixture
+    import isolated_source_cases
 
 from contextlib import contextmanager, redirect_stdout
 import io
@@ -19,8 +21,6 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import engine
 import statev2_guard as guard
-import code_mode_fixture
-import isolated_source_cases
 import claude
 import codex
 
@@ -626,14 +626,14 @@ class GuardTests(unittest.TestCase):
                         write = self.heredoc(target, 'print(1)')
                         copy = f'cp {seed} "{copy_root}/{destination}"\n'
                         command = 'd=$(mktemp -d)\n' + (copy + write if order == 'before' else write + copy) + 'python3 -I ' + target
-                        expected = UNRESOLVED
+                        expected = None if destination == 'sibling.ndjson' else UNRESOLVED
                         with self.subTest(write_root=write_root, copy_root=copy_root, destination=destination, order=order):
                             self.assertEqual(self.classify(command), expected)
                             self.adapters(command, expected)
                             if destination in {'', 'readback.ndjson'}:
                                 rule, cause = guard.classify_detail(command, str(self.root))
                                 self.assertIn('unchecked copy', cause)
-                                self.assertNotIn('literal absolute', guard.refusal_reason(rule, cause, str(self.root)))
+                                self.assertIn('Accepted:', guard.refusal_reason(rule, cause, str(self.root)))
 
     def test_same_call_checked_test_runners(self):
         target = str(self.root / 'skip.test.mjs')
@@ -731,6 +731,72 @@ class GuardTests(unittest.TestCase):
         run = 'python3 -m unittest discover -s tmp'
         self.assertEqual(guard.classify_detail(prefix + run + '\n' + run, str(self.root)), (None, None))
 
+    def test_same_call_mktemp_reporters(self):
+        body = ('import tempfile, unittest\nclass T(unittest.TestCase):\n'
+                ' def test_fixture(self):\n  with tempfile.TemporaryDirectory() as root:\n'
+                '   self.assertTrue(root)\n')
+        self.write('other_existing.py', 'import unittest\n')
+        venv = '/Users/ardud/.local/share/memory-system/.venv/bin/python3'
+        rows = [
+            ('recall73', 'x.py', f'A=1 B=$(mktemp -d) {venv} -m unittest x other_existing'),
+            ('recall93', 'x.py', 'B=$(mktemp -d) A=1 ~/.local/share/memory-system/.venv/bin/python3 -m unittest x'),
+            ('system', 'x.py', 'A=1 B=$(mktemp -d) python3 -m unittest x'),
+            ('isolated', 'x.py', 'B=$(mktemp -d) python3 -I x.py'),
+            ('template', 'x.py', 'B=$(mktemp -d -t foo.XXXXXX) python3 -I x.py'),
+            ('recall52', 'integrations/memory-system/tests/test_backup_partial.py',
+             f'RECALL_RULE_PREFLIGHT=1 RECALL_TOOL_LOG_DIR=$(mktemp -d) {venv} -m unittest discover -s integrations/memory-system/tests -p test_backup_partial.py'),
+            ('recall115', 'test_backup_io.py', 'RECALL_RULE_PREFLIGHT=1 RECALL_TOOL_LOG_DIR=$(mktemp -d) ~/.local/share/memory-system/.venv/bin/python3 -m unittest test_backup_io'),
+            ('recall94', 'integrations/memory-system/tests/test_backup_shipper.py', 'RECALL_TOOL_LOG_DIR=$(mktemp -d) python3 -m unittest discover -s integrations/memory-system/tests -p test_backup_shipper.py -v'),
+            ('recall94 standalone', 'integrations/memory-system/tests/test_backup_shipper.py', 'D=$(mktemp -d)\nRECALL_TOOL_LOG_DIR="$D" python3 -m unittest discover -s integrations/memory-system/tests -p test_backup_shipper.py -v'),
+            ('recall122', 'integrations/memory-system/tests/test_backup_manifest.py', 'RECALL_TOOL_LOG_DIR=$(mktemp -d) /usr/bin/python3 -m unittest discover -s integrations/memory-system/tests -p test_backup_manifest.py'),
+        ]
+        for label, target, runner in rows:
+            source = body
+            directory = self.root
+            if label == 'recall115':
+                directory = self.root / 'integrations/memory-system/tests'
+                directory.mkdir(parents=True, exist_ok=True)
+                self.write('integrations/memory-system/src/synthetic_backup.py', 'def copy(): pass\n')
+                source = 'import sys\nsys.path.insert(0, "../src")\nfrom synthetic_backup import copy\nfrom unittest import mock\n' + body
+            command = self.heredoc(target, source) + runner
+            with self.subTest(reporter=label):
+                self.assertEqual(guard.classify_detail(command, str(directory)), (None, None))
+                self.adapters('cd ' + shlex.quote(str(directory)) + ' && ' + command)
+
+    def test_same_call_mktemp_substitution_forms(self):
+        prefix = self.heredoc('x.py', 'print(1)')
+        for substitution in ['mktemp -d', 'mktemp -d foo.XXXXXX', 'mktemp -d -t foo.XXXXXX',
+                             'mktemp -d "foo.XXXXXX"', '/usr/bin/mktemp -d']:
+            for assignment in [f'B=$({substitution})', f'B="$({substitution})"']:
+                for setup in [assignment + ' ', 'A=1 ' + assignment + ' C=2 ', assignment + '\n']:
+                    command = prefix + setup + 'python3 -I x.py'
+                    with self.subTest(substitution=substitution, setup=setup):
+                        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_same_call_mktemp_substitution_still_denies(self):
+        prefix = self.heredoc('x.py', 'print(1)')
+        for substitution in ['cp other.py x.py', 'sed -i s/1/2/ x.py', 'tee x.py < other.py',
+                             'mktemp -u', 'mktemp -d -u', 'mktemp -d --dry-run', 'python3 unchecked.py',
+                             'mktemp -d; cp other.py x.py', 'mktemp -d > x.py',
+                             'mktemp -d $(python3 unchecked.py)', 'mktemp -d "$TEMPLATE"',
+                             'mktemp -d; true', 'mktemp -d | cat']:
+            for setup in [f'B=$({substitution}) ', f'B=$({substitution})\n']:
+                command = prefix + setup + 'python3 -I x.py'
+                with self.subTest(substitution=substitution, setup=setup):
+                    self.assertIsNotNone(self.classify(command))
+        for database in [LIVE, '/Users/x/.local/share/opencode/opencode.db']:
+            command = self.heredoc('x.py', f'open({database!r}, "rb").read()') + 'B=$(mktemp -d) python3 -I x.py'
+            self.assertEqual(self.classify(command), SCRIPT)
+        for setup in ['PATH=/untrusted B=$(mktemp -d) ', 'mktemp() { cp other.py x.py; }\nB=$(mktemp -d) ',
+                      'alias mktemp="cp other.py x.py"\nB=$(mktemp -d) ',
+                      'cp other.py /usr/bin/mktemp\nB=$(mktemp -d) ']:
+            self.assertIsNotNone(self.classify(prefix + setup + 'python3 -I x.py'))
+        command = prefix + 'B=$(mktemp -d) python3 -I x.py'
+        with patch.dict(os.environ, {'BASH_FUNC_mktemp%%': '() { cp other.py x.py; }'}):
+            self.assertIsNotNone(self.classify(command))
+        with patch.object(guard, '_trusted_fixture_tool', return_value=False):
+            self.assertIsNotNone(self.classify(command))
+
     def test_same_call_offbox_reporter(self):
         relative = 'integrations/memory-system/tests/benchmark_recall_storage.py'
         for destination in [relative, str(self.root / relative)]:
@@ -782,6 +848,405 @@ class GuardTests(unittest.TestCase):
         for filename, run in [('report.py', 'python3 -I'), ('readback.ts', 'bun')]:
             command = 'd=$(mktemp -d); ' + self.heredoc('"$d/' + filename + '"', 'import sqlite3; sqlite3.connect(' + repr(LIVE) + ')') + run + ' "$d/' + filename + '"'
             self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_mktemp_109_templates_and_inline_invocations(self):
+        templates = ['', ' tmp/work.XXXXXX', ' -t work', ' ~/.robob/board-artifacts/work.XXXXXX',
+                     ' "$HOME/.robob/board-artifacts/work.XXXXXX"', ' "$PWD/tmp/work.XXXXXX"']
+        for template in templates:
+            for binary, filename, body in [('python3 -I', 'x.py', 'print(1)'), ('node', 'x.js', 'console.log(1)'), ('bash', 'x.sh', 'echo hi')]:
+                for wrapper in ['', 'offbox run -- ', 'offbox run --include "$d" -- ',
+                                'offbox run --include="$d" --bg --no-fallback --size xlarge -- ']:
+                    setup = 'd=$(mktemp -d' + template + ')\n'
+                    command = setup + self.heredoc('"$d/' + filename + '"', body) + wrapper + binary + ' "$d/' + filename + '"'
+                    with self.subTest(template=template, binary=binary, wrapper=wrapper):
+                        self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+                for wrapper in ['', 'offbox run -- ']:
+                    command = wrapper + binary + ' "$(mktemp -d' + template + ')/' + filename + '"'
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None), command)
+        # Expanding a previously bound directory cannot use the empty-dir proof.
+        for wrapper in ['', 'offbox run -- ']:
+            self.assertEqual(self.classify('d=$(mktemp -d); ' + wrapper + 'python3 "$d/x.py"'), UNRESOLVED)
+        for template in [' -u', ' -u tmp/x.XXXXXX', ' -t /outside/x', ' tmp/../x.XXXXXX',
+                         ' ~/.robob/userdata/x.XXXXXX', ' ~/.t3/userdata/x.XXXXXX',
+                         ' ~/.local/share/opencode/x.XXXXXX', ' "$(echo tmp)/x.XXXXXX"']:
+            for wrapper in ['', 'offbox run -- ']:
+                command = 'd=$(mktemp -d' + template + '); ' + self.heredoc('"$d/x.py"', 'print(1)') + wrapper + 'python3 "$d/x.py"'
+                self.assertEqual(self.classify(command), UNRESOLVED, command)
+                self.assertEqual(self.classify(wrapper + 'python3 "$(mktemp -d' + template + ')/x.py"'), UNRESOLVED)
+
+    def test_mktemp_109_sibling_writers_and_heredoc_spellings(self):
+        for writer in ['echo hi > "$d/other"', 'printf "%s\\n" hi > "$d/other"', 'cp /source/bundle.tgz "$d/bundle.tgz"',
+                       self.heredoc('"$d/other"', 'hello'), 'print -r -- "$d" > tmp/path.txt',
+                       'printf "%s\\n" "$d/x.py" > tmp/path.txt']:
+            for before in [True, False]:
+                script = self.heredoc('"$d/x.py"', 'print(1)')
+                prefix = 'd=$(mktemp -d)\n' + (writer + '\n' + script if before else script + writer + '\n')
+                for wrapper in ['', 'offbox run -- ']:
+                    command = prefix + wrapper + 'python3 -I "$d/x.py"'
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None), command)
+        for writer in ['cat > "$d/x.py"', 'cat <<\'EOF\' > "$d/x.py"', 'tee "$d/x.py"']:
+            header = writer if '<<' in writer else writer + " <<'EOF'"
+            command = 'd=$(mktemp -d)\n' + header + '\nprint(1)\nEOF\npython3 "$d/x.py"'
+            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None), command)
+        command = 'd=$(mktemp -d); ' + self.heredoc('"$d/x.sh"', "python3 - <<'PY'\nprint(1)\nPY")
+        self.assertIsNone(self.classify(command + 'chmod +x "$d/x.sh"; offbox run --include "$d" -- bash "$d/x.sh"'))
+        command = 'd=$(mktemp -d); ' + self.heredoc('"$d/x.py"', 'print(1)')
+        self.assertIsNone(self.classify(command + 'cp "$d/x.py" tmp/copy.py; python3 "$d/x.py"'))
+
+    def test_mktemp_109_tee_output_aliases(self):
+        for input_text in [' < tmp/t.py', ' <<< hi']:
+            for write_root in ['$d', '${d}']:
+                for run_root in ['$d', '${d}']:
+                    for target, expected in [('x.py', UNRESOLVED), ('other', None)]:
+                        for before in [True, False]:
+                            for wrapper in ['', 'offbox run -- ']:
+                                writer = 'tee "' + write_root + '/' + target + '"' + input_text + '\n'
+                                script = self.heredoc('"' + run_root + '/x.py"', 'print(1)')
+                                command = 'd=$(mktemp -d)\n' + (writer + script if before else script + writer)
+                                command += wrapper + 'python3 "' + run_root + '/x.py"'
+                                with self.subTest(command=command):
+                                    self.assertEqual(self.classify(command), expected)
+
+    def test_mktemp_109_filesystem_alias_writers(self):
+        # Compare identities before files exist, independently of the test host's
+        # case/normalization behavior. Local and offbox must use the same proof.
+        rows = [
+            ('x.py', 'X.py', UNRESOLVED),
+            ('café.py', 'cafe\u0301.py', UNRESOLVED),
+            ('café.py', 'CAFE\u0301.PY', UNRESOLVED),
+            ('sub/x.py', 'SUB/X.PY', UNRESOLVED),
+            ('x.py', 'other.py', None),
+            ('x.py', 'x.py.backup', None),
+            ('café.py', 'cafe.py', None),
+        ]
+        for script_name, target, expected in rows:
+            for writer in ['cp /source/unchecked.py "{target}"', 'echo hi > "{target}"',
+                           'tee "{target}" < tmp/input.py']:
+                for root in ['$d', '${d}']:
+                    for before in [False, True]:
+                        script = self.heredoc('"$d/' + script_name + '"', 'print(1)')
+                        write = writer.format(target=root + '/' + target) + '\n'
+                        prefix = 'd=$(mktemp -d)\nmkdir "$d/sub"\n'
+                        prefix += write + script if before else script + write
+                        for wrapper in ['', 'offbox run --include "$d" --pull tmp/log -- ']:
+                            command = prefix + wrapper + 'python3 -I "$d/' + script_name + '"'
+                            with self.subTest(command=command):
+                                rule, cause = guard.classify_detail(command, str(self.root))
+                                self.assertEqual(rule, expected)
+                                if expected:
+                                    self.assertIn('Accepted:', cause)
+                                    self.assertIn('copy' if writer.startswith('cp') else 'writer', cause)
+        # cp to an existing directory writes the source basename beneath it.
+        for target in ['sub', 'SUB', 'sub/', 'SUB/']:
+            for before in [False, True]:
+                script = self.heredoc('"$d/sub/unchecked.py"', 'print(1)')
+                write = 'cp /source/unchecked.py "$d/' + target + '"\n'
+                prefix = 'd=$(mktemp -d)\nmkdir "$d/sub"\n'
+                prefix += write + script if before else script + write
+                for wrapper in ['', 'offbox run -- ']:
+                    command = prefix + wrapper + 'python3 -I "$d/sub/unchecked.py"'
+                    self.assertEqual(self.classify(command), UNRESOLVED, command)
+
+    def test_mktemp_109_print_binding_changes(self):
+        script = self.heredoc('"$d/x.py"', 'print(1)')
+        writers = ['print -v d -- /literal/existing-directory',
+                   'print -rv d -- /literal/existing-directory',
+                   'print -vr d -- /literal/existing-directory',
+                   'print -r -v d -- /literal/existing-directory',
+                   'print -vd -- /literal/existing-directory',
+                   'print "$FLAGS" d /literal/existing-directory',
+                   'print -v PATH -- /literal/bin',
+                   'print -v BASH_ENV -- /literal/startup']
+        for writer in writers:
+            for before in [False, True]:
+                prefix = 'd=$(mktemp -d)\n' + (writer + '\n' + script if before else script + writer + '\n')
+                for wrapper in ['', 'offbox run -- ']:
+                    command = prefix + wrapper + 'python3 -I "$d/x.py"'
+                    with self.subTest(command=command):
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, UNRESOLVED)
+                        self.assertIn('print flags may reassign', cause)
+                        self.assertIn('at line', cause)
+                        self.assertIn('Accepted:', cause)
+        for operand in ['"$d"', '-v', '-rv', '"$FLAGS"']:
+            for wrapper in ['', 'offbox run -- ']:
+                command = 'd=$(mktemp -d)\n' + script + 'print -r -- ' + operand + ' > tmp/path.txt\n'
+                command += wrapper + 'python3 -I "$d/x.py"'
+                self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None), command)
+
+    def test_mktemp_109_print_binding_changes_in_loops(self):
+        setup = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.py"', 'print(1)')
+        forms = ['{print}', '! {print}', 'if true; then {print}; fi', 'command {print}',
+                 'command -p -- {print}', 'builtin {print}', 'noglob {print}', 'nocorrect {print}',
+                 '{{ {print}; }}', 'if true; then {{ {print}; }}; fi',
+                 'case "$n" in *) {print};; esac', 'case "$n" in 1|2) {{ {print}; }};; esac',
+                 'time {print}', 'time -p {print}', '! time {{ {print}; }}',
+                 '{{ time {print}; }}', 'time case "$n" in *) {print};; esac',
+                 '! time if true; then {{ {print}; }}; fi',
+                 'time for j in 1 2; do {print}; done']
+        for flags in ['-v d --', '-rv d --', '-vr d --', '-r -v d --', '-vd --', '"$FLAGS" d', '-v PATH --']:
+            for form in forms:
+                mutation = form.format(print='print ' + flags + ' /literal/rebound')
+                for wrapper in ['', 'offbox run -- ']:
+                    body = 'for n in 1 2; do\n' + wrapper + 'python3 -I "$d/x.py"\n' + mutation + '\ndone'
+                    commands = [setup + body]
+                    if not wrapper:
+                        commands.append('offbox run -- ' + shlex.quote(setup + body))
+                    for command in commands:
+                        with self.subTest(command=command):
+                            rule, cause = guard.classify_detail(command, str(self.root))
+                            self.assertEqual(rule, UNRESOLVED)
+                            self.assertIn('print flags may reassign', cause)
+                            self.assertIn('in a loop at line', cause)
+                            self.assertIn('Accepted:', cause)
+        for operand in ['"$d"', '-v', '-rv']:
+            for form in [forms[i] for i in [0, 1, 2, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]]:
+                for wrapper in ['', 'offbox run -- ']:
+                    output = form.format(print='print -r -- ' + operand)
+                    command = setup + 'for n in 1 2; do\n' + wrapper + 'python3 -I "$d/x.py"\n' + output + '\ndone'
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None), command)
+                    if not wrapper:
+                        self.assertEqual(guard.classify_detail('offbox run -- ' + shlex.quote(command), str(self.root)), (None, None))
+
+    def test_mktemp_109_loop_prefixes_and_case_patterns(self):
+        setup = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.py"', 'print(1)')
+        forms = [prefix + ' for n in 1 2; do\n{invoke}\n{print}\ndone'
+                 for prefix in ['!', 'time', 'time -p', '! time', 'time !']]
+        keywords = ['if', 'then', 'elif', 'else', 'fi', 'for', 'while', 'until', 'select',
+                    'do', 'done', 'case', 'esac', 'in', '!', 'time']
+        for keyword in keywords:
+            for pattern in [keyword, "'" + keyword + "'", '"' + keyword + '"']:
+                for opening in ['', '(']:
+                    forms.append('for n in 1 2; do\n{invoke}\ncase "$n" in\n'
+                                 + opening + pattern + '|1|2) {print};;\nesac\ndone')
+        # A keyword argument must not extend or truncate the matching loop.
+        forms.append('for n in 1 2; do\necho for done\n{invoke}\n{print}\ndone')
+        for flags in ['-v d --', '-rv d --', '"$FLAGS" d', '-v PATH --', '-r --']:
+            output_only = flags == '-r --'
+            for form in forms:
+                for wrapper in ['', 'offbox run -- ']:
+                    body = form.format(invoke=wrapper + 'python3 -I "$d/x.py"',
+                                       print='print ' + flags + ' /literal/rebound')
+                    commands = [setup + body]
+                    if not wrapper:
+                        commands.append('offbox run -- ' + shlex.quote(setup + body))
+                    for command in commands:
+                        with self.subTest(command=command):
+                            rule, cause = guard.classify_detail(command, str(self.root))
+                            if output_only:
+                                self.assertEqual((rule, cause), (None, None))
+                            else:
+                                self.assertEqual(rule, UNRESOLVED)
+                                self.assertIn('print flags may reassign', cause)
+                                self.assertIn('in a loop at line', cause)
+                                self.assertIn('Accepted:', cause)
+
+    def test_mktemp_109_case_arm_separators(self):
+        unsafe = self.write('case-unsafe.py', f'open({LIVE!r}).read()')
+        setup = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.py"', 'print(1)')
+        for separator in [';;', ';&', ';|', ';;&']:
+            for opening in ['', '(']:
+                for arm_break, command_break in [(' ', ' '), ('\n', ' '), (' ', '\n')]:
+                    for wrapper in ['', 'offbox run -- ']:
+                        tail = separator + arm_break + opening + '1|2)' + command_break + '{command};; esac'
+                        direct = 'case 1 in 1) : ' + tail.format(command=wrapper + f'python3 -I "{unsafe}"')
+                        commands = [direct]
+                        if not wrapper:
+                            commands.append('offbox run -- ' + shlex.quote(direct))
+                        for command in commands:
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), SCRIPT)
+                        for flags in ['-v d --', '-rv d --', '"$FLAGS" d', '-v PATH --', '-r --']:
+                            mutation = 'case "$n" in 1) : ' + tail.format(command='print ' + flags + ' /literal/rebound')
+                            loop = setup + 'for n in 1 2; do\n' + wrapper + 'python3 -I "$d/x.py"\n' + mutation + '\ndone'
+                            commands = [loop]
+                            if not wrapper:
+                                commands.append('offbox run -- ' + shlex.quote(loop))
+                            for command in commands:
+                                with self.subTest(command=command):
+                                    rule, cause = guard.classify_detail(command, str(self.root))
+                                    if flags == '-r --':
+                                        self.assertEqual((rule, cause), (None, None))
+                                    else:
+                                        self.assertEqual(rule, UNRESOLVED)
+                                        self.assertIn('print flags may reassign', cause)
+                                        self.assertIn('in a loop at line', cause)
+                                        self.assertIn('Accepted:', cause)
+
+    def test_mktemp_109_case_fallthrough_cwd(self):
+        safe = self.write('arm.py', 'print(1)')
+        self.write('sub/arm.py', f'open({LIVE!r}).read()')
+        for separator in [';;', ';&', ';|', ';;&']:
+            for opening in ['', '(']:
+                for arm_break, command_break in [(' ', ' '), ('\n', ' '), (' ', '\n')]:
+                    tail = separator + arm_break + opening + '1|2)' + command_break + '{command};; esac'
+                    for wrapper in ['', 'offbox run -- ']:
+                        for path in ['arm.py', str(safe)]:
+                            case = 'case 1 in 1) cd sub ' + tail.format(command=wrapper + f'python3 -I "{path}"')
+                            commands = [case]
+                            if not wrapper:
+                                commands.append('offbox run -- ' + shlex.quote(case))
+                            for command in commands:
+                                with self.subTest(command=command):
+                                    rule, cause = guard.classify_detail(command, str(self.root))
+                                    if separator == ';;' or path == str(safe):
+                                        self.assertIsNone(rule, cause)
+                                    else:
+                                        self.assertEqual(rule, UNRESOLVED)
+                                        self.assertIn('directory changed', cause)
+                    for quote in ['', "'"]:
+                        pattern = quote + '$(python3 -I arm.py)' + quote + '|1|2'
+                        case = 'case 1 in 1) cd sub ' + separator + arm_break + opening + pattern + ') :;; esac'
+                        for command in [case, 'offbox run -- ' + shlex.quote(case)]:
+                            with self.subTest(command=command):
+                                rule, cause = guard.classify_detail(command, str(self.root))
+                                if separator == ';;' or quote:
+                                    self.assertIsNone(rule, cause)
+                                else:
+                                    self.assertEqual(rule, UNRESOLVED)
+                                    self.assertIn('continuing case arms', cause)
+        # A terminating alternative restores the original entry cwd even after
+        # earlier continuing arms made their own entry cwd ambiguous.
+        self.assertIsNone(self.classify('case 1 in 1) cd sub ;& 2) :;; 3) python3 -I arm.py;; esac'))
+
+    def test_mktemp_109_offbox_flags(self):
+        setup = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.py"', 'print(1)')
+        for flags in ['--git', '--fresh', '--no-sync', '--no-retry', '--template python',
+                      '--template=python', '--base warm', '--base=warm', '--pull tmp/out', '--pull=tmp/out']:
+            with self.subTest(flags=flags):
+                self.assertIsNone(self.classify(setup + 'offbox run ' + flags + ' -- python3 "$d/x.py"'))
+        # Unsupported flags retain the baseline payload scan without gaining
+        # caller proofs or the exact fixture-invocation exception.
+        for flags in ['--env FOO=bar', '--unknown']:
+            self.assertEqual(self.classify(setup + 'offbox run ' + flags + ' -- python3 "$d/x.py"'), UNRESOLVED)
+            self.assertEqual(self.classify('offbox run ' + flags + ' -- python3 tmp/live.py'), SCRIPT)
+        for flags in ['--pull tmp/out', '--pull=tmp/out']:
+            command = setup + 'offbox run ' + flags + ' -- true; python3 "$d/x.py"'
+            rule, cause = guard.classify_detail(command, str(self.root))
+            self.assertEqual(rule, UNRESOLVED)
+            self.assertIn('offbox --pull at line', cause)
+
+    def test_mktemp_109_unsafe_matrix(self):
+        script = self.heredoc('"$d/x.py"', 'print(1)')
+        rows = [
+            ('d=$(mktemp -d); ' + script, 'python3 $d/x.py', 'unquoted'),
+            ('[ -n "$OTHER" ] && d=$(mktemp -d); ' + script, 'python3 "$d/x.py"', 'conditional'),
+            ('d=$(mktemp -d); d=$OTHER; ' + script, 'python3 "$d/x.py"', 'reassigned'),
+            ('d=$(mktemp -d); cp /source/x.py "$d/x.py"; ', 'python3 "$d/x.py"', 'copy'),
+            ('d=$(mktemp -d); printf "%s" "$BODY" > "$d/x.py"; ', 'python3 "$d/x.py"', 'non-heredoc'),
+            ('d=$(mktemp -d); curl -o "$d/x.py" https://example.test/x; ', 'python3 "$d/x.py"', 'invalidated'),
+            ('d=$(mktemp -d); python3 -c \'open("out", "w").write("x")\'; ', 'python3 "$d/x.py"', 'no readable'),
+            ('d=$(mktemp -d); python3 -c \'import sys; open(sys.argv[1], "w").write("x")\' "$d/x.py"; ', 'python3 "$d/x.py"', 'invalidated'),
+            ('d=$(mktemp -d); ' + script + 'echo hi > "$d/x.py"\n', 'python3 "$d/x.py"', 'non-heredoc'),
+            ('d=$(mktemp -d); ' + script + 'echo hi > $d/other\n', 'python3 "$d/x.py"', 'unquoted'),
+            ('d=$(mktemp -d); ' + script + 'echo hi > "$UNKNOWN/other"\n', 'python3 "$d/x.py"', 'unbounded'),
+        ]
+        for setup, runner, reason in rows:
+            for wrapper in ['', 'offbox run -- ']:
+                command = setup + wrapper + runner
+                with self.subTest(command=command):
+                    rule, cause = guard.classify_detail(command, str(self.root))
+                    self.assertEqual(rule, UNRESOLVED)
+                    self.assertIn('Accepted:', cause)
+                    self.assertIn(reason, cause)
+        for wrapper in ['', 'offbox run -- ']:
+            rule, cause = guard.classify_detail('d=$(mktemp -d); ' + wrapper + 'bash "$d/x.sh"', str(self.root))
+            self.assertEqual(rule, UNRESOLVED)
+            self.assertIn('no readable same-call heredoc writer', cause)
+        for wrapper in ['', 'offbox run -- ']:
+            for live in [LIVE, str(Path.home() / '.t3/userdata/state.sqlite'), '/Users/x/.local/share/opencode/opencode.db']:
+                command = 'd=$(mktemp -d); ' + self.heredoc('"$d/x.py"', f'open({live!r}).read()') + wrapper + 'python3 "$d/x.py"'
+                self.assertIsNotNone(self.classify(command))
+                command = 'd=$(mktemp -d); cp ' + live + ' "$d/data"; ' + script + wrapper + 'python3 "$d/x.py"'
+                self.assertIsNotNone(self.classify(command))
+
+    def test_mktemp_109_single_string_payload_scope(self):
+        prefix = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.py"', 'print(1)')
+        self.assertEqual(self.classify(prefix + 'offbox run -- \'python3 "$d/x.py"\''), UNRESOLVED)
+        for cd in ['', 'cd tmp\n']:
+            for body, expected in [('print(1)', None), (f'open({LIVE!r}).read()', SCRIPT)]:
+                payload = 'd=$(mktemp -d)\n' + cd + self.heredoc('"$d/x.py"', body) + 'python3 "$d/x.py"'
+                self.assertEqual(self.classify('offbox run -- ' + shlex.quote(payload)), expected)
+
+    def test_mktemp_109_bun_preload_and_messages(self):
+        for flag in ['--preload "$d/clock.ts"', '--preload="$d/clock.ts"']:
+            for body, expected in [('console.log(1)', None), (f'require("fs").readFileSync({LIVE!r})', SCRIPT)]:
+                command = 'd=$(mktemp -d)\n' + self.heredoc('"$d/clock.ts"', body) + 'bun test ' + flag + ' tmp/test.ts'
+                self.assertEqual(self.classify(command), expected, command)
+        for binary in ['python3', 'node', 'bash', 'bun']:
+            command = 'd=$(mktemp -d)\nprintf hi > "$d/x.py"\n' + binary + ' "$d/x.py"'
+            rule, cause = guard.classify_detail(command, str(self.root))
+            reason = guard.refusal_reason(rule, cause, str(self.root))
+            for text in ['non-heredoc writer (printf) at line 2', 'Accepted:', binary, 'literal absolute script path']:
+                self.assertIn(text, reason)
+            self.assertEqual(reason.count('Accepted:'), 1)
+        for command in ['python3 tmp/live.py', 'vp run migrate-dev-db']:
+            rule, cause = guard.classify_detail(command, str(self.root))
+            self.assertNotIn('Accepted:', guard.refusal_reason(rule, cause, str(self.root)))
+
+    def test_mktemp_109_runtime_file_operands(self):
+        runners = [('bun test', '--preload'), ('bun', '--preload')]
+        runners += [('node', flag) for flag in sorted(guard.NODE_SCRIPT_OPTIONS)]
+        for runner, flag in runners:
+            for separator in [' ', '=']:
+                for wrapper in ['', 'offbox run -- ', 'offbox run --include "$d" -- ']:
+                    for quoted in [True, False]:
+                        operand = '"$d/hook.js"' if quoted else '$d/hook.js'
+                        for body, expected in [('console.log(1)', None if quoted else UNRESOLVED),
+                                               (f'require("fs").readFileSync({LIVE!r})', SCRIPT if quoted else UNRESOLVED)]:
+                            command = 'd=$(mktemp -d)\n' + self.heredoc('"$d/hook.js"', body)
+                            command += wrapper + runner + ' ' + flag + separator + operand + ' tmp/main.js'
+                            with self.subTest(command=command):
+                                self.assertEqual(self.classify(command), expected)
+
+    def test_mktemp_109_path_marker(self):
+        marker = self.write('tmp/scratch-path.txt', str(self.root / 'tmp/marker-root'))
+        (self.root / 'tmp/marker-root').mkdir()
+        setup = f'd=$(cat {marker})\n' + self.heredoc('"$d/x.py"', 'print(1)')
+        self.assertIsNone(self.classify(setup + 'python3 "$d/x.py"'))
+        for value in [str(self.root / 'tmp/marker-root') + '\n', '/tmp/a\n/tmp/b', '$OTHER', '/tmp/a*', '~/x', LIVE, '/Users/x/.robob/userdata', '/tmp/$(echo x)']:
+            marker.write_text(value)
+            rule, cause = guard.classify_detail(setup + 'python3 "$d/x.py"', str(self.root))
+            self.assertEqual(rule, UNRESOLVED, value)
+            self.assertIn('read the path first, then use it literally', cause)
+        marker.write_text(str(self.root / 'tmp/marker-root'))
+        for mutation in [f'echo /tmp/other > {marker}\n', f'echo /tmp/other > {marker}; ', f'cp /other/file {marker}\n']:
+            for command in [mutation + setup + 'python3 "$d/x.py"', setup + mutation + 'python3 "$d/x.py"']:
+                self.assertEqual(self.classify(command), UNRESOLVED)
+        for wrapper in ['', 'offbox run -- ']:
+            self.assertEqual(self.classify(setup + wrapper + 'python3 $d/x.py'), UNRESOLVED)
+            self.assertIsNone(self.classify(setup + wrapper + 'python3 "$d/x.py"'))
+        for mutation in [f'm={marker}; echo /tmp/other > "$m"; ',
+                         f'python3 -c \'open("{marker}", "w").write("/tmp/other")\'; ',
+                         'python3 tmp/unknown-writer.py; ']:
+            self.assertEqual(self.classify(mutation + setup + 'python3 "$d/x.py"'), UNRESOLVED)
+        for target in ['"$PWD/tmp/scratch-path.txt"', '"${PWD}/tmp/scratch-path.txt"',
+                       '"$PWD"/tmp/scratch-path.txt', '"${PWD}"/tmp/scratch-path.txt']:
+            for wrapper in ['', 'offbox run -- ']:
+                command = f'printf %s {LIVE} > {target}; d=$(cat {marker}); ' + wrapper + 'python3 "$d"'
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED)
+                self.assertIn('read the path first, then use it literally', cause)
+        command = f'cd tmp; printf %s {LIVE} > scratch-path.txt; cd ..; d=$(cat {marker}); python3 "$d"'
+        self.assertEqual(self.classify(command), UNRESOLVED)
+        alias = self.root / 'tmp/marker-alias'
+        alias.symlink_to(marker)
+        for writer in [f'printf %s {LIVE} > {alias}; ', f'm={alias}; printf %s {LIVE} > "$m"; ']:
+            command = writer + f'd=$(cat {marker}); python3 "$d"'
+            rule, cause = guard.classify_detail(command, str(self.root))
+            self.assertEqual(rule, UNRESOLVED)
+            self.assertIn('read the path first, then use it literally', cause)
+        hard = self.root / 'tmp/marker-hardlink'
+        os.link(marker, hard)
+        for reader in [marker, hard]:
+            for wrapper in ['', 'offbox run -- ']:
+                for before in [True, False]:
+                    writer = f'printf %s /Users/x/.robob/userdata > {hard}; '
+                    binding = f'd=$(cat {reader}); '
+                    command = (writer + binding if before else binding + writer) + wrapper + 'python3 "$d/statev2.sqlite"'
+                    rule, cause = guard.classify_detail(command, str(self.root))
+                    self.assertEqual(rule, UNRESOLVED)
+                    self.assertIn('read the path first, then use it literally', cause)
 
     def test_same_call_review_writer_forms(self):
         bodies = {
@@ -4561,7 +5026,8 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
         with patch.object(engine, "_state", return_value=self.root / "hook-state"):
             result = engine.decide(event, "codex")
             line = json.loads((self.root / "hook-state/decisions.jsonl").read_text().splitlines()[-1])
-            self.assertEqual(line["cause"], result["context"]["cause"])
+            self.assertEqual(line["cause"], result["context"]["cause"][:240])
+            self.assertIn('Accepted:', result['reason'])
         with patch.object(guard, "classify_detail", side_effect=ValueError("broken")), patch.object(engine, "_log"), patch.object(engine, "resolve_identity", side_effect=AssertionError("must deny before identity")):
             result = engine.decide(event, "codex")
             self.assertEqual(result["decision"], "deny")

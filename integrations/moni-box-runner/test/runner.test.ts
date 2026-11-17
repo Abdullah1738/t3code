@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -96,6 +97,105 @@ test("pausing the backend interrupts the active harness and fences its tool turn
   await s.lease(); s.runner.enqueue(opaqueId("active"), { text: "long task" });
   const tick = s.runner.tick(); await ready; s.runner.pause(); await tick;
   expect(s.runner.db.query<{ state: string }, []>("SELECT state FROM inbox").get()!.state).toBe("interrupted");
+  expect(s.runner.db.query<{ interrupted_at: number }, []>("SELECT interrupted_at FROM inbox").get()!.interrupted_at).toBeGreaterThan(0);
+});
+
+test.each([false, true])("events expose only fence metadata with hasSend=%s; resolving done releases the next turn", async hasSend => {
+  const canary = "PRIVATE_FENCE_INPUT_AND_REPLY";
+  const s = setup({ run: async ({ id }) => {
+    if (id === opaqueId("first")) {
+      if (hasSend) await s.runner.action(opaqueId("tool-send"), "/send", { text: canary });
+      throw new Error(canary);
+    }
+    return "NO_REPLY";
+  } });
+  await s.lease();
+  const id = opaqueId("first"), next = opaqueId("next");
+  s.runner.enqueue(id, { id: "wake:legacy", kind: "wake", text: canary });
+  s.runner.enqueue(next, { kind: "inbound", text: canary });
+  await s.runner.tick(); await s.runner.tick();
+  const response = await (await s.runner.handle(s.request("/events", {}))).text();
+  expect(response).not.toContain(canary);
+  expect(JSON.parse(response)).toEqual({ events: [
+    { id, state: "interrupted", failure: null, kind: "wake", interruptedAt: expect.any(Number), hasSend },
+    { id: next, state: "pending", failure: null, kind: "inbound", interruptedAt: null, hasSend: false },
+  ] });
+  expect((await s.runner.handle(s.request("/resolve", { id, state: "done", reconciled: true }))).status).toBe(200);
+  expect((await s.runner.handle(s.request("/resolve", { id, state: "pending", reconciled: true }))).status).toBe(409);
+  await s.runner.tick();
+  expect(await (await s.runner.handle(s.request("/events", {}))).json()).toEqual({ events: [] });
+});
+
+test("legacy schema upgrades timestamp crash interruption and recognize old reply actions without exposing text", async () => {
+  const s = setup({ run: async () => "NO_REPLY" }), root = join(s.root, "legacy"); mkdirSync(root);
+  const db = new Database(join(root, "agent.sqlite")), id = opaqueId("legacy");
+  db.exec("CREATE TABLE inbox(seq INTEGER PRIMARY KEY,id TEXT UNIQUE,payload TEXT,state TEXT); CREATE TABLE actions(id TEXT PRIMARY KEY,path TEXT,payload TEXT,result TEXT,state TEXT)");
+  db.query("INSERT INTO inbox(id,payload,state) VALUES (?,?,'running')").run(id, JSON.stringify({ id: "wake:old", text: "PRIVATE_OLD" }));
+  db.query("INSERT INTO actions VALUES (?,'/send',?,NULL,'pending')").run(opaqueId(`reply:${id}:0`), JSON.stringify({ text: "PRIVATE_OLD" })); db.close();
+  for (const now of [1234, 5678]) {
+    const runner = new BoxRunner({ ...s.runner.config, root }, { run: async () => "NO_REPLY" }, { now: () => now, callbackReady: async () => true });
+    clean.push(() => runner.db.close());
+    await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+    expect(await (await runner.handle(s.request("/events", {}))).json()).toEqual({ events: [
+      { id, state: "interrupted", failure: null, kind: "wake", interruptedAt: 1234, hasSend: true },
+    ] });
+  }
+});
+
+test.each([
+  { state: "interrupted", action: "/send", hasSend: true },
+  { state: "running", action: "/send", hasSend: true },
+  { state: "pending", action: "/send", hasSend: false },
+  { state: "interrupted", action: "/metrics", hasSend: false },
+  { state: "interrupted", action: null, hasSend: false },
+])("legacy attribution: $state with $action reports hasSend=$hasSend", async ({ state, action, hasSend }) => {
+  const s = setup({ run: async () => "NO_REPLY" }), root = join(s.root, "legacy-tool"); mkdirSync(root);
+  const db = new Database(join(root, "agent.sqlite")), id = opaqueId("legacy-tool");
+  db.exec("CREATE TABLE inbox(seq INTEGER PRIMARY KEY,id TEXT UNIQUE,payload TEXT,state TEXT); CREATE TABLE actions(id TEXT PRIMARY KEY,path TEXT,payload TEXT,result TEXT,state TEXT)");
+  db.query("INSERT INTO inbox(id,payload,state) VALUES (?,?,?)").run(id, JSON.stringify({ text: "PRIVATE_LEGACY_TOOL" }), state);
+  if (action) db.query("INSERT INTO actions VALUES (?,?,?,NULL,'done')").run(opaqueId("custom-operation"), action, JSON.stringify({ text: "PRIVATE_LEGACY_TOOL" }));
+  db.close();
+  for (let restart = 0; restart < 2; restart++) {
+    const runner = new BoxRunner({ ...s.runner.config, root }, { run: async () => "NO_REPLY" }, { callbackReady: async () => true }); clean.push(() => runner.db.close());
+    await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+    const events = await (await runner.handle(s.request("/events", {}))).json() as { events: { id: string; hasSend: boolean }[] };
+    expect(events.events.find(e => e.id === id)?.hasSend).toBe(hasSend);
+    expect(JSON.stringify(events)).not.toContain("PRIVATE_LEGACY_TOOL");
+    const next = opaqueId("post-migration"); runner.enqueue(next, { text: "PRIVATE_LEGACY_TOOL" });
+    runner.db.query("UPDATE inbox SET state='interrupted' WHERE id=?").run(next);
+    const later = await (await runner.handle(s.request("/events", {}))).json() as { events: { id: string; hasSend: boolean }[] };
+    expect(later.events.find(e => e.id === next)?.hasSend).toBe(false);
+  }
+});
+
+test.each([0, 1, 100, 101, 1000])("events paginate %s rows within the CLI cap and keep an exact tail count", async count => {
+  const s = setup({ run: async () => "NO_REPLY" }); await s.lease();
+  const ids = Array.from({ length: count }, (_, i) => opaqueId(`page:${i}`));
+  s.runner.db.transaction(() => { for (const id of ids) s.runner.enqueue(id, { kind: "wake", text: "PRIVATE_PAGE_CONTENT" }); })();
+  let after: string | undefined; const seen: string[] = [];
+  do {
+    const response = await (await s.runner.handle(s.request("/events", { after }))).text();
+    expect(Buffer.byteLength(response)).toBeLessThan(128 * 1024); expect(response).not.toContain("PRIVATE_PAGE_CONTENT");
+    const page = JSON.parse(response) as { events: { id: string }[]; nextCursor?: string; remaining?: number };
+    expect(page.events.length).toBeLessThanOrEqual(100); seen.push(...page.events.map(e => e.id));
+    expect(page.remaining ?? 0).toBe(count - seen.length); after = page.nextCursor;
+  } while (after);
+  expect(seen).toEqual(ids);
+});
+
+test("head-only probe skips more than a page of attachment failures and counts the entire blocked tail", async () => {
+  const s = setup({ run: async () => "NO_REPLY" }); await s.lease();
+  s.runner.db.transaction(() => {
+    for (let i = 0; i < 1200; i++) {
+      const id = opaqueId(`head:${i}`); s.runner.enqueue(id, { text: "PRIVATE_HEAD" });
+      if (i < 150) s.runner.db.query("UPDATE inbox SET state='attachment-failed' WHERE id=?").run(id);
+      if (i === 150) s.runner.db.query("UPDATE inbox SET state='interrupted' WHERE id=?").run(id);
+    }
+  })();
+  const response = await (await s.runner.handle(s.request("/events", { headOnly: true }))).json() as { events: { id: string }[]; remaining: number };
+  expect(response.events.map(e => e.id)).toEqual([opaqueId("head:150")]); expect(response.remaining).toBe(1049);
+  for (const after of ["", "a".repeat(12), "G".repeat(64), 12, false, null]) expect((await s.runner.handle(s.request("/events", { after }))).status).toBe(400);
+  for (const headOnly of ["true", 1, null]) expect((await s.runner.handle(s.request("/events", { headOnly }))).status).toBe(400);
 });
 
 test("permanent scope refusals fail one action while temporary unavailability retains it", async () => {

@@ -20,6 +20,36 @@ test("test default stays outside the home log tree when the override is absent",
 });
 const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
+
+test("auth log-only metadata is allowlisted identically in Python and TypeScript", () => {
+  const dir = fixture();
+  const entries = [
+    { name: "triage.decision", props: { class: "otp", routed: "logged" } },
+    { name: "fastpath.auth_logged", props: { source: "mail", senderLabel: "Claude", authKind: "signin_link" } },
+    { name: "fastpath.auth_logged", props: { source: "sms", senderLabel: "an inbox sender", authKind: "otp" } },
+    { name: "fastpath.auth_logged", props: { senderLabel: "private@example.test", authKind: "123456", body: "private", link: "https://example.test/private" } },
+  ].map(entry => ({ ...entry, component: "triage", kind: "event" as const }));
+  for (const entry of entries) toolLog(entry);
+  const script = `import json, sys\nsys.path.insert(0, "helpers")\nfrom toollog import tool_log\nfor entry in json.loads(sys.argv[1]): tool_log(entry)\n`;
+  const result = Bun.spawnSync(["python3", "-I", "-B", "-c", script, JSON.stringify(entries)], { env: { ...process.env, TOOLLOG_DIR: dir } });
+  expect(result.exitCode).toBe(0);
+  const all = rows(dir);
+  for (const offset of [0, entries.length]) {
+    for (let i = 0; i < 3; i++) expect(all[offset + i].props).toEqual(entries[i]!.props);
+    expect(all[offset + 3].props).toBeUndefined();
+  }
+});
+
+test.each(["data_read.retried", "data_read.failed", "data_write.retried", "data_write.failed", "runs_log.write_failed"])("%s retains only file fault metadata", name => {
+  const dir = fixture();
+  const props = { path: "/home/fixture/settings.json", errnoCode: "EDEADLK", attempts: 4, ms: 1750, dataless: true };
+  toolLog({ component: "triage", kind: "error", name, props: { ...props, body: "private" } });
+  expect(rows(dir)[0].props).toEqual(props);
+  for (const path of ["private body", "/file\nprivate", "/" + "x".repeat(1024)]) {
+    toolLog({ component: "triage", kind: "error", name, props: { path } });
+  }
+  expect(rows(dir).slice(1).every(row => row.props === undefined)).toBe(true);
+});
 const emptyBreakdown = {
   byDependency: {}, dependencyTotals: { dependencies: 0, busyRuns: 0 },
   slots: { allSlotsBusyMinutes: 0, topHolders: [] },

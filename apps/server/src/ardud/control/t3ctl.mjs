@@ -51,6 +51,7 @@ const HELP = `t3ctl <command> [options]
   harness-cutover plan|run|status       plan, start/resume the paced job, or inspect cutover
   desktop-lease acquire --task ID --scope TARGET --mode native|cua-driver [--driver D --native-id ID --agent-id ID]
   desktop-lease heartbeat|release --ticket TICKET [--driver D --native-id ID --agent-id ID]
+    release also withdraws your queued ticket
   desktop-lease reconcile --ticket TICKET --evidence TEXT   requires environment:maintain
 
 Global: --request-timeout SECONDS      HTTP request deadline (default 30s for ordinary requests)

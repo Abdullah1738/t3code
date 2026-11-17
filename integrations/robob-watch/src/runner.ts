@@ -1,3 +1,4 @@
+import { applyOwnerAlertResults, dispatchOwnerAlerts, ownerFailureAlerts, queueOwnerFailure, queueOwnerRecovery } from "./owner-alerts.ts";
 import { randomUUID } from "node:crypto";
 import type { DependencyBusy } from "./cause.ts";
 import { recordHealthDelivery, isHealthNag } from "./healthDelivery.ts";
@@ -170,28 +171,41 @@ async function headsUps(watcher: Watcher, state: State): Promise<void> {
 }
 
 /** The persisted pause survives a failed notice send or runner restart; retries keep the same text and key. */
-async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
+export async function pauseNotice(watcher: Watcher, state: State): Promise<void> {
   const instance = watcherInstance(watcher.id);
+  const pausedAt = state.failure_paused_at;
+  const current = withRelayLock(() => {
+    const definition = loadWatcher(watcher.id);
+    const fresh = loadState(watcher.id);
+    if (!definition || watcherInstance(watcher.id) !== instance || !fresh.failure_paused_at
+      || fresh.failure_paused_at !== pausedAt) return;
+    if (queueOwnerFailure(definition, fresh, "pause")) saveState(watcher.id, fresh);
+    return { watcher: definition, state: fresh };
+  });
+  if (!current) return;
+  watcher = current.watcher;
+  state = current.state;
+  // Resume owns this same lock. Bridge completion must never restore its old pause snapshot.
+  const update = (change: (fresh: State) => void) => withRelayLock(() => {
+    const fresh = loadState(watcher.id);
+    if (!loadWatcher(watcher.id) || watcherInstance(watcher.id) !== instance || fresh.failure_paused_at !== pausedAt) return;
+    change(fresh);
+    saveState(watcher.id, fresh);
+    return fresh;
+  });
   if (!state.failure_alerted) {
     const mins = Math.round((Date.parse(state.failure_paused_at!) - Date.parse(state.failing_since!)) / 60_000);
     const sent = await alert(watcher, `Watcher "${watcher.title}" paused after ${state.consecutive_failures} failures in a row (${mins} min). Last error: ${(state.last_error ?? "").slice(0, 300)}. Fix it, then robob-watch resume ${watcher.id}. Log: ${join(watcherDir(watcher.id), "log")}`,
-      `robob-watch:${watcher.id}:paused:${hash(state.failure_episode ?? state.failing_since ?? "")}`, "error");
+      `robob-watch:${watcher.id}:paused:${hash(state.failure_episode ?? state.failing_since ?? "")}`, "error", !ownerFailureAlerts(watcher, state));
     log(watcher.id, `pause notice ok=${sent.ok} via=${sent.via}`);
-    const fresh = loadState(watcher.id);
-    // Resume/remove can happen while the bridge is sending; never restore the old pause over that command.
-    if (!loadWatcher(watcher.id) || watcherInstance(watcher.id) !== instance || fresh.failure_paused_at !== state.failure_paused_at) return;
-    fresh.failure_alerted = sent.ok;
-    saveState(watcher.id, fresh);
-    Object.assign(state, fresh);
+    const fresh = update(fresh => { fresh.failure_alerted = sent.ok; });
+    if (!fresh) return;
+    state = fresh;
   }
   if (shouldEscalate(watcher, state)) {
-    const sent = await escalate(watcher, state, `robob-watch:${watcher.id}:escalate:${hash(state.failure_episode ?? state.failing_since ?? "").slice(0, 32)}`);
+    const sent = await escalate(watcher, state, `robob-watch:${watcher.id}:escalate:${hash(state.failure_episode ?? state.failing_since ?? "").slice(0, 32)}`, !ownerFailureAlerts(watcher, state));
     log(watcher.id, `failure escalation ok=${sent.ok} via=${sent.via}${sent.ok ? "" : ` ${sent.detail}`}`);
-    const fresh = loadState(watcher.id);
-    if (!loadWatcher(watcher.id) || watcherInstance(watcher.id) !== instance || fresh.failure_paused_at !== state.failure_paused_at) return;
-    fresh.failure_escalated = sent.ok;
-    saveState(watcher.id, fresh);
-    Object.assign(state, fresh);
+    update(fresh => { fresh.failure_escalated = sent.ok; });
   }
 }
 
@@ -229,13 +243,14 @@ async function failWatcher(watcher: Watcher, fresh: State, instance: string | un
     await pauseNotice(watcher, fresh);
     return;
   }
+  if (shouldEscalate(watcher, fresh)) queueOwnerFailure(watcher, fresh, "failing");
   saveState(id, fresh);
   if (shouldNotifyFailure(watcher, fresh, timedOut)) {
     const mins = Math.round((now() - Date.parse(fresh.dependency_busy?.since ?? fresh.failing_since!)) / 60_000);
     const text = busy ? `Dependency ${busy.dependency} has been busy for ${mins} min. Watcher "${watcher.title}" keeps retrying; nothing is lost. Check ${join(watcherDir(id), "log")}.`
       : `Watcher "${watcher.title}" has failed ${fresh.consecutive_failures} ${fresh.consecutive_failures === 1 ? "time" : "times"} in a row (${mins} min) and is backing off. Last error: ${fresh.last_error.slice(0, 300)}. Check ${join(watcherDir(id), "log")}.`;
     const sent = await alert(watcher, text,
-      `robob-watch:${id}:failing:${hash(failureKey)}:${fresh.consecutive_failures}`, "error");
+      `robob-watch:${id}:failing:${hash(failureKey)}:${fresh.consecutive_failures}`, "error", !ownerFailureAlerts(watcher, fresh));
     const current = loadState(id);
     if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
       log(id, "failure notice completed after resume/remove; state kept");
@@ -252,7 +267,7 @@ async function failWatcher(watcher: Watcher, fresh: State, instance: string | un
     toolLog({ component: "runner", kind: "event", name: "watch.failure_notice_held", ids: { watcher: id }, props: { count, threshold, timedOut } });
   }
   if (shouldEscalate(watcher, fresh)) {
-    const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(failureKey).slice(0, 32)}`);
+    const sent = await escalate(watcher, fresh, `robob-watch:${id}:escalate:${hash(failureKey).slice(0, 32)}`, !ownerFailureAlerts(watcher, fresh));
     const current = loadState(id);
     if (!loadWatcher(id) || !sameInstance() || current.failing_since !== fresh.failing_since) {
       log(id, "failure notice completed after resume/remove; state kept");
@@ -372,6 +387,15 @@ function recoverAdmission(id: string, instance: string | undefined): void {
 }
 
 export async function tickOne(id: string): Promise<void> {
+  applyOwnerAlertResults(id);
+  try { await tickWatcher(id); }
+  finally {
+    applyOwnerAlertResults(id);
+    dispatchOwnerAlerts(id);
+  }
+}
+
+async function tickWatcher(id: string): Promise<void> {
   const instance = watcherInstance(id);
   const sameInstance = () => watcherInstance(id) === instance;
   const initial = loadWatcher(id);
@@ -599,6 +623,7 @@ export async function tickOne(id: string): Promise<void> {
     toolLog({ component: "runner", kind: "event", name: "watch.recovered", ids: { watcher: id }, props: { count: failures, failures, notified } });
     log(id, `check recovered after ${failures} failures (${notified ? "notified" : "not notified"})`);
   }
+  queueOwnerRecovery(watcher, fresh);
   fresh.consecutive_failures = 0;
   fresh.failure_alerted = false;
   delete fresh.failure_escalated;

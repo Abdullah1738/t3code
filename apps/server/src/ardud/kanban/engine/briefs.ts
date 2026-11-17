@@ -289,7 +289,7 @@ const purposeText = (purpose: EvaluatorPurpose) => {
     case "nightly":
       return "Nightly review";
     case "stalled":
-      return "Stalled sweep: find cards that stopped moving (idle Working threads, flagged cards, review threads with no verdict). Read their threads, then steer, restart, split, re-route or escalate. Clear the stalled flag when fixed.";
+      return "Stalled sweep: find cards that stopped moving (idle Working threads, flagged cards, review threads with no verdict, completed/deployed cards whose evaluator step went idle). Read their threads, then steer, restart, split, re-route or escalate. Clear the stalled flag when fixed.";
     case "completed":
       return "Completed batch: for each Completed card, check the change is deployed where it should be. Move deployed ones to deployed; open a card for anything missing. Cards are completed and deployed only once the card's review passed. Leave a card alone while its current step is a board script's.";
     case "deployed":
@@ -404,9 +404,9 @@ export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
     )
     .join("\n");
 
-export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
+export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>, boardStop?: string) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
-  const instruction = `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait (a durable watcher, offbox runs you're blocked on, another card, a time), set it yourself with card_wait on your card (on time with until, script, or card) and end your turn; clear it if something else wakes you first. Wait inside your turn only for a short step that nothing can wake you for.`;
+  const instruction = `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} ${boardStop ? `still in Working. ${boardStop}` : "still in Working and your turn ended."} A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait (a durable watcher, offbox runs you're blocked on, another card, a time), set it yourself with card_wait on your card (on time with until, script, or card) and end your turn; clear it if something else wakes you first. Wait inside your turn only for a short step that nothing can wake you for.`;
   return lines(
     instruction,
     ...cards.map((card) =>

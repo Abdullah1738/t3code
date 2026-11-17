@@ -2,20 +2,33 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  ControlErrorBody,
+  NodeId,
+  RuntimeRequestId,
+  RunId,
+  TurnItemId,
+  type OrchestrationV2RuntimeRequest,
+  type OrchestrationV2TurnItem,
   ProviderInstanceId,
   type ModelSelection,
   type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as EnvironmentAuth from "../../auth/EnvironmentAuth.ts";
+import { createPendingAttachmentId } from "../../attachmentStore.ts";
 import * as ServerSecretStore from "../../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../../config.ts";
 import { idleThreadProjection, liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
@@ -42,6 +55,7 @@ const native = {
   model: "claude-opus-5-5",
   options: [{ id: "effort", value: "xhigh" }],
 };
+const decodeError = Schema.decodeUnknownSync(ControlErrorBody);
 const catalog = [
   {
     instanceId: "claudeAgent",
@@ -76,12 +90,56 @@ const makeHarness = (
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    const infrastructure = yield* Layer.build(
+      ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-model-routing" }).pipe(
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    );
+    const config = Context.get(infrastructure, ServerConfig.ServerConfig);
+    const fileSystem = Context.get(infrastructure, FileSystem.FileSystem);
+    const path = Context.get(infrastructure, Path.Path);
+    const attachmentIoFailure = yield* Ref.make<"stat" | "copy" | undefined>(undefined);
+    const claimFileSystem: FileSystem.FileSystem = {
+      ...fileSystem,
+      stat: (file) =>
+        Ref.get(attachmentIoFailure).pipe(
+          Effect.flatMap((failure) =>
+            fileSystem.stat(failure === "stat" ? `${file}.missing` : file),
+          ),
+        ),
+      copyFile: (from, to) =>
+        Ref.get(attachmentIoFailure).pipe(
+          Effect.flatMap((failure) =>
+            fileSystem.copyFile(failure === "copy" ? `${from}.missing` : from, to),
+          ),
+        ),
+    };
+    const stageAttachment = Effect.gen(function* () {
+      const id = createPendingAttachmentId();
+      yield* fileSystem.writeFile(
+        path.join(config.attachmentsDir, `${id}.png`),
+        new Uint8Array([1, 2, 3]),
+      );
+      return {
+        attachmentId: id,
+        type: "image" as const,
+        name: "image.png",
+        mimeType: "image/png",
+        sizeBytes: 3,
+      };
+    });
     const shell = {
       ...liveThreadShell(ThreadId.make("thread")),
       providerInstanceId: base.instanceId,
       modelSelection: base,
     };
     const projection = idleThreadProjection(shell);
+    const sendFailure = yield* Ref.make<ThreadManagementService.ThreadManagementError | undefined>(
+      undefined,
+    );
+    const startupFailure = yield* Ref.make(false);
+    const requests = yield* Ref.make<ReadonlyArray<OrchestrationV2RuntimeRequest>>([]);
+    const turnItems = yield* Ref.make<ReadonlyArray<OrchestrationV2TurnItem>>([]);
     const calls = yield* Ref.make<Array<{ kind: string; value: unknown }>>([]);
     const record = (kind: string, value: unknown) =>
       Ref.update(calls, (all) => [...all, { kind, value }]);
@@ -102,15 +160,25 @@ const makeHarness = (
                 }),
                 Layer.mock(ThreadManagementService.ThreadManagementService)({
                   getThreadShell: () => Effect.succeed(shell),
-                  getThreadRecords: () => Effect.succeed(projection),
+                  getThreadRecords: () =>
+                    Effect.gen(function* () {
+                      return {
+                        ...projection,
+                        runtimeRequests: yield* Ref.get(requests),
+                        turnItems: yield* Ref.get(turnItems),
+                      };
+                    }),
                   sendToThread: (input) =>
-                    record("send", input).pipe(
-                      Effect.as({
+                    Effect.gen(function* () {
+                      const failure = yield* Ref.get(sendFailure);
+                      if (failure !== undefined) return yield* failure;
+                      yield* record("send", input);
+                      return {
                         message: { id: input.messageId, attachments: [] },
                         run: { id: "run", status: "queued" },
                         delivery: "queued",
-                      } as never),
-                    ),
+                      } as never;
+                    }),
                   dispatch: (command) =>
                     record("dispatch", command).pipe(Effect.as({ sequence: 1 } as never)),
                 }),
@@ -152,11 +220,22 @@ const makeHarness = (
                   defaultModelSelection: base,
                 }),
                 Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
-                  enqueueCommand: (effect) => effect,
+                  enqueueCommand: (effect) =>
+                    Effect.gen(function* () {
+                      if (yield* Ref.get(startupFailure))
+                        return yield* new ServerRuntimeStartup.ServerRuntimeStartupError({
+                          mode: "desktop",
+                          host: null,
+                          port: 3773,
+                          cause: new Error("not ready"),
+                        });
+                      return yield* effect;
+                    }),
                 }),
                 Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({}),
                 Layer.mock(ServerSecretStore.ServerSecretStore)({}),
-                ServerConfig.layerTest(process.cwd(), { prefix: "t3-control-model-routing" }),
+                Layer.succeed(ServerConfig.ServerConfig, config),
+                Layer.succeed(FileSystem.FileSystem, claimFileSystem),
                 Layer.succeed(SqlClient.SqlClient, sql),
               ).pipe(Layer.provideMerge(NodeServices.layer)),
             ),
@@ -183,7 +262,17 @@ const makeHarness = (
         );
         return { status: response.status, body: (await response.json()) as Record<string, any> };
       });
-    return { request, calls, shell };
+    return {
+      request,
+      calls,
+      shell,
+      sendFailure,
+      startupFailure,
+      requests,
+      turnItems,
+      attachmentIoFailure,
+      stageAttachment,
+    };
   });
 
 const run = <A, E>(
@@ -377,6 +466,215 @@ describe("control resolver routes", () => {
           instanceId: "claudeAgent",
           model: "claude-opus-5-5",
         });
+      }),
+    ),
+  );
+});
+
+describe("control conflict responses", () => {
+  it.effect.each(["send", "create"] as const)(
+    "%s separates attachment validation from I/O failures",
+    (route) =>
+      run("off", ({ request, calls, shell, stageAttachment, attachmentIoFailure }) =>
+        Effect.gen(function* () {
+          const attachment = yield* stageAttachment;
+          const file = {
+            attachmentId: "file",
+            type: "file" as const,
+            name: "file.txt",
+            mimeType: "text/plain",
+            sizeBytes: 1,
+          };
+          const cases = [
+            { name: "duplicate ids", attachments: [attachment, attachment], message: "Duplicate" },
+            {
+              name: "file count",
+              attachments: Array.from({ length: 101 }, (_, i) => ({
+                ...file,
+                attachmentId: `file-${i}`,
+              })),
+              message: "100 files",
+            },
+            {
+              name: "total image size",
+              attachments: Array.from({ length: 9 }, (_, i) => ({
+                ...attachment,
+                attachmentId: `image-${i}`,
+                sizeBytes: 10 * 1024 * 1024,
+              })),
+              message: "80 MiB",
+            },
+            {
+              name: "expired upload",
+              attachments: [{ ...attachment, attachmentId: createPendingAttachmentId() }],
+              message: "removed or expired",
+            },
+            {
+              name: "stored size",
+              attachments: [{ ...attachment, sizeBytes: 4 }],
+              message: "stored size",
+            },
+            {
+              name: "upload type",
+              attachments: [{ ...attachment, mimeType: "image/jpeg" }],
+              message: "type does not match",
+            },
+          ];
+          for (const test of cases) {
+            const response = yield* request(
+              "POST",
+              route === "send" ? "/threads/thread/send" : "/threads",
+              {
+                projectId: shell.projectId,
+                text: "keep",
+                prompt: "keep",
+                attachments: test.attachments,
+                clientRequestId: `${route}-${test.name}`,
+              },
+            );
+            assert.equal(response.status, 400, test.name);
+            assert.equal(response.body.error.code, "invalid_request", test.name);
+            assert.include(response.body.error.message, test.message, test.name);
+          }
+          for (const failure of ["stat", "copy"] as const) {
+            yield* Ref.set(attachmentIoFailure, failure);
+            const response = yield* request(
+              "POST",
+              route === "send" ? "/threads/thread/send" : "/threads",
+              {
+                projectId: shell.projectId,
+                text: "keep",
+                prompt: "keep",
+                attachments: [attachment],
+                clientRequestId: `${route}-${failure}`,
+              },
+            );
+            assert.equal(response.status, 500, failure);
+            assert.equal(response.body.error.code, "internal", failure);
+            assert.isUndefined(response.body.error.retrySafe, failure);
+          }
+          assert.isEmpty(yield* Ref.get(calls));
+        }),
+      ),
+  );
+
+  it.effect.each(["resolved", "expired", "cancelled"] as const)(
+    "a %s request reports a terminal refusal without dispatching",
+    (status) =>
+      run("off", ({ request, calls, requests, turnItems, shell }) =>
+        Effect.gen(function* () {
+          const requestId = RuntimeRequestId.make("old-question");
+          const now = DateTime.makeUnsafe("2026-11-16T11:49:00Z");
+          yield* Ref.set(requests, [
+            {
+              id: requestId,
+              nodeId: NodeId.make("old-node"),
+              providerTurnId: null,
+              nativeRequestRef: null,
+              kind: "user_input",
+              status,
+              responseCapability: { type: "message" },
+              createdAt: now,
+              resolvedAt: now,
+            },
+          ]);
+          const runId = RunId.make("request-run");
+          yield* Ref.set(turnItems, [
+            {
+              id: TurnItemId.make("request-item"),
+              type: "user_input_request",
+              requestId,
+              questions: [],
+              threadId: shell.id,
+              runId,
+              nodeId: NodeId.make("old-node"),
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 0,
+              status: "completed",
+              title: null,
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+            },
+          ]);
+          const response = yield* request("POST", `/threads/thread/requests/${requestId}/respond`, {
+            answers: { question: "yes" },
+            clientRequestId: "respond-id",
+          });
+          assert.equal(response.status, 409);
+          const error = decodeError(response.body.error);
+          assert.deepInclude(error, {
+            reason: "request_resolved",
+            retrySafe: false,
+            holder: { threadId: shell.id, runId, status, requestId },
+          });
+          assert.isEmpty(yield* Ref.get(calls));
+        }),
+      ),
+  );
+
+  it.effect.each(["starting", "failed", "completed"])(
+    "steer reports the observed %s holder without saving input",
+    (status) =>
+      run("off", ({ request, calls, sendFailure, shell }) =>
+        Effect.gen(function* () {
+          const holder = { threadId: shell.id, runId: "observed", status };
+          yield* Ref.set(
+            sendFailure,
+            new ThreadManagementService.ThreadManagementNoSteerableRunError({
+              threadId: shell.id,
+              mode: "steer",
+              holder,
+            }),
+          );
+          const response = yield* request("POST", "/threads/thread/send", {
+            text: "keep this",
+            mode: "steer",
+            clientRequestId: "same-id",
+          });
+          assert.equal(response.status, 409);
+          const error = decodeError(response.body.error);
+          assert.deepInclude(error, {
+            code: "conflict",
+            reason: "no_steerable_turn",
+            retrySafe: true,
+            holder,
+          });
+          assert.isEmpty(yield* Ref.get(calls));
+        }),
+      ),
+  );
+
+  it.effect("startup and storage failures do not masquerade as conflicts", () =>
+    run("off", ({ request, calls, startupFailure, sendFailure, shell }) =>
+      Effect.gen(function* () {
+        yield* Ref.set(startupFailure, true);
+        const startup = yield* request("POST", "/threads/thread/send", {
+          text: "keep",
+          clientRequestId: "startup",
+        });
+        assert.equal(startup.status, 503);
+        assert.equal(startup.body.error.reason, "startup_unavailable");
+        assert.equal(startup.body.error.retrySafe, true);
+        yield* Ref.set(startupFailure, false);
+        yield* Ref.set(
+          sendFailure,
+          new ThreadManagementService.ThreadManagementProjectionLoadError({
+            projectId: shell.projectId,
+            threadId: shell.id,
+            cause: new Error("storage"),
+          }),
+        );
+        const storage = yield* request("POST", "/threads/thread/send", {
+          text: "keep",
+          clientRequestId: "storage",
+        });
+        assert.equal(storage.status, 500);
+        assert.isUndefined(storage.body.error.retrySafe);
+        assert.isEmpty(yield* Ref.get(calls));
       }),
     ),
   );

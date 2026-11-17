@@ -582,6 +582,17 @@ export type ProviderAdapterV2SubagentOutcome = {
   readonly result: OrchestrationV2Subagent["result"];
 };
 
+export const ProviderBackgroundTerminal = Schema.Struct({
+  processId: Schema.String,
+  command: Schema.optionalKey(Schema.String),
+  cwd: Schema.optionalKey(Schema.String),
+  itemId: Schema.optionalKey(Schema.String),
+  osPid: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+  cpuPercent: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+  rssKb: Schema.optionalKey(Schema.NullOr(Schema.Number)),
+});
+export type ProviderBackgroundTerminal = typeof ProviderBackgroundTerminal.Type;
+
 export interface ProviderAdapterV2SessionRuntime {
   readonly instanceId: ProviderInstanceId;
   readonly driver: ProviderDriverKind;
@@ -656,10 +667,27 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly steerTurn: (
     input: ProviderAdapterV2SteerInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;
+  readonly listBackgroundTerminals?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+  }) => Effect.Effect<ReadonlyArray<ProviderBackgroundTerminal>, ProviderAdapterV2Error>;
+  readonly terminateBackgroundTerminal?: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly processId: string;
+  }) => Effect.Effect<
+    { readonly terminated: true; readonly alreadyGone: boolean },
+    ProviderAdapterV2Error
+  >;
   readonly stopTask?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly taskId: string;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /** Checked by the delegated progress guard; adapters own native fencing and termination. */
+  readonly checkRetryHealth?: (input: {
+    readonly runId: RunId;
+    readonly attemptId: RunAttemptId | null;
+    readonly noResponseBudgetMs: number;
+    readonly flapLimit: number;
+  }) => Effect.Effect<boolean, ProviderAdapterV2Error>;
   readonly interruptStartingRun?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly runId: RunId;

@@ -428,6 +428,7 @@ class GoRepairTests(unittest.TestCase):
             (home / 'w/go.mod').write_text('module repair-fixture\n')
             env = clean_env(HOME=tmp, PATH=f'{bins}:/usr/bin:/bin', FAKE_GOROOT=str(root))
             with patch.object(runs, 'DOCKER_REPAIR', ':'), patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), \
+                    patch.object(runs.quint_tools, 'block', return_value=':'), \
                     patch.object(runs.userns, 'setup', return_value=':'):
                 script = remote_script('w', '.', ['echo USER_COMMAND'], None, 'test', repo_root=home / 'w')
             script = script.replace(
@@ -521,6 +522,7 @@ class NonGoRepairTests(unittest.TestCase):
                          patch.multiple(runs, LDCACHE_REPAIR=':', SQLITE_SETUP=':'), patch.object(runs, 'WATCH_REPAIR', ':'), \
                          patch.object(runs.userns, 'setup', return_value=':'), \
              patch.object(runs.containers, 'script', return_value=':'), \
+                         patch.object(runs.quint_tools, 'block', return_value=':'), \
                          patch.object(runs.node_tools, 'block', return_value=':'):
                         fx.script = remote_script('w/repo', '.', [cmd], None, 'test', repo_root=repo)
                     result = fx.run()

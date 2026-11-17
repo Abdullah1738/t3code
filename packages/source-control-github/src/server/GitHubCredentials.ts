@@ -3,9 +3,9 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Hex from "effect/encoding/Hex";
 import * as Exit from "effect/Exit";
-import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
@@ -17,7 +17,7 @@ import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 
 import * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 import { readSourceControlHostSettings } from "@t3tools/source-control-core/client/definition";
-import type { ServerSettings, VcsError } from "@t3tools/contracts";
+import type { ServerSettings } from "@t3tools/contracts";
 
 import * as GitHubClient from "../client/definition.ts";
 
@@ -118,6 +118,12 @@ export function environmentToken(
   return null;
 }
 
+function spawnField(value: unknown, key: string): string | number | null {
+  if (typeof value !== "object" || value === null) return null;
+  const field: unknown = Object.getOwnPropertyDescriptor(value, key)?.value;
+  return typeof field === "string" || typeof field === "number" ? field : null;
+}
+
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
   const sourceControlHost = yield* SourceControlHost.SourceControlHost;
@@ -135,11 +141,17 @@ export const make = Effect.gen(function* () {
       Effect.orDie,
     );
 
-  const fromGh = (host: string, account: string | undefined) =>
-    process
+  const fromGh = Effect.fn("GitHubCredentials.fromGh")(function* (
+    host: string,
+    account: string | undefined,
+  ) {
+    // Resolve afresh: a previous missing CLI must not survive a PATH or installation change.
+    const resolvedGh = resolveExecutable("gh", platform, environment);
+    const command = resolvedGh ?? "gh";
+    return yield* process
       .run({
         operation: "GitHubCredentials.get",
-        command: "gh",
+        command,
         args: [
           "auth",
           "token",
@@ -153,60 +165,63 @@ export const make = Effect.gen(function* () {
         timeoutMs: 10_000,
       })
       .pipe(
-        Effect.catch(
-          Effect.fn("GitHubCredentials.spawnFailure")(function* (
-            error: VcsError,
-          ): Effect.fn.Return<never, GitHubCredentialUnavailableError> {
-            if (error._tag === "VcsProcessSpawnError") {
-              const reason =
-                error.cause instanceof PlatformError.PlatformError ? error.cause.reason : undefined;
-              const native = reason?.cause ?? error.cause;
-              const field = (name: string) => {
-                if (typeof native !== "object" || native === null || !(name in native)) return null;
-                const value = Reflect.get(native, name);
-                return typeof value === "string" || typeof value === "number" ? value : null;
-              };
-              const cwdExists = yield* fs.stat(workingDirectory).pipe(
-                Effect.map((info) => info.type === "Directory"),
-                Effect.catch((error) =>
-                  Effect.succeed(error.reason._tag === "NotFound" ? false : null),
-                ),
-              );
-              // Use the uncached spawn resolver: a stale negative lookup must not label a
-              // present CLI missing, and ENOENT can name the cwd or an executable's loader.
-              const resolvedCommand = resolveExecutable("gh", platform, environment) ?? null;
-              yield* Effect.logWarning("GitHubCredentials.get spawn failed", {
-                command: "gh",
-                host,
-                path: environment.PATH ?? environment.Path ?? environment.path ?? null,
-                cwd: workingDirectory,
-                cwdExists,
-                resolvedCommand,
-                reason: reason?._tag ?? null,
-                code: field("code"),
-                errno: field("errno"),
-                syscall:
-                  field("syscall") ?? (reason && "syscall" in reason ? reason.syscall : null),
-                pathEntryCount: (environment.PATH ?? environment.Path ?? "")
-                  .split(platform === "win32" ? ";" : ":")
-                  .filter((entry) => entry.trim()).length,
-              });
-              if (reason?._tag === "NotFound" && cwdExists === true && resolvedCommand === null) {
-                return yield* new GitHubCliMissingError({ host });
-              }
-            }
-            // gh exits non-zero with "no oauth token" when it has no login for the host.
-            return yield* error._tag === "VcsProcessExitError"
-              ? new GitHubNotSignedInError({ host, ...(account === undefined ? {} : { account }) })
-              : new GitHubCliFailedError({ host, cause: error });
-          }),
-        ),
         Effect.map((output) => output.stdout.trim()),
         Effect.filterOrFail(
           (token) => token !== "",
           () => new GitHubNotSignedInError({ host, ...(account === undefined ? {} : { account }) }),
         ),
+        Effect.catch((error) =>
+          Effect.gen(function* () {
+            const cwdExists = yield* fs.stat(workingDirectory).pipe(
+              Effect.map((stat) => stat.type === "Directory"),
+              Effect.catch((error) =>
+                Effect.succeed(error.reason._tag === "NotFound" ? false : null),
+              ),
+            );
+            const ghOnPath = resolveExecutable("gh", platform, environment) ?? null;
+            const cause =
+              error._tag === "VcsProcessSpawnError" &&
+              error.cause instanceof PlatformError.PlatformError
+                ? error.cause
+                : undefined;
+            // ENOENT also means the spawn cwd disappeared. An executable that still resolves
+            // can have a missing interpreter or race with an upgrade; neither proves gh absent.
+            const missing =
+              cause?.reason._tag === "NotFound" && cwdExists === true && ghOnPath === null;
+            const failure =
+              error._tag === "GitHubNotSignedInError"
+                ? error
+                : missing
+                  ? new GitHubCliMissingError({ host })
+                  : error._tag === "VcsProcessExitError"
+                    ? new GitHubNotSignedInError({
+                        host,
+                        ...(account === undefined ? {} : { account }),
+                      })
+                    : new GitHubCliFailedError({ host, cause: error });
+            yield* Effect.logWarning("GitHub credential CLI failed", {
+              operation: "GitHubCredentials.get",
+              host,
+              command,
+              errorTag: error._tag,
+              credentialErrorTag: failure._tag,
+              platformReason: cause?.reason._tag ?? null,
+              errno: spawnField(cause?.cause, "errno"),
+              code: spawnField(cause?.cause, "code"),
+              syscall: spawnField(cause?.cause, "syscall") ?? spawnField(cause?.reason, "syscall"),
+              path: spawnField(cause?.cause, "path"),
+              cwd: workingDirectory,
+              cwdExists,
+              resolvedGh: ghOnPath,
+              pathDirs: (environment.PATH ?? environment.Path ?? "").split(
+                platform === "win32" ? ";" : ":",
+              ),
+            });
+            return yield* failure;
+          }),
+        ),
       );
+  });
 
   const readSettings = (settings: ServerSettings) =>
     readSourceControlHostSettings(

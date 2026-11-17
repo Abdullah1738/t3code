@@ -29,7 +29,7 @@ import toollog
 from . import common
 from .common import EXIT_HOME_DOWN, EXIT_INFRA, OffboxError, log, say
 
-from .startup_health import START_WAIT_S, starting_phase, wait_seconds
+from .startup_health import START_WAIT_S, starting_phase, wait_seconds, accepting_health
 
 PROBE_TIMEOUT_S = 3.0
 HOME_START_WAIT_S = START_WAIT_S
@@ -253,7 +253,7 @@ def wait_while_starting(reason, run_id="", *, checkpoint="probe", box=None,
                     return f"home still {'slow' if slow else 'starting'} after {bound:g} s ({phase})"
                 sleep(min(5, left))
                 data = read(min(slow_probe_seconds() if slow else PROBE_TIMEOUT_S, max(.001, end - clock())))
-                if isinstance(data, dict) and data.get("ok") is True:
+                if accepting_health(data):
                     note_home_answer(clock)
                     outcome = "ready"
                     return None
@@ -290,7 +290,7 @@ def _probe(timeout: float = PROBE_TIMEOUT_S, *, wait: bool = True) -> str | None
     data = _health(timeout) if wait else _health(timeout, bounded=True)
     if timed_out(data) or starting_phase(data):
         begin_transient(began=start)
-    classification = "good" if isinstance(data, dict) and data.get("ok") is True else "hard"
+    classification = "good" if accepting_health(data) else "hard"
     reachable = tcp_connects(health_url() or "") if wait and timed_out(data) else None
     if reachable:
         classification = "slow"
@@ -298,14 +298,16 @@ def _probe(timeout: float = PROBE_TIMEOUT_S, *, wait: bool = True) -> str | None
         say(f"home offbox server is slow to answer ({elapsed:.0f} ms); waiting up to "
             f"{slow_probe_seconds():g} s instead of moving to Boat")
         data = _health(slow_probe_seconds())
-        if isinstance(data, dict) and data.get("ok") is True:
+        if accepting_health(data):
             classification = "good"
         elif not timed_out(data):
             classification = "hard"
     phase = starting_phase(data)
-    if isinstance(data, dict) and (data.get("ok") is True or phase):
-        note_home_answer(ready=data.get("ok") is True)
-    if phase:
+    if accepting_health(data) or phase:
+        note_home_answer(ready=accepting_health(data))
+    if accepting_health(data) and data.get("degraded"):
+        classification = "degraded"
+    elif phase:
         classification = "starting"
     PROBE_FACTS.set({"class": classification, "tcp": reachable, "ms": round((time.monotonic()-start)*1000, 1)})
     if wait and (phase or classification == "slow"):
@@ -315,7 +317,7 @@ def _probe(timeout: float = PROBE_TIMEOUT_S, *, wait: bool = True) -> str | None
         if result is None:
             PROBE_FACTS.set({"class": "good", "ms": round((time.monotonic()-start)*1000, 1)})
         return result
-    return None if isinstance(data, dict) and data.get("ok") is True else _health_reason(data)
+    return None if accepting_health(data) else _health_reason(data)
 
 
 def _health(timeout: float = PROBE_TIMEOUT_S, *, bounded=False):
@@ -368,7 +370,7 @@ def slow_read_reachable(deadline=None):
         actual = data.get("boot_id")
         if expected and actual and expected != actual:
             return False
-        if data.get("ok") is not True and not starting_phase(data):
+        if not accepting_health(data) and not starting_phase(data):
             return False
         note_home_answer(ready=False)
     elif not timed_out(data):
@@ -644,7 +646,7 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
         _forward_background(queued)
     elapsed = max(0, time.monotonic() - WAIT_STARTED)*1000 if WAIT_STARTED is not None else 0
     toollog.emit("backend", "backend.failover", duration_ms=elapsed, ok=True, ids={"run": run_id},
-                 props={"from": "home", "to": "boat", "reason": "unreachable", "waitMs": elapsed})
+                 props={"from": "home", "to": "boat", "reason": reason, "waitMs": elapsed})
     if 'low on disk' in reason:
         detail = reason[reason.index('low on disk'):]
         routing_line(f"home offbox server is {detail}; this run is going to Boat", run_id)
@@ -653,7 +655,7 @@ def fail_over(reason: str, argv: list[str], run_id: str = "", *, explicit_base: 
     else:
         monitor = common.home_state()
         classification = failure_class(reason)
-        routing_line(f"home offbox server not reachable ({reason[:160]}); this run goes to Boat instead "
+        routing_line(f"home offbox could not prepare this run ({reason}); this run goes to Boat instead "
             f"class={classification} run={run_id or '-'} monitor_last_check={monitor.get('last_check')} "
             f"monitor_last_outcome={monitor.get('last_outcome')}", run_id)
     log(f"failover to boat: {reason[:300]}")

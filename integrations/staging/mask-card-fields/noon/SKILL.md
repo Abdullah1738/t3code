@@ -472,11 +472,14 @@ Never clear an existing owner basket during training.
 
 Use the default iMessage-thread model for searches/comparisons/orders; use
 `opus/gpt-6-astra` only to build/fix tooling (provider-block fallback unchanged).
-Owner/Moni phone fallbacks take their own priority hold and export
-`PHONE_HOLD_OWNER` as its exact token for every `ph` call and runner. Background
-phone jobs use `ph lease run --owner <card-or-thread-id> --purpose "<short>" -- <cmd>`.
-`ph lease status` shows the claim. Exit 5 means yield without looping or deleting
-another task's claim. Rank baskets by fewest orders, then ETA, then total with fees.
+Owner/Moni phone fallbacks use `ph hold acquire --token <session-id>`, export
+`PHONE_HOLD_OWNER=<session-id>` for every `ph` call and runner, and release with
+`ph hold release` on completion, cancellation or failure. ph refreshes on every
+call; use `ph hold refresh` during long OTP/reply waits. It archives holds when
+their agent exits or after 30 minutes without a refresh. `ph hold status` shows
+the holder's process and time until stale. Background jobs use
+`ph lease run --owner <card-or-thread-id> --purpose "<short>" -- <cmd>`.
+Exit 5 means yield without looping or deleting another task's claim. Rank baskets by fewest orders, then ETA, then total with fees.
 Use `basket ITEM ITEM --json`; API items include `image_url`, and searches accept
 `--images-dir DIR` for visual comparison. Ordering is `commerce` CLI first; the
 phone fallback uses Jev + `jevrun.py`.

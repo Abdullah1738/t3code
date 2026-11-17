@@ -24,6 +24,9 @@ const COOLDOWNS = [5 * 60_000, 15 * 60_000];
 const REPLAY_DELAY = 60_000;
 const DELIVERY_DEADLINE = 3 * 60_000;
 export const ROUTER_UNAVAILABLE_LIMIT_MS = 15 * 60_000;
+// Allow 300s wake backoff + 240s slot queue + the runner's 90s timeout,
+// with 90s scheduling slack. Check execution can outlive our own 45s timer.
+export const ROUTER_STREAK_GAP_MS = 12 * 60_000;
 export const SUPERVISOR_DEADLINE_MS = 45_000;
 
 function newState() { return { version: 1, incidents: [], active: null }; }
@@ -32,8 +35,9 @@ export function readState(path) {
   try {
     const s = JSON.parse(readFileSync(path, 'utf8'));
     if (s?.version !== 1 || !Array.isArray(s.incidents) || !Object.hasOwn(s, 'active')) throw new Error('invalid state');
-    if (s.routerUnavailableSince !== undefined || s.routerUnavailableCount !== undefined) {
+    if (s.routerUnavailableSince !== undefined || s.routerUnavailableCount !== undefined || s.routerUnavailableLastAt !== undefined) {
       if (!Number.isFinite(s.routerUnavailableSince) || s.routerUnavailableSince < 0 || !Number.isSafeInteger(s.routerUnavailableCount) || s.routerUnavailableCount < 1) throw new Error('invalid router availability state');
+      if (s.routerUnavailableLastAt !== undefined && (!Number.isFinite(s.routerUnavailableLastAt) || s.routerUnavailableLastAt < s.routerUnavailableSince)) throw new Error('invalid router availability state');
     }
     const incidentIds = new Set(), accountIds = new Set();
     for (const i of s.incidents) {
@@ -311,12 +315,27 @@ export async function tick(ctx) {
 
 async function tickImpl(ctx) {
   const state = ctx.load();
+  const startedAt = ctx.now();
+  const continuing = state.routerUnavailableLastAt !== undefined
+    && startedAt >= state.routerUnavailableLastAt
+    && startedAt - state.routerUnavailableLastAt <= ROUTER_STREAK_GAP_MS;
+  // A killed fetch cannot publish its result. Preserve an ongoing outage's
+  // continuity before fetching so the following retry does not look like downtime.
+  if (continuing) {
+    state.routerUnavailableLastAt = startedAt;
+    ctx.save(state);
+  }
   let payload;
   try { payload = await ctx.providers(); }
   catch (error) {
     if (!(error instanceof RouterUnavailableError)) throw error;
     const now = ctx.now();
-    state.routerUnavailableSince ??= now;
+    // Legacy journals lack a last tick; their elapsed time cannot prove continuity.
+    if (!continuing) {
+      state.routerUnavailableSince = now;
+      state.routerUnavailableCount = 0;
+    }
+    state.routerUnavailableLastAt = now;
     state.routerUnavailableCount = (state.routerUnavailableCount ?? 0) + 1;
     ctx.save(state);
     const elapsed = Math.max(0, now - state.routerUnavailableSince);
@@ -332,6 +351,8 @@ async function tickImpl(ctx) {
   }
   pendingConnections(payload);
   if (state.routerUnavailableSince !== undefined) {
+    ctx.log?.(`9router Claude detector: router recovered after ${state.routerUnavailableCount} consecutive unavailable ticks`);
+    delete state.routerUnavailableLastAt;
     delete state.routerUnavailableSince;
     delete state.routerUnavailableCount;
     ctx.save(state);

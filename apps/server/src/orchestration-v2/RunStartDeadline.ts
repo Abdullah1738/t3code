@@ -63,7 +63,7 @@ const make = Effect.gen(function* () {
           bootstrapAccepted.add(event.payload.runAttemptId);
         for (const [id, run] of pending) {
           if (
-            run.activeAttemptId === event.payload.runAttemptId &&
+            providerStartAccepted(run, [event.payload], []) &&
             run.providerRestartCleanup?.completed !== false
           )
             pending.delete(id);
@@ -76,6 +76,27 @@ const make = Effect.gen(function* () {
     for (const [id, run] of pending) {
       const deadline = run.providerStartDeadlineAt;
       if (deadline === undefined || now < DateTime.toEpochMillis(deadline)) continue;
+      if (run.providerRestartCleanup?.completed !== false) {
+        // Output may arrive without a prompt acknowledgement. Use the same
+        // persisted evidence as recovery before attempting to expire the run.
+        const records = yield* engine
+          .getThreadRecords(run.threadId, ["providerTurns", "turnItems"], {
+            turnItemRunIds: [run.id],
+          })
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("Provider start deadline could not read acceptance", {
+                runId: id,
+                cause,
+              }).pipe(Effect.as(null)),
+            ),
+          );
+        if (records === null) continue;
+        if (providerStartAccepted(run, records.providerTurns, records.turnItems)) {
+          if (pending.get(id) === run) pending.delete(id);
+          continue;
+        }
+      }
       const observed = Option.isSome(progress) ? progress.value.get(id, run.activeAttemptId) : null;
       yield* engine
         .dispatch({

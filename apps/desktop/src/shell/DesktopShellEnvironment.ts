@@ -1,6 +1,7 @@
 import type { DesktopBackendBootstrap } from "@t3tools/contracts";
 import {
   buildEnvironmentCaptureCommand,
+  isBareMacosPath,
   listLoginShellCandidates,
   setWindowsPath,
 } from "@t3tools/shared/shell";
@@ -479,6 +480,7 @@ const installPosixEnvironment = Effect.fn("desktop.shellEnvironment.installPosix
 
     const hydrated =
       Option.isSome(mergedPath) &&
+      (config.platform !== "darwin" || !isBareMacosPath(mergedPath.value)) &&
       (Option.isSome(trimNonEmpty(shellEnvironment.PATH)) || Option.isSome(launchctlPath));
     if (hydrated && Option.isSome(mergedPath)) {
       config.env.PATH = mergedPath.value;

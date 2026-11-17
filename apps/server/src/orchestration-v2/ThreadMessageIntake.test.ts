@@ -20,6 +20,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import { createPendingAttachmentId, resolveAttachmentPath } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
@@ -50,6 +51,41 @@ const layerFailingDispatch = (captured: OrchestrationV2ServerCommand[]) =>
   });
 
 const NOW = DateTime.makeUnsafe("2026-09-13T00:00:00.000Z");
+
+it.effect("preserves attachment reference I/O failures before responding", () =>
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const fs = yield* FileSystem.FileSystem;
+    const ioError = yield* Effect.flip(fs.stat(NodePath.join(config.attachmentsDir, "missing")));
+    const captured: OrchestrationV2ServerCommand[] = [];
+    const failure = yield* Effect.flip(
+      dispatchCommand({
+        type: "runtime-request.respond",
+        commandId: CommandId.make("attachment-io"),
+        threadId: ThreadId.make("thread-io"),
+        requestId: RuntimeRequestId.make("request-io"),
+        answers: {},
+        attachmentsByQuestionId: {
+          q: [
+            {
+              type: "image",
+              id: ChatAttachmentId.make("thread-io-00000000-0000-4000-8000-000000000001"),
+              name: "io.png",
+              mimeType: "image/png",
+              sizeBytes: 1,
+            },
+          ],
+        },
+      }).pipe(
+        Effect.provide(layerFailingDispatch(captured)),
+        Effect.provideService(FileSystem.FileSystem, { ...fs, exists: () => Effect.fail(ioError) }),
+      ),
+    );
+    expect(failure._tag).toBe("AttachmentClaimError");
+    if (failure._tag === "AttachmentClaimError") expect(failure.cause).toBe(ioError);
+    expect(captured).toEqual([]);
+  }).pipe(Effect.provide(layerIntakeTest)),
+);
 
 const answeredRespondEvents = (input: {
   readonly threadId: ThreadId;

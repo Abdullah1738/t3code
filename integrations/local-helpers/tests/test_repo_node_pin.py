@@ -607,7 +607,10 @@ class InstallPlanTest(unittest.TestCase):
             self.assertEqual(shell.count(installer.BEGIN), 1)
             self.assertEqual(installer.updated(shell), shell)
             self.assertEqual((home / '.zshrc').read_text(), original)
-            self.assertEqual(len(changes), 9)
+            payload = {dst.relative_to(home): data for dst, data, _ in changes}
+            for name in ['shared-deps.sh', 'pnpm-bin/pnpm']:
+                self.assertEqual(payload[Path('.local/libexec/repo-node-pin') / name],
+                                 (HELPER / name).read_bytes())
 
     def test_preview_never_includes_unchanged_sentinel_secrets(self):
         sentinel = 'SENTINEL_CREDENTIAL_MUST_NOT_LEAVE_SHELL_FILE'

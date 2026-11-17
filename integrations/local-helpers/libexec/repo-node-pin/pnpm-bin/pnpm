@@ -1,4 +1,8 @@
 #!/bin/sh
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+. "$here/../shared-deps.sh"
+repo_shared_deps_check pnpm "$@" || exit 1
+
 # Execute the cached CLI directly: Corepack dispatch may download or update its default.
 if [ -z "${ROBOB_REPO_PNPM_CLI:-}" ]; then
     printf '%s\n' "repo-node: ${ROBOB_REPO_PNPM_HINT:-no compatible pnpm selected}" >&2
