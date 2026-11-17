@@ -474,9 +474,10 @@ FIXTURE_TOOLS = ('mktemp', 'cat', 'ln', 'cp', 'mkdir', 'rm', 'chmod', 'touch', '
 # A changed helper fails closed until its new hash is reviewed in here.
 REPO_NODE_PIN_HASHES = {
     'bash-env.sh': {'84d84773c9b61952f5a39367470ad4043c463e8573259846ec3bb614931c8d60'},
-    # Both audited startup forms work; only the newer one sources safe-chain.
+    # Keep the pre-safe-chain form and both safe-chain forms during rollout.
     'init.sh': {'d97da32ec68ee02cbf663db7675199cd12e9bd47db27cd9bb45468d133e9a4b0',
-                '90a6436ed6c5ab91b13da9fd27e57d26cdd96b6dcfe0677e591ca5f942f38327'},
+                '90a6436ed6c5ab91b13da9fd27e57d26cdd96b6dcfe0677e591ca5f942f38327',
+                'c853ec309cdbdf38108e133875a54141bf348c6e23b6cd4e881010aa24d37aea'},
     'select.py': {'7be0cf8c91fdb19d5ea261085f67d8fe88d9100bf39d3ebca1eec4f6d867eaa4',
                   '1ded56be26d29b956ca8a62217e94c1ca952513f2cd96934a9680c08c045d61d'},
 }
@@ -3077,7 +3078,7 @@ def _attached_script_operand(word, binary):
     return value if equal and flag in options else word
 
 
-def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None) -> list[Path]:
+def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None, _stdin=None, _environment=None, _opaque=None, _preservation=True, _budget=None, _glob_writes=None, _cwd_candidates=None) -> list[Path]:
     """Resolve bounded shell paths and inspect sources without executing them."""
     paths = []
     script_files, node_test_files = _budget if _budget is not None else (set(), set())
@@ -3096,6 +3097,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         variable_written.update(prior_variable)
         tool_changes.update(prior_tool_changes)
     unknown_cause = "directory changed in a conditional branch"
+    unknown_directories = set(_cwd_candidates or ())
     conditional = 0
     inherited_values, inherited_unsafe, caller_command = _environment or ({}, False, None)
     shell_values = {"HOME": str(Path.home()), **inherited_values}
@@ -3149,6 +3151,28 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         detail = f'{site}: {binary_label(words)} at line {current_line}; {reason or proof_failure}'
         for path in paths:
             target.setdefault(path, detail)
+
+    def reader_directories(directory):
+        # Unknown script paths still refuse; reader checks must also retain
+        # directories that a skipped branch or loop could leave in effect.
+        return (directory,) if directory is not None else (None, *unknown_directories)
+
+    def direct_read(words, directory):
+        return any(_direct_read(words, candidate) for candidate in reader_directories(directory))
+
+    def remember_reader_directory(directory):
+        if directory is not None:
+            unknown_directories.add(directory)
+            if len(unknown_directories) > MAX_SCRIPTS:
+                raise AmbiguousScript(f"more than MAX_SCRIPTS ({MAX_SCRIPTS}) directory alternatives")
+
+    def change_directory(value, directory):
+        if directory is None:
+            # Keep both skipped and taken alternatives, including wrapper
+            # directories that do not change their caller's cwd.
+            for candidate in tuple(unknown_directories):
+                remember_reader_directory(_literal_path(value, candidate))
+        return _literal_path(value, directory)
 
     def source_identity(path):
         # The same call may run on a case-insensitive, normalization-insensitive
@@ -4044,7 +4068,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
     def check_source(source, directory, python=False, rule="live-database-script", shell=False, test_target=None, location=None):
         # Config/foreign operand discounts cannot supply fixture evidence.
         checked = _js_fixture_source(source) if test_target is not None and not python and not shell else source
-        if _source_hit(checked, directory, python, shell):
+        if any(_source_hit(checked, candidate, python, shell) for candidate in reader_directories(directory)):
             match = _database_reference(source)
             line = source.count("\n", 0, match.start()) + 1 if match else 1
             detail = (f"{location or '<inline script>'}:{line} names {_token(match[0])}." if match else
@@ -4083,7 +4107,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if not value or value.startswith("--"):
                 raise AmbiguousScript("missing migrate-dev-db argument " + _token(flag))
             if value.startswith(('~', '$')):
-                if _direct_read(['cat', value], directory):
+                if direct_read(['cat', value], directory):
                     raise LiveRead("live-database-read")
                 raise AmbiguousScript("use literal migrate-dev-db paths without home or variable expansion " + _token(value))
             if flag == "--source":
@@ -4095,7 +4119,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 source_directory = source_operand.parent
             elif flag == "--base-dir":
                 _, destination = migration_path(value, flag)
-                if _direct_read(['cat', str(destination / 'userdata/statev2.sqlite')], directory):
+                if direct_read(['cat', str(destination / 'userdata/statev2.sqlite')], directory):
                     raise LiveRead("live-database-read")
             index += 1
         # Its default is HOME/.t3/userdata/statev2.sqlite, a protected database.
@@ -4308,7 +4332,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             proof_command = command if caller_command is None else caller_command
             redirect = re.search(r'\s+>\s+([^\s;&|<>$`]+)\s+2>&1\s*$', proof_command)
             destination = shlex.split(redirect[1]) if redirect else []
-            if redirect and (len(destination) != 1 or _direct_read(['cat', destination[0]], directory)):
+            if redirect and (len(destination) != 1 or direct_read(['cat', destination[0]], directory)):
                 raise LiveRead('live-database-script', f"{path}:1 has an unsafe output redirect.")
             plain = proof_command[:redirect.start()] if redirect else proof_command
             invocation = _fixture_invocation(plain)
@@ -4429,7 +4453,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                   _sources=(written, invalidated_written, write_history, variable_written, tool_changes),
                                   _stdin=(input_words, input_bodies or {}), _environment=environment, _opaque=opaque,
                                   _preservation=_preservation and preservation,
-                                  _budget=(script_files, node_test_files), _glob_writes=glob_writes)
+                                  _budget=(script_files, node_test_files), _glob_writes=glob_writes,
+                                  _cwd_candidates=unknown_directories)
         paths.extend(path for path in remote_paths if path not in paths)
         check_budget()
 
@@ -4512,7 +4537,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             for op, target in redirects:
                 if '>' in op and not (op == '>&' and re.fullmatch(r'\d+|-', target)):
                     remember_glob_write(target, directory)
-                if op == '<>' and any(_direct_read(['cat', *values], directory) for values in variants([target])):
+                if op == '<>' and any(direct_read(['cat', *values], directory) for values in variants([target])):
                     raise LiveRead('live-database-read')
             if any(word in {'>', '>>', '>|', '&>', '&>>', '<>', '>&'} for word in words):
                 glob_writes.add(None)
@@ -4526,7 +4551,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         def caller_argv(count):
             # Prefix unwrapping only removes words from the front. Preserve
             # literal quote segments until caller expansions are complete.
-            bindings = {'HOME': {str(Path.home())}, **({'PWD': {str(directory)}} if directory is not None else {}),
+            # Reader candidates do not enumerate every loop iteration's cwd.
+            # Keep script paths unresolved even when those candidates are safe.
+            pwd_values = ({str(directory)} if directory is not None else
+                          {'$PWD', *(str(candidate) for candidate in unknown_directories)})
+            bindings = {'HOME': {str(Path.home())}, **({'PWD': pwd_values} if pwd_values else {}),
                         **{name: set(values) for name, values in script_values.items()}}
             # Reader evidence survives declarations that invalidate script
             # proofs. Keep an unknown alternative rather than trusting it.
@@ -4641,10 +4670,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         remember_assignment(flag, directory, not cwd_only, True)
                     elif flag in {"-C", "--chdir"}:
                         child_directory = True
-                        directory = _literal_path(words.pop(0), directory) if words else None
+                        directory = change_directory(words.pop(0), directory) if words else None
                     elif flag.startswith("--chdir="):
                         child_directory = True
-                        directory = _literal_path(flag.split("=", 1)[1], directory)
+                        directory = change_directory(flag.split("=", 1)[1], directory)
                     elif flag in {"-u", "--unset"} and words:
                         words.pop(0)
                     elif flag.startswith('-S') or flag == '--split-string' or flag.startswith('--split-string='):
@@ -4661,14 +4690,14 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         value = words.pop(0) if words else ""
                         if flag == "--directory":
                             child_directory = True
-                            directory = _literal_path(value, directory)
+                            directory = change_directory(value, directory)
                 while words and words[0].startswith("-"):
                     flag = words.pop(0)
                     if flag in {"--directory", "--project", "--python", "--with", "--group", "--extra"}:
                         value = words.pop(0) if words else ""
                         if flag == "--directory":
                             child_directory = True
-                            directory = _literal_path(value, directory)
+                            directory = change_directory(value, directory)
             elif binary == "offbox" and words[1:2] == ['run']:
                 options_end = words.index('--') if '--' in words else len(words)
                 for index in range(2, options_end):
@@ -4861,7 +4890,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             return after
         if shell_builtin and binary == "cd":
             args = [arg for arg in args if arg not in {"--", "-L", "-P"}]
-            changed = _literal_path(args[0] if args else str(Path.home()), directory) if len(args) <= 1 else None
+            changed = change_directory(args[0] if args else str(Path.home()), directory) if len(args) <= 1 else None
             if changed is None and "loop that changes directory" not in unknown_cause:
                 unknown_cause = "cd to a non-literal directory " + _token(args[0] if args else "")
             return after if child_directory else changed
@@ -5034,7 +5063,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             if opaque_contains(copied, opaque_key(key[1], key[0])):
                                 del opaque_written[key]
         if binary == "vp" and args[:2] == ["run", "migrate-dev-db"]:
-            if any(_direct_read(['cat', *values], directory)
+            if any(direct_read(['cat', *values], directory)
                    for values in variants([v for op, v in redirects if op in {'<', '<>'}])):
                 raise LiveRead("live-database-read")
             migration_context(words)
@@ -5209,10 +5238,10 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if config:
                 listing_reads = [*listing_reads, config]
         if (binary in {'rg', 'fd', 'fdfind', 'find'} and _listing_only(read_words) and
-                _direct_read(['cat', *listing_reads], directory)):
+                direct_read(['cat', *listing_reads], directory)):
             # Environment-selected config files are read even in listing mode.
             raise LiveRead('live-database-read')
-        if any(_direct_read(values + assignment_reads, directory)
+        if any(direct_read(values + assignment_reads, directory)
                for values in variants(read_words)):
             if python and any(flag in words for flag in {"-c", "-e"}) and any(".write_text(" in word or ".write_bytes(" in word for word in words):
                 match = _database_reference(" ".join(read_words[1:]))
@@ -5220,7 +5249,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     raise LiveRead("live-database-read", f"Inline-code argument names {_token(match[0])}; it cannot be verified as data only.\n"
                                    "Use apply_patch to write report data containing protected database paths.")
             raise LiveRead("live-database-read")
-        if any(_direct_read(["cat", *values], directory)
+        if any(direct_read(["cat", *values], directory)
                for values in variants([v for op, v in redirects if op in {'<', '<>'}])):
             raise LiveRead("live-database-read")
         if stdin_code and (python or binary in shells | {'node', 'bun', 'deno'}):
@@ -5407,6 +5436,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             guarded = False
             safe_chain = True
 
+            def mark_cwd_change(before, after):
+                if before != after:
+                    if before is not None and after is None:
+                        remember_reader_directory(before)
+                    for frame in branches:
+                        frame["changed"] = True
+
             def run(words, current, concurrent=False):
                 nonlocal conditional, uncertain_write, current_line
                 before = current
@@ -5422,9 +5458,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     invalidated_written.update(changed_sources)
                     conditional -= uncertain
                     uncertain_write -= bool(branches) or concurrent or guarded and not safe_chain
-                if before != current:
-                    for frame in branches:
-                        frame["changed"] = True
+                mark_cwd_change(before, current)
                 return current
 
             while index < (len(tokens) if stop is None else stop):
@@ -5487,6 +5521,9 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     loop_cwd, end = walk(index, current, probe=True, stop=stop,
                                          binding_preflight=True, end_after_loop=True)
                     if loop_cwd != current:
+                        # The body starts unknown, so its cd may no longer
+                        # produce a change that enclosing exits can observe.
+                        mark_cwd_change(current, loop_cwd)
                         current = None
                         unknown_cause = "a loop that changes directory"
                     # The next iteration may inherit any assignment from the
@@ -5554,9 +5591,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             script_values[name] = script_values.get(name, {'$' + name}) | previous_values.get(name, {'$' + name})
                         opaque_written.clear()
                     if token == "{":
-                        if nested != current:
-                            for frame in branches:
-                                frame["changed"] = True
+                        mark_cwd_change(current, nested)
                         current = nested
                     continue
                 if token == closing:
@@ -5627,7 +5662,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         if 'script_loop' in frame:
                             name, previous = frame['script_loop']
                             script_values[name] = script_values.get(name, {'$' + name}) | previous
-                        current = None if frame["changed"] else frame["cwd"]
+                        after = None if frame["changed"] else frame["cwd"]
+                        if frame['changed'] and frame['cwd'] is not None:
+                            remember_reader_directory(frame['cwd'])
+                        mark_cwd_change(current, after)
+                        current = after
                         if frame["changed"]:
                             unknown_cause = "directory changed in a conditional branch or loop"
                         if end_after_loop and token == 'done' and not branches:

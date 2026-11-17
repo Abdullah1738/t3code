@@ -49,14 +49,16 @@ export class BoxRunner {
     return row?.id ?? null;
   }
   private events(after?: string, headOnly = false) {
-    const rows = this.db.query<{ id: string; seq: number; state: string; failure: string | null; kind: "inbound" | "wake"; interruptedAt: number | null }, [string | null, number, number]>(`SELECT inbox.id,seq,state,inbox_errors.code AS failure,
+    const rows = this.db.query<{ id: string; seq: number; state: string; failure: string | null; kind: "inbound" | "wake"; interruptedAt: number | null; watcher: string | null }, [string | null, number, number]>(`SELECT inbox.id,seq,state,inbox_errors.code AS failure,
+      json_extract(payload,'$.watcher') AS watcher,
       CASE WHEN json_extract(payload,'$.kind')='wake' OR (json_extract(payload,'$.kind') IS NULL AND json_extract(payload,'$.id') LIKE 'wake:%') THEN 'wake' ELSE 'inbound' END AS kind,
       interrupted_at AS interruptedAt FROM inbox LEFT JOIN inbox_errors ON inbox.id=inbox_errors.id
       WHERE state!='done' AND seq>COALESCE((SELECT seq FROM inbox WHERE id=?),0) AND (?=0 OR state!='attachment-failed') ORDER BY seq LIMIT ?`).all(after ?? null, Number(headOnly), headOnly ? 1 : 100);
     const sent = this.db.query("SELECT 1 FROM actions WHERE path='/send' AND (inbox_id=? OR id=? OR id=?) LIMIT 1");
     // Legacy tool sends have no attribution. Conservatively flag only work interrupted at migration.
     const legacy = this.db.query("SELECT 1 FROM settings WHERE key=?");
-    const events = rows.map(({ seq, ...row }) => ({ ...row, hasSend: !!legacy.get(`legacy-send:${row.id}`)
+    const events = rows.map(({ seq, watcher, ...row }) => ({ ...row,
+      ...(typeof watcher === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/.test(watcher) ? { watcher } : {}), hasSend: !!legacy.get(`legacy-send:${row.id}`)
       || !!sent.get(row.id, opaqueId(`reply:${row.id}:0`), opaqueId(`attachment-failed:${row.id}`)) }));
     const last = rows.at(-1);
     const remaining = last ? this.db.query<{ n: number }, [number]>("SELECT count(*) n FROM inbox WHERE state!='done' AND seq>?").get(last.seq)!.n : 0;
@@ -86,14 +88,14 @@ export class BoxRunner {
     if (!this.active() || this.flushing) return;
     this.flushing = true;
     try {
-    const rows = this.db.query<{ id: string; path: string; payload: string }, []>("SELECT * FROM actions WHERE state='pending' ORDER BY rowid").all();
+    const rows = this.db.query<{ id: string; path: string; payload: string; inbox_id: string | null }, []>("SELECT * FROM actions WHERE state='pending' ORDER BY rowid").all();
     for (const row of rows) {
       if (!this.active()) return;
       const payload = JSON.parse(row.payload);
       try {
       const response = await (this.io.fetch ?? fetch)(this.config.callbackUrl + row.path, { method: "POST", redirect: "error",
         headers: { authorization: `Bearer ${this.config.callbackToken}`, "content-type": "application/json" },
-        body: JSON.stringify({ ...payload, operationId: row.id, ...(row.path === "/send" ? { id: row.id } : {}), epoch: this.config.epoch }), signal: AbortSignal.timeout(15_000) });
+        body: JSON.stringify({ ...payload, operationId: row.id, ...(row.path === "/send" ? { id: row.id, ...(row.inbox_id ? { inboxId: row.inbox_id } : {}) } : {}), epoch: this.config.epoch }), signal: AbortSignal.timeout(15_000) });
       if (!response.ok) {
         if (([400, 403, 404, 413, 422].includes(response.status) || response.status === 409 && row.path !== "/send") && row.path !== "/metrics") {
           this.db.query("UPDATE actions SET state='failed',result=? WHERE id=?").run(JSON.stringify({ error: "Action refused", status: response.status }), row.id); continue;
@@ -229,13 +231,27 @@ export class BoxRunner {
       }
       if (path === "/resolve") {
         if (!validId(body.id) || body.reconciled !== true || !["done", "pending"].includes(String(body.state))) return reply(400, { error: "Reconcile the failed event first" });
+        if (body.autoFailMs !== undefined && (!Number.isSafeInteger(body.autoFailMs) || Number(body.autoFailMs) < 0 || body.state !== "done")) return reply(400, { error: "Invalid auto-fail guard" });
         const id = body.id;
-        const state = this.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)?.state;
-        if (state !== "interrupted" && state !== "attachment-failed" && state !== body.state) return reply(409, { error: "Event cannot be resolved" });
-        this.db.transaction(() => {
+        const accepted = this.db.transaction(() => {
+          const state = this.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)?.state;
+          if (state !== "interrupted" && state !== "attachment-failed" && state !== body.state) return false;
+          if (body.autoFailMs !== undefined) {
+            // A done row alone cannot prove this request won a race with an operator's resumed turn.
+            if (state === "done") return !!this.db.query("SELECT 1 FROM settings WHERE key=?").get(`wake-autofailed:${id}`);
+            const head = this.events(undefined, true).events[0];
+            let page = this.events(id);
+            while (!page.events.some(row => row.kind === "inbound") && page.nextCursor) page = this.events(page.nextCursor);
+            if (head?.id !== id || head.state !== "interrupted" || head.kind !== "wake" || head.hasSend
+              || head.interruptedAt === null || this.now() - head.interruptedAt < Number(body.autoFailMs)
+              || !page.events.some(row => row.kind === "inbound")) return false;
+            this.db.query("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)").run(`wake-autofailed:${id}`, String(this.now()));
+          }
           this.db.query("UPDATE inbox SET state=? WHERE id=? AND state IN ('interrupted','attachment-failed')").run(String(body.state), id);
           this.db.query("DELETE FROM inbox_errors WHERE id=?").run(id);
-        })();
+          return true;
+        }).immediate();
+        if (!accepted) return reply(409, { error: "Event cannot be resolved" });
         return reply(200, { accepted: true });
       }
       if (path === "/watch" && this.watch) { await this.watch(body); return reply(200, { accepted: true }); }

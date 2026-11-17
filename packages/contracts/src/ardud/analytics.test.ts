@@ -50,6 +50,26 @@ describe("analytics ingest contract", () => {
     ).toThrow();
     expect(() => decodeEvent({ ...input, props: { ...input.props, head: "private" } })).toThrow();
   });
+  it.each(["host_reboot", "quarantine_max_age"])(
+    "accepts desktop lease recovery reason %s",
+    (reason) => {
+      expect(
+        decodeEvent({
+          ts: event.ts,
+          kind: "desktop_lease.transition",
+          surface: "server",
+          route: "desktop-lease",
+          ticket: "ticket-1",
+          taskId: "task-1",
+          mode: "native",
+          from: "quarantined",
+          to: "finished",
+          reason,
+          age_ms: 1000,
+        }),
+      ).toMatchObject({ reason, kind: "desktop_lease.transition" });
+    },
+  );
   it("accepts MCP filters and rejects unhashed request ids", () => {
     const call = { ...event, kind: "mcp.call", clientRequestId: "a".repeat(64) };
     expect(decodeEvent(call).clientRequestId).toBe("a".repeat(64));

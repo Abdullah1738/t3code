@@ -76,8 +76,13 @@ incomplete install is never selected.
 
 Toolchain exit code:
 
-- **99**: pinned Node/pnpm provisioning, checksum verification, or activation
+- **99**: pinned Node/pnpm/Quint provisioning, checksum verification, or activation
   failed. The user command never started. No box-default fallback.
+
+Quint runs use CLI 0.33.1 in a box-local cache behind the guarded wrapper. The
+first run installs it; warm runs check its version without npm. An explicit
+`QUINT_BIN` is preserved. Setup prints `offbox-quint:` events and a guarded CLI
+status line; runs without a Quint command or repo spec skip provisioning.
 
 ## Changing it
 

@@ -576,6 +576,7 @@ export interface KanbanServiceShape {
   ) => Effect.Effect<
     {
       readonly currentAt?: string;
+      readonly release?: ReturnType<typeof BoardReplies.boardReleaseSummary>;
       readonly idleEvaluatorBoard?: Rules.IdleEvaluatorBoard;
       readonly lastEventAtByCard?: ReadonlyMap<string, string>;
       readonly currentSlots?: ReadonlyArray<SlotEvent>;
@@ -6277,6 +6278,7 @@ const make = Effect.gen(function* () {
                   snapshot.board,
                   DateTime.formatIso(DateTime.makeUnsafe(now)),
                   boards,
+                  false,
                 ),
               };
             }),
@@ -15048,6 +15050,7 @@ const make = Effect.gen(function* () {
                           snapshot.board,
                           DateTime.formatIso(DateTime.makeUnsafe(now)),
                           boards,
+                          false,
                         );
                         const links = yield* rawStore.threadLinks({ cardId: current.id });
                         return { current, snapshot, release, links };
@@ -20451,6 +20454,13 @@ const make = Effect.gen(function* () {
             );
           }
           const previousLedger = board.releaseLedger ?? [];
+          const previousRelease = previousLedger.find(
+            (entry) =>
+              entry.boardId === board.id &&
+              entry.cardId === card.id &&
+              entry.subtaskId === subtaskId,
+          );
+          const buildCommit = Subtasks.releaseBuildCommit(note) ?? previousRelease?.buildCommit;
           const releaseLedger = gated?.interrupting
             ? previousLedger.filter(
                 (entry) =>
@@ -20473,6 +20483,7 @@ const make = Effect.gen(function* () {
                       at: releaseAt ?? at,
                       ...(gated.service === undefined ? {} : { service: gated.service }),
                       ...(releaseAt === undefined ? {} : { postHoc: true }),
+                      ...(buildCommit === undefined ? {} : { buildCommit }),
                       critical: Subtasks.criticalReleaseReason(note),
                       approvalId: cleared?.id ?? null,
                     },
@@ -23457,6 +23468,7 @@ const make = Effect.gen(function* () {
               event.at,
             ]),
           );
+          const releaseBoards = read.board === null ? [] : yield* store.boards;
           const idleEvaluatorBoard =
             read.board === null
               ? undefined
@@ -23465,7 +23477,8 @@ const make = Effect.gen(function* () {
                   ...BoardReplies.boardReleaseSummary(
                     read.board,
                     read.currentAt,
-                    yield* store.boards,
+                    releaseBoards,
+                    false,
                   ),
                 };
           const readinessBefore = history.filter((event) => event.at < window.since);
@@ -23482,6 +23495,15 @@ const make = Effect.gen(function* () {
             }
           return {
             ...read,
+            ...(read.board === null
+              ? {}
+              : {
+                  release: BoardReplies.boardReleaseSummary(
+                    read.board,
+                    read.currentAt,
+                    releaseBoards,
+                  ),
+                }),
             ...(idleEvaluatorBoard === undefined ? {} : { idleEvaluatorBoard }),
             lastEventAtByCard,
             prior,

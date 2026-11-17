@@ -83,6 +83,7 @@ const makeHarness = (
       filename,
       ...(options.holderTurnActive ? { holderTurnActive: options.holderTurnActive } : {}),
       now: () => now,
+      bootTimeMs: () => null,
       factory: (storeOptions) => {
         opens++;
         if (options.failFirstOpen && opens === 1) throw new Error("simulated open failure");

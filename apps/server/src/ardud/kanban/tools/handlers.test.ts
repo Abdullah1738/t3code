@@ -9528,6 +9528,12 @@ it.effect(
         compact.nextReleaseWindowAt,
         DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(firstAt), { hours: 4 })),
       );
+      const activity = (yield* call(evaluator, "board_activity", {})).structured.activity as {
+        releaseLedger: unknown;
+        nextReleaseWindowAt: string | null;
+      };
+      assert.deepStrictEqual(activity.releaseLedger, ledger);
+      assert.strictEqual(activity.nextReleaseWindowAt, compact.nextReleaseWindowAt);
       const ordinary = yield* create({ gate: "deploy" });
       yield* kanban.markSubtask(ordinary.id, "s1", "done", "Installed", actor, "evaluator");
       assert.lengthOf((yield* kanban.snapshot(board.id)).board.releaseLedger!, 1);
@@ -9541,6 +9547,17 @@ it.effect(
       );
       ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
       assert.strictEqual(ledger[1]!.critical, "server will not start after .10");
+      const afterCritical = (yield* call(evaluator, "board_activity", {})).structured.activity as {
+        releaseLedger: unknown;
+        nextReleaseWindowAt: string | null;
+      };
+      assert.deepStrictEqual(afterCritical.releaseLedger, ledger);
+      // A critical completion bypasses its current window; subsequent releases
+      // still use the same gate and four-hour interval.
+      assert.strictEqual(
+        afterCritical.nextReleaseWindowAt,
+        DateTime.formatIso(DateTime.add(DateTime.makeUnsafe(ledger[1]!.at), { hours: 4 })),
+      );
       yield* TestClock.adjust(4 * 3_600_000 + 60_000);
       const third = yield* create();
       yield* kanban.markSubtask(third.id, "s1", "done", null, actor, "evaluator");
@@ -9589,6 +9606,43 @@ const releasePeer = Effect.fn("test.releasePeer")(function* (
   yield* store.putBoard({ ...health, standingApprovals: [approval] });
   return { board: health, actor, evaluator };
 });
+
+it.effect("interrupting completion keeps buildCommit metadata without a deploy gate", () =>
+  Effect.gen(function* () {
+    const { kanban, store, board, actor, create } = yield* releaseFixture;
+    const card = yield* create({ interrupting: true, service: "robob" });
+    const { gate: _gate, gateSource: _source, ...ungated } = card.subtasks[0]!;
+    yield* store.putCard({
+      ...card,
+      subtasks: [
+        {
+          ...ungated,
+          text: "Record completed work",
+          gateCleared: {
+            gate: "deploy",
+            reason: "Bookkeeping for completed work",
+            by: actor,
+            at: card.createdAt,
+            text: "Record completed work",
+          },
+        },
+      ],
+    });
+    yield* kanban.markSubtask(
+      card.id,
+      "s1",
+      "done",
+      "Installed; buildCommit: `abcdef123456`",
+      actor,
+      "evaluator",
+    );
+    const saved = (yield* kanban.snapshot(board.id)).board;
+    assert.lengthOf(saved.releaseLedger!, 1);
+    assert.strictEqual(saved.releaseLedger![0]!.buildCommit, "abcdef123456");
+    assert.strictEqual(saved.releaseLedger![0]!.service, "robob");
+    assert.strictEqual(saved.releaseLedger![0]!.approvalId, null);
+  }).pipe(Effect.provide(fakeThreads().layer)),
+);
 
 it.effect("replays Watchers #66 versus telegram #64 and Health #22 across boards", () =>
   Effect.gen(function* () {
@@ -9872,15 +9926,27 @@ it.effect("replays Recall #101 bookkeeping for #144 using the refusal's released
   }).pipe(Effect.provide(fakeThreads().layer)),
 );
 
-it.effect(
-  "re-ticking done with releasedAt replaces only the matching board/card/subtask receipt",
-  () =>
+it.effect.each([
+  { name: "omitted note", note: undefined, commit: "abcdef123456" },
+  { name: "plain note", note: "Corrected install timestamp", commit: "abcdef123456" },
+  { name: "replacement commit", note: "buildCommit 123456abcdef", commit: "123456abcdef" },
+])(
+  "re-ticking done with releasedAt replaces only the matching receipt ($name)",
+  ({ note, commit }) =>
     Effect.gen(function* () {
       const { kanban, store, board, actor, evaluator, create } = yield* releaseFixture;
       const card = yield* create({ interrupting: true, service: "robob-watch" });
-      yield* kanban.markSubtask(card.id, "s1", "done", null, actor, "evaluator");
+      yield* kanban.markSubtask(
+        card.id,
+        "s1",
+        "done",
+        "buildCommit abcdef123456",
+        actor,
+        "evaluator",
+      );
       const saved = (yield* kanban.snapshot(board.id)).board;
       const row = saved.releaseLedger![0]!;
+      assert.strictEqual(row.buildCommit, "abcdef123456");
       const unrelated = [
         { ...row, boardId: KanbanBoardId.make("other-board") },
         { ...row, cardId: KanbanCardId.make("other-card") },
@@ -9894,10 +9960,14 @@ it.effect(
         subtask: "s1",
         state: "done",
         releasedAt: at,
+        ...(note === undefined ? {} : { note }),
       });
       assert.isFalse(corrected.isError, corrected.text);
       const ledger = (yield* kanban.snapshot(board.id)).board.releaseLedger!;
-      assert.deepStrictEqual(ledger, [...unrelated, { ...row, at, postHoc: true }]);
+      assert.deepStrictEqual(ledger, [
+        ...unrelated,
+        { ...row, at, postHoc: true, buildCommit: commit },
+      ]);
       const duplicate = yield* call(evaluator, "subtask_done", {
         card: card.id,
         subtask: "s1",

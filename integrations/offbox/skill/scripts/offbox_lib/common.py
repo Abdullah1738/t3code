@@ -318,7 +318,7 @@ EXIT_HOME_DOWN = 93            # person-box work while the home server is down: 
 EXIT_INTERRUPTED = 94          # the home command was interrupted and was not run again
 EXIT_DETACHED = 95             # the Robob client went away; the remote run is still running
 EXIT_LOCAL = 96                # local state failure; never automatic local fallback
-EXIT_TOOLCHAIN = 99            # repo Node/pnpm could not be provisioned; user command never started
+EXIT_TOOLCHAIN = 99            # pinned Node/pnpm/Quint could not be provisioned; user command never started
 EXIT_NOT_STARTED = 100         # queued client died before acquiring a box; nothing ran, safe to rerun
 EXIT_WAIT_TIMEOUT = 124        # `offbox wait --timeout` ran out; the run keeps going on its box
 
