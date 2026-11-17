@@ -1342,6 +1342,8 @@ const handlers = {
           return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
         }
         if (input.assignToSelf) {
+          // Taken at once: the caller's subtasks are the whole plan, so the ids
+          // the reply names are the input's own, with no packet in front.
           const result = yield* service.createForThread(caller.threadId, fields);
           return { ...result, ...gatedResult(result.card, input.subtasks, board.guessedGates) };
         }
