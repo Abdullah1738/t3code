@@ -174,11 +174,59 @@ class CpuTests(unittest.TestCase):
             props = toollog.cpu_fields(dict(top=[dict(family=label, parentFamily=label)]))
             self.assertEqual(props['top'][0]['family'], Path(real).name)
             self.assertEqual(props['top'][0]['parentFamily'], Path(real).name)
-        for comm in ('/Users/ardud/private/tool', '/home/test/tool',
-                     str(Path.home())+'/tool', '/usr/bin/sk-private-key', '/System/secret=private'):
+        for comm in ('/usr/bin/sk-private-key', '/System/secret=private'):
             with self.subTest(comm=comm):
                 label = cpu_labels.family(comm)
                 self.assertEqual(label, '[redacted]')
+
+    def test_home_and_system_family_basename_matrix_at_logger_boundary(self):
+        home = '/Users/tester'
+        cases = [
+            ('nvm node', home+'/.nvm/versions/node/v26.2.0/bin/node', 'node'),
+            ('local tool', home+'/.local/bin/offbox', 'offbox'),
+            ('agent browser', home+'/.nvm/versions/node/v26.13.1/lib/node_modules/agent-browser/bin/agent-browser', 'agent-browser'),
+            ('ssh mux', 'ssh: '+home+'/.local/share/offbox/cm/abc [mux]', 'ssh'),
+            ('claude', home+'/.robob/harness-cli/claude/current/bin/claude', 'claude'),
+            ('bun', home+'/.bun/bin/bun', 'bun'),
+            ('home Python', home+'/.local/bin/python3.9', 'python'),
+            ('Linux home', '/home/tester/.local/bin/node', 'node'),
+            ('current home', str(Path.home())+'/.local/bin/bun', 'bun'),
+            ('tilde home', '~/.local/bin/python3.9', 'python'),
+            ('home bundle executable', home+'/private.app/Contents/MacOS/node', 'node'),
+            ('secret directory', home+'/ghp_private-token/node', 'node'),
+            ('system extension', '/Library/SystemExtensions/D48C98D4-DA18-4029-9DFF-49EF981973AB/'
+             'io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/'
+             'io.tailscale.ipn.macsys.network-extension', 'io.tailscale.ipn.macsys.network-extension'),
+            ('Cryptex helper', '/System/Cryptexes/App/System/Library/CoreServices/SafeHelper.app/Contents/MacOS/SafeHelper', 'SafeHelper'),
+            ('system application', '/System/Applications/Safe.app/Contents/MacOS/Safe', 'Safe'),
+            # These two names themselves match the existing password guard.
+            ('Passwords helper', '/System/Cryptexes/App/System/Library/CoreServices/'
+             'PasswordManagerBrowserExtensionHelper.app/Contents/MacOS/PasswordManagerBrowserExtensionHelper', '[redacted]'),
+            ('Passwords', '/System/Applications/Passwords.app/Contents/MacOS/Passwords', '[redacted]'),
+        ]
+        for form, comm, expected in cases:
+            with self.subTest(form=form):
+                label = cpu_labels.family(comm)
+                self.assertEqual(label, expected)
+                props = toollog.cpu_fields(dict(top=[dict(family=label, parentFamily=label)],
+                                               families=[dict(family=label, count=1)]))
+                self.assertEqual(props['top'][0]['family'], expected)
+                self.assertEqual(props['top'][0]['parentFamily'], expected)
+                self.assertEqual(props['families'][0]['family'], expected)
+                self.assertNotIn('/Users/', json.dumps(props))
+                self.assertNotIn('tester', json.dumps(props))
+
+    def test_secret_home_basenames_remain_redacted(self):
+        for name in ('a1'*20, 'ghp_private-token', 'github_pat_private', 'sk-private-key',
+                     'xoxb-private', 'password=private', 'cookie=private',
+                     'otp=654321', '4242424242424242', 'mds'+'a1'*20):
+            with self.subTest(name=name):
+                label = cpu_labels.family('/Users/tester/.local/bin/'+name)
+                self.assertIn('redacted', label.lower())
+                props = toollog.cpu_fields(dict(top=[dict(family=label, parentFamily=label)]))
+                self.assertNotIn(name, json.dumps(props))
+        with patch('cpu_labels.janitor_redact', side_effect=ImportError):
+            self.assertEqual(cpu_labels.family('/Users/tester/bin/python3.9'), '[redacted]')
 
     def test_spike_threshold_cap_reset_and_optional_failure(self):
         for load, expected in ((32, 0), (32.001, 1)):
