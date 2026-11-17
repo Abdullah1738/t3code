@@ -309,6 +309,7 @@ const threads = Layer.effect(
       } satisfies KanbanThreadView;
     });
     return KanbanThreads.of({
+      remove: () => Effect.void,
       claimContext: (threadId) =>
         Effect.sync(() => (views.has(threadId) ? { projectId, model } : null)),
       view,
@@ -323,6 +324,7 @@ const threads = Layer.effect(
           status: views.get(threadId) === false ? "completed" : "running",
           message: null,
         }),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: Effect.fn("OverloadProvider.launch")(function* () {

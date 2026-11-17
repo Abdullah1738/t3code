@@ -123,6 +123,35 @@ it.effect.each([
   }).pipe(Effect.provide(layer)),
 );
 
+it.effect.each([
+  ["SQL", sqlLayer],
+  ["memory", Projection.layerMemory],
+] as const)("%s recovery pages match the old sorted set, including non-id cursors", ([, layer]) =>
+  Effect.gen(function* () {
+    const store = yield* Projection.ProjectionStoreV2;
+    for (let n = 0; n < 35; n++)
+      yield* seed({
+        id: `page-${String(n).padStart(3, "0")}`,
+        archived: n % 7 === 0,
+        deleted: n % 11 === 0,
+      });
+    yield* seed({ id: "quote'comma,?" });
+    const all = [...(yield* store.listActiveThreadIds())].sort();
+    for (const cursor of [null, "", "page-00", "page-004", "page-004x", "page-020", "zzz"]) {
+      const remaining = all.filter((id) => cursor === null || id > cursor);
+      for (const limit of [1, 5, 50, 500]) {
+        const ids = yield* store.pageActiveThreadIds(cursor, limit + 1);
+        const expected = remaining.slice(0, limit);
+        assert.deepEqual(ids.slice(0, limit), expected);
+        assert.equal(
+          ids.length > limit ? ids[limit - 1] : null,
+          remaining.length > limit ? expected.at(-1) : null,
+        );
+      }
+    }
+  }).pipe(Effect.provide(layer)),
+);
+
 it.effect("SQL active IDs select only IDs and never read or decode shells", () =>
   Effect.gen(function* () {
     const store = yield* Projection.ProjectionStoreV2;
@@ -225,6 +254,16 @@ it.live.skipIf(process.env.T3_BENCH_ACTIVE_THREAD_IDS !== "1")(
             Layer.provide(
               Layer.mergeAll(
                 Layer.mock(ThreadManagement.ThreadManagementService)({
+                  pageActiveThreadIds: (cursor, limit) =>
+                    (oldPath ? oldIds() : store.listActiveThreadIds()).pipe(
+                      Effect.map((ids) =>
+                        [...ids]
+                          .sort()
+                          .filter((id) => cursor === null || id > cursor)
+                          .slice(0, limit),
+                      ),
+                      Effect.orDie,
+                    ),
                   listActiveThreadIds: () =>
                     (oldPath ? oldIds() : store.listActiveThreadIds()).pipe(Effect.orDie),
                   getThreadShell: () => Effect.succeed(null),

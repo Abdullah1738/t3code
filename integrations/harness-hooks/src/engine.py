@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import random
 import re
 import secrets
 import shlex
@@ -28,17 +29,26 @@ import card_mask
 import desktop_lease
 import statev2_guard
 import snapshot_guard
+import shared_deps_guard
 import quint_verify_guard
 import rootwide_search_guard
+import phone_adb_guard
 
 
 import toollog
 
+GATE_LIGHT_SAMPLE = 20
+
 
 def _tool_log(**fields):
     try:
-        from offbox_toollog import emit
         props = fields.get("props", {})
+        if (fields.get("kind") == "perf" and fields.get("ok") is True
+                and props.get("decision") == "allowed" and props.get("commandClass") == "light"):
+            if not random.random() < 1 / GATE_LIGHT_SAMPLE:
+                return
+            props["sample"] = GATE_LIGHT_SAMPLE
+        from offbox_toollog import emit
         if props.get("harness") == "claude":
             props["harness"] = "claudeAgent"
         emit("gate", "gate.decision", **fields)
@@ -81,13 +91,15 @@ _LOG_RULES = {
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
     "live-database-snapshot",
-    "rootwide-search", "quint-verify", "card-mask",
+    "rootwide-search", "quint-verify", "shared-dependencies", "card-mask",
+    "phone-adb-state", "phone-adb-forward", "phone-adb-state-unleased", "phone-adb-forward-unleased", "phone-adb-unavailable",
 }
 _LOG_ERRORS = {
+    "phone-lock-unavailable",
     "session-export-error", "adapter-error", "ambiguous-native-identity", "missing-native-identity",
     "identity-unavailable", "identity-pending", "identity-ambiguous", "TimeoutExpired",
     "ValueError", "TypeError", "OSError", "RuntimeError", "PermissionError", "FileNotFoundError",
-    "TimeoutError", "HTTPError", "URLError", "JSONDecodeError", "CalledProcessError",
+    "TimeoutError", "ConnectionRefusedError", "HTTPError", "URLError", "JSONDecodeError", "CalledProcessError",
 }
 
 
@@ -99,7 +111,7 @@ def _log(**record):
     try:
         rule = _log_enum(record.get("rule"), _LOG_RULES) or "no-policy"
         guard = ("statev2" if rule.startswith("live-database") else "betterstack-scope" if rule == "betterstack-scope"
-                 else "quint-verify" if rule == "quint-verify" else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
+                 else "phone-adb" if rule.startswith("phone-adb") else "quint-verify" if rule == "quint-verify" else "rootwide-search" if rule == "rootwide-search" else "offbox-gate" if rule.startswith("offbox") or rule in {
                      "go-test", "go-build", "tsc-project", "eslint-repo", "pkg-run-check", "pkg-check-bare",
                      "pytest", "js-test", "vp-test", "bun-test", "pkg-test", "pkg-run-test", "pkg-install", "yarn-bare",
                      "docker-run", "docker-container-run", "docker-build", "docker-buildx-build", "docker-compose-up", "docker-compose-v1",
@@ -145,6 +157,11 @@ def _log(**record):
             "cause": record.get("cause")[:240] if record.get("rule") == "live-database-script-unresolved" and isinstance(record.get("cause"), str) else None,
             "audit_error": audit_error,
         }
+        if guard == "desktop-lease":
+            row.update(record.get("desktop_timing") or {})
+            call_id = record.get("toolUseId")
+            if isinstance(call_id, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", call_id):
+                row["toolUseId"] = call_id
         fd = os.open(path / "decisions.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -757,6 +774,7 @@ def _shell_input_field(event, harness):
 
 def decide(event, harness):
     """Return {decision, reason, context}; JSONL-log every call, including failures."""
+    desktop_timing = {}
     start = time.monotonic()
     command = None
     identity = {}
@@ -787,9 +805,9 @@ def decide(event, harness):
             # This policy must not enter the general engine's fail-open identity path.
             try:
                 if kind == "PreToolUse":
-                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control, _state())
+                    decision, reason, rule, error_type = desktop_lease.admit(event, harness, _control, _state(), desktop_timing)
                 else:
-                    rule, error_type = desktop_lease.finish(event, harness, _control, _state())
+                    rule, error_type = desktop_lease.finish(event, harness, _control, _state(), desktop_timing)
                     decision, reason = "allow", ""
                 result = {"decision": decision, "reason": reason, "context": {"rule": rule}}
             except Exception as error:
@@ -808,6 +826,31 @@ def decide(event, harness):
             inp = event.get("tool_input", {})
             command_cwd = inp.get("workdir") or inp.get("cwd") or cwd or os.getcwd()
             cwd = command_cwd
+            try:
+                phone = phone_adb_guard.classify(command)
+            except Exception:
+                # A phone-parser failure must not bypass the independent
+                # search, database or offbox guards below.
+                phone = {"matched": False, "reason": None, "rule": "phone-adb-unavailable", "error": "phone-lock-unavailable"}
+            if phone['reason']:
+                error_type = phone['error']
+                result = {"decision": "deny", "reason": phone['reason'], "context": {"rule": phone['rule']}}
+                return result
+            if phone['matched'] or phone['error']:
+                # Admission continues through the independent guards. Keep a
+                # separate phone decision so unleased calls remain countable.
+                _log(harness=harness, event=kind, tool=tool, command=command, cwd=cwd,
+                     rule=phone['rule'], decision="allow", error=phone['error'])
+            try:
+                shared_reason = shared_deps_guard.classify(command, command_cwd)
+            except Exception as error:
+                # This policy must not disable the independent database and offbox guards.
+                error_type = type(error).__name__
+                shared_reason = None
+            if shared_reason:
+                result = {"decision": "deny", "reason": shared_reason,
+                          "context": {"rule": "shared-dependencies"}}
+                return result
             if quint_verify_guard.classify(command, command_cwd):
                 result = {"decision": "deny", "reason": quint_verify_guard.REASON,
                           "context": {"rule": "quint-verify"}}
@@ -930,7 +973,8 @@ def decide(event, harness):
         _log(harness=harness, event=event.get("hook_event_name") if isinstance(event, dict) else None,
              tool=log_tool or (event.get("tool_name") if isinstance(event, dict) else None),
              robobThreadId=identity.get("robobThreadId"), decision=result["decision"], rule=result["context"].get("rule"),
-             identity_source=identity.get("identity_source"), cause=result["context"].get("cause"),
+             identity_source=identity.get("identity_source"), cause=result["context"].get("cause"), desktop_timing=desktop_timing,
+             toolUseId=event.get("tool_use_id") if isinstance(event, dict) else None,
              sessionId=_native(event, harness)[0] if isinstance(event, dict) else None,
              nativeAgentId=event.get("agent_id") if harness == "claude" and isinstance(event, dict) else None,
              cardNumber=identity.get("cardNumber"), cwd=cwd, matchedRoot=matched_root,

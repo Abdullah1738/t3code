@@ -38,6 +38,7 @@ export const layer = McpToolAccess.toLayer(ThreadRedactionToolkit, {
         scope.client.maintenanceAuthorized !== true
       ) {
         return yield* new OrchestratorMcpFailure({
+          reason: "maintenance_client_required",
           code: "capability_denied",
           message:
             "Redaction requires an owner-approved maintenance client. Thread and card-worker credentials are denied.",
@@ -48,7 +49,12 @@ export const layer = McpToolAccess.toLayer(ThreadRedactionToolkit, {
         .redactItem(input)
         .pipe(
           Effect.mapError(
-            (e) => new OrchestratorMcpFailure({ code: "invalid_request", message: e.message }),
+            (e) =>
+              new OrchestratorMcpFailure({
+                reason: "invalid_args",
+                code: "invalid_request",
+                message: e.message,
+              }),
           ),
         );
     }),

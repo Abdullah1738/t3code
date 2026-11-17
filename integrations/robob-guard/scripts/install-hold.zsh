@@ -18,6 +18,10 @@ robob_hold_end() {
   "$HOME/.local/bin/robob-install-hold" stop --by "$ROBOB_INSTALL_HOLD_BY" --pid "$ROBOB_INSTALL_HOLD_PID" || true
 }
 
+robob_quit_reason() {
+  /usr/bin/python3 -I "${${(%):-%x}:A:h}/../quit_reason.py" --initiator installer --reason "$1"
+}
+
 robob_hold_health() {
   local response
   response=$("$@") || return 1

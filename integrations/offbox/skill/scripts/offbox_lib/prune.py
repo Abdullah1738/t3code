@@ -238,7 +238,13 @@ class Result(NamedTuple):
     timed_out: bool = False
 
 
-def run(con, box_id: str, current: str) -> Result:
+def clean_trash(box_id):
+    # Disk recovery must measure after deletion, rather than racing the ordinary background cleanup.
+    cleanup = 'rm -rf "$HOME/.offbox/trash"; sudo -n fstrim / >/dev/null 2>&1'
+    ssh_sync.ssh(box_id, 'timeout 8 bash -c ' + shlex.quote(cleanup), timeout=10)
+
+
+def run(con, box_id: str, current: str, *, force=False) -> Result:
     """Move old checkouts out of ~/w; only an SSH identity failure interrupts the caller."""
     timed_out = False
     try:
@@ -247,10 +253,12 @@ def run(con, box_id: str, current: str) -> Result:
         # aged-out pass can't drop it and replay settled dirs (they are re-offered only after they go stale again).
         raw = kv_get(con, key)
         prev = kv_get(con, key, max_age=EVERY_S)
-        if prev is not None and not (prev.get("left") and now() - prev.get("at", 0) >= RETRY_S):
+        if not force and prev is not None and not (prev.get("left") and now() - prev.get("at", 0) >= RETRY_S):
             return Result()
         if _protected(con, box_id):
             return Result()
+        if force and con.execute('SELECT 1 FROM prune_holds WHERE box_id=?', (box_id,)).fetchone():
+            return Result(0, True)
         # settled maps dir -> the last-used time it was settled at. It only suppresses that generation: a recreated
         # checkout that is used and goes stale again has a newer last-used time, so it is offered again.
         settled = _settled_map((raw or {}).get("settled"))
@@ -259,6 +267,8 @@ def run(con, box_id: str, current: str) -> Result:
         # Every path below keeps the settled map, so a failed pass never replays settled dirs on the next one.
         kv_set(con, key, {"at": now(), "stale": len(dirs), "left": len(dirs), "settled": settled})
         if not dirs:
+            if force:
+                clean_trash(box_id)
             return Result()
         run_id = f"{WORKER_ID_PREFIX}{common.now()}-{os.getpid()}-{secrets.token_hex(3)}"
         # The hold is taken before the remote script can start and released only when its worker is confirmed gone.
@@ -301,6 +311,8 @@ def run(con, box_id: str, current: str) -> Result:
             con.commit()
             event(con, box_id, "box_prune", f"{len(done)} of {len(dirs)} stale: " + " ".join(done))
             say(f"pruned {len(done)} old checkout(s) on {box_id} (OFFBOX_PRUNE_KEEP / OFFBOX_PRUNE_DAYS)")
+        if force and finished:
+            clean_trash(box_id)
         return Result(len(done), timed_out)
     except common.SshHostKeyMismatch:
         raise

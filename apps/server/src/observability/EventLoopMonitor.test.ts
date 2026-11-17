@@ -3,6 +3,7 @@ import * as NodeTimers from "node:timers";
 import * as NodeV8 from "node:v8";
 import * as NodeVM from "node:vm";
 import * as NodePerfHooks from "node:perf_hooks";
+import * as NodeProcess from "node:process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -12,6 +13,7 @@ import * as Logger from "effect/Logger";
 import * as Metric from "effect/Metric";
 import * as Tracer from "effect/Tracer";
 import * as TestClock from "effect/testing/TestClock";
+import { vi } from "vite-plus/test";
 
 import * as EventLoopMonitor from "./EventLoopMonitor.ts";
 
@@ -31,6 +33,8 @@ const stalled: EventLoopMonitor.EventLoopReadings = {
   },
   rssBytes: 1536 * 1024 * 1024,
   heapUsedBytes: 512 * 1024 * 1024,
+  heapTotalBytes: 768 * 1024 * 1024,
+  externalBytes: 32 * 1024 * 1024,
   gc: { count: 3, totalMs: 450.5, maxMs: 400, majorCount: 1, majorMaxMs: 400 },
   elapsedMs: 30_000,
 };
@@ -53,6 +57,72 @@ const monitor = (
   );
 
 describe("EventLoopMonitor", () => {
+  it.effect(
+    "logs memory to the logger and a root trace every sixty seconds and stops with scope",
+    () => {
+      // TestClock advances the heartbeat while the process may still be in its first half-second.
+      const uptime = vi
+        .spyOn(NodeProcess.getBuiltinModule("process"), "uptime")
+        .mockReturnValue(0.1);
+      const spans: Array<Tracer.NativeSpan> = [];
+      const messages: Array<unknown> = [];
+      const tracer = Tracer.make({
+        span: (options) => {
+          const span = new Tracer.NativeSpan(options);
+          spans.push(span);
+          return span;
+        },
+      });
+      const logger = Logger.make(({ message }) => messages.push(message));
+      return Effect.gen(function* () {
+        yield* Effect.gen(function* () {
+          yield* monitor([quiet, stalled, quiet]);
+          yield* TestClock.adjust("60 seconds");
+          assert.lengthOf(
+            spans.filter((span) => span.name === "server.memory"),
+            1,
+          );
+          yield* TestClock.adjust("30 seconds");
+          assert.lengthOf(
+            spans.filter((span) => span.name === "server.memory"),
+            1,
+          );
+          yield* TestClock.adjust("30 seconds");
+          assert.lengthOf(
+            spans.filter((span) => span.name === "server.memory"),
+            2,
+          );
+        }).pipe(Effect.scoped);
+        yield* TestClock.adjust("120 seconds");
+        const memory = spans.filter((span) => span.name === "server.memory");
+        assert.lengthOf(memory, 2);
+        for (const span of memory) {
+          const attributes = Object.fromEntries(span.attributes);
+          assert.deepInclude(attributes, {
+            rss: quiet.rssBytes,
+            heapUsed: quiet.heapUsedBytes,
+            heapTotal: quiet.heapTotalBytes,
+            external: quiet.externalBytes,
+          });
+          assert.strictEqual(attributes.uptimeSeconds, 0);
+          assert.isAbove(Number(attributes.heapLimit), 0);
+          assert.isTrue(
+            messages.some(
+              (message) =>
+                Array.isArray(message) &&
+                message[0] === "server memory" &&
+                JSON.stringify(message[1]) === JSON.stringify(attributes),
+            ),
+          );
+        }
+      }).pipe(
+        Effect.withTracer(tracer),
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.ensuring(Effect.sync(() => uptime.mockRestore())),
+      );
+    },
+  );
+
   it.effect("samples HTTP sockets on the resource telemetry tick", () =>
     Effect.gen(function* () {
       let samples = 0;
@@ -87,15 +157,18 @@ describe("EventLoopMonitor", () => {
       yield* Effect.gen(function* () {
         yield* monitor([stalled, quiet, { ...stalled, sampledAt: "1970-01-01T00:01:29.999Z" }]);
         yield* TestClock.adjust("60 seconds");
-        assert.lengthOf(spans, 0);
+        assert.lengthOf(
+          spans.filter((span) => span.name !== "server.memory"),
+          0,
+        );
         yield* TestClock.adjust("30 seconds");
       }).pipe(Effect.scoped, Effect.withTracer(tracer));
 
       assert.deepStrictEqual(
-        spans.map((span) => span.name),
+        spans.map((span) => span.name).filter((name) => name !== "server.memory"),
         ["server.eventLoop.stall"],
       );
-      const [span] = spans;
+      const span = spans.find((span) => span.name === "server.eventLoop.stall");
       assert.deepStrictEqual(Object.fromEntries(span!.attributes), {
         delayMaxMs: 4_950,
         utilization: 0.18,
@@ -483,7 +556,8 @@ describe("EventLoopMonitor", () => {
 
   it.effect("warns when a stall cannot be written to the stall log", () => {
     const warnings: Array<unknown> = [];
-    const logger = Logger.make(({ message }) => {
+    const logger = Logger.make(({ message, logLevel }) => {
+      if (logLevel !== "Warn") return;
       warnings.push(Array.isArray(message) ? message[0] : message);
     });
     return Effect.gen(function* () {

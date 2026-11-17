@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as DelegatedTaskProgressGuard from "../orchestration-v2/DelegatedTaskProgressGuard.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -27,6 +28,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 
+import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
@@ -48,16 +50,26 @@ import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
 
-const driver = ProviderDriverKind.make("claudeAgent");
-const instanceId = ProviderInstanceId.make("claudeAgent");
-const modelSelection = { instanceId, model: "claude-test" };
-
 it.effect.each([
   "silent",
+  "post_tool_recovery",
+  "first_event_recovery",
+  "first_event_adapter_owned_claude",
+  "first_event_recovery_continuation_queued",
+  "first_event_recovery_continuation_preparing",
+  "first_event_recovery_continuation_starting",
+  "first_event_recovery_network_continuation_queued",
+  "first_event_recovery_network_continuation_preparing",
+  "first_event_recovery_network_continuation_starting",
+  "post_tool_adapter_owned_claude",
+  "post_tool_recovery_race",
+  "first_event_recovery_race",
+  "reasoning_no_recovery",
   "command_execution",
   "dynamic_tool",
   "file_change",
@@ -73,8 +85,22 @@ it.effect.each([
   "new_attempt",
   "ended_run",
   "new_current_run",
-] as const)("delegated stall commit: %s", (race) =>
-  Effect.scoped(
+] as const)("delegated stall commit: %s", (race) => {
+  const recovering =
+    (race.startsWith("post_tool") || race.startsWith("first_event")) && !race.endsWith("claude");
+  const recoveryRace = race.includes("_race");
+  const firstEvent = race.startsWith("first_event");
+  const postTool = race.startsWith("post_tool");
+  const codex = (recovering || race === "reasoning_no_recovery") && !race.endsWith("claude");
+  const driver = ProviderDriverKind.make(codex ? "codex" : "claudeAgent");
+  const instanceId = ProviderInstanceId.make(driver);
+  const modelSelection = {
+    instanceId,
+    model: codex ? "gpt-6.1-sol" : "claude-test",
+    options: codex ? [{ id: "serviceTier", value: "default" }] : [{ id: "fastMode", value: false }],
+  };
+  const capabilities = codex ? CodexProviderCapabilitiesV2 : ClaudeProviderCapabilitiesV2;
+  return Effect.scoped(
     Effect.gen(function* () {
       const cwd = yield* checkpointWorkspace("task-cancel-native-subagent");
       const turns: Array<{
@@ -85,7 +111,7 @@ it.effect.each([
       const adapter: ProviderAdapter.ProviderAdapterV2["Service"] = {
         instanceId,
         driver,
-        getCapabilities: () => Effect.succeed(ClaudeProviderCapabilitiesV2),
+        getCapabilities: () => Effect.succeed(capabilities),
         planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
         openSession: (input) =>
           Effect.gen(function* () {
@@ -102,7 +128,7 @@ it.effect.each([
                 status: "ready",
                 cwd,
                 model: modelSelection.model,
-                capabilities: ClaudeProviderCapabilitiesV2,
+                capabilities,
                 createdAt: now,
                 updatedAt: now,
                 lastError: null,
@@ -150,7 +176,7 @@ it.effect.each([
               interruptTurn: ({ providerTurnId, providerThread }) =>
                 Effect.gen(function* () {
                   interrupts += 1;
-                  const entry = turns.find(
+                  const entry = turns.findLast(
                     (entry) => entry.turn.threadId === providerThread.appThreadId,
                   )!;
                   yield* Queue.offer(events, {
@@ -323,24 +349,56 @@ it.effect.each([
           phase: "narration",
           streaming: false,
         } as const;
-        const partialStored = yield* watch(
-          (event) => event.type === "turn-item.updated" && event.payload.id === partial.id,
-        );
-        const childRuntime = turns.find((entry) => entry.turn.threadId === task.childThreadId)!;
-        yield* Queue.offer(childRuntime.events, {
-          type: "turn_item.updated",
-          driver,
-          turnItem: partial,
-        });
-        yield* Fiber.join(partialStored);
-        yield* guard.handle({
-          id: EventId.make("guard-text"),
-          type: "turn-item.updated",
-          threadId: task.childThreadId!,
-          runId: childRun.id,
-          occurredAt: now,
-          payload: partial,
-        });
+        if (!firstEvent) {
+          const partialStored = yield* watch(
+            (event) => event.type === "turn-item.updated" && event.payload.id === partial.id,
+          );
+          const childRuntime = turns.find((entry) => entry.turn.threadId === task.childThreadId)!;
+          yield* Queue.offer(childRuntime.events, {
+            type: "turn_item.updated",
+            driver,
+            turnItem: partial,
+          });
+          yield* Fiber.join(partialStored);
+          yield* guard.handle({
+            id: EventId.make("guard-text"),
+            type: "turn-item.updated",
+            threadId: task.childThreadId!,
+            runId: childRun.id,
+            occurredAt: now,
+            payload: partial,
+          });
+        }
+        if (postTool || race === "reasoning_no_recovery") {
+          const item = {
+            ...partial,
+            id: TurnItemId.make("last-model-event"),
+            ...(postTool
+              ? {
+                  type: "dynamic_tool" as const,
+                  toolName: "t3-code.list_thread_pull_requests",
+                  input: {},
+                  output: "[]",
+                }
+              : { type: "reasoning" as const, text: "Thinking" }),
+          };
+          const stored = yield* watch(
+            (event) => event.type === "turn-item.updated" && event.payload.id === item.id,
+          );
+          yield* Queue.offer(
+            turns.findLast((entry) => entry.turn.threadId === task.childThreadId)!.events,
+            { type: "turn_item.updated", driver, turnItem: item },
+          );
+          yield* Fiber.join(stored);
+          yield* guard.handle({
+            id: EventId.make("guard-last-event"),
+            type: "turn-item.updated",
+            threadId: task.childThreadId!,
+            runId: childRun.id,
+            occurredAt: now,
+            payload: item,
+          });
+        }
         const scope: McpInvocationScope = {
           environmentId: EnvironmentId.make("environment:task-stall"),
           requestNamespace: "provider-session:task-stall",
@@ -354,10 +412,207 @@ it.effect.each([
           issuedAt: 1,
         };
         const before = yield* service.taskStatus(scope, task.id);
-        assert.equal(before.lastProgressKind, "assistant_text");
+        assert.equal(
+          before.lastProgressKind,
+          firstEvent ? "run_started" : postTool ? "dynamic_tool_finished" : "assistant_text",
+        );
         assert.equal(before.lastProgressAt, DateTime.formatIso(now));
         yield* TestClock.adjust("16 minutes");
-        if (race !== "silent") {
+        let stalledAt = now;
+        if (!codex && (firstEvent || postTool)) {
+          const threads = yield* ThreadManagementService.ThreadManagementService;
+          const rejected = yield* threads
+            .sendToThread({
+              threadId: task.childThreadId!,
+              projectId: ProjectId.make("project:task-cancel"),
+              commandId: CommandId.make("duplicate-claude-silent-recovery"),
+              messageId: MessageId.make("duplicate-claude-silent-recovery"),
+              mode: "restart",
+              createdBy: "system",
+              creationSource: "server",
+              modelSelection,
+              text: "Continue",
+              attachments: [],
+              delegatedTaskStallRecovery: {
+                phase: postTool ? "post_tool" : "first_event",
+                lastProgressAt: DateTime.formatIso(now),
+                attemptId: childRun.activeAttemptId,
+              },
+            })
+            .pipe(Effect.result);
+          assert.equal(rejected._tag, "Failure");
+          assert.equal(interrupts, 0);
+          yield* guard.check();
+          yield* worker.drain();
+          const current = yield* orchestrator.getThreadProjection(task.childThreadId!);
+          assert.lengthOf(current.attempts, 1);
+          assert.isUndefined(current.runs[0]!.delegatedTaskStallRecovery);
+          assert.equal(interrupts, 1);
+          return;
+        }
+        if (recovering && recoveryRace) {
+          const sink = yield* EventSink.EventSinkV2;
+          const originalCommit = sink.commitCommand;
+          let injected = false;
+          Object.assign(sink, {
+            commitCommand: (input: Parameters<typeof originalCommit>[0]) =>
+              Effect.gen(function* () {
+                if (!injected && input.commandType === "message.dispatch") {
+                  injected = true;
+                  const at = yield* DateTime.now;
+                  yield* sink.write({
+                    events: [
+                      {
+                        id: EventId.make("racing-recovery-output"),
+                        type: "turn-item.updated",
+                        threadId: task.childThreadId!,
+                        runId: childRun.id,
+                        occurredAt: at,
+                        payload: { ...partial, text: "New output before recovery", updatedAt: at },
+                      },
+                    ],
+                  });
+                }
+                return yield* originalCommit(input);
+              }),
+          });
+          yield* guard.check();
+          assert.isTrue(injected);
+          yield* worker.drain();
+          const current = (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!;
+          assert.isUndefined(current.delegatedTaskStallRecovery);
+          assert.isUndefined(current.delegatedTaskStall);
+          assert.equal(
+            turns.filter((entry) => entry.turn.threadId === task.childThreadId).length,
+            1,
+          );
+          return;
+        }
+        if (recovering) {
+          const networkContinuation = race.includes("_network_continuation_");
+          let recovered = childRun;
+          if (!networkContinuation) {
+            const running = yield* turnRunning();
+            yield* guard.check();
+            assert.isDefined(
+              (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!
+                .delegatedTaskStallRecovery,
+            );
+            yield* worker.drain();
+            yield* Fiber.join(running);
+            recovered = (yield* orchestrator.getThreadProjection(task.childThreadId!)).runs[0]!;
+            assert.equal(recovered.id, childRun.id);
+            assert.equal(recovered.providerThreadId, childRun.providerThreadId);
+            assert.notEqual(recovered.activeAttemptId, childRun.activeAttemptId);
+            assert.equal(
+              recovered.delegatedTaskStallRecovery?.phase,
+              postTool ? "post_tool" : "first_event",
+            );
+            const restarted = turns.findLast(
+              (entry) => entry.turn.threadId === task.childThreadId,
+            )!.turn;
+            assert.deepEqual(restarted.modelSelection, childRun.modelSelection);
+            assert.include(
+              restarted.message.text,
+              postTool ? "Write your final report now from what you have." : "Review the change",
+            );
+          }
+          if (race.includes("_continuation_")) {
+            const queued = race.endsWith("queued");
+            const continuationSource: typeof recovered = networkContinuation
+              ? {
+                  ...recovered,
+                  transientRecovery: {
+                    firstError: {
+                      class: "transport_error" as const,
+                      category: "transient" as const,
+                      code: "claude_network_error",
+                      retryable: true,
+                      message: "Connection dropped (ECONNRESET)",
+                    },
+                    since: DateTime.formatIso(yield* DateTime.now),
+                  },
+                }
+              : recovered;
+            const sink = yield* EventSink.EventSinkV2;
+            const bootCommandId = CommandId.make("command:runtime-reconcile:startup:boot");
+            yield* sink.writeWithEffects({
+              commandId: bootCommandId,
+              events: [
+                {
+                  id: EventId.make("boot-interrupted"),
+                  type: "run.updated",
+                  threadId: task.childThreadId!,
+                  runId: recovered.id,
+                  occurredAt: yield* DateTime.now,
+                  payload: {
+                    ...continuationSource,
+                    status: queued ? "waiting" : "interrupted",
+                    completedAt: yield* DateTime.now,
+                    ...(queued
+                      ? {
+                          restartCancelledBackgroundWork: [{ kind: "task", label: "Pending work" }],
+                        }
+                      : {}),
+                  },
+                },
+              ],
+              effects: [
+                {
+                  id: `effect:restart-continuation:${recovered.id}`,
+                  commandId: bootCommandId,
+                  threadId: task.childThreadId!,
+                  request: { type: "provider-runtime.continue", sourceRunId: recovered.id },
+                },
+              ],
+            });
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make("boot-continuation"),
+              threadId: task.childThreadId!,
+              messageId: MessageId.make("boot-continuation"),
+              restartContinuationOfRunId: recovered.id,
+              text: "Continue",
+              attachments: [],
+              dispatchMode: {
+                type: queued
+                  ? "queue_after_active"
+                  : race.endsWith("preparing")
+                    ? "defer_start"
+                    : "start_immediately",
+              },
+              modelSelection,
+              createdBy: "agent",
+              creationSource: "server",
+            });
+            const continuation = (yield* orchestrator.getThreadProjection(
+              task.childThreadId!,
+            )).runs.at(-1)!;
+            assert.notEqual(continuation.id, recovered.id);
+            assert.equal(
+              continuation.status,
+              queued ? "queued" : race.endsWith("preparing") ? "preparing" : "starting",
+            );
+            assert.equal(continuation.delegatedTaskId, recovered.delegatedTaskId);
+            assert.deepEqual(
+              continuation.delegatedTaskStallRecovery,
+              continuationSource.delegatedTaskStallRecovery,
+            );
+            assert.deepEqual(continuation.transientRecovery, continuationSource.transientRecovery);
+            return;
+          }
+          stalledAt = yield* DateTime.now;
+          yield* guard.handle({
+            id: EventId.make("guard-recovered"),
+            type: "run.updated",
+            threadId: task.childThreadId!,
+            runId: recovered.id,
+            occurredAt: stalledAt,
+            payload: recovered,
+          });
+          yield* TestClock.adjust("16 minutes");
+        }
+        if (!recovering && race !== "silent" && race !== "reasoning_no_recovery") {
           const sink = yield* EventSink.EventSinkV2;
           const originalCommit = sink.commitCommand;
           let injected = false;
@@ -528,14 +783,20 @@ it.effect.each([
         const after = yield* service.taskStatus(scope, task.id);
         assert.equal(after.status, "failed");
         assert.equal(after.failureReason, "stalled");
-        assert.match(after.summary!, /^Stalled: no tool call or text for 15 min/);
+        assert.match(after.summary!, /^stalled: no model output for 16 min/);
         assert.isTrue(after.resultLooksIncomplete);
-        assert.include(after.incompleteReason!, "its last text was a progress note");
-        assert.include(after.summary!, DateTime.formatIso(now));
-        assert.include(after.summary!, "I checked the first file.");
+        if (!firstEvent)
+          assert.include(after.incompleteReason!, "its last text was a progress note");
+        assert.include(after.summary!, DateTime.formatIso(stalledAt));
+        if (!firstEvent) assert.include(after.summary!, "I checked the first file.");
+        if (recovering)
+          assert.equal(
+            turns.filter((entry) => entry.turn.threadId === task.childThreadId).length,
+            2,
+          );
         const parentAfter = yield* orchestrator.getThreadProjection(parentThreadId);
-        assert.include(parentAfter.subagents[0]!.result!, "Stalled:");
-        assert.isTrue(parentAfter.messages.some((message) => message.text.includes("Stalled:")));
+        assert.include(parentAfter.subagents[0]!.result!, "stalled:");
+        assert.isTrue(parentAfter.messages.some((message) => message.text.includes("stalled:")));
         const cancelled = yield* service.cancelTask(scope, {
           taskId: task.id,
           clientRequestId: "after-stall",
@@ -543,5 +804,5 @@ it.effect.each([
         assert.equal(cancelled.status, "failed");
       }).pipe(Effect.provide(layerTest));
     }),
-  ),
-);
+  );
+});

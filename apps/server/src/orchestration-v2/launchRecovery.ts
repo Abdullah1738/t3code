@@ -12,13 +12,17 @@ export function isAutomaticClaudeRecovery(
   driver: string,
   run: Pick<
     OrchestrationV2Run,
-    "launchRecovery" | "transientRecovery" | "restartContinuationOfRunId"
+    | "launchRecovery"
+    | "transientRecovery"
+    | "delegatedTaskStallRecovery"
+    | "restartContinuationOfRunId"
   >,
 ) {
   return (
     driver === "claudeAgent" &&
     (run.launchRecovery !== undefined ||
       run.transientRecovery !== undefined ||
+      run.delegatedTaskStallRecovery !== undefined ||
       run.restartContinuationOfRunId !== undefined)
   );
 }
@@ -84,6 +88,7 @@ export function nextLaunchRecovery(input: {
     evidence?.beforeResponse !== true ||
     failure.category === "context_exhausted" ||
     run.transientRecovery !== undefined ||
+    run.delegatedTaskStallRecovery !== undefined ||
     run.launchRecovery?.replayAllowed === false ||
     input.thread.archivedAt !== null ||
     input.thread.deletedAt !== null
@@ -103,6 +108,7 @@ export function nextLaunchRecovery(input: {
     input.automated &&
     /(?:\bplease relay\b|\[Watcher event\b)/i.test(input.text) &&
     (access || failure.category === "transient");
+  if (relay && failure.retryable === false) return undefined;
   const index = models.indexOf(run.modelSelection.model);
   const kind: "model_access" | "relay" | undefined = relay
     ? "relay"

@@ -4,6 +4,7 @@ Watcher checks supply already-read evidence. No polling process or merchant
 request is started here. Only the allowlisted view is written to the web root.
 """
 import threading
+import toollog
 import argparse
 from collections import Counter
 import datetime as dt
@@ -111,8 +112,13 @@ def items(rows, *, private_notes=False):
         if not isinstance(row, dict):
             continue
         name = text(row.get('name') or row.get('title') or row.get('productTitle') or row.get('product_name'))
-        ident = text(row.get('sku') or row.get('sku_config') or row.get('skuConfig') or
+        ident = text(row.get('item_code') or row.get('itemCode') or row.get('sku') or row.get('sku_config') or row.get('skuConfig') or
                      row.get('item_id') or row.get('product_code') or row.get('productCode'), 80)
+        identifiers = {key: value for key, raw in (
+            ('item_code', row.get('item_code') or row.get('itemCode')),
+            ('sku', row.get('sku')), ('sku_config', row.get('sku_config') or row.get('skuConfig')),
+            ('item_id', row.get('item_id')),
+        ) if (value := text(raw, 80))}
         qty = number(row.get('qty', row.get('quantity', 1)))
         if not qty or qty != int(qty):
             continue
@@ -127,7 +133,7 @@ def items(rows, *, private_notes=False):
                        if isinstance(row.get(k), str) and row[k].strip()), None)
         if private_notes and isinstance(row.get('notes'),str) and row['notes'].strip():
             detail=(detail+'; ' if detail else '')+'Note: '+text(row['notes'],500)
-        out.append({'name': name or (f'Item {ident}' if ident else 'Item details pending'),
+        out.append({**identifiers, 'name': name or (f'Item {ident}' if ident else 'Item details pending'),
                     'unresolved': bool(row.get('unresolved') or not name), 'detail': detail,
                     'qty': int(qty), 'price': price, 'line_total': amount(row.get('line_total')),
                     'image': image_url(row.get('image_url') or row.get('image') or row.get('imageUrl'))})
@@ -1102,6 +1108,7 @@ def safe_sync(cfg, data, *, send=False, recover=False, update=False):
         return {'status': 'failed:' + type(exc).__name__ + ':' + str(exc), 'rendered': False}
 
 
+@toollog.entrypoint('delivery-card', 'delivery-card')
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--app', required=True, choices=THEMES)
@@ -1142,7 +1149,7 @@ def main(argv=None):
         else:
             domain_args = ['--merchant-domain', a.merchant_domain] if a.app == 'web' else []
             p = subprocess.run([str(Path.home() / '.local/bin/order-watch'), 'status', '--app', a.app, '--order', a.order,
-                                *domain_args], capture_output=True, text=True, timeout=240)
+                                *domain_args], capture_output=True, text=True, timeout=240, env=toollog.caller_env())
             if p.returncode:
                 raise SystemExit('order-watch status failed')
             data = json.loads(p.stdout)

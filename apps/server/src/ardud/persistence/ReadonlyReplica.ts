@@ -1,5 +1,6 @@
 import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
+import { StatementStats } from "@t3tools/shared/nodeSqliteClient";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -192,6 +193,7 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   options: SupervisorOptions = defaultSupervisorOptions,
 ): Effect.fn.Return<never, ReadonlyExportUnavailable> {
   const observer = yield* ErrorObserver;
+  const statementStats = yield* StatementStats;
   const clock = yield* Clock.Clock;
   const stallMs = Duration.toMillis(Duration.fromInputUnsafe(options.stallTimeout));
   let lastBeat = clock.currentTimeMillisUnsafe();
@@ -209,10 +211,33 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   const rebuildEvents: ReadonlyRebuildEvent[] = [];
   const diagnosticEvents: ReadonlyExportDiagnosticEvent[] = [];
   const logRebuilds = Effect.gen(function* () {
-    for (const event of rebuildEvents.splice(0))
+    for (const event of rebuildEvents.splice(0)) {
       yield* (event.event === "abort" ? Effect.logWarning : Effect.logInfo)(
         "Readonly export rebuild",
       ).pipe(Effect.annotateLogs({ ...event }), Effect.withSpan("ardud.readonlyExport.rebuild"));
+      const message =
+        event.event === "start" && event.kind !== "additive"
+          ? "Readonly replica ready cleared"
+          : event.event === "progress" && event.kind === "events_reset"
+            ? "Readonly events reset progress"
+            : event.event === "publish" && event.kind !== "additive"
+              ? "Readonly replica ready restored"
+              : undefined;
+      if (message)
+        yield* Effect.logInfo(message).pipe(
+          Effect.annotateLogs({
+            ...event,
+            reason: event.readyReason ?? event.reason,
+            rowsDone: event.rowsDone ?? event.rows,
+            durationMs: event.elapsedMs,
+            // ready=0 is private when a completed generation survives the reset.
+            visibility:
+              event.event !== "publish" && event.publishedReady === "1"
+                ? "unpublished"
+                : "published",
+          }),
+        );
+    }
     for (const event of diagnosticEvents.splice(0))
       yield* Effect.logInfo("Readonly export diagnostics").pipe(
         Effect.annotateLogs({ component: "readonly-export", ...event }),
@@ -261,6 +286,13 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
           if (message?.type === "rebuild") rebuildEvents.push(message.rebuild);
           if (message?.type === "diagnostic") diagnosticEvents.push(message.diagnostic);
           if (message?.type === "metrics") {
+            for (const completion of message.metrics.statements ?? []) {
+              try {
+                statementStats?.(completion);
+              } catch {
+                /* Observation cannot stop export. */
+              }
+            }
             for (const [cause, count] of Object.entries(message.metrics.lineageRepairCounts))
               metrics.lineageRepairCounts[cause] =
                 (metrics.lineageRepairCounts[cause] ?? 0) + count;
@@ -271,6 +303,22 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
               metrics.phaseSteps[phase] = (metrics.phaseSteps[phase] ?? 0) + steps;
             metrics = {
               ...metrics,
+              ...(message.metrics.updatedAtLagMs === undefined
+                ? {}
+                : {
+                    updatedAtLagMs: Math.max(
+                      metrics.updatedAtLagMs ?? 0,
+                      message.metrics.updatedAtLagMs,
+                    ),
+                  }),
+              ...(message.metrics.auxiliaryWindowMs === undefined
+                ? {}
+                : {
+                    auxiliaryWindowMs: Math.max(
+                      metrics.auxiliaryWindowMs ?? 0,
+                      message.metrics.auxiliaryWindowMs,
+                    ),
+                  }),
               identityRows: metrics.identityRows + message.metrics.identityRows,
               identityLagMaxMs: Math.max(
                 metrics.identityLagMaxMs,
@@ -330,6 +378,8 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
             phaseMs: metrics.phaseMs,
             phaseSteps: metrics.phaseSteps,
             lineageRepairCounts: metrics.lineageRepairCounts,
+            updatedAtLagMs: metrics.updatedAtLagMs,
+            auxiliaryWindowMs: metrics.auxiliaryWindowMs,
           }),
           Effect.withSpan("ardud.readonlyExport.cyclePhases"),
         );

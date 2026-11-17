@@ -1,5 +1,6 @@
 import {
   type OrchestrationV2Notification,
+  type CommandId,
   MessageId,
   ProviderDriverKind,
   ProviderThreadId,
@@ -31,6 +32,7 @@ export interface ProviderContinuationRequest {
    */
   readonly delivery?: "adapter_buffered" | "message_text";
   readonly messageId?: MessageId;
+  readonly commandId?: CommandId;
   readonly dispatchIfCurrent?: <A, E, R>(
     effect: Effect.Effect<A, E, R>,
   ) => Effect.Effect<Option.Option<A>, E, R>;

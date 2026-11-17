@@ -9,9 +9,11 @@ import sys
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
+import marketplace
 import charges
 import order_lookup as lookup
 
@@ -26,7 +28,7 @@ def row(oid, minutes=0, status='delivered'):
 
 def proof():
     return {'orders': [], 'complete': False, 'lanes': {
-        name: dict(exhaustive=False, covered_from=(AT - dt.timedelta(days=1)).isoformat(), limit=None)
+        name: dict(walked_at=(AT + dt.timedelta(days=1)).isoformat(), exhaustive=False, covered_from=(AT - dt.timedelta(days=1)).isoformat(), limit=None)
         for name in lookup.LANES}}
 
 
@@ -122,6 +124,7 @@ def details(oid, service, timeout):
     if oid in data.get('fail',[]):raise ValueError('private error must not escape')
     row=next(r for page in data[service].values() for r in page if r['order']==oid)
     return dict(ok=True,account_verified=True,order=oid,total=row.get('total','1.00'),currency='AED',
+                whole_order_complete=row.get('whole_order_complete',False),status=row.get('detail_status','unknown'),
                 placed_at=row.get('detail_time',row.get('placed_at')),address='PRIVATE',card_last4='9999',items=['PRIVATE'])
 ''')
         self.modules = {}
@@ -176,7 +179,9 @@ def details(oid, service, timeout):
         with patch.object(lookup, 'native', side_effect=RuntimeError('private fixture')):
             result = lookup.parallel_lanes(str(self.root), None, None, [])
         self.assertFalse(result['complete'])
-        self.assertTrue(all(l['stop_reason'] == 'reader_error' for l in result['lanes'].values()))
+        self.assertTrue(all(l['stop_reason'] == 'reader_error' for name, l in result['lanes'].items()
+                            if name != 'marketplace'))
+        self.assertEqual(result['lanes']['marketplace']['stop_reason'], 'snapshot_incomplete')
         self.assertNotIn('private', json.dumps(result))
 
     def test_verified_vertical_pages_cross_ties_and_skip_old_details(self):
@@ -200,82 +205,6 @@ def details(oid, service, timeout):
                 self.fixture(**{service: {'1': [row('A')], '2': [row('A')]}, 'paging': [service]})
                 result = lookup.native('noon', str(self.root), services=(service,))
                 self.assertFalse(result['lanes'][service]['exhaustive'])
-
-    def test_repeated_scoped_status_updates_invalidate_positive_matches(self):
-        for status, raw_status in (
-            ('cancelled', 'cancelled'), ('cancelled', 'canceled'), ('unknown', 'failed'),
-            ('unknown', 'future_status'), ('out for delivery', 'out_for_delivery'),
-            ('delivered', 'cancelled'), ('unknown', 'delivered'), ('delivered', 'delivered'),
-        ):
-            with self.subTest(status=status, raw_status=raw_status):
-                first = {**row('A'), 'item_id': 'A-1', 'shipment_id': 'A-S1', 'total': CHARGE['amount']}
-                second = {**first, 'status': status, 'raw_status': raw_status}
-                other = {**row('B'), 'item_id': 'B-1', 'shipment_id': 'B-S1', 'total': '99.00'}
-                self.fixture(marketplace={'1': [first, other], '2': [second, other]}, paging=['marketplace'])
-                result = lookup.native('noon', str(self.root), services=('marketplace',))
-                self.assertFalse(result['lanes']['marketplace']['exhaustive'])
-                self.assertIsNone(result['lanes']['marketplace']['covered_from'])
-                if status == raw_status == 'delivered':
-                    self.assertEqual(charges.order_receipt(CHARGE, AT, AT,
-                        lookup=lambda *a, **kw: result)['verdict'], 'receipt')
-                else:
-                    with self.assertRaises(charges.Lookup):
-                        charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
-                    self.assertEqual([r['order'] for r in result['orders']], ['B'])
-
-    def test_persistent_cache_invalidation_survives_next_read_page_timeout(self):
-        cached = {**row('N1'), 'service': 'marketplace', 'total': CHARGE['amount'],
-                  'currency': 'AED', 'whole_order_complete': True}
-        unrelated = {**cached, 'order': 'N2', 'total': '98.00'}
-        for status, raw_status in (
-            ('cancelled', 'cancelled'), ('cancelled', 'canceled'), ('unknown', 'failed'),
-            ('unknown', 'future_status'), ('out for delivery', 'out_for_delivery'),
-            ('delivered', 'cancelled'), ('unknown', 'delivered'), ('delivered', 'delivered'),
-        ):
-            for item in ('N1-1', 'N1-2'):
-                with self.subTest(status=status, raw_status=raw_status, item=item):
-                    self.cache.write_text(json.dumps([cached, unrelated]))
-                    first = {**row('N1'), 'item_id': 'N1-1', 'shipment_id': 'N1-S1', 'total': '99.00'}
-                    second = {**first, 'item_id': item, 'status': status, 'raw_status': raw_status}
-                    self.fixture(marketplace={'1': [first], '2': [second]}, paging=['marketplace'])
-                    observed = lookup.read('noon', cache_path=self.cache)
-                    after_invalidation = lookup.load_cache(self.cache)
-                    self.fixture(marketplace={'1': [first], '2': [first]}, paging=['marketplace'],
-                                 page_fail={'marketplace': [2]})
-                    result = lookup.read('noon', cache_path=self.cache)
-                    if status == raw_status == 'delivered':
-                        self.assertEqual(charges.order_receipt(CHARGE, AT, AT,
-                            lookup=lambda *a, **kw: result)['verdict'], 'receipt')
-                        self.assertEqual(result['lanes']['marketplace']['cached'], 1)
-                    else:
-                        with self.assertRaises(charges.Lookup):
-                            charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)
-                        self.assertEqual(observed['orders'], [])
-                        self.assertEqual(observed['invalidated'], [{'service': 'marketplace', 'order': 'N1'}])
-                        self.assertEqual([r['order'] for r in after_invalidation], ['N2'])
-                        self.assertEqual(result['orders'][0]['total'], '99.00')
-                        self.assertEqual(result['lanes']['marketplace']['cached'], 0)
-                    self.assertIn('N2', {r['order'] for r in lookup.load_cache(self.cache)})
-
-    def test_first_page_contradiction_evicts_cache_even_when_detail_fails(self):
-        cached = {**row('N1'), 'service': 'marketplace', 'total': CHARGE['amount'],
-                  'currency': 'AED', 'whole_order_complete': True}
-        for status in ('cancelled', 'failed', 'out for delivery', 'unknown'):
-            with self.subTest(status=status):
-                self.cache.write_text(json.dumps([cached]))
-                self.fixture(marketplace={'1': [row('N1', status=status)]}, fail=['N1'])
-                result = lookup.read('noon', cache_path=self.cache)
-                self.assertEqual(result['invalidated'], [{'service': 'marketplace', 'order': 'N1'}])
-                self.assertEqual(lookup.load_cache(self.cache), [])
-                self.assertEqual(result['orders'], [])
-
-    def test_cache_invalidation_write_failure_is_not_silent(self):
-        self.cache.write_text(json.dumps([{**row('N1'), 'service': 'marketplace',
-            'total': CHARGE['amount'], 'currency': 'AED', 'whole_order_complete': True}]))
-        self.fixture(marketplace={'1': [row('N1', status='cancelled')]})
-        with patch('state_json.write_json', side_effect=OSError('write failed')):
-            with self.assertRaisesRegex(ValueError, 'order lookup unavailable'):
-                lookup.read('noon', cache_path=self.cache)
 
     def test_overlapping_cache_readers_cannot_restore_cancelled_receipt(self):
         cached = {**row('N1'), 'service': 'marketplace', 'total': CHARGE['amount'],
@@ -417,34 +346,6 @@ def details(oid, service, timeout):
         self.assertEqual(result['lanes']['food']['pages'], 1)
         self.assertEqual(result['lanes']['food']['limit'], 'page-1 history only')
 
-    def test_marketplace_history_exhaustion_without_creation_order_assumption(self):
-        self.fixture(marketplace={'1': [row('A', -60)], '2': [row('B')]}, paging=['marketplace'])
-        result = lookup.native('noon', str(self.root), services=('marketplace',))
-        lane = result['lanes']['marketplace']
-        self.assertTrue(lane['exhaustive'])
-        self.assertEqual(lane['pages'], 2)
-        self.assertEqual(lane['stop_reason'], 'end_of_history')
-        self.assertIsNone(lane['covered_from'])
-
-    def test_later_cancelled_shipment_stays_unread_even_for_seen_order(self):
-        for status in ('cancelled', 'canceled', 'failed', 'unknown', 'out for delivery'):
-            with self.subTest(status=status):
-                first = {**row('A'), 'item_id': 'A-1'}
-                second = {**row('A', status=status), 'item_id': 'A-2'}
-                self.fixture(marketplace={'1': [first], '2': [second]}, paging=['marketplace'])
-                result = lookup.native('noon', str(self.root), services=('marketplace',))
-                self.assertEqual(result['orders'], [])
-                self.assertFalse(result['lanes']['marketplace']['exhaustive'])
-                self.assertIsNone(result['lanes']['marketplace']['covered_from'])
-
-    def test_marketplace_cache_requires_whole_order_delivery(self):
-        base = {**row('N1'), 'service': 'marketplace', 'total': 12.34, 'currency': 'AED'}
-        for status, complete, expected in (('delivered', True, 1), ('delivered', False, 0),
-                                            ('cancelled', True, 0), ('failed', True, 0)):
-            with self.subTest(status=status, complete=complete):
-                self.cache.write_text(json.dumps([{**base, 'status': status, 'whole_order_complete': complete}]))
-                self.assertEqual(len(lookup.load_cache(self.cache)), expected)
-
     def test_failed_lane_cannot_starve_other_main_thread_readers(self):
         self.fixture(minutes={'1': []}, food={'1': [row('F1')]}, list_fail=['minutes'])
         result = self.native()
@@ -507,56 +408,6 @@ def details(oid, service, timeout):
         self.assertEqual(result['lanes']['minutes']['pages'], 3)
         self.assertEqual(charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result)['verdict'], 'receipt')
 
-    def test_unknown_time_gap_erases_negative_coverage(self):
-        orders = []
-        for oid, minutes in (('N1', -60), ('N2', 0)):
-            item = row(oid, minutes)
-            item['detail_time'] = item.pop('placed_at')
-            orders.append(item)
-        self.fixture(marketplace={'1': orders}, fail=['N2'])
-        result = self.native()
-        self.assertIsNone(result['lanes']['marketplace']['covered_from'])
-        self.assertEqual([r['order'] for r in result['orders']], ['N1'])
-        complete = proof()
-        complete['lanes']['marketplace'] = result['lanes']['marketplace']
-        with self.assertRaises(charges.Lookup):
-            charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: complete)
-
-    def test_marketplace_shipment_statuses_never_freeze_order_totals(self):
-        forms = [('single terminal', ['delivered']), ('mixed', ['delivered', 'preparing']),
-                 ('all terminal', ['delivered', 'delivered']), ('cancelled', ['cancelled'])]
-        for label, statuses in forms:
-            with self.subTest(label=label):
-                self.fixture(marketplace={'1': [dict(row('N1', status=status), total='1.00') for status in statuses]})
-                lookup.read('noon', cache_path=self.cache)
-                self.fixture(marketplace={'1': [dict(row('N1', status=status), total='2.00') for status in statuses]})
-                result = lookup.read('noon', cache_path=self.cache)
-                if 'cancelled' in statuses:
-                    self.assertEqual(result['orders'], [])
-                else:
-                    self.assertEqual(result['orders'][0]['total'], '2.00')
-                self.assertFalse(any(r['service']=='marketplace' for r in json.loads(self.cache.read_text())))
-
-    def test_shipment_cancellations_never_authorize_no_order_or_ask(self):
-        forms = [('cancelled first', ['cancelled', 'preparing']),
-                 ('cancelled second', ['preparing', 'cancelled']),
-                 ('all cancelled', ['cancelled', 'cancelled']),
-                 ('failed shipment', ['failed', 'preparing']),
-                 ('single cancelled', ['cancelled'])]
-        for label, statuses in forms:
-            with self.subTest(label=label):
-                self.fixture(marketplace={'1': [dict(row('N1', status=status), total='12.34')
-                                                 for status in statuses]})
-                result = self.native()
-                self.assertIsNone(result['lanes']['marketplace']['covered_from'])
-                self.assertFalse(result['complete'])
-                with patch.object(lookup, 'read', return_value=result), \
-                        patch.object(charges, 'receipt', return_value=None), \
-                        patch.object(charges, 'card_owner', return_value='abdullah'):
-                    verdict = charges.explain(CHARGE, AT, AT + dt.timedelta(days=3), said=lambda *a, **kw: [])
-                self.assertEqual(verdict['verdict'], 'unverified')
-                self.assertTrue(verdict['errors'])
-
     def test_terminal_cache_reuse_nonterminal_refetch_corrupt_empty_and_projection(self):
         self.fixture(food={'1': [row('F1'), row('F2', -1, 'preparing')]})
         lookup.read('noon', cache_path=self.cache)
@@ -592,6 +443,200 @@ def details(oid, service, timeout):
                     self.assertNotIsInstance(exc.exception, lookup.SourceLimit)
                     self.assertEqual(str(exc.exception), 'order lookup unavailable')
 
+    def refresh(self, **fixture):
+        self.fixture(paging=['marketplace'], **fixture)
+        return marketplace.refresh(self.root, self.root)
+
+    def test_refresh_stores_holds_walks_cancellations_and_only_delivered_rows_match(self):
+        delivered = dict(row('N4'), whole_order_complete=True, detail_status='delivered')
+        result = self.refresh(marketplace={'1': [row('N1', status='cancelled'), row('N2', status='preparing')],
+                                          '2': [row('N3', status='unknown'), delivered]})
+        self.assertEqual(result['result'], 'end_of_history')
+        snapshot, reason = marketplace.load(self.root)
+        self.assertIsNone(reason)
+        self.assertTrue(snapshot['complete'])
+        self.assertEqual(result['known'], 4)
+        self.assertEqual(result['delivered'], 1)
+        self.assertEqual(set(snapshot), {'version', 'walked_at', 'complete', 'orders'})
+        self.assertTrue(all(set(v) == {'createdAt', 'delivered'} for v in snapshot['orders'].values()))
+        with patch.object(self.modules['native_orders'], 'orders', side_effect=AssertionError('network')):
+            result = lookup.native('noon', str(self.root), cache=lookup.load_cache(self.cache),
+                                   snapshot=snapshot, services=('marketplace',))
+        self.assertEqual([r['order'] for r in result['orders']], ['N4'])
+        self.assertEqual(result['lanes']['marketplace']['hold_count'], 1)
+        self.assertTrue(result['complete'])
+        self.assertIsNone(result['lanes']['marketplace']['covered_from'])
+
+    def test_refresh_roundtrip_delivery_monotonicity_and_prune(self):
+        self.refresh(marketplace={'1': [row('N1'), row('OLD')]})
+        self.refresh(marketplace={'1': [dict(row('N1'), whole_order_complete=True, detail_status='delivered')]})
+        snapshot, _ = marketplace.load(self.root)
+        self.assertEqual(set(snapshot['orders']), {'N1'})
+        self.assertTrue(snapshot['orders']['N1']['delivered'])
+        calls = (self.root / 'details.log').read_text()
+        self.refresh(marketplace={'1': [row('N1', status='cancelled')]})
+        self.assertTrue(marketplace.load(self.root)[0]['orders']['N1']['delivered'])
+        self.assertEqual((self.root / 'details.log').read_text(), calls)
+
+    def test_incomplete_walk_does_not_advance_proof(self):
+        self.refresh(marketplace={'1': [row('N1')]})
+        before, _ = marketplace.load(self.root)
+        for form in ('budget', 'cursor', 'list'):
+            with self.subTest(form=form):
+                self.fixture(marketplace={'1': [row('N1')], '2': [row('N2')], '3': [row('N3')]}, paging=['marketplace'])
+                original = self.modules['native_orders'].orders
+                def fail(*args, **kw):
+                    if form == 'budget' and kw['page'] == 2:
+                        raise TimeoutError()
+                    result = original(*args, **kw)
+                    if form == 'cursor':
+                        result['coverage']['marketplace']['next_cursor'] = 'same'
+                    if form == 'list' and kw['page'] == 2:
+                        result['ok'] = False
+                    return result
+                with patch.object(self.modules['native_orders'], 'orders', side_effect=fail):
+                    result = marketplace.refresh(self.root, self.root)
+                self.assertEqual(result['result'], {'budget': 'budget', 'cursor': 'invalid_paging', 'list': 'list_error'}[form])
+                snapshot, _ = marketplace.load(self.root)
+                self.assertEqual(snapshot['walked_at'], before['walked_at'])
+                self.assertEqual(snapshot['complete'], before['complete'])
+
+    def test_unknown_detail_and_zone_fail_closed(self):
+        for kwargs in ({'fail': ['N1']}, {'marketplace': {'1': [dict(row('N1'), detail_time='2026-11-10T12:00:00')]}}):
+            fixture = {'marketplace': {'1': [row('N1')]}, **kwargs}
+            result = self.refresh(**fixture)
+            self.assertEqual(result['result'], 'placement_unknown')
+            self.assertFalse(marketplace.load(self.root)[0]['complete'])
+
+    def test_refresh_scoped_page_progress_controls_proof_and_pruning(self):
+        first = dict(row('N1'), item_id='I1', shipment_id='S1')
+        forms = (
+            ('same card', [first], [first], False),
+            ('changed status', [first], [dict(first, status='cancelled')], False),
+            ('shipment card replay', [dict(row('N1'), shipment_id='S1')],
+             [dict(row('N1'), shipment_id='S1', status='failed')], False),
+            ('order card replay', [row('N1')], [row('N1', status='unknown')], False),
+            ('new item', [first], [dict(first, item_id='I2')], True),
+            ('new shipment', [first], [dict(first, shipment_id='S2')], True),
+            ('new shipment without item', [dict(row('N1'), shipment_id='S1')],
+             [dict(row('N1'), shipment_id='S2')], True),
+            ('overlap plus new card', [first], [first, dict(first, item_id='I2')], True),
+            ('empty terminal page', [first], [], True),
+        )
+        for label, before, after, complete in forms:
+            with self.subTest(label=label):
+                self.refresh(marketplace={'1': [row('OLD')]})
+                saved, _ = marketplace.load(self.root)
+                result = self.refresh(marketplace={'1': before, '2': after})
+                snapshot, _ = marketplace.load(self.root)
+                self.assertEqual(result['result'], 'end_of_history' if complete else 'invalid_paging')
+                self.assertEqual('OLD' not in snapshot['orders'], complete)
+                if not complete:
+                    self.assertEqual(snapshot['walked_at'], saved['walked_at'])
+                    self.assertIn(saved['orders']['OLD']['createdAt'], marketplace.lane(snapshot, [])[1]['hold_times'])
+
+    def test_detail_failures_preserve_previous_proof_and_save_successful_progress(self):
+        forms = ('exception', 'timeout', 'unzoned', 'wrong_order', 'unverified', 'not_ok', 'bad_receipt')
+        good = dict(row('GOOD', -60), whole_order_complete=True, detail_status='delivered')
+        bad = row('BAD', 120)
+        for previous in ('cold', 'known', 'unknown'):
+            for form in forms:
+                with self.subTest(previous=previous, form=form):
+                    before = marketplace.empty()
+                    if previous != 'cold':
+                        before.update(complete=True, walked_at=(AT + dt.timedelta(days=1)).isoformat(),
+                                      orders={'OLD': {'createdAt': bad['placed_at'], 'delivered': False}})
+                        if previous == 'known':
+                            before['orders']['BAD'] = {'createdAt': bad['placed_at'], 'delivered': False}
+                    (self.root / 'marketplace-placements.json').write_text(json.dumps(before))
+                    self.cache.write_text('[]')
+                    self.fixture(marketplace={'1': [good, bad]}, paging=['marketplace'])
+                    original = self.modules['noon_order_details'].details
+                    def fail(oid, *args, **kwargs):
+                        if oid != 'BAD':
+                            return original(oid, *args, **kwargs)
+                        if form in ('exception', 'timeout'):
+                            raise TimeoutError() if form == 'timeout' else ValueError('private detail')
+                        detail = original(oid, *args, **kwargs)
+                        detail.update({'unzoned': {'placed_at': '2026-11-10T12:00:00'},
+                                       'wrong_order': {'order': 'OTHER'},
+                                       'unverified': {'account_verified': False},
+                                       'not_ok': {'ok': False},
+                                       'bad_receipt': {'whole_order_complete': True, 'status': 'delivered',
+                                                       'total': 'invalid'}}[form])
+                        return detail
+                    with patch.object(self.modules['noon_order_details'], 'details', side_effect=fail):
+                        result = marketplace.refresh(self.root, self.root)
+                    self.assertEqual(result['result'], 'budget' if form == 'timeout' else 'placement_unknown')
+                    snapshot, reason = marketplace.load(self.root)
+                    self.assertIsNone(reason)
+                    self.assertEqual(snapshot['walked_at'], before['walked_at'])
+                    self.assertEqual(snapshot['complete'], before['complete'])
+                    self.assertTrue(snapshot['orders']['GOOD']['delivered'])
+                    self.assertTrue(before['orders'].items() <= snapshot['orders'].items())
+                    rows, lane = marketplace.lane(snapshot, lookup.load_cache(self.cache))
+                    self.assertEqual(lane['exhaustive'], previous != 'cold')
+                    if previous != 'cold':
+                        result = proof()
+                        result['orders'], result['lanes']['marketplace'] = rows, lane
+                        self.assertIsNone(charges.order_receipt(CHARGE, AT, AT, lookup=lambda *a, **kw: result))
+                    with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}):
+                        self.assertEqual(marketplace.refresh_status(self.root), 'started')
+
+    def test_busy_refresh_and_corrupt_snapshot(self):
+        with (self.root / 'marketplace-refresh.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(marketplace.refresh(self.root, self.root)['result'], 'busy')
+        (self.root / 'marketplace-placements.json').write_text('PRIVATE broken')
+        snapshot, reason = marketplace.load(self.root)
+        self.assertEqual(snapshot, marketplace.empty())
+        self.assertEqual(reason, 'snapshot_corrupt')
+        self.refresh(marketplace={'1': [row('N1')]})
+        self.assertTrue(marketplace.load(self.root)[0]['complete'])
+
+    def test_snapshot_stop_reasons_and_missing_delivered_cache(self):
+        for reason in ('snapshot_missing', 'snapshot_corrupt', None):
+            rows, lane = marketplace.lane(marketplace.empty(), [], reason)
+            self.assertEqual(lane['stop_reason'], reason or 'snapshot_incomplete')
+            self.assertFalse(lane['exhaustive'])
+        snapshot = dict(marketplace.empty(), complete=True, walked_at=AT.isoformat(),
+                        orders={'N1': {'createdAt': AT.isoformat(), 'delivered': True}})
+        self.assertEqual(marketplace.lane(snapshot, [])[1]['stop_reason'], 'placement_unknown')
+
+    def test_refresh_cli_prints_counts_only(self):
+        self.fixture(marketplace={'1': [row('PRIVATE')]}, paging=['marketplace'])
+        result = subprocess.run([sys.executable, '-I', '-B', lookup.__file__, 'refresh-marketplace',
+            '--data', str(self.root), '--root', str(self.root)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertEqual(set(json.loads(result.stdout)), {'orders_total', 'known', 'delivered', 'fetched', 'pages', 'ms', 'result'})
+        self.assertNotIn('PRIVATE', result.stdout + result.stderr)
+
+    def test_refresh_respects_native_deadline_contract_and_restores_missing_cache(self):
+        import signal
+        delivered = dict(row('N1'), whole_order_complete=True, detail_status='delivered')
+        self.fixture(marketplace={'1': [delivered]}, paging=['marketplace'])
+        original = self.modules['native_orders'].orders
+        def native(*args, **kwargs):
+            self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+            self.assertGreater(kwargs['timeout'], 0)
+            self.assertLessEqual(kwargs['timeout'], 60)
+            return original(*args, **kwargs)
+        with patch.object(self.modules['native_orders'], 'orders', side_effect=native):
+            self.assertEqual(marketplace.refresh(self.root, self.root, 180)['result'], 'end_of_history')
+        self.cache.write_text('[]')
+        self.assertEqual(marketplace.refresh(self.root, self.root)['fetched'], 1)
+        self.assertEqual(len(lookup.load_cache(self.cache)), 1)
+
+    def test_refresh_storage_lock_is_bounded_by_total_budget(self):
+        self.fixture(marketplace={'1': [row('N1')]}, paging=['marketplace'])
+        with (self.root / 'order-details.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            start = time.monotonic()
+            result = marketplace.refresh(self.root, self.root, 0.1)
+        self.assertEqual(result['result'], 'cache_busy')
+        self.assertLess(time.monotonic() - start, 0.5)
+
     def test_cache_cap_drops_oldest(self):
         cached = [dict(row('F'+str(i), -i), service='food', total=1, currency='AED', cached_at=AT.isoformat())
                   for i in range(1002)]
@@ -601,6 +646,23 @@ def details(oid, service, timeout):
         saved = json.loads(self.cache.read_text())
         self.assertEqual(len(saved), 1000)
         self.assertNotIn('F1001', {r['order'] for r in saved})
+
+    def test_cache_cap_preserves_receipts_referenced_by_snapshot(self):
+        cached = [dict(row('M'+str(i), i), service='minutes', total=1, currency='AED', cached_at=AT.isoformat())
+                  for i in range(1000)]
+        delivered = dict(row('OLD', -2000), service='marketplace', total=1, currency='AED',
+                         whole_order_complete=True, cached_at=AT.isoformat())
+        self.cache.write_text(json.dumps([delivered, *cached]))
+        snapshot = dict(marketplace.empty(), complete=True, walked_at=AT.isoformat(), orders={
+            'OLD': {'createdAt': delivered['placed_at'], 'delivered': True}})
+        (self.root / 'marketplace-placements.json').write_text(json.dumps(snapshot))
+        self.fixture()
+        for _ in range(2):
+            result = lookup.read('noon', cache_path=self.cache)
+            self.assertTrue(result['lanes']['marketplace']['exhaustive'])
+            self.assertEqual(result['lanes']['marketplace']['cached'], 1)
+            self.assertEqual(len(lookup.load_cache(self.cache)), 1001)
+            self.assertEqual([r['order'] for r in result['orders']], ['OLD'])
 
 
 if __name__ == '__main__':

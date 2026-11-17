@@ -388,7 +388,23 @@ describe("VcsProcess.run", () => {
       }),
   );
 
-  it.effect("bounds a synthetic burst of GitHub API processes", () =>
+  it.effect.each([
+    { platform: "darwin", command: "gh", limit: 4 },
+    { platform: "darwin", command: "/opt/homebrew/bin/gh", limit: 4 },
+    { platform: "linux", command: "./tools/gh", limit: 4 },
+    { platform: "linux", command: "/opt/custom tools/gh", limit: 4 },
+    { platform: "win32", command: "C:/tools/gh.exe", limit: 4 },
+    { platform: "win32", command: "C:\\Program Files\\GitHub CLI\\GH.EXE", limit: 4 },
+    { platform: "win32", command: "gh.cmd", limit: 4 },
+    { platform: "win32", command: "gh.bat", limit: 4 },
+    { platform: "win32", command: "GH", limit: 4 },
+    { platform: "linux", command: "/usr/bin/git", limit: 8 },
+    { platform: "linux", command: "/opt/gh/git", limit: 8 },
+    { platform: "linux", command: "/opt/tools/GH", limit: 8 },
+    { platform: "linux", command: "gh-helper", limit: 8 },
+    { platform: "win32", command: "github.exe", limit: 8 },
+    { platform: "win32", command: "gh-helper.exe", limit: 8 },
+  ] as const)("bounds $command on $platform to $limit processes", ({ command, platform, limit }) =>
     Effect.gen(function* () {
       const gate = yield* Deferred.make<void>();
       const starts = yield* Queue.unbounded<number>();
@@ -425,7 +441,7 @@ describe("VcsProcess.run", () => {
         Array.from({ length: 32 }, (_, index) =>
           service.run({
             operation: `synthetic.github.${index}`,
-            command: "gh",
+            command,
             args: ["api", "user"],
             cwd: "/workspace",
           }),
@@ -433,16 +449,16 @@ describe("VcsProcess.run", () => {
         { concurrency: "unbounded" },
       ).pipe(Effect.forkChild);
 
-      yield* Effect.all(Array.from({ length: 4 }, () => Queue.take(starts)));
+      yield* Effect.all(Array.from({ length: limit }, () => Queue.take(starts)));
       yield* Effect.yieldNow;
       expect(yield* Queue.size(starts)).toBe(0);
-      expect(yield* Ref.get(peak)).toBe(4);
+      expect(yield* Ref.get(peak)).toBe(limit);
 
       yield* Deferred.succeed(gate, undefined);
       yield* Fiber.join(burst);
       expect(yield* Ref.get(total)).toBe(32);
-      expect(yield* Ref.get(peak)).toBe(4);
-    }),
+      expect(yield* Ref.get(peak)).toBe(limit);
+    }).pipe(Effect.provideService(HostProcess.Platform, platform)),
   );
 
   it.effect("collects stdout", () =>

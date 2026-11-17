@@ -27,7 +27,11 @@ export const dispatchFailure = (
   error: OrchestratorV2Error | ThreadManagement.ThreadManagementProviderInstanceDisabledError,
 ) =>
   error._tag === "ThreadManagementProviderInstanceDisabledError"
-    ? new OrchestratorMcpFailure({ code: "invalid_request", message: error.message })
+    ? new OrchestratorMcpFailure({
+        reason: "provider_disabled",
+        code: "invalid_request",
+        message: error.message,
+      })
     : (error._tag === "OrchestratorDispatchError" ||
           error._tag === "OrchestratorCommandRejectedError") &&
         typeof error.cause === "string" &&
@@ -54,6 +58,7 @@ export const readCaller = Effect.fn("mcp.readCaller")(function* () {
   const scope = yield* McpInvocationContext.McpInvocationContext;
   if (!scope.capabilities.has("orchestration")) {
     return yield* new OrchestratorMcpFailure({
+      reason: "capability_missing",
       code: "capability_denied",
       message: "This credential cannot control threads.",
     });
@@ -118,20 +123,19 @@ export const assertTargetWithinLimits = (
  */
 export function assertLiveCaller({ caller, scope }: Caller) {
   if (caller === undefined) return Effect.void;
-  return OrchestrationMcp.isLiveCallerShell(caller, scope.thread?.providerInstanceId)
-    ? Effect.void
-    : Effect.fail(
-        new OrchestratorMcpFailure({
-          code: "parent_not_active",
-          message: "The calling provider no longer owns an active thread run.",
-        }),
-      );
+  return OrchestrationMcp.assertLiveCallerShell(caller, scope.thread);
 }
 
 export const assertFullAccess = (context: Caller, message: string) =>
   context.limits.runtimeMode === "full-access" && context.limits.interactionMode === "default"
     ? Effect.void
-    : Effect.fail(new OrchestratorMcpFailure({ code: "capability_denied", message }));
+    : Effect.fail(
+        new OrchestratorMcpFailure({
+          reason: "full_access_required",
+          code: "capability_denied",
+          message,
+        }),
+      );
 
 export const resolveProjectId = (context: Caller, projectId: ProjectId | undefined) =>
   projectId !== undefined

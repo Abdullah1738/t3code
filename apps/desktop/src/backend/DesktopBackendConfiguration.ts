@@ -1,3 +1,4 @@
+import type { DesktopBackendBootstrap } from "@t3tools/contracts";
 import * as NodeOS from "node:os";
 
 import { parsePersistedServerObservabilitySettings } from "@t3tools/shared/serverSettings";
@@ -504,6 +505,7 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
       readonly cliPath: Option.Option<string>;
       readonly buildCommit: Option.Option<string>;
       readonly shellEnvironmentPrepared: boolean;
+      readonly shellPathHydration: NonNullable<DesktopBackendBootstrap["shellPathHydration"]>;
     },
   ): Effect.fn.Return<
     DesktopBackendManager.DesktopBackendStartConfig,
@@ -522,8 +524,9 @@ const resolvePrimaryStartConfig = Effect.fn("desktop.backendConfiguration.resolv
       host: backendExposure.bindHost,
       desktopBootstrapToken: input.bootstrapToken,
       desktopBootstrapSecret: input.bootstrapSecret,
-      // Failed Windows probes leave server hydration enabled for another attempt.
+      // Failed probes leave server hydration enabled for another attempt.
       shellEnvironmentPrepared: input.shellEnvironmentPrepared,
+      shellPathHydration: input.shellPathHydration,
       tailscaleServeEnabled: backendExposure.tailscaleServeEnabled,
       tailscaleServePort: backendExposure.tailscaleServePort,
       desktopTelemetryFd: 4,
@@ -837,6 +840,7 @@ export const make = Effect.gen(function* () {
       cliPath,
       buildCommit,
       shellEnvironmentPrepared,
+      shellPathHydration: shellEnvironment.pathHydration,
     }).pipe(
       Effect.provideService(DesktopEnvironment.DesktopEnvironment, environment),
       Effect.provideService(DesktopServerExposure.DesktopServerExposure, serverExposure),

@@ -1014,6 +1014,8 @@ export const cancelQueuedRun = Effect.fn("EnvironmentCommands.cancelQueuedRun")(
 ) {
   return yield* dispatch({
     type: "queued-run.cancel",
+    reason: "queued_cancel",
+    detail: "Queued message cancelled from the client.",
     commandId: yield* allocateCommandId(input),
     threadId: input.threadId,
     runId: input.runId,

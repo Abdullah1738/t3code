@@ -899,6 +899,9 @@ it.effect("uses durable deadlines, notifications, and a slow liveness poll", () 
     );
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Queue.take(available),
+      awaitStartWork: Effect.never,
+      runStartOnce: Effect.succeed(false),
+      nextStartClaimableAt: Effect.succeed(Option.none()),
       awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
       runControlOnce: Effect.succeed(false),
@@ -954,6 +957,9 @@ it.effect("does not hot-loop when a claim fails", () =>
     const now = yield* DateTime.now;
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Effect.never,
+      awaitStartWork: Effect.never,
+      runStartOnce: Effect.succeed(false),
+      nextStartClaimableAt: Effect.succeed(Option.none()),
       awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
       runControlOnce: Effect.succeed(false),
@@ -993,6 +999,9 @@ it.effect("backs off briefly when a due deadline loses a claim race", () =>
     const now = yield* DateTime.now;
     const worker = EffectWorker.OrchestrationEffectWorkerV2.of({
       awaitWork: Effect.never,
+      awaitStartWork: Effect.never,
+      runStartOnce: Effect.succeed(false),
+      nextStartClaimableAt: Effect.succeed(Option.none()),
       awaitControlWork: Effect.never,
       runRecoveryOnce: Effect.succeed(false),
       runControlOnce: Effect.succeed(false),
@@ -1188,11 +1197,18 @@ it.effect.each([
             },
     };
     let admissions = 0;
+    const admission = {
+      queuedAtMs: 0,
+      waitedMs: 30 * 60_000,
+      positionAtFailure: 7,
+      totalAtFailure: 12,
+      rule: "no_progress" as const,
+    };
     const expire = Effect.sync(() => {
       admissions++;
     }).pipe(
       Effect.andThen(
-        Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now })),
+        Effect.fail(new RestartPacing.RestartAdmissionTimeoutError({ deadline: now, admission })),
       ),
     );
     const layer = layerExecutorFor({
@@ -1282,6 +1298,7 @@ it.effect.each([
           runId,
           expectedAttemptId: attemptId,
           deadline: now,
+          admission,
         },
       ]);
     else assert.deepEqual(commands, []);

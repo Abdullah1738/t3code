@@ -384,6 +384,8 @@ def archive_ignored(r):
 
 
 def main():
+    from io_priority import throttle_disk
+    throttle_disk()
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int, default=MAX_PER_RUN)

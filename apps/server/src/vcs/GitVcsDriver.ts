@@ -1,6 +1,7 @@
 import * as NodeBuffer from "node:buffer";
 
 import * as Context from "effect/Context";
+import * as Cache from "effect/Cache";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -789,19 +790,23 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       }),
     );
 
-  // Git reports relative paths from the physical cwd, which can differ from a symlink.
-  const resolveGitCommonDir = Effect.fn("GitVcsDriver.resolveGitCommonDir")(function* (
-    cwd: string,
-  ) {
-    const result = yield* execute({
-      operation: "GitVcsDriver.checkpoints.resolveGitCommonDir",
-      cwd,
-      args: ["rev-parse", "--git-common-dir"],
-    });
-    const gitCommonDir = result.stdout.trim();
-    if (path.isAbsolute(gitCommonDir)) return gitCommonDir;
-    const physicalCwd = yield* fileSystem.realPath(cwd).pipe(Effect.orElseSucceed(() => cwd));
-    return path.resolve(physicalCwd, gitCommonDir);
+  // Zero TTL shares only overlapping lookups, never a later turn's repository
+  // mapping. Each capture still creates its own index, commit and checkpoint ref.
+  const commonDirectories = yield* Cache.make({
+    capacity: 2048,
+    timeToLive: 0,
+    // Git reports relative paths from the physical cwd, which can differ from a symlink.
+    lookup: Effect.fn("GitVcsDriver.resolveGitCommonDir")(function* (cwd: string) {
+      const result = yield* execute({
+        operation: "GitVcsDriver.checkpoints.resolveGitCommonDir",
+        cwd,
+        args: ["rev-parse", "--git-common-dir"],
+      });
+      const gitCommonDir = result.stdout.trim();
+      if (path.isAbsolute(gitCommonDir)) return gitCommonDir;
+      const physicalCwd = yield* fileSystem.realPath(cwd).pipe(Effect.orElseSucceed(() => cwd));
+      return path.resolve(physicalCwd, gitCommonDir);
+    }),
   });
 
   // Git renames loose objects and refs into place without fsync by default, so
@@ -841,7 +846,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         "-c",
         "splitIndex.sharedIndexExpire=never",
       ];
-      const gitCommonDir = yield* resolveGitCommonDir(input.cwd);
+      const gitCommonDir = yield* Cache.get(commonDirectories, input.cwd);
       const indexId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
       const tempIndexPath = path.join(gitCommonDir, `t3-checkpoint-index-${indexId}`);
       const commitEnv: NodeJS.ProcessEnv = {

@@ -26,8 +26,9 @@
 	<integer>60</integer>
 	<key>Nice</key>
 	<integer>10</integer>
+	<!-- Background I/O throttling can stall a writer and every queued sync source. -->
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
 	<key>StandardOutPath</key>
 	<string>/Users/ardud/.local/share/message-archive/logs/daemon.log</string>
 	<key>StandardErrorPath</key>

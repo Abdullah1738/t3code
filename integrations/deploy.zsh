@@ -16,8 +16,30 @@ case "$name" in
   tail-gateway) exec "${0:A:h}/tail-gateway/install.zsh" "$@" ;;  # https://<name>.tail gateway, see tail-gateway/README.md
   robob-widgets) exec "${0:A:h}/robob-widgets/install.zsh" "$@" ;;
   harness-hooks) exec "${0:A:h}/harness-hooks/install.zsh" "$@" ;;
-  *) print -u2 "usage: deploy.zsh <9router-reauth|router-logging|agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks> [--dry-run]"; exit 2 ;;
+  venice-x402) exec "${0:A:h}/venice-x402/install.zsh" "$@" ;;  # x402 Venice proxy + LaunchAgent, see venice-x402/README.md
+  *) print -u2 "usage: deploy.zsh <9router-reauth|router-logging|agent-bridges|spectrum-bridge|telegram-bridge|robob-watch|memory-system|coord|app-api-cli|stream-recovery|catalog-guard|robob-guard|message-archive|offbox|local-helpers|harness-homes|harness-cli|tail-gateway|robob-widgets|harness-hooks|venice-x402> [--dry-run] [--no-fence]"; exit 2 ;;
 esac
+
+if [[ "$name" == memory-system ]]; then
+  no_fence=0
+  deploy_args=()
+  for arg in "$@"; do
+    if [[ "$arg" == --no-fence ]]; then
+      no_fence=1
+    else
+      deploy_args+=("$arg")
+    fi
+  done
+  set -- "${deploy_args[@]}"
+  if (( no_fence )); then
+    print -u2 "WARNING: memory-system deploy is bypassing the backup fence (--no-fence)"
+  elif [[ "${1:-}" != --dry-run && "${MEMORY_DEPLOY_FENCED:-}" != 1 ]]; then
+    # Backups load Python between steps; hold their fence across every install.
+    export MEMORY_DEPLOY_FENCED=1
+    exec python3 "${0:A:h}/memory-system/src/backup_control.py" fence \
+      "$HOME/.local/share/memory-system/logs/backup.lock" --reason deploy -- zsh -f "$0" "$name" "$@"
+  fi
+fi
 
 src="${0:A:h}/$name/"
 dst="$HOME/.local/share/$name/"

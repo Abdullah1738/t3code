@@ -1,3 +1,9 @@
+import * as Analytics from "../../ardud/analytics/Analytics.ts";
+import { AnalyticsEvent } from "@t3tools/contracts";
+import { assertLiveCallerShell } from "../../mcp/OrchestratorMcpService.ts";
+import { liveThreadShell } from "../../mcp/McpToolAccess.testkit.ts";
+import * as ProviderProcessRegistry from "../../ardud/providers/ProviderProcessRegistry.ts";
+import * as ClaudeTurnStartup from "../../ardud/providers/ClaudeTurnStartup.ts";
 import type { OrchestrationV2Run } from "@t3tools/contracts";
 import { continuedLaunchRecovery, nextLaunchRecovery } from "../launchRecovery.ts";
 // @effect-diagnostics nodeBuiltinImport:off -- workflow fixtures use files and the fake Claude CLI uses Node streams
@@ -44,6 +50,7 @@ import {
   type ProviderReplayTranscript,
   type ProviderApprovalDecision,
   ProviderSessionId,
+  ProviderThreadId,
   ProviderTurnId,
   RunAttemptId,
   RunId,
@@ -67,6 +74,7 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Scheduler from "effect/Scheduler";
+import * as Semaphore from "effect/Semaphore";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -94,6 +102,8 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
+import * as ClaudeApiErrorTranscript from "./ClaudeApiErrorTranscript.ts";
+import * as ProviderStartProgress from "../../ardud/orchestration/ProviderStartProgress.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { ClaudeOrchestratorReplayHarness } from "./ClaudeAdapterV2.testkit.ts";
 import { provideDeterministicTestRuntime } from "../testkit/DeterministicRuntime.ts";
@@ -106,6 +116,12 @@ import {
   materializeFixtureInput,
   projectionFor,
 } from "../testkit/fixtures/shared.ts";
+
+const isSteerRunError = Schema.is(ProviderAdapter.ProviderAdapterSteerRunError);
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+const decodeAnalyticsEvent = Schema.decodeUnknownEffect(AnalyticsEvent, {
+  onExcessProperty: "error",
+});
 
 const decodeUserInputQuestions = Schema.decodeUnknownSync(
   Schema.Array(OrchestrationV2UserInputQuestion),
@@ -921,7 +937,10 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
             },
           });
           const threadId = ThreadId.make("thread-claude-recall");
-          yield* (yield* McpProviderSessions.McpProviderSessions).set(mcpSessionFor(threadId));
+          yield* (yield* McpProviderSessions.McpProviderSessions).set({
+            ...mcpSessionFor(threadId),
+            runtimeProviderSessionId: ProviderSessionId.make("provider-session-claude-recall"),
+          });
           const runtime = yield* adapter.openSession({
             threadId,
             providerSessionId: ProviderSessionId.make("provider-session-claude-recall"),
@@ -2492,12 +2511,16 @@ describe("ClaudeAdapterV2 native fork", () => {
   );
 });
 
-function makeFakeClaudeCli(answerSetServers: boolean | "recall-error" | "reject" = true) {
+function makeFakeClaudeCli(
+  answerSetServers: boolean | "recall-error" | "reject" | "hold" = true,
+  onSetServers?: () => void,
+) {
   const spawns: Array<SpawnOptions> = [];
   const controlRequests: Array<object> = [];
   const stdouts: NodeStream.PassThrough[] = [];
   let homeConnected = false;
   const stdins: Array<NodeStream.PassThrough> = [];
+  const pendingRegistrations: Array<() => void> = [];
   const spawn = (options: SpawnOptions): SpawnedProcess => {
     spawns.push(options);
     const stdin = new NodeStream.PassThrough();
@@ -2550,7 +2573,13 @@ function makeFakeClaudeCli(answerSetServers: boolean | "recall-error" | "reject"
                   }
                 : {},
         };
-        stdout.write(`${JSON.stringify({ type: "control_response", response })}\n`);
+        const reply = () => {
+          stdout.write(`${JSON.stringify({ type: "control_response", response })}\n`);
+        };
+        if (setServers && answerSetServers === "hold") {
+          pendingRegistrations.push(reply);
+          onSetServers?.();
+        } else reply();
       }
     });
     stdin.on("end", () => {
@@ -2566,6 +2595,7 @@ function makeFakeClaudeCli(answerSetServers: boolean | "recall-error" | "reject"
     spawns,
     controlRequests,
     closed,
+    releaseRegistration: () => pendingRegistrations.shift()?.(),
     emitHomeFailure: () =>
       stdouts[0]!.write(
         `${JSON.stringify({ type: "system", subtype: "init", mcp_servers: [{ name: "dia", status: "failed" }] })}\n`,
@@ -2583,12 +2613,14 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
     cli: ReturnType<typeof makeFakeClaudeCli>,
     statuses: Array<{ server: string; status: string }> = [],
     recall = false,
+    measureStartup?: ClaudeTurnStartup.StartupAttempt["stage"],
   ) =>
     Effect.gen(function* () {
       const runner = yield* ClaudeAdapterV2.ClaudeAgentSdkQueryRunner;
       return yield* runner.open({
         threadId: ThreadId.make("thread-claude-mcp-channel"),
         providerSessionId: ProviderSessionId.make("provider-session-claude-mcp-channel"),
+        ...(measureStartup === undefined ? {} : { measureStartup }),
         onMcpStatus: (status) =>
           Effect.sync(() => {
             statuses.push(status);
@@ -2612,7 +2644,11 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
         },
       });
     }).pipe(
-      Effect.provide(ClaudeAdapterV2.layerQueryRunner),
+      Effect.provide(
+        ClaudeAdapterV2.layerQueryRunner.pipe(
+          Layer.provide(ProviderProcessRegistry.ProviderProcessRegistry.layerTest),
+        ),
+      ),
       Effect.provideService(
         ProviderEventLoggers.ProviderEventLoggers,
         ProviderEventLoggers.NoOpProviderEventLoggers,
@@ -2696,6 +2732,82 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
       }
     }),
   );
+
+  it.effect.each(["success", "timeout"] as const)(
+    "measures initial MCP registration separately from SDK setup: %s",
+    (scenario) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const entered = yield* Queue.unbounded<void>();
+          const cli = makeFakeClaudeCli("hold", () => {
+            Queue.offerUnsafe(entered, undefined);
+          });
+          const rows: Array<typeof AnalyticsEvent.Type> = [];
+          const analytics = Analytics.Analytics.of({
+            record: (row) =>
+              Effect.sync(() => {
+                rows.push(row);
+              }),
+            flush: Effect.void,
+            ingest: () => Effect.void,
+            read: () => Effect.die("unused analytics read"),
+          });
+          const start = yield* ClaudeTurnStartup.prepare(
+            {
+              threadId: ThreadId.make("thread-claude-mcp-channel"),
+              runId: RunId.make("run-cold-mcp-registration"),
+              attemptId: RunAttemptId.make("attempt-cold-mcp-registration"),
+            },
+            true,
+            (startup) =>
+              startup
+                .stage(
+                  "sdk_open",
+                  (scenario === "timeout" ? Effect.sleep("13 seconds") : Effect.void).pipe(
+                    Effect.andThen(openWith(cli, [], false, startup.stage)),
+                  ),
+                )
+                .pipe(Effect.map((session) => session.close)),
+            (effect) => effect,
+          ).pipe(
+            Effect.flatMap((deliver) => deliver),
+            Effect.exit,
+            Effect.provideService(Analytics.Analytics, analytics),
+            Effect.forkScoped,
+          );
+          if (scenario === "timeout") yield* TestClock.adjust("13 seconds");
+          yield* Queue.take(entered);
+          yield* TestClock.adjust(scenario === "timeout" ? "2 seconds" : "3 seconds");
+          if (scenario === "success") cli.releaseRegistration();
+          else {
+            yield* TestClock.adjust("13 seconds");
+            yield* Queue.take(entered);
+            yield* TestClock.adjust("2 seconds");
+          }
+          const result = yield* Fiber.join(start);
+          assert.equal(result._tag, scenario === "success" ? "Success" : "Failure");
+          if (Exit.isFailure(result))
+            assert.equal(
+              makeProviderFailure({ cause: result.cause }).message,
+              "Claude did not start within 15 s (MCP registration); nothing was sent to the model. Retry is safe.",
+            );
+          assert.deepEqual(
+            rows.map((row) => [
+              row.props?.outcome,
+              row.props?.stage,
+              row.props?.sdkOpenMs,
+              row.props?.mcpRegistrationMs,
+            ]),
+            scenario === "success"
+              ? [["success", "sdk_accept", 0, 3000]]
+              : [
+                  ["timeout", "mcp_registration", 13000, 2000],
+                  ["timeout", "mcp_registration", 13000, 2000],
+                ],
+          );
+        }),
+      ),
+  );
 });
 
 describe("ClaudeAdapterV2 native session identity", () => {
@@ -2703,6 +2815,7 @@ describe("ClaudeAdapterV2 native session identity", () => {
     providerTurnOrdinal: number,
     nativeThreadHasTurns?: boolean,
     seededHead?: string | null,
+    savedTranscript?: { readonly nativeThreadId: string; readonly text: string },
   ) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -2711,14 +2824,23 @@ describe("ClaudeAdapterV2 native session identity", () => {
         const attachmentsDir = yield* fileSystem.makeTempDirectoryScoped({
           prefix: "t3-claude-v2-session-identity-",
         });
+        const path = yield* Path.Path;
+        if (savedTranscript !== undefined) {
+          const projectDir = path.join(attachmentsDir, "projects", "-previous-workspace");
+          yield* fileSystem.makeDirectory(projectDir, { recursive: true });
+          yield* fileSystem.writeFileString(
+            path.join(projectDir, `${savedTranscript.nativeThreadId}.jsonl`),
+            savedTranscript.text,
+          );
+        }
         const openedQueries: Array<ClaudeAdapterV2.ClaudeAgentSdkQueryOpenInput> = [];
         const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
           instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
           settings: DEFAULT_CLAUDE_SETTINGS,
-          environment: {},
+          environment: { CLAUDE_CONFIG_DIR: attachmentsDir },
           attachmentsDir,
           fileSystem,
-          path: yield* Path.Path,
+          path,
           crypto: yield* Crypto.Crypto,
           idAllocator,
           queryRunner: {
@@ -2804,20 +2926,25 @@ describe("ClaudeAdapterV2 native session identity", () => {
       ),
     );
 
-  it.effect("creates the native session on the first provider turn", () =>
-    Effect.gen(function* () {
-      const openedQueries = yield* openTurnWithOrdinal(1);
-      assert.equal(openedQueries.length, 1);
-      assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
-      assert.equal(openedQueries[0]?.options.resume, undefined);
-    }),
+  it.effect.each([undefined, false])(
+    "creates the first native session without a transcript and nativeThreadHasTurns=%s",
+    (nativeThreadHasTurns) =>
+      Effect.gen(function* () {
+        const openedQueries = yield* openTurnWithOrdinal(1, nativeThreadHasTurns);
+        assert.equal(openedQueries.length, 1);
+        assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
+        assert.equal(openedQueries[0]?.options.resume, undefined);
+      }),
   );
 
-  it.effect(
-    "resumes the native session on a fresh session instance when prior provider turns exist",
-    () =>
+  it.effect.each([
+    { providerTurnOrdinal: 1, nativeThreadHasTurns: true },
+    { providerTurnOrdinal: 2, nativeThreadHasTurns: undefined },
+  ])(
+    "resumes a prior native session with ordinal $providerTurnOrdinal and nativeThreadHasTurns=$nativeThreadHasTurns",
+    ({ providerTurnOrdinal, nativeThreadHasTurns }) =>
       Effect.gen(function* () {
-        const openedQueries = yield* openTurnWithOrdinal(2);
+        const openedQueries = yield* openTurnWithOrdinal(providerTurnOrdinal, nativeThreadHasTurns);
         assert.equal(openedQueries.length, 1);
         assert.equal(openedQueries[0]?.options.resume, "native-session-identity");
         assert.equal(openedQueries[0]?.options.sessionId, undefined);
@@ -2830,6 +2957,46 @@ describe("ClaudeAdapterV2 native session identity", () => {
       assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
       assert.equal(openedQueries[0]?.options.resume, undefined);
     }),
+  );
+
+  it.effect("creates a new native session when only another session has a transcript", () =>
+    Effect.gen(function* () {
+      const openedQueries = yield* openTurnWithOrdinal(1, false, undefined, {
+        nativeThreadId: "other-native-session",
+        text: '{"type":"user","message":{"role":"user","content":"hello"}}\n',
+      });
+      assert.equal(openedQueries.length, 1);
+      assert.equal(openedQueries[0]?.options.sessionId, "native-session-identity");
+      assert.isUndefined(openedQueries[0]?.options.resume);
+    }),
+  );
+
+  it.effect.each([
+    { providerTurnOrdinal: 1, nativeThreadHasTurns: undefined },
+    { providerTurnOrdinal: 1, nativeThreadHasTurns: false },
+    { providerTurnOrdinal: 2, nativeThreadHasTurns: false },
+  ])(
+    "resumes a saved transcript with ordinal $providerTurnOrdinal and nativeThreadHasTurns=$nativeThreadHasTurns",
+    ({ providerTurnOrdinal, nativeThreadHasTurns }) =>
+      Effect.gen(function* () {
+        const openedQueries = yield* openTurnWithOrdinal(
+          providerTurnOrdinal,
+          nativeThreadHasTurns,
+          undefined,
+          {
+            nativeThreadId: "native-session-identity",
+            text: [
+              '{"type":"user","message":{"role":"user","content":"hello"}}',
+              '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}}',
+              "",
+            ].join("\n"),
+          },
+        );
+        assert.equal(openedQueries.length, 1);
+        assert.equal(openedQueries[0]?.options.resume, "native-session-identity");
+        assert.isUndefined(openedQueries[0]?.options.sessionId);
+        assert.isUndefined(openedQueries[0]?.options.resumeSessionAt);
+      }),
   );
 
   it.effect.each([
@@ -2905,6 +3072,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       | "invalid_request"
       | "rate_limit"
       | "server_error"
+      | "unknown"
       | undefined;
     readonly text?: string;
     readonly parentToolUseId?: string | null;
@@ -3032,6 +3200,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     });
 
   const makeWakeHarnessWithOptions = (options?: {
+    readonly beforeOpen?: Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly cancelPendingPrompt?: (
       uuid: string,
     ) => Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
@@ -3100,6 +3269,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Queue.unbounded<
           Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "subagent.updated" }>
         >();
+      const retryReceipts =
+        yield* Queue.unbounded<
+          Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "turn_item.updated" }>
+        >();
       const systemNoticeReceipts =
         yield* Queue.unbounded<
           Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "turn_item.updated" }>
@@ -3140,6 +3313,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           allocateSessionId: Effect.succeed(options?.nativeSessionId ?? WAKE_NATIVE_SESSION),
           open: (input) =>
             Effect.gen(function* () {
+              yield* options?.beforeOpen ?? Effect.void;
               openedOptions = input.options;
               if (options?.freshQueueOnReopen === true && processQueues.length > 0) {
                 const processMessages = yield* Queue.unbounded<SDKMessage>();
@@ -3245,6 +3419,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             if (event.type === "plan.updated") {
               yield* Queue.offer(planReceipts, event);
             }
+            if (event.type === "turn_item.updated" && event.turnItem.type === "error")
+              yield* Queue.offer(retryReceipts, event);
             if (event.type === "turn_item.updated" && event.turnItem.type === "system_notice") {
               yield* Queue.offer(systemNoticeReceipts, event);
             }
@@ -3290,6 +3466,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         terminalReceipts,
         subagentReceipts,
         systemNoticeReceipts,
+        retryReceipts,
         runtimeRequestReceipts,
         planReceipts,
         providerThreadReceipts,
@@ -3300,6 +3477,172 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+
+  it.effect("keeps the current Claude wake caller live before continuation admission", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sessions = yield* McpProviderSessions.McpProviderSessions;
+        const threadId = ThreadId.make("thread-claude-wake");
+        const caller = {
+          threadId,
+          providerSessionId: "wake-credential",
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        };
+        const credential = {
+          ...caller,
+          runtimeProviderSessionId: ProviderSessionId.make("provider-session-claude-wake"),
+          environmentId: EnvironmentId.make("test"),
+          endpoint: "http://localhost/mcp",
+          authorizationHeader: "Bearer test",
+          browserToolsAvailable: false,
+        };
+        yield* sessions.set(credential);
+        const h = yield* makeWakeHarness;
+        const shell = {
+          ...liveThreadShell(threadId, { activeRunId: null }),
+          providerInstanceId: caller.providerInstanceId,
+        };
+        yield* h.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("wake-access"),
+            text: "Start background work",
+            attachments: [],
+          }),
+        );
+        yield* h.offerAndWait(wakeTaskStarted);
+        yield* h.offerAndWait(turnOneResult);
+        yield* Queue.take(h.terminalReceipts);
+        yield* h.offerAndWait(wakeNotification);
+        assert.equal(yield* sessions.readWakeCaller(caller), "starting");
+        const gap = yield* assertLiveCallerShell(shell, caller).pipe(Effect.flip);
+        assert.equal(gap.code, "run_starting");
+        const firstTool = claudeSdkFrame({
+          type: "assistant",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "wake-board-write",
+                name: "mcp__t3-code__card_update",
+                input: { card: "#1038" },
+              },
+            ],
+          },
+          parent_tool_use_id: null,
+          uuid: "wake-board-write",
+          session_id: WAKE_NATIVE_SESSION,
+        });
+        yield* h.offerAndWait(firstTool);
+        // No continuation has been admitted: the first write must use native wake evidence.
+        assert.lengthOf(h.terminalEvents(), 1);
+        assert.lengthOf(h.continuationRequests, 1);
+        yield* assertLiveCallerShell(shell, caller);
+        yield* h.offerAndWait(wakeResult);
+        yield* assertLiveCallerShell(shell, caller);
+        yield* sessions.set({
+          ...credential,
+          providerSessionId: "replacement-credential",
+          runtimeProviderSessionId: ProviderSessionId.make("replacement-runtime"),
+        });
+        const replaced = yield* assertLiveCallerShell(shell, caller).pipe(Effect.flip);
+        assert.equal(replaced.code, "parent_not_active");
+        yield* sessions.set(credential);
+        yield* assertLiveCallerShell(shell, caller);
+        yield* Queue.shutdown(h.sdkMessages);
+        yield* h.awaitQueryCleanup;
+        const ended = yield* assertLiveCallerShell(shell, caller).pipe(Effect.flip);
+        assert.equal(ended.code, "parent_not_active");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each(["lifecycle", "prompt_echo", "native_output"] as const)(
+    "records same-attempt native %s evidence before orchestration receives it",
+    (evidence) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const progress = yield* ProviderStartProgress.ProviderStartProgress;
+          const h = yield* makeWakeHarness;
+          const input = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("native-progress"),
+            text: "Say hello",
+            attachments: [],
+          });
+          yield* progress.begin({
+            threadId: input.threadId,
+            runId: input.runId,
+            attemptId: input.attemptId,
+            attemptOrdinal: 1,
+            provider: input.modelSelection.instanceId,
+            model: input.modelSelection.model,
+            delegated: false,
+            providerSessionId: h.runtime.providerSessionId,
+          });
+          yield* h.runtime.startTurn(input);
+          assert.isNull(progress.get(input.runId, input.attemptId)?.nativeAcceptedAt);
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "init",
+              uuid: "00000000-0000-4000-8000-000000009901",
+              session_id: WAKE_NATIVE_SESSION,
+            }),
+          );
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "command_lifecycle",
+              command_uuid: "another-prompt",
+              state: "started",
+            }),
+          );
+          assert.isNotNull(progress.get(input.runId, input.attemptId)?.sdkReceivedAt);
+          assert.isNull(progress.get(input.runId, input.attemptId)?.nativeAcceptedAt);
+          assert.isNull(progress.get(input.runId, input.attemptId)?.adapterEmittedAt);
+          yield* h.offerAndWait(
+            evidence === "lifecycle"
+              ? claudeSdkFrame({
+                  type: "command_lifecycle",
+                  command_uuid: h.promptUuid(0),
+                  state: "started",
+                })
+              : claudeSdkFrame({
+                  ...makeAssistantTextFrame({
+                    uuid: "00000000-0000-4000-8000-000000009902",
+                    text: "Native output",
+                  }),
+                  ...(evidence === "prompt_echo" ? { user_message_uuid: h.promptUuid(0) } : {}),
+                }),
+          );
+          const snapshot = progress.get(input.runId, input.attemptId)!;
+          assert.equal(snapshot.nativeSessionId, WAKE_NATIVE_SESSION);
+          assert.isNotNull(snapshot.sdkReceivedAt);
+          assert.isNotNull(snapshot.nativeAcceptedAt);
+          assert.isNotNull(snapshot.adapterEmittedAt);
+          assert.equal(snapshot.step, "adapter_emitted");
+          assert.isNull(progress.get(input.runId, RunAttemptId.make("different-attempt")));
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ProviderStartProgress.layer,
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+          ),
+        ),
+      ),
+  );
 
   it.effect.each([false, true])(
     "shares concurrent prompt skill discovery only for the same cwd (different cwd: %s)",
@@ -3631,6 +3974,117 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
+  it.effect.each(["once", "twice", "non-timeout", "delivery-timeout"] as const)(
+    "retries only pre-delivery Claude startup timeouts: %s",
+    (scenario) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const entered = yield* Queue.unbounded<number>();
+          const rows: Array<typeof AnalyticsEvent.Type> = [];
+          const analytics = Analytics.Analytics.of({
+            record: (row) =>
+              Effect.sync(() => {
+                rows.push(row);
+              }),
+            flush: Effect.void,
+            ingest: () => Effect.void,
+            read: () => Effect.die("unused analytics read"),
+          });
+          let preparations = 0;
+          const harness = yield* makeWakeHarnessWithOptions({
+            beforeOpen:
+              scenario === "non-timeout"
+                ? Effect.fail(
+                    new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                      method: "open",
+                      cause: new Error("private setup"),
+                    }),
+                  )
+                : Effect.void,
+            retryMcp: Effect.suspend(() => {
+              preparations++;
+              if (scenario === "delivery-timeout" || (scenario === "once" && preparations > 1))
+                return Effect.void;
+              return Queue.offer(entered, preparations).pipe(Effect.andThen(Effect.never));
+            }),
+            offer: () =>
+              scenario === "delivery-timeout"
+                ? Effect.fail(
+                    new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                      method: "offer",
+                      cause: { _tag: "TimeoutError" },
+                    }),
+                  )
+                : Effect.void,
+          });
+          const input = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("startup-timeout"),
+            text: "Work",
+            attachments: [],
+          });
+          const start = yield* harness.runtime
+            .startTurn(input)
+            .pipe(
+              Effect.exit,
+              Effect.provideService(Analytics.Analytics, analytics),
+              Effect.forkScoped,
+            );
+          if (scenario === "once" || scenario === "twice") {
+            assert.equal(yield* Queue.take(entered), 1);
+            yield* TestClock.adjust("15 seconds");
+            if (scenario === "twice") {
+              assert.equal(yield* Queue.take(entered), 2);
+              yield* TestClock.adjust("15 seconds");
+            }
+          }
+          const result = yield* Fiber.join(start);
+          assert.equal(result._tag, scenario === "once" ? "Success" : "Failure");
+          assert.equal(
+            preparations,
+            scenario === "once" || scenario === "twice" ? 2 : scenario === "non-timeout" ? 0 : 1,
+          );
+          assert.lengthOf(
+            harness.offeredMessages,
+            scenario === "once" || scenario === "delivery-timeout" ? 1 : 0,
+          );
+          if (Exit.isFailure(result)) {
+            const summary = makeProviderFailure({ cause: result.cause }).message;
+            assert.equal(
+              summary,
+              scenario === "twice"
+                ? "Claude did not start within 15 s (MCP registration); nothing was sent to the model. Retry is safe."
+                : "The provider could not start this turn. Retry the turn; if it keeps failing, check the provider setup and server logs.",
+            );
+          }
+          for (const row of rows) yield* decodeAnalyticsEvent(row);
+          assert.deepEqual(
+            rows.map((row) => [row.props?.outcome, row.props?.retryCount, row.props?.stage]),
+            scenario === "once"
+              ? [
+                  ["timeout", 0, "mcp_registration"],
+                  ["success", 1, "sdk_accept"],
+                ]
+              : scenario === "twice"
+                ? [
+                    ["timeout", 0, "mcp_registration"],
+                    ["timeout", 1, "mcp_registration"],
+                  ]
+                : [["error", 0, scenario === "delivery-timeout" ? "sdk_accept" : "sdk_open"]],
+          );
+          if (scenario === "once" || scenario === "twice")
+            assert.equal(rows[0]?.props?.mcpRegistrationMs, 15000);
+          assert.equal(rows[0]?.props?.sdkAcceptMs, scenario === "delivery-timeout" ? 0 : null);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
   it.effect.each(["setModel", "applyFlagSettings", "setPermissionMode", "retryMcp"] as const)(
     "releases Stop when Claude preparation stalls in %s without interrupting background work",
     (method) =>
@@ -3719,6 +4173,131 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect.each(["matching", "runId", "attemptId", "providerThreadId"] as const)(
+    "checks queued Stop identity before a successful preparation retry: %s",
+    (identity) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const entered = yield* Deferred.make<void>();
+          let preparations = 0;
+          const harness = yield* makeWakeHarnessWithOptions({
+            retryMcp: Effect.suspend(() =>
+              ++preparations === 1
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never))
+                : Effect.void,
+            ),
+          });
+          const input = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("stop-before-startup-retry"),
+            text: "Work",
+            attachments: [],
+          });
+          const start = yield* harness.runtime
+            .startTurn(input)
+            .pipe(Effect.exit, Effect.forkScoped);
+          yield* Deferred.await(entered);
+          const stopRequested = yield* Deferred.make<void>();
+          const stop = yield* Deferred.succeed(stopRequested, undefined).pipe(
+            Effect.andThen(
+              harness.runtime.interruptStartingRun!({
+                providerThread:
+                  identity === "providerThreadId"
+                    ? {
+                        ...harness.providerThread,
+                        id: ProviderThreadId.make("different-provider-thread"),
+                      }
+                    : harness.providerThread,
+                runId: identity === "runId" ? RunId.make("different-run") : input.runId,
+                attemptId:
+                  identity === "attemptId"
+                    ? RunAttemptId.make("different-attempt")
+                    : input.attemptId,
+              }),
+            ),
+            Effect.forkScoped,
+          );
+          yield* Deferred.await(stopRequested);
+          yield* TestClock.adjust("15 seconds");
+          yield* Fiber.join(stop);
+          const result = yield* Fiber.join(start);
+          assert.equal(result._tag, identity === "matching" ? "Failure" : "Success");
+          assert.equal(preparations, identity === "matching" ? 1 : 2);
+          assert.lengthOf(harness.offeredMessages, identity === "matching" ? 0 : 1);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
+  it.effect("records an interrupted handoff before SDK delivery", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const prepared = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const lock = yield* Semaphore.make(1);
+        const rows: Array<typeof AnalyticsEvent.Type> = [];
+        let stopped = false;
+        let offers = 0;
+        const analytics = Analytics.Analytics.of({
+          record: (row) =>
+            Effect.sync(() => {
+              rows.push(row);
+            }),
+          flush: Effect.void,
+          ingest: () => Effect.void,
+          read: () => Effect.die("unused analytics read"),
+        });
+        const start = yield* ClaudeTurnStartup.prepare(
+          {
+            threadId: ThreadId.make("thread-stop-at-preparation-handoff"),
+            runId: RunId.make("run-stop-at-preparation-handoff"),
+            attemptId: RunAttemptId.make("attempt-stop-at-preparation-handoff"),
+          },
+          true,
+          (startup) =>
+            startup.seal.pipe(
+              Effect.as(
+                Effect.sync(() => {
+                  offers++;
+                }),
+              ),
+            ),
+          (effect) =>
+            lock
+              .withPermits(1)(effect)
+              .pipe(
+                Effect.tap(() => Deferred.succeed(prepared, undefined)),
+                Effect.tap(() => Deferred.await(release)),
+              ),
+          Effect.suspend(() => (stopped ? Effect.interrupt : Effect.void)),
+        ).pipe(
+          Effect.flatMap((deliver) => deliver),
+          Effect.exit,
+          Effect.provideService(Analytics.Analytics, analytics),
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(prepared);
+        yield* lock.withPermits(1)(
+          Effect.sync(() => {
+            stopped = true;
+          }),
+        );
+        yield* Deferred.succeed(release, undefined);
+        assert.equal((yield* Fiber.join(start))._tag, "Failure");
+        assert.equal(offers, 0);
+        assert.deepEqual(
+          rows.map((row) => [row.props?.outcome, row.props?.stage, row.props?.retryCount]),
+          [["interrupted", "sdk_accept", 0]],
+        );
+      }),
+    ),
+  );
+
   it.effect(
     "stops only the matching attached Claude attempt while prompt delivery is pending",
     () =>
@@ -3758,6 +4337,90 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.isTrue(closed);
           assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "interrupted");
           yield* Fiber.interrupt(start);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each(["no-query", "idle-query", "healthy-successor"] as const)(
+    "reports typed not-active Stop without touching a live query: %s",
+    (scenario) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let nativeInterrupts = 0;
+          let nativeCloses = 0;
+          const harness = yield* makeWakeHarnessWithOptions({
+            interrupt: Effect.sync(() => {
+              nativeInterrupts++;
+            }),
+            close: (queue) =>
+              Effect.sync(() => {
+                nativeCloses++;
+              }).pipe(Effect.andThen(Queue.shutdown(queue))),
+          });
+          const turn = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("not-active-successor"),
+            text: "Keep working",
+            attachments: [],
+          });
+          if (scenario !== "no-query") yield* harness.runtime.startTurn(turn);
+          if (scenario === "idle-query") {
+            yield* harness.offerAndWait(
+              makeResultFrame({ uuid: "not-active-idle", result: "Done" }),
+            );
+            yield* Queue.take(harness.terminalReceipts);
+          }
+          const stale = ProviderTurnId.make("stale-turn");
+          const stopped = yield* harness.runtime
+            .interruptTurn({
+              providerThread: harness.providerThread,
+              providerTurnId: stale,
+              requestRuntimeRestart: false,
+              stopBackgroundWork: false,
+            })
+            .pipe(Effect.flip);
+          assert.instanceOf(stopped, ProviderAdapter.ProviderAdapterTurnNotActiveError);
+          if (!isTurnNotActiveError(stopped)) throw new Error("Expected not-active Stop");
+          assert.equal(stopped.providerThreadId, harness.providerThread.id);
+          assert.equal(stopped.providerTurnId, stale);
+          assert.equal(nativeInterrupts, 0);
+          assert.equal(nativeCloses, 0);
+          const steer = yield* harness.runtime
+            .steerTurn({
+              threadId: harness.threadId,
+              runId: turn.runId,
+              providerThread: harness.providerThread,
+              providerTurnId: stale,
+              message: turn.message,
+            })
+            .pipe(Effect.flip);
+          assert.isTrue(isSteerRunError(steer));
+          if (!isSteerRunError(steer)) throw new Error("Expected steer refusal");
+          assert.isTrue(isProtocolError(steer.cause));
+          if (scenario === "healthy-successor") {
+            const liveId = (yield* IdAllocator.IdAllocatorV2).derive.providerTurn({
+              driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+              nativeTurnId: `turn:${turn.attemptId}`,
+            });
+            yield* harness.runtime.steerTurn({
+              threadId: harness.threadId,
+              runId: turn.runId,
+              providerThread: harness.providerThread,
+              providerTurnId: liveId,
+              message: {
+                ...turn.message,
+                messageId: MessageId.make("successor-steer"),
+                text: "Continue",
+              },
+            });
+            assert.lengthOf(harness.terminalEvents(), 0);
+          }
         }).pipe(
           Effect.provide(
             Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
@@ -4076,6 +4739,134 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 event.providerTurn.tokenUsage?.usedTokens === 400,
             ),
           );
+        }),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(["lifecycle", "init_echo"] as const)(
+    "gives a follow-up on the same open query its own acceptance and final result: %s",
+    (evidence) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const acceptedAt: Array<number> = [];
+          for (const ordinal of [1, 2]) {
+            const input = {
+              ...makeClaudeTestTurnInput({
+                threadId: harness.threadId,
+                providerThread: harness.providerThread,
+                now: yield* DateTime.now,
+                attemptId: RunAttemptId.make(`same-query-${ordinal}`),
+                text: `Prompt ${ordinal}`,
+                attachments: [],
+                providerTurnOrdinal: ordinal,
+              }),
+              runOrdinal: ordinal,
+            };
+            yield* harness.runtime.startTurn(input);
+            const provisional = Option.getOrThrow(
+              yield* Stream.fromQueue(harness.providerTurnReceipts).pipe(
+                Stream.filter((event) => event.providerTurn.runAttemptId === input.attemptId),
+                Stream.take(1),
+                Stream.runHead,
+              ),
+            ).providerTurn;
+            assert.equal(provisional.status, "running");
+            assert.isUndefined(provisional.promptAcceptedAt);
+            assert.lengthOf(harness.processQueues, 1);
+            const promptUuid = harness.promptUuid(ordinal - 1);
+            if (ordinal === 2) assert.notEqual(promptUuid, harness.promptUuid(0));
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                type: "command_lifecycle",
+                command_uuid: promptUuid,
+                state: "queued",
+              }),
+            );
+            const init = claudeSdkFrame({
+              type: "system",
+              subtype: "init",
+              uuid: `00000000-0000-4000-8000-00000000991${ordinal}`,
+              session_id: WAKE_NATIVE_SESSION,
+              user_message_uuids: [promptUuid],
+            });
+            yield* harness.offerAndWait(
+              evidence === "lifecycle"
+                ? claudeSdkFrame({
+                    type: "command_lifecycle",
+                    command_uuid: promptUuid,
+                    state: "started",
+                  })
+                : init,
+            );
+            const accepted = Option.getOrThrow(
+              yield* Stream.fromQueue(harness.providerTurnReceipts).pipe(
+                Stream.filter(
+                  (event) =>
+                    event.providerTurn.runAttemptId === input.attemptId &&
+                    event.providerTurn.promptAcceptedAt !== undefined,
+                ),
+                Stream.take(1),
+                Stream.runHead,
+              ),
+            ).providerTurn;
+            if (accepted.promptAcceptedAt === undefined) throw new Error("Prompt was not accepted");
+            acceptedAt.push(DateTime.toEpochMillis(accepted.promptAcceptedAt));
+            assert.equal(accepted.id, provisional.id);
+            if (evidence === "lifecycle") yield* harness.offerAndWait(init);
+            const text = `Result ${ordinal}`;
+            yield* harness.offerAndWait(
+              makeAssistantTextFrame({
+                uuid: `00000000-0000-4000-8000-00000000992${ordinal}`,
+                text,
+              }),
+            );
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                ...makeResultFrame({
+                  uuid: `00000000-0000-4000-8000-00000000993${ordinal}`,
+                  result: text,
+                  terminalReason: null,
+                }),
+                user_message_uuid: promptUuid,
+                user_message_uuids: [promptUuid],
+              }),
+            );
+            const terminal = yield* Queue.take(harness.terminalReceipts);
+            assert.equal(terminal.providerTurnId, provisional.id);
+            assert.equal(terminal.runOrdinal, ordinal);
+            assert.equal(terminal.status, "completed");
+            assert.isNull(terminal.failure);
+            const completed = harness.events.findLast(
+              (event) =>
+                event.type === "provider_turn.updated" && event.providerTurn.id === provisional.id,
+            );
+            if (completed?.type !== "provider_turn.updated") throw new Error("Missing turn end");
+            assert.equal(completed.providerTurn.status, "completed");
+            assert.deepEqual(completed.providerTurn.promptAcceptedAt, accepted.promptAcceptedAt);
+            assert.isNotNull(completed.providerTurn.completedAt);
+            const final = harness.events.findLast(
+              (event) => event.type === "message.updated" && event.message.runId === input.runId,
+            );
+            if (final?.type !== "message.updated") throw new Error("Missing final result");
+            assert.equal(final.message.text, text);
+            assert.equal(final.message.phase, "answer");
+            yield* harness.offerAndWait(
+              claudeSdkFrame({
+                type: "command_lifecycle",
+                command_uuid: promptUuid,
+                state: "completed",
+              }),
+            );
+            yield* TestClock.adjust("1 second");
+          }
+          assert.isAbove(acceptedAt[1]!, acceptedAt[0]!);
+          assert.lengthOf(harness.terminalEvents(), 2);
+          assert.lengthOf(harness.processQueues, 1);
         }),
       ).pipe(
         Effect.provide(
@@ -6296,6 +7087,1458 @@ describe("ClaudeAdapterV2 background wake turns", () => {
   );
 
   it.effect.each(
+    [400, 401, 403, 404, 413, 418, 429].flatMap((status) =>
+      ["terminal", "retry"].flatMap((kind) =>
+        ["sdk-first", "health-first"].map((order) => ({ status, order, kind })),
+      ),
+    ),
+  )("does not cut off SDK $status while $kind I/O is pending ($order)", ({ status, order, kind }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const configDir = yield* fs.makeTempDirectoryScoped();
+      const dir = path.join(configDir, "projects", "-workspace");
+      yield* fs.makeDirectory(dir, { recursive: true });
+      const reads = [yield* Deferred.make<void>(), yield* Deferred.make<void>()];
+      const releases = [yield* Deferred.make<void>(), yield* Deferred.make<void>()];
+      let readCount = 0;
+      let interrupts = 0;
+      yield* Effect.gen(function* () {
+        const h = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+          interrupt: Effect.sync(() => {
+            interrupts++;
+          }),
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("terminal-read-race"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(turn);
+        yield* fs.writeFileString(
+          path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`),
+          JSON.stringify({
+            type: "system",
+            subtype: "api_error",
+            timestamp: DateTime.formatIso(yield* DateTime.now),
+            error:
+              status === 404
+                ? { status: 404, formatted: "HTTP 404 model not found" }
+                : { message: "Request timed out.", connection: null },
+            source: "request_retry",
+          }) + "\n",
+        );
+        const input = {
+          runId: turn.runId,
+          attemptId: turn.attemptId,
+          noResponseBudgetMs: 300_000,
+          flapLimit: 20,
+        };
+        yield* TestClock.adjust(order === "health-first" ? "5 minutes" : "299 seconds");
+        const health =
+          order === "health-first"
+            ? yield* h.runtime.checkRetryHealth!(input).pipe(Effect.forkScoped)
+            : undefined;
+        if (health !== undefined) yield* Deferred.await(reads[0]!);
+        const terminal = yield* h
+          .offerAndWait(
+            kind === "terminal"
+              ? makeResultFrame({
+                  uuid: "permanent-terminal-read",
+                  result: "Permanent API error",
+                  isError: true,
+                  apiErrorStatus: status,
+                  terminalReason: "api_error",
+                })
+              : claudeSdkFrame({
+                  type: "system",
+                  subtype: "api_retry",
+                  error: "unknown",
+                  error_status: status,
+                  attempt: 1,
+                  max_retries: 10,
+                  retry_delay_ms: 602,
+                  session_id: WAKE_NATIVE_SESSION,
+                  uuid: "permanent-retry-read",
+                }),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(reads[health === undefined ? 0 : 1]!);
+        if (health === undefined) {
+          yield* TestClock.adjust("1 second");
+          assert.isFalse(yield* h.runtime.checkRetryHealth!(input));
+          assert.equal(readCount, 1);
+        } else {
+          yield* Deferred.succeed(releases[0]!, undefined);
+          assert.isFalse(yield* Fiber.join(health));
+        }
+        yield* Deferred.succeed(releases[health === undefined ? 0 : 1]!, undefined);
+        yield* Fiber.join(terminal);
+        if (kind === "retry")
+          yield* Queue.offer(
+            h.sdkMessages,
+            makeResultFrame({
+              uuid: "retry-read-terminal",
+              result: "API error",
+              isError: true,
+              apiErrorStatus: null,
+              terminalReason: "api_error",
+            }),
+          );
+        const result = yield* Queue.take(h.terminalReceipts);
+        assert.equal(result.status, "failed");
+        if (result.status !== "failed") return;
+        assert.equal(result.failure.code, `api_error_${status}`);
+        assert.notEqual(result.failure.category, "transient");
+        assert.equal(interrupts, 0);
+      }).pipe(
+        Effect.provideService(
+          ClaudeApiErrorTranscript.ApiErrorReadObserver,
+          Effect.gen(function* () {
+            const index = readCount++;
+            if (index >= reads.length) return;
+            yield* Deferred.succeed(reads[index]!, undefined);
+            if (index === 0 || order === "health-first") yield* Deferred.await(releases[index]!);
+          }),
+        ),
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each([
+    "silent",
+    "timeout",
+    "refused",
+    "recovered",
+    "flap",
+    "permanent",
+    "after-tool",
+  ] as const)("bounds delegated no-response retries: %s", (shape) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const configDir = yield* fs.makeTempDirectoryScoped();
+      const harness = yield* makeWakeHarnessWithOptions({
+        environment: { CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_BASE_URL: "http://127.0.0.1:20128" },
+        close: (queue) => Queue.shutdown(queue),
+        freshQueueOnReopen: true,
+      });
+      const now = yield* DateTime.now;
+      const turn = makeClaudeTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now,
+        attemptId: RunAttemptId.make("budget-first"),
+        text: "Continue.",
+        attachments: [],
+      });
+      yield* harness.runtime.startTurn(turn);
+      const healthInput = {
+        runId: turn.runId,
+        attemptId: turn.attemptId,
+        noResponseBudgetMs: 300_000,
+        flapLimit: 20,
+      };
+      const retry = (attempt: number, status: number | null = null) =>
+        harness.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "api_retry",
+            attempt,
+            max_retries: 30,
+            retry_delay_ms: 602,
+            error_status: status,
+            error: status === 429 ? "rate_limit" : "unknown",
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: `retry-${attempt}`,
+          }),
+        );
+      const root = (type: string) =>
+        harness.offerAndWait(
+          claudeSdkFrame({
+            type: "stream_event",
+            parent_tool_use_id: null,
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: `root-${type}`,
+            event:
+              type === "message_start"
+                ? {
+                    type,
+                    message: {
+                      id: "msg",
+                      type: "message",
+                      role: "assistant",
+                      content: [],
+                      model: "claude-sonnet-5-5",
+                      usage: { input_tokens: 0, output_tokens: 0 },
+                    },
+                  }
+                : { type },
+          }),
+        );
+      if (shape === "after-tool") {
+        yield* harness.offerAndWait(
+          makeAssistantTextFrame({ uuid: "before-tool", text: "Working." }),
+        );
+        yield* TestClock.adjust("6 minutes");
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "user",
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            uuid: "tool-finished",
+            message: {
+              role: "user",
+              content: [
+                { type: "tool_result", tool_use_id: "tool", content: "offbox wait finished" },
+              ],
+            },
+          }),
+        );
+      }
+      if (shape === "timeout" || shape === "refused") {
+        const dir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        for (const attempt of [1, 2]) {
+          yield* fs.writeFileString(
+            path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`),
+            JSON.stringify({
+              type: "system",
+              subtype: "api_error",
+              timestamp: DateTime.formatIso(yield* DateTime.now),
+              error:
+                shape === "refused"
+                  ? {
+                      formatted: "Connection refused (ECONNREFUSED)",
+                      connection: { code: "ECONNREFUSED" },
+                    }
+                  : {
+                      message: "Request timed out.",
+                      connection: null,
+                      isNetworkDown: false,
+                      noResponse: null,
+                    },
+              source: "request_retry",
+              retryAttempt: attempt,
+              maxRetries: 10,
+              retryInMs: 602,
+            }) + "\n",
+          );
+          yield* retry(attempt);
+          const notice = yield* Queue.take(harness.retryReceipts);
+          assert.include(
+            notice.turnItem.type === "error" ? notice.turnItem.failure.message : "",
+            shape === "refused" ? "ECONNREFUSED" : "Request timed out",
+          );
+          yield* TestClock.adjust("1 minute");
+        }
+      } else if (shape === "recovered") {
+        for (let i = 1; i <= 6; i++) {
+          yield* retry(i);
+          yield* TestClock.adjust("20 seconds");
+        }
+        yield* root("message_start");
+        yield* root("ping");
+        yield* TestClock.adjust("5 minutes");
+        assert.isFalse(yield* harness.runtime.checkRetryHealth!(healthInput));
+        return;
+      } else if (shape === "flap") {
+        for (let i = 1; i <= 21; i++) {
+          yield* retry(i);
+          yield* root("message_start");
+        }
+      } else if (shape === "permanent") yield* retry(1, 429);
+      if (shape !== "flap") {
+        yield* TestClock.adjust(
+          shape === "timeout" || shape === "refused" ? "179 seconds" : "299 seconds",
+        );
+        assert.isFalse(yield* harness.runtime.checkRetryHealth!(healthInput));
+        yield* TestClock.adjust("1 second");
+      }
+      const stopped = yield* harness.runtime.checkRetryHealth!(healthInput);
+      assert.equal(stopped, shape !== "permanent");
+      if (!stopped) return;
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      assert.equal(terminal.status, "failed");
+      if (terminal.status !== "failed") return;
+      assert.equal(
+        terminal.failure.code,
+        shape === "flap" ? "claude_retry_flap" : "claude_no_response_budget",
+      );
+      assert.equal(terminal.failure.category, "transient");
+      assert.deepEqual(terminal.failure.claudeAccess, {
+        status: null,
+        beforeResponse: shape !== "after-tool" && shape !== "flap",
+        refusalFree: true,
+        refused: false,
+      });
+      if (shape === "timeout") assert.include(terminal.failure.message, "Request timed out");
+      assert.isFalse(yield* harness.runtime.checkRetryHealth!(healthInput));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each(
+    (
+      [
+        "message_start",
+        "content_block_start",
+        "thinking_delta",
+        "message_delta",
+        "ping",
+        "assistant",
+      ] as const
+    ).flatMap((kind) =>
+      [undefined, 400, 401, 403, 413, 429].flatMap((priorStatus) =>
+        ["budget", "terminal"].map((ending) => ({ kind, priorStatus, ending })),
+      ),
+    ),
+  )("a late $kind starts a fresh $ending after SDK $priorStatus", ({ kind, priorStatus, ending }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const configDir = yield* fs.makeTempDirectoryScoped();
+      const harness = yield* makeWakeHarnessWithOptions({
+        environment: { CLAUDE_CONFIG_DIR: configDir },
+        close: (queue) => Queue.shutdown(queue),
+      });
+      const turn = makeClaudeTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("late-response"),
+        text: "Continue.",
+        attachments: [],
+      });
+      yield* harness.runtime.startTurn(turn);
+      if (priorStatus !== undefined) {
+        const dir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        yield* fs.writeFileString(
+          path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`),
+          JSON.stringify({
+            type: "system",
+            subtype: "api_error",
+            timestamp: DateTime.formatIso(yield* DateTime.now),
+            error: { status: priorStatus, formatted: "Historical API error" },
+          }) + "\n",
+        );
+      }
+      if (priorStatus !== undefined)
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "api_retry",
+            attempt: 1,
+            max_retries: 10,
+            retry_delay_ms: 602,
+            error_status: priorStatus,
+            error: "unknown",
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "earlier-permanent-retry",
+          }),
+        );
+      yield* TestClock.adjust("6 minutes");
+      if (kind === "assistant")
+        yield* harness.offerAndWait(
+          makeAssistantTextFrame({ uuid: "fresh-assistant", text: "Working." }),
+        );
+      else
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "stream_event",
+            parent_tool_use_id: null,
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "fresh-stream",
+            event:
+              kind === "message_start"
+                ? {
+                    type: kind,
+                    message: {
+                      id: "fresh",
+                      type: "message",
+                      role: "assistant",
+                      content: [],
+                      model: "claude-sonnet-5-5",
+                      usage: { input_tokens: 0, output_tokens: 0 },
+                    },
+                  }
+                : kind === "content_block_start"
+                  ? {
+                      type: kind,
+                      index: 0,
+                      content_block: { type: "thinking", thinking: "" },
+                    }
+                  : kind === "thinking_delta"
+                    ? {
+                        type: "content_block_delta",
+                        index: 0,
+                        delta: { type: "thinking_delta", thinking: "Working" },
+                      }
+                    : kind === "message_delta"
+                      ? {
+                          type: kind,
+                          delta: { stop_reason: null, stop_sequence: null },
+                          usage: { output_tokens: 1 },
+                        }
+                      : { type: "ping" },
+          }),
+        );
+      if (ending === "terminal") {
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "network-error-after-response",
+            terminalReason: "api_error",
+            isError: true,
+            apiErrorStatus: null,
+            result: "API Error: upstream connection lost",
+          }),
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status === "failed") {
+          assert.equal(terminal.failure.category, "transient");
+          assert.equal(terminal.failure.code, "claude_network_error");
+          assert.include(terminal.failure.message, "upstream connection lost");
+          assert.notInclude(terminal.failure.message, "Historical API error");
+        }
+        return;
+      }
+      if (priorStatus !== undefined)
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "user",
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            uuid: "next-request-after-recovered-retry",
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "finished-tool", content: "Done" }],
+            },
+          }),
+        );
+      else
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "api_retry",
+            attempt: 1,
+            max_retries: 10,
+            retry_delay_ms: 602,
+            error_status: null,
+            error: "unknown",
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "fresh-retry",
+          }),
+        );
+      const input = {
+        runId: turn.runId,
+        attemptId: turn.attemptId,
+        noResponseBudgetMs: 300_000,
+        flapLimit: 20,
+      };
+      yield* TestClock.adjust("299 seconds");
+      assert.isFalse(yield* harness.runtime.checkRetryHealth!(input));
+      yield* TestClock.adjust("1 second");
+      assert.isTrue(yield* harness.runtime.checkRetryHealth!(input));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each(
+    [undefined, null, 404, 400, 401, 403, 413, 418, 429].flatMap((status) =>
+      ["budget", "terminal"].flatMap((ending) =>
+        [false, true].flatMap((retryFirst) =>
+          ["Request timed out.", "Connection dropped (ECONNRESET)"].flatMap((networkText) =>
+            (retryFirst || (status != null && status !== 404) ? [true] : [true, false]).map(
+              (nativeFirst) => ({ status, ending, retryFirst, networkText, nativeFirst }),
+            ),
+          ),
+        ),
+      ),
+    ),
+  )(
+    "keeps native $networkText recovery after a model error with $status ($ending, retry: $retryFirst, native first: $nativeFirst)",
+    ({ status, ending, retryFirst, networkText, nativeFirst }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const dir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        const h = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+          close: Queue.shutdown,
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("synthetic-model-after-reset"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(turn);
+        yield* fs.writeFileString(
+          path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`),
+          JSON.stringify({
+            type: "system",
+            subtype: "api_error",
+            timestamp: DateTime.formatIso(yield* DateTime.now),
+            error: {
+              message: networkText,
+              connection: null,
+            },
+          }) + "\n",
+        );
+        const file = path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`);
+        if (!nativeFirst) yield* fs.rename(file, `${file}.unavailable`);
+        if (retryFirst)
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "api_retry",
+              error: "unknown",
+              error_status: null,
+              attempt: 1,
+              max_retries: 10,
+              retry_delay_ms: 602,
+              session_id: WAKE_NATIVE_SESSION,
+              uuid: "native-reset-before-model-error",
+            }),
+          );
+        yield* h.offerAndWait(
+          claudeSdkFrame({
+            ...makeAssistantTextFrame({ uuid: "synthetic-model-error", text: "API error" }),
+            error: "model_not_found",
+            ...(status === undefined ? {} : { api_error_status: status }),
+          }),
+        );
+        if (!nativeFirst) yield* fs.rename(`${file}.unavailable`, file);
+        const recoverable = status == null || status === 404;
+        if (ending === "budget") {
+          yield* TestClock.adjust("5 minutes");
+          assert.equal(
+            yield* h.runtime.checkRetryHealth!({
+              runId: turn.runId,
+              attemptId: turn.attemptId,
+              noResponseBudgetMs: 300_000,
+              flapLimit: 20,
+            }),
+            recoverable,
+          );
+          if (!recoverable) return;
+        } else
+          yield* Queue.offer(
+            h.sdkMessages,
+            makeResultFrame({
+              uuid: "synthetic-model-terminal",
+              terminalReason: "api_error",
+              apiErrorStatus: null,
+              isError: true,
+              result: `API Error: ${networkText}`,
+            }),
+          );
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        assert.equal(
+          terminal.failure.code,
+          ending === "budget"
+            ? "claude_no_response_budget"
+            : recoverable
+              ? "claude_network_error"
+              : `api_error_${status}`,
+        );
+        assert.equal(terminal.failure.retryable, recoverable);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    [undefined, null, 404].flatMap((syntheticStatus) =>
+      [undefined, 400, 401].flatMap((nativeStatus) =>
+        [false, true].map((health) => ({ syntheticStatus, nativeStatus, health })),
+      ),
+    ),
+  )(
+    "keeps unresolved synthetic $syntheticStatus permanent without native network evidence ($nativeStatus, health: $health)",
+    ({ syntheticStatus, nativeStatus, health }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const dir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        const h = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+          close: Queue.shutdown,
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("unresolved-synthetic-model"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(turn);
+        yield* h.offerAndWait(
+          claudeSdkFrame({
+            ...makeAssistantTextFrame({ uuid: "unresolved-model-error", text: "API error" }),
+            error: "model_not_found",
+            ...(syntheticStatus === undefined ? {} : { api_error_status: syntheticStatus }),
+          }),
+        );
+        if (nativeStatus !== undefined)
+          yield* fs.writeFileString(
+            path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`),
+            JSON.stringify({
+              type: "system",
+              subtype: "api_error",
+              timestamp: DateTime.formatIso(yield* DateTime.now),
+              error: { status: nativeStatus, message: `HTTP ${nativeStatus} error` },
+            }) + "\n",
+          );
+        if (health) {
+          yield* TestClock.adjust("5 minutes");
+          assert.isFalse(
+            yield* h.runtime.checkRetryHealth!({
+              runId: turn.runId,
+              attemptId: turn.attemptId,
+              noResponseBudgetMs: 300_000,
+              flapLimit: 20,
+            }),
+          );
+        }
+        yield* Queue.offer(
+          h.sdkMessages,
+          makeResultFrame({
+            uuid: "unresolved-model-terminal",
+            terminalReason: "api_error",
+            apiErrorStatus: null,
+            isError: true,
+            result: "API Error: model unavailable",
+          }),
+        );
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        assert.equal(
+          terminal.failure.category,
+          nativeStatus === 401
+            ? "auth_expired"
+            : nativeStatus === 400
+              ? "unknown"
+              : "model_invalid",
+        );
+        assert.notEqual(terminal.failure.retryable, true);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    [
+      ...[400, 401, 403, 404, 413, 418, 429].map((status) => ({
+        status,
+        message: `HTTP ${status} error`,
+      })),
+      ...["usage limit reached", "authentication failed", "invalid API key"].map((message) => ({
+        status: undefined,
+        message,
+      })),
+    ].flatMap((cause) =>
+      ["unreadable", "timeout"].flatMap((replacement) =>
+        [false, true].flatMap((recovered) =>
+          ["budget", "terminal"].map((ending) => ({ ...cause, replacement, recovered, ending })),
+        ),
+      ),
+    ),
+  )(
+    "retains health-only permanent $message after $replacement, response=$recovered ($ending)",
+    ({ status, message, replacement, recovered, ending }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const dir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        const file = path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`);
+        const h = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+          close: Queue.shutdown,
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("health-only-permanent"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(turn);
+        yield* fs.writeFileString(
+          file,
+          JSON.stringify({
+            type: "system",
+            subtype: "api_error",
+            timestamp: DateTime.formatIso(yield* DateTime.now),
+            error: { status, message, connection: null },
+          }) + "\n",
+        );
+        const input = {
+          runId: turn.runId,
+          attemptId: turn.attemptId,
+          noResponseBudgetMs: 300_000,
+          flapLimit: 20,
+        };
+        yield* TestClock.adjust("5 minutes");
+        assert.isFalse(yield* h.runtime.checkRetryHealth!(input));
+        yield* TestClock.adjust("1 second");
+        if (recovered) {
+          yield* h.offerAndWait(
+            makeAssistantTextFrame({ uuid: "recovered-health-permanent", text: "Working." }),
+          );
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "user",
+              session_id: WAKE_NATIVE_SESSION,
+              parent_tool_use_id: null,
+              uuid: "next-request-after-health-permanent",
+              message: {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "tool", content: "Done" }],
+              },
+            }),
+          );
+        }
+        if (replacement === "unreadable") yield* fs.rename(file, `${file}.unavailable`);
+        else
+          yield* fs.writeFileString(
+            file,
+            JSON.stringify({
+              type: "system",
+              subtype: "api_error",
+              timestamp: DateTime.formatIso(yield* DateTime.now),
+              error: { message: "Request timed out.", connection: null },
+            }) + "\n",
+          );
+        if (ending === "budget") {
+          yield* TestClock.adjust("5 minutes");
+          assert.equal(yield* h.runtime.checkRetryHealth!(input), recovered);
+          if (!recovered) return;
+        } else
+          yield* Queue.offer(
+            h.sdkMessages,
+            makeResultFrame({
+              uuid: "health-only-permanent-terminal",
+              terminalReason: "api_error",
+              apiErrorStatus: null,
+              isError: true,
+              result: "API Error: Request timed out.",
+            }),
+          );
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        if (recovered)
+          assert.equal(
+            terminal.failure.code,
+            ending === "budget" ? "claude_no_response_budget" : "claude_network_error",
+          );
+        else assert.isFalse(terminal.failure.retryable);
+        assert.equal(terminal.failure.retryable, recovered);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    [false, true].flatMap((successful) =>
+      ["budget", "terminal"].flatMap((ending) =>
+        ["HTTP 404", "404 model_not_found"].map((formatted) => ({ successful, ending, formatted })),
+      ),
+    ),
+  )(
+    "retains native $formatted classification after response=$successful ($ending)",
+    ({ successful, ending, formatted }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const dir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        const harness = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+          close: Queue.shutdown,
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("native-upstream-404"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn(turn);
+        if (successful)
+          yield* harness.offerAndWait(
+            makeAssistantTextFrame({ uuid: "successful-response-before-404", text: "Working." }),
+          );
+        yield* TestClock.adjust("1 second");
+        yield* fs.writeFileString(
+          path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`),
+          JSON.stringify({
+            type: "system",
+            subtype: "api_error",
+            timestamp: DateTime.formatIso(yield* DateTime.now),
+            error: { status: 404, formatted },
+          }) + "\n",
+        );
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "api_retry",
+            error: "unknown",
+            error_status: null,
+            attempt: 1,
+            max_retries: 10,
+            retry_delay_ms: 602,
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "native-upstream-404-retry",
+          }),
+        );
+        const retry = yield* Queue.take(harness.retryReceipts);
+        assert.equal(retry.turnItem.type, "error");
+        if (retry.turnItem.type !== "error") return;
+        assert.equal(retry.turnItem.failure.category, successful ? "transient" : "model_invalid");
+        if (ending === "budget") {
+          yield* TestClock.adjust("5 minutes");
+          assert.equal(
+            yield* harness.runtime.checkRetryHealth!({
+              runId: turn.runId,
+              attemptId: turn.attemptId,
+              noResponseBudgetMs: 300_000,
+              flapLimit: 20,
+            }),
+            successful,
+          );
+          if (!successful) return;
+        } else
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeResultFrame({
+              uuid: "native-upstream-404-terminal",
+              terminalReason: "api_error",
+              apiErrorStatus: null,
+              isError: true,
+              result: "API Error: unknown",
+            }),
+          );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        assert.equal(terminal.failure.category, successful ? "transient" : "model_invalid");
+        assert.include(terminal.failure.message, formatted);
+        if (ending === "terminal")
+          assert.include(terminal.failure.message, "Claude gave up after repeated API errors.");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    [
+      ...[400, 401, 403, 404, 413, 429].map((status) => ({
+        status,
+        message: `HTTP ${status} error`,
+        stops: false,
+      })),
+      { status: undefined, message: "usage limit reached", stops: false },
+      { status: undefined, message: "authentication failed", stops: false },
+      { status: undefined, message: "invalid API key", stops: false },
+      { status: undefined, message: "Request timed out.", stops: true },
+      { status: undefined, message: "Connection refused (ECONNREFUSED)", stops: true },
+      { status: 502, message: "502 fetch connect timeout", stops: true },
+      { status: 529, message: "529 overloaded_error", stops: true },
+    ].flatMap((row) =>
+      (row.stops ? [undefined] : [undefined, "unknown", "server_error", "invalid_request"]).map(
+        (assistantError) => ({ ...row, assistantError }),
+      ),
+    ),
+  )(
+    "keeps native $message when a later transcript read fails ($assistantError)",
+    ({ status, message, stops, assistantError }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const dir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        const file = path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`);
+        const harness = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+          close: Queue.shutdown,
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("cached-native-cause"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn(turn);
+        yield* fs.writeFileString(
+          file,
+          JSON.stringify({
+            type: "system",
+            subtype: "api_error",
+            timestamp: DateTime.formatIso(yield* DateTime.now),
+            error: { status, message, connection: null },
+            source: "request_retry",
+            retryAttempt: 1,
+          }) + "\n",
+        );
+        const retry = (attempt: number) =>
+          harness.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "api_retry",
+              error: "unknown",
+              error_status: null,
+              attempt,
+              max_retries: 10,
+              retry_delay_ms: 602,
+              session_id: WAKE_NATIVE_SESSION,
+              uuid: `cached-native-${attempt}`,
+            }),
+          );
+        yield* retry(1);
+        const first = yield* Queue.take(harness.retryReceipts);
+        yield* fs.rename(file, `${file}.unavailable`);
+        yield* retry(2);
+        const second = yield* Queue.take(harness.retryReceipts);
+        assert.equal(first.turnItem.type, "error");
+        assert.equal(second.turnItem.type, "error");
+        if (first.turnItem.type !== "error" || second.turnItem.type !== "error") return;
+        assert.include(second.turnItem.failure.message, message);
+        assert.deepEqual(second.turnItem.failure, first.turnItem.failure);
+        if (assistantError !== undefined)
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              ...makeAssistantTextFrame({ uuid: "statusless-assistant-error", text: "API error" }),
+              error: assistantError,
+              api_error_status: null,
+            }),
+          );
+        yield* TestClock.adjust("5 minutes");
+        assert.equal(
+          yield* harness.runtime.checkRetryHealth!({
+            runId: turn.runId,
+            attemptId: turn.attemptId,
+            noResponseBudgetMs: 300_000,
+            flapLimit: 20,
+          }),
+          stops,
+        );
+        if (!stops)
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeResultFrame({
+              uuid: "unreadable-native-terminal",
+              terminalReason: "api_error",
+              apiErrorStatus: null,
+              isError: true,
+              result: "API Error: unknown",
+            }),
+          );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        assert.include(terminal.failure.message, message);
+        assert.equal(terminal.failure.category === "transient", stops);
+        if (stops) assert.equal(terminal.failure.code, "claude_no_response_budget");
+        else assert.isNull(terminal.failure.claudeAccess?.status ?? null);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each([
+    ...[
+      { status: 500, formatted: "500 internal server error", stops: true },
+      { status: 502, formatted: "502 ERR_HTTP2_STREAM_ERROR", stops: true },
+      { status: 503, formatted: "503 service unavailable", stops: true },
+      { status: 529, formatted: "529 overloaded_error", stops: true },
+      { status: 400, formatted: "400 malformed request", stops: false },
+      { status: 400, formatted: "400 invalid model", stops: false },
+      { status: 401, formatted: "401 authentication failed", stops: false },
+      { status: 403, formatted: "403 forbidden", stops: false },
+      { status: 404, formatted: "404 model not found", stops: false },
+      { status: 413, formatted: "413 context too large", stops: false },
+      { status: 429, formatted: "429 rate limit", stops: false },
+      { status: 502, formatted: "502 upstream 429 quota exceeded", stops: false },
+      { status: null, formatted: "usage limit reached", stops: false },
+      { status: null, formatted: "authentication failed", stops: false },
+    ].map((row) => ({ ...row, sdkStatus: row.status, messageOnly: false })),
+    ...[400, 401, 403, 404, 413, 418, 429].flatMap((sdkStatus) =>
+      [
+        { status: null, formatted: "Request timed out." },
+        { status: null, formatted: "Connection dropped (ECONNRESET)" },
+        { status: 502, formatted: "502 fetch connect timeout" },
+        { status: 529, formatted: "529 overloaded_error" },
+      ].map((native) => ({ ...native, sdkStatus, messageOnly: false, stops: false })),
+    ),
+    ...[
+      "authentication failed",
+      "invalid API key",
+      "usage limit reached",
+      "quota exceeded",
+      "401 invalid credentials",
+      "403 forbidden",
+      "429 rate limit",
+      "model not found",
+      "Unknown error",
+    ].map((formatted) => ({
+      status: null,
+      formatted,
+      sdkStatus: null,
+      messageOnly: true,
+      stops: false,
+    })),
+  ])(
+    "bounds a native retry flap: $formatted / SDK $sdkStatus / message $messageOnly",
+    ({ status, formatted, sdkStatus, messageOnly, stops }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const dir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        const harness = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+          close: (queue) => Queue.shutdown(queue),
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("native-flap"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn(turn);
+        yield* fs.writeFileString(
+          path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`),
+          JSON.stringify({
+            type: "system",
+            subtype: "api_error",
+            timestamp: DateTime.formatIso(yield* DateTime.now),
+            error: messageOnly ? { message: formatted, connection: null } : { status, formatted },
+          }) + "\n",
+        );
+        const input = {
+          runId: turn.runId,
+          attemptId: turn.attemptId,
+          noResponseBudgetMs: 300_000,
+          flapLimit: 20,
+        };
+        for (let attempt = 1; attempt <= 21; attempt++) {
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "api_retry",
+              attempt,
+              max_retries: 30,
+              retry_delay_ms: 602,
+              error_status: sdkStatus,
+              error: "unknown",
+              session_id: WAKE_NATIVE_SESSION,
+              uuid: `native-flap-${attempt}`,
+            }),
+          );
+          if (attempt === 20) assert.isFalse(yield* harness.runtime.checkRetryHealth!(input));
+        }
+        assert.equal(yield* harness.runtime.checkRetryHealth!(input), stops);
+        if (!stops) {
+          yield* TestClock.adjust("5 minutes");
+          assert.isFalse(yield* harness.runtime.checkRetryHealth!(input));
+          yield* Queue.offer(
+            harness.sdkMessages,
+            makeResultFrame({
+              uuid: "permanent-native-terminal",
+              isError: true,
+              terminalReason: "api_error",
+              apiErrorStatus: null,
+              result: "API Error: unknown",
+            }),
+          );
+          const terminal = yield* Queue.take(harness.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          if (terminal.status === "failed") {
+            assert.notEqual(terminal.failure.category, "transient");
+            assert.notEqual(terminal.failure.code, "claude_network_error");
+          }
+        } else {
+          const terminal = yield* Queue.take(harness.terminalReceipts);
+          assert.equal(terminal.status, "failed");
+          if (terminal.status === "failed")
+            assert.equal(terminal.failure.code, "claude_retry_flap");
+        }
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect("fences the old query before the resumed attempt accepts late frames", () =>
+    Effect.gen(function* () {
+      const closing = yield* Deferred.make<void>();
+      const harness = yield* makeWakeHarnessWithOptions({
+        close: () => Deferred.succeed(closing, undefined).pipe(Effect.asVoid),
+        freshQueueOnReopen: true,
+      });
+      const turn = makeClaudeTestTurnInput({
+        threadId: harness.threadId,
+        providerThread: harness.providerThread,
+        now: yield* DateTime.now,
+        attemptId: RunAttemptId.make("fenced-old"),
+        text: "Continue.",
+        attachments: [],
+      });
+      yield* harness.runtime.startTurn(turn);
+      yield* TestClock.adjust("5 minutes");
+      const stop = yield* harness.runtime.checkRetryHealth!({
+        runId: turn.runId,
+        attemptId: turn.attemptId,
+        noResponseBudgetMs: 300_000,
+        flapLimit: 20,
+      }).pipe(Effect.forkChild);
+      yield* Deferred.await(closing);
+      yield* TestClock.adjust("10 seconds");
+      assert.isTrue(yield* Fiber.join(stop));
+      yield* harness.runtime.startTurn({ ...turn, attemptId: RunAttemptId.make("fenced-resume") });
+      yield* harness.offerAndWait(
+        makeAssistantTextFrame({ uuid: "late-old-query", text: "OLD QUERY MUST BE DROPPED" }),
+      );
+      assert.isFalse(
+        harness.events.some(
+          (event) =>
+            event.type === "message.updated" &&
+            event.message.text.includes("OLD QUERY MUST BE DROPPED"),
+        ),
+      );
+      assert.isFalse(
+        yield* harness.runtime.checkRetryHealth!({
+          runId: turn.runId,
+          attemptId: turn.attemptId,
+          noResponseBudgetMs: 300_000,
+          flapLimit: 20,
+        }),
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each(
+    [400, 401, 403, 404, 413, 418, 429].flatMap((status) =>
+      ["Request timed out.", "Connection dropped (ECONNRESET)"].flatMap((text) =>
+        [false, true].flatMap((listed) =>
+          [undefined, "unknown", "server_error", "invalid_request"].map((assistantError) => ({
+            status,
+            text,
+            listed,
+            assistantError,
+          })),
+        ),
+      ),
+    ),
+  )(
+    "retains SDK $status despite a statusless $text terminal (listed: $listed, assistant: $assistantError)",
+    ({ status, text, listed, assistantError }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const turn = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("permanent-sdk"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn(turn);
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "api_retry",
+            attempt: 1,
+            max_retries: 10,
+            retry_delay_ms: 602,
+            error: "unknown",
+            error_status: status,
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "permanent-sdk-retry",
+          }),
+        );
+        if (assistantError !== undefined) {
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              ...makeAssistantTextFrame({
+                uuid: "permanent-sdk-statusless-assistant",
+                text: "API error",
+              }),
+              error: assistantError,
+              api_error_status: null,
+            }),
+          );
+          yield* TestClock.adjust("5 minutes");
+          assert.isFalse(
+            yield* harness.runtime.checkRetryHealth!({
+              runId: turn.runId,
+              attemptId: turn.attemptId,
+              noResponseBudgetMs: 300_000,
+              flapLimit: 20,
+            }),
+          );
+        }
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "statusless-network-text",
+            result: `API Error: ${text}`,
+            apiErrorStatus: null,
+            isError: true,
+            terminalReason: "api_error",
+            ...(listed ? { errors: [text] } : {}),
+          }),
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status !== "failed") return;
+        assert.equal(terminal.failure.code, `api_error_${status}`);
+        assert.notEqual(terminal.failure.category, "transient");
+        if (listed) assert.equal(terminal.failure.message, text);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(
+    [400, 401, 403, 404, 413, 418, 429].flatMap((status) =>
+      [
+        "Request timed out.",
+        "Connection dropped (ECONNRESET)",
+        "502 fetch connect timeout",
+        "upstream connection lost",
+      ].flatMap((text) =>
+        ["api_error", "missing", "execution", "synthetic-404"].flatMap((terminal) =>
+          ["retry", "assistant"].flatMap((source) =>
+            [false, true].map((generic) => ({ status, text, terminal, source, generic })),
+          ),
+        ),
+      ),
+    ),
+  )(
+    "blocks replay after SDK $status/$source and native $text for $terminal result (generic: $generic)",
+    ({ status, text, terminal, source, generic }) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
+        const dir = path.join(configDir, "projects", "-workspace");
+        yield* fs.makeDirectory(dir, { recursive: true });
+        const harness = yield* makeWakeHarnessWithOptions({
+          environment: { CLAUDE_CONFIG_DIR: configDir },
+        });
+        const turn = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("permanent-sdk-native-conflict"),
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn(turn);
+        yield* fs.writeFileString(
+          path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`),
+          JSON.stringify({
+            type: "system",
+            subtype: "api_error",
+            timestamp: DateTime.formatIso(yield* DateTime.now),
+            error: { message: text, connection: null },
+          }) + "\n",
+        );
+        yield* harness.offerAndWait(
+          source === "retry"
+            ? claudeSdkFrame({
+                type: "system",
+                subtype: "api_retry",
+                error: "unknown",
+                error_status: status,
+                attempt: 1,
+                max_retries: 10,
+                retry_delay_ms: 602,
+                session_id: WAKE_NATIVE_SESSION,
+                uuid: "permanent-sdk-native-conflict-retry",
+              })
+            : claudeSdkFrame({
+                ...makeAssistantTextFrame({
+                  uuid: "permanent-sdk-native-conflict-assistant",
+                  text: "API error",
+                }),
+                error: "server_error",
+                api_error_status: status,
+              }),
+        );
+        if (generic) {
+          if (source === "retry") yield* Queue.take(harness.retryReceipts);
+          yield* harness.offerAndWait(
+            claudeSdkFrame({
+              type: "system",
+              subtype: "api_retry",
+              error: "unknown",
+              error_status: null,
+              attempt: 2,
+              max_retries: 10,
+              retry_delay_ms: 602,
+              session_id: WAKE_NATIVE_SESSION,
+              uuid: "generic-after-permanent",
+            }),
+          );
+          const retry = yield* Queue.take(harness.retryReceipts);
+          assert.include(
+            retry?.type === "turn_item.updated" && retry.turnItem.type === "error"
+              ? retry.turnItem.failure.message
+              : "",
+            text,
+          );
+          yield* TestClock.adjust("5 minutes");
+          assert.isFalse(
+            yield* harness.runtime.checkRetryHealth!({
+              runId: turn.runId,
+              attemptId: turn.attemptId,
+              noResponseBudgetMs: 300_000,
+              flapLimit: 20,
+            }),
+          );
+        }
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "permanent-sdk-native-conflict-result",
+            isError: true,
+            apiErrorStatus: terminal === "synthetic-404" ? 404 : null,
+            terminalReason:
+              terminal === "api_error" || terminal === "synthetic-404" ? "api_error" : null,
+            subtype: terminal === "execution" ? "error_during_execution" : "success",
+            result: `API Error: ${text}`,
+            errors: [text],
+          }),
+        );
+        const result = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(result.status, terminal === "missing" ? "completed" : "failed");
+        if (result.status !== "failed") return;
+        if (generic || (terminal === "synthetic-404" && [401, 403, 429].includes(status))) {
+          assert.equal(result.failure.code, "claude_network_error");
+          assert.isFalse(result.failure.retryable);
+        } else {
+          assert.equal(result.failure.code, `api_error_${status}`);
+          assert.notEqual(result.failure.category, "transient");
+        }
+        assert.equal(result.failure.message, text);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each([
+    { text: "Connection dropped (ECONNRESET)", status: null, expected: "claude_network_error" },
+    { text: "upstream connection lost", status: null, expected: "claude_network_error" },
+    { text: "upstream connection lost", status: 404, expected: "claude_network_error" },
+    { text: "Request timed out.", status: null, expected: "claude_network_error" },
+    { text: "401 Connection dropped (ECONNRESET)", status: 401, expected: "api_error_401" },
+  ])("classifies terminal network error $text", ({ text, status, expected }) =>
+    Effect.gen(function* () {
+      const harness = yield* makeWakeHarness;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("network-terminal"),
+          text: "Continue.",
+          attachments: [],
+        }),
+      );
+      yield* harness.offerAndWait(
+        makeAssistantTextFrame({ uuid: "successful-work", text: "Saved work." }),
+      );
+      yield* harness.offerAndWait(
+        makeAssistantErrorFrame({
+          uuid: "native-error",
+          text: `API Error: ${text}`,
+          error: "unknown",
+        }),
+      );
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({
+          uuid: "network-end",
+          result: `API Error: ${text}`,
+          isError: true,
+          terminalReason: "api_error",
+          apiErrorStatus: status,
+        }),
+      );
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      assert.equal(terminal.status, "failed");
+      if (terminal.status !== "failed") return;
+      assert.equal(terminal.failure.code, expected);
+      assert.include(terminal.failure.message, text);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
+  it.effect.each(
     [
       { status: 400, text: "API Error: 400 invalid model requested", category: "model_invalid" },
       { status: 400, text: "API Error: 400 malformed request", category: "unknown" },
@@ -6389,7 +8632,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.equal(
           terminal.failure.code,
           usesTranscript
-            ? "api_error_502"
+            ? "claude_network_error"
             : scenario.status === null
               ? "api_error"
               : `api_error_${scenario.status}`,
@@ -6402,6 +8645,85 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),
       ),
+  );
+
+  it.effect.each(
+    (
+      [
+        "malformed_tool_use_exhausted",
+        "budget_exhausted",
+        "structured_output_retry_exhausted",
+        "tool_deferred_unavailable",
+        "turn_setup_failed",
+        "blocking_limit",
+        "rapid_refill_breaker",
+        "prompt_too_long",
+        "image_error",
+        "model_error",
+      ] as const
+    ).flatMap((reason) =>
+      ["Request timed out.", "Connection dropped (ECONNRESET)"].map((history) => ({
+        reason,
+        history,
+      })),
+    ),
+  )("preserves explicit $reason after native $history", ({ reason, history }) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const configDir = yield* fs.makeTempDirectoryScoped();
+      const harness = yield* makeWakeHarnessWithOptions({
+        environment: { CLAUDE_CONFIG_DIR: configDir },
+      });
+      const now = yield* DateTime.now;
+      yield* harness.runtime.startTurn(
+        makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now,
+          attemptId: RunAttemptId.make("explicit-terminal-reason"),
+          text: "Continue.",
+          attachments: [],
+        }),
+      );
+      const dir = path.join(configDir, "projects", "-workspace");
+      yield* fs.makeDirectory(dir, { recursive: true });
+      yield* fs.writeFileString(
+        path.join(dir, `${WAKE_NATIVE_SESSION}.jsonl`),
+        JSON.stringify({
+          type: "system",
+          subtype: "api_error",
+          timestamp: DateTime.formatIso(now),
+          error: { message: history, connection: null },
+          source: "request_retry",
+        }) + "\n",
+      );
+      yield* Queue.offer(
+        harness.sdkMessages,
+        makeResultFrame({
+          uuid: "explicit-terminal",
+          isError: true,
+          terminalReason: reason,
+          apiErrorStatus: null,
+          result: "Turn ended.",
+        }),
+      );
+      const terminal = yield* Queue.take(harness.terminalReceipts);
+      assert.equal(terminal.status, "failed");
+      if (terminal.status !== "failed") return;
+      assert.equal(terminal.failure.code, reason);
+      assert.equal(
+        terminal.failure.category,
+        reason === "prompt_too_long" || reason === "blocking_limit"
+          ? "context_exhausted"
+          : "unknown",
+      );
+      assert.notInclude(terminal.failure.message, history);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
   );
 
   it.effect("names an expired Claude login instead of the terminal API error", () =>
@@ -7722,7 +10044,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         if (terminal.status !== "failed") return;
         assert.equal(
           terminal.failure.code,
-          laterStatus === null ? "api_error_transport" : "api_error_502",
+          laterStatus === null ? "claude_network_error" : "api_error_502",
         );
         assert.equal(terminal.failure.category, "transient");
         const recovery = nextLaunchRecovery({
@@ -7937,6 +10259,83 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           recovery,
           "a native refusal before continuation admission must exclude later relay replay",
         );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+        ),
+      ),
+  );
+
+  it.effect.each([
+    { status: 404, category: "cyber", success: false },
+    { status: 502, category: null, success: false },
+    { status: 404, category: "cyber", success: true },
+  ])(
+    "classifies a safeguard fallback only when it fails: $status/$category/$success",
+    ({ status, category, success }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("claude-refusal-fallback-attempt"),
+            text: "Continue the audit",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "system",
+            subtype: "model_refusal_fallback",
+            trigger: "refusal",
+            direction: "retry",
+            original_model: "claude-opus-5-5",
+            fallback_model: "claude-opus-4-8",
+            request_id: "request-refusal-fallback",
+            api_refusal_category: category,
+            api_refusal_explanation: null,
+            content:
+              "Opus 5.5's safeguards flagged this session. Opus 4.8 is answering instead. Details: `[cyber]`",
+            session_id: WAKE_NATIVE_SESSION,
+            uuid: "00000000-0000-4000-8000-000000000411",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          success
+            ? makeAssistantTextFrame({ uuid: "00000000-0000-4000-8000-000000000412", text: "ok" })
+            : makeAssistantErrorFrame({
+                uuid: "00000000-0000-4000-8000-000000000412",
+                error: "invalid_request",
+                text: "There's an issue with the selected model (claude-opus-4-8). It may not exist or you may not have access to it.",
+              }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000413",
+            result: success ? "ok" : "Claude gave up after repeated API errors.",
+            terminalReason: success ? "completed" : "api_error",
+            ...(success ? {} : { apiErrorStatus: status }),
+            isError: !success,
+          }),
+        );
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, success ? "completed" : "failed");
+        if (terminal.status === "failed") {
+          assert.equal(terminal.failure.code, "model_refusal");
+          assert.equal(terminal.failure.category, "content_filter");
+          assert.include(
+            terminal.failure.message,
+            "claude-opus-5-5 safeguards flagged this session [cyber]",
+          );
+          assert.include(terminal.failure.message, "fallback model claude-opus-4-8 failed");
+          assert.include(terminal.failure.message, `HTTP ${status}`);
+        }
       }).pipe(
         Effect.scoped,
         Effect.provide(
@@ -9221,83 +11620,120 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         }).pipe(Effect.scoped, Effect.provide(layers)),
     );
 
-    it.effect.each(["query exit", "watchdog", "watchdog with unresponsive close"] as const)(
-      "%s settles an earlier run's native subagent and open call",
-      (mode) =>
-        Effect.gen(function* () {
-          const closed = yield* Deferred.make<void>();
-          const h = yield* start({
-            close: (q) =>
-              Deferred.succeed(closed, undefined).pipe(
-                Effect.andThen(
-                  mode === "watchdog with unresponsive close" ? Effect.never : Queue.shutdown(q),
-                ),
+    it.effect.each([
+      "query exit",
+      "watchdog",
+      "watchdog with unresponsive close",
+      "no response",
+      "no response with slow stream exit",
+      "no response with failed close",
+      "no response with hung close",
+    ] as const)("%s settles an earlier run's native subagent and open call", (mode) =>
+      Effect.gen(function* () {
+        const closed = yield* Deferred.make<void>();
+        const h = yield* start({
+          close: (q) =>
+            Deferred.succeed(closed, undefined).pipe(
+              Effect.andThen(
+                mode === "watchdog with unresponsive close"
+                  ? Effect.never
+                  : mode === "no response with failed close"
+                    ? Effect.fail(
+                        new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                          method: "close",
+                          cause: new Error("close failed"),
+                        }),
+                      )
+                    : mode === "no response with hung close"
+                      ? Effect.never
+                      : mode === "no response with slow stream exit"
+                        ? Effect.void
+                        : Queue.shutdown(q),
               ),
-          });
-          const taskId = "old-run-task";
-          const toolUseId = "toolu-old-run-agent";
-          const bashToolUseId = "toolu-old-run-bash";
-          const bashStatuses = () =>
-            h.events.flatMap((event) =>
-              event.type === "turn_item.updated" &&
-              event.turnItem.nativeItemRef?.nativeId === bashToolUseId
-                ? [event.turnItem.status]
-                : [],
-            );
-          yield* h.offerAndWait(
-            makeSubagentTaskStartedFrame({
-              taskId,
-              toolUseId,
-              uuid: "old-run-task-start",
-            }),
+            ),
+        });
+        const taskId = "old-run-task";
+        const toolUseId = "toolu-old-run-agent";
+        const bashToolUseId = "toolu-old-run-bash";
+        const bashStatuses = () =>
+          h.events.flatMap((event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === bashToolUseId
+              ? [event.turnItem.status]
+              : [],
           );
-          const started = yield* Queue.take(h.subagentReceipts);
-          assert.equal(started.subagent.status, "running");
-          for (const frame of makeSubagentAssistantFrames({
-            parentToolUseId: toolUseId,
-            uuid: "old-run-assistant",
-            bashToolUseId,
-          }))
-            yield* h.offerAndWait(frame);
-          yield* h.offerAndWait(
-            makeResultFrame({ uuid: "old-run-complete", result: "Working in background." }),
-          );
-          const firstTerminal = yield* Queue.take(h.terminalReceipts);
-          assert.equal(firstTerminal.status, "completed");
-          assert.isTrue(yield* h.hasPendingBackgroundWork);
-          assert.deepEqual(bashStatuses(), ["running"]);
+        yield* h.offerAndWait(
+          makeSubagentTaskStartedFrame({
+            taskId,
+            toolUseId,
+            uuid: "old-run-task-start",
+          }),
+        );
+        const started = yield* Queue.take(h.subagentReceipts);
+        assert.equal(started.subagent.status, "running");
+        for (const frame of makeSubagentAssistantFrames({
+          parentToolUseId: toolUseId,
+          uuid: "old-run-assistant",
+          bashToolUseId,
+        }))
+          yield* h.offerAndWait(frame);
+        yield* h.offerAndWait(
+          makeResultFrame({ uuid: "old-run-complete", result: "Working in background." }),
+        );
+        const firstTerminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(firstTerminal.status, "completed");
+        assert.isTrue(yield* h.hasPendingBackgroundWork);
+        assert.deepEqual(bashStatuses(), ["running"]);
 
-          const next = makeClaudeTestTurnInput({
-            threadId: h.threadId,
-            providerThread: h.providerThread,
-            now: yield* DateTime.now,
-            attemptId: RunAttemptId.make("next-run"),
-            providerTurnOrdinal: 2,
-            text: "Continue.",
-            attachments: [],
-          });
-          yield* h.runtime.startTurn(next);
+        const next = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("next-run"),
+          providerTurnOrdinal: 2,
+          text: "Continue.",
+          attachments: [],
+        });
+        yield* h.runtime.startTurn(next);
+        if (mode.startsWith("no response")) {
+          yield* TestClock.adjust("5 minutes");
+          const check = yield* h.runtime.checkRetryHealth!({
+            runId: next.runId,
+            attemptId: next.attemptId,
+            noResponseBudgetMs: 300_000,
+            flapLimit: 20,
+          }).pipe(Effect.forkScoped);
+          yield* Deferred.await(closed);
+          if (
+            mode === "no response with slow stream exit" ||
+            mode === "no response with hung close"
+          )
+            yield* TestClock.adjust("10 seconds");
+          assert.isTrue(yield* Fiber.join(check));
+        } else {
           yield* h.offerAndWait(compacting);
           if (mode === "query exit") yield* Queue.shutdown(h.sdkMessages);
           else yield* TestClock.adjust("5 minutes");
-          const terminal = yield* Queue.take(h.terminalReceipts);
-          assert.equal(terminal.status, "failed");
-          if (mode !== "query exit") yield* Deferred.await(closed);
-          else {
-            let ended = yield* Queue.take(h.subagentReceipts);
-            while (ended.subagent.status === "running")
-              ended = yield* Queue.take(h.subagentReceipts);
-          }
-          const latest = h.events.findLast((event) => event.type === "subagent.updated");
-          assert.equal(latest?.type === "subagent.updated" && latest.subagent.status, "failed");
-          assert.equal(
-            latest?.type === "subagent.updated" && latest.subagent.runId,
-            started.subagent.runId,
-          );
-          assert.deepEqual(bashStatuses(), ["running", "failed"]);
-          assert.isFalse(yield* h.hasPendingBackgroundWork);
-          assert.lengthOf(h.terminalEvents(), 2);
-        }).pipe(Effect.scoped, Effect.provide(layers)),
+        }
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (mode.startsWith("no response"))
+          assert.equal(terminal.failure?.code, "claude_no_response_budget");
+        if (mode !== "query exit") yield* Deferred.await(closed);
+        else {
+          let ended = yield* Queue.take(h.subagentReceipts);
+          while (ended.subagent.status === "running") ended = yield* Queue.take(h.subagentReceipts);
+        }
+        const latest = h.events.findLast((event) => event.type === "subagent.updated");
+        assert.equal(latest?.type === "subagent.updated" && latest.subagent.status, "failed");
+        assert.equal(
+          latest?.type === "subagent.updated" && latest.subagent.runId,
+          started.subagent.runId,
+        );
+        assert.deepEqual(bashStatuses(), ["running", "failed"]);
+        assert.isFalse(yield* h.hasPendingBackgroundWork);
+        assert.lengthOf(h.terminalEvents(), 2);
+      }).pipe(Effect.scoped, Effect.provide(layers)),
     );
 
     it.effect("keeps a replacement turn and native task live after watchdog disposal", () =>

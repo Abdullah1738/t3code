@@ -7,6 +7,43 @@ import { join } from 'node:path';
 import { recoveryScan } from '../cli.mjs';
 import { openDb, assertReplicaFresh } from '../lib/io.mjs';
 import { fixture } from '../../router-logging/test/support.mjs';
+import { timedScan } from '../lib/logging.mjs';
+
+for (const throws of [false, true]) test(`nested restart scan times database reopens on ${throws ? 'failure' : 'success'}`, async t => {
+  const { rows } = fixture(t);
+  let clock = 0, opens = 0, closes = 0;
+  t.mock.method(performance, 'now', () => clock);
+  const error = Object.assign(new Error('Robob replica is not ready'), {code:'REPLICA_NOT_READY'});
+  const io = {
+    PATHS:{db:'fixture'},
+    openDb:() => {
+      opens++;
+      clock += opens === 2 ? 37 : 1;
+      if (throws && opens === 2) throw error;
+      return {close(){closes++;}};
+    },
+    assertReplicaFresh() {}, serverRuntime:() => {clock += 5; return null;}, openCodeRuntime:() => null,
+    cancelledSubagentsSince:() => [], cancelledDelegatedTasksSince:() => [], restartRunsSince:() => [],
+    failedRunsSince:() => [], failedSubagentsSince:() => [],
+  };
+  const scan = timedScan('stream', io, timed => recoveryScan({
+    opts:{dryRun:true,seed:true,maxAgeHours:6},state:{handled:{},servers:[]},now:Date.now(),
+  }, timed));
+  if (throws) await assert.rejects(scan, e => e === error); else await scan;
+  for (const lane of ['stream', 'restart']) {
+    const row = rows().find(row => row.name === `${lane}.scan`);
+    assert.equal(row.ok, !throws);
+    assert.equal(row.props.longestSyncOp, 'openDb');
+    assert.equal(row.props.longestSyncMs, 37);
+    assert.equal(typeof row.props.loopBlockMaxMs, 'number');
+    if (throws) assert.equal(row.props.phase, 'openDb');
+    const phase = rows().find(row => row.name === `${lane}.phase` && row.props.phase === 'openDb');
+    assert.equal(phase.props.durationMaxMs, 37);
+    assert.equal(phase.props.failed, Number(throws));
+  }
+  assert.ok(opens >= 2);
+  assert.equal(closes, opens - Number(throws));
+});
 
 for (const publishing of [true, false]) test(`slow scan with replica publishing=${publishing} preserves the freshness bound`, async t => {
   fixture(t);
@@ -32,7 +69,7 @@ for (const publishing of [true, false]) test(`slow scan with replica publishing=
   const io = {
     PATHS: { db: path },
     openDb: path => { opens++; return openDb(path); },
-    assertReplicaFresh, serverRuntime: () => null, openCodeRuntime: () => null,
+    assertReplicaFresh, loadStallState: () => ({ stalls: {} }), serverRuntime: () => null, openCodeRuntime: () => null,
     cancelledSubagentsSince: slow, cancelledDelegatedTasksSince: slow, restartRunsSince: slow,
     failedRunsSince: slow, failedSubagentsSince: slow,
     telegram: () => assert.fail('must not notify'), sendToThread: () => assert.fail('must not send'),
@@ -65,7 +102,7 @@ for (const lane of ['restart', 'stream']) test(`${lane} resolves each slow ances
   let traversals = 0;
   const io = {
     PATHS:{db:'fixture'}, openDb:() => ({at:clock,close(){}}), assertReplicaFresh:check,
-    serverRuntime:() => null, openCodeRuntime:() => null,
+    loadStallState: () => ({ stalls: {} }), serverRuntime:() => null, openCodeRuntime:() => null,
     cancelledSubagentsSince:() => lane === 'restart' ? subs : [],
     cancelledDelegatedTasksSince:() => [], restartRunsSince:() => [],
     failedRunsSince:() => lane === 'stream' ? [{run_id:'failed',thread_id:'parent',completed_at:ended,

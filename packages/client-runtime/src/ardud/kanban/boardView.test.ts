@@ -455,6 +455,35 @@ describe("createBoardView", () => {
     expect(idsOf(second.active[0]!)).toEqual(["card-2", "card-4", "card-3"]);
   });
 
+  it.each(["done", "skipped"] as const)(
+    "updates a Completed blocker's landing label when its marked step is %s",
+    (state) => {
+      const step: KanbanCard["subtasks"][number] = {
+        id: "s1",
+        step: 1,
+        owner: "evaluator",
+        state: "open",
+        text: "Host release via #99, then live read-back",
+        holdsDependents: true,
+        note: null,
+        doneBy: null,
+        doneAt: null,
+      };
+      const blocker = card(1, { stage: "completed", subtasks: [step] });
+      const initial = stateOf([blocker, card(2, { blockedBy: [blocker.id] })]);
+      const engine = createBoardView();
+      const flag = (state: KanbanBoardState) =>
+        engine
+          .model(state, NOW, STAGE)
+          .active[0]!.rows.flatMap((row) =>
+            row.kind === "card" && row.card.id === "card-2" ? [row.card.flag] : [],
+          )[0];
+      expect(flag(initial)).toEqual({ kind: "blocked", label: "Waits for #1 to land" });
+      const finished = withCard(initial, { ...blocker, subtasks: [{ ...step, state }] });
+      expect(flag(finished)).toBeNull();
+    },
+  );
+
   it("follows a blocker on the same work thread into its own blockers", () => {
     const thread = "work-1" as never;
     const cards = [

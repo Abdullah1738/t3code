@@ -2,6 +2,7 @@
 import datetime as dt
 import fcntl
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -11,7 +12,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('money_cases', Path(__file__).with_name('cases.py'))
@@ -19,6 +20,8 @@ mc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mc)
 
 from test_charges import ControlServer, summary
+
+os.environ['MONEY_CASES_REFRESH_DISABLED'] = '1'
 
 TZ = mc.TZ
 
@@ -42,6 +45,14 @@ class Base(unittest.TestCase):
         registry = patch.object(mc, 'merchant_dead', return_value=[])
         registry.start()
         self.addCleanup(registry.stop)
+
+    def assert_census(self, actual, expected):
+        self.assertEqual(sum(actual['limit_reasons'].values()), actual['limited'])
+        self.assertEqual(sum(actual['limit_age_days'].values()), actual['limited'])
+        self.assertEqual(set(actual['limit_age_days']), {'lt7', '7_30', '30_60', 'gt60'})
+        self.assertTrue(set(actual['limit_reasons']) <= mc.charges.LIMIT_REASONS)
+        self.assertTrue(all(type(n) is int and n >= 0 for n in actual['limit_reasons'].values()))
+        self.assertEqual({k: v for k, v in actual.items() if k not in ('limit_reasons', 'limit_age_days')}, expected)
 
     def case(self, case_id='acme', deadline='2026-10-25', when=at('2026-10-24T09:00'), **extra):
         fields = dict(merchant='Acme', amount='120.50', currency='aed', state='refund asked',
@@ -75,6 +86,103 @@ class Base(unittest.TestCase):
         (folder / 'state.json').write_text(json.dumps({'status': status, 'fires': fires,
                                                        'last_fire_at': '2026-10-23T10:44:18Z',
                                                        'last_run_at': '2026-10-23T11:00:00Z'}))
+
+
+def data_snapshot(data):
+    return {str(p.relative_to(data)): (p.stat().st_size, hashlib.sha256(p.read_bytes()).hexdigest(),
+                                      p.stat().st_mtime_ns)
+            for p in data.rglob('*') if p.is_file()}
+
+
+@contextmanager
+def screen_sources(root, corrupt=False, locks=True):
+    """Real cache readers/writers with only the control API and subprocess sources replaced."""
+    data = root / 'data'
+    data.mkdir()
+    charged, now = at('2026-10-24T04:10'), at('2026-10-24T05:00')
+    text = 'Purchase of AED 12.34 with Credit Card ending 1111 at noon, Dubai. Avl Cr. Limit'
+    book = {'version': 1, 'questions': []}
+    mc.new_question(book, mc.charges.parse(text, 'EmiratesNBD'), text, charged, now, 'sms')
+    owner = {'a': {'version': mc.charges.OWNER_CACHE_VERSION, 'updatedAt': '2026-10-24T00:00:00Z',
+                  'coveredFrom': '2026-10-23T00:00:00Z', 'title': 'iMessage test', 'texts': []}}
+    files = {'cases.json': {'version': 1, 'cases': [], 'purchases': []}, 'questions.json': book,
+             'owner-texts.json': owner, 'order-details.json': [], 'msgs-searches.json': {},
+             'subscriptions.json': {'version': 1, 'subscriptions': []},
+             'cards.json': {'dead': {}}}
+    import marketplace
+    files['marketplace-placements.json'] = marketplace.empty()
+    for name, value in files.items():
+        (data / name).write_text(json.dumps(value) + '\n')
+    if corrupt:
+        (data / 'owner-texts.json').write_text('{broken owner cache\n')
+    if locks:
+        for name in ('cases', 'questions', 'cards', 'subscriptions', 'order-details', 'marketplace-refresh'):
+            (data / (name + '.lock')).touch()
+    (data / 'nested').mkdir()
+    (data / 'nested' / 'sentinel').write_bytes(b'unchanged')
+    msgs = root / 'msgs'
+    calls = root / 'msgs-calls'
+    msgs.write_text('#!/bin/sh\nprintf "called\\n" >> ' + str(calls) + '\nprintf "\\n"\n')
+    msgs.chmod(0o700)
+    original = subprocess.run
+    orders = []
+
+    def run(argv, *args, **kwargs):
+        if len(argv) > 3 and str(argv[3]) == str(Path(mc.charges.order_lookup.__file__).resolve()):
+            orders.append(json.loads(kwargs['input']))
+            row = dict(service='food', order='new-order', total='99.00', currency='AED',
+                       placed_at=charged.isoformat(), status='delivered', raw_status='delivered')
+            result = {'orders': [row], 'complete': True,
+                      'lanes': {name: {'exhaustive': True, 'covered_from': None, 'limit': None,
+                                       'walked_at': now.isoformat()} for name in mc.charges.order_lookup.LANES}}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(result), '')
+        return original(argv, *args, **kwargs)
+
+    with ExitStack() as stack:
+        server = stack.enter_context(ControlServer([summary('unrelated owner words')]))
+        stack.enter_context(patch.dict(os.environ, {'MONEY_CASES_DIR': str(data),
+                                                   'ROBOB_TOOL_LOG_DIR': str(root / 'logs'),
+                                                   'TOOLLOG_ROOT': str(root / 'logs')}))
+        stack.enter_context(patch.object(mc, 'DATA', data))
+        stack.enter_context(patch.object(mc.charges, 'MSGS', str(msgs)))
+        stack.enter_context(patch.object(subprocess, 'run', side_effect=run))
+        yield data, text, charged, now, server, orders, calls
+
+
+class ScreenReadOnly(unittest.TestCase):
+    def test_screen_default_sources_leave_every_file_unchanged(self):
+        for corrupt, locks in ((False, True), (True, True), (False, False)):
+            with self.subTest(corrupt=corrupt, locks=locks), tempfile.TemporaryDirectory() as tmp:
+                with screen_sources(Path(tmp), corrupt, locks) as (data, text, charged, now, server, orders, calls):
+                    before = data_snapshot(data)
+                    result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=False)
+                    self.assertEqual(result['verdict'], 'ask', result)
+                    self.assertEqual(result['errors'], [])
+                    self.assertEqual(data_snapshot(data), before)
+                    self.assertTrue(orders)
+                    self.assertTrue(calls.read_text().strip())
+                    self.assertTrue(any(path.endswith('/messages') for path, _, _ in server.calls))
+
+    def test_read_only_screen_does_not_create_a_missing_data_directory(self):
+        with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
+            data, text, charged, now, server, orders, calls = fixture
+            missing = data.parent / 'missing-data'
+            result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=missing, record=False)
+            self.assertEqual(result['verdict'], 'ask', result)
+            self.assertFalse(missing.exists())
+
+    def test_recording_still_saves_both_caches_and_question(self):
+        with tempfile.TemporaryDirectory() as tmp, screen_sources(Path(tmp)) as fixture:
+            data, text, charged, now, server, orders, calls = fixture
+            before = data_snapshot(data)
+            result = mc.screen(text, 'EmiratesNBD', at=charged, now=now, data=data, record=True)
+            self.assertEqual(result['verdict'], 'ask', result)
+            after = data_snapshot(data)
+            for name in ('owner-texts.json', 'order-details.json', 'questions.json'):
+                self.assertNotEqual(before[name], after[name], name)
+            self.assertEqual(json.loads((data / 'owner-texts.json').read_text())['a']['texts'][0]['text'],
+                             'unrelated owner words')
+            self.assertEqual(json.loads((data / 'order-details.json').read_text())[0]['order'], 'new-order')
 
 
 class Moments(unittest.TestCase):
@@ -481,7 +589,9 @@ class CheckEntry(Base):
                'WATCH_ID': 'money-cases', 'MONEY_CASES_DIR': str(self.data),
                'MONEY_CASES_MSGS': str(fake), 'ROBOB_TOOL_LOG_DIR': str(self.tmp / 'runner-logs')}
         started = time.monotonic()
-        with ControlServer() as server:
+        with ControlServer(threads=[{'threadId': 'a', 'title': 'iMessage test',
+                                     'creationSource': 'server', 'origin': 'imessage',
+                                     'updatedAt': mc.charges.iso(now)}]) as server:
             env['T3_CONTROL_TOKEN_FILE'] = str(server.credentials)
             done = subprocess.run(['/usr/bin/python3', '-B', str(Path(__file__).with_name('cases.py')), 'check'],
                                   env=env, stdin=subprocess.DEVNULL, start_new_session=True,
@@ -490,6 +600,19 @@ class CheckEntry(Base):
         self.assertLess(time.monotonic() - started, 5)
         state = json.loads((self.wd / 'pings.json').read_text())
         self.assertEqual(state['timing']['owner_queries'], 3)
+        timing = state['timing']
+        expected = {'owner_list_pages': 2, 'owner_threads_selected': 1,
+                    'owner_threads_fresh': 0, 'owner_threads_needed': 1,
+                    'owner_threads_fetched': 1, 'owner_timeouts': 0, 'owner_cache_size': 1}
+        for key, value in expected.items():
+            self.assertEqual(timing[key], value, key)
+        for key in ('owner_list_ms', 'owner_fetch_ms_max'):
+            self.assertGreaterEqual(timing[key], 0)
+        self.assertEqual(timing['owner_result'], 'ok')
+        self.assertNotIn('I paid', json.dumps(timing))
+        self.assertNotIn('iMessage', json.dumps(timing))
+        self.assertNotIn('test-secret', json.dumps(timing))
+
         self.assertEqual(state['timing']['msgs_calls'], 2)
         self.assertEqual(trace.read_text().splitlines(), ['search', 'show'])
         questions = json.loads((self.wd / 'scratch-books/questions.json').read_text())['questions']
@@ -1213,12 +1336,12 @@ def read(row, deadline=None, **_):
 
 def finder(*rows):
     """A fake msgs search; charges.py itself keeps rows by time, sender and source."""
-    def find(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None):
+    def find(query, since, until=None, source=None, n=20, deadline=None, memo=None, stats=None, all_copies=False):
         return [r for r in rows if source is None or r['source'] == source]
     return find
 
 
-def nobody(since, until, deadline=None):
+def nobody(since, until, deadline=None, **kwargs):
     return []
 
 
@@ -2749,6 +2872,124 @@ class UnmatchedCharges(Base):
 
 
 class CheckBudget(Base):
+    def test_marketplace_limits_are_counted_as_limited(self):
+        now = at('2026-11-14T12:00')
+        when = now - dt.timedelta(days=3)
+        for kind in ('marketplace_hold', 'marketplace_stale'):
+            with self.subTest(kind=kind):
+                self.data = self.tmp / kind
+                self.seed([when])
+                with mc.Locked(self.data, 'questions') as book:
+                    book['questions'][0].update(merchant='noon', mkey='noon')
+                result = {'orders': [], 'complete': True, 'lanes': {
+                    name: {'exhaustive': True} for name in mc.charges.order_lookup.LANES}}
+                result['lanes']['marketplace'].update(
+                    walked_at=(when if kind == 'marketplace_stale' else now).isoformat(),
+                    hold_times=[when.isoformat()] if kind == 'marketplace_hold' else [])
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.charges.order_lookup, 'read', return_value=result):
+                    mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+                self.assertEqual(stats['charge_census']['noon'][kind], 1)
+                self.assertEqual(stats['charge_census']['noon']['limited'], 1)
+                self.assertEqual(stats['charge_census']['noon']['error'], 0)
+
+    def test_detached_refresh_runs_after_logging_without_affecting_check_duration(self):
+        import marketplace
+        from state_json import write_json
+        self.case()
+        with patch.dict(os.environ, {'MONEY_CASES_REFRESH_DISABLED': '0'}), \
+                patch.object(marketplace.subprocess, 'Popen') as launch, \
+                patch.object(mc, 'record_event') as log:
+            self.check('2026-10-24T09:00')
+            launch.assert_called_once()
+            self.assertTrue(launch.call_args.kwargs['start_new_session'])
+            self.assertEqual(launch.call_args.kwargs['stdout'], subprocess.DEVNULL)
+            self.assertEqual(launch.call_args.kwargs['stderr'], subprocess.DEVNULL)
+            event = next(c for c in log.call_args_list if c.args[0] == 'check.run')
+            self.assertEqual(event.kwargs['props']['marketplace_refresh'], 'started')
+            launch.reset_mock()
+            write_json(self.data / 'marketplace-placements.json', dict(marketplace.empty(),
+                walked_at=dt.datetime.now(dt.timezone.utc).isoformat()))
+            self.check('2026-10-24T09:00')
+            launch.assert_not_called()
+            write_json(self.data / 'marketplace-placements.json', marketplace.empty())
+            with (self.data / 'marketplace-refresh.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                self.check('2026-10-24T09:00')
+            launch.assert_not_called()
+
+    def test_follow_redacts_repeated_text_once_without_batching_cursor_commits(self):
+        from collections import Counter
+        now = at('2026-10-25T12:00')
+        for count in (1, 8, 32):
+            with self.subTest(questions=count):
+                self.data = self.tmp / str(count)
+                self.seed([now - dt.timedelta(days=3, hours=n) for n in range(count)])
+                result = {'verdict': 'unverified', 'why': 'fixture unavailable', 'errors': ['fixture unavailable']}
+                visited = []
+
+                def source(charge, when, *args, **kwargs):
+                    # The cursor must already be durable before the external lookup.
+                    saved = mc.load_questions(self.data)
+                    visited.append(saved['follow_cursor']['id'])
+                    self.assertEqual(mc.parse_time(saved['follow_cursor']['at']), when)
+                    return result
+
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                with patch.object(mc.charges, 'explain', source), \
+                        patch.object(mc, 'write_json', wraps=mc.write_json) as write, \
+                        patch.object(mc, 'redact', wraps=mc.redact) as redact:
+                    with mc.follow_timing(stats):
+                        mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+                self.assertEqual(len(set(visited)), count)
+                writes = Counter(call.args[0].name for call in write.call_args_list)
+                # One durable cursor per attempted lookup and one final result commit.
+                self.assertEqual(writes, {'questions.json': count + 1})
+                self.assertEqual(stats['writes_n'], count + 1)
+                calls = Counter(call.args[0] for call in redact.call_args_list)
+                self.assertEqual(calls[ALERT], 1)
+                self.assertEqual(calls['q-budget0'], 1)
+
+    def test_follow_redaction_cache_matches_uncached_writes_and_expires_on_interrupt(self):
+        rows = ['password: fixture123!', 'OTP: 123456', 'received € — 東京', 'ordinary text']
+        now = at('2026-10-25T12:00')
+        original = self.seed([now - dt.timedelta(days=3, hours=n) for n in range(3)])
+        original['questions'][0]['notes'] = [{'text': text} for text in rows]
+        changed = json.loads(json.dumps(original))
+        changed['questions'][0]['notes'][0]['text'] = 'password: changed456!'
+        snapshots = [original, changed, original]
+        expected = [(json.dumps(mc.redact_all(book), ensure_ascii=False, indent=1) + '\n').encode()
+                    for book in snapshots]
+        stats = {}
+        with patch.object(mc, 'redact', wraps=mc.redact) as redact:
+            with self.assertRaises(mc.CheckTimeout):
+                with mc.follow_timing(stats):
+                    for snapshot, fresh in zip(snapshots, expected):
+                        with mc.Locked(self.data, 'questions') as book:
+                            book.update(snapshot)
+                        self.assertEqual((self.data / 'questions.json').read_bytes(), fresh)
+                    raise mc.CheckTimeout('interrupted')
+            self.assertEqual(sum(call.args[0] == 'password: changed456!'
+                                 for call in redact.call_args_list), 1)
+            def original_calls():
+                return sum(call.args[0] == rows[0] for call in redact.call_args_list)
+            before = original_calls()
+            mc.redact_all(original)
+            self.assertEqual(original_calls() - before, 1)
+            with mc.follow_timing({}):
+                before = original_calls()
+                mc.redact_all(original)
+                self.assertEqual(original_calls() - before, 1)
+        self.assertEqual(original['questions'][0]['notes'][0]['text'], rows[0])
+
+    def test_follow_redaction_cache_has_a_fixed_entry_limit(self):
+        with mc.follow_timing({}):
+            for n in range(8200):
+                text = f'ordinary fixture text {n}'
+                self.assertEqual(mc.redact_all(text), mc.redact(text))
+            self.assertEqual(mc._REDACTION_CACHE.get().cache_info().currsize, 8192)
+        self.assertIsNone(mc._REDACTION_CACHE.get())
+
     def test_follow_rotates_across_budgeted_runs_even_with_the_same_timestamp(self):
         now = at('2026-10-25T12:00')
         self.seed([now - dt.timedelta(days=3, hours=n) for n in range(5)])
@@ -2860,7 +3101,7 @@ class CheckBudget(Base):
         def orders(app, deadline=None, **kwargs):
             calls.append((app, deadline - time.time()))
             return {'orders': [], 'complete': False, 'lanes': {
-                lane: {'covered_from': None, 'stop_reason': 'slice_out'}
+                lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None, 'stop_reason': 'slice_out'}
                 for lane in mc.charges.order_lookup.LANES}}
         def slow(*args, **kwargs):
             Event().wait(1)
@@ -2894,7 +3135,7 @@ class CheckBudget(Base):
                     return {'orders': ([{'order': 'fixture', 'total': sample['amount'], 'currency': sample['currency'],
                         'placed_at': (now - dt.timedelta(hours=1)).isoformat(), 'status': 'delivered'}]
                         if matched else []), 'complete': False, 'lanes': {
-                        lane: {'covered_from': None if lane == 'marketplace' else
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None if lane == 'marketplace' else
                                (now - dt.timedelta(days=5)).isoformat(), 'exhaustive': False}
                         for lane in mc.charges.order_lookup.LANES}}
                 def owner(*args, **kwargs):
@@ -2936,7 +3177,7 @@ class CheckBudget(Base):
                 def orders(*args, **kwargs):
                     clock[0] += 11
                     return {'orders': [], 'complete': False, 'lanes': {
-                        lane: {'covered_from': None if offset is None else
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None if offset is None else
                             (edge + dt.timedelta(seconds=offset)).isoformat(), 'exhaustive': False}
                         for lane in mc.charges.order_lookup.LANES}}
                 stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
@@ -2948,10 +3189,12 @@ class CheckBudget(Base):
                 self.assertFalse(q.get('checked'))
                 self.assertEqual(q['status'], 'open')
                 self.assertFalse(q.get('case_opened') or q.get('asks'))
-                self.assertEqual(stats['charge_census']['noon'], dict(open=1, matched=0,
+                self.assert_census(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=1, matched=0,
                     proven_clean=0, limited=1, error=0, not_checked=0))
+                self.assertEqual(stats['charge_census']['noon']['limit_reasons'],
+                    {'receipt_not_checked' if offset == -1 else 'lane_uncovered:minutes': 1})
 
-    def test_reserved_order_reads_precede_owner_and_have_independent_slices(self):
+    def test_owner_precedes_reserved_order_reads_with_independent_slices(self):
         now = at('2026-11-14T12:00')
         self.seed([now - dt.timedelta(days=3, hours=n) for n in range(2)])
         with mc.Locked(self.data, 'questions') as book:
@@ -2970,7 +3213,7 @@ class CheckBudget(Base):
         with patch.object(mc.time, 'time', lambda: clock[0]), \
                 patch.object(mc.charges.order_lookup, 'read', orders):
             mc.follow(self.data, now, self.root, 1030, finder(), owner)
-        self.assertEqual(calls[:2], [('noon', 10), ('careem', 2)])
+        self.assertEqual(calls[:3], [('owner', 0), ('noon', 10), ('careem', 2)])
         self.assertTrue(all(q['unverified'] for q in self.questions()))
 
     def test_slow_external_source_leaves_time_for_order_lanes(self):
@@ -2988,7 +3231,7 @@ class CheckBudget(Base):
                 def orders(app, deadline=None, **kwargs):
                     reads.append(deadline - time.time())
                     return {'orders': [], 'complete': False, 'lanes': {
-                        lane: {'covered_from': None, 'stop_reason': 'unproven_paging'}
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'covered_from': None, 'stop_reason': 'unproven_paging'}
                         for lane in mc.charges.order_lookup.LANES}}
                 stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
                 with patch.object(mc.charges, 'OWNER_BUDGET', 0.05), \
@@ -3019,16 +3262,43 @@ class CheckBudget(Base):
         with patch.object(mc.time, 'time', lambda: clock[0]), \
                 patch.object(mc.time, 'monotonic', lambda: clock[0]):
             mc.follow(self.data, now, self.root, 1020, finder(), owner, stats=stats)
-        self.assertEqual(calls, [4, 1.5])
-        self.assertTrue(self.questions()[0]['unverified'])
-        self.assertEqual(stats['starved_by'], 'owner_threads')
+        self.assertEqual(calls, [mc.charges.OWNER_BUDGET])
+        self.assertFalse(self.questions()[0].get('unverified'))
+        self.assertEqual(stats['owner_threads_ms'], 2500)
+
+    def test_warm_owner_read_precedes_twenty_second_msgs_lookup(self):
+        now = at('2026-10-25T12:00')
+        self.seed([now - dt.timedelta(hours=1)])
+        with ControlServer() as server:
+            mc.charges.owner_texts(now - dt.timedelta(hours=2), now,
+                                   cache_path=self.data / 'owner-texts.json')
+            server.calls.clear()
+            clock, sequence = [1000.0], []
+            def owner(*args, deadline=None):
+                sequence.append('owner')
+                self.assertEqual(deadline - clock[0], mc.charges.OWNER_BUDGET)
+                return mc.charges.owner_texts(*args, deadline=deadline, stats=stats,
+                                              cache_path=self.data / 'owner-texts.json')
+            def msgs(*args, **kwargs):
+                sequence.append('msgs')
+                clock[0] += 20
+                raise mc.charges.Lookup('fixture: msgs consumed 20 seconds')
+            stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+            with patch.object(mc.time, 'time', lambda: clock[0]):
+                mc.follow(self.data, now, self.root, 1040, msgs, owner, stats=stats)
+            self.assertEqual(sequence[0], 'owner')
+            self.assertIn('msgs', sequence)
+            self.assertEqual(stats['owner_result'], 'ok')
+            self.assertEqual(stats['owner_threads_fresh'], 1)
+            self.assertEqual(stats['owner_threads_fetched'], 0)
+            self.assertEqual(stats['owner_queries'], 2)
 
     def test_owner_prefetch_leaves_budget_for_questions(self):
         now = at('2026-10-25T12:00')
         self.seed([now - dt.timedelta(hours=n) for n in range(3)])
 
         def unavailable(*args, deadline=None):
-            self.assertEqual(deadline, 1004)
+            self.assertEqual(deadline, 1000 + mc.charges.OWNER_BUDGET)
             raise mc.LookupTimeout('out of time')
 
         with patch.object(mc.time, 'time', return_value=1000):
@@ -3043,6 +3313,65 @@ class CheckBudget(Base):
         self.assertEqual(source.call_count, 1)
         self.assertTrue(all(q['checked'] and q['unverified'] for q in self.questions()))
         self.assertTrue(errors)
+
+    def test_deferred_census_reports_owner_failure_without_reclassifying_charges(self):
+        now = at('2026-11-14T12:00')
+        for owner_result, reason in (('list_failed', 'owner_list_failed'), ('incomplete', 'owner_incomplete')):
+            with self.subTest(owner_result=owner_result):
+                self.data = self.tmp / owner_result
+                self.seed([now - dt.timedelta(days=3)])
+                with mc.Locked(self.data, 'questions') as book:
+                    book['questions'][0].update(merchant='noon', mkey='noon')
+                stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+                clock = [1000.0]
+                def owner(*args, **kwargs):
+                    stats['owner_result'] = owner_result
+                    raise mc.charges.Lookup('fixture owner failure')
+                def orders(*args, **kwargs):
+                    clock[0] += 11
+                    return {'orders': [], 'complete': True, 'lanes': {
+                        lane: {'walked_at': '2026-12-31T00:00:00+00:00', 'exhaustive': True}
+                        for lane in mc.charges.order_lookup.LANES}}
+                with patch.object(mc.time, 'time', lambda: clock[0]), \
+                        patch.object(mc.charges.order_lookup, 'read', orders):
+                    mc.follow(self.data, now, self.root, 1012, finder(), owner, end=1039, stats=stats)
+                counts = stats['charge_census']['noon']
+                self.assertEqual(counts['limit_reasons'], {reason: 1})
+                self.assertEqual(counts['limit_age_days'], {'lt7': 1, '7_30': 0, '30_60': 0, 'gt60': 0})
+                self.assertEqual((counts['limited'], counts['error']), (1, 0))
+                self.assertFalse(self.questions()[0].get('asks'))
+                self.assertFalse(self.questions()[0].get('checked'))
+
+    def test_census_reason_classes_age_edges_and_first_reason(self):
+        now = at('2026-11-14T12:00')
+        reasons = sorted(mc.charges.LIMIT_REASONS)
+        days = [1, 7 - 1/86400, 7, 30, 30 + 1/86400, 60, 60 + 1/86400]
+        self.seed([now - dt.timedelta(days=days[n % len(days)]) for n in range(len(reasons))])
+        with mc.Locked(self.data, 'questions') as book:
+            for n, q in enumerate(book['questions']):
+                q.update(merchant='noon' if n % 2 == 0 else 'careem', mkey='fixture-' + str(n), amount=str(10+n))
+        by_amount = {q['amount']: reason for q, reason in zip(self.questions(), reasons)}
+        def explained(charge, when, *args, **kwargs):
+            reason = by_amount[charge['amount']]
+            return {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
+                    'limits': [{'why': 'fixture', 'kinds': ['food_page_1'], 'reason': reason},
+                               {'why': 'later', 'kinds': ['marketplace_hold'], 'reason': 'marketplace_hold'}]}
+        stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+        with patch.object(mc.charges, 'explain', side_effect=explained), \
+                patch.object(mc.charges, 'order_receipt', return_value=None):
+            mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
+        for app in ('noon', 'careem'):
+            counts = stats['charge_census'][app]
+            selected = [q for q in self.questions() if q['merchant'] == app]
+            self.assertEqual(counts['limit_reasons'], {by_amount[q['amount']]: 1 for q in selected})
+            expected = dict.fromkeys(('lt7', '7_30', '30_60', 'gt60'), 0)
+            for q in selected:
+                bucket = ('lt7', 'lt7', '7_30', '7_30', '30_60', '30_60', 'gt60')[(int(q['amount']) - 10) % len(days)]
+                expected[bucket] += 1
+            self.assertEqual(counts['limit_age_days'], expected)
+            self.assertEqual(sum(counts['limit_reasons'].values()), counts['limited'])
+            self.assertEqual(sum(expected.values()), counts['limited'])
+            self.assertEqual(counts['error'], 0)
 
     def test_source_census_accounts_for_matches_clean_limits_errors_and_deferred(self):
         now = at('2026-11-14T12:00')
@@ -3062,9 +3391,9 @@ class CheckBudget(Base):
         ])
         with patch.object(mc.charges, 'explain', side_effect=lambda *a, **kw: next(outcomes)):
             mc.follow(self.data, now, self.root, find=finder(), said=nobody, stats=stats)
-        self.assertEqual(stats['charge_census']['noon'], dict(open=4, matched=1,
+        self.assert_census(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=4, matched=1,
             proven_clean=1, limited=1, error=1, not_checked=0))
-        self.assertEqual(stats['charge_census']['careem'], dict(open=1, matched=0,
+        self.assert_census(stats['charge_census']['careem'], dict(open=1, matched=0,
             proven_clean=0, limited=1, error=0, not_checked=0))
         # No time to admit another screen: remaining rows are deferred, never clean.
         stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
@@ -3104,7 +3433,7 @@ class CheckBudget(Base):
                     mc.follow(self.data, now, self.root, 1007 if form == 'deferred' else None,
                               finder(), nobody, stats=stats)
                 self.assertTrue(all(q['status'] == 'closed' for q in self.questions()))
-                self.assertEqual(stats['charge_census']['noon'], dict(open=2, matched=2,
+                self.assert_census(stats['charge_census']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=2,
                     proven_clean=0, limited=0, error=0, not_checked=0))
 
     def census_alias_check(self, label, merchants, outcomes, deferred=False):
@@ -3121,7 +3450,8 @@ class CheckBudget(Base):
                 clock[0] += 2
             return next(results)
         with patch.object(mc.charges.order_lookup, 'read', return_value={'orders': [], 'complete': True,
-                    'lanes': {lane: {'exhaustive': True} for lane in mc.charges.order_lookup.LANES}}), \
+                    'lanes': {lane: {'exhaustive': True, 'walked_at': now.isoformat()}
+                              for lane in mc.charges.order_lookup.LANES}}), \
                 patch.object(mc.time, 'time', side_effect=lambda: clock[0]), \
                 patch.object(mc, 'FOLLOW_BUDGET', 7 if deferred else mc.FOLLOW_BUDGET), \
                 patch.object(mc.charges, 'explain', side_effect=explain):
@@ -3154,11 +3484,45 @@ class CheckBudget(Base):
                             census = row['props']['chargeCensus']
                             for source, count in (('noon', 2 if peer == 'noon food' else 1),
                                                   ('careem', 1 if peer == 'careem' else 0)):
-                                self.assertEqual(census[source], dict(open=count, matched=0,
+                                self.assert_census(census[source], dict(
+                                    **({'marketplace_hold': 0, 'marketplace_stale': 0} if source == 'noon' else {}),
+                                    open=count, matched=0,
                                     proven_clean=0, limited=count if kind == 'limited' else 0,
                                     error=count if kind == 'error' else 0, not_checked=0))
+                                self.assertEqual(census[source]['limit_reasons'],
+                                    {'lane_uncovered:food': count} if kind == 'limited' and count else {})
                             self.assertEqual(row['ok'], kind == 'limited')
                             self.assertNotIn('fixture', json.dumps(row))
+
+    def test_check_census_carries_blocking_alias_reason_in_both_orders(self):
+        forms = [
+            ('verdict', 'msgs_timeout', {'limit_reason': 'msgs_timeout',
+                'limits': [{'why': 'fixture later limit', 'kinds': ['food_page_1'], 'reason': 'lane_uncovered:food'}]}),
+            ('limit', 'lane_uncovered:food', {'limits': [
+                {'why': 'fixture first limit', 'kinds': ['food_page_1'], 'reason': 'lane_uncovered:food'},
+                {'why': 'fixture later limit', 'kinds': ['marketplace_hold'], 'reason': 'marketplace_hold'}]}),
+            ('legacy', 'lane_uncovered:food', {'limits': [{'why': 'fixture limit', 'kinds': ['food_page_1']}]}),
+        ]
+        for form, reason, fields in forms:
+            for clean in ('ask', 'wait'):
+                clear = {'verdict': clean, 'why': 'fixture clean', 'errors': [],
+                         'until': at('2026-11-15T12:00').isoformat()}
+                blocked = {'verdict': 'unverified', 'why': 'fixture blocked', 'errors': [], **fields}
+                for reverse in (False, True):
+                    label = f'alias-reason-{form}-{clean}-{reverse}'
+                    with self.subTest(label=label):
+                        merchants, outcomes = ['noon', 'noon food'], [clear, blocked]
+                        if reverse:
+                            merchants.reverse()
+                            outcomes.reverse()
+                        questions, row = self.census_alias_check(label, merchants, outcomes)
+                        census = row['props']['chargeCensus']['noon']
+                        self.assert_census(census, dict(marketplace_hold=0, marketplace_stale=0,
+                            open=2, matched=0, proven_clean=0, limited=2, error=0, not_checked=0))
+                        self.assertEqual(census['limit_reasons'], {reason: 2})
+                        self.assertEqual(census['limit_age_days'], {'lt7': 2, '7_30': 0, '30_60': 0, 'gt60': 0})
+                        self.assertTrue(all(q['unverified'] and q['status'] == 'open' and not q['asks']
+                                            for q in questions))
 
     def test_check_census_mixed_alias_errors_are_order_independent(self):
         limited = {'verdict': 'unverified', 'why': 'fixture limit', 'errors': [],
@@ -3170,7 +3534,7 @@ class CheckBudget(Base):
                 questions, row = self.census_alias_check('mixed-' + str(reverse),
                     ['noon', 'noon food'], outcomes)
                 self.assertTrue(all(q['unverified'] for q in questions))
-                self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=2, matched=0,
+                self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
                     proven_clean=0, limited=0, error=2, not_checked=0))
                 self.assertFalse(row['ok'])
 
@@ -3182,7 +3546,7 @@ class CheckBudget(Base):
         questions, row = self.census_alias_check('non-transitive',
             ['noon', 'noon food', 'noon'], [failed, limited, clear])
         self.assertTrue(all(q['unverified'] for q in questions))
-        self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=3, matched=0,
+        self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=3, matched=0,
             proven_clean=0, limited=1, error=2, not_checked=0))
 
     def test_check_census_deferred_alias_has_only_order_evidence(self):
@@ -3191,7 +3555,7 @@ class CheckBudget(Base):
                                                [clear], deferred=True)
         self.assertTrue(questions[0]['unverified'])
         self.assertFalse(questions[1].get('checked'))
-        self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=2, matched=0,
+        self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
             proven_clean=0, limited=2, error=0, not_checked=0))
         self.assertFalse(row['ok'])
 
@@ -3204,7 +3568,7 @@ class CheckBudget(Base):
             with self.subTest(kind=kind):
                 questions, row = self.census_alias_check('distinct-' + kind,
                                                        ['noon', 'noon'], [clear, blocked])
-                self.assertEqual(row['props']['chargeCensus']['noon'], dict(open=2, matched=0,
+                self.assert_census(row['props']['chargeCensus']['noon'], dict(marketplace_hold=0, marketplace_stale=0, open=2, matched=0,
                     proven_clean=1, limited=1 if kind == 'limited' else 0,
                     error=1 if kind == 'error' else 0, not_checked=0))
                 self.assertFalse(questions[0]['unverified'])
@@ -3354,6 +3718,7 @@ class CheckBudget(Base):
                             mc.case_from(self.data, book['questions'][0], now, 'check', self.root)
                 cid = mc.load(self.data)['cases'][0]['id']
                 self.assertEqual(self.questions()[0]['status'], 'open')
+                before = data_snapshot(self.data) if entry == 'readonly' else None
                 if entry == 'answered':
                     mc.answered(self.data, qid, 'not mine', now)
                     q = self.questions()[0]
@@ -3371,6 +3736,8 @@ class CheckBudget(Base):
                 else:
                     mc.triaged(self.data, [(qid, 'imsg:test', False)], now)
                 q = self.questions()[0]
+                if entry == 'readonly':
+                    self.assertEqual(data_snapshot(self.data), before)
                 if entry not in ('answered', 'readonly'):
                     self.assertEqual((q['status'], q['case']), ('case', cid))
                 self.assertEqual(mc.load(self.data)['cases'][0]['status'], 'open')
@@ -3576,6 +3943,7 @@ class CheckBudget(Base):
         with ControlServer(rows), patch.object(mc.charges, 'owner_texts', wraps=mc.charges.owner_texts) as query:
             mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
         self.assertEqual(query.call_count, 1)
+        self.assertTrue((self.data / 'owner-texts.json').exists())
         for n, q in enumerate(self.questions()):
             self.assertEqual(q['status'], 'closed')
             self.assertIn(f'item {n}', q['outcome'])
@@ -3605,14 +3973,14 @@ class CheckBudget(Base):
         self.assertEqual(str(state['question_errors']).count('test source failed'), 1)
         self.assertTrue(all(q['status'] == 'open' for q in self.questions()))
 
-    def test_long_union_falls_back_to_each_question(self):
+    def test_long_union_uses_one_owner_read_and_the_checks_data_dir(self):
         now = at('2026-10-25T12:00')
         self.seed([now, now - dt.timedelta(days=3)])
         with patch.object(mc.charges, 'owner_texts', return_value=[]) as query:
             mc.run_check(self.wd, 'r', self.data, self.root, now, finder())
-        self.assertEqual(query.call_count, 2)
-        self.assertTrue(all(call.args[1] - call.args[0] <= dt.timedelta(hours=1)
-                            for call in query.call_args_list))
+        self.assertEqual(query.call_count, 1)
+        self.assertEqual(query.call_args.args[:2], (now - dt.timedelta(days=3) - mc.charges.OWNER_AROUND, now))
+        self.assertEqual(query.call_args.kwargs['cache_path'], self.data / 'owner-texts.json')
 
     def test_msgs_cache_is_shared_by_ambiguous_questions_and_reset_each_run(self):
         now = at('2026-10-25T12:00')
@@ -4642,6 +5010,83 @@ class PaymentDeadlines(Base):
         self.assertNotIn('21:00', event)
         parent = next(c for c in mc.load(self.data)['cases'] if c['kind'] == 'autopay_expected')
         self.assertEqual(parent['payment_case'], bank)
+
+
+class ReceiptVariantCompetition(unittest.TestCase):
+    def test_aed_usd_charges_compete_for_the_same_receipt(self):
+        observed = at('2026-11-12T12:00')
+        for merchant, brand in [('BOAT.DEV', 'Boat'), ('BROWSER USE INC', 'Browser Use')]:
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                       sender=f'{brand} <receipts@stripe.example>', subject='Receipt')
+            text = f'{brand} receipt\nAmount paid $50.00'
+            for currency, amount, rival_currency, rival_amount in [
+                    ('AED', '190.47', 'USD', '50.00'), ('USD', '50.00', 'AED', '190.47')]:
+                current = dict(id='q-current', kind='charge', currency=currency, card='1111',
+                               merchant=merchant, amount=amount, pending=False, at=mc.stamp(observed))
+                for bound in [False, True]:
+                    rival = dict(current, id='q-rival', currency=rival_currency, amount=rival_amount,
+                                 at=mc.stamp(observed + dt.timedelta(minutes=1)))
+                    if bound:
+                        # A recorded binding vetoes reuse even outside the matching window.
+                        rival.update(at=mc.stamp(observed - dt.timedelta(days=7)), status='closed',
+                                     explanation={'msgs': row['id']})
+                    for known in [False, True]:
+                        with self.subTest(merchant=merchant, currency=currency, bound=bound, known=known):
+                            questions = [current, rival] if known else [rival]
+                            accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                             questions, observed)
+                            self.assertFalse(accepts(row, text))
+
+    def test_unbound_fx_competitors_need_matching_evidence(self):
+        observed = at('2026-11-12T12:00')
+        row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                   sender='Boat <receipts@stripe.example>', subject='Receipt')
+        for currency, amount, rival_currency, rival_amount, wrong_amount in [
+                ('AED', '190.47', 'USD', '50.00', '25.00'),
+                ('USD', '50.00', 'AED', '190.47', '100.00')]:
+            current = dict(id='q-current', kind='charge', currency=currency, card='1111',
+                           merchant='BOAT.DEV', amount=amount, pending=False, at=mc.stamp(observed))
+            rival = dict(current, id='q-rival', currency=rival_currency, amount=rival_amount)
+            for label, changes in [('merchant', {'merchant': 'Other'}),
+                                   ('amount', {'amount': wrong_amount}), ('currency', {'currency': 'EUR'}),
+                                   ('time', {'at': mc.stamp(observed - dt.timedelta(days=7))})]:
+                with self.subTest(currency=currency, form=label):
+                    accepts = mc.receipt_for_question(None, current, 'q-current',
+                                                     [current, dict(rival, **changes)], observed)
+                    self.assertTrue(accepts(row, 'Boat receipt\nAmount paid $50.00'))
+
+    def test_different_amounts_cannot_share_a_variant_receipt(self):
+        observed = at('2026-11-12T12:00')
+        forms = [
+            ('UBER * PENDING', '201.03', True, '200.94', False,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', False),
+            ('UBER * PENDING', '201.03', True, '201.00', True,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', False),
+            ('BOAT.DEV', '190.47', False, '190.90', False,
+             'Boat <receipts@stripe.example>', 'Boat receipt\nAmount paid $50.00', False),
+            ('UBER * PENDING', '201.03', True, '200.94', True,
+             'Uber <receipts@uber.com>', 'Uber receipt\nTotal AED 200.94', True),
+        ]
+        for merchant, amount, pending, rival_amount, rival_pending, sender, text, bound in forms:
+            current = dict(id='q-current', kind='charge', currency='AED', card='1111',
+                           merchant=merchant, amount=amount, pending=pending, at=mc.stamp(observed))
+            rival = dict(current, id='q-rival', amount=rival_amount, pending=rival_pending,
+                         at=mc.stamp(observed + dt.timedelta(minutes=1)))
+            if bound:
+                rival.update(status='closed', explanation={'msgs': 7})
+            row = dict(id=7, ts=(observed + dt.timedelta(minutes=45)).timestamp(),
+                       sender=sender, subject='Receipt')
+            for known in [False, True]:
+                with self.subTest(merchant=merchant, rival=rival_amount, known=known):
+                    questions = [current, rival] if known else [rival]
+                    accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                     questions, observed)
+                    self.assertFalse(accepts(row, text))
+                    unrelated = dict(rival, merchant='Other', amount='999.00', pending=False)
+                    unrelated.pop('explanation', None)
+                    accepts = mc.receipt_for_question(None, current, 'q-current' if known else None,
+                                                     [unrelated], observed)
+                    self.assertTrue(accepts(row, text))
 
 
 if __name__ == '__main__':
