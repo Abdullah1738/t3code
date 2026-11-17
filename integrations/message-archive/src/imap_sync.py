@@ -242,14 +242,45 @@ def _sync_folder(db, pool, ex, acct, folder, stats, stop):
     if st.get("uidvalidity") not in (None, uv):
         old = f"{folder}:{st['uidvalidity']}:"
         old_ids = store.known_ext_ids(db, "email", acct, old)
+        stats["known_listed"] = True
+        with store.writing(db):
+            store.set_state(db, key, {k: v for k, v in st.items() if k != "max_uid"})
         stats["deleted"] += store.reconcile(db, "email", acct, gone=old_ids)
         timing.log(f"{acct}/{folder}: UIDVALIDITY changed {st['uidvalidity']} -> {uv}, refetching")
         st = {}
-    server = search_uids(c, "ALL")
-    known = {int(x[len(prefix):]) for x in store.known_ext_ids(db, "email", acct, prefix)}
+    server = set(search_uids(c, "ALL"))
+    max_uid = st.get("max_uid")
+    pending = set(st.get("pending_uids", ()))
+    unlisted = set(st.get("unlisted_uids", ()))
+    candidates = {u for u in server if max_uid is not None and u > max_uid}
+    back = store.deleted_ext_ids(db, "email", acct, prefix) & {f"{prefix}{u}" for u in server}
+    # Previously listed failures already contribute to stored EXISTS, even above max_uid.
+    new_count = len(candidates - pending)
+    # A returning deleted UID can hide an expunge at the same EXISTS count.
+    known_listed = not (st.get("uidvalidity") == uv and max_uid is not None and not back
+                        and not (unlisted & server)
+                        and len(server) == exists == st.get("exists", 0) + new_count)
+    if known_listed:
+        stats["known_listed"] = True
+        known = {int(x[len(prefix):]) for x in store.known_ext_ids(db, "email", acct, prefix)}
+        candidates = server
+        max_uid = max(known, default=0)
+    else:
+        # Failed fetches can leave holes below max_uid; BAD_LIMIT lasts only until restart.
+        candidates |= pending & server
+        known = {int(x[len(prefix):]) for x in store.existing_ext_ids(
+            db, "email", acct, (f"{prefix}{u}" for u in candidates))} if candidates else set()
     with store.waiting(_BAD_LOCK):
         skipped = {u for (a, f, v, u), n in BAD.items() if (a, f, v) == (acct, folder, uv) and n >= BAD_LIMIT}
-    missing = sorted(set(server) - known - skipped)
+    # Unarchived failures have no deleted row to flag their return after a transient listing.
+    unlisted = (unlisted | pending) - server - known
+    pending = candidates - known
+    missing = sorted(pending - skipped)
+    if missing or ("max_uid" in st and known_listed):
+        # Chunk writes commit separately: a stop or failure must force reconciliation on retry.
+        with store.writing(db):
+            store.set_state(db, key, {**{k: v for k, v in st.items() if k != "max_uid"},
+                                     "pending_uids": sorted(pending), "unlisted_uids": sorted(unlisted)})
     if missing:
         timing.log(f"{acct}/{folder}: {len(server)} on server, {len(missing)} to fetch")
     chunks = [missing[i:i + CHUNK] for i in range(0, len(missing), CHUNK)]
@@ -260,20 +291,27 @@ def _sync_folder(db, pool, ex, acct, folder, stats, stop):
         for items in ex.map(timing.worker(lambda ch: _fetch_chunk(pool, acct, folder, uv, ch)), chunks[i:i + 20]):
             # One short write per chunk so the lock is never held while waiting on the network.
             store.upsert_many(db, items, stats)
+            archived = {int(item["ext_id"][len(prefix):]) for item in items}
+            pending -= archived
+            max_uid = max(max_uid, max(archived, default=0))
             done += len(items)
         if len(missing) > 1000:
             timing.log(f"{acct}/{folder}: fetched {done}/{len(missing)}")
     # Only trust deletions when the listing agrees with EXISTS; never trust an empty listing.
-    gone = known - set(server) if len(server) == exists and (server or not known) else set()
-    back = store.deleted_ext_ids(db, "email", acct, prefix) & {f"{prefix}{u}" for u in server}
+    gone = known - server if known_listed and len(server) == exists and (server or not known) else set()
     stats["deleted"] += store.reconcile(db, "email", acct, {f"{prefix}{u}" for u in gone}, back)
+    state = {"uidvalidity": uv, "exists": exists, "last_ok": int(time.time()),
+             "pending_uids": sorted(pending), "unlisted_uids": sorted(unlisted)}
+    # An incomplete listing must not become the baseline for the next deletion check.
+    if len(server) == exists and (server or not known):
+        state["max_uid"] = max_uid
     with store.writing(db):
-        store.set_state(db, key, {"uidvalidity": uv, "exists": exists, "last_ok": int(time.time())})
+        store.set_state(db, key, state)
     return True
 
 
 def sync(acct, db, stop=None):
-    stats = {"added": 0, "updated": 0, "same": 0, "deleted": 0}
+    stats = {"added": 0, "updated": 0, "same": 0, "deleted": 0, "known_listed": False}
     pool = Pool(acct)
     ex = ThreadPoolExecutor(WORKERS.get(acct, 2))
     try:

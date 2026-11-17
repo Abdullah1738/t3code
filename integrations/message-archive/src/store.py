@@ -365,3 +365,13 @@ def known_ext_ids(db, source, account, prefix=None):
     else:
         rows = db.execute("SELECT ext_id FROM items WHERE source=? AND account=?", (source, account))
     return {r[0] for r in rows}
+
+
+def existing_ext_ids(db, source, account, ext_ids):
+    ids = iter(ext_ids)
+    found = set()
+    while chunk := list(itertools.islice(ids, 500)):
+        rows = db.execute("SELECT ext_id FROM items WHERE source=? AND account=? AND ext_id IN ("
+                          + ", ".join("?" for _ in chunk) + ")", (source, account, *chunk))
+        found.update(r[0] for r in rows)
+    return found
