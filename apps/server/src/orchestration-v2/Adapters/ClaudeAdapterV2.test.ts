@@ -2521,6 +2521,7 @@ function makeFakeClaudeCli(
   let homeConnected = false;
   const stdins: Array<NodeStream.PassThrough> = [];
   const pendingRegistrations: Array<() => void> = [];
+  const exits: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
   const spawn = (options: SpawnOptions): SpawnedProcess => {
     spawns.push(options);
     const stdin = new NodeStream.PassThrough();
@@ -2532,12 +2533,21 @@ function makeFakeClaudeCli(
       stdout,
       killed: false,
       exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
       kill: () => {
+        child.killed = true;
         stdout.end();
-        child.emit("exit", null, "SIGTERM");
+        exit(null, "SIGTERM");
         return true;
       },
     });
+    const exit = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.exitCode = code;
+      child.signalCode = signal;
+      child.emit("exit", code, signal);
+    };
+    exits.push(exit);
     let pending = "";
     stdin.on("data", (chunk: Buffer) => {
       pending += chunk.toString("utf8");
@@ -2584,7 +2594,7 @@ function makeFakeClaudeCli(
     });
     stdin.on("end", () => {
       stdout.end();
-      child.emit("exit", 0, null);
+      exit(0, null);
     });
     return child;
   };
@@ -2595,6 +2605,8 @@ function makeFakeClaudeCli(
     spawns,
     controlRequests,
     closed,
+    exitWithoutClosingOutput: (code: number | null, signal: NodeJS.Signals | null) =>
+      exits[0]!(code, signal),
     releaseRegistration: () => pendingRegistrations.shift()?.(),
     emitHomeFailure: () =>
       stdouts[0]!.write(
@@ -2669,6 +2681,38 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
       const spawned = JSON.stringify(cli.spawns);
       assert.notInclude(spawned, "--mcp-config");
       assert.notInclude(spawned, "dummy-mcp-credential");
+    }),
+  );
+
+  it.effect.each([
+    { code: 137, signal: null },
+    { code: null, signal: "SIGKILL" as const },
+  ])("observes CLI exit without waiting for stdout EOF: $code $signal", (exit) =>
+    Effect.gen(function* () {
+      const exitLog = yield* Deferred.make<unknown>();
+      const logger = Logger.make(({ message }) => {
+        if (Array.isArray(message) && message[0] === "orchestration-v2.claude-process-exited")
+          Deferred.doneUnsafe(exitLog, Effect.succeed(message));
+      });
+      const cli = makeFakeClaudeCli();
+      const session = yield* openWith(cli).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      );
+      assert.isDefined(session.processExit);
+      const exited = yield* session.processExit!.pipe(Effect.forkChild);
+      cli.exitWithoutClosingOutput(exit.code, exit.signal);
+      assert.deepEqual(yield* Fiber.join(exited), exit);
+      assert.deepEqual(yield* Deferred.await(exitLog), [
+        "orchestration-v2.claude-process-exited",
+        {
+          threadId: "thread-claude-mcp-channel",
+          providerSessionId: "provider-session-claude-mcp-channel",
+          pid: null,
+          exitCode: exit.code,
+          signal: exit.signal,
+        },
+      ]);
+      yield* session.close;
     }),
   );
 
@@ -3232,6 +3276,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly nativeSessionId?: string;
     readonly settings?: ClaudeSettings;
     readonly freshQueueOnReopen?: boolean;
+    readonly processExit?: (
+      index: number,
+    ) => NonNullable<ClaudeAdapterV2.ClaudeAgentSdkQuerySession["processExit"]>;
     readonly fileSystem?: FileSystem.FileSystem;
   }) =>
     Effect.gen(function* () {
@@ -3319,6 +3366,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 const processMessages = yield* Queue.unbounded<SDKMessage>();
                 processQueues.push(processMessages);
                 return {
+                  ...(options?.processExit === undefined
+                    ? {}
+                    : { processExit: options.processExit(processQueues.length - 1) }),
                   messages: Stream.fromQueue(processMessages),
                   offer: (message: SDKUserMessage) =>
                     Effect.sync(() => {
@@ -3335,6 +3385,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               }
               processQueues.push(sdkMessages);
               return {
+                ...(options?.processExit === undefined
+                  ? {}
+                  : { processExit: options.processExit(processQueues.length - 1) }),
                 messages: Stream.fromQueue(sdkMessages).pipe(
                   Stream.flatMap((message) =>
                     Stream.make(message).pipe(
@@ -3571,6 +3624,279 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         ),
       ),
     ),
+  );
+
+  const makeRootBashFrame = (
+    promptUuid: string,
+    toolUseId: string,
+    input: Record<string, unknown> = { command: "git status" },
+  ) =>
+    claudeSdkFrame({
+      type: "assistant",
+      message: {
+        model: "claude-sonnet-4-6",
+        id: `msg_${toolUseId}`,
+        type: "message",
+        role: "assistant",
+        content: [{ type: "tool_use", id: toolUseId, name: "Bash", input }],
+      },
+      user_message_uuid: promptUuid,
+      parent_tool_use_id: null,
+      uuid: `frame_${toolUseId}`,
+      session_id: WAKE_NATIVE_SESSION,
+    });
+
+  it.effect.each([
+    { code: 137, signal: null, reason: "code 137" },
+    { code: null, signal: "SIGKILL" as const, reason: "signal SIGKILL" },
+    { code: 0, signal: null, reason: "code 0" },
+  ])("fails active work on native CLI exit while SDK messages stay open: $reason", (exit) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const exited = yield* Deferred.make<{
+          code: number | null;
+          signal: NodeJS.Signals | null;
+        }>();
+        const h = yield* makeWakeHarnessWithOptions({ processExit: () => Deferred.await(exited) });
+        yield* h.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("native-cli-exit"),
+            text: "Run the checks",
+            attachments: [],
+          }),
+        );
+        yield* h.offerAndWait(makeRootBashFrame(h.promptUuid(0), "exit-root-bash"));
+        yield* h.offerAndWait(
+          makeSubagentTaskStartedFrame({
+            taskId: "exit-child",
+            toolUseId: "exit-child-tool",
+            uuid: "exit-child-start",
+          }),
+        );
+        for (const frame of makeSubagentAssistantFrames({
+          parentToolUseId: "exit-child-tool",
+          uuid: "exit-child-bash-start",
+          bashToolUseId: "exit-child-bash",
+        }))
+          yield* h.offerAndWait(frame);
+
+        yield* Deferred.succeed(exited, { code: exit.code, signal: exit.signal });
+        const terminal = yield* Queue.take(h.terminalReceipts);
+        assert.equal(terminal.status, "failed");
+        if (terminal.status === "failed") {
+          assert.equal(terminal.failure.class, "transport_error");
+          assert.equal(terminal.failure.code, "cli_process_exited");
+          assert.include(terminal.failure.message, exit.reason);
+        }
+        const child = yield* Stream.fromQueue(h.subagentReceipts).pipe(
+          Stream.filter((event) => event.subagent.status !== "running"),
+          Stream.take(1),
+          Stream.runCollect,
+        );
+        assert.equal(child[0]?.subagent.status, "failed");
+        for (const id of ["exit-root-bash", "exit-child-bash"]) {
+          const tool = h.events.findLast(
+            (event) =>
+              event.type === "turn_item.updated" && event.turnItem.nativeItemRef?.nativeId === id,
+          );
+          assert.equal(
+            tool?.type === "turn_item.updated" ? tool.turnItem.status : undefined,
+            "failed",
+          );
+        }
+        assert.lengthOf(h.terminalEvents(), 1);
+        assert.isFalse(yield* h.hasPendingBackgroundWork);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each([false, true])("rejects CLI exit during MCP registration (reused: %s)", (reused) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const exited = yield* Deferred.make<{
+          code: number | null;
+          signal: NodeJS.Signals | null;
+        }>();
+        let registrations = 0;
+        const h = yield* makeWakeHarnessWithOptions({
+          processExit: () => Deferred.await(exited),
+          retryMcp: Effect.suspend(() =>
+            ++registrations === (reused ? 2 : 1)
+              ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+              : Effect.void,
+          ),
+        });
+        const input = makeClaudeTestTurnInput({
+          threadId: h.threadId,
+          providerThread: h.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("exit-before-admission"),
+          text: "Run it",
+          attachments: [],
+        });
+        if (reused) {
+          yield* h.runtime.startTurn(input);
+          yield* h.offerAndWait(
+            makeResultFrame({ uuid: "pre-admission-previous", result: "Done" }),
+          );
+          yield* Queue.take(h.terminalReceipts);
+        }
+        const pending = yield* h.runtime
+          .startTurn({
+            ...input,
+            attemptId: RunAttemptId.make("exit-during-registration"),
+            providerTurnOrdinal: reused ? 2 : 1,
+          })
+          .pipe(Effect.result, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        yield* Deferred.succeed(exited, { code: null, signal: "SIGKILL" });
+        yield* h.awaitQueryCleanup;
+        const result = yield* Fiber.join(pending);
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          const cause = result.failure.cause;
+          assert.isTrue(Schema.is(ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError)(cause));
+          if (Schema.is(ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError)(cause))
+            assert.deepInclude(cause.cause, { signal: "SIGKILL", code: null });
+        }
+        assert.lengthOf(h.offeredMessages, reused ? 1 : 0);
+        assert.lengthOf(h.terminalEvents(), reused ? 1 : 0);
+        assert.isFalse(yield* Deferred.isDone(release));
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("keeps native CLI exit during Stop interrupted", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const exited = yield* Deferred.make<{
+          code: number | null;
+          signal: NodeJS.Signals | null;
+        }>();
+        const h = yield* makeWakeHarnessWithOptions({
+          processExit: () => Deferred.await(exited),
+          close: () =>
+            Deferred.succeed(exited, { code: null, signal: "SIGTERM" }).pipe(Effect.asVoid),
+        });
+        yield* h.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("native-cli-stop"),
+            text: "Run it",
+            attachments: [],
+          }),
+        );
+        yield* h.offerAndWait(makeRootBashFrame(h.promptUuid(0), "stop-root-bash"));
+        const running = yield* Queue.take(h.providerTurnReceipts);
+        yield* h.runtime.interruptTurn({
+          providerThread: h.providerThread,
+          providerTurnId: running.providerTurn.id,
+        });
+        assert.equal((yield* Queue.take(h.terminalReceipts)).status, "interrupted");
+        assert.lengthOf(h.terminalEvents(), 1);
+        const tool = h.events.findLast(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === "stop-root-bash",
+        );
+        assert.equal(
+          tool?.type === "turn_item.updated" ? tool.turnItem.status : undefined,
+          "interrupted",
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each(["idle exit", "replacement"] as const)(
+    "does not fail a completed turn or a new query after %s",
+    (mode) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const exited = yield* Deferred.make<{
+            code: number | null;
+            signal: NodeJS.Signals | null;
+          }>();
+          const h = yield* makeWakeHarnessWithOptions({
+            processExit: (index) => (index === 0 ? Deferred.await(exited) : Effect.never),
+            freshQueueOnReopen: true,
+            close: () => Effect.void,
+          });
+          const first = makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("native-cli-completed"),
+            text: "First",
+            attachments: [],
+          });
+          yield* h.runtime.startTurn(first);
+          if (mode === "idle exit") yield* h.offerAndWait(wakeTaskStarted);
+          yield* h.offerAndWait(
+            makeResultFrame({ uuid: "completed-before-cli-exit", result: "Done" }),
+          );
+          assert.equal((yield* Queue.take(h.terminalReceipts)).status, "completed");
+          if (mode === "idle exit") {
+            yield* Deferred.succeed(exited, { code: 0, signal: null });
+            yield* Stream.fromQueue(h.providerThreadReceipts).pipe(
+              Stream.filter((event) => event.providerThread.status === "idle"),
+              Stream.take(1),
+              Stream.runDrain,
+            );
+          }
+          yield* h.runtime.startTurn({
+            ...first,
+            runId: RunId.make("native-cli-replacement-run"),
+            attemptId: RunAttemptId.make("native-cli-replacement"),
+            providerTurnOrdinal: 2,
+            modelSelection: CLAUDE_TEST_RESTART_MODEL_SELECTION,
+          });
+          assert.lengthOf(h.processQueues, 2);
+          if (mode === "replacement") {
+            yield* Deferred.succeed(exited, { code: 137, signal: null });
+            yield* Queue.offer(
+              h.sdkMessages,
+              makeResultFrame({ uuid: "late-old-result", result: "Old query" }),
+            );
+          }
+          yield* Queue.offer(
+            h.processQueues[1]!,
+            makeResultFrame({ uuid: "replacement-result", result: "New query" }),
+          );
+          assert.equal((yield* Queue.take(h.terminalReceipts)).status, "completed");
+          assert.deepEqual(
+            h.terminalEvents().map((event) => event.status),
+            ["completed", "completed"],
+          );
+          assert.isFalse(
+            h.events.some(
+              (event) => event.type === "message.updated" && event.message.text === "Old query",
+            ),
+          );
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
   );
 
   it.effect("keeps the current Claude wake caller live before continuation admission", () =>
@@ -3998,75 +4324,103 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
-  it.effect("settles a reserved continuation whose query exits during MCP retry", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        let retries = 0;
-        let closeBeforeReplay = Effect.void;
-        const harness = yield* makeWakeHarnessWithOptions({
-          freshQueueOnReopen: true,
-          close: Queue.shutdown,
-          retryMcp: Effect.suspend(() => (++retries === 2 ? closeBeforeReplay : Effect.void)),
-        });
-        const first = makeClaudeTestTurnInput({
-          threadId: harness.threadId,
-          providerThread: harness.providerThread,
-          now: yield* DateTime.now,
-          attemptId: RunAttemptId.make("closed-reservation-root"),
-          text: "Work",
-          attachments: [],
-        });
-        yield* harness.runtime.startTurn(first);
-        yield* harness.offerAndWait(wakeTaskStarted);
-        yield* harness.offerAndWait(turnOneResult);
-        yield* Queue.take(harness.terminalReceipts);
-        closeBeforeReplay = Queue.shutdown(harness.sdkMessages).pipe(
-          Effect.andThen(
-            Stream.fromQueue(harness.providerThreadReceipts).pipe(
-              Stream.filter(
-                (event) =>
-                  event.providerThread.status === "idle" &&
-                  event.providerThread.pendingBackgroundTasks?.length === 0,
+  it.effect.each(["stream_end", "process_exit"] as const)(
+    "settles a reserved continuation whose query exits during MCP retry (%s)",
+    (scenario) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let retries = 0;
+          let closeBeforeReplay = Effect.void;
+          let interrupts = 0;
+          const exited = yield* Deferred.make<{
+            code: number | null;
+            signal: NodeJS.Signals | null;
+          }>();
+          const harness = yield* makeWakeHarnessWithOptions({
+            freshQueueOnReopen: true,
+            close: Queue.shutdown,
+            retryMcp: Effect.suspend(() => (++retries === 2 ? closeBeforeReplay : Effect.void)),
+            ...(scenario === "process_exit"
+              ? {
+                  processExit: (index: number) =>
+                    index === 0 ? Deferred.await(exited) : Effect.never,
+                  interrupt: Effect.suspend(() => {
+                    interrupts++;
+                    return Effect.fail(
+                      new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                        method: "interrupt",
+                        cause: new Error("Claude process has exited"),
+                      }),
+                    );
+                  }),
+                }
+              : {}),
+          });
+          const first = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("closed-reservation-root"),
+            text: "Work",
+            attachments: [],
+          });
+          yield* harness.runtime.startTurn(first);
+          yield* harness.offerAndWait(wakeTaskStarted);
+          yield* harness.offerAndWait(turnOneResult);
+          yield* Queue.take(harness.terminalReceipts);
+          closeBeforeReplay = (
+            scenario === "process_exit"
+              ? Deferred.succeed(exited, { code: null, signal: "SIGKILL" })
+              : Queue.shutdown(harness.sdkMessages)
+          ).pipe(
+            Effect.andThen(
+              Stream.fromQueue(harness.providerThreadReceipts).pipe(
+                Stream.filter(
+                  (event) =>
+                    event.providerThread.status === "idle" &&
+                    event.providerThread.pendingBackgroundTasks?.length === 0,
+                ),
+                Stream.take(1),
+                Stream.runDrain,
               ),
-              Stream.take(1),
-              Stream.runDrain,
             ),
+          );
+          const continuation = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("closed-reservation-continuation"),
+            providerTurnOrdinal: 2,
+            text: "Continue",
+            attachments: [],
+            messageCreatedBy: "agent",
+            messageCreationSource: "provider",
+          });
+          assert.isTrue(
+            Exit.isFailure(yield* harness.runtime.startTurn(continuation).pipe(Effect.exit)),
+          );
+          yield* harness.runtime.interruptStartingRun!({
+            providerThread: harness.providerThread,
+            runId: continuation.runId,
+            attemptId: continuation.attemptId,
+            stopBackgroundWork: false,
+          });
+          const next = {
+            ...first,
+            runId: RunId.make("closed-reservation-next"),
+            attemptId: RunAttemptId.make("closed-reservation-next"),
+            providerTurnOrdinal: 3,
+          };
+          assert.isTrue(Exit.isSuccess(yield* harness.runtime.startTurn(next).pipe(Effect.exit)));
+          assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "interrupted");
+          assert.lengthOf(harness.terminalEvents(), 2);
+          assert.equal(interrupts, 0);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
           ),
-        );
-        const continuation = makeClaudeTestTurnInput({
-          threadId: harness.threadId,
-          providerThread: harness.providerThread,
-          now: yield* DateTime.now,
-          attemptId: RunAttemptId.make("closed-reservation-continuation"),
-          providerTurnOrdinal: 2,
-          text: "Continue",
-          attachments: [],
-          messageCreatedBy: "agent",
-          messageCreationSource: "provider",
-        });
-        assert.isTrue(
-          Exit.isFailure(yield* harness.runtime.startTurn(continuation).pipe(Effect.exit)),
-        );
-        yield* harness.runtime.interruptStartingRun!({
-          providerThread: harness.providerThread,
-          runId: continuation.runId,
-          attemptId: continuation.attemptId,
-        });
-        const next = {
-          ...first,
-          runId: RunId.make("closed-reservation-next"),
-          attemptId: RunAttemptId.make("closed-reservation-next"),
-          providerTurnOrdinal: 3,
-        };
-        assert.isTrue(Exit.isSuccess(yield* harness.runtime.startTurn(next).pipe(Effect.exit)));
-        assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "interrupted");
-        assert.lengthOf(harness.terminalEvents(), 2);
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
         ),
       ),
-    ),
   );
 
   it.effect.each(["once", "twice", "non-timeout", "delivery-timeout"] as const)(
@@ -14820,6 +15174,216 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect.each([
+    { label: "default", input: {}, expected: 600_000 },
+    { label: "explicit", input: { timeout: 45_000 }, expected: 45_000 },
+    { label: "capped", input: { timeout: 900_000 }, expected: 600_000 },
+    { label: "zero", input: { timeout: 0 }, expected: 600_000 },
+    { label: "negative", input: { timeout: -1 }, expected: 600_000 },
+    { label: "nonfinite", input: { timeout: Infinity }, expected: 600_000 },
+    { label: "nonnumeric", input: { timeout: "45000" }, expected: 600_000 },
+    { label: "background", input: { timeout: 45_000, run_in_background: true }, expected: 0 },
+  ])("records the Bash timeout for $label commands", ({ input, expected }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeWakeHarness;
+        yield* h.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: h.threadId,
+            providerThread: h.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("bash-timeout"),
+            text: "Run it",
+            attachments: [],
+          }),
+        );
+        yield* h.offerAndWait(
+          makeRootBashFrame(h.promptUuid(0), "timeout-bash", { command: "git status", ...input }),
+        );
+        yield* h.offerAndWait(makeResultFrame({ uuid: "timeout-result", result: "Done" }));
+        yield* Queue.take(h.terminalReceipts);
+        const commands = h.events.flatMap((event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "command_execution"
+            ? [event.turnItem]
+            : [],
+        );
+        assert.isNotEmpty(commands);
+        assert.isTrue(commands.every((command) => command.timeoutMs === expected));
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each([
+    {
+      label: "error header",
+      content: "Exit code 137\nKilled",
+      isError: true,
+      structured: undefined,
+      exitCode: 137,
+    },
+    {
+      label: "structured fallback",
+      isError: true,
+      content: "Exit code 137\nKilled",
+      structured: { stdout: "", stderr: "Killed" },
+      exitCode: 137,
+    },
+    {
+      label: "structured code",
+      isError: false,
+      content: "Failed",
+      structured: { stdout: "", stderr: "Failed", exitCode: 2 },
+      exitCode: 2,
+    },
+    {
+      label: "successful stdout collision",
+      content: "Exit code 137\nDone",
+      isError: false,
+      structured: undefined,
+      exitCode: undefined,
+    },
+    {
+      label: "successful multiline collision",
+      content: "stdout\nExit code 137\nDone",
+      isError: false,
+      structured: undefined,
+      exitCode: undefined,
+    },
+    {
+      label: "error with embedded stdout collision",
+      content: "stdout\nExit code 137\nDone",
+      isError: true,
+      structured: undefined,
+      exitCode: undefined,
+    },
+    {
+      label: "colon error header",
+      content: "Exit code: 137\r\nKilled",
+      isError: true,
+      structured: undefined,
+      exitCode: 137,
+    },
+    {
+      label: "structured success overrides text",
+      content: "Exit code 137\nDone",
+      isError: false,
+      structured: { stdout: "Exit code 137", stderr: "", exitCode: 0 },
+      exitCode: 0,
+    },
+    {
+      label: "snake case structured exit",
+      content: "Failed",
+      isError: false,
+      structured: { exit_code: 3 },
+      exitCode: 3,
+    },
+    {
+      label: "unsafe numeric header",
+      content: "Exit code 999999999999999999999\nFailed",
+      isError: true,
+      structured: undefined,
+      exitCode: undefined,
+    },
+    {
+      label: "error header without body",
+      content: "Exit code 137",
+      isError: true,
+      structured: undefined,
+      exitCode: 137,
+    },
+    {
+      label: "negative header",
+      content: "Exit code -9\nKilled",
+      isError: true,
+      structured: undefined,
+      exitCode: -9,
+    },
+    {
+      label: "whitespace header",
+      content: "\n  exit CODE 137  \nKilled",
+      isError: true,
+      structured: undefined,
+      exitCode: 137,
+    },
+    {
+      label: "inline header suffix",
+      content: "Exit code 137 is stdout",
+      isError: true,
+      structured: undefined,
+      exitCode: undefined,
+    },
+    {
+      label: "ordinary output",
+      isError: false,
+      content: "Read Exit code 137 here",
+      structured: undefined,
+      exitCode: undefined,
+    },
+  ])(
+    "preserves the Bash result exit code from $label",
+    ({ content, isError, structured, exitCode }) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const h = yield* makeWakeHarness;
+          yield* h.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: h.threadId,
+              providerThread: h.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("bash-exit-code"),
+              text: "Run it",
+              attachments: [],
+            }),
+          );
+          yield* h.offerAndWait(makeRootBashFrame(h.promptUuid(0), "exit-code-bash"));
+          yield* h.offerAndWait(
+            claudeSdkFrame({
+              type: "user",
+              message: {
+                role: "user",
+                content: [
+                  {
+                    type: "tool_result",
+                    tool_use_id: "exit-code-bash",
+                    content,
+                    is_error: isError,
+                  },
+                ],
+              },
+              parent_tool_use_id: null,
+              uuid: "bash-exit-result",
+              session_id: WAKE_NATIVE_SESSION,
+              ...(structured === undefined ? {} : { tool_use_result: structured }),
+            }),
+          );
+          yield* h.offerAndWait(makeResultFrame({ uuid: "bash-exit-complete", result: "Done" }));
+          yield* Queue.take(h.terminalReceipts);
+          const command = h.events
+            .flatMap((event) =>
+              event.type === "turn_item.updated" && event.turnItem.type === "command_execution"
+                ? [event.turnItem]
+                : [],
+            )
+            .at(-1);
+          assert.isDefined(command);
+          assert.equal(command?.exitCode, exitCode);
+          assert.equal(
+            command?.outputIndicatesFailure,
+            exitCode === undefined ? undefined : exitCode !== 0,
+          );
+          assert.equal(command?.status, isError || (exitCode ?? 0) !== 0 ? "failed" : "completed");
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
   it.effect("stores a Bash result's stdout and stderr as command output", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -24884,6 +25448,42 @@ describe("ClaudeAdapterV2 background wake turns", () => {
 });
 
 describe("ClaudeAdapterV2 query message stream", () => {
+  it.effect("does not wait for a stuck SDK iterator cleanup after native CLI exit", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const readStarted = Promise.withResolvers<void>();
+        const returnStarted = Promise.withResolvers<void>();
+        const pendingRead = Promise.withResolvers<IteratorResult<SDKMessage, void>>();
+        const pendingReturn = Promise.withResolvers<IteratorResult<SDKMessage, void>>();
+        const processExit = Promise.withResolvers<{
+          code: number | null;
+          signal: NodeJS.Signals | null;
+        }>();
+        const query = {
+          next: () => {
+            readStarted.resolve();
+            return pendingRead.promise;
+          },
+          return: () => {
+            returnStarted.resolve();
+            return pendingReturn.promise;
+          },
+        } as unknown as ClaudeQuery;
+        const consuming = yield* Stream.fromAsyncIterable(
+          ClaudeAdapterV2.claudeQueryMessages(query, processExit.promise),
+          (cause) => cause,
+        ).pipe(Stream.runDrain, Effect.forkChild);
+        yield* Effect.promise(() => readStarted.promise);
+        const stopping = yield* Fiber.interrupt(consuming).pipe(Effect.forkChild);
+        yield* Effect.promise(() => returnStarted.promise);
+        processExit.resolve({ code: 137, signal: null });
+        yield* Fiber.join(stopping);
+        pendingRead.resolve({ done: true, value: undefined });
+        pendingReturn.resolve({ done: true, value: undefined });
+      }),
+    ),
+  );
+
   it.effect("closes the query when the message stream is interrupted mid-read", () =>
     Effect.gen(function* () {
       let closed = false;

@@ -3103,7 +3103,11 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
             (row) => row.id === child.taskId,
           )!;
           assert.equal(settled.status, "cancelled");
-          assert.equal(settled.result, "Original child answer");
+          assert.include(settled.result!, "Child task cancelled; no final report.");
+          assert.include(
+            settled.result!,
+            "Partial assistant findings (not a final report):\nOriginal child answer",
+          );
           assert.equal(
             (yield* orchestrator.getThreadProjection(child.childThreadId)).runs.length,
             1,
@@ -3680,7 +3684,10 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
       const settled = yield* orchestrator.getThreadProjection(threadId);
       const task = settled.subagents.find((row) => row.id === child.taskId);
       assert.equal(task?.status, "interrupted");
-      assert.equal(task?.result, "Child task ended with status interrupted.");
+      assert.equal(
+        task?.result,
+        "Child task interrupted; no final report.\n\nStop reason: Child task ended with status interrupted.",
+      );
       assert.equal(task?.completionDelivery?.state, "claimed");
     }),
   );
@@ -4473,7 +4480,7 @@ describe("delegated background results", () => {
 
       const wakeRunId = RunId.make(id("background-result-wake"));
       const finalText = cancelled
-        ? "Child task ended with status cancelled."
+        ? `Child task cancelled; no final report.${scenario === "cancelled_queued_wake" ? "\nReason: queued_cancel" : ""}`
         : scenario === "single" || scenario === "foreign_task"
           ? "Single-turn result"
           : "WATCH_DONE: exit 0, 18:48:10 / 18:51:30";
@@ -4927,7 +4934,15 @@ it.layer(layerTest)("stopped delegated tool results", (it) => {
         yield* orchestrator.recoverDelegatedTasks;
         const parent = yield* orchestrator.getThreadProjection(threadId);
         const result = parent.subagents.find((task) => task.id === child.taskId)!.result!;
-        if (!partial) assert.equal(result, "I'll load the remote-compute skill first.");
+        if (!partial && status === "cancelled") {
+          assert.include(result, "Child task cancelled; no final report.");
+          assert.include(result, "Detail: Stalled: command_execution_finished");
+          assert.include(
+            result,
+            "Partial assistant findings (not a final report):\nI'll load the remote-compute skill first.",
+          );
+          assert.notInclude(result, "Last completed tool:");
+        } else if (!partial) assert.equal(result, "I'll load the remote-compute skill first.");
         else {
           assert.include(result, "Stalled: command_execution_finished then no progress for 15 min");
           if (toolResult === "wait") {
