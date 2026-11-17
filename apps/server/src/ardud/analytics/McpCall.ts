@@ -115,6 +115,12 @@ export class McpCall extends Context.Service<
     readerLane: string;
     boundedRead?: { readonly phase: string; readonly waitedMs: number };
     readDeadlineExpired?: true;
+    activityStages?: Array<{
+      stage: NonNullable<NonNullable<AnalyticsEvent["props"]>["activityStages"]>[number]["stage"];
+      durationMs: number;
+      completed: boolean;
+      started?: number;
+    }>;
     waitStage?: "lookup.caller" | "lookup.target" | "waiting";
     waitLookupMs?: number;
     phase: Phase;
@@ -358,6 +364,10 @@ export function callOutcome(
   exit: Exit.Exit<McpSchema.CallToolResult | McpSchema.InputRequired, unknown>,
   state: McpCall["Service"],
 ): Pick<AnalyticsEvent, "outcome" | "errorTag" | "errorPhase" | "saved" | "props"> {
+  const activityStages = state.activityStages?.map(({ started, ...row }) => ({
+    ...row,
+    durationMs: started === undefined ? row.durationMs : Math.max(0, performance.now() - started),
+  }));
   const { notFoundReason, ...taskLookup } = state.taskLookup ?? {};
   if (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause))
     return {
@@ -370,6 +380,7 @@ export function callOutcome(
       errorPhase: state.phase,
       props: {
         ...taskLookup,
+        ...(activityStages === undefined ? {} : { activityStages }),
         ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
         code: "unknown",
         ...interruptionProps(exit.cause),
@@ -508,6 +519,7 @@ export function callOutcome(
     ...(state.readOnly && state.taskLookup === undefined ? {} : { saved }),
     props: {
       ...taskLookup,
+      ...(activityStages === undefined ? {} : { activityStages }),
       ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
       ...(notFoundReason === undefined ? {} : { notFoundReason }),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),

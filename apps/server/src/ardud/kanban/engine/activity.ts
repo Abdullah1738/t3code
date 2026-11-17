@@ -373,9 +373,10 @@ const threadAt = (
   at: string,
   threadsByCard: ReadonlyMap<string, ReadonlyArray<KanbanThreadLink>>,
 ) =>
-  (threadsByCard.get(card.id) ?? [])
-    .filter((link) => link.role === role && link.startedAt <= at)
-    .findLast((link) => link.endedAt === null || link.endedAt >= at);
+  (threadsByCard.get(card.id) ?? []).findLast(
+    (link) =>
+      link.role === role && link.startedAt <= at && (link.endedAt === null || link.endedAt >= at),
+  );
 
 /**
  * A card's waits in the window, from each wait set to the next wait end (both
@@ -1102,9 +1103,13 @@ export const rollup = (input: RollupInput) => {
   }> = [];
   for (const card of active) {
     const events = byCard.get(card.id) ?? [];
-    events.forEach((event, index) => {
+    const endings = events.filter(endsStall);
+    let endingIndex = 0;
+    events.forEach((event) => {
       if (!isStall(event)) return;
-      const end = events.slice(index + 1).find(endsStall);
+      while (endings[endingIndex] !== undefined && endings[endingIndex]!.id <= event.id)
+        endingIndex++;
+      const end = endings[endingIndex];
       const ongoing = end === undefined && card.stalled !== null;
       stallItems.push({
         card: card.number,

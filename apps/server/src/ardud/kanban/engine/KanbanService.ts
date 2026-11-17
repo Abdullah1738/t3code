@@ -167,6 +167,7 @@ import * as Analytics from "../../analytics/Analytics.ts";
 import * as BoardAnalytics from "./analytics.ts";
 import * as EvaluatorAnalytics from "./evaluatorAnalytics.ts";
 import { McpCall, resolvedContext } from "../../analytics/McpCall.ts";
+import * as ActivityReadMetrics from "../../analytics/ActivityReadMetrics.ts";
 import {
   askKind,
   askTimingProps,
@@ -23448,125 +23449,154 @@ const make = Effect.gen(function* () {
         }),
       ),
     activity: (boardId, window) =>
-      readDb(
-        Effect.gen(function* () {
-          const { history, ...read } = yield* Effect.all({
-            currentAt: nowIso,
-            // Current holders stay current even when the requested activity window is historical.
-            currentSlots: store.openSlots(boardId),
-            board: store.board(boardId),
-            cards: store.cards(boardId),
-            events: store.boardEvents(boardId, window.since, window.until),
-            threads: store.threadLinks({ boardId, open: false }),
-            pools: store.pools(boardId),
-            slotHistory: store.slotHistory({ boardId, from: window.since, to: window.until }),
-            history: store.activityHistory(boardId, window),
-          });
-          const lastEventAtByCard = new Map(
-            (yield* store.evaluatorStepEvents(boardId)).map((event) => [
-              event.cardId as string,
-              event.at,
-            ]),
-          );
-          const releaseBoards = read.board === null ? [] : yield* store.boards;
-          const idleEvaluatorBoard =
-            read.board === null
-              ? undefined
-              : {
-                  ...read.board,
-                  ...BoardReplies.boardReleaseSummary(
-                    read.board,
-                    read.currentAt,
-                    releaseBoards,
-                    false,
-                  ),
-                };
-          const readinessBefore = history.filter((event) => event.at < window.since);
-          const prior = readinessBefore.filter(
-            (event) => event.toStage !== null && event.fromStage !== event.toStage,
-          );
-          const after = history.filter((event) => event.at >= window.until);
-          const dispatchCards = yield* dispatchCardPass(boardId, new Set()).read;
-          const reviews = new Map<string, Rules.ReviewEvidence>();
-          if (read.board)
-            for (const card of dispatchCards) {
-              if (card.settledAt === null && kanbanReviewAlreadyDone(card))
-                reviews.set(card.id, yield* reviewEvidence(read.board, card));
-            }
-          return {
-            ...read,
-            ...(read.board === null
-              ? {}
-              : {
-                  release: BoardReplies.boardReleaseSummary(
-                    read.board,
-                    read.currentAt,
-                    releaseBoards,
-                  ),
-                }),
-            ...(idleEvaluatorBoard === undefined ? {} : { idleEvaluatorBoard }),
-            lastEventAtByCard,
-            prior,
-            after,
-            readinessBefore,
-            dispatchCards,
-            holds: yield* boardHolds(boardId),
-            dispatchPools: Rules.maskDownPools(read.pools, new Set((yield* Ref.get(down)).keys())),
-            reviews,
-            workThreadHomes: yield* workThreadHomes(dispatchCards),
-            assignmentWakeRetries: new Map(assignmentWakeRetries),
-          };
-        }),
-      ).pipe(
-        Effect.flatMap((read) =>
+      ActivityReadMetrics.step(
+        "load",
+        readDb(
           Effect.gen(function* () {
-            const poolChanges: KanbanPoolChange[] = [];
-            if (Option.isSome(analytics)) {
-              yield* analytics.value.flush;
-              const end = Date.parse(window.until);
-              for (
-                let at = Math.floor(Date.parse(window.since) / 86_400_000) * 86_400_000;
-                at < end;
-                at += 86_400_000
-              ) {
-                let cursor: string | undefined;
-                do {
-                  const result = yield* analytics.value.read({
-                    day: DateTime.formatIsoDateUtc(DateTime.makeUnsafe(at)),
-                    boardId,
-                    kind: "kanban.pool_change",
-                    section: "boards",
-                    limit: 500,
-                    ...(cursor === undefined ? {} : { cursor }),
-                  });
-                  // A section contains whole small boards or nested rows of a large board.
-                  // The summary's rollup is only a preview, even when hasMore is false.
-                  for (const row of result.rows ?? []) {
-                    if (row.truncated)
-                      return yield* failWith(
-                        "invalid",
-                        "Pool change history contains a truncated row",
-                      );
-                    const changes =
-                      row.path.length === 1
-                        ? ((yield* decodeBoardPoolChanges(row.value)).poolChanges ?? [])
-                        : row.path.length === 3 && row.path[1] === "poolChanges"
-                          ? [yield* decodePoolChange(row.value)]
-                          : [];
-                    poolChanges.push(
-                      ...changes.filter((row) => row.at >= window.since && row.at < window.until),
-                    );
-                  }
-                  if (result.hasMore && (result.cursor === undefined || result.cursor === cursor))
-                    return yield* failWith("invalid", "Pool change history cursor did not advance");
-                  cursor = result.hasMore ? result.cursor : undefined;
-                } while (cursor !== undefined);
+            const { history, ...read } = yield* Effect.all({
+              currentAt: nowIso,
+              // Current holders stay current even when the requested activity window is historical.
+              currentSlots: ActivityReadMetrics.step("slots", store.openSlots(boardId)),
+              board: ActivityReadMetrics.step("board", store.board(boardId)),
+              cards: ActivityReadMetrics.step("cards", store.cards(boardId)),
+              events: ActivityReadMetrics.step(
+                "events",
+                store.boardEvents(boardId, window.since, window.until),
+              ),
+              threads: ActivityReadMetrics.step(
+                "threads",
+                store.threadLinks({ boardId, open: false }),
+              ),
+              pools: ActivityReadMetrics.step("pools", store.pools(boardId)),
+              slotHistory: ActivityReadMetrics.step(
+                "slots",
+                store.slotHistory({ boardId, from: window.since, to: window.until }),
+              ),
+              history: ActivityReadMetrics.step("history", store.activityHistory(boardId, window)),
+            });
+            const lastEventAtByCard = new Map(
+              (yield* ActivityReadMetrics.step(
+                "evaluatorEvents",
+                store.evaluatorStepEvents(boardId),
+              )).map((event) => [event.cardId as string, event.at]),
+            );
+            const releaseBoards = read.board === null ? [] : yield* store.boards;
+            const idleEvaluatorBoard =
+              read.board === null
+                ? undefined
+                : {
+                    ...read.board,
+                    ...BoardReplies.boardReleaseSummary(
+                      read.board,
+                      read.currentAt,
+                      releaseBoards,
+                      false,
+                    ),
+                  };
+            const readinessBefore = history.filter((event) => event.at < window.since);
+            const prior = readinessBefore.filter(
+              (event) => event.toStage !== null && event.fromStage !== event.toStage,
+            );
+            const after = history.filter((event) => event.at >= window.until);
+            const dispatchCards = yield* ActivityReadMetrics.step(
+              "dispatch",
+              dispatchCardPass(boardId, new Set()).read,
+            );
+            const reviews = new Map<string, Rules.ReviewEvidence>();
+            if (read.board)
+              for (const card of dispatchCards) {
+                if (card.settledAt === null && kanbanReviewAlreadyDone(card))
+                  reviews.set(card.id, yield* reviewEvidence(read.board, card));
               }
-            }
-            return { ...read, poolChanges };
+            return {
+              ...read,
+              ...(read.board === null
+                ? {}
+                : {
+                    release: BoardReplies.boardReleaseSummary(
+                      read.board,
+                      read.currentAt,
+                      releaseBoards,
+                    ),
+                  }),
+              ...(idleEvaluatorBoard === undefined ? {} : { idleEvaluatorBoard }),
+              lastEventAtByCard,
+              prior,
+              after,
+              readinessBefore,
+              dispatchCards,
+              holds: yield* boardHolds(boardId),
+              dispatchPools: Rules.maskDownPools(
+                read.pools,
+                new Set((yield* Ref.get(down)).keys()),
+              ),
+              reviews,
+              workThreadHomes: yield* workThreadHomes(dispatchCards),
+              assignmentWakeRetries: new Map(assignmentWakeRetries),
+            };
           }),
+        ).pipe(
+          Effect.flatMap((read) =>
+            ActivityReadMetrics.step(
+              "analytics",
+              Effect.gen(function* () {
+                const poolChanges: KanbanPoolChange[] = [];
+                if (Option.isSome(analytics)) {
+                  yield* analytics.value.flush;
+                  const end = Date.parse(window.until);
+                  for (
+                    let at = Math.floor(Date.parse(window.since) / 86_400_000) * 86_400_000;
+                    at < end;
+                    at += 86_400_000
+                  ) {
+                    let cursor: string | undefined;
+                    do {
+                      const result = yield* analytics.value.read({
+                        day: DateTime.formatIsoDateUtc(DateTime.makeUnsafe(at)),
+                        boardId,
+                        kind: "kanban.pool_change",
+                        section: "boards",
+                        limit: 500,
+                        ...(cursor === undefined ? {} : { cursor }),
+                      });
+                      // A section contains whole small boards or nested rows of a large board.
+                      // The summary's rollup is only a preview, even when hasMore is false.
+                      for (const row of result.rows ?? []) {
+                        if (row.truncated)
+                          return yield* failWith(
+                            "invalid",
+                            "Pool change history contains a truncated row",
+                          );
+                        const changes =
+                          row.path.length === 1
+                            ? ((yield* decodeBoardPoolChanges(row.value)).poolChanges ?? [])
+                            : row.path.length === 3 && row.path[1] === "poolChanges"
+                              ? [yield* decodePoolChange(row.value)]
+                              : [];
+                        poolChanges.push(
+                          ...changes.filter(
+                            (row) => row.at >= window.since && row.at < window.until,
+                          ),
+                        );
+                      }
+                      if (
+                        result.hasMore &&
+                        (result.cursor === undefined || result.cursor === cursor)
+                      )
+                        return yield* failWith(
+                          "invalid",
+                          "Pool change history cursor did not advance",
+                        );
+                      cursor = result.hasMore ? result.cursor : undefined;
+                    } while (cursor !== undefined);
+                  }
+                }
+                return { ...read, poolChanges };
+              }),
+            ),
+          ),
+          Effect.mapError(toKanbanError),
         ),
-        Effect.mapError(toKanbanError),
       ),
     cardByNumber: (boardId, number) => readDb(store.cardByNumber(boardId, number)),
     cards: (boardId, options) =>
