@@ -382,18 +382,18 @@ export interface ThreadManagementServiceShape {
     commandId: CommandId,
     attemptId: string,
   ) => Effect.Effect<boolean>;
+  readonly snapshotDelegationTimeouts: () => Effect.Effect<
+    ReadonlyArray<CommandReceiptStore.DelegationTimeout>
+  >;
   readonly settleDelegationTimeout: (
     commandId: CommandId,
     outcome: DetachedDelegationOutcome,
     afterRestart?: boolean,
     attemptId?: string,
-  ) => Effect.Effect<
-    AnalyticsEvent["detachedOutcomeWake"],
-    ThreadManagementFailure | CommandReceiptStore.CommandReceiptStoreV2Error
-  >;
+  ) => Effect.Effect<AnalyticsEvent["detachedOutcomeWake"]>;
   readonly sweepDelegationTimeouts: (
     records?: ReadonlyArray<CommandReceiptStore.DelegationTimeout>,
-  ) => Effect.Effect<void, CommandReceiptStore.CommandReceiptStoreV2Error>;
+  ) => Effect.Effect<void>;
   readonly promoteQueuedMessages: Orchestrator.OrchestratorV2["Service"]["promoteQueuedMessages"];
   readonly searchThreadStream: (
     input: OrchestrationV2SearchThreadInput,
@@ -714,6 +714,19 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const snapshotDelegationTimeouts = Effect.fn(
+    "ThreadManagementService.snapshotDelegationTimeouts",
+  )(() =>
+    receipts.listDelegationTimeouts().pipe(
+      Effect.tapError((cause) =>
+        Effect.logWarning("delegation timeout startup read failed; retrying", { cause }).pipe(
+          Effect.andThen(Effect.sleep("1 second")),
+        ),
+      ),
+      Effect.eventually,
+    ),
+  );
+
   const settleDelegationTimeout: ThreadManagementServiceShape["settleDelegationTimeout"] =
     Effect.fn("ThreadManagementService.settleDelegationTimeout")(function* (
       commandId,
@@ -721,125 +734,145 @@ const make = Effect.gen(function* () {
       afterRestart = false,
       attemptId,
     ) {
-      // A retry holds this same key through commit. Its saved task must win over an older failure.
+      let completedWake: AnalyticsEvent["detachedOutcomeWake"];
+      let notificationAttempted = false;
+      // A saved retry must win before a failure notification commits.
       // Receipt and wake I/O must stay off the cancellation registration lock.
-      return yield* delegationCreateLock.withLock(
-        commandId,
-        Effect.gen(function* () {
-          const pending = yield* receipts.getDelegationTimeout(commandId, attemptId);
-          if (Option.isNone(pending)) return "suppressed_definite" as const;
-          const record = pending.value;
-          const receipt = yield* receipts.getByCommandId(commandId);
-          const parent = yield* orchestrator.getThreadShell(record.parentThreadId);
-          let wake: AnalyticsEvent["detachedOutcomeWake"];
-          if (Option.isSome(receipt) && receipt.value.status === "accepted") {
-            wake = "suppressed_retry_saved";
-          } else if (parent === null || parent.archivedAt !== null || parent.deletedAt !== null) {
-            yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
-            return undefined;
-          } else {
-            const records = yield* orchestrator.getThreadRecords(record.parentThreadId, [
-              "subagents",
-            ]);
-            if (
-              records.subagents.some(
-                (task) => task.id === record.taskId && task.childThreadId !== null,
-              )
-            ) {
-              wake = "suppressed_retry_saved";
-            } else {
-              const wakeId = `delegation-create-failure:${encodeURIComponent(record.parentThreadId)}:${encodeURIComponent(record.clientRequestId)}`;
-              const delivered = yield* receipts.getByCommandId(CommandId.make(`command:${wakeId}`));
-              if (Option.isSome(delivered) && delivered.value.status === "accepted") {
-                yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
-                return undefined;
-              }
-              const abandoned = abandonedDelegations.get(commandId);
-              const detail = afterRestart
-                ? "lost in server restart"
-                : Option.isSome(receipt) && receipt.value.status === "rejected"
-                  ? `rejected: ${receipt.value.error ?? outcome.reason ?? "No reason recorded"}`
-                  : abandoned !== undefined
-                    ? `abandoned after ${abandoned.elapsedSeconds} s at ${outcome.stage} (${abandoned.reason})`
-                    : `never saved${outcome.reason === undefined ? "" : `: ${outcome.reason}`}`;
-              const now = yield* DateTime.now;
-              const elapsedSeconds = afterRestart
-                ? Math.max(
-                    0,
-                    Math.round(
-                      (DateTime.toEpochMillis(now) - Date.parse(record.createdAt)) / 1_000,
-                    ),
-                  )
-                : outcome.elapsedSeconds;
-              if (afterRestart)
-                yield* receipts.upsert({
-                  commandId: lostCreateReceiptId(commandId),
-                  threadId: record.parentThreadId,
-                  commandType: "delegation.create-lost",
-                  acceptedAt: yield* DateTime.now,
-                  resultSequence: 0,
-                  status: "rejected",
-                  error: detail,
-                });
-              // The command receipt commits with the notification. A crash before cleanup replays it.
-              yield* orchestrator.dispatch({
-                type: "message.dispatch",
-                commandId: CommandId.make(`command:${wakeId}`),
-                threadId: record.parentThreadId,
-                messageId: MessageId.make(`message:${wakeId}`),
-                text: `Async delegation ${record.clientRequestId}\nTask ${record.taskId}\n${detail}\nAfter ${elapsedSeconds} s at ${outcome.stage}\nNothing ran. Retry delegate_task with the same clientRequestId.`,
-                notification: {
-                  source: { kind: "background_task" },
-                  outcome: "failed",
-                  summary: `Delegation ${record.clientRequestId}: ${detail}`,
-                },
-                attachments: [],
-                dispatchMode: { type: "queue_after_active" },
-                createdBy: "agent",
-                creationSource: "server",
-              });
-              wake = afterRestart ? "sent_after_restart" : "sent";
+      return yield* delegationCreateLock
+        .withLock(
+          commandId,
+          Effect.gen(function* () {
+            const pending = yield* receipts.getDelegationTimeout(commandId, attemptId);
+            if (Option.isNone(pending)) return completedWake ?? ("suppressed_definite" as const);
+            const record = pending.value;
+            if (completedWake !== undefined) {
+              yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
+              return completedWake;
             }
-          }
-          yield* Effect.annotateCurrentSpan("t3.delegate.detached_outcome_wake", wake);
-          if (
-            (afterRestart || outcome.stage === "outcome_admission") &&
-            record.analyticsJson !== null
-          ) {
-            const analytics = yield* Effect.serviceOption(Analytics.Analytics);
-            const now = yield* DateTime.now;
-            if (Option.isSome(analytics))
-              yield* decodeTimeoutAnalytics(record.analyticsJson).pipe(
-                Effect.flatMap((event) =>
-                  analytics.value.record({
-                    ...event,
-                    ts: DateTime.formatIso(now),
-                    detachedOutcomeWake: wake,
-                  }),
-                ),
-                Effect.ignoreCause,
-              );
-          }
-          yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
-          return wake;
-        }),
-      );
+            const wakeId = `delegation-create-failure:${encodeURIComponent(record.parentThreadId)}:${encodeURIComponent(record.clientRequestId)}`;
+            const delivered = yield* receipts.getByCommandId(CommandId.make(`command:${wakeId}`));
+            const alreadyDelivered =
+              Option.isSome(delivered) && delivered.value.status === "accepted";
+            const receipt = yield* receipts.getByCommandId(commandId);
+            const parent = yield* orchestrator.getThreadShell(record.parentThreadId);
+            let wake: AnalyticsEvent["detachedOutcomeWake"];
+            if (alreadyDelivered && notificationAttempted) {
+              wake = afterRestart ? "sent_after_restart" : "sent";
+            } else if (Option.isSome(receipt) && receipt.value.status === "accepted") {
+              wake = "suppressed_retry_saved";
+            } else if (parent === null || parent.archivedAt !== null || parent.deletedAt !== null) {
+              yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
+              return undefined;
+            } else {
+              const records = yield* orchestrator.getThreadRecords(record.parentThreadId, [
+                "subagents",
+              ]);
+              if (
+                records.subagents.some(
+                  (task) => task.id === record.taskId && task.childThreadId !== null,
+                )
+              ) {
+                wake = "suppressed_retry_saved";
+              } else {
+                if (alreadyDelivered) {
+                  yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
+                  return undefined;
+                }
+                const abandoned = abandonedDelegations.get(commandId);
+                const detail = afterRestart
+                  ? "lost in server restart"
+                  : Option.isSome(receipt) && receipt.value.status === "rejected"
+                    ? `rejected: ${receipt.value.error ?? outcome.reason ?? "No reason recorded"}`
+                    : abandoned !== undefined
+                      ? `abandoned after ${abandoned.elapsedSeconds} s at ${outcome.stage} (${abandoned.reason})`
+                      : `never saved${outcome.reason === undefined ? "" : `: ${outcome.reason}`}`;
+                const now = yield* DateTime.now;
+                const elapsedSeconds = afterRestart
+                  ? Math.max(
+                      0,
+                      Math.round(
+                        (DateTime.toEpochMillis(now) - Date.parse(record.createdAt)) / 1_000,
+                      ),
+                    )
+                  : outcome.elapsedSeconds;
+                if (afterRestart)
+                  yield* receipts.upsert({
+                    commandId: lostCreateReceiptId(commandId),
+                    threadId: record.parentThreadId,
+                    commandType: "delegation.create-lost",
+                    acceptedAt: yield* DateTime.now,
+                    resultSequence: 0,
+                    status: "rejected",
+                    error: detail,
+                  });
+                // The command receipt commits with the notification. A crash before cleanup replays it.
+                notificationAttempted = true;
+                yield* orchestrator.dispatch(
+                  {
+                    type: "message.dispatch",
+                    commandId: CommandId.make(`command:${wakeId}`),
+                    threadId: record.parentThreadId,
+                    messageId: MessageId.make(`message:${wakeId}`),
+                    text: `Async delegation ${record.clientRequestId}\nTask ${record.taskId}\n${detail}\nAfter ${elapsedSeconds} s at ${outcome.stage}\nNothing ran. Retry delegate_task with the same clientRequestId.`,
+                    notification: {
+                      source: { kind: "background_task" },
+                      outcome: "failed",
+                      summary: `Delegation ${record.clientRequestId}: ${detail}`,
+                    },
+                    attachments: [],
+                    dispatchMode: { type: "queue_after_active" },
+                    createdBy: "agent",
+                    creationSource: "server",
+                  },
+                  { retryPlanningFailures: true },
+                );
+                wake = afterRestart ? "sent_after_restart" : "sent";
+              }
+            }
+            completedWake = wake;
+            yield* Effect.annotateCurrentSpan("t3.delegate.detached_outcome_wake", wake);
+            if (
+              (afterRestart || outcome.stage === "outcome_admission") &&
+              record.analyticsJson !== null
+            ) {
+              const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+              const now = yield* DateTime.now;
+              if (Option.isSome(analytics))
+                yield* decodeTimeoutAnalytics(record.analyticsJson).pipe(
+                  Effect.flatMap((event) =>
+                    analytics.value.record({
+                      ...event,
+                      ts: DateTime.formatIso(now),
+                      detachedOutcomeWake: wake,
+                    }),
+                  ),
+                  Effect.ignoreCause,
+                );
+            }
+            yield* receipts.removeDelegationTimeout(commandId, record.attemptId);
+            return wake;
+          }),
+        )
+        .pipe(
+          // Retry outside the lock so storage trouble cannot prevent a same-key retry from saving.
+          Effect.tapError((cause) =>
+            Effect.logWarning("delegation timeout recovery failed; retrying", {
+              commandId,
+              cause,
+            }).pipe(Effect.andThen(Effect.sleep("1 second"))),
+          ),
+          Effect.eventually,
+          Effect.map((wake) => wake ?? completedWake),
+        );
     });
   const sweepDelegationTimeouts = Effect.fn("ThreadManagementService.sweepDelegationTimeouts")(
     function* (records?: ReadonlyArray<CommandReceiptStore.DelegationTimeout>) {
-      for (const record of records ?? (yield* receipts.listDelegationTimeouts())) {
+      for (const record of records ?? (yield* snapshotDelegationTimeouts())) {
         yield* settleDelegationTimeout(
           record.commandId,
           { outcome: "failed", stage: "dispatch", elapsedSeconds: 0 },
           true,
           record.attemptId,
-        ).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("delegation timeout recovery failed", {
-              commandId: record.commandId,
-              cause,
-            }),
-          ),
         );
       }
     },
@@ -2122,6 +2155,7 @@ const make = Effect.gen(function* () {
     hasReceipt,
     recordDelegationTimeout: receipts.saveDelegationTimeout,
     clearDelegationTimeout: receipts.removeDelegationTimeout,
+    snapshotDelegationTimeouts,
     reconcileDelegationTimeout: Effect.fn("ThreadManagementService.reconcileDelegationTimeout")(
       (commandId, attemptId) =>
         // Worker death cannot prove COMMIT failed. A fresh reader must resolve the attempt

@@ -3744,16 +3744,7 @@ const make = Effect.gen(function* () {
           Deferred.await(callerSettled).pipe(
             Effect.flatMap((timedOut) =>
               timedOut
-                ? threadManagement
-                    .settleDelegationTimeout(commandId, outcome, false, attemptId)
-                    .pipe(
-                      Effect.catchCause((cause) =>
-                        Effect.logWarning("delegation timeout outcome wake failed", {
-                          commandId,
-                          cause,
-                        }).pipe(Effect.as(undefined)),
-                      ),
-                    )
+                ? threadManagement.settleDelegationTimeout(commandId, outcome, false, attemptId)
                 : Effect.succeed("suppressed_definite" as const),
             ),
           );

@@ -183,6 +183,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
   const threads = ThreadManagementService.ThreadManagementService.of({
     recordDelegationTimeout: unused,
     clearDelegationTimeout: unused,
+    snapshotDelegationTimeouts: unused,
     reconcileDelegationTimeout: unused,
     settleDelegationTimeout: unused,
     sweepDelegationTimeouts: unused,

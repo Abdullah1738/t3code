@@ -3589,8 +3589,18 @@ describe("OrchestratorMcpService provider resolution", () => {
     "concurrent_retry",
     "concurrent_retry_saved",
     "settlement_io",
+    "transient_read",
+    "transient_dispatch",
+    "transient_dispatch_committed",
+    "transient_cleanup",
+    "transient_cleanup_committed",
+    "transient_cleanup_retry_saved",
+    "transient_dispatch_committed_retry_saved",
   ] as const)("settles a detached async create exactly once: %s", (variant) =>
     Effect.gen(function* () {
+      const retryAfterWake =
+        variant === "transient_cleanup_retry_saved" ||
+        variant === "transient_dispatch_committed_retry_saved";
       const workerExit = variant.includes("_exit_after")
         ? "after"
         : variant.endsWith("_exit_before")
@@ -3609,7 +3619,9 @@ describe("OrchestratorMcpService provider resolution", () => {
         ? variant.startsWith("admission_")
           ? "admission_committed"
           : "cleanup_committed"
-        : variant;
+        : variant.startsWith("transient_")
+          ? "never_saved"
+          : variant;
       const readerRetry = variant === "cleanup_file_exit_after_reader_retry";
       const fs = yield* FileSystem.FileSystem;
       const directory = fileBacked
@@ -3643,6 +3655,21 @@ describe("OrchestratorMcpService provider resolution", () => {
       const entered = yield* Deferred.make<void>();
       const reconciliationReadFailed = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
+      const settlementFailed = yield* Deferred.make<void>();
+      let failureInjected = false;
+      const failSettlement = <A, E, R, E2>(
+        point: string,
+        effect: Effect.Effect<A, E, R>,
+        error: E2,
+      ) =>
+        Effect.suspend<A, E | E2, R>(() => {
+          if (variant.replace(/_retry_saved$/, "") !== `transient_${point}` || failureInjected)
+            return effect;
+          failureInjected = true;
+          return Deferred.succeed(settlementFailed, undefined).pipe(
+            Effect.andThen(Effect.fail(error)),
+          );
+        });
       const settled = yield* Deferred.make<void>();
       const recorded = yield* Deferred.make<void>();
       const outcomeRelease = yield* Deferred.make<void>();
@@ -3704,6 +3731,12 @@ describe("OrchestratorMcpService provider resolution", () => {
           dispatch: (command) =>
             Effect.gen(function* () {
               if (command.type === "message.dispatch") {
+                const dispatchError = new Orchestrator.OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause: "temporary notification dispatch failure",
+                });
+                yield* failSettlement("dispatch", Effect.void, dispatchError);
                 if (
                   yield* receipts.insertIfAbsent({
                     commandId: command.commandId,
@@ -3716,11 +3749,28 @@ describe("OrchestratorMcpService provider resolution", () => {
                   })
                 )
                   notifications.push(command.text);
+                yield* failSettlement("dispatch_committed", Effect.void, dispatchError);
                 return { sequence: 1, storedEvents: [] };
               }
               assert.equal(command.type, "delegated_task.request");
               commandId = command.commandId;
               creates++;
+              if (retryAfterWake && creates === 2) {
+                saved = true;
+                yield* receipts.upsert({
+                  commandId,
+                  threadId: parentThreadId,
+                  commandType: command.type,
+                  acceptedAt: yield* DateTime.now,
+                  resultSequence: 1,
+                  status: "accepted",
+                  error: null,
+                });
+                return {
+                  sequence: 1,
+                  storedEvents: [{ event: { type: "subagent.updated", payload: task() } }],
+                } as never;
+              }
               if (
                 (outcome === "concurrent_retry" || outcome === "concurrent_retry_saved") &&
                 creates === 2
@@ -3845,8 +3895,29 @@ describe("OrchestratorMcpService provider resolution", () => {
           Layer.provide(
             Layer.succeed(CommandReceiptStore.CommandReceiptStoreV2, {
               ...receipts,
+              removeDelegationTimeout: (id, attemptId) =>
+                Effect.gen(function* () {
+                  if (variant === "transient_cleanup_committed") {
+                    yield* receipts.removeDelegationTimeout(id, attemptId);
+                    return yield* failSettlement(
+                      "cleanup_committed",
+                      Effect.void,
+                      new CommandReceiptStore.CommandReceiptStoreWriteError({ commandId: id }),
+                    );
+                  }
+                  return yield* failSettlement(
+                    "cleanup",
+                    receipts.removeDelegationTimeout(id, attemptId),
+                    new CommandReceiptStore.CommandReceiptStoreWriteError({ commandId: id }),
+                  );
+                }),
               getDelegationTimeout: (id, attemptId) =>
                 Effect.gen(function* () {
+                  yield* failSettlement(
+                    "read",
+                    Effect.void,
+                    new CommandReceiptStore.CommandReceiptStoreReadError({ commandId: id }),
+                  );
                   if (readerRetry && reconciliations > 0 && !failedReconciliationRead) {
                     failedReconciliationRead = true;
                     yield* Deferred.succeed(reconciliationReadFailed, undefined);
@@ -4291,6 +4362,28 @@ describe("OrchestratorMcpService provider resolution", () => {
             );
             assert.equal(yield* Fiber.join(cancel), "not_pending");
             yield* Deferred.succeed(outcomeRelease, undefined);
+          }
+          if (variant.startsWith("transient_")) {
+            yield* Deferred.await(settlementFailed);
+            assert.isFalse(
+              yield* Deferred.isDone(settled),
+              "a transient error must keep the original outcome hook alive",
+            );
+            assert.lengthOf(
+              yield* receipts.listDelegationTimeouts(),
+              variant === "transient_cleanup_committed" ? 0 : 1,
+            );
+            if (retryAfterWake) {
+              assert.lengthOf(notifications, 1, "the original hook already committed its wake");
+              const retry = yield* service.delegateTask(scope, {
+                task: "Review",
+                mode: "async",
+                clientRequestId: key,
+              });
+              assert.equal(retry.taskId, taskId());
+              assert.equal(creates, 2, "the same-key retry saves during recovery backoff");
+            }
+            yield* TestClock.adjust("1 second");
           }
           yield* Deferred.await(settled);
           yield* Deferred.await(recorded);

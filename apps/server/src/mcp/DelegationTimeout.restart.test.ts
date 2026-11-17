@@ -14,6 +14,8 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as ServerSettings from "../serverSettings.ts";
@@ -40,6 +42,16 @@ it.effect.each([
   "missing",
   "crash_during_cleanup",
   "newer_timeout",
+  "transient_startup_read",
+  "transient_read",
+  "transient_receipt",
+  "transient_parent",
+  "transient_projection",
+  "transient_diagnostic",
+  "transient_dispatch",
+  "transient_dispatch_committed",
+  "transient_cleanup",
+  "transient_retry_saved",
 ] as const)("recovers a persisted async timeout after service restart: %s", (scenario) =>
   Effect.gen(function* () {
     const receipts = yield* Receipts.CommandReceiptStoreV2;
@@ -53,15 +65,41 @@ it.effect.each([
     const notifications: string[] = [];
     const events: AnalyticsEvent[] = [];
     const shell = liveThreadShell(parent);
+    const failedAttempt = yield* Deferred.make<void>();
+    const failurePoint =
+      scenario === "crash_during_cleanup"
+        ? "cleanup"
+        : scenario === "transient_retry_saved"
+          ? "read"
+          : scenario.replace("transient_", "");
+    let failureInjected = false;
+    let recovering = false;
+    const failOnce = <A, E, R, E2>(point: string, effect: Effect.Effect<A, E, R>, error: E2) =>
+      Effect.suspend<A, E | E2, R>(() => {
+        if (!recovering || failurePoint !== point || failureInjected) return effect;
+        failureInjected = true;
+        return Deferred.succeed(failedAttempt, undefined).pipe(Effect.andThen(Effect.fail(error)));
+      });
+    const dispatchError = () =>
+      new Orchestrator.OrchestratorDispatchError({
+        commandId,
+        commandType: "message.dispatch",
+        cause: "temporary dispatch failure",
+      });
     const engine = Layer.mock(Orchestrator.OrchestratorV2)({
       getCallerRow: () => Effect.succeed(shell),
       getThreadShell: () =>
-        Effect.succeed(
-          scenario === "missing"
-            ? null
-            : { ...shell, archivedAt: scenario === "archived" ? DateTime.makeUnsafe(0) : null },
+        failOnce(
+          "parent",
+          Effect.succeed(
+            scenario === "missing"
+              ? null
+              : { ...shell, archivedAt: scenario === "archived" ? DateTime.makeUnsafe(0) : null },
+          ),
+          dispatchError(),
         ),
-      getThreadRecords: () => Effect.succeed(idleThreadProjection(shell)),
+      getThreadRecords: () =>
+        failOnce("projection", Effect.succeed(idleThreadProjection(shell)), dispatchError()),
       dispatch: (command) =>
         Effect.gen(function* () {
           if (command.type === "delegated_task.request") {
@@ -69,6 +107,7 @@ it.effect.each([
             yield* Deferred.await(held);
           }
           if (command.type === "message.dispatch") {
+            yield* failOnce("dispatch", Effect.void, dispatchError());
             if (
               yield* receipts.insertIfAbsent({
                 commandId: command.commandId,
@@ -81,6 +120,7 @@ it.effect.each([
               })
             )
               notifications.push(command.text);
+            yield* failOnce("dispatch_committed", Effect.void, dispatchError());
           }
           return { sequence: 1, storedEvents: [] };
         }).pipe(
@@ -147,43 +187,101 @@ it.effect.each([
         status: "accepted",
         error: null,
       });
-    let failCleanup = scenario === "crash_during_cleanup";
+    recovering = true;
     const crashStore = Layer.succeed(Receipts.CommandReceiptStoreV2, {
       ...receipts,
+      listDelegationTimeouts: () =>
+        failOnce(
+          "startup_read",
+          receipts.listDelegationTimeouts(),
+          new Receipts.CommandReceiptStoreReadError({ commandId }),
+        ),
+      getDelegationTimeout: (id, attemptId) =>
+        failOnce(
+          "read",
+          receipts.getDelegationTimeout(id, attemptId),
+          new Receipts.CommandReceiptStoreReadError({ commandId: id }),
+        ),
+      getByCommandId: (id) =>
+        failOnce(
+          "receipt",
+          receipts.getByCommandId(id),
+          new Receipts.CommandReceiptStoreReadError({ commandId: id }),
+        ),
+      upsert: (receipt) =>
+        failOnce(
+          "diagnostic",
+          receipts.upsert(receipt),
+          new Receipts.CommandReceiptStoreWriteError({ commandId: receipt.commandId }),
+        ),
       removeDelegationTimeout: (id, attemptId) =>
-        failCleanup
-          ? Effect.sync(() => {
-              failCleanup = false;
-            }).pipe(
-              Effect.andThen(
-                Effect.fail(new Receipts.CommandReceiptStoreWriteError({ commandId: id })),
-              ),
-            )
-          : receipts.removeDelegationTimeout(id, attemptId),
+        failOnce(
+          "cleanup",
+          receipts.removeDelegationTimeout(id, attemptId),
+          new Receipts.CommandReceiptStoreWriteError({ commandId: id }),
+        ),
     });
     yield* Effect.gen(function* () {
       const restarted = yield* Threads.ThreadManagementService;
-      const startupRecords = yield* receipts.listDelegationTimeouts();
+      const snapshot = yield* restarted.snapshotDelegationTimeouts().pipe(Effect.forkScoped);
+      if (scenario === "transient_startup_read") {
+        yield* Deferred.await(failedAttempt);
+        assert.isUndefined(
+          snapshot.pollUnsafe(),
+          "a failed startup read must retain snapshot ownership",
+        );
+        yield* TestClock.adjust("1 second");
+      }
+      const startupRecords = yield* Fiber.join(snapshot);
       const newerRecord = {
         ...record,
         commandId: CommandId.make("newer-timeout"),
         clientRequestId: "newer-request",
       };
       if (scenario === "newer_timeout") yield* restarted.recordDelegationTimeout(newerRecord);
-      yield* restarted.sweepDelegationTimeouts(startupRecords);
+      const sweep = yield* restarted
+        .sweepDelegationTimeouts(startupRecords)
+        .pipe(Effect.forkScoped);
+      if (
+        (scenario.startsWith("transient_") && scenario !== "transient_startup_read") ||
+        scenario === "crash_during_cleanup"
+      ) {
+        yield* Deferred.await(failedAttempt);
+        assert.isUndefined(sweep.pollUnsafe(), "one transient failure must not abandon recovery");
+        if (scenario === "transient_retry_saved")
+          yield* receipts.upsert({
+            commandId,
+            threadId: parent,
+            commandType: "delegated_task.request",
+            acceptedAt: yield* DateTime.now,
+            resultSequence: 1,
+            status: "accepted",
+            error: null,
+          });
+        yield* TestClock.adjust("1 second");
+      }
+      yield* Fiber.join(sweep);
+      const failed =
+        scenario !== "saved" &&
+        scenario !== "archived" &&
+        scenario !== "missing" &&
+        scenario !== "transient_retry_saved";
+      assert.equal(
+        notifications.length,
+        failed ? 1 : 0,
+        "recovery must finish without a second sweep or restart",
+      );
       yield* restarted.sweepDelegationTimeouts(startupRecords);
       assert.deepEqual(
         yield* receipts.listDelegationTimeouts(),
         scenario === "newer_timeout" ? [newerRecord] : [],
       );
-      const failed =
-        scenario === "lost" || scenario === "crash_during_cleanup" || scenario === "newer_timeout";
       assert.equal(notifications.length, failed ? 1 : 0);
       assert.equal(
         events.filter((event) => event.detachedOutcomeWake === "sent_after_restart").length,
         failed ? 1 : 0,
       );
-      if (scenario === "saved")
+      if (scenario === "saved" || scenario === "transient_retry_saved")
         assert.equal(events.at(-1)?.detachedOutcomeWake, "suppressed_retry_saved");
       if (failed) {
         assert.include(notifications[0]!, "lost in server restart");

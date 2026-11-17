@@ -472,28 +472,11 @@ export const layerProduction = Layer.mergeAll(
   Layer.effectDiscard(
     Effect.gen(function* () {
       const threads = yield* ThreadManagementService.ThreadManagementService;
-      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
       // Snapshot before activation so a new timeout cannot be mistaken for a previous process's work.
-      const pending = yield* receipts
-        .listDelegationTimeouts()
-        .pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("delegation timeout startup read failed", { cause }).pipe(
-              Effect.as([]),
-            ),
-          ),
-        );
-      yield* forkParked(
-        threads
-          .sweepDelegationTimeouts(pending)
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("delegation timeout startup sweep failed", { cause }),
-            ),
-          ),
-      );
+      const pending = yield* threads.snapshotDelegationTimeouts();
+      yield* forkParked(threads.sweepDelegationTimeouts(pending));
     }),
-  ).pipe(Layer.provide(Layer.mergeAll(layerThreadManagementProvided, CommandReceiptStore.layer))),
+  ).pipe(Layer.provide(layerThreadManagementProvided)),
   layer.pipe(Layer.provide(layerProjectService)),
   layerProjectService,
   layerManagedProjectFoldersProvided,
