@@ -3104,8 +3104,9 @@ it.effect.each(
                 span.value.name === "KanbanService.cardOf"
               ) {
                 cardBlocked = true;
-                yield* Deferred.succeed(entered, undefined);
-                yield* Deferred.await(resume);
+                yield* SavedWrite.read(
+                  Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+                );
               }
               return yield* real.card(id);
             }),
@@ -3117,8 +3118,9 @@ it.effect.each(
                 blockedRead !== undefined &&
                 ++reads >= blockedRead
               ) {
-                yield* Deferred.succeed(entered, undefined);
-                yield* Deferred.await(resume);
+                yield* SavedWrite.read(
+                  Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(resume))),
+                );
               }
               return yield* real.pools(id);
             }),
@@ -3196,18 +3198,33 @@ it.effect(
       });
       const entered = yield* Deferred.make<void>();
       const ready = yield* Deferred.make<void>();
+      const healthyStarted = yield* Deferred.make<void>();
       let blockedBoard: string | undefined;
+      let healthyCard: string | undefined;
       let reads = 0;
       const delayed = Layer.effect(
         KanbanStore.KanbanStore,
         Effect.map(KanbanStore.KanbanStore, (real) =>
           KanbanStore.KanbanStore.of({
             ...real,
+            putCard: (card) =>
+              real
+                .putCard(card)
+                .pipe(
+                  Effect.tap(() =>
+                    card.id === healthyCard && card.stage === "working"
+                      ? Deferred.succeed(healthyStarted, undefined)
+                      : Effect.void,
+                  ),
+                ),
             pools: (id) =>
               Effect.gen(function* () {
                 if (id === blockedBoard && ++reads >= 3) {
-                  yield* Deferred.succeed(entered, undefined);
-                  yield* Deferred.await(ready);
+                  yield* SavedWrite.read(
+                    Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(ready)),
+                    ),
+                  );
                 }
                 return yield* real.pools(id);
               }),
@@ -3232,9 +3249,11 @@ it.effect(
           { title: "Healthy", prompt: "Healthy" },
           owner,
         );
+        healthyCard = sibling.id;
         blockedBoard = board.id;
         const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
         yield* Deferred.await(entered);
+        yield* Deferred.await(healthyStarted);
         yield* TestClock.adjust("3 seconds");
         yield* Fiber.join(dispatch);
         assert.strictEqual(reads, 3);
@@ -3287,8 +3306,11 @@ it.effect.each([false, true])(
               Effect.gen(function* () {
                 if (launched && (yield* stalledReader)) {
                   reads += 1;
-                  yield* Deferred.succeed(entered, undefined);
-                  yield* Deferred.await(ready);
+                  yield* SavedWrite.read(
+                    Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(ready)),
+                    ),
+                  );
                 }
                 return yield* real.pools(id);
               }),
@@ -3415,8 +3437,11 @@ it.effect.each(["slot", "blocker", "dependency"] as const)(
                   id === (kind === "dependency" ? dependency : occupant) &&
                   ++refreshed === 1
                 ) {
-                  yield* Deferred.succeed(entered, undefined);
-                  yield* Deferred.await(pending);
+                  yield* SavedWrite.read(
+                    Deferred.succeed(entered, undefined).pipe(
+                      Effect.andThen(Deferred.await(pending)),
+                    ),
+                  );
                 }
                 return yield* real.card(id);
               }),

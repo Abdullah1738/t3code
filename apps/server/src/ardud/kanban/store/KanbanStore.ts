@@ -794,37 +794,44 @@ const make = Effect.gen(function* () {
   const first = <A>(items: ReadonlyArray<A>): A | null => items[0] ?? null;
 
   const run = <A, E>(operation: string, effect: Effect.Effect<A, E>) =>
-    effect.pipe(Effect.mapError(fail(operation)));
+    effect.pipe(Effect.provideService(SavedWrite.writing, true), Effect.mapError(fail(operation)));
 
   // Reads inside a write transaction stay on the writer for read-your-writes.
   const runRead = <A, E>(operation: string, effect: Effect.Effect<A, E>) =>
-    run(
-      operation,
-      Effect.suspend(() => {
-        const counters: Record<string, { hits: number; misses: number; evictions: number }> = {};
-        const fetched = { jsonRowsFetched: 0, jsonBytesFetched: 0 };
-        return SavedWrite.stage(NodeSqliteClient.readOnly(effect), "read").pipe(
-          Effect.provideService(readCounters, counters),
-          Effect.provideService(jsonFetchCounters, fetched),
-          Effect.ensuring(
-            Effect.suspend(() =>
-              Effect.annotateCurrentSpan({
-                ...fetched,
-                ...Object.fromEntries(
-                  Object.entries(counters).flatMap(([name, counts]) =>
-                    Object.entries(counts).map(([kind, count]) => [
-                      `kanban.decode.${name}.${kind}`,
-                      count,
-                    ]),
-                  ),
+    Effect.suspend(() => {
+      const counters: Record<string, { hits: number; misses: number; evictions: number }> = {};
+      const fetched = { jsonRowsFetched: 0, jsonBytesFetched: 0 };
+      return SavedWrite.stage(
+        Effect.gen(function* () {
+          // A SELECT within a mutation or an existing transaction must not open
+          // an interruptible timeout child or borrow a background reader.
+          const transaction = yield* Effect.serviceOption(sql.transactionService);
+          return yield* (yield* SavedWrite.writing) || transaction._tag === "Some"
+            ? effect
+            : SavedWrite.read(NodeSqliteClient.readOnly(effect));
+        }),
+        "read",
+      ).pipe(
+        Effect.provideService(readCounters, counters),
+        Effect.provideService(jsonFetchCounters, fetched),
+        Effect.ensuring(
+          Effect.suspend(() =>
+            Effect.annotateCurrentSpan({
+              ...fetched,
+              ...Object.fromEntries(
+                Object.entries(counters).flatMap(([name, counts]) =>
+                  Object.entries(counts).map(([kind, count]) => [
+                    `kanban.decode.${name}.${kind}`,
+                    count,
+                  ]),
                 ),
-              }),
-            ),
+              ),
+            }),
           ),
-          Effect.withSpan("KanbanStore.read", { attributes: { "kanban.operation": operation } }),
-        );
-      }),
-    );
+        ),
+        Effect.withSpan("KanbanStore.read", { attributes: { "kanban.operation": operation } }),
+      );
+    }).pipe(Effect.mapError(fail(operation)));
 
   const boards = runRead(
     "read boards",
@@ -1212,7 +1219,7 @@ const make = Effect.gen(function* () {
       ),
     );
   const nextCardNumber = (boardId: KanbanBoardId) =>
-    run(
+    runRead(
       "next card number",
       Effect.map(
         sql<{ readonly next: number }>`

@@ -2000,12 +2000,22 @@ const make = Effect.gen(function* () {
   const tickSql = <A extends object = Record<string, unknown>>(
     strings: TemplateStringsArray,
     ...args: Array<unknown>
-  ) =>
-    TickTimings.measure(
-      /^\s*(SELECT|WITH)\b/i.test(strings[0] ?? "") ? "board_load" : "event_persistence",
-      boardSql<A>(strings, ...args),
+  ) => {
+    const select = /^\s*SELECT\b/i.test(strings[0] ?? "");
+    const query = boardSql<A>(strings, ...args);
+    return TickTimings.measure(
+      select ? "board_load" : "event_persistence",
+      select
+        ? SavedWrite.stage(
+            Effect.flatMap(Effect.serviceOption(boardSql.transactionService), (transaction) =>
+              transaction._tag === "Some" ? query : SavedWrite.read(query),
+            ),
+            "read",
+          )
+        : query,
       true,
     );
+  };
   const tickTransaction: typeof boardSql.withTransaction = (effect) =>
     TickTimings.measure(
       "event_persistence",
@@ -3192,7 +3202,7 @@ const make = Effect.gen(function* () {
     });
     if (held === undefined) return;
     yield* syncSlot(held.boardId, threadId, why, cardId);
-  }, Effect.uninterruptible);
+  }, SavedWrite.maskedWrite);
 
   const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
   const nowMillis = DateTime.now.pipe(Effect.map(DateTime.toEpochMillis));
@@ -3271,7 +3281,7 @@ const make = Effect.gen(function* () {
     title: string,
     receiptKey?: string,
   ) {
-    yield* Effect.uninterruptible(
+    yield* SavedWrite.maskedWrite(
       Effect.gen(function* () {
         yield* store.putThreadLink(link);
         if (link.role === "evaluator") {
@@ -3565,7 +3575,7 @@ const make = Effect.gen(function* () {
           for (const kind of ["release", "take"] as const) {
             for (const poolKey of kind === "release" ? [...before] : current.keys()) {
               if (kind === "release" ? current.has(poolKey) : before.has(poolKey)) continue;
-              yield* Effect.uninterruptible(
+              yield* SavedWrite.maskedWrite(
                 Effect.gen(function* () {
                   yield* rawStore.addSlotEvent({
                     boardId,
@@ -3677,7 +3687,7 @@ const make = Effect.gen(function* () {
     let card = incoming;
     const previous =
       snapshot?.before ?? (yield* SavedWrite.bestEffort(rawStore.card(card.id), null));
-    yield* Effect.uninterruptible(
+    yield* SavedWrite.maskedWrite(
       Effect.gen(function* () {
         if (
           card.asks.some(
@@ -3700,7 +3710,7 @@ const make = Effect.gen(function* () {
               !previous?.asks.some((old) => old.id === ask.id),
           );
           if (fresh.length > 0) {
-            const rows = yield* boardSql<{
+            const rows = yield* tickSql<{
               decisions: number;
               notices: number;
             }>`SELECT
@@ -3884,7 +3894,7 @@ const make = Effect.gen(function* () {
       return event;
     }
     const application = extra.instructionApplication;
-    return yield* Effect.uninterruptible(
+    return yield* SavedWrite.maskedWrite(
       Effect.gen(function* () {
         const event = yield* write;
         yield* Effect.logInfo(
@@ -6110,7 +6120,7 @@ const make = Effect.gen(function* () {
       yield* locks
         .access(
           board.id,
-          Effect.uninterruptible(
+          SavedWrite.maskedWrite(
             Effect.gen(function* () {
               const queueId = yield* tickTransaction(
                 Effect.gen(function* () {
@@ -9302,7 +9312,7 @@ const make = Effect.gen(function* () {
       }),
     );
     // The acknowledged sequence must survive cancellation with its message.
-    yield* Effect.uninterruptible(
+    yield* SavedWrite.maskedWrite(
       Effect.gen(function* () {
         yield* boardTransaction(
           discussion.boardId,
@@ -10527,7 +10537,7 @@ const make = Effect.gen(function* () {
           yield* cleanup;
           return;
         }
-        yield* Effect.uninterruptible(
+        yield* SavedWrite.maskedWrite(
           Effect.gen(function* () {
             yield* locks.attached(key);
             pendingWakes.delete(key);
@@ -12144,7 +12154,7 @@ const make = Effect.gen(function* () {
     const measurements = outerMeasurements ?? [];
     const observer = yield* SavedWrite.observer;
     const receipts: SavedWrite.Saved[] = [];
-    const result = yield* Effect.uninterruptible(
+    const result = yield* SavedWrite.maskedWrite(
       boardTransaction(
         boardId,
         effect.pipe(
@@ -16741,7 +16751,7 @@ const make = Effect.gen(function* () {
             { discard: true },
           ),
         ),
-        Effect.uninterruptible,
+        SavedWrite.maskedWrite,
       );
       for (const stop of stops) {
         archiveLanes?.add(stop.lane);
@@ -18510,7 +18520,7 @@ const make = Effect.gen(function* () {
             : paused;
         // Once one card is saved, finish its shared model and hold updates before
         // cancellation can run cleanup against a partially updated thread.
-        yield* Effect.uninterruptible(
+        yield* SavedWrite.maskedWrite(
           Effect.gen(function* () {
             yield* saveCard(saved, undefined, false, false);
             if (
@@ -18620,7 +18630,7 @@ const make = Effect.gen(function* () {
             held = false;
             return Effect.asVoid(lock.release(1));
           });
-          return Effect.uninterruptible(
+          return SavedWrite.maskedWrite(
             Effect.suspend(() =>
               held && confirmingModel
                 ? restoreWorkModel(threadId, cardId, true).pipe(
@@ -18990,7 +19000,7 @@ const make = Effect.gen(function* () {
         // Take the card's board permit before acquiring its SQLite writer.
         yield* cardOf(input.cardId);
         yield* refusePendingStop(input.threadId);
-        const restored = yield* Effect.uninterruptible(
+        const restored = yield* SavedWrite.maskedWrite(
           tickTransaction(
             Effect.gen(function* () {
               const card = (yield* upgradeFindings([yield* cardOf(input.cardId)]))[0]!;
@@ -21381,7 +21391,7 @@ const make = Effect.gen(function* () {
         work,
       });
     }
-    const movedThreads = yield* Effect.uninterruptible(
+    const movedThreads = yield* SavedWrite.maskedWrite(
       Effect.gen(function* () {
         yield* commitPoolChanges(
           board.id,
@@ -22923,7 +22933,7 @@ const make = Effect.gen(function* () {
               else {
                 const next = { ...target, updatedAt: yield* nowIso };
                 appendTarget = next;
-                yield* Effect.uninterruptible(
+                yield* SavedWrite.maskedWrite(
                   logEvent(next, actor, "comment", { body, at: next.updatedAt }).pipe(
                     Effect.andThen(SavedWrite.record({ kind: "card", card: next })),
                   ),
