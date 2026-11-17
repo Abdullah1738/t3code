@@ -184,12 +184,13 @@ tmpfs profile (`nosuid,nodev`, mode1777). New clones of old bases get the disk a
 the exact managed tmpfs entry, preserving unrelated raw.lxc. Foreign mounts at `/tmp` or below it fail
 provisioning. Never hot-remount or restart boxes to accelerate rollout; no image rebuild is required.
 
-For a reviewed release, copy the candidate server files to `/root/offbox-server`, then install the two
-Python files and prepare the parent/config. Batch the boatd restart with other approved server changes:
+For a reviewed release, copy the candidate server files to `/root/offbox-server`, install the Python
+dependencies before the daemon, and prepare the scratch parent/config. Batch the boatd restart with other approved server changes:
 
 ```sh
-install -m 0755 /root/offbox-server/boatd.py /opt/boatd/boatd.py
 install -m 0644 /root/offbox-server/boatd_tmp.py /opt/boatd/boatd_tmp.py
+install -m 0644 /root/offbox-server/boatd_memory.py /opt/boatd/boatd_memory.py
+install -m 0755 /root/offbox-server/boatd.py /opt/boatd/boatd.py
 bash /root/offbox-server/install-host.sh scratch-disk
 systemctl restart boatd
 ```

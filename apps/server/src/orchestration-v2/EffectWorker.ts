@@ -220,6 +220,7 @@ export const layerExecutor: Layer.Layer<
                           runId: run.id,
                           expectedAttemptId: run.activeAttemptId,
                           deadline: error.deadline,
+                          admission: error.admission,
                         });
                       })
                     : threads.recoverDelegatedTask(effect.threadId, sourceRunId),
@@ -281,6 +282,25 @@ export const layerExecutor: Layer.Layer<
                 ),
               ),
             );
+          case "notification.delivery.accept":
+            return threads
+              .dispatch({
+                type: "notification.delivery.accept",
+                commandId: effect.commandId,
+                threadId: effect.threadId,
+                messageId: effect.request.messageId,
+              })
+              .pipe(
+                Effect.asVoid,
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "provider-turn.start": {
             const startRequest = effect.request;
             return Effect.gen(function* () {
@@ -321,6 +341,7 @@ export const layerExecutor: Layer.Layer<
                       runId: run.id,
                       expectedAttemptId: run.activeAttemptId,
                       deadline: error.deadline,
+                      admission: error.admission,
                     });
                   }),
               }),
@@ -1015,10 +1036,14 @@ export class OrchestrationEffectWorkerV2 extends Context.Service<
   OrchestrationEffectWorkerV2Shape
 >()("t3/orchestration-v2/EffectWorker/OrchestrationEffectWorkerV2") {}
 
+// Accepted input needs more time to commit bookkeeping than the provider send budget.
+export const DEFAULT_MAX_ACCEPTED_ATTEMPTS = 10;
+
 export interface OrchestrationEffectWorkerOptions {
   readonly workerId?: string;
   readonly leaseDurationMs?: number;
   readonly maxAttempts?: number;
+  readonly maxAcceptedAttempts?: number;
 }
 
 export const layerWithOptions = (
@@ -1036,6 +1061,13 @@ export const layerWithOptions = (
       const workerId = options.workerId ?? `orchestration-v2:${process.pid}`;
       const leaseDurationMs = Math.max(1, options.leaseDurationMs ?? 30_000);
       const maxAttempts = Math.max(1, options.maxAttempts ?? 5);
+      const maxAcceptedAttempts = Math.max(
+        maxAttempts,
+        options.maxAcceptedAttempts ?? DEFAULT_MAX_ACCEPTED_ATTEMPTS,
+      );
+      const isAcceptance = (effect: EffectOutbox.OrchestrationEffectV2) =>
+        effect.request.type === "notification.delivery.accept" ||
+        (effect.request.type === "provider-turn.steer" && effect.request.providerAccepted === true);
       const wasCancelled = (effectId: string) =>
         outbox.get(effectId).pipe(
           Effect.map(
@@ -1052,42 +1084,44 @@ export const layerWithOptions = (
       ) =>
         Cause.hasInterruptsOnly(cause)
           ? Effect.void
-          : outbox
-              .retry({
-                effectId: effect.id,
-                workerId,
-                error: refundAttempt
-                  ? "Resuming after restart"
-                  : `Worker failed before settling the claimed effect: ${Cause.pretty(cause)}`,
-                delayMs: 0,
-                steerAccepted:
-                  effect.request.type === "provider-turn.steer" &&
-                  effect.request.providerAccepted === true,
-                steerFollowUpPending:
-                  effect.request.type === "provider-turn.steer" &&
-                  effect.request.followUpPending === true,
-                refundAttempt,
-              })
-              .pipe(
-                Effect.flatMap((requeued) =>
-                  requeued
-                    ? Effect.logWarning("Requeued effect after unexpected worker failure", {
-                        effectId: effect.id,
-                        effectType: effect.request.type,
-                      })
-                    : Effect.logWarning("Could not requeue effect after worker lost its lease", {
-                        effectId: effect.id,
-                        effectType: effect.request.type,
-                      }),
-                ),
-                Effect.catchCause((requeueCause) =>
-                  Effect.logError("Failed to requeue effect after unexpected worker failure", {
-                    effectId: effect.id,
-                    effectType: effect.request.type,
-                    error: Cause.pretty(requeueCause),
-                  }),
-                ),
-              );
+          : !refundAttempt && isAcceptance(effect) && effect.attemptCount >= maxAcceptedAttempts
+            ? terminalizeClaim(effect, cause)
+            : outbox
+                .retry({
+                  effectId: effect.id,
+                  workerId,
+                  error: refundAttempt
+                    ? "Resuming after restart"
+                    : `Worker failed before settling the claimed effect: ${Cause.pretty(cause)}`,
+                  delayMs: 0,
+                  steerAccepted:
+                    effect.request.type === "provider-turn.steer" &&
+                    effect.request.providerAccepted === true,
+                  steerFollowUpPending:
+                    effect.request.type === "provider-turn.steer" &&
+                    effect.request.followUpPending === true,
+                  refundAttempt,
+                })
+                .pipe(
+                  Effect.flatMap((requeued) =>
+                    requeued
+                      ? Effect.logWarning("Requeued effect after unexpected worker failure", {
+                          effectId: effect.id,
+                          effectType: effect.request.type,
+                        })
+                      : Effect.logWarning("Could not requeue effect after worker lost its lease", {
+                          effectId: effect.id,
+                          effectType: effect.request.type,
+                        }),
+                  ),
+                  Effect.catchCause((requeueCause) =>
+                    Effect.logError("Failed to requeue effect after unexpected worker failure", {
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      error: Cause.pretty(requeueCause),
+                    }),
+                  ),
+                );
       const terminalizeClaim = (
         effect: EffectOutbox.OrchestrationEffectV2,
         cause: Cause.Cause<unknown>,
@@ -1097,32 +1131,26 @@ export const layerWithOptions = (
           .fail({
             effectId: effect.id,
             workerId,
-            error: `Worker failed to settle a process-bound effect after execution started: ${Cause.pretty(cause)}`,
+            error: `Worker failed to settle an effect after execution started: ${Cause.pretty(cause)}`,
           })
           .pipe(
             Effect.flatMap((failed) =>
               failed
-                ? Effect.logError("Terminalized process-bound effect after settlement failure", {
+                ? Effect.logError("Terminalized effect after settlement failure", {
                     effectId: effect.id,
                     effectType: effect.request.type,
                   })
-                : Effect.logWarning(
-                    "Could not terminalize process-bound effect after worker lost its lease",
-                    {
-                      effectId: effect.id,
-                      effectType: effect.request.type,
-                    },
-                  ),
+                : Effect.logWarning("Could not terminalize effect after worker lost its lease", {
+                    effectId: effect.id,
+                    effectType: effect.request.type,
+                  }),
             ),
             Effect.catchCause((failCause) =>
-              Effect.logError(
-                "Failed to terminalize process-bound effect after settlement failure",
-                {
-                  effectId: effect.id,
-                  effectType: effect.request.type,
-                  error: Cause.pretty(failCause),
-                },
-              ),
+              Effect.logError("Failed to terminalize effect after settlement failure", {
+                effectId: effect.id,
+                effectType: effect.request.type,
+                error: Cause.pretty(failCause),
+              }),
             ),
           );
       };
@@ -1220,13 +1248,19 @@ export const layerWithOptions = (
           if (cancelledBeforeExecution) return true;
 
           // Recovery owns the last path out for work whose provider can no longer report.
+          const acceptance = isAcceptance(effect);
           const durableRecovery =
             effect.request.type === "provider-session.reconcile-turn" ||
             effect.request.type === "provider-session.reconcile-root" ||
             (effect.request.type === "provider-turn.steer" &&
+              !acceptance &&
               effect.request.followUpPending === true);
           const execution = executor
-            .execute(effect, { willRetry: durableRecovery || effect.attemptCount < maxAttempts })
+            .execute(effect, {
+              willRetry:
+                durableRecovery ||
+                effect.attemptCount < (acceptance ? maxAcceptedAttempts : maxAttempts),
+            })
             .pipe(
               Effect.provideService(EffectOutbox.ExecutingEffect, effect),
               Effect.as("executed" as const),
@@ -1307,7 +1341,10 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : !durableRecovery && !recoveringSteer && effect.attemptCount >= maxAttempts
+            : !durableRecovery &&
+                !recoveringSteer &&
+                effect.attemptCount >=
+                  (acceptance || acceptedSteer ? maxAcceptedAttempts : maxAttempts)
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

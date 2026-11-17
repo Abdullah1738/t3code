@@ -3,6 +3,7 @@ import { messageLengthError } from "./message-length.ts";
 import { cardKind, logCardRender, toolError, toolLog } from "./toollog.ts";
 import { validNotifyId, validNotifyText } from "./agent-policy.ts";
 import { validAgentRequestId, validAnswerStatus } from "./agent-bus.ts";
+import { validId } from "./remote-protocol.ts";
 import { constants } from "node:fs";
 import { lstat, open, stat } from "node:fs/promises";
 import { request } from "node:http";
@@ -35,7 +36,7 @@ class RawOutput {
 
 const COMMANDS_HELP = "Expected health, send, cancel-send, send-file, poll, app, react, wake, secret-request, secret, publish, unpublish, ban, unban, or bans."
   + " Sendblue mode adds location-request, location, messages, ask-owner, agent-ask, agent-answer, agent-requests, notify-rule, chats, allow, allow-group,"
-  + " guest-allow, guest-revoke, guests, guest-send, share-contact, and opt-in."
+  + " guest-allow, guest-revoke, guests, guest-send, share-contact, opt-in, remote-events, and remote-resolve."
   + " Logs: log-rollup [--day YYYY-MM-DD]."
   + " Public links: share, unshare, and shares."
   + " Alerts and reminders moved to the telegram bridge CLI.";
@@ -80,6 +81,8 @@ const OPTIONS_BY_COMMAND: Record<string, string[]> = {
   "agent-ask": ["to", "text", "session", "key", "parent"],
   "agent-answer": ["request", "text", "session", "status"],
   "agent-requests": ["session"],
+  "remote-events": ["chat", "session", "after"],
+  "remote-resolve": ["chat", "session", "id", "state"],
   "notify-rule": ["session", "text", "id"],
   chats: ["session"],
   allow: ["address", "name", "admin", "session"],
@@ -396,6 +399,18 @@ export function parseCommand(args: string[]): Command {
         return { method: "POST", path: "/notify-rule", body: { sessionId, action: "rm", id: Number(values.id) } };
       }
       throw new CliError("Expected notify-rule add --text, list, or rm --id, with --session");
+    }
+    case "remote-events":
+    case "remote-resolve": {
+      const sessionId = sessionOnly(values.session)!;
+      if (values.chat !== "moni") throw new CliError("--chat must be moni");
+      if (command === "remote-events") {
+        if (values.after !== undefined && !validId(values.after)) throw new CliError("--after must be a full event id");
+        return { method: "POST", path: "/remote-events", body: { chat: "moni", sessionId, ...(values.after ? { after: values.after } : {}) } };
+      }
+      if (!validId(values.id)) throw new CliError("--id must be a full event id");
+      if (values.state !== "done" && values.state !== "pending") throw new CliError("--state must be done or pending");
+      return { method: "POST", path: "/remote-resolve", body: { chat: "moni", sessionId, id: values.id, state: values.state } };
     }
     case "agent-requests":
       return { method: "POST", path: "/agent-requests", body: { sessionId: sessionOnly(values.session)! } };

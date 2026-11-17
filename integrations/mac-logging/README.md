@@ -8,8 +8,17 @@ lines with an explicit `ok`; `errorRate` is the share of error-kind lines.
 
 Run `mac-log-status` for last-seen times, ages, last outcomes and overdue jobs,
 or `mac-log-status --json` for the same report as JSON. `--now ISO` freezes the
-clock (include `Z` or an explicit UTC offset). The command always exits 0,
-including invalid arguments or unreadable input; inspect the report for errors.
+cadence clock (include `Z` or an explicit UTC offset); launchd checks always
+describe the current state. The command exits 1 for overdue jobs, unreadable
+input (including invalid timestamps) or a launchd state other than `loaded`,
+and 2 for invalid option syntax.
+JSON includes an overall `ok` boolean and `launchd`, mapping each of
+`com.abdullah.mac-log-collector`, `com.abdullah.mac-deep-inventory`,
+`com.abdullah.mac-memory` and `com.abdullah.mac-cpu` to `loaded`, `not-loaded`
+or `unknown`. Each read-only `launchctl print gui/<uid>/<label>` has a two-second
+timeout (eight seconds total for four timeouts). Only an explicit
+`Could not find service` error means `not-loaded`; other failures are `unknown`.
+Status never loads or restarts agents, and does not send notifications.
 It reads the UTC day files covering the last 36 hours (three files before noon
 UTC, two from noon onward). Missing and unreadable files are listed separately.
 Malformed rows, including invalid timestamps and dates that overflow when
@@ -114,7 +123,9 @@ partial with no total again. Its own directory allocation is included.
 Parts do not recurse. The hourly scanner leaves parts parents and recent
 timeouts to this pass.
 The daily budget is 90 minutes; du runs under nice 10
-and utility scheduling without inherited launchd background I/O policy.
+and utility scheduling with explicit `taskpolicy -d throttle` disk I/O policy.
+The hourly du children also use `-d throttle`; scan roots, accounting and cache
+semantics are unchanged.
 Termination keeps completed rows; unfinished children remain explicit partials.
 Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
 daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
@@ -209,33 +220,52 @@ These events never alert or launch extra scans.
 
 `com.abdullah.mac-tailnet` invokes `collector.py --tailnet` every 60 seconds,
 independently of the hourly collector's slow disk scans. `tailnet.py` calls only
-`/Applications/Tailscale.app/Contents/MacOS/Tailscale status --json` (five-second
+`/Applications/Tailscale.app/Contents/MacOS/Tailscale status --json` (15-second
 timeout, no socket override). It never changes Tailscale preferences or reconnects.
-`THRESHOLD_CHECKS` (3) and `PROBE_HOST` (`100.75.104.72`) are its configuration
-values. Up requires `BackendState=Running` and `Self.Online=true`; existing IPs
-and extension PIDs do not prove connectivity. Starting and CLI failures count
-as not up. The third consecutive not-up check queues one Telegram alert. A
-healthy check resets the streak and queues one recovery line for alerted outages.
-Brief outages produce no notification. Three minute checks are a sampling
-threshold, not a guarantee of three full elapsed minutes after the first failure.
+A valid Running/online response is up; explicit Stopped, NeedsLogin,
+NeedsMachineAuth, NoState, Starting or Running/offline is down. Missing or invalid
+CLI data is unknown. Unknown CLI checks probe home SSH (100.75.104.72:22) and the
+remote Mullvad de-dus-wg-102 DNS listener (100.64.1.71:53), using ordinary TCP
+connections through the Mac's Tailscale interface. Either success proves up.
+If neither responds, a read-only HTTPS request to `SELF_HTTPS_URL`
+(`https://abdullahs-macbook-pro.tailcca332.ts.net:18400/`) accepts any HTTP status
+as reachable, including application errors. Only when every probe fails can
+unknown CLI evidence count toward an outage. An unavailable probe tool leaves
+the outcome unknown and breaks the streak without claiming recovery.
+Explicit down states require `THRESHOLD_CHECKS=3` AND `THRESHOLD_SECONDS=180`;
+unknown CLI evidence requires `UNKNOWN_THRESHOLD_CHECKS=5` AND
+`UNKNOWN_THRESHOLD_SECONDS=300`. Both count and wall-clock gates apply, even
+when minute ticks bunch under load. Any up tick resets the streak. Recovery is
+sent only for an alerted outage.
 
 `state/tailnet.json` and a separate nonblocking lock preserve streaks and queued
 notification payloads across invocations. Keys and text remain identical on retry,
 including after a timeout that may have followed durable Telegram queueing.
-Recovery uses a distinct key. Unix timestamps measure outages across processes;
-monotonic time measures only one invocation's probe duration.
+Recovery uses a distinct key. The first run drops legacy unproven counters and
+pending timeout alerts, while preserving already alerted explicit-state outages.
+Unix timestamps measure outages across processes; monotonic time measures CLI
+and probe duration. The CLI timeout is 15 s, pgrep 3 s, each of two probes 6 s
+(`nc -z -G 5`), HTTPS has an 8 s curl deadline and a 9 s subprocess deadline,
+and at most one Telegram send is attempted per invocation (10 s).
+The subprocess budget is at most 49 s per run.
 
-`tailnet.sample` records backend state, online flag, IP count, CLI exit/timeout,
-extension PIDs and the result of `nc -z -G 3 <PROBE_HOST> 22` (four-second outer
-timeout, only for Running). A failed home probe never triggers a tailnet alert.
+`tailnet.sample` adds `outcome`, `cliOutcome`, `confirmedDown`, `cliMs` (also
+`statusDurationMs`), `loadAvg1`, and `confirmedBy` (`home_tcp`, `peer_tcp`,
+`self_https`, or null). Unknown CLI evidence adds `confirmProbes` (host to
+port/ok/error/ms) and, if HTTPS ran, `selfHttpsReachable` / `selfHttpsError`. Backend state,
+online flag, IP count, CLI exit/timeout and extension PIDs remain available.
+Running samples retain a home SSH probe; its failure alone never overrides a
+healthy CLI. `tailnet.cli_slow` records unknown CLI evidence resolved up by peers,
+at most once per 900 seconds, with `suppressed` counting intervening occurrences.
 `tailnet.state` and `tailnet.extension` record initial observations and changes;
+switching between successful probe sources alone does not emit a state change.
 a PID change alone is not a crash. `tailnet.alert` / `tailnet.recovery` record
 notification queue acceptance or failure. Failed sends retry next minute.
-Raw CLI output, addresses, peers, identity and notification text never enter
-these events. `mac-log-status` and daily rollups flag a missing sample after
-three minutes. The app CLI's “Skip a start command” and “Peer connection was
-rejected” logs are known harmless noise; check for `EditPrefs` and backend changes
-when verifying read-only behavior.
+Only configured probe addresses enter these events; raw CLI output, identity,
+other peers and notification text are discarded. `mac-log-status` and daily
+rollups flag a missing sample after three minutes. The app CLI's “Skip a start
+command” and “Peer connection was rejected” logs are known harmless noise;
+check for `EditPrefs` and backend changes when verifying read-only behavior.
 
 After review and merge/push, run `zsh integrations/mac-logging/install.zsh`
 (`--dry-run` first, `--check` after). The installer copies but never loads agents.
@@ -247,8 +277,9 @@ Removing the minute agent stops checks; no Tailscale change is needed.
 
 `com.abdullah.mac-cpu` runs `cpu.py` every 60 seconds at normal priority,
 through `/bin/zsh` for launchd file access. One `/bin/ps` inventory reads PID,
-parent, cumulative CPU time, RSS, state, start time and elapsed time with a
-30-second timeout. It never invokes top or changes another process.
+parent, uid, cumulative CPU time, RSS, state, start time and elapsed time with a
+30-second timeout. Normal samples never invoke top. The sampler never changes
+another process.
 
 `state/cpu.json` retains PID, start time, cumulative CPU seconds, host CPU ticks,
 the daily spike counter and Unix observation time under its own nonblocking lock. CPU seconds
@@ -273,13 +304,48 @@ sets `hintError` without losing numeric CPU evidence.
 
 `cpu.spike` captures up to 15 PIDs with parent families and redacted 160-character commands when load1 > 2× logical CPUs, plus host/unattributed CPU, observed spawn families and runnable thread counts; it is capped at 240 records/day and 8192 bytes/record, and is conditional rather than a cadence job.
 
-Host tick deltas add `systemCpuPct`, `userPct`, `sysPct` and
+Host tick deltas add `systemCpuPct`, `userPct`, `sysPct`, `nicePct`, `idlePct` and
 `unattributedCpuPct` on the same one-core=100% scale; a failed read sets
 `systemCpuError` without losing the sample. The first valid read is a baseline.
 `spawned`/`exited` compare PID + start time, and `spawnedFamilies` counts only
 new processes still visible at the next inventory. `pidAdvance` is omitted:
 long-lived high PIDs hid a real 200-process burst after allocator wrap on this Mac.
 The optional thread read has a two-second timeout.
+
+`userPct` excludes nice time; user + sys + nice is busy CPU. `kernelTaskPct`
+is null on normal samples. Spikes read the second frame of a bounded
+`top -l 2 -s 1 -pid 0` call, with `kernelTaskWindowS: 1` and cumulative
+`kernelTaskTime` for reference; failure sets `kernelTaskError`.
+The expensive read is limited to once per five minutes, including failed
+attempts, using a wall timestamp in the existing sampler state. Skipped spikes
+report null CPU with `kernelTaskSkipped: "rate"`; quiet samples retain the
+cooldown, and a clock rollback starts a fresh cooldown.
+System time also runs in other
+processes, so neither kernel_task nor sys time should be added to process CPU.
+
+Exited-child CPU comes from `proc_pid_rusage` V1, converted from Mach ticks.
+Darwin 27's `ps -S` did not include it in the fork/wait proof. `childCpu` lists
+ten parent PIDs with their family and the parent's family in `parentFamily`;
+`childCpuFamilies` groups those family pairs before truncation. `childCpuPct`
+sums all readable parent deltas, separately from `totalCpuPct`.
+The reader captures Mach time before ps; later process starts are excluded with
+coverage reason `identity`, preventing PID reuse from corrupting a baseline.
+Ancestors are read before children to avoid racing a reaping transfer.
+Old CPU of disappeared descendants is subtracted when reaping transfers their
+lifetime counters. Ambiguous transfers (including possible orphan adoption) are excluded and counted in
+`childUncertainParents`. `unattributedAfterChildrenPct` subtracts the recovered
+child CPU from the original gap, floored at zero. Baseline or unavailable child
+readings leave the total null, rather than claiming zero.
+
+`childReadable`/`childUnreadable` and `childCoverage` expose failures by uid and
+fixed reason. Other-user processes, including launchd, normally deny reads;
+if PID 1 is readable, its child CPU is labelled `orphaned-exited`.
+`lostParents` counts vanished parents known from the old tree or child counters;
+parents born and gone inside the interval remain invisible. The syscall pass
+has a 30-second budget and adds no process inventory command.
+`observedSpawnsLowerBound`, its per-minute rate and `observedSpawnsByParent`
+count new PID/start identities still present in the next snapshot. They miss
+processes that exit between snapshots and are not an exact exec counter.
 
 Hints and spike commands use the janitor's reviewed #45 `leftover_processes.redact` helper,
 loaded from the sibling source tree or the installed
@@ -296,6 +362,43 @@ bytes, dropping lowest-ranked detail rows if necessary (`topOmitted` and
 use at most 12.1 MB/day. The existing shared
 day-log cap and retention still apply. The installer copies the new helpers
 and plist; the evaluator must load `com.abdullah.mac-cpu` after review.
+
+## Minute disk-wait samples
+
+The existing `com.abdullah.mac-cpu` 60-second schedule runs `u_sample.py`
+before the CPU probe, using one wide `ps` snapshot of PID, parent, start/elapsed/
+CPU times, state, executable and argv, capped at five seconds. A 1,024-column
+executable field preserves Darwin paths before taking their basename; argv
+stays last. It never reads a volume or invokes lsof. Errors
+leave CPU sampling running and retain the last U state. Exiting `?` states
+are accepted; isolated torn rows are skipped with a `proc.u_parse` diagnostic
+(argv omitted). More than five bad rows and over 10% bad fails the probe.
+
+`proc.u_sample` requires the same PID/start time observed in U for ≥60 s.
+`ageS` is process age; the first observation is a baseline. Non-U observations,
+PID reuse, backward clocks or gaps over three minutes reset it. Snapshots
+cannot prove what happened between observations. `count` and `byComm` (top 50)
+cover qualifying processes; up to 15 `procs` include parent attribution, CPU
+seconds and argv (≤200 characters, known secrets redacted). `volume` is the
+first `/Volumes/<name>`, `/var/folders` or `/Users/<user>` argv prefix, or null:
+a hint, not a measured wait location. Unquoted names with spaces yield only
+the first word. PID 99184 stays counted but gets one detail row per UTC day.
+`lsofStuck` and up to five `lsofCallers` identify the parents starting lsof.
+Plain lsof can block on any wedged volume regardless of its target path or port.
+
+Private, nonblocking-locked `state/proc-u.json` keeps U baselines, the daily
+marker and one episode, using Unix wall-clock times only and no argv. Episodes
+start on a qualifying nonempty sample and close after three successful empty
+samples; errors/partial reads cannot close them. One `proc.u_episode` row
+records closure, retried after append failure. Other empty minutes are silent;
+there are no new alerts. A permanent waiter such as 99184 keeps the episode
+open even while its detail is suppressed. Rollup `uEpisodes` lists episodes sampled or closed
+that UTC day, retaining original starts across midnight, end (null while open),
+last seen, peak count, 15 volume hints and ten comms by peak concurrent count.
+Summaries cover all processes before detail truncation. U rows cap at 16 KiB
+with omission counters (≤23.6 MB per 1440 nonempty samples); shared retention
+and the day cap apply. The evaluator copies helpers with `install.zsh` in the
+batched release; no new or changed plist is needed.
 
 ## Memory samples
 
@@ -549,3 +652,49 @@ offbox run -- 'PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integra
 Tests use private temporary roots and mock commands. Never use a real upkeep
 run to test instrumentation: those jobs can remove software, kill processes,
 prune snapshots and send alerts.
+
+## Volume crawl attribution
+
+The minute CPU snapshot selects candidates for `scan.volume_crawl` for `du`,
+`rg`, `find`, `fd`, `ncdu` and `dust` alive for at least 30 seconds. It matches
+filesystem operands resolving to `/`, a volume root, the home directory, or an
+immediate child of ExternalSSD. Implicit operands use cwd; explicit operands
+are resolved before classification. `rg -n foo src/` from a repo cwd is scoped;
+from `/Volumes/ExternalSSD` it names an immediate child and qualifies. A single
+`lsof -a -d cwd -p … -Fn` call has a two-second timeout for all candidates;
+missing cwd still permits attribution from absolute operands. `?` exiting
+processes are skipped. A separate two-second helper reads NUL-delimited
+Darwin `KERN_PROCARGS2` vectors for at most 32 candidates and four ancestors
+each. Candidate batches rotate if there are more. Reads have 256 KiB per-PID
+and 1 MiB total output limits. `proc_pidinfo` identity must match before/after
+the read and the original ps start-second, UID, PPID and executable name.
+Unreadable, changed or oversized vectors skip classification; flattened ps
+text is never reparsed as argv. No extra ps snapshot or environment dump runs.
+The metadata snapshot keeps full `comm` last so Darwin does not truncate the
+existing CPU family labels and interpreter hints. Native reads require LP64;
+the executable path's pointer-aligned boundary locates the first argument,
+preserving leading empty arguments without consuming environment entries.
+
+Records retain PID, PPID, up to four ancestor PID/name pairs, cwd, elapsed
+seconds and CPU percent from matching consecutive process identities (null on
+baseline). `argv` holds executable and resolved filesystem operands only;
+patterns, find expressions and option values are omitted. Paths are retained
+without the general logger's home/secret-word replacement. A parent-visible
+project/UUID thread identifier in a recognized `t3ctl` identity operand is
+retained; shell programs and query text never supply identity. It is null
+when no such operand is visible. The checked agent
+shell had no T3/ROBOB thread-id environment key. Raw argv stays out of CPU state.
+Lines are capped at 8 KiB by dropping trailing operands with `argvOmitted`.
+Oversized cwd/thread strings become null with `stringsOmitted`; parent names
+are bounded. Unknown option arity skips classification instead of guessing
+filesystem operands.
+The existing day cap and retention apply.
+Ncdu import mode is excluded because it reads an inventory rather than crawling.
+Fd execution clauses are excluded through their literal semicolon terminator
+or argv end; fd options and scan roots after a terminator are still parsed.
+
+Argument vectors retain spaces, quotes, backslashes and empty operands.
+This event is attribution evidence, never authority to kill or throttle a PID.
+A process may exit between the argv read and lsof. Missing cwd
+prevents classification of relative operands. Crawls shorter than 30 seconds
+or wholly between minute samples are outside this detector's coverage.

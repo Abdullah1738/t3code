@@ -1021,7 +1021,7 @@ const sessionLoss = ({
         );
         assert.deepEqual(
           after.runs.find((run) => run.id === target.run.id),
-          restarted.runs[0],
+          { ...restarted.runs[0], ...(rebound === "ended" ? { openTools: {} } : {}) },
         );
         assert.deepEqual(
           after.attempts.find((row) => row.id === restarted.runs[0]?.activeAttemptId),

@@ -3,6 +3,7 @@ import * as NodeWorkerThreads from "node:worker_threads";
 import * as NodeStream from "node:stream";
 import type * as NodeChildProcess from "node:child_process";
 import { spawnWorker, type SpawnEvent } from "./spawnWorker.ts";
+import { createCommandResolver } from "./commandResolver.ts";
 
 export class SpawnClient {
   private worker: NodeWorkerThreads.Worker | undefined;
@@ -13,7 +14,8 @@ export class SpawnClient {
   constructor(
     createWorker = () =>
       new NodeWorkerThreads.Worker(
-        `(${spawnWorker.toString()})(require('node:child_process'), require('node:worker_threads').parentPort)`,
+        `(${spawnWorker.toString()})(require('node:child_process'), require('node:worker_threads').parentPort,
+          (${createCommandResolver.toString()})(require('node:fs'), require('node:path')))`,
         { eval: true, execArgv: [] },
       ),
   ) {
@@ -116,7 +118,14 @@ export class SpawnClient {
           resolveSpawn(event.pid);
           break;
         case "error":
-          fail(Object.assign(new Error(event.message), { code: event.code }));
+          fail(
+            Object.assign(new Error(event.message), {
+              code: event.code,
+              errno: event.errno,
+              syscall: event.syscall,
+              path: event.path,
+            }),
+          );
           break;
         case "exit":
           exited = true;

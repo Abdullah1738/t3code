@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
@@ -226,7 +227,12 @@ it.effect.each([
           assert.isNumber(state.waitLookupMs);
           assert.equal(state.callerReaderLane, caller === "client" ? "background" : "identity");
         }).pipe(
-          Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))),
+          Effect.provide(
+            OrchestratorMcpService.layer.pipe(
+              Layer.provide(McpProviderSessions.layer),
+              Layer.provide(dependencies),
+            ),
+          ),
           Effect.provideService(McpCall, state),
           Effect.ensuring(Deferred.succeed(release, undefined)),
         );
@@ -374,7 +380,12 @@ it.effect.each([
         if (scenario === "slow lookup") assert.equal(state.waitLookupMs, 600);
       }
     }).pipe(
-      Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))),
+      Effect.provide(
+        OrchestratorMcpService.layer.pipe(
+          Layer.provide(McpProviderSessions.layer),
+          Layer.provide(dependencies),
+        ),
+      ),
       Effect.provideService(McpCall, state),
     );
   }),

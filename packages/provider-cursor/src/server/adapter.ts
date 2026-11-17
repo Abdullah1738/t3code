@@ -2141,7 +2141,12 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             runtimePolicy: openInput.runtimePolicy,
             platform,
             threadId: openInput.threadId,
-            mcpSession: yield* mcpSessions.read(openInput.threadId),
+            mcpSession: yield* McpProviderSessions.readForRuntime(
+              mcpSessions,
+              openInput.threadId,
+              input.providerSessionId,
+              CursorAgentSdk.CURSOR_PROVIDER,
+            ),
           });
           if (
             platform === "win32" &&
@@ -2268,7 +2273,14 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
               modelSelection: turnInput.modelSelection,
               runtimePolicy: turnInput.runtimePolicy,
             });
-            const mcpServers = cursorMcpServers(yield* mcpSessions.read(turnInput.threadId));
+            const mcpServers = cursorMcpServers(
+              yield* McpProviderSessions.readForRuntime(
+                mcpSessions,
+                turnInput.threadId,
+                input.providerSessionId,
+                CursorAgentSdk.CURSOR_PROVIDER,
+              ),
+            );
             const message = yield* resolveUserMessage(turnInput, mcpServers);
             const pendingUpdates: Array<InteractionUpdate> = [];
             let context: ActiveCursorTurn | null = null;

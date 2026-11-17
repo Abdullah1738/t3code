@@ -62,6 +62,7 @@ export class BoxWatchers {
 }
 async function boxCheck(watch: BoxWatch, run: string, ok: string, dir: string, retry: boolean) {
   const child = Bun.spawn(["/bin/bash", "-c", watch.check], { env: { HOME: process.env.HOME,
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 1000}`,
     PATH: `${process.env.HOME}/person/bin:${process.env.PATH}`, WATCH_DIR: dir, WATCH_ID: watch.id, WATCH_RUN: run, WATCH_OK: ok, WA_RETRY: retry ? "1" : "0" },
     stdout: "pipe", stderr: "ignore", timeout: 60_000, killSignal: "SIGKILL" });
   const [stdout, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);

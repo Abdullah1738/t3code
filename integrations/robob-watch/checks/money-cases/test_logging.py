@@ -23,6 +23,24 @@ SHARED = HERE.parents[2] / 'app-api-cli' / 'toollog.py'
 
 
 class Logging(Base):
+    def test_census_fixed_reason_and_age_allowlists(self):
+        reasons = {code: 1 for code in mc.charges.LIMIT_REASONS}
+        mc.toollog.emit('money-cases', 'check.run', props={'chargeCensus': {
+            'noon': {'limited': len(reasons), 'limit_reasons': {**reasons, 'PRIVATE': 1,
+                     'source_limit:PRIVATE': 1, 'lane_uncovered:PRIVATE': 1},
+                     'limit_age_days': {'lt7': 0, '7_30': 1, '30_60': 2, 'gt60': 3,
+                                        'PRIVATE': 1}},
+            'careem': {'limit_reasons': {'other': -1, 'msgs_timeout': True, 'owner_list_failed': 'PRIVATE'},
+                       'limit_age_days': {'lt7': -1, '7_30': True, 'gt60': 'PRIVATE'}}}})
+        row, = self.rows('check.run')
+        census = row['props']['chargeCensus']
+        self.assertEqual(census['noon']['limit_reasons'], reasons)
+        self.assertEqual(census['noon']['limit_age_days'], {'lt7': 0, '7_30': 1, '30_60': 2, 'gt60': 3})
+        self.assertEqual(census['careem']['limit_reasons'], {})
+        self.assertEqual(census['careem']['limit_age_days'], {})
+        self.assertNotIn('PRIVATE', json.dumps(row))
+        self.assertEqual((HERE / 'toollog.py').read_bytes(), SHARED.read_bytes())
+
     def test_marketplace_metadata_is_sanitized_and_copies_match(self):
         mc.toollog.emit('money-cases', 'check.run', props={
             'marketplace_refresh': 'fresh', 'limitKinds': ['marketplace_hold', 'marketplace_stale'],

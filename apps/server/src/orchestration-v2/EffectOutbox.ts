@@ -48,6 +48,10 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerTurnId: ProviderTurnId,
   }),
   Schema.Struct({
+    type: Schema.Literal("notification.delivery.accept"),
+    messageId: MessageId,
+  }),
+  Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
     sourceRunId: RunId,
     queued: Schema.optional(Schema.Boolean),
@@ -172,6 +176,7 @@ export const START_LANE_EFFECT_TYPES = ["provider-turn.start"] as const satisfie
 export const CONTROL_LANE_EFFECT_TYPES = [
   "provider-session.reconcile-root",
   "provider-session.reconcile-turn",
+  "notification.delivery.accept",
   "provider-turn.interrupt",
   "provider-turn.steer",
   "runtime-request.respond",
@@ -189,6 +194,7 @@ export const CONTROL_LANE_EFFECT_TYPES = [
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-session.reconcile-root",
   "provider-session.reconcile-turn",
+  "notification.delivery.accept",
   "provider-runtime.continue",
   "provider-session.detach",
   "provider-session.stop-background-work",
@@ -253,6 +259,19 @@ export interface PendingOrchestrationEffectV2 {
   readonly availableAt?: DateTime.Utc;
 }
 
+export const nativeNoticeAcceptanceEffect = (
+  threadId: ThreadId,
+  messageId: MessageId,
+): PendingOrchestrationEffectV2 => {
+  const commandId = CommandId.make(`command:notice-native-accepted:${threadId}:${messageId}`);
+  return {
+    id: `effect:${commandId}`,
+    commandId,
+    threadId,
+    request: { type: "notification.delivery.accept", messageId },
+  };
+};
+
 export class EffectOutboxError extends Schema.TaggedError<EffectOutboxError>()(
   "EffectOutboxError",
   {
@@ -284,6 +303,9 @@ export interface EffectOutboxV2Shape {
   readonly listPendingSteerTurns: (
     providerSessionId: ProviderSessionId,
   ) => Effect.Effect<ReadonlyArray<ProviderTurnId>, EffectOutboxError>;
+  readonly pendingRunContinuation: (
+    threadId: ThreadId,
+  ) => Effect.Effect<string | null, EffectOutboxError>;
   readonly hasPendingRunContinuation: (
     threadId: ThreadId,
   ) => Effect.Effect<boolean, EffectOutboxError>;
@@ -448,6 +470,8 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           SELECT 1
           FROM orchestration_v2_effect_outbox AS active
           WHERE active.thread_id = candidate.thread_id
+            -- Native input already arrived; its bookkeeping cannot wait for a start or steer.
+            AND candidate.effect_type != 'notification.delivery.accept'
             AND (
               active.status = 'running'
               OR (
@@ -483,6 +507,21 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
       Effect.forEach(rows, rowToEffect).pipe(
         Effect.mapError((cause) => new EffectOutboxError({ operation, cause })),
       );
+
+    const pendingRunContinuation = Effect.fn("EffectOutbox.pendingRunContinuation")(
+      function* (threadId: ThreadId) {
+        const rows = yield* sql<{ effect_id: string }>`
+          SELECT effect_id FROM orchestration_v2_effect_outbox
+          WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
+            AND effect_type = 'provider-runtime.continue'
+            AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
+          LIMIT 1
+        `;
+        return rows[0]?.effect_id ?? null;
+      },
+      NodeSqliteClient.readOnly,
+      Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+    );
 
     const service: EffectOutboxV2Shape = {
       enqueue: Effect.fn("EffectOutbox.enqueue")(
@@ -556,18 +595,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         },
         Effect.mapError((cause) => new EffectOutboxError({ operation: "list", cause })),
       ),
-      hasPendingRunContinuation: Effect.fn("EffectOutbox.hasPendingRunContinuation")(
-        function* (threadId) {
-          const rows = yield* sql`
-          SELECT 1 FROM orchestration_v2_effect_outbox
-          WHERE thread_id = ${threadId} AND status IN ('pending', 'running')
-            AND effect_type = 'provider-runtime.continue'
-            AND COALESCE(json_extract(payload_json, '$.queued'), 0) <> 1
-          LIMIT 1
-        `;
-          return rows.length > 0;
-        },
-        Effect.mapError((cause) => new EffectOutboxError({ operation: "get", cause })),
+      pendingRunContinuation,
+      hasPendingRunContinuation: Effect.fn("EffectOutbox.hasPendingRunContinuation")((threadId) =>
+        pendingRunContinuation(threadId).pipe(Effect.map((id) => id !== null)),
       ),
       hasRunContinuationAt: Effect.fn("EffectOutbox.hasRunContinuationAt")(
         function* ({ threadId, requestedAt, startupAt }) {

@@ -13,6 +13,12 @@ export const REPLY_BUDGET_MS = 25_000;
 export const ADMISSION_BUDGET_MS = REPLY_BUDGET_MS - 5_000;
 
 export const TOOLS = new Set([
+  "card_claim",
+  "card_create",
+  "card_wait",
+  "card_ask",
+  "card_ask_answer",
+  "card_thread",
   "card_move",
   "card_review_result",
   "subtask_done",
@@ -24,7 +30,7 @@ export const TOOLS = new Set([
   "report_bug",
   "discussion_post",
 ]);
-export const TIMED_TOOLS = new Set([...TOOLS, "card_create", "card_wait", "wiki_read"]);
+export const TIMED_TOOLS = new Set([...TOOLS, "wiki_read"]);
 
 /** Encloses encoding and the reply budget, not just the mutation handler. */
 export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
@@ -48,6 +54,8 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   let timeoutElapsedMs = 0;
   let timeoutObservedAtMs = 0;
   let closed = false;
+  const admissions = new Map<symbol, { detail: Effect.Effect<string>; fiberId: number }>();
+  let admissionDetail: string | undefined;
   const updateStage = () => {
     if (closed) return;
     const now = elapsed();
@@ -133,11 +141,12 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     const saved = savedState();
     const savedMessage =
       saved === false
-        ? tool === "evaluator_start"
-          ? "Not saved; evaluator not started. Safe to retry with the same arguments."
-          : tool === "report_bug"
-            ? "Nothing was saved; retry with the same arguments."
-            : "Not saved (board busy). Safe to retry."
+        ? (admissionDetail ??
+          (tool === "evaluator_start"
+            ? "Not saved; evaluator not started. Safe to retry with the same arguments."
+            : tool === "report_bug"
+              ? "Nothing was saved; retry with the same arguments."
+              : `Not saved (reply timed out before a save; stage: ${stageAtTimeout ?? stage}). Safe to retry.`))
         : tool === "evaluator_start"
           ? receipt?.kind === "evaluator"
             ? `Saved; evaluator launched as ${receipt.threadId}. Do not retry. Use evaluator_status with this threadId to find its cards.`
@@ -225,6 +234,13 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     );
   };
   const work = effect.pipe(
+    Effect.provideService(BoardLocks.admissionObserver, (detail, fiberId) => {
+      const token = Symbol();
+      admissions.set(token, { detail, fiberId });
+      return () => {
+        admissions.delete(token);
+      };
+    }),
     // Interactive pre-write reads must not queue behind tick and maintenance scans.
     (effect) => (timingOnly ? effect : NodeSqliteClient.foregroundReads(effect)),
     Effect.provideService(SavedWrite.traceObserver, {
@@ -310,12 +326,17 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     return Effect.sleep(REPLY_BUDGET_MS);
   }).pipe(
     Effect.andThen(
-      Effect.sync(() => {
+      Effect.gen(function* () {
         stageAtTimeout = stage;
         timeoutElapsedMs = elapsed();
         timeoutObservedAtMs = clock.currentTimeMillisUnsafe();
         timeoutLocks = [...lockSnapshots.values()].at(-1)?.(timeoutObservedAtMs) ?? {};
         timerLatenessMs = Math.max(0, elapsed() - scheduledAt - REPLY_BUDGET_MS);
+        const foreground = [...scopes.values()].findLast((scope) => scope.stage === "admission");
+        const detail = [...admissions.values()].findLast(
+          (entry) => entry.fiberId === foreground?.fiberId,
+        )?.detail;
+        if (stageAtTimeout === "admission" && detail !== undefined) admissionDetail = yield* detail;
       }),
     ),
     Effect.as(Option.none()),

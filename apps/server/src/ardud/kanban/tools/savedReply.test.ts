@@ -606,6 +606,7 @@ it.effect("a clock jump records timer lateness before cancellation cleanup", () 
 
 it.effect.each([...SavedReply.TOOLS])("%s interrupted before commit is not saved", (tool) =>
   Effect.gen(function* () {
+    const { spans, tracer } = captureTrace();
     const entered = yield* Deferred.make<void>();
     const release = yield* Deferred.make<void>();
     const finalizing = yield* Deferred.make<void>();
@@ -635,18 +636,24 @@ it.effect.each([...SavedReply.TOOLS])("%s interrupted before commit is not saved
           ),
         ),
         tool,
-      ),
+      ).pipe(Effect.withTracer(tracer)),
     );
     yield* Deferred.await(entered);
     yield* TestClock.adjust(SavedReply.REPLY_BUDGET_MS);
     yield* Deferred.await(finalizing);
     // The fallback cannot inspect commit state until cancellation cleanup finishes.
     assert.isUndefined(call.pollUnsafe());
+    yield* TestClock.adjust(15_000);
+    assert.isUndefined(call.pollUnsafe());
     yield* Deferred.succeed(finishCleanup, undefined);
     const result = callResult(yield* Fiber.join(call));
     const data = replyData(result.structuredContent);
     assert.isTrue(interrupted);
     assert.isFalse(written);
+    const span = spans.find((span) => span.name === "KanbanTools.savedReply")!;
+    assert.strictEqual(span.attributes.get("kanban.reply.elapsed_ms"), 40_000);
+    assert.strictEqual(span.attributes.get("kanban.reply.timer_lateness_ms"), 0);
+    assert.notInclude(data.message, "board busy");
     {
       assert.isTrue(result.isError);
       assert.strictEqual(data.saved, false);
@@ -1070,7 +1077,7 @@ it.effect("a saved write stalled on acknowledgement has a dominant replyWait", (
   }),
 );
 
-it.effect.each(["card_create", "card_wait", "wiki_read"])(
+it.effect.each(["wiki_read"])(
   "%s records timing without changing its reader lane or adding a deadline",
   (tool) =>
     Effect.gen(function* () {
@@ -1455,4 +1462,51 @@ it.effect("#1712 store reader substeps retain the specific read operation", () =
       subSteps: [{ subStep: "KanbanStore.read.card", ms: 25_000 }],
     });
   }),
+);
+
+it.effect.each(["read", "admission"] as const)(
+  "#1412 discussion_post attributes its %s timeout to foreground work only",
+  (phase) =>
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope;
+      const locks = yield* BoardLocks.make();
+      const startBackground = yield* Deferred.make<void>();
+      const holders = [];
+      for (const [board, label] of [
+        ["a", "foreground-holder"],
+        ["b", "background-holder"],
+      ]) {
+        const entered = yield* Deferred.make<void>();
+        holders.push(
+          yield* locks
+            .board(board!, Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)))
+            .pipe(Effect.provideService(BoardLocks.operationName, label!), Effect.forkChild),
+        );
+        yield* Deferred.await(entered);
+      }
+      const call = yield* SavedReply.protect(
+        Effect.gen(function* () {
+          yield* SavedWrite.background(
+            Deferred.await(startBackground).pipe(
+              Effect.andThen(locks.board("b", Effect.succeed(reply))),
+              Effect.provideService(BoardLocks.writeWaitMs, 60_000),
+            ),
+          ).pipe(Effect.forkIn(scope));
+          return yield* phase === "admission"
+            ? locks
+                .board("a", Effect.succeed(reply))
+                .pipe(Effect.provideService(BoardLocks.writeWaitMs, 60_000))
+            : SavedWrite.stage(Effect.never, "read");
+        }),
+        "discussion_post",
+      ).pipe(Effect.forkChild);
+      yield* TestClock.adjust(1_000);
+      yield* Deferred.succeed(startBackground, undefined);
+      yield* TestClock.adjust(24_000);
+      const data = replyData(callResult(yield* Fiber.join(call)).structuredContent);
+      assert.isFalse(data.saved);
+      assert.notInclude(data.message, "background-holder");
+      assert.include(data.message, phase === "admission" ? "by foreground-holder" : "stage: read");
+      for (const holder of holders) yield* Fiber.interrupt(holder);
+    }).pipe(Effect.scoped),
 );

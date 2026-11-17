@@ -2,8 +2,9 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { volumeState, recordWritten, recordDrop, recordWriteError, pendingVolumes, volumeSnapshot, volumeProps, startVolumeReports } from './volume.mjs';
 
-const CAP = 50 * 1024 * 1024;
+const CAP = 200 * 1024 * 1024;
 const seen = new Set();
 const failurePhases = new WeakMap();
 const props = new Set(['model','size','count','status','enabled','locked','limited','reloginNeeded','state','action','tag','dryRun','complete','cost','hour','exitCode','attempt','source','failed','total','fourxx','fivexx','phase','durationMaxMs','omitted']);
@@ -17,6 +18,7 @@ const safeProp = (key, value) => {
   return typeof value === 'boolean' || typeof value === 'number' && Number.isFinite(value) || token(value);
 };
 const ids = new Set(['account','connection','thread','incident','request','session']);
+ids.add('writer');
 for (const prop of ['firstAttemptMs', 'retryAttemptMs', 'outcome', 'consecutive', 'sinceMs']) props.add(prop);
 const token = v => typeof v === 'string' && /^[A-Za-z0-9_.:/-]{1,100}$/.test(v) && !/(sk-|bearer|password|secret|token|api.?key|otp|cookie|prompt|@)/i.test(v) ? v : undefined;
 const errorTag = v => typeof v === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(v) ? token(v) : undefined;
@@ -56,17 +58,27 @@ export function clean(event, now = new Date()) {
   const safeIds = Object.fromEntries(Object.entries(event.ids ?? {}).filter(([k,v]) => ids.has(k) && ['string','number'].includes(typeof v)).map(([k,v]) => [k,createHash('sha256').update(String(v)).digest('hex').slice(0,16)]));
   const safeProps = Object.fromEntries(Object.entries(event.props ?? {}).filter(([k,v]) => props.has(k) && safeProp(k, v)));
   Object.assign(safeProps, replicaProps(event.props));
+  if (name === 'log.volume') Object.assign(safeProps, volumeProps(event.props));
   if (Object.keys(safeIds).length) row.ids = safeIds;
   if (Object.keys(safeProps).length) row.props = safeProps;
   if (event.error) { const tag = token(event.error.tag) ?? 'unknown'; row.error = { tag, message: errorMessage(event.error.message, tag) }; }
   return row;
 }
 export function emit(component, name, fields = {}) {
+  let counts;
   try {
     const now = new Date(), day = now.toISOString().slice(0,10);
-    const row = clean({ ...fields, component, name, kind: fields.kind ?? 'event' }, now);
-    if (!row) return;
     const root = process.env.ROUTER_LOG_DIR ?? join(homedir(), '.robob/logs/tools/9router');
+    counts = volumeState(root, day);
+    const row = clean({ ...fields, component, name, kind: fields.kind ?? 'event' }, now);
+    if (!row) { recordDrop(counts, 'invalid_event'); return; }
+    if (Buffer.byteLength(JSON.stringify(row)+'\n') > 4096) { recordDrop(counts, 'line_size'); return; }
+    write(root, day, now, row, counts);
+  } catch { if (counts) recordDrop(counts, 'invalid_event'); }
+}
+function write(root, day, now, row, counts) {
+  const volume = row.name === 'log.volume';
+  try {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     fs.chmodSync(root, 0o700);
     const key = `${root}/${day}`;
@@ -88,13 +100,30 @@ export function emit(component, name, fields = {}) {
         try {
           fs.closeSync(fs.openSync(join(root, `.cap-${day}`), 'wx', 0o600));
           fs.writeSync(fd, JSON.stringify(clean({ component:'logger', name:'log.cap', kind:'error', error:{tag:'daily_cap'} }, now)) + '\n');
+          recordWritten(counts, 'log.cap');
         } catch (e) { if (e.code !== 'EEXIST') throw e; }
-        if (row.kind !== 'error') return;
+        // Drop counters must remain visible after the daily cap.
+        if (row.kind !== 'error' && !volume) { recordDrop(counts, 'daily_cap'); return false; }
       }
       fs.writeSync(fd, JSON.stringify(row) + '\n');
+      if (!volume) recordWritten(counts, row.name);
+      return true;
     } finally { fs.closeSync(fd); }
-  } catch { /* Logging must never change tool behavior. */ }
+  } catch { recordWriteError(counts, !volume); return false; }
 }
+export function reportVolume(heartbeat = false) {
+  for (const counts of pendingVolumes(heartbeat)) {
+    try {
+      if (!fs.existsSync(counts.root) || !fs.statSync(counts.root).isDirectory()) continue;
+      const file = join(counts.root, counts.day+'.ndjson');
+      const snapshot = volumeSnapshot(counts, fs.existsSync(file) ? fs.statSync(file).size : 0);
+      const now = new Date(counts.day + new Date().toISOString().slice(10));
+      const row = clean({component:'logger',name:'log.volume',kind:'event',ids:snapshot.ids,props:snapshot.props},now);
+      if (write(counts.root,counts.day,now,row,counts)) counts.reported = snapshot.version;
+    } catch { recordWriteError(counts, false); }
+  }
+}
+startVolumeReports(reportVolume, reportVolume);
 export async function observed(component, name, work, fields = {}) {
   const start = performance.now();
   let result;

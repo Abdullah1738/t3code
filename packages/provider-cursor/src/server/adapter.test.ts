@@ -62,7 +62,8 @@ describe("CursorAdapterV2", () => {
         yield* mcpSessions.set({
           environmentId: EnvironmentId.make("cursor-lifecycle-environment"),
           threadId,
-          providerSessionId: "cursor-lifecycle-session",
+          providerSessionId: "mcp-cursor-lifecycle-session",
+          runtimeProviderSessionId: ProviderSessionId.make("cursor-lifecycle-session"),
           providerInstanceId: instanceId,
           endpoint: "http://127.0.0.1:43123/mcp",
           authorizationHeader: "Bearer synthetic-cursor-token",

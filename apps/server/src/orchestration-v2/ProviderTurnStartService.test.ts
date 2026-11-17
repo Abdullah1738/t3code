@@ -962,6 +962,124 @@ const noRolloutFailure = (thread: OrchestrationV2ThreadProjection["providerThrea
     },
   });
 
+effectIt.effect.each(["interrupted", "failed", "completed", "cancelled", "rolled_back"] as const)(
+  "stops late output after external %s through the prepared production controls",
+  (status) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({ text: "Continue", nativeDelivery: true });
+      yield* harness.start;
+      const controls = harness.startRootRun.mock.calls[0]![0];
+      const providerTurnId = ProviderTurnId.make("late-prepared-turn");
+      const nativeStarted = yield* Deferred.make<void>();
+      const closed = yield* Deferred.make<void>();
+      const presented: Array<string> = [];
+      harness.nativeStartTurn.mockImplementation(() =>
+        Effect.gen(function* () {
+          const current = harness.projection();
+          const completedAt = yield* DateTime.now;
+          harness.setProjection({
+            ...current,
+            runs: current.runs.map((run) =>
+              run.id === controls.run.id ? { ...run, status, completedAt } : run,
+            ),
+          });
+          yield* Deferred.succeed(nativeStarted, undefined);
+        }),
+      );
+      const events = Stream.fromEffect(Deferred.await(nativeStarted)).pipe(
+        Stream.flatMap(() =>
+          Stream.make(
+            {
+              type: "message.updated" as const,
+              driver: controls.providerThread.driver,
+              message: {
+                ...harness.projection().messages[0]!,
+                id: MessageId.make("late-prepared-message"),
+                threadId: controls.run.threadId,
+                runId: controls.run.id,
+                role: "assistant" as const,
+                text: "Still working",
+                streaming: false,
+              },
+            },
+            {
+              type: "turn.terminal" as const,
+              driver: controls.providerThread.driver,
+              providerThreadId: controls.providerThread.id,
+              providerTurnId,
+              runOrdinal: controls.run.ordinal,
+              status: "completed" as const,
+              threadDisposition: "reusable" as const,
+              failure: null,
+            },
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const execution = yield* RunExecutionService.RunExecutionServiceV2;
+        yield* execution.startRootRun({
+          ...controls,
+          rootNode: { ...controls.rootNode, providerTurnId },
+          attempt: { ...controls.attempt, providerTurnId },
+          session: {
+            ...controls.session,
+            subscribeEvents: Effect.succeed({
+              events,
+              close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid),
+            }),
+          },
+        });
+        yield* Deferred.await(closed);
+      }).pipe(
+        Effect.provide(
+          RunExecutionService.layer.pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                McpAppModelContext.layerEmpty,
+                PreviewAgentActivity.layer,
+                IdAllocator.layer,
+                ServerSettings.layerTest(),
+                Layer.mock(CheckpointService.CheckpointServiceV2)({
+                  captureBaseline: () => Effect.void,
+                }),
+                Layer.mock(TurnItemPositionStore.TurnItemPositionStoreV2)({
+                  allocate: () => Effect.succeed(1),
+                }),
+                Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+                  ingestNormalized: (input) =>
+                    Effect.sync(() => {
+                      const current = harness
+                        .projection()
+                        .runs.find((run) => run.id === controls.run.id)!;
+                      if (
+                        input.writeIfRunCurrent !== undefined &&
+                        current.status !== input.writeIfRunCurrent.expectedStatus
+                      )
+                        return [];
+                      if (input.event.type === "message.updated")
+                        presented.push(input.event.message.text);
+                      return [];
+                    }),
+                }),
+                Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent: harness.writeIfRunCurrent }),
+              ),
+            ),
+          ),
+        ),
+      );
+      expect(presented).toEqual([]);
+      expect(harness.nativeInterruptTurn).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          providerTurnId,
+          stopBackgroundWork: true,
+        }),
+      );
+      expect(harness.projection().runs.find((run) => run.id === controls.run.id)?.status).toBe(
+        status,
+      );
+    }),
+);
+
 effectIt.effect.each(["early", "late", "late with history"] as const)(
   "recovers an ordinal-1 no-rollout resume at %s and persists its new native identity",
   (phase) =>

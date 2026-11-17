@@ -1094,7 +1094,9 @@ class ClaudeCommandIdentityTests(IdentityTests):
         self.assertTrue(me["proven"])
 
     def test_tampered_token_stays_unresolved(self):
-        bad = self.token()[:-2] + "00"
+        token = self.token()
+        bad = token[:-1] + ("1" if token[-1] == "0" else "0")
+        self.assertNotEqual(bad, token)
         with self.resolve(OTHER):
             me = self.who(CLAUDE_CODE_SESSION_ID=CLAUDE_UUID, HARNESS_HOOKS_COMMAND_IDENTITY=bad)
         self.assertEqual(me["resolution"], "unresolved")

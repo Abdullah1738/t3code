@@ -180,3 +180,5 @@ the homes until the release; the evaluator installs them.
   `harness` string (`claude` or `codex`) restricts them; `codex` also selects
   `codex-cu`.
 - `t3-code` is never in the manifest: Robob injects it per thread.
+
+Writes to `opencode.jsonc`, `plugin/` and `lib/` reload OpenCode live and can drop in-flight sessions for about 20 seconds. Installers wait for a quiet window (up to `OPENCODE_RELOAD_WAIT`, default 600 seconds); `--allow-reload` explicitly overrides the wait. Install in this order: opencode-plugins → harness-homes. Identical bytes are left untouched.

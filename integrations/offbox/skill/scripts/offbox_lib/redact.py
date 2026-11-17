@@ -19,7 +19,18 @@ def _spec(spec: str) -> str:
 def redact_argv(argv: list[str]) -> list[str]:
     """argv for the log line: every --env NAME=VALUE keeps only its name. The by-name form is unchanged."""
     out, value_next = [], False
+    reason_next = False
     for x in argv:
+        opt, eq, _ = x.partition('=')
+        if argv[:1] == ['box']:
+            if reason_next:
+                out.append('<provided>')
+                reason_next = False
+                continue
+            if opt.startswith('--') and '--reason'.startswith(opt) and len(opt) >= 3:
+                out.append(opt + '=<provided>' if eq else x)
+                reason_next = not eq
+                continue
         opt, eq, spec = x.partition("=")
         if value_next:
             out.append(_spec(x))

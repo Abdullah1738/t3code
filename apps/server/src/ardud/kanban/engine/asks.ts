@@ -98,6 +98,31 @@ export const closeAsks = (
       }
     : card;
 
+/** Gate clears remain in history after their step, or the whole card, is finished. */
+export const closeClearedGateNotices = (card: KanbanCard, at: string): KanbanCard =>
+  closeAsks(
+    card,
+    at,
+    (ask) => {
+      if (
+        ask.kind !== "notice" ||
+        ask.batchKey !== "gate-cleared" ||
+        ask.blocking ||
+        ask.answer !== undefined
+      )
+        return false;
+      if (card.stage === "verified" || card.settledAt !== null) return true;
+      const legacy = ask.title?.match(/^Gate cleared on #(\d+) (s\d+)$/);
+      const subtaskId =
+        ask.subtaskId ?? (legacy?.[1] === String(card.number) ? legacy[2] : undefined);
+      return card.subtasks.some(
+        (subtask) =>
+          subtask.id === subtaskId && (subtask.state === "done" || subtask.state === "skipped"),
+      );
+    },
+    () => ({ verdict: "auto_closed", by: { _tag: "system", component: "gate-cleared" }, at }),
+  );
+
 export const updateAsk = (
   card: KanbanCard,
   askId: string,

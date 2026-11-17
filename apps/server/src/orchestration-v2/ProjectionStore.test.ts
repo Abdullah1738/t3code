@@ -9,6 +9,7 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationV2ProviderSession,
+  type OrchestrationV2Run,
   OrchestrationV2ProviderSessionJson,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
@@ -49,6 +50,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { startState } from "../ardud/orchestration/ProviderStartProgress.ts";
+import { silentRecoveryStillSafe } from "./delegatedTaskProgress.ts";
 import {
   buildBoundedThreadProjection,
   decodeThreadHistoryCursor,
@@ -1657,6 +1659,257 @@ it.effect("memory projection keeps restart-cancelled work through a stale run.up
   restartCancelledWorkSurvivesStaleRunUpdate.pipe(Effect.provide(ProjectionStore.layerMemory)),
 );
 
+const openToolsFollowLifecycle = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const threadId = yield* addRolledBackRecoveryCandidate("open-tools");
+  const before = yield* store.getThreadProjection(threadId);
+  const run = { ...before.runs[0]!, status: "running" as const, completedAt: null };
+  const first = before.turnItems[0]!;
+  let seq = 0;
+  const updateRun = (payload: typeof run | OrchestrationV2Run) =>
+    store.apply({
+      id: EventId.make(`open-tools:run:${++seq}`),
+      type: "run.updated",
+      threadId,
+      occurredAt: run.requestedAt,
+      payload,
+    });
+  const updateItem = (payload: OrchestrationV2TurnItem) =>
+    store.apply({
+      id: EventId.make(`open-tools:item:${++seq}`),
+      type: "turn-item.updated",
+      threadId,
+      occurredAt: payload.updatedAt,
+      payload,
+    });
+  const tools = () =>
+    store
+      .getThreadRecords(threadId, ["runs"], { runIds: [run.id] })
+      .pipe(Effect.map((records) => records.runs[0]!.openTools ?? {}));
+  yield* updateRun(run);
+  const command = {
+    threadId,
+    runId: run.id,
+    nodeId: run.rootNodeId,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    ordinal: first.ordinal + 1,
+    title: "Blocking wait",
+    updatedAt: run.requestedAt,
+    id: TurnItemId.make('tool:"quoted.id"'),
+    type: "command_execution" as const,
+    input: "offbox wait job",
+    status: "running" as const,
+    startedAt: DateTime.makeUnsafe("2099-11-09T10:00:00Z"),
+    completedAt: null,
+  };
+  const mcp = {
+    ...command,
+    id: TurnItemId.make("tool:mcp"),
+    type: "dynamic_tool" as const,
+    toolName: "example.wait",
+    startedAt: DateTime.makeUnsafe("2099-11-09T10:01:00Z"),
+  };
+  yield* updateItem(command);
+  yield* updateItem(mcp);
+  yield* updateItem({
+    ...command,
+    id: TurnItemId.make("reasoning"),
+    type: "reasoning",
+    text: "Thinking",
+    streaming: true,
+  });
+  const expected = {
+    [encodeURIComponent(command.id)]: {
+      kind: "command_execution",
+      since: "2099-11-09T10:00:00.000Z",
+    },
+    [encodeURIComponent(mcp.id)]: { kind: "dynamic_tool", since: "2099-11-09T10:01:00.000Z" },
+  };
+  assert.deepEqual(yield* tools(), expected);
+  yield* updateRun(run);
+  yield* updateItem({ ...command, updatedAt: DateTime.makeUnsafe("2099-11-09T10:30:00Z") });
+  assert.deepEqual(yield* tools(), expected);
+  yield* updateItem({ ...command, status: "completed" });
+  assert.deepEqual(Object.values(yield* tools()), [expected[encodeURIComponent(mcp.id)]]);
+  yield* updateItem({ ...mcp, type: "run_interrupt_request", message: "board stop" });
+  assert.deepEqual(yield* tools(), {});
+  yield* updateItem(command);
+  for (const status of [
+    "completed",
+    "interrupted",
+    "failed",
+    "cancelled",
+    "rolled_back",
+  ] as const) {
+    yield* updateRun({ ...run, status, completedAt: run.requestedAt });
+    yield* updateItem(mcp);
+    assert.deepEqual(yield* tools(), {});
+    yield* updateRun(run);
+    yield* updateItem(command);
+  }
+  const queries: string[] = [];
+  const record: Statement.Transformer = (statement) => {
+    queries.push(statement.compile()[0]);
+    return Effect.succeed(statement);
+  };
+  yield* tools().pipe(Effect.provideService(Statement.CurrentTransformer, record));
+  assert.isFalse(
+    queries.some((query) =>
+      /FROM (?:ardud_history_turn_items|orchestration_v2_projection_turn_items)/.test(query),
+    ),
+  );
+});
+
+it.effect("memory projection tracks open tools across completion, interrupt and recovery", () =>
+  openToolsFollowLifecycle.pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+it.effect("SQL projection tracks open tools across completion, interrupt and recovery", () =>
+  openToolsFollowLifecycle.pipe(Effect.provide(layerTest)),
+);
+
+const openToolSnapshotCases = [
+  ...(["preparing", "queued", "starting", "running", "waiting"] as const).map((status) => ({
+    name: `${status}: populated snapshot after one tool completes`,
+    status,
+    change: "complete-command" as const,
+    snapshotTools: "populated" as const,
+  })),
+  ...(["completed", "interrupted", "failed", "cancelled", "rolled_back"] as const).map(
+    (status) => ({
+      name: `${status}: populated snapshot with tools still open`,
+      status,
+      change: "none" as const,
+      snapshotTools: "populated" as const,
+    }),
+  ),
+  {
+    name: "running: populated snapshot after all tools complete",
+    status: "running",
+    change: "complete-all",
+    snapshotTools: "populated",
+  },
+  {
+    name: "running: populated snapshot after interrupt request",
+    status: "running",
+    change: "interrupt",
+    snapshotTools: "populated",
+  },
+  {
+    name: "running: empty snapshot while a newer tool remains open",
+    status: "running",
+    change: "complete-command",
+    snapshotTools: "empty",
+  },
+  {
+    name: "running: omitted tools while a newer tool remains open",
+    status: "running",
+    change: "complete-command",
+    snapshotTools: "omitted",
+  },
+] satisfies ReadonlyArray<{
+  name: string;
+  status: OrchestrationV2Run["status"];
+  change: "complete-command" | "complete-all" | "interrupt" | "none";
+  snapshotTools: "populated" | "empty" | "omitted";
+}>;
+
+const openToolsSurviveRunSnapshot = (testCase: (typeof openToolSnapshotCases)[number]) =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = yield* addRolledBackRecoveryCandidate("open-tools-snapshot");
+    const before = yield* store.getThreadProjection(threadId);
+    const run = { ...before.runs[0]!, status: "running" as const, completedAt: null };
+    let seq = 0;
+    const updateRun = (payload: OrchestrationV2Run) =>
+      store.apply({
+        id: EventId.make(`snapshot:run:${++seq}`),
+        type: "run.updated",
+        threadId,
+        occurredAt: run.requestedAt,
+        payload,
+      });
+    const updateItem = (payload: OrchestrationV2TurnItem) =>
+      store.apply({
+        id: EventId.make(`snapshot:item:${++seq}`),
+        type: "turn-item.updated",
+        threadId,
+        occurredAt: payload.updatedAt,
+        payload,
+      });
+    const readRun = () =>
+      store
+        .getThreadRecords(threadId, ["runs"], { runIds: [run.id] })
+        .pipe(Effect.map((records) => records.runs[0]!));
+    const command = {
+      id: TurnItemId.make("snapshot:old-command"),
+      threadId,
+      runId: run.id,
+      nodeId: run.rootNodeId,
+      providerThreadId: null,
+      providerTurnId: null,
+      nativeItemRef: null,
+      parentItemId: null,
+      ordinal: before.turnItems[0]!.ordinal + 1,
+      title: "Blocking wait",
+      type: "command_execution" as const,
+      input: "offbox wait old-job",
+      status: "running" as const,
+      startedAt: run.requestedAt,
+      updatedAt: run.requestedAt,
+      completedAt: null,
+    };
+    const mcp = {
+      ...command,
+      id: TurnItemId.make("snapshot:new-mcp"),
+      type: "dynamic_tool" as const,
+      toolName: "example.wait",
+      startedAt: DateTime.add(run.requestedAt, { minutes: 1 }),
+    };
+    yield* updateRun(run);
+    yield* updateItem(command);
+    yield* updateItem(mcp);
+    const snapshot = yield* readRun();
+    assert.lengthOf(Object.keys(snapshot.openTools ?? {}), 2);
+    if (testCase.change === "complete-command" || testCase.change === "complete-all") {
+      yield* updateItem({ ...command, status: "completed", completedAt: run.requestedAt });
+    }
+    if (testCase.change === "complete-all") {
+      yield* updateItem({ ...mcp, status: "completed", completedAt: mcp.startedAt });
+    }
+    if (testCase.change === "interrupt") {
+      yield* updateItem({ ...command, type: "run_interrupt_request", message: "board stop" });
+    }
+    const authoritativeTools = (yield* readRun()).openTools;
+    const { openTools: _snapshotTools, ...withoutTools } = snapshot;
+    yield* updateRun({
+      ...withoutTools,
+      ...(testCase.snapshotTools === "populated"
+        ? { openTools: snapshot.openTools ?? {} }
+        : testCase.snapshotTools === "empty"
+          ? { openTools: {} }
+          : {}),
+      status: testCase.status,
+      completedAt: testCase.change === "none" ? run.requestedAt : null,
+    });
+    const expected = testCase.change === "none" ? {} : authoritativeTools;
+    assert.deepEqual((yield* readRun()).openTools, expected);
+    if (testCase.change === "complete-command") {
+      assert.deepEqual(Object.keys(expected ?? {}), [encodeURIComponent(mcp.id)]);
+    }
+  });
+
+it.effect.each(openToolSnapshotCases)(
+  "memory projection replaces snapshot tools: $name",
+  (testCase) =>
+    openToolsSurviveRunSnapshot(testCase).pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+it.effect.each(openToolSnapshotCases)("SQL projection replaces snapshot tools: $name", (testCase) =>
+  openToolsSurviveRunSnapshot(testCase).pipe(Effect.provide(layerTest)),
+);
+
 const backgroundThreadUpdatesKeepTimestamp = Effect.gen(function* () {
   const store = yield* ProjectionStore.ProjectionStoreV2;
   const createdAt = DateTime.makeUnsafe("2026-10-06T14:00:00.000Z");
@@ -2559,6 +2812,71 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           );
         }
       }),
+  );
+  it.effect.each([
+    "claude_no_response_budget",
+    "claude_retry_flap",
+    "claude_network_error",
+  ] as const)("keeps %s recovery through a stale provider restart in SQL and memory", (code) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate(`network-recovery:${code}`);
+      let memory = yield* store.getThreadProjection(threadId);
+      const run = {
+        ...memory.runs[0]!,
+        status: "running" as const,
+        activeAttemptId: RunAttemptId.make(`attempt:${code}:initial`),
+      };
+      const now = yield* DateTime.now;
+      // The switch captured attempt A before the cutoff committed attempt B.
+      const staleRestart = { ...run, status: "running" as const };
+      const recovery = {
+        firstError: {
+          class: "transport_error" as const,
+          category: "transient" as const,
+          code,
+          retryable: true,
+          message: "Connection dropped (ECONNRESET)",
+        },
+        since: DateTime.formatIso(now),
+      };
+      const emptyProgress = { turnItems: [], runtimeRequests: [], messages: [] };
+      const silent = {
+        phase: "first_event" as const,
+        lastProgressAt: DateTime.formatIso(now),
+        attemptId: run.activeAttemptId,
+      };
+      assert.isTrue(silentRecoveryStillSafe(emptyProgress, staleRestart, silent));
+      for (const [index, payload] of [
+        run,
+        {
+          ...run,
+          status: "starting" as const,
+          activeAttemptId: RunAttemptId.make(`${run.id}:network-recovery`),
+          transientRecovery: recovery,
+        },
+        staleRestart,
+      ].entries()) {
+        const event = {
+          id: EventId.make(`event:network-recovery:${code}:${index}`),
+          type: "run.updated" as const,
+          threadId,
+          runId: run.id,
+          providerInstanceId,
+          occurredAt: now,
+          payload,
+        };
+        yield* store.apply(event);
+        memory = ProjectionStore.applyToProjection(memory, event);
+      }
+      const sql = yield* store.getThreadProjection(threadId);
+      for (const projection of [memory, sql]) {
+        const current = projection.runs[0]!;
+        assert.deepEqual(current.transientRecovery, recovery);
+        assert.isUndefined(current.delegatedTaskStallRecovery);
+        assert.isFalse(silentRecoveryStillSafe(emptyProgress, current, silent));
+      }
+    }),
   );
   it.effect.each(
     (["interrupted", "cancelled"] as const).flatMap((status) =>

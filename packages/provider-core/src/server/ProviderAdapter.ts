@@ -685,6 +685,13 @@ export interface ProviderAdapterV2SessionRuntime {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly taskId: string;
   }) => Effect.Effect<void, ProviderAdapterV2Error>;
+  /** Checked by the delegated progress guard; adapters own native fencing and termination. */
+  readonly checkRetryHealth?: (input: {
+    readonly runId: RunId;
+    readonly attemptId: RunAttemptId | null;
+    readonly noResponseBudgetMs: number;
+    readonly flapLimit: number;
+  }) => Effect.Effect<boolean, ProviderAdapterV2Error>;
   readonly interruptStartingRun?: (input: {
     readonly providerThread: OrchestrationV2ProviderThread;
     readonly runId: RunId;
