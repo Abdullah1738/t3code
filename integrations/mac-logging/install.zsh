@@ -20,7 +20,7 @@ copy_file() {
     install -m "$perm" "$src" "$dst"
   fi
 }
-for file in toollog.py toollog.sh jobs.py collector.py memory.py deep_inventory.py rollup.py status.py cpu.py cpu_labels.py tailnet.py u_sample.py; do
+for file in toollog.py toollog.sh jobs.py collector.py memory.py deep_inventory.py rollup.py status.py cpu.py cpu_labels.py tailnet.py u_sample.py volume_crawls.py process_argv.py; do
   copy_file "$here/$file" "$HOME/.local/lib/mac-logging/$file" 600
 done
 # A plain executable wrapper keeps imports local to the installed helper directory.

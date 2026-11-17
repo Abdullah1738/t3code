@@ -123,7 +123,9 @@ partial with no total again. Its own directory allocation is included.
 Parts do not recurse. The hourly scanner leaves parts parents and recent
 timeouts to this pass.
 The daily budget is 90 minutes; du runs under nice 10
-and utility scheduling without inherited launchd background I/O policy.
+and utility scheduling with explicit `taskpolicy -d throttle` disk I/O policy.
+The hourly du children also use `-d throttle`; scan roots, accounting and cache
+semantics are unchanged.
 Termination keeps completed rows; unfinished children remain explicit partials.
 Both entry points acquire `state/disk-inventory.lock` non-blocking. A busy
 daily pass exits cleanly; a busy hourly scan logs `skipReason=deep_pass_running`
@@ -650,3 +652,49 @@ offbox run -- 'PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s integra
 Tests use private temporary roots and mock commands. Never use a real upkeep
 run to test instrumentation: those jobs can remove software, kill processes,
 prune snapshots and send alerts.
+
+## Volume crawl attribution
+
+The minute CPU snapshot selects candidates for `scan.volume_crawl` for `du`,
+`rg`, `find`, `fd`, `ncdu` and `dust` alive for at least 30 seconds. It matches
+filesystem operands resolving to `/`, a volume root, the home directory, or an
+immediate child of ExternalSSD. Implicit operands use cwd; explicit operands
+are resolved before classification. `rg -n foo src/` from a repo cwd is scoped;
+from `/Volumes/ExternalSSD` it names an immediate child and qualifies. A single
+`lsof -a -d cwd -p … -Fn` call has a two-second timeout for all candidates;
+missing cwd still permits attribution from absolute operands. `?` exiting
+processes are skipped. A separate two-second helper reads NUL-delimited
+Darwin `KERN_PROCARGS2` vectors for at most 32 candidates and four ancestors
+each. Candidate batches rotate if there are more. Reads have 256 KiB per-PID
+and 1 MiB total output limits. `proc_pidinfo` identity must match before/after
+the read and the original ps start-second, UID, PPID and executable name.
+Unreadable, changed or oversized vectors skip classification; flattened ps
+text is never reparsed as argv. No extra ps snapshot or environment dump runs.
+The metadata snapshot keeps full `comm` last so Darwin does not truncate the
+existing CPU family labels and interpreter hints. Native reads require LP64;
+the executable path's pointer-aligned boundary locates the first argument,
+preserving leading empty arguments without consuming environment entries.
+
+Records retain PID, PPID, up to four ancestor PID/name pairs, cwd, elapsed
+seconds and CPU percent from matching consecutive process identities (null on
+baseline). `argv` holds executable and resolved filesystem operands only;
+patterns, find expressions and option values are omitted. Paths are retained
+without the general logger's home/secret-word replacement. A parent-visible
+project/UUID thread identifier in a recognized `t3ctl` identity operand is
+retained; shell programs and query text never supply identity. It is null
+when no such operand is visible. The checked agent
+shell had no T3/ROBOB thread-id environment key. Raw argv stays out of CPU state.
+Lines are capped at 8 KiB by dropping trailing operands with `argvOmitted`.
+Oversized cwd/thread strings become null with `stringsOmitted`; parent names
+are bounded. Unknown option arity skips classification instead of guessing
+filesystem operands.
+The existing day cap and retention apply.
+Ncdu import mode is excluded because it reads an inventory rather than crawling.
+Fd execution clauses are excluded through their literal semicolon terminator
+or argv end; fd options and scan roots after a terminator are still parsed.
+
+Argument vectors retain spaces, quotes, backslashes and empty operands.
+This event is attribution evidence, never authority to kill or throttle a PID.
+A process may exit between the argv read and lsof. Missing cwd
+prevents classification of relative operands. Crawls shorter than 30 seconds
+or wholly between minute samples are outside this detector's coverage.

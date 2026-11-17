@@ -551,7 +551,7 @@ deep_inventory.run_pass([Path(sys.argv[2])],run,budget=30)
         end=self.rows('disk.deep.end')[-1]['props']
         for field in ('timeouts','secondsInTimeouts','childrenDescended','partsMeasured'):
             self.assertEqual(end[field],0)
-        self.assertEqual(end['spawnPolicy'],'nice-10-utility')
+        self.assertEqual(end['spawnPolicy'],'nice-10-utility-io-throttle')
         self.assertEqual(self.rows('disk.deep.root')[-1]['props']['childrenWithPartsInProgress'],0)
         self.assertEqual(end['partsFreshnessS'],jobs.INVENTORY_PARTS_FRESH_S)
 
