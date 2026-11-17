@@ -47277,3 +47277,457 @@ it.effect("#1710 stale recovered snapshot is rejected before a provider send or 
     );
   }),
 );
+
+const inBackstopRead = Effect.fn("test.inBackstopRead")(function* (name: string) {
+  const span = yield* Effect.option(Effect.currentSpan);
+  let cursor: Tracer.AnySpan | undefined = Option.getOrUndefined(span);
+  while (cursor?._tag === "Span") {
+    if (cursor.name === name) return true;
+    cursor = Option.getOrUndefined(cursor.parent);
+  }
+  return false;
+});
+
+it.effect.each([
+  { backstop: "worker", dependency: "findLastFailure", read: 1, detached: false },
+  { backstop: "worker", dependency: "findLastFailure", read: 2, detached: false },
+  { backstop: "worker", dependency: "find", read: 1, detached: false },
+  { backstop: "silentRun", dependency: "find", read: 1, detached: false },
+  { backstop: "silentRun", dependency: "find", read: 1, detached: true },
+] as const)(
+  "#1748 $backstop plan $dependency read $read releases card_update (detached=$detached)",
+  ({ backstop, dependency, read, detached }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let armed = false;
+      let reads = 0;
+      const stall = <A, E, R>(name: string, effect: Effect.Effect<A, E, R>) =>
+        Effect.gen(function* () {
+          const result = yield* effect;
+          if (
+            !armed ||
+            name !== dependency ||
+            !(yield* inBackstopRead(`KanbanService.${backstop}BackstopPlan`)) ||
+            ++reads !== read
+          )
+            return result;
+          armed = false;
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+          return result;
+        });
+      const delayedThreads = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            find: (id) => stall("find", real.find(id)),
+            findLastFailure: (id) => stall("findLastFailure", real.findLastFailure(id)),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-16T00:00:00.000Z"));
+        const { kanban, card, threadId } = yield* workingCard;
+        if (backstop === "silentRun") {
+          yield* Ref.update(fake.threads, (all) => {
+            Object.assign(all.get(threadId)!, {
+              running: backstop === "silentRun",
+              runId: "latched-run",
+              runStartedAt: card.createdAt,
+              runRequestedAt: card.createdAt,
+            });
+            return all;
+          });
+        }
+        if (detached) {
+          const store = yield* KanbanStore.KanbanStore;
+          yield* store.putCard({
+            ...card,
+            stage: "todo",
+            activeThreadId: null,
+            activeRole: null,
+            activePool: null,
+          });
+        }
+        yield* TestClock.adjust("31 minutes");
+        armed = true;
+        const ticking = yield* Effect.forkChild(kanban.tick);
+        yield* Effect.raceFirst(
+          Deferred.await(entered),
+          Fiber.join(ticking).pipe(
+            Effect.andThen(Effect.die(new Error(`Backstop completed before plan ${dependency}`))),
+          ),
+        );
+        const saved = yield* kanban.editCard(
+          card.id,
+          { description: "Saved while the backstop read is blocked" },
+          owner,
+        );
+        assert.equal(saved.description, "Saved while the backstop read is blocked");
+        assert.isFalse(yield* Deferred.isDone(release));
+        assert.isUndefined(ticking.pollUnsafe());
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(ticking);
+        assert.equal((yield* kanban.card(card.id)).card.description, saved.description);
+        assert.deepEqual(fake.interrupted, []);
+        assert.equal(yield* nudgesTo(fake, threadId), 0);
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.provide(testLayer(delayedThreads)),
+      );
+    }),
+);
+
+it.effect.each(
+  (["worker", "silentRun"] as const).flatMap((backstop) =>
+    (["wait", "ask", "stage", "reassignment", "role", "generation", "thread fence"] as const).map(
+      (change) => ({
+        backstop,
+        change,
+      }),
+    ),
+  ),
+)("#1748 $backstop rejects a stale plan after $change", ({ backstop, change }) =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake;
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    let armed = false;
+    const delayedThreads = Layer.effect(
+      KanbanThreads,
+      Effect.map(KanbanThreads, (real) =>
+        KanbanThreads.of({
+          ...real,
+          find: (id) =>
+            real.find(id).pipe(
+              Effect.tap(() =>
+                Effect.gen(function* () {
+                  if (armed && (yield* inBackstopRead(`KanbanService.${backstop}BackstopPlan`))) {
+                    armed = false;
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(release);
+                  }
+                }),
+              ),
+            ),
+        }),
+      ),
+    ).pipe(Layer.provide(fake.layer));
+    yield* Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-11-16T00:00:00.000Z"));
+      const { kanban, card, threadId } = yield* workingCard;
+      const store = yield* KanbanStore.KanbanStore;
+      if (backstop === "silentRun") {
+        yield* Ref.update(fake.threads, (all) => {
+          Object.assign(all.get(threadId)!, {
+            running: true,
+            runId: "latched-run",
+            runStartedAt: card.createdAt,
+            runRequestedAt: card.createdAt,
+          });
+          return all;
+        });
+      }
+      yield* TestClock.adjust("31 minutes");
+      armed = true;
+      const ticking = yield* Effect.forkChild(kanban.tick);
+      yield* Deferred.await(entered);
+      const changed: KanbanCard = {
+        ...card,
+        ...(change === "wait"
+          ? {
+              wait: yield* decodeWait({
+                on: "time",
+                until: "2026-11-17T00:00:00.000Z",
+                at: "2026-11-16T00:31:00.000Z",
+                by: { _tag: "thread", threadId },
+                note: "Wait for tomorrow",
+                wakeRole: "work",
+              }),
+            }
+          : {}),
+        ...(change === "ask"
+          ? {
+              asks: [
+                {
+                  id: "new-blocking-ask",
+                  text: "Hold this work?",
+                  blocking: true,
+                  by: owner,
+                  at: "2026-11-16T00:31:00.000Z",
+                  seq: null,
+                  closedAt: null,
+                },
+              ],
+            }
+          : {}),
+        ...(change === "stage" ? { stage: "needs_owner" } : {}),
+        ...(change === "reassignment"
+          ? { activeThreadId: ThreadId.make("replacement-worker") }
+          : {}),
+        ...(change === "role" ? { activeRole: "review" } : {}),
+      };
+      if (change === "thread fence") yield* kanban.threadEvent(threadId);
+      if (change === "generation")
+        yield* kanban.editCard(card.id, { description: "A write that will be restored" }, owner);
+      // Restore identical values for the generation case; all other cases
+      // change only the row, independently of the process's version counters.
+      yield* store.putCard(changed);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(ticking);
+      const after = (yield* kanban.card(card.id)).card;
+      if (change !== "wait") {
+        assert.equal(after.activeThreadId, changed.activeThreadId);
+        assert.equal(after.activeRole, changed.activeRole);
+        assert.equal(after.stage, changed.stage);
+      }
+      assert.deepEqual(after.wait, changed.wait);
+      assert.deepEqual(after.asks, changed.asks);
+      assert.equal(after.nudgedAt, card.nudgedAt);
+      assert.deepEqual(fake.interrupted, []);
+      assert.lengthOf(
+        fake.sends.filter(
+          (send) =>
+            send.threadId === threadId &&
+            send.text.includes("still in Working and your turn ended"),
+        ),
+        0,
+      );
+    }).pipe(
+      Effect.ensuring(Deferred.succeed(release, undefined)),
+      Effect.provide(testLayer(delayedThreads)),
+    );
+  }),
+);
+
+it.effect.each(["advance", "park", "release"] as const)(
+  "#1748 %s pre-lock validation lets card.wait take turn admission without a lock cycle",
+  (path) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let armed = false;
+      const delayed = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (real) =>
+          KanbanThreads.of({
+            ...real,
+            find: (id) =>
+              real.find(id).pipe(
+                Effect.tap(() =>
+                  Effect.gen(function* () {
+                    if (!armed || !(yield* inBackstopRead("KanbanService.workerBackstopPlan")))
+                      return;
+                    armed = false;
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(release);
+                  }),
+                ),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-16T00:00:00.000Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        const created = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Admission",
+            prompt: "Work",
+            subtasks: [
+              { step: 1, owner: "work", text: "Build" },
+              { step: 2, owner: "review", text: "Review" },
+            ],
+          },
+          owner,
+        );
+        yield* kanban.dispatchNow;
+        const card = (yield* kanban.card(created.id)).card;
+        const threadId = card.activeThreadId!;
+        if (path === "advance")
+          yield* store.putCard({
+            ...card,
+            subtasks: card.subtasks.map((task) =>
+              task.owner === "work" ? { ...task, state: "done" } : task,
+            ),
+          });
+        if (path === "park") {
+          yield* setRunning(fake, threadId, true);
+          yield* kanban.waitCard(
+            card.id,
+            { on: "time", until: "2026-11-17T00:00:00.000Z", note: "Park after turn" },
+            { _tag: "thread", threadId },
+          );
+          yield* setRunning(fake, threadId, false);
+        }
+        yield* TestClock.adjust("31 minutes");
+        if (path === "release") {
+          yield* kanban.tick;
+          assert.equal(yield* nudgesTo(fake, threadId), 1);
+          yield* TestClock.adjust("31 minutes");
+        }
+        // A sibling on the same thread exercises the admission/gate order
+        // without invalidating the target card and triggering stale-plan backoff.
+        const sibling = yield* kanban.createCard(
+          board.id,
+          { title: "Same thread", prompt: "Work" },
+          owner,
+        );
+        yield* store.putCard({
+          ...sibling,
+          stage: "working",
+          activeRole: "work",
+          activeThreadId: threadId,
+          workThreadId: threadId,
+        });
+        const before = yield* Clock.currentTimeMillis;
+        armed = true;
+        const ticking = yield* Effect.forkChild(kanban.tick);
+        yield* Effect.raceFirst(
+          Deferred.await(entered),
+          Fiber.join(ticking).pipe(
+            Effect.andThen(Effect.die(new Error(`Missing ${path} admission read`))),
+          ),
+        );
+        const waited = yield* kanban.waitCard(
+          sibling.id,
+          { on: "time", until: "2026-11-18T00:00:00.000Z", note: "Owner superseded the plan" },
+          owner,
+        );
+        assert.equal(waited.wait?.note, "Owner superseded the plan");
+        assert.isFalse(yield* Deferred.isDone(release));
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(ticking);
+        assert.equal(yield* Clock.currentTimeMillis, before);
+        assert.equal((yield* kanban.card(sibling.id)).card.wait?.note, "Owner superseded the plan");
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.provide(testLayer(delayed)),
+      );
+    }),
+);
+
+it.effect(
+  "#1748 a detached silent plan rechecks membership after another card claims its thread",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let target: string | undefined;
+      let armed = false;
+      const membership: Array<ReadonlyArray<string>> = [];
+      const delayedStore = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            card: (id) =>
+              real.card(id).pipe(
+                Effect.tap(() =>
+                  Effect.gen(function* () {
+                    // This fence is after every preplan read, before its facts are admitted.
+                    if (
+                      !armed ||
+                      id !== target ||
+                      !(yield* inBackstopRead("KanbanService.backstopCard"))
+                    )
+                      return;
+                    armed = false;
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(release);
+                  }),
+                ),
+              ),
+            cardsByThread: (id) =>
+              real.cardsByThread(id).pipe(
+                Effect.tap((cards) =>
+                  Effect.gen(function* () {
+                    const span = yield* Effect.option(Effect.currentSpan);
+                    let cursor: Tracer.AnySpan | undefined = Option.getOrUndefined(span);
+                    while (cursor?._tag === "Span") {
+                      if (cursor.attributes.get("kanban.tick_step") === "silentRunBackstop") {
+                        membership.push(cards.map((card) => card.id));
+                        break;
+                      }
+                      cursor = Option.getOrUndefined(cursor.parent);
+                    }
+                  }),
+                ),
+              ),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-16T00:00:00.000Z"));
+        const { kanban, board, card: origin, threadId } = yield* workingCard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 2);
+        const detached = yield* kanban.createCard(
+          board.id,
+          { title: "Detached A", prompt: "Work" },
+          owner,
+        );
+        const carried = (yield* kanban.claimCard(threadId, detached.id)).card;
+        yield* store.putCard({
+          ...origin,
+          stage: "verified",
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+        yield* store.putCard({
+          ...carried,
+          stage: "todo",
+          priority: KANBAN_BACKLOG,
+          activeThreadId: null,
+          activeRole: null,
+          activePool: null,
+        });
+        const next = yield* kanban.createCard(
+          board.id,
+          { title: "Claimed B", prompt: "Work" },
+          owner,
+        );
+        yield* Ref.update(fake.threads, (all) => {
+          Object.assign(all.get(threadId)!, {
+            running: true,
+            runId: "claimed-silent-run",
+            runStartedAt: origin.createdAt,
+            runRequestedAt: origin.createdAt,
+          });
+          return all;
+        });
+        yield* TestClock.adjust("31 minutes");
+        const before = yield* Clock.currentTimeMillis;
+        target = detached.id;
+        armed = true;
+        const ticking = yield* Effect.forkChild(kanban.tick);
+        yield* Effect.raceFirst(
+          Deferred.await(entered),
+          Fiber.join(ticking).pipe(
+            Effect.andThen(Effect.die(new Error("Detached silent plan did not reach its fence"))),
+          ),
+        );
+        const claimed = yield* kanban.claimCard(threadId, next.id);
+        assert.equal(claimed.card.activeThreadId, threadId);
+        assert.isFalse(yield* Deferred.isDone(release));
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(ticking);
+        assert.deepEqual(fake.interrupted, []);
+        assert.isTrue(membership.some((ids) => ids.includes(next.id)));
+        assert.equal((yield* store.card(next.id))!.activeThreadId, threadId);
+        assert.isNull((yield* store.card(detached.id))!.nudgedAt);
+        assert.equal(yield* Clock.currentTimeMillis, before);
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(release, undefined)),
+        Effect.provide(testLayer(fake.layer, undefined, undefined, delayedStore)),
+      );
+    }),
+);
