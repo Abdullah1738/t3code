@@ -24,6 +24,7 @@ import {
   PACKET_SUBTASK,
   passReview,
   reviewRoundStartedAt,
+  releaseBuildCommit,
   planSubtasks,
   pendingWakeNote,
   subtaskLines,
@@ -32,6 +33,22 @@ import {
 } from "./subtasks.ts";
 
 const owner = { _tag: "owner" } as const;
+
+it.each([
+  ["Installed; buildCommit d86aed779b94", "d86aed779b94"],
+  ["buildCommit: `ABCDEF123456`", "abcdef123456"],
+  ["buildCommit=abcdef1", "abcdef1"],
+  [
+    "buildCommit abcdef1234567890abcdef1234567890abcdef12",
+    "abcdef1234567890abcdef1234567890abcdef12",
+  ],
+  ["Reviewed abcdef1; installed", undefined],
+  ["buildCommit abcdef", undefined],
+  ["buildCommit abcdef1234567890abcdef1234567890abcdef12345", undefined],
+  [null, undefined],
+])("release receipt extracts only an explicitly named commit from %s", (note, commit) => {
+  expect(releaseBuildCommit(note)).toBe(commit);
+});
 const at = "2026-10-26T12:00:00.000Z";
 const torsshReview =
   "Review (single GPT-6 Astra xhigh, design chain): torrc injection impossible, token fresh per launch and never logged, only the policy FD inherited, no bridge fallback on PT failure/relaunch, snowflake consent rechecked, #30/#36/#56 lyrebird gates unchanged";

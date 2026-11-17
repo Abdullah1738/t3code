@@ -689,6 +689,9 @@ export const criticalReleaseReason = (note: string | null): string | null => {
   return reason.length >= 10 ? reason : null;
 };
 
+export const releaseBuildCommit = (note: string | null): string | undefined =>
+  note?.match(/\bbuildCommit\s*[:=]?\s*`?([a-f0-9]{7,40})\b`?/i)?.[1]?.toLowerCase();
+
 export const releaseWindow = (
   standing: Pick<StandingReleaseContext, "approvals" | "ledger" | "boardId" | "at">,
   service?: string,

@@ -2098,6 +2098,7 @@ export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
 export const KanbanRelease = Schema.Struct({
   service: Schema.optional(Schema.String),
   postHoc: Schema.optional(Schema.Boolean),
+  buildCommit: Schema.optional(Schema.String),
   boardId: KanbanBoardId,
   cardId: KanbanCardId,
   cardNumber: Schema.Number,
@@ -2127,6 +2128,8 @@ export const KanbanBoard = Schema.Struct({
   releaseLedger: Schema.optional(Schema.Array(KanbanRelease)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  /** Evidence from unmarked history is reported without becoming gate input. */
+  historicalReleaseLedger: Schema.optional(Schema.Array(KanbanRelease)),
   standingApprovals: Schema.Array(KanbanStandingApproval).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
