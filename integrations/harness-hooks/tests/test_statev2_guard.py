@@ -582,6 +582,118 @@ class GuardTests(unittest.TestCase):
                     self.assertEqual(self.classify(prefix + run), expected)
                     self.adapters(prefix + run, expected)
 
+    def test_same_call_inline_node_safe_modes(self):
+        prefix = "export OTHER='NODE_OPTIONS+=data'\n" + self.heredoc('scripts/a.mjs', 'console.log(1)')
+        prefix += "printf '%s' '-vNODE_OPTIONS'\nprintf -- '-vNODE_OPTIONS'\n"
+        prefix += "printf '$opt'\nprintf '*'\nprintf \"\\$opt\"\n"
+        prefix += "printf '%s' 'NODE_OPTIONS+=data'\n"
+        for options in ('', '--input-type=module ', '--input-type module ',
+                        '--input-type=commonjs ', '--input-type commonjs ',
+                        '--no-warnings --input-type=module '):
+            runs = ['node ' + options + flag + ' ' + shlex.quote(code)
+                    for flag in ('-e', '--eval', '-p', '--print')
+                    for code in ('console.log(1)', "console.log('$value')", "console.log('*')")]
+            runs += ["node " + options + dash + " <<'JS'\nconsole.log(1)\nJS\n" for dash in ('', '-')]
+            for run in runs:
+                with self.subTest(options=options, run=run):
+                    command = prefix + run + '\nnode --test scripts/a.mjs'
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_same_call_inline_node_runtime_options(self):
+        self.write('scripts/mutate.cjs', "require('node:fs').writeFileSync('scripts/a.mjs', 'console.log(2)')")
+        self.write('package.json', json.dumps({'scripts': {'mutate': 'node scripts/mutate.cjs'}}))
+        # Runtime mode, startup inputs, output side effects and unknown flags
+        # must all fail closed, including options following an eval body.
+        options = (
+            '--run mutate', '--run=mutate', '--require ./scripts/mutate.cjs', '--require=./scripts/mutate.cjs',
+            '-r ./scripts/mutate.cjs', '-r./scripts/mutate.cjs', '--import ./scripts/mutate.cjs',
+            '--loader ./scripts/mutate.cjs', '--experimental-loader ./scripts/mutate.cjs',
+            '--test-global-setup ./scripts/mutate.cjs', '--env-file ./node.env', '--env-file-if-exists=./node.env',
+            '--experimental-config-file ./node.json', '--snapshot-blob ./node.blob',
+            '--redirect-warnings scripts/a.mjs', '--cpu-prof', '--heap-prof', '--trace-events-enabled',
+            '--test', '--watch', '--unknown-guard-option', '--input-type=unknown',
+        )
+        for target, setup in (('scripts/a.mjs', ''), ('"$d/a.mjs"', 'd=$(mktemp -d)\n')):
+            prefix = setup + self.heredoc(target, 'console.log(1)')
+            for option in options:
+                for run in (f"node {option} -e 'console.log(1)'",
+                            f"node -e 'console.log(1)' {option}",
+                            f"node {option} - <<'JS'\nconsole.log(1)\nJS\n"):
+                    with self.subTest(target=target, option=option, run=run):
+                        command = prefix + run + '\nnode --test ' + target
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, UNRESOLVED)
+                        self.assertIn('node: inline runtime options or arguments unproved', cause)
+                        self.assertNotIn('mutate', cause)
+        self.adapters(self.heredoc('scripts/a.mjs', 'console.log(1)') +
+                      "node --run mutate -e 'console.log(1)'\nnode --test scripts/a.mjs", UNRESOLVED)
+        code = "console.log('$value')"
+        command = self.heredoc('scripts/a.mjs', 'console.log(1)')
+        command += 'env -u ' + shlex.quote(code) + ' node -e "' + code + '"\nnode --test scripts/a.mjs'
+        rule, cause = guard.classify_detail(command, str(self.root))
+        self.assertEqual(rule, UNRESOLVED)
+        self.assertIn('node: inline source not literal', cause)
+
+    def test_same_call_inline_node_startup_environment(self):
+        self.write('preload.cjs', "require('node:fs').writeFileSync('scripts/a.mjs', 'console.log(2)')")
+        self.write('-v', '')
+        setting = shlex.quote('--require ./preload.cjs')
+        for target, setup in (('scripts/a.mjs', ''), ('"$d/a.mjs"', 'd=$(mktemp -d)\n')):
+            prefix = setup + self.heredoc(target, 'console.log(1)')
+            for run in ("node --input-type=module -e 'console.log(1)'",
+                        "node --input-type=module - <<'JS'\nconsole.log(1)\nJS\n"):
+                tail = '\nnode --test ' + target
+                for placement, command, inherited in (
+                    ('command-local', prefix + 'NODE_OPTIONS=' + setting + ' ' + run + tail, ''),
+                    ('env', prefix + 'env NODE_OPTIONS=' + setting + ' ' + run + tail, ''),
+                    ('assignment', 'NODE_OPTIONS=' + setting + '\n' + prefix + run + tail, ''),
+                    ('export', 'export NODE_OPTIONS=' + setting + '\n' + prefix + run + tail, ''),
+                    ('append', 'NODE_OPTIONS+=' + setting + '\n' + prefix + run + tail, ''),
+                    ('export-append', 'export NODE_OPTIONS+=' + setting + '\n' + prefix + run + tail, ''),
+                    ('readonly-append', 'readonly NODE_OPTIONS+=' + setting + '\n' + prefix + run + tail, ''),
+                    ('declare-append', 'declare -x NODE_OPTIONS+=' + setting + '\n' + prefix + run + tail, ''),
+                    ('typeset-append', 'typeset -x NODE_OPTIONS+=' + setting + '\n' + prefix + run + tail, ''),
+                    ('array-assignment', 'NODE_OPTIONS[0]=' + setting + '\n' + prefix + run + tail, ''),
+                    ('computed-declaration', 'binding=NODE_OPTIONS\nexport "$binding"=' + setting + '\n' + prefix + run + tail, ''),
+                    ('declaration-brace-prefix', 'export {NODE_OPTIONS,OTHER}=' + setting + '\n' + prefix + run + tail, ''),
+                    ('declaration-brace-suffix', 'export NODE_{OPTIONS,OTHER}=' + setting + '\n' + prefix + run + tail, ''),
+                    ('declaration-brace-infix', 'export NODE_OP{TION,TIO}S=' + setting + '\n' + prefix + run + tail, ''),
+                    ('declaration-brace-nested', 'export NODE_{OPTION{S,X},OTHER}=' + setting + '\n' + prefix + run + tail, ''),
+                    ('declaration-brace-quoted-prefix', "export 'NODE_'{OPTIONS,OTHER}=" + setting + '\n' + prefix + run + tail, ''),
+                    ('declaration-brace-declare', 'declare -x NODE_{OPTIONS,OTHER}=' + setting + '\n' + prefix + run + tail, ''),
+                    ('declaration-brace-typeset', 'typeset -x NODE_{OPTIONS,OTHER}=' + setting + '\n' + prefix + run + tail, ''),
+                    ('declaration-brace-readonly', 'readonly NODE_{OPTIONS,OTHER}=' + setting + '\n' + prefix + run + tail, ''),
+                    ('declaration-brace-then-unset', 'export NODE_{OPTIONS,OTHER}=' + setting + '\n' + prefix + run + '\nunset NODE_OPTIONS' + tail, ''),
+                    ('read', "read -r NODE_OPTIONS <<'OPTS'\n--require ./preload.cjs\nOPTS\n" + prefix + run + tail, ''),
+                    ('printf', "printf -v NODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-attached', "set -a; printf -vNODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-attached-computed', "binding=NODE_OPTIONS; printf -v\"$binding\" '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('command-printf-attached', "command printf -vNODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-expanded', "set -a; opt=-v; printf \"$opt\" NODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-expanded-unquoted', "opt=-v; printf $opt NODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-expanded-braces', "opt=-v; printf ${opt} NODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-empty-expansion', "opt=; printf $opt -v NODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-mixed-quotes', "opt=-v; printf \"$opt\" NODE_OPTIONS '%.0s%s' '$opt' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-substitution', "printf $(echo -v) NODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-backticks', "printf `echo -v` NODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-glob', "printf -? NODE_OPTIONS '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('printf-braces', "printf {-v,NODE_OPTIONS} '%s' " + setting + '\n' + prefix + run + tail, ''),
+                    ('wait', 'wait -p NODE_OPTIONS\n' + prefix + run + tail, ''),
+                    ('wait-attached', 'wait -pNODE_OPTIONS\n' + prefix + run + tail, ''),
+                    ('wait-combined', 'wait -npNODE_OPTIONS\n' + prefix + run + tail, ''),
+                    ('wait-expanded', 'opt=-pNODE_OPTIONS; wait "$opt"\n' + prefix + run + tail, ''),
+                    ('loop', prefix + 'for NODE_OPTIONS in ' + setting + '; do\n' + run + '\ndone' + tail, ''),
+                    ('inherited', prefix + run + tail, '--require ./preload.cjs'),
+                    ('inherited-after-transient-empty', 'NODE_OPTIONS= true\n' + prefix + run + tail, '--require ./preload.cjs'),
+                    ('offbox-env', 'NODE_OPTIONS=' + setting + ' offbox run -- bash -c ' + shlex.quote(prefix + run + tail), ''),
+                ):
+                    with self.subTest(target=target, run=run, placement=placement), patch.dict(os.environ, {'NODE_OPTIONS': inherited}):
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, UNRESOLVED)
+                        self.assertIn('node: NODE_OPTIONS startup proof failed', cause)
+                        self.assertNotIn('preload.cjs', cause)
+                        self.adapters(command, UNRESOLVED)
+
     def test_same_call_single_quoted_binding_punctuation(self):
         code = 's="(( ${t.name}"; print(s)'
         prefix = 'd=$(mktemp -d)\npython3 -I -c ' + shlex.quote(code) + '\n'

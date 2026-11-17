@@ -3304,7 +3304,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         return _inherited_startup_safe(name, directory, caller_command if caller_command is not None else command,
                                        shell_values, written, script)
 
-    def may_change_scripts(words, directory, stdin_sources=()):
+    def may_change_scripts(words, directory, stdin_sources=(), *, literal_eval=False):
         nonlocal proof_failure
         proof_failure = 'opaque binary'
         words = list(words)
@@ -3422,7 +3422,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                                    for source in sources):
                     return False
             elif binary in {'node', 'bun'}:
-                inline = node_inline_sources(words, stdin_sources)
+                inline = node_inline_sources(words, stdin_sources, literal_eval=literal_eval)
                 if inline:
                     return not all(node_inline_preserves_sources(source, directory) for source in inline)
                 args = _interpreter_args(binary, words[1:])
@@ -3456,16 +3456,37 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             return not output_only_print(words)
         return binary not in {'cat', 'tee', 'mkdir', 'chmod', 'set', 'head', 'tail', 'echo', 'printf', 'true', 'false', ':', 'test', '[', 'ls', 'stat', 'wc', 'pwd'}
 
-    def node_inline_sources(words, stdin_sources):
+    def node_inline_sources(words, stdin_sources, *, literal_eval=False):
+        nonlocal proof_failure
         if not words or os.path.basename(words[0]) != 'node':
             return []
-        args, inputs, _, _ = _node_arguments(words[1:])
-        if inputs:
+        # Shell bindings retain possible transient/conditional values, so an
+        # empty local assignment cannot erase an inherited startup hook here.
+        if os.environ.get('NODE_OPTIONS') or 'NODE_OPTIONS' in shell_values:
+            proof_failure = 'node: NODE_OPTIONS startup proof failed'
             return []
-        if len(args) >= 2 and args[0] in {'-e', '--eval', '-p', '--print'}:
+        proof_failure = 'node: inline runtime options or arguments unproved'
+        if unsafe_bindings:
+            return []
+        # _node_arguments removes options for operand discovery, including
+        # --run. That is not evidence that the literal eval body runs alone.
+        # Accept only modes whose complete argv leaves startup and outputs
+        # unchanged; options after the body must face the same restriction.
+        args = words[1:]
+        while args:
+            if args[0] in {'--no-warnings', '--input-type=module', '--input-type=commonjs'}:
+                args = args[1:]
+            elif len(args) > 1 and args[0] == '--input-type' and args[1] in {'module', 'commonjs'}:
+                args = args[2:]
+            else:
+                break
+        if len(args) == 2 and args[0] in {'-e', '--eval', '-p', '--print'}:
             source = args[1]
-            return [source] if source in invocation_literals or not re.search(r'[$`]', source) else []
-        return list(stdin_sources) if not args or args[0] == '-' else []
+            if literal_eval or not re.search(r'[$`*?\[\]{}~]', source):
+                return [source]
+            proof_failure = 'node: inline source not literal'
+            return []
+        return list(stdin_sources) if args in ([], ['-']) else []
 
     def node_inline_preserves_sources(source, directory, depth=0):
         nonlocal proof_failure
@@ -4039,7 +4060,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         environment = None
         if inherit_environment:
             environment = ({name: value for name, value in shell_values.items()
-                            if STARTUP_ENV.fullmatch(name) or name in {'ZDOTDIR', 'PATH', 'IFS'}},
+                            if STARTUP_ENV.fullmatch(name) or name in {'ZDOTDIR', 'PATH', 'IFS', 'NODE_OPTIONS'}},
                            unsafe_binding_cause if unsafe_bindings else False, caller_command if caller_command is not None else command)
         remote_paths = scripts_in(source, directory, _depth=depth,
                                   _sources=(written, invalidated_written, write_history, variable_written, tool_changes),
@@ -4058,6 +4079,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         checked = set()
         literal_words = set()
         reader_literal_words = set()
+        binding_literal_words = set()
         double_words = set()
         unquoted_words = set()
         def decode(value):
@@ -4071,6 +4093,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 reader_word = reader_word.replace(key, text)
             if not re.search(r'[$`]', reader_word):
                 reader_literal_words.add(decoded)
+                if not re.search(r'[*?\[\]{}~]', value):
+                    binding_literal_words.add(value)
             if any(key in value and key.startswith('\0guard_literal_') and re.search(r'[$`]', text)
                    for key, text in quoted.items()):
                 literal_words.add(decoded)
@@ -4186,6 +4210,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         child_directory = False
         while words:
             binary = os.path.basename(words[0])
+            if re.match(r'^NODE_OPTIONS(?:\+=|\[[^=]*=)', words[0]):
+                shell_values.setdefault('NODE_OPTIONS', '')
             if re.match(r"^[A-Za-z_]\w*=", words[0]):
                 transient = any(not re.match(r'^[A-Za-z_]\w*=', word) for word in words)
                 remember_assignment(words.pop(0), directory, not cwd_only, transient)
@@ -4327,6 +4353,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             unsafe_binding_cause = f'{binary} shell binding builtin at line {current_line}'
         after = caller_directory if child_directory else directory
         if binary in {"export", "readonly", "declare", "typeset", "local"}:
+            # Only literal scalar names can exclude startup variables. Brace
+            # fragments, globbing and computed names need the same taint as
+            # an explicit NODE_OPTIONS declaration.
+            names = [arg.partition('=')[0] for arg in args]
+            if any(name in {'NODE_OPTIONS', 'NODE_OPTIONS+'} or
+                   not re.fullmatch(r'(?:[A-Za-z_]\w*\+?|--|-[A-Za-z]+)', name) for name in names):
+                shell_values.setdefault('NODE_OPTIONS', '')
             if not cwd_only:
                 if binary in {'declare', 'typeset', 'local'} and any(re.fullmatch(r'-[A-Za-z]*[naiA][A-Za-z]*', arg) for arg in args):
                     unsafe_bindings = True
@@ -4363,18 +4396,34 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
         elif binary in {'read', 'readarray', 'mapfile', 'unset', 'eval', 'source', '.', 'let', 'getopts'}:
             script_values.clear()
             opaque_written.clear()
-        if binary in {'printf', 'wait'} and any(arg in {'-v', '-p'} for arg in args):
+            shell_values.setdefault('NODE_OPTIONS', '')
+        binding_option = False
+        if binary in {'printf', 'wait'}:
+            # Keep raw quote markers per argument: a literal '$opt' elsewhere
+            # in this invocation cannot prove an expanded "$opt" is data.
+            for arg, raw in zip(args, raw_words[-len(args):] if args else []):
+                if raw not in binding_literal_words:
+                    binding_option = True
+                    break
+                if arg == '--' or not arg.startswith('-'):
+                    break
+                if binary == 'printf' and arg.startswith('-v') or binary == 'wait' and re.match(r'^-[A-Za-z]*p', arg):
+                    binding_option = True
+                    break
+        if binding_option:
             script_values.clear()
             opaque_written.clear()
+            shell_values.setdefault('NODE_OPTIONS', '')
         invalidate_print_bindings(words, current_line)
         invocation_written = dict(opaque_written)
         invocation_fresh = set(fresh_variables)
         stdin_sources = documents if exact_documents and not here_strings and not any(op == '<' for op, _ in redirects) else []
+        literal_eval = bool(raw_words) and raw_words[-1] in binding_literal_words
         if written or opaque_written:
-            inline_sources = node_inline_sources(words, stdin_sources)
+            inline_sources = node_inline_sources(words, stdin_sources, literal_eval=literal_eval)
             if inline_sources and not all(node_inline_preserves_sources(source, directory) for source in inline_sources):
                 raise AmbiguousScript(f'{proof_failure}; execution inline source: node at line {current_line}')
-        changes_scripts = may_change_scripts(words, directory, stdin_sources)
+        changes_scripts = may_change_scripts(words, directory, stdin_sources, literal_eval=literal_eval)
         if changes_scripts:
             if opaque_written or fresh_variables:
                 last_invalidation = f'invalidated by {binary_label(words)} command at line {current_line}; intervening command; {proof_failure}'
@@ -4828,6 +4877,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                         index += 1
                     continue
                 if token in {"for", "while", "until", "select"} and not words and not probe:
+                    if token in {'for', 'select'} and index + 1 < len(tokens) and tokens[index + 1] == 'NODE_OPTIONS':
+                        shell_values.setdefault('NODE_OPTIONS', '')
                     # Any iteration can inherit the cwd left by the preceding
                     # one. Preflight loop bodies before resolving relative paths.
                     # Reuse the normal group/case traversal to discover binding
@@ -4844,11 +4895,14 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     if any(word in {'read', 'readarray', 'mapfile', 'unset', 'printf', 'let', 'getopts', 'eval', 'source', '.', 'wait', 'local', 'declare', 'typeset', 'export', 'readonly', 'trap', 'alias', 'unalias', 'enable', 'builtin', 'shopt', 'setopt'} or re.match(r'^[A-Za-z_]\w*(?:\+=|\[[^=]*=)', word) for word in segment):
                         script_values.clear()
                         opaque_written.clear()
+                        shell_values.setdefault('NODE_OPTIONS', '')
                     for offset, decoded in enumerate(segment):
                         assignment = re.match(r'^([A-Za-z_]\w*)=', decoded)
                         loop_name = segment[offset + 1] if decoded in {'for', 'select'} and offset + 1 < len(segment) else None
                         if assignment or loop_name and re.fullmatch(r'[A-Za-z_]\w*', loop_name):
                             name = assignment[1] if assignment else loop_name
+                            if name == 'NODE_OPTIONS':
+                                shell_values.setdefault('NODE_OPTIONS', '')
                             script_values[name] = {'$' + name}
                             invalidate_variable(name)
                     group = []
