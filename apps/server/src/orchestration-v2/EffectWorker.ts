@@ -497,8 +497,12 @@ export const layerExecutor: Layer.Layer<
                       Option.isSome(
                         yield* outbox.get(`effect:session-ended:${request.providerTurnId}`),
                       );
+                    // A steer can commit after release captured its pending effects.
+                    const queueFollowUp =
+                      sessionEnded ||
+                      ("turnEnded" in error && error.turnEnded && !error.turnCompleted);
                     if (
-                      ((!("turnCompleted" in error) || !error.turnCompleted) && !sessionEnded) ||
+                      ((!("turnCompleted" in error) || !error.turnCompleted) && !queueFollowUp) ||
                       effect.request.type !== "provider-turn.steer"
                     ) {
                       return yield* error;
@@ -515,12 +519,12 @@ export const layerExecutor: Layer.Layer<
                     const run = projection.runs.find((item) => item.id === message?.runId);
                     if (message === undefined || run === undefined) return yield* error;
                     // A prior attempt may have queued this message before its outbox ack failed.
-                    if (sessionEnded && run.userMessageId === message.id) return;
+                    if (queueFollowUp && run.userMessageId === message.id) return;
                     yield* threads
                       .dispatch({
                         type: "message.dispatch",
                         commandId: CommandId.make(
-                          `command:steer-follow-up:${effect.id}${sessionEnded ? `:${effect.attemptCount}` : ""}`,
+                          `command:steer-follow-up:${effect.id}${queueFollowUp ? `:${effect.attemptCount}` : ""}`,
                         ),
                         threadId: effect.threadId,
                         messageId: message.id,
@@ -532,7 +536,7 @@ export const layerExecutor: Layer.Layer<
                           : { modelSelection: run.modelSelection }),
                         dispatchMode: {
                           type:
-                            !sessionEnded &&
+                            !queueFollowUp &&
                             message.delegatedCompletion === undefined &&
                             message.notification === undefined
                               ? "start_immediately"

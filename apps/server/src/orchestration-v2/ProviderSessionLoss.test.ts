@@ -54,12 +54,18 @@ const sessionLoss = ({
   nativeThreads = false,
   shared = true,
   buffered,
+  foregroundOnly = false,
 }: {
   instance: "codex" | "codex-cu" | "opencode";
   reason: Sessions.ProviderSessionReleaseReason;
   replace?: boolean;
   promotion?: boolean;
-  accepted?: "before recovery" | "after recovery" | "replacement session" | "blocked closure";
+  accepted?:
+    | "before recovery"
+    | "after recovery"
+    | "replacement session"
+    | "blocked closure"
+    | "after preflight";
   faultRead?: boolean;
   activeTurnOnly?: boolean;
   delivered?: boolean;
@@ -68,11 +74,14 @@ const sessionLoss = ({
   nativeThreads?: boolean;
   shared?: boolean;
   buffered?: "new turn" | "running update";
+  foregroundOnly?: boolean;
 }) =>
   Effect.gen(function* () {
     const allAdmitted = yield* Deferred.make<void>();
     const admitted = yield* Deferred.make<void>();
     const resumeIngestion = yield* Deferred.make<void>();
+    const preflight = yield* Deferred.make<void>();
+    const commitSteer = yield* Deferred.make<void>();
     const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
     const closing = yield* Deferred.make<void>();
     const finishClose = yield* Deferred.make<void>();
@@ -277,7 +286,53 @@ const sessionLoss = ({
             },
           ],
         });
+        const toolId = NodeId.make(`foreground-tool:${threadId}`);
+        if (accepted !== "after preflight")
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make(`foreground-tool-node:${threadId}`),
+                type: "node.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  ...root,
+                  id: toolId,
+                  kind: "tool_call",
+                  parentNodeId: root.id,
+                  providerTurnId: turn.id,
+                  status: "running",
+                  checkpointScopeId: null,
+                },
+              },
+              {
+                id: EventId.make(`foreground-tool-item:${threadId}`),
+                type: "turn-item.updated",
+                threadId,
+                occurredAt: now,
+                payload: {
+                  id: TurnItemId.make(`foreground-tool:${threadId}`),
+                  threadId,
+                  runId: run.id,
+                  nodeId: toolId,
+                  providerThreadId: providerThread.id,
+                  providerTurnId: turn.id,
+                  nativeItemRef: null,
+                  parentItemId: null,
+                  ordinal: 2,
+                  status: "running",
+                  title: null,
+                  startedAt: now,
+                  completedAt: null,
+                  updatedAt: now,
+                  type: "command_execution",
+                  input: "native command",
+                },
+              },
+            ],
+          });
         if (
+          !foregroundOnly &&
           !(
             threadId === threads[0] &&
             terminalBeforeRelease !== undefined &&
@@ -381,7 +436,31 @@ const sessionLoss = ({
         createdBy: "agent" as const,
         creationSource: "mcp" as const,
       };
-      if (accepted !== undefined) yield* engine.dispatch(acceptedCommand);
+      const admitting =
+        accepted === "after preflight"
+          ? yield* Effect.gen(function* () {
+              const get = sessions.get;
+              let first = true;
+              const spy = vi.spyOn(sessions, "get").mockImplementation((id) =>
+                get(id).pipe(
+                  Effect.tap(() =>
+                    Effect.gen(function* () {
+                      if (!first) return;
+                      first = false;
+                      yield* Deferred.succeed(preflight, undefined);
+                      yield* Deferred.await(commitSteer);
+                    }),
+                  ),
+                ),
+              );
+              yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()));
+              const fiber = yield* engine.dispatch(acceptedCommand).pipe(Effect.forkScoped);
+              yield* Deferred.await(preflight);
+              return fiber;
+            })
+          : undefined;
+      if (accepted !== undefined && admitting === undefined)
+        yield* engine.dispatch(acceptedCommand);
       if (nativeThreads) {
         const source = (yield* projections.getThreadProjection(target.threadId)).subagents[0]!;
         const now = yield* DateTime.now;
@@ -897,6 +976,10 @@ const sessionLoss = ({
         const duringReplacement = yield* projections.getThreadProjection(target.threadId);
         const child = duringReplacement.subagents[0]!;
         const childNode = duringReplacement.nodes.find((node) => node.id === child.id)!;
+        const oldTool = duringReplacement.nodes.find(
+          (node) => node.id === `foreground-tool:${target.threadId}`,
+        )!;
+        const oldToolItem = duringReplacement.turnItems.find((item) => item.nodeId === oldTool.id)!;
         const replacementChild = NodeId.make("replacement-child");
         yield* sink.write({
           events: [
@@ -914,8 +997,47 @@ const sessionLoss = ({
               occurredAt: now,
               payload: { ...child, id: replacementChild, startedAt: now, updatedAt: now },
             },
+            {
+              id: EventId.make("replacement-tool-node"),
+              type: "node.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: {
+                ...oldTool,
+                id: NodeId.make("replacement-tool"),
+                providerTurnId: replacementTurn,
+              },
+            },
+            {
+              id: EventId.make("replacement-tool-item"),
+              type: "turn-item.updated",
+              threadId: target.threadId,
+              occurredAt: now,
+              payload: {
+                ...oldToolItem,
+                id: TurnItemId.make("replacement-tool"),
+                nodeId: NodeId.make("replacement-tool"),
+                providerTurnId: replacementTurn,
+              },
+            },
           ],
         });
+      }
+      if (admitting !== undefined) {
+        yield* sessions.open({
+          threadId: target.threadId,
+          providerSessionId: sessionId,
+          modelSelection,
+          runtimePolicy: {
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          },
+        });
+        assert.isEmpty(yield* outbox.listByCommandId(acceptedCommand.commandId));
+        assert.isTrue(Option.isNone(yield* outbox.get(`effect:session-ended:${target.turn.id}`)));
+        yield* Deferred.succeed(commitSteer, undefined);
+        yield* Fiber.join(admitting);
       }
       const recordedSteerEffect =
         accepted === undefined
@@ -997,6 +1119,7 @@ const sessionLoss = ({
       }
       if (accepted !== undefined || faultRead) {
         for (const item of targets) {
+          if (admitting !== undefined && item === target) continue;
           const effect = Option.getOrThrow(
             yield* outbox.get(`effect:session-ended:${item.turn.id}`),
           );
@@ -1032,12 +1155,14 @@ const sessionLoss = ({
         );
       }
       for (const [index, target] of targets.entries()) {
-        const hasNativeWork = !(
-          index === 0 &&
-          terminalBeforeRelease !== undefined &&
-          accepted !== undefined &&
-          !nativeThreads
-        );
+        const hasNativeWork =
+          !foregroundOnly &&
+          !(
+            index === 0 &&
+            terminalBeforeRelease !== undefined &&
+            accepted !== undefined &&
+            !nativeThreads
+          );
         const current = yield* projections.getThreadProjection(target.threadId);
         const settled =
           buffered && index === 0
@@ -1068,6 +1193,14 @@ const sessionLoss = ({
             current.nodes.find((node) => node.id === "replacement-child")?.status,
             "running",
           );
+          assert.equal(
+            current.nodes.find((node) => node.id === "replacement-tool")?.status,
+            "running",
+          );
+          assert.equal(
+            current.turnItems.find((item) => item.id === "replacement-tool")?.status,
+            "running",
+          );
         }
         if (hasNativeWork && instance === "opencode") {
           assert.deepEqual(
@@ -1094,6 +1227,17 @@ const sessionLoss = ({
           assert.include(
             childSettled,
             current.nodes.find((node) => node.id === `remote:${target.threadId}`)?.status,
+          );
+        }
+        if (instance !== "opencode" && admitting === undefined) {
+          assert.equal(
+            current.nodes.find((node) => node.id === `foreground-tool:${target.threadId}`)?.status,
+            "interrupted",
+          );
+          assert.equal(
+            current.turnItems.find((item) => item.id === `foreground-tool:${target.threadId}`)
+              ?.status,
+            "interrupted",
           );
         }
         if (hasNativeWork)
@@ -1164,6 +1308,7 @@ const sessionLoss = ({
         assert.lengthOf(current.runs, 2);
       }
     }).pipe(
+      Effect.ensuring(Deferred.succeed(commitSteer, undefined)),
       Effect.ensuring(Deferred.succeed(resumeIngestion, undefined)),
       Effect.ensuring(Deferred.succeed(finishClose, undefined)),
       Effect.provide(layer),
@@ -1220,6 +1365,30 @@ it.effect.each(["completed", "failed", "interrupted", "cancelled"] as const)(
       terminalBeforeRelease,
     }),
 );
+
+it.effect.each(["running", "failed"] as const)(
+  "settles foreground tool artifacts after shared release (parent=%s)",
+  (status) =>
+    sessionLoss({
+      instance: "codex-cu",
+      reason: "runtime_error",
+      foregroundOnly: true,
+      ...(status === "failed" ? { terminalBeforeRelease: status } : {}),
+    }),
+);
+
+it.effect.each([
+  { activeTurnOnly: true, delivered: false },
+  { activeTurnOnly: false, delivered: true },
+])("does not requeue restricted late-committed input (%s)", (restriction) =>
+  sessionLoss({
+    instance: "codex-cu",
+    reason: "runtime_error",
+    accepted: "after preflight",
+    terminalBeforeRelease: "failed",
+    ...restriction,
+  }),
+);
 it.effect("persists release identity before reopening after a failed marker write", () =>
   sessionLoss({
     instance: "codex-cu",
@@ -1253,4 +1422,15 @@ it.effect.each(["new turn", "running update"] as const)(
   "drains admitted native-child writes before capturing shared session loss (%s)",
   (buffered) =>
     sessionLoss({ instance: "codex-cu", reason: "runtime_error", nativeThreads: true, buffered }),
+);
+
+it.effect.each(["completed", "failed", "interrupted", "cancelled"] as const)(
+  "retains a steer committed after release and replacement (old turn=%s)",
+  (terminalBeforeRelease) =>
+    sessionLoss({
+      instance: "codex-cu",
+      reason: "runtime_error",
+      accepted: "after preflight",
+      terminalBeforeRelease,
+    }),
 );

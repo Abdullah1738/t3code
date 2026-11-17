@@ -11016,7 +11016,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           const emitted = yield* Ref.get(events);
           for (const node of child.nodes) {
             if (
-              node.runId !== null ||
               !ownedNodes.has(node.id) ||
               !isOrchestrationV2WorkActive(node.status) ||
               emitted.some((event) => event.type === "node.updated" && event.payload.id === node.id)
@@ -11028,6 +11027,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             )({
               type: "node.updated",
               threadId: command.threadId,
+              ...(node.runId === null ? {} : { runId: node.runId }),
               nodeId: node.id,
               occurredAt: now,
               payload: { ...node, status: "interrupted", completedAt: now },
@@ -11035,7 +11035,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }
           for (const item of child.turnItems) {
             if (
-              item.runId !== null ||
               item.providerTurnId !== command.providerTurnId ||
               !isOrchestrationV2WorkActive(item.status) ||
               emitted.some(
@@ -11049,6 +11048,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             )({
               type: "turn-item.updated",
               threadId: command.threadId,
+              ...(item.runId === null ? {} : { runId: item.runId }),
               ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
               occurredAt: now,
               payload: {

@@ -994,7 +994,9 @@ export const layerWithOptions = (
           );
           for (const threadId of threadIds) {
             const projection = yield* projectionStore
-              .getThreadRecords(threadId, ["providerTurns", "nodes", "subagents"])
+              .getThreadRecords(threadId, ["providerTurns", "nodes", "subagents", "turnItems"], {
+                turnItemStatuses: ["pending", "running", "waiting"],
+              })
               .pipe(
                 Effect.catchTags({
                   ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
@@ -1050,14 +1052,20 @@ export const layerWithOptions = (
                   !pendingSteers.has(turn.id) &&
                   !(
                     input.entry.runtime.backgroundTasksEndWithProcess === true &&
-                    projection.subagents.some(
-                      (task) =>
-                        task.origin === "provider_native" &&
-                        ["pending", "running", "waiting"].includes(task.status) &&
-                        projection.nodes.some(
-                          (node) => node.id === task.id && node.providerTurnId === turn.id,
-                        ),
-                    )
+                    (projection.nodes.some(
+                      (node) =>
+                        node.providerTurnId === turn.id &&
+                        ["pending", "running", "waiting"].includes(node.status),
+                    ) ||
+                      projection.turnItems.some((item) => item.providerTurnId === turn.id) ||
+                      projection.subagents.some(
+                        (task) =>
+                          task.origin === "provider_native" &&
+                          ["pending", "running", "waiting"].includes(task.status) &&
+                          projection.nodes.some(
+                            (node) => node.id === task.id && node.providerTurnId === turn.id,
+                          ),
+                      ))
                   ))
               )
                 continue;
