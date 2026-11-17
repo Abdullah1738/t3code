@@ -29014,10 +29014,13 @@ it.effect.each(["deployed", "working", "todo", "legacy"] as const)(
           assert.isFalse(
             result.events.some((event) => event.body?.startsWith("fresh work thread:")),
           );
-          assert.include(
-            (yield* Ref.get(fake.threads)).get(current)!.messages.at(-1)!,
-            "P2: preserve batch ownership",
-          );
+          // Rework runs before new work, so the todo home may wake this thread afterward.
+          const rework = (yield* Ref.get(fake.threads))
+            .get(current)!
+            .messages.slice(oldMessages)
+            .filter((message) => message.startsWith(`Card #${claimed.number} is back with you.`));
+          assert.lengthOf(rework, 1);
+          assert.include(rework[0]!, "P2: preserve batch ownership");
         }
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
