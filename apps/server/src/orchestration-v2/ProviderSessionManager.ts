@@ -1002,7 +1002,7 @@ export const layerWithOptions = (
                   ProjectionStoreThreadNotFoundError: () => Effect.succeed(null),
                 }),
               );
-            if (projection === null || projection.providerTurns.length === 0) continue;
+            if (projection === null) continue;
             const bindings = yield* projectionStore.getThreadRecords(
               threadId,
               ["providerThreads"],
@@ -1010,10 +1010,44 @@ export const layerWithOptions = (
                 providerSessionId: input.entry.runtime.providerSessionId,
                 providerThreadIds: [
                   ...new Set(projection.providerTurns.map((turn) => turn.providerThreadId)),
+                  ...new Set(
+                    projection.nodes.flatMap((node) =>
+                      node.providerTurnId !== null || node.providerThreadId === null
+                        ? []
+                        : [node.providerThreadId],
+                    ),
+                  ),
                 ],
               },
             );
             const owned = new Set(bindings.providerThreads.map((thread) => thread.id));
+            if (input.entry.runtime.backgroundTasksEndWithProcess === true) {
+              for (const node of projection.nodes) {
+                if (
+                  node.kind !== "root_turn" ||
+                  node.runId !== null ||
+                  node.providerTurnId !== null ||
+                  node.providerThreadId === null ||
+                  !owned.has(node.providerThreadId) ||
+                  !isOrchestrationV2WorkActive(node.status) ||
+                  (node.startedAt !== null &&
+                    DateTime.isGreaterThan(node.startedAt, input.releasedAt))
+                )
+                  continue;
+                const id = `effect:session-ended-root:${node.id}:${node.startedAt === null ? "unknown" : DateTime.formatIso(node.startedAt)}`;
+                effects.push({
+                  id,
+                  commandId: CommandId.make(`${id}:reconcile`),
+                  threadId,
+                  request: {
+                    type: "provider-session.reconcile-root",
+                    providerThreadId: node.providerThreadId,
+                    nodeId: node.id,
+                    startedAt: node.startedAt,
+                  },
+                });
+              }
+            }
             // Native Codex children use runless turns in separate threads. Capture their
             // identities now so a replacement at the same timestamp cannot be swept later.
             if (input.entry.runtime.backgroundTasksEndWithProcess === true) {
@@ -1034,8 +1068,10 @@ export const layerWithOptions = (
                   projection.nodes.some(
                     (node) =>
                       node.id === task.id &&
-                      node.providerTurnId !== null &&
-                      ownedTurns.has(node.providerTurnId),
+                      ((node.providerTurnId !== null && ownedTurns.has(node.providerTurnId)) ||
+                        (node.providerTurnId === null &&
+                          node.providerThreadId !== null &&
+                          owned.has(node.providerThreadId))),
                   )
                 ) {
                   threadIds.add(task.childThreadId);

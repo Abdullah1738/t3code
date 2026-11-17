@@ -35,6 +35,12 @@ const StoppedRunAttempts = Schema.Array(
 
 export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
+    type: Schema.Literal("provider-session.reconcile-root"),
+    providerThreadId: ProviderThreadId,
+    nodeId: NodeId,
+    startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  }),
+  Schema.Struct({
     type: Schema.Literal("provider-session.reconcile-turn"),
     preserveBackgroundWork: Schema.optional(Schema.Boolean),
     releasedAt: Schema.optional(Schema.DateTimeUtcFromString),
@@ -163,6 +169,7 @@ export const START_LANE_EFFECT_TYPES = ["provider-turn.start"] as const satisfie
 >;
 
 export const CONTROL_LANE_EFFECT_TYPES = [
+  "provider-session.reconcile-root",
   "provider-session.reconcile-turn",
   "provider-turn.interrupt",
   "provider-turn.steer",
@@ -179,6 +186,7 @@ export const CONTROL_LANE_EFFECT_TYPES = [
 ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
 
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
+  "provider-session.reconcile-root",
   "provider-session.reconcile-turn",
   "provider-runtime.continue",
   "provider-session.detach",

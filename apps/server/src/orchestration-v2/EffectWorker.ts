@@ -122,6 +122,27 @@ export const layerExecutor: Layer.Layer<
       execute: (effect, options) => {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
+          case "provider-session.reconcile-root":
+            return threads
+              .dispatch({
+                type: "thread.provider-root.settle",
+                commandId: CommandId.make(`${effect.id}:settle:${effect.attemptCount}`),
+                threadId: effect.threadId,
+                providerThreadId: effect.request.providerThreadId,
+                nodeId: effect.request.nodeId,
+                startedAt: effect.request.startedAt,
+              })
+              .pipe(
+                Effect.asVoid,
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "provider-session.reconcile-turn":
             return threads
               .dispatch({
@@ -1185,8 +1206,12 @@ export const layerWithOptions = (
           }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
           if (cancelledBeforeExecution) return true;
 
+          // Recovery owns the last path out for work whose provider can no longer report.
+          const durableRecovery =
+            effect.request.type === "provider-session.reconcile-turn" ||
+            effect.request.type === "provider-session.reconcile-root";
           const execution = executor
-            .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
+            .execute(effect, { willRetry: durableRecovery || effect.attemptCount < maxAttempts })
             .pipe(
               Effect.provideService(EffectOutbox.ExecutingEffect, effect),
               Effect.as("executed" as const),
@@ -1254,7 +1279,7 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
+            : !durableRecovery && effect.attemptCount >= maxAttempts
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

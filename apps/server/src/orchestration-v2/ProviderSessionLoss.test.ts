@@ -55,6 +55,8 @@ const sessionLoss = ({
   shared = true,
   buffered,
   foregroundOnly = false,
+  unstartedChild,
+  retryRecovery,
 }: {
   instance: "codex" | "codex-cu" | "opencode";
   reason: Sessions.ProviderSessionReleaseReason;
@@ -75,6 +77,8 @@ const sessionLoss = ({
   shared?: boolean;
   buffered?: "new turn" | "running update";
   foregroundOnly?: boolean;
+  unstartedChild?: "released" | "replacement" | "restarted";
+  retryRecovery?: "turn" | "root";
 }) =>
   Effect.gen(function* () {
     const allAdmitted = yield* Deferred.make<void>();
@@ -187,6 +191,7 @@ const sessionLoss = ({
         ? [ThreadId.make("session-loss-a"), ThreadId.make("session-loss-b")]
         : [ThreadId.make("session-loss-a")];
       const targets = [];
+      let unstartedRootMarker = "";
       for (const threadId of threads) {
         yield* engine.dispatch({
           type: "thread.create",
@@ -504,6 +509,28 @@ const sessionLoss = ({
           };
           const toolId = NodeId.make(`native-tool:${depth}`);
           const taskId = NodeId.make(`native-task:${depth}`);
+          if (unstartedChild !== undefined && depth === 1) {
+            unstartedRootMarker = `effect:session-ended-root:native-root:1:${DateTime.formatIso(now)}`;
+            yield* sink.write({
+              events: [
+                {
+                  id: EventId.make("unstarted-binding"),
+                  type: "provider-thread.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: providerThread,
+                },
+                {
+                  id: EventId.make("unstarted-root"),
+                  type: "node.updated",
+                  threadId,
+                  occurredAt: now,
+                  payload: { ...root, providerTurnId: null, startedAt: now },
+                },
+              ],
+            });
+            continue;
+          }
           const events = [
             {
               id: EventId.make(`native-thread:${depth}`),
@@ -1089,10 +1116,118 @@ const sessionLoss = ({
       if (nativeThreads) {
         for (let depth = 0; depth < 2; depth++) {
           const marker = Option.getOrThrow(
-            yield* outbox.get(`effect:session-ended:native-turn:${depth}`),
+            yield* outbox.get(
+              unstartedChild !== undefined && depth === 1
+                ? unstartedRootMarker
+                : `effect:session-ended:native-turn:${depth}`,
+            ),
           );
           assert.equal(marker.threadId, `native-child:${depth}`);
         }
+      }
+      if (unstartedChild !== undefined) {
+        const threadId = ThreadId.make("native-child:1");
+        const child = yield* projections.getThreadProjection(threadId);
+        assert.isEmpty(child.providerTurns);
+        const root = child.nodes.find((node) => node.id === "native-root:1")!;
+        const now = yield* DateTime.now;
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make("unrelated-unstarted-root"),
+              type: "node.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...root,
+                id: NodeId.make("unrelated-native-root"),
+                rootNodeId: NodeId.make("unrelated-native-root"),
+              },
+            },
+            ...(unstartedChild === "restarted"
+              ? [
+                  {
+                    id: EventId.make("restarted-unstarted-root"),
+                    type: "node.updated" as const,
+                    threadId,
+                    occurredAt: now,
+                    payload: { ...root, startedAt: DateTime.add(now, { milliseconds: 1 }) },
+                  },
+                ]
+              : []),
+            ...(unstartedChild === "replacement"
+              ? [
+                  {
+                    id: EventId.make("rebound-unstarted-root"),
+                    type: "node.updated" as const,
+                    threadId,
+                    occurredAt: now,
+                    payload: { ...root, providerTurnId: ProviderTurnId.make("new-native-turn") },
+                  },
+                  {
+                    id: EventId.make("rebound-native-turn"),
+                    type: "provider-turn.updated" as const,
+                    threadId,
+                    occurredAt: now,
+                    payload: {
+                      ...target.turn,
+                      id: ProviderTurnId.make("new-native-turn"),
+                      providerThreadId: child.providerThreads[0]!.id,
+                      runAttemptId: null,
+                      nodeId: root.id,
+                    },
+                  },
+                ]
+              : []),
+          ],
+        });
+      }
+      if (retryRecovery !== undefined) {
+        const threadId = ThreadId.make("native-child:1");
+        const id =
+          retryRecovery === "root" ? unstartedRootMarker : "effect:session-ended:native-turn:1";
+        const read = projections.getThreadRecords;
+        const claim = outbox.claimNext;
+        const claims = vi
+          .spyOn(outbox, "claimNext")
+          .mockImplementation((input) => claim({ ...input, threadId }));
+        let failures = 0;
+        const spy = vi
+          .spyOn(projections, "getThreadRecords")
+          .mockImplementation((id, records, options) =>
+            id === threadId && failures++ < 6
+              ? Effect.fail(
+                  new ProjectionStore.ProjectionStoreReadError({
+                    threadId,
+                    cause: "temporary storage failure",
+                  }),
+                )
+              : read(id, records, options),
+          );
+        yield* Effect.gen(function* () {
+          for (let attempt = 1; attempt <= 6; attempt++) {
+            assert.isTrue(yield* worker.runControlOnce);
+            const pending = Option.getOrThrow(yield* outbox.get(id));
+            assert.equal(pending.status, "pending");
+            assert.equal(pending.attemptCount, attempt);
+            yield* TestClock.adjust(
+              Math.max(
+                0,
+                Date.parse(pending.availableAt) - DateTime.toEpochMillis(yield* DateTime.now),
+              ),
+            );
+          }
+          spy.mockRestore();
+          assert.isTrue(yield* worker.runControlOnce);
+          assert.equal(Option.getOrThrow(yield* outbox.get(id)).status, "succeeded");
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              spy.mockRestore();
+              claims.mockRestore();
+            }),
+          ),
+        );
       }
       if (accepted === "before recovery") yield* executor.execute(steerEffect!);
       if (faultRead) {
@@ -1258,6 +1393,19 @@ const sessionLoss = ({
           const child = yield* projections.getThreadProjection(
             ThreadId.make(`native-child:${depth}`),
           );
+          if (unstartedChild !== undefined && depth === 1) {
+            assert.equal(
+              child.nodes.find((node) => node.id === "native-root:1")?.status,
+              unstartedChild !== "released" ? "running" : "interrupted",
+            );
+            assert.equal(
+              child.nodes.find((node) => node.id === "unrelated-native-root")?.status,
+              "running",
+            );
+            if (unstartedChild === "replacement")
+              assert.equal(child.providerTurns[0]?.status, "running");
+            continue;
+          }
           assert.equal(
             child.providerTurns.find((turn) => turn.id === `native-turn:${depth}`)?.status,
             "interrupted",
@@ -1432,5 +1580,37 @@ it.effect.each(["completed", "failed", "interrupted", "cancelled"] as const)(
       reason: "runtime_error",
       accepted: "after preflight",
       terminalBeforeRelease,
+    }),
+);
+
+it.effect.each(
+  (["running", "completed"] as const).flatMap((parent) =>
+    (["released", "replacement", "restarted"] as const).map((unstartedChild) => ({
+      parent,
+      unstartedChild,
+    })),
+  ),
+)(
+  "recovers a native child before its first turn ($parent, $unstartedChild)",
+  ({ parent, unstartedChild }) =>
+    sessionLoss({
+      instance: "codex-cu",
+      reason: "runtime_error",
+      nativeThreads: true,
+      unstartedChild,
+      ...(parent === "completed" ? { terminalBeforeRelease: parent } : {}),
+    }),
+);
+
+it.effect.each(["turn", "root"] as const)(
+  "recovers after six consecutive reconciliation read failures (%s)",
+  (retryRecovery) =>
+    sessionLoss({
+      instance: "codex-cu",
+      reason: "runtime_error",
+      nativeThreads: true,
+      terminalBeforeRelease: "completed",
+      retryRecovery,
+      ...(retryRecovery === "root" ? { unstartedChild: "released" as const } : {}),
     }),
 );

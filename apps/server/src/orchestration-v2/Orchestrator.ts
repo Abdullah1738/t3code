@@ -638,6 +638,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "checkpoint.rollback":
     case "checkpoint.rollback.fail":
     case "thread.background-work.settle":
+    case "thread.provider-root.settle":
     case "thread.stop":
     case "provider.switch":
       return command.threadId;
@@ -10872,6 +10873,52 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
   });
 
+  const dispatchProviderRootSettle = Effect.fn("Orchestrator.dispatchProviderRootSettle")(
+    function* (
+      command: Extract<
+        OrchestrationV2InternalCommand,
+        { readonly type: "thread.provider-root.settle" }
+      >,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    ) {
+      const projection = yield* projectionStore
+        .getThreadRecords(command.threadId, ["nodes", "turnItems"])
+        .pipe(
+          Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.succeed(null) }),
+          mapDispatchError(command),
+        );
+      const node = projection?.nodes.find((candidate) => candidate.id === command.nodeId);
+      if (
+        projection === null ||
+        node === undefined ||
+        node.providerTurnId !== null ||
+        node.providerThreadId !== command.providerThreadId ||
+        node.runId !== null ||
+        (node.startedAt === null
+          ? command.startedAt !== null
+          : command.startedAt === null ||
+            DateTime.toEpochMillis(node.startedAt) !== DateTime.toEpochMillis(command.startedAt))
+      )
+        return;
+      const now = yield* DateTime.now;
+      const ended = yield* endRunlessRootTurns({
+        threadId: command.threadId,
+        providerInstanceId: projection.thread.providerInstanceId,
+        projection: {
+          nodes: [node],
+          turnItems: projection.turnItems.filter((item) => item.providerTurnId === null),
+          providerTurns: [],
+        },
+        status: "interrupted",
+        now,
+        emitted: yield* Ref.get(events),
+        allocateEventId: () =>
+          idAllocator.allocate.event({ threadId: command.threadId, commandId: command.commandId }),
+      }).pipe(mapDispatchError(command));
+      yield* Ref.update(events, (current) => [...current, ...ended]);
+    },
+  );
+
   const dispatchBackgroundWorkSettle = Effect.fn("Orchestrator.dispatchBackgroundWorkSettle")(
     function* (
       command: Extract<
@@ -13697,6 +13744,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.background-work.settle":
         yield* dispatchBackgroundWorkSettle(command, events, effects);
         break;
+      case "thread.provider-root.settle":
+        yield* dispatchProviderRootSettle(command, events);
+        break;
       case "thread.fork":
         yield* dispatchThreadFork(command, events);
         break;
@@ -13995,6 +14045,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         planned.events.length > 0 ||
         command.type === "run.start-expire" ||
         command.type === "thread.background-work.settle" ||
+        command.type === "thread.provider-root.settle" ||
         command.type === "thread.stop" ||
         command.type === "subagent.stop" ||
         (command.type === "message.dispatch" && command.restartContinuationOfRunId !== undefined)
