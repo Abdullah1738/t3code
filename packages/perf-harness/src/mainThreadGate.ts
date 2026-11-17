@@ -36,6 +36,8 @@ export const mainThreadWorkload = {
 
 const Effect = await import("effect/Effect");
 const Layer = await import("effect/Layer");
+const Fiber = await import("effect/Fiber");
+const Schedule = await import("effect/Schedule");
 const DateTime = await import("effect/DateTime");
 const NodeServices = await import("@effect/platform-node/NodeServices");
 const Sqlite = await import("../../../apps/server/src/persistence/Sqlite.ts");
@@ -75,30 +77,30 @@ const pct = (values: ReadonlyArray<number>, p: number) => {
 type Sample = { ms: number; frozenMs: number; rows?: number; failure?: string };
 
 /** Longest gap between 1 ms ticks while `effect` is in flight: time the loop was frozen. */
-const frozen = <A>(effect: import("effect/Effect").Effect<A, unknown, never>) =>
-  Effect.gen(function* () {
-    let last = performance.now();
-    let worst = 0;
-    const timer = setInterval(() => {
-      const now = performance.now();
-      worst = Math.max(worst, now - last);
-      last = now;
-    }, 1);
-    // Let the ticker settle before the measured call.
-    yield* Effect.sleep("20 millis");
-    worst = 0;
-    last = performance.now();
-    const started = performance.now();
-    const exit = yield* Effect.exit(effect);
-    const ms = performance.now() - started;
-    worst = Math.max(worst, performance.now() - last);
-    clearInterval(timer);
-    const sample: Sample = { ms, frozenMs: worst };
-    if (exit._tag === "Success") {
-      if (Array.isArray(exit.value)) sample.rows = exit.value.length;
-    } else sample.failure = String(exit.cause).slice(0, 300);
-    return sample;
-  });
+// Sampling must not add tracing spans to the measured read.
+const frozen = Effect.fnUntraced(function* <A, E>(effect: import("effect/Effect").Effect<A, E>) {
+  let last = performance.now();
+  let worst = 0;
+  const ticker = yield* Effect.sync(() => {
+    const now = performance.now();
+    worst = Math.max(worst, now - last);
+    last = now;
+  }).pipe(Effect.repeat(Schedule.spaced("1 millis")), Effect.forkScoped);
+  // Let the ticker settle before the measured call.
+  yield* Effect.sleep("20 millis");
+  worst = 0;
+  last = performance.now();
+  const started = performance.now();
+  const exit = yield* Effect.exit(effect);
+  const ms = performance.now() - started;
+  worst = Math.max(worst, performance.now() - last);
+  yield* Fiber.interrupt(ticker);
+  const sample: Sample = { ms, frozenMs: worst };
+  if (exit._tag === "Success") {
+    if (Array.isArray(exit.value)) sample.rows = exit.value.length;
+  } else sample.failure = String(exit.cause).slice(0, 300);
+  return sample;
+}, Effect.scoped);
 
 const layer = Projection.layer.pipe(
   Layer.provideMerge(Sqlite.layerFromPath(mainPath)),
@@ -166,15 +168,11 @@ try {
       // The check turn start and run finalize make: is this run still current/active?
       const threadId = ThreadId.make("synthetic-thread-20");
       const runId = RunId.make("synthetic-run-absent");
-      const narrow = (
-        store as unknown as {
-          getRunControlState?: (
-            threadId: typeof threadId,
-            runId: typeof runId,
-          ) => import("effect/Effect").Effect<unknown, unknown, never>;
-        }
-      ).getRunControlState;
-      const check =
+      const narrow = "getRunControlState" in store ? store.getRunControlState : undefined;
+      const check: import("effect/Effect").Effect<
+        unknown,
+        import("../../../apps/server/src/orchestration-v2/ProjectionStore.ts").ProjectionStoreV2Error
+      > =
         typeof narrow === "function"
           ? narrow(threadId, runId)
           : store.getRuntimeRecoveryProjection(threadId);
