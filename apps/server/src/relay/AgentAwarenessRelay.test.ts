@@ -181,6 +181,11 @@ const makeTestRelay = Effect.fnUntraced(function* (
   const shellReads: ThreadId[] = [];
   const catchUp = { shellSnapshotReads: 0 };
   const threads = ThreadManagementService.ThreadManagementService.of({
+    recordDelegationTimeout: unused,
+    clearDelegationTimeout: unused,
+    reconcileDelegationTimeout: unused,
+    settleDelegationTimeout: unused,
+    sweepDelegationTimeouts: unused,
     promoteQueuedMessages: unused,
     getCallerRow: () => Effect.die("unused getCallerRow"),
     getThreadIdsForWorktree: () => Effect.die("unused getThreadIdsForWorktree"),

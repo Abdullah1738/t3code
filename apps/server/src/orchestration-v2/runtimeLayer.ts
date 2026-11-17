@@ -45,6 +45,7 @@ import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as ProviderRuntimeRecoveryService from "./ProviderRuntimeRecoveryService.ts";
+import { forkParked } from "../serverActivation.ts";
 import * as ProviderSwitchService from "./ProviderSwitchService.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
 import * as RestartPacing from "../ardud/restart-pacing/RestartPacing.ts";
@@ -468,6 +469,31 @@ export const layer = Layer.mergeAll(
 ).pipe(Layer.provideMerge(layerStartProgress));
 
 export const layerProduction = Layer.mergeAll(
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+      // Snapshot before activation so a new timeout cannot be mistaken for a previous process's work.
+      const pending = yield* receipts
+        .listDelegationTimeouts()
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("delegation timeout startup read failed", { cause }).pipe(
+              Effect.as([]),
+            ),
+          ),
+        );
+      yield* forkParked(
+        threads
+          .sweepDelegationTimeouts(pending)
+          .pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("delegation timeout startup sweep failed", { cause }),
+            ),
+          ),
+      );
+    }),
+  ).pipe(Layer.provide(Layer.mergeAll(layerThreadManagementProvided, CommandReceiptStore.layer))),
   layer.pipe(Layer.provide(layerProjectService)),
   layerProjectService,
   layerManagedProjectFoldersProvided,

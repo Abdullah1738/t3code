@@ -346,10 +346,32 @@ const TransactionAcquire = Context.Reference<TransactionPending | undefined>(
   { defaultValue: () => undefined },
 );
 
-/** Observes only a successful outer writer COMMIT, before the fiber can yield. */
+/** Observes a successful outer writer COMMIT after its acknowledgement. */
 export const TransactionCommitObserver = Context.Reference<(() => void) | undefined>(
   "@t3tools/shared/nodeSqliteClient/TransactionCommitObserver",
   { defaultValue: () => undefined },
+);
+
+// A fresh cell per transaction arbitrates expiry against native COMMIT execution:
+// 0 pending, 1 executing, 2 committed, 3 cancelled, 4 failed, 5 unknown worker exit.
+// ACK delivery is independent; an unknown result requires durable reconciliation.
+export const TransactionCommitSignal = Context.Reference<Int32Array<SharedArrayBuffer> | undefined>(
+  "@t3tools/shared/nodeSqliteClient/TransactionCommitSignal",
+  { defaultValue: () => undefined },
+);
+
+export const cancelTransactionCommit = Effect.fn("NodeSqliteClient.cancelTransactionCommit")(
+  (signal: Int32Array<SharedArrayBuffer>) =>
+    Effect.promise(async () => {
+      let state = Atomics.compareExchange(signal, 0, 0, 3);
+      // SQLite's synchronous COMMIT alone can win expiry; never wait for its worker reply or permit.
+      while (state === 1) {
+        const wait = Atomics.waitAsync(signal, 0, 1);
+        if (wait.async) await wait.value;
+        state = Atomics.load(signal, 0);
+      }
+      return state === 5 ? undefined : state === 2;
+    }),
 );
 
 export interface SqliteStatementObservation {
@@ -2039,6 +2061,7 @@ parentPort.on("message", (request) => {
   let priorRecovery = {};
   let classification;
   let executed = false;
+  let commitSignal;
   let lastPhase;
   const phase = (reason, attributes = {}) => {
     if (!request.preBegin || reason === lastPhase) return;
@@ -2099,6 +2122,14 @@ parentPort.on("message", (request) => {
     phase("sqlite_begin");
     if (isCancelled(id)) throw new Error("SQLite request cancelled before execution");
     operation = "execute";
+    if (request.commitSignal !== undefined && /^\\s*(?:COMMIT|END)\\s*;?\\s*$/i.test(statement.sourceSQL)) {
+      commitSignal = new Int32Array(request.commitSignal);
+      if (Atomics.compareExchange(commitSignal, 0, 0, 1) !== 0) {
+        if (db.isTransaction) db.exec("ROLLBACK");
+        throw new Error("SQLite transaction commit cancelled before execution");
+      }
+      Atomics.notify(commitSignal, 0);
+    }
     statement.setReadBigInts(safeIntegers);
     statement.setReturnArrays(values);
     const start = performance.now();
@@ -2110,6 +2141,10 @@ parentPort.on("message", (request) => {
       return raw ? result : [];
     })();
     executed = true;
+    if (commitSignal !== undefined) {
+      Atomics.store(commitSignal, 0, 2);
+      Atomics.notify(commitSignal, 0);
+    }
     elapsedMs += performance.now() - executionStarted;
     if (controlStarted !== undefined) controlMs = performance.now() - controlStarted;
     executionStarted = undefined;
@@ -2128,6 +2163,11 @@ parentPort.on("message", (request) => {
     parentPort.postMessage({ id, rows, committed, committedTransaction, write: observedWrite, elapsedMs, controlMs, checkpointWaitMs,
       inTransaction, ...priorRecovery, ...snapshot });
   } catch (error) {
+    if (commitSignal !== undefined && Atomics.load(commitSignal, 0) === 1) {
+      try { if (db.isTransaction) db.exec("ROLLBACK"); } catch {}
+      Atomics.store(commitSignal, 0, 4);
+      Atomics.notify(commitSignal, 0);
+    }
     activeClassification = undefined;
     const statementElapsed = executionStarted === undefined ? elapsedMs : (elapsedMs ?? 0) + performance.now() - executionStarted;
     if (controlStarted !== undefined && controlMs === undefined) controlMs = performance.now() - controlStarted;
@@ -2394,6 +2434,9 @@ const makeWriterSession = Effect.fnUntraced(function* (
               /* Timing must not change a transaction's outcome. */
             }
           if ("error" in reply) {
+            const signal = fiber.getRef(TransactionCommitSignal);
+            if (signal !== undefined && Atomics.compareExchange(signal, 0, 1, 5) === 1)
+              Atomics.notify(signal, 0);
             if (reply.inTransaction === false) setup.reset();
             setup.record(reply);
             resume(
@@ -2457,6 +2500,7 @@ const makeWriterSession = Effect.fnUntraced(function* (
             id,
             preBegin: preBegin !== undefined,
             cancellation: cancellation.buffer,
+            commitSignal: fiber.getRef(TransactionCommitSignal)?.buffer,
             safeIntegers: Boolean(Context.get(fiber.context, Client.SafeIntegers)),
           };
           preBegin?.phase("worker_queue", { "db.writer.pending_requests": pending.size });
@@ -2811,7 +2855,17 @@ const make = Effect.fn("makeWithDatabase")(function* (
             const controlStart = control === undefined ? undefined : performance.now();
             let arrays = false;
             let result: Exit.Exit<ReadonlyArray<unknown>, SqlError>;
+            const commitSignal = /^\s*(?:COMMIT|END)\s*;?\s*$/i.test(statement.sourceSQL)
+              ? fiber.getRef(TransactionCommitSignal)
+              : undefined;
             try {
+              if (
+                commitSignal !== undefined &&
+                Atomics.compareExchange(commitSignal, 0, 0, 1) !== 0
+              ) {
+                if (db.isTransaction) db.exec("ROLLBACK");
+                throw new Error("SQLite transaction commit cancelled before execution");
+              }
               const value = withClassification(classification, () => {
                 statement.setReadBigInts(Boolean(Context.get(fiber.context, Client.SafeIntegers)));
                 if (hasRows(statement)) {
@@ -2823,13 +2877,13 @@ const make = Effect.fn("makeWithDatabase")(function* (
                 return mode === "raw" ? (result as unknown as ReadonlyArray<unknown>) : [];
               });
               const commitObserver = fiber.getRef(TransactionCommitObserver);
-              if (
-                commitObserver !== undefined &&
-                !db.isTransaction &&
-                /^\s*(?:COMMIT|END)\s*;?\s*$/i.test(statement.sourceSQL)
-              ) {
+              if (!db.isTransaction && /^\s*(?:COMMIT|END)\s*;?\s*$/i.test(statement.sourceSQL)) {
+                if (commitSignal !== undefined) {
+                  Atomics.store(commitSignal, 0, 2);
+                  Atomics.notify(commitSignal, 0);
+                }
                 try {
-                  commitObserver();
+                  commitObserver?.();
                 } catch {
                   /* An observer cannot turn a successful COMMIT into a failed write. */
                 }
@@ -2861,6 +2915,13 @@ const make = Effect.fn("makeWithDatabase")(function* (
               executionFailed = false;
               result = Exit.succeed(value);
             } catch (cause) {
+              if (commitSignal !== undefined && Atomics.load(commitSignal, 0) === 1) {
+                try {
+                  if (db.isTransaction) db.exec("ROLLBACK");
+                } catch {}
+                Atomics.store(commitSignal, 0, 4);
+                Atomics.notify(commitSignal, 0);
+              }
               result = Exit.fail(
                 new SqlError({
                   reason: classifyError(cause, "Failed to execute statement", "execute", options),
