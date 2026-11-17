@@ -101,6 +101,22 @@ export async function install(ops, { rollback = false } = {}) {
     await ops.prune().catch((error) => ops.phase("prune_failed", { error: String(error) }));
 }
 
+export async function requestInstallerQuit({
+  home, pid, rollback = false, run, now = Date.now(), requesterPid = process.pid, fs: io = NodeFSP,
+}) {
+  const file = NodePath.join(home, ".robob/userdata/logs/desktop-quit-request.json");
+  await io.mkdir(NodePath.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${requesterPid}.tmp`;
+  await io.writeFile(temporary, JSON.stringify({
+    at: now, targetPid: pid, requesterPid, initiator: "installer",
+    reason: rollback ? "release-rollback" : "release-install",
+  }), { mode: 0o600 });
+  await io.rename(temporary, file);
+  try {
+    await run("/usr/bin/osascript", ["-e", 'tell application "Robob" to quit'], 2000);
+  } catch {}
+}
+
 async function writeBackupMarker(file, value, io) {
   const handle = await io.open(file, "w", 0o600);
   try {
@@ -912,9 +928,7 @@ export async function main(args, {
         NodePath.join(app, "Contents/MacOS/Robob"),
       );
       quitTree = tree;
-      try {
-        await run("/usr/bin/osascript", ["-e", 'tell application "Robob" to quit'], 2000);
-      } catch {}
+      await requestInstallerQuit({ home, pid, rollback, run });
       while ((await survivingOwned(tree, true, quitAbort)).length && Date.now() - quitAt < 12_000)
         await sleep(100);
       await cleanupOwnedTree(tree, 250, true, Math.max(1, 15_000 - (Date.now() - quitAt)));
