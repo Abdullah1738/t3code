@@ -289,7 +289,7 @@ const purposeText = (purpose: EvaluatorPurpose) => {
     case "nightly":
       return "Nightly review";
     case "stalled":
-      return "Stalled sweep: find cards that stopped moving (idle Working threads, flagged cards, review threads with no verdict). Read their threads, then steer, restart, split, re-route or escalate. Clear the stalled flag when fixed.";
+      return "Stalled sweep: find cards that stopped moving (idle Working threads, flagged cards, review threads with no verdict, completed/deployed cards whose evaluator step went idle). Read their threads, then steer, restart, split, re-route or escalate. Clear the stalled flag when fixed.";
     case "completed":
       return "Completed batch: for each Completed card, check the change is deployed where it should be. Move deployed ones to deployed; open a card for anything missing. Cards are completed and deployed only once the card's review passed. Leave a card alone while its current step is a board script's.";
     case "deployed":

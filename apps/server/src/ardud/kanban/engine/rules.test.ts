@@ -18,6 +18,7 @@ import * as DateTime from "effect/DateTime";
 import { newWait } from "./waits.ts";
 
 import {
+  idleEvaluatorStall,
   applyReviewResult,
   checkClaim,
   checkMove,
@@ -2871,3 +2872,171 @@ it.each(["todo", "needs_review"] as const)(
     );
   },
 );
+
+describe("idleEvaluatorStall", () => {
+  const since = "2026-10-25T00:00:00.000Z";
+  const now = Date.parse(since) + 7 * 3_600_000;
+  const task = {
+    id: "s2",
+    step: 2,
+    owner: "evaluator" as const,
+    text: "Next step",
+    state: "open" as const,
+    createdAt: since,
+    doneAt: null,
+    doneBy: null,
+    note: null,
+  };
+  const base = () =>
+    card({ stage: "completed", movedAt: since, updatedAt: since, subtasks: [task] });
+  it.each(["completed", "deployed"] as const)("matches an idle %s step", (stage) => {
+    expect(idleEvaluatorStall({ ...base(), stage }, now, board)).toEqual({
+      step: 2,
+      openEvaluatorSubtasks: ["s2"],
+      idleSinceAt: since,
+      reason: "Idle evaluator step s2",
+    });
+  });
+  it("uses the actual latest event rather than metadata updates", () => {
+    expect(
+      idleEvaluatorStall({ ...base(), updatedAt: iso(now), lastEventAt: since }, now, board),
+    ).not.toBeNull();
+  });
+  it.each([
+    ["five hours", () => ({ updatedAt: iso(now - 5 * 3_600_000) })],
+    [
+      "wait",
+      () => ({
+        wait: newWait(
+          { on: "time", until: iso(now + 3_600_000), note: "Later" },
+          { _tag: "owner" },
+          since,
+        ),
+      }),
+    ],
+    [
+      "blocking pick",
+      () => ({
+        asks: [
+          {
+            id: "q1",
+            text: "Pick",
+            kind: "pick" as const,
+            blocking: true,
+            by: { _tag: "owner" as const },
+            at: since,
+            seq: null,
+            closedAt: null,
+          },
+        ],
+      }),
+    ],
+    [
+      "nonblocking question",
+      () => ({
+        asks: [
+          {
+            id: "q1",
+            text: "Question",
+            blocking: false,
+            by: { _tag: "owner" as const },
+            at: since,
+            seq: null,
+            closedAt: null,
+          },
+        ],
+      }),
+    ],
+    ["script", () => ({ subtasks: [{ ...task, owner: "script" as const }] })],
+    ["worker", () => ({ subtasks: [{ ...task, owner: "work" as const }] })],
+    ["mixed script", () => ({ subtasks: [task, { ...task, id: "s3", owner: "script" as const }] })],
+    [
+      "flagged",
+      () => ({ stalled: { reason: "Paused", by: { _tag: "owner" as const }, at: since } }),
+    ],
+    ["settled", () => ({ settledAt: since })],
+    ["no tasks", () => ({ subtasks: [] })],
+    ["working", () => ({ stage: "working" as const })],
+  ] as const)("excludes %s", (_name, patch) => {
+    expect(idleEvaluatorStall({ ...base(), ...patch() }, now, board)).toBeNull();
+  });
+  it("ignores open notices and ended waits", () => {
+    const notice = {
+      id: "q1",
+      text: "Notice",
+      kind: "notice" as const,
+      blocking: false,
+      by: { _tag: "owner" as const },
+      at: since,
+      seq: null,
+      closedAt: null,
+    };
+    expect(idleEvaluatorStall({ ...base(), asks: [notice] }, now, board)).not.toBeNull();
+    const wait = newWait(
+      { on: "time", until: iso(now - 1), note: "Later" },
+      { _tag: "owner" },
+      since,
+    );
+    expect(idleEvaluatorStall({ ...base(), wait }, now, board)).not.toBeNull();
+    expect(
+      idleEvaluatorStall({ ...base(), wait: { ...wait, expiredAt: iso(now - 1) } }, now, board),
+    ).not.toBeNull();
+  });
+  it("honors the persisted release ledger and ignores revoked pacing", () => {
+    const recent = iso(now - 3_600_000);
+    const approval = {
+      id: "sa-1",
+      gate: "deploy" as const,
+      minIntervalHours: 4,
+      quote: "Release",
+      sourceThreadId: "owner",
+      saidAt: since,
+      approvedAsk: { cardId: "approval", askId: "q1" },
+      recordedAt: since,
+      recordedBy: "evaluator",
+      revokedAt: null,
+      revokedBy: null,
+      revokeReason: null,
+    };
+    const pacing = {
+      ...board,
+      standingApprovals: [approval],
+      releaseLedger: [
+        {
+          boardId: board.id,
+          cardId: KanbanCardId.make("released"),
+          cardNumber: 1,
+          subtaskId: "s1",
+          at: recent,
+          critical: null,
+          approvalId: approval.id,
+        },
+      ],
+    };
+    const input = { ...base(), subtasks: [{ ...task, interrupting: true }] };
+    expect(idleEvaluatorStall(input, now, pacing)).toBeNull();
+    expect(idleEvaluatorStall(input, now + 3 * 3_600_000, pacing)).not.toBeNull();
+    expect(
+      idleEvaluatorStall(input, now, {
+        ...pacing,
+        standingApprovals: [{ ...approval, revokedAt: recent }],
+      }),
+    ).not.toBeNull();
+  });
+  it("defers interrupting steps until the board or shared service window opens", () => {
+    const next = iso(now + 3_600_000);
+    const input = { ...base(), subtasks: [{ ...task, interrupting: true }] };
+    expect(idleEvaluatorStall(input, now, { ...board, nextReleaseWindowAt: next })).toBeNull();
+    expect(
+      idleEvaluatorStall(input, now + 3_600_000, { ...board, nextReleaseWindowAt: next }),
+    ).not.toBeNull();
+    expect(
+      idleEvaluatorStall(
+        { ...input, subtasks: [{ ...task, interrupting: true, service: "robob" }] },
+        now,
+        { ...board, nextReleaseWindowByService: { robob: next } },
+      ),
+    ).toBeNull();
+    expect(idleEvaluatorStall(base(), now, { ...board, nextReleaseWindowAt: next })).not.toBeNull();
+  });
+});

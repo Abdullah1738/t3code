@@ -130,7 +130,7 @@ const endsStall = (event: KanbanCardEvent) =>
 
 /** When the owner answered: the typed answer's time; plain asks keep only closedAt and count as closed. */
 const answeredAt = (ask: KanbanOwnerAsk): string | null => ask.answer?.at ?? null;
-const isNotice = (ask: Pick<KanbanOwnerAsk, "kind">) => ask.kind === "notice";
+const isNotice = Rules.isNotice;
 
 const askTouched = (ask: KanbanOwnerAsk, window: ActivityWindow) =>
   ask.closedAt === null ||
@@ -437,6 +437,8 @@ const capped = <T>(items: ReadonlyArray<T>, max: number) =>
 export interface RollupInput {
   readonly window: ActivityWindow;
   readonly currentAt?: string;
+  readonly idleEvaluatorBoard?: Rules.IdleEvaluatorBoard;
+  readonly lastEventAtByCard?: ReadonlyMap<string, string>;
   readonly currentSlots?: ReadonlyArray<SlotEvent>;
   readonly board?: KanbanBoard | Pick<KanbanBoard, "pause" | "setup" | "archivedAt"> | null;
   readonly dispatchCards?: ReadonlyArray<KanbanCard>;
@@ -1081,7 +1083,13 @@ export const rollup = (input: RollupInput) => {
   const stallItems: Array<{
     card: number;
     at: string;
-    kind: "run_failed" | "flagged" | "verdict_refused";
+    kind: "run_failed" | "flagged" | "verdict_refused" | "idle_evaluator";
+    stage?: KanbanStage;
+    step?: number;
+    openEvaluatorSubtasks?: string[];
+    idleHours?: number;
+    lastEventAt?: string;
+    evaluatorThreadAlive?: boolean;
     until?: string;
     minutes?: number;
     ongoing?: true;
@@ -1110,6 +1118,33 @@ export const rollup = (input: RollupInput) => {
       });
     });
   }
+
+  const nowMs = Date.parse(input.currentAt ?? until);
+  const idleBoard =
+    input.idleEvaluatorBoard ??
+    (input.board && "standingApprovals" in input.board ? input.board : undefined);
+  if (idleBoard)
+    for (const card of input.cards) {
+      const lastEventAt =
+        input.lastEventAtByCard?.get(card.id) ?? byCard.get(card.id)?.at(-1)?.at ?? card.updatedAt;
+      const idle = Rules.idleEvaluatorStall({ ...card, lastEventAt }, nowMs, idleBoard);
+      if (!idle) continue;
+      stallItems.push({
+        kind: "idle_evaluator",
+        card: card.number,
+        at: stamp(lastEventAt),
+        stage: card.stage,
+        step: idle.step,
+        openEvaluatorSubtasks: idle.openEvaluatorSubtasks,
+        idleHours: Math.round(((nowMs - Date.parse(lastEventAt)) / HOUR) * 10) / 10,
+        lastEventAt,
+        evaluatorThreadAlive: (threadsByCard.get(card.id) ?? []).some(
+          (link) => link.role === "evaluator" && link.endedAt === null,
+        ),
+      });
+    }
+  const stallsByKind: Record<string, number> = {};
+  for (const item of stallItems) stallsByKind[item.kind] = (stallsByKind[item.kind] ?? 0) + 1;
 
   // Run failures by the model of the thread that failed.
   const failures: Record<string, { count: number; reasons: Array<string> }> = {};
@@ -1291,7 +1326,7 @@ export const rollup = (input: RollupInput) => {
         ...capped(evaluatorOnly, max),
       },
     },
-    stalls: { count: stallItems.length, ...capped(stallItems, max) },
+    stalls: { count: stallItems.length, byKind: stallsByKind, ...capped(stallItems, max) },
     failures: { count: failureCount, byKind: failuresByKind, byPool: failures },
     threads: {
       started,
