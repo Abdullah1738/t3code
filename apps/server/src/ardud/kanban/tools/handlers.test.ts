@@ -8049,6 +8049,51 @@ it.effect("a work thread's card_create numbers the packet first in its gated rep
   }).pipe(Effect.provide(layer));
 });
 
+it.effect("a work thread's card_create with assignToSelf takes its own plan", () => {
+  const { layer, running } = fakeThreads();
+  return Effect.gen(function* () {
+    const kanban = yield* KanbanService.KanbanService;
+    const board = yield* kanban.ensureBoard({
+      slug: "worker-self-gates",
+      name: "Worker self gates",
+      defaultProjectId: ProjectId.make("project-1"),
+    });
+    yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+    const origin = yield* kanban.createCard(
+      board.id,
+      { title: "Origin", prompt: "Origin" },
+      owner,
+    );
+    yield* kanban.dispatchNow;
+    const worker = (yield* kanban.card(origin.id)).card.workThreadId!;
+    running.add(worker);
+    const created = yield* call(worker, "card_create", {
+      title: "Worker follow-up self",
+      prompt: "Follow-up",
+      assignToSelf: true,
+      subtasks: [{ text: "Deploy the helper", owner: "evaluator" }],
+    });
+    assert.isFalse(created.isError, created.text);
+    // The caller's own plan is the whole plan: no packet step in front of it.
+    assert.deepStrictEqual(created.structured.gated, [
+      { id: "s1", gate: "deploy", source: "guessed" },
+    ]);
+    const card = yield* decodeKanbanCard(created.structured.card);
+    assert.deepStrictEqual(
+      card.subtasks.map(({ id, step, text }) => [id, step, text]),
+      [["s1", 1, "Deploy the helper"]],
+    );
+    assert.strictEqual(card.workThreadId, worker);
+    const bare = yield* call(worker, "card_create", {
+      title: "Worker follow-up bare",
+      prompt: "Follow-up",
+      assignToSelf: true,
+    });
+    assert.isFalse(bare.isError, bare.text);
+    assert.deepStrictEqual((yield* decodeKanbanCard(bare.structured.card)).subtasks, []);
+  }).pipe(Effect.provide(layer));
+});
+
 it.effect(
   "card_edit clears three finished guesses and card_move verifies without reopening",
   () => {

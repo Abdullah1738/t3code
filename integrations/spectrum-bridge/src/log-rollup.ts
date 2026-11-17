@@ -12,6 +12,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const causes = new Map<string, { tag: string; causeKey: string; count: number }>();
   const renderFailures = new Map<string, number>();
   const represented = new Set<string>();
+  const representedSingleFailures = new Set<string>();
   const individualCalls: LogLine[] = [];
   const chainAggregation = createChainAggregation();
   const robobLink = createRobobLinkAggregation();
@@ -20,10 +21,13 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const alerts = new Set<string>();
   let overdue = 0, requeued_by_watchdog = 0, answered_late = 0;
   let total = 0, ok = 0, failed = 0, recordedRows = 0, failedCalls = 0;
+  let dedupedFailures = 0, countedErrors = 0;
   function observeError(line: LogLine) {
+    if (line.alreadyLogged === true) return;
     // Legacy request diagnostics are owned by control.catch1/2, including in mixed-version days.
     const requestFailure = line.component === "robob" && line.name === "turn.robob_call" && line.kind === "perf" && line.ok === false;
-    if (requestFailure && line.props?.failureFormat === "single") failedCalls++;
+    if (requestFailure && line.props?.failureFormat === "single"
+      && (!line.ids?.callBatchId || !representedSingleFailures.has(`${line.ids.callBatchId}\0${callName(line)}`))) failedCalls++;
     if (requestFailure && line.props?.failureFormat !== "single" && line.error?.tag === "control.request_failed") return;
     if (!line.error) return;
     if (line.error.causeKey) {
@@ -48,6 +52,10 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     names.set(name, stats); components.set(component, names);
   }
   function consume(line: LogLine, count = 1, oks = Number(line.ok === true), failures = Number(line.ok === false), histogram?: Iterable<[number, number]>) {
+    if (line.alreadyLogged === true) {
+      if (line.kind === "error" || failures > 0) dedupedFailures += count;
+      failures = 0;
+    } else if (line.kind === "error") countedErrors += count;
     total += count; ok += oks; failed += failures;
     countsByName[line.name] = (countsByName[line.name] ?? 0) + count;
     countsByKind[line.kind] += count;
@@ -84,6 +92,10 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     } else if (line.name === "turn.robob_calls" && line.calls) {
       for (const [name, stats] of Object.entries(line.calls)) {
         if (line.ids?.callBatchId) represented.add(`${line.ids.callBatchId}\0${name}`);
+        if (stats.singleFailures !== undefined) {
+          failedCalls += stats.singleFailures;
+          if (line.ids?.callBatchId) representedSingleFailures.add(`${line.ids.callBatchId}\0${name}`);
+        }
         consume({ ...line, name: "turn.robob_call", calls: undefined }, stats.count, stats.ok, stats.failed, stats.histogram);
         component("robob", name, stats.count, stats.ok, stats.failed, stats.histogram);
       }
@@ -112,7 +124,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     };
   }
   return { robob_link: robobLink.summary(day), overdue, requeued_by_watchdog, unanswered_alerts: alerts.size, answered_late, first_reply_latency_ms: percentiles(firstReplies), total, recordedRows, countsByName, countsByKind, ok, failed,
-    okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countsByKind.error + failedCalls) / total : 0,
+    dedupedFailures, okRate: ok + failed ? ok / (ok + failed) : 0, errorRate: total ? (countedErrors + failedCalls) / total : 0,
     durationMs, byComponent, cardRenderFailures: Object.fromEntries(renderFailures),
     topCauses: [...causes.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.causeKey.localeCompare(b.causeKey)).slice(0, 20), chains: chainAggregation.summary(),
     topErrorTags: [...errors.values()].sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag) || a.name.localeCompare(b.name)).slice(0, 20) };

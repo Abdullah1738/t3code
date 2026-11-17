@@ -1128,12 +1128,20 @@ export interface ClaimContext {
   readonly pools?: ReadonlyArray<KanbanPool>;
   /** Now: a card held for its evaluator is let go when the time to decide runs out. */
   readonly nowMs?: number;
+  /**
+   * The card is being created and taken by its own work thread in one call
+   * (card_create assignToSelf): the plan is the caller's, so an open step that
+   * is the evaluator's is not a reason to refuse the take.
+   */
+  readonly takeAtOnce?: boolean;
 }
 
 /**
  * A work thread may take a todo card that runs on its pool and project, isn't
  * running, stalled or kept for another work thread, and isn't blocked by work
- * outside the thread or awaiting review or merge.
+ * outside the thread or awaiting review or merge. A card it creates and takes in
+ * one call (`takeAtOnce`) is its own plan, so an open step owned by the
+ * evaluator or a script does not hold it back.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
   // Same hold as planDispatch: no card work starts while the board's setup runs.
@@ -1166,7 +1174,7 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
       "evaluator_decision_pending",
     );
   }
-  if (kanbanWaitsOnEvaluator(card)) {
+  if (!ctx.takeAtOnce && kanbanWaitsOnEvaluator(card)) {
     return no(
       `card #${card.number} waits on ${kanbanScriptStep(card) ? "a script's" : "an evaluator's"} subtask first`,
       "evaluator_step_pending",
