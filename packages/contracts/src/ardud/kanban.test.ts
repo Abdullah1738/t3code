@@ -740,7 +740,21 @@ describe("kanbanBoardIcon", () => {
     expect(decodeBoard(stored).iconImage).toBeNull();
     expect(decodeBoard(stored).nightlyReview).toBeNull();
     expect(decodeBoard(stored).standingApprovals).toEqual([]);
+    expect(decodeBoard(stored).criticalOverflowSlots).toBe(1);
   });
+
+  it.each([0, 1, 2, 3, 4])("accepts %i critical overflow slots", (criticalOverflowSlots) => {
+    expect(decodeBoard({ ...stored, criticalOverflowSlots }).criticalOverflowSlots).toBe(
+      criticalOverflowSlots,
+    );
+  });
+
+  it.each([-1, 5, 1.5, "1", null])(
+    "rejects invalid critical overflow slots %s",
+    (criticalOverflowSlots) => {
+      expect(() => decodeBoard({ ...stored, criticalOverflowSlots })).toThrow();
+    },
+  );
 
   it("takes only small inline pictures as a board image", () => {
     const valid = Schema.is(KanbanBoardIconImage);
