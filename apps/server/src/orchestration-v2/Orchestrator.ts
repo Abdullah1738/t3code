@@ -406,6 +406,7 @@ export interface OrchestratorV2DispatchResult {
 
 export interface OrchestratorDispatchOptions {
   readonly isStale?: () => boolean;
+  readonly retryPlanningFailures?: boolean;
 }
 
 export interface OrchestratorV2Shape {
@@ -13969,6 +13970,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
   const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
     command: OrchestrationV2ServerCommand,
+    options?: OrchestratorDispatchOptions,
   ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
     yield* Effect.annotateCurrentSpan({
       "orchestration_v2.command_id": command.commandId,
@@ -14178,6 +14180,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           if (cause._tag === "OrchestratorThreadAboveModeLimitError") return yield* cause;
           // Native input already arrived. A failed bookkeeping read must not poison its retry id.
           if (command.type === "notification.delivery.accept") return yield* cause;
+          // Durable recovery owns this retry; a rejected receipt would poison its stable id.
+          if (options?.retryPlanningFailures) return yield* cause;
           const rejectedAt = yield* DateTime.now;
           const receipt = yield* eventSink
             .commitRejectedCommand({
@@ -14543,7 +14547,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 revoked: true,
               }),
             )
-          : dispatchWithReceiptEffect(command),
+          : dispatchWithReceiptEffect(command, options),
       ),
     );
     if (command.type === "thread.stop") {

@@ -17,7 +17,7 @@ import type { CallerRow } from "../orchestration-v2/ProjectionStore.ts";
 import { claudeRecoveryResult } from "../orchestration-v2/launchRecovery.ts";
 import { stalledSummary } from "../orchestration-v2/delegatedTaskProgress.ts";
 import {
-  type AnalyticsEvent,
+  AnalyticsEvent,
   CommandId,
   type RunAttemptId,
   type RunId,
@@ -264,6 +264,15 @@ type CallerParent = { readonly thread: CallerRow };
 const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
 const isProjectionStoreThreadNotFoundError = Schema.is(ProjectionStoreThreadNotFoundError);
 const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
+const encodeDetachedAnalytics = Schema.encodeEffect(Schema.fromJsonString(AnalyticsEvent));
+const uncertainAsyncExit = (exit: Exit.Exit<unknown, unknown>) => {
+  const error = Exit.isFailure(exit)
+    ? exit.cause.reasons.find((reason) => reason._tag === "Fail")?.error
+    : undefined;
+  return (
+    isOrchestratorMcpFailure(error) && error.code === "delegation_timeout" && error.saved !== true
+  );
+};
 
 function failure(
   code: OrchestratorMcpFailure["code"],
@@ -2238,7 +2247,7 @@ const make = Effect.gen(function* () {
               detail =
                 state.status === "abandoned"
                   ? ` This delegation was not created: the create stopped after ${state.elapsedSeconds} s waiting at dispatch/threadManagement.dispatch (${state.reason}). Nothing ran. Retry delegate_task with the same clientRequestId.`
-                  : " This delegation was never saved. Retry delegate_task with the same clientRequestId.";
+                  : ` This delegation was never saved${state.reason === undefined ? "" : `: ${state.reason}`}. Retry delegate_task with the same clientRequestId.`;
             break;
         }
       }
@@ -3350,6 +3359,7 @@ const make = Effect.gen(function* () {
         ...(input.target?.model === undefined ? {} : { "t3.delegate.model": input.target.model }),
       });
       let retryKey = input.clientRequestId;
+      let detachedOutcomeHook: Parameters<typeof McpDeadline.withDeadline>[1]["onDetachedOutcome"];
       const bounded = <A, E, R>(stage: string, effect: Effect.Effect<A, E, R>, taskId?: string) =>
         McpDeadline.withDeadline(effect, {
           code: stage === "caller" ? "caller_unresolved" : "delegation_timeout",
@@ -3366,6 +3376,9 @@ const make = Effect.gen(function* () {
           ...(retryKey === undefined ? {} : { requestKey: retryKey }),
           ...(taskId === undefined ? {} : { taskId }),
           ...(stage === "dispatch" ? { onTimeout: "detach" as const } : {}),
+          ...(stage === "dispatch" && detachedOutcomeHook !== undefined
+            ? { onDetachedOutcome: detachedOutcomeHook }
+            : {}),
         }).pipe((bounded) => McpTaskTrace.stage(bounded, stage));
       const { scope, parent } = yield* bounded(
         "caller",
@@ -3749,6 +3762,99 @@ const make = Effect.gen(function* () {
         Effect.Success<ReturnType<typeof threadManagement.dispatch>>,
         OrchestratorMcpFailure
       >();
+      let outcomeAttemptId: string | undefined;
+      if (input.mode !== "wait") {
+        const callerSettled = yield* Deferred.make<boolean>();
+        const analyticsCall = yield* Effect.serviceOption(McpCallAnalytics.McpCall);
+        const now = yield* DateTime.now;
+        const identity = Option.isSome(analyticsCall)
+          ? analyticsCall.value.detachedAnalytics
+          : undefined;
+        const event =
+          identity === undefined
+            ? null
+            : yield* encodeDetachedAnalytics({
+                tool: identity.tool,
+                ...(identity.callerThreadId === undefined
+                  ? {}
+                  : { callerThreadId: identity.callerThreadId }),
+                startedAt: identity.startedAt,
+                bootId: identity.bootId,
+                build: identity.build,
+                clientRequestId: McpCallAnalytics.hashClientRequestId(key, identity.callerIdentity),
+                ts: DateTime.formatIso(now),
+                kind: "mcp.detached",
+                surface: "server",
+                route: "mcp",
+                outcome: "failed",
+                ...(Option.isSome(analyticsCall)
+                  ? {
+                      ...(analyticsCall.value.boardId === undefined
+                        ? {}
+                        : { boardId: analyticsCall.value.boardId }),
+                      ...(analyticsCall.value.cardId === undefined
+                        ? {}
+                        : { cardId: analyticsCall.value.cardId }),
+                      ...(analyticsCall.value.cardNumber === undefined
+                        ? {}
+                        : { cardNumber: analyticsCall.value.cardNumber }),
+                      ...(analyticsCall.value.callerCardNumber === undefined
+                        ? {}
+                        : { callerCardNumber: analyticsCall.value.callerCardNumber }),
+                    }
+                  : {}),
+              }).pipe(Effect.orDie);
+        outcomeAttemptId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+        const attemptId = outcomeAttemptId;
+        yield* Effect.addFinalizer((exit) =>
+          Deferred.succeed(callerSettled, uncertainAsyncExit(exit)),
+        );
+        detachedOutcomeHook = (outcome) =>
+          Deferred.await(callerSettled).pipe(
+            Effect.flatMap((timedOut) =>
+              timedOut
+                ? threadManagement.settleDelegationTimeout(commandId, outcome, false, attemptId)
+                : Effect.succeed("suppressed_definite" as const),
+            ),
+          );
+        const admissionCommit = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+        const admission = yield* bounded(
+          "outcome_admission",
+          threadManagement
+            .recordDelegationTimeout({
+              attemptId,
+              commandId,
+              parentThreadId: scope.thread.threadId,
+              clientRequestId: key,
+              taskId: expectedTaskId,
+              createdAt: DateTime.formatIso(now),
+              analyticsJson: event,
+            })
+            .pipe(
+              Effect.mapError(threadManagementFailure),
+              Effect.provideService(NodeSqliteClient.TransactionCommitSignal, admissionCommit),
+            ),
+        ).pipe(Effect.exit);
+        if (Exit.isFailure(admission)) {
+          const committed = yield* NodeSqliteClient.cancelTransactionCommit(admissionCommit);
+          if (
+            committed ??
+            (yield* threadManagement.reconcileDelegationTimeout(commandId, attemptId))
+          ) {
+            // The writer publishes COMMIT independently of its delayed acknowledgement.
+            yield* detachedOutcomeHook({
+              outcome: "failed",
+              stage: "outcome_admission",
+              elapsedSeconds: Math.round(
+                Number((yield* Clock.monotonicTimeNanos) - waitStartedAt) / 1_000_000_000,
+              ),
+              reason: "admission completed after its deadline; create was not dispatched",
+            }).pipe(Effect.forkDetach);
+            return yield* uncertainCreation(undefined);
+          }
+          return yield* Effect.failCause(admission.cause);
+        }
+      }
       const upgradeCompletionWake = Effect.fn("OrchestratorMcpService.upgradeCompletionWake")(
         (taskId: NodeId) =>
           threadManagement
@@ -3799,204 +3905,244 @@ const make = Effect.gen(function* () {
       // ThreadManagementService.dispatch is the chokepoint for this command
       // type's own enablement check, using the same command id and its
       // receipt-replay exemption, so no separate assert runs here.
-      const dispatched = yield* threadManagement
-        .dispatch({
-          type: "delegated_task.request",
-          createdBy: "agent",
-          creationSource: "mcp",
-          commandId,
-          parentThreadId: scope.thread.threadId,
-          parentRunId: parentRun.id,
-          parentNodeId: parentRun.rootNodeId,
-          parentAdmittedAt,
-          ...(callerRuntime === undefined ? {} : { parentProviderSessionId: callerRuntime }),
-          task: taskPrompt(input),
-          ...(input.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: input.idleTimeoutMs }),
-          ...(input.title === undefined ? {} : { title: input.title }),
-          modelSelection: target.modelSelection,
-          ...(target.selectionRouting === undefined
-            ? {}
-            : { selectionRouting: target.selectionRouting }),
-          runtimeMode,
-          interactionMode,
-          ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
-          // Async delegations wake the parent on every child terminal; wait
-          // delegations deliver through the blocking tool call, so a wake is
-          // only needed if the parent settled first (timeout, disconnect).
-          completionWake: input.mode === "wait" ? "settled_only" : "always",
-        })
-        .pipe(
-          Effect.catchTags({
-            OrchestratorCommandRejectedError: (error) =>
-              rejected(userFacingDispatchErrorMessage(error) ?? error.message).pipe(
-                Effect.flatMap(Effect.fail),
+      const parentNodeId = parentRun.rootNodeId;
+      const response = yield* Effect.gen(function* () {
+        const dispatched = yield* threadManagement
+          .dispatch({
+            type: "delegated_task.request",
+            createdBy: "agent",
+            creationSource: "mcp",
+            commandId,
+            parentThreadId: scope.thread.threadId,
+            parentRunId: parentRun.id,
+            parentNodeId,
+            parentAdmittedAt,
+            ...(callerRuntime === undefined ? {} : { parentProviderSessionId: callerRuntime }),
+            task: taskPrompt(input),
+            ...(input.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: input.idleTimeoutMs }),
+            ...(input.title === undefined ? {} : { title: input.title }),
+            modelSelection: target.modelSelection,
+            ...(target.selectionRouting === undefined
+              ? {}
+              : { selectionRouting: target.selectionRouting }),
+            runtimeMode,
+            interactionMode,
+            ...(workspaceStrategy === undefined ? {} : { workspaceStrategy }),
+            // Async delegations wake the parent on every child terminal; wait
+            // delegations deliver through the blocking tool call, so a wake is
+            // only needed if the parent settled first (timeout, disconnect).
+            completionWake: input.mode === "wait" ? "settled_only" : "always",
+          })
+          .pipe(
+            Effect.catchTags({
+              OrchestratorCommandRejectedError: (error) =>
+                rejected(userFacingDispatchErrorMessage(error) ?? error.message).pipe(
+                  Effect.flatMap(Effect.fail),
+                ),
+              OrchestratorCommandPreviouslyRejectedError: (error) =>
+                rejected(error.detail, true).pipe(Effect.flatMap(Effect.fail)),
+            }),
+            Effect.mapError((error) =>
+              isOrchestratorMcpFailure(error)
+                ? error
+                : error._tag === "ThreadManagementProviderInstanceDisabledError"
+                  ? threadManagementFailure(error)
+                  : failure(
+                      "orchestration_error",
+                      `Unable to create delegated task: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
+                    ),
+            ),
+            (dispatch) =>
+              Effect.uninterruptibleMask((restore) =>
+                Effect.gen(function* () {
+                  const result = yield* restore(dispatch);
+                  const createdRun = result.storedEvents.find(
+                    (stored) =>
+                      stored.event.type === "run.created" &&
+                      stored.event.payload.workspacePreparation !== undefined,
+                  );
+                  // A late commit must schedule preparation before its bounded waiter can leave.
+                  const preparation =
+                    createdRun?.event.type === "run.created"
+                      ? yield* threadLaunch
+                          .prepareRun({
+                            commandId,
+                            threadId: createdRun.event.threadId,
+                            runId: createdRun.event.payload.id,
+                          })
+                          .pipe(Effect.forkIn(serviceScope, { uninterruptible: false }))
+                      : undefined;
+                  return { result, preparation };
+                }),
               ),
-            OrchestratorCommandPreviouslyRejectedError: (error) =>
-              rejected(error.detail, true).pipe(Effect.flatMap(Effect.fail)),
-          }),
-          Effect.mapError((error) =>
-            isOrchestratorMcpFailure(error)
-              ? error
-              : error._tag === "ThreadManagementProviderInstanceDisabledError"
-                ? threadManagementFailure(error)
-                : failure(
-                    "orchestration_error",
-                    `Unable to create delegated task: ${userFacingDispatchErrorMessage(error) ?? errorMessage(error)}`,
-                  ),
-          ),
-          (dispatch) =>
-            Effect.uninterruptibleMask((restore) =>
+            Effect.onExit((exit) =>
+              Deferred.done(
+                dispatchAccepted,
+                Exit.map(exit, ({ result }) => result),
+              ),
+            ),
+            (effect) => bounded("dispatch", effect, expectedTaskId),
+            Effect.catch((error) =>
               Effect.gen(function* () {
-                const result = yield* restore(dispatch);
-                const createdRun = result.storedEvents.find(
-                  (stored) =>
-                    stored.event.type === "run.created" &&
-                    stored.event.payload.workspacePreparation !== undefined,
-                );
-                // A late commit must schedule preparation before its bounded waiter can leave.
-                const preparation =
-                  createdRun?.event.type === "run.created"
-                    ? yield* threadLaunch
-                        .prepareRun({
-                          commandId,
-                          threadId: createdRun.event.threadId,
-                          runId: createdRun.event.payload.id,
-                        })
-                        .pipe(Effect.forkIn(serviceScope, { uninterruptible: false }))
-                    : undefined;
-                return { result, preparation };
+                if (
+                  error.saved !== undefined ||
+                  (error.code !== "delegation_timeout" && error.code !== "orchestration_error")
+                )
+                  return yield* error;
+                if (input.mode !== "wait" && error.code === "delegation_timeout") {
+                  const accepted = yield* Deferred.await(dispatchAccepted).pipe(
+                    Effect.exit,
+                    Effect.timeoutOption(ASYNC_DISPATCH_GRACE),
+                  );
+                  if (Option.isSome(accepted)) {
+                    if (Exit.isSuccess(accepted.value))
+                      return {
+                        receipt: yield* recoverAsyncReceipt(
+                          accepted.value.value,
+                          target.modelSelection,
+                        ),
+                      };
+                    const createError = accepted.value.cause.reasons.find(
+                      (reason) => reason._tag === "Fail",
+                    )?.error;
+                    if (createError?.saved === false) return yield* createError;
+                  }
+                }
+                const state = yield* creationState();
+                if (
+                  input.mode !== "wait" &&
+                  (state === undefined || state.status === "pending") &&
+                  (yield* readPersistedTask())
+                )
+                  return {
+                    receipt: yield* recoverAsyncReceipt(undefined, target.modelSelection),
+                  };
+                if (
+                  state?.status === "accepted" &&
+                  state.threadId === scope.thread.threadId &&
+                  state.commandType === "delegated_task.request"
+                ) {
+                  yield* McpCallAnalytics.setSaved(true);
+                  savedTaskId = expectedTaskId;
+                  if (input.mode !== "wait")
+                    return {
+                      receipt: yield* recoverAsyncReceipt(undefined, target.modelSelection),
+                    };
+                  if (error.code !== "delegation_timeout") return yield* uncertainCreation(true);
+                }
+                if (
+                  state?.status === "rejected" &&
+                  state.threadId === scope.thread.threadId &&
+                  state.commandType === "delegated_task.request"
+                ) {
+                  return yield* yield* rejected(
+                    state.error ?? "The orchestrator rejected the request.",
+                  );
+                }
+                if (input.mode === "wait" && error.code === "delegation_timeout") {
+                  const accepted = yield* Deferred.await(dispatchAccepted).pipe(
+                    Effect.catchCause((cause) =>
+                      Effect.gen(function* () {
+                        if (savedTaskId !== undefined) return yield* uncertainCreation(true);
+                        const createError = cause.reasons.find(
+                          (reason) => reason._tag === "Fail",
+                        )?.error;
+                        if (createError?.saved !== undefined) return yield* createError;
+                        const finalState = yield* creationState();
+                        if (
+                          finalState?.status === "accepted" &&
+                          finalState.threadId === scope.thread.threadId &&
+                          finalState.commandType === "delegated_task.request"
+                        ) {
+                          savedTaskId = expectedTaskId;
+                          yield* McpCallAnalytics.setSaved(true);
+                          return yield* uncertainCreation(true);
+                        }
+                        if (
+                          finalState?.status === "rejected" ||
+                          finalState?.status === "abandoned" ||
+                          finalState?.status === "never_saved"
+                        )
+                          return yield* yield* rejected(
+                            finalState.status === "rejected"
+                              ? (finalState.error ??
+                                  createError?.message ??
+                                  "The create was rejected.")
+                              : (createError?.message ?? "The create stopped before it was saved."),
+                          );
+                        return yield* Effect.failCause(cause);
+                      }),
+                    ),
+                    Effect.timeoutOption(
+                      Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs)),
+                    ),
+                  );
+                  if (Option.isSome(accepted)) {
+                    yield* McpCallAnalytics.dispatchFenceRecovered;
+                    yield* Effect.annotateCurrentSpan({
+                      "t3.delegate.dispatch_fence_recovered": true,
+                    });
+                    // Retain the committed events for the timeout fallback; waitForTask
+                    // reads the current projection within the remaining call budget.
+                    return { result: accepted.value, preparation: undefined };
+                  }
+                  return yield* state?.status === "accepted" ? uncertainCreation(true) : error;
+                }
+                if (
+                  (input.mode !== "wait" || error.code === "orchestration_error") &&
+                  (state?.status === "abandoned" || state?.status === "never_saved")
+                ) {
+                  return yield* yield* rejected(
+                    input.mode === "wait"
+                      ? error.message
+                      : state.status === "abandoned"
+                        ? state.reason
+                        : "The create was never saved.",
+                  );
+                }
+                return yield* error;
               }),
             ),
-          Effect.onExit((exit) =>
-            Deferred.done(
-              dispatchAccepted,
-              Exit.map(exit, ({ result }) => result),
-            ),
-          ),
-          (effect) => bounded("dispatch", effect, expectedTaskId),
-          Effect.catch((error) =>
-            Effect.gen(function* () {
-              if (
-                error.saved !== undefined ||
-                (error.code !== "delegation_timeout" && error.code !== "orchestration_error")
-              )
-                return yield* error;
-              if (input.mode !== "wait" && error.code === "delegation_timeout") {
-                const accepted = yield* Deferred.await(dispatchAccepted).pipe(
-                  Effect.exit,
-                  Effect.timeoutOption(ASYNC_DISPATCH_GRACE),
-                );
-                if (Option.isSome(accepted)) {
-                  if (Exit.isSuccess(accepted.value))
-                    return {
-                      receipt: yield* recoverAsyncReceipt(
-                        accepted.value.value,
-                        target.modelSelection,
-                      ),
-                    };
-                  const createError = accepted.value.cause.reasons.find(
-                    (reason) => reason._tag === "Fail",
-                  )?.error;
-                  if (createError?.saved === false) return yield* createError;
-                }
-              }
-              const state = yield* creationState();
-              if (
-                input.mode !== "wait" &&
-                (state === undefined || state.status === "pending") &&
-                (yield* readPersistedTask())
-              )
-                return {
-                  receipt: yield* recoverAsyncReceipt(undefined, target.modelSelection),
-                };
-              if (
-                state?.status === "accepted" &&
-                state.threadId === scope.thread.threadId &&
-                state.commandType === "delegated_task.request"
-              ) {
-                yield* McpCallAnalytics.setSaved(true);
-                savedTaskId = expectedTaskId;
-                if (input.mode !== "wait")
-                  return { receipt: yield* recoverAsyncReceipt(undefined, target.modelSelection) };
-                if (error.code !== "delegation_timeout") return yield* uncertainCreation(true);
-              }
-              if (
-                state?.status === "rejected" &&
-                state.threadId === scope.thread.threadId &&
-                state.commandType === "delegated_task.request"
-              ) {
-                return yield* yield* rejected(
-                  state.error ?? "The orchestrator rejected the request.",
-                );
-              }
-              if (input.mode === "wait" && error.code === "delegation_timeout") {
-                const accepted = yield* Deferred.await(dispatchAccepted).pipe(
-                  Effect.catchCause((cause) =>
-                    Effect.gen(function* () {
-                      if (savedTaskId !== undefined) return yield* uncertainCreation(true);
-                      const createError = cause.reasons.find(
-                        (reason) => reason._tag === "Fail",
-                      )?.error;
-                      if (createError?.saved !== undefined) return yield* createError;
-                      const finalState = yield* creationState();
-                      if (
-                        finalState?.status === "accepted" &&
-                        finalState.threadId === scope.thread.threadId &&
-                        finalState.commandType === "delegated_task.request"
-                      ) {
-                        savedTaskId = expectedTaskId;
-                        yield* McpCallAnalytics.setSaved(true);
-                        return yield* uncertainCreation(true);
-                      }
-                      if (
-                        finalState?.status === "rejected" ||
-                        finalState?.status === "abandoned" ||
-                        finalState?.status === "never_saved"
-                      )
-                        return yield* yield* rejected(
-                          finalState.status === "rejected"
-                            ? (finalState.error ??
-                                createError?.message ??
-                                "The create was rejected.")
-                            : (createError?.message ?? "The create stopped before it was saved."),
-                        );
-                      return yield* Effect.failCause(cause);
-                    }),
-                  ),
-                  Effect.timeoutOption(
-                    Duration.millis(yield* remainingWaitMs(waitStartedAt, input.timeoutMs)),
-                  ),
-                );
-                if (Option.isSome(accepted)) {
-                  yield* McpCallAnalytics.dispatchFenceRecovered;
-                  yield* Effect.annotateCurrentSpan({
-                    "t3.delegate.dispatch_fence_recovered": true,
-                  });
-                  // Retain the committed events for the timeout fallback; waitForTask
-                  // reads the current projection within the remaining call budget.
-                  return { result: accepted.value, preparation: undefined };
-                }
-                return yield* state?.status === "accepted" ? uncertainCreation(true) : error;
-              }
-              if (
-                (input.mode !== "wait" || error.code === "orchestration_error") &&
-                (state?.status === "abandoned" || state?.status === "never_saved")
-              ) {
-                return yield* yield* rejected(
-                  input.mode === "wait"
-                    ? error.message
-                    : state.status === "abandoned"
-                      ? state.reason
-                      : "The create was never saved.",
-                );
-              }
-              return yield* error;
-            }),
-          ),
+          );
+        if ("receipt" in dispatched) return dispatched.receipt;
+        const { result, preparation } = dispatched;
+        return yield* continueDelegation(
+          expectedTaskId,
+          result,
+          preparation,
+          target.modelSelection,
         );
-      if ("receipt" in dispatched) return dispatched.receipt;
-      const { result, preparation } = dispatched;
-      return yield* continueDelegation(expectedTaskId, result, preparation, target.modelSelection);
+      }).pipe(Effect.exit);
+      if (input.mode !== "wait" && !uncertainAsyncExit(response)) {
+        if (Exit.isSuccess(response)) {
+          yield* threadManagement
+            .clearDelegationTimeout(commandId, outcomeAttemptId)
+            .pipe(Effect.ignoreCause, Effect.forkDetach);
+        } else if (outcomeAttemptId !== undefined) {
+          // A definite unsaved reply must clear its recovery intent before the caller knows the outcome.
+          // If writer admission is unavailable, keep the timeout contract and let the outcome hook wake it.
+          const retirementCommit = new Int32Array(
+            new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+          );
+          const cleared = yield* bounded(
+            "outcome_cleanup",
+            threadManagement
+              .clearDelegationTimeout(commandId, outcomeAttemptId)
+              .pipe(
+                Effect.mapError(threadManagementFailure),
+                Effect.provideService(NodeSqliteClient.TransactionCommitSignal, retirementCommit),
+              ),
+          ).pipe(Effect.exit);
+          if (Exit.isFailure(cleared)) {
+            const committed = yield* NodeSqliteClient.cancelTransactionCommit(retirementCommit);
+            const retired =
+              committed ??
+              !(yield* threadManagement.reconcileDelegationTimeout(commandId, outcomeAttemptId));
+            if (!retired) return yield* uncertainCreation(undefined);
+          }
+        }
+      }
+      return yield* response;
     }, withDelegationLifetime),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       yield* Effect.annotateCurrentSpan({
