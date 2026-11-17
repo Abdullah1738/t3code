@@ -28,7 +28,7 @@ from . import command_usage, common, containers, java_version, prune, prepare, u
 from . import resources, box_disk, queue_lifecycle
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
-                     is_silenced, offsets_path, person, read_json, record_delivery, say, silence, write)
+                     is_silenced, offsets_path, person, read_json, record_delivery, say, silence, size_summary, write)
 
 
 def _source_stamp():
@@ -1721,38 +1721,64 @@ class Runner:
                 con.close()
         db_retry(update)
 
+    def decide_size(self, con, cmd_text):
+        a, me = self.a, self.me
+        # Freeze the decision in the submitter; --bg serializes it with the args for the detached client.
+        if not hasattr(a, '_size_decision'):
+            a._size_decision = lease.auto_size(con, cmd_text, me, a.size)
+            size, why = a._size_decision
+            if why:
+                say(f"NOTE run {self.run_id} will run on {size}" +
+                    (f", not the --size {a.size} you asked for" if a.size and a.size != size else "") +
+                    f": {why}")
+        return a._size_decision
+
     def register_pending(self) -> None:
         if self.registered:
             return
         a, me = self.a, self.me
-        con = db()
-        existing = con.execute('SELECT client_pid,mode FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
-        if existing:
-            con.close()
-            if existing['client_pid'] != os.getpid() or not (
-                    (a.bg and existing['mode'] == 'bg') or os.environ.get(home.RETURNED_HOME_ENV)):
-                raise OffboxError(f'{self.run_id}: queued run belongs to another client', code=EXIT_LOCAL)
-            self.registered = True
-            return
         steps = getattr(a, "steps", None) or []
-        if steps:
-            cmd_text = " ; ".join(steps)
-        else:
-            cmd_text = " ".join(shlex.quote(x) for x in a.cmd) if len(a.cmd) > 1 else a.cmd[0]
+        cmd_text = " ; ".join(steps) if steps else (shlex.join(a.cmd) if len(a.cmd) > 1 else a.cmd[0])
+        con = db()
+        existing = con.execute('SELECT * FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
+        if existing:
+            try:
+                if existing['client_pid'] != os.getpid() or not (
+                        (a.bg and existing['mode'] == 'bg') or os.environ.get(home.RETURNED_HOME_ENV)):
+                    raise OffboxError(f'{self.run_id}: queued run belongs to another client', code=EXIT_LOCAL)
+                if existing['size_note'] is None:
+                    # Pre-migration queued clients never saved a decision; the original argv is still available.
+                    size, why = self.decide_size(con, cmd_text)
+                    self.record(size=size, requested_size=a.size, size_note=why or '')
+                    if why:
+                        event(con, None, "size_override", json.dumps(dict(run_id=self.run_id, requested=a.size,
+                                                                         effective=size, reason=why)))
+                elif not hasattr(a, '_size_decision'):
+                    # A queued run can be re-entered after a backend handoff with a freshly parsed argv.
+                    a._size_decision = (existing['size'], existing['size_note'])
+                self.registered = True
+                return
+            finally:
+                con.close()
+        size, why = self.decide_size(con, cmd_text)
         # client_pid: `offbox wait` on a run still queued for a box can tell a live client from one that died.
         def register():
             with write(con):
                 con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
-                               log_path, pulls, rel_cwd, local_cwd, client_pid, step_count) VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?,?)""",
+                               log_path, pulls, rel_cwd, local_cwd, client_pid, step_count, size, requested_size, size_note)
+                               VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?,?,?,?,?)""",
                             (self.run_id, me["owner"], me.get("session"), me.get("thread"), me["repo_root"], str(self.cwd),
                              cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
-                             json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps)))
+                             json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps), size, a.size, why or ''))
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
                 if home.failed_over():
                     con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'failover_queue:{self.run_id}', '1'))
         try:
             db_retry(register)
             self.registered = True
+            if why:
+                event(con, None, "size_override", json.dumps(dict(run_id=self.run_id, requested=a.size,
+                                                                 effective=size, reason=why)))
             try:
                 save_run_state(self.run_id, resources=resources.unavailable(
                     'not_started' if api.BACKEND == 'server' else 'boat'),
@@ -1778,10 +1804,7 @@ class Runner:
         cmd_text = " ; ".join(steps) if steps else (shlex.join(a.cmd) if len(a.cmd) > 1 else a.cmd[0])
         self.wait_images = wait_images = needs_image_wait(cmd_text, me["repo_root"])
         t0 = now()
-        size, why = lease.auto_size(con, cmd_text, me, a.size)
-        if why and why != getattr(a, '_size_notice', None):
-            say(why)
-            a._size_notice = why
+        size, why = a._size_decision
         env, explicit = build_env(a.env or [])
         from . import start_check
         claim = start_check.claim_id(con, self.run_id)
@@ -4030,6 +4053,10 @@ def _run_remote(a, rn) -> int:
     if code is None:
         say("remote process was lost (box restarted?); treating as infra failure")
     resources.display(rn.run_id)
+    row = getattr(rn, 'lease_row', None)
+    line = size_summary(dict(requested_size=a.size, size=row['size'])) if row else ""
+    if line:
+        say(line)
     steps = getattr(a, "steps", None) or []
     deps_hint = box_deps_hint(rn.root, rn.log_path)
     effective = space_result(rn.run_id, code, rn.log_path, report=True)

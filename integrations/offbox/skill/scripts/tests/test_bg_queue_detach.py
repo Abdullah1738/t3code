@@ -45,7 +45,13 @@ def configure_fixture(root, backend):
     lease.ensure_ttl = lambda *args: _publish(root / 'ttl', 'extended')
     api.get = lambda *args: {'state': 'running'}
     lease.touch = lease.idle_ttl = lambda *args: None
-    lease.auto_size = lambda *args: ('large', '')
+    if os.environ.get('OFFBOX_TEST_REQUESTED_SIZE'):
+        a.size = os.environ['OFFBOX_TEST_REQUESTED_SIZE']
+        a.cmd = ['true']
+        if sys.argv[1:2] == ['_bg-queue']:
+            lease.auto_size = lambda *args: (_ for _ in ()).throw(AssertionError('child recomputed size'))
+    else:
+        lease.auto_size = lambda *args: ('large', '')
     runs.Runner._log_pool = lambda *args: None
     runs.Runner._prepare_box = lambda *args: None
     runs._keep_ttl = lambda *args: contextlib.nullcontext()
@@ -64,6 +70,8 @@ def configure_fixture(root, backend):
         runs.Runner.register_pending = aged
 
     def acquire(*args, **kwargs):
+        if os.environ.get('OFFBOX_TEST_REQUESTED_SIZE'):
+            _publish(root / 'acquired-size', kwargs['size'])
         _publish(root / 'waiting', str(os.getpid()))
         with common.file_lock('fixture-slot', timeout=15):
             outcome = os.environ.get('OFFBOX_TEST_QUEUE_OUTCOME')
@@ -77,7 +85,7 @@ def configure_fixture(root, backend):
             if outcome == 'settled':
                 with contextlib.closing(common.db()) as con:
                     con.execute("UPDATE runs SET status='killed',exit_code=130 WHERE run_id=?", (kwargs['run_id'],))
-            return dict(box_id='box-fake', size='large', remote_dir='repo')
+            return dict(box_id='box-fake', size=kwargs.get('size') or 'large', remote_dir='repo')
 
     def start(box, command, *, meta, **kwargs):
         with (root / 'starts').open('a') as stream:
@@ -112,6 +120,8 @@ def fixture(root, bg, backend):
     if masked:
         _publish(root / 'mask-restored', str(signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, ())))
     _publish(root / 'returned', str(code))
+    if os.environ.get('OFFBOX_TEST_RETURN'):
+        return
     while True:
         if masked:
             time.sleep(.01)
