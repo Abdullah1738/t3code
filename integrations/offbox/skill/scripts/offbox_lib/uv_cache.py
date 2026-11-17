@@ -17,18 +17,24 @@ MISSING = re.compile(
     r"[`'\"]?:?[^\n]*?(?:No such file or directory|os error 2)", re.I)
 DIST = re.compile(r"/([A-Za-z0-9_][A-Za-z0-9_.-]*?)-[0-9][^/]*\.dist-info/")
 INSTALL = re.compile(r"Failed to install:\s+([A-Za-z0-9_][A-Za-z0-9_.-]*?)-[0-9][^\s]*\.whl", re.I)
+CAUSE = re.compile(r"\r?\n[ \t]+Caused by:[ \t]*", re.I)
+PERMISSION = re.compile(r"Permission denied|\bos error 13\b", re.I)
 
 
 def broken_entry(text):
-    for match in MISSING.finditer(text):
-        context = text[max(0, match.start() - 2048):match.start()]
-        installs = list(INSTALL.finditer(context))
-        if not installs and not match.group(0).lower().startswith('failed to read'):
+    # uv can put the path and ENOENT on adjacent cause lines. Keep separate errors apart.
+    for error in CAUSE.sub(' ', text).splitlines():
+        if PERMISSION.search(error):
             continue
-        dist = DIST.search(match['path'])
-        package = dist[1] if dist else installs[-1][1] if installs else None
-        if package:
-            return match['entry'], re.sub(r'[-_.]+', '-', package).lower()
+        for match in MISSING.finditer(error):
+            context = error[max(0, match.start() - 2048):match.start()]
+            installs = list(INSTALL.finditer(context))
+            if not installs and not match.group(0).lower().startswith('failed to read'):
+                continue
+            dist = DIST.search(match['path'])
+            package = dist[1] if dist else installs[-1][1] if installs else None
+            if package:
+                return match['entry'], re.sub(r'[-_.]+', '-', package).lower()
     return None
 
 

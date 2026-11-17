@@ -23,6 +23,10 @@ SUITE_RC=2
 '''
 SECOND = AA00.replace('click-8.5.1', 'jsonschema_specifications-2025.9.1').replace(
     'click==8.5.1', 'jsonschema-specifications==2025.9.1').replace('mZwmaowx3NLXC838', 'lT_xdwwz4JR4AcK_')
+MULTILINE = '''Failed to install: click-8.5.1-py3-none-any.whl (click==8.5.1)
+  Caused by: failed to read directory `/home/user/.xcache/uv/archive-v0/mZwmaowx3NLXC838`
+  Caused by: No such file or directory (os error 2)
+'''
 
 
 class UvCacheTests(Isolated):
@@ -53,16 +57,64 @@ class UvCacheTests(Isolated):
                 self.assertEqual(uv_cache.broken_entry(text), expected)
 
     def test_foreground_hint_event_repair_and_exit(self):
-        with patch.object(uv_cache, 'repair', return_value=uv_cache.RepairResult(True, 'cleared', 'moved')) as repair:
-            code, lines = steps.CliStepTests.run_cli(self, ['uv', 'run', '--with', 'click', 'true'], 2, AA00)
-        self.assertEqual(code, 2)
-        repair.assert_called_once_with('bx_fake', 'mZwmaowx3NLXC838', 'click', timeout=20)
-        self.assertEqual(self.events('uv_cache_corrupt')[0]['package'], 'click')
-        self.assertEqual(self.events('uv_cache_repaired')[0]['entry'], 'mZwmaowx3NLXC838')
-        hints = [line for line in lines if 'the uv cache on' in line]
-        self.assertEqual(hints, ['offbox: the uv cache on bx_fake has a broken entry (mZwmaowx3NLXC838); '
-                                 'it was moved aside — rerun, or set UV_CACHE_DIR=$(mktemp -d) for a private cache'])
-        self.assertEqual(lines[-1], 'offbox: remote exit 2')
+        for text in (AA00, MULTILINE):
+            with self.subTest(text=text), patch.object(
+                    uv_cache, 'repair', return_value=uv_cache.RepairResult(True, 'cleared', 'moved')) as repair:
+                code, lines = steps.CliStepTests.run_cli(self, ['uv', 'run', '--with', 'click', 'true'], 2, text)
+                self.assertEqual(code, 2)
+                repair.assert_called_once_with('bx_fake', 'mZwmaowx3NLXC838', 'click', timeout=20)
+                self.assertEqual(self.events('uv_cache_corrupt')[-1]['package'], 'click')
+                self.assertEqual(self.events('uv_cache_repaired')[-1]['entry'], 'mZwmaowx3NLXC838')
+                hints = [line for line in lines if 'the uv cache on' in line]
+                self.assertEqual(hints, ['offbox: the uv cache on bx_fake has a broken entry (mZwmaowx3NLXC838); '
+                                         'it was moved aside — rerun, or set UV_CACHE_DIR=$(mktemp -d) for a private cache'])
+                self.assertEqual(lines[-1], 'offbox: remote exit 2')
+
+    def test_report_cause_chain_forms(self):
+        missing = 'No such file or directory (os error 2)'
+        denied = MULTILINE.replace(missing, 'Permission denied (os error 13)')
+        cases = (
+            ('same-line-file', AA00, True),
+            ('split-directory', MULTILINE, True),
+            ('split-file', AA00.replace(': ' + missing, '\n  Caused by: ' + missing), True),
+            ('split-read-file', AA00.replace('failed to open file', 'Failed to read').replace(
+                ': ' + missing, '\n  Caused by: ' + missing), True),
+            ('double-quoted', MULTILINE.replace('`', '"'), True),
+            ('unquoted', MULTILINE.replace('`', ''), True),
+            ('crlf', MULTILINE.replace('\n', '\r\n'), True),
+            ('nested-cause', MULTILINE.replace('  Caused by: failed', '  Caused by: installation failed\n    Caused by: failed'), True),
+            ('os-error-only', MULTILINE.replace(missing, 'os error 2'), True),
+            ('message-only', MULTILINE.replace(missing, 'No such file or directory'), True),
+            ('same-line-denied', AA00.replace(missing, 'Permission denied (os error 13)'), False),
+            ('split-denied', denied, False),
+            ('denied-then-missing', denied + '  Caused by: ' + missing + '\n', False),
+            ('different-error', MULTILINE.replace('  Caused by: ' + missing, 'error: ' + missing), False),
+            ('ordinary-line-between', MULTILINE.replace('  Caused by: ' + missing, 'other command output\n  Caused by: ' + missing), False),
+            ('blank-line-between', MULTILINE.replace('  Caused by: ' + missing, '\n  Caused by: ' + missing), False),
+            ('different-install', MULTILINE.replace('  Caused by: failed', 'error: failed'), False),
+        )
+        log = runs.LOGS_DIR / 'cause-chain.log'
+        for name, text, expected in cases:
+            with self.subTest(name=name):
+                log.write_text(text)
+                err = io.StringIO()
+                with patch.object(uv_cache, 'repair', return_value=uv_cache.RepairResult(True, 'cleared', 'moved')) as repair, \
+                        contextlib.redirect_stderr(err):
+                    uv_cache.report('B', name, log, 2)
+                corrupt = [event for event in self.events('uv_cache_corrupt') if event['run'] == name]
+                repaired = [event for event in self.events('uv_cache_repaired') if event['run'] == name]
+                if expected:
+                    repair.assert_called_once_with('B', 'mZwmaowx3NLXC838', 'click', timeout=20)
+                    self.assertEqual(len(corrupt), 1)
+                    self.assertEqual(corrupt[0]['package'], 'click')
+                    self.assertEqual(corrupt[0]['entry'], 'mZwmaowx3NLXC838')
+                    self.assertEqual(len(repaired), 1)
+                    self.assertEqual(err.getvalue().count('it was moved aside'), 1)
+                else:
+                    repair.assert_not_called()
+                    self.assertEqual(corrupt, [])
+                    self.assertEqual(repaired, [])
+                    self.assertEqual(err.getvalue(), '')
 
     def test_non_cache_failure_does_not_repair_or_hint(self):
         with patch.object(uv_cache, 'repair') as repair:
