@@ -1630,125 +1630,127 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
   },
 );
 
+it.effect.each(
+  (["timeout", "transport", "acknowledgement", null] as const).flatMap((reason) =>
+    (["failed", "cancelled"] as const).map((status) => ({ reason, status })),
+  ),
+)(
+  "unconfirmed delegated wake holds its delivery generation ($reason, $status)",
+  ({ reason, status }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+      const now = yield* DateTime.now;
+      const name = `uncertain-wake-${reason}-${status}`;
+      const threadId = ThreadId.make(`thread:${name}`);
+      const runId = RunId.make(`run:${name}`);
+      const taskId = NodeId.make(`task:${name}`);
+      const deliveryRunId = RunId.make(`run:${name}:delivery`);
+      const messageId = MessageId.make(`message:delegated-delivery:${threadId}`);
+      yield* seedParentWithTerminalTask({
+        threadId,
+        runId,
+        taskId,
+        now,
+        projectId: ProjectId.make(`project:${name}`),
+        rootNodeId: NodeId.make(`root:${name}`),
+        deliveryState: "claimed",
+        deliveryTaskIds: [taskId],
+        completionWake: "always",
+      });
+      const rejection = makeProviderFailure({
+        code: "provider_rejected",
+        message: "Confirmed not accepted.",
+        category: "config",
+        retryable: true,
+      });
+      const failure =
+        reason === null
+          ? rejection
+          : makeProviderFailure({
+              cause: new ProviderPromptAcceptanceError({
+                driver: ProviderDriverKind.make("opencode"),
+                serverOrigin: "http://opencode.test",
+                reason,
+                budgetSeconds: 60,
+              }),
+            });
+      const terminal = runEvent({
+        threadId,
+        runId: deliveryRunId,
+        ordinal: 2,
+        status,
+        now,
+        providerThreadId: parentProviderThreadId(threadId),
+        userMessageId: messageId,
+      });
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(`event:${name}:message`),
+            type: "message.updated",
+            threadId,
+            runId: deliveryRunId,
+            occurredAt: now,
+            payload: {
+              id: messageId,
+              threadId,
+              runId: deliveryRunId,
+              nodeId: null,
+              role: "user",
+              text: "Delegated task completed",
+              attachments: [],
+              streaming: false,
+              createdBy: "agent",
+              creationSource: "server",
+              createdAt: now,
+              updatedAt: now,
+              delegatedCompletion: { parentRunId: runId, generation: 1, taskIds: [taskId] },
+            },
+          },
+          { ...terminal, payload: { ...terminal.payload, failure } },
+        ],
+      });
+      for (let recovery = 0; recovery < 2; recovery++) {
+        yield* orchestrator.recoverDelegatedTasks;
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        const cohort = projection.runs.find((run) => run.id === runId)!.delegatedCompletion!;
+        assert.equal(cohort.delivery?.generation, reason === null ? 2 : 1);
+        assert.equal(cohort.nextGeneration, reason === null ? 3 : 2);
+        assert.equal(
+          projection.subagents.find((task) => task.id === taskId)?.completionDelivery?.state,
+          "claimed",
+        );
+        assert.equal(yield* requests.pending!(threadId), reason === null);
+      }
+      if (reason !== null) {
+        yield* sink.write({
+          events: [
+            {
+              ...terminal,
+              id: EventId.make(`event:${name}:reconciled`),
+              payload: { ...terminal.payload, failure: rejection },
+            },
+          ],
+        });
+        yield* orchestrator.recoverDelegatedTasks;
+        const projection = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(
+          projection.runs.find((run) => run.id === runId)!.delegatedCompletion!.delivery
+            ?.generation,
+          2,
+        );
+        assert.isTrue(yield* requests.pending!(threadId));
+      }
+    }).pipe(
+      Effect.provide(Layer.fresh(Layer.merge(layerTest, ProviderContinuationRequests.layer))),
+    ),
+);
+
 it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
   "delegated recovery without an effect worker",
   (it) => {
-    it.effect.each(
-      (["timeout", "transport", "acknowledgement", null] as const).flatMap((reason) =>
-        (["failed", "cancelled"] as const).map((status) => ({ reason, status })),
-      ),
-    )(
-      "unconfirmed delegated wake holds its delivery generation ($reason, $status)",
-      ({ reason, status }) =>
-        Effect.gen(function* () {
-          const orchestrator = yield* Orchestrator.OrchestratorV2;
-          const sink = yield* EventSink.EventSinkV2;
-          const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
-          const now = yield* DateTime.now;
-          const name = `uncertain-wake-${reason}-${status}`;
-          const threadId = ThreadId.make(`thread:${name}`);
-          const runId = RunId.make(`run:${name}`);
-          const taskId = NodeId.make(`task:${name}`);
-          const deliveryRunId = RunId.make(`run:${name}:delivery`);
-          const messageId = MessageId.make(`message:delegated-delivery:${threadId}`);
-          yield* seedParentWithTerminalTask({
-            threadId,
-            runId,
-            taskId,
-            now,
-            projectId: ProjectId.make(`project:${name}`),
-            rootNodeId: NodeId.make(`root:${name}`),
-            deliveryState: "claimed",
-            deliveryTaskIds: [taskId],
-            completionWake: "always",
-          });
-          const rejection = makeProviderFailure({
-            code: "provider_rejected",
-            message: "Confirmed not accepted.",
-            category: "config",
-            retryable: true,
-          });
-          const failure =
-            reason === null
-              ? rejection
-              : makeProviderFailure({
-                  cause: new ProviderPromptAcceptanceError({
-                    driver: ProviderDriverKind.make("opencode"),
-                    serverOrigin: "http://opencode.test",
-                    reason,
-                    budgetSeconds: 60,
-                  }),
-                });
-          const terminal = runEvent({
-            threadId,
-            runId: deliveryRunId,
-            ordinal: 2,
-            status,
-            now,
-            providerThreadId: parentProviderThreadId(threadId),
-            userMessageId: messageId,
-          });
-          yield* sink.write({
-            events: [
-              {
-                id: EventId.make(`event:${name}:message`),
-                type: "message.updated",
-                threadId,
-                runId: deliveryRunId,
-                occurredAt: now,
-                payload: {
-                  id: messageId,
-                  threadId,
-                  runId: deliveryRunId,
-                  nodeId: null,
-                  role: "user",
-                  text: "Delegated task completed",
-                  attachments: [],
-                  streaming: false,
-                  createdBy: "agent",
-                  creationSource: "server",
-                  createdAt: now,
-                  updatedAt: now,
-                  delegatedCompletion: { parentRunId: runId, generation: 1, taskIds: [taskId] },
-                },
-              },
-              { ...terminal, payload: { ...terminal.payload, failure } },
-            ],
-          });
-          for (let recovery = 0; recovery < 2; recovery++) {
-            yield* orchestrator.recoverDelegatedTasks;
-            const projection = yield* orchestrator.getThreadProjection(threadId);
-            const cohort = projection.runs.find((run) => run.id === runId)!.delegatedCompletion!;
-            assert.equal(cohort.delivery?.generation, reason === null ? 2 : 1);
-            assert.equal(cohort.nextGeneration, reason === null ? 3 : 2);
-            assert.equal(
-              projection.subagents.find((task) => task.id === taskId)?.completionDelivery?.state,
-              "claimed",
-            );
-            assert.equal(yield* requests.pending!(threadId), reason === null);
-          }
-          if (reason !== null) {
-            yield* sink.write({
-              events: [
-                {
-                  ...terminal,
-                  id: EventId.make(`event:${name}:reconciled`),
-                  payload: { ...terminal.payload, failure: rejection },
-                },
-              ],
-            });
-            yield* orchestrator.recoverDelegatedTasks;
-            const projection = yield* orchestrator.getThreadProjection(threadId);
-            assert.equal(
-              projection.runs.find((run) => run.id === runId)!.delegatedCompletion!.delivery
-                ?.generation,
-              2,
-            );
-            assert.isTrue(yield* requests.pending!(threadId));
-          }
-        }),
-    );
-
     it.effect(
       "recovers a pre-restart result without the effect worker or repeated parent history reads",
       () =>
