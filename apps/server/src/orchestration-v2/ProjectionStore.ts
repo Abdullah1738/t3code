@@ -385,7 +385,7 @@ export interface ProjectionRecordFilter {
   readonly recentTurnItemLimit?: number;
   readonly turnItemOrder?: "completion";
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
-  /** Cleanup can fail an unfinished tool without ever receiving its result. */
+  /** Cleanup can retain partial output without ever receiving a tool result. */
   readonly toolResultsOnly?: boolean;
   readonly omitSettledLeafNodes?: boolean;
 }
@@ -3599,7 +3599,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE thread_id = ${threadId}
                   ${filter?.turnItemTypes === undefined ? sql`` : sql`AND type IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemTypes)}))`}
                   ${filter?.turnItemStatuses === undefined ? sql`` : sql`AND status IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemStatuses)}))`}
-                  ${filter?.toolResultsOnly !== true ? sql`` : sql`AND (status = 'completed' OR json_type(payload_json, '$.output') IS NOT NULL OR json_type(payload_json, '$.exitCode') IS NOT NULL)`}
+                  ${filter?.toolResultsOnly !== true ? sql`` : sql`AND type IN ('command_execution', 'dynamic_tool') AND COALESCE(json_extract(payload_json, '$.toolResultIncomplete'), 0) = 0 AND (status = 'completed' OR (status = 'failed' AND json_type(payload_json, '$.toolResultIncomplete') = 'false') OR json_type(payload_json, '$.output') IS NOT NULL OR json_type(payload_json, '$.exitCode') IS NOT NULL)`}
                   ${filter?.turnItemRunId === undefined ? sql`` : sql`AND run_id = ${filter.turnItemRunId}`}
                   ${filter?.turnItemRunIds === undefined ? sql`` : sql`AND (run_id IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemRunIds.filter((id): id is RunId => id !== null))})) OR (${filter.turnItemRunIds.includes(null) ? 1 : 0} = 1 AND run_id IS NULL))`}
                 ${
@@ -8336,10 +8336,12 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                   (filter?.turnItemStatuses === undefined ||
                     filter.turnItemStatuses.includes(row.status)) &&
                   (filter?.toolResultsOnly !== true ||
-                    row.status === "completed" ||
-                    (row.type === "command_execution" &&
-                      (row.output !== undefined || row.exitCode !== undefined)) ||
-                    (row.type === "dynamic_tool" && row.output !== undefined)) &&
+                    ((row.type === "command_execution" || row.type === "dynamic_tool") &&
+                      row.toolResultIncomplete !== true &&
+                      (row.status === "completed" ||
+                        (row.status === "failed" && row.toolResultIncomplete === false) ||
+                        row.output !== undefined ||
+                        (row.type === "command_execution" && row.exitCode !== undefined)))) &&
                   (filter?.turnItemRunId === undefined || filter.turnItemRunId === row.runId),
               )
               .toSorted((a, b) =>

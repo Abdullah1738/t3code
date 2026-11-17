@@ -1164,6 +1164,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
           readonly active: ActiveCursorToolCall;
           readonly completed: boolean;
           readonly unfinishedStatus?: "interrupted" | "failed" | "cancelled";
+          readonly toolResultIncomplete?: boolean;
         }) {
           const { active } = input;
           const toolCall = active.toolCall;
@@ -1344,7 +1345,10 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
           yield* emitProviderEvent({
             type: "turn_item.updated",
             driver: CursorAgentSdk.CURSOR_PROVIDER,
-            turnItem,
+            turnItem:
+              turnItem.type === "command_execution" || turnItem.type === "dynamic_tool"
+                ? { ...turnItem, toolResultIncomplete: input.toolResultIncomplete === true }
+                : turnItem,
           });
         });
 
@@ -2023,6 +2027,7 @@ export const makeCursorAdapterV2 = Effect.fn("makeCursorAdapterV2")(function* (
             yield* emitToolArtifacts({
               active: tool,
               completed: true,
+              toolResultIncomplete: true,
               ...(input.status === "completed" ? {} : { unfinishedStatus: input.status }),
             });
           }

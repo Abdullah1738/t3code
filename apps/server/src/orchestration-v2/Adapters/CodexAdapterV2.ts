@@ -2678,6 +2678,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               completedAt,
               updatedAt: completedAt,
               type: "command_execution",
+              toolResultIncomplete: true,
               input: tracked.command,
               ...(tracked.aggregatedOutput === undefined
                 ? {}
@@ -2818,6 +2819,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               driver: CODEX_PROVIDER,
               turnItem: {
                 ...artifacts.turnItem,
+                toolResultIncomplete: true,
                 status,
                 completedAt,
                 updatedAt: completedAt,
@@ -3984,6 +3986,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             completedAt,
             updatedAt,
             type: "command_execution",
+            toolResultIncomplete: false,
             input: item.command,
             ...(item.aggregatedOutput === null || item.aggregatedOutput === undefined
               ? {}
@@ -4167,6 +4170,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               completedAt,
               updatedAt,
               type: "dynamic_tool",
+              toolResultIncomplete: false,
               ...projection,
             };
             return { node, turnItem };

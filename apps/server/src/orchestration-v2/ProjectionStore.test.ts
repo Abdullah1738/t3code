@@ -9185,6 +9185,27 @@ const toolResultCases = [
     selected: true,
   },
   {
+    name: "command explicit result",
+    tool: {
+      type: "command_execution",
+      input: "command",
+      status: "failed",
+      output: "failed",
+      toolResultIncomplete: false,
+    },
+    selected: true,
+  },
+  ...(["completed", "failed"] as const).map((status) => ({
+    name: `command explicit ${status} without output or exit code`,
+    tool: {
+      type: "command_execution" as const,
+      input: "command",
+      status,
+      toolResultIncomplete: false,
+    },
+    selected: true,
+  })),
+  {
     name: "command failed empty output",
     tool: { type: "command_execution", input: "command", status: "failed", output: "" },
     selected: true,
@@ -9199,6 +9220,19 @@ const toolResultCases = [
     tool: { type: "command_execution", input: "command", status: "failed" },
     selected: false,
   },
+  ...(["completed", "failed"] as const).flatMap((status) =>
+    ["", "partial progress"].map((output) => ({
+      name: `command cleanup ${status} with ${output ? "partial" : "empty"} output`,
+      tool: {
+        type: "command_execution" as const,
+        input: "unfinished",
+        status,
+        output,
+        toolResultIncomplete: true,
+      },
+      selected: false,
+    })),
+  ),
   {
     name: "MCP completed empty",
     tool: { type: "dynamic_tool", toolName: "mcp__test", input: null, status: "completed" },
@@ -9227,10 +9261,58 @@ const toolResultCases = [
     selected: true,
   },
   {
+    name: "MCP explicit result",
+    tool: {
+      type: "dynamic_tool",
+      toolName: "mcp__test",
+      input: null,
+      status: "failed",
+      output: null,
+      toolResultIncomplete: false,
+    },
+    selected: true,
+  },
+  ...(["completed", "failed"] as const).map((status) => ({
+    name: `MCP explicit ${status} without output`,
+    tool: {
+      type: "dynamic_tool" as const,
+      toolName: "mcp__test",
+      input: null,
+      status,
+      toolResultIncomplete: false,
+    },
+    selected: true,
+  })),
+  {
     name: "MCP cleanup failure",
     tool: { type: "dynamic_tool", toolName: "mcp__test", input: null, status: "failed" },
     selected: false,
   },
+  ...["Action required", "Unsupported ACP update: timeline_update"].map((toolName) => ({
+    name: `synthetic ACP notice ${toolName}`,
+    tool: {
+      type: "dynamic_tool" as const,
+      toolName,
+      input: {},
+      status: "completed" as const,
+      toolResultIncomplete: true,
+    },
+    selected: false,
+  })),
+  ...(["completed", "failed"] as const).flatMap((status) =>
+    [null, "partial progress"].map((output) => ({
+      name: `MCP cleanup ${status} with ${output === null ? "null" : "partial"} output`,
+      tool: {
+        type: "dynamic_tool" as const,
+        toolName: "mcp__unfinished",
+        input: null,
+        status,
+        output,
+        toolResultIncomplete: true,
+      },
+      selected: false,
+    })),
+  ),
 ] as const;
 const selectCompletedToolResult = Effect.fn("test.selectCompletedToolResult")(function* (
   scenario: (typeof toolResultCases)[number],
@@ -9262,7 +9344,8 @@ const selectCompletedToolResult = Effect.fn("test.selectCompletedToolResult")(fu
       type: "command_execution" as const,
       input: "offbox wait",
       status: "completed" as const,
-      output: "finished output",
+      output: "exit 0 /logs/finished-wait.log",
+      exitCode: 0,
     },
     {
       ...base,
@@ -9284,6 +9367,34 @@ const selectCompletedToolResult = Effect.fn("test.selectCompletedToolResult")(fu
   const selected = yield* store.getThreadRecords(threadId, ["turnItems"], completedToolFilter(run));
   assert.lengthOf(selected.turnItems, 1);
   assert.equal(selected.turnItems[0]!.id, scenario.selected ? latest : earlier);
+  if ("toolResultIncomplete" in scenario.tool && scenario.tool.toolResultIncomplete) {
+    for (const [index, output] of [undefined, "", "late actual tool result"].entries()) {
+      yield* store.apply({
+        id: EventId.make(`late-actual-result:${index}`),
+        type: "turn-item.updated",
+        threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: {
+          ...base,
+          ...scenario.tool,
+          id: latest,
+          ordinal: 3,
+          toolResultIncomplete: false,
+          status: "failed",
+          output,
+          completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 2 + index),
+        },
+      });
+      const late = yield* store.getThreadRecords(threadId, ["turnItems"], completedToolFilter(run));
+      const item = late.turnItems[0]!;
+      assert.equal(item.id, latest);
+      assert.equal(
+        item.type === "command_execution" || item.type === "dynamic_tool" ? item.output : undefined,
+        output,
+      );
+    }
+  }
 });
 
 it.effect.each(toolResultCases)("SQL last tool result: $name", (scenario) =>

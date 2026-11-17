@@ -5908,6 +5908,83 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
   );
 
+  it.effect.each(
+    ["Bash", "mcp__test__empty"].flatMap((toolName) =>
+      ["", []].map((content) => ({ toolName, content })),
+    ),
+  )(
+    "retains completion evidence for failed $toolName with empty content $content",
+    ({ toolName, content }) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("empty-failed-tool"),
+            text: "Run the tool.",
+            attachments: [],
+          }),
+        );
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "assistant",
+            uuid: "empty-tool-start",
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              id: "empty-tool-start",
+              model: "claude-opus-5-5",
+              content: [
+                { type: "tool_use", id: "empty-tool", name: toolName, input: { command: "false" } },
+              ],
+            },
+          }),
+        );
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "user",
+            uuid: "empty-tool-result",
+            session_id: WAKE_NATIVE_SESSION,
+            parent_tool_use_id: null,
+            message: {
+              role: "user",
+              content: [
+                { type: "tool_result", tool_use_id: "empty-tool", is_error: true, content },
+              ],
+            },
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({ uuid: "empty-tool-terminal", result: "Done" }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        const last = harness.events.findLast(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.nativeItemRef?.nativeId === "empty-tool",
+        );
+        assert.equal(last?.type, "turn_item.updated");
+        if (last?.type !== "turn_item.updated") return;
+        const item = last.turnItem;
+        assert.equal(item.type, toolName === "Bash" ? "command_execution" : "dynamic_tool");
+        if (item.type !== "command_execution" && item.type !== "dynamic_tool") return;
+        assert.equal(item.status, "failed");
+        assert.isFalse(item.toolResultIncomplete);
+        if (item.type === "command_execution") {
+          assert.equal(item.output, typeof content === "string" ? undefined : "[]");
+          assert.isUndefined(item.exitCode);
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
   it.effect.each(["cancelled", "denied", "permission_denied", undefined])(
     "preserves native tool non-execution metadata %s without inferring a denial from text",
     (kind) =>
@@ -5965,9 +6042,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           const failed = items.findLast((item) => item.nativeItemRef?.nativeId === "tool-error")!;
           assert.equal(failed.status, kind === "cancelled" ? "cancelled" : "failed");
           assert.equal(failed.toolNonExecutionKind, kind);
+          assert.isFalse(failed.toolResultIncomplete);
           const ok = items.findLast((item) => item.nativeItemRef?.nativeId === "tool-ok")!;
           assert.equal(ok.status, "completed");
           assert.equal(ok.toolNonExecutionKind, undefined);
+          assert.isFalse(ok.toolResultIncomplete);
           const node = harness.events.findLast(
             (event) =>
               event.type === "node.updated" && event.node.nativeItemRef?.nativeId === "tool-error",
@@ -6134,6 +6213,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.equal(
           bash?.type === "turn_item.updated" ? bash.turnItem.status : undefined,
           "failed",
+        );
+        assert.isTrue(
+          bash?.type === "turn_item.updated" && bash.turnItem.type === "command_execution"
+            ? bash.turnItem.toolResultIncomplete
+            : false,
         );
       }).pipe(
         Effect.scoped,

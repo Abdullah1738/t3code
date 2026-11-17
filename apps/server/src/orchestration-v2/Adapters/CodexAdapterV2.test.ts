@@ -10657,6 +10657,31 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       }),
       {
         type: "emit_inbound",
+        label: "item/completed/wait",
+        frame: {
+          method: "item/completed",
+          params: {
+            item: {
+              type: "commandExecution",
+              id: "finished-offbox-wait",
+              command: "offbox wait run-finished",
+              cwd: "/workspace",
+              processId: null,
+              source: "unifiedExecStartup",
+              status: "completed",
+              commandActions: [{ type: "unknown", command: "offbox wait run-finished" }],
+              aggregatedOutput: "exit 0 /logs/finished-wait.log",
+              exitCode: 0,
+              durationMs: 1,
+            },
+            threadId: FAILED_NATIVE_THREAD,
+            turnId: FAILED_NATIVE_TURN,
+            completedAtMs: 1782622440400,
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
         label: "item/started/command",
         frame: {
           method: "item/started",
@@ -10670,7 +10695,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               source: "unifiedExecStartup",
               status: "inProgress",
               commandActions: [{ type: "unknown", command: FAILED_COMMAND }],
-              aggregatedOutput: null,
+              aggregatedOutput: "partial progress",
               exitCode: null,
               durationMs: null,
             },
@@ -10715,7 +10740,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             text: FAILED_PROMPT,
           }),
         );
-        yield* awaitUntil(() => harness.terminalEvents().length === 1, "failed terminal");
+        yield* harness.firstTerminal;
         assert.equal(harness.terminalEvents()[0]?.status, "failed");
 
         const terminalIndex = harness.events.findIndex((event) => event.type === "turn.terminal");
@@ -10727,6 +10752,28 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             event.turnItem.status === "failed",
         );
         assert.isAtLeast(failedCommandIndex, 0);
+        const cleanup = harness.events[failedCommandIndex]!;
+        assert.equal(cleanup.type, "turn_item.updated");
+        if (cleanup.type !== "turn_item.updated" || cleanup.turnItem.type !== "command_execution")
+          return;
+        assert.equal(cleanup.turnItem.output, "partial progress");
+        assert.isTrue(cleanup.turnItem.toolResultIncomplete);
+        const finished = harness.events.find(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "command_execution" &&
+            event.turnItem.status === "completed" &&
+            event.turnItem.input === "offbox wait run-finished",
+        );
+        assert.equal(finished?.type, "turn_item.updated");
+        if (
+          finished?.type !== "turn_item.updated" ||
+          finished.turnItem.type !== "command_execution"
+        )
+          return;
+        assert.isFalse(finished.turnItem.toolResultIncomplete);
+        assert.equal(finished.turnItem.output, "exit 0 /logs/finished-wait.log");
+        assert.equal(finished.turnItem.exitCode, 0);
         assert.isAbove(
           terminalIndex,
           failedCommandIndex,

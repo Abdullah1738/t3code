@@ -4040,10 +4040,16 @@ it.layer(layerTest)("stopped delegated tool results", (it) => {
         partial: kind !== "shell",
       })),
     ),
-  ];
+  ].flatMap((scenario) =>
+    (["wait", "empty-command", "empty-mcp"] as const).map((toolResult) => ({
+      ...scenario,
+      name: `${scenario.name}-${toolResult}`,
+      toolResult,
+    })),
+  );
   it.effect.each(cases)(
     "publishes $name result through the shared completion builder",
-    ({ name, status, lostWork, partial }) =>
+    ({ name, status, lostWork, partial, toolResult }) =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const sink = yield* EventSink.EventSinkV2;
@@ -4137,9 +4143,11 @@ it.layer(layerTest)("stopped delegated tool results", (it) => {
                 id: TurnItemId.make(`partial-cleanup-command:${name}`),
                 ordinal: 4,
                 input: "unfinished command",
+                output: "partial progress from command that never finished",
+                toolResultIncomplete: true,
                 status: "failed",
-                completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 2),
-                updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 2),
+                completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 3),
+                updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 3),
               },
             },
             {
@@ -4154,12 +4162,81 @@ it.layer(layerTest)("stopped delegated tool results", (it) => {
                 type: "dynamic_tool",
                 toolName: "mcp__unfinished",
                 input: {},
+                output: "partial progress from tool that never finished",
+                toolResultIncomplete: true,
                 ordinal: 5,
                 status: "failed",
-                completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 3),
-                updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 3),
+                completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 4),
+                updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 4),
               },
             },
+            ...(toolResult === "wait"
+              ? []
+              : [
+                  {
+                    id: EventId.make(`partial-tool-empty:${name}`),
+                    type: "turn-item.updated" as const,
+                    threadId: child.childThreadId,
+                    runId: run.id,
+                    occurredAt: now,
+                    payload: {
+                      ...toolBase,
+                      id: TurnItemId.make(`partial-tool-empty:${name}`),
+                      ordinal: 6,
+                      status: "failed" as const,
+                      toolResultIncomplete: false,
+                      completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 2),
+                      updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 2),
+                      ...(toolResult === "empty-command"
+                        ? { type: "command_execution" as const, input: "empty failed command" }
+                        : {
+                            type: "dynamic_tool" as const,
+                            input: {},
+                            toolName: "mcp__empty_failed",
+                          }),
+                    },
+                  },
+                ]),
+            ...["Action required", "Unsupported ACP update: timeline_update"].map(
+              (notice, index) => ({
+                id: EventId.make(`partial-synthetic:${index}:${name}`),
+                type: "turn-item.updated" as const,
+                threadId: child.childThreadId,
+                runId: run.id,
+                occurredAt: now,
+                payload: {
+                  ...toolBase,
+                  id: TurnItemId.make(`partial-synthetic:${index}:${name}`),
+                  ordinal: 7 + index,
+                  type: "dynamic_tool" as const,
+                  title: notice,
+                  toolName: notice,
+                  input: {},
+                  toolResultIncomplete: true,
+                  completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 5 + index),
+                  updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 5 + index),
+                },
+              }),
+            ),
+            ...(["command_execution", "dynamic_tool"] as const).map((type, index) => ({
+              id: EventId.make(`partial-success-cleanup:${index}:${name}`),
+              type: "turn-item.updated" as const,
+              threadId: child.childThreadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: {
+                ...toolBase,
+                id: TurnItemId.make(`partial-success-cleanup:${index}:${name}`),
+                ordinal: 9 + index,
+                ...(type === "dynamic_tool"
+                  ? { type, input: {}, toolName: "mcp__unfinished" }
+                  : { type, input: "unfinished command" }),
+                output: "partial progress from cleanup of a completed turn",
+                toolResultIncomplete: true,
+                completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 7 + index),
+                updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 7 + index),
+              },
+            })),
             {
               id: EventId.make(`partial-run-reason:${name}`),
               type: "run.updated",
@@ -4179,7 +4256,10 @@ it.layer(layerTest)("stopped delegated tool results", (it) => {
           completedToolFilter(run),
         );
         assert.lengthOf(selected.turnItems, 1);
-        assert.equal(selected.turnItems[0]!.id, TurnItemId.make(`partial-tool-last:${name}`));
+        assert.equal(
+          selected.turnItems[0]!.id,
+          TurnItemId.make(`partial-tool-${toolResult === "wait" ? "last" : "empty"}:${name}`),
+        );
         const serviceLayer = OrchestratorMcpService.layer.pipe(
           Layer.provide(McpProviderSessions.layer),
           Layer.provide(
@@ -4233,10 +4313,22 @@ it.layer(layerTest)("stopped delegated tool results", (it) => {
         if (!partial) assert.equal(result, "I'll load the remote-compute skill first.");
         else {
           assert.include(result, "Stalled: command_execution_finished then no progress for 15 min");
-          assert.include(result, "Last completed tool: offbox wait run-1116-watch (exit 1)");
-          assert.include(result, "[truncated;");
-          assert.isTrue(result.endsWith("exit 1 /logs/run-1116-watch.log"));
+          if (toolResult === "wait") {
+            assert.include(result, "Last completed tool: offbox wait run-1116-watch (exit 1)");
+            assert.include(result, "[truncated;");
+            assert.isTrue(result.endsWith("exit 1 /logs/run-1116-watch.log"));
+          } else {
+            assert.isTrue(
+              result.endsWith(
+                `Last completed tool: ${toolResult === "empty-command" ? "empty failed command" : "mcp__empty_failed"}\n`,
+              ),
+            );
+            assert.notInclude(result, "/logs/run-1116-watch.log");
+          }
           assert.notInclude(result, "obsolete output");
+          assert.notInclude(result, "partial progress");
+          assert.notInclude(result, "Action required");
+          assert.notInclude(result, "Unsupported ACP update");
         }
         assert.equal(unpublished.summary, result);
         const published = yield* readStatus;

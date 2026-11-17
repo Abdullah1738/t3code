@@ -5113,6 +5113,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly updatedAt: DateTime.Utc;
           readonly presentation: ClaudeToolPresentation | undefined;
           readonly toolNonExecutionKind?: string;
+          readonly toolResultIncomplete?: boolean;
         }) => {
           const completedAt = input.status === "running" ? null : input.updatedAt;
           const nodeId = idAllocator.derive.nodeFromProviderItem({
@@ -5226,6 +5227,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ? {
                   ...itemBase,
                   type: "command_execution",
+                  toolResultIncomplete: input.toolResultIncomplete === true,
                   input: commandInputFromClaudeTool(input.toolName, input.toolInput),
                   ...(outputText.length === 0 ? {} : { output: outputText }),
                 }
@@ -5260,6 +5262,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   : {
                       ...itemBase,
                       type: "dynamic_tool",
+                      toolResultIncomplete: input.toolResultIncomplete === true,
                       ...(input.presentation?.toolIcon === undefined
                         ? {}
                         : { toolIcon: input.presentation.toolIcon }),
@@ -6874,6 +6877,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 parentNodeId: toolCall.parentNodeId,
                 ordinal: toolCall.ordinal,
                 output: NO_CLAUDE_NATIVE_TOOL_OUTPUT,
+                toolResultIncomplete: true,
                 status: input.status,
                 startedAt: toolCall.startedAt,
                 updatedAt: input.completedAt,
