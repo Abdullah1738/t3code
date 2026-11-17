@@ -29,6 +29,7 @@ import card_mask
 import desktop_lease
 import statev2_guard
 import snapshot_guard
+import shared_deps_guard
 import quint_verify_guard
 import rootwide_search_guard
 import phone_adb_guard
@@ -90,7 +91,7 @@ _LOG_RULES = {
     "desktop-unavailable", "desktop-end", "desktop-end-error", "desktop-flush", "desktop-flush-none",
     "live-database-read", "live-database-script", "live-database-script-unresolved", "live-database-unavailable",
     "live-database-snapshot",
-    "rootwide-search", "quint-verify", "card-mask",
+    "rootwide-search", "quint-verify", "shared-dependencies", "card-mask",
     "phone-adb-state", "phone-adb-forward", "phone-adb-state-unleased", "phone-adb-forward-unleased", "phone-adb-unavailable",
 }
 _LOG_ERRORS = {
@@ -840,6 +841,16 @@ def decide(event, harness):
                 # separate phone decision so unleased calls remain countable.
                 _log(harness=harness, event=kind, tool=tool, command=command, cwd=cwd,
                      rule=phone['rule'], decision="allow", error=phone['error'])
+            try:
+                shared_reason = shared_deps_guard.classify(command, command_cwd)
+            except Exception as error:
+                # This policy must not disable the independent database and offbox guards.
+                error_type = type(error).__name__
+                shared_reason = None
+            if shared_reason:
+                result = {"decision": "deny", "reason": shared_reason,
+                          "context": {"rule": "shared-dependencies"}}
+                return result
             if quint_verify_guard.classify(command, command_cwd):
                 result = {"decision": "deny", "reason": quint_verify_guard.REASON,
                           "context": {"rule": "quint-verify"}}

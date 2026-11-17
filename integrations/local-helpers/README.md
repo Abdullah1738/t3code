@@ -259,3 +259,5 @@ and `oxlint-plugin-t3code` importers, whose runtime dependencies lint loads.
 To try an uninstalled branch, run its absolute `integrations/local-helpers/bin/vp`
 path from the target worktree. Config snapshots and Vite’s cache stay in a
 private temporary directory; the borrowed install is read-only.
+
+`vp` outcomes: `${XDG_STATE_HOME:-~/.local/state}/vp-shim/events.jsonl` (5 MB rotation).

@@ -1,0 +1,154 @@
+[
+  {
+    "command": "pnpm install",
+    "denied": true
+  },
+  {
+    "command": "pnpm i",
+    "denied": true
+  },
+  {
+    "command": "vp i",
+    "denied": true
+  },
+  {
+    "command": "vp install",
+    "denied": true
+  },
+  {
+    "command": "corepack pnpm@11.10.0 install --frozen-lockfile",
+    "denied": true
+  },
+  {
+    "command": "/absolute/pnpm install",
+    "denied": true
+  },
+  {
+    "command": "node /absolute/pnpm.cjs install",
+    "denied": true
+  },
+  {
+    "command": "pnpm exec vp test run a.test.ts",
+    "denied": true
+  },
+  {
+    "command": "pnpm run test",
+    "denied": true
+  },
+  {
+    "command": "env A=b pnpm --filter app install",
+    "denied": true
+  },
+  {
+    "command": "bash -lc \"pnpm install\"",
+    "denied": true
+  },
+  {
+    "command": "command pnpm install",
+    "denied": true
+  },
+  {
+    "command": "env -- corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "env -u NODE_OPTIONS corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "env --unset NODE_OPTIONS corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "env --unset=NODE_OPTIONS corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "env -i A=b corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "env -C . corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "env --chdir=. corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "command -- corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "command -p -- corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "exec -- corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "nohup corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "node --no-warnings /absolute/pnpm.cjs install",
+    "denied": true
+  },
+  {
+    "command": "node --trace-warnings -- /absolute/pnpm.cjs install",
+    "denied": true
+  },
+  {
+    "command": "node -r preload /absolute/pnpm.cjs install",
+    "denied": true
+  },
+  {
+    "command": "node --require=preload --no-warnings /absolute/pnpm.cjs install",
+    "denied": true
+  },
+  {
+    "command": "node --import preload /absolute/pnpm.cjs install",
+    "denied": true
+  },
+  {
+    "command": "node --no-warnings /absolute/corepack.cjs pnpm@11.10.0 install",
+    "denied": true
+  },
+  {
+    "command": "node --no-warnings /absolute/vp install",
+    "denied": true
+  },
+  {
+    "command": "env -C /tmp true; corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "env --chdir=/tmp true && corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "env -C /tmp sh -c true; node --no-warnings /absolute/pnpm.cjs install",
+    "denied": true
+  },
+  {
+    "command": "(cd /tmp); corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "sh -c \"cd /tmp\"; corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "cd /tmp | cat; corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "cd /tmp & corepack pnpm install",
+    "denied": true
+  },
+  {
+    "command": "false && cd /tmp; corepack pnpm install",
+    "denied": false
+  }
+]
