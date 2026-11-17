@@ -127,6 +127,27 @@ def log_decision(item, category, routed=None, *, source=None, deduped=False, act
               'ids': log_ids(item), 'props': props})
 
 
+def log_auth_only(item, alert):
+    log_decision(item, 'otp', 'logged')
+    source = log_source(item)
+    tool_log({'component': 'fastpath', 'kind': 'event', 'name': 'fastpath.auth_logged', 'ok': True,
+              'ids': log_ids(item), 'props': {
+                  **({'source': source} if source else {}),
+                  'senderLabel': fastpath.sender_label(item.get('sender')),
+                  'authKind': 'signin_link' if 'a sign-in link' in alert.get('text', '') else 'otp'}})
+
+
+def legacy_auth_text(*entries):
+    return next((text for entry in entries for key in ('text', 'telegram_text', 'imessage_text')
+                 for text in (entry.get(key),) if isinstance(text, str)
+                 and text.startswith(('Security: an OTP', 'Security: a sign-in link'))), None)
+
+
+def has_auth_issuance(item):
+    text = str(item.get('subject') or '') + ' ' + str(item.get('preview') or '')
+    return fastpath.issued_auth(text) or (fastpath.classify(item) or {}).get('kind') == 'auth'
+
+
 def log_drop(item, reason):
     deduped = reason in ('other_watcher', 'answered', 'robob_chat', 'fastpath', 'charge_asked', 'queued')
     category = 'deduped' if deduped else 'otp' if reason == 'stale_otp' else 'noise'
@@ -839,14 +860,16 @@ def mail_record(M, mail, account, validity, record, cutoff, now, request):
     # Persist a rejection too: a preview must not override the full-message decision.
     item['renewal_notice'] = renewal_notice(item, text)
     if request.get('fast'):
-        item['hard_alert'] = fastpath.classify({**item, 'preview': text,
-            'signin_link': fastpath.html_signin_link('\n'.join(html))}, request.get('actions', []), request.get('rates'))
+        raw_item = {**item, 'preview': text, 'signin_link': fastpath.html_signin_link('\n'.join(html))}
+        if has_auth_issuance({**raw_item, 'subject': str(msg.get('Subject', ''))}):
+            item['auth_issued'] = True
+        item['hard_alert'] = fastpath.classify(raw_item, request.get('actions', []), request.get('rates'))
         if (item.get('hard_alert') or {}).get('kind') == 'auth':
             item['auth_identity'] = {k: item[k] for k in ('sender', 'account', 'ts')}
     item['preview'] = clean(text)
     item['attachments'] = [clean(a, 100) for a in attachments[:5]]
     redact_item(item, ' '.join([str(msg.get('Subject', '')), text, *attachments]))
-    return item, None if item.get('hard_alert') else prefilter(item, now, request['rules'])
+    return item, None if (item.get('hard_alert') or {}).get('kind') in ('sim', 'login', 'debit') else prefilter(item, now, request['rules'])
 
 
 def mail_worker(account, request):
@@ -1077,6 +1100,8 @@ def collect_imessage(cursor, now, initialized_at=None, since=None, fast=None):
                           'chat_id': chats[0]['ROWID'] if chats else None, 'guid': r['guid'],
                           'sender': clean(r['sender'], 150), 'subject': clean(r['subject'], 150), 'preview': clean(text)}
             if fast is not None:
+                if has_auth_issuance({**item, 'subject': str(r['subject'] or ''), 'preview': text}):
+                    item['auth_issued'] = True
                 item['hard_alert'] = fastpath.classify({**item, 'preview': text}, fast.get('actions', []), fast.get('rates'))
                 if (item.get('hard_alert') or {}).get('kind') == 'auth':
                     item['auth_identity'] = {k: item[k] for k in ('sender', 'ts')}
@@ -1615,18 +1640,32 @@ def run_fast(args):
             log_drop({'id': item_id, 'source': 'email' if source in ACCOUNTS else source}, reason)
         for item in result['items']:
             hard = item['hard_alert'] if 'hard_alert' in item else fastpath.classify(item, actions, config.get('fastpath_aed_rates'))
-            if hard:
-                identity = item.get('auth_identity') or {k: item[k] for k in ('sender', 'account', 'ts') if k in item}
-                if hard['kind'] == 'auth' and fastpath.expected(identity, actions):
+            identity = item.get('auth_identity') or {k: item[k] for k in ('sender', 'account', 'ts') if k in item}
+            if hard and hard['kind'] == 'auth':
+                if fastpath.expected(identity, actions):
                     log_decision(item, 'otp', 'ignored')
-                    continue
-                log_decision(item, {'auth': 'otp', 'debit': 'charge'}.get(hard['kind'], 'security'),
+                else:
+                    log_auth_only(item, hard)
+                if state['pending'].get(item['id'], {}).get('kind') == 'auth':
+                    del state['pending'][item['id']]
+                continue
+            if (not hard
+                    and (item.get('auth_issued') or has_auth_issuance(item))
+                    and fastpath.expected(identity, actions)):
+                log_decision(item, 'otp', 'ignored')
+            if hard:
+                log_decision(item, 'charge' if hard['kind'] == 'debit' else 'security',
                              source='charge' if hard['kind'] == 'debit' else None,
                              deduped=item['id'] in state['pending'], action='queue')
-                state['pending'].setdefault(item['id'], {'text': hard['text'], 'kind': hard['kind'], 'at': item['ts'],
-                                                        **({'auth_identity': identity} if hard['kind'] == 'auth' else {})})
+                state['pending'].setdefault(item['id'], {'text': hard['text'], 'kind': hard['kind'], 'at': item['ts']})
     for item_id, alert in list(state['pending'].items()):
-        if alert.get('auth_identity') and fastpath.expected(alert['auth_identity'], actions):
+        if alert.get('kind') == 'auth':
+            if alert.get('auth_identity') and fastpath.expected(alert['auth_identity'], actions):
+                log_decision({'id': item_id}, 'otp', 'ignored')
+            else:
+                log_auth_only({'id': item_id, 'sender': (alert.get('auth_identity') or {}).get('sender')}, alert)
+            del state['pending'][item_id]
+        elif alert.get('auth_identity') and fastpath.expected(alert['auth_identity'], actions):
             log_decision({'id': item_id}, 'otp', 'ignored')
             del state['pending'][item_id]
     live = wd.resolve() == (LIVE.parent / 'inbox-triage-fastpath').resolve()
@@ -1710,11 +1749,17 @@ def urgent_alerts(state, report, wd, now, dry=False, deadline=None):
         if seconds <= 0:
             errors[hit['id']] = 'time budget; telegram notify not attempted'
             continue
+        legacy = legacy_auth_text(attempts.get(hit['id'], {}), ledger.get(hit['id'], {}))
+        if legacy:
+            # Redacted OTPs and hidden links may no longer classify as auth.
+            attempts.pop(hit['id'], None)
+            log_auth_only(hit, {'text': legacy})
+            continue
         sender = clean(hit.get('sender'), 50)
         summary = clean(hit.get('subject') or hit.get('preview'), 110)
         reason = clean(hit['reason'], 110)
         hard = fastpath.classify(hit)
-        text = hard['text'] if hard else clean(f'{kind.capitalize()}: {sender} — {summary} — {reason}', 300)
+        text = hard['text'] if hard and hard['kind'] != 'auth' else clean(f'{kind.capitalize()}: {sender} — {summary} — {reason}', 300)
         # The old outage path and fast collector share one immutable payload and delivery ledger.
         if hit['id'] not in attempts:
             attempts[hit['id']] = {'text': text, 'at': now}
@@ -2110,7 +2155,8 @@ def run(args):
                 continue
             hard = fastpath.classify(item)
             delivered = fast_sent.get(item['id'], {})
-            if hard and hard['kind'] != 'debit' and delivered.get('telegram') and imessage_confirmed(item['id'], delivered):
+            if (hard and hard['kind'] in ('sim', 'login') and not legacy_auth_text(delivered)
+                    and delivered.get('telegram') and imessage_confirmed(item['id'], delivered)):
                 done[item['id']] = 'fastpath'
     kept_by_id = {i['id']: i for i in kept}
     for i, reason in sorted(done.items()):
