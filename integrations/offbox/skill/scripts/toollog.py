@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 import time
 
@@ -76,8 +77,18 @@ ENUMS['reason'].update({'incus_unavailable', 'state_unavailable', 'box_unreadabl
 _DAYS = set()
 
 
+def testing():
+    return os.environ.get("OFFBOX_TEST") == "1" or "unittest" in sys.modules or "pytest" in sys.modules
+
+
 def directory():
-    return Path(os.environ.get("OFFBOX_TOOL_LOG_DIR", str(Path.home() / ".robob/logs/tools/offbox")))
+    # Keep the earlier override working for hooks and isolated shell health checks.
+    override = os.environ.get("OFFBOX_LOG_DIR") or os.environ.get("OFFBOX_TOOL_LOG_DIR")
+    if override:
+        return Path(override).expanduser()
+    if testing():
+        return None
+    return Path.home() / ".robob/logs/tools/offbox"
 
 
 def repo_id(value):
@@ -166,18 +177,21 @@ def emit(component, name, *, kind="event", duration_ms=None, ok=None, ids=None, 
         now = datetime.now(timezone.utc)
         day = now.strftime("%Y-%m-%d")
         root = directory()
+        if root is None:
+            return
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         root.chmod(0o700)
         key = (str(root), day)
         if key not in _DAYS:
             cutoff = (now - timedelta(days=30)).strftime("%Y-%m-%d")
             for path in root.iterdir():
-                match = re.fullmatch(r"(?:rollup-)?(\d{4}-\d{2}-\d{2})\.(?:ndjson|json|cap)", path.name)
+                match = re.fullmatch(r"(?:rollup-(?:live-)?)?(\d{4}-\d{2}-\d{2})\.(?:ndjson|json|cap)", path.name)
                 if match and match[1] < cutoff:
                     path.unlink(missing_ok=True)
             _DAYS.add(key)
         line = {"ts": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-                "tool": "offbox", "component": component, "kind": kind, "name": name}
+                "tool": "offbox", "component": component, "kind": kind, "name": name,
+                "source": "test" if testing() else "live"}
         if type(duration_ms) in (int, float) and math.isfinite(duration_ms):
             line["durationMs"] = round(max(0, duration_ms), 3)
         if type(ok) is bool:
@@ -237,15 +251,28 @@ def observed(component, name, tag, *, timeout_tag=None):
     return decorate
 
 
-def rollup(day=None):
+def _live(row):
+    if row.get("source") == "test":
+        return False
+    ids = row.get("ids")
+    if ids is None or isinstance(ids, dict) and "run" not in ids:
+        return not row["name"].startswith("run.")
+    run = ids.get("run") if isinstance(ids, dict) else None
+    # new_id used four hex digits historically and now uses token_hex(4) (eight).
+    return isinstance(run, str) and re.fullmatch(r"run-[0-9]{4}-[0-9]{6}-(?:[0-9a-f]{4}|[0-9a-f]{8})", run) is not None
+
+
+def rollup(day=None, *, live_only=False):
     """Explicit rollups may fail; callers can report the failure without affecting their work."""
     day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     datetime.strptime(day, "%Y-%m-%d")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
         raise ValueError("expected YYYY-MM-DD")
     root = directory()
+    if root is None:
+        raise ValueError("OFFBOX_LOG_DIR is required during tests")
     counts, kinds, errors, samples, durations = Counter(), Counter(), Counter(), {}, {}
-    total = ok = checked = bad = malformed = 0
+    total = ok = checked = bad = malformed = excluded = records = 0
     sampled = False
     path = root / (day + ".ndjson")
     if path.exists():
@@ -256,10 +283,14 @@ def rollup(day=None):
                     if not isinstance(row, dict) or row.get("tool") != "offbox" or not _atom(row.get("name")) or row.get("kind") not in ("event", "perf", "error"):
                         raise ValueError()
                     name, kind = row["name"], row["kind"]
+                    if live_only and not _live(row):
+                        excluded += 1
+                        continue
                     weight = (row.get("props") or {}).get("sample", 1)
                     if type(weight) is not int or weight < 1:
                         weight = 1
                     sampled |= weight > 1
+                    records += 1
                     total += weight
                     counts[name] += weight
                     kinds[kind] += weight
@@ -283,6 +314,8 @@ def rollup(day=None):
               "okRate": ok/checked if checked else None, "errorRate": bad/total if total else None,
               "durationMs": {name: stats(xs) for name, xs in durations.items()}, "malformedLines": malformed,
               "topErrors": [{"tag": tag, "count": count, "sampleIds": samples[tag]} for tag, count in errors.most_common(20)]}
+    if live_only:
+        result.update(liveOnly=True, records=records, excludedRecords=excluded)
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root.chmod(0o700)
     fd, tmp = tempfile.mkstemp(prefix=".rollup-", dir=root)
@@ -290,7 +323,7 @@ def rollup(day=None):
         with os.fdopen(fd, "w") as target:
             json.dump(result, target, separators=(",", ":"))
             target.write("\n")
-        dest = root / ("rollup-" + day + ".json")
+        dest = root / ("rollup-" + ("live-" if live_only else "") + day + ".json")
         os.replace(tmp, dest)
         return result
     finally:
@@ -303,7 +336,8 @@ def rollup_previous():
         if now.hour == 0 and now.minute < 5:
             return
         day = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-        if not (directory() / ("rollup-" + day + ".json")).exists():
+        root = directory()
+        if root is not None and not (root / ("rollup-" + day + ".json")).exists():
             rollup(day)
     except Exception:
         pass
