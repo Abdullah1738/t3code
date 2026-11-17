@@ -4,6 +4,7 @@ import { bounded } from "../src/router.ts";
 import { toolError, toolLog, type LogLine } from "../src/toollog.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { summarizeLog } from "../src/log-rollup.ts";
+import { cleanCalls } from "../src/log-calls.ts";
 
 const client = () => new ControlClient({ url: "http://127.0.0.1:3773", token: "PRIVATE_TOKEN" });
 const echo = "91274f60-34f8-4298-bf6d-a96a95f36503";
@@ -112,4 +113,73 @@ test("unmarked local failures, cyclic causes, and throwing cause accessors keep 
   expect(rows.filter(row => row.name === "bridge.catch")).toHaveLength(4);
   expect(rows.every(row => row.alreadyLogged === undefined)).toBe(true);
   expect(result!).toMatchObject({ failed: 4, total: 4, dedupedFailures: 0, errorRate: 1 });
+});
+
+for (const cause of ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"]) {
+  test.each([0, 3])(`${cause} outage counts all 12 failures once with summary flush interval %s`, async interval => {
+    let failing = false;
+    const fetcher = spyOn(globalThis, "fetch").mockImplementation(fetchMock(async () => {
+      if (!failing) return new Response(JSON.stringify({ ok: true }));
+      throw Object.assign(new TypeError("PRIVATE_BODY"), { code: cause });
+    }));
+    try {
+      let result: Awaited<ReturnType<typeof toolLog.rollup>>;
+      const rows = await captureLogs(async () => {
+        // Close any preceding test's outage before starting this one.
+        await client().request("GET", "/health");
+        failing = true;
+        for (let index = 1; index <= 12; index++) {
+          await client().request("GET", "/threads/id-outage/messages").catch(error => toolError("router", "router.catch1", error));
+          if (interval && index % interval === 0) toolLog.flush();
+        }
+        toolLog.flush();
+        result = await toolLog.rollup(new Date().toISOString().slice(0, 10));
+      });
+      expect(rows.filter(row => row.name === "turn.robob_call" && row.ok === false)).toHaveLength(5);
+      const catches = rows.filter(row => row.name === "bridge.catch");
+      expect(catches).toHaveLength(12);
+      expect(catches.every(row => row.alreadyLogged === true)).toBe(true);
+      expect(new Set(catches.map(row => row.ids?.requestId)).size).toBe(12);
+      const summaries = rows.filter(row => row.name === "turn.robob_calls").map(row => row.calls!.messages).filter(Boolean);
+      expect(summaries.reduce((sum, stats) => sum + stats.singleFailures!, 0)).toBe(12);
+      if (interval) expect(summaries.some(stats => stats.singleFailures === 3)).toBe(true);
+      expect(result!).toMatchObject({ failed: 12, dedupedFailures: 12, countsByName: { "turn.robob_call": 13, "bridge.catch": 12 } });
+      expect(result!.errorRate).toBe(12 / result!.total);
+      expect(result!.topErrorTags).toHaveLength(1);
+      expect(result!.topErrorTags[0]).toMatchObject({ tag: "control.request_failed", count: 5 });
+    } finally { fetcher.mockRestore(); }
+  });
+}
+
+test.each([
+  { shape: "partial_details", single: 6, details: 5, legacy: 0, reverse: false },
+  { shape: "summary_only", single: 6, details: 0, legacy: 0, reverse: false },
+  { shape: "all_details", single: 6, details: 6, legacy: 0, reverse: false },
+  { shape: "reversed", single: 6, details: 5, legacy: 0, reverse: true },
+  { shape: "legacy", single: 0, details: 5, legacy: 6, reverse: false },
+  { shape: "mixed", single: 3, details: 5, legacy: 3, reverse: false },
+  { shape: "old_single_summary", single: undefined, details: 5, legacy: 0, reverse: false },
+])("outage summary shape $shape preserves new and legacy failure ownership", async ({ single, details, legacy, reverse }) => {
+  const detail: LogLine = { ts: "2026-11-16T12:00:00Z", tool: "imessage", component: "robob", kind: "perf",
+    name: "turn.robob_call", ok: false, durationMs: 25, ids: { callBatchId: "batch" },
+    props: { method: "GET", route: "/threads/:id/messages", failureFormat: "single" },
+    error: { tag: "control.request_failed", name: "TypeError", message: "[redacted]" } };
+  const records: LogLine[] = [{ ...detail, name: "turn.robob_calls", ok: undefined, error: undefined, props: undefined,
+    calls: { messages: { count: 6, ok: 0, failed: 6, singleFailures: single, p50: 25, p95: 25, max: 25, histogram: [[25, 6]] } } }];
+  for (let index = 0; index < details; index++) records.push({ ...detail,
+    props: { ...detail.props, ...(index < (single ?? 6) ? {} : { failureFormat: "" }) } });
+  for (let index = 0; index < 6; index++) records.push({ ...detail, component: "router", kind: "error", name: "bridge.catch",
+    props: undefined, alreadyLogged: index >= legacy, error: { ...detail.error!, tag: index < legacy ? "control.catch1" : "router.catch1" } });
+  if (reverse) records.reverse();
+  const result = await summarizeLog((async function* () { yield* records; })());
+  expect(result).toMatchObject({ total: 12, recordedRows: records.length, failed: 6 + legacy, dedupedFailures: 6 - legacy,
+    errorRate: ((single ?? details) + legacy) / 12, countsByName: { "turn.robob_call": 6, "bridge.catch": 6 } });
+  expect(result.topErrorTags.some(item => item.tag === "router.catch1")).toBe(false);
+});
+
+test.each([undefined, 0, 6, -1, 7, .5, NaN, Infinity, "6", true])("singleFailures accepts only bounded integer counts (%s)", singleFailures => {
+  const stats = cleanCalls({ messages: { ok: 0, failed: 6, histogram: [[25, 6]], singleFailures } })!.messages!;
+  const valid = typeof singleFailures === "number" && Number.isSafeInteger(singleFailures) && singleFailures >= 0 && singleFailures <= 6;
+  expect(stats.singleFailures).toBe(valid ? singleFailures as number : undefined);
+  expect(stats.failed).toBe(6);
 });

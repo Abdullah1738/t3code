@@ -12,6 +12,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
   const causes = new Map<string, { tag: string; causeKey: string; count: number }>();
   const renderFailures = new Map<string, number>();
   const represented = new Set<string>();
+  const representedSingleFailures = new Set<string>();
   const individualCalls: LogLine[] = [];
   const chainAggregation = createChainAggregation();
   const robobLink = createRobobLinkAggregation();
@@ -25,7 +26,8 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     if (line.alreadyLogged === true) return;
     // Legacy request diagnostics are owned by control.catch1/2, including in mixed-version days.
     const requestFailure = line.component === "robob" && line.name === "turn.robob_call" && line.kind === "perf" && line.ok === false;
-    if (requestFailure && line.props?.failureFormat === "single") failedCalls++;
+    if (requestFailure && line.props?.failureFormat === "single"
+      && (!line.ids?.callBatchId || !representedSingleFailures.has(`${line.ids.callBatchId}\0${callName(line)}`))) failedCalls++;
     if (requestFailure && line.props?.failureFormat !== "single" && line.error?.tag === "control.request_failed") return;
     if (!line.error) return;
     if (line.error.causeKey) {
@@ -90,6 +92,10 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     } else if (line.name === "turn.robob_calls" && line.calls) {
       for (const [name, stats] of Object.entries(line.calls)) {
         if (line.ids?.callBatchId) represented.add(`${line.ids.callBatchId}\0${name}`);
+        if (stats.singleFailures !== undefined) {
+          failedCalls += stats.singleFailures;
+          if (line.ids?.callBatchId) representedSingleFailures.add(`${line.ids.callBatchId}\0${name}`);
+        }
         consume({ ...line, name: "turn.robob_call", calls: undefined }, stats.count, stats.ok, stats.failed, stats.histogram);
         component("robob", name, stats.count, stats.ok, stats.failed, stats.histogram);
       }
