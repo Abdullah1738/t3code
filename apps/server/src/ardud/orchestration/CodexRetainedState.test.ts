@@ -284,6 +284,72 @@ it.effect("an unavailable optional rollout does not pin an otherwise empty threa
       yield* state.register("native", `${dir}/missing.jsonl`);
       yield* state.idle("native");
       assert.isFalse(yield* state.holds("native"));
+      yield* state.refresh("native");
+      yield* TestClock.adjust(CODEX_RETAINED_STATE_IDLE_CAP_MS);
+      yield* state.refresh("native");
+      assert.isFalse(yield* state.holds("native"));
+      assert.isUndefined(yield* state.takeLoss("native"));
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(
+  (["cell", "session", "empty"] as const).flatMap((kind) =>
+    (["before idle", "after an empty probe"] as const).map((created) => ({ kind, created })),
+  ),
+)("retries a rollout created after registration (%j)", ({ kind, created }) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped();
+      const path = `${dir}/rollout.jsonl`;
+      const state = yield* make();
+      yield* state.register("native", path);
+      if (created === "after an empty probe") {
+        yield* state.idle("native");
+        assert.isFalse(yield* state.holds("native"));
+      }
+      const payload =
+        kind === "empty"
+          ? { type: "message" }
+          : output("exec-1", kind === "cell" ? yielded : session);
+      yield* fs.writeFileString(path, JSON.stringify({ type: "response_item", payload }) + "\n");
+      if (created === "after an empty probe") {
+        // Repeated registration must not skip receipts from the deferred rollout.
+        yield* state.register("native", path);
+        yield* state.refresh("native");
+      } else yield* state.idle("native");
+      assert.equal(yield* state.holds("native"), kind !== "empty");
+      yield* TestClock.adjust(CODEX_RETAINED_STATE_IDLE_CAP_MS);
+      assert.isFalse(yield* state.holds("native"));
+      const loss = yield* state.takeLoss("native");
+      if (kind === "empty") assert.isUndefined(loss);
+      else {
+        assert.include(loss!, kind === "cell" ? "Cell g2142:27" : "Exec session 90878");
+        assert.include(loss!, "may or may not have run");
+      }
+      assert.isUndefined(yield* state.takeLoss("native"));
+    }),
+  ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("reports a rollout that disappears after becoming readable", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped();
+      const path = `${dir}/rollout.jsonl`;
+      const state = yield* make();
+      yield* state.register("native", path);
+      yield* fs.writeFileString(path, "");
+      yield* state.refresh("native");
+      assert.isFalse(yield* state.holds("native"));
+      yield* fs.remove(path);
+      yield* state.idle("native");
+      assert.isTrue(yield* state.holds("native"));
+      yield* TestClock.adjust(CODEX_RETAINED_STATE_IDLE_CAP_MS);
+      assert.isFalse(yield* state.holds("native"));
+      assert.include((yield* state.takeLoss("native"))!, "could not be read completely");
       assert.isUndefined(yield* state.takeLoss("native"));
     }),
   ).pipe(Effect.provide(NodeServices.layer)),

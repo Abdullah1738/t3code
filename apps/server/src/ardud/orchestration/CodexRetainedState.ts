@@ -184,6 +184,7 @@ export const make = Effect.fn("CodexRetainedState.make")(function* () {
     string,
     {
       path?: string;
+      rolloutSeen: boolean;
       offset: bigint;
       remainder: string;
       decoder: InstanceType<typeof TextDecoder>;
@@ -196,6 +197,7 @@ export const make = Effect.fn("CodexRetainedState.make")(function* () {
     let state = threads.get(id);
     if (!state) {
       state = {
+        rolloutSeen: false,
         offset: 0n,
         remainder: "",
         decoder: new TextDecoder(),
@@ -213,9 +215,10 @@ export const make = Effect.fn("CodexRetainedState.make")(function* () {
     if (!path || (state.path && !state.closed)) return;
     // Resume starts a new host: historical cells belong to restart recovery (#876).
     const info = yield* fs.stat(path).pipe(Effect.option);
-    if (Option.isNone(info)) return;
     state.path = path;
-    state.offset = info.value.size;
+    state.rolloutSeen = Option.isSome(info);
+    // thread/start may return the path before Codex creates the rollout.
+    state.offset = Option.isSome(info) ? info.value.size : 0n;
     state.remainder = "";
     state.decoder = new TextDecoder();
   });
@@ -224,7 +227,14 @@ export const make = Effect.fn("CodexRetainedState.make")(function* () {
     if (!state.path || state.closed) return;
     yield* Effect.scoped(
       Effect.gen(function* () {
-        const file = yield* fs.open(state.path!, { flag: "r" });
+        const file = yield* fs.open(state.path!, { flag: "r" }).pipe(
+          Effect.catchIf(
+            (error) => !state.rolloutSeen && error.reason._tag === "NotFound",
+            () => Effect.succeed(undefined),
+          ),
+        );
+        if (!file) return;
+        state.rolloutSeen = true;
         const size = (yield* file.stat).size;
         if (size < state.offset) {
           state.items.markUncertain();

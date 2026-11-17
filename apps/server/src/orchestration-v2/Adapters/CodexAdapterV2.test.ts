@@ -4029,7 +4029,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         }
         yield* harness.awaitInputEnd;
         yield* Deferred.succeed(processExited, undefined);
-        yield* Effect.yieldNow;
+        yield* harness.firstTerminal;
         assert.lengthOf(harness.terminalEvents(), 1, "Process EOF left the native turn active");
       }).pipe(
         Effect.scoped,
@@ -4097,7 +4097,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       yield* Fiber.interrupt(recoveryWait);
       yield* harness.awaitInputEnd;
       yield* Deferred.succeed(processExited, undefined);
-      yield* Effect.yieldNow;
+      yield* harness.firstTerminal;
       assert.lengthOf(
         harness.terminalEvents(),
         1,
