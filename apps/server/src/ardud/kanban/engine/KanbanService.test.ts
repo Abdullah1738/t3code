@@ -37377,6 +37377,173 @@ const unstartedLifecycleLayer = () => {
 };
 
 it.effect.each(
+  (["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
+    (["accepted input", "clean successor"] as const).flatMap((reconciliation) =>
+      [false, true].map((restart) => ({ reason, reconciliation, restart })),
+    ),
+  ),
+)(
+  "persisted uncertain steering holds active evaluator reminders ($reason, $reconciliation, restart=$restart)",
+  ({ reason, reconciliation, restart }) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const lifecycle = yield* KanbanThreads.pipe(Effect.provide(KanbanThreadLifecycle.layer));
+      const fake = yield* makeFake;
+      const base = yield* KanbanThreads.pipe(Effect.provide(fake.layer));
+      let evaluator: ThreadId | undefined;
+      const wrapped = Layer.succeed(KanbanThreads, {
+        ...base,
+        findLastFailure: (id) =>
+          id === evaluator ? lifecycle.findLastFailure(id) : base.findLastFailure(id),
+      });
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Finish reviewed evaluator work",
+            prompt: "Finish",
+            subtasks: [{ step: 1, owner: "evaluator", text: "Reconcile and finish" }],
+          },
+          owner,
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Finish the audit" }]);
+        const thread = (yield* kanban.discussion(discussion.id)).evaluatorThreadId!;
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("steer-reminder:create"),
+          threadId: thread,
+          projectId: ProjectId.make("project-1"),
+          title: "Active evaluator",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-6.1-sol" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "system",
+          creationSource: "server",
+        });
+        yield* lifecycle.send({ threadId: thread, text: "Current evaluator input" });
+        const records = yield* orchestrator.getThreadRecords(thread, ["runs", "messages"]);
+        const run = records.runs[0]!;
+        const message = records.messages[0]!;
+        const now = yield* DateTime.now;
+        yield* projections.apply({
+          id: EventId.make("steer-reminder:running"),
+          type: "run.updated",
+          threadId: thread,
+          runId: run.id,
+          occurredAt: now,
+          payload: { ...run, status: "running", startedAt: now },
+        });
+        const failure = makeProviderFailure({
+          cause: new ProviderPromptAcceptanceError({
+            driver: ProviderDriverKind.make("opencode"),
+            serverOrigin: "http://opencode.test",
+            reason,
+            budgetSeconds: 60,
+          }),
+        });
+        const steer = {
+          ...message,
+          id: MessageId.make("uncertain-review-steer"),
+          text: "Do the evaluator step",
+          deliveryFailure: failure,
+        };
+        yield* projections.apply({
+          id: EventId.make("steer-reminder:uncertain-input"),
+          type: "message.updated",
+          threadId: thread,
+          runId: run.id,
+          occurredAt: now,
+          payload: steer,
+        });
+        evaluator = thread;
+        const current = (yield* store.card(card.id))!;
+        yield* store.putCard({
+          ...current,
+          stage: "in_review",
+          reviewStep: 1,
+          nudgedAt: DateTime.formatIso(now),
+          links: [
+            {
+              kind: "pr",
+              url: "https://example.com/pull/1725",
+              label: null,
+              state: "open",
+              checkedAt: null,
+            },
+          ],
+        });
+        const before = yield* Ref.get(fake.threads);
+        const target = before.get(thread)!;
+        target.running = true;
+        target.runId = run.id;
+        target.runStartedAt = DateTime.formatIso(now);
+        const ids = [...before.keys()];
+        const messages = [...target.messages];
+        const check = Effect.gen(function* () {
+          const service = yield* KanbanService.KanbanService;
+          for (const elapsed of ["61 minutes", "6 hours", "6 hours"] as const) {
+            yield* TestClock.adjust(elapsed);
+            yield* service.tick;
+            const after = yield* Ref.get(fake.threads);
+            assert.deepEqual([...after.keys()], ids);
+            assert.deepEqual(after.get(thread)!.messages, messages);
+          }
+          const reconciledAt = yield* DateTime.now;
+          if (reconciliation === "accepted input")
+            yield* projections.apply({
+              id: EventId.make("steer-reminder:accepted"),
+              type: "message.updated",
+              threadId: thread,
+              runId: run.id,
+              occurredAt: reconciledAt,
+              payload: { ...steer, deliveryFailure: undefined },
+            });
+          else {
+            yield* projections.apply({
+              id: EventId.make("steer-reminder:finished"),
+              type: "run.updated",
+              threadId: thread,
+              runId: run.id,
+              occurredAt: reconciledAt,
+              payload: { ...run, status: "completed", startedAt: now, completedAt: reconciledAt },
+            });
+            const successor = {
+              ...run,
+              id: RunId.make("clean-review-successor"),
+              ordinal: run.ordinal + 1,
+              status: "running" as const,
+              startedAt: reconciledAt,
+              completedAt: null,
+            };
+            yield* projections.apply({
+              id: EventId.make("steer-reminder:successor"),
+              type: "run.updated",
+              threadId: thread,
+              runId: successor.id,
+              occurredAt: reconciledAt,
+              payload: successor,
+            });
+          }
+          yield* service.tick;
+          const after = yield* Ref.get(fake.threads);
+          assert.isTrue(
+            after.size > ids.length || after.get(thread)!.messages.length > messages.length,
+          );
+        });
+        yield* restart ? check.pipe(Effect.provide(KanbanService.layer)) : check;
+      }).pipe(Effect.provide(testLayer(wrapped)));
+    }).pipe(Effect.provide(unstartedLifecycleLayer())),
+);
+
+it.effect.each(
   (["reset", "stop"] as const).flatMap((action) =>
     (["inline", "deferred"] as const).flatMap((mode) =>
       (["detached starting", "detached queue only", "active", "distinct old threads"] as const).map(
