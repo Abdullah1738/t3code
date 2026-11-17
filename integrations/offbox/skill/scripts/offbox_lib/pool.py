@@ -136,6 +136,11 @@ def pool_cap(con, key, *, locked=False):
                 active = con.execute("SELECT 1 FROM runs WHERE run_id=? AND box_id IS NOT NULL AND "
                                      "(status IN ('starting','running') OR EXISTS "
                                      "(SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id) OR "
+                                     "(pulls IS NOT NULL AND pulls!='[]' AND "
+                                     "(pull_state IS NULL OR pull_state IN ('pending','running')) AND "
+                                     "(pull_state='running' OR NOT EXISTS (SELECT 1 FROM kv "
+                                     "WHERE k='lost_confirmed:' || runs.run_id AND v='fenced' "
+                                     "AND runs.status='lost' AND runs.exit_code IS NULL))) OR "
                                      "(status='lost' AND exit_code IS NULL AND NOT EXISTS "
                                      "(SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)))",
                                      (row['run_id'],)).fetchone() is not None

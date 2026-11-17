@@ -2964,7 +2964,7 @@ def killed_result(run_id, *, wait=False, until=None, row=None, known_code=None):
                     if (current['status'], current['exit_code']) != ('killed', cached['exit_code']):
                         # Repair old killed/NULL rows and confirmed kills saved during a DB outage.
                         con.execute("UPDATE runs SET status='killed',exit_code=?,end_at=COALESCE(end_at,?) WHERE run_id=? "
-                                    "AND (pull_state IS NULL OR pull_state!='running') "
+                                    "AND (COALESCE(pulls,'[]')='[]' OR pull_state IN ('none','done','partial','failed')) "
                                     "AND (status IN ('starting','running') OR exit_code IS NULL OR "
                                     "(status='failed' AND exit_code IN (137,143)))",
                                     (cached['exit_code'], cached.get('end_at') or now(), run_id))
@@ -3126,7 +3126,8 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
                     elif st == 'killed' and code == 143 and r['exit_code'] in (None, 137, 143):
                         # Kill confirmation may arrive after the attached client saved lost/infra.
                         con.execute("UPDATE runs SET status='killed',exit_code=143,end_at=? WHERE run_id=? "
-                                    "AND (pull_state IS NULL OR pull_state!='running')", (now(), run_id))
+                                    "AND (COALESCE(pulls,'[]')='[]' OR pull_state IN ('none','done','partial','failed'))",
+                                    (now(), run_id))
                     else:
                         con.execute("UPDATE runs SET status=?, exit_code=?, end_at=? WHERE run_id=? "
                                     "AND (pull_state IS NULL OR pull_state!='running') "
@@ -3154,8 +3155,9 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
         return code
     if not r:
         return code
-    if st == 'killed' and code == 143 and r['pull_state'] == 'running' and r['exit_code'] in (None, 137, 143):
-        # Keep the command receipt without releasing the box while its pull is publishing.
+    if (st == 'killed' and code == 143 and r['exit_code'] in (None, 137, 143)
+            and json.loads(r['pulls'] or '[]') and r['pull_state'] not in ('none','done','partial','failed')):
+        # Keep the receipt and box reservation from confirmation through the last pull write.
         save_run_state(run_id, status=st, exit_code=code, end_at=now(), until=until)
         return code
     st, code = r['status'], r['exit_code']

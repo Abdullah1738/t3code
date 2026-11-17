@@ -407,7 +407,13 @@ def find_lease(con, owner: str, root: str):
 
 
 def active_runs(con, box_id: str) -> int:
+    # Command completion can precede the pull claim, including receipts from older clients.
     return con.execute("SELECT COUNT(*) FROM runs WHERE box_id=? AND (status IN ('starting','running') "
+                       "OR (pulls IS NOT NULL AND pulls!='[]' AND "
+                       "(pull_state IS NULL OR pull_state IN ('pending','running')) AND "
+                       "(pull_state='running' OR NOT EXISTS (SELECT 1 FROM kv "
+                       "WHERE k='lost_confirmed:' || runs.run_id AND v='fenced' "
+                       "AND runs.status='lost' AND runs.exit_code IS NULL))) "
                        "OR EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id) "
                        "OR (status='lost' AND exit_code IS NULL AND NOT EXISTS "
                        "(SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)))",

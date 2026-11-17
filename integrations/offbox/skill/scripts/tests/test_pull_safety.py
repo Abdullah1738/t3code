@@ -73,6 +73,102 @@ class PullSafetyTests(Isolated):
         self.assertEqual(baseline['files']['new.txt'], 'absent')
         self.assertEqual(self.row()['pull_state'], 'pending')
 
+    def test_kill_before_pull_claim_keeps_checkout_reserved_from_allocator(self):
+        self.write_file('f.txt', 'base')
+        self.baseline()
+        self.write_file('f.txt', 'result of killed run', remote=True)
+        self.box('bx_other', member=True)
+        self.con.execute("UPDATE runs SET owner=?,remote_dir=? WHERE run_id='run-pull'",
+                         (self.me['owner'], pool.remote_dir_for(self.me['repo_root'])))
+        self.con.commit()
+        observed = {}
+
+        def incoming(box, remote_dir, rel, pattern, stage, **options):
+            observed['active_during_transfer'] = lease.active_runs(self.con, box)
+            selected = pool.acquire(self.me)
+            try:
+                observed['allocated_box'] = selected['box_id']
+                if selected['box_id'] == box and selected['remote_dir'] == remote_dir:
+                    self.write_file('f.txt', 'result of next run', remote=True)
+                return self.sync(box, remote_dir, rel, pattern, stage, **options)
+            finally:
+                pool.release_guard(selected)
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)))
+            stack.enter_context(patch.object(lease, 'touch'))
+            stack.enter_context(patch.object(lease, 'idle_ttl'))
+            stack.enter_context(patch.object(runs, 'settle_docker'))
+            stack.enter_context(patch.object(api, 'cmd_kill', return_value={}))
+            stack.enter_context(patch.object(api, 'cmd_status', return_value={
+                'running': False, 'status': 'exited', 'exitCode': 143}))
+            stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('network forbidden')))
+            stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
+            from offbox_lib import box_disk
+            stack.enter_context(patch.object(box_disk, 'picker_ok', return_value=True))
+            stack.enter_context(patch.object(ssh_sync, 'pull', side_effect=incoming))
+            self.assertEqual(misc.kill_run('run-pull', self.me), 0)
+            observed['active_before_claim'] = lease.active_runs(self.con, 'bx_pull')
+            observed['confirmed_exit'] = runs.killed_result('run-pull', row=self.row())['exit_code']
+            observed['status_after_receipt'] = self.row()['status']
+            self.assertEqual(misc._settled(self.row()), 143)
+        self.assertEqual(observed['active_before_claim'], 1, observed)
+        self.assertEqual(observed['active_during_transfer'], 1, observed)
+        self.assertEqual(observed['allocated_box'], 'bx_other', observed)
+        self.assertEqual(observed['confirmed_exit'], 143)
+        self.assertEqual(observed['status_after_receipt'], 'running')
+        self.assertEqual((self.root / 'f.txt').read_text(), 'result of killed run')
+        self.assertEqual((self.row()['status'], self.row()['exit_code'], self.row()['pull_state']),
+                         ('killed', 143, 'done'))
+        self.assertEqual(lease.active_runs(self.con, 'bx_pull'), 0)
+        self.assertEqual(len(self.events('pull_start')), 1)
+        self.assertIn('pulls: done (1 files, 0 conflicts)', self.output.getvalue())
+
+    def test_terminal_command_reserves_box_until_its_pulls_are_terminal(self):
+        for status, code in (('killed', 143), ('done', 0), ('failed', 7)):
+            for state in (None, 'pending', 'running', 'none', 'done', 'partial', 'failed'):
+                with self.subTest(status=status, pull_state=state):
+                    self.con.execute("UPDATE runs SET status=?,exit_code=?,pull_state=?",
+                                     (status, code, state))
+                    self.con.execute("INSERT OR REPLACE INTO pool_cap_callers "
+                                     "(token,pool_key,pid,run_id,cap,granted) "
+                                     "VALUES ('pull-cap','repo',999999,'run-pull',8,1)")
+                    self.con.commit()
+                    reserved = state in (None, 'pending', 'running')
+                    self.assertEqual(lease.active_runs(self.con, 'bx_pull'), int(reserved))
+                    cap = pool.pool_cap(self.con, 'repo')
+                    retained = self.con.execute("SELECT 1 FROM pool_cap_callers WHERE token='pull-cap'").fetchone()
+                    self.assertEqual(bool(retained), reserved)
+                    if reserved:
+                        self.assertEqual(cap, 8)
+        self.con.execute("UPDATE runs SET pulls='[]',pull_state='pending'")
+        self.con.commit()
+        self.assertEqual(lease.active_runs(self.con, 'bx_pull'), 0)
+
+    def test_only_proven_never_started_fence_releases_pending_pull_reservation(self):
+        cases = [('lost', None, None), ('lost', None, '1'), ('lost', None, 'box'),
+                 ('lost', None, 'fenced'), ('lost', 7, 'fenced'), ('killed', 143, 'fenced')]
+        for status, code, proof in cases:
+            for state in (None, 'pending', 'running', 'none', 'done', 'partial', 'failed'):
+                with self.subTest(status=status, code=code, proof=proof, pull_state=state):
+                    self.con.execute("UPDATE runs SET status=?,exit_code=?,pull_state=?",
+                                     (status, code, state))
+                    self.con.execute("DELETE FROM kv WHERE k='lost_confirmed:run-pull'")
+                    if proof:
+                        self.con.execute("INSERT INTO kv(k,v) VALUES ('lost_confirmed:run-pull',?)", (proof,))
+                    self.con.execute("INSERT OR REPLACE INTO pool_cap_callers "
+                                     "(token,pool_key,pid,run_id,cap,granted) "
+                                     "VALUES ('pull-cap','repo',999999,'run-pull',8,1)")
+                    self.con.commit()
+                    never_started = status == 'lost' and code is None and proof == 'fenced'
+                    unconfirmed_lost = status == 'lost' and code is None and proof is None
+                    reserved = (unconfirmed_lost or (state in (None, 'pending', 'running') and
+                                (not never_started or state == 'running')))
+                    self.assertEqual(lease.active_runs(self.con, 'bx_pull'), int(reserved))
+                    pool.pool_cap(self.con, 'repo')
+                    retained = self.con.execute("SELECT 1 FROM pool_cap_callers WHERE token='pull-cap'").fetchone()
+                    self.assertEqual(bool(retained), reserved)
+
     def test_publish_or_conflict_for_all_local_states(self):
         cases = [('base', None, 'remote', 'written'), ('base', 'edit', 'remote', 'conflict'),
                  (None, None, 'remote', 'written'), (None, 'created', 'remote', 'conflict'),
