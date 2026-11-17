@@ -298,13 +298,16 @@ class PinTests(Isolated):
     def test_pool_does_not_replace_own_pinned_box_after_transient_404(self):
         self.pinned()
         common.kv_set(self.con, 'pin_owner:bx_kept', self.me['owner'])
-        with patch.object(api, 'get', return_value=None), \
-                patch.object(lease, 'acquire_private', return_value={'box_id': 'bx_new', 'size': 'large'}) as create:
-            with self.assertRaisesRegex(common.OffboxError, 'pinned'):
-                got = pool.acquire(self.me)
-                pool.release_guard(got)
-        create.assert_not_called()
-        self.assert_kept()
+        for result in (None, {'state': 'error'}, {'state': 'cancelled'},
+                       {'state': 'archived', 'dataExpiredAt': '2026-11-12T22:00:00Z'}):
+            with self.subTest(result=result), patch.object(api, 'get', return_value=result), \
+                    patch.object(lease, 'acquire_private', return_value={'box_id': 'bx_new', 'size': 'large'}) as create:
+                with self.assertRaisesRegex(common.OffboxError, 'pinned') as refusal:
+                    got = pool.acquire(self.me)
+                    pool.release_guard(got)
+                self.assertEqual(refusal.exception.code, 2)
+                create.assert_not_called()
+                self.assert_kept()
 
     def test_reuse_retains_pin_on_missing_error_cancelled_expired_and_timeout(self):
         row = self.pinned()

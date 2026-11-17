@@ -1087,7 +1087,7 @@ def _pin_disk_unavailable(con, box_id, why):
         reason = (f'{box_id}: pinned disk unavailable ({why}); ' +
                   (f'saved snapshot {saved} requires explicit restoration' if saved else 'no saved snapshot is recorded'))
         event(con, box_id, 'pin_restore_required', reason)
-        raise PinnedLeaseError(reason)
+        raise PinnedLeaseError(reason, code=2)
 
 
 class DiskTooBig(OffboxError):
