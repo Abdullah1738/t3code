@@ -21,7 +21,9 @@ import { DesktopLease, QUIET_MS, STALE_MS, type DesktopLeaseOptions } from "./De
 import * as DesktopLeaseService from "./DesktopLeaseService.ts";
 
 const caller = { driver: "codex", nativeId: "native-child" };
+const nextCaller = { driver: "codex", nativeId: "native-next-child" };
 const childThreadId = ThreadId.make("child-holder");
+const rootThreadId = ThreadId.make("root-holder");
 const request = { taskId: "task", scope: "fixture", mode: "native" as const };
 const at = DateTime.makeUnsafe("2026-11-13T00:00:00Z");
 const running: OrchestrationV2Run = {
@@ -46,6 +48,7 @@ type Lookup = "running" | "idle" | "waiting" | "failed";
 const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* () {
   let now = DateTime.toEpochMillis(at);
   let lookup: Lookup = "running";
+  const threadLookups = new Map<ThreadId, Lookup>();
   let lookupGate = Effect.void;
   const lookedUp: ThreadId[] = [];
   let callbacks: DesktopLeaseOptions = {};
@@ -56,16 +59,17 @@ const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* 
     recordTransition: (event) => callbacks.recordTransition?.(event),
   });
   const identity = Layer.mock(ExecutionIdentity.ExecutionIdentity)({
-    resolve: () =>
+    resolve: (input) =>
       Effect.succeed({
         resolution: "resolved",
-        robobThreadId: childThreadId,
-        rootThreadId: "root-holder",
-        parentThreadId: "root-holder",
+        robobThreadId:
+          input.nativeId === nextCaller.nativeId ? ThreadId.make("child-next") : childThreadId,
+        rootThreadId,
+        parentThreadId: rootThreadId,
         executionKind: "app-managed-child",
         driver: "codex",
         providerInstanceId: "codex",
-        nativeSessionId: caller.nativeId,
+        nativeSessionId: input.nativeId,
         nativeAgentId: null,
         parentNativeAgentId: null,
         nativeOwnerThreadId: null,
@@ -79,15 +83,17 @@ const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* 
       Effect.gen(function* () {
         lookedUp.push(threadId);
         yield* lookupGate;
-        if (lookup === "failed")
+        const threadLookup = threadLookups.get(threadId) ?? lookup;
+        if (threadLookup === "failed")
           return yield* new ProjectionStore.ProjectionStoreThreadNotFoundError({ threadId });
         return {
           run:
-            lookup === "idle"
+            threadLookup === "idle"
               ? undefined
               : {
                   ...running,
-                  status: lookup === "waiting" ? ("waiting" as const) : ("running" as const),
+                  threadId,
+                  status: threadLookup === "waiting" ? ("waiting" as const) : ("running" as const),
                 },
           providerThread: undefined,
           providerTurn: undefined,
@@ -111,6 +117,9 @@ const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* 
     },
     setLookup: (value: Lookup) => {
       lookup = value;
+    },
+    setThreadLookup: (threadId: ThreadId, value: Lookup) => {
+      threadLookups.set(threadId, value);
     },
     setLookupGate: (gate: Effect.Effect<void>) => {
       lookupGate = gate;
@@ -281,21 +290,45 @@ describe("desktop lease service liveness", () => {
     ),
   );
 
-  it.effect.each(["running", "idle", "failed"] as const)(
-    "checks the root before recovering an old quarantine (%s)",
-    (lookup) =>
-      run(({ service, lookedUp, addTime, setLookup }) =>
+  it.effect.each([
+    ["running", "running"],
+    ["running", "idle"],
+    ["running", "failed"],
+    ["idle", "running"],
+    ["idle", "idle"],
+    ["idle", "failed"],
+    ["failed", "running"],
+    ["failed", "idle"],
+    ["failed", "failed"],
+  ] as const)(
+    "requires inactive root and child before recovery (root %s, child %s)",
+    ([rootLookup, childLookup]) =>
+      run(({ service, lookedUp, addTime, setThreadLookup }) =>
         Effect.gen(function* () {
-          yield* service.acquire(caller, request);
+          const first = yield* service.acquire(caller, request);
           yield* service.callStart(caller, "hung-root-check");
           addTime(QUIET_MS);
           assert.equal((yield* service.status()).lease?.state, "quarantined");
-          setLookup(lookup);
+          setThreadLookup(rootThreadId, rootLookup);
+          setThreadLookup(childThreadId, childLookup);
           addTime(QUIET_MS);
-          const result = yield* service.status();
-          assert.equal(lookedUp.at(-1), "root-holder");
-          if (lookup === "idle") assert.isNull(result.lease);
-          else assert.equal(result.lease?.state, "quarantined");
+          const next = yield* service.acquire(nextCaller, { ...request, taskId: "next" });
+          const canRecover = rootLookup === "idle" && childLookup === "idle";
+          assert.equal(next.state, canRecover ? "held" : "queued");
+          assert.equal(lookedUp.at(rootLookup === "idle" ? -2 : -1), rootThreadId);
+          if (canRecover) {
+            assert.equal(next.status.lease?.ticket, next.ticket);
+          } else {
+            assert.equal(next.status.lease?.ticket, first.ticket);
+            assert.equal(next.status.lease?.state, "quarantined");
+            assert.equal(next.status.lease?.openCallId, "hung-root-check");
+            setThreadLookup(rootThreadId, "idle");
+            setThreadLookup(childThreadId, "idle");
+            const recovered = yield* service.acquire(nextCaller, { ...request, taskId: "next" });
+            assert.equal(recovered.ticket, next.ticket);
+            assert.equal(recovered.state, "held");
+            assert.equal(recovered.status.lease?.ticket, next.ticket);
+          }
         }),
       ),
   );

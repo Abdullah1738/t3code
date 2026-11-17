@@ -44,7 +44,7 @@ type CallerIdentity = {
 type StoreOptions = {
   readonly filename?: string;
   readonly now?: () => number;
-  readonly holderTurnActive?: (rootThreadId: string) => HolderTurnActive;
+  readonly holderTurnActive?: (threadId: string) => HolderTurnActive;
   readonly factory?: (options: DesktopLeaseOptions) => DesktopLease;
 };
 
@@ -116,9 +116,9 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
     holderTurnActive,
     ...storeOptions
   } = options;
-  const holderActivity = Effect.fn("DesktopLease.holderTurnActive")(function* (root: string) {
-    if (holderTurnActive) return holderTurnActive(root);
-    return yield* projection.getRunningTurnContext(ThreadId.make(root)).pipe(
+  const holderActivity = Effect.fn("DesktopLease.holderTurnActive")(function* (threadId: string) {
+    if (holderTurnActive) return holderTurnActive(threadId);
+    return yield* projection.getRunningTurnContext(ThreadId.make(threadId)).pipe(
       Effect.map((context): HolderTurnActive => context.run?.status === "running"),
       Effect.catchCause(() => Effect.succeed("unknown" as const)),
     );
@@ -183,7 +183,15 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
           )
         : false;
     const activity =
-      lease?.state === "quarantined" ? yield* holderActivity(lease.rootThreadId) : "unknown";
+      lease?.state === "quarantined"
+        ? yield* Effect.gen(function* () {
+            const rootActivity = yield* holderActivity(lease.rootThreadId);
+            // Async children can execute desktop calls after their root's turn has ended.
+            return rootActivity === false && lease.childThreadId !== lease.rootThreadId
+              ? yield* holderActivity(lease.childThreadId)
+              : rootActivity;
+          })
+        : "unknown";
     return yield* measure(
       "persistence",
       Effect.try({
