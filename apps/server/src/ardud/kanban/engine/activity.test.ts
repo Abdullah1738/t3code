@@ -595,7 +595,7 @@ describe("rollup", () => {
   });
 
   it("puts run failures on the model of the thread that failed", () => {
-    expect(result.failures).toEqual({
+    expect(result.failures).toMatchObject({
       count: 1,
       byKind: { stalled: 1 },
       byPool: { [Rules.poolKey(opus)]: { count: 1, reasons: ["provider boom"] } },
@@ -2774,5 +2774,210 @@ describe("#1776 current pool holders", () => {
     const takeAt = "2026-11-14T10:00:00.000Z";
     const result = run({ currentAt, currentSlots: [slot(2, held.activeThreadId!, takeAt)] });
     expect(result.holders.items[0]!.holders[0]).toMatchObject({ heldSince: takeAt, heldForH: 2 });
+  });
+});
+
+describe("failure detail rows", () => {
+  it.each([
+    { name: "primary before end", primary: true, endedAt: "2026-11-12T01:00:00.001Z" },
+    { name: "primary at end", primary: true, endedAt: t("01:00") },
+    { name: "primary after end", primary: true, endedAt: "2026-11-12T00:59:59.999Z" },
+    { name: "carried before end", primary: false, endedAt: "2026-11-12T01:00:00.001Z" },
+    { name: "carried at end", primary: false, endedAt: t("01:00") },
+    { name: "carried after end", primary: false, endedAt: "2026-11-12T00:59:59.999Z" },
+  ])("keeps the persisted failure source for $name", ({ primary, endedAt }) => {
+    const result = Activity.rollup({
+      window,
+      cards: [card("failed", { workThreadId: ThreadId.make("replacement") })],
+      threads: [
+        thread("failed-thread", primary ? "failed" : "primary", "work", sonnet, before, endedAt),
+        thread("replacement", "failed", "work", opus, before),
+      ],
+      events: [
+        {
+          ...event("failed", t("01:00"), "flagged", "working", "working", "Run failed: crash"),
+          failedThreadId: ThreadId.make("failed-thread"),
+        },
+      ],
+      pools: [],
+    });
+    expect(result.failures.rows[0]).toMatchObject({
+      threadId: "failed-thread",
+      role: "work",
+      pool: Rules.poolKey(sonnet),
+    });
+  });
+
+  it.each([
+    { name: "known reviewer after stage change", role: "review", stage: "needs_review" },
+    { name: "known worker despite review stage", role: "work", stage: "in_review" },
+  ] as const)("uses source role and model for $name", ({ role, stage }) => {
+    const result = Activity.rollup({
+      window,
+      cards: [card("failed")],
+      threads: [thread("source", "failed", role, sonnet, before, t("00:59"))],
+      events: [
+        {
+          ...event("failed", t("01:00"), "flagged", stage, stage, "Run failed: crash"),
+          failedThreadId: ThreadId.make("source"),
+        },
+      ],
+      pools: [],
+    });
+    expect(result.failures.rows[0]).toMatchObject({
+      threadId: "source",
+      role,
+      pool: Rules.poolKey(sonnet),
+    });
+  });
+
+  it.each([
+    {
+      name: "persisted id without a link",
+      persisted: true,
+      linked: false,
+      endedAt: null,
+      expected: "source",
+    },
+    { name: "legacy live link", persisted: false, linked: true, endedAt: null, expected: "source" },
+    {
+      name: "legacy ended link",
+      persisted: false,
+      linked: true,
+      endedAt: t("00:59"),
+      expected: null,
+    },
+    { name: "legacy missing link", persisted: false, linked: false, endedAt: null, expected: null },
+  ])("handles $name", ({ persisted, linked, endedAt, expected }) => {
+    const result = Activity.rollup({
+      window,
+      cards: [card("failed")],
+      threads: linked ? [thread("source", "failed", "work", sonnet, before, endedAt)] : [],
+      events: [
+        {
+          ...event("failed", t("01:00"), "flagged", "working", "working", "Run failed: crash"),
+          ...(persisted ? { failedThreadId: ThreadId.make("source") } : {}),
+        },
+      ],
+      pools: [],
+    });
+    expect(result.failures.rows[0]?.threadId).toBe(expected);
+  });
+
+  it("names each card and failed thread, repeats, role and pool without changing aggregates", () => {
+    const cards = [card("first", { number: 4476 }), card("second", { number: 1939 })];
+    const threads = [
+      thread("work-one", "first", "work", opus, before),
+      thread("review-two", "second", "review", sonnet, before),
+    ];
+    const events = [
+      event("first", t("01:00"), "moved", "working", "todo", "Run failed, retrying once: boom"),
+      event("second", t("02:00"), "flagged", "in_review", "in_review", "Run failed: crash"),
+      event("first", t("03:00"), "flagged", "working", "working", "Run failed: again"),
+    ];
+    const failures = Activity.rollup({ window, cards, threads, events, pools: [] }).failures;
+    expect(failures.byPool).toEqual({
+      [Rules.poolKey(opus)]: { count: 2, reasons: ["boom", "again"] },
+      [Rules.poolKey(sonnet)]: { count: 1, reasons: ["crash"] },
+    });
+    expect(
+      failures.rows.map(({ card, kind, role, pool, threadId, repeat }) => ({
+        card,
+        kind,
+        role,
+        pool,
+        threadId,
+        repeat,
+      })),
+    ).toEqual([
+      {
+        card: 4476,
+        kind: "stalled",
+        role: "work",
+        pool: Rules.poolKey(opus),
+        threadId: "work-one",
+        repeat: 2,
+      },
+      {
+        card: 1939,
+        kind: "stalled",
+        role: "review",
+        pool: Rules.poolKey(sonnet),
+        threadId: "review-two",
+        repeat: 1,
+      },
+      {
+        card: 4476,
+        kind: "retried",
+        role: "work",
+        pool: Rules.poolKey(opus),
+        threadId: "work-one",
+        repeat: 2,
+      },
+    ]);
+    expect(JSON.stringify(failures.rows)).not.toContain('"title"');
+  });
+  it("renders structured bound facts and leaves old events readable", () => {
+    const admission = {
+      queuedAtMs: Date.parse(t("00:00")),
+      waitedMs: 1800000,
+      positionAtFailure: 8,
+      totalAtFailure: 34,
+      rule: "no_progress" as const,
+    };
+    const old = event(
+      "first",
+      t("01:00"),
+      "flagged",
+      "working",
+      "working",
+      "Run failed: The restart admission queue never released this run (waited 30 min)",
+    );
+    const fresh = {
+      ...event("first", t("02:00"), "flagged", "working", "working", old.body),
+      admission,
+    };
+    const result = Activity.rollup({
+      window,
+      cards: [card("first")],
+      events: [old, fresh],
+      threads: [],
+      pools: [],
+    });
+    expect(result.failures.rows.map((row) => row.admission)).toEqual([admission, null]);
+    expect(result.failures.rows[0]?.threadId).toBeNull();
+    expect(result.restartAdmission).toMatchObject({
+      scope: "server-wide",
+      source: "analytics_read",
+      section: "restartAdmission",
+      days: ["2026-11-12"],
+      boardFailures: [1],
+    });
+  });
+  it("keeps the latest 50 of 60 failures and says how many remain", () => {
+    const events = Array.from({ length: 60 }, (_, i) =>
+      event(
+        "first",
+        DateTime.formatIso(DateTime.makeUnsafe(Date.parse(t("00:00")) + i * 1000)),
+        "flagged",
+        "working",
+        "working",
+        "Run failed: " + "x".repeat(200),
+      ),
+    );
+    const result = Activity.rollup({
+      window,
+      cards: [card("first")],
+      events,
+      threads: [],
+      pools: [],
+    });
+    expect(result.failures.rows).toHaveLength(50);
+    expect(result.failures.more).toBe(10);
+    expect(result.failures.rows[0]?.at).toBe(events.at(-1)?.at);
+    expect(result.failures.rows.every((row) => row.repeat === 60 && row.reason.length <= 120)).toBe(
+      true,
+    );
+    expect(JSON.stringify(result).length).toBeLessThanOrEqual(49000);
   });
 });

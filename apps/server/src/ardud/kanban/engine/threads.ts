@@ -619,7 +619,8 @@ const make = Effect.gen(function* () {
         const run = latestExecutedRun(records.runs);
         const failure =
           latestRootProviderFailure(run, records.turnItems) ??
-          rootRuntimeLoss(run, records.turnItems);
+          rootRuntimeLoss(run, records.turnItems) ??
+          (run?.status === "failed" ? (run.failure ?? null) : null);
         // A failed run can leave no error item on its root node; it still counts as failed.
         if (failure === null && run?.status === "failed") {
           return {

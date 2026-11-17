@@ -384,3 +384,35 @@ it("pages dispatch outcome counts under the existing reply budget", () => {
   }
   expect(restore(rows)).toEqual(withOutcomes.mcpCalls);
 });
+
+it("pages the server-wide restartAdmission section with its schema and exact waits", () => {
+  const rows: AnalyticsEvent[] = [100, 200, 300].map((waitedMs) =>
+    event({
+      kind: "restart.admission.admitted",
+      bootId: "boot-one",
+      restartAdmission: {
+        sourceRunId: "source-" + waitedMs,
+        classification: "continuation",
+        queuedAtMs: 0,
+        waitedMs,
+        positionAtEntry: 12,
+        position: 1,
+        total: 7,
+        maxQueueDepth: 20,
+        active: 1,
+        maxActive: 4,
+        loaded: true,
+      },
+    }),
+  );
+  const result = makeReadPager().read({ day, section: "restartAdmission" }, finish(rows), rows);
+  check(result);
+  expect(restore(result.rows!)).toEqual(finish(rows).restartAdmission);
+  expect(finish(rows).restartAdmission?.groups[0]?.wait).toEqual({
+    count: 3,
+    p50Ms: 200,
+    p90Ms: 300,
+    maxMs: 300,
+    approximate: false,
+  });
+});

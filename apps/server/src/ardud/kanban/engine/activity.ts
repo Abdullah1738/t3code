@@ -835,7 +835,8 @@ const waitKind = (card: KanbanCard): string | null =>
 /**
  * The window's rollup: ask-to-answer times and old open asks, review rounds,
  * time in each stage with dwell percentiles, open cards long in one stage,
- * stalls, run failures by model, thread starts, restarts and evaluator wakes,
+ * stalls, individual run failures by card/thread/model, a server-wide restart-admission analytics pointer,
+ * thread starts, restarts and evaluator wakes,
  * cards left in working or in_review with no thread, and ledger pool usage. No card titles or text: numbers, stages,
  * kinds and times only (run failure reasons are the provider's error words).
  */
@@ -1114,6 +1115,20 @@ export const rollup = (input: RollupInput) => {
   // Run failures by the model of the thread that failed.
   const failures: Record<string, { count: number; reasons: Array<string> }> = {};
   const failuresByKind: Partial<Record<FailureKind, number>> = {};
+  const failureRows: Array<{
+    card: number;
+    kind: FailureKind;
+    role: "work" | "review";
+    pool: string;
+    threadId: string | null;
+    runId: string | null;
+    at: string;
+    reason: string;
+    repeat: number;
+    admission: KanbanCardEvent["admission"] | null;
+  }> = [];
+  const repeats = new Map<number, number>();
+  const admissionCards = new Set<number>();
   let failureCount = 0;
   for (const card of active) {
     for (const event of byCard.get(card.id) ?? []) {
@@ -1132,8 +1147,40 @@ export const rollup = (input: RollupInput) => {
       entry.count++;
       const reason = failureReason(event, 120);
       if (entry.reasons.length < 3 && !entry.reasons.includes(reason)) entry.reasons.push(reason);
+      repeats.set(card.number, (repeats.get(card.number) ?? 0) + 1);
+      if (event.admission || /restart admission queue never released/.test(event.body ?? ""))
+        admissionCards.add(card.number);
+      // A terminal event can be written after the link ended, and carried cards
+      // share a primary card's link. Persisted identity survives both boundaries.
+      const sourceThread =
+        event.failedThreadId === undefined ? thread : threadsById.get(event.failedThreadId);
+      failureRows.push({
+        card: card.number,
+        kind,
+        role:
+          sourceThread?.role === "work" || sourceThread?.role === "review"
+            ? sourceThread.role
+            : role,
+        pool: sourceThread?.model ? Rules.poolKey(sourceThread.model) : pool,
+        threadId: event.failedThreadId ?? thread?.threadId ?? null,
+        runId: event.runId ?? null,
+        at: event.at,
+        reason,
+        repeat: 0,
+        admission: event.admission ?? null,
+      });
     }
   }
+
+  failureRows.sort((a, b) => b.at.localeCompare(a.at) || a.card - b.card);
+  for (const row of failureRows) row.repeat = repeats.get(row.card)!;
+  const admissionDays: string[] = [];
+  for (
+    let day = time(window.since.slice(0, 10) + "T00:00:00.000Z");
+    day < time(until);
+    day += 24 * HOUR
+  )
+    admissionDays.push(isoOf(day).slice(0, 10));
 
   // Threads started in the window; a card with a second thread for the same role restarted.
   const started: Record<string, Record<string, number>> = {};
@@ -1292,7 +1339,24 @@ export const rollup = (input: RollupInput) => {
       },
     },
     stalls: { count: stallItems.length, ...capped(stallItems, max) },
-    failures: { count: failureCount, byKind: failuresByKind, byPool: failures },
+    failures: {
+      count: failureCount,
+      byKind: failuresByKind,
+      byPool: failures,
+      rows: failureRows.slice(0, Math.min(50, max)),
+      ...(failureRows.length > Math.min(50, max)
+        ? { more: failureRows.length - Math.min(50, max) }
+        : {}),
+    },
+    restartAdmission: {
+      scope: "server-wide" as const,
+      source: "analytics_read" as const,
+      section: "restartAdmission" as const,
+      days: admissionDays,
+      note: "Read each UTC day without board/card/kind filters; hour buckets can extend beyond this window. Queue depth and active are observed maxima; loaded time share is unavailable.",
+      boardFailures: [...admissionCards].sort((a, b) => a - b).slice(0, max),
+      ...(admissionCards.size > max ? { more: admissionCards.size - max } : {}),
+    },
     threads: {
       started,
       restarts: capped(restarts, max),
