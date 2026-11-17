@@ -171,7 +171,7 @@ def observe_outage(error=None):
 
 
 @contextlib.contextmanager
-def pause_for_home_start():
+def pause_for_home_start(*, extra_seconds=0):
     """An answering home server's startup has its own bound, outside box preparation time."""
     budget = _ACTIVE.get()
     if budget is None:
@@ -184,7 +184,7 @@ def pause_for_home_start():
     try:
         yield
     finally:
-        elapsed = time.monotonic() - began
+        elapsed = time.monotonic() - began + extra_seconds
         for field in ('start', 'end', 'total_start', 'phase_start', 'next_progress'):
             setattr(budget, field, getattr(budget, field) + elapsed)
         _ACTIVE.reset(token)

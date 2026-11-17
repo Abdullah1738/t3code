@@ -23,7 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import native_crash
-from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence, quint_tools
+from . import ssh_outage, home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence, quint_tools
 from . import command_usage, common, containers, java_version, prune, prepare, userns
 from . import resources, box_disk, queue_lifecycle
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
@@ -1482,6 +1482,8 @@ def space_result(run_id, code, path=None, *, report=False):
         record['disk_probe_error'] = None
     if previous.get('setup_native_crash') is True:
         record['setup_native_crash'] = True
+    if str(previous.get('infra_reason') or '').startswith('ssh_unreachable_before_start:'):
+        record.update(infra_failure=True, infra_reason=previous['infra_reason'])
     if previous.get('infra_reason') == 'native_crash_after_start':
         record.update(infra_failure='native_crash', infra_reason='native_crash_after_start')
     if any(previous.get(k) != v for k, v in record.items()):
@@ -2046,32 +2048,57 @@ class Runner:
             raise OffboxError(f'{self.run_id}: settled before the command started; nothing ran', code=130)
 
     def _prepare_box(self, con, a, rdir, env_file, body) -> dict | None:
+        progress = {'checked': False, 'synced': False}
+        while True:
+            began = time.monotonic()
+            try:
+                return self._prepare_box_once(con, a, rdir, env_file, body, progress)
+            except ssh_outage.SshUnreachable as error:
+                if self.started:
+                    raise
+                state = ssh_outage.control_state(error)
+                if state and state not in api.LIVE_STATES and not self.push_resumed:
+                    with prepare.guard(self.box, seconds=3600):
+                        self._resume_stopped_push(con)
+                elif not ssh_outage.wait_for_connection(error):
+                    raise
+                # Connection recovery has its own wait/resume bounds, outside the preparation budget.
+                self.lease_row['_prepare_end'] += time.monotonic() - began
+
+    def _resume_stopped_push(self, con):
+        self.push_resumed = True
+        # The pool guard is still held. Bypass _reuse's cached running/master fast path.
+        row = dict(self.lease_row, state='stopped')
+        try:
+            resumed = lease._reuse(con, row, row['size'])
+            if resumed is None:
+                raise OffboxError(f"lease {self.box} is no longer available")
+        except (common.SshHostKeyMismatch, home.StartWaitFailed, ssh_outage.SshUnreachable):
+            raise
+        except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
+            raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
+        log(f"push_box_stopped_resumed {self.box}")
+
+    def _prepare_box_once(self, con, a, rdir, env_file, body, progress) -> dict | None:
         """Everything before the command starts. Raises lease.DeadMount when the box's filesystem is dead."""
-        with prepare.guard(self.box, self.lease_row.get('_prepare_end')):
-            replacement = self._check_box(con, a, rdir)
-        if replacement is not None:
-            return replacement
-        # A healthy first push can take 10–25 minutes. Bound source reads too, using push's existing hour allowance.
-        with prepare.guard(self.box, seconds=3600), prepare.phase('push', self.box):
-            while True:
-                try:
-                    self._sync_box(con, a, rdir, env_file, body)
-                    break
-                except ssh_sync.BoxStoppedDuringPush:
-                    if self.push_resumed:
-                        raise
-                    self.push_resumed = True
-                    # The pool guard is still held. Bypass _reuse's cached running/master fast path.
-                    row = dict(self.lease_row, state='stopped')
+        if not progress['checked']:
+            with prepare.guard(self.box, self.lease_row.get('_prepare_end')):
+                replacement = self._check_box(con, a, rdir)
+            if replacement is not None:
+                return replacement
+            progress['checked'] = True
+        if not progress['synced']:
+            # A healthy first push can take 10–25 minutes. Bound source reads too, using push's existing hour allowance.
+            with prepare.guard(self.box, seconds=3600), prepare.phase('push', self.box):
+                while True:
                     try:
-                        resumed = lease._reuse(con, row, row['size'])
-                        if resumed is None:
-                            raise OffboxError(f"lease {self.box} is no longer available")
-                    except (common.SshHostKeyMismatch, home.StartWaitFailed):
-                        raise
-                    except (OffboxError, OSError, subprocess.TimeoutExpired) as e:
-                        raise OffboxError(f"{e}; box stopped during push: {self.box}") from e
-                    log(f"push_box_stopped_resumed {self.box}")
+                        self._sync_box(con, a, rdir, env_file, body)
+                        break
+                    except ssh_sync.BoxStoppedDuringPush:
+                        if self.push_resumed:
+                            raise
+                        self._resume_stopped_push(con)
+            progress['synced'] = True
         space = box_disk.measure(self.box, '/home/user/' + rdir)
         fs = box_disk.low(space)
         if fs:
@@ -2195,6 +2222,8 @@ class Runner:
             if reason:
                 raise lease.DeadMount(self.box, reason) from e
         sync_exc = push_exc if push_exc is not None else err[0] if err else None
+        if isinstance(sync_exc, ssh_outage.SshUnreachable):
+            raise sync_exc
         if sync_exc is not None:
             disk_failure = box_disk.push_failure(sync_exc)
             if disk_failure and not isinstance(sync_exc, api.ApiError):
@@ -3852,7 +3881,9 @@ def _run_remote(a, rn) -> int:
     old = {s: signal.signal(s, on_sig) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         try:
-            with home.pre_start(rn.run_id):
+            from . import cli
+            may_wait = cli._pre_start_wait_applies(a, OffboxError('SSH connection unavailable'))
+            with home.pre_start(rn.run_id), ssh_outage.recovery(enabled=may_wait):
                 rn.start()
         except OffboxError as e:
             if not rn.started:
@@ -3863,6 +3894,11 @@ def _run_remote(a, rn) -> int:
                         e = source_error
                 if isinstance(e, common.SourceGone):
                     rn.source_gone(e)
+                elif isinstance(e, ssh_outage.SshUnreachable):
+                    save_run_state(rn.run_id, box_id=e.box, status='infra', exit_code=EXIT_INFRA,
+                                   end_at=now(), infra_failure=True,
+                                   infra_reason='ssh_unreachable_before_start:' + e.reason)
+                    finish(rn.run_id, EXIT_INFRA, 'infra', catch_up=False, bookkeeping=False, reclaim_tmp=False)
                 elif e.code == EXIT_LOCAL:
                     finish(rn.run_id, EXIT_LOCAL, "local_error")
                 elif not os.environ.get(BACKGROUND_RUN_ENV) and not (
