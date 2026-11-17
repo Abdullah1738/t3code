@@ -110,6 +110,8 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
     for r in rows:
         d = dict(r)
         d["active_runs"] = lease.active_runs(con, r["box_id"])
+        from . import unfit
+        d['suspect'] = unfit.get(con, d['box_id'])
         d['disk_full'] = (d.get('note') or '').startswith(box_disk.NOTE)
         d['disk_space'] = (kv_get(con, 'disk_full:' + d['box_id']) or {}).get('space', {})
         out.append(d)
@@ -119,6 +121,9 @@ def list_leases(me: dict, show_all: bool, as_json: bool) -> None:
     if not out:
         print("no leases" + ("" if show_all else " for this thread (use --all)"))
     for d in out:
+        suspect = d.get("suspect")
+        if suspect:
+            print(f"{d['box_id']}: suspect: {suspect['reason']} ({suspect['source']}, expires {iso(suspect['expires_at'])})")
         pin = " pinned" if (d.get("pinned_until") or 0) > now() else ""
         note = f"  [{d['note']}]" if d['state'] == 'resume_stalled' or (d.get("note") or "").startswith((TOO_BIG_NOTE, DEAD_MOUNT_NOTE, BOX_WEDGED_NOTE, 'disk-full:', pool.RECYCLED_NOTE)) else ""
         print(f"{d['box_id']:<12} {('disk_full' if d['disk_full'] else d['state']):<8} {d['size'] or '':<8} {d['repo_key']:<24} used {ago(d['last_used_at']):>6} "
@@ -578,8 +583,12 @@ def _home_run_notices(me):
 
 
 def status(me: dict) -> None:
-    from . import box_disk
+    from . import box_disk, unfit
     with db() as disk_con:
+        for row in disk_con.execute("SELECT box_id FROM leases WHERE state != 'deleted'"):
+            mark = unfit.get(disk_con, row['box_id'])
+            if mark:
+                print(f"{row['box_id']}: suspect: {mark['reason']} ({mark['source']}, expires {iso(mark['expires_at'])})")
         for row in disk_con.execute("SELECT box_id FROM leases WHERE note LIKE 'disk-full:%'"):
             info = kv_get(disk_con, 'disk_full:' + row['box_id']) or {}
             print(f"{row['box_id']}: disk_full " + ', '.join(
@@ -1437,6 +1446,8 @@ def logs(run_id: str, do_follow: bool) -> int:
     if code is None:
         from .run_evidence import report
         report(dict(r), p)
+    from . import native_crash
+    native_crash.readback(r, code, _raw_log(p), report=True)
     from .runs import space_result
     effective = space_result(r['run_id'], code, p, report=True)
     import offbox_disk_space
@@ -1561,6 +1572,10 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
                 con.commit()
             finally:
                 con.close()
+    from . import native_crash
+    r = native_crash.readback(checked, code, _raw_log(LOGS_DIR / f"{r['run_id']}.log"), report=True)
+    if r['status'] in ('infra', 'killed'):
+        status = r['status']
     if not echo and code == 0:
         resources.display(r['run_id'])
     from .runs import report_interruption
@@ -1807,6 +1822,8 @@ def _holder_stuck(r, st, log_path, pos: int, echo: bool, deadline=None, *, show_
         report(dict(r), log_path, until=deadline, receipt_code=receipt_code)
         say(f"exit unknown; inspect with offbox ssh {r['box_id']}")
     from .runs import space_result
+    from . import native_crash
+    native_crash.readback(r, code, _raw_log(log_path), report=True)
     effective = space_result(r['run_id'], code, log_path, report=True)
     return 90 if effective is None else effective
 
@@ -2153,6 +2170,8 @@ def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) 
                 say(f"{r['run_id']} settled with no output on record")
             else:
                 _incomplete_log(settled, result)
+            from . import native_crash
+            native_crash.readback(settled, code, _raw_log(log_path), report=True)
         if until is not None and now() >= until:
             raise _wait_timeout(_run_row(r['run_id']))
         # Catch-up must also drain bytes whose stream echo failed before recording later bytes as delivered.
@@ -2217,3 +2236,23 @@ def stats(days: float, as_json: bool) -> None:
         w50, w95 = k.get("wall_p50_s") or 0, k.get("wall_p95_s") or 0
         print(f"{k['kind'][:44]:<44} {k['runs']:>5} {w50:>6.0f}s/{w95:>5.0f}s {k['cores_p50']:>6.1f}/{k['cores_p95']:<6.1f} "
               f"{k['mem_p50_gb']:>7.1f}/{k['mem_p95_gb']:<6.1f} {k['oom_kills']:>4}")
+
+
+def run_events(run_id, as_json=False):
+    with contextlib.closing(db()) as con:
+        run = con.execute('SELECT * FROM runs WHERE run_id=?', (run_id,)).fetchone()
+        if run is None:
+            run = con.execute('SELECT * FROM runs WHERE run_id LIKE ?', ('%' + run_id,)).fetchone()
+        if run is None:
+            raise OffboxError(f'no run {run_id}', code=2)
+        require_mine(con, run['box_id'])
+        run_id = run['run_id']
+        rows = [dict(r) for r in con.execute("SELECT * FROM events WHERE "
+                "CASE WHEN json_valid(detail) THEN json_extract(detail,'$.run_id')=? "
+                "OR json_extract(detail,'$.old_run_id')=? OR json_extract(detail,'$.new_run_id')=? "
+                "ELSE detail LIKE ? END ORDER BY ts", (run_id, run_id, run_id, run_id + ' %'))]
+    if as_json:
+        print(json.dumps(rows))
+    else:
+        for r in rows:
+            print(f"{iso(r['ts'])} {r['kind']} {r['box_id'] or '-'} {r['detail']}")
