@@ -330,6 +330,12 @@ const GeneralEvent = Schema.Struct({
       readerQueryMs: Schema.optionalKey(Measurement),
       readerStatements: Schema.optionalKey(Measurement),
       serializationMs: Schema.optionalKey(Measurement),
+      requestId: Schema.optionalKey(
+        Schema.String.check(Schema.isPattern(/^[A-Za-z0-9._:-]{1,64}$/)),
+      ),
+      itemCount: Schema.optionalKey(Measurement),
+      itemsTotal: Schema.optionalKey(Measurement),
+      responseBytes: Schema.optionalKey(Measurement),
       readerHolders: Schema.optionalKey(
         Schema.Array(
           Schema.Struct({
