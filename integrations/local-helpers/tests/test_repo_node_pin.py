@@ -187,6 +187,38 @@ class SelectionTest(unittest.TestCase):
                                    text=True, capture_output=True, timeout=10)
                 self.assertEqual(r.stdout.strip(), 'v22.23.2', r.stderr)
 
+    def test_interactive_startup_does_not_run_debug_refresh_for_each_command(self):
+        (self.repo / '.nvmrc').write_text('22')
+        zdot = self.home / 'zdot'
+        zdot.mkdir()
+        (zdot / '.zshenv').write_text(
+            '. ' + shlex.quote(str(HELPER / 'init.sh')) + '\n'
+            'startup_calls=0\n'
+            'functions -c _repo_node_hook _startup_original_hook\n'
+            '_repo_node_hook() { (( ++startup_calls )); _startup_original_hook; }\n')
+        # Model command-heavy rc files such as nvm.sh, without timing assertions.
+        for name in ['.zprofile', '.zshrc']:
+            (zdot / name).write_text('PATH=' + shlex.quote(self.env['PATH']) + '\n' + ':\n' * 1000)
+        for flags in ['-ic', '-ilc']:
+            with self.subTest(flags=flags):
+                r = subprocess.run(
+                    ['/bin/zsh', flags, 'print -r -- $startup_calls; '
+                     'node -v; cd ' + shlex.quote(str(self.repo)) + '; node -v'],
+                    cwd=self.plain, env=dict(self.env, ZDOTDIR=str(zdot)),
+                    text=True, capture_output=True, timeout=10)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.splitlines(), ['0', 'v26.2.0', 'v22.23.2'], r.stderr)
+
+    def test_interactive_startup_leaves_existing_debug_trap_untouched(self):
+        for trap in ["trap ':' DEBUG", 'TRAPDEBUG() { return 0; }']:
+            with self.subTest(trap=trap):
+                r = subprocess.run(
+                    ['/bin/zsh', '-fic', trap + '\noriginal=$(trap)\n. '
+                     + shlex.quote(str(HELPER / 'init.sh'))
+                     + '\n[[ "$(trap)" == "$original" ]]'],
+                    cwd=self.plain, env=self.env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_lock_v9_accepts_cached_pnpm9_when_no10(self):
         (self.repo / 'pnpm-lock.yaml').write_text('lockfileVersion: 9.0\n')
         self.pnpm('9.15.9')
