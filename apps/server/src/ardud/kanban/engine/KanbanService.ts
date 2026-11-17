@@ -2840,7 +2840,7 @@ const make = Effect.gen(function* () {
       {
         readonly dueAt: number;
         readonly message: string;
-        readonly state: "retry" | "sent" | "gone" | "paused";
+        readonly state: "retry" | "sent" | "gone" | "paused" | "unconfirmed";
         readonly runId: string | null;
         readonly ownerDiscussion?: KanbanDiscussionId;
         readonly recoveryPost?: NonNullable<ReturnType<typeof postRecoveryIdentity>>;
@@ -5289,9 +5289,8 @@ const make = Effect.gen(function* () {
     return links;
   });
 
-  const reusableEvaluator = Effect.fn("KanbanService.reusableEvaluator")(function* (
+  const cardEvaluatorCandidates = Effect.fn("KanbanService.cardEvaluatorCandidates")(function* (
     card: KanbanCard,
-    observation?: EvaluatorAnalytics.ReuseObservation,
   ) {
     const ids = new Set<ThreadId>();
     if (card.discussionId) {
@@ -5304,6 +5303,14 @@ const make = Effect.gen(function* () {
     for (const ask of card.asks.toReversed())
       if (ask.by._tag === "evaluator") ids.add(ask.by.threadId);
     if (card.createdBy._tag === "evaluator") ids.add(card.createdBy.threadId);
+    return { ids, links };
+  });
+
+  const reusableEvaluator = Effect.fn("KanbanService.reusableEvaluator")(function* (
+    card: KanbanCard,
+    observation?: EvaluatorAnalytics.ReuseObservation,
+  ) {
+    const { ids, links } = yield* cardEvaluatorCandidates(card);
     const now = yield* nowMillis;
     const rejected = new Set<EvaluatorReuseMissReason>();
     for (const id of ids) {
@@ -6778,6 +6785,24 @@ const make = Effect.gen(function* () {
       model?: ModelSelection,
     ) {
       if ((yield* boardOf(discussion.boardId)).archivedAt !== null) return discussion;
+      const trigger = yield* EvaluatorAnalytics.origin;
+      if (
+        trigger === "step_reminder" ||
+        trigger === "system_stall" ||
+        trigger === "discussion_nudge"
+      ) {
+        const card = discussion.cardId ? yield* store.card(discussion.cardId) : null;
+        const candidates = card ? (yield* cardEvaluatorCandidates(card)).ids : new Set<ThreadId>();
+        if (discussion.evaluatorThreadId !== null) candidates.add(discussion.evaluatorThreadId);
+        // Check the same candidates as reuse, before expiry can replace them. The
+        // persisted failure also guards a reminder after service recreation.
+        for (const id of candidates) {
+          if (!(yield* isBoardEvaluator(id, discussion.boardId))) continue;
+          const failure = yield* threads.findLastFailure(id);
+          if (failure !== null && Rules.isUnconfirmedPromptAcceptance(failure))
+            return yield* failWith("conflict", failure.message);
+        }
+      }
       const recovery = yield* recoveryPost;
       const actorOf = (threadId: ThreadId): KanbanActor => ({ _tag: "evaluator", threadId });
       const deliverSaved = Effect.fn("KanbanService.deliverDiscussionEvaluator")(function* (
@@ -11699,6 +11724,73 @@ const make = Effect.gen(function* () {
     return wakes;
   });
 
+  const reportUnconfirmedEvaluator = Effect.fn("KanbanService.reportUnconfirmedEvaluator")(
+    function* (
+      link: KanbanThreadLink,
+      failure: { readonly message: string; readonly runId?: string | null },
+      discussionId?: KanbanDiscussionId,
+    ) {
+      const prior = (yield* Ref.get(evaluatorFailures)).get(link.threadId);
+      const runId = failure.runId ?? null;
+      if (
+        prior?.state === "unconfirmed" &&
+        prior.runId === runId &&
+        prior.message === failure.message
+      )
+        return;
+      const actor: KanbanActor = { _tag: "system", component: "evaluator-watch" };
+      const discussions = yield* store.discussions(link.boardId);
+      const targets = discussions.filter(
+        (discussion) =>
+          discussion.archivedAt === null &&
+          (discussion.evaluatorThreadId === link.threadId ||
+            discussion.id === (discussionId ?? link.discussionId)),
+      );
+      if (targets.length === 0 && link.cardId !== null) {
+        const card = yield* store.card(link.cardId);
+        if (card) targets.push(yield* cardDiscussionUnlocked(card.id));
+      }
+      if (targets.length === 0) {
+        targets.push(
+          discussions.find(
+            (discussion) =>
+              discussion.cardId === null &&
+              discussion.archivedAt === null &&
+              discussion.title === EVALUATOR_ERRORS_TITLE,
+          ) ?? (yield* newDiscussion(link.boardId, EVALUATOR_ERRORS_TITLE, null, actor)),
+        );
+      }
+      const title = (yield* threads.view(link.threadId))?.title ?? link.purpose ?? "evaluator";
+      for (const target of targets)
+        yield* postUnlocked(
+          target.id,
+          actor,
+          [
+            {
+              _tag: "md",
+              text: `Evaluator [${title}](t3-thread://v1/${link.threadId}): ${failure.message}`,
+            },
+          ],
+          false,
+        );
+      // Keep the reported run so repeated turn-end observations do not post again.
+      yield* Ref.update(evaluatorFailures, (all) =>
+        new Map(all).set(link.threadId, {
+          dueAt: 0,
+          message: failure.message,
+          state: "unconfirmed",
+          runId,
+        }),
+      );
+    },
+    (effect, link) =>
+      effect.pipe(
+        Effect.onError(() =>
+          Ref.update(unresolvedTurnEnds, (all) => new Set(all).add(link.threadId)),
+        ),
+      ),
+  );
+
   /**
    * An evaluator failed twice (or ran out of context): it is given up. Its discussions
    * get a fresh evaluator once; a one-shot evaluator is handed to its card or reported.
@@ -12321,12 +12413,11 @@ const make = Effect.gen(function* () {
       }
       if (Rules.isUnconfirmedPromptAcceptance(failure)) {
         // A new evaluator can repeat the original prepare's plugin effects too.
-        // Retire any scheduled retry, keeping the failure for manual reconciliation.
-        yield* Ref.update(evaluatorFailures, (all) => {
-          const next = new Map(all);
-          next.delete(threadId);
-          return next;
-        });
+        yield* reportUnconfirmedEvaluator(
+          link,
+          failure,
+          ownerDiscussion ?? recoveryPost?.discussionId,
+        );
         return;
       }
       if (entry?.state === "gone") {
@@ -13189,11 +13280,13 @@ const make = Effect.gen(function* () {
       )
         continue;
       if (Rules.isUnconfirmedPromptAcceptance(failure.success)) {
-        yield* Ref.update(evaluatorFailures, (all) => {
-          const next = new Map(all);
-          next.delete(threadId);
-          return next;
-        });
+        const link = yield* store.threadLink(threadId);
+        if (link)
+          yield* reportUnconfirmedEvaluator(
+            link,
+            failure.success,
+            entry.ownerDiscussion ?? entry.recoveryPost?.discussionId,
+          );
         continue;
       }
       const action =

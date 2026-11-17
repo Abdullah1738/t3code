@@ -70,6 +70,11 @@ import {
   AnalyticsEvent,
 } from "@t3tools/contracts";
 
+import {
+  makeProviderFailure,
+  ProviderPromptAcceptanceError,
+} from "@t3tools/provider-core/server/failure";
+
 import * as ServerConfig from "../../../config.ts";
 import * as Analytics from "../../analytics/Analytics.ts";
 import { RPC_REQUIRED_SCOPES } from "../../../auth/RpcAuthorization.ts";
@@ -20672,14 +20677,15 @@ it.effect.each(
             yield* kanban.tick;
           }
         }
-        const failure = {
-          class: "provider_error" as const,
-          category: "transient" as const,
-          code: `provider_prompt_acceptance_${reason}`,
-          retryable: false,
-          message:
-            "OpenCode prompt acceptance is unconfirmed; check the session state before retrying.",
-        };
+        const failure = makeProviderFailure({
+          class: "provider_error",
+          cause: new ProviderPromptAcceptanceError({
+            driver: ProviderDriverKind.make("opencode"),
+            serverOrigin: "http://opencode.test",
+            reason,
+            budgetSeconds: 60,
+          }),
+        });
         const before = yield* Ref.get(fake.threads);
         const messages = [...before.get(thread)!.messages];
         const ids = [...before.keys()];
@@ -20690,9 +20696,27 @@ it.effect.each(
         }
         yield* TestClock.adjust("3 minutes");
         yield* kanban.tick;
+        const noticeDiscussion =
+          discussion ??
+          (yield* kanban.discussions(board.id)).find(
+            (candidate) => candidate.title === "Evaluator errors",
+          );
+        assert.isDefined(noticeDiscussion);
+        const notices = (yield* kanban.messages(noticeDiscussion!.id)).filter((message) =>
+          lastText([message]).includes(failure.message),
+        );
+        assert.lengthOf(notices, 1);
+        assert.deepEqual(notices[0]!.author, { _tag: "system", component: "evaluator-watch" });
+        assert.include(lastText(notices), `t3-thread://v1/${thread}`);
         yield* kanban.turnEnded(thread);
         yield* TestClock.adjust("10 minutes");
         yield* kanban.tick;
+        assert.lengthOf(
+          (yield* kanban.messages(noticeDiscussion!.id)).filter((message) =>
+            lastText([message]).includes(failure.message),
+          ),
+          1,
+        );
         const after = yield* Ref.get(fake.threads);
         assert.deepEqual([...after.keys()], ids);
         assert.deepEqual(after.get(thread)!.messages, messages);
@@ -20700,6 +20724,203 @@ it.effect.each(
           assert.equal((yield* kanban.discussion(discussion.id)).evaluatorThreadId, thread);
         assert.isNull((yield* kanban.caller(thread))?.paused ?? null);
       }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect.each(
+  (["todo", "review", "stall"] as const).flatMap((path) =>
+    ([1, 2] as const).flatMap((priority) =>
+      (["timeout", "transport", "acknowledgement"] as const).flatMap((reason) =>
+        (["attached", "card link", "creator", "ask"] as const).flatMap((ownership) =>
+          [false, true].map((restart) => ({ path, priority, reason, ownership, restart })),
+        ),
+      ),
+    ),
+  ),
+)(
+  "unconfirmed evaluator acceptance blocks periodic reminders ($path, P$priority, $reason, $ownership, restart=$restart)",
+  ({ path, priority, reason, ownership, restart }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      yield* Effect.gen(function* () {
+        yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00Z"));
+        const { kanban, board } = yield* toyBoard;
+        const store = yield* KanbanStore.KanbanStore;
+        yield* kanban.setPool(board.id, board.defaultCardModel, 0);
+        const card = yield* kanban.createCard(
+          board.id,
+          {
+            title: "Finish evaluator work",
+            prompt: "Finish",
+            priority,
+            subtasks: [{ step: 1, owner: "evaluator", text: "Finish" }],
+          },
+          { _tag: "evaluator", threadId: ThreadId.make("packet") },
+        );
+        const discussion = yield* kanban.cardDiscussion(card.id);
+        yield* kanban.post(discussion.id, owner, [{ _tag: "md", text: "Finish the audit" }]);
+        const thread = (yield* kanban.discussion(discussion.id)).evaluatorThreadId!;
+        const failure = makeProviderFailure({
+          cause: new ProviderPromptAcceptanceError({
+            driver: ProviderDriverKind.make("opencode"),
+            serverOrigin: "http://opencode.test",
+            reason,
+            budgetSeconds: 60,
+          }),
+        });
+        fake.failures.set(thread, failure);
+        yield* kanban.turnEnded(thread);
+        const at = "2026-11-17T00:00:00.000Z";
+        let current = (yield* store.card(card.id))!;
+        if (ownership !== "attached") {
+          yield* store.putDiscussion({
+            ...(yield* store.discussion(discussion.id))!,
+            evaluatorThreadId: null,
+          });
+          if (ownership === "creator" || ownership === "ask")
+            yield* registerEvaluatorFixture(board, thread);
+          if (ownership === "creator")
+            current = { ...current, createdBy: { _tag: "evaluator", threadId: thread } };
+          if (ownership === "ask")
+            current = {
+              ...current,
+              asks: [
+                {
+                  id: "q-evaluator",
+                  text: "Review this audit",
+                  blocking: false,
+                  by: { _tag: "evaluator", threadId: thread },
+                  at,
+                  closedAt: at,
+                  seq: null,
+                },
+              ],
+            };
+          yield* store.putCard(current);
+        }
+        if (path === "review")
+          yield* store.putCard({
+            ...current,
+            stage: "in_review",
+            reviewStep: 1,
+            nudgedAt: at,
+            links: [
+              {
+                kind: "pr",
+                url: "https://example.com/pull/1725",
+                label: null,
+                state: "open",
+                checkedAt: null,
+              },
+            ],
+          });
+        if (path === "stall")
+          yield* store.putCard({
+            ...current,
+            stalled: {
+              at,
+              by: { _tag: "system", component: "dispatcher" },
+              reason: "Provider start failed",
+            },
+          });
+        const before = yield* Ref.get(fake.threads);
+        const ids = [...before.keys()];
+        const messages = [...before.get(thread)!.messages];
+        const check = Effect.gen(function* () {
+          const service = yield* KanbanService.KanbanService;
+          yield* service.tick;
+          for (const elapsed of ["16 minutes", "61 minutes", "6 hours"] as const) {
+            yield* TestClock.adjust(elapsed);
+            yield* service.tick;
+            const after = yield* Ref.get(fake.threads);
+            assert.deepEqual([...after.keys()], ids);
+            assert.deepEqual(after.get(thread)!.messages, messages);
+            assert.equal(
+              (yield* service.discussion(discussion.id)).evaluatorThreadId,
+              ownership === "attached" ? thread : null,
+            );
+            assert.equal(
+              (yield* service.card(card.id)).card.stage,
+              path === "review" ? "in_review" : "todo",
+            );
+          }
+          assert.isTrue(
+            (yield* service.messages(discussion.id)).some((message) =>
+              lastText([message]).includes(failure.message),
+            ),
+          );
+          fake.failures.delete(thread);
+          yield* TestClock.adjust("7 hours");
+          yield* service.tick;
+          const reconciled = yield* Ref.get(fake.threads);
+          assert.isTrue(
+            reconciled.size > ids.length ||
+              reconciled.get(thread)!.messages.length > messages.length,
+          );
+        });
+        yield* restart ? check.pipe(Effect.provide(KanbanService.layer)) : check;
+      }).pipe(Effect.provide(testLayer(fake.layer)));
+    }),
+);
+
+it.effect(
+  "an unconfirmed evaluator notice retries a failed write without replaying its prompt",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      let failPost = true;
+      const failingNoticeStore = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            putMessage: (message) =>
+              Effect.suspend(() => {
+                if (
+                  failPost &&
+                  message.author._tag === "system" &&
+                  message.author.component === "evaluator-watch"
+                ) {
+                  failPost = false;
+                  return Effect.fail(
+                    new KanbanStore.KanbanStoreError({
+                      operation: "write message",
+                      cause: "injected",
+                    }),
+                  );
+                }
+                return real.putMessage(message);
+              }),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board } = yield* toyBoard;
+        const thread = yield* kanban.startEvaluator(board.id, {
+          kind: "request",
+          text: "Read the audit",
+        });
+        const messages = [...(yield* Ref.get(fake.threads)).get(thread)!.messages];
+        const failure = makeProviderFailure({
+          cause: new ProviderPromptAcceptanceError({
+            driver: ProviderDriverKind.make("opencode"),
+            serverOrigin: "http://opencode.test",
+            reason: "timeout",
+            budgetSeconds: 60,
+          }),
+        });
+        fake.failures.set(thread, failure);
+        assert.isTrue(Result.isFailure(yield* kanban.turnEnded(thread).pipe(Effect.result)));
+        yield* kanban.tick;
+        yield* kanban.tick;
+        const channel = (yield* kanban.discussions(board.id)).find(
+          (discussion) => discussion.title === "Evaluator errors",
+        )!;
+        const notices = yield* kanban.messages(channel.id);
+        assert.lengthOf(notices, 1);
+        assert.include(lastText(notices), failure.message);
+        assert.deepEqual((yield* Ref.get(fake.threads)).get(thread)!.messages, messages);
+      }).pipe(Effect.provide(testLayer(fake.layer, undefined, undefined, failingNoticeStore)));
     }),
 );
 
