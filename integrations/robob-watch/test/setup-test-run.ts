@@ -1,5 +1,5 @@
 import { afterAll } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,9 +10,4 @@ process.env.ROBOB_TEST = "1";
 
 const logRoot = mkdtempSync(join(tmpdir(), "watchers-test-logs-"));
 process.env.TOOLLOG_DIR = logRoot;
-// Destination guard tests provide their own config; ordinary fixtures must not read live chat routing.
-if (!process.env.SPECTRUM_BRIDGE_CONFIG) {
-  process.env.SPECTRUM_BRIDGE_CONFIG = join(logRoot, "bridge-config.json");
-  writeFileSync(process.env.SPECTRUM_BRIDGE_CONFIG, JSON.stringify({ chatBackends: {} }));
-}
 afterAll(() => rmSync(logRoot, { recursive: true, force: true }));

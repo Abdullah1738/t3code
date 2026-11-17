@@ -349,7 +349,7 @@ for (const configuration of walConfigurations) {
       const errors = result.rows.filter((row: { kind: string }) => row.kind === "error");
       expect(errors).toHaveLength(healthy ? 0 : 1);
       expect(JSON.stringify(errors)).not.toContain("PRIVATE");
-    }, 30_000); // Healthy cases start 120 real shells; macOS startup hooks exceed the default 5 s budget.
+    });
   }
 }
 
