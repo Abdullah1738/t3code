@@ -496,3 +496,5 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
   Edit there, run its tests (README), commit, `git push origin HEAD:main`, then `integrations/offbox/install.zsh`.
   Always push: install refuses unpushed changes, and `install.zsh --check` shows drift.
 - Raw boat access: `~/.local/bin/boat` (CLI, signed in). API key is in Keychain `boat-api`/`ardud`; never print it.
+
+A box that crashes native programs during setup is kept out of rotation for 24 h (manual `offbox box suspect BOX --reason "…"` marks last until `offbox box clear BOX`); a run that never started moves once to another home box, while a run that started after a recorded setup crash is flagged as infra to re-run.

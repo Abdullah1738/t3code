@@ -738,6 +738,9 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
 
 def refresh_box(con, box_id: str) -> None:
     """Resume and stop a stopped box: boat counts its 14-day data limit from the last stop."""
+    from . import unfit
+    if unfit.get(con, box_id):
+        return
     row = con.execute('SELECT note FROM leases WHERE box_id=?', (box_id,)).fetchone()
     if row and (row['note'] or '').startswith(BOX_WEDGED_NOTE):
         return
@@ -1384,6 +1387,9 @@ def _reuse(con, row, size: str | None, skip_archiving: bool = False, retrying: b
 
 
 def _reuse_available(con, row, size, skip_archiving=False, retrying=False, before_grow=None):
+    from . import unfit
+    if not unfit.available(con, row['box_id']):
+        return None
     check_deletion(con, row['box_id'])
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
