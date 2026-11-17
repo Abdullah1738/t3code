@@ -123,6 +123,7 @@ const toolFailure = (error: KanbanError) =>
               ? "operation_failed"
               : "invalid_args"),
     reasonClass: error.reasonClass ?? kanbanReasonClass(error.code, error.reason),
+    ...(typeof error.saved === "boolean" ? { saved: error.saved } : {}),
     ...(error.invalidField === undefined ? {} : { invalidField: error.invalidField }),
     message: error.message,
   });

@@ -10154,10 +10154,30 @@ const make = Effect.gen(function* () {
     const cleanup = Effect.suspend(() => {
       if (cleaned || reused === null || key === null || pending === null) return Effect.void;
       cleaned = true;
-      return locks.unlock.pipe(
-        Effect.andThen(
-          locks.fresh(
-            locks.board(
+      // Permit waits enable interruption; finish compensation before cancellation returns.
+      const compensate = locks
+        .fresh(
+          Effect.gen(function* () {
+            if (!pending.accepted && !pending.revoked) {
+              // A conflicted send can start its turn before its acceptance callback returns.
+              // Read before acquiring compensation's board permit.
+              const observed = yield* Effect.result(threadIo.queuedRuns(reused, true));
+              if (observed._tag === "Failure") {
+                yield* Effect.logWarning("kanban assignment run check failed", {
+                  cardId: card.id,
+                  errorTag: observed.failure._tag,
+                });
+                return false;
+              }
+              // Match this brief, not unrelated work already running on the reused thread.
+              pending.accepted = observed.success.some(
+                (run) =>
+                  run.userMessageId === `kanban:${key}` ||
+                  (run.userMessageId.startsWith(`kanban:${key}:retry:`) &&
+                    /^[0-9]+$/.test(run.userMessageId.slice(`kanban:${key}:retry:`.length))),
+              );
+            }
+            return yield* locks.board(
               board.id,
               Effect.gen(function* () {
                 const current = yield* cardOf(card.id);
@@ -10168,7 +10188,10 @@ const make = Effect.gen(function* () {
                   current.movedAt === at;
                 // A live consumer already owns this claim independently of the assignment send.
                 const accepted =
-                  owns && !pending.revoked && pending.accepted && (yield* destination.valid);
+                  owns &&
+                  !pending.revoked &&
+                  pending.accepted &&
+                  (yield* locks.outside(destination.valid, undefined, true));
                 if (owns && !pending.revoked && (pending.touched || accepted)) {
                   assignmentWakeRetries.delete(card.id);
                   yield* releasePriorHold;
@@ -10233,7 +10256,9 @@ const make = Effect.gen(function* () {
                   });
                   destination.expectedCard = yield* saveDispatchCard(restored);
                   if (restored.stalled !== null)
-                    yield* logEvent(restored, system, "flagged", { body: restored.stalled.reason });
+                    yield* logEvent(restored, system, "flagged", {
+                      body: restored.stalled.reason,
+                    });
                   if (!superseded) {
                     const backoffMs = Math.min(600_000, 30_000 * 2 ** (attempts - 1));
                     assignmentWakeRetries.set(card.id, {
@@ -10273,37 +10298,43 @@ const make = Effect.gen(function* () {
                 }
                 return true;
               }),
-            ),
-          ),
-        ),
-        Effect.catchCause((cause) =>
-          Effect.logWarning("kanban assignment rollback failed", {
-            cardId: card.id,
-            errorTag: analyticsErrorTag(cause),
-          }).pipe(Effect.as(!pending.accepted && !pending.touched)),
-        ),
-        Effect.flatMap((withdraw) =>
-          withdraw
-            ? touching(
-                reused,
-                threadIo
-                  .withdraw({
-                    threadId: reused,
-                    key,
-                    retryWithdrawn: true,
-                    text: `The board changed while assigning card #${card.number}. Re-read card_get before acting on that assignment; keep working on your other cards.`,
-                  })
-                  .pipe(Effect.asVoid),
-              )
-            : Effect.void,
-        ),
-        Effect.ensuring(
-          Effect.sync(() => {
-            pendingWakes.delete(key);
-            delivering.delete(card.id);
+            );
           }),
-        ),
-      );
+        )
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("kanban assignment rollback failed", {
+              cardId: card.id,
+              errorTag: analyticsErrorTag(cause),
+            }).pipe(Effect.as(!pending.accepted && !pending.touched)),
+          ),
+          Effect.flatMap((withdraw) =>
+            withdraw
+              ? touching(
+                  reused,
+                  threadIo
+                    .withdraw({
+                      threadId: reused,
+                      key,
+                      retryWithdrawn: true,
+                      text: `The board changed while assigning card #${card.number}. Re-read card_get before acting on that assignment; keep working on your other cards.`,
+                    })
+                    .pipe(Effect.asVoid),
+                )
+              : Effect.void,
+          ),
+          Effect.ensuring(
+            Effect.sync(() => {
+              pendingWakes.delete(key);
+              delivering.delete(card.id);
+            }),
+          ),
+          Effect.forkChild,
+          Effect.flatMap(Fiber.join),
+          Effect.uninterruptible,
+        );
+      // A child cannot release a permit owned by its caller's fiber.
+      return locks.unlock.pipe(Effect.andThen(compensate));
     });
     if (pending !== null && key !== null) {
       // Register before saving: cancellation must not leave a claim without its wake.
@@ -15983,7 +16014,15 @@ const make = Effect.gen(function* () {
           Effect.flatMap((admitted) =>
             admitted
               ? Effect.void
-              : failWith("conflict", "Assignment is being rolled back; retry shortly."),
+              : Effect.fail(
+                  new KanbanError({
+                    code: "conflict",
+                    reason: "conflict",
+                    reasonClass: "conflict",
+                    saved: false,
+                    detail: "Assignment is being rolled back; retry shortly. Nothing was saved.",
+                  }),
+                ),
           ),
         ),
         () => effect,
