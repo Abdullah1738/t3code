@@ -157,6 +157,7 @@ const layerProviderSessionManagerProvided = ProviderSessionManager.layer.pipe(
       layerCommandOutputHubProvided,
       layerProviderAdapterRegistryProvided,
       layerEventSinkProvided,
+      EffectOutbox.layer,
       IdAllocator.layer,
       layerProviderEventIngestorProvided,
       ProjectionStore.layer,
@@ -407,6 +408,7 @@ const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
     Layer.mergeAll(
       layerEventSinkProvided,
       ProjectionStore.layer,
+      EffectOutbox.layer,
       layerRestartPacingProvided,
       layerRunFinalizationServiceProvided,
       layerCheckpointRollbackServiceProvided,

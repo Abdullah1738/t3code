@@ -3385,6 +3385,9 @@ const OrchestrationV2InternalCommand = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("thread.background-work.settle"),
+    runOnly: Schema.optional(Schema.Boolean),
+    releasedAt: Schema.optional(Schema.DateTimeUtc),
+    preserveBackgroundWork: Schema.optional(Schema.Boolean),
     commandId: CommandId,
     threadId: ThreadId,
     providerThreadId: ProviderThreadId,
@@ -3400,6 +3403,14 @@ const OrchestrationV2InternalCommand = Schema.Union([
         }),
       }),
     ),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.provider-root.settle"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    providerThreadId: ProviderThreadId,
+    nodeId: NodeId,
+    startedAt: Schema.NullOr(Schema.DateTimeUtc),
   }),
   /**
    * Internal so no client can mark a request saved without the value being

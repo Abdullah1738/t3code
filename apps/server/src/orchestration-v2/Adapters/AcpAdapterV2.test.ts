@@ -4273,7 +4273,7 @@ describe("AcpAdapterV2", () => {
               Effect.flatMap(makeXAiPromptCompletionRuntime),
             ),
         });
-        yield* adapter.openSession({
+        const session = yield* adapter.openSession({
           threadId: ThreadId.make(`grok-model-${model}`),
           providerSessionId: ProviderSessionId.make(`grok-model-${model}`),
           modelSelection: { instanceId, model },
@@ -4283,6 +4283,7 @@ describe("AcpAdapterV2", () => {
             cwd: process.cwd(),
           }),
         });
+        assert.isTrue(session.backgroundTasksEndWithProcess);
         const requests = (yield* Queue.takeAll(protocolEvents)).map(rawProtocolRequest);
         assert.equal(
           requests.filter(
