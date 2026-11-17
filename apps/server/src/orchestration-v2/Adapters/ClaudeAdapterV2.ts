@@ -1,3 +1,4 @@
+import * as ProviderRetryAnalytics from "../../ardud/analytics/ProviderRetry.ts";
 import * as ClaudeTurnStartup from "../../ardud/providers/ClaudeTurnStartup.ts";
 import * as ClaudeApiErrorTranscript from "./ClaudeApiErrorTranscript.ts";
 import * as ProviderStartProgress from "../../ardud/orchestration/ProviderStartProgress.ts";
@@ -3602,6 +3603,7 @@ interface ActiveClaudeTurnContext {
   compaction: Extract<OrchestrationV2TurnItem, { type: "compaction" }> | null;
   compactionWatchdogStop: Deferred.Deferred<void> | null;
   lastSdkMessageAt: number;
+  analyticsLastResponseAt?: DateTime.Utc;
   readonly retryHealth: { since: number; frames: number; seenResponse: boolean; retrying: boolean };
 
   readonly ignoredTaskIds: Set<string>;
@@ -4101,6 +4103,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
   adapterOptions: ClaudeAdapterV2Options,
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+  const recordRetry = yield* ProviderRetryAnalytics.makeRecorder();
   const { attachmentsDir, fileSystem, path, crypto, idAllocator, queryRunner } = adapterOptions;
   const subagentModelCatalog = scopeClaudeModelCatalog(
     BUNDLED_CLAUDE_MODEL_CATALOG,
@@ -7979,6 +7982,26 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                     context.compactionWatchdogStop = null;
                     liveQuery.stopping = true;
                     yield* Ref.set(queryContext, null);
+                    const failure = makeProviderFailure({
+                      class: "provider_error",
+                      category: "transient",
+                      code: "compaction_no_progress",
+                      message: "Claude compaction made no progress for 5 min.",
+                    });
+                    const activeRetry = (yield* Ref.get(providerRetries)).get(
+                      context.providerTurnId,
+                    );
+                    yield* recordRetry({
+                      kind: "provider.guard_interrupt",
+                      threadId: context.input.threadId,
+                      runId: context.input.runId,
+                      provider: adapterOptions.instanceId,
+                      model: context.input.modelSelection.model,
+                      ...(activeRetry === undefined ? {} : { retry: activeRetry.retry }),
+                      errorMessage: failure.message,
+                      lastResponseAt: context.analyticsLastResponseAt ?? context.startedAt,
+                      guardFiredDuringRetry: context.retryHealth.retrying,
+                    });
                     // Close starts independently of both turn cleanup and
                     // workflow transcript enrichment, including their failures.
                     yield* liveQuery.query.close.pipe(
@@ -7987,16 +8010,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                       Effect.forkIn(sessionScope),
                     );
                     yield* Effect.gen(function* () {
-                      yield* finalizeActiveTurnAfterQueryExit(
-                        liveQuery,
-                        undefined,
-                        makeProviderFailure({
-                          class: "provider_error",
-                          category: "transient",
-                          code: "compaction_no_progress",
-                          message: "Claude compaction made no progress for 5 min.",
-                        }),
-                      );
+                      yield* finalizeActiveTurnAfterQueryExit(liveQuery, undefined, failure);
                       yield* endSubagentCallsOfClosedQuery(liveQuery, "failed");
                     }).pipe(
                       Effect.timeout(CLAUDE_TURN_FINALIZATION_TIMEOUT),
@@ -8209,6 +8223,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ].includes(event.type)
             ) {
               context.retryHealth.since = DateTime.toEpochMillis(frameTime);
+              context.analyticsLastResponseAt = frameTime;
               context.retryHealth.seenResponse = true;
               context.retryHealth.retrying = false;
               context.responseReceived = true;
@@ -8667,6 +8682,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               updated.set(context.providerTurnId, state);
               return updated;
             });
+            yield* recordRetry({
+              kind: "provider.retry",
+              threadId: context.input.threadId,
+              runId: context.input.runId,
+              provider: adapterOptions.instanceId,
+              model: context.input.modelSelection.model,
+              retry,
+              errorMessage: failure.message,
+              lastResponseAt: context.analyticsLastResponseAt ?? context.startedAt,
+            });
             yield* emitProviderEvent({
               type: "turn_item.updated",
               driver: CLAUDE_PROVIDER,
@@ -8693,6 +8718,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             if (message.parent_tool_use_id === null) {
               if (message.error === undefined) {
                 if (message.message.model !== "<synthetic>") {
+                  context.analyticsLastResponseAt = now;
                   context.retryHealth.since = DateTime.toEpochMillis(now);
                   context.retryHealth.frames = 0;
                   context.retryHealth.seenResponse = true;
@@ -11628,6 +11654,18 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   }),
                   claudeAccess: claudeAccessEvidence(context, null, "transient"),
                 };
+                const activeRetry = (yield* Ref.get(providerRetries)).get(context.providerTurnId);
+                yield* recordRetry({
+                  kind: "provider.guard_interrupt",
+                  threadId: context.input.threadId,
+                  runId: context.input.runId,
+                  provider: adapterOptions.instanceId,
+                  model: context.input.modelSelection.model,
+                  ...(activeRetry === undefined ? {} : { retry: activeRetry.retry }),
+                  errorMessage: failure.message,
+                  lastResponseAt: context.analyticsLastResponseAt ?? context.startedAt,
+                  guardFiredDuringRetry: health.retrying,
+                });
                 yield* interruptTurn({
                   providerThread: context.input.providerThread,
                   providerTurnId: context.providerTurnId,

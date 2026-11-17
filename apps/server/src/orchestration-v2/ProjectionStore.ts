@@ -383,7 +383,10 @@ export interface ProjectionRecordFilter {
   readonly latestRunOnly?: boolean;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
   readonly recentTurnItemLimit?: number;
+  readonly turnItemOrder?: "completion";
   readonly turnItemStatuses?: ReadonlyArray<OrchestrationV2TurnItem["status"]>;
+  /** Cleanup can fail an unfinished tool without ever receiving its result. */
+  readonly toolResultsOnly?: boolean;
   readonly omitSettledLeafNodes?: boolean;
 }
 
@@ -3596,12 +3599,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 WHERE thread_id = ${threadId}
                   ${filter?.turnItemTypes === undefined ? sql`` : sql`AND type IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemTypes)}))`}
                   ${filter?.turnItemStatuses === undefined ? sql`` : sql`AND status IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemStatuses)}))`}
+                  ${filter?.toolResultsOnly !== true ? sql`` : sql`AND (status = 'completed' OR json_type(payload_json, '$.output') IS NOT NULL OR json_type(payload_json, '$.exitCode') IS NOT NULL)`}
                   ${filter?.turnItemRunId === undefined ? sql`` : sql`AND run_id = ${filter.turnItemRunId}`}
                   ${filter?.turnItemRunIds === undefined ? sql`` : sql`AND (run_id IN (SELECT value FROM json_each(${encodeIdList(filter.turnItemRunIds.filter((id): id is RunId => id !== null))})) OR (${filter.turnItemRunIds.includes(null) ? 1 : 0} = 1 AND run_id IS NULL))`}
                 ${
                   filter?.recentTurnItemLimit === undefined
                     ? sql`ORDER BY ordinal ASC, turn_item_id ASC`
-                    : sql`ORDER BY ordinal DESC, turn_item_id DESC LIMIT ${Math.max(1, Math.min(200, Math.floor(filter.recentTurnItemLimit)))}`
+                    : sql`ORDER BY ${filter.turnItemOrder === "completion" ? sql`COALESCE(json_extract(payload_json, '$.completedAt'), updated_at) DESC,` : sql``} ordinal DESC, turn_item_id DESC LIMIT ${Math.max(1, Math.min(200, Math.floor(filter.recentTurnItemLimit)))}`
                 }
               `
               : yield* sql<PayloadRow>`
@@ -8331,7 +8335,18 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                     filter.turnItemTypes.includes(row.type)) &&
                   (filter?.turnItemStatuses === undefined ||
                     filter.turnItemStatuses.includes(row.status)) &&
+                  (filter?.toolResultsOnly !== true ||
+                    row.status === "completed" ||
+                    (row.type === "command_execution" &&
+                      (row.output !== undefined || row.exitCode !== undefined)) ||
+                    (row.type === "dynamic_tool" && row.output !== undefined)) &&
                   (filter?.turnItemRunId === undefined || filter.turnItemRunId === row.runId),
+              )
+              .toSorted((a, b) =>
+                filter?.turnItemOrder === "completion"
+                  ? DateTime.toEpochMillis(a.completedAt ?? a.updatedAt) -
+                      DateTime.toEpochMillis(b.completedAt ?? b.updatedAt) || a.ordinal - b.ordinal
+                  : a.ordinal - b.ordinal,
               )
               .slice(
                 filter?.recentTurnItemLimit === undefined

@@ -1,4 +1,5 @@
 import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
+import { completedToolFilter } from "../ardud/orchestration/delegatedPartialResult.ts";
 import { liveThreadShell } from "../mcp/McpToolAccess.testkit.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
@@ -1396,7 +1397,7 @@ const seedRestartCancelledChild = (input: {
   readonly completionWake: "always" | "settled_only";
   readonly continuationPending: boolean;
   readonly continuationCommandId?: CommandId;
-  readonly runStatus?: "cancelled" | "completed" | "interrupted";
+  readonly runStatus?: "cancelled" | "completed" | "interrupted" | "failed";
   readonly lostWork?: OrchestrationV2Run["restartCancelledBackgroundWork"];
   readonly partialResult?: string;
   readonly now: DateTime.Utc;
@@ -4020,5 +4021,227 @@ describe("delegated background results", () => {
         scenario === "foreign_task" ? wakeRunId : completed.contextTransfers[0]!.sourcePoint.runId,
       );
     }).pipe(Effect.provide(Layer.merge(layerTest, ProviderContinuationRequests.layer))),
+  );
+});
+
+it.layer(layerTest)("stopped delegated tool results", (it) => {
+  const cases = [
+    ...(["interrupted", "failed", "completed"] as const).map((status) => ({
+      name: status,
+      status,
+      lostWork: undefined,
+      partial: status !== "completed",
+    })),
+    ...(["completed", "cancelled"] as const).flatMap((status) =>
+      (["shell", "monitor", "subagent", "task"] as const).map((kind) => ({
+        name: `${status}-restart-${kind}`,
+        status,
+        lostWork: [{ kind, label: "lost background work" }],
+        partial: kind !== "shell",
+      })),
+    ),
+  ];
+  it.effect.each(cases)(
+    "publishes $name result through the shared completion builder",
+    ({ name, status, lostWork, partial }) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const store = yield* ProjectionStore.ProjectionStoreV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make(`partial-parent:${name}`);
+        const projectId = ProjectId.make(`partial-project:${name}`);
+        const runId = RunId.make(`partial-parent:${name}`);
+        const rootNodeId = NodeId.make(`partial-root:${name}`);
+        yield* seedParentWithTerminalTask({
+          threadId,
+          projectId,
+          runId,
+          rootNodeId,
+          taskId: NodeId.make(`partial-seed:${name}`),
+          deliveryState: "acknowledged",
+          now,
+        });
+        const child = yield* seedRestartCancelledChild({
+          parentThreadId: threadId,
+          projectId,
+          parentRunId: runId,
+          rootNodeId,
+          name: `partial-child:${name}`,
+          completionWake: "always",
+          continuationPending: false,
+          runStatus: status,
+          lostWork,
+          partialResult: "I'll load the remote-compute skill first.",
+          now,
+        });
+        const run = (yield* orchestrator.getThreadProjection(child.childThreadId)).runs[0]!;
+        const toolBase = {
+          threadId: child.childThreadId,
+          runId: run.id,
+          nodeId: null,
+          providerThreadId: null,
+          providerTurnId: null,
+          nativeItemRef: null,
+          parentItemId: null,
+          title: null,
+          type: "command_execution" as const,
+          status: "completed" as const,
+          startedAt: now,
+          updatedAt: now,
+          completedAt: now,
+        };
+        // Tools start in one order and finish in another. Only the latest finished body is loaded.
+        yield* sink.write({
+          events: [
+            {
+              id: EventId.make(`partial-tool-old:${name}`),
+              type: "turn-item.updated",
+              threadId: child.childThreadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: {
+                ...toolBase,
+                id: TurnItemId.make(`partial-tool-old:${name}`),
+                ordinal: 3,
+                input: "offbox wait run-1116-watch",
+                exitCode: 1,
+                output: "obsolete output",
+              },
+            },
+            {
+              id: EventId.make(`partial-tool-last:${name}`),
+              type: "turn-item.updated",
+              threadId: child.childThreadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: {
+                ...toolBase,
+                id: TurnItemId.make(`partial-tool-last:${name}`),
+                ordinal: 2,
+                input: "offbox wait run-1116-watch",
+                exitCode: 1,
+                completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 1),
+                updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 1),
+                output: "x".repeat(6000) + "\nexit 1 /logs/run-1116-watch.log",
+              },
+            },
+            {
+              id: EventId.make(`partial-cleanup-command:${name}`),
+              type: "turn-item.updated",
+              threadId: child.childThreadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: {
+                ...toolBase,
+                id: TurnItemId.make(`partial-cleanup-command:${name}`),
+                ordinal: 4,
+                input: "unfinished command",
+                status: "failed",
+                completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 2),
+                updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 2),
+              },
+            },
+            {
+              id: EventId.make(`partial-cleanup-mcp:${name}`),
+              type: "turn-item.updated",
+              threadId: child.childThreadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: {
+                ...toolBase,
+                id: TurnItemId.make(`partial-cleanup-mcp:${name}`),
+                type: "dynamic_tool",
+                toolName: "mcp__unfinished",
+                input: {},
+                ordinal: 5,
+                status: "failed",
+                completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 3),
+                updatedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 3),
+              },
+            },
+            {
+              id: EventId.make(`partial-run-reason:${name}`),
+              type: "run.updated",
+              threadId: child.childThreadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: {
+                ...run,
+                cancelDetail: "Stalled: command_execution_finished then no progress for 15 min",
+              },
+            },
+          ],
+        });
+        const selected = yield* store.getThreadRecords(
+          child.childThreadId,
+          ["turnItems"],
+          completedToolFilter(run),
+        );
+        assert.lengthOf(selected.turnItems, 1);
+        assert.equal(selected.turnItems[0]!.id, TurnItemId.make(`partial-tool-last:${name}`));
+        const serviceLayer = OrchestratorMcpService.layer.pipe(
+          Layer.provide(McpProviderSessions.layer),
+          Layer.provide(
+            Layer.mergeAll(
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+                getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+                getThreadProjection: (id) => orchestrator.getThreadProjection(id),
+                getThreadRecords: (id, fields, filter) =>
+                  orchestrator.getThreadRecords(id, fields, filter),
+                delegatedTaskResultPending: (id, taskId) =>
+                  orchestrator.delegatedTaskResultPending(id, taskId),
+                dispatch: (command) => orchestrator.dispatch(command),
+              }),
+              Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+              Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+              Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+              Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+                list: () => Effect.succeed([]),
+              }),
+              Layer.mock(ProjectService.ProjectService)({}),
+              Layer.mock(SecretRequests.SecretRequests)({}),
+              Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+              ServerSettings.layerTest(),
+              NodeServices.layer,
+            ),
+          ),
+        );
+        const readStatus = Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          return yield* service.taskStatus(
+            {
+              environmentId: EnvironmentId.make("partial-env"),
+              requestNamespace: "partial-test",
+              thread: {
+                threadId,
+                providerInstanceId: modelSelection.instanceId,
+                providerSessionId: "partial-session",
+              },
+              client: undefined,
+              capabilities: new Set(["orchestration"]),
+              issuedAt: 1,
+            },
+            child.taskId,
+          );
+        }).pipe(Effect.provide(serviceLayer));
+        const unpublished = yield* readStatus;
+        yield* orchestrator.recoverDelegatedTasks;
+        const parent = yield* orchestrator.getThreadProjection(threadId);
+        const result = parent.subagents.find((task) => task.id === child.taskId)!.result!;
+        if (!partial) assert.equal(result, "I'll load the remote-compute skill first.");
+        else {
+          assert.include(result, "Stalled: command_execution_finished then no progress for 15 min");
+          assert.include(result, "Last completed tool: offbox wait run-1116-watch (exit 1)");
+          assert.include(result, "[truncated;");
+          assert.isTrue(result.endsWith("exit 1 /logs/run-1116-watch.log"));
+          assert.notInclude(result, "obsolete output");
+        }
+        assert.equal(unpublished.summary, result);
+        const published = yield* readStatus;
+        assert.equal(published.summary, result);
+        assert.lengthOf(parent.contextTransfers, 1);
+      }),
   );
 });

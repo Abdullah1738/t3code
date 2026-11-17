@@ -1,6 +1,5 @@
 import { assert, it } from "@effect/vitest";
 import {
-  type AnalyticsEvent,
   type KanbanThreadLink,
   type OrchestrationV2ProviderTurn,
   KanbanBoardId,
@@ -14,6 +13,9 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
+import { AnalyticsEvent } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+import { makeProviderRetryTurnItem } from "@t3tools/provider-core/server/failure";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -25,6 +27,7 @@ import * as Analytics from "./Analytics.ts";
 import * as KanbanStore from "../kanban/store/KanbanStore.ts";
 import { makeRunUsageObserver, makeRunUsageState } from "./RunUsage.ts";
 
+const decodeRetryEvent = Schema.decodeUnknownSync(AnalyticsEvent, { onExcessProperty: "error" });
 const threadId = ThreadId.make("thread:one");
 const providerThreadId = ProviderThreadId.make("provider:one");
 const providerTurnId = ProviderTurnId.make("turn:one");
@@ -360,4 +363,64 @@ it.effect("keeps terminal usage when cleanup interrupts its reader during attrib
     assert.equal(row.cardId, "card:one");
     assert.equal(row.endReason, "interrupted");
   }),
+);
+
+it.effect.each(["pi", "cursor", "codex", "claudeAgent"])(
+  "records %s retry items only when the native adapter has no recorder",
+  (provider) =>
+    Effect.gen(function* () {
+      const rows: AnalyticsEvent[] = [];
+      const now = yield* DateTime.now;
+      const selected = input(now);
+      const observer = yield* makeRunUsageObserver({
+        ...selected,
+        run: { ...selected.run, providerInstanceId: ProviderInstanceId.make(provider) },
+      }).pipe(
+        Effect.provide(
+          Layer.mock(Analytics.Analytics)({
+            record: (event) =>
+              Effect.sync(() => rows.push(decodeRetryEvent(event))).pipe(Effect.asVoid),
+          }),
+        ),
+      );
+      for (const attempt of [1, 2]) {
+        yield* TestClock.adjust("1 second");
+        const item = makeProviderRetryTurnItem({
+          driver: ProviderDriverKind.make(provider),
+          threadId,
+          runId: selected.run.id,
+          nodeId: NodeId.make("root"),
+          providerThreadId,
+          providerTurnId,
+          itemOrdinal: 1,
+          failure: makeProviderFailure({ class: "transport_error", message: "Request timed out." }),
+          retry: { attempt, maxAttempts: 10, retryDelayMs: 100 },
+          status: "running",
+          startedAt: now,
+          updatedAt: yield* DateTime.now,
+        });
+        yield* observer.observe({
+          type: "turn_item.updated",
+          driver: ProviderDriverKind.make(provider),
+          turnItem: item,
+        });
+        yield* observer.observe({
+          type: "turn_item.updated",
+          driver: ProviderDriverKind.make(provider),
+          turnItem: { ...item, status: "completed" },
+        });
+      }
+      assert.deepEqual(
+        rows.map((event) => event.props?.attempt),
+        provider === "codex" || provider === "claudeAgent" ? [] : [1, 2],
+      );
+      if (rows.length > 0) {
+        assert.deepEqual(
+          rows.map((event) => event.props?.waitSinceResponseMs),
+          [1000, 2000],
+        );
+        assert.equal(rows[0]!.props?.maxRetries, 10);
+        assert.equal(rows[0]!.props?.errorMessage, "Request timed out.");
+      }
+    }),
 );

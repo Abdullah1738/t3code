@@ -43,6 +43,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { liveColumns } from "../ardud/persistence/historyArchiveSql.ts";
+import { completedToolFilter } from "../ardud/orchestration/delegatedPartialResult.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
@@ -9165,4 +9166,129 @@ it.effect("SQL client shell omits idle subagents but keeps live ones and their c
     }
     assert.deepEqual(paged, [...expected].toSorted());
   }).pipe(Effect.provide(layerTest)),
+);
+
+const toolResultCases = [
+  {
+    name: "command completed empty",
+    tool: { type: "command_execution", input: "command", status: "completed" },
+    selected: true,
+  },
+  {
+    name: "command failed output",
+    tool: {
+      type: "command_execution",
+      input: "command",
+      status: "failed",
+      output: "command failed",
+    },
+    selected: true,
+  },
+  {
+    name: "command failed empty output",
+    tool: { type: "command_execution", input: "command", status: "failed", output: "" },
+    selected: true,
+  },
+  {
+    name: "command failed exit code",
+    tool: { type: "command_execution", input: "command", status: "failed", exitCode: 1 },
+    selected: true,
+  },
+  {
+    name: "command cleanup failure",
+    tool: { type: "command_execution", input: "command", status: "failed" },
+    selected: false,
+  },
+  {
+    name: "MCP completed empty",
+    tool: { type: "dynamic_tool", toolName: "mcp__test", input: null, status: "completed" },
+    selected: true,
+  },
+  {
+    name: "MCP failed output",
+    tool: {
+      type: "dynamic_tool",
+      toolName: "mcp__test",
+      input: null,
+      status: "failed",
+      output: "tool failed",
+    },
+    selected: true,
+  },
+  {
+    name: "MCP failed null result",
+    tool: {
+      type: "dynamic_tool",
+      toolName: "mcp__test",
+      input: null,
+      status: "failed",
+      output: null,
+    },
+    selected: true,
+  },
+  {
+    name: "MCP cleanup failure",
+    tool: { type: "dynamic_tool", toolName: "mcp__test", input: null, status: "failed" },
+    selected: false,
+  },
+] as const;
+const selectCompletedToolResult = Effect.fn("test.selectCompletedToolResult")(function* (
+  scenario: (typeof toolResultCases)[number],
+) {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const threadId = yield* addRolledBackRecoveryCandidate(`tool-result:${scenario.name}`);
+  const run = (yield* store.getThreadRecords(threadId, ["runs"])).runs[0]!;
+  const now = yield* DateTime.now;
+  const base = {
+    threadId,
+    runId: run.id,
+    nodeId: null,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef: null,
+    parentItemId: null,
+    title: null,
+    startedAt: now,
+    completedAt: now,
+    updatedAt: now,
+  };
+  const earlier = TurnItemId.make("earlier-result");
+  const latest = TurnItemId.make("latest-result");
+  for (const payload of [
+    {
+      ...base,
+      id: earlier,
+      ordinal: 2,
+      type: "command_execution" as const,
+      input: "offbox wait",
+      status: "completed" as const,
+      output: "finished output",
+    },
+    {
+      ...base,
+      id: latest,
+      ordinal: 3,
+      completedAt: DateTime.makeUnsafe(DateTime.toEpochMillis(now) + 1),
+      ...scenario.tool,
+    },
+  ]) {
+    yield* store.apply({
+      id: EventId.make(`event:${payload.id}`),
+      type: "turn-item.updated",
+      threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload,
+    });
+  }
+  const selected = yield* store.getThreadRecords(threadId, ["turnItems"], completedToolFilter(run));
+  assert.lengthOf(selected.turnItems, 1);
+  assert.equal(selected.turnItems[0]!.id, scenario.selected ? latest : earlier);
+});
+
+it.effect.each(toolResultCases)("SQL last tool result: $name", (scenario) =>
+  selectCompletedToolResult(scenario).pipe(Effect.provide(layerTest)),
+);
+it.effect.each(toolResultCases)("memory last tool result: $name", (scenario) =>
+  selectCompletedToolResult(scenario).pipe(Effect.provide(ProjectionStore.layerMemory)),
 );
