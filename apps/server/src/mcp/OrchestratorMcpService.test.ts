@@ -4692,6 +4692,29 @@ describe("OrchestratorMcpService provider resolution", () => {
     { mode: "wait", legacy: true },
     { mode: "async", legacy: false, recoveryTimeout: true },
     { mode: "async", legacy: true, recoveryTimeout: true },
+    { mode: "async", legacy: false, dispatchTimeout: "before commit", cancelOnArrival: true },
+    {
+      mode: "async",
+      legacy: false,
+      dispatchTimeout: "before commit",
+      cancelOnArrival: true,
+      maskedCommit: true,
+    },
+    {
+      mode: "async",
+      legacy: false,
+      dispatchTimeout: "before commit",
+      cancelOnArrival: true,
+      concurrentRetry: true,
+    },
+    { mode: "async", legacy: false, dispatchTimeout: "after commit", cancelOnArrival: true },
+    {
+      mode: "async",
+      legacy: false,
+      dispatchTimeout: "before commit",
+      cancelOnArrival: true,
+      worktree: true,
+    },
     { mode: "async", legacy: false, dispatchTimeout: "before commit", expireCreate: true },
     {
       mode: "async",
@@ -4764,7 +4787,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     },
     { mode: "wait", legacy: true, dispatchTimeout: "before commit", noRetry: true },
   ] as const)(
-    "replays the same delegation across any namespace rebind (parentEnds=$parentEnds, rejectBeforeAdmission=$rejectBeforeAdmission, replayReadFailure=$replayReadFailure, $mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease, finishBeforeReply=$finishBeforeReply, finishDuringRetry=$finishDuringRetry, commitInGrace=$commitInGrace, expireCreate=$expireCreate, failCreate=$failCreate)",
+    "replays the same delegation across any namespace rebind (parentEnds=$parentEnds, rejectBeforeAdmission=$rejectBeforeAdmission, replayReadFailure=$replayReadFailure, $mode, legacy=$legacy, stillRunning=$stillRunning, recoveryTimeout=$recoveryTimeout, dispatchTimeout=$dispatchTimeout, concurrentRetry=$concurrentRetry, worktree=$worktree, noRetry=$noRetry, finishBeforeRelease=$finishBeforeRelease, cancelOnArrival=$cancelOnArrival, maskedCommit=$maskedCommit, finishBeforeReply=$finishBeforeReply, finishDuringRetry=$finishDuringRetry, commitInGrace=$commitInGrace, expireCreate=$expireCreate, failCreate=$failCreate)",
     (testCase) => {
       const { mode, legacy } = testCase;
       const stillRunning = "stillRunning" in testCase;
@@ -4805,9 +4828,11 @@ describe("OrchestratorMcpService provider resolution", () => {
           const dispatchEntered = yield* Deferred.make<void>();
           const dispatchRelease = yield* Deferred.make<void>();
           const dispatchFinished = yield* Deferred.make<void>();
+          const cancelFinished = yield* Deferred.make<void>();
           const retryDispatchEntered = yield* Deferred.make<void>();
           const wakeUpgraded = yield* Deferred.make<void>();
           const prepared = yield* Deferred.make<void>();
+          let createFailed = false;
           let blockDispatch = dispatchTimeout !== undefined;
           let failReplayRead = false;
           let blockRecovery = false;
@@ -4832,16 +4857,21 @@ describe("OrchestratorMcpService provider resolution", () => {
                     const hold = Deferred.succeed(dispatchEntered, undefined).pipe(
                       Effect.andThen(Deferred.await(dispatchRelease)),
                     );
-                    if (dispatchTimeout === "before commit") yield* hold;
-                    if ("failCreate" in testCase)
-                      return yield* new Orchestrator.OrchestratorDispatchError({
-                        commandId: command.commandId,
-                        commandType: command.type,
-                        cause: "create failed before commit",
-                      });
-                    const result = yield* real.dispatch(command);
-                    if (dispatchTimeout === "after commit") yield* hold;
-                    return result;
+                    const create = Effect.gen(function* () {
+                      if (dispatchTimeout === "before commit") yield* hold;
+                      if ("failCreate" in testCase)
+                        return yield* new Orchestrator.OrchestratorDispatchError({
+                          commandId: command.commandId,
+                          commandType: command.type,
+                          cause: "create failed before commit",
+                        });
+                      const result = yield* real.dispatch(command);
+                      if (dispatchTimeout === "after commit") yield* hold;
+                      return result;
+                    });
+                    return yield* "maskedCommit" in testCase
+                      ? create.pipe(Effect.uninterruptible)
+                      : create;
                   }),
               };
             }),
@@ -4866,6 +4896,11 @@ describe("OrchestratorMcpService provider resolution", () => {
                 ...real,
                 dispatch: (command) =>
                   Effect.gen(function* () {
+                    if (command.type === "delegated_task.completion-delivery.dispose") {
+                      return yield* real
+                        .dispatch(command)
+                        .pipe(Effect.tap(() => Deferred.succeed(cancelFinished, undefined)));
+                    }
                     if (command.type === "delegated_task.wake-policy") {
                       return yield* real
                         .dispatch(command)
@@ -4876,10 +4911,12 @@ describe("OrchestratorMcpService provider resolution", () => {
                     return yield* real
                       .dispatch(command)
                       .pipe(
-                        Effect.ensuring(
-                          command.type === "delegated_task.request"
-                            ? Deferred.succeed(dispatchFinished, undefined)
-                            : Effect.void,
+                        Effect.onExit((exit) =>
+                          Effect.gen(function* () {
+                            if (command.type !== "delegated_task.request") return;
+                            createFailed = Exit.isFailure(exit);
+                            yield* Deferred.succeed(dispatchFinished, undefined);
+                          }),
                         ),
                       );
                   }),
@@ -5152,6 +5189,19 @@ describe("OrchestratorMcpService provider resolution", () => {
                 const accepted = yield* service.taskStatus(scope, recoveringId);
                 assert.equal(accepted.taskId, recoveringId);
               }
+              if ("cancelOnArrival" in testCase) {
+                const cancelled = yield* service.cancelTask(boundScope, {
+                  taskId: recoveringId,
+                  clientRequestId: "cancel-on-arrival",
+                  reason: "No longer needed",
+                });
+                assert.equal(
+                  cancelled.status,
+                  dispatchTimeout === "before commit" ? "cancel_pending" : "interrupted",
+                );
+                if (dispatchTimeout === "before commit")
+                  assert.include(cancelled.detail!, "as soon as");
+              }
               const concurrent =
                 "concurrentRetry" in testCase
                   ? yield* service.delegateTask(boundScope, request).pipe(Effect.forkScoped)
@@ -5245,9 +5295,12 @@ describe("OrchestratorMcpService provider resolution", () => {
                 );
                 yield* TestClock.adjust("1 second");
               }
+              if ("maskedCommit" in testCase) yield* TestClock.adjust("110 seconds");
               yield* Deferred.succeed(dispatchRelease, undefined);
               yield* Deferred.await(dispatchFinished);
-              if ("worktree" in testCase) yield* Deferred.await(prepared);
+              if ("maskedCommit" in testCase) assert.isTrue(createFailed);
+              if ("worktree" in testCase && !("cancelOnArrival" in testCase))
+                yield* Deferred.await(prepared);
               if (concurrent !== undefined) {
                 const retry = yield* Fiber.join(concurrent);
                 assert.equal(retry.taskId, recoveringId);
@@ -5255,6 +5308,23 @@ describe("OrchestratorMcpService provider resolution", () => {
                   assert.equal(retry.startPending, true);
                   assert.equal(retry.waitTimedOut, false);
                 }
+              }
+              if ("cancelOnArrival" in testCase) {
+                yield* Deferred.await(cancelFinished);
+                const cancelled = yield* service.taskStatus(boundScope, recoveringId);
+                assert.equal(cancelled.status, "interrupted");
+                if (cancelled.partial) return assert.fail("expected committed cancelled task");
+                const child = yield* orchestrator.getThreadProjection(cancelled.childThreadId);
+                assert.equal(child.runs[0]!.status, "interrupted");
+                assert.equal(child.runs[0]!.cancelReason, "task_cancel");
+                const replay = yield* service.delegateTask(boundScope, request);
+                assert.equal(replay.taskId, recoveringId);
+                assert.equal(replay.status, "interrupted");
+                assert.lengthOf(
+                  (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+                  1,
+                );
+                return;
               }
               if (
                 !("finishBeforeRelease" in testCase) &&
