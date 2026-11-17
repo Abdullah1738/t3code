@@ -12,6 +12,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Logger from "effect/Logger";
+import * as TestClock from "effect/testing/TestClock";
 import { afterEach, test } from "vite-plus/test";
 
 import {
@@ -40,6 +41,182 @@ const evalWorker = (code: string, workerData?: unknown) => {
   cleanups.push(() => void worker.terminate());
   return { worker: worker as unknown as ExportWorker, exited };
 };
+
+test("reset pages keep sending heartbeats across a twenty minute scan", () => {
+  let now = 0;
+  const timers: Array<() => void> = [];
+  const beats: number[] = [];
+  NodeVM.runInNewContext(exportWorkerSource("() => workerData.replica"), {
+    require: (name: string) =>
+      name === "node:worker_threads"
+        ? {
+            parentPort: {
+              postMessage: (message: { type: string }) => {
+                if (message.type === "step") beats.push(now);
+              },
+            },
+            workerData: {
+              replica: {
+                step: () => {
+                  now += 250;
+                  return true;
+                },
+              },
+            },
+          }
+        : {},
+    Date: { now: () => now },
+    setTimeout: (run: () => void, delay: number) =>
+      timers.push(() => {
+        now += delay;
+        run();
+      }),
+  });
+  while (now < 20 * 60_000) timers.shift()!();
+  assert.isAbove(beats.length, 200);
+  assert.isAtMost(Math.max(...beats.map((at, i) => at - (beats[i - 1] ?? 0))), 5_260);
+});
+
+it.effect("phase timings report maximum publication lag and auxiliary window", () =>
+  Effect.gen(function* () {
+    const worker = Object.assign(new NodeEvents.EventEmitter(), { terminate: async () => 0 });
+    const logs: Array<{ message: string; annotations: unknown }> = [];
+    const logger = Logger.map(Logger.formatStructured, ({ message, annotations }) =>
+      logs.push({ message: String(message), annotations }),
+    );
+    const fiber = yield* Effect.forkScoped(
+      superviseExportWorker(() => worker as unknown as ExportWorker).pipe(
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+      ),
+      { startImmediately: true },
+    );
+    yield* Effect.yieldNow;
+    for (const [updatedAtLagMs, auxiliaryWindowMs] of [
+      [4_000, 3_000],
+      [2_000, 5_000],
+    ])
+      worker.emit("message", {
+        type: "metrics",
+        metrics: {
+          phaseMs: { auxiliary: 1 },
+          phaseSteps: { auxiliary: 1 },
+          lineageRepairs: [],
+          lineageRepairCounts: {},
+          identityRows: 0,
+          identityLagMaxMs: 0,
+          updatedAtLagMs,
+          auxiliaryWindowMs,
+        },
+      });
+    yield* TestClock.adjust("30 seconds");
+    const phases = logs.filter((row) => row.message === "Readonly export phase timings");
+    assert.lengthOf(phases, 1);
+    assert.include(JSON.stringify(phases[0]!.annotations), '"updatedAtLagMs":4000');
+    assert.include(JSON.stringify(phases[0]!.annotations), '"auxiliaryWindowMs":5000');
+    yield* Fiber.interrupt(fiber);
+  }),
+);
+
+it.effect("reset progress logs survive the watchdog interval without replacing the worker", () =>
+  Effect.gen(function* () {
+    let terminated = 0;
+    const worker = Object.assign(new NodeEvents.EventEmitter(), {
+      terminate: async () => ++terminated,
+    });
+    const logs: Array<{ message: string; annotations: unknown }> = [];
+    const logger = Logger.map(Logger.formatStructured, ({ message, annotations }) =>
+      logs.push({ message: String(message), annotations }),
+    );
+    const fiber = yield* Effect.forkScoped(
+      superviseExportWorker(() => worker as unknown as ExportWorker, {
+        stallTimeout: "10 minutes",
+        restartDelay: "15 seconds",
+        terminateTimeout: "30 seconds",
+      }).pipe(Effect.provide(Logger.layer([logger], { mergeWithExisting: false }))),
+      { startImmediately: true },
+    );
+    yield* Effect.yieldNow;
+    const reset = {
+      kind: "events_reset",
+      reason: "gap",
+      readyReason: "gap",
+      generation: 2,
+      table: "orchestration_events",
+      rows: 0,
+      pages: 0,
+      elapsedMs: 0,
+      cursor: 1,
+      cycleTarget: 3,
+      firstMissingSequence: 2,
+      rowsReturned: 1,
+      publishedReady: "1",
+    };
+    worker.emit("message", { type: "rebuild", rebuild: { ...reset, event: "start" } });
+    for (let tick = 0; tick < 144; tick++) {
+      worker.emit("message", { type: "step" });
+      worker.emit("message", {
+        type: "metrics",
+        metrics: {
+          phaseMs: { resetScan: 1 },
+          phaseSteps: { resetScan: 1 },
+          lineageRepairs: [],
+          lineageRepairCounts: {},
+          identityRows: 0,
+          identityLagMaxMs: 0,
+        },
+      });
+      if (tick % 6 === 0)
+        worker.emit("message", {
+          type: "rebuild",
+          rebuild: {
+            ...reset,
+            event: "progress",
+            table: "orchestration_v2_projection_threads",
+            rows: tick * 100,
+            cursor: tick * 100,
+            elapsedMs: tick * 5_000,
+          },
+        });
+      yield* TestClock.adjust("5 seconds");
+    }
+    assert.equal(terminated, 0);
+    worker.emit("message", {
+      type: "rebuild",
+      rebuild: { ...reset, event: "publish", elapsedMs: 720_000 },
+    });
+    yield* TestClock.adjust("30 seconds");
+    assert.isTrue(
+      logs.some(
+        (row) =>
+          row.message === "Readonly replica ready cleared" &&
+          JSON.stringify(row.annotations).includes('"firstMissingSequence":2'),
+      ),
+    );
+    assert.isTrue(logs.some((row) => row.message === "Readonly events reset progress"));
+    assert.isTrue(
+      logs
+        .filter(
+          (row) =>
+            row.message === "Readonly replica ready cleared" ||
+            row.message === "Readonly events reset progress",
+        )
+        .every((row) => JSON.stringify(row.annotations).includes('"visibility":"unpublished"')),
+    );
+    assert.isTrue(
+      logs.some(
+        (row) =>
+          row.message === "Readonly replica ready restored" &&
+          JSON.stringify(row.annotations).includes('"durationMs":720000') &&
+          JSON.stringify(row.annotations).includes('"visibility":"published"'),
+      ),
+    );
+    assert.isAtLeast(
+      logs.filter((row) => row.message === "Readonly export phase timings").length,
+      12,
+    );
+    yield* Fiber.interrupt(fiber);
+  }).pipe(Effect.scoped),
+);
 
 test("worker diagnostics use the lifecycle log envelope without posting rebuild state", () => {
   const diagnostics = [
@@ -236,6 +413,7 @@ function staleRemountedReplica() {
     CREATE TABLE ardud_opencode_import (native_session_id TEXT PRIMARY KEY, thread_id TEXT);
     CREATE TABLE ardud_kanban_cards (id TEXT PRIMARY KEY, active_thread_id TEXT, json TEXT);
     CREATE TABLE ardud_kanban_threads (thread_id TEXT PRIMARY KEY, ended INTEGER);
+    CREATE TABLE ardud_kanban_slot_events (id INTEGER PRIMARY KEY, board_id TEXT, pool_key TEXT, thread_id TEXT, card_id TEXT, kind TEXT, at TEXT, why TEXT);
     INSERT INTO orchestration_events VALUES (1,'thread.created','a','{"id":"a"}');
     INSERT INTO orchestration_v2_projection_threads VALUES ('a','{"title":"before"}');`);
   const options = { sourcePath, replicaPath };

@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { vi } from "vite-plus/test";
@@ -51,6 +52,7 @@ import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 
 const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+  Layer.provide(McpProviderSessions.layer),
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
 );
@@ -79,6 +81,9 @@ it.effect.each([
   "restart_legacy_continuation_with_result",
   "restart_disposed_queue",
   "restart_with_result",
+  "restart_parent_cancel_shutdown",
+  "restart_parent_cancel_startup",
+  "completed_parent_cancel",
 ] as const)("task status and cancellation settle %s", (scenario) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -289,7 +294,11 @@ it.effect.each([
           const run = before.runs[0]!;
           const now = yield* DateTime.now;
           const terminalStatus =
-            scenario === "restart_failed_without_result" ? "failed" : "cancelled";
+            scenario === "restart_failed_without_result"
+              ? "failed"
+              : scenario === "completed_parent_cancel"
+                ? "completed"
+                : "cancelled";
           const hasResult =
             scenario === "restart_with_result" ||
             scenario === "restart_answer_with_narration" ||
@@ -424,7 +433,11 @@ it.effect.each([
                     threadId: task.childThreadId!,
                     runId: run.id,
                     occurredAt: now,
-                    payload: { ...childTurn, status: "cancelled", completedAt: now },
+                    payload: {
+                      ...childTurn,
+                      status: scenario === "completed_parent_cancel" ? "completed" : "cancelled",
+                      completedAt: now,
+                    },
                   },
                   {
                     id: EventId.make("restart-cancelled-child"),
@@ -435,6 +448,11 @@ it.effect.each([
                     payload: {
                       ...cutRun,
                       status: terminalStatus,
+                      ...(scenario === "restart_parent_cancel_shutdown"
+                        ? { cancelReason: "server_shutdown" as const }
+                        : scenario === "restart_parent_cancel_startup"
+                          ? { cancelReason: "server_restart" as const }
+                          : {}),
                       completedAt: now,
                     },
                   },
@@ -563,8 +581,62 @@ it.effect.each([
                   },
                 ],
               });
+            if (
+              scenario === "restart_parent_cancel_shutdown" ||
+              scenario === "restart_parent_cancel_startup" ||
+              scenario === "completed_parent_cancel"
+            ) {
+              const cancelledBeforeRecovery = yield* service.cancelTask(scope, {
+                taskId: task.id,
+                clientRequestId: "cancel-restart-before-publication",
+                reason: "Parent cancelled this interrupted work.",
+              });
+              const expectedStatus =
+                scenario === "completed_parent_cancel" ? "completed" : "cancelled";
+              assert.equal(cancelledBeforeRecovery.status, expectedStatus);
+              yield* worker.drain();
+              yield* orchestrator.recoverDelegatedTasks;
+              const stoppedChild = yield* orchestrator.getThreadProjection(task.childThreadId!);
+              assert.lengthOf(stoppedChild.runs, 1);
+              assert.equal(stoppedChild.runs[0]?.status, terminalStatus);
+              if (scenario !== "completed_parent_cancel")
+                assert.equal(
+                  stoppedChild.runs[0]?.cancelReason,
+                  scenario === "restart_parent_cancel_shutdown"
+                    ? "server_shutdown"
+                    : "server_restart",
+                );
+              assert.isTrue(
+                stoppedChild.turnItems.some(
+                  (item) =>
+                    item.type === "run_interrupt_request" && item.cancelReason === "task_cancel",
+                ),
+              );
+              const stoppedTask = (yield* orchestrator.getThreadProjection(
+                parentThreadId,
+              )).subagents.find((row) => row.id === task.id)!;
+              assert.equal(stoppedTask.status, expectedStatus);
+              if (scenario !== "completed_parent_cancel")
+                assert.equal(stoppedTask.cancelReason, "task_cancel");
+              assert.equal(stoppedTask.completionDelivery?.state, "disposed");
+              assert.notInclude(stoppedTask.result ?? "", '"resumable":true');
+              const stoppedStatus = yield* service.taskStatus(scope, task.id);
+              assert.notEqual(stoppedStatus.resumable, true);
+              assert.isNull(stoppedStatus.currentRunId);
+              assert.isFalse(stoppedStatus.hasPendingChildRuns);
+              return;
+            }
+            if (scenario === "shutdown_narration" || scenario === "startup_narration")
+              yield* orchestrator.recoverDelegatedTasks;
             const firstPoll = yield* service.taskStatus(scope, task.id);
-            assert.equal(firstPoll.status, hasResult ? "running" : terminalStatus);
+            assert.equal(
+              firstPoll.status,
+              hasResult
+                ? "running"
+                : scenario === "shutdown_narration" || scenario === "startup_narration"
+                  ? "interrupted"
+                  : terminalStatus,
+            );
             assert.equal(firstPoll.workState, hasResult ? "working" : "result_available");
             if (scenario === "restart_missing_spawn_target_narration")
               assert.isNull(firstPoll.childRunId);
@@ -620,7 +692,12 @@ it.effect.each([
               const recoveredTask = (yield* orchestrator.getThreadProjection(
                 parentThreadId,
               )).subagents.find((entry) => entry.id === task.id)!;
-              assert.equal(recoveredTask.status, terminalStatus);
+              assert.equal(
+                recoveredTask.status,
+                scenario === "shutdown_narration" || scenario === "startup_narration"
+                  ? "interrupted"
+                  : terminalStatus,
+              );
               assert.isNotNull(recoveredTask.result);
             }
           }
@@ -628,7 +705,13 @@ it.effect.each([
           const held = hasResult;
           assert.equal(
             status.status,
-            held ? "running" : scenario === "external_interrupt" ? "interrupted" : terminalStatus,
+            held
+              ? "running"
+              : scenario === "external_interrupt" ||
+                  scenario === "shutdown_narration" ||
+                  scenario === "startup_narration"
+                ? "interrupted"
+                : terminalStatus,
           );
           assert.equal(status.workState, held ? "working" : "result_available");
           assert.isNull(status.currentRunId);
@@ -695,13 +778,21 @@ it.effect.each([
           );
           assert.equal(
             cancelled.status,
-            scenario === "external_interrupt" ? "interrupted" : "cancelled",
+            scenario === "external_interrupt" ||
+              scenario === "shutdown_narration" ||
+              scenario === "startup_narration"
+              ? "interrupted"
+              : "cancelled",
           );
           const parentAfter = yield* orchestrator.getThreadProjection(parentThreadId);
           const settledTask = parentAfter.subagents.find((row) => row.id === task.id)!;
           assert.equal(
             settledTask.status,
-            scenario === "external_interrupt" ? "interrupted" : "cancelled",
+            scenario === "external_interrupt" ||
+              scenario === "shutdown_narration" ||
+              scenario === "startup_narration"
+              ? "interrupted"
+              : "cancelled",
           );
           assert.isNotNull(settledTask.result);
           assert.equal(settledTask.completionDelivery?.state, "disposed");

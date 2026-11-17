@@ -54,7 +54,12 @@ export function ogImageOf(html: string, pageUrl: string): string | undefined {
 }
 
 export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fetchFn: typeof fetch = fetch, chat?: string) {
+  const attempts = new Map<string, number>();
   return async (pageUrl: string): Promise<string | undefined> => {
+    const attempt = (attempts.get(pageUrl) ?? 0) + 1;
+    attempts.set(pageUrl, attempt);
+    // Failed cards can be abandoned by delivery; bound diagnostic-only memory.
+    if (attempts.size > 1_000) attempts.delete(attempts.keys().next().value!);
     const at = performance.now();
     let ok = false;
     let failureCode = "invalid_url";
@@ -92,6 +97,9 @@ export function cardPreviewImage(upload: (file: LineFile) => Promise<string>, fe
     } catch (caughtError) { toolError("card-preview", "card-preview.catch3", caughtError);
       throw new LineError("Card preview is unavailable", "card_preview_unavailable", true, false);
     }
-    } finally { logCardRender("cards", cardKind(pageUrl), performance.now() - at, ok, { chat, failureCode }); }
+    } finally {
+      if (ok) attempts.delete(pageUrl);
+      logCardRender("cards", cardKind(pageUrl), performance.now() - at, ok, { chat, failureCode, attempt });
+    }
   };
 }

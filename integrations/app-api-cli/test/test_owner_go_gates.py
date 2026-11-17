@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import time
 import unittest
@@ -18,6 +19,7 @@ from types import SimpleNamespace
 import card_vault_fill as card
 import commerce_journal as journal
 import owner_go as go
+import toollog
 
 HCLOUD = Path(__file__).parents[2] / 'local-helpers/bin/hcloud'
 loader = importlib.machinery.SourceFileLoader('hcloud_gate', str(HCLOUD))
@@ -32,7 +34,8 @@ class GateTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.ledger = go.Ledger(Path(temp.name) / 'go')
         import card_status
-        p = patch.dict(os.environ, {'CARD_STATUS_FILE':str(Path(temp.name) / 'cards.json')})
+        p = patch.dict(os.environ, {'CARD_STATUS_FILE':str(Path(temp.name) / 'cards.json'),
+                                    'ORDERING_PAUSE_FILE':str(Path(temp.name) / 'paused')})
         p.start(); self.addCleanup(p.stop)
         card_status.record_declined('9546', reason='synthetic-test-decline', source='unit-test')
         p = patch.object(go, 'Ledger', return_value=self.ledger)
@@ -40,6 +43,9 @@ class GateTests(unittest.TestCase):
         p = patch.object(journal, 'ROOT', Path(temp.name) / 'commerce')
         p.start(); self.addCleanup(p.stop)
         self.home = Path(temp.name)
+        p = patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(self.home / 'logs'),
+                                    'TOOLLOG_ROOT': str(self.home / 'logs')})
+        p.start(); self.addCleanup(p.stop)
         p = patch.object(hcloud.Path, 'home', return_value=self.home)
         p.start(); self.addCleanup(p.stop)
         self.config = self.home / '.config/hcloud/cli.toml'
@@ -56,19 +62,235 @@ class GateTests(unittest.TestCase):
         with self.assertRaisesRegex(go.ApprovalError, 'OWNER_GO_REQUIRED'): card.fill(**args, runner=runner)
         runner.assert_not_called()
         self.approve(vendor='test', item='server', amount=100, currency='EUR')
-        runner.side_effect = [subprocess.CompletedProcess([], 0, 'SECRET\n'), subprocess.CompletedProcess([], 0, 'SECRET')]
-        self.assertEqual(card.fill(**args, runner=runner), {'ok':True, 'filled':'card_cvc'})
-        self.assertEqual(runner.call_args_list[-1].args[0], ['ph', 'type', 'SECRET'])
+        runner.side_effect = [self.completed(), self.completed(self.focus_xml()),
+                              self.completed('SECRET\n'), self.completed('SECRET'), self.completed()]
+        self.assertEqual(card.fill(**args, phone=True, runner=runner), {'ok':True, 'filled':'card_cvc'})
+        self.assertEqual(runner.call_args_list[-2].args[0], ['ph', 'type', 'SECRET'])
+        acquire, focus, _, typed, release = runner.call_args_list
+        self.assertEqual(acquire.args[0][:3], ['ph', 'lease', 'acquire'])
+        self.assertEqual(release.args[0][:3], ['ph', 'lease', 'release'])
+        self.assertEqual(acquire.args[0][4], release.args[0][4])
+        self.assertEqual(focus.kwargs['env']['PH_LEASE_OWNER'], acquire.args[0][4])
+        self.assertEqual(typed.kwargs['env']['PH_LEASE_OWNER'], acquire.args[0][4])
+
+    @staticmethod
+    def completed(stdout='', code=0):
+        return subprocess.CompletedProcess([], code, stdout, 'SECRET tool diagnostic')
+
+    @staticmethod
+    def focus_xml(**attrs):
+        node = {'focused': 'true', 'enabled': 'true', 'class': 'android.widget.EditText', **attrs}
+        return '<hierarchy><node ' + ' '.join(f'{k}="{v}"' for k, v in node.items()) + '/></hierarchy>'
+
+    def card_args(self, **kwargs):
+        return dict(vendor='test', item='server', amount=100, currency='EUR', card='Marriott', field='card_cvc', **kwargs)
+
+    def card_cli(self, flags, runner):
+        original = card.fill
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(card, 'fill', side_effect=lambda **args: original(**args, runner=runner)), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            rc = card.main(['--vendor', 'test', '--item', 'server', '--amount', '100',
+                            '--currency', 'EUR', '--card', 'Marriott', '--field', 'card_cvc', *flags])
+        self.assertNotIn('SECRET', output.getvalue() + errors.getvalue())
+        return rc, json.loads(output.getvalue())
+
+    def fill_rows(self):
+        return [row for path in (self.home / 'logs/orders').glob('*.ndjson')
+                for line in path.read_text().splitlines() if (row := json.loads(line))['name'] == 'card.fill']
+
+    def test_card_route_matrix_refuses_before_keychain(self):
+        self.approve(vendor='test', item='server', amount=100, currency='EUR')
+        routes = [[], ['--cdp-target', 'frame'], ['--selector', '#cvc'],
+                  ['--phone', '--cdp-target', 'frame'], ['--phone', '--selector', '#cvc'],
+                  ['--phone', '--cdp-target', 'frame', '--selector', '#cvc'],
+                  ['--cdp-port', '9333'], ['--phone', '--cdp-port', '9222'],
+                  ['--cdp-target', '', '--selector', '#cvc'],
+                  ['--cdp-target', 'frame', '--selector', '   ']]
+        for flags in routes:
+            with self.subTest(flags=flags):
+                runner = Mock()
+                self.assertEqual(self.card_cli(flags, runner),
+                                 (2, {'ok': False, 'error': 'CARD_FILL_TARGET_REQUIRED'}))
+                runner.assert_not_called()
+
+    def test_card_owner_go_still_precedes_route_validation(self):
+        runner = Mock()
+        rc, result = self.card_cli([], runner)
+        self.assertEqual((rc, result['error']), (4, 'OWNER_GO_REQUIRED'))
+        runner.assert_not_called()
+
+    def test_card_phone_requires_one_focused_editable_node(self):
+        self.approve(vendor='test', item='server', amount=100, currency='EUR')
+        states = ['', 'not XML SECRET', '<hierarchy/>', self.focus_xml(focused='false'),
+                  self.focus_xml(enabled='false'), self.focus_xml(**{'class': 'android.widget.TextView'}),
+                  '<hierarchy>' + self.focus_xml().split('<hierarchy>')[1].split('</hierarchy>')[0] * 2 + '</hierarchy>']
+        for xml in states:
+            with self.subTest(xml=xml):
+                runner = Mock(side_effect=[self.completed(), self.completed(xml), self.completed()])
+                self.assertEqual(self.card_cli(['--phone'], runner),
+                                 (2, {'ok': False, 'error': 'CARD_FILL_NO_FOCUS'}))
+                self.assertEqual([call.args[0][:2] for call in runner.call_args_list],
+                                 [['ph', 'lease'], ['ph', 'sh'], ['ph', 'lease']])
+
+    def test_card_phone_releases_lease_on_failure_and_never_retries_typing(self):
+        self.approve(vendor='test', item='server', amount=100, currency='EUR')
+        for failure_at in ('focus', 'keychain', 'type'):
+            with self.subTest(failure_at=failure_at):
+                results = [self.completed(), self.completed(self.focus_xml()), self.completed('SECRET'),
+                           self.completed(code=4)]
+                if failure_at != 'type':
+                    index = {'focus': 1, 'keychain': 2}[failure_at]
+                    results[index:] = [subprocess.TimeoutExpired('SECRET', 20)]
+                runner = Mock(side_effect=[*results, self.completed()])
+                self.assertEqual(self.card_cli(['--phone'], runner),
+                                 (2, {'ok': False, 'error': 'CARD_FILL_FAILED'}))
+                self.assertEqual(runner.call_args_list[-1].args[0][:3], ['ph', 'lease', 'release'])
+                self.assertLessEqual(sum(c.args[0][:2] == ['ph', 'type'] for c in runner.call_args_list), 1)
+
+    def test_card_phone_busy_refuses_before_focus_or_keychain(self):
+        self.approve(vendor='test', item='server', amount=100, currency='EUR')
+        runner = Mock(return_value=self.completed(code=5))
+        self.assertEqual(self.card_cli(['--phone'], runner), (2, {'ok': False, 'error': 'CARD_FILL_FAILED'}))
+        self.assertEqual(runner.call_count, 1)
 
     def test_dia_fill_passes_value_only_on_stdin(self):
         self.approve(vendor='test', item='server', amount=100, currency='EUR')
         runner = Mock(side_effect=[subprocess.CompletedProcess([], 0, 'SECRET\n'), subprocess.CompletedProcess([], 0)])
-        card.fill(vendor='test', item='server', amount=100, currency='EUR', card='Marriott', field='card_cvc',
-                  target='frame-id', selector='#cvc', runner=runner)
+        card.fill(**self.card_args(), target='frame-id', selector='#cvc', runner=runner)
         call = runner.call_args_list[-1]
         self.assertNotIn('SECRET', str(call.args))
         self.assertIn('SECRET', call.kwargs['input'])
+        self.assertEqual(json.loads(call.kwargs['input'])['port'], 9222)
 
+    def test_cdp_port_matrix_and_stdin_only(self):
+        self.approve(vendor='test', item='server', amount=100, currency='EUR')
+        for port in (1, 9333, 65535):
+            with self.subTest(port=port):
+                runner = Mock(side_effect=[self.completed('SECRET'), self.completed()])
+                self.assertEqual(self.card_cli(['--cdp-target', 'stripe-frame', '--selector', 'input[name=cvc]',
+                                                '--cdp-port', str(port)], runner),
+                                 (0, {'ok': True, 'filled': 'card_cvc'}))
+                call = runner.call_args_list[-1]
+                self.assertNotIn('SECRET', str(call.args))
+                self.assertEqual(json.loads(call.kwargs['input']),
+                                 dict(target='stripe-frame', selector='input[name=cvc]', port=port, value='SECRET'))
+        for port in (0, 65536, -1, True, '9333', 9333.5):
+            with self.subTest(port=port):
+                runner = Mock()
+                with self.assertRaises(ValueError):
+                    card.fill(**self.card_args(), target='frame', selector='#cvc', cdp_port=port, runner=runner)
+                runner.assert_not_called()
+        self.assertNotIn('9222', card.CDP_FILL)
+        self.assertIn('input.port', card.CDP_FILL)
+
+    def test_card_fill_logs_one_event_per_attempt_with_no_value(self):
+        self.approve(vendor='test', item='server', amount=100, currency='EUR')
+        for code in (0, 2):
+            runner = Mock(side_effect=[self.completed('SECRET'), self.completed('SECRET', code=code)])
+            self.card_cli(['--cdp-target', 'stripe', '--selector', '#cvc', '--cdp-port', '9333'], runner)
+        rows = self.fill_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r['ok'] for r in rows], [True, False])
+        self.assertEqual(rows[1]['error']['tag'], 'CARD_FILL_FAILED')
+        for row in rows:
+            self.assertEqual(row['component'], 'card-vault-fill')
+            self.assertEqual(row['props']['route'], 'cdp')
+            self.assertEqual(row['props']['cdpPort'], 9333)
+            self.assertEqual(row['props']['field'], 'card_cvc')
+            self.assertEqual(row['props']['cardNickname'], 'Marriott')
+            self.assertIn(row['props']['outcome'], ('success', 'failure'))
+            self.assertGreaterEqual(row['durationMs'], 0)
+            self.assertRegex(row['ids']['vendorId'], r'^[a-f0-9]{16}$')
+            self.assertRegex(row['ids']['cardId'], r'^[a-f0-9]{16}$')
+            self.assertNotIn('SECRET', json.dumps(row))
+        with patch.object(toollog, '_write', side_effect=OSError('SECRET')):
+            self.assertEqual(self.card_cli(['--cdp-target', 'stripe', '--selector', '#cvc'],
+                                          Mock(side_effect=[self.completed('SECRET'), self.completed()])),
+                             (0, {'ok': True, 'filled': 'card_cvc'}))
+
+    def test_card_fill_refusals_log_exact_codes_and_no_raw_identity(self):
+        runner = Mock()
+        self.card_cli([], runner)
+        self.approve(vendor='test', item='server', amount=100, currency='EUR')
+        self.card_cli([], runner)
+        self.card_cli(['--phone'], Mock(side_effect=[self.completed(), self.completed('<hierarchy/>'), self.completed()]))
+        rows = self.fill_rows()
+        self.assertEqual([r['error']['tag'] for r in rows],
+                         ['OWNER_GO_REQUIRED', 'CARD_FILL_TARGET_REQUIRED', 'CARD_FILL_NO_FOCUS'])
+        toollog.emit('card-vault-fill', 'card.fill', props={'cardNickname': 'SECRET', 'vendor': 'SECRET',
+                    'route': 'SECRET', 'field': 'SECRET', 'cdpPort': 'SECRET'},
+                    ids={'vendorId': 'SECRET', 'cardId': 'SECRET'})
+        self.assertNotIn('SECRET', json.dumps(self.fill_rows()))
+
+    def test_cdp_runtime_checks_exact_loopback_port_focus_and_nonempty_value(self):
+        node = shutil.which('node')
+        self.assertIsNotNone(node, 'Node is required for the CDP runtime regression')
+        harness = r'''
+const cfg = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+// The production script gets an independent read of the same stdin payload.
+require('node:fs').readFileSync = () => JSON.stringify(cfg);
+const seen = {fetch: null, socket: null, inserted: false, expressions: []};
+global.fetch = async (url, options) => {
+  seen.fetch = [url, options];
+  return {json: async () => [{id: cfg.listedTarget ?? cfg.target, webSocketDebuggerUrl: cfg.wsUrl}]};
+};
+global.WebSocket = class {
+  constructor(url) { seen.socket = url; this.listeners = new Set(); queueMicrotask(() => this.onopen()); }
+  addEventListener(_, listener) { this.listeners.add(listener); }
+  removeEventListener(_, listener) { this.listeners.delete(listener); }
+  send(raw) {
+    const message = JSON.parse(raw);
+    let result = {};
+    if (message.method === 'Runtime.evaluate') {
+      seen.expressions.push(message.params.expression);
+      const first = seen.expressions.length === 1;
+      result = {result: {value: first ? cfg.focused : cfg.filled}};
+    } else if (message.method === 'Input.insertText') {
+      if (message.params.text !== cfg.value) throw Error();
+      seen.inserted = true;
+    }
+    queueMicrotask(() => {
+      for (const listener of this.listeners) listener({data: JSON.stringify({id: message.id, result})});
+    });
+  }
+  close() {}
+};
+process.on('exit', () => process.stdout.write(JSON.stringify(seen)));
+'''
+        cases = [
+            ('local ipv4', {}, 0, True),
+            ('localhost', {'wsUrl': 'wss://localhost:9333/devtools/page/stripe'}, 0, True),
+            ('different port', {'wsUrl': 'ws://127.0.0.1:9222/devtools/page/stripe'}, 2, False),
+            ('remote', {'wsUrl': 'ws://example.com:9333/devtools/page/stripe'}, 2, False),
+            ('host suffix', {'wsUrl': 'ws://localhost.example.com:9333/devtools/page/stripe'}, 2, False),
+            ('credentials', {'wsUrl': 'ws://127.0.0.1:9333@example.com/devtools/page/stripe'}, 2, False),
+            ('port suffix', {'wsUrl': 'ws://127.0.0.1:93330/devtools/page/stripe'}, 2, False),
+            ('target mismatch', {'listedTarget': 'stripe-other'}, 2, False),
+            ('no focus', {'focused': False}, 2, False),
+            ('empty value', {'filled': False}, 2, True),
+            ('nonboolean result', {'filled': 'SECRET'}, 2, True),
+            ('port injection', {'port': '9333/SECRET'}, 2, False),
+        ]
+        for name, changes, code, inserted in cases:
+            with self.subTest(name=name):
+                payload = dict(target='stripe', selector='input[name=cvc]', value='SECRET', port=9333,
+                               wsUrl='ws://127.0.0.1:9333/devtools/page/stripe', focused=True, filled=True)
+                payload.update(changes)
+                result = subprocess.run([node, '-e', harness + card.CDP_FILL], input=json.dumps(payload),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, code, result.stderr)
+                seen = json.loads(result.stdout)
+                self.assertEqual(seen['inserted'], inserted)
+                self.assertNotIn('SECRET', result.stdout + result.stderr)
+                if type(payload['port']) is int:
+                    self.assertEqual(seen['fetch'], ['http://127.0.0.1:9333/json/list', {'redirect': 'error'}])
+                if inserted:
+                    self.assertEqual(len(seen['expressions']), 2)
+                    self.assertIn('e.value.length > 0', seen['expressions'][1])
+
+    # The private 9546 decline permits this fallback; 9546 NowNow place has an earlier contract gate.
+    @patch.object(journal.order_card, 'LAST4', '2342')
     def test_every_commerce_lane_and_financial_kind_refuses_before_consumption(self):
         for vertical in ('minutes', 'nownow', 'main', 'supermall', 'food'):
             for kind in ('place', 'payment', 'preauthorize', 'prepay'):
@@ -95,6 +317,28 @@ class GateTests(unittest.TestCase):
         with self.assertRaisesRegex(journal.JournalError, 'OWNER_GO_REQUIRED'):
             journal.consume(flow, 'place', kind='place', payable_minor=201, **args)
         self.assertTrue(journal.consume(flow, 'place', kind='place', payable_minor=200, **args))
+
+    def test_delegated_record_passes_existing_financial_gate_and_journal_stays_at_most_once(self):
+        from agent_bus_support import REQUEST, create_bus
+        now = dt.datetime.now(go.UTC)
+        db = self.home / 'bus.sqlite'
+        create_bus(db, now)
+        delegate = self.ledger.delegate(principal='moni', channel='agent-bus', quote='Yes',
+            source='owner/test', at=now.isoformat(), now=now)
+        flow = str(uuid.uuid4())
+        journal.open_flow(flow_id=flow, app='noon', vertical='minutes',
+                          account_hash='a'*64, scope_hash='b'*64)
+        item = go.commerce_item(journal.binding(flow))
+        with patch.dict(os.environ, {'AGENT_BUS_DB': str(db)}):
+            record = self.ledger.record_delegated(principal='moni', bus_request=REQUEST,
+                vendor='noon', item=item, amount=200, currency='AED', now=now)
+        self.assertEqual(record['delegation'], delegate['id'])
+        args = dict(cart_hash='c'*64, review_hash='d'*64, request_hash='f'*64)
+        with self.assertRaisesRegex(journal.JournalError, 'OWNER_GO_REQUIRED'):
+            journal.consume(flow, 'financial', kind='place', payable_minor=201, **args)
+        self.assertTrue(journal.consume(flow, 'financial', kind='place', payable_minor=200, **args))
+        with self.assertRaises(journal.JournalError):
+            journal.consume(flow, 'financial', kind='place', payable_minor=200, **args)
 
     def test_food_preparation_returns_the_item_accepted_by_the_financial_gate(self):
         import commerce_cli as cli

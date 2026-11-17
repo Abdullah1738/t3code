@@ -202,6 +202,7 @@ export interface AcpAdapterV2ExtensionContext {
 }
 
 export interface AcpAdapterV2Flavor {
+  readonly backgroundTasksEndWithProcess?: true;
   readonly promptFailure?: (cause: unknown) => OrchestrationV2ProviderFailure;
   readonly driver: ProviderDriverKind;
   readonly capabilities: OrchestrationV2ProviderCapabilities;
@@ -935,6 +936,22 @@ function toolStatus(
   }
 }
 
+function toolResultMarkerForUpdate(toolCall: AcpToolCallState): false | undefined {
+  const status = toolStatus(toolCall.status);
+  return status === "completed" || status === "failed" ? false : undefined;
+}
+
+function rememberToolResultEvidence(
+  context: Pick<ActiveAcpTurn, "incompleteToolResults">,
+  key: string,
+  incomplete: boolean | undefined,
+): boolean {
+  const previous = context.incompleteToolResults.has(key);
+  if (incomplete === true) context.incompleteToolResults.add(key);
+  else if (incomplete === false) context.incompleteToolResults.delete(key);
+  return previous !== context.incompleteToolResults.has(key);
+}
+
 type ProjectedToolStatus = ReturnType<typeof toolStatus> | "interrupted";
 
 function nodeStatus(status: ProjectedToolStatus): OrchestrationV2ExecutionNode["status"] {
@@ -1031,6 +1048,8 @@ interface ActiveAcpTurn {
   contextUsage: ThreadTokenUsageSnapshot | null;
   nativeMetadata: OrchestrationV2ProviderThreadNativeMetadata | null;
   readonly tools: Map<string, AcpToolCallState & { readonly backgroundCommandTaskId?: string }>;
+  /** Streamed patches cannot turn cleanup into a received tool result. */
+  readonly incompleteToolResults: Set<string>;
   readonly toolUpdatesSkipped: Map<string, number>;
   readonly toolStartedAt: Map<string, DateTime.Utc>;
   readonly subagents: Map<string, ActiveAcpSubagent>;
@@ -1239,7 +1258,10 @@ interface ActiveAcpSubagent {
   readonly childItemOrdinals: Map<string, number>;
   nextChildOrdinal: number;
   terminalStatusProjected: boolean;
-  readonly toolState: Pick<ActiveAcpTurn, "tools" | "toolUpdatesSkipped" | "toolStartedAt">;
+  readonly toolState: Pick<
+    ActiveAcpTurn,
+    "tools" | "toolUpdatesSkipped" | "toolStartedAt" | "incompleteToolResults"
+  >;
   readonly toolSessionIds: Map<string, string>;
 }
 
@@ -1346,10 +1368,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
   const host = yield* ProviderHost.ProviderHost;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const { flavor, selfInvocation: self } = options;
-  const readMcpContext = (threadId: ThreadId | null) =>
-    threadId === null
-      ? Effect.succeed(acpMcpContext(undefined, self))
-      : mcpSessions.read(threadId).pipe(Effect.map((session) => acpMcpContext(session, self)));
   const driver = flavor.driver;
   const continuationRequests = options.continuationRequests;
   const postSettleContinuationEnabled =
@@ -1362,6 +1380,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
     planSelectionTransition: (input) => Effect.succeed(acpSelectionTransition(input)),
     openSession: Effect.fn("AcpAdapterV2.openSession")(
       function* (input: ProviderAdapter.ProviderAdapterV2OpenSessionInput) {
+        const readMcpContext = (threadId: ThreadId | null) =>
+          threadId === null
+            ? Effect.succeed(acpMcpContext(undefined, self))
+            : McpProviderSessions.readForRuntime(
+                mcpSessions,
+                threadId,
+                input.providerSessionId,
+                driver,
+              ).pipe(Effect.map((session) => acpMcpContext(session, self)));
         const sessionScope = yield* Effect.scope;
         let itemIdentityVersion: 2 | undefined =
           input.initialProviderItemIdentityVersion ??
@@ -1562,7 +1589,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const nativeBuildConfigurationBySessionId = new Map<string, AcpNativeBuildConfiguration>();
         const initialSessionActivationFailure = yield* Ref.make<{
           readonly sessionId: string;
-          readonly error: EffectAcpErrors.AcpError;
+          readonly error: EffectAcpErrors.AcpError | ProviderAdapter.ProviderAdapterProtocolError;
         } | null>(null);
         const activeSessionSetup =
           yield* Ref.make<AcpSessionRuntime.AcpSessionRuntimeStartResult | null>(null);
@@ -2612,6 +2639,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           sessionId: string,
           toolCall: AcpToolCallState,
           projectedStatus?: ProjectedToolStatus,
+          toolResultIncomplete?: boolean,
         ) {
           const nativeTaskId = subagent.task.nativeTaskRef?.nativeId ?? String(subagent.task.id);
           const key =
@@ -2624,8 +2652,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const previous = context.tools.get(key);
           const merged = mergeToolCallState(previous, toolCall);
           context.tools.set(key, merged);
+          const evidenceChanged = rememberToolResultEvidence(context, key, toolResultIncomplete);
           if (
             projectedStatus === undefined &&
+            !evidenceChanged &&
             !shouldPersistToolUpdate(context, key, previous, merged, merged.status)
           )
             return;
@@ -2661,6 +2691,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               completedAt: completedAtForStatus(status, now),
               updatedAt: now,
               type: "dynamic_tool",
+              toolResultIncomplete: context.incompleteToolResults.has(key),
               ...(mcpIdentity === undefined
                 ? {}
                 : mcpToolPresentation({
@@ -2698,6 +2729,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 sessionId,
                 { ...tool, status: "failed" },
                 "interrupted",
+                true,
               );
           }
         });
@@ -2800,6 +2832,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             terminalStatusProjected: false,
             toolState: {
               tools: new Map(),
+              incompleteToolResults: new Set(),
               toolUpdatesSkipped: new Map(),
               toolStartedAt: new Map(),
             },
@@ -3210,6 +3243,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   subagent,
                   notification.sessionId,
                   flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall,
+                  undefined,
+                  toolResultMarkerForUpdate(
+                    flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall,
+                  ),
                 );
               }
             }
@@ -3349,6 +3386,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           context: ActiveAcpTurn,
           incoming: AcpToolCallState,
           projectedStatus?: ProjectedToolStatus,
+          toolResultIncomplete?: boolean,
         ) => Effect.Effect<void> = () => Effect.void;
 
         const markAwaitingBackgroundHydration =
@@ -3365,7 +3403,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               if (tool !== undefined) {
                 const status = toolStatus(tool.status);
                 if (status === "pending" || status === "running") {
-                  yield* emitTool(context, { ...tool, status: "completed" });
+                  yield* emitTool(context, { ...tool, status: "completed" }, undefined, true);
                 }
               }
               yield* rearmDeferredFinalize(context);
@@ -3401,6 +3439,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           context: ActiveAcpTurn,
           incoming: AcpToolCallState,
           projectedStatus?: ProjectedToolStatus,
+          toolResultIncomplete?: boolean,
         ) {
           if (context.assistant.current?.sourceMessageId == null)
             yield* closeTextStream(context, "assistant");
@@ -3410,6 +3449,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const previous = context.tools.get(incoming.toolCallId);
           const merged = mergeToolCallState(previous, incoming);
           const normalized = flavor.normalizeToolCall?.(merged) ?? merged;
+          const evidenceChanged = rememberToolResultEvidence(
+            context,
+            incoming.toolCallId,
+            toolResultIncomplete,
+          );
           const backgroundTaskId = flavor.extractBackgroundTaskId?.(normalized);
           const backgroundCommandTaskId =
             flavor.isBackgroundCommandTool?.(normalized) === true
@@ -3477,7 +3521,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           }
 
           const backgroundCompletions =
-            projectedStatus === undefined
+            projectedStatus === undefined && !context.incompleteToolResults.has(toolCall.toolCallId)
               ? (flavor.extractBackgroundTaskCompletion?.(toolCall) ?? [])
               : [];
           let hydratedRegisteredMonitor = false;
@@ -3525,7 +3569,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         backgroundCompletion.appendOutput,
                       )
                   : { ...target, status: nextStatus };
-              yield* emitTool(context, hydrated);
+              yield* emitTool(
+                context,
+                hydrated,
+                undefined,
+                backgroundCompletion.status === "running" ? undefined : false,
+              );
             }
           }
 
@@ -3544,6 +3593,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           }
           if (
             projectedStatus === undefined &&
+            !evidenceChanged &&
             !shouldPersistToolUpdate(
               context,
               toolCall.toolCallId,
@@ -3680,9 +3730,6 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 {},
               ...(rawOutput === undefined ? {} : { output: acpMcpToolCallOutput(rawOutput) }),
             };
-            yield* emitProviderEvent({ type: "turn_item.updated", driver, turnItem });
-            yield* rearmDeferredFinalize(context);
-            return;
           } else if (changes.length > 0) {
             turnItem = {
               ...base,
@@ -3827,7 +3874,17 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 }
             }
           }
-          yield* emitProviderEvent({ type: "turn_item.updated", driver, turnItem });
+          yield* emitProviderEvent({
+            type: "turn_item.updated",
+            driver,
+            turnItem:
+              turnItem.type === "command_execution" || turnItem.type === "dynamic_tool"
+                ? {
+                    ...turnItem,
+                    toolResultIncomplete: context.incompleteToolResults.has(toolCall.toolCallId),
+                  }
+                : turnItem,
+          });
           yield* rearmDeferredFinalize(context);
         });
 
@@ -4159,7 +4216,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (
             status !== "pending" &&
             status !== "running" &&
-            !context.backgroundCommands.has(mutation.taskId)
+            !context.backgroundCommands.has(mutation.taskId) &&
+            !context.incompleteToolResults.has(tool.toolCallId)
           ) {
             return;
           }
@@ -4169,6 +4227,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             context,
             mutation.output === undefined ? finished : setToolOutputText(finished, mutation.output),
             mutation.status,
+            false,
           );
           yield* rearmDeferredFinalize(context);
         });
@@ -4348,6 +4407,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 },
                 next.output,
               ),
+              undefined,
+              status === "completed" || status === "failed" ? false : undefined,
             );
           }
           return true;
@@ -4765,7 +4826,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   }
                   continue;
                 }
-                yield* projectSubagentTool(subagent, notification.sessionId, toolCall);
+                yield* projectSubagentTool(
+                  subagent,
+                  notification.sessionId,
+                  toolCall,
+                  undefined,
+                  toolResultMarkerForUpdate(toolCall),
+                );
               }
               return;
             }
@@ -4818,19 +4885,29 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               const toolCallId = `${context.nativeTurnId}:requires-action`;
               const existing = context.tools.get(toolCallId);
               if (update.state === "requires_action") {
-                yield* emitTool(context, {
-                  toolCallId,
-                  kind: "other",
-                  title: "Action required",
-                  status: "requiresAction",
-                  data: { state: "requires_action" },
-                });
+                yield* emitTool(
+                  context,
+                  {
+                    toolCallId,
+                    kind: "other",
+                    title: "Action required",
+                    status: "requiresAction",
+                    data: { state: "requires_action" },
+                  },
+                  undefined,
+                  true,
+                );
               } else if (existing?.status === "requiresAction") {
-                yield* emitTool(context, {
-                  ...existing,
-                  status: "completed",
-                  data: { ...existing.data, state: update.state },
-                });
+                yield* emitTool(
+                  context,
+                  {
+                    ...existing,
+                    status: "completed",
+                    data: { ...existing.data, state: update.state },
+                  },
+                  undefined,
+                  true,
+                );
               }
               break;
             }
@@ -4993,17 +5070,29 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               const parsed = parseSessionUpdateEvent(notification);
               for (const event of parsed.events) {
                 if (event._tag === "ToolCallUpdated") {
-                  yield* emitTool(context, event.toolCall);
+                  yield* emitTool(
+                    context,
+                    event.toolCall,
+                    undefined,
+                    toolResultMarkerForUpdate(
+                      flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall,
+                    ),
+                  );
                 } else if (event._tag === "PlanUpdated") {
                   yield* emitPlan(context, event.payload);
                 } else if (event._tag === "UnknownUpdate") {
-                  yield* emitTool(context, {
-                    toolCallId: `${context.nativeTurnId}:unsupported:${event.updateType}`,
-                    kind: "other",
-                    title: `Unsupported ACP update: ${event.updateType}`,
-                    status: "completed",
-                    data: { updateType: event.updateType },
-                  });
+                  yield* emitTool(
+                    context,
+                    {
+                      toolCallId: `${context.nativeTurnId}:unsupported:${event.updateType}`,
+                      kind: "other",
+                      title: `Unsupported ACP update: ${event.updateType}`,
+                      status: "completed",
+                      data: { updateType: event.updateType },
+                    },
+                    undefined,
+                    true,
+                  );
                 }
               }
             }
@@ -6322,7 +6411,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           threadId: ThreadId | null,
           commitSessionState: (
             replacement: AcpSessionRuntime.AcpSessionRuntimeStartResult,
-          ) => Effect.Effect<void>,
+          ) => Effect.Effect<void, ProviderAdapter.ProviderAdapterProtocolError>,
         ) {
           const previousScope = runtimeScope;
           const previousGeneration = yield* Ref.get(runtimeCallbackGeneration);
@@ -6841,7 +6930,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           for (const tool of context.tools.values()) {
             const status = toolStatus(tool.status);
             if (status === "pending" || status === "running" || status === "waiting") {
-              yield* emitTool(context, tool, "interrupted");
+              yield* emitTool(context, tool, "interrupted", true);
             }
           }
           if (!options.terminalizeSubagents) return;
@@ -6869,7 +6958,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           for (const tool of context.tools.values()) {
             if (!acpCompletedTurnShouldTerminalizeTool(tool, { ...flavor, extractSubagentUpdate }))
               continue;
-            yield* emitTool(context, tool, "completed");
+            yield* emitTool(context, tool, "completed", true);
           }
         });
 
@@ -7276,7 +7365,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               ? null
               : yield* resolvePromptParts(turnInput, requestedSessionId);
             const startedAt = yield* DateTime.now;
-            const nativeTurnId = `${requestedSessionId}:turn:${turnInput.providerTurnOrdinal}`;
+            // Wake turns and retries may reuse both the attempt and the ordinal,
+            // including after reopening the adapter on the same native session.
+            const startId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+            const nativeTurnId = `${requestedSessionId}:attempt:${turnInput.attemptId}:start:${startId}`;
             const providerTurnId = deriveProviderTurnId(nativeTurnId);
             const completed = yield* Deferred.make<void, never>();
             const promptWireSettled = yield* Deferred.make<void, never>();
@@ -7312,6 +7404,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               contextUsage: rememberedContextUsage ?? turnInput.providerThread.contextUsage ?? null,
               nativeMetadata: initialNativeMetadata,
               tools: new Map(),
+              incompleteToolResults: new Set(),
               toolUpdatesSkipped: new Map(),
               toolStartedAt: new Map(),
               subagents: new Map(),
@@ -7668,6 +7761,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           providerSessionId: input.providerSessionId,
           providerSession,
           events: Stream.fromEffectRepeat(Queue.take(events)),
+          ...(flavor.backgroundTasksEndWithProcess === true
+            ? { backgroundTasksEndWithProcess: true as const }
+            : {}),
           ...(flavor.getModelContextWindow === undefined
             ? {}
             : {

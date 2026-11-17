@@ -10,9 +10,11 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import data_io
 
 LANES = ('minutes', 'marketplace', 'food', 'nownow')
 SAME_TIME = dt.timedelta(minutes=15)
@@ -60,13 +62,18 @@ def projection(row):
 
 def load_cache(path):
     try:
-        rows = json.loads(path.read_text())
+        rows = json.loads(data_io.read_text(path))
         return [projection(row) for row in rows if terminal(row)] if isinstance(rows, list) else []
     except (OSError, ValueError, TypeError, AttributeError, InvalidOperation):
         return []
 
 
-def read(app, deadline=None, since=None, cache_path=None):
+def read(app, deadline=None, since=None, cache_path=None, *, write_cache=True):
+    with data_io.scope(min(time.time() + 10, deadline) if deadline is not None else time.time() + 10):
+        return _read(app, deadline, since, cache_path, write_cache=write_cache)
+
+
+def _read(app, deadline, since, cache_path, *, write_cache=True):
     from state_json import write_json
     remaining = 10 if deadline is None else min(10, deadline - time.time() - 0.1)
     if remaining < 1:
@@ -78,32 +85,34 @@ def read(app, deadline=None, since=None, cache_path=None):
         'MONEY_CASES_DIR', '~/Documents/assistant/money-cases')).expanduser() / 'order-details.json'
     lock_fd = None
     try:
-        if app == 'noon':
+        if app == 'noon' and write_cache:
             # The lock must precede the snapshot and span the subprocess: locking
             # only the write lets a stale reader restore an evicted receipt.
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            lock_fd = os.open(cache_path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR, 0o600)
+            data_io.materialize_io(lambda: cache_path.parent.mkdir(parents=True, exist_ok=True), cache_path.parent)
+            lock_fd = data_io.materialize_io(lambda: os.open(cache_path.with_suffix('.lock'), os.O_CREAT | os.O_RDWR, 0o600), cache_path.with_suffix('.lock'), deadline)
             while True:
                 left = end - time.monotonic()
                 if left < 1:
                     raise OutOfTime('order lookup out of time')
                 try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    data_io.materialize_io(lambda: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB), cache_path.with_suffix('.lock'), deadline)
                     break
                 except BlockingIOError:
                     time.sleep(min(0.05, left))
         cache = load_cache(cache_path) if app == 'noon' else []
-        # Readers log by default. Their diagnostics are disposable: only our sanitized
-        # lane metrics leave this sandbox. They never write the live app state/logs.
-        with tempfile.TemporaryDirectory(prefix='money-orders-') as scratch:
-            env = {**os.environ, 'ROBOB_TOOL_LOG_DIR': scratch}
-            remaining = end - time.monotonic()
-            if remaining < 1:
-                raise OutOfTime('order lookup out of time')
-            result = subprocess.run([str(python), '-I', '-B', str(Path(__file__).resolve()), app, str(root),
-                                     str(time.time() + remaining - 0.5)],
-                                    input=json.dumps({'since': since.isoformat() if since else None, 'cache': cache}),
-                                    capture_output=True, text=True, timeout=remaining, env=env)
+        from marketplace import load
+        snapshot, snapshot_reason = load(cache_path.parent) if app == 'noon' else (None, None)
+        # Keep the caller's log destination: provider metadata must reach the same
+        # rollup as check.run. The shared logger allowlists every field.
+        env = dict(os.environ)
+        remaining = end - time.monotonic()
+        if remaining < 1:
+            raise OutOfTime('order lookup out of time')
+        result = subprocess.run([str(python), '-I', '-B', str(Path(__file__).resolve()), app, str(root),
+                                 str(time.time() + remaining - 0.5)],
+                                input=json.dumps({'since': since.isoformat() if since else None, 'cache': cache,
+                                                  'snapshot': snapshot, 'snapshot_reason': snapshot_reason}),
+                                capture_output=True, text=True, timeout=remaining, env=env)
         if result.returncode:
             raise ValueError('order lookup unavailable')
         result = json.loads(result.stdout)
@@ -112,7 +121,7 @@ def read(app, deadline=None, since=None, cache_path=None):
         if (not isinstance(result, dict) or not isinstance(result.get('orders'), list)
                 or type(result.get('complete')) is not bool):
             raise ValueError('invalid orders')
-        if app == 'noon':
+        if app == 'noon' and write_cache:
             merged = {(r['service'], r['order']): r for r in cache}
             invalidated = set()
             invalidations = result.get('invalidated', [])
@@ -133,7 +142,13 @@ def read(app, deadline=None, since=None, cache_path=None):
                 if terminal(row) and key not in invalidated:
                     merged[key] = {**row, 'cached_at': dt.datetime.now(dt.timezone.utc).isoformat()}
             try:
-                write_json(cache_path, sorted(merged.values(), key=lambda r: moment(r['placed_at']))[-1000:])
+                ordered = sorted(merged.values(), key=lambda r: moment(r['placed_at']))
+                retained = {(r['service'], r['order']) for r in ordered[-1000:]}
+                # Snapshot delivery proof needs its receipt even when newer
+                # receipts from the other lanes fill the normal cache allowance.
+                protected = {oid for oid, entry in snapshot['orders'].items() if entry['delivered']}
+                write_json(cache_path, [r for r in ordered if (r['service'], r['order']) in retained
+                                       or r['service'] == 'marketplace' and r['order'] in protected])
             except OSError:
                 if invalidated:
                     raise  # A failed eviction must not be reported as a completed lookup.
@@ -156,7 +171,7 @@ def lane_process(connection, service, root, deadline, since, cache):
         connection.close()
 
 
-def parallel_lanes(root, deadline, since, cache):
+def parallel_lanes(root, deadline, since, cache, snapshot=None, snapshot_reason=None):
     # The installed readers require main-thread signal deadlines. Fork before
     # importing them: each lane gets its own main thread and the same time slice.
     started = time.monotonic()
@@ -166,6 +181,11 @@ def parallel_lanes(root, deadline, since, cache):
     services, failed = {}, set()
     try:
         for service in LANES:
+            if service == 'marketplace':
+                from marketplace import lane, empty
+                rows, proof = lane(snapshot or empty(), cache or [], snapshot_reason)
+                results.append({'orders': rows, 'lanes': {service: proof}})
+                continue
             receive, send = context.Pipe(duplex=False)
             process = context.Process(target=lane_process, args=(send, service, root, end - 0.2, since, cache), daemon=True)
             process.start()
@@ -204,7 +224,7 @@ def parallel_lanes(root, deadline, since, cache):
             'invalidated': invalidated}
 
 
-def native(app, root, deadline=None, since=None, cache=None, services=None):
+def native(app, root, deadline=None, since=None, cache=None, services=None, snapshot=None, snapshot_reason=None):
     sys.path.insert(0, root)
     if app == 'careem':
         import careem_http_orders
@@ -215,13 +235,17 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
                 return {'limit': BINDING_LIMIT}
             raise ValueError('order lookup unavailable') from None
     if services is None:
-        return parallel_lanes(root, deadline, since, cache)
+        return parallel_lanes(root, deadline, since, cache, snapshot, snapshot_reason)
     end = time.monotonic() + (8 if deadline is None else max(0, min(8, deadline - time.time())))
     import native_orders
     from noon_order_details import details
     since = moment(since) if since is not None else None
     known = {(r['service'], r['order']): r for r in (cache or [])}
     def read_lane(service):
+        if service == 'marketplace':
+            from marketplace import lane, empty
+            rows, proof = lane(snapshot or empty(), cache or [], snapshot_reason)
+            return rows, proof, []
         start = time.monotonic()
         lane_end = end
         rows = []
@@ -406,8 +430,28 @@ def native(app, root, deadline=None, since=None, cache=None, services=None):
 
 
 if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        payload = json.load(sys.stdin)
-        print(json.dumps(native(sys.argv[1], sys.argv[2], float(sys.argv[3]), **payload)))
+        if sys.argv[1] == 'refresh-marketplace':
+            import argparse
+            from marketplace import refresh
+            parser = argparse.ArgumentParser()
+            parser.add_argument('command')
+            parser.add_argument('--data', type=Path, required=True)
+            parser.add_argument('--root', type=Path, default=Path(os.environ.get('MONEY_CASES_APP_API', '~/.local/share/app-api-cli')).expanduser())
+            parser.add_argument('--budget', type=float, default=120)
+            args = parser.parse_args()
+            if not 0 < args.budget <= 180:
+                parser.error('budget must be between 0 and 180')
+            sys.path.insert(0, str(args.root))
+            import toollog
+            with toollog.caller_context('money-cases', command='refresh-marketplace', run_id=os.environ.get('WATCH_RUN')):
+                print(json.dumps(refresh(args.data, args.root, args.budget)))
+        else:
+            payload = json.load(sys.stdin)
+            sys.path.insert(0, sys.argv[2])
+            import toollog
+            with toollog.caller_context('money-cases', command='order-lookup', run_id=os.environ.get('WATCH_RUN')):
+                print(json.dumps(native(sys.argv[1], sys.argv[2], float(sys.argv[3]), **payload)))
     except Exception:
         sys.exit(1)

@@ -13,7 +13,8 @@ import uuid
 
 
 STATE_DIR = Path(os.environ.get(
-    "DEV_JANITOR_WATCH_STATE", os.path.expanduser("~/.local/share/dev-janitor/hourly")
+    "DEV_JANITOR_WATCH_STATE", str(Path(os.environ.get(
+        "DEV_JANITOR_LOG_DIR", os.path.expanduser("~/.local/share/dev-janitor"))) / "hourly")
 ))
 STALE_SECONDS = 4 * 60 * 60
 ALERT_SECONDS = 6 * 60 * 60
@@ -148,8 +149,16 @@ def worker(lock_fd):
         import dev_janitor
 
         scan = dev_janitor.scan()
-        dev_janitor.record_report(scan)
         stats["found"] = len(scan["resources"])
+        if "agent_browser" in scan.get("processes", {}):
+            dev_janitor.close_browser_candidates(scan)
+            browser = scan["processes"]["agent_browser"]
+            stats["found"] += len(browser["candidates"])
+            stats["killed"] += sum(action["ok"] for action in browser["actions"])
+        dev_janitor.record_report(scan)
+        if any(action["action"] == "close" and not action["ok"]
+               for action in scan.get("processes", {}).get("agent_browser", {}).get("actions", [])):
+            raise RuntimeError("agent-browser close failed; see audit")
         candidates = scan["candidates"]
         if candidates:
             # apply() re-scans immediately before *each* action; do not act on the initial snapshot alone.
@@ -161,7 +170,7 @@ def worker(lock_fd):
         ok = True
         write_state({"status": "ok", "finished_at": time.time(),
                      "liveness_unavailable": scan.get("liveness_unavailable"),
-                     "processes": {key: scan.get("processes", {}).get(key, []) for key in ("candidates", "problems", "checked", "skipped", "budget_skipped")}})
+                     "processes": dev_janitor.leftover_processes.report_summary(scan["processes"]) if scan.get("processes") else {}})
     except Exception as e:  # noqa: BLE001
         write_state({"status": "failed", "error": str(e)[:500], "finished_at": time.time()})
         return 1

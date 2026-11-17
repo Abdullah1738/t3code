@@ -101,6 +101,102 @@ for (let board = 0; board < 80; board++) {
 const large = finish(largeEvents);
 
 describe("analytics read budget", () => {
+  it("pages MCP diagnostic groups with their reasons, roles and phase percentiles intact", () => {
+    const rollup = finish([
+      event({
+        tool: "card_edit",
+        cardNumber: 4336,
+        callerCardNumber: 4336,
+        callerRole: "work",
+        callerKind: "board_thread",
+        cardStage: "working",
+        outcome: "refused",
+        errorTag: "capability_denied",
+        denyReason: "not_card_owner",
+        durationMs: 10,
+      }),
+      event({
+        tool: "card_edit",
+        cardNumber: 4336,
+        callerCardNumber: 4336,
+        callerRole: "work",
+        callerKind: "board_thread",
+        cardStage: "working",
+        outcome: "timeout",
+        errorTag: "reply_timeout",
+        replyStage: "ack",
+        durationMs: 310,
+        replyPhases: { admission: 10, read: 20, commit: 30, ack: 250 },
+        writePhases: { lockWait: 10, read: 20, write: 30, replyWait: 250 },
+      }),
+      event({
+        tool: "card_edit",
+        cardNumber: 4336,
+        callerCardNumber: 4336,
+        callerRole: "review",
+        callerKind: "board_thread",
+        cardStage: "in_review",
+        outcome: "timeout",
+        errorTag: "reply_timeout",
+        replyStage: "commit",
+        durationMs: 555,
+        replyPhases: { admission: 10, read: 20, commit: 500, ack: 25 },
+        writePhases: { lockWait: 10, read: 20, write: 500, replyWait: 25 },
+      }),
+    ]);
+    const pager = makeReadPager();
+    const selection = { day, kind: "mcp.call", tool: "card_edit", cardNumber: 4336 } as const;
+    const names = ["mcpFailureBreakdown", "mcpFailureContexts", "mcpReplyTimeouts"] as const;
+    expect(pager.read(selection, rollup, []).sections.map(({ name }) => name)).toEqual(
+      expect.arrayContaining([...names]),
+    );
+    expect(rollup.mcpReplyTimeouts!.some((row) => (row.replyPhases.ack?.p95Ms ?? 0) > 0)).toBe(
+      true,
+    );
+    for (const section of names) {
+      const input = { ...selection, section, limit: 1 };
+      let page = pager.read(input, rollup, []);
+      expect(page.hasMore).toBe(true);
+      const rows = [...page.rows!];
+      let pages = 1;
+      check(page);
+      while (page.hasMore) {
+        page = pager.resume({ ...input, cursor: page.cursor! })!;
+        check(page);
+        rows.push(...page.rows!);
+        expect(++pages).toBeLessThan(10);
+      }
+      expect(restore(rows)).toEqual(rollup[section]);
+    }
+  });
+
+  it.each([
+    { name: "unfiltered retry", from: undefined, to: undefined, allowed: true },
+    { name: "added filter", from: undefined, to: 4336, allowed: false },
+    { name: "same card", from: 4336, to: 4336, allowed: true },
+    { name: "different card", from: 4336, to: 4339, allowed: false },
+    { name: "omitted filter", from: 4336, to: undefined, allowed: false },
+  ])("binds cardNumber on cursor continuation: $name", ({ from, to, allowed }) => {
+    const common = { day, section: "samples", limit: 1 } as const;
+    const pager = makeReadPager();
+    const first = pager.read(
+      { ...common, ...(from === undefined ? {} : { cardNumber: from }) },
+      finish([]),
+      [event(), event()],
+    );
+    expect(first.cursor).toBeDefined();
+    const next = pager.resume({
+      ...common,
+      cursor: first.cursor!,
+      ...(to === undefined ? {} : { cardNumber: to }),
+    });
+    if (allowed) {
+      expect(next).toBeDefined();
+      check(next!);
+      expect(next!.hasMore).toBe(false);
+    } else expect(next).toBeUndefined();
+  });
+
   it("returns a bounded summary and an exact index for every top-level group", () => {
     expect(chars(large)).toBeGreaterThan(150_000);
     const result = makeReadPager().read({ day }, large, largeEvents.slice(0, 500));
@@ -265,4 +361,141 @@ describe("analytics read budget", () => {
     expect(last.rows![0]!.value).toEqual(samples[1]);
     expect(last.hasMore).toBe(false);
   });
+});
+
+it("pages dispatch outcome counts under the existing reply budget", () => {
+  const rollup = finish(largeEvents);
+  const withOutcomes = {
+    ...rollup,
+    mcpCalls: rollup.mcpCalls.map((row) => ({
+      ...row,
+      dispatchTimeouts: { committed: 12, failed: 3, capped: 2, noOutcome: 1 },
+    })),
+  };
+  const pager = makeReadPager();
+  const input = { day, section: "mcpCalls", limit: 7 } as const;
+  let page = pager.read(input, withOutcomes, []);
+  const rows = [...page.rows!];
+  check(page);
+  while (page.hasMore) {
+    page = pager.resume({ ...input, cursor: page.cursor! })!;
+    check(page);
+    rows.push(...page.rows!);
+  }
+  expect(restore(rows)).toEqual(withOutcomes.mcpCalls);
+});
+
+it("pages the server-wide restartAdmission section with its schema and exact waits", () => {
+  const rows: AnalyticsEvent[] = [100, 200, 300].map((waitedMs) =>
+    event({
+      kind: "restart.admission.admitted",
+      bootId: "boot-one",
+      restartAdmission: {
+        sourceRunId: "source-" + waitedMs,
+        classification: "continuation",
+        queuedAtMs: 0,
+        waitedMs,
+        positionAtEntry: 12,
+        position: 1,
+        total: 7,
+        maxQueueDepth: 20,
+        active: 1,
+        maxActive: 4,
+        loaded: true,
+      },
+    }),
+  );
+  const result = makeReadPager().read({ day, section: "restartAdmission" }, finish(rows), rows);
+  check(result);
+  expect(restore(result.rows!)).toEqual(finish(rows).restartAdmission);
+  expect(finish(rows).restartAdmission?.groups[0]?.wait).toEqual({
+    count: 3,
+    p50Ms: 200,
+    p90Ms: 300,
+    maxMs: 300,
+    approximate: false,
+  });
+});
+
+it("keeps combined runtime, restart-admission and Git rate reads inside the cap", () => {
+  const events: AnalyticsEvent[] = [];
+  for (let minute = 0; minute < 1440; minute++) {
+    const ts = `${day}T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`;
+    events.push(
+      event({
+        ts,
+        kind: "server.runtime_sample",
+        props: {
+          runningTurns: { total: 350, byProvider: { codex: 350 }, byModel: { sol: 350, other: 0 } },
+          runningByOrigin: {
+            boardWork: 50,
+            boardReview: 50,
+            boardEvaluator: 50,
+            delegatedChild: 50,
+            scheduledTask: 0,
+            other: 150,
+          },
+          providerSessions: { codex: 1 },
+          host: { load1: 60, load5: 50, load15: 40, rssMiB: 2000, heapUsedMiB: 1500 },
+          sampleMs: 0.25,
+        },
+      }),
+      event({
+        ts,
+        kind: "vcs.git_exec_rate",
+        props: {
+          total: 120,
+          distinctCwds: 20,
+          maxPerSecond: 10,
+          windowMs: 60_000,
+          overflow: 0,
+          top: Array.from({ length: 20 }, (_, index) => ({
+            operation: `GitManager.op${index}`,
+            subcommand: "status",
+            cwdHash: index.toString(16).padStart(16, "0"),
+            count: 6,
+          })),
+        },
+      }),
+      event({
+        ts,
+        kind: "restart.admission.admitted",
+        bootId: `boot-${minute % 6}`,
+        restartAdmission: {
+          sourceRunId: `source-${minute}`,
+          classification: "continuation",
+          queuedAtMs: 0,
+          waitedMs: minute,
+          positionAtEntry: 12,
+          position: 1,
+          total: 7,
+          maxQueueDepth: 20,
+          active: 1,
+          maxActive: 4,
+          loaded: true,
+        },
+      }),
+    );
+  }
+  const rollup = finish(events);
+  expect(rollup.runtimeSamples).toHaveLength(24);
+  expect(rollup.restartAdmission!.groups).toHaveLength(128);
+  expect(rollup.restartAdmission!.overflow).toBeGreaterThan(0);
+  expect(rollup.kindCounts["vcs.git_exec_rate"]).toBe(1440);
+  const pager = makeReadPager();
+  check(pager.read({ day }, rollup, events));
+  for (const section of ["runtimeSamples", "restartAdmission", "samples"] as const) {
+    let result = pager.read({ day, section, limit: 500 }, rollup, events);
+    check(result);
+    const rows = [...result.rows!];
+    let pages = 1;
+    while (result.hasMore) {
+      result = pager.resume({ day, section, limit: 500, cursor: result.cursor! })!;
+      check(result);
+      rows.push(...result.rows!);
+      expect(++pages).toBeLessThan(200);
+    }
+    expect(restore(rows)).toEqual(section === "samples" ? events : rollup[section]);
+    expect(rows.some((row) => row.truncated)).toBe(false);
+  }
 });

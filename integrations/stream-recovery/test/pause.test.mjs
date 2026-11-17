@@ -79,6 +79,10 @@ test('status JSON counts only pending work and exposes no ledger contents or cre
   state.handled = { pending: { threads: { a: {}, b: {}, c: { done: true } }, incident: { runs: [{ thread_id: 'a' }, { thread_id: 'c' }] }, note: 'PRIVATE-NOTE' }, done: { done: true, threads: { c: {} } } };
   state.stalls = { pending: { threadId: 'b', note: 'PRIVATE-TOKEN' }, done: { done: true, threadId: 'd' } };
   writeFileSync(join(dir, 'state.json'), JSON.stringify(state));
+  writeFileSync(join(dir, 'stall-state.json'), JSON.stringify({ stalls: state.stalls }));
+  // The replica ledger's legacy copy must not contribute a third incident.
+  state.stalls.extra = { threadId: 'legacy' };
+  writeFileSync(join(dir, 'state.json'), JSON.stringify(state));
   const result = command(dir, 'status', '--json');
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), { paused: false, until: null, reason: null, pendingIncidents: 2, pendingThreads: 2, lastSuccessfulScan: iso(T0) });
@@ -97,7 +101,7 @@ function fixture(dir, { count = 1, busy = false, held = false, subs = [] } = {})
   const io = {
     now: () => clock, readControl: () => loadControl(dir), harnessCutoverStatus: cutover,
     OC_URL: 'http://fixture', assertReplicaFresh() {}, assertThreadInReplica() {},
-    serverRuntime: () => ({ pid: 1, readyMs: T0 + 1000, procStartMs: T0 - MIN }), openCodeRuntime: () => null,
+    loadStallState: () => ({ stalls: {} }), serverRuntime: () => ({ pid: 1, readyMs: T0 + 1000, procStartMs: T0 - MIN }), openCodeRuntime: () => null,
     restartRunsSince: () => runs, cancelledSubagentsSince: () => [], cancelledDelegatedTasksSince: () => subs,
     childNativeSession: () => null, childRunOutcomeSince: () => null, delegatedStoppedSince: () => false,
     runMessages: () => [], subagentParent: () => null, threadRoot: () => null,

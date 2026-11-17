@@ -216,7 +216,10 @@ describe("stageBoard", () => {
     expect(view.total).toBe(5);
   });
 
-  it("labels a card waiting on a completed blocker's merge", () => {
+  it.each([
+    { text: "Land: rebase on master, fast-forward and push master" },
+    { text: "Host release via #99, then live read-back", holdsDependents: true },
+  ])("labels a card waiting on a completed blocker's landing step: $text", (landing) => {
     const state = boardStateFromSnapshot(
       snapshot([
         card(1, {
@@ -225,7 +228,7 @@ describe("stageBoard", () => {
             {
               id: "m1",
               step: 4,
-              text: "Rebase on latest ardud/main, merge into ardud/main, push origin main",
+              ...landing,
               owner: "evaluator",
               state: "open",
               note: null,
@@ -240,7 +243,7 @@ describe("stageBoard", () => {
     const todo = stageBoard(state, NOW).active.find((column) => column.stage === "todo")!;
     expect(todo.cards[0]!.flag).toEqual({
       kind: "blocked",
-      label: "Waits for #1 to be merged",
+      label: "Waits for #1 to land",
     });
   });
 

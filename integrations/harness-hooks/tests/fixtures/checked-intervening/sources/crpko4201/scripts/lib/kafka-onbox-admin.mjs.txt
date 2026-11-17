@@ -1,0 +1,41 @@
+import { bootstrapShellLine } from "./kafka-acl-apply.mjs";
+
+export const shellQuote = value => `'${String(value).replaceAll("'", "'\"'\"'")}'`;
+
+// Secrets are read only on the broker. The command sent to SSM contains no secret.
+export function kafkaAdminPrelude({ env, region, auth = "broker-scram", bootstrap, commandConfig } = {}) {
+  if (auth === "internal-tls") {
+    const config = commandConfig ?? "/opt/kafka/tls/internal-admin-client.conf";
+    if (!/^\/[A-Za-z0-9._/-]+$/.test(config)) throw new Error("--command-config must be an absolute path");
+    return ["set -euo pipefail", `CFG=${shellQuote(config)}`,
+      'test -r "$CFG" || { echo "admin client config $CFG not found (runbook step 3)" >&2; exit 3; }',
+      bootstrapShellLine(bootstrap), "ACLS=/opt/kafka/bin/kafka-acls.sh"];
+  }
+  if (auth !== "broker-scram") throw new Error("--admin-auth must be broker-scram or internal-tls");
+  if (!/^[a-z][a-z0-9-]*$/.test(env ?? "") || !/^[a-z]{2}-[a-z]+-\d$/.test(region ?? "")) throw new Error("broker admin environment and region required");
+  if (bootstrap !== undefined || commandConfig !== undefined) throw new Error("--bootstrap-server and --command-config require --admin-auth internal-tls");
+  const configWriter = [
+    "import json,sys",
+    "try:",
+    " p=json.load(sys.stdin)['password']",
+    " if not isinstance(p,str) or not p or any(c in p for c in '\\r\\n'): raise ValueError()",
+    " jaas='org.apache.kafka.common.security.scram.ScramLoginModule required username=\"broker\" password='+json.dumps(p,ensure_ascii=True)+';'",
+    " print('security.protocol=SASL_PLAINTEXT\\nsasl.mechanism=SCRAM-SHA-512\\nsasl.jaas.config='+jaas.replace('\\\\','\\\\\\\\'))",
+    "except Exception: sys.exit('broker credential unavailable')"
+  ].join("\n");
+  return ["set +x", "set -euo pipefail", "umask 077", "CFG=",
+    "trap 'rm -f -- \"$CFG\"' EXIT", "trap 'exit 129' HUP", "trap 'exit 130' INT", "trap 'exit 143' TERM",
+    "CFG=$(mktemp /tmp/kafka-admin.XXXXXXXX)", 'chmod 600 "$CFG"',
+    `aws secretsmanager get-secret-value --region ${shellQuote(region)} --secret-id ${shellQuote(`crpko/${env}/kafka/scram/broker`)} --query SecretString --output text | python3 -I -c ${shellQuote(configWriter)} > "$CFG"`,
+    'BOOT="$(hostname -f):9096"', "ACLS=/opt/kafka/bin/kafka-acls.sh"];
+}
+
+export function clusterIdentityShell(clusterId) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(clusterId ?? "")) throw new Error("invalid cluster id");
+  return ['ID=$(/opt/kafka/bin/kafka-cluster.sh cluster-id --bootstrap-server "$BOOT" --config "$CFG")',
+    `test "$ID" = ${shellQuote(`Cluster ID: ${clusterId}`)}`];
+}
+
+export function scramUsersShell() {
+  return '/opt/kafka/bin/kafka-configs.sh --bootstrap-server "$BOOT" --command-config "$CFG" --describe --entity-type users';
+}

@@ -134,7 +134,9 @@ class TemplateTools(unittest.TestCase):
                     self.assertTrue(uses)
                     self.assertLess(body.index('offbox_fetch()'), uses[0].start())
                     self.assertIn("UV_LINK_MODE=copy", body)
-                    self.assertIn("zsh openjdk-21-jre-headless", body)
+                    self.assertIn("zsh openjdk-21-jdk-headless", body)
+                    self.assertIn("javac -version 2>&1 | grep -q '^javac 21\\.'", body)
+                    self.assertIn("--set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac", body)
                     self.assertEqual(body.count('FDB_VERSION="${OFFBOX_FDB_VERSION:-7.3.63}"'),
                                      int(name in ("crpko-go", "crpko-harness")))
                     result = subprocess.run(["/bin/bash", "-n"], input=body, text=True, capture_output=True)
@@ -155,6 +157,49 @@ __offbox_curl -fsSL https://example.invalid/node.tar.xz -o /tmp/fixture
             self.assertIn('--connect-timeout 7 --speed-limit 30 --speed-time 2 --max-time 9', call)
             self.assertIn('--retry 1 --retry 0', call)
         self.assertIn('attempt 2/2 failed (curl exit 18)', result.stderr)
+
+    def test_home_base_has_a_verified_full_jdk(self):
+        body = (TEMPLATES.parents[1] / 'server/base-image.sh').read_text()
+        self.assertIn('openjdk-21-jdk-headless', body)
+        self.assertNotIn('openjdk-21-jre-headless', body)
+        self.assertIn('--set java /usr/lib/jvm/java-21-openjdk-amd64/bin/java', body)
+        self.assertIn('--set javac /usr/lib/jvm/java-21-openjdk-amd64/bin/javac', body)
+        self.assertIn("javac -version 2>&1 | grep -q '^javac 21\\.'", body)
+
+    def test_system_toolchain_archives_never_import_archive_owners(self):
+        body = (TEMPLATES.parents[1] / 'server/base-image.sh').read_text()
+        self.assertIn('NODE=v24.22.3\n', body)
+        for line in body.splitlines():
+            if '| tar ' in line:
+                self.assertIn('--no-same-owner', line)
+        for name in ('generic', 'crpko-go', 'crpko-harness'):
+            body = (TEMPLATES / (name + '.sh')).read_text()
+            extraction = next(line for line in body.splitlines() if 'sudo tar -C /usr/local' in line)
+            self.assertIn('--no-same-owner', extraction)
+
+    def test_base_and_stack_templates_install_the_shim_interpreter(self):
+        base = TEMPLATES.parents[1] / 'server/base-image.sh'
+        paths = [base, *(TEMPLATES / (name + '.sh') for name in common.TEMPLATES)]
+        for path in paths:
+            with self.subTest(path=path.name):
+                body = path.read_text().replace('\\\n', ' ')
+                installs = re.findall(r'^\s*(?:sudo )?apt-get install\s+([^\n]+)', body, re.M)
+                self.assertTrue(any('zsh' in shlex.split(args) for args in installs), path)
+        self.assertIn("test -x /bin/zsh || { echo 'offbox base: /bin/zsh missing' >&2; exit 1; }",
+                      base.read_text())
+
+    def test_java_checks_fail_template_builds_without_a_21_compiler(self):
+        paths = [TEMPLATES / (name + '.sh') for name in common.TEMPLATES]
+        paths.append(TEMPLATES.parents[1] / 'server/base-image.sh')
+        for path in paths:
+            check = next(line for line in path.read_text().splitlines() if line.startswith('javac -version'))
+            for version, code in (('javac 21.0.13', 0), ('javac 11.0.1', 1), ('', 1)):
+                with self.subTest(path=path.name, version=version):
+                    self.shim('javac', 'printf "%s\\n" "$COMPILER_VERSION"\n')
+                    result = subprocess.run(['/bin/bash', '-c', 'set -euo pipefail\n' + check],
+                                            env=dict(self.env, COMPILER_VERSION=version),
+                                            text=True, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, code, result.stderr)
 
     def test_no_download_curl_bypasses_fetch(self):
         downloads = []

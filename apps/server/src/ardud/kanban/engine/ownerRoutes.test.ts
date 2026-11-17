@@ -1,4 +1,4 @@
-/** Board administration uses the operate scope; the owner's words and picks need his own session. */
+/** Words, picks and permanent board erasure need the owner's session; other administration uses operate. */
 // @effect-diagnostics-next-line nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 
@@ -47,7 +47,7 @@ const assertRefusal = (
     assert.strictEqual(refusal.text, NOT_OWNER_DEVICE_MESSAGE, where);
     return;
   }
-  assert.isUndefined(refusal.reason, where);
+  assert.strictEqual(refusal.reason, "role_not_allowed", where);
   assert.include(refusal.text, "Only the owner does this", where);
   if (caller._tag === "component") {
     assert.include(refusal.text, `the ${caller.component} component's session`, where);
@@ -132,7 +132,11 @@ it.effect(
           assert.strictEqual(posted.status, 403);
           assertRefusal(
             caller,
-            { code: posted.body.error.code, text: posted.body.error.message },
+            {
+              code: posted.body.error.code,
+              reason: posted.body.error.reason,
+              text: posted.body.error.message,
+            },
             "t3ctl owner words",
           );
           assert.deepStrictEqual(yield* kanban.messages(discussion.id, {}), before);
@@ -274,12 +278,12 @@ const handlersFor = (session: OwnerGateSession) => {
   return { ran: engine.ran, handlers };
 };
 
-const OWNER_RPCS: ReadonlySet<string> = new Set([M.cardAsk, M.messagePost, M.answer]);
+const OWNER_RPCS: ReadonlySet<string> = new Set([M.cardAsk, M.messagePost, M.answer, M.boardPurge]);
 /** Streams: the feed of boards and of one board. */
 const STREAMS: ReadonlySet<string> = new Set([M.boards, M.subscribe]);
 
 it.effect(
-  "WS keeps owner words and picks gated while board administration accepts operate sessions",
+  "WS gates owner words, picks and board erasure while other administration accepts operate sessions",
   () =>
     Effect.gen(function* () {
       const guarded = Object.keys(KANBAN_GUARDED_SCOPES);

@@ -184,7 +184,8 @@ class AcquisitionStartupTests(Isolated):
         def child(*args, **kwargs):
             with home.wait_budget(), home.pre_start(rid):
                 return api.call('GET', '/limits', retries=0)
-        with patch.object(runs, 'background_client', side_effect=child), patch.object(os, 'chdir'), \
+        with patch.dict(os.environ), patch.object(runs, 'background_client', side_effect=child), \
+                patch.object(os, 'chdir'), \
                 patch.object(api, '_request', side_effect=refusal) as send:
             with self.assertRaises(home.StartWaitFailed):
                 runs.background_queue(rid, payload)

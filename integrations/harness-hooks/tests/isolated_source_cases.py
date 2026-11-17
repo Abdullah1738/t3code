@@ -1,5 +1,7 @@
 """Commands to classify only; none of these shell strings may be executed."""
 import os
+import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +16,29 @@ def fixture_environment_patch():
     kept = {name: value for name, value in os.environ.items() if not name.startswith('BASH_FUNC_')}
     blanked = {name: value for name, value in fixture_environment().items() if not name.startswith('BASH_FUNC_')}
     return patch.dict(os.environ, {**kept, **blanked}, clear=True)
+
+
+@contextmanager
+def trusted_node_environment():
+    # This synthetic tool is classified only, never executed or opened.
+    node = str(Path.home() / '.nvm/versions/node/v0.0.0/bin/node')
+    lookup = shutil.which
+
+    def which(name, *args, **kwargs):
+        return node if name == 'node' else lookup(name, *args, **kwargs)
+
+    search = [str(Path(node).parent), *(entry for entry in os.get_exec_path() if os.path.isabs(entry))]
+    with patch.dict(os.environ, {'PATH': os.pathsep.join(search)}), patch.object(shutil, 'which', side_effect=which):
+        yield
+
+
+def write_migration_helpers(root):
+    repo = Path(__file__).resolve().parents[3]
+    for name in ('historySourceFiles.ts', 'historyArchiveSql.ts'):
+        relative = Path('apps/server/src/ardud/persistence') / name
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text((repo / relative).read_text())
 
 
 def cases(root):

@@ -94,7 +94,17 @@ class Parsers(unittest.TestCase):
         self.assertIn('host boxes 9→14 running', text)
         self.assertIn('cpu-throttled', text)
         self.assertEqual(resources.summary(resources.unavailable('boat')),
-                         'offbox: box pressure unavailable · host boxes ?→? running')
+                         'offbox: box pressure unavailable · host boxes unknown')
+
+    def test_incus_failure_explains_unknown_host_counts(self):
+        for data in (resources.unavailable(), resources.record(fixture(1), fixture(21), 'samples 2')):
+            for host in (dict(start=None, end=None, start_reason='incus_unavailable', end_reason='incus_unavailable'),
+                         dict(start=3, end=None, end_reason='incus_unavailable')):
+                with self.subTest(status=data['status'], host=host):
+                    data['host_boxes'] = host
+                    text = resources.summary(data)
+                    self.assertIn('host boxes unknown (Incus unavailable)', text)
+                    self.assertNotIn('?→?', text)
 
 
 class Persistence(Isolated):
@@ -154,6 +164,28 @@ class Persistence(Isolated):
             self.assertEqual(api.command_host_boxes('bx_fake', 7, 'cmd_pressure'), dict(start=7, end=10))
             list(api._execution_frames('bx_fake', 7, [dict(type='attempt', attempt=2)]))
             self.assertIsNone(api.command_host_boxes('bx_fake', 7, 'cmd_pressure'))
+
+    def test_host_count_reasons_survive_api_cache_and_footer_reconstruction(self):
+        host = dict(start=None, end=None, start_reason='incus_unavailable', end_reason='incus_unavailable')
+        row = self.row()
+        path = runs.LOGS_DIR / 'run-pressure.log'
+        data = resources.record(fixture(1), fixture(21), 'samples 2')
+        payload = ('output\n' + resources.PREFIX + row['run_id'] + ' ' + json.dumps(data) + '\n').encode()
+        path.write_bytes(payload)
+        common.atomic_write_json(common.offsets_path(path), dict(stdoutOffset=7, stderrOffset=1, logBytes=len(payload)))
+        runs.save_run_state(row['run_id'], resources=resources.unavailable('pending'))
+        status = dict(status='exited', commandId='cmd_pressure', metrics={'host_boxes': host})
+        with patch.object(api, 'BACKEND', 'server'), patch.object(api, '_COMMAND_HOST_BOXES', {}):
+            with patch.object(api, 'call', return_value=status):
+                api.cmd_status('bx_fake', 7)
+            self.assertEqual(api.command_host_boxes('bx_fake', 7, 'cmd_pressure'), host)
+            resources.finalize(row)
+            api._COMMAND_HOST_BOXES.clear()
+            resources.finalize(row)
+        saved = common.read_json(runs.LOGS_DIR / 'run-pressure.state.json', {})
+        self.assertEqual(saved['resources']['host_boxes'], host)
+        self.assertIn('host boxes unknown (Incus unavailable)', path.read_text())
+        self.assertNotIn('?→?', path.read_text())
 
     def test_footer_does_not_commit_uncheckpointed_remote_bytes(self):
         path = runs.LOGS_DIR / 'run-pressure.log'

@@ -14,10 +14,14 @@ from test.test_commerce_nownow_order import make_flow, happy_responses, FakeAuth
 class CaptureTests(unittest.TestCase):
     def setUp(self):
         approve_test_flows(self)
+        import order_card
+        for field, value in (('LAST4', '2342'), ('NETWORK', 'mastercard')):
+            card = patch.object(order_card, field, value)
+            card.start(); self.addCleanup(card.stop)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         for module in (j, c.receipts):
-            p = patch.object(module, 'ROOT', Path(temp.name) / 'commerce')
+            p = patch.object(module, 'ROOT', Path(temp.name).resolve() / 'commerce')
             p.start()
             self.addCleanup(p.stop)
 

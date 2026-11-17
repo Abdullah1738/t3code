@@ -22,7 +22,7 @@ OTHER = 'Sun Nov 15 10:20:30 2026'
 
 
 def line(pid=1, cpu_time='0:01.23', start=START, etime='02:00', command='/usr/bin/node', state='R+', rss=2048):
-    return f'{pid} 0 {cpu_time} {rss} {state} {start} {etime} {command}\n'
+    return f'{pid} 0 {cpu_time} {rss} {state} {start} {etime} 501 {command}\n'
 
 
 class CpuTests(unittest.TestCase):
@@ -34,6 +34,15 @@ class CpuTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.calls = []
+        children = patch.object(cpu, 'rusage_reader', side_effect=OSError('unavailable'))
+        children.start()
+        self.addCleanup(children.stop)
+        load = patch.object(cpu.os, 'getloadavg', return_value=(1, 1, 1))
+        load.start()
+        self.addCleanup(load.stop)
+        cores = patch.object(cpu.os, 'cpu_count', return_value=16)
+        cores.start()
+        self.addCleanup(cores.stop)
 
     def runner(self, text=None, args=None, failure=None):
         def run(argv, **kwargs):
@@ -54,6 +63,445 @@ class CpuTests(unittest.TestCase):
 
     def events(self):
         return [json.loads(line) for p in self.root.glob('*.ndjson') for line in p.read_text().splitlines()]
+
+    def spike_runner(self, text=None, args=None, thread_failure=False):
+        normal = self.runner(text=text)
+        def run(argv, **kwargs):
+            if argv[0] == '/usr/bin/top':
+                self.assertEqual(kwargs['timeout'], 5)
+                return SimpleNamespace(returncode=0, stdout='PID %CPU TIME\n0 0.0 06:18:29\nPID %CPU TIME\n0 1.5 06:18:30\n')
+            if argv[:3] == ['/bin/ps', '-ww', '-o']:
+                self.calls.append(argv)
+                return SimpleNamespace(returncode=0, stdout=args or f'1 {START} /sbin/launchd\n')
+            if '-axM' in argv:
+                self.calls.append(argv)
+                if thread_failure:
+                    raise subprocess.TimeoutExpired(argv, 2)
+                return SimpleNamespace(returncode=0, stdout='USER PID TT %CPU STAT PRI STIME UTIME COMMAND\nroot 1 ?? 1.0 R 31T 0:00.1 0:00.2 launchd\n 1 0.0 R 31T 0:00.1 0:00.2\n')
+            return normal(argv, **kwargs)
+        return run
+
+    def test_host_ticks_abi_and_system_delta(self):
+        import ctypes
+        def host_statistics(host, flavor, ticks, count):
+            self.assertEqual((host, flavor), (7, 3))
+            self.assertEqual(ctypes.cast(count, ctypes.POINTER(ctypes.c_uint))[0], 4)
+            ticks[:] = (160, 120, 300, 20)
+            return 0
+        ticks = cpu.host_ticks(host_statistics, 7)
+        props = dict(baseline=False, totalCpuPct=500)
+        result = cpu.system_cpu(ticks, dict(ticks=[100, 100, 200, 0]), props, 16)
+        self.assertEqual(result, dict(systemCpuPct=800, userPct=480, sysPct=160, nicePct=160,
+                                      idlePct=800, unattributedCpuPct=300))
+        self.assertEqual(cpu.system_cpu(ticks, {}, props, 16), {})
+        self.assertEqual(cpu.system_cpu(ticks, dict(ticks=ticks), dict(props, baseline=True), 16), {})
+        self.assertEqual(cpu.system_cpu(ticks, dict(ticks=[100, 100, 200, 0]), dict(props, totalCpuPct=900), 16)['unattributedCpuPct'], 0)
+        with self.assertRaises(cpu.ProbeError):
+            cpu.host_ticks(lambda *args: 5, 7)
+
+    def test_tick_wrap_reset_and_bad_saved_ticks(self):
+        props = dict(baseline=False, totalCpuPct=0)
+        self.assertEqual(cpu.system_cpu([10, 10, 20, 0], dict(ticks=[2**32-10, 0, 0, 0]), props, 16)['systemCpuPct'], 960)
+        for old in ([100, 100, 200, 0], [True, 0, 0, 0], [1], 'bad'):
+            with self.subTest(old=old):
+                self.assertEqual(cpu.system_cpu([0]*4, dict(ticks=old), props, 16)['systemCpuError'], 'baseline')
+
+    def test_system_first_read_failure_and_recovery_keep_sample(self):
+        ticks = iter(([100, 100, 200, 0], [160, 120, 300, 20]))
+        with patch.object(cpu.time, 'time', side_effect=[1_800_000_000, 1_800_000_060]):
+            first = cpu.sample(self.runner(), ticks_read=lambda: next(ticks))
+            second = cpu.sample(self.runner(text=line(cpu_time='5:01.23')), ticks_read=lambda: next(ticks))
+        self.assertNotIn('systemCpuPct', first)
+        self.assertNotIn('systemCpuError', first)
+        self.assertEqual(second['systemCpuPct'], 800)
+        self.assertEqual(second['unattributedCpuPct'], 300)
+        def failed():
+            raise cpu.ProbeError('unavailable')
+        with patch.object(cpu.time, 'time', return_value=1_800_000_120):
+            result = cpu.sample(self.runner(), ticks_read=failed)
+        self.assertEqual(result['systemCpuError'], 'unavailable')
+        self.assertNotIn('systemCpuPct', result)
+        self.assertTrue(self.events()[-1]['ok'])
+        self.assertNotIn('ticks', cpu.read_state('cpu'))
+
+    def test_spawn_exit_reuse_and_wrap_without_false_pid_cursor(self):
+        cases = [(10, 11, START, (1, 1)), (99999, 1, START, (1, 1)),
+                 (10, 10, OTHER, (1, 1)), (10, 10, START, (0, 0))]
+        for before, after, start, expected in cases:
+            with self.subTest(before=before, after=after, start=start):
+                _, old = cpu.deltas(cpu.parse_ps(line(pid=before)), {}, 100)
+                rows = cpu.parse_ps(line(pid=after, start=start))
+                props, _ = cpu.deltas(rows, old, 160)
+                measured = cpu.churn(rows, old, props)
+                self.assertEqual((measured['spawned'], measured['exited']), expected)
+                self.assertNotIn('pidAdvance', measured)
+        # A high survivor hides any allocator advance after a wrap.
+        _, old = cpu.deltas(cpu.parse_ps(line(pid=99999)), {}, 100)
+        rows = cpu.parse_ps(line(pid=99999)+line(pid=10))
+        props, _ = cpu.deltas(rows, old, 160)
+        self.assertEqual(cpu.churn(rows, old, props)['spawned'], 1)
+        self.assertEqual(cpu.churn(rows, {}, dict(props, baseline=True)), {})
+
+    def test_parent_family_live_launchd_and_gone(self):
+        rows = cpu.parse_ps(line(pid=1, command='/sbin/launchd')+line(pid=20, command='/bin/zsh')+line(pid=21)+line(pid=22))
+        rows[1]['ppid'], rows[2]['ppid'], rows[3]['ppid'] = 1, 20, 999
+        _, old = cpu.deltas(rows, {}, 100)
+        props, _ = cpu.deltas(rows, old, 160)
+        by_pid = {p['pid']: p for p in props['top']}
+        self.assertEqual(by_pid[20]['parentFamily'], 'launchd')
+        self.assertEqual(by_pid[21]['parentFamily'], 'zsh')
+        self.assertIsNone(by_pid[22]['parentFamily'])
+
+    def test_spawned_families_count_cpu_parent_and_top_eight(self):
+        now = 1_800_000_060
+        born = __import__('time').strftime('%a %b %d %H:%M:%S %Y', __import__('time').localtime(now-30))
+        rows = cpu.parse_ps(line(pid=1, command='/sbin/launchd')+
+                            ''.join(line(pid=i+10, start=born, cpu_time='0:30', command='/bin/tool'+str(i%10)) for i in range(20)))
+        for p in rows[1:]:
+            p['ppid'] = 1
+        _, old = cpu.deltas(rows[:1], {}, now-60)
+        props, _ = cpu.deltas(rows, old, now)
+        measured = cpu.churn(rows, old, props)
+        self.assertEqual(measured['spawned'], 20)
+        self.assertEqual(len(measured['spawnedFamilies']), 8)
+        self.assertEqual(measured['spawnedFamilies'][0], dict(family='tool0', count=2, cpuPct=100, parentFamily='launchd'))
+
+    def test_real_system_daemon_labels_and_home_secret_matrix(self):
+        real = '/System/Library/DriverExtensions/com.apple.DriverKit-AppleBCMWLAN.dext/com.apple.DriverKit-AppleBCMWLAN'
+        self.assertEqual(cpu_labels.janitor_redact(Path(real).name), '[REDACTED]')
+        for root in cpu_labels.SYSTEM_ROOTS:
+            label = cpu_labels.family(root+Path(real).name)
+            props = toollog.cpu_fields(dict(top=[dict(family=label, parentFamily=label)]))
+            self.assertEqual(props['top'][0]['family'], Path(real).name)
+            self.assertEqual(props['top'][0]['parentFamily'], Path(real).name)
+        for comm in ('/usr/bin/sk-private-key', '/System/secret=private'):
+            with self.subTest(comm=comm):
+                label = cpu_labels.family(comm)
+                self.assertEqual(label, '[redacted]')
+
+    def test_home_and_system_family_basename_matrix_at_logger_boundary(self):
+        home = '/Users/tester'
+        cases = [
+            ('nvm node', home+'/.nvm/versions/node/v26.2.0/bin/node', 'node'),
+            ('local tool', home+'/.local/bin/offbox', 'offbox'),
+            ('agent browser', home+'/.nvm/versions/node/v26.13.1/lib/node_modules/agent-browser/bin/agent-browser', 'agent-browser'),
+            ('ssh mux', 'ssh: '+home+'/.local/share/offbox/cm/abc [mux]', 'ssh'),
+            ('claude', home+'/.robob/harness-cli/claude/current/bin/claude', 'claude'),
+            ('bun', home+'/.bun/bin/bun', 'bun'),
+            ('home Python', home+'/.local/bin/python3.9', 'python'),
+            ('Linux home', '/home/tester/.local/bin/node', 'node'),
+            ('current home', str(Path.home())+'/.local/bin/bun', 'bun'),
+            ('tilde home', '~/.local/bin/python3.9', 'python'),
+            ('home bundle executable', home+'/private.app/Contents/MacOS/node', 'node'),
+            ('secret directory', home+'/ghp_private-token/node', 'node'),
+            ('system extension', '/Library/SystemExtensions/D48C98D4-DA18-4029-9DFF-49EF981973AB/'
+             'io.tailscale.ipn.macsys.network-extension.systemextension/Contents/MacOS/'
+             'io.tailscale.ipn.macsys.network-extension', 'io.tailscale.ipn.macsys.network-extension'),
+            ('Cryptex helper', '/System/Cryptexes/App/System/Library/CoreServices/SafeHelper.app/Contents/MacOS/SafeHelper', 'SafeHelper'),
+            ('system application', '/System/Applications/Safe.app/Contents/MacOS/Safe', 'Safe'),
+            # These two names themselves match the existing password guard.
+            ('Passwords helper', '/System/Cryptexes/App/System/Library/CoreServices/'
+             'PasswordManagerBrowserExtensionHelper.app/Contents/MacOS/PasswordManagerBrowserExtensionHelper', '[redacted]'),
+            ('Passwords', '/System/Applications/Passwords.app/Contents/MacOS/Passwords', '[redacted]'),
+        ]
+        for form, comm, expected in cases:
+            with self.subTest(form=form):
+                label = cpu_labels.family(comm)
+                self.assertEqual(label, expected)
+                props = toollog.cpu_fields(dict(top=[dict(family=label, parentFamily=label)],
+                                               families=[dict(family=label, count=1)]))
+                self.assertEqual(props['top'][0]['family'], expected)
+                self.assertEqual(props['top'][0]['parentFamily'], expected)
+                self.assertEqual(props['families'][0]['family'], expected)
+                self.assertNotIn('/Users/', json.dumps(props))
+                self.assertNotIn('tester', json.dumps(props))
+
+    def test_secret_home_basenames_remain_redacted(self):
+        for name in ('a1'*20, 'ghp_private-token', 'github_pat_private', 'sk-private-key',
+                     'xoxb-private', 'password=private', 'cookie=private',
+                     'otp=654321', '4242424242424242', 'mds'+'a1'*20):
+            with self.subTest(name=name):
+                label = cpu_labels.family('/Users/tester/.local/bin/'+name)
+                self.assertIn('redacted', label.lower())
+                props = toollog.cpu_fields(dict(top=[dict(family=label, parentFamily=label)]))
+                self.assertNotIn(name, json.dumps(props))
+        with patch('cpu_labels.janitor_redact', side_effect=ImportError):
+            self.assertEqual(cpu_labels.family('/Users/tester/bin/python3.9'), '[redacted]')
+
+    def test_spike_threshold_cap_reset_and_optional_failure(self):
+        for load, expected in ((32, 0), (32.001, 1)):
+            with self.subTest(load=load), patch.object(cpu.os, 'getloadavg', return_value=(load, 10, 10)):
+                before = len([e for e in self.events() if e['name']=='cpu.spike'])
+                cpu.sample(self.spike_runner(thread_failure=True), ticks_read=lambda: [1]*4)
+                spikes = [e for e in self.events() if e['name']=='cpu.spike']
+                self.assertEqual(len(spikes)-before, expected)
+                if expected:
+                    self.assertEqual(spikes[-1]['props']['threadError'], 'timeout')
+                    self.assertNotIn('runnableThreadsByFamily', spikes[-1]['props'])
+        now = 1_800_000_000
+        day = dt.datetime.fromtimestamp(now, dt.timezone.utc).date().isoformat()
+        state = cpu.read_state('cpu')
+        state.update(spikeDay=day, spikeCount=239)
+        cpu.save_state('cpu', state)
+        with patch.object(cpu.time, 'time', return_value=now), patch.object(cpu.os, 'getloadavg', return_value=(40, 10, 10)):
+            cpu.sample(self.spike_runner(), ticks_read=lambda: [1]*4)
+            self.assertEqual(cpu.read_state('cpu')['spikeCount'], 240)
+            self.calls.clear()
+            cpu.sample(self.spike_runner(), ticks_read=lambda: [1]*4)
+            self.assertEqual(self.calls, [cpu.PS])
+            self.assertEqual(cpu.read_state('cpu')['spikeCount'], 240)
+        with patch.object(cpu.time, 'time', return_value=now+86400), patch.object(cpu.os, 'getloadavg', return_value=(40, 10, 10)):
+            cpu.sample(self.spike_runner(), ticks_read=lambda: [1]*4)
+            self.assertEqual(cpu.read_state('cpu')['spikeCount'], 1)
+
+    def test_spike_one_command_batch_redacted_and_byte_bounded(self):
+        rows = cpu.parse_ps(''.join(line(pid=i+1, command='/bin/git') for i in range(30)))
+        for p in rows:
+            p['ppid'] = 30
+        _, old = cpu.deltas(rows, {}, 100)
+        props, _ = cpu.deltas(rows, old, 160)
+        props.update(load=[40, 30, 20], ncpu=16, spawnedFamilies=[])
+        args = ''.join(str(i)+f' {START} /usr/bin/git /Users/ardud/private/repo '+('界'*300)+'\n' for i in range(1, 31))
+        snapshot = cpu.spike(props, rows, self.spike_runner(args=args))
+        batches = [call for call in self.calls if call[:3] == ['/bin/ps', '-ww', '-o']]
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(set(map(int, batches[0][-1].split(','))), set(range(1, 16))|{30})
+        self.assertEqual(len(snapshot['top']), 15)
+        for p in snapshot['top']:
+            self.assertLessEqual(len(p['cmd']), 160)
+            self.assertLessEqual(len(p['parentCmd']), 160)
+            for key in ('cmd', 'parentCmd'):
+                self.assertNotIn('/Users/', p[key])
+                self.assertNotIn('hidden', p[key])
+        record = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc), props=snapshot)
+        encoded = (json.dumps(record, separators=(',', ':'))+'\n').encode()
+        self.assertLessEqual(len(encoded), 8192)
+        self.assertLess(len(record['props']['top']), 15)
+        self.assertIn('topOmitted', record['props'])
+
+    def test_kernel_rate_limit_persists_across_quiet_samples_and_midnight(self):
+        now = 1_800_000_000
+        run = self.spike_runner()
+        top = []
+        def counted(argv, **kwargs):
+            if argv[0] == '/usr/bin/top':
+                top.append(argv)
+            return run(argv, **kwargs)
+        for offset, load, count, skipped in ((0, 40, 1, False), (60, 40, 1, True),
+                (120, 1, 1, False), (299, 40, 1, True), (300, 40, 2, False)):
+            with self.subTest(offset=offset), patch.object(cpu.time, 'time', return_value=now+offset), \
+                    patch.object(cpu.os, 'getloadavg', return_value=(load, 1, 1)):
+                value = cpu.sample(counted, ticks_read=lambda: [1]*4)
+                self.assertEqual(len(top), count)
+                self.assertEqual(value.get('kernelTaskSkipped') == 'rate', skipped)
+                self.assertEqual(value['kernelTaskPct'], None if load == 1 or skipped else 1.5)
+        state = cpu.read_state('cpu')
+        state['spikeDay'] = 'previous-day'
+        cpu.save_state('cpu', state)
+        with patch.object(cpu.time, 'time', return_value=now+301), \
+                patch.object(cpu.os, 'getloadavg', return_value=(40, 1, 1)):
+            cpu.sample(counted, ticks_read=lambda: [1]*4)
+        self.assertEqual(len(top), 2)
+        self.assertEqual(self.events()[-1]['props']['kernelTaskSkipped'], 'rate')
+        self.assertEqual(cpu.read_state('cpu')['kernelTaskAt'], now+300)
+
+    def test_kernel_failure_and_clock_rollback_consume_cooldown(self):
+        now = 1_800_000_000
+        run = self.spike_runner()
+        calls = []
+        def failed(argv, **kwargs):
+            if argv[0] == '/usr/bin/top':
+                calls.append(argv)
+                raise subprocess.TimeoutExpired(argv, 5)
+            return run(argv, **kwargs)
+        with patch.object(cpu.os, 'getloadavg', return_value=(40, 1, 1)):
+            for offset in (0, 60, -60, 0, 240):
+                with patch.object(cpu.time, 'time', return_value=now+offset):
+                    cpu.sample(failed, ticks_read=lambda: [1]*4)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(cpu.read_state('cpu')['kernelTaskAt'], now+240)
+
+    def test_rusage_reader_precedes_inventory_and_identity_failures_are_visible(self):
+        import errno
+        order = []
+        run = self.runner()
+        def reader_factory():
+            order.append('reader')
+            def read(pid):
+                raise OSError(errno.ESTALE, 'identity')
+            return read
+        def runner(argv, **kwargs):
+            if argv == cpu.PS:
+                order.append('inventory')
+            return run(argv, **kwargs)
+        props = cpu.sample(runner, reader_factory=reader_factory)
+        self.assertEqual(order[:2], ['reader', 'inventory'])
+        self.assertEqual(props['childReadable'], 0)
+        self.assertEqual(props['childCoverage'], [dict(uid=501, reason='identity', count=1)])
+        self.assertEqual(self.events()[-1]['props']['childCoverage'], props['childCoverage'])
+
+
+    def test_thread_layout_and_missing_parent_commands(self):
+        rows = cpu.parse_ps(line(pid=1, command='/sbin/launchd'))
+        text = 'USER PID TT %CPU STAT PRI STIME UTIME COMMAND\nroot 1 ?? 1.0 R 31T 0:00.1 0:00.2 launchd\n 1 0.0 R+ 31T 0:00.1 0:00.2\n 1 0.0 S 31T 0:00.1 0:00.2\nroot 999 ?? 0.0 R 31T 0:00.1 0:00.2 gone\n'
+        self.assertEqual(cpu.runnable_threads(text, rows), [dict(family='launchd', count=2), dict(family='unknown', count=1)])
+        _, old = cpu.deltas(rows, {}, 100)
+        props, _ = cpu.deltas(rows, old, 160)
+        props.update(load=[40, 10, 10], ncpu=16)
+        snapshot = cpu.spike(props, rows, self.spike_runner(args='999 unrelated\n'))
+        self.assertIsNone(snapshot['top'][0]['cmd'])
+        self.assertIsNone(snapshot['top'][0]['parentCmd'])
+
+    def test_spike_credentials_matrix_at_logger_boundary(self):
+        cases = [
+            ('Cookie header', 'curl -H "Cookie: sid=shortvalue; other=secondvalue"'),
+            ('Set-Cookie header', 'curl -H "Set-Cookie: sid=shortvalue"'),
+            ('cookie argument', 'curl --cookie sid=shortvalue'),
+            ('cookie equals', 'curl --cookie=sid=shortvalue'),
+            ('short cookie', 'curl -b sid=shortvalue'),
+            ('joined cookie', 'curl -bsid=shortvalue'),
+            ('user argument', 'curl -u alice:shortvalue'),
+            ('joined user', 'curl -ualice:shortvalue'),
+            ('bundled user', 'curl -su alice:shortvalue'),
+            ('bundled joined user', 'curl -sualice:shortvalue'),
+            ('many bundled flags', 'curl -fsSLu alice:shortvalue'),
+            ('numeric user bundle', 'curl -4u alice:shortvalue'),
+            ('punctuation user bundle', 'curl -#u alice:shortvalue'),
+            ('quoted user bundle', 'sh -c "curl \'-4u\' alice:shortvalue"'),
+            ('quoted long user', 'sh -c "curl \'--user\' alice:shortvalue"'),
+            ('long user', 'curl --user alice:shortvalue'),
+            ('user equals', 'curl --user=alice:shortvalue'),
+            ('proxy user', 'curl -U alice:shortvalue'),
+            ('joined proxy user', 'curl -Ualice:shortvalue'),
+            ('bundled proxy user', 'curl -sU alice:shortvalue'),
+            ('bundled joined proxy user', 'curl -sUalice:shortvalue'),
+            ('numeric proxy bundle', 'curl -6U alice:shortvalue'),
+            ('punctuation proxy bundle', 'curl -#U alice:shortvalue'),
+            ('quoted proxy bundle', 'sh -c "curl \'-6U\' alice:shortvalue"'),
+            ('long proxy user', 'curl --proxy-user alice:shortvalue'),
+            ('proxy user equals', 'curl --proxy-user=alice:shortvalue'),
+            ('bundled cookie', 'curl -sb sid=shortvalue'),
+            ('bundled joined cookie', 'curl -sbsid=shortvalue'),
+            ('numeric cookie bundle', 'curl -4b sid=shortvalue'),
+            ('punctuation cookie bundle', 'curl -#b sid=shortvalue'),
+            ('quoted cookie bundle', 'sh -c "curl \'-4b\' sid=shortvalue"'),
+            ('Basic header', 'curl -H "Authorization: Basic shortvalue"'),
+            ('Bearer header', 'curl -H "Authorization: Bearer shortvalue"'),
+            ('URL userinfo', 'curl https://alice:shortvalue@example.test/'),
+            ('password flag', 'tool --password=shortvalue'),
+            ('token flag', 'tool --token shortvalue'),
+            ('home in inline code', 'python -c "open(\'/Users/ardud/shortvalue\')"'),
+        ]
+        for form, command in cases:
+            with self.subTest(form=form):
+                props = dict(top=[dict(cmd=command, parentCmd=command)])
+                row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc), props=props)
+                text = json.dumps(row)
+                if form != 'home in inline code':
+                    self.assertNotIn('shortvalue', text)
+                self.assertNotIn('secondvalue', text)
+                self.assertNotIn('/Users/', text)
+        # Python's unbuffered flag must retain the script identity.
+        self.assertEqual(cpu_labels.command_label('python -u work.py'), 'python -u work.py')
+
+    def test_spike_rechecks_child_and_parent_start_in_one_batch(self):
+        rows = cpu.parse_ps(line(pid=1, command='/sbin/launchd')+line(pid=2, command='/bin/git'))
+        rows[1]['ppid'] = 1
+        _, old = cpu.deltas(rows, {}, 100)
+        props, _ = cpu.deltas(rows, old, 160)
+        props.update(load=[40, 10, 10], ncpu=16)
+        for child_start, parent_start in ((START, START), (OTHER, START), (START, OTHER), (OTHER, OTHER)):
+            with self.subTest(child=child_start, parent=parent_start):
+                args = f'1 {parent_start} /sbin/launchd\n2 {child_start} /bin/git diff\n'
+                snapshot = cpu.spike(props, rows, self.spike_runner(args=args))
+                child = next(p for p in snapshot['top'] if p['pid'] == 2)
+                self.assertEqual(child['cmd'], '/bin/git diff' if child_start == START else None)
+                self.assertEqual(child['parentCmd'], '/sbin/launchd' if parent_start == START else None)
+
+    def test_cookie_header_option_separator_and_case_matrix(self):
+        for name in ('Cookie', 'cookie', 'COOKIE', 'Set-Cookie', 'set-cookie', 'SET-COOKIE'):
+            for option in ('-H{h}:sid=tiny', '-H "{h}: sid=tiny"',
+                           '-H"{h}: sid=tiny"', '--header {h}:sid=tiny',
+                           '--header={h}:sid=tiny', '--header="{h}: sid=tiny"'):
+                command = 'curl '+option.format(h=name)+' https://example.test/'
+                with self.subTest(command=command):
+                    row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                                         props=dict(top=[dict(cmd=command, parentCmd=command)]))
+                    self.assertNotIn('tiny', json.dumps(row))
+                    self.assertEqual(row['props']['top'][0]['cmd'], '[redacted]')
+                    self.assertEqual(row['props']['top'][0]['parentCmd'], '[redacted]')
+
+    def test_credential_detection_precedes_opaque_token_redaction(self):
+        for length in (0, 1, 31, 32, 33, 160, 512):
+            for suffix in ('HCookie:sid=tiny', 'u alice:tiny', 'U alice:tiny', 'b sid=tiny'):
+                command = 'curl -'+'v'*length+suffix+' https://example.test/'
+                with self.subTest(length=length, suffix=suffix):
+                    row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                                         props=dict(top=[dict(cmd=command, parentCmd=command)]))
+                    self.assertNotIn('tiny', json.dumps(row))
+
+    def test_otp_forms_at_logger_boundary(self):
+        for value in ('0123', '654321', '12345678'):
+            for marker in ('--otp=', '--otp ', '--otp:', '--OTP=', 'otp=', 'otp: '):
+                for prefix in ('npm publish ', 'npm publish '+'v'*32, 'npm publish '+'x'*200+' '):
+                    command = prefix+marker+value
+                    with self.subTest(value=value, marker=marker, prefix=prefix):
+                        row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                                             props=dict(top=[dict(cmd=command, parentCmd=command)]))
+                        for key in ('cmd', 'parentCmd'):
+                            self.assertEqual(row['props']['top'][0][key], '[redacted]')
+                        self.assertNotIn(value, json.dumps(row['props']))
+
+    def test_payment_number_lengths_and_separators_at_logger_boundary(self):
+        for digits in range(13, 20):
+            number = '4242424242424242424'[:digits]
+            for separator in ('', ' ', '-'):
+                value = separator.join(number[i:i+4] for i in range(0, len(number), 4))
+                for prefix in ('curl --data ', 'curl '+'x'*200+' --data '):
+                    command = prefix+'"card_number='+value+'"'
+                    with self.subTest(digits=digits, separator=separator, prefix=prefix):
+                        row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                                             props=dict(top=[dict(cmd=command, parentCmd=command)]))
+                        for key in ('cmd', 'parentCmd'):
+                            self.assertEqual(row['props']['top'][0][key], '[redacted]')
+                        self.assertNotIn(value, json.dumps(row['props']))
+        # The shared policy's numeric boundaries are 13–19 digits, rather than
+        # every numeric argument in an otherwise useful command.
+        for digits in (12, 20):
+            self.assertIsNone(toollog.SECRET.search('tool --count='+'4'*digits))
+        command = 'python -u report.py --count=654321'
+        row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                             props=dict(top=[dict(cmd=command, parentCmd=command)]))
+        self.assertEqual(row['props']['top'][0]['cmd'], command)
+        self.assertEqual(row['props']['top'][0]['parentCmd'], command)
+
+    def test_shared_secret_guard_checks_original_command_before_helper(self):
+        for command in ('npm publish --otp=654321', 'curl --data card_number=4242424242424242'):
+            with self.subTest(command=command), patch('cpu_labels.janitor_redact', return_value='safe') as helper:
+                self.assertEqual(cpu_labels.command_label(command), '[redacted]')
+                row = toollog.record('cpu', 'event', 'cpu.spike', dt.datetime.now(dt.timezone.utc),
+                                     props=dict(top=[dict(cmd=command, parentCmd=command)]))
+                self.assertEqual(row['props']['top'][0]['cmd'], '[redacted]')
+                self.assertEqual(row['props']['top'][0]['parentCmd'], '[redacted]')
+                helper.assert_not_called()
+
+    def test_churn_preserves_exiting_identities_without_cpu_baselines(self):
+        rows = cpu.parse_ps(line(pid=1)+line(pid=2, cpu_time='0:10'))
+        _, old = cpu.deltas(rows, {}, 100)
+        for state in ('?E', '?', '?s', '?N'):
+            with self.subTest(state=state):
+                rows = cpu.parse_ps(line(pid=1)+line(pid=2, cpu_time='0:00', state=state))
+                props, saved = cpu.deltas(rows, old, old['at']+60)
+                measured = cpu.churn(rows, old, props)
+                self.assertEqual((measured['spawned'], measured['exited']), (0, 0))
+                self.assertNotIn('2', saved['processes'])
+                self.assertEqual(saved['identities']['2'], START)
+                old = saved
+        rows = cpu.parse_ps(line(pid=1))
+        props, saved = cpu.deltas(rows, old, old['at']+60)
+        measured = cpu.churn(rows, old, props)
+        self.assertEqual((measured['spawned'], measured['exited']), (0, 1))
+        self.assertNotIn('2', saved['identities'])
 
     def test_cpu_time_forms(self):
         for value, expected in [('0:01.23', 1.23), ('12:34.56', 754.56),

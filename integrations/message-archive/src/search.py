@@ -6,6 +6,7 @@ Syntax (Gmail-like, works for every source):
   from:me  in:email|imessage|whatsapp|chats  account:gmail  after:2026-01-01  before:2026-10-01
   newer_than:30d  older_than:1y  has:attachment  is:junk  is:deleted
 """
+from contextlib import nullcontext
 import re
 import shlex
 import time
@@ -142,7 +143,7 @@ def chat_sizes(db, rows):
     return {c: n for c, n in chat_counts(db, rows).items() if n <= STUB_MAX}
 
 
-def run(db, q, limit=20, sort="rank", include_junk=False, dedupe=True):
+def run(db, q, limit=20, sort="rank", include_junk=False, dedupe=True, metrics=None):
     fts, where, params, flags = parse(q)
     if not include_junk and not flags["junk"]:
         where.append("items.junk = 0")
@@ -151,20 +152,21 @@ def run(db, q, limit=20, sort="rank", include_junk=False, dedupe=True):
         if own_transaction:
             db.execute("BEGIN")
         try:
-            floor = db.execute("SELECT min(id) FROM items INDEXED BY items_ts WHERE ts >= ?",
-                               (flags["min_ts"],)).fetchone()[0]
+            with metrics.stage("candidate_range") if metrics else nullcontext():
+                floor = db.execute("SELECT min(id) FROM items INDEXED BY items_ts WHERE ts >= ?",
+                                   (flags["min_ts"],)).fetchone()[0]
             if floor is None:
                 return []
             # Every row inside the window has id >= its minimum, including backfills.
             # Keep both reads on one snapshot in case a sync changes an older row's timestamp.
-            return _run(db, fts, where, params, limit, sort, dedupe, floor)
+            return _run(db, fts, where, params, limit, sort, dedupe, floor, metrics)
         finally:
             if own_transaction:
                 db.rollback()
-    return _run(db, fts, where, params, limit, sort, dedupe)
+    return _run(db, fts, where, params, limit, sort, dedupe, metrics=metrics)
 
 
-def _run(db, fts, where, params, limit, sort, dedupe, floor=None):
+def _run(db, fts, where, params, limit, sort, dedupe, floor=None, metrics=None):
     now = int(time.time())
     if fts:
         sql = (f"SELECT items.*, snippet(items_fts, -1, '[', ']', '...', 14) AS snip, "
@@ -188,14 +190,43 @@ def _run(db, fts, where, params, limit, sort, dedupe, floor=None):
         args.append(now)
     sql += " LIMIT ?"
     args.append(limit * 4 if dedupe else limit)
+    if fts and sort == "date" and floor is not None:
+        # Walk the small timestamp index before fetching message bodies. The FTS-first
+        # join reads old bodies and generates snippets for every new top-N contender.
+        candidates = ("SELECT items.id FROM items INDEXED BY items_ts WHERE items.id IN "
+                      "(SELECT rowid FROM items_fts WHERE items_fts MATCH ? AND rowid >= ?)")
+        for w in where:
+            candidates += f" AND ({w})"
+        # FTS visits rowids ascending; preserve that tie order when walking items_ts backwards.
+        candidates += " ORDER BY items.ts DESC, items.id ASC LIMIT ?"
+        # Unary + prevents IN from restarting MATCH (and bm25's phrase statistics)
+        # for each candidate. Scan the bounded posting list once, then test membership.
+        sql = ("WITH candidates AS MATERIALIZED (" + candidates + ") "
+               + f"SELECT items.*, snippet(items_fts, -1, '[', ']', '...', 14) AS snip, "
+               + f"bm25(items_fts, {WEIGHTS}) AS score FROM items_fts JOIN items ON items.id = items_fts.rowid "
+               + "WHERE items_fts MATCH ? AND items_fts.rowid >= ? "
+               + "AND +items_fts.rowid IN (SELECT id FROM candidates) "
+               + "ORDER BY items.ts DESC, items.id ASC")
+        args.extend((fts, floor))
     out, seen = [], set()
-    for r in db.execute(sql, args):
-        key = (r["msgid"] or "").lower() if r["source"] == "email" and r["msgid"] else None
-        if dedupe and key:
-            if key in seen:
-                continue
-            seen.add(key)
-        out.append(r)
+    with metrics.stage("fts_query") if metrics else nullcontext():
+        cur = db.execute(sql, args)
+    while True:
+        with metrics.stage("fetch_filter") if metrics else nullcontext():
+            r = cur.fetchone()
+        if r is None:
+            break
+        if metrics:
+            metrics.rows_matched += 1
+        with metrics.stage("dedupe") if metrics else nullcontext():
+            key = (r["msgid"] or "").lower() if r["source"] == "email" and r["msgid"] else None
+            if dedupe and key:
+                if key in seen:
+                    continue
+                seen.add(key)
+            out.append(r)
         if len(out) >= limit:
             break
+    if metrics:
+        metrics.rows_returned = len(out)
     return out

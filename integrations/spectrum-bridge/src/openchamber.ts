@@ -339,7 +339,7 @@ export interface ChatBackend {
    * without it (OpenChamber) keep follow-ups as their own turns.
    */
   steer?(id: string, directory: string, messageId: string, text: string, guidance?: string, files?: readonly FilePart[], guard?: SteerGuard): Promise<SteerDelivery>;
-  abort(id: string, directory: string): Promise<boolean>;
+  abort(id: string, directory: string, cancelReason?: "user_stop" | "thread_reset"): Promise<boolean>;
   statuses(complete?: boolean): Promise<Record<string, SessionStatus>>;
   /**
    * Whether one session is busy. Optional because `statuses()` already answers it;

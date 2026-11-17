@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
-from toollog import directory, private_dir, safe_fields, finite_number
+from toollog import directory, private_dir, safe_fields, finite_number, memory_command
 from status import report
 
 
@@ -24,6 +24,8 @@ def rollup(day, root=None):
     waits = dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None, busyRuns=0, topBusyComms=[])
     busy_comms = Counter()
     latest_unmount_at = ''
+    spikes = dict(minutes=0, highestLoad=[])
+    u_episodes = {}
     total = oks = failed = outcomes = malformed = 0
     source = root / (day + '.ndjson')
     if source.exists():
@@ -37,6 +39,29 @@ def rollup(day, root=None):
                     names[name] += 1
                     kinds[kind] += 1
                     total += 1
+                    if name == 'cpu.spike':
+                        props = safe_fields(row.get('props', {}), name)
+                        load = props.get('load')
+                        if load:
+                            spikes['minutes'] += 1
+                            # These are names already sanitized on write. Apply
+                            # path/credential guards without mistaking long Apple
+                            # basenames for opaque argv tokens a second time.
+                            raw = row.get('props', {})
+                            families = Counter()
+                            for proc in raw.get('top', [])[:15]:
+                                if isinstance(proc, dict) and finite_number(proc.get('cpuPct')) and proc['cpuPct'] >= 0:
+                                    families[memory_command(proc.get('family'))] += proc['cpuPct']
+                            spawned = [dict(family=memory_command(p.get('family')), count=p['count'])
+                                       for p in raw.get('spawnedFamilies', [])[:8]
+                                       if isinstance(p, dict) and type(p.get('count')) is int and p['count'] >= 0]
+                            minute = dict(ts=row.get('ts'), load1=load[0],
+                                          systemCpuPct=props.get('systemCpuPct'),
+                                          unattributedCpuPct=props.get('unattributedCpuPct'),
+                                          families=[dict(family=f, cpuPct=round(v, 3)) for f, v in families.most_common(3)],
+                                          spawnedFamilies=sorted(spawned, key=lambda p: (-p['count'], p['family']))[:3])
+                            spikes['highestLoad'].append(minute)
+                            spikes['highestLoad'] = sorted(spikes['highestLoad'], key=lambda p: -p['load1'])[:5]
                     if type(row.get('ok')) is bool:
                         outcomes += 1
                         oks += row['ok']
@@ -93,6 +118,14 @@ def rollup(day, root=None):
                         stamp = row.get('ts', '')
                         if props.get('stuckUnmount') and mount and stamp >= latest_unmount_at:
                             waits['latestStuckUnmountMountPoint'], latest_unmount_at = mount, stamp
+                    if name in ('proc.u_sample', 'proc.u_episode') and row.get('ok') is True:
+                        props = safe_fields(row.get('props'), name)
+                        episode = props.get('episode', {}) if name == 'proc.u_sample' else props
+                        if episode:
+                            start = episode['start']
+                            stamp = row.get('ts', '')
+                            if stamp >= u_episodes.get(start, ('', {}))[0]:
+                                u_episodes[start] = (stamp, episode)
                     tag = row.get('error', {}).get('tag')
                     if tag:
                         tags[tag] += 1
@@ -104,7 +137,7 @@ def rollup(day, root=None):
     for name, values in durations.items():
         values.sort()
         stats[name] = {key: values[max(0, math.ceil(len(values) * pct) - 1)] for key, pct in [('p50', .5), ('p95', .95), ('max', 1)]}
-    result = dict(day=day, tool='mac', backup=backup, diskTooling=disk, diskWait=waits, diskInventory=inventory, total=total, countsByName=dict(names), countsByKind=dict(kinds),
+    result = dict(day=day, tool='mac', cpuSpikes=spikes, backup=backup, diskTooling=disk, diskWait=waits, diskInventory=inventory, total=total, countsByName=dict(names), countsByKind=dict(kinds),
                   outcomes=outcomes, okRate=oks / outcomes if outcomes else None,
                   errorRate=kinds['error'] / total if total else None,
                   failedRate=failed / outcomes if outcomes else None, durationMs=stats, malformed=malformed,
@@ -114,6 +147,9 @@ def rollup(day, root=None):
     end = dt.datetime.combine(date + dt.timedelta(days=1), dt.time(), dt.timezone.utc)
     cadence = report(end, root, day=date)
     result.update(jobs=cadence['jobs'], missingJobs=cadence['missingJobs'])
+    result['uEpisodes'] = [dict(start=ep['start'], end=ep['end'], lastSeen=ep['lastSeen'],
+                              peakCount=ep['peakCount'], volumes=ep['volumes'], topComms=ep['topComms'])
+                           for _, (_, ep) in sorted(u_episodes.items())]
     private_dir(root)
     fd, temp = tempfile.mkstemp(prefix='.rollup-', dir=root)
     try:

@@ -2,6 +2,7 @@ import contextlib
 import datetime as dt
 import fcntl
 from email.message import EmailMessage
+import hashlib
 import io
 import json
 import shlex
@@ -17,6 +18,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import order_tracker as tracker
 import order_receipts as receipt
+import delivery_cards
+import order_items
 
 
 class OrderProof(unittest.TestCase):
@@ -131,6 +134,159 @@ class OrderProof(unittest.TestCase):
         again = tracker.transition(dict(result), state, cfg, self.now + 300)
         self.assertEqual([e for e in again if e['kind'] == 'item_dropped'], [])
 
+    def test_noon_item_code_survives_registration_and_matches_native_emoji_name(self):
+        baseline = delivery_cards.items([{'name': 'Chicken Tawook Wrap HP', 'item_code': 'I162175398A',
+                                         'qty': 1, 'price': 48}])
+        cfg = dict(self.cfg, app='noon', merchant='noon', card_meta={'items': baseline})
+        cfg.pop('placed_items')
+        result = {'status': 'preparing', 'items_complete': True,
+                  'items': [{'item_code': 'I162175398A', 'name': 'Chicken Tawook Wrap HP \U0001f4aa',
+                             'qty': 1, 'price': 48}]}
+        state = {'primed': True, 'status': 'preparing'}
+        self.assertEqual(tracker.transition(result, state, cfg, self.now), [])
+        self.assertEqual(state['dropped_items_seen'], [])
+
+    def test_name_only_basket_matches_spacing_punctuation_and_emoji(self):
+        for observed in ('Chicken  Tawook Wrap HP \U0001f4aa', 'Chicken Tawook Wrap HP \u2764\ufe0f',
+                         'Chicken-Tawook Wrap, HP', '\uff23hicken Tawook Wrap HP'):
+            with self.subTest(observed=observed):
+                cfg = dict(self.cfg, placed_items=[{'name': 'Chicken Tawook Wrap HP', 'price': 48}])
+                result = {'status': 'placed', 'items_complete': True, 'items': [{'name': observed, 'price': 48}]}
+                self.assertTrue(order_items.same_item(cfg['placed_items'][0], result['items'][0]))
+                self.assertEqual(tracker.transition(result, {}, cfg, self.now), [])
+
+    def test_real_item_code_drop_keeps_original_message_and_requester(self):
+        cfg = dict(self.cfg, app='noon', merchant='noon', placed_items=[
+            {'name': 'Chicken Tawook Wrap HP', 'item_code': 'wrap', 'price': 48},
+            {'name': 'Fresh mint', 'item_code': 'mint', 'price': 1}])
+        result = {'status': 'placed', 'items_complete': True,
+                  'items': [{'name': 'Chicken Tawook Wrap HP \U0001f4aa', 'item_code': 'wrap', 'price': 48}]}
+        events = tracker.transition(result, {}, cfg, self.now)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['kind'], 'item_dropped')
+        self.assertEqual(events[0]['item'], 'Fresh mint')
+        self.assertEqual(events[0]['chat'], 'moni')
+        self.assertEqual(events[0]['message'], 'noon removed Fresh mint (AED 1.00); want me to get it elsewhere?')
+
+    def test_identifier_forms_match_card_storage_with_an_overlapping_sibling(self):
+        forms = [
+            ('over cap', 'x' * 81), ('padded whitespace', '  item   code  '), ('numeric', 12345),
+            ('exact cap', 'x' * 80), ('space before cap', 'x' * 78 + ' yz'),
+            ('space at cap', 'x' * 79 + ' y'), ('space after cap', 'x' * 80 + ' y'),
+            ('tab at cap', 'x' * 79 + '\t y'), ('nbsp at cap', 'x' * 79 + '\u00a0y'),
+            ('repeated whitespace at cap', 'x' * 79 + '   y'),
+        ]
+        for field in ('item_id', 'item_code', 'sku', 'sku_config'):
+            for label, raw in forms:
+                with self.subTest(field=field, form=label):
+                    original = {'name': 'Wrap', field: raw, 'price': 48}
+                    sibling = {'name': 'Mint', field: 'sibling', 'price': 1}
+                    cfg = dict(self.cfg, placed_items=delivery_cards.items([original, sibling]))
+                    result = {'status': 'placed', 'items_complete': True, 'items': [original, sibling]}
+                    self.assertEqual(tracker.transition(result, {}, cfg, self.now), [])
+                    self.assertEqual(order_items.identity(original), order_items.identity(cfg['placed_items'][0]))
+                    canonical = order_items.match_fields(original)[field]
+                    self.assertEqual(order_items.match_fields({field: canonical})[field], canonical)
+                    cfg['placed_items'] = delivery_cards.items(cfg['placed_items'])
+                    self.assertEqual(tracker.transition(result, {}, cfg, self.now), [])
+
+    def test_matched_item_explicit_removal_or_zero_price_still_fires(self):
+        for change in ({'status': 'removed'}, {'status': 'cancelled'}, {'status': 'canceled'},
+                       {'status': 'unavailable'}, {'price': 0}):
+            with self.subTest(change=change):
+                original = {'name': 'Wrap', 'item_code': 'wrap', 'price': 48}
+                cfg = dict(self.cfg, placed_items=[original])
+                result = {'status': 'placed', 'items': [dict(original, **change)]}
+                events = tracker.transition(result, {}, cfg, self.now)
+                self.assertEqual([e['item'] for e in events], ['Wrap'])
+
+    def test_disjoint_manifest_suppresses_absence_but_not_merchant_drops(self):
+        cfg = dict(self.cfg, app='noon', placed_items=[{'name': 'Wrap', 'item_code': 'wrap', 'price': 48}])
+        result = {'status': 'placed', 'items_complete': True,
+                  'items': [{'name': 'Salad', 'item_code': 'salad', 'price': 20}]}
+        self.assertEqual(tracker.transition(result, {}, cfg, self.now), [])
+        result['dropped_items'] = [{'item_code': 'wrap', 'name': 'Wrap'}]
+        events = tracker.transition(result, {}, cfg, self.now)
+        self.assertEqual([e['item'] for e in events], ['Wrap'])
+
+    def test_legacy_drop_keys_do_not_replay_after_normalization_or_item_code_retention(self):
+        for extra in ({}, {'item_code': 'wrap'}, {'item_code': 'wrap', 'sku': 'old-sku'},
+                      {'item_code': 'wrap', 'sku_config': 'old-config'}, {'item_id': 'old-id'}):
+            for display in ('Chicken Wrap \U0001f4aa', 'Chicken-Wrap', 'Fresh mint'):
+                with self.subTest(extra=extra, display=display):
+                    original = dict(name=display, price=48, **extra)
+                    old_key = str(extra.get('item_id') or extra.get('sku') or extra.get('sku_config')
+                                  or order_items.name(original).casefold())
+                    cfg = dict(self.cfg, placed_items=[original])
+                    state = {'primed': True, 'dropped_items_seen': [old_key]}
+                    result = {'status': 'placed', 'items_complete': True, 'items': []}
+                    self.assertEqual(tracker.transition(result, state, cfg, self.now), [])
+
+    def test_new_drop_key_dedupes_across_restart(self):
+        cfg = dict(self.cfg, placed_items=[{'name': 'Chicken Wrap \U0001f4aa', 'item_code': 'wrap', 'price': 48}])
+        result = {'status': 'placed', 'items_complete': True, 'items': []}
+        state = {}
+        self.assertEqual(len(tracker.transition(result, state, cfg, self.now)), 1)
+        self.assertEqual(state['dropped_items_seen'], ['wrap'])
+        self.assertEqual(tracker.transition(result, json.loads(json.dumps(state)), cfg, self.now + 60), [])
+
+    def test_name_normalization_preserves_scripts_digits_and_emoji_only_fallback(self):
+        for original, observed, matches in (
+            ('\u0634\u0627\u0648\u0631\u0645\u0627 \u062f\u062c\u0627\u062c', '\u0634\u0627\u0648\u0631\u0645\u0627 \u0644\u062d\u0645', False),
+            ('\u0634\u0627\u0648\u0631\u0645\u0627 \u062f\u062c\u0627\u062c', '\u0634\u0627\u0648\u0631\u0645\u0627 \u062f\u062c\u0627\u062c \U0001f4aa', True),
+            ('\u9e21\u8089\u5377 12', '\u9e21\u8089\u5377 \uff11\uff12 \u2764\ufe0f', True),
+            ('Wrap 12', 'Wrap 13', False), ('\U0001f4aa', '\u2764\ufe0f', False),
+            ('Wrap', 'Wrap\U0001f4aa\U0001f3fd\u200d\u2764\ufe0f\ue000\ud800\u02c2', True),
+        ):
+            with self.subTest(original=original, observed=observed):
+                self.assertEqual(order_items.same_item({'name': original}, {'name': observed}), matches)
+
+    def test_identifier_precedence_and_name_fallback(self):
+        fields = ('item_id', 'item_code', 'sku', 'sku_config', 'name')
+        for n, preferred in enumerate(fields):
+            with self.subTest(preferred=preferred):
+                original = {field: 'same' for field in fields[n:]}
+                current = {field: 'different' for field in fields[n:]}
+                current[preferred] = 'same'
+                self.assertEqual(order_items.matched_field(original, current), preferred)
+                self.assertEqual(order_items.identity(original), 'same')
+                current[preferred] = 'mismatch'
+                current['name'] = 'same'
+                if preferred != 'name':
+                    self.assertFalse(order_items.same_item(original, current))
+
+    def test_item_drop_checks_reach_structured_log_once_per_call(self):
+        logroot = self.root / 'logs'
+        cfg = dict(self.cfg, app='noon', placed_items=[{'name': 'Wrap', 'item_code': 'wrap', 'price': 48}])
+        disjoint = {'items_complete': True, 'items': [{'name': 'Salad', 'item_code': 'salad'}]}
+        with patch.dict('os.environ', {'ROBOB_TOOL_LOG_DIR': str(logroot)}):
+            self.assertEqual(order_items.dropped(disjoint, {}, cfg), [])
+            for field in ('item_id', 'item_code', 'sku', 'sku_config', 'name'):
+                original = {field: 'wrap', 'price': 48}
+                order_items.dropped({'items': [original]}, {}, dict(cfg, placed_items=[original]))
+            order_items.dropped({'items_complete': True, 'items': []}, {}, cfg)
+            order_items.dropped({}, {}, dict(cfg, placed_items=[]))
+            order_items.dropped({}, {}, {'app': 'noon'})
+        logs = [json.loads(line) for path in (logroot / 'orders').glob('*.ndjson')
+                for line in path.read_text().splitlines()]
+        self.assertEqual(len(logs), 9)
+        self.assertEqual({row['name'] for row in logs}, {'order_watch.item_drop_check'})
+        first = logs[0]
+        self.assertEqual(first['component'], 'order-watch')
+        self.assertNotEqual(first['ids']['watcher'], cfg['watcher'])
+        self.assertEqual(first['props'], {
+            'app': 'noon', 'baseline_count': 1, 'row_count': 1, 'complete': True,
+            'matched_by': dict.fromkeys(('item_id', 'item_code', 'sku', 'sku_config', 'name'), 0),
+            'absent_count': 1, 'emitted_count': 0, 'suppressed_reason': 'no_overlap'})
+        for row, field in zip(logs[1:6], ('item_id', 'item_code', 'sku', 'sku_config', 'name')):
+            self.assertEqual(row['props']['matched_by'][field], 1)
+            self.assertIsNone(row['props']['suppressed_reason'])
+        self.assertEqual(logs[6]['props']['emitted_count'], 1)
+        self.assertEqual(logs[7]['props']['baseline_count'], 0)
+        self.assertNotIn('ids', logs[8])
+        self.assertNotIn('Wrap', json.dumps(logs))
+        self.assertNotIn('price', json.dumps(logs))
+
     def test_registration_prime_holds_drops_for_first_real_wake(self):
         folder = self.root / 'check'
         folder.mkdir()
@@ -231,10 +387,12 @@ class OrderProof(unittest.TestCase):
         ]
         for label, original, rows, complete, removed in cases:
             with self.subTest(projection=label):
-                cfg = dict(self.cfg, placed_items=[dict(original, price='1.00')])
-                result = {'status': 'placed', 'items': rows, 'items_complete': complete}
+                # A shared line establishes overlap before checking this missing line's namespace.
+                anchor = {'item_id': 'anchor', 'sku': 'anchor', 'name': 'Shared line'}
+                cfg = dict(self.cfg, placed_items=[anchor, dict(original, price='1.00')])
+                result = {'status': 'placed', 'items': rows + [anchor] if rows else rows, 'items_complete': complete}
                 events = tracker.transition(result, {}, cfg, self.now)
-                self.assertEqual(bool(events), removed)
+                self.assertEqual(any(e['item'] != 'Shared line' for e in events), removed)
 
     def test_email_explicit_drops_share_the_common_dedupe(self):
         raw = self.mail(body='ORD-123\nBlack sesame: removed\nFresh mint: AED 0.00')
@@ -265,6 +423,84 @@ class OrderProof(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(tracker.main(['can-report', 'ORD-123']), 0)
             self.assertEqual(tracker.main(['can-report', 'missing']), 1)
+
+    def assert_logged_can_report(self, argv, refusal):
+        expected = (receipt.can_report(argv[1]) if len(argv) == 2 else
+                    {'ok': False, 'error': 'usage: order-watch can-report ORDER_ID'})
+        folder = self.root / 'logs'
+        def rows():
+            return [json.loads(line) for path in (folder / 'orders').glob('*.ndjson')
+                    for line in path.read_text().splitlines()]
+        before = len(rows())
+        output = io.StringIO()
+        with patch.dict('os.environ', {'ROBOB_TOOL_LOG_DIR': str(folder), 'TOOLLOG_ROOT': str(folder)}), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(tracker.main(argv), 0 if expected['ok'] else 1)
+        self.assertEqual(output.getvalue(), json.dumps(expected) + '\n')
+        row, = rows()[before:]
+        self.assertEqual(row['name'], 'order_watch.can_report')
+        self.assertEqual(row['component'], 'order-watch')
+        self.assertEqual(row['kind'], 'event')
+        self.assertEqual(row['ok'], expected['ok'])
+        self.assertEqual(row['props'], {
+            'outcome': 'success' if expected['ok'] else 'refused', 'refusal': refusal,
+            'untrackable': bool(expected.get('untrackable')),
+            'eta_given': expected.get('eta') not in (None, 'no ETA given')})
+        identity = expected.get('tracker')
+        self.assertEqual(row.get('ids', {}), {'watcher': hashlib.sha256(identity.encode()).hexdigest()[:16]}
+                         if identity else {})
+        self.assertEqual(set(row) - {'ids'}, {'ts', 'tool', 'component', 'kind', 'name', 'ok', 'props'})
+        return row
+
+    def test_can_report_logs_each_refusal_once_without_changing_output(self):
+        cases = [
+            ('unregistered', ['can-report', 'missing'], [], None, 'not_registered'),
+            ('ambiguous', ['can-report', 'ORD-123'], [self.cfg, self.cfg], None, 'not_registered'),
+            ('invalid-id', ['can-report', 'private@example.test'], [], None, 'invalid_id'),
+            ('invalid-registration', ['can-report', 'ORD-123'], [dict(self.cfg, watcher='../private')],
+             None, 'invalid_registration'),
+            ('not-running', ['can-report', 'ORD-123'], [self.cfg], None, 'not_running_or_held'),
+            ('held', ['can-report', 'ORD-123'], [dict(self.cfg, delivery_card={'held': True})],
+             {'id': self.cfg['watcher'], 'check': 'check command'}, 'not_running_or_held'),
+            ('missing-id', ['can-report'], [], None, 'usage'),
+            ('extra-id', ['can-report', 'ORD-123', 'extra'], [], None, 'usage'),
+        ]
+        for label, argv, configs, definition, refusal in cases:
+            with self.subTest(label=label), patch.object(tracker, 'ROOT', self.root / label), \
+                    patch.object(tracker, 'WATCHERS', self.root / label / 'watchers'):
+                for index, cfg in enumerate(configs):
+                    tracker.write(tracker.ROOT / 'orders' / (str(index) + '.json'), cfg)
+                if definition:
+                    tracker.write(tracker.WATCHERS / self.cfg['watcher'] / 'watcher.json', definition)
+                self.assert_logged_can_report(argv, refusal)
+
+    def test_can_report_logs_success_eta_and_untrackable_without_private_text(self):
+        tracker.write(tracker.WATCHERS / self.cfg['watcher'] / 'watcher.json',
+                      {'id': self.cfg['watcher'], 'check': 'check command'})
+        for untrackable in (False, True):
+            for eta in (None, 'no ETA given', '14–15 November, leave at Apartment 987 Example Street'):
+                with self.subTest(untrackable=untrackable, eta=eta):
+                    tracker.write(tracker.ROOT / 'orders' / (self.cfg['watcher'] + '.json'),
+                                  dict(self.cfg, untrackable=untrackable, eta=eta))
+                    row = self.assert_logged_can_report(['can-report', 'ORD-123'], 'none')
+                    self.assertNotIn('ORD-123', json.dumps(row))
+                    if eta:
+                        self.assertNotIn(eta, json.dumps(row))
+
+    def test_can_report_survives_emit_and_disk_write_failures(self):
+        folder = self.root / 'logs'
+        tracker.write(tracker.ROOT / 'orders' / (self.cfg['watcher'] + '.json'),
+                      dict(self.cfg, untrackable=True))
+        for order in ('ORD-123', 'missing'):
+            expected = receipt.can_report(order)
+            for target in ('emit', 'os.open'):
+                with self.subTest(order=order, target=target), \
+                        patch.dict('os.environ', {'ROBOB_TOOL_LOG_DIR': str(folder), 'TOOLLOG_ROOT': str(folder)}), \
+                        patch('toollog.' + target, side_effect=OSError('disk full')), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(tracker.main(['can-report', order]), 0 if expected['ok'] else 1)
+                self.assertEqual(output.getvalue(), json.dumps(expected) + '\n')
+        self.assertFalse(list(folder.glob('orders/*.ndjson')))
 
     def test_untrackable_registration_never_polls_until_manual_delivery(self):
         argv = ['add', '--merchant', 'Acme', '--order-id', 'ORD-123', '--untrackable',

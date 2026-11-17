@@ -382,10 +382,11 @@ class BaseRouting(unittest.TestCase):
                             ):
                                 stack.enter_context(mocked)
                             code = cli.main(['run', '--base', 'warm', *flags, '--', 'true'])
-                        self.assertEqual(code, 93, err.getvalue())
-                        self.assertIn("saved base 'torssh:warm'", err.getvalue())
-                        self.assertLessEqual(clock[0] - 1000, 60 + pool.LOCK_WAIT_S)
-                        self.assertGreaterEqual(health_probe.call_count, 2)
+                        expired = int(queue_wait) < 60
+                        self.assertEqual(code, 92 if expired else 93, err.getvalue())
+                        self.assertIn('queue timed out' if expired else "saved base 'torssh:warm'", err.getvalue())
+                        self.assertLessEqual(clock[0] - 1000, int(queue_wait) if expired else 60 + pool.LOCK_WAIT_S)
+                        self.assertGreaterEqual(health_probe.call_count, 1 if expired else 2)
                         remote.assert_called_once()
                         local.assert_not_called()
                         execute.assert_not_called()
