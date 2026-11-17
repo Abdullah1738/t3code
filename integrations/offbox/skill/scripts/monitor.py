@@ -153,6 +153,10 @@ def maintenance(con, now, pool, pending):
 
 
 def tick(con, dry_run=False):
+    if not dry_run:
+        import toollog
+        toollog.rollup_previous()
+        toollog.rollup_today()
     now = time.time()
     sample = pressure(get(con, "pressure", {}), now)
     groups, cpu, total = sample_processes(get(con, "cpu", {}), now)
@@ -171,8 +175,6 @@ def tick(con, dry_run=False):
 
 
 def main():
-    import toollog
-    toollog.rollup_previous()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", nargs="?", choices=["loop"])
     parser.add_argument("--once", action="store_true")

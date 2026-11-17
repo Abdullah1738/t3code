@@ -853,6 +853,7 @@ def tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac_
     import toollog
     if configured_url(Path(sdir) if sdir is not None else state_dir()) is not None:
         toollog.rollup_previous()
+        toollog.rollup_today()
     return _tick(sdir, dry_run, clock, check, mac, effects, tcp, retry)
 
 

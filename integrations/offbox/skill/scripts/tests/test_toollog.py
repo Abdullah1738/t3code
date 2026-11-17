@@ -196,6 +196,99 @@ class Logs(unittest.TestCase):
             self.assertEqual(roll.call_count,1)
             self.assertEqual(roll.call_args.args,('2026-11-12',))
 
+    def clock(self, value):
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return value
+        return patch.object(toollog, 'datetime', Clock)
+
+    def test_rollup_marks_completed_days_only_after_midnight_grace(self):
+        cases = [('2026-11-12', 0, 2, False), ('2026-11-12', 0, 5, True),
+                 ('2026-11-12', 0, 10, True), ('2026-11-13', 0, 10, False),
+                 ('2026-11-14', 12, 0, False), ('2026-11-12', 20, 0, True)]
+        for day, hour, minute, complete in cases:
+            with self.subTest(day=day, hour=hour, minute=minute):
+                now = datetime(2026, 11, 13, hour, minute, tzinfo=timezone.utc)
+                with self.clock(now):
+                    result = toollog.rollup(day)
+                self.assertIs(result['complete'], complete)
+                self.assertEqual(result['generatedAt'], now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+                self.assertEqual(json.loads((self.root / ('rollup-' + day + '.json')).read_text()), result)
+
+    def test_previous_repairs_partial_old_and_corrupt_rollups_once(self):
+        values = ['missing', '{broken', 'null', '[]', '{}', '{"complete": false}', '{"complete": 1}']
+        self.root.mkdir()
+        path = self.root / 'rollup-2026-11-12.json'
+        row = dict(tool='offbox', name='gate.decision', kind='perf', ok=True, props={'sample': 20})
+        (self.root / '2026-11-12.ndjson').write_text(json.dumps(row) + '\n')
+        for value in values:
+            with self.subTest(value=value), self.clock(datetime(2026, 11, 13, 0, 10, tzinfo=timezone.utc)):
+                path.unlink(missing_ok=True)
+                if value != 'missing':
+                    path.write_text(value)
+                toollog.rollup_previous()
+                result = json.loads(path.read_text())
+                self.assertIs(result['complete'], True)
+                self.assertEqual(result['total'], 20)
+                self.assertTrue(result['sampled'])
+                before = (path.stat().st_mtime_ns, path.read_bytes())
+                with patch.object(toollog, 'rollup', wraps=toollog.rollup) as roll:
+                    toollog.rollup_previous()
+                    roll.assert_not_called()
+                self.assertEqual((path.stat().st_mtime_ns, path.read_bytes()), before)
+
+    def test_today_refreshes_missing_then_only_when_an_hour_old(self):
+        now = datetime(2026, 11, 13, 20, 0, tzinfo=timezone.utc)
+        path = self.root / 'rollup-2026-11-13.json'
+        with self.clock(now), patch.object(toollog, 'rollup', wraps=toollog.rollup) as roll:
+            toollog.rollup_today()
+            self.assertEqual(roll.call_count, 1)
+            self.assertIs(json.loads(path.read_text())['complete'], False)
+            os.utime(path, (now.timestamp() - 3599,) * 2)
+            before = (path.stat().st_mtime_ns, path.read_bytes())
+            toollog.rollup_today()
+            self.assertEqual(roll.call_count, 1)
+            self.assertEqual((path.stat().st_mtime_ns, path.read_bytes()), before)
+            os.utime(path, (now.timestamp() - 3600,) * 2)
+            toollog.rollup_today()
+            self.assertEqual(roll.call_count, 2)
+            os.utime(path, (now.timestamp() - 60,) * 2)
+            toollog.rollup_today(max_age_s=60)
+            self.assertEqual(roll.call_count, 3)
+
+    def test_recurring_rollups_fail_open(self):
+        with patch.object(toollog, 'directory', side_effect=OSError('unreadable')):
+            toollog.rollup_previous()
+            toollog.rollup_today()
+        with patch.object(toollog, 'rollup', side_effect=OSError('unwritable')):
+            with self.clock(datetime(2026, 11, 13, 20, tzinfo=timezone.utc)):
+                toollog.rollup_previous()
+                toollog.rollup_today()
+
+    def test_mac_monitor_refreshes_rollups_on_ticks_and_dry_run_leaves_them_untouched(self):
+        import monitor
+        con = monitor.connect(':memory:')
+        self.addCleanup(con.close)
+        now = datetime(2026, 11, 13, 20, tzinfo=timezone.utc)
+        pressure = dict(active=False, load1=0, swap_gb=0, free_pct=90)
+        with self.clock(now), contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(monitor, 'pressure', return_value=pressure))
+            stack.enter_context(patch.object(monitor, 'sample_processes', return_value=({}, {}, 0)))
+            stack.enter_context(patch.object(monitor, 'log'))
+            monitor.tick(con, dry_run=True)
+            self.assertFalse(self.root.exists())
+            monitor.tick(con)
+            previous = self.root / 'rollup-2026-11-12.json'
+            today = self.root / 'rollup-2026-11-13.json'
+            self.assertIs(json.loads(previous.read_text())['complete'], True)
+            self.assertIs(json.loads(today.read_text())['complete'], False)
+            row = dict(tool='offbox', name='gate.decision', kind='perf', props={'sample': 20})
+            (self.root / '2026-11-13.ndjson').write_text(json.dumps(row) + '\n')
+            os.utime(today, (now.timestamp() - 3600,) * 2)
+            monitor.tick(con)
+            self.assertEqual(json.loads(today.read_text())['total'], 20)
+
 
 class Instrumentation(Isolated):
     # Exercise the logging wrappers; the failover test stubs _probe and traps execve.
