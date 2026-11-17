@@ -1530,8 +1530,14 @@ def _settled(r, echo=False, pos=0, *, locked=False, until=None, show_failure=Fal
     from . import pulls
     from .runs import killed_result, complete_killed
     killed = killed_result(r['run_id'], wait=r['exit_code'] in (None, 137, 143), until=until, row=r)
-    if killed is None and json.loads(dict(r).get('pulls') or '[]') and r['exit_code'] is not None and (r['status'] in ('done', 'failed', 'interrupted', 'killed')
-                                     or dict(r).get('pull_state') in ('pending', 'running')):
+    lost = False
+    if r['status'] == 'lost' and r['exit_code'] is None:
+        with contextlib.closing(db()) as con:
+            lost = con.execute("SELECT 1 FROM kv WHERE k=? AND v!='fenced'",
+                               (f"lost_confirmed:{r['run_id']}",)).fetchone() is not None
+    if killed is None and json.loads(dict(r).get('pulls') or '[]') and (lost or (
+            r['exit_code'] is not None and (r['status'] in ('done', 'failed', 'interrupted', 'killed')
+                                           or dict(r).get('pull_state') in ('pending', 'running')))):
         pulls.wait(r['run_id'], until=until)
         with contextlib.closing(db()) as con:
             current = con.execute('SELECT * FROM runs WHERE run_id=?', (r['run_id'],)).fetchone()

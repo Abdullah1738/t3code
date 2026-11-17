@@ -169,6 +169,145 @@ class PullSafetyTests(Isolated):
                     retained = self.con.execute("SELECT 1 FROM pool_cap_callers WHERE token='pull-cap'").fetchone()
                     self.assertEqual(bool(retained), reserved)
 
+    def test_confirmed_lost_reaper_wait_refresh_releases_checkout_after_pull(self):
+        from offbox_lib import box_disk, run_evidence
+        self.write_file('f.txt', 'base')
+        self.baseline()
+        self.write_file('f.txt', 'last remote content', remote=True)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(lease, 'touch'))
+            stack.enter_context(patch.object(lease, 'idle_ttl'))
+            stack.enter_context(patch.object(runs, 'settle_docker'))
+            stack.enter_context(patch.object(runs, 'recorded_exit', return_value=None))
+            stack.enter_context(patch.object(runs, 'remote_alive', return_value='gone'))
+            stack.enter_context(patch.object(api, 'get', return_value={'state': 'running'}))
+            stack.enter_context(patch.object(api, 'cmd_status', return_value={
+                'running': False, 'status': 'lost', 'exitCode': None}))
+            stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('network forbidden')))
+            stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
+            stack.enter_context(patch.object(misc, '_catch_up_finished', return_value='complete'))
+            stack.enter_context(patch.object(runs, 'recover_lost_exit', return_value=(None, 'no receipt')))
+            stack.enter_context(patch.object(run_evidence, 'report'))
+            stack.enter_context(patch.object(ssh_sync, 'pull', side_effect=self.sync))
+            reap._check_unlocked(self.con, 'bx_pull', 'running', False, [])
+            self.assertEqual(self.con.execute("SELECT v FROM kv WHERE k='lost_confirmed:run-pull'").fetchone()[0], '1')
+            self.assertEqual(misc.wait('run-pull', 2), 90)
+            reap._check_unlocked(self.con, 'bx_pull', 'running', False, [])
+            pool._refresh_background(self.con, 'repo')
+            self.assertEqual(len(self.calls), 1)
+            self.assertEqual((self.root / 'f.txt').read_text(), 'last remote content')
+            self.assertEqual((self.row()['status'], self.row()['exit_code'], self.row()['pull_state']),
+                             ('lost', None, 'done'))
+            self.assertEqual(lease.active_runs(self.con, 'bx_pull'), 0)
+            stack.enter_context(patch.dict(os.environ, {'OFFBOX_POOL_SIZE': '1'}))
+            stack.enter_context(patch.object(lease, '_reuse', side_effect=lambda c, r, s, **kw: dict(r)))
+            stack.enter_context(patch.object(box_disk, 'picker_ok', return_value=True))
+            selected = pool.acquire(self.me)
+            try:
+                self.assertEqual(selected['box_id'], 'bx_pull')
+            finally:
+                pool.release_guard(selected)
+        self.assertEqual(len(self.events('pull_start')), 1)
+        self.assertIn('pulls: done (1 files, 0 conflicts)', self.output.getvalue())
+        self.assertIn('exit=None', self.output.getvalue())
+        self.assertIn('exit unknown', self.output.getvalue())
+
+    def test_confirmed_lost_pending_pulls_settle_at_each_entry(self):
+        from offbox_lib import run_evidence
+        for entry in ('wait', 'reap', 'refresh', 'reconcile'):
+            for proof in ('1', 'box'):
+                with self.subTest(entry=entry, proof=proof), contextlib.ExitStack() as stack:
+                    self.write_file('f.txt', 'base')
+                    self.baseline()
+                    self.write_file('f.txt', 'last remote content', remote=True)
+                    self.con.execute("UPDATE runs SET status='lost',exit_code=NULL,pull_state='pending'")
+                    self.con.execute("INSERT OR REPLACE INTO kv(k,v) VALUES ('lost_confirmed:run-pull',?)", (proof,))
+                    self.con.commit()
+                    (common.LOGS_DIR / 'run-pull.pulls.jsonl').unlink(missing_ok=True)
+                    self.con.execute("DELETE FROM events WHERE kind LIKE 'pull_%'")
+                    self.con.commit()
+                    self.calls.clear()
+                    stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('network forbidden')))
+                    stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
+                    stack.enter_context(patch.object(misc, '_catch_up_finished', return_value='complete'))
+                    stack.enter_context(patch.object(run_evidence, 'report'))
+                    stack.enter_context(patch.object(ssh_sync, 'pull', side_effect=self.sync))
+                    if entry == 'wait':
+                        self.assertEqual(misc._settled(self.row(), until=common.now()+2), 90)
+                    elif entry == 'reap':
+                        reap._check_unlocked(self.con, 'bx_pull', 'running', False, [])
+                    elif entry == 'refresh':
+                        pool._refresh_background(self.con, 'repo')
+                    else:
+                        runs.reconcile_lost(self.con, 'bx_pull', state='running', until=common.now()+2)
+                    self.assertEqual(len(self.calls), 1)
+                    self.assertEqual((self.row()['status'], self.row()['exit_code'], self.row()['pull_state']),
+                                     ('lost', None, 'done'))
+                    self.assertEqual(lease.active_runs(self.con, 'bx_pull'), 0)
+                    owner = json.loads(self.row()['pull_owner'])
+                    self.assertEqual(owner['role'], {'refresh': 'refresh', 'reap': 'reap'}.get(entry, 'wait'))
+
+    def test_confirmed_lost_live_pull_stays_reserved_and_wait_respects_timeout(self):
+        from offbox_lib import run_evidence
+        self.baseline()
+        owner = json.dumps({'pid': os.getpid(), 'role': 'refresh', 'claim': 'live-lost-pull'})
+        self.con.execute("UPDATE runs SET status='lost',exit_code=NULL,pull_state='running',pull_owner=?", (owner,))
+        self.con.execute("INSERT INTO kv(k,v) VALUES ('lost_confirmed:run-pull','1')")
+        self.con.commit()
+        with contextlib.ExitStack() as stack:
+            transfer = stack.enter_context(patch.object(ssh_sync, 'pull', side_effect=AssertionError('duplicate pull')))
+            stack.enter_context(patch.object(misc, '_catch_up_finished'))
+            stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
+            stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('network forbidden')))
+            stack.enter_context(patch.object(run_evidence, 'report'))
+            pool._refresh_background(self.con, 'repo')
+            reap._check_unlocked(self.con, 'bx_pull', 'running', False, [])
+            self.assertEqual(lease.active_runs(self.con, 'bx_pull'), 1)
+            with self.assertRaises(common.OffboxError) as error:
+                misc._settled(self.row(), until=common.now()+.02)
+            self.assertEqual(error.exception.code, 124)
+            self.assertEqual(self.row()['pull_owner'], owner)
+            transfer.assert_not_called()
+
+    def test_confirmed_lost_failed_pull_releases_reservation_with_unknown_exit(self):
+        from offbox_lib import run_evidence
+        self.baseline()
+        self.con.execute("UPDATE runs SET status='lost',exit_code=NULL")
+        self.con.execute("INSERT INTO kv(k,v) VALUES ('lost_confirmed:run-pull','box')")
+        self.con.commit()
+        with contextlib.ExitStack() as stack:
+            transfer = stack.enter_context(patch.object(ssh_sync, 'pull', side_effect=common.OffboxError('box unavailable')))
+            stack.enter_context(patch.object(misc, '_catch_up_log', return_value='complete'))
+            stack.enter_context(patch.object(run_evidence, 'report'))
+            self.assertEqual(misc._settled(self.row(), until=common.now()+2), 90)
+            self.assertEqual(misc._settled(self.row(), until=common.now()+2), 90)
+            transfer.assert_called_once()
+        self.assertEqual((self.row()['status'], self.row()['exit_code'], self.row()['pull_state']),
+                         ('lost', None, 'failed'))
+        self.assertEqual(lease.active_runs(self.con, 'bx_pull'), 0)
+        self.assertEqual(self.events('pull_end')[-1]['outcome'], 'failed')
+        self.assertIn('box unavailable', self.output.getvalue())
+
+    def test_lost_reconciliation_skips_unconfirmed_fenced_and_affinity_pulls(self):
+        for proof in (None, 'fenced', '1'):
+            with self.subTest(proof=proof), contextlib.ExitStack() as stack:
+                self.baseline()
+                self.con.execute("UPDATE runs SET status='lost',exit_code=NULL,pull_state='pending'")
+                self.con.execute("DELETE FROM kv WHERE k='lost_confirmed:run-pull'")
+                if proof:
+                    self.con.execute("INSERT INTO kv(k,v) VALUES ('lost_confirmed:run-pull',?)", (proof,))
+                self.con.commit()
+                transfer = stack.enter_context(patch.object(ssh_sync, 'pull', side_effect=AssertionError('unsafe pull')))
+                stack.enter_context(patch.object(runs, 'confirmed_lost', return_value=None))
+                stack.enter_context(patch.object(misc, '_catch_up_finished'))
+                if proof == '1':
+                    pool._refresh_background(self.con, 'repo', pull_artifacts=False)
+                else:
+                    runs.reconcile_lost(self.con, 'bx_pull', state='running', foreign=True, role='refresh')
+                transfer.assert_not_called()
+                self.assertEqual(self.row()['pull_state'], 'pending')
+                self.assertEqual(lease.active_runs(self.con, 'bx_pull'), 0 if proof == 'fenced' else 1)
+
     def test_publish_or_conflict_for_all_local_states(self):
         cases = [('base', None, 'remote', 'written'), ('base', 'edit', 'remote', 'conflict'),
                  (None, None, 'remote', 'written'), (None, 'created', 'remote', 'conflict'),

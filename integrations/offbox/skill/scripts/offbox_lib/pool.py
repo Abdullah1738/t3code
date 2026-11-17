@@ -1581,7 +1581,7 @@ def _refresh_background(con, key, pull_artifacts=True):
                         continue
                     runs.finish(row['run_id'], row['exit_code'], row['status'], run=row)
                     continue
-                runs.reconcile_lost(con, row['box_id'], foreign=True, role='refresh')
+                runs.reconcile_lost(con, row['box_id'], foreign=True, role='refresh', pull_artifacts=pull_artifacts)
                 row = runs.restore_run_state(con.execute('SELECT * FROM runs WHERE run_id=?', (row['run_id'],)).fetchone())
                 if row['status'] not in ('starting','running') and not (
                         row['status'] == 'infra' and start_check.recovery_marked(con, row)):

@@ -614,7 +614,7 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 killed = killed_result(run['run_id'], wait=True, row=run, known_code=code) if code in (None, 137, 143) else None
                 if killed is not None and killed['process_id']:
                     status, code = 'killed', killed['exit_code']
-                if status in ('done','failed','interrupted','killed') and run['pulls']:
+                if status in ('done','failed','interrupted','killed','lost') and run['pulls']:
                     from .runs import settle_pulls
                     if not settle_pulls(run['run_id'], 'reap', foreign=True):
                         continue

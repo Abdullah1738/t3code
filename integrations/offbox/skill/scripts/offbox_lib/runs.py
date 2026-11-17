@@ -1248,11 +1248,32 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
 
 
 def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = None,
-                   until: float | None = None, *, foreign: bool = False, role: str = 'wait') -> None:
+                   until: float | None = None, *, foreign: bool = False, role: str = 'wait',
+                   pull_artifacts: bool = True) -> None:
     """Under box-<id>: repair old lost rows before following or handing their box to another run."""
-    rows = con.execute("SELECT * FROM runs WHERE box_id=? AND status='lost' AND exit_code IS NULL "
-                       "AND NOT EXISTS (SELECT 1 FROM kv WHERE k='lost_confirmed:' || runs.run_id)",
+    def settle_artifacts(row):
+        if not json.loads(row['pulls'] or '[]'):
+            return True
+        if not pull_artifacts:
+            return False
+        if foreign:
+            return settle_pulls(row['run_id'], role, until=until, foreign=True)
+        from .pulls import wait
+        wait(row['run_id'], role, until=until)
+        return True
+
+    rows = con.execute("SELECT * FROM runs WHERE box_id=? AND status='lost' AND exit_code IS NULL",
                        (box_id,)).fetchall()
+    unconfirmed = []
+    for row in rows:
+        proof = con.execute('SELECT v FROM kv WHERE k=?', (f"lost_confirmed:{row['run_id']}",)).fetchone()
+        if proof:
+            # Death without an exit receipt still leaves artifacts to collect; a fenced start never ran.
+            if proof['v'] != 'fenced':
+                settle_artifacts(row)
+        else:
+            unconfirmed.append(row)
+    rows = unconfirmed
     if not rows:
         return
     deadline = now() + timeout
@@ -1273,6 +1294,8 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
         con.executemany('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)',
                         [(f"lost_confirmed:{r['run_id']}", '1') for r in rows])
         con.commit()
+        for row in rows:
+            settle_artifacts(row)
         return
     if state not in api.LIVE_STATES:
         return
@@ -1283,6 +1306,8 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
             st = None
         if st and st['status'] == 'lost':
             con.execute('INSERT OR IGNORE INTO kv(k,v) VALUES (?,?)', (f"lost_confirmed:{row['run_id']}", '1'))
+            con.commit()
+            settle_artifacts(row)
         else:
             code = st['exitCode'] if st else None
             status = ('done' if code == 0 else 'failed') if st else 'running'
@@ -1296,13 +1321,8 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
                 if wedged:
                     say(wedged_message(box_id, *wedged))
                     continue
-            if st and row['pulls']:
-                if foreign:
-                    if not settle_pulls(row['run_id'], role, until=until, foreign=True):
-                        continue
-                else:
-                    from .pulls import wait
-                    wait(row['run_id'], role, until=until)
+            if st and not settle_artifacts(row):
+                continue
             if until is not None and now() >= until:
                 raise OffboxError(f"lost reconciliation timed out on {box_id}", code=EXIT_WAIT_TIMEOUT, started=True)
             if st:
