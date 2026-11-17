@@ -109,7 +109,9 @@ macOS has no `timeout(1)`, and agents write `timeout 40 cmd` out of Linux habit.
 durations take `s`/`m`/`h`/`d`, and it exits 124 on timeout, 137 when KILL was
 needed, 125/126/127 for its own, can't-run and not-found errors. The command
 runs in its own process group so the signal also reaches its children; TERM,
-INT, HUP and QUIT sent to timeout are passed on. Tests:
+INT, HUP and QUIT sent to timeout are passed on. When timeout owns the terminal
+it hands it to that group (so the command can read it) and takes it back after;
+Ctrl-Z stops both. Tests:
 `/usr/bin/python3 -B -m unittest discover -s tests -p test_timeout.py`.
 
 ## Quint

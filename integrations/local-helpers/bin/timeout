@@ -8,7 +8,7 @@ use strict;
 use warnings;
 use Config;
 use Getopt::Long qw(GetOptionsFromArray);
-use POSIX qw(:sys_wait_h setpgid _exit);
+use POSIX qw(:sys_wait_h setpgid getpgrp tcgetpgrp tcsetpgrp _exit);
 use Time::HiRes ();
 
 sub fail { print STDERR "timeout: $_[0]\n"; exit 125 }
@@ -62,9 +62,24 @@ my @cmd = @ARGV;
 # Without --foreground the command gets its own process group and the signal goes to the whole group,
 # so a grandchild holding the caller's pipe dies too (GNU does the same).
 my $group = !$opt{foreground};
-my $pid = fork // fail("fork failed: $!");
+# A background group that reads the terminal gets SIGTTIN, so when timeout owns the terminal it hands it to
+# the command's group (from both sides, like a shell, since either may run first) and takes it back after.
+my $tty;
+if ($group && open(my $fh, '+<', '/dev/tty')) {
+  my $fg = tcgetpgrp(fileno $fh);
+  $tty = $fh if defined $fg && $fg == getpgrp();
+}
+sub tty_to {
+  return unless $tty;
+  local $SIG{TTOU} = 'IGNORE';  # tcsetpgrp from a background group raises SIGTTOU
+  tcsetpgrp(fileno $tty, $_[0]);
+}
+# Only take the terminal back from the command's group, never from a shell that has since claimed it.
+my $pid;
+sub tty_back { tty_to(getpgrp()) if $tty && (tcgetpgrp(fileno $tty) // -1) == $pid }
+$pid = fork // fail("fork failed: $!");
 if ($pid == 0) {
-  setpgid(0, 0) if $group;
+  if ($group) { setpgid(0, 0); tty_to($$) }
   $SIG{$_} = 'DEFAULT' for qw(ALRM TERM INT HUP QUIT);
   { no warnings 'exec'; exec { $cmd[0] } @cmd; }
   my $err = $!;
@@ -72,7 +87,9 @@ if ($pid == 0) {
   _exit($!{ENOENT} ? 127 : 126);
 }
 # Also from this side: the alarm may fire before the child has run its own setpgid.
-setpgid($pid, $pid) if $group;
+if ($group) { setpgid($pid, $pid); tty_to($pid) }
+# timeout itself never reads the terminal; don't let a -v message stop it when it is in the background.
+$SIG{TTOU} = 'IGNORE';
 
 my ($timed_out, $killing) = (0, 0);
 sub send_sig {
@@ -96,10 +113,20 @@ for my $s (qw(TERM INT HUP QUIT)) {
 $SIG{ALRM} = sub { $timed_out = 1; send_sig($sig); arm_kill() };
 Time::HiRes::alarm($limit) if $limit > 0;
 
-my $got;
-do { $got = waitpid($pid, 0) } until $got == $pid || ($got == -1 && !$!{EINTR});
+my ($got, $status);
+while (1) {
+  $got = waitpid($pid, $tty ? WUNTRACED : 0);
+  $status = ${^CHILD_ERROR_NATIVE};  # $? reads 0 for a stopped child
+  last unless $got == $pid && WIFSTOPPED($status);
+  # Ctrl-Z stopped the command: take the terminal back and stop too, so the shell sees the job stop.
+  # On resume, hand the terminal over again only if the shell put us in the foreground (fg, not bg).
+  tty_back();
+  kill 'STOP', $$;
+  tty_to($pid) if (tcgetpgrp(fileno $tty) // -1) == getpgrp();
+  kill 'CONT', -$pid;
+}
 fail("waitpid failed: $!") if $got != $pid;
-my $status = $?;
+tty_back();
 Time::HiRes::alarm(0);
 $SIG{$_} = 'DEFAULT' for qw(ALRM TERM INT HUP QUIT);
 
