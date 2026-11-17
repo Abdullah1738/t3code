@@ -1285,6 +1285,27 @@ it("reports a refused verdict separately from no verdict and ordinary flags", ()
   });
 });
 
+describe("pool change activity", () => {
+  it("shows only changes in the window, with exact time, slots and actor", () => {
+    const change = {
+      at: t("12:00"),
+      poolKey: "codex/sol#xhigh",
+      fromSlots: 2,
+      toSlots: 1,
+      op: "set",
+      actorKind: "evaluator",
+      actorId: "thread-1",
+    } as const;
+    const read = { ...input, poolChanges: [change, { ...change, at: window.until }] };
+    expect(Activity.rollup(read).poolChanges.items).toEqual([change]);
+    expect(
+      Activity.rollup({ ...read, window: { since: t("13:00"), until: window.until } }).poolChanges
+        .items,
+    ).toEqual([]);
+    expect(Activity.rollup(input).poolChanges.items).toEqual([]);
+  });
+});
+
 describe("ledger pool activity", () => {
   const pool = Rules.poolKey(opus);
   const hourly = { since: t("00:00"), until: t("03:00") };

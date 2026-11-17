@@ -22,6 +22,7 @@ import {
   type KanbanCardEvent,
   type KanbanOwnerAsk,
   type KanbanPool,
+  type KanbanPoolChange,
   type KanbanStage,
   type KanbanThreadLink,
 } from "@t3tools/contracts";
@@ -451,6 +452,7 @@ export interface RollupInput {
   readonly events: ReadonlyArray<KanbanCardEvent>;
   readonly threads: ReadonlyArray<KanbanThreadLink>;
   readonly pools: ReadonlyArray<KanbanPool>;
+  readonly poolChanges?: ReadonlyArray<KanbanPoolChange> | undefined;
   /** Last event per slot before since, then all events in the window, ordered by id. */
   readonly slotHistory?: {
     readonly events: ReadonlyArray<SlotEvent>;
@@ -1408,6 +1410,10 @@ export const rollup = (input: RollupInput) => {
         ),
       },
     },
+    poolChanges: capped(
+      (input.poolChanges ?? []).filter((row) => inWindow(row.at, window)),
+      max,
+    ),
     pools: poolUsage,
     holders: capped(
       [...holders.values()].map(({ pool, slots }) => {

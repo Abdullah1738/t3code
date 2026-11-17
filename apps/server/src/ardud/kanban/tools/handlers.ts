@@ -1590,6 +1590,7 @@ const handlers = {
         return {
           pools: yield* service.setPool(board.id, model, input.slots, {
             replaces: input.replaces,
+            actor: { actorKind: "evaluator", actorId: caller.threadId },
           }),
         };
       }),
@@ -1636,7 +1637,11 @@ const handlers = {
         const board = yield* boardFor(service, caller, input.boardId);
         const apply = yield* selectionRoutingEnabled;
         const model = yield* modelOf(input.model, apply);
-        return { pools: yield* service.removePool(board.id, model) };
+        return {
+          pools: yield* service.removePool(board.id, model, {
+            actor: { actorKind: "evaluator", actorId: caller.threadId },
+          }),
+        };
       }),
     ),
   ),
