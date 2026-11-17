@@ -4679,7 +4679,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                             raise AmbiguousScript('offbox --step has no command')
                         # Steps are shell commands, never exact-invocation
                         # fixture proofs. Inspect them even beside a payload.
-                        scan_remote(step, directory, depth + 1, inherit_environment=True)
+                        scan_remote(step, directory, depth + 1, inherit_environment=True,
+                                    preservation=wrapper_proved)
                 payload = _offbox_payload(words, known_only=False)
                 if payload is None:
                     break

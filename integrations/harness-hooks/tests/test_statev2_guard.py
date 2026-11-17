@@ -1846,6 +1846,22 @@ bash "$TASK_DIR/step5r.sh"
         self.assertEqual(rule, UNRESOLVED, cause)
         self.assertIn('python: non-isolated startup', cause)
 
+    @trusted_node_test
+    def test_same_call_offbox_steps_keep_wrapper_proof(self):
+        for runner, filename, body in [('python3 -I', 'step.py', 'print(1)'),
+                                       ('node', 'step.mjs', 'console.log(1)'),
+                                       ('bash', 'step.sh', 'echo ok')]:
+            prefix = self.heredoc('tmp/' + filename, body)
+            step = shlex.quote(runner + ' tmp/' + filename)
+            for flags in ['--step ' + step, '--step=' + step,
+                          '--step true --step ' + step]:
+                command = prefix + 'offbox run ' + flags
+                with self.subTest(runner=runner, flags=flags):
+                    rule, cause = guard.classify_detail(command, str(self.root))
+                    self.assertEqual(rule, UNRESOLVED, cause)
+                    self.assertIn('command wrapper proof failed', cause)
+                    self.adapters(command, UNRESOLVED)
+
     def test_same_call_still_refuses_rewrites(self):
         target = str(self.root / 'tmp/replay.py')
         prefix = self.heredoc(target, 'print(1)')
