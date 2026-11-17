@@ -219,23 +219,34 @@ def cpu_fields(values):
     numeric = {'windowS', 'cpuS', 'totalCpuPct', 'ncpu', 'processCount', 'runnable',
                'uninterruptible', 'pid', 'ppid', 'count', 'cpuPct', 'rssMb',
                'skippedLines', 'badLines', 'lines', 'exiting', 'systemCpuPct',
-               'userPct', 'sysPct', 'unattributedCpuPct', 'spawned', 'exited'}
+               'userPct', 'sysPct', 'nicePct', 'idlePct', 'kernelTaskPct', 'kernelTaskWindowS',
+               'unattributedCpuPct', 'spawned', 'exited', 'uid', 'perMinute',
+               'childCpuPct', 'childReadable', 'childUnreadable', 'childUncertainParents',
+               'lostParents', 'unattributedAfterChildrenPct', 'observedSpawnsLowerBound',
+               'observedSpawnsPerMinuteLowerBound'}
 
     def number(value):
         return finite_number(value) and 0 <= value <= 1e15
 
-    def label(value, limit):
+    def label(value, limit, encoded=False):
+        def bounded(text):
+            text = ''.join(c if c.isprintable() else ' ' for c in text)[:limit]
+            # Records serialize with ensure_ascii: one Unicode character can
+            # cost up to twelve bytes, so bound the encoded label too.
+            while encoded and len(json.dumps(text))-2 > limit:
+                text = text[:-1]
+            return text
         if not isinstance(value, str):
             return None
         if isinstance(value, SystemFamily) and '/' not in value and not SECRET_LABEL.search(value):
-            return str(value)[:limit]
+            return bounded(str(value))
         try:
             value = janitor_redact(value)
         except (ImportError, OSError):
             return None
         if SECRET.search(value) or '/Users/' in value or '/home/' in value or value.startswith(('/', '~')):
             return '[redacted]'
-        return ''.join(c if c.isprintable() else ' ' for c in value)[:limit]
+        return bounded(value)
 
     for key, value in (values or {}).items():
         if key in numeric and (value is None or number(value)):
@@ -244,26 +255,40 @@ def cpu_fields(values):
             result[key] = value
         elif key == 'badLine':
             result[key] = label(value, 200)
-        elif key in ('failure', 'hintError', 'systemCpuError', 'commandError', 'threadError') and (value is None or value in MEMORY_ERRORS):
+        elif key == 'kernelTaskTime' and isinstance(value, str) and re.fullmatch(r'[0-9:.\-]{1,32}', value):
+            result[key] = value
+        elif key == 'kernelTaskSkipped' and value == 'rate':
+            result[key] = value
+        elif key in ('failure', 'hintError', 'systemCpuError', 'commandError', 'threadError', 'kernelTaskError') and (value is None or value in MEMORY_ERRORS):
             result[key] = value
         elif key == 'load' and (value is None or isinstance(value, list)):
             result[key] = None if value is None else [n for n in value[:3] if number(n)]
-        elif key in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily') and isinstance(value, list):
+        elif key in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily', 'childCpu',
+                     'childCpuFamilies', 'childCoverage', 'observedSpawnsByParent') and isinstance(value, list):
             result[key] = []
-            for proc in value[:{'top': 20, 'families': 15, 'spawnedFamilies': 8, 'runnableThreadsByFamily': 8}[key]]:
+            for proc in value[:{'top': 20, 'families': 15, 'spawnedFamilies': 8, 'runnableThreadsByFamily': 8,
+                               'childCpu': 10, 'childCpuFamilies': 10, 'childCoverage': 64,
+                               'observedSpawnsByParent': 10}[key]]:
                 if not isinstance(proc, dict):
                     continue
                 keys = (('pid', 'ppid', 'family', 'parentFamily', 'state', 'hint', 'cpuS', 'cpuPct', 'rssMb', 'etime', 'cmd', 'parentCmd')
                         if key == 'top' else ('family', 'count', 'cpuPct', 'parentFamily')
                         if key == 'spawnedFamilies' else ('family', 'count')
-                        if key == 'runnableThreadsByFamily' else ('family', 'count', 'cpuPct', 'rssMb'))
+                        if key == 'runnableThreadsByFamily' else ('pid', 'ppid', 'family', 'parentFamily', 'cpuPct')
+                        if key == 'childCpu' else ('family', 'parentFamily', 'cpuPct')
+                        if key == 'childCpuFamilies' else ('uid', 'reason', 'count')
+                        if key == 'childCoverage' else ('pid', 'family', 'count', 'perMinute')
+                        if key == 'observedSpawnsByParent' else ('family', 'count', 'cpuPct', 'rssMb'))
                 clean = {}
                 for field in keys:
                     item = proc.get(field)
                     if field in numeric and number(item):
                         clean[field] = item
+                    elif field == 'reason' and item in ('permission', 'exited', 'identity', 'unavailable', 'timeout'):
+                        clean[field] = item
                     elif field in ('family', 'parentFamily', 'hint'):
-                        clean[field] = label(item, 72 if field == 'hint' else 64)
+                        clean[field] = label(item, 72 if field == 'hint' else 64,
+                                             encoded=key in ('childCpu', 'childCpuFamilies'))
                     elif field in ('cmd', 'parentCmd') and field in proc:
                         clean[field] = command_label(item) if isinstance(item, str) else None
                     elif field == 'state' and isinstance(item, str) and re.fullmatch(r'[A-Za-z?+<>-]{1,16}', item):
@@ -419,7 +444,9 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
         limit = 7000 if name == 'cpu.sample' else 8192
         while len((json.dumps(row, separators=(',', ':'), allow_nan=False)+'\n').encode()) > limit:
             props = row['props']
-            key = next((k for k in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily') if props.get(k)), None)
+            key = next((k for k in ('top', 'families', 'spawnedFamilies', 'runnableThreadsByFamily',
+                                    'childCoverage', 'observedSpawnsByParent',
+                                    'childCpuFamilies', 'childCpu') if props.get(k)), None)
             if not props.get(key):
                 break
             props[key].pop()

@@ -266,8 +266,9 @@ Removing the minute agent stops checks; no Tailscale change is needed.
 
 `com.abdullah.mac-cpu` runs `cpu.py` every 60 seconds at normal priority,
 through `/bin/zsh` for launchd file access. One `/bin/ps` inventory reads PID,
-parent, cumulative CPU time, RSS, state, start time and elapsed time with a
-30-second timeout. It never invokes top or changes another process.
+parent, uid, cumulative CPU time, RSS, state, start time and elapsed time with a
+30-second timeout. Normal samples never invoke top. The sampler never changes
+another process.
 
 `state/cpu.json` retains PID, start time, cumulative CPU seconds, host CPU ticks,
 the daily spike counter and Unix observation time under its own nonblocking lock. CPU seconds
@@ -292,13 +293,48 @@ sets `hintError` without losing numeric CPU evidence.
 
 `cpu.spike` captures up to 15 PIDs with parent families and redacted 160-character commands when load1 > 2× logical CPUs, plus host/unattributed CPU, observed spawn families and runnable thread counts; it is capped at 240 records/day and 8192 bytes/record, and is conditional rather than a cadence job.
 
-Host tick deltas add `systemCpuPct`, `userPct`, `sysPct` and
+Host tick deltas add `systemCpuPct`, `userPct`, `sysPct`, `nicePct`, `idlePct` and
 `unattributedCpuPct` on the same one-core=100% scale; a failed read sets
 `systemCpuError` without losing the sample. The first valid read is a baseline.
 `spawned`/`exited` compare PID + start time, and `spawnedFamilies` counts only
 new processes still visible at the next inventory. `pidAdvance` is omitted:
 long-lived high PIDs hid a real 200-process burst after allocator wrap on this Mac.
 The optional thread read has a two-second timeout.
+
+`userPct` excludes nice time; user + sys + nice is busy CPU. `kernelTaskPct`
+is null on normal samples. Spikes read the second frame of a bounded
+`top -l 2 -s 1 -pid 0` call, with `kernelTaskWindowS: 1` and cumulative
+`kernelTaskTime` for reference; failure sets `kernelTaskError`.
+The expensive read is limited to once per five minutes, including failed
+attempts, using a wall timestamp in the existing sampler state. Skipped spikes
+report null CPU with `kernelTaskSkipped: "rate"`; quiet samples retain the
+cooldown, and a clock rollback starts a fresh cooldown.
+System time also runs in other
+processes, so neither kernel_task nor sys time should be added to process CPU.
+
+Exited-child CPU comes from `proc_pid_rusage` V1, converted from Mach ticks.
+Darwin 27's `ps -S` did not include it in the fork/wait proof. `childCpu` lists
+ten parent PIDs with their family and the parent's family in `parentFamily`;
+`childCpuFamilies` groups those family pairs before truncation. `childCpuPct`
+sums all readable parent deltas, separately from `totalCpuPct`.
+The reader captures Mach time before ps; later process starts are excluded with
+coverage reason `identity`, preventing PID reuse from corrupting a baseline.
+Ancestors are read before children to avoid racing a reaping transfer.
+Old CPU of disappeared descendants is subtracted when reaping transfers their
+lifetime counters. Ambiguous transfers (including possible orphan adoption) are excluded and counted in
+`childUncertainParents`. `unattributedAfterChildrenPct` subtracts the recovered
+child CPU from the original gap, floored at zero. Baseline or unavailable child
+readings leave the total null, rather than claiming zero.
+
+`childReadable`/`childUnreadable` and `childCoverage` expose failures by uid and
+fixed reason. Other-user processes, including launchd, normally deny reads;
+if PID 1 is readable, its child CPU is labelled `orphaned-exited`.
+`lostParents` counts vanished parents known from the old tree or child counters;
+parents born and gone inside the interval remain invisible. The syscall pass
+has a 30-second budget and adds no process inventory command.
+`observedSpawnsLowerBound`, its per-minute rate and `observedSpawnsByParent`
+count new PID/start identities still present in the next snapshot. They miss
+processes that exit between snapshots and are not an exact exec counter.
 
 Hints and spike commands use the janitor's reviewed #45 `leftover_processes.redact` helper,
 loaded from the sibling source tree or the installed
