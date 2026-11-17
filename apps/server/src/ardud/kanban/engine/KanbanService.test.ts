@@ -28735,6 +28735,101 @@ it.effect.each(
   }),
 );
 
+it.effect.each(
+  (["work", "review"] as const).flatMap((role) =>
+    [false, true].map((contended) => ({ role, contended })),
+  ),
+)(
+  "#1754 an accepted $role wake with an edited brief is revoked after dispatch interruption (contended=$contended)",
+  ({ role, contended }) =>
+    Effect.gen(function* () {
+      const gate = yield* assignmentGate;
+      const validation = yield* Deferred.make<void>();
+      const resumeValidation = yield* Deferred.make<void>();
+      const writerEntered = yield* Deferred.make<void>();
+      const releaseWriter = yield* Deferred.make<void>();
+      const admitting = yield* Deferred.make<void>();
+      let blockValidation = false;
+      let siblingId: KanbanCardId | undefined;
+      const observed = Layer.effect(
+        KanbanStore.KanbanStore,
+        Effect.map(KanbanStore.KanbanStore, (real) =>
+          KanbanStore.KanbanStore.of({
+            ...real,
+            boards: Effect.gen(function* () {
+              const boards = yield* real.boards;
+              if (blockValidation) {
+                blockValidation = false;
+                yield* Deferred.succeed(validation, undefined);
+                yield* Deferred.await(resumeValidation);
+              }
+              return boards;
+            }),
+            putCard: (row) =>
+              (row.id === siblingId
+                ? Deferred.succeed(writerEntered, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseWriter)),
+                  )
+                : Effect.void
+              ).pipe(Effect.andThen(real.putCard(row))),
+          }),
+        ),
+      ).pipe(Layer.provide(KanbanStore.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, thread } = yield* reuseDeliveryFixture(role);
+        const sibling = contended
+          ? yield* kanban.createCard(
+              board.id,
+              { title: "Sibling", prompt: "Other work", priority: 99 },
+              owner,
+            )
+          : null;
+        gate.fake.runOnSend.add(thread);
+        gate.control.enabled = true;
+        const dispatch = yield* Effect.forkChild(
+          kanban.dispatchNow.pipe(
+            Effect.provideService(BoardLocks.admissionObserver, () => {
+              Deferred.doneUnsafe(admitting, Effect.void);
+              return () => {};
+            }),
+          ),
+        );
+        yield* Deferred.await(gate.entered);
+        yield* kanban.editCard(card.id, { description: "New instructions" }, owner);
+        if (sibling) {
+          blockValidation = true;
+          const interrupting = yield* Effect.forkChild(Fiber.interrupt(dispatch));
+          yield* Deferred.await(validation);
+          siblingId = sibling.id;
+          const writer = yield* Effect.forkChild(
+            kanban.editCard(sibling.id, { description: "Saved across compensation" }, owner),
+          );
+          yield* Deferred.await(writerEntered);
+          yield* Deferred.succeed(resumeValidation, undefined);
+          // Also release the writer when broken compensation exits before it can wait for admission.
+          yield* Effect.raceFirst(Deferred.await(admitting), Fiber.await(dispatch));
+          yield* Deferred.succeed(releaseWriter, undefined);
+          yield* Fiber.join(writer);
+          yield* Fiber.join(interrupting);
+        } else yield* Fiber.interrupt(dispatch);
+        const after = yield* kanban.card(card.id);
+        assert.equal(after.card.stage, role === "work" ? "todo" : "needs_review");
+        assert.isNull(after.card.activeThreadId);
+        assert.equal(after.card.description, "New instructions");
+        assert.lengthOf(gate.withdrawals, 1);
+        assert.equal(gate.withdrawals[0]!.threadId, thread);
+        assert.isTrue(
+          after.events.some((event) => event.body === "Assignment changed after wake was accepted"),
+        );
+        assert.isFalse(
+          after.events.some((event) => event.body?.startsWith("Assignment wake did not complete")),
+        );
+        assert.isTrue((yield* Ref.get(gate.fake.threads)).get(thread)!.running);
+        if (contended) assert.isTrue(yield* Deferred.isDone(admitting));
+      }).pipe(Effect.provide(inlineTestLayer(gate.layer, undefined, undefined, observed)));
+    }),
+);
+
 it.effect.each(["work", "review"] as const)(
   "#1553 an accepted %s wake is preserved when compensation cannot read the card",
   (role) =>
@@ -29014,10 +29109,12 @@ it.effect.each(["deployed", "working", "todo", "legacy"] as const)(
           assert.isFalse(
             result.events.some((event) => event.body?.startsWith("fresh work thread:")),
           );
-          assert.include(
-            (yield* Ref.get(fake.threads)).get(current)!.messages.at(-1)!,
-            "P2: preserve batch ownership",
-          );
+          const briefs = (yield* Ref.get(fake.threads))
+            .get(current)!
+            .messages.slice(oldMessages)
+            .filter((message) => message.startsWith(`Card #${claimed.number} is back with you.`));
+          assert.lengthOf(briefs, 1);
+          assert.include(briefs[0]!, "P2: preserve batch ownership");
         }
       }).pipe(Effect.provide(testLayer(fake.layer)));
     }),
@@ -43164,6 +43261,147 @@ it.effect("card_next skips the board and activity when a released worker's pool 
   }),
 );
 
+it.effect.each(
+  (["work", "review"] as const).flatMap((role) =>
+    (["queued", "starting", "running"] as const).flatMap((status) =>
+      (["exact", "retry", "unrelated", "unreadable"] as const).map((identity) => ({
+        role,
+        status,
+        identity,
+      })),
+    ),
+  ),
+)(
+  "#1754 reconciles a $status $role wake with $identity identity before rollback",
+  ({ role, status, identity }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const analytics: AnalyticsEvent[] = [];
+      let armed = false;
+      let withdrawals = 0;
+      let run: OrchestrationV2Run | undefined;
+      const checking = yield* Deferred.make<void>();
+      const resumeCheck = yield* Deferred.make<void>();
+      const gateCheck = status === "running" && identity === "exact";
+      const wrapped = Layer.effect(
+        KanbanThreads,
+        Effect.map(KanbanThreads, (base) =>
+          KanbanThreads.of({
+            ...base,
+            send: (input) =>
+              armed
+                ? Effect.gen(function* () {
+                    const at = yield* DateTime.now;
+                    const message =
+                      identity === "unrelated"
+                        ? "kanban:another-card"
+                        : `kanban:${input.key}${identity === "retry" ? ":retry:1" : ""}`;
+                    run = {
+                      id: RunId.make("started-before-response"),
+                      threadId: input.threadId,
+                      ordinal: 2,
+                      providerInstanceId: ProviderInstanceId.make("codex"),
+                      modelSelection: input.model!,
+                      providerThreadId: null,
+                      userMessageId: MessageId.make(message),
+                      rootNodeId: null,
+                      activeAttemptId: null,
+                      status,
+                      requestedAt: at,
+                      startedAt: status === "running" ? at : null,
+                      completedAt: null,
+                      checkpointId: null,
+                      contextHandoffId: null,
+                    };
+                    // The run committed but the response/callback never reached the dispatcher.
+                    return yield* Effect.fail(
+                      new KanbanThreadError({
+                        operation: "send",
+                        detail: "response lost after run start",
+                        rejected: true,
+                      }),
+                    );
+                  })
+                : base.send(input),
+            queuedRuns: (_thread, includeActive) =>
+              Effect.gen(function* () {
+                if (run) {
+                  assert.isTrue(includeActive);
+                  if (gateCheck) {
+                    yield* Deferred.succeed(checking, undefined);
+                    yield* Deferred.await(resumeCheck);
+                  }
+                  if (identity === "unreadable")
+                    return yield* Effect.fail(
+                      new KanbanThreadError({ operation: "queue", detail: "reader unavailable" }),
+                    );
+                }
+                return run ? [run] : [];
+              }),
+            withdraw: (input) => {
+              withdrawals += 1;
+              return base.withdraw(input);
+            },
+          }),
+        ),
+      ).pipe(Layer.provide(fake.layer));
+      yield* Effect.gen(function* () {
+        const { kanban, board, card, thread } = yield* reuseDeliveryFixture(role);
+        const sibling = gateCheck
+          ? yield* kanban.createCard(
+              board.id,
+              { title: "Sibling", prompt: "Other work", priority: 99 },
+              owner,
+            )
+          : null;
+        armed = true;
+        if (sibling) {
+          const dispatch = yield* Effect.forkChild(kanban.dispatchNow);
+          yield* Deferred.await(checking);
+          // A stalled run lookup must not hold the board's write gate.
+          yield* kanban.editCard(sibling.id, { comment: "Still writable" }, owner);
+          yield* Deferred.succeed(resumeCheck, undefined);
+          yield* Fiber.join(dispatch);
+        } else yield* kanban.dispatchNow;
+        const after = yield* kanban.card(card.id);
+        const delivered = identity !== "unrelated";
+        assert.equal(
+          after.card.stage,
+          delivered
+            ? role === "work"
+              ? "working"
+              : "in_review"
+            : role === "work"
+              ? "todo"
+              : "needs_review",
+        );
+        assert.equal(after.card.activeThreadId, delivered ? thread : null);
+        assert.equal(withdrawals, delivered ? 0 : 1);
+        assert.equal(
+          after.events.some((event) => event.body?.startsWith("Assignment wake did not complete")),
+          !delivered,
+        );
+        assert.lengthOf(
+          analytics.filter((event) => event.kind === "kanban.assignment_wake_failed"),
+          delivered ? 0 : 1,
+        );
+      }).pipe(
+        Effect.provide(
+          testLayer(wrapped).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    analytics.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);
+
 it.effect.each([
   { role: "work", gate: "event" },
   { role: "work", gate: "save" },
@@ -43231,7 +43469,13 @@ it.effect.each([
         assert.isTrue(triggered);
         assert.isFalse(exposed);
         assert.equal(result._tag, "Failure");
-        if (result._tag === "Failure") assert.include(result.failure.detail, "being rolled back");
+        if (result._tag === "Failure") {
+          assert.include(result.failure.detail, "being rolled back");
+          assert.include(result.failure.detail, "Nothing was saved");
+          assert.equal(result.failure.code, "conflict");
+          assert.equal(result.failure.reasonClass, "conflict");
+          assert.strictEqual(result.failure.saved, false);
+        }
         const after = (yield* kanban.card(card.id)).card;
         assert.isNull(after.activeThreadId);
         assert.equal(after.stage, role === "work" ? "todo" : "needs_review");
