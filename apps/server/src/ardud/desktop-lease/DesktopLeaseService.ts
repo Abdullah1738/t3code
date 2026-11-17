@@ -1,5 +1,6 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off - bound arbitrary lease task IDs in analytics.
 import * as NodeCrypto from "node:crypto";
+import * as NodeOS from "node:os";
 import { ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
@@ -44,8 +45,19 @@ type CallerIdentity = {
 type StoreOptions = {
   readonly filename?: string;
   readonly now?: () => number;
+  readonly bootTimeMs?: () => number | null;
   readonly holderTurnActive?: (threadId: string) => HolderTurnActive;
   readonly factory?: (options: DesktopLeaseOptions) => DesktopLease;
+};
+
+// Uptime is host-wide, so server restarts preserve a live desktop lease.
+const hostBootTimeMs = () => {
+  try {
+    // @effect-diagnostics-next-line globalDate:off - compare wall-clock lease timestamps to host uptime.
+    return Math.round((Date.now() - NodeOS.uptime() * 1000) / 1000) * 1000;
+  } catch {
+    return null;
+  }
 };
 
 // Each measured phase owns its span; this wrapper only records the elapsed time on exit.
@@ -159,6 +171,7 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
       Effect.try({
         try: () => {
           store ??= factory({
+            bootTimeMs: hostBootTimeMs,
             ...storeOptions,
             holderTurnActive: (root) =>
               checkedHolder?.root === root && store?.currentLease()?.ticket === checkedHolder.ticket
@@ -187,9 +200,12 @@ const make = Effect.fn("DesktopLeaseService.make")(function* (options: StoreOpti
         ? yield* Effect.gen(function* () {
             const rootActivity = yield* holderActivity(lease.rootThreadId);
             // Async children can execute desktop calls after their root's turn has ended.
-            return rootActivity === false && lease.childThreadId !== lease.rootThreadId
-              ? yield* holderActivity(lease.childThreadId)
-              : rootActivity;
+            if (rootActivity === true || lease.childThreadId === lease.rootThreadId) {
+              return rootActivity;
+            }
+            const childActivity = yield* holderActivity(lease.childThreadId);
+            if (childActivity === true) return true;
+            return rootActivity === false && childActivity === false ? false : "unknown";
           })
         : "unknown";
     return yield* measure(
