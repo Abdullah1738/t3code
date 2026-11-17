@@ -66,6 +66,8 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skill/scripts"))
     import offbox_disk_space
 
+import offbox_protocol as protocol
+
 VAR = Path(os.environ.get("BOATD_VAR", "/var/lib/boatd"))
 ETC = Path(os.environ.get("BOATD_ETC", "/etc/boatd"))
 CMDS = VAR / "cmds"
@@ -205,7 +207,7 @@ def migrate(con) -> None:
     have = _cols(con, "commands")
     for col in ("retry_interrupted INTEGER DEFAULT 0", "attempt INTEGER DEFAULT 1", "boot_id TEXT",
                 "interrupted_at REAL", "sync INTEGER NOT NULL DEFAULT 0", "timeout_s REAL",
-                "killed INTEGER NOT NULL DEFAULT 0"):
+                "killed INTEGER NOT NULL DEFAULT 0", "protocol_nonce TEXT"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE commands ADD COLUMN {col}")
     con.execute("CREATE INDEX IF NOT EXISTS commands_cpu_start ON commands(sync, started_at)")
@@ -1371,10 +1373,10 @@ def queue_cmd(con, box_id, body, owner):
     sync = not bool(body.get("detached"))
     timeout_s = int(body.get("timeoutSeconds") or 60) if sync else None
     con.execute("INSERT INTO commands (box_id, pid, command_id, command, cwd, status, created_at, kind, repo, run_id, "
-                "retry_interrupted, attempt, sync, timeout_s) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
+                "retry_interrupted, attempt, sync, timeout_s, protocol_nonce) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
                 (box_id, pid, cid, command, body.get("cwd") or "/home/user", "queued", now(),
                  meta.get("kind") or guess_kind(command), meta.get("repo"), meta.get("run_id"), retry,
-                 int(sync), timeout_s))
+                 int(sync), timeout_s, meta.get("protocol_nonce")))
     con.execute("COMMIT")
     return pid, cid, retry
 
@@ -1658,7 +1660,9 @@ def save_interruption(con, c, info, *, result=None, view=None, repair_legacy=Fal
     if action == 'retry':
         # Clients use this exact line as an attempt boundary even when the next wrapper emits no bytes.
         _note(c['box_id'], c['pid'], f"the server restarted while this run was going (attempt {c['attempt'] or 1} is lost); "
-                                  f"it is queued again as attempt {(c['attempt'] or 1)+1}")
+                                  f"it is queued again as attempt {(c['attempt'] or 1)+1}" +
+                                  (f" [run={c['run_id']} n={c['protocol_nonce']}]"
+                                   if c['run_id'] and c['protocol_nonce'] else ""))
     elif action == 'interrupted':
         _note(c['box_id'], c['pid'], f"{info['cause']}: the command ran partly; it is not run again; check what it did before running it again")
     return action
@@ -2406,7 +2410,7 @@ def run_cmd(box_id: str, pid: int) -> int:
     if dispatched and code != 0 and not earlier:
         view = command_probe(r)
         if view.get('readable') and not view.get('pids') and view.get('marker') is None and view.get('box_rc') is None and \
-                outf.tell() == out_offset and 'offbox-command-started:' not in stderr and \
+                outf.tell() == out_offset and not protocol.Protocol(r['run_id'] or '', r['protocol_nonce'] or '').command_started(stderr) and \
                 (wrapper_path in stderr or '/usr/local/sbin/boatd-wrap' in stderr) and any(s in stderr.lower() for s in (
                     'no such file or directory', 'executable file not found', 'permission denied')):
             # An explicit execve rejection plus no guest marker is positive proof of a pre-start failure.
@@ -2464,7 +2468,8 @@ def run_cmd(box_id: str, pid: int) -> int:
     observed = dispatched and failure is None and sig is None and not stream_failure(stderr)
     status = "lost" if code == 255 and not ct_running(box_id) else "exited"
     disk = offbox_disk_space.command_result(d / f'{pid}.out', d / f'{pid}.err', code,
-                                            stdout_offset=out_offset, stderr_offset=err_offset)
+                                            stdout_offset=out_offset, stderr_offset=err_offset,
+                                             identity=protocol.Protocol(r['run_id'] or '', r['protocol_nonce'] or ''))
     errf.write((offbox_disk_space.MARKER + json.dumps(
         dict(phase='result', attempt=attempt, record=disk)) + '\n').encode())
     result = dict(attempt=attempt, status=status, exit_code=code, signal=sig,
@@ -2665,9 +2670,13 @@ def reconcile(con) -> dict:
         if (json.loads(c['metrics'] or '{}').get('interruption') or {}).get('stream_state') == 'ended':
             continue
         text = tail(cmd_dir(c['box_id']) / f"{c['pid']}.err", 8192)
-        boundaries = [m.end() for m in re.finditer(
-            r'(?m)^offbox-server: the server restarted while this run was going \(attempt \d+ is lost\); '
-            r'it is queued again as attempt \d+\s*$', text)]
+        identity = protocol.Protocol(c['run_id'] or '', c['protocol_nonce'] or '')
+        boundaries, offset = [], 0
+        for line in text.splitlines(keepends=True):
+            offset += len(line)
+            marker = identity.parse(line)
+            if marker and marker.kind == 'retry':
+                boundaries.append(offset)
         if boundaries:
             text = text[boundaries[-1]:]
         elif (c['attempt'] or 1) > 1:

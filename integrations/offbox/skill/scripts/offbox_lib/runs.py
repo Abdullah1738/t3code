@@ -10,6 +10,8 @@ import json
 import os
 import re
 import select
+import secrets
+import offbox_protocol as protocol
 import shlex
 import signal
 import stat
@@ -35,7 +37,7 @@ def _source_stamp():
     try:
         folder = Path(__file__).resolve().parent
         files = [*folder.glob('*.py'), folder.parent / 'offbox.py', folder.parent / 'toollog.py',
-                 folder.parent / 'offbox_disk_space.py']
+                 folder.parent / 'offbox_disk_space.py', folder.parent / 'offbox_protocol.py']
         return tuple((p.name, p.stat().st_mtime_ns, p.stat().st_size) for p in sorted(files))
     except Exception:
         return None
@@ -613,16 +615,14 @@ print(raw)
 
 SETUP_FAILED_MARKER = "offbox-setup-failed"
 BOX_WEDGED_MARKER = "offbox-box-wedged"
-COMMAND_STARTED_MARKER = "offbox-command-started:"
+COMMAND_STARTED_MARKER = protocol.COMMAND_STARTED_MARKER
 # boat's agent could not start the command's systemd scope: the box's systemd is broken and our script never ran.
 # A stop + resume fixes it (bx_azff4qna 21 Oct, bx_z9u6f9c8 30 Oct).
 SCOPE_FAILED = re.compile(r"^Failed to start transient scope unit: ")
 # Go failing to read its own std tree (a box read glitch, not the user's code). User module paths never match.
 GO_STD_GLITCH = re.compile(r"package (unsafe|internal/\S+|runtime(/\S+)?) is not in std \(/usr/local/go/src/|"
                            r"build constraints exclude all Go files in /usr/local/go/src/(internal|runtime|unsafe)\b")
-STEP_RESULT = re.compile(r"offbox step (\d+) rc=(-?\d+): ")
-STEP_RETRY = re.compile(r"^offbox-server: the server restarted while this run was going \(attempt \d+ is lost\); "
-                        r"it is queued again as attempt \d+$")
+
 
 
 PIPELINE_STATUS = r'''__offbox_pipeline_status() {
@@ -728,9 +728,11 @@ def last_stage_is_grep(cmd: str) -> bool:
     return bool(stage) and os.path.basename(stage[0]) in ("grep", "egrep", "fgrep")
 
 
-def steps_block(steps: list[str]) -> str:
+def steps_block(steps: list[str], nonce: str = "") -> str:
     """Each step runs in its own subshell with pipefail; a failing step does not stop the next one."""
-    lines = [run_evidence.shell(BOUNDED_PROCESS),
+    token = f" [n={nonce}]" if nonce else ""
+    lines = [f'export OFFBOX_PROTOCOL_NONCE={shlex.quote(nonce)}',
+             run_evidence.shell(BOUNDED_PROCESS),
              f'__offbox_evidence begin pid=$$ planned={len(steps)}',
              "__offbox_first=0", "__offbox_completed=0", "__offbox_current=0",
              # A graceful early exit must not look like a fully completed step run.
@@ -742,27 +744,18 @@ def steps_block(steps: list[str]) -> str:
         lines += [f'__offbox_current={n}', f'__offbox_evidence start step={n}',
                   "(", "set -o pipefail", step, ")", "__offbox_rc=$?",
                   f'__offbox_evidence end step={n} rc=$__offbox_rc',
-                  f'echo "offbox step {n} rc=$__offbox_rc: "{shlex.quote(label)} >&2 || exit 90',
+                  f'echo "offbox step {n} rc=$__offbox_rc{token}: "{shlex.quote(label)} >&2 || exit 90',
                   f'__offbox_completed={n}',
                   '[ "$__offbox_rc" -eq 0 ] || [ "$__offbox_first" -ne 0 ] || __offbox_first=$__offbox_rc']
     lines.append('exit "$__offbox_first"')
     return "\n".join(lines)
 
 
-def step_results(log_path: Path | None) -> list[tuple[int, int]]:
-    """(step number, rc) for every step line the remote script printed into the run log."""
+def step_results(log_path: Path | None, run=None) -> list[tuple[int, int]]:
+    """Only this run's wrapper can supply results or reset its current attempt."""
     if not log_path or not Path(log_path).exists():
         return []
-    out = []
-    for line in Path(log_path).read_text(errors="replace").splitlines():
-        # Home retries append to the same stderr. Earlier attempts cannot supply a missing result.
-        # The server note precedes even a retry that never reaches our command preamble.
-        if line.startswith(COMMAND_STARTED_MARKER) or STEP_RETRY.fullmatch(line):
-            out.clear()
-        m = STEP_RESULT.search(line)
-        if m:
-            out.append((int(m.group(1)), int(m.group(2))))
-    return out
+    return protocol.for_run(run, log_path).steps(Path(log_path).read_text(errors="replace"))[0]
 
 
 def steps_summary(results: list[tuple[int, int]], planned: int) -> str:
@@ -780,13 +773,13 @@ def missing_step_count(results: list[tuple[int, int]], planned: int) -> int:
     return len(set(range(1, planned + 1)) - {n for n, _ in results})
 
 
-def checked_steps_code(log_path: Path | None, planned: int, code: int | None, *, report: bool = True) -> int | None:
-    missing = missing_step_count(step_results(log_path), planned)
+def checked_steps_code(log_path: Path | None, planned: int, code: int | None, *, report: bool = True, run=None) -> int | None:
+    missing = missing_step_count(step_results(log_path, run), planned)
     if missing:
         if report:
             say(f"steps incomplete: got {planned - missing} of {planned} step results; remote exit unknown")
         return None
-    return steps_exit(log_path, planned) if planned and code in (None, 0) else code
+    return steps_exit(log_path, planned, run) if planned and code in (None, 0) else code
 
 
 def planned_steps(run) -> int:
@@ -798,9 +791,10 @@ def argument_list_failure(run, path: Path, *, report: bool) -> bool:
         text = path.read_text(errors='replace')
     except OSError:
         return False
-    if (COMMAND_STARTED_MARKER in text or run_evidence.PREFIX in text
+    if (protocol.for_run(run, path).blocks_replay(text) or any(
+            m.kind not in ("retry", "step") for m in protocol.for_run(run, path).scan(text))
             or not re.search(r'^.*boatd-wrap: line \d+: .*Argument list too long$', text, re.M)
-            or any(STEP_RETRY.fullmatch(line) for line in text.splitlines())
+            or any(m.kind == "retry" for m in protocol.for_run(run, path).scan(text))
             or 'Error: Command not executable' not in text):
         return False
     if report:
@@ -842,7 +836,7 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     if known not in (None, 0) and code in (None, 0):
         code = known
     result = history_result
-    if catch_up and (api.BACKEND == 'server' or missing_step_count(step_results(path), planned) or
+    if catch_up and (api.BACKEND == 'server' or missing_step_count(step_results(path, run), planned) or
                      disk.get('infra_failure') == 'disk_probe' or recover_plain):
         from .misc import _catch_up_log
         budget = 10 if until is None else min(10, max(0, until - now()))
@@ -860,7 +854,7 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
     if probe_crashed or recover_plain:
         try:
             with path.open(errors='replace') as output:
-                command_started = any(line.startswith(COMMAND_STARTED_MARKER) for line in output)
+                command_started = protocol.for_run(run, path).command_started(output.read())
         except OSError:
             command_started = False
         if (not command_started and 'disk_attempt' not in probe_record and
@@ -874,11 +868,18 @@ def settled_steps_code(run, code: int | None, *, log_path: Path | None = None, p
         return native_code
     if not planned:
         return code
-    checked = checked_steps_code(path, planned, code, report=report)
+    checked = checked_steps_code(path, planned, code, report=report, run=run)
     if history_incomplete:
         if report and checked is not None:
             say('steps incomplete: final attempt output unavailable; remote exit unknown')
         checked = None
+    try:
+        results, ignored = protocol.for_run(run, path).steps(path.read_text(errors='replace'))
+    except OSError:
+        results, ignored = [], 0
+    log('step_check ' + json.dumps(dict(run_id=run['run_id'], planned=planned,
+                                       found=[n for n, _ in results], ignored=ignored,
+                                       decision='incomplete' if checked is None else 'exit', exit_code=checked)))
     if checked is None and code not in (None, 0) and known is None:
         # A missing tail can be recovered later; it must never erase a known failure.
         try:
@@ -947,9 +948,9 @@ def repo_setup_failed(code: int | None, log_path: Path | None) -> bool:
             and REPO_SETUP_FAILED_MARKER in Path(log_path).read_text(errors="replace").splitlines())
 
 
-def _wedged_line(text: str) -> str | None:
+def _wedged_line(text: str, run=None) -> str | None:
     lines = text.splitlines()
-    if COMMAND_STARTED_MARKER in text:
+    if protocol.for_run(run).command_started(text):
         return None
     return next((line for line in lines if line.startswith(BOX_WEDGED_MARKER + ': ')), None)
 
@@ -957,7 +958,7 @@ def _wedged_line(text: str) -> str | None:
 def box_wedged(log_path: Path | None) -> str | None:
     """Diagnostic only: a merged display log is not sufficient to authorize retry."""
     if log_path and Path(log_path).exists():
-        return _wedged_line(Path(log_path).read_text(errors="replace"))
+        return _wedged_line(Path(log_path).read_text(errors="replace"), protocol.for_run(path=log_path).run_id)
     return None
 
 
@@ -968,7 +969,7 @@ def settle_box_wedged(con, run, code):
     run = restore_run_state(run)
     # A local start fence rules out retry even when command history is unavailable.
     try:
-        if run['log_path'] and COMMAND_STARTED_MARKER in Path(run['log_path']).read_text(errors='replace'):
+        if run['log_path'] and protocol.for_run(run).command_started(Path(run['log_path']).read_text(errors='replace')):
             return None
     except OSError:
         pass
@@ -981,10 +982,11 @@ def settle_box_wedged(con, run, code):
     for _ in range(8):
         page = api.history_logs(run['box_id'], run['command_id'], 'stderr', offset)
         text += page.get('data') or ''
-        if COMMAND_STARTED_MARKER in text:
+        identity = protocol.for_run(run)
+        if identity.blocks_replay(text):
             return None
         if page.get('done'):
-            evidence = _wedged_line(text)
+            evidence = _wedged_line(text, run)
             break
         nxt = page.get('nextOffset')
         if not nxt or nxt <= offset:
@@ -1024,12 +1026,12 @@ def scope_failed(log_path: Path | None) -> bool:
 COMMAND_INLINE_MAX = 100 * 1024
 
 
-def command_payload(script: str, run_id: str, *, claim_id: str | None = None) -> tuple[str, str | None]:
-    command = exit_recording_command(script, run_id, claim_id=claim_id)
+def command_payload(script: str, run_id: str, *, claim_id: str | None = None, nonce: str = "") -> tuple[str, str | None]:
+    command = exit_recording_command(script, run_id, claim_id=claim_id, nonce=nonce)
     path = None
     if len(command.encode()) > COMMAND_INLINE_MAX:
         path = f"/home/user/.offbox/cmd/{claim_id or run_id}.sh"
-        command = exit_recording_command(script, run_id, claim_id=claim_id, script_file=path)
+        command = exit_recording_command(script, run_id, claim_id=claim_id, script_file=path, nonce=nonce)
     if len(command.encode()) > COMMAND_INLINE_MAX:
         raise OffboxError(f"command is {len(command.encode())} bytes, over the box start limit; "
                           "put the steps in a script file and run it; a single argument over 128 KiB needs its contents "
@@ -1038,7 +1040,7 @@ def command_payload(script: str, run_id: str, *, claim_id: str | None = None) ->
 
 
 def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = None,
-                           script_file: str | None = None) -> str:
+                           script_file: str | None = None, nonce: str = "") -> str:
     """Run the remote script under a parent shell that writes its exit code to ~/.offbox/exit/<run>.rc,
     so a run boat later reports as lost still has its real status on the box."""
     f = f'"$HOME/.offbox/exit/{run_id}.rc"'
@@ -1096,6 +1098,7 @@ def exit_recording_command(script: str, run_id: str, *, claim_id: str | None = N
         execute += '\n__offbox_rc=$?'
     outer = "\n".join([
         f'export OFFBOX_RUN_ID={shlex.quote(run_id)}',
+        f'export OFFBOX_PROTOCOL_NONCE={shlex.quote(nonce)}',
         run_evidence.shell(BOUNDED_PROCESS),
         "__offbox_signal() {",
         '__offbox_evidence "signal=$1"',
@@ -1373,11 +1376,11 @@ def reconcile_lost(con, box_id: str, timeout: float = 20, state: str | None = No
                 state_warning(row['run_id'], code, error)
 
 
-def steps_exit(log_path: Path | None, planned: int) -> int | None:
+def steps_exit(log_path: Path | None, planned: int, run=None) -> int | None:
     """For --step runs: the first nonzero step rc (else 0), but only when every planned step reported."""
     if planned <= 0:
         return None
-    res = dict(step_results(log_path))
+    res = dict(step_results(log_path, run))
     if missing_step_count(list(res.items()), planned):
         return None
     return next((res[n] for n in range(1, planned + 1) if res[n] != 0), 0)
@@ -1550,8 +1553,8 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
                   steps: list[str] | None = None, node: str = "", wait_images: bool = False,
                   image_wait: int = 180, repo_key: str = "", repo_root: Path | None = None,
                   preserve_containers: str = 'private lease', box_id: str = "<box>",
-                  usage: command_usage.Usage | None = None, template: str = "") -> str:
-    cmd = steps_block(steps) if steps else command_block(
+                  usage: command_usage.Usage | None = None, template: str = "", nonce: str = "") -> str:
+    cmd = steps_block(steps, nonce) if steps else command_block(
         argv[0] if len(argv) == 1 else " ".join(shlex.quote(a) for a in argv))
     if api.BACKEND == 'server':
         try:
@@ -1595,6 +1598,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
                   'if [ -n "${__offbox_bash_env:-}" ]; then rm -f -- "$__offbox_bash_env"; fi; exit "$__offbox_exit"')
     lines = ["set -a", f'[ -f "{env_file}" ] && . "{env_file}"; rm -f "{env_file}"' if env_file else ":", "set +a",
              f'export OFFBOX_RUN_ID={run_id}',
+             f'export OFFBOX_PROTOCOL_NONCE={shlex.quote(nonce)}',
              f'export OFFBOX_BOX_ID={shlex.quote(box_id)}',
              '__obsp=' + shlex.quote(offbox_disk_space.probe_payload()),
              '__obprobe() { echo "offbox-space-probe: $1" >&2; ' + probe_command + '; }',
@@ -1630,7 +1634,7 @@ def remote_script(rdir: str, rel: str, argv: list[str], env_file: str | None, ru
   }
 done''' if repo_key == "crpko-devops" else ':'),
               '__offbox_command_started=1',
-              f'echo "{COMMAND_STARTED_MARKER} {run_id}" >&2',
+              f'echo "{COMMAND_STARTED_MARKER} {run_id}' + (f' [n={nonce}]' if nonce else '') + '" >&2',
               # Keep caller cd/exit/traps inside a subshell so the root check always runs.
               "(\n" + cmd + "\n)"]
     return "\n".join(lines)
@@ -1655,6 +1659,7 @@ class Runner:
     def __init__(self, a, me: dict):
         self.a, self.me = a, me
         self.run_id = home.take_invocation_run() or new_id("run")
+        self.protocol_nonce = secrets.token_hex(8)
         home.flush_routing(self.run_id)
         self.root = Path(me["repo_root"])
         recorded_cwd = None
@@ -1767,6 +1772,7 @@ class Runner:
         con = db()
         existing = con.execute('SELECT * FROM runs WHERE run_id=?', (self.run_id,)).fetchone()
         if existing:
+            self.protocol_nonce = protocol.for_run(existing).nonce
             try:
                 if existing['client_pid'] != os.getpid() or not (
                         (a.bg and existing['mode'] == 'bg') or os.environ.get(home.RETURNED_HOME_ENV)):
@@ -1790,11 +1796,11 @@ class Runner:
         def register():
             with write(con):
                 con.execute("""INSERT INTO runs (run_id, owner, session_id, thread_id, repo_root, cwd, cmd, mode, status, start_at,
-                               log_path, pulls, rel_cwd, local_cwd, client_pid, step_count, size, requested_size, size_note)
-                               VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?,?,?,?,?)""",
+                               log_path, pulls, rel_cwd, local_cwd, client_pid, step_count, size, requested_size, size_note, protocol_nonce)
+                               VALUES (?,?,?,?,?,?,?,?, 'starting', ?,?,?,?,?,?,?,?,?,?,?)""",
                             (self.run_id, me["owner"], me.get("session"), me.get("thread"), me["repo_root"], str(self.cwd),
                              cmd_text[:4000], "bg" if a.bg else "fg", now(), str(self.log_path),
-                             json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps), size, a.size, why or ''))
+                             json.dumps(a.pull or []), self.rel, str(self.cwd), os.getpid(), len(steps), size, a.size, why or '', self.protocol_nonce))
                 con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'start_claim:{self.run_id}', '1'))
                 if home.failed_over():
                     con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'failover_queue:{self.run_id}', '1'))
@@ -1805,7 +1811,7 @@ class Runner:
                 event(con, None, "size_override", json.dumps(dict(run_id=self.run_id, requested=a.size,
                                                                  effective=size, reason=why)))
             try:
-                save_run_state(self.run_id, resources=resources.unavailable(
+                save_run_state(self.run_id, protocol_nonce=self.protocol_nonce, resources=resources.unavailable(
                     'not_started' if api.BACKEND == 'server' else 'boat'),
                     **offbox_disk_space.client_metadata())
             except Exception:
@@ -1847,8 +1853,8 @@ class Runner:
             script = remote_script(rdir, self.rel, a.cmd, env_file, self.run_id, steps=steps or None,
                                    node=node_block, wait_images=wait_images, image_wait=image_wait_seconds(),
                                    repo_key=me["repo_key"], repo_root=self.root,
-                                   preserve_containers=preserve, box_id=box, usage=usage, template=template)
-            command, path = command_payload(script, self.run_id, claim_id=claim)
+                                   preserve_containers=preserve, box_id=box, usage=usage, template=template, nonce=self.protocol_nonce)
+            command, path = command_payload(script, self.run_id, claim_id=claim, nonce=self.protocol_nonce)
             return command, path, script.encode()
 
         # Validate the same transport before acquiring anything; final box-specific values are checked again.
@@ -1959,7 +1965,7 @@ class Runner:
                          props={'cmd_bytes': len(command.encode()),
                                 'cmd_via': 'file' if self.command_file else 'argv', 'step_count': len(steps)})
             r = api.cmd_start(self.box, command,
-                              meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id},
+                              meta={"repo": me.get("repo_key"), "kind": run_kind(cmd_text), "run_id": self.run_id, "protocol_nonce": self.protocol_nonce},
                               retry_interrupted=retry_interrupted(a))
         except home.StartWaitFailed:
             self.started = False
@@ -2757,7 +2763,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                                 _commit(mirror_path, out_off, err_off, mf.tell())
                         if until_command_started and t == 'stderr':
                             startup_tail += data
-                            if COMMAND_STARTED_MARKER + ' ' + (run_id or '') in startup_tail.splitlines():
+                            if protocol.for_run(run_id).command_started(startup_tail):
                                 return _COMMAND_RUNNING
                             startup_tail = startup_tail[-4096:]
                     elif t == "reconnect":
@@ -3110,10 +3116,10 @@ def report_killed(row, log_path=None):
         except OSError:
             text = ''
         # Evidence annotates the interrupted step; it never decides the run's result.
-        detail = run_evidence.describe(text, planned)
+        detail = run_evidence.describe(text, planned, protocol.for_run(row, path))
         signal_step = re.search(r'caught \w+ at step (\d+)', detail)
         try:
-            results = dict(step_results(path))
+            results = dict(step_results(path, row))
         except OSError:
             results = {}
         step = int(signal_step[1]) if signal_step else next(
@@ -3731,7 +3737,7 @@ def pre_command_disk_full(path, code):
     if code in (None, 0) or not path.exists():
         return None
     text = path.read_text(errors='replace')
-    if COMMAND_STARTED_MARKER in text:
+    if protocol.for_run(path=path).blocks_replay(text):
         return None
     record = offbox_disk_space.result(path, code)
     phases = record['disk_space']
@@ -3760,7 +3766,7 @@ def complete_stream(row, stream, *, until_started=False):
                 page = api.history_logs(row['box_id'], row['command_id'], stream, offset)
                 pages += 1
                 chunks.append(page.get('data') or '')
-                if until_started and COMMAND_STARTED_MARKER in ''.join(chunks):
+                if until_started and protocol.for_run(row).blocks_replay(''.join(chunks)):
                     return ''.join(chunks)
                 if page.get('done') is True:
                     return ''.join(chunks)
@@ -3776,13 +3782,13 @@ def complete_stream(row, stream, *, until_started=False):
 def confirmed_disk_full(row, path, code, gate_receipt=None):
     from .misc import _raw_log
     raw = _raw_log(path)
-    if raw.exists() and COMMAND_STARTED_MARKER in raw.read_text(errors='replace'):
+    if raw.exists() and protocol.for_run(row, raw).blocks_replay(raw.read_text(errors='replace')):
         return None
     failure = pre_command_disk_full(path, code)
     if not failure and gate_receipt is None:
         return None
     text = complete_stderr(row)
-    if text is not None and COMMAND_STARTED_MARKER in text:
+    if text is not None and protocol.for_run(row).blocks_replay(text):
         return None
     if gate_receipt is not None:
         return gate_receipt
@@ -3805,7 +3811,7 @@ def recover_admission_log(row, code):
     path = _raw_log(LOGS_DIR / f"{row['run_id']}.log")
     if code != EXIT_INFRA or now() >= until:
         return
-    if path.exists() and COMMAND_STARTED_MARKER in path.read_text(errors='replace'):
+    if path.exists() and protocol.for_run(row, path).blocks_replay(path.read_text(errors='replace')):
         return
     return read_gate_receipt(row, until=until)
 
@@ -3813,7 +3819,7 @@ def recover_admission_log(row, code):
 def read_gate_receipt(row, *, until):
     from .misc import _raw_log
     path = _raw_log(LOGS_DIR / f"{row['run_id']}.log")
-    if path.exists() and COMMAND_STARTED_MARKER in path.read_text(errors='replace'):
+    if path.exists() and protocol.for_run(row, path).blocks_replay(path.read_text(errors='replace')):
         return
     try:
         left = max(0, until - now())
@@ -3967,7 +3973,7 @@ def _run_remote(a, rn) -> int:
     rn.remote_code = None if getattr(a, 'steps', None) else code
     if (code in (EXIT_INFRA, 97, 98) and rn.registered and not getattr(rn, 'admission_checked', False)
             and not pre_command_disk_full(rn.log_path, code)
-            and not (rn.log_path.exists() and COMMAND_STARTED_MARKER in rn.log_path.read_text(errors='replace'))):
+            and not (rn.log_path.exists() and protocol.for_run(rn.run_id, rn.log_path).blocks_replay(rn.log_path.read_text(errors='replace')))):
         # An accepted start can lose its attach stream too; status alone carries no admission evidence.
         with contextlib.closing(db()) as con:
             row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
@@ -3987,7 +3993,7 @@ def _run_remote(a, rn) -> int:
     disk_candidate = pre_command_disk_full(rn.log_path, code)
     setup_marker = (REPO_SETUP_FAILED_MARKER if repo_setup_failed(code, rn.log_path) else
                     SETUP_FAILED_MARKER if code == 97 and setup_failed(rn.log_path) else None)
-    if setup_marker and COMMAND_STARTED_MARKER in rn.log_path.read_text(errors='replace'):
+    if setup_marker and protocol.for_run(rn.run_id, rn.log_path).blocks_replay(rn.log_path.read_text(errors='replace')):
         setup_marker = None
     disk_row = None
     gate_receipt = getattr(rn, 'gate_receipt', None)
@@ -3996,7 +4002,7 @@ def _run_remote(a, rn) -> int:
             disk_row = con.execute('SELECT * FROM runs WHERE run_id=?', (rn.run_id,)).fetchone()
     disk_failure = confirmed_disk_full(disk_row, rn.log_path, code, gate_receipt)
     setup_stderr = complete_stderr(disk_row) if setup_marker and not disk_candidate else None
-    setup_confirmed = (setup_stderr is not None and COMMAND_STARTED_MARKER not in setup_stderr
+    setup_confirmed = (setup_stderr is not None and not protocol.for_run(disk_row).blocks_replay(setup_stderr)
                        and setup_marker in setup_stderr.splitlines())
     if disk_failure:
         rn.started = False

@@ -13,6 +13,10 @@ EVIDENCE = ('offbox-box-wedged: kept image restore did not finish in 1s and dock
             'D-state: 2 (sync, umount)')
 
 
+def start_line(row):
+    return f"offbox-command-started: {row['run_id']} [n={row['protocol_nonce']}]"
+
+
 class BoxWedgedTests(Isolated):
     def setUp(self):
         super().setUp()
@@ -46,6 +50,7 @@ class BoxWedgedTests(Isolated):
 
         def stream(rn):
             code, text = next(outcomes)
+            text = text.replace("offbox-command-started: r", start_line(dict(run_id=rn.run_id, protocol_nonce=rn.protocol_nonce)))
             self.stderr = text
             rn.log_path.write_text(text)
             return code
@@ -133,7 +138,7 @@ class BoxWedgedTests(Isolated):
                 try:
                     row = case.detached_row()
                     path = Path(row['log_path'])
-                    path.write_text('offbox-command-started: r\n' + EVIDENCE)
+                    path.write_text(start_line(row)+'\n'+EVIDENCE)
                     with patch.object(api, 'cmd_status', return_value={'status':'exited','running':False,'exitCode':97}), \
                          patch.object(api, 'history_logs', side_effect=common.OffboxError('history unavailable')) as history:
                         if entry == 'wait':
@@ -168,6 +173,11 @@ class BoxWedgedTests(Isolated):
                     frames = [{'type': stream, 'data': data} for stream, data in chunks] + [{'type':'exit','exitCode':97}]
                     stderr = ''.join(data for stream, data in chunks if stream == 'stderr')
                     def real_stream(rn):
+                        for frame in frames:
+                            if frame.get('data'):
+                                frame['data'] = frame['data'].replace('started: r', start_line(dict(run_id=rn.run_id, protocol_nonce=rn.protocol_nonce)).removeprefix('offbox-command-'))
+                        nonlocal_stderr = stderr.replace('offbox-command-started: r', start_line(dict(run_id=rn.run_id, protocol_nonce=rn.protocol_nonce)))
+                        api.history_logs.return_value = {'data':nonlocal_stderr,'done':True}
                         return runs.follow(rn.box, rn.pid, rn.log_path, echo=False, run_id=rn.run_id)
                     with patch.object(runs.Runner, 'stream', real_stream), \
                          patch.object(runs, '_ttl_keeper'), patch.object(api, 'cmd_attach', return_value=iter(frames)), \
@@ -299,7 +309,7 @@ class BoxWedgedTests(Isolated):
         row = self.detached_row()
         with patch.object(api, 'cmd_status', return_value=None), \
              patch.object(api, 'history_get', return_value={'exitCode':97}), \
-             patch.object(api, 'history_logs', return_value={'data':'offbox-command-started: r\n'+EVIDENCE, 'done':True}):
+             patch.object(api, 'history_logs', return_value={'data':start_line(row)+'\n'+EVIDENCE, 'done':True}):
             reap._check_stale_runs(self.con, 'bxA', api.STOPPED_STATES[0], False, [])
         self.assertIsNone(self.row('bxA')['note'])
         self.stop_box.assert_not_called()
@@ -438,7 +448,7 @@ class BoxWedgedTests(Isolated):
     def test_history_page_containing_start_fence_prevents_set_aside(self):
         row = self.detached_row()
         with patch.object(api, 'history_logs', side_effect=[
-            {'data': 'offbox-command-started: r\n', 'nextOffset': 30},
+            {'data': start_line(row)+'\n', 'nextOffset': len(start_line(row))+1},
             {'data': EVIDENCE, 'done': True}]), patch.object(runs, 'do_pulls'):
             self.assertIsNone(runs.settle_box_wedged(self.con, row, 97))
         self.stop_box.assert_not_called()

@@ -705,7 +705,7 @@ class LogCatchupTests(Isolated):
             self.assertFalse(misc._live_log_notice(self.row(), shown, 'n/a', 0))
         self.assertEqual(output, [])
         (common.LOGS_DIR / 'run-x.home-read.json').unlink()
-        shown.write_bytes(shown.read_bytes() + b'offbox-command-started: yes\n')
+        shown.write_bytes(shown.read_bytes() + b'offbox-command-started: run-x\n')
         with patch.object(misc, 'say') as say:
             self.assertFalse(misc._live_log_notice(self.row(), shown, 'n/a', 0))
         say.assert_not_called()

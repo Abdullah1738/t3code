@@ -228,7 +228,9 @@ def error_line(line):
     return not line.startswith((MARKER, 'offbox: warning:')) and bool(ENOSPC.search(line))
 
 
-def result(path, code, *, offset=0):
+def result(path, code, *, offset=0, identity=None):
+    import offbox_protocol
+    identity = identity or offbox_protocol.for_run(path=path)
     phases, matches, seen_attempt, final = {}, False, 0, None
     probe_error, traceback_line, string_trace, command_started = None, None, 0, False
     probe_errors, started_attempts = {}, set()
@@ -285,7 +287,7 @@ def result(path, code, *, offset=0):
                     except (ValueError, KeyError, TypeError):
                         pass
                 else:
-                    if line.startswith('offbox-command-started:'):
+                    if identity.command_started(line):
                         command_started = True
                         started_attempts.add(seen_attempt)
                     if line.startswith(PROBE_BEGIN_MARKER):
@@ -345,8 +347,8 @@ def result(path, code, *, offset=0):
     return out
 
 
-def command_result(stdout, stderr, code, *, stdout_offset=0, stderr_offset=0):
-    record = result(stderr, code, offset=stderr_offset)
+def command_result(stdout, stderr, code, *, stdout_offset=0, stderr_offset=0, identity=None):
+    record = result(stderr, code, offset=stderr_offset, identity=identity)
     if code not in (0, None) and not record['infra_failure']:
         with open(stdout, 'rb') as output:
             output.seek(stdout_offset)

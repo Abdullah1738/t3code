@@ -94,8 +94,12 @@ def configure_fixture(root, backend):
 
     pool.acquire = acquire
     api.cmd_start = start
-    api.cmd_attach = lambda *args, **kw: iter([dict(type='stderr',
-        data=f'{runs.COMMAND_STARTED_MARKER} {os.environ[runs.BACKGROUND_RUN_ENV]}\n')])
+    def attach(*args, **kw):
+        rid = os.environ[runs.BACKGROUND_RUN_ENV]
+        with contextlib.closing(common.db()) as con:
+            row = con.execute('SELECT protocol_nonce FROM runs WHERE run_id=?', (rid,)).fetchone()
+        return iter([dict(type='stderr',data=f'{runs.COMMAND_STARTED_MARKER} {rid} [n={row[0]}]\n')])
+    api.cmd_attach = attach
     runs._ttl_keeper = lambda *args: None
     return a, me
 

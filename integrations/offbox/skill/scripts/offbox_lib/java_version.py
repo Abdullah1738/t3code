@@ -141,7 +141,8 @@ def record(con, run, path: Path, backend: str) -> None:
         with path.open(errors='replace') as stream:
             for line in stream:
                 # Java setup precedes the command; never scan a test suite's full output.
-                if line.startswith('offbox-command-started:'):
+                from offbox_protocol import for_run
+                if for_run(run, path).command_started(line):
                     break
                 if not line.startswith(PREFIX):
                     continue

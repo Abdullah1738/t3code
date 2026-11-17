@@ -583,7 +583,7 @@ CAPACITY_SCHEMA = """
 
 # 9: #174 (6->7, pull_* columns) and #220 (6->8, size columns) were bumped in parallel, so a
 # DB can sit at 7 or 8 with only one set; 9 re-runs the idempotent column loop for both.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DB_TIMEOUT = 30
 
 
@@ -669,7 +669,7 @@ def _migrate(con):
             con.execute(statement)
     have = {r[1] for r in con.execute("PRAGMA table_info(runs)")}
     for col in ("pulls TEXT", "rel_cwd TEXT", "remote_dir TEXT", "local_cwd TEXT", "docker INTEGER",
-                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL", "cmd_bytes INTEGER", "cmd_via TEXT",
+                "client_pid INTEGER", "wrapper_pid INTEGER", "step_count INTEGER DEFAULT 0", "protocol_nonce TEXT", "known_exit_code INTEGER", "command_at REAL", "logged_end_at REAL", "cmd_bytes INTEGER", "cmd_via TEXT",
                 "requested_size TEXT", "size_note TEXT",
                 "pull_state TEXT", "pull_started_at REAL", "pull_ended_at REAL", "pull_owner TEXT", "pull_summary TEXT"):
         if col.split()[0] not in have:

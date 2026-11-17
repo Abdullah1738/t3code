@@ -184,14 +184,14 @@ class DiskProbeTests(unittest.TestCase):
         notice = 'offbox: disk-space probe failed (exit 1); the command runs without disk evidence\n'
         for code in (0, 1, 7, 90):
             with self.subTest(code=code):
-                self.log.write_text(TRACEBACK + notice + 'offbox-command-started: run-test\n')
+                self.log.write_text(TRACEBACK + notice + f'offbox-command-started: {self.log.stem}\n')
                 record = disk.result(self.log, code)
                 self.assertEqual(record['command_exit_code'], code)
                 self.assertIsNone(record['infra_failure'])
                 self.assertIn('IndentationError', record['disk_probe_error'])
         self.log.write_text(TRACEBACK + disk.MARKER + json.dumps(dict(phase='gate', space={})) + '\n')
         self.assertEqual(disk.result(self.log, 90)['infra_failure'], 'enospc')
-        self.log.write_text('offbox-command-started: run-test\n' + TRACEBACK)
+        self.log.write_text(f'offbox-command-started: {self.log.stem}\n' + TRACEBACK)
         self.assertNotIn('disk_probe_error', disk.result(self.log, 90))
 
     def test_saved_unknown_wrapper_probe_failure_survives_missing_log(self):
@@ -211,7 +211,7 @@ class DiskProbeTests(unittest.TestCase):
         self.assertIsNone(save.call_args.kwargs['infra_failure'])
 
     def test_end_failure_does_not_attribute_the_commands_traceback_to_probe(self):
-        self.log.write_text('offbox-command-started: r\n' + TRACEBACK + disk.PROBE_BEGIN_MARKER + 'end\n' +
+        self.log.write_text(f'offbox-command-started: {self.log.stem}\n' + TRACEBACK + disk.PROBE_BEGIN_MARKER + 'end\n' +
                             disk.PROBE_ERROR_MARKER + 'end probe failed (exit 1)\n')
         record = disk.result(self.log, 90)
         self.assertEqual(record['disk_probe_error'], disk.PROBE_ERROR_MARKER + 'end probe failed (exit 1)')
@@ -221,7 +221,7 @@ class DiskProbeTests(unittest.TestCase):
     def test_authoritative_probe_diagnostics_preserve_command_exit_90(self):
         for started in (True, False):
             with self.subTest(started=started):
-                self.log.write_text(TRACEBACK + ('offbox-command-started: r\n' if started else ''))
+                self.log.write_text(TRACEBACK + (f'offbox-command-started: {self.log.stem}\n' if started else ''))
                 record = disk.result(self.log, 90)
                 self.log.write_text(disk.MARKER + json.dumps(dict(phase='result', attempt=1, record=record)) + '\n')
                 observed = disk.result(self.log, 90)

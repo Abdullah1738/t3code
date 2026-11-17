@@ -44,6 +44,10 @@ class BoxDiskTests(Isolated):
     def row(self, box):
         return self.con.execute('SELECT * FROM leases WHERE box_id=?', (box,)).fetchone()
 
+    def start_line(self, box):
+        row=self.con.execute('SELECT * FROM runs WHERE box_id=? ORDER BY rowid DESC',(box,)).fetchone()
+        return f"{runs.COMMAND_STARTED_MARKER} {row['run_id']} [n={row['protocol_nonce']}]\n"
+
     def events(self, kind):
         return [json.loads(r[0]) for r in self.con.execute('SELECT detail FROM events WHERE kind=?', (kind,))]
 
@@ -59,7 +63,7 @@ class BoxDiskTests(Isolated):
         self.stack.enter_context(patch.object(ssh_sync, 'push', return_value={}))
         start = self.stack.enter_context(patch.object(api, 'cmd_start', return_value={'processId': 7, 'commandId': 'c'}))
         def stream(rn):
-            rn.log_path.write_text('offbox-command-started: run\n')
+            rn.log_path.write_text(self.start_line(rn.box))
             return 0
         self.stack.enter_context(patch.object(runs.Runner, 'stream', stream))
         self.stack.enter_context(patch.object(runs, 'follow', return_value=runs._COMMAND_RUNNING))
@@ -239,7 +243,7 @@ class BoxDiskTests(Isolated):
             if box=='bxA':
                 path.write_text(disk.MARKER+json.dumps(dict(phase='gate',space=space(tmp=4096)))+'\n')
                 return 90
-            path.write_text('offbox-command-started: run-disk-gate\n')
+            path.write_text(self.start_line(box))
             return runs._COMMAND_RUNNING
         def cleanup(*args,**kw):
             self.assertFalse([call for call in lifecycle.call_args_list if call.args[1] == 'handoff'])
@@ -330,8 +334,7 @@ class BoxDiskTests(Isolated):
                         raise api.NetworkError('attach lost after the gate record')
                     return interrupted()
                 raise api.NetworkError('accepted start lost its attach stream')
-            rid=self.con.execute("SELECT run_id FROM runs WHERE box_id='bxB'").fetchone()[0]
-            return iter([dict(type='stderr',data=f'{runs.COMMAND_STARTED_MARKER} {rid}\n'),
+            return iter([dict(type='stderr',data=self.start_line(box)),
                          dict(type='exit',exitCode=0)])
         def history(box,command,which,offset=0,**kw):
             if partial:
@@ -396,8 +399,8 @@ class BoxDiskTests(Isolated):
         for location in ('local','complete_stderr','partial_stderr'):
             for receipt in (None,proof):
                 with self.subTest(location=location,receipt=receipt is not None):
-                    path.write_text(gate+(runs.COMMAND_STARTED_MARKER+' user\n' if location=='local' else ''))
-                    page=dict(data=runs.COMMAND_STARTED_MARKER+' user\n',done=location=='complete_stderr')
+                    path.write_text(gate+(runs.COMMAND_STARTED_MARKER+' '+rid+'\n' if location=='local' else ''))
+                    page=dict(data=runs.COMMAND_STARTED_MARKER+' '+rid+'\n',done=location=='complete_stderr')
                     with patch.object(api,'history_logs',return_value=page),patch.object(ssh_sync,'ssh') as ssh:
                         self.assertIsNone(runs.confirmed_disk_full(row,path,90,receipt))
                     ssh.assert_not_called()
@@ -412,7 +415,7 @@ class BoxDiskTests(Isolated):
                 path.write_text(disk.MARKER+json.dumps(dict(phase='start',space=space(workspace=0)))+
                                 '\nmkdir "/home/user/toolchain": No space left on device (28)\n'+marker+'\n')
                 return code
-            path.write_text(f'{runs.COMMAND_STARTED_MARKER} replacement\n')
+            path.write_text(self.start_line(box))
             return runs._COMMAND_RUNNING if bg else 0
         def measure(box,*args,**kw):
             return space(workspace=0) if box=='bxA' and failed else space()
@@ -469,7 +472,7 @@ class BoxDiskTests(Isolated):
             for message,failed_path,fs in cases:
                 for started in (False,True):
                     with self.subTest(code=code,message=message,started=started):
-                        prefix=f'{runs.COMMAND_STARTED_MARKER} run\n' if started else ''
+                        prefix=f'{runs.COMMAND_STARTED_MARKER} forms\n' if started else ''
                         path.write_text(prefix+f'write "{failed_path}" failed: {message}\n')
                         failure=runs.pre_command_disk_full(path,code)
                         self.assertEqual(failure,None if started else (fs,failed_path,{}))
@@ -523,24 +526,34 @@ class BoxDiskTests(Isolated):
         self.assertEqual(measured.call_count,2)
         self.assertEqual(self.events('box_disk_full')[0]['space'],space())
 
-    def _interleaved_user_case(self, code):
+    def _interleaved_user_case(self, code, framing="line"):
         real_follow=runs.follow
         acquire,start=self.run_fixture()
-        stderr=[runs.COMMAND_STARTED_MARKER[:15],runs.COMMAND_STARTED_MARKER[15:]+' user\nENOSPC\n'+
-                runs.SETUP_FAILED_MARKER+'\n'+runs.REPO_SETUP_FAILED_MARKER+'\n']
-        def frames(*args,**kw):
-            yield dict(type='stderr',data=stderr[0])
+        def stderr(box):
+            line=self.start_line(box)
+            if framing=='prefix': line='setup without newline'+line
+            if framing=='suffix': line=line.rstrip('\n')+'setup suffix\n'
+            return line+'ENOSPC\n'+runs.SETUP_FAILED_MARKER+'\n'+runs.REPO_SETUP_FAILED_MARKER+'\n'
+        def frames(box,*args,**kw):
+            text=stderr(box)
+            yield dict(type='stderr',data=text[:15])
             yield dict(type='stdout',data='interleaved stdout\n')
-            yield dict(type='stderr',data=stderr[1])
+            yield dict(type='stderr',data=text[15:])
             yield dict(type='exit',exitCode=code)
         with patch.object(runs.Runner,'stream',lambda rn:real_follow(rn.box,rn.pid,rn.log_path,
                           echo=False,run_id=rn.run_id)), \
              patch.object(api,'cmd_attach',side_effect=frames), \
-             patch.object(api,'history_logs',return_value=dict(data=''.join(stderr),done=True)), \
+             patch.object(api,'history_logs',side_effect=lambda box,*a,**kw:dict(data=stderr(box),done=True)), \
              patch.object(runs,'settle_docker'),patch.object(runs.resources,'finalize'):
             self.assertEqual(runs.run_remote(self.a,self.me),90)
         acquire.assert_called_once();start.assert_called_once()
         self.assertFalse(self.events('box_disk_full'))
+
+    def test_glued_authenticated_start_never_replays_disk_failure(self):
+        self._interleaved_user_case(1, 'prefix')
+
+    def test_suffixed_authenticated_start_never_replays_disk_failure(self):
+        self._interleaved_user_case(1, 'suffix')
 
     def test_interleaved_user_start_never_replays_exit1(self):
         self._interleaved_user_case(1)
@@ -555,22 +568,26 @@ class BoxDiskTests(Isolated):
         real_follow=runs.follow
         acquire,start=self.run_fixture()
         for code in (97,98):
-            for split in (False,True):
-                with self.subTest(code=code,split=split):
+            for split,framing in ((split,framing) for split in (False,True) for framing in ('line','prefix','suffix')):
+                with self.subTest(code=code,split=split,framing=framing):
                     acquire.side_effect=None;acquire.return_value=dict(self.row('bxA'),remote_dir='w/r')
                     acquire.reset_mock();start.reset_mock()
-                    stderr=(runs.COMMAND_STARTED_MARKER+' user\nENOSPC\n'+runs.SETUP_FAILED_MARKER+
-                            '\n'+runs.REPO_SETUP_FAILED_MARKER+'\n')
-                    def frames(*args,**kw):
-                        yield dict(type='stderr',data=stderr[:15] if split else stderr)
+                    def stderr(box):
+                        line=self.start_line(box)
+                        if framing=='prefix': line='setup without newline'+line
+                        if framing=='suffix': line=line.rstrip('\n')+'setup suffix\n'
+                        return line+'ENOSPC\n'+runs.SETUP_FAILED_MARKER+'\n'+runs.REPO_SETUP_FAILED_MARKER+'\n'
+                    def frames(box,*args,**kw):
+                        text=stderr(box)
+                        yield dict(type='stderr',data=text[:15] if split else text)
                         if split:
                             yield dict(type='stdout',data='stdout\n')
-                            yield dict(type='stderr',data=stderr[15:])
+                            yield dict(type='stderr',data=text[15:])
                         yield dict(type='exit',exitCode=code)
                     with patch.object(runs.Runner,'stream',lambda rn:real_follow(rn.box,rn.pid,rn.log_path,
                                       echo=False,run_id=rn.run_id)), \
                          patch.object(api,'cmd_attach',side_effect=frames), \
-                         patch.object(api,'history_logs',return_value=dict(data=stderr,done=True)), \
+                         patch.object(api,'history_logs',side_effect=lambda box,*a,**kw:dict(data=stderr(box),done=True)), \
                          patch.object(fallback,'allowed',return_value=True), \
                          patch.object(fallback,'run_local',return_value=0) as local, \
                          patch.object(runs,'settle_docker'),patch.object(runs.resources,'finalize'):

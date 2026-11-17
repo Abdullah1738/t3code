@@ -931,8 +931,8 @@ class SummaryAndHintTests(unittest.TestCase):
             log = Path(d) / 'run.log'
             log.write_text('offbox step 1 rc=0: a\noffbox step 2 rc=0: b\n'
                            + runs.COMMAND_STARTED_MARKER + ' run-retry\noffbox step 1 rc=0: a\n')
-            self.assertEqual(runs.step_results(log), [(1, 0)])
-            self.assertIsNone(runs.steps_exit(log, 2))
+            self.assertEqual(runs.step_results(log, "run-retry"), [(1, 0)])
+            self.assertIsNone(runs.steps_exit(log, 2, "run-retry"))
 
     def test_grep_hint_only_for_exit_1_from_trailing_grep(self):
         self.assertTrue(runs.last_stage_is_grep('go test ./... 2>&1 | tee /tmp/l | tail -40; grep -c FAIL /tmp/l'))

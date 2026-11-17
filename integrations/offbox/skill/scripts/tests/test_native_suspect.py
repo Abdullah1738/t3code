@@ -20,6 +20,10 @@ def marker(reason='toolchain_unpack_crash'):
     return disk.MARKER + json.dumps(dict(phase='toolchain', infra_failure='native_crash', infra_reason=reason)) + '\n'
 
 
+def start_line(rn):
+    return f'{runs.COMMAND_STARTED_MARKER} {rn.run_id} [n={rn.protocol_nonce}]\n'
+
+
 class SuspectTests(Isolated):
     def setUp(self):
         super().setUp()
@@ -51,7 +55,7 @@ class SuspectTests(Isolated):
         self.stack.enter_context(patch.object(ssh_sync, 'push', return_value={}))
         start = self.stack.enter_context(patch.object(api, 'cmd_start', return_value={'processId': 7, 'commandId': 'c'}))
         def stream(rn):
-            rn.log_path.write_text('offbox-command-started: run\n')
+            rn.log_path.write_text(start_line(rn))
             return 0
         self.stack.enter_context(patch.object(runs.Runner, 'stream', stream))
         self.stack.enter_context(patch.object(runs, 'follow', return_value=runs._COMMAND_RUNNING))
@@ -65,12 +69,15 @@ class SuspectTests(Isolated):
         self.a.cmd, self.a.steps = ['make check'], []
         return acquire, start
 
-    def crash_stream(self, reason, *, second=False, started=False):
+    def crash_stream(self, reason, *, second=False, started=False, framing="line"):
         def stream(rn):
             if rn.box == 'bxA' or second:
-                rn.log_path.write_text(marker(reason) + ('offbox-command-started: run\n' if started else ''))
+                line=start_line(rn) if started else ''
+                if framing=='prefix': line='setup without newline'+line
+                if framing=='suffix': line=line.rstrip('\n')+'setup suffix\n'
+                rn.log_path.write_text(marker(reason) + line)
                 return 90
-            rn.log_path.write_text('offbox-command-started: run\n')
+            rn.log_path.write_text(start_line(rn))
             return 0
         return stream
 
@@ -113,6 +120,20 @@ class SuspectTests(Isolated):
         self.assertEqual(acquire.call_count,1)
         self.assertTrue(unfit.get(self.con,'bxA'))
 
+    def _glued_native_case(self, framing):
+        acquire, start=self.run_fixture()
+        with patch.object(api,'BACKEND','server'), patch.object(runs.Runner,'stream',
+                self.crash_stream('setup_native_crash',started=True,framing=framing)):
+            self.assertEqual(runs.run_remote(self.a,self.me),90)
+        acquire.assert_called_once()
+        start.assert_called_once()
+
+    def test_glued_authenticated_start_never_replays_native_crash(self):
+        self._glued_native_case('prefix')
+
+    def test_suffixed_authenticated_start_never_replays_native_crash(self):
+        self._glued_native_case('suffix')
+
     def test_started_native_exit_matrix_never_claims_nothing_ran(self):
         from itertools import product
         for reason,code,user_sig in product(('toolchain_unpack_crash','setup_native_crash','go_inventory_crash'),
@@ -122,7 +143,7 @@ class SuspectTests(Isolated):
                     self.con.execute('DELETE FROM '+table)
                 acquire,start=self.run_fixture()
                 def stream(rn):
-                    rn.log_path.write_text(marker(reason)+'offbox-command-started: run\n'+
+                    rn.log_path.write_text(marker(reason)+start_line(rn)+
                                            ('SIGSEGV in user command\n' if user_sig else 'user output\n'))
                     return code
                 buf=io.StringIO()
@@ -313,7 +334,8 @@ class SuspectTests(Isolated):
         self.a.bg=True
         rid='run-bg'; os.environ[runs.BACKGROUND_RUN_ENV]=rid
         def follow(box,pid,path,**kw):
-            path.write_text(marker('setup_native_crash') if box=='bxA' else 'offbox-command-started: run\n')
+            nonce=self.con.execute('SELECT protocol_nonce FROM runs WHERE run_id=?',(rid,)).fetchone()[0]
+            path.write_text(marker('setup_native_crash') if box=='bxA' else f'{runs.COMMAND_STARTED_MARKER} {rid} [n={nonce}]\n')
             return 90 if box=='bxA' else 0
         with patch.object(runs.home,'take_invocation_run',return_value=rid), patch.object(api,'BACKEND','server'), \
              patch.object(runs.Runner,'stream',self.crash_stream('setup_native_crash')), patch.object(runs,'follow',side_effect=follow):
@@ -492,7 +514,7 @@ class SuspectTests(Isolated):
                 rid=f'signal-position-{code}-{user_sig}'
                 path=runs.LOGS_DIR/f'{rid}.log'
                 text=marker('setup_native_crash')+'SIGSEGV during setup\n'
-                if code!=90: text+='offbox-command-started: run\n'+('SIGSEGV in user command\n' if user_sig else 'ordinary failure\n')
+                if code!=90: text+=f'{runs.COMMAND_STARTED_MARKER} {rid}\n'+('SIGSEGV in user command\n' if user_sig else 'ordinary failure\n')
                 path.write_text(text)
                 native_crash.settle({'run_id':rid,'box_id':'b'},code,path)
                 state=common.read_json(runs.LOGS_DIR/f'{rid}.state.json',{})

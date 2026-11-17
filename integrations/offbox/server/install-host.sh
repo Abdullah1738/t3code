@@ -470,6 +470,8 @@ install -m 0644 "$tool_log" /opt/boatd/toollog.py
 disk_space="$HERE/offbox_disk_space.py"
 [ -f "$disk_space" ] || disk_space="$HERE/../skill/scripts/offbox_disk_space.py"
 install -m 0644 "$disk_space" /opt/boatd/offbox_disk_space.py
+protocol="$(dirname "$disk_space")/offbox_protocol.py"
+install -m 0644 "$protocol" /opt/boatd/offbox_protocol.py
 install -m 0644 "$HERE/boatd_memory.py" /opt/boatd/boatd_memory.py
 printf '#!/bin/sh\nexec /usr/bin/python3 /opt/boatd/boatd.py "$@"\n' > /usr/local/sbin/boatd
 chmod 0755 /usr/local/sbin/boatd

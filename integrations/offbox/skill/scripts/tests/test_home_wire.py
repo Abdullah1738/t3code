@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 from pathlib import Path
 import sys
 import threading
@@ -66,6 +67,56 @@ class Wire(Isolated):
         self.assertEqual((rows[a["processId"]]["retry_interrupted"], rows[b["processId"]]["retry_interrupted"]), (1, 0))
         st = api.cmd_status(box, a["processId"])
         self.assertEqual((st["attempt"], st["retryInterrupted"], st["bootId"]), (1, True, "boot-2"))
+
+    def test_nonce_persists_over_http_and_authenticates_server_retry(self):
+        nonce, run_id = '1234567890abcdef', 'run-nonced-retry'
+        box = self.srv.box(running=False)
+        pid = self.srv.cmd(box, retry=1)
+        self.srv.con.execute('UPDATE commands SET run_id=?,protocol_nonce=? WHERE box_id=? AND pid=?',
+                             (run_id, nonce, box, pid))
+        path = common.LOGS_DIR / (run_id+'.log')
+        runs.save_run_state(run_id, protocol_nonce=nonce)
+        err = boatd.cmd_dir(box) / f'{pid}.err'
+        first = f'offbox step 1 rc=7 [n={nonce}]: first\n'
+        err.write_text(first)
+        self.assertEqual(boatd.reconcile(self.srv.con)['retry'], 1)
+        path.write_text(err.read_text())
+        self.assertIn(f'[run={run_id} n={nonce}]', path.read_text())
+        self.assertEqual(runs.step_results(path), [])
+        with err.open('a') as stream:
+            stream.write(f'offbox step 1 rc=0 [n={nonce}]: second\n')
+        path.write_text(err.read_text())
+        self.assertEqual(runs.step_results(path), [(1, 0)])
+        other = self.srv.make_box('ardud')
+        result = api.cmd_start(other, 'true', meta={'run_id':run_id, 'protocol_nonce':nonce})
+        row = self.srv.con.execute('SELECT * FROM commands WHERE box_id=? AND pid=?',
+                                  (other, result['processId'])).fetchone()
+        self.assertEqual((row['run_id'], row['protocol_nonce']), (run_id, nonce))
+
+    def test_legacy_retry_without_next_wrapper_clears_pre_nonce_client_results(self):
+        box = self.srv.box(running=False)
+        pid = self.srv.cmd(box, retry=1)
+        run_id = 'run-legacy-retry'
+        self.srv.con.execute('UPDATE commands SET run_id=? WHERE box_id=? AND pid=?', (run_id, box, pid))
+        err = boatd.cmd_dir(box) / f'{pid}.err'
+        err.write_text('offbox step 1 rc=0: first attempt\n')
+        self.assertEqual(boatd.reconcile(self.srv.con)['retry'], 1)
+        text = err.read_text()
+        expected = ('offbox-server: the server restarted while this run was going (attempt 1 is lost); '
+                    'it is queued again as attempt 2')
+        self.assertIn(expected, text.splitlines())
+        # Frozen pre-nonce collector contract: the server ships before old clients are replaced.
+        retry = re.compile(r'offbox-server: the server restarted while this run was going '
+                           r'\(attempt \d+ is lost\); it is queued again as attempt \d+')
+        step = re.compile(r'offbox step (\d+) rc=(-?\d+): ')
+        results = []
+        for line in text.splitlines():
+            if line.startswith(runs.COMMAND_STARTED_MARKER) or retry.fullmatch(line):
+                results.clear()
+            elif match := step.search(line):
+                results.append((int(match[1]), int(match[2])))
+        self.assertEqual(results, [])
+        self.assertEqual(runs.protocol.Protocol(run_id).steps(text)[0], [])
 
     def test_a_run_the_server_retried_is_followed_to_its_end_with_both_attempts_output(self):
         box = self.srv.box(running=False)                 # the machine restarted: its container is down too
@@ -180,7 +231,7 @@ class Wire(Isolated):
                     self.assertEqual(misc.wait(run_id, None), expected)
                     self.assertEqual(misc.logs(run_id, False), 90 if expected == 90 else 0)
                 self.assertEqual(runs.step_results(log), [(int(n), int(rc)) for n, rc in
-                                 runs.STEP_RESULT.findall(second)])
+                                 [(m.fields["step"], m.fields["rc"]) for m in runs.protocol.Protocol().scan(second) if m.kind == "step"]])
                 row = misc._run_row(run_id)
                 self.assertEqual(row['status'], 'infra' if expected == 90 else 'done' if expected == 0 else 'failed')
 
