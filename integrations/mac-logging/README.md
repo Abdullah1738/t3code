@@ -361,6 +361,43 @@ use at most 12.1 MB/day. The existing shared
 day-log cap and retention still apply. The installer copies the new helpers
 and plist; the evaluator must load `com.abdullah.mac-cpu` after review.
 
+## Minute disk-wait samples
+
+The existing `com.abdullah.mac-cpu` 60-second schedule runs `u_sample.py`
+before the CPU probe, using one wide `ps` snapshot of PID, parent, start/elapsed/
+CPU times, state, executable and argv, capped at five seconds. A 1,024-column
+executable field preserves Darwin paths before taking their basename; argv
+stays last. It never reads a volume or invokes lsof. Errors
+leave CPU sampling running and retain the last U state. Exiting `?` states
+are accepted; isolated torn rows are skipped with a `proc.u_parse` diagnostic
+(argv omitted). More than five bad rows and over 10% bad fails the probe.
+
+`proc.u_sample` requires the same PID/start time observed in U for ≥60 s.
+`ageS` is process age; the first observation is a baseline. Non-U observations,
+PID reuse, backward clocks or gaps over three minutes reset it. Snapshots
+cannot prove what happened between observations. `count` and `byComm` (top 50)
+cover qualifying processes; up to 15 `procs` include parent attribution, CPU
+seconds and argv (≤200 characters, known secrets redacted). `volume` is the
+first `/Volumes/<name>`, `/var/folders` or `/Users/<user>` argv prefix, or null:
+a hint, not a measured wait location. Unquoted names with spaces yield only
+the first word. PID 99184 stays counted but gets one detail row per UTC day.
+`lsofStuck` and up to five `lsofCallers` identify the parents starting lsof.
+Plain lsof can block on any wedged volume regardless of its target path or port.
+
+Private, nonblocking-locked `state/proc-u.json` keeps U baselines, the daily
+marker and one episode, using Unix wall-clock times only and no argv. Episodes
+start on a qualifying nonempty sample and close after three successful empty
+samples; errors/partial reads cannot close them. One `proc.u_episode` row
+records closure, retried after append failure. Other empty minutes are silent;
+there are no new alerts. A permanent waiter such as 99184 keeps the episode
+open even while its detail is suppressed. Rollup `uEpisodes` lists episodes sampled or closed
+that UTC day, retaining original starts across midnight, end (null while open),
+last seen, peak count, 15 volume hints and ten comms by peak concurrent count.
+Summaries cover all processes before detail truncation. U rows cap at 16 KiB
+with omission counters (≤23.6 MB per 1440 nonempty samples); shared retention
+and the day cap apply. The evaluator copies helpers with `install.zsh` in the
+batched release; no new or changed plist is needed.
+
 ## Memory samples
 
 `com.abdullah.mac-memory` runs `memory.py` every 300 seconds independently of
