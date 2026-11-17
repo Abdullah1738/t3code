@@ -11,6 +11,7 @@ import {
   makeHttpAs,
   owner,
   testLayer,
+  toyBoard,
   workingCard,
 } from "./askFlows.testkit.ts";
 
@@ -188,6 +189,62 @@ it.effect.each(["pick", "batch", "free_text", "drop_owner", "drop_worker"] as co
         );
         assert.equal(exit?.props?.actor, route === "drop_worker" ? "thread" : "owner");
         assert.equal((yield* kanban.card(card.id)).card.stage, "todo");
+      }).pipe(
+        Effect.provide(
+          testLayer(fake.layer).pipe(
+            Layer.provide(
+              Layer.mock(Analytics.Analytics)({
+                record: (event) =>
+                  Effect.sync(() => {
+                    events.push(event);
+                  }),
+              }),
+            ),
+          ),
+        ),
+      );
+    }),
+);
+
+it.effect(
+  "counts owner decisions and notices separately across boards from the same snapshot",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake;
+      const events: AnalyticsEvent[] = [];
+      yield* Effect.gen(function* () {
+        const { kanban, card } = yield* workingCard();
+        yield* kanban.askOwner(card.id, { question: "Decision", blocking: false }, owner, "owner");
+        const { board: otherBoard } = yield* toyBoard("other");
+        for (let index = 0; index < 2; index++) {
+          const other = yield* kanban.createCard(
+            otherBoard.id,
+            { title: `Notice ${index}`, prompt: "" },
+            owner,
+          );
+          yield* kanban.askOwner(
+            other.id,
+            { question: "Notice", kind: "notice", respond: { ack: true }, blocking: false },
+            owner,
+            "owner",
+          );
+        }
+        const asked = yield* kanban.askOwner(
+          card.id,
+          { question: "Next decision", blocking: false },
+          owner,
+          "owner",
+        );
+        assert.deepStrictEqual(askOf(asked, "q2").timing, {
+          kind: "input",
+          openAsksAtCreation: 1,
+          openNoticesAtCreation: 2,
+        });
+        const row = events.findLast(
+          (event) => event.kind === "kanban.ask_opened" && event.cardId === card.id,
+        );
+        assert.equal(row?.props?.openAsksAtCreation, 1);
+        assert.equal(row?.props?.openNoticesAtCreation, 2);
       }).pipe(
         Effect.provide(
           testLayer(fake.layer).pipe(

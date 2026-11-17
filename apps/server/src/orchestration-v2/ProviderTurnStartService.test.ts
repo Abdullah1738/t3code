@@ -7,6 +7,7 @@ import { it as effectIt } from "@effect/vitest";
 import {
   KanbanBoardId,
   KanbanCardId,
+  KanbanScriptId,
   KanbanDiscussionId,
   type KanbanDiscussion,
   type ServerSettingsError,
@@ -3281,6 +3282,293 @@ effectIt.effect.each(
       if (refused)
         expect(harness.projection().contextHandoffs.at(-1)?.delivery?.status).not.toBe("pending");
     }),
+);
+
+effectIt.effect.each([
+  "keyed",
+  "legacy",
+  "answered by another evaluator",
+  "still owed",
+  "script pending",
+  "script answered",
+  "recovery pending",
+  "recovery answered",
+  "recovery read-through pending",
+  "recovery answered then newer",
+] as const)("#1569 rechecks an owner reply wake before provider execution (%s)", (kind) =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "The owner is waiting for your reply in discussion disc-1569. Post it with discussion_post.",
+      nativeDelivery: kind === "still owed" || kind.endsWith("pending"),
+    });
+    const initial = harness.projection();
+    const messageId = MessageId.make(
+      kind.startsWith("recovery")
+        ? "kanban:post-recovery:disc-1569:1:launch-key"
+        : kind === "keyed" || kind.startsWith("script")
+          ? "kanban:wake:owner:card-1569:owner-reply:disc-1569:thread:action"
+          : "kanban:wake:owner:card-1569:old-uuid",
+    );
+    harness.setProjection({
+      ...initial,
+      runs: initial.runs.map((run) => ({ ...run, userMessageId: messageId })),
+      messages: initial.messages.map((message) => ({ ...message, id: messageId })),
+    });
+    const store = yield* KanbanStore.KanbanStore;
+    const evaluator = initial.runs[0]!.threadId;
+    const talk: KanbanDiscussion = {
+      id: KanbanDiscussionId.make("disc-1569"),
+      boardId: KanbanBoardId.make("robob"),
+      cardId:
+        kind.startsWith("script") || kind.startsWith("recovery")
+          ? KanbanCardId.make("card-1603")
+          : null,
+      title: "Owner reply",
+      evaluatorThreadId: evaluator,
+      participants: [
+        {
+          actor: { _tag: "evaluator", threadId: evaluator },
+          name: "Evaluator",
+          lastReadSeq: 1,
+          typingUntil: null,
+          owes: "asked",
+        },
+      ],
+      lastSeq: 1,
+      lastMessageAt: null,
+      createdBy: { _tag: "owner" },
+      createdAt: "2026-11-15T00:00:00Z",
+      archivedAt: null,
+      titleEditedAt: null,
+      settledAt: null,
+      snoozedUntil: null,
+      pinnedAt: null,
+      reopenedAt: null,
+    };
+    yield* store.putDiscussion(kind.startsWith("recovery") ? { ...talk, participants: [] } : talk);
+    yield* store.putMessage({
+      discussionId: talk.id,
+      seq: 1,
+      author:
+        kind.startsWith("script") || kind.startsWith("recovery")
+          ? { _tag: "script", scriptId: KanbanScriptId.make("script-1603") }
+          : { _tag: "owner" },
+      authorName: "Owner",
+      blocks: [{ _tag: "md", text: "Please reply" }],
+      answers: [],
+      createdAt: talk.createdAt,
+    });
+    // The reminder is already queued above; the reply lands before its provider start.
+    if (kind !== "still owed" && !kind.endsWith("pending")) {
+      yield* store.putMessage({
+        discussionId: talk.id,
+        seq: 2,
+        author: {
+          _tag: "evaluator",
+          threadId:
+            kind === "answered by another evaluator" ? ThreadId.make("other-evaluator") : evaluator,
+        },
+        authorName: "Evaluator",
+        blocks: [{ _tag: "md", text: "Answered" }],
+        answers: [],
+        createdAt: "2026-11-15T00:01:00Z",
+      });
+      yield* store.putDiscussion({
+        ...talk,
+        lastSeq: 2,
+        participants: talk.participants.map((p) => ({
+          ...p,
+          owes: kind === "answered by another evaluator" ? "asked" : null,
+        })),
+      });
+    }
+    if (kind === "recovery read-through pending" || kind === "recovery answered then newer") {
+      yield* store.putMessage({
+        discussionId: talk.id,
+        seq: 3,
+        author: { _tag: "owner" },
+        authorName: "Owner",
+        blocks: [{ _tag: "md", text: "Newer post" }],
+        answers: [],
+        createdAt: "2026-11-15T00:02:00Z",
+      });
+      yield* store.putDiscussion({
+        ...talk,
+        lastSeq: 3,
+        participants: talk.participants.map((p) => ({ ...p, lastReadSeq: 3, owes: "asked" })),
+      });
+    }
+    yield* harness.start;
+    if (kind === "still owed" || kind.endsWith("pending")) {
+      expect(harness.startRootRun).toHaveBeenCalledTimes(1);
+      expect(harness.open).toHaveBeenCalledTimes(1);
+      return;
+    }
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("completed");
+    expect(harness.finishUsageBeforeStart).toHaveBeenCalledTimes(1);
+  }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provide(Sqlite.layerMemory)))),
+);
+
+effectIt.effect.each(
+  (["open", "ensure", "handoff", "retry"] as const).flatMap((phase) =>
+    (["pending", "answered", "answered then newer", "settled", "archived"] as const).map(
+      (state) => ({ phase, state }),
+    ),
+  ),
+)("#1603 recovery rechecks $state at native offer after $phase", ({ phase, state }) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    let advance: Effect.Effect<void> = Effect.void;
+    const harness = makeLocalCommandHarness({
+      text: "Retained native recovery body",
+      nativeDelivery: true,
+      beforeSetup: (entered) => (phase === "open" && entered === "open" ? advance : Effect.void),
+    });
+    const initial = harness.projection();
+    const sourceRun = initial.runs.at(-1)!;
+    const target = initial.providerThreads.at(-1)!;
+    const talk: KanbanDiscussion = {
+      id: KanbanDiscussionId.make("disc-native-recovery-1603"),
+      boardId: KanbanBoardId.make("robob"),
+      cardId: KanbanCardId.make("card-native-1603"),
+      title: "Native offer",
+      evaluatorThreadId: sourceRun.threadId,
+      participants: [],
+      lastSeq: 1,
+      lastMessageAt: null,
+      createdBy: { _tag: "owner" },
+      createdAt: "2026-11-16T00:00:00Z",
+      archivedAt: null,
+      titleEditedAt: null,
+      settledAt: null,
+      snoozedUntil: null,
+      pinnedAt: null,
+      reopenedAt: null,
+    };
+    const post = {
+      discussionId: talk.id,
+      seq: 1,
+      author: { _tag: "script", scriptId: KanbanScriptId.make("script-1603") } as const,
+      authorName: "Sweep",
+      blocks: [{ _tag: "md", text: "Please reply" }] as const,
+      answers: [],
+      createdAt: talk.createdAt,
+    };
+    yield* store.putDiscussion(talk);
+    yield* store.putMessage(post);
+    advance = Effect.gen(function* () {
+      if (state.startsWith("answered"))
+        yield* store.putMessage({
+          ...post,
+          seq: 2,
+          author: { _tag: "evaluator", threadId: sourceRun.threadId },
+        });
+      if (state === "answered then newer")
+        yield* store.putMessage({ ...post, seq: 3, author: { _tag: "owner" } });
+      yield* store.putDiscussion({
+        ...talk,
+        lastSeq: state === "answered then newer" ? 3 : state === "answered" ? 2 : 1,
+        settledAt: state === "settled" ? talk.createdAt : null,
+        archivedAt: state === "archived" ? talk.createdAt : null,
+      });
+    }).pipe(Effect.orDie);
+    const messageId = MessageId.make(`kanban:post-recovery:${talk.id}:1:launch`);
+    harness.setProjection({
+      ...initial,
+      runs: initial.runs.map((run) => ({ ...run, userMessageId: messageId })),
+      messages: initial.messages.map((message) => ({ ...message, id: messageId })),
+      contextHandoffs:
+        phase !== "handoff"
+          ? []
+          : [
+              {
+                id: ContextHandoffId.make("handoff:recovery-1603"),
+                threadId: sourceRun.threadId,
+                targetRunId: sourceRun.id,
+                fromProviderThreadIds: [],
+                toProviderThreadId: target.id,
+                coveredRunOrdinals: { from: 1, to: 1 },
+                strategy: "full_thread_summary",
+                status: "ready",
+                summaryMessageId: null,
+                summaryText: "Retained context",
+                createdByProviderInstanceId: null,
+                createdAt: sourceRun.requestedAt,
+                updatedAt: sourceRun.requestedAt,
+              },
+            ],
+    });
+    if (phase === "ensure")
+      harness.retryableEnsureThread.mockImplementationOnce(() =>
+        advance.pipe(
+          Effect.as({
+            ...target,
+            nativeThreadRef: {
+              driver: target.driver,
+              nativeId: "native-offer-1603",
+              strength: "strong" as const,
+            },
+          }),
+        ),
+      );
+    if (phase === "handoff")
+      harness.injectHistory.mockImplementation(() => advance.pipe(Effect.as(false)));
+    yield* harness.start;
+    const controls = harness.startRootRun.mock.calls[0]![0];
+    expect(controls).toBeDefined();
+    if (phase === "retry") {
+      const oldRun = RunId.make("stale-recovery-1603");
+      const oldAttempt = RunAttemptId.make("stale-recovery-attempt-1603");
+      const current = harness.projection();
+      harness.setProjection({
+        ...current,
+        runs: [
+          ...current.runs,
+          {
+            ...controls.run,
+            id: oldRun,
+            ordinal: 0,
+            activeAttemptId: oldAttempt,
+            status: "completed",
+          },
+        ],
+      });
+      harness.nativeStartTurn.mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapter.ProviderAdapterTurnStartError({
+            driver: controls.session.driver,
+            threadId: controls.run.threadId,
+            providerThreadId: controls.providerThread.id,
+            runId: controls.run.id,
+            cause: new ProviderAdapter.ProviderAdapterProtocolError({
+              driver: controls.session.driver,
+              reason: "previous_turn_active",
+              detail: "stale native turn",
+              activeTurn: {
+                runId: oldRun,
+                attemptId: oldAttempt,
+                providerThreadId: controls.providerThread.id,
+                providerTurnId: ProviderTurnId.make("stale-native-recovery-1603"),
+              },
+            }),
+          }),
+        ),
+      );
+      harness.nativeInterruptTurn.mockImplementationOnce(() => advance);
+    }
+    const outcome = yield* startPreparedTurn(controls).pipe(Effect.result);
+    expect(outcome._tag).toBe(state === "pending" ? "Success" : "Failure");
+    if (outcome._tag === "Failure")
+      expect(outcome.failure).toMatchObject({ code: "provider_prompt_not_sent" });
+    expect(harness.nativeStartTurn).toHaveBeenCalledTimes(
+      phase === "retry" ? (state === "pending" ? 2 : 1) : state === "pending" ? 1 : 0,
+    );
+    if (phase === "retry") expect(harness.nativeInterruptTurn).toHaveBeenCalledOnce();
+    if (phase === "handoff" && state !== "pending")
+      expect(harness.projection().contextHandoffs[0]?.delivery?.status).not.toBe("pending");
+  }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provide(Sqlite.layerMemory)))),
 );
 
 effectIt.effect.each([

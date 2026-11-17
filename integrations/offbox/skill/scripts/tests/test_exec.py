@@ -156,14 +156,142 @@ class ExecTests(Isolated):
                 code, stdout, stderr = self.invoke("bx_own", "--timeout", "20", *(["--json"] if as_json else []),
                                                    "--", "private command")
                 self.assertEqual(code, 124)
-                self.assertEqual(json.loads(stdout) if as_json else stdout, data if as_json else data["stdout"])
-                if not as_json:
+                if as_json:
+                    envelope = json.loads(stdout)
+                    self.assertEqual({k: envelope[k] for k in data}, data)
+                    self.assertEqual(envelope["offbox"], {
+                        "code": "command_timeout", "box": "bx_own", "timeoutSeconds": 20, "pid": 1002,
+                        "queueMs": 0, "runMs": 20000, "killed": True, "outcome": "stopped"})
+                else:
+                    self.assertEqual(stdout, data["stdout"])
                     self.assertTrue(stderr.startswith(data["stderr"]))
-                self.assertIn("offbox exec: command ran past --timeout 20s on bx_own (server command 1002); "
-                              "nothing fell back locally", stderr)
+                self.assertIn("offbox exec: command ran past --timeout 20s on bx_own "
+                              "(server command 1002: waited 0.0s in the server's run queue, ran 20.0s, killed); "
+                              "nothing fell back locally\n", stderr)
+                self.assertTrue(stderr.endswith("offbox exec: it started and was stopped after 20.0s; "
+                                                "any side effects up to then may have happened, and it will not run again.\n"))
                 self.assertEqual({k: self.rows()[-1]["props"][k] for k in ("queueMs", "runMs", "pid", "killed")},
                                  {"queueMs": 0, "runMs": 20000, "pid": 1002, "killed": True})
                 self.assertNotIn("partial output", json.dumps(self.rows()))
+
+    def test_timeout_explains_queue_run_and_outcome_without_echoing_input(self):
+        never_started = "it never started; the server cancelled it and it will not run later."
+        old_server = ("the server cancels timed-out commands, so it will not run later; "
+                      "check with offbox ssh bx_own if a partial run matters.")
+        def stopped(seconds):
+            return (f"it started and was stopped after {seconds}s; any side effects up to then "
+                    "may have happened, and it will not run again.")
+        cases = [
+            ({"processId": 1007, "queuedMs": 58200, "runMs": 1800, "killed": True},
+             "server command 1007: waited 58.2s in the server's run queue, ran 1.8s, killed", True, stopped("1.8")),
+            ({"processId": 1007, "queuedMs": 60000, "runMs": 0},
+             "server command 1007: waited 60.0s in the server's run queue, ran 0.0s", True, never_started),
+            ({"processId": 1007, "queuedMs": 0, "runMs": 0, "killed": True},
+             "server command 1007: waited 0.0s in the server's run queue, ran 0.0s, killed", False, never_started),
+            ({"processId": 1007, "queuedMs": 0, "runMs": 60000, "killed": True},
+             "server command 1007: waited 0.0s in the server's run queue, ran 60.0s, killed", False, stopped("60.0")),
+            ({}, "the server sent no command id or timings: the home server is older than the exec queue fix",
+             False, old_server),
+            ({"processId": 1007}, "server command 1007", False, old_server),
+            ({"queuedMs": 30000, "killed": False}, "waited 30.0s in the server's run queue", True, never_started),
+            ({"queuedMs": 29999}, "waited 30.0s in the server's run queue", False, never_started),
+            ({"runMs": 1250}, "ran 1.2s", False, stopped("1.2")),
+            ({"runMs": 0}, "ran 0.0s", False, old_server),
+            ({"processId": "private-command", "queuedMs": -1, "runMs": "private-command", "killed": "private-command"},
+             "the server sent no command id or timings: the home server is older than the exec queue fix", False, old_server),
+        ]
+        for data, detail, hint, outcome in cases:
+            with self.subTest(data=data):
+                self.call.side_effect = api.ApiError(408, "command_timeout", "private-command", data={
+                    **data, "message": "private-command"})
+                code, stdout, stderr = self.invoke("bx_own", "--timeout", "60", "--", "private-command")
+                expected = [f"offbox exec: command ran past --timeout 60s on bx_own ({detail}); nothing fell back locally"]
+                if hint:
+                    expected.append("offbox exec: the command was waiting behind other runs on the home server, not running; "
+                                    "retry, or use offbox ssh bx_own '<cmd>' for a quick read.")
+                expected.append(f"offbox exec: {outcome}")
+                self.assertEqual((code, stdout, stderr.splitlines()), (124, "", [f"offbox: {line}" for line in expected]))
+                self.assertNotIn("private-command", stderr)
+                self.assertNotIn("unknown", stderr)
+
+    def test_timeout_json_always_writes_one_envelope_preserving_server_keys(self):
+        full = {"code": "command_timeout", "processId": 1007, "queuedMs": 58200, "runMs": 1800,
+                "killed": True, "stdout": "partial output\n", "stderr": "partial error\n",
+                "timeoutSeconds": 99, "message": "private-command", "extra": {"kept": [1, "value"]}}
+        cases = [
+            (full, (1007, 58200, 1800, True, "stopped")),
+            ({"queuedMs": 60000, "runMs": 0}, (None, 60000, 0, None, "never_started")),
+            ({"queuedMs": 0, "runMs": 0}, (None, 0, 0, None, "never_started")),
+            ({"queuedMs": 60000}, (None, 60000, None, None, "never_started")),
+            ({"queuedMs": 30000.5}, (None, 30000, None, None, "never_started")),
+            ({"runMs": 1500.5}, (None, None, 1500, None, "stopped")),
+            ({"processId": 1007}, (1007, None, None, None, "cancelled_old_server")),
+            ({}, (None, None, None, None, "cancelled_old_server")),
+            (None, (None, None, None, None, "cancelled_old_server")),
+            ("private-command", (None, None, None, None, "cancelled_old_server")),
+            (["private-command"], (None, None, None, None, "cancelled_old_server")),
+            ({"processId": True, "queuedMs": -1, "runMs": "private-command", "killed": 1},
+             (None, None, None, None, "cancelled_old_server")),
+        ]
+        for data, (pid, queue_ms, run_ms, killed, outcome) in cases:
+            with self.subTest(data=data):
+                error = api.ApiError(408, "command_timeout", "private-command")
+                error.data = data  # Exercise None too: ApiError's constructor currently replaces it with {}.
+                self.call.side_effect = error
+                code, stdout, stderr = self.invoke("bx_own", "--timeout", "60", "--json", "--", "private-command")
+                envelope = json.loads(stdout)
+                self.assertEqual(code, 124)
+                self.assertEqual(envelope, {**(data if isinstance(data, dict) else {}), "offbox": {
+                    "code": "command_timeout", "box": "bx_own", "timeoutSeconds": 60, "pid": pid,
+                    "queueMs": queue_ms, "runMs": run_ms, "killed": killed, "outcome": outcome}})
+                self.assertTrue(stderr.startswith("offbox: offbox exec: command ran past --timeout 60s on bx_own "))
+                self.assertNotIn("private-command", stderr)
+                self.assertNotIn("partial output", stderr)
+                self.assertNotIn("partial error", stderr)
+                if isinstance(data, dict):
+                    self.assertNotIn("offbox", data)
+
+    def test_timeout_json_uses_clamped_timeout(self):
+        self.call.side_effect = api.ApiError(408, "command_timeout", "private-command")
+        code, stdout, stderr = self.invoke("bx_own", "--timeout", "9999", "--json", "--", "private-command")
+        self.assertEqual((code, json.loads(stdout)["offbox"]["timeoutSeconds"]), (124, 600))
+        self.assertIn("command ran past --timeout 600s", stderr)
+
+    def test_timeout_json_flushes_before_human_diagnostics(self):
+        stdout = io.StringIO()
+        self.call.side_effect = api.ApiError(408, "command_timeout", "private-command")
+        with contextlib.redirect_stdout(stdout), patch.object(stdout, "flush") as flush:
+            def say(line):
+                flush.assert_called_once_with()
+                self.assertEqual(json.loads(stdout.getvalue())["offbox"]["outcome"], "cancelled_old_server")
+            with patch.object(common, "say", side_effect=say) as diagnostics:
+                self.assertEqual(cli.main(["exec", "bx_own", "--json", "--", "private-command"]), 124)
+        self.assertEqual(diagnostics.call_count, 2)
+
+    def test_timeout_json_preserves_exit_and_diagnostics_when_stdout_fails(self):
+        self.call.side_effect = api.ApiError(408, "command_timeout", "private-command")
+        for failure in (BrokenPipeError, OSError, ValueError):
+            for operation in ("write", "flush"):
+                with self.subTest(failure=failure, operation=operation):
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                            patch.object(stdout, operation, side_effect=failure("gone")):
+                        code = cli.main(["exec", "bx_own", "--json", "--", "private-command"])
+                    self.assertEqual(code, 124)
+                    self.assertIn("the server sent no command id or timings", stderr.getvalue())
+                    self.assertIn("it will not run later", stderr.getvalue())
+                    self.assertNotIn("internal error", stderr.getvalue())
+
+    def test_timeout_non_json_ignores_non_object_body(self):
+        for data in (None, "private-command", ["private-command"]):
+            with self.subTest(data=data):
+                error = api.ApiError(408, "command_timeout", "private-command")
+                error.data = data
+                self.call.side_effect = error
+                code, stdout, stderr = self.invoke("bx_own", "--", "private-command")
+                self.assertEqual((code, stdout), (124, ""))
+                self.assertIn("the server sent no command id or timings", stderr)
+                self.assertNotIn("private-command", stderr)
 
     def test_success_includes_timing_metadata(self):
         self.result.update(queuedMs=0, runMs=15, killed=False)

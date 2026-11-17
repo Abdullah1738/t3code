@@ -59,6 +59,14 @@ export class McpCall extends Context.Service<
       readonly build: string;
       readonly bootId: string;
     };
+    threadList?: {
+      phase: "caller" | "project" | "candidates" | "shell" | "render";
+      batchCount: number;
+      candidateRows: number;
+      elapsedMs: number;
+      readerWaitMs: number;
+      queryMs: number;
+    };
     threadRead?: {
       readerWaitMs: number;
       queryMs: number;
@@ -98,10 +106,13 @@ export class McpCall extends Context.Service<
     // Handler waits can update readerLane after caller resolution has finished.
     callerReaderLane?: string;
     readerLane: string;
+    boundedRead?: { readonly phase: string; readonly waitedMs: number };
+    readDeadlineExpired?: true;
     waitStage?: "lookup.caller" | "lookup.target" | "waiting";
     waitLookupMs?: number;
     phase: Phase;
     saved: boolean | "unknown";
+    dispatchFenceRecovered?: boolean;
     taskLookup?: TaskLookup;
     replyFailure?: "reply_timeout" | "reply_error";
     replyStage?: string;
@@ -128,6 +139,7 @@ const BOARD_BUSY =
 const TYPED_OUTCOMES = {
   TimeoutError: "timeout",
   ThreadReadTimeoutError: "timeout",
+  WikiReadTimeoutError: "timeout",
   PullRequestWatchTimeoutError: "timeout",
   PullRequestWatchUnavailableError: "refused",
   PullRequestToolTimeoutError: "timeout",
@@ -270,6 +282,15 @@ export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
   if (call._tag === "Some" && call.value.saved !== true) call.value.saved = saved;
 });
 
+// Recovery belongs to the enclosing delegateTask span, not another analytics span.
+export const dispatchFenceRecovered = Effect.gen(function* () {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some") {
+    call.value.dispatchFenceRecovered = true;
+    call.value.phase = "result";
+  }
+});
+
 // readTask owns the lookup span; retain only categories in the call ledger.
 export const setTaskLookup = Effect.fnUntraced(function* (
   lookup: Required<Pick<TaskLookup, "foundBy" | "idCanonical">> & TaskLookup,
@@ -342,6 +363,7 @@ export function callOutcome(
       errorPhase: state.phase,
       props: {
         ...taskLookup,
+        ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
         code: "unknown",
         ...interruptionProps(exit.cause),
         ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
@@ -377,11 +399,18 @@ export function callOutcome(
         : content;
   const classified = classifyFailure(error);
   // The boundary deadline wins over a detached handler's cancellation/cleanup failure.
-  const readTimeout = classified?.tag === "ThreadReadTimeoutError";
-  const code = readTimeout ? classified.tag : (state.handlerErrorTag ?? classified?.tag);
-  const typedOutcome = readTimeout
-    ? classified.outcome
-    : (state.handlerOutcome ?? classified?.outcome);
+  const typedReadTimeout =
+    classified?.tag === "ThreadReadTimeoutError" || classified?.tag === "WikiReadTimeoutError";
+  const code = state.readDeadlineExpired
+    ? "TimeoutError"
+    : typedReadTimeout
+      ? classified.tag
+      : (state.handlerErrorTag ?? classified?.tag);
+  const typedOutcome = state.readDeadlineExpired
+    ? "timeout"
+    : typedReadTimeout
+      ? classified.outcome
+      : (state.handlerOutcome ?? classified?.outcome);
   const inputRequired = exit._tag === "Success" && exit.value instanceof McpSchema.InputRequired;
   const failed =
     inputRequired ||
@@ -472,7 +501,10 @@ export function callOutcome(
     ...(state.readOnly && state.taskLookup === undefined ? {} : { saved }),
     props: {
       ...taskLookup,
-      ...(code === "task_not_found" && notFoundReason !== undefined ? { notFoundReason } : {}),
+      ...(state.dispatchFenceRecovered ? { dispatchFenceRecovered: true } : {}),
+      ...((code === "task_not_found" || code === "task_creating") && notFoundReason !== undefined
+        ? { notFoundReason }
+        : {}),
       ...(state.replyStage === undefined ? {} : { phase: state.replyStage }),
       ...(state.replySubSteps === undefined ? {} : { subSteps: state.replySubSteps }),
       code:
@@ -515,7 +547,7 @@ export function callOutcome(
                             ? "Defect"
                             : "McpToolError"))),
           errorPhase:
-            readTimeout &&
+            typedReadTimeout &&
             (error.phase === "lane_wait" || error.phase === "query" || error.phase === "render")
               ? error.phase
               : code === "caller_unresolved" ||

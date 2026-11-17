@@ -145,6 +145,9 @@ test("control wrappers preserve bounded diagnostics for request, body, upload an
     { failure: { code: "ConnectionClosed", message: secret }, props: { cause: "socket_closed", detail: "ConnectionClosed" } },
     { failure: { code: "ENOENT", path: secret }, props: { cause: "ENOENT", detail: "ENOENT" } },
     { failure: { code: "ECONNREFUSED", path: secret }, props: { cause: "ECONNREFUSED", detail: "ECONNREFUSED" } },
+    ...["ConnectionRefused", "FailedToOpenSocket"].map(code => ({
+      failure: Object.assign(new TypeError(secret), { code, errno: 0 }), props: { cause: "ECONNREFUSED", detail: code },
+    })),
     { failure: secret, props: { cause: "non_error", detail: "String" } },
   ];
   try {

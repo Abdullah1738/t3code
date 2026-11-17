@@ -1,3 +1,4 @@
+import { threadReadCount } from "../ardud/persistence/threadReadCount.ts";
 import * as Deferred from "effect/Deferred";
 import { ShellRunLookupMigration } from "../ardud/persistence/shellRunLookupMigration.ts";
 import * as IdSetQueries from "./IdSetQueries.ts";
@@ -372,6 +373,7 @@ export interface ProjectionRecordFilter {
   readonly messageRoles?: ReadonlyArray<OrchestrationV2ConversationMessage["role"]>;
   readonly turnItemRunId?: RunId;
   readonly messageIds?: ReadonlyArray<MessageId>;
+  readonly messageOrder?: "timeline" | "unordered";
   readonly messageRunIds?: ReadonlyArray<RunId>;
   readonly turnItemRunIds?: ReadonlyArray<RunId | null>;
   readonly runIds?: ReadonlyArray<RunId>;
@@ -531,6 +533,12 @@ function threadListCandidate(shell: OrchestrationV2ThreadShell): ThreadListCandi
   };
 }
 
+export interface ThreadListPageOptions {
+  readonly limit: number;
+  readonly titleContains?: string;
+  readonly after?: { readonly updatedAtMs: number; readonly threadId: string };
+}
+
 export interface ShellSnapshotOptions {
   /** Control summaries omit history counts, fork ancestors and background/provider detail. */
   readonly summaryOnly?: boolean;
@@ -645,6 +653,7 @@ export interface ProjectionStoreV2Shape {
   >;
   readonly getThreadListCandidates: (
     projectId: ProjectId,
+    options?: ThreadListPageOptions,
   ) => Effect.Effect<ReadonlyArray<ThreadListCandidate>, ProjectionStoreV2Error>;
   readonly getCallerRow: (
     threadId: ThreadId,
@@ -1003,6 +1012,10 @@ function preserveRunRecordedFields(
       : {}),
     ...(next.delegatedTaskStall === undefined && current.delegatedTaskStall !== undefined
       ? { delegatedTaskStall: current.delegatedTaskStall }
+      : {}),
+    ...(next.delegatedTaskStallRecovery === undefined &&
+    current.delegatedTaskStallRecovery !== undefined
+      ? { delegatedTaskStallRecovery: current.delegatedTaskStallRecovery }
       : {}),
     ...(next.delegatedCompletion === undefined && current.delegatedCompletion !== undefined
       ? { delegatedCompletion: current.delegatedCompletion }
@@ -2458,7 +2471,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 payload_json = json_patch(${keepRecordedRunField(
                   keepRecordedRunField(
                     keepRecordedRunField(
-                      keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                      keepRecordedRunField(
+                        keepRecordedRunField(sql`excluded.payload_json`, "$.delegatedCompletion"),
+                        "$.delegatedTaskStallRecovery",
+                      ),
                       "$.delegatedTaskStall",
                     ),
                     "$.restartCancelledBackgroundWork",
@@ -3967,6 +3983,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             : window === undefined
               ? sql<PayloadRow>`
                 SELECT payload_json FROM orchestration_v2_projection_messages
+                  ${filter?.messageIds === undefined ? sql`` : sql`INDEXED BY sqlite_autoindex_orchestration_v2_projection_messages_1`}
                 WHERE thread_id = ${threadId}
                   ${filter?.messageIds === undefined ? sql`` : sql`AND message_id IN (SELECT value FROM json_each(${encodeIdList(filter.messageIds)}))`}
                   ${filter?.messageRoles === undefined ? sql`` : sql`AND role IN (SELECT value FROM json_each(${encodeIdList(filter.messageRoles)}))`}
@@ -4110,7 +4127,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           decodeRows(decodeContextTransferPayload, threadId)(contextTransferRows),
         ]);
         const messageOrdinals = new Map<string, number>();
-        if (fields !== undefined && fields.includes("messages") && messages.length > 1) {
+        if (
+          fields !== undefined &&
+          fields.includes("messages") &&
+          messages.length > 1 &&
+          filter?.messageOrder !== "unordered"
+        ) {
           const rows = yield* sql<{ message_id: string; ordinal: number }>`
             SELECT json_extract(payload_json, '$.messageId') AS message_id, MIN(ordinal) AS ordinal
             FROM ardud_history_turn_items
@@ -4119,7 +4141,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           `;
           for (const row of rows) messageOrdinals.set(row.message_id, row.ordinal);
         }
-        const orderedMessages = sortMessagesByTurnItemOrder(messages, turnItems, messageOrdinals);
+        const orderedMessages =
+          filter?.messageOrder === "unordered"
+            ? messages
+            : sortMessagesByTurnItemOrder(messages, turnItems, messageOrdinals);
         const projection = {
           thread,
           runs,
@@ -6395,13 +6420,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       threadId: ThreadId,
       options: ProjectionTimelinePageOptions,
     ) {
-      // Keep visibility and global positions before the message filter. Only page ids
-      // cross the worker boundary; counts still inspect the visible index in SQLite.
+      // Stream global positions before filtering messages, stopping at the lookahead.
+      // Sorting this numbered stream or reusing it for totals would exhaust the history.
       const rows = yield* sql<{
         total_items: number;
         turn_item_id: string | null;
         position: number | null;
-      }>`WITH visible AS MATERIALIZED (
+      }>`WITH visible AS NOT MATERIALIZED (
         SELECT i.turn_item_id, i.type,
           ROW_NUMBER() OVER (ORDER BY i.ordinal ASC, i.turn_item_id ASC) - 1 AS position
         FROM ardud_history_turn_items i
@@ -6417,7 +6442,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND NOT EXISTS (SELECT 1 FROM ardud_history_turn_items request
               WHERE request.thread_id = i.thread_id AND request.run_id = i.run_id
                 AND request.type = 'run_interrupt_request'))
-      ), page AS (
+      ), page AS MATERIALIZED (
         SELECT turn_item_id, position FROM visible
         WHERE ${
           options.itemId === undefined
@@ -6425,9 +6450,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ${options.view === "activity" ? sql`` : sql`AND type IN ('user_message', 'assistant_message', 'proposed_plan')`}`
             : sql`turn_item_id = ${options.itemId}`
         }
-        ORDER BY position ASC LIMIT ${options.limit + 1}
+        LIMIT ${options.limit + 1}
       )
-      SELECT (SELECT COUNT(*) FROM visible) AS total_items, page.turn_item_id, page.position
+      SELECT ${threadReadCount(sql, threadId)} AS total_items, page.turn_item_id, page.position
       FROM (SELECT 1) LEFT JOIN page ON 1 ORDER BY page.position ASC`;
       const page = rows.filter((row) => row.turn_item_id !== null && row.position !== null);
       const items = yield* Effect.forEach(page.slice(0, options.limit), (row) =>
@@ -6587,7 +6612,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         limit,
         threadIds,
       }: ShellSnapshotOptions = {},
-      listCandidatesOnly = false,
+      listCandidatesOnly: ThreadListPageOptions | undefined = undefined,
+      olderThanCursor = false,
     ) {
       const lookupIndexesReady =
         lookupMigration === undefined ||
@@ -6792,7 +6818,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             FROM orchestration_v2_projection_threads t${
               // Walk the recency index and stop at the limit; a sort would build every row.
               listCandidatesOnly && lookupIndexesReady
-                ? sql` INDEXED BY ardud_shell_project_threads_idx`
+                ? sql` INDEXED BY ardud_mcp_project_recency_idx`
                 : recentFirst && limit !== undefined
                   ? sql` INDEXED BY ardud_v2_threads_updated_idx`
                   : sql``
@@ -6862,13 +6888,31 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   })`
                 : sql``
             }
+            ${
+              listCandidatesOnly?.titleContains === undefined
+                ? sql``
+                : sql` AND (
+              instr(lower(t.title), ${listCandidatesOnly.titleContains.toLocaleLowerCase()}) > 0
+              OR t.title GLOB '*[^ -~]*'
+            )`
+            }
+            ${
+              listCandidatesOnly?.after === undefined
+                ? sql``
+                : olderThanCursor
+                  ? sql` AND CAST(ROUND(unixepoch(t.updated_at, 'subsec') * 1000) AS INTEGER) < ${listCandidatesOnly.after.updatedAtMs}`
+                  : sql` AND CAST(ROUND(unixepoch(t.updated_at, 'subsec') * 1000) AS INTEGER) = ${listCandidatesOnly.after.updatedAtMs}
+                    AND t.thread_id < ${listCandidatesOnly.after.threadId}`
+            }
             ${afterThreadId === undefined ? sql`` : sql` AND t.thread_id > ${afterThreadId}`}
             ${
-              limit === undefined
-                ? sql`ORDER BY t.updated_at ASC, t.thread_id ASC`
-                : recentFirst
-                  ? sql`ORDER BY t.updated_at DESC, t.thread_id ASC LIMIT ${limit}`
-                  : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`
+              listCandidatesOnly !== undefined
+                ? sql`ORDER BY CAST(ROUND(unixepoch(t.updated_at, 'subsec') * 1000) AS INTEGER) DESC, t.thread_id DESC LIMIT ${listCandidatesOnly.limit}`
+                : limit === undefined
+                  ? sql`ORDER BY t.updated_at ASC, t.thread_id ASC`
+                  : recentFirst
+                    ? sql`ORDER BY t.updated_at DESC, t.thread_id ASC LIMIT ${limit}`
+                    : sql`ORDER BY t.thread_id ASC LIMIT ${limit}`
             }
           `;
     });
@@ -7451,36 +7495,41 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
 
     const getThreadListCandidates: ProjectionStoreV2Shape["getThreadListCandidates"] = Effect.fn(
       "ProjectionStore.getThreadListCandidates",
-    )(function* (projectId) {
-      const candidates: ThreadListCandidate[] = [];
-      let afterThreadId: string | undefined;
-      while (true) {
-        // Release the reader between batches; candidate filtering needs no history counts,
-        // fork sources, provider history or pending background items.
-        const rows = yield* sql.withTransaction(
-          selectShellThreadRows(
+    )(function* (projectId, options = { limit: 100 }) {
+      // SQLite lower() folds ASCII only. Non-ASCII titles remain candidates so the
+      // MCP's locale-aware predicate preserves existing Unicode matching.
+      const rows = yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const sameTime = yield* selectShellThreadRows(
             undefined,
+            { projectId, location: "active" },
+            options,
+          );
+          if (options.after === undefined || sameTime.length === options.limit) return sameTime;
+          // SQLite does not seek an expression-index tuple cursor. Equality plus id
+          // range and the older-time range each seek directly; both share one reader.
+          const older = yield* selectShellThreadRows(
+            undefined,
+            { projectId, location: "active" },
             {
-              projectId,
-              location: "active",
-              limit: 100,
-              ...(afterThreadId === undefined ? {} : { afterThreadId }),
+              ...options,
+              limit: options.limit - sameTime.length,
             },
             true,
-          ),
-        );
-        for (const row of rows) {
-          const state = yield* shellThreadStateFromRow({
-            row,
-            runOrdinalsByThreadId: new Map(),
-            itemCountsByThreadId: new Map(),
-            providerThreadsByThreadId: new Map(),
-            pendingTurnItemsByThreadId: new Map(),
-          });
-          candidates.push(threadListCandidate(shellFromState({ state, visibleItemCount: 0 })));
-        }
-        if (rows.length < 100) break;
-        afterThreadId = rows[rows.length - 1]!.thread_id;
+          );
+          return [...sameTime, ...older];
+        }),
+      );
+      const candidates: ThreadListCandidate[] = [];
+      for (const row of rows) {
+        const state = yield* shellThreadStateFromRow({
+          row,
+          runOrdinalsByThreadId: new Map(),
+          itemCountsByThreadId: new Map(),
+          providerThreadsByThreadId: new Map(),
+          pendingTurnItemsByThreadId: new Map(),
+        });
+        candidates.push(threadListCandidate(shellFromState({ state, visibleItemCount: 0 })));
       }
       return candidates;
     }, Effect.mapError(shellSnapshotReadError));
@@ -7862,13 +7911,38 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
       }),
       readShellSnapshot: (options) =>
         service.getShellSnapshot(options).pipe(Effect.map(Effect.succeed)),
-      getThreadListCandidates: (projectId) =>
+      getThreadListCandidates: (projectId, options = { limit: 100 }) =>
         service
           .getShellSnapshot({
             projectId,
             location: "active",
           })
-          .pipe(Effect.map((snapshot) => snapshot.threads.map(threadListCandidate))),
+          .pipe(
+            Effect.map((snapshot) =>
+              snapshot.threads
+                .filter(
+                  (thread) =>
+                    options.titleContains === undefined ||
+                    thread.title
+                      .toLocaleLowerCase()
+                      .includes(options.titleContains.toLocaleLowerCase()),
+                )
+                .filter(
+                  (thread) =>
+                    options.after === undefined ||
+                    DateTime.toEpochMillis(thread.updatedAt) < options.after.updatedAtMs ||
+                    (DateTime.toEpochMillis(thread.updatedAt) === options.after.updatedAtMs &&
+                      thread.id < options.after.threadId),
+                )
+                .toSorted(
+                  (a, b) =>
+                    DateTime.toEpochMillis(b.updatedAt) - DateTime.toEpochMillis(a.updatedAt) ||
+                    b.id.localeCompare(a.id),
+                )
+                .slice(0, options.limit)
+                .map(threadListCandidate),
+            ),
+          ),
       getCallerRow: Effect.fn("ProjectionStore.getCallerRow")(function* (threadId) {
         const projection = (yield* Ref.get(replayState)).projections.get(threadId);
         if (projection === undefined || projection.thread.deletedAt !== null) return null;

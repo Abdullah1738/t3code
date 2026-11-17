@@ -486,7 +486,7 @@ export function reviewerQuietDue(
 // A response-header timeout is the provider not answering, so it waits for the
 // probe like an outage instead of flagging the card as a broken run.
 const OUTAGE_TEXT =
-  /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired|timed out waiting for response headers/i;
+  /extra usage|plan limits|usage limit|rate limit|rate_limit_error|quota|overloaded|authentication_error|access token has expired|timed out waiting for response headers|model unavailable/i;
 
 /**
  * A failed run the same request would pass once the provider is back. The normalized
@@ -769,8 +769,13 @@ export function dispatchQueue(
   const ranking = kanbanSchedule(cards, { nowMs });
   const pickOrder = kanbanPickOrder(cards, { nowMs });
   const priority = ({ card }: QueueEntry) => ranking.get(card.id)?.rank ?? card.priority;
+  // Reviews and their follow-up work must drain before new work. Thread ids
+  // alone also name first-run retries, which keep their ordinary work ranking.
+  const newWork = ({ card, role }: QueueEntry) =>
+    Number(role === "work" && card.reviewRound === 0 && card.reviewThreadId === null);
   queue.sort(
     (a, b) =>
+      newWork(a) - newWork(b) ||
       priority(a) - priority(b) ||
       (a.role !== b.role ? (a.role === "review" ? -1 : 1) : pickOrder(a.card, b.card)),
   );
@@ -798,7 +803,8 @@ const blockingNumbers = (
   });
 
 /**
- * Fill free pool slots by effective urgency, reviews before todos at the same rank.
+ * Fill free pool slots with reviews and their follow-up work before other todos.
+ * Reviews and follow-up work compete by effective urgency, reviews winning a tie.
  * Within each role, pick order uses rank, holds, then oldest first.
  * Skip blocked, settled and backlog cards. Lowering a pool below what is
  * running frees nothing; it only stops new starts, and a pool at 0 takes no
@@ -853,6 +859,7 @@ export function dispatchQueueStatus(
   reviews: ReadonlyMap<string, ReviewEvidence> = new Map(),
   workThreadHomes: ReadonlyMap<string, KanbanCard | null> = new Map(),
   assignmentWakeRetries: ReadonlyMap<string, AssignmentWakeRetry> = new Map(),
+  attempted: ReadonlySet<string> = new Set(),
 ): ReadonlyArray<QueuedCard> {
   // Archiving is gated outside planDispatch; leave its legacy planning behavior intact.
   if (board.archivedAt !== null) {
@@ -875,7 +882,7 @@ export function dispatchQueueStatus(
     holds,
     () => 0,
     nowMs,
-    new Set(),
+    attempted,
     reviews,
     workThreadHomes,
     assignmentWakeRetries,

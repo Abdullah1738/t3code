@@ -11,6 +11,8 @@ import type {
 
 import { parseChangeRequestUrl } from "@t3tools/shared/changeRequestUrl";
 import { threadPullRequestKeysEqual } from "@t3tools/shared/threadPullRequests";
+import { PullRequestProviderError } from "@t3tools/source-control-core/server/PullRequestProvider";
+import * as Schema from "effect/Schema";
 
 /**
  * Wakes in a row that bring only comments. Check, conflict, or push news resets the count, so
@@ -20,18 +22,28 @@ export const PULL_REQUEST_WATCH_WAKE_LIMIT = 10;
 const LISTED_ITEMS = 10;
 const SNIPPET_LENGTH = 200;
 
+const isProviderError = Schema.is(PullRequestProviderError);
+
+export const isMissingTool = (error: PullRequestUnavailableError | PullRequestOperationError) =>
+  error._tag === "PullRequestUnavailableError"
+    ? error.reason === "cli-missing"
+    : isProviderError(error.cause) && error.cause.reason === "missing-tool";
+
 export function pullRequestWatchStopMessage(
   link: Pick<ThreadPullRequestLink, "host" | "number" | "url">,
   failures: number,
   error: PullRequestUnavailableError | PullRequestOperationError | undefined,
   reason?: string,
+  serverPath?: string,
 ): string {
   const stopped = `T3 Code stopped watching pull request #${link.number} (${link.url}) after ${failures} consecutive unsuccessful ${failures === 1 ? "read" : "reads"}.${reason ? ` ${reason}` : ""}`;
+  const pathDetail =
+    error !== undefined && isMissingTool(error) ? ` Server PATH: ${serverPath || "(unset)"}.` : "";
   if (error?._tag === "PullRequestUnavailableError") {
     const host = link.host ?? parseChangeRequestUrl(link.url)?.host ?? "this host";
-    return `${stopped} The server can't read pull requests on ${host} (${error.reason}). ${error.message} Watching again won't help until server access is fixed. Check the PR with your own tools instead.`;
+    return `${stopped} The server can't read pull requests on ${host} (${error.reason}). ${error.message} Watching again won't help until server access is fixed. Check the PR with your own tools instead.${pathDetail}`;
   }
-  return `${stopped}${error === undefined ? "" : ` Last error: ${error.message}`} Check it yourself, and call watch_pull_request to watch it again.`;
+  return `${stopped}${error === undefined ? "" : ` Last error: ${error.message}`} Check it yourself, and call watch_pull_request to watch it again.${pathDetail}`;
 }
 
 export type PullRequestWatchChange =

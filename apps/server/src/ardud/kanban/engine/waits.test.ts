@@ -325,6 +325,43 @@ describe("the board's own checks, through the check contract", () => {
     });
   });
 
+  it.each(["done", "skipped"] as const)(
+    "card: accepts a marked Completed target and wakes when %s",
+    (state) => {
+      const step = {
+        ...subtask("evaluator", "Host release via #99, then live read-back"),
+        holdsDependents: true,
+      };
+      const blocker = card(190, { stage: "completed", subtasks: [step] });
+      const dependent = card(189, { stage: "todo" });
+      const request: WaitRequest = {
+        on: "card",
+        card: blocker,
+        note: "Wait for host release and read-back",
+      };
+      expect(checkWait(dependent, request, evaluator, NOW, true)).toMatchObject({ ok: true });
+      const waiting = { ...dependent, wait: newWait(request, evaluator, AT) };
+      const known = (target: KanbanCard) => facts({ cards: new Map([[target.id, target]]) });
+      expect(answer(waiting, known(blocker))).toEqual(hold);
+      expect(resolveWait(waiting, known(blocker), ctx, AT)._tag).toBe("hold");
+      const finished = { ...blocker, subtasks: [{ ...step, state }] };
+      expect(answer(waiting, known(finished))).toEqual({
+        result: "wake",
+        note: "Card #190 is done",
+      });
+      const ended = resolveWait(waiting, known(finished), ctx, AT);
+      expect(ended).toMatchObject({ _tag: "end" });
+      if (ended._tag === "end") expect(ended.card).not.toHaveProperty("wait");
+      expect(
+        checkWait(dependent, { ...request, card: finished }, evaluator, NOW, true),
+      ).toMatchObject({ ok: false });
+      const unmarked = { ...blocker, subtasks: [subtask("evaluator", step.text)] };
+      expect(
+        checkWait(dependent, { ...request, card: unmarked }, evaluator, NOW, true),
+      ).toMatchObject({ ok: false });
+    },
+  );
+
   it.each([
     ["working", null, [], false],
     ["completed", null, [subtask("evaluator", "merge into main")], false],

@@ -29,8 +29,8 @@ class LockRollupTests(unittest.TestCase):
             result = rollup('2026-11-15', tmp)['locks']
         self.assertEqual(result['count'], 29)
         self.assertEqual(result['unlocks'], 1)
-        self.assertEqual(result['byProviderModelCause'][0], dict(provider='codex', model='gpt-image-2', cause='quota', count=28, lockMs=dict(p50=5000, p95=7000, max=7000)))
-        self.assertEqual(result['topAccounts'], [dict(account=f'{n:016x}', count=n) for n in range(7, 2, -1)])
+        self.assertEqual(result['byProviderModelCause'][0], dict(provider='codex', model='gpt-image-2', cause='quota', count=28, distinct=28, capped=0, upstreamResetMs=None, lockMs=dict(p50=5000, p95=7000, max=7000)))
+        self.assertEqual(result['topAccounts'], [dict(account=f'{n:016x}', count=n, distinct=n) for n in range(7, 2, -1)])
 
     def test_snapshot_uses_exposed_deadlines_and_shared_hash_without_content(self):
         now = dt.datetime(2026, 11, 15, tzinfo=dt.timezone.utc)
@@ -73,7 +73,7 @@ class LockRollupTests(unittest.TestCase):
             result = rollup('2026-11-15', tmp)['locks']
             self.assertIsNone(result['byProviderModelCause'][0]['lockMs'])
             self.assertEqual(result['count'], 4)
-            self.assertEqual(rollup('2026-11-16', tmp)['locks'], dict(count=0, unlocks=0, byProviderModelCause=[], topAccounts=[]))
+            self.assertEqual(rollup('2026-11-16', tmp)['locks'], dict(count=0, distinct=0, unlocks=0, byProviderModelCause=[], topAccounts=[]))
 
 
 if __name__ == '__main__':

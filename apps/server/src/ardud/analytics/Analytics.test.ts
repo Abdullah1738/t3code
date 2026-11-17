@@ -84,6 +84,171 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect("reads slot and claim decisions in defaults and by kind", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const decisions = [
+        event({
+          kind: "kanban.slot",
+          surface: "server",
+          boardId: "a",
+          cardId: "c",
+          threadId: "t",
+          props: { poolKey: "sol", slot: "take", why: "start", held: false },
+        }),
+        event({
+          kind: "kanban.slot",
+          surface: "server",
+          boardId: "a",
+          threadId: "t",
+          props: { poolKey: "sol", slot: "release", why: "hold_end", held: false },
+        }),
+        event({
+          kind: "kanban.claim_denied",
+          surface: "server",
+          boardId: "a",
+          cardId: "c",
+          threadId: "t",
+          props: {
+            poolKey: "sol",
+            reason: "pool_full",
+            holdsSlot: false,
+            carried: 0,
+            used: 1,
+            slots: 1,
+          },
+        }),
+        event({
+          kind: "kanban.claim",
+          surface: "server",
+          boardId: "a",
+          cardId: "c",
+          threadId: "t",
+          props: {
+            poolKey: "sol",
+            reason: "taken",
+            holdsSlot: true,
+            carried: 0,
+            used: 1,
+            slots: 1,
+          },
+        }),
+        event({
+          kind: "kanban.next",
+          surface: "server",
+          boardId: "a",
+          threadId: "t",
+          props: { holdsSlot: true, candidateCount: 1 },
+        }),
+      ];
+      for (const row of decisions) yield* analytics.record(row);
+      yield* analytics.flush;
+      const cold = yield* open(setup);
+      for (const reader of [analytics, cold]) {
+        assert.sameDeepMembers([...(yield* reader.read({ day, boardId: "a" })).samples], decisions);
+        for (const kind of new Set(decisions.map((row) => row.kind))) {
+          assert.sameDeepMembers(
+            [...(yield* reader.read({ day, kind })).samples],
+            decisions.filter((row) => row.kind === kind),
+          );
+        }
+      }
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("reads silent child stall decisions with their phase and recovery action", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      for (const [phase, action] of [
+        ["post_tool", "resumed"],
+        ["first_event", "restarted"],
+        ["mid_turn", "failed"],
+      ] as const) {
+        yield* analytics.record(
+          event({
+            kind: "delegated_task.stall",
+            surface: "server",
+            route: "provider",
+            threadId: "thread:delegated:child",
+            taskId: "task:child",
+            props: {
+              runId: "run:child",
+              provider: "codex",
+              model: "gpt-6.1-sol",
+              effort: "max",
+              phase,
+              action,
+              lastProgressKind: "run_started",
+              silentSeconds: 900,
+            },
+          }),
+        );
+      }
+      const result = yield* analytics.read({ day, kind: "delegated_task.stall", limit: 10 });
+      assert.lengthOf(result.samples, 3);
+      assert.sameMembers(
+        result.samples.map((row) => row.props?.action),
+        ["resumed", "restarted", "failed"],
+      );
+      assert.sameMembers(
+        result.samples.map((row) => row.props?.phase),
+        ["post_tool", "first_event", "mid_turn"],
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("reads delegated notice delays and terminal status corrections by kind", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const notice = event({
+        ts,
+        surface: "server",
+        route: "delegated-tasks",
+        kind: "delegated.notice",
+        parentThreadId: "thread:parent",
+        parentRunId: "run:parent",
+        noticeMessageId: "message:notice",
+        noticeKind: "mixed",
+        children: [
+          {
+            childTaskId: "node:baseline",
+            status: "completed",
+            terminalAt: `${day}T11:59:48.000Z`,
+            delayMs: 12000,
+          },
+          {
+            childTaskId: "node:review",
+            status: "failed",
+            terminalAt: `${day}T11:59:50.000Z`,
+            delayMs: 10000,
+          },
+        ],
+      });
+      const correction = event({
+        ts,
+        surface: "server",
+        route: "delegated-tasks",
+        kind: "delegated.terminal-status-changed",
+        parentThreadId: "thread:parent",
+        parentRunId: "run:parent",
+        taskId: "node:review",
+        oldStatus: "completed",
+        newStatus: "failed",
+        reason: "child_terminal_reconciled",
+      });
+      yield* analytics.record(notice);
+      yield* analytics.record(correction);
+      yield* analytics.flush;
+      assert.deepEqual(yield* readSamples(analytics, { day, kind: "delegated.notice" }), [notice]);
+      assert.deepEqual(
+        yield* readSamples(analytics, { day, kind: "delegated.terminal-status-changed" }),
+        [correction],
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
   it.effect("prioritises board kinds and ignores board long tasks in samples and rollup", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;

@@ -947,3 +947,50 @@ describe("discussion preview loader", () => {
     stopB();
   });
 });
+
+it("purges through the guarded board method and removes an open board from the feed", async () => {
+  const fake = fakeTransport(new Set(["kanban.board.purge"]));
+  const client = createKanbanClient(fake.transport);
+  const registry = AtomRegistry.make();
+  expect(registry.get(client.permission("kanban.board.purge"))).toBe(false);
+  const board = client.board("board-toy");
+  const stop = board.subscribe(() => {});
+  fake.push(snapshotEvent(0));
+  expect(board.get()).toBeDefined();
+  fake.push({ _tag: "change", change: { _tag: "boardRemoved", boardId: "board-toy" as never } });
+  expect(board.get()).toBeUndefined();
+  const save = client.purgeBoard("board-toy");
+  const request = fake.take("kanban.board.purge");
+  expect(request.input).toEqual({ boardId: "board-toy" });
+  request.resolve(undefined);
+  await save;
+  stop();
+});
+
+it.each([false, true])(
+  "keeps pending purge threads hidden without board content (previously known=%s)",
+  (known) => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const stop = client.boardThreads.subscribe(() => {});
+    const pending = {
+      boardId: "gone",
+      board: null,
+      purged: true,
+      threadIds: ["failed-thread"],
+      needsOwner: 0,
+      running: 0,
+      unread: 0,
+    } as never;
+    if (known)
+      fake.pushList([
+        { ...(pending as object), purged: false, board: { id: "gone", name: "Gone" } } as never,
+      ]);
+    fake.pushList([pending]);
+    expect(client.boards.get()).toEqual([]);
+    expect([...client.boardThreads.get()!]).toEqual(["failed-thread"]);
+    fake.pushList([]);
+    expect([...client.boardThreads.get()!]).toEqual([]);
+    stop();
+  },
+);

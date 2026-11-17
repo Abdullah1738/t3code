@@ -23,7 +23,7 @@ PROBE_BEGIN_MARKER = 'offbox-space-probe: '
 PROBE_ERROR_MARKER = 'offbox-space-probe-error: '
 PROBE_FAILED = 'offbox: disk-space probe failed (exit '
 PROBE_INVALID = 'offbox: infra: disk probe payload invalid (client code changed on disk since start?)'
-ENOSPC = re.compile(r'No space left on device|\bENOSPC\b|os error 28|Errno 28', re.I)
+ENOSPC = re.compile(r'No space left on device|\bENOSPC\b|os error 28|Errno\s*28|errno[ :=]*28', re.I)
 
 
 def snapshot(workspace=None, home=None):
@@ -139,9 +139,11 @@ def remove_checked(parent, name, uid, cutoff, device, expected=None):
 
 
 def reap(root, uid, live, *, clock=time.time, proc=Path('/proc'), emit=print,
-         mountinfo=Path('/proc/self/mountinfo')):
+         mountinfo=Path('/proc/self/mountinfo'), finished_before=None):
     root = Path(root)
-    cutoff = min([clock()-600] + [r['started_at'] for r in live])
+    # A confirmed finished run needs no grace period; every live wrapper still fences its files.
+    cutoff = min([finished_before if finished_before is not None else clock()-600] +
+                 [r['started_at'] for r in live])
     device = root.stat().st_dev
     # st_dev alone cannot distinguish a bind mount of the same filesystem.
     mounts = [re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), line.split()[4])
@@ -367,18 +369,34 @@ def probe():
     space = snapshot(sys.argv[2] if len(sys.argv) > 2 else None)
     print(MARKER + json.dumps(dict(phase=phase, space=space)), file=sys.stderr, flush=True)
     if phase == 'start':
+        receipt = None
+        run = os.environ.get('OFFBOX_RUN_ID', '')
+        if re.fullmatch(r'run-[A-Za-z0-9-]+', run):
+            receipt = Path.home() / '.offbox/exit' / (run + '.gate')
+            try:
+                receipt.unlink(missing_ok=True)
+            except OSError:
+                pass
         line = warning(space, os.environ.get('OFFBOX_BOX_ID', '<box>'))
         if line:
             print(line, file=sys.stderr)
         if space.get('tmp', {}).get('free_bytes', GATE_BYTES) < GATE_BYTES:
-            print(MARKER + json.dumps(dict(phase='gate', space=space)), file=sys.stderr, flush=True)
+            record = json.dumps(dict(phase='gate', space=space))
+            # A lost command-start response has no API log identity, including on home boxes.
+            if receipt is not None:
+                try:
+                    receipt.parent.mkdir(parents=True, exist_ok=True)
+                    receipt.write_text(record)
+                except OSError:
+                    pass
+            print(MARKER + record, file=sys.stderr, flush=True)
             print('offbox: infra: /tmp below 256 MiB; command not started; see remote-compute: Disk space', file=sys.stderr)
             sys.exit(90)
 
 
 def _build_probe_payload():
     # Send only the probe, not the reaper; wrapped shell commands must remain below 64 KiB.
-    source = ('import os,json,subprocess,sys\nfrom pathlib import Path\n'
+    source = ('import os,json,re,subprocess,sys\nfrom pathlib import Path\n'
               f'WARN_BYTES={WARN_BYTES}\nGATE_BYTES={GATE_BYTES}\nMARKER={MARKER!r}\n'
               + '\n'.join(inspect.getsource(f) for f in (snapshot, warning, probe)) + '\nprobe()\n')
     compile(source, '<offbox disk probe>', 'exec')

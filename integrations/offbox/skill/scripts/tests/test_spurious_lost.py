@@ -29,6 +29,54 @@ class SpuriousLostTests(Isolated):
     def row(self):
         return self.con.execute("SELECT * FROM runs WHERE run_id='run-t'").fetchone()
 
+    def test_never_admitted_home_loss_settles_without_guest_markers_on_a_live_box(self):
+        lost = dict(status='lost', running=False, exitCode=None, startedAt=None,
+                    notAdmitted=True, queueLostReason='unit_inactive')
+        self.con.execute("UPDATE runs SET command_id='cmd-lost'")
+        self.con.commit()
+        for route in ('stream', 'status', 'history'):
+            with self.subTest(route=route), contextlib.ExitStack() as stack:
+                self.con.execute("UPDATE runs SET status='running',exit_code=NULL,end_at=NULL")
+                self.con.execute("DELETE FROM kv WHERE k='lost_confirmed:run-t'")
+                self.con.commit()
+                stack.enter_context(patch.object(api, 'BACKEND', 'server'))
+                stack.enter_context(patch.object(common, '_BACKEND', 'server'))
+                stack.enter_context(patch.dict('os.environ', {'OFFBOX_BACKEND': 'server'}))
+                stack.enter_context(patch.object(runs, '_ttl_keeper'))
+                stack.enter_context(patch.object(runs, 'settle_docker'))
+                stack.enter_context(patch.object(api, 'history_get', return_value={'command': lost}))
+                stack.enter_context(patch.object(api, 'cmd_status', return_value=lost if route == 'status' else
+                                               dict(status='lost', running=False)))
+                stack.enter_context(patch.object(api, 'cmd_attach', **(
+                    {'return_value': iter([dict(type='hello', status='lost'), dict(lost, type='exit')])}
+                    if route == 'stream' else {'side_effect': OSError('stream disconnected')})))
+                recorded = stack.enter_context(patch.object(runs, 'recorded_exit', side_effect=AssertionError('no guest .rc')))
+                alive = stack.enter_context(patch.object(runs, 'remote_alive', side_effect=AssertionError('no guest .pid')))
+                stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                self.assertEqual(misc.wait('run-t', 45), common.EXIT_INFRA)
+                self.assertEqual(self.row()['status'], 'lost')
+                self.assertEqual(self.con.execute("SELECT v FROM kv WHERE k='lost_confirmed:run-t'").fetchone()[0],
+                                 'not_admitted')
+                self.assertEqual(lease.active_runs(self.con, 'bx'), 0)
+                self.assertEqual(misc.wait('run-t', 45), common.EXIT_INFRA)
+                recorded.assert_not_called()
+                alive.assert_not_called()
+
+    def test_never_admitted_confirmation_rejects_other_loss_shapes(self):
+        lost = dict(status='lost', running=False, startedAt=None, notAdmitted=True, queueLostReason='unit_inactive')
+        cases = [
+            ('server', {}, True), ('boat', {}, False),
+            ('server', dict(status='running'), False), ('server', dict(running=True), False),
+            ('server', dict(startedAt='2026-11-16T20:00:00Z'), False),
+            ('server', dict(notAdmitted=False), False), ('server', dict(notAdmitted=1), False),
+            ('server', dict(queueLostReason=None), False), ('server', dict(queueLostReason='too_old'), False),
+        ]
+        for backend, changes, expected in cases:
+            with self.subTest(backend=backend, changes=changes), patch.object(api, 'BACKEND', backend):
+                self.assertEqual(runs.confirm_queue_loss('run-t', dict(lost, **changes), record=False), expected)
+        self.assertIsNone(self.con.execute("SELECT v FROM kv WHERE k='lost_confirmed:run-t'").fetchone())
+
     def test_2786_reaper_reads_existing_exit_file(self):
         for code in (0, 1):
             with self.subTest(code=code), patch.object(runs, 'recorded_exit', return_value=code):

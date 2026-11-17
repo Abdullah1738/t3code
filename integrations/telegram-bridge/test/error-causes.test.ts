@@ -11,6 +11,8 @@ test("fixture replay classifies every error shape without unknown or private tex
       [{ status, message: secret }, status, `HTTP ${status}`] as [unknown, number, string]),
     ...["ENOENT", "ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT"].map(code =>
       [{ cause: { code, path: secret } }, code, code] as [unknown, string, string]),
+    ...["ConnectionRefused", "FailedToOpenSocket"].map(code =>
+      [Object.assign(new TypeError(secret), { code, errno: 0 }), "ECONNREFUSED", code] as [unknown, string, string]),
     [new SyntaxError(secret), "decode", "SyntaxError"],
     [new URIError(secret), "decode", "URIError"],
     [{ name: "AssertionError", message: secret }, "decode", "AssertionError"],
@@ -42,6 +44,36 @@ test("fixture replay classifies every error shape without unknown or private tex
     if (row.props?.cause === "unclassified") expect(row.props.errorClass).toBe(row.props.detail);
   }
   for (const part of secret.split(" ")) expect(logs.text()).not.toContain(part);
+});
+
+test.each(["ConnectionRefused", "FailedToOpenSocket"])("Bun %s survives nested causes and preserves diagnostic precedence", code => {
+  const failure = Object.assign(new TypeError(secret), { code, errno: 0 });
+  const diagnostic = { cause: "ECONNREFUSED", detail: code };
+  expect(errorInfo(failure)).toEqual(diagnostic);
+  expect(errorInfo(new Error(secret, { cause: failure }))).toEqual(diagnostic);
+  expect(errorInfo({ name: "ZodError", cause: failure })).toEqual(diagnostic);
+  expect(errorInfo({ status: 503, cause: failure })).toEqual({ cause: 503, detail: "HTTP 503" });
+  expect(errorInfo({ code: "ECONNRESET", cause: failure })).toEqual({ cause: "ECONNRESET", detail: "ECONNRESET" });
+  expect(errorInfo({ causeClass: "timeout", cause: failure })).toEqual({ cause: "timeout", detail: "timeout" });
+});
+
+test("16 November boot-window fixture logs Bun connection refusals without private text", () => {
+  const failure = Object.assign(new TypeError("Unable to connect. Is the computer able to access the url?"), {
+    code: "ConnectionRefused", errno: 0, path: secret,
+  });
+  const tags = ["tg.attention.board", "tg.control.request", "tg.attention.requests", "tg.attention.directories",
+    "tg.control.events", "tg.robob.notifications", "tg.main.backendHealth"];
+  for (const tag of tags) toolError("telegram", tag, { thread: secret }, failure);
+  expect(logs.entries().map(row => ({ name: row.name, props: row.props, tag: row.error?.tag }))).toEqual(tags.map(tag => ({
+    name: "telegram.error", props: { cause: "ECONNREFUSED", detail: "ConnectionRefused" }, tag,
+  })));
+  expect(logs.text()).not.toContain(failure.message);
+  for (const part of secret.split(" ")) expect(logs.text()).not.toContain(part);
+});
+
+test.each(["ConnectionReset", "Timeout", "TimeoutError", "connectionrefused", "ConnectionRefused-private-id", "__proto__", "toString"])("unobserved Bun-like code %s stays unclassified", code => {
+  const failure = Object.assign(new TypeError(secret), { code });
+  expect(errorInfo(failure)).toEqual({ cause: "unclassified", detail: "TypeError", errorClass: "TypeError" });
 });
 
 test("diagnostic fields reject arbitrary class names, details and legacy unknown", () => {

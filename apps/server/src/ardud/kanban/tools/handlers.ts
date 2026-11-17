@@ -22,6 +22,7 @@ import {
 } from "@t3tools/contracts";
 import { resolvedContext } from "../../analytics/McpCall.ts";
 import * as CardNextMetrics from "../../analytics/CardNextMetrics.ts";
+import * as WikiReadTiming from "../../analytics/WikiReadTiming.ts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -37,7 +38,10 @@ import * as Asks from "../engine/asks.ts";
 import {
   askGateWarning,
   gateOf,
+  idNumber,
+  needsPacketStep,
   secretKindApprovalWarning,
+  withPacketStep,
   type SubtaskInput,
 } from "../engine/subtasks.ts";
 import { KanbanService, messageTextFields } from "../engine/KanbanService.ts";
@@ -70,10 +74,19 @@ const gatedResult = (
   card: KanbanCard,
   inputs: ReadonlyArray<SubtaskInput> = [],
   guessedGates?: KanbanBoard["guessedGates"],
+  /** The card before the plan, so generated ids match planSubtasks exactly. */
+  before?: Pick<KanbanCard, "subtaskSeq" | "subtasks">,
 ) => {
-  let nextId = card.subtaskSeq - inputs.filter((input) => !input.id?.trim()).length;
+  // The ids planSubtasks hands out: an explicit one raises the counter, an
+  // entry without one takes the next number (in input order).
+  let nextId = (before?.subtasks ?? []).reduce(
+    (max, subtask) => Math.max(max, idNumber(subtask.id)),
+    before?.subtaskSeq ?? 0,
+  );
   const gated = inputs.flatMap((input) => {
-    const id = input.id?.trim() || `s${++nextId}`;
+    const explicit = input.id?.trim();
+    if (explicit) nextId = Math.max(nextId, idNumber(explicit));
+    const id = explicit || `s${++nextId}`;
     const subtask = card.subtasks.find((entry) => entry.id === id);
     const gate = subtask && gateOf(subtask, guessedGates);
     return input.gate == null && gate && subtask && subtask.gateSource !== "set"
@@ -164,7 +177,10 @@ const withCaller = Effect.fn("KanbanTools.withCaller")(
     return yield* service.agentCall(
       threadId,
       Effect.gen(function* () {
-        const link = yield* CardNextMetrics.stage("caller", service.caller(threadId));
+        const link = yield* WikiReadTiming.step(
+          "caller",
+          CardNextMetrics.stage("caller", service.caller(threadId)),
+        );
         if (link?.boardId) yield* resolvedContext({ boardId: link.boardId });
         const actor: KanbanActor =
           link !== null && link.role !== "evaluator"
@@ -1212,9 +1228,27 @@ const handlers = {
             "slug",
           );
         }
-        const board = yield* boardFor(service, caller, input.boardId, true);
+        const board = yield* WikiReadTiming.step(
+          "board",
+          boardFor(service, caller, input.boardId, true),
+        );
+        if (
+          input.slug === undefined &&
+          input.slugs === undefined &&
+          input.section === undefined &&
+          !input.outline
+        ) {
+          return {
+            pages: [],
+            index: (yield* service.wikiIndex(board.id)).toSorted((a, b) =>
+              a.slug.localeCompare(b.slug),
+            ),
+            hint: "Pass slug to read a page.",
+          };
+        }
         const pages = yield* service.wiki(board.id, {
           slug: input.slug,
+          slugs: input.slugs,
           section: input.section,
           outline: input.outline,
         });
@@ -1231,18 +1265,7 @@ const handlers = {
             missing: input.slugs.filter((slug) => !bySlug.has(slug)),
           };
         }
-        return {
-          pages: [],
-          index: pages
-            .toSorted((a, b) => a.slug.localeCompare(b.slug))
-            .map((page) => ({
-              slug: page.slug,
-              title: page.title,
-              updatedAt: page.updatedAt,
-              bytes: Buffer.byteLength(page.body, "utf8"),
-            })),
-          hint: "Pass slug to read a page.",
-        };
+        return { pages };
       }),
     ),
   ),
@@ -1333,7 +1356,12 @@ const handlers = {
           { ...fields, stage: input.stage, question: input.question ?? null },
           caller.actor,
         );
-        return { card, ...gatedResult(card, input.subtasks, board.guessedGates) };
+        // The engine puts the packet first for a thread's or a script's card, so
+        // the ids the reply names must be numbered with it in front.
+        const planInput = needsPacketStep(caller.actor)
+          ? withPacketStep(input.subtasks ?? [])
+          : input.subtasks;
+        return { card, ...gatedResult(card, planInput, board.guessedGates) };
       }),
     ),
   ),
@@ -1455,7 +1483,7 @@ const handlers = {
                     entry.text !== card.subtasks.find((previous) => previous.id === entry.id)?.text,
                 )
                 .map(({ id }) => ({ id })));
-        return { card: edited, ...gatedResult(edited, planInput, board.guessedGates) };
+        return { card: edited, ...gatedResult(edited, planInput, board.guessedGates, card) };
       }),
     ),
   ),

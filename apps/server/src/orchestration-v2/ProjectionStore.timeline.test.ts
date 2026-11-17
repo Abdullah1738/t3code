@@ -17,6 +17,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Tracer from "effect/Tracer";
 import * as Statement from "effect/sql/Statement";
+import * as SqlClient from "effect/sql/SqlClient";
+import { liveColumns } from "../ardud/persistence/historyArchiveSql.ts";
 import { createOrchestrationV2TurnItemVisibility } from "@t3tools/shared/orchestrationV2Timeline";
 import * as Sqlite from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -205,6 +207,20 @@ it.effect(
           assert.isTrue(sql.every((span) => Number(span.attributes.get("db.rows_returned")) <= 2));
         }
       }
+      const sql = yield* SqlClient.SqlClient;
+      const columns = liveColumns("orchestration_v2_projection_turn_items");
+      yield* sql.unsafe(`INSERT INTO ardud_base.orchestration_v2_projection_turn_items (${columns})
+        SELECT ${columns} FROM main.orchestration_v2_projection_turn_items`);
+      yield* sql.unsafe(`INSERT INTO ardud_archive.ardud_turn_items (${columns})
+        SELECT ${columns} FROM main.orchestration_v2_projection_turn_items WHERE ordinal % 3 <> 0`);
+      yield* sql`DELETE FROM main.orchestration_v2_projection_turn_items WHERE ordinal % 3 <> 2`;
+      const tiered = yield* store.getTimelinePage(threadId, { view: "activity", limit: 100 });
+      assert.equal(tiered.totalItems, visible.length);
+      assert.deepEqual(
+        tiered.items.map((row) => row.item.id),
+        visible.map((item) => item.id),
+      );
+      assert.isFalse(tiered.hasMore);
       for (const item of items.slice(80)) {
         const result = yield* store.getTimelinePage(threadId, {
           view: "messages",

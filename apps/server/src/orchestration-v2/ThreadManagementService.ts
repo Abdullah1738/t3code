@@ -15,6 +15,7 @@ import type {
   ProjectionRecords,
 } from "./ProjectionStore.ts";
 import {
+  ControlRejectionHolder,
   type ChatAttachment,
   CommandId,
   isProviderNativeSubagentThread,
@@ -166,6 +167,7 @@ export interface ThreadManagementSendInput {
   readonly modelSelection?: ModelSelection;
   readonly mode: ThreadManagementSendMode;
   readonly activeTurnOnly?: boolean;
+  readonly delegatedTaskStallRecovery?: OrchestrationV2Run["delegatedTaskStallRecovery"];
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
   /** ardud: start the message on a fresh provider thread (context reset). */
@@ -271,6 +273,7 @@ export class ThreadManagementNoSteerableRunError extends Schema.TaggedError<Thre
   {
     threadId: ThreadId,
     mode: Schema.Literals(["steer", "restart"]),
+    holder: Schema.optional(ControlRejectionHolder),
   },
 ) {
   override get message(): string {
@@ -1337,12 +1340,29 @@ const make = Effect.gen(function* () {
           : ["runs", "providerTurns"],
     );
     const steerableRun = input.mode === "queue" ? undefined : latestSteerableRun(target);
+    const observedRun =
+      input.mode === "queue"
+        ? undefined
+        : (latestActiveRun(target) ??
+          target.runs.reduce<OrchestrationV2Run | undefined>(
+            (latest, run) => (latest === undefined || run.ordinal > latest.ordinal ? run : latest),
+            undefined,
+          ));
+    const holder = {
+      threadId: input.threadId,
+      runId: observedRun?.id ?? null,
+      status: observedRun?.status ?? null,
+    };
     // Replays must reach the orchestrator even after the run finishes or the thread archives.
     const preflightError =
       target.thread.archivedAt !== null
         ? new ThreadManagementThreadArchivedError({ threadId: input.threadId })
         : (input.mode === "steer" || input.mode === "restart") && steerableRun === undefined
-          ? new ThreadManagementNoSteerableRunError({ threadId: input.threadId, mode: input.mode })
+          ? new ThreadManagementNoSteerableRunError({
+              threadId: input.threadId,
+              mode: input.mode,
+              holder,
+            })
           : undefined;
     const readReceipt = (commandId: CommandId) =>
       receipts.getByCommandId(commandId).pipe(
@@ -1390,6 +1410,7 @@ const make = Effect.gen(function* () {
         return yield* new ThreadManagementNoSteerableRunError({
           threadId: input.threadId,
           mode: input.mode,
+          holder,
         });
       }
       const providerThread =
@@ -1406,6 +1427,7 @@ const make = Effect.gen(function* () {
           : undefined;
       if (
         input.mode === "restart" &&
+        input.delegatedTaskStallRecovery === undefined &&
         capabilities?.supportsSteeringByInterruptRestart === false &&
         capabilities.supportsInterrupt &&
         capabilities.supportsQueuedMessages
@@ -1453,6 +1475,9 @@ const make = Effect.gen(function* () {
           ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
           text: input.text,
           attachments: input.attachments,
+          ...(input.delegatedTaskStallRecovery === undefined
+            ? {}
+            : { delegatedTaskStallRecovery: input.delegatedTaskStallRecovery }),
           ...(input.modelSelection === undefined ? {} : { modelSelection: input.modelSelection }),
           dispatchMode,
           createdBy: input.createdBy,

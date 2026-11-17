@@ -12,6 +12,7 @@ import {
   type KanbanAskOption,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanCardEvent,
   type KanbanOwnerAsk,
   type KanbanSubtask,
   type KanbanStandingApproval,
@@ -878,7 +879,7 @@ export const approvalProblem = (
       service === undefined
         ? `; set service on ${subtask.id} (card_edit) so only releases of the same service count`
         : "";
-    return `card #${card.number} ${subtask.id} (interrupting${service ? `, ${service}` : ""}) is inside the ${window.hours} h release window: last ${service ? `${service} ` : ""}release ${source}#${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override${guidance}`;
+    return `card #${card.number} ${subtask.id} (interrupting${service ? `, ${service}` : ""}) is inside the ${window.hours} h release window: last ${service ? `${service} ` : ""}release ${source}#${window.last.cardNumber} at ${time(window.last.at)}, next window ${time(window.next)}; write "critical: <reason>" in the done note to override${guidance}; if this step records release #${window.last.cardNumber} that already happened, tick it with releasedAt: "${window.last.at}" (or the real restart time); it is recorded then and starts no new window`;
   }
   let reason: string;
   if (!latest || !answer) {
@@ -943,6 +944,7 @@ export interface SubtaskInput {
   readonly service?: string | null | undefined;
   /** For a script's subtask: the name of the board script that does it. Absent: any script on the card's board. */
   readonly script?: string | undefined;
+  readonly holdsDependents?: boolean | undefined;
 }
 
 /**
@@ -960,6 +962,10 @@ export const withPacketStep = (
   { step: 1, text: PACKET_SUBTASK, owner: "evaluator" },
   ...inputs.map((input) => (input.step === undefined ? input : { ...input, step: input.step + 1 })),
 ];
+
+/** A thread's or a script's card waits for an evaluator to write its packet. */
+export const needsPacketStep = (actor: KanbanActor): boolean =>
+  actor._tag === "thread" || actor._tag === "script";
 
 export type SubtaskPlan =
   | {
@@ -989,15 +995,21 @@ export type MarkCheck =
   | { readonly ok: true }
   | { readonly ok: false; readonly reason: string; readonly denyReason: McpDenyReason };
 
-const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
+/** The number in an `s<N>` subtask id; 0 for anything else. */
+export const idNumber = (id: string) => Number.parseInt(id.replace(/^s/, ""), 10) || 0;
+
+/** The ids the board hands out: s1, s2, ... */
+const subtaskId = /^s[1-9]\d*$/;
 
 /**
  * Replaces a card's plan with `inputs`. An id alone keeps that subtask;
  * omitted text, owner and step on open ids keep their stored values. New
- * entries need text and owner and get the next id. Listed done and skipped
+ * entries need text and owner; a new entry may name its own `s<N>` id that the
+ * card does not have yet, and otherwise gets the next one. Listed done and skipped
  * subtasks keep their history (but may clear a guessed gate), and omitted ones stay.
  * `seq` is the card's counter of ids ever handed out, so an open subtask dropped
- * from the plan never has its id reused by a later entry.
+ * from the plan never has its id reused by a later entry, and naming an id moves
+ * it past that number.
  */
 export function planSubtasks(
   existing: ReadonlyArray<KanbanSubtask>,
@@ -1138,47 +1150,67 @@ export function planSubtasks(
     }
     const known = id ? byId.get(id) : undefined;
     if (id) {
-      if (!known)
-        return {
-          ok: false,
-          denyReason: "subtask_not_found",
-          reason: `the card has no subtask ${id}. Existing subtask ids: ${subtaskIds(existing) || "none"}`,
-        };
       if (listed.has(id))
         return { ok: false, denyReason: "invalid_args", reason: `subtask ${id} is listed twice` };
+      // An s<N> id the card does not have yet names a new subtask below.
+      if (!known && !subtaskId.test(id))
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: `"${id}" is not a subtask id; use s1, s2, ...`,
+        };
+      if (!known && reason !== undefined)
+        return {
+          ok: false,
+          denyReason: "invalid_args",
+          reason: "clearGate needs an existing subtask id",
+        };
       listed.add(id);
-      if (known.state !== "open" && reason !== undefined) {
-        const clear = planClear(
-          known,
-          reason,
-          known.owner,
-          known.text,
-          known.ownerOnly,
-          known.interrupting,
-          gateOf(known, guessedGates),
-        );
-        if (!clear.ok) return clear;
-        const { gate: _gate, gateSource: _source, ...rest } = known;
-        planned.push({ ...rest, gateCleared: clear.gateCleared });
-        step = known.step;
-        continue;
-      }
-      // An id alone also preserves script bindings and approval timestamps.
-      if (
-        known.state !== "open" ||
-        (input.text === undefined &&
-          input.owner === undefined &&
-          input.step === undefined &&
-          input.gate === undefined &&
-          input.clearGate === undefined &&
-          input.ownerOnly === undefined &&
-          input.interrupting === undefined &&
-          input.service === undefined &&
-          input.script === undefined)
-      ) {
-        planned.push(known);
-        step = known.step;
-        continue;
+      if (known) {
+        if (known.state !== "open" && reason !== undefined) {
+          const clear = planClear(
+            known,
+            reason,
+            known.owner,
+            known.text,
+            known.ownerOnly,
+            known.interrupting,
+            gateOf(known, guessedGates),
+          );
+          if (!clear.ok) return clear;
+          const { gate: _gate, gateSource: _source, ...rest } = known;
+          planned.push({ ...rest, gateCleared: clear.gateCleared });
+          step = known.step;
+          continue;
+        }
+        // An id or hold-only patch preserves script bindings and approval timestamps.
+        if (
+          known.state !== "open" ||
+          (input.text === undefined &&
+            input.owner === undefined &&
+            input.step === undefined &&
+            input.gate === undefined &&
+            input.clearGate === undefined &&
+            input.ownerOnly === undefined &&
+            input.interrupting === undefined &&
+            input.service === undefined &&
+            input.script === undefined)
+        ) {
+          if (known.state === "open" && input.holdsDependents !== undefined) {
+            if (input.holdsDependents && (known.owner === "work" || known.owner === "review")) {
+              return {
+                ok: false,
+                denyReason: "invalid_args",
+                reason: "a step holding dependents must be owned by the evaluator or a script",
+              };
+            }
+            planned.push({ ...known, holdsDependents: input.holdsDependents });
+          } else {
+            planned.push(known);
+          }
+          step = known.step;
+          continue;
+        }
       }
     }
     const rawText = input.text ?? known?.text;
@@ -1205,6 +1237,14 @@ export function planSubtasks(
         ok: false,
         denyReason: "invalid_args",
         reason: `subtask "${text}" is the worker's; a deploy, money or secret step must be owned by the evaluator or a script`,
+      };
+    }
+    const holdsDependents = input.holdsDependents ?? known?.holdsDependents;
+    if (holdsDependents === true && (owner === "work" || owner === "review")) {
+      return {
+        ok: false,
+        denyReason: "invalid_args",
+        reason: "a step holding dependents must be owned by the evaluator or a script",
       };
     }
     const interrupting = input.interrupting ?? known?.interrupting;
@@ -1300,11 +1340,18 @@ export function planSubtasks(
         ...(gateCleared ? { gateCleared } : {}),
         ...(approvalChanged && gate && !clearing && at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
+        ...(holdsDependents === undefined ? {} : { holdsDependents }),
       });
     } else {
-      nextId += 1;
+      // An explicit id names the new subtask; the counter still moves past it so
+      // a later entry without one never reuses the number.
+      if (id === undefined) nextId += 1;
+      else nextId = Math.max(nextId, idNumber(id));
+      const newId = id ?? `s${nextId}`;
+      // Tracked so a later entry cannot name the same id again, whichever way it was made.
+      listed.add(newId);
       planned.push({
-        id: `s${nextId}`,
+        id: newId,
         step,
         text,
         owner,
@@ -1314,6 +1361,7 @@ export function planSubtasks(
         ...(gate === undefined ? {} : { gate, gateSource }),
         ...(at ? { createdAt: at } : {}),
         ...(script ? { script } : {}),
+        ...(input.holdsDependents === undefined ? {} : { holdsDependents: input.holdsDependents }),
         state: "open",
         note: null,
         doneBy: null,
@@ -1347,6 +1395,7 @@ export function checkMark(
   role: SubtaskRole,
   note: string | null,
   scriptName: string | null = null,
+  correctingRelease = false,
 ): MarkCheck {
   const subtask = card.subtasks.find((candidate) => candidate.id === id);
   if (!subtask)
@@ -1355,7 +1404,10 @@ export function checkMark(
       denyReason: "subtask_not_found",
       reason: `card #${card.number} has no subtask ${id}. Existing subtask ids: ${subtaskIds(card.subtasks) || "none"}`,
     };
-  if (subtask.state === state)
+  if (
+    subtask.state === state &&
+    !(correctingRelease && role === "evaluator" && subtask.interrupting && state === "done")
+  )
     return {
       ok: false,
       denyReason: "subtask_state_unchanged",
@@ -1495,8 +1547,35 @@ export const markSubtask = (
         };
   });
 
-export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
-  const current = kanbanOpenStep(card);
+export function reviewRoundStartedAt(events: ReadonlyArray<KanbanCardEvent>, reviewStep: number) {
+  let remaining = reviewStep;
+  let startedAt: string | undefined;
+  // Dispatch retries and later reviewers belong to the same round until its
+  // passed chain steps are exhausted; a final verdict or return to work ends it.
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]!;
+    if (event.kind === "review") {
+      if (remaining === 0 || event.body !== "clear" || event.toStage !== "needs_review") break;
+      remaining--;
+    } else if (event.kind === "moved" && event.toStage === "in_review") {
+      startedAt = event.at;
+    } else if (event.toStage === "todo" || event.toStage === "working") {
+      break;
+    }
+  }
+  // Incomplete legacy history cannot establish a whole-round cutoff.
+  return remaining === 0 ? startedAt : undefined;
+}
+
+export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">, roundStartedAt?: string) {
+  // Without a known start, older callers keep judging the plan as it stands.
+  const startedAt = roundStartedAt === undefined ? undefined : Date.parse(roundStartedAt);
+  const subtasks = card.subtasks.map((subtask) =>
+    startedAt !== undefined && subtask.doneAt !== null && Date.parse(subtask.doneAt) > startedAt
+      ? { ...subtask, state: "open" as const }
+      : subtask,
+  );
+  const current = kanbanOpenStep({ subtasks });
   if (current === null) return [];
   const open = card.subtasks.filter(
     (subtask) => subtask.owner === "review" && subtask.state === "open",
@@ -1505,7 +1584,7 @@ export function reviewSubtasksToPass(card: Pick<KanbanCard, "subtasks">) {
   // Unfinished work in the current step can already have been reviewed, but
   // future work must get its turn before its review can pass.
   if (
-    card.subtasks.some(
+    subtasks.some(
       (subtask) =>
         subtask.owner === "work" &&
         subtask.state === "open" &&
@@ -1522,8 +1601,9 @@ export function passReview(
   card: Pick<KanbanCard, "subtasks">,
   by: KanbanActor,
   at: string,
+  roundStartedAt?: string,
 ): ReadonlyArray<KanbanSubtask> {
-  const ids = new Set(reviewSubtasksToPass(card).map((subtask) => subtask.id));
+  const ids = new Set(reviewSubtasksToPass(card, roundStartedAt).map((subtask) => subtask.id));
   return card.subtasks.map((subtask) =>
     ids.has(subtask.id)
       ? { ...subtask, state: "done", note: "Review passed", doneBy: by, doneAt: at }
@@ -1574,7 +1654,8 @@ export function subtaskLines(card: Pick<KanbanCard, "subtasks">): string | null 
       subtask.script === undefined
         ? OWNER_NAMES[subtask.owner]
         : `${OWNER_NAMES[subtask.owner]} "${subtask.script}"`;
-    return `- ${subtask.id} step ${subtask.step}, ${owner} (${mark}${note}): ${subtask.text}`;
+    const hold = subtask.holdsDependents === true ? " [holds dependents]" : "";
+    return `- ${subtask.id} step ${subtask.step}, ${owner}${hold} (${mark}${note}): ${subtask.text}`;
   });
   return `Subtasks (same step means any order; a step opens when the ones before are done or skipped):\n${rows.join("\n")}`;
 }

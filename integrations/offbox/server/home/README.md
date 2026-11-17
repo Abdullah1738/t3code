@@ -153,43 +153,58 @@ back to its recorded value (100 on the inspected host). No service restart is ne
 
 ## Box scratch space
 
-The `offbox` Incus profile mounts an executable tmpfs at `/tmp` when a box starts: mode `1777`,
-`nosuid,nodev`, capped at 8 GiB. The ZFS rootfs uses `normalization=formD`: a legal NFC filename can expand
-beyond 255 bytes during comparison and fail with `ENOTSUP`. tmpfs accepts those names without migrating
-datasets. `$HOME`, its caches and the checkout remain on ZFS and retain that limitation.
+New home boxes get an independent ZFS dataset at `offbox/scratch/bx-<id>`, mounted at `/tmp`
+through the instance's `offbox-tmp` disk device. Each has `normalization=none`, `utf8only=on`,
+`refquota=64G`, `reservation=0`, and mode `1777`. The idmapped mount is executable with
+`raw.mount.options=nosuid,nodev` (supported by Incus 7.6). It accepts legal Unicode names that fail
+on the rootfs's `normalization=formD`. HOME, caches and the checkout remain unchanged (#116).
 
-8 GiB is a ceiling, not reserved RAM. Written pages count against the box's memory limit and swap is
-disabled. Normal home sizes have 16/24/48 GiB RAM; a small box has 8 GiB, so a job must leave room for its
-own processes too. npm, Go, pip and uv caches already live under `$HOME`; Terraform working directories
-and provider caches remain on disk. For scratch larger than the available memory or the cap, create a
-private disk-backed directory with `mktemp -d "$HOME/scratch.XXXXXX"` and set `TMPDIR` (also `GOTMPDIR`
-for Go). That disk-backed directory still has ZFS's filename limitation. Docker storage is unaffected.
-`/tmp` contents disappear at every box stop and are not saved in snapshots or clones.
+The cap follows measured use: the unchanged harness at 6fe29829 passed 6,295 tests with a 13.022 GiB
+`/tmp` peak. A separate pytest retention probe kept three previous sessions alongside the current one;
+four equally large sessions extrapolate to 52.089 GiB. 64 GiB leaves growth margin without charging
+scratch contents as unreclaimable tmpfs shmem against the box's 8/16/24/48 GiB memory limit.
+The quota reserves no disk space; host admission and low-space handling still govern the shared pool.
+Disk I/O and ZFS cache can still consume host resources.
 
-Full host provisioning configures this automatically. To update an existing host without upgrades,
-service restarts or a base-image rebuild, copy the reviewed `../install-host.sh` to
-`/root/offbox-server/install-host.sh`, then run on the host:
+`org.offbox:managed=scratch-v1`, `org.offbox:box=bx_<id>` and `org.offbox:owner=<owner>` label the dataset.
+The instance has matching `user.offbox.scratch=<dataset>` and `user.offbox.scratch-owner=<owner>` keys.
+These stable names/properties let filesystem recording classify ZFS as `scratch_disk`, not tmpfs.
+`--require-tmpfs` remains a separate client concern (#131); a disk is never reported as tmpfs.
+
+Creation takes an `@empty` snapshot after setting mode 1777. Every real start (including recovery)
+validates the canonical dataset, mountpoint, ownership and device, confirms the instance is stopped,
+and runs exactly `zfs rollback offbox/scratch/bx-<id>@empty` before starting. No recursive rollback or
+file walk is used. A failed validation or rollback prevents startup. Resuming a running box does not
+clear files. Clones get fresh independent backing; saved bases and rootfs snapshots carry no scratch
+contents. Deletion first confirms the instance is gone, refuses other references or unexpected
+snapshots, then destroys only its `@empty` and dataset. Interrupted creates use the same delete path.
+
+Rollout is **new boxes only**. Existing running, warm and saved boxes retain #67's executable 8 GiB
+tmpfs profile (`nosuid,nodev`, mode1777). New clones of old bases get the disk and locally override only
+the exact managed tmpfs entry, preserving unrelated raw.lxc. Foreign mounts at `/tmp` or below it fail
+provisioning. Never hot-remount or restart boxes to accelerate rollout; no image rebuild is required.
+
+For a reviewed release, copy the candidate server files to `/root/offbox-server`, then install the two
+Python files and prepare the parent/config. Batch the boatd restart with other approved server changes:
 
 ```sh
-# Keep the pre-change value once; retain this backup until rollout and rollback are settled.
-if ! test -f /root/offbox-tmp-before-67.raw.lxc; then
-  previous=$(incus profile get offbox raw.lxc) || exit
-  printf '%s\n' "$previous" > /root/offbox-tmp-before-67.raw.lxc
-fi
-bash /root/offbox-server/install-host.sh tmp-profile
-incus profile get offbox raw.lxc
+install -m 0755 /root/offbox-server/boatd.py /opt/boatd/boatd.py
+install -m 0644 /root/offbox-server/boatd_tmp.py /opt/boatd/boatd_tmp.py
+bash /root/offbox-server/install-host.sh scratch-disk
+systemctl restart boatd
 ```
 
-`raw.lxc` changes take effect only at the next start. Running boxes keep their current `/tmp`; new boxes
-and existing boxes resumed after a normal stop get tmpfs. Do not hot-mount over a running job's `/tmp` or
-restart boxes to accelerate rollout. Old files underneath the mount remain on disk but are hidden after
-the next start. The command preserves other `raw.lxc` settings and refuses existing mounts at `/tmp` or
-any of its descendants, which a later parent mount would hide.
-Per-instance `raw.lxc` overrides take precedence over the profile; reconcile those separately if present.
+The narrow installer action changes no instance or shared profile and restarts no service. The boatd
+restart interrupts its API and follows the board's release pacing; commands run in independent units.
+Read back a newly created box's `findmnt -b -M /tmp` and dataset properties. Keep the legacy
+`install-host.sh tmp-profile` path for old boxes; it never restarts anything.
 
-Rollback on the host: `incus profile set offbox raw.lxc "$(cat /root/offbox-tmp-before-67.raw.lxc)"`.
-This also takes effect at future starts; current mounts stay in place until boxes stop naturally.
-Revert the provisioning change too if future host installs must retain the rollback.
+Rollback: run `bash /root/offbox-server/install-host.sh scratch-disk-undo`, then restart boatd in the
+next permitted batch. This stops creating disks for new boxes (including clones) but **retains start,
+copy and delete handling for existing disk boxes**. Do not reinstall an older boatd that forgets their
+backing. Existing boxes retain their current mounts until natural retirement; never destroy their
+datasets as a rollout rollback. Do not run full host provisioning to undo this setting: it enables the
+disk default again.
 
 ## VPN (Mullvad)
 
