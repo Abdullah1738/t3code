@@ -2177,6 +2177,202 @@ bash "$TASK_DIR/step5r.sh"
         # earlier continuing arms made their own entry cwd ambiguous.
         self.assertIsNone(self.classify('case 1 in 1) cd sub ;& 2) :;; 3) python3 -I arm.py;; esac'))
 
+    def test_loop_cwd_enclosing_boundaries(self):
+        safe = self.write('arm.py', 'print(1)')
+        self.write('sub/arm.py', f'open({LIVE!r}).read()')
+        structures = [
+            'case 1 in 1) for j in 1; do {body}; done;; esac',
+            'case 1 in 1) while false; do {body}; done;; esac',
+            'case 1 in 1) until true; do {body}; done;; esac',
+            'case 1 in 1) select j in 1; do {body}; done;; esac',
+            'if true; then for j in 1; do {body}; done; fi',
+            'for a in 1; do for b in 1; do {body}; done; done',
+            'case 1 in 1) if true; then for j in 1; do {body}; done; fi;; esac',
+        ]
+        for structure in structures:
+            for body, tail, expected in [
+                ('cd sub', 'python3 -I arm.py', UNRESOLVED),
+                (':', 'python3 -I arm.py', None),
+                ('cd sub', 'python3 -I ' + shlex.quote(str(safe)), None),
+                ('cd sub', 'cd ' + shlex.quote(str(self.root)) + '; python3 -I arm.py', None),
+            ]:
+                command = structure.format(body=body) + '; ' + tail
+                for wrapped in [command, command.replace('python3 -I ', 'offbox run -- python3 -I '),
+                                'offbox run -- ' + shlex.quote(command)]:
+                    with self.subTest(command=wrapped):
+                        rule, cause = guard.classify_detail(wrapped, str(self.root))
+                        self.assertEqual(rule, expected, cause)
+                        if expected:
+                            self.assertTrue(any(part in cause for part in [
+                                'directory changed', 'a loop that changes directory',
+                            ]), cause)
+
+    def test_loop_cwd_enclosing_independent_alternatives(self):
+        self.write('arm.py', 'print(1)')
+        self.write('sub/arm.py', f'open({LIVE!r}).read()')
+        for command in [
+            'case x in a) for j in 1; do cd sub; done;; b) python3 -I arm.py;; esac',
+            'if true; then for j in 1; do cd sub; done; else python3 -I arm.py; fi',
+            'if true; then for j in 1; do cd sub; done; elif false; then python3 -I arm.py; fi',
+        ]:
+            # An independent entry must not restore the enclosing exit.
+            for tail, expected in [('', None), ('; python3 -I arm.py', UNRESOLVED)]:
+                full = command + tail
+                for wrapped in [full, full.replace('python3 -I ', 'offbox run -- python3 -I '),
+                                'offbox run -- ' + shlex.quote(full)]:
+                    with self.subTest(command=wrapped):
+                        self.assertEqual(guard.classify(wrapped, str(self.root)), expected)
+
+    def test_loop_cwd_enclosing_relative_database_reads(self):
+        roots = [
+            ('/Users/x/.robob/userdata', 'statev2.sqlite'),
+            (str(Path.home() / '.t3/userdata'), 'state.sqlite'),
+            ('/Users/x/.local/share/opencode', 'opencode.db'),
+        ]
+        for root, name in roots:
+            for suffix in ['', '-wal', '-shm', '-journal']:
+                operand = name + suffix
+                readers = [
+                    'python3 -I -c ' + shlex.quote(f'open({operand!r}).read()'),
+                    'node -e ' + shlex.quote(f'require("fs").readFileSync({operand!r})'),
+                    'cat ' + operand,
+                    'sqlite3 ' + operand + ' .schema',
+                    'cat < ' + operand,
+                    "python3 -I <<'PY'\n" + f'open({operand!r}).read()\nPY\n',
+                ]
+                for enclosing in [
+                    'case 1 in 1) while false; do cd sub; done;; esac',
+                    'if true; then while false; do cd sub; done; fi',
+                    'case 1 in 1) for j in 1; do cd sub; done;; esac',
+                ]:
+                    for reader in readers:
+                        command = 'cd ' + shlex.quote(root) + '; ' + enclosing + '; ' + reader
+                        for wrapped in [command, command.replace(reader, 'offbox run -- ' + reader),
+                                        'offbox run -- ' + shlex.quote(command)]:
+                            with self.subTest(command=wrapped):
+                                # The existing JS reader does not recognize a
+                                # bare legacy state.sqlite even at known cwd.
+                                if name == 'state.sqlite' and reader.startswith('node -e '):
+                                    self.assertIsNone(guard.classify(wrapped, str(self.root)))
+                                else:
+                                    self.assertIsNotNone(guard.classify(wrapped, str(self.root)))
+
+    def test_loop_cwd_enclosing_database_recovery(self):
+        prefix = 'cd /Users/x/.robob/userdata; case 1 in 1) while false; do cd sub; done;; esac; '
+        for name in ['statev2.sqlite', 'state.sqlite', 'opencode.db']:
+            for recovery in ['', 'cd ' + shlex.quote(str(self.root)) + '; ']:
+                operand = name if recovery else str(self.root / name)
+                readers = [
+                    'python3 -I -c ' + shlex.quote(f'open({operand!r}).read()'),
+                    'node -e ' + shlex.quote(f'require("fs").readFileSync({operand!r})'),
+                    'cat ' + shlex.quote(operand),
+                    'cat < ' + shlex.quote(operand),
+                    "python3 -I <<'PY'\n" + f'open({operand!r}).read()\nPY\n',
+                ]
+                # Bare sqlite3 state.sqlite is independently refused even at a
+                # known cwd; an absolute foreign operand has its own proof.
+                if not recovery or name != 'state.sqlite':
+                    readers.append('sqlite3 ' + shlex.quote(operand) + ' .schema')
+                for reader in readers:
+                    command = prefix + recovery + reader
+                    for wrapped in [command, prefix + recovery + 'offbox run -- ' + reader,
+                                    'offbox run -- ' + shlex.quote(command)]:
+                        with self.subTest(command=wrapped):
+                            self.assertEqual(guard.classify_detail(wrapped, str(self.root)), (None, None))
+
+    def test_loop_cwd_enclosing_cwd_relative_readers(self):
+        for root in ['/Users/x/.robob/userdata', str(Path.home() / '.t3/userdata'),
+                     '/Users/x/.local/share/opencode']:
+            for body in [
+                'from pathlib import Path; [p.read_bytes() for p in Path(".").glob("*.sqlite")]',
+                'from pathlib import Path; [p.read_bytes() for p in Path.cwd().iterdir()]',
+                'from pathlib import Path; [p.read_bytes() for p in Path(".").rglob("*.sqlite*")]',
+                'import os; [open(p, "rb").read() for p in os.listdir(".")]',
+                'import sqlite3, glob; sqlite3.connect(next(glob.iglob("*")))',
+            ]:
+                reader = 'python3 -I -c ' + shlex.quote(body)
+                for enclosing in [
+                    'case 1 in 1) while false; do cd sub; done;; esac',
+                    'if true; then while false; do cd sub; done; fi',
+                ]:
+                    for recovery in ['', 'cd ' + shlex.quote(str(self.root)) + '; ']:
+                        prefix = 'cd ' + shlex.quote(root) + '; ' + enclosing + '; ' + recovery
+                        command = prefix + reader
+                        for wrapped in [command, prefix + 'offbox run -- ' + reader,
+                                        'offbox run -- ' + shlex.quote(command)]:
+                            with self.subTest(command=wrapped):
+                                self.assertEqual(guard.classify(wrapped, str(self.root)), None if recovery else READ)
+
+    def test_loop_cwd_enclosing_later_directory_changes(self):
+        enclosing_blocks = [
+            'case 1 in 1) while false; do cd sub; done;; esac',
+            'if true; then while false; do cd sub; done; fi',
+        ]
+        for enclosing in enclosing_blocks:
+            for reader in ['cat userdata/statev2.sqlite',
+                           'python3 -I -c ' + shlex.quote('open("userdata/statev2.sqlite").read()')]:
+                for transition in ['cd ..; ', 'env -C .. ', 'env --chdir .. ', 'env --chdir=.. ',
+                                   'uv --directory .. run ', 'uv run --directory .. ']:
+                    prefix = 'cd /Users/x/.robob/userdata; ' + enclosing + '; '
+                    command = prefix + transition + reader
+                    argv = prefix + (transition + 'offbox run -- ' + reader if transition == 'cd ..; '
+                                     else 'offbox run -- ' + transition + reader)
+                    for wrapped in [command, argv, 'offbox run -- ' + shlex.quote(command)]:
+                        with self.subTest(command=wrapped):
+                            self.assertIsNotNone(guard.classify(wrapped, str(self.root)))
+
+    def test_loop_cwd_enclosing_directory_candidate_budget(self):
+        command = 'case 1 in 1) while false; do cd sub; done;; esac; cd ..; cd ../other; true'
+        with patch.object(guard, 'MAX_SCRIPTS', 2):
+            rule, cause = guard.classify_detail(command, str(self.root))
+        self.assertEqual(rule, UNRESOLVED)
+        self.assertIn('MAX_SCRIPTS', cause)
+
+    def test_loop_cwd_enclosing_remote_pwd_arguments(self):
+        for enclosing in ['case 1 in 1) while false; do cd sub; done;; esac',
+                          'if true; then while false; do cd sub; done; fi']:
+            for transition, operand in [('', '$PWD/statev2.sqlite'), ('cd ..; ', '$PWD/userdata/statev2.sqlite')]:
+                for reader in ['cat "' + operand + '"', 'python3 -I -c "open(\'' + operand + '\').read()"']:
+                    command = 'cd /Users/x/.robob/userdata; ' + enclosing + '; ' + transition + 'offbox run -- ' + reader
+                    with self.subTest(command=command):
+                        self.assertIsNotNone(guard.classify(command, str(self.root)))
+
+    def test_loop_cwd_enclosing_remote_pwd_script_proof(self):
+        safe = self.write('repeat/arm.py', 'print(1)')
+        self.write('repeat/sub/arm.py', 'print(1)')
+        self.write('repeat/sub/sub/arm.py', 'print(1)')
+        deep = self.write('repeat/sub/sub/sub/arm.py', f'open({LIVE!r}).read()')
+        variable_safe = self.write('variable/arm.py', 'print(1)')
+        variable_target = self.write('variable/sub/arm.py', f'open({LIVE!r}).read()')
+        loop = 'for j in 1 2 3; do cd sub; done'
+        cases = [
+            (safe.parent, loop, deep, safe),
+            (safe.parent, 'case 1 in 1) { ' + loop + '; };; esac', deep, safe),
+            (safe.parent, 'if true; then { ' + loop + '; }; fi', deep, safe),
+            (variable_safe.parent, 'd=sub; cd "$d"', variable_target, variable_safe),
+        ]
+        for cwd, prefix, target, safe_script in cases:
+            with self.subTest(target=str(target)):
+                self.assertEqual(guard.classify('python3 -I ' + shlex.quote(str(target)), str(cwd)), SCRIPT)
+            for pwd in ['$PWD', '${PWD}']:
+                script = 'python3 -I "' + pwd + '/arm.py"'
+                local = prefix + '; ' + script
+                argv = prefix + '; offbox run -- ' + script
+                for command in [local, argv, 'offbox run -- ' + shlex.quote(local),
+                                'offbox run -- ' + shlex.quote(argv)]:
+                    with self.subTest(command=command):
+                        self.assertEqual(guard.classify(command, str(cwd)), UNRESOLVED)
+                absolute = prefix + '; python3 -I ' + shlex.quote(str(safe_script))
+                absolute_argv = prefix + '; offbox run -- python3 -I ' + shlex.quote(str(safe_script))
+                recovery = prefix + '; cd ' + shlex.quote(str(cwd)) + '; offbox run -- ' + script
+                unchanged = prefix.replace('cd sub', ':').replace('cd "$d"', ':') + '; offbox run -- ' + script
+                for command in [absolute, absolute_argv, 'offbox run -- ' + shlex.quote(absolute),
+                                'offbox run -- ' + shlex.quote(absolute_argv), recovery,
+                                'offbox run -- ' + shlex.quote(recovery), unchanged,
+                                'offbox run -- ' + shlex.quote(unchanged)]:
+                    with self.subTest(command=command):
+                        self.assertEqual(guard.classify_detail(command, str(cwd)), (None, None))
+
     def test_mktemp_109_offbox_flags(self):
         setup = 'd=$(mktemp -d)\n' + self.heredoc('"$d/x.py"', 'print(1)')
         for flags in ['--git', '--fresh', '--no-sync', '--no-retry', '--template python',

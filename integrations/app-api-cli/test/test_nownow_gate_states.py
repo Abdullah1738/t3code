@@ -32,7 +32,7 @@ class StateFixtures(unittest.TestCase):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         for mod, key, value in ((j, 'ROOT', Path(temp.name).resolve()/'commerce'),
                 (lane.receipts, 'ROOT', Path(temp.name).resolve()/'commerce'),
-                (order_card, 'LAST4', '2342'), (order_card, 'NETWORK', 'mastercard')):
+                (cli, 'ORDER_CARD_LAST4', '2342'), (order_card, 'LAST4', '2342'), (order_card, 'NETWORK', 'mastercard')):
             p = patch.object(mod, key, value); p.start(); self.addCleanup(p.stop)
 
     def clear_response(self, harness):

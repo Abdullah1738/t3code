@@ -111,10 +111,11 @@ test.each(forms)("control classification: $label", async fixture => {
   const abort = new AbortController();
   if (fixture.cancelled) abort.abort();
   try {
+    // Recover an earlier test's outage before capturing this fixture's transitions.
+    fetcher.mockImplementation(fetchMock(async () => new Response(JSON.stringify({ ok: true }))));
+    await client.request("GET", "/health");
+    fetcher.mockImplementation(fetchMock(fail));
     const rows = await captureLogs(async () => {
-      fetcher.mockImplementation(fetchMock(async () => new Response(JSON.stringify({ ok: true }))));
-      await client.request("GET", "/health");
-      fetcher.mockImplementation(fetchMock(fail));
       for (let i = 0; i < 10; i++) await client.request("POST", "/threads/secret-id/send?text=PRIVATE_MESSAGE", { text: "PRIVATE_MESSAGE" }, { signal: abort.signal }).catch(() => {});
       fetcher.mockImplementation(fetchMock(async () => new Response(JSON.stringify({ ok: true }))));
       await client.request("GET", "/health");

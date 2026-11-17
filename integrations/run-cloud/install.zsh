@@ -1,7 +1,7 @@
 #!/bin/zsh -f
 # Install the run-cloud skill (rcsim) from this repo onto the Mac, or check that the Mac matches it.
 #
-#   install.zsh [--dry-run]    copy skill/ over the live skill, keeping a .bak-<stamp> of every file replaced
+#   install.zsh [--dry-run]    copy skill/ over the live skill, keeping a backup outside the skills directory
 #   install.zsh --check        exit 1 if the live skill differs from this tree
 #
 # The live skill is ~/.config/opencode/skills/run-cloud. The LaunchAgent that runs rcsim monitor reads the
@@ -38,7 +38,8 @@ if [[ $mode == check ]]; then
 fi
 
 # Back up each file that the install would replace or delete, so a bad install can be undone by hand.
-backup_dir="$live.bak-$stamp"
+backup_root="${RUN_CLOUD_BACKUP_ROOT:-$HOME/.local/share/run-cloud/backups}"
+backup_dir="$backup_root/skill-$stamp"
 changes="$(rsync --copy-unsafe-links -rlp --checksum --dry-run --itemize-changes "${excludes[@]}" "$src/" "$live/" 2>/dev/null || true)"
 if [[ -z "$changes" ]]; then
   print "run-cloud: nothing to install (live skill already matches)"
@@ -46,6 +47,7 @@ if [[ -z "$changes" ]]; then
 fi
 print -r -- "$changes"
 if (( dry )); then
+  print "run-cloud: Previous copy would be kept at $backup_dir"
   print "run-cloud: --dry-run, nothing written"
   exit 0
 fi

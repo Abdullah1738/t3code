@@ -8,6 +8,7 @@ import * as NodeSqlite from "node:sqlite";
 
 export const STALE_MS = 120_000;
 export const QUIET_MS = 600_000;
+export const QUARANTINE_MAX_MS = 6 * 60 * 60_000;
 export const QUEUE_POLL_TIMEOUT_MS = 120_000;
 export type DesktopMode = "native" | "cua-driver";
 export type LeaseState = "held" | "stopping" | "quarantined";
@@ -48,6 +49,7 @@ export interface QueuedRequest extends IdentifiedRequest {
 }
 
 export interface LeaseStatus {
+  readonly message?: string;
   readonly lease: Lease | null;
   readonly queue: ReadonlyArray<QueuedRequest>;
 }
@@ -162,6 +164,8 @@ export interface LeaseTransition {
   readonly reason:
     | "open_call_timeout"
     | "auto_reconciled"
+    | "host_reboot"
+    | "quarantine_max_age"
     | "manual_reconciled"
     | "queued_withdrawn"
     | "queue_expired";
@@ -170,6 +174,7 @@ export interface LeaseTransition {
 export interface DesktopLeaseOptions {
   readonly filename?: string;
   readonly now?: () => number;
+  readonly bootTimeMs?: () => number | null;
   readonly holderTurnActive?: (rootThreadId: string) => HolderTurnActive;
   readonly recordTransition?: (event: LeaseTransition) => void;
 }
@@ -178,6 +183,7 @@ export interface DesktopLeaseOptions {
 export class DesktopLease {
   private readonly db: NodeSqlite.DatabaseSync;
   private readonly now: () => number;
+  private readonly bootTimeMs: () => number | null;
   private readonly holderTurnActive: NonNullable<DesktopLeaseOptions["holderTurnActive"]>;
   private readonly recordTransition: NonNullable<DesktopLeaseOptions["recordTransition"]>;
   private transitions: LeaseTransition[] = [];
@@ -201,6 +207,7 @@ export class DesktopLease {
       }
     }
     this.now = options.now ?? Date.now;
+    this.bootTimeMs = options.bootTimeMs ?? (() => null);
     this.holderTurnActive = options.holderTurnActive ?? (() => "unknown");
     this.recordTransition = options.recordTransition ?? (() => {});
     this.db = new NodeSqlite.DatabaseSync(filename);
@@ -399,6 +406,29 @@ export class DesktopLease {
       .run(row.seq);
   }
 
+  private autoReconcile(
+    row: Row,
+    evidence: string,
+    reason: LeaseTransition["reason"],
+    now: number,
+  ) {
+    this.db
+      .prepare("UPDATE ardud_desktop_requests SET evidence = ? WHERE seq = ?")
+      .run(evidence, row.seq);
+    this.db
+      .prepare(`UPDATE ardud_desktop_calls SET state = 'failed', ended_at = ?
+      WHERE ticket = ? AND state = 'started'`)
+      .run(now, row.ticket);
+    this.finish(row);
+    this.transition(row, "finished", reason, now);
+  }
+
+  private recoveryMessage(holder: Row | undefined) {
+    if (holder?.lease_state !== "quarantined" && holder?.lease_state !== "stopping") return "";
+    const since = holder.lease_state === "quarantined" ? holder.quarantined_at : holder.stopping_at;
+    return `Held by ${holder.ticket} (${holder.task_id}, ${holder.lease_state} since ${iso(since)}). It clears itself once its threads are idle, after a reboot, or after 6 h. To clear it now, the owner runs: t3ctl desktop-lease reconcile --ticket ${holder.ticket} --evidence "<why>" (needs environment:maintain, an admin login).`;
+  }
+
   private advance(now: number) {
     // A returning caller at the deadline must observe cancellation, not revive its old ticket.
     const expired = this.db
@@ -413,32 +443,48 @@ export class DesktopLease {
     }
     let holder = this.holder();
     if (!holder) return;
-    if (holder.lease_state === "quarantined") {
-      if (
-        holder.quarantined_at !== null &&
-        now - holder.quarantined_at >= QUIET_MS &&
-        this.holderTurnActive(holder.root_thread_id) === false
-      ) {
-        const call = this.openCall(holder.ticket);
-        const evidence = `auto-reconciled: holder ${holder.root_thread_id} has no running turn; open call ${call?.call_id ?? "none"} started ${call ? iso(call.started_at) : "unknown"}`;
-        this.db
-          .prepare("UPDATE ardud_desktop_requests SET evidence = ? WHERE seq = ?")
-          .run(evidence, holder.seq);
-        this.db
-          .prepare(`UPDATE ardud_desktop_calls SET state = 'failed', ended_at = ?
-          WHERE ticket = ? AND state = 'started'`)
-          .run(now, holder.ticket);
-        this.finish(holder);
-        this.transition(holder, "finished", "auto_reconciled", now);
-      }
-      return;
-    }
     if (holder.lease_state === "held" && now - holder.heartbeat_at! >= STALE_MS) {
       this.db
         .prepare(`UPDATE ardud_desktop_requests
         SET lease_state = 'stopping', stopping_at = ?, stopping_reason = 'stale' WHERE seq = ?`)
         .run(now, holder.seq);
       holder = this.holder()!;
+    }
+    if (holder.lease_state === "quarantined" || holder.lease_state === "stopping") {
+      const boot = this.bootTimeMs();
+      if (
+        boot !== null &&
+        Number.isFinite(boot) &&
+        boot > holder.heartbeat_at! &&
+        !this.db
+          .prepare(`SELECT 1 FROM ardud_desktop_calls
+          WHERE ticket = ? AND state = 'started' AND started_at >= ? LIMIT 1`)
+          .get(holder.ticket, boot)
+      ) {
+        // No process survives a host reboot, even if projection liveness still says running.
+        const call = this.openCall(holder.ticket);
+        const evidence = `auto-reconciled: host rebooted at ${iso(boot)} after last heartbeat ${iso(holder.heartbeat_at)}${call ? `; open call ${call.call_id} started ${iso(call.started_at)}` : ""}`;
+        this.autoReconcile(holder, evidence, "host_reboot", now);
+        return;
+      }
+    }
+    if (holder.lease_state === "quarantined") {
+      if (holder.quarantined_at !== null && now - holder.quarantined_at >= QUIET_MS) {
+        const active = this.holderTurnActive(holder.root_thread_id);
+        if (active === false) {
+          const call = this.openCall(holder.ticket);
+          const evidence = `auto-reconciled: holder ${holder.root_thread_id} has no running turn; open call ${call?.call_id ?? "none"} started ${call ? iso(call.started_at) : "unknown"}`;
+          this.autoReconcile(holder, evidence, "auto_reconciled", now);
+        } else if (
+          active === "unknown" &&
+          now - holder.quarantined_at >= QUARANTINE_MAX_MS &&
+          holder.heartbeat_at! <= holder.quarantined_at
+        ) {
+          const evidence = `auto-reconciled: quarantined ${now - holder.quarantined_at}ms with no heartbeat and liveness unknown`;
+          this.autoReconcile(holder, evidence, "quarantine_max_age", now);
+        }
+      }
+      return;
     }
     // On-demand checks enforce the age limit even while a caller heartbeats.
     const expiredCall = this.db
@@ -466,7 +512,9 @@ export class DesktopLease {
     const queued = this.db
       .prepare("SELECT * FROM ardud_desktop_requests WHERE request_state = 'queued' ORDER BY seq")
       .all() as Row[];
+    const message = this.recoveryMessage(holder);
     return {
+      ...(message ? { message } : {}),
       lease: holder ? this.leaseOf(holder) : null,
       queue: queued.map((row, index) => ({
         ...requestOf(row),
@@ -576,7 +624,9 @@ export class DesktopLease {
     return this.transaction((now) => {
       this.advance(now);
       const row = this.ownedHolder(caller, ticket);
-      if (row.lease_state !== "held") return fail("Lease is not held; do not start desktop work.");
+      if (row.lease_state !== "held") {
+        return fail(`Lease is not held; do not start desktop work. ${this.recoveryMessage(row)}`);
+      }
       this.db
         .prepare("UPDATE ardud_desktop_requests SET heartbeat_at = ? WHERE seq = ?")
         .run(now, row.seq);
@@ -627,8 +677,12 @@ export class DesktopLease {
         row.lease_state !== "held" ||
         row.root_thread_id !== caller.rootThreadId ||
         row.child_thread_id !== caller.robobThreadId
-      )
-        return fail("Only the current lease holder may start desktop work.");
+      ) {
+        const message = this.recoveryMessage(row);
+        return fail(
+          `Only the current lease holder may start desktop work.${message ? ` ${message}` : ""}`,
+        );
+      }
       const existing = this.db
         .prepare("SELECT ticket, state FROM ardud_desktop_calls WHERE call_id = ?")
         .get(toolUseId) as CallRow | undefined;

@@ -17,7 +17,13 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ProjectionStore from "../../orchestration-v2/ProjectionStore.ts";
 import * as ExecutionIdentity from "../identity/ExecutionIdentity.ts";
-import { DesktopLease, QUIET_MS, STALE_MS, type DesktopLeaseOptions } from "./DesktopLease.ts";
+import {
+  DesktopLease,
+  QUIET_MS,
+  QUARANTINE_MAX_MS,
+  STALE_MS,
+  type DesktopLeaseOptions,
+} from "./DesktopLease.ts";
 import * as DesktopLeaseService from "./DesktopLeaseService.ts";
 
 const caller = { driver: "codex", nativeId: "native-child" };
@@ -47,6 +53,7 @@ const running: OrchestrationV2Run = {
 type Lookup = "running" | "idle" | "waiting" | "failed";
 const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* () {
   let now = DateTime.toEpochMillis(at);
+  let boot: number | null = null;
   let lookup: Lookup = "running";
   const threadLookups = new Map<ThreadId, Lookup>();
   let lookupGate = Effect.void;
@@ -55,6 +62,7 @@ const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* 
   const store = new DesktopLease({
     filename: ":memory:",
     now: () => now,
+    bootTimeMs: () => callbacks.bootTimeMs?.() ?? null,
     holderTurnActive: (root) => callbacks.holderTurnActive?.(root) ?? "unknown",
     recordTransition: (event) => callbacks.recordTransition?.(event),
   });
@@ -102,6 +110,7 @@ const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* 
   });
   const context = yield* Layer.build(
     DesktopLeaseService.layerWithOptions({
+      bootTimeMs: () => boot,
       factory: (options) => {
         callbacks = options;
         return store;
@@ -112,6 +121,9 @@ const makeHarness = Effect.fn("test.DesktopLeaseService.makeHarness")(function* 
     service: Context.get(context, DesktopLeaseService.DesktopLeaseService),
     store,
     lookedUp,
+    setBoot: (value: number | null) => {
+      boot = value;
+    },
     addTime: (ms: number) => {
       now += ms;
     },
@@ -315,7 +327,7 @@ describe("desktop lease service liveness", () => {
           const next = yield* service.acquire(nextCaller, { ...request, taskId: "next" });
           const canRecover = rootLookup === "idle" && childLookup === "idle";
           assert.equal(next.state, canRecover ? "held" : "queued");
-          assert.equal(lookedUp.at(rootLookup === "idle" ? -2 : -1), rootThreadId);
+          assert.equal(lookedUp.at(rootLookup !== "running" ? -2 : -1), rootThreadId);
           if (canRecover) {
             assert.equal(next.status.lease?.ticket, next.ticket);
           } else {
@@ -329,6 +341,62 @@ describe("desktop lease service liveness", () => {
             assert.equal(recovered.state, "held");
             assert.equal(recovered.status.lease?.ticket, next.ticket);
           }
+        }),
+      ),
+  );
+
+  it.effect.each([
+    ["quarantined", "failed"],
+    ["quarantined", "running"],
+    ["stopping", "failed"],
+    ["stopping", "running"],
+  ] as const)(
+    "passes the injected reboot time through to a %s holder (lookup %s)",
+    ([state, lookup]) =>
+      run(({ service, addTime, setBoot, setLookup }) =>
+        Effect.gen(function* () {
+          const held = yield* service.acquire(caller, request);
+          yield* service.callStart(caller, "pre-reboot");
+          if (state === "stopping") yield* service.release(caller, held.ticket);
+          else {
+            addTime(QUIET_MS);
+            assert.equal((yield* service.status()).lease?.state, "quarantined");
+          }
+          addTime(1000);
+          setLookup(lookup);
+          setBoot(DateTime.toEpochMillis(at) + (state === "quarantined" ? QUIET_MS : 0) + 1000);
+          assert.isNull((yield* service.status()).lease);
+          const next = yield* service.acquire(nextCaller, { ...request, taskId: "after-reboot" });
+          assert.equal(next.state, "held");
+          assert.equal(
+            (yield* Effect.flip(service.callEnd("pre-reboot", "completed"))).code,
+            "conflict",
+          );
+        }),
+      ),
+  );
+
+  it.effect.each([
+    ["running", "failed", false],
+    ["failed", "running", false],
+    ["idle", "running", false],
+    ["failed", "failed", true],
+    ["failed", "idle", true],
+    ["idle", "failed", true],
+  ] as const)(
+    "requires neither thread known active for age recovery (root %s, child %s)",
+    ([rootLookup, childLookup, clears]) =>
+      run(({ service, addTime, setThreadLookup }) =>
+        Effect.gen(function* () {
+          yield* service.acquire(caller, request);
+          yield* service.callStart(caller, "aged");
+          addTime(QUIET_MS);
+          assert.equal((yield* service.status()).lease?.state, "quarantined");
+          setThreadLookup(rootThreadId, rootLookup);
+          setThreadLookup(childThreadId, childLookup);
+          addTime(QUARANTINE_MAX_MS);
+          const next = yield* service.acquire(nextCaller, { ...request, taskId: "after-age" });
+          assert.equal(next.state, clears ? "held" : "queued");
         }),
       ),
   );

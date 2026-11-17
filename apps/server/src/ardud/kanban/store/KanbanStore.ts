@@ -34,6 +34,7 @@ import {
 } from "@t3tools/contracts";
 
 import { makeDecodeCache } from "./decodeCache.ts";
+import { backfillRelease12 } from "./releaseBackfill.ts";
 import { SummaryCard } from "./summaryCard.ts";
 import * as BoardsDatabase from "../../persistence/BoardsDatabase.ts";
 import { initializeKanbanSchema } from "../../persistence/kanbanSchema.ts";
@@ -502,6 +503,10 @@ const make = Effect.gen(function* () {
   yield* BoardsDatabase.initialize(
     initializeKanbanSchema(sql).pipe(Effect.andThen(ensureKanbanCacheVersions(sql))),
   ).pipe(Effect.mapError(fail("create tables")));
+
+  yield* BoardsDatabase.onReady(
+    backfillRelease12(sql).pipe(Effect.mapError(fail("backfill release ledger"))),
+  );
 
   const callerWrites = Context.Reference<Array<() => void> | undefined>("KanbanCallerWrites", {
     defaultValue: () => undefined,

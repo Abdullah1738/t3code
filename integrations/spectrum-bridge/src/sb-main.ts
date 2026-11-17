@@ -378,7 +378,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
     }
   }
   const unansweredTimer = setInterval(() => {
-    if (ready()) for (const chat of chats.all()) void chat.parts.router?.checkUnanswered().catch(error => toolError("sb-main", "unanswered.check", error));
+    if (ready()) for (const chat of chats.all()) void (chat.parts.remote ?? chat.parts.router)?.checkUnanswered().catch(error => toolError("sb-main", "unanswered.check", error));
   }, 60_000);
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
