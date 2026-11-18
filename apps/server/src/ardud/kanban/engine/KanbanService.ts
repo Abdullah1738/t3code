@@ -10878,6 +10878,23 @@ const make = Effect.gen(function* () {
                         yield* saveCard(repaired);
                         cards[i] = repaired;
                       }
+                      for (let i = 0; i < cards.length; i++) {
+                        const card = cards[i]!;
+                        if (
+                          card.stage === "needs_review" &&
+                          card.settledAt === null &&
+                          Rules.reviewFinished(card, Rules.chainFor(board, card)?.steps.length ?? 1)
+                        ) {
+                          cards[i] = yield* applyReviewOutcome(
+                            board,
+                            card,
+                            Rules.finishedReview(card),
+                            { _tag: "system", component: "dispatcher" },
+                            "clear",
+                            "Review already passed; no reviewer needed",
+                          );
+                        }
+                      }
                       const reviews = new Map<string, Rules.ReviewEvidence>();
                       for (let i = 0; i < cards.length; i++) {
                         const card = cards[i]!;
@@ -16812,6 +16829,12 @@ const make = Effect.gen(function* () {
       yield* !NodeUtil.isDeepStrictEqual(board.guessedGates, next.guessedGates)
         ? commitReviewGate(board.id, write.pipe(Effect.andThen(recheckBoardReviewGates(next))))
         : write;
+      if (patch.reviewChains !== undefined || patch.defaultReviewChain !== undefined) {
+        const chainActor: KanbanActor = { _tag: "system", component: "board.update" };
+        for (const card of yield* store.openCards(board.id)) {
+          yield* settleReviewChain(board, next, card, card, chainActor);
+        }
+      }
     }
     if (pools.length > 0) {
       yield* publish(board.id, { _tag: "pools", pools: yield* store.pools(board.id) });
@@ -18537,7 +18560,8 @@ const make = Effect.gen(function* () {
           });
         next = Asks.closeClearedGateNotices(next, at);
         if (plan?.ok) next = yield* recheckReviewGate(next, board, true);
-        const paused = yield* pauseIfBacklog(card, next, actor, at);
+        const settled = yield* settleReviewChain(board, board, card, next, actor);
+        const paused = yield* pauseIfBacklog(card, settled, actor, at);
         // An open work thread now runs the new model's pool, so the card's slot moves with it.
         const saved =
           paused.activeThreadId !== null &&
@@ -18599,7 +18623,8 @@ const make = Effect.gen(function* () {
             ),
           ),
         );
-        yield* laterEvaluatorTurn(card, saved, actor);
+        // Review settlement already queued its evaluator step; only later changes need a handoff.
+        yield* laterEvaluatorTurn(evaluatorTurnDue(next, settled) ? settled : card, saved, actor);
         if (patch.prompt?.trim() && patch.prompt.trim() !== card.prompt && !patch.title) {
           yield* forkWriter(card.id, { title: true, description: !patch.description });
         }
@@ -20743,6 +20768,165 @@ const make = Effect.gen(function* () {
     );
   });
 
+  const applyReviewOutcome = Effect.fn("KanbanService.applyReviewOutcome")(function* (
+    board: KanbanBoard,
+    card: KanbanCard,
+    outcome: Rules.ReviewOutcome,
+    actor: KanbanActor,
+    verdict: "clear" | "findings",
+    body: string,
+    sha: string | null = null,
+    late = false,
+    options: {
+      readonly snapshot?: CardWriteSnapshot;
+      readonly roundStartedAt?: string | undefined;
+      readonly beforeSave?: () => void;
+    } = {},
+  ) {
+    const at = yield* nowIso;
+    // Only the last chain verdict closes the plan's next review step,
+    // even when earlier work still needs ticking off.
+    const passed = verdict === "clear" && !outcome.continueReview;
+    const reviewSubtasks = passed
+      ? Subtasks.reviewSubtasksToPass(card, options.roundStartedAt)
+      : [];
+    if (passed) {
+      for (const subtask of reviewSubtasks) {
+        const missing = Subtasks.approvalProblem(
+          card,
+          subtask,
+          board.standingApprovals,
+          board.guessedGates,
+        );
+        if (missing) return yield* failWith("denied", missing, "approval_required");
+      }
+    }
+    const subtasks = passed
+      ? Subtasks.passReview(card, actor, at, options.roundStartedAt)
+      : card.subtasks;
+    const moreWork = passed && Subtasks.workAfterReview({ subtasks });
+    const unfinishedWork = kanbanStepSubtasks({ subtasks }, "work");
+    const reviewPlanStep = reviewSubtasks[0]?.step;
+    const earlierWork =
+      reviewPlanStep !== undefined &&
+      moreWork &&
+      unfinishedWork.some((work) => work.step < reviewPlanStep);
+    const to = moreWork
+      ? "todo"
+      : outcome.continueReview
+        ? "needs_review"
+        : outcome.stage === "completed" &&
+            !reviewPlanClear({ ...card, subtasks, reviewFindingsPending: false })
+          ? "in_review"
+          : outcome.stage;
+    const prCompletion = to === "completed" && trackedPrs(card).length > 0;
+    let next: KanbanCard = {
+      // A verdict is a review that ended normally: its retry record goes.
+      ...Retries.withoutRetries(
+        release(yield* moveWait(card, to, at, actor, prCompletion, options.snapshot)),
+      ),
+      // The dispatcher's no-verdict flag is answered by the verdict; a
+      // reviewer's own flag stays for the evaluator.
+      stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
+      subtasks,
+      stage: to,
+      reviewStep: moreWork && !earlierWork ? 0 : outcome.reviewStep,
+      reviewRound: outcome.reviewRound,
+      reviewFindingsPending: verdict === "findings",
+      wakeNote:
+        verdict === "findings"
+          ? `Review findings (round ${card.reviewRound + 1}):\n${body}\n\nFix them, then card_move to needs_review.`
+          : earlierWork
+            ? `The review${sha ? ` at ${sha}` : ""} passed. Tick your open subtasks (${Subtasks.subtaskIds(unfinishedWork)}) with subtask_done, then card_move to needs_review. Don't change code.`
+            : moreWork
+              ? Subtasks.nextStepNote("The review passed. ")
+              : // A review start keeps the card's wake note so the reviewer reads it
+                // (startCard). The verdict is where it has been read: without this it
+                // came back in every later review brief.
+                null,
+      nudgedAt: null,
+      movedAt: at,
+      updatedAt: at,
+    };
+    next = Asks.closeClearedGateNotices(next, at);
+    yield* logEvent(next, actor, "review", {
+      at,
+      fromStage: card.stage,
+      toStage: next.stage,
+      body,
+      head: sha,
+      before: card,
+    });
+    options.beforeSave?.();
+    yield* saveCard(next, undefined, false, undefined, undefined, options.snapshot);
+    if (prCompletion) {
+      // Keep the verdict body intact for review evidence and replay detection.
+      yield* logEvent(next, actor, "comment", {
+        at,
+        body: "review clear and PRs merged",
+        before: next,
+      });
+      yield* logStageSync(next);
+    }
+    yield* kick;
+    if (evaluatorTurnDue(card, next))
+      yield* later(
+        next.boardId,
+        cardLane(next),
+        {
+          kind: "evaluatorTurn",
+          before: card,
+          after: next,
+          actor,
+          evaluatorTrigger: "review_verdict",
+        },
+        forkPostCommit(evaluatorTurn(card, next, actor)),
+      );
+    if (verdict === "findings" && next.reviewRound === 3) {
+      const text = `#${card.number} got review findings for the third time. Findings:\n${body}\n\nDecide the scope now: steer the worker on what must still be fixed here, move the rest to a new card, or accept what's left with a note on the card.`;
+      yield* later(
+        next.boardId,
+        cardLane(next),
+        {
+          kind: "noteDiscussion",
+          cardId: next.id,
+          text,
+          evaluatorTrigger: "review_verdict",
+        },
+        forkPostCommit(noteDiscussion(next, text)),
+      );
+    }
+    return next;
+  });
+
+  const settleReviewChain = Effect.fn("KanbanService.settleReviewChain")(function* (
+    before: KanbanBoard,
+    board: KanbanBoard,
+    previous: KanbanCard,
+    card: KanbanCard,
+    actor: KanbanActor,
+  ) {
+    const oldChain = Rules.chainFor(before, previous);
+    const chain = Rules.chainFor(board, card);
+    if (NodeUtil.isDeepStrictEqual(oldChain, chain) || card.settledAt !== null) return card;
+    if (Rules.reviewFinished(card, chain?.steps.length ?? 1)) {
+      if (card.stage !== "needs_review" && card.stage !== "in_review") return card;
+      return yield* applyReviewOutcome(
+        board,
+        card,
+        Rules.finishedReview(card),
+        actor,
+        "clear",
+        "Review chain changed; review already passed",
+      );
+    }
+    // Progress belongs to a named chain; length/model edits within it retain passed steps.
+    if (oldChain?.name === chain?.name) return card;
+    const next = { ...card, reviewStep: 0, updatedAt: yield* nowIso };
+    yield* saveCard(next);
+    return next;
+  });
+
   const REVIEW_REPLAY_WINDOW_MS = 10 * 60_000;
   const reviewResult: KanbanServiceShape["reviewResult"] = (threadId, verdict, findings, head) =>
     Effect.suspend(() => {
@@ -20887,112 +21071,35 @@ const make = Effect.gen(function* () {
             snapshot = { ...snapshot, before: card };
             const chain = Rules.chainFor(board, card);
             const outcome = Rules.applyReviewResult(card, chain?.steps.length ?? 1, verdict);
-            const at = yield* nowIso;
             const reviewStartedAt = live
               ? card.movedAt
               : (events.findLast((event) => event.toStage === "in_review")?.at ?? link.startedAt);
             const roundStartedAt =
               Subtasks.reviewRoundStartedAt(events, card.reviewStep) ??
               (card.reviewStep === 0 ? reviewStartedAt : undefined);
-            // Only the last chain verdict closes the plan's next review step,
-            // even when earlier work still needs ticking off.
-            const passed = verdict === "clear" && !outcome.continueReview;
-            const reviewSubtasks = passed
-              ? Subtasks.reviewSubtasksToPass(card, roundStartedAt)
-              : [];
-            if (passed) {
-              for (const subtask of reviewSubtasks) {
-                const missing = Subtasks.approvalProblem(
-                  card,
-                  subtask,
-                  board.standingApprovals,
-                  board.guessedGates,
-                );
-                if (missing) return yield* failWith("denied", missing, "approval_required");
-              }
-            }
-            const subtasks = passed
-              ? Subtasks.passReview(card, { _tag: "thread", threadId }, at, roundStartedAt)
-              : card.subtasks;
-            const moreWork = passed && Subtasks.workAfterReview({ subtasks });
-            const unfinishedWork = kanbanStepSubtasks({ subtasks }, "work");
-            const reviewPlanStep = reviewSubtasks[0]?.step;
-            const earlierWork =
-              reviewPlanStep !== undefined &&
-              moreWork &&
-              unfinishedWork.some((work) => work.step < reviewPlanStep);
-            const to = moreWork
-              ? "todo"
-              : outcome.continueReview
-                ? "needs_review"
-                : outcome.stage === "completed" &&
-                    !reviewPlanClear({ ...card, subtasks, reviewFindingsPending: false })
-                  ? "in_review"
-                  : outcome.stage;
-            const prCompletion = to === "completed" && trackedPrs(card).length > 0;
-            let next: KanbanCard = {
-              // A verdict is a review that ended normally: its retry record goes.
-              ...Retries.withoutRetries(
-                release(
-                  yield* moveWait(
-                    card,
-                    to,
-                    at,
-                    { _tag: "thread", threadId },
-                    prCompletion,
-                    snapshot,
-                  ),
-                ),
-              ),
-              // The dispatcher's no-verdict flag is answered by the verdict; a
-              // reviewer's own flag stays for the evaluator.
-              stalled: late && card.stalled?.by._tag === "system" ? null : card.stalled,
-              subtasks,
-              stage: to,
-              reviewStep: moreWork && !earlierWork ? 0 : outcome.reviewStep,
-              reviewRound: outcome.reviewRound,
-              reviewFindingsPending: verdict === "findings",
-              wakeNote:
-                verdict === "findings"
-                  ? `Review findings (round ${card.reviewRound + 1}):\n${body}\n\nFix them, then card_move to needs_review.`
-                  : earlierWork
-                    ? `The review${sha ? ` at ${sha}` : ""} passed. Tick your open subtasks (${Subtasks.subtaskIds(unfinishedWork)}) with subtask_done, then card_move to needs_review. Don't change code.`
-                    : moreWork
-                      ? Subtasks.nextStepNote("The review passed. ")
-                      : // A review start keeps the card's wake note so the reviewer reads it
-                        // (startCard). The verdict is where it has been read: without this it
-                        // came back in every later review brief.
-                        null,
-              nudgedAt: null,
-              movedAt: at,
-              updatedAt: at,
-            };
-            next = Asks.closeClearedGateNotices(next, at);
-            yield* logEvent(next, { _tag: "thread", threadId }, "review", {
-              at,
-              fromStage: card.stage,
-              toStage: next.stage,
+            const next = yield* applyReviewOutcome(
+              board,
+              card,
+              outcome,
+              { _tag: "thread", threadId },
+              verdict,
               body,
-              head: sha,
-              before: card,
-            });
-            savingVerdict = true;
-            yield* saveCard(next, undefined, false, undefined, undefined, snapshot);
-            if (prCompletion) {
-              // Keep the verdict body intact for review evidence and replay detection.
-              yield* logEvent(next, { _tag: "thread", threadId }, "comment", {
-                at,
-                body: "review clear and PRs merged",
-                before: next,
-              });
-              yield* logStageSync(next);
-            }
+              sha,
+              late,
+              {
+                snapshot,
+                roundStartedAt,
+                beforeSave: () => {
+                  savingVerdict = true;
+                },
+              },
+            );
             yield* recordAnalytics({
               kind: "kanban.review_verdict",
               boardId: card.boardId,
               cardId: card.id,
               threadId,
-              durationMs: BoardAnalytics.elapsed(at, reviewStartedAt),
+              durationMs: BoardAnalytics.elapsed(next.movedAt, reviewStartedAt),
               props: {
                 round: card.reviewRound + 1,
                 chain: BoardAnalytics.label(chain?.name ?? "none"),
@@ -21000,35 +21107,6 @@ const make = Effect.gen(function* () {
                 ...(sha === null ? {} : { head: sha }),
               },
             });
-            yield* kick;
-            const actor: KanbanActor = { _tag: "thread", threadId };
-            if (evaluatorTurnDue(card, next))
-              yield* later(
-                next.boardId,
-                cardLane(next),
-                {
-                  kind: "evaluatorTurn",
-                  before: card,
-                  after: next,
-                  actor,
-                  evaluatorTrigger: "review_verdict",
-                },
-                forkPostCommit(evaluatorTurn(card, next, actor)),
-              );
-            if (verdict === "findings" && next.reviewRound === 3) {
-              const text = `#${card.number} got review findings for the third time. Findings:\n${body}\n\nDecide the scope now: steer the worker on what must still be fixed here, move the rest to a new card, or accept what's left with a note on the card.`;
-              yield* later(
-                next.boardId,
-                cardLane(next),
-                {
-                  kind: "noteDiscussion",
-                  cardId: next.id,
-                  text,
-                  evaluatorTrigger: "review_verdict",
-                },
-                forkPostCommit(noteDiscussion(next, text)),
-              );
-            }
             return { card: next, recorded: true };
           }).pipe(Effect.withSpan("apply")),
         ),
