@@ -168,6 +168,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         rc, out, err = self.run_install()
         self.assertEqual(rc, 0, err)
         for rel in (".local/libexec/mail/mail_oauth.py", ".local/libexec/mail/kc-read",
+                    ".local/bin/opencode", ".local/bin/opencode-web", ".local/libexec/opencode/service-bin.zsh",
                     ".local/libexec/card-preview/cardpreview.py", ".local/libexec/qcard/render.py",
                     ".local/bin/toollog", ".local/libexec/toollog/toollog.py",
                     ".local/bin/vp", ".local/libexec/vp/launcher.mjs",
@@ -186,6 +187,8 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
                     "Library/LaunchAgents/com.ardud.mirage-beacon-keepalive.plist"):
             self.assertTrue(os.path.isfile(self.live(rel)), rel)
         self.assertTrue(os.access(self.live(".local/bin/qcard"), os.X_OK))
+        self.assertTrue(os.access(self.live(".local/bin/opencode"), os.X_OK))
+        self.assertEqual(stat.S_IMODE(os.stat(self.live(".local/libexec/opencode/service-bin.zsh")).st_mode), 0o644)
         self.assertTrue(os.access(self.live(".local/bin/quint"), os.X_OK))
         self.assertTrue(os.access(self.live(".local/libexec/vp/toolchain"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
@@ -837,12 +840,20 @@ class OpenCodeWebTest(unittest.TestCase):
         self.home = self.temp.name
         self.served = os.path.join(self.home, "served")
         self.service = self.fake_bin("service binary", "opencode v2.0.22")
-        self.launcher = os.path.join(self.home, "opencode-web")
-        with open(os.path.join(HERE, "bin/opencode-web")) as fh:
+        os.makedirs(os.path.join(self.home, "bin"))
+        config_dir = os.path.join(self.home, "libexec/opencode")
+        os.makedirs(config_dir)
+        self.launcher = os.path.join(self.home, "bin/opencode-web")
+        self.shim = os.path.join(self.home, "bin/opencode")
+        shutil.copy2(os.path.join(HERE, "bin/opencode-web"), self.launcher)
+        shutil.copy2(os.path.join(HERE, "bin/opencode"), self.shim)
+        self.config = os.path.join(config_dir, "service-bin.zsh")
+        with open(os.path.join(HERE, "libexec/opencode/service-bin.zsh")) as fh:
             source = fh.read()
-        # Substitute the fixed reference in this copy only; the real launcher has no reference override.
+        # Substitute the fixed reference in this copy only; neither launcher has a reference override.
+        self.assertEqual(source.count("/Volumes/ExternalSSD/opencode2/current/bin/opencode"), 1)
         source = source.replace("/Volumes/ExternalSSD/opencode2/current/bin/opencode", self.service)
-        with open(self.launcher, "w") as fh:
+        with open(self.config, "w") as fh:
             fh.write(source)
         self.lsof = os.path.join(self.home, "lsof")
         with open(self.lsof, "w") as fh:
@@ -899,7 +910,7 @@ exit 42
 
     def test_default_uses_service_binary_without_a_running_service(self):
         # Fail before running if the fixture did not replace the reference; never invoke a real binary.
-        with open(self.launcher) as fh:
+        with open(self.config) as fh:
             self.assertIn(self.service, fh.read())
         r = self.run_web()
         self.assertEqual(r.returncode, 42, r.stdout + r.stderr)
@@ -941,6 +952,22 @@ exit 42
         self.assertEqual(r.returncode, 42, r.stdout + r.stderr)
         self.assertIn("waiting for it to exit", r.stdout)
         self.assertTrue(os.path.exists(self.served))
+
+    def test_cli_shim_uses_shared_binary_and_forwards_arguments_and_status(self):
+        args = ["session", "arg with spaces; dollar$", "--port", "4096"]
+        r = subprocess.run([self.shim, *args], env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 42, r.stderr)
+        with open(self.served) as fh:
+            self.assertEqual(fh.read().splitlines(), [self.service, *args, "BUN_INSPECT=must-not-leak"])
+
+    def test_both_launchers_fail_when_shared_config_is_missing(self):
+        os.remove(self.config)
+        for launcher in (self.shim, self.launcher):
+            with self.subTest(launcher=launcher):
+                r = subprocess.run(["/bin/zsh", "-f", launcher], env=self.env,
+                                   capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertFalse(os.path.exists(self.served))
 
 
 if __name__ == "__main__":

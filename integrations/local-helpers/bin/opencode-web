@@ -5,6 +5,7 @@
 # port; then this waits and takes over when that one exits, rather than killing it (and the agents inside it).
 port=${OPENCODE_WEB_PORT:-4096}
 lsof=${OPENCODE_WEB_LSOF:-/usr/sbin/lsof}
+service_config="${0:A:h}/../libexec/opencode/service-bin.zsh"
 # The OpenCode server's inspector port leaks into children; bun can't bind it twice.
 unset BUN_INSPECT
 busy() { "$lsof" -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1 }
@@ -16,8 +17,7 @@ cd "$HOME" || exit 1
 # Same environment as a terminal (PATH with nvm/bun, code mode, ~/.zshrc exports) so agents behave the same.
 # `serve` serves the same web UI as `web` without opening a browser on every restart.
 exec /bin/zsh -lic '
-  # Matches com.ardud.opencode-service start.zsh; there is no shared binary-path config.
-  service_bin="/Volumes/ExternalSSD/opencode2/current/bin/opencode"
+  source "$2" || exit 1
   bin=${OPENCODE_WEB_BIN:-$service_bin}
   port=$1
   # Validate after login startup too: .zshrc can change the override and inspector environment.
@@ -45,4 +45,4 @@ exec /bin/zsh -lic '
   fi
   print -r -- "$(date "+%F %T") starting $bin serve on 127.0.0.1:$port"
   exec "$bin" serve --hostname 127.0.0.1 --port "$port"
-' opencode-web "$port" </dev/null
+' opencode-web "$port" "$service_config" </dev/null
