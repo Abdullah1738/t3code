@@ -173,6 +173,63 @@ class BudgetTests(unittest.TestCase):
         state['childState'][str(self.root)][str(self.path)] = dict(partial=True, parts={str(nested):value})
         self.assertEqual(budgets.inventory_size(nested, state, NOW.timestamp())['bytes'], budgets.GB)
 
+    def test_root_freshness_preserves_child_measurement_policies(self):
+        forms = [('ordinary', 24*3600-1, True), ('ordinary', 24*3600, False),
+                 ('deep', 48*3600-1, True), ('deep', 48*3600, False),
+                 ('parts', 24*3600-1, True), ('parts', 24*3600, True),
+                 ('parts', 48*3600, True), ('parts', 72*3600-1, True),
+                 ('parts', 72*3600, False)]
+        for mode, age, fresh in forms:
+            with self.subTest(mode=mode, age=age):
+                child = dict(bytes=90*budgets.GB, at=NOW.timestamp()-age, partial=False)
+                if mode == 'parts':
+                    child.update(isDirectory=True, parts={str(self.path/'part'):dict(child)})
+                recent = dict(bytes=10*budgets.GB, at=NOW.timestamp(), partial=False)
+                state = dict(duMode='links', at=NOW.timestamp(), sizes={str(self.root):100*budgets.GB},
+                             childState={str(self.root):{str(self.path):child, str(self.root/'recent'):recent}})
+                with patch.object(jobs, 'DEEP_ROOTS', {str(self.root)} if mode == 'deep' else set()):
+                    value = budgets.inventory_size(self.root, state, NOW.timestamp())
+                self.assertEqual(value, dict(bytes=100*budgets.GB, at=NOW.timestamp()-age, fresh=fresh))
+
+    def test_root_listing_freshness_is_separate_from_child_measurement_age(self):
+        part = dict(bytes=100*budgets.GB, at=NOW.timestamp()-48*3600, partial=False)
+        child = dict(part, isDirectory=True, parts={str(self.path/'part'):part})
+        forms = [('recent', NOW.timestamp(), True), ('boundary_before', NOW.timestamp()-86400+1, True),
+                 ('expired', NOW.timestamp()-86400, False), ('future', NOW.timestamp()+1, False),
+                 ('missing', None, False), ('invalid', 'recent', False)]
+        for name, listed_at, fresh in forms:
+            with self.subTest(name=name):
+                state = dict(duMode='links', at=listed_at, sizes={str(self.root):child['bytes']},
+                             childState={str(self.root):{str(self.path):child}})
+                value = budgets.inventory_size(self.root, state, NOW.timestamp())
+                self.assertEqual(value, dict(bytes=100*budgets.GB, at=child['at'], fresh=fresh))
+
+    def test_aged_root_parts_keep_hourly_streak_alert_and_rollup(self):
+        for age_hours in (24, 48, 69):
+            with self.subTest(age_hours=age_hours), patch.object(self, 'logs', self.logs/str(age_hours)), \
+                 patch.dict(os.environ, TOOLLOG_DIR=str(self.logs)):
+                measured_at = NOW.timestamp()-age_hours*3600
+                part = dict(bytes=90*budgets.GB, at=measured_at, partial=False)
+                child = dict(part, isDirectory=True, parts={str(self.path/'part'):part})
+                row = dict(self.row, path=str(self.root), owner_board='mac', budget_gb=60)
+                for hour in range(3):
+                    now = NOW+dt.timedelta(hours=hour)
+                    recent = dict(bytes=10*budgets.GB, at=now.timestamp(), partial=False)
+                    state = dict(duMode='links', at=now.timestamp(), sizes={str(self.root):100*budgets.GB},
+                                 childState={str(self.root):{str(self.path):child, str(self.root/'recent'):recent}})
+                    jobs.save_state('disk-inventory', state)
+                    props = self.sample(now, [row])
+                    self.assertEqual((props['source'], props['status'], props['sizeGb'], props['sizeAgeS']),
+                                     ('inventory', 'ok', 100, (age_hours+hour)*3600))
+                self.assertEqual(jobs.read_state('disk-budget')[str(self.root)]['streak'], 3)
+                alerts = self.rows('disk.budget.over')
+                self.assertEqual(len(alerts), 1)
+                self.assertEqual((alerts[0]['props']['owner'], alerts[0]['props']['overBy']), ('mac', 40))
+                top = rollup(NOW.date().isoformat(), self.logs)['diskBudgets']['topOverBudget']
+                self.assertEqual(len(top), 1)
+                self.assertEqual((top[0]['path'], top[0]['sizeGb'], top[0]['overBy'], top[0]['sizeAgeS']),
+                                 (str(self.root), 100, 40, (age_hours+2)*3600))
+
     def test_three_hour_streak_daily_dedupe_restart_gap_and_recovery(self):
         start = NOW.replace(hour=21)
         for i in range(7):

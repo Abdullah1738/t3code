@@ -84,11 +84,15 @@ def inventory_size(path, inventory, now):
         values = [cached_value(v, now, path) for p, v in cache.items() if p != excluded]
         if any(v is None for v in values):
             return None
-        at = min((v['at'] for v in values), default=inventory.get('at'))
+        listed_at = inventory.get('at')
+        at = min((v['at'] for v in values), default=listed_at)
         if not jobs.number(at) or at > now:
             return None
+        # A recent listing can contain valid 48h/72h measurements. Keep
+        # their age separate from listing freshness and each child's policy.
         return dict(bytes=sum(v['bytes'] for v in values), at=at,
-                    fresh=all(v['fresh'] for v in values) and now-at < jobs.INVENTORY_FRESH_S)
+                    fresh=all(v['fresh'] for v in values) and jobs.number(listed_at)
+                    and 0 <= now-listed_at < jobs.INVENTORY_FRESH_S)
     pending = [(root, cache) for root, cache in roots.items() if isinstance(cache, dict)]
     while pending:
         root, cache = pending.pop()
