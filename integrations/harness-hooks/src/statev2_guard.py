@@ -85,6 +85,18 @@ NODE_VALUE_OPTIONS = {
     '--trace-event-categories', '--trace-event-file-pattern', '--trace-require-module',
     '--unhandled-rejections', '--use-largepages', '--v8-pool-size', '--watch-kill-signal', '--watch-path',
 }
+BUN_SUBCOMMANDS = {
+    'test', 'install', 'i', 'add', 'a', 'remove', 'rm', 'update', 'outdated', 'audit',
+    'dedupe', 'prune', 'link', 'unlink', 'publish', 'patch', 'pm', 'info', 'why',
+    'build', 'init', 'create', 'c', 'upgrade', 'completions', 'x', 'repl', 'exec',
+}
+BUN_VALUE_OPTIONS = {'--cwd', '--filter', '-F', '--elide-lines', '--shell'}
+# Bun 1.4 test options; optional numeric operands must not swallow a test file.
+BUN_TEST_VALUE_OPTIONS = {
+    '-t', '--test-name-pattern', '--timeout', '--rerun-each', '--retry', '--seed',
+    '--coverage-reporter', '--coverage-dir', '--reporter', '--reporter-outfile',
+    '--max-concurrency', '--path-ignore-patterns', '--parallel-delay', '--shard', '--timings',
+}
 REASON = (
     "statev2 guard: this command was NOT run (owner incident 2026-11-05).\n"
     "Shell reads of Robob's live statev2.sqlite and OpenCode's live opencode.db are blocked, "
@@ -2890,6 +2902,8 @@ def _interpreter_args(binary, args):
         operands |= {"-o", "+o", "-O", "+O"}
     if binary in {"node", "bun", "deno"}:
         operands |= {"--test-name-pattern", "--test-skip-pattern", "--test-reporter", "--test-reporter-destination", "--test-concurrency"}
+    if binary == 'bun':
+        operands |= BUN_VALUE_OPTIONS
     result, index = [], 0
     while index < len(args):
         flag = args[index]
@@ -2901,6 +2915,51 @@ def _interpreter_args(binary, args):
         if flag not in operands:
             result.append(flag)
     return result
+
+
+def _bun_arguments(args):
+    mode, result, directories, index, options = None, [], [], 0, True
+    explicit_run = False
+    while index < len(args):
+        arg = args[index]
+        flag, equal, value = arg.partition('=')
+        if options and flag in {'-', '-e', '--eval', '-p', '--print'}:
+            return 'script', result + args[index:], directories
+        if options and flag == '--preload':
+            result.append(arg)
+            if not equal and index + 1 < len(args):
+                index += 1
+                result.append(args[index])
+        elif options and flag in BUN_VALUE_OPTIONS | (BUN_TEST_VALUE_OPTIONS if mode == 'test' else set()):
+            if not equal:
+                index += 1
+                value = args[index] if index < len(args) else ''
+            if flag == '--cwd':
+                directories.append(value)
+        elif options and mode == 'test' and flag in {'--bail', '--parallel'}:
+            if not equal and index + 1 < len(args) and args[index + 1].isdigit():
+                index += 1
+        elif options and arg == '--':
+            options = False
+            if mode != 'exec':
+                result.append(arg)
+        elif mode is None and not explicit_run and options and arg == 'run':
+            explicit_run = True
+        elif mode is None and not explicit_run and options and arg in BUN_SUBCOMMANDS:
+            mode = arg
+            if mode not in {'test', 'exec'}:
+                return mode, result + args[index + 1:], directories
+        elif not options or not arg.startswith('-'):
+            if mode is None:
+                mode = 'script' if '/' in arg or re.search(r'\.(?:[cm]?[jt]s|[jt]sx)$', arg) else 'task'
+                return mode, result + args[index:], directories
+            if mode == 'exec':
+                return mode, result + args[index:], directories
+            result.append(arg)
+        else:
+            result.append(arg)
+        index += 1
+    return mode or 'script', result, directories
 
 
 def _node_arguments(args):
@@ -5310,7 +5369,11 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             raise AmbiguousScript("migrate-dev-db package command not found")
         shells = {"bash", "sh", "zsh", "dash", "ksh"}
         python = bool(re.fullmatch(r"python[\d.]*", binary))
+        bun_mode = None
         if binary == 'bun':
+            bun_mode, args, bun_directories = _bun_arguments(args)
+            for value in bun_directories:
+                directory = change_directory(value, directory)
             remaining, index, options = [], 0, True
             while index < len(args):
                 arg = args[index]
@@ -5329,11 +5392,13 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                     add(value, directory, 'bun')
                 else:
                     remaining.append(arg)
-                    if arg == '--' or arg not in {'test', 'run'} and not arg.startswith('-') and args[:1] != ['test']:
+                    if arg == '--' or not arg.startswith('-') and bun_mode != 'test':
                         options = False
                 index += 1
             args = remaining
-        if python or binary in shells | {"bun", "deno"}:
+        if python or binary in shells | {"deno"}:
+            args = _interpreter_args(binary, args)
+        if binary == 'bun':
             args = _interpreter_args(binary, args)
         node_test = False
         node_inputs = []
@@ -5346,9 +5411,7 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 if argument in invocation_literals:
                     invocation_literals.add(operand)
             args, node_inputs, node_test, node_runtime_options = _node_arguments(args)
-        if binary == 'bun' and args[:1] == ['test']:
-            node_test, args = True, args[1:]
-        if binary in {'bun', 'deno'} and args[:1] == ['run']:
+        if binary == 'deno' and args[:1] == ['run']:
             args = _interpreter_args(binary, args[1:])
         program_args = list(args)
         while (program_args and program_args[0] != '-' and
@@ -5357,6 +5420,8 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
             if flag in {'--', '-c'} or binary not in shells and flag in {'-e', '--eval', '-p', '--print', '-m'}:
                 break
         stdin_code = not args or program_args[:1] == ['-'] or all(arg.startswith('-') for arg in args)
+        if bun_mode and bun_mode != 'script':
+            stdin_code = False
         shell_options = args[:len(args) - len(program_args)] if binary in shells else []
         shell_stdin = any(re.fullmatch(r'-[a-z]*s[a-z]*', arg) for arg in shell_options)
         shell_command = any(re.fullmatch(r'-[a-z]*c[a-z]*', arg) for arg in shell_options)
@@ -5535,6 +5600,21 @@ def scripts_in(command: str, cwd: str | Path | None, *, _depth=0, _sources=None,
                 return finish_invocation()
         if binary == "eval":
             return scan(" ".join(args), directory, depth + 1)
+        if bun_mode == 'exec':
+            if args:
+                scan_child(args[0], directory, depth + 1)
+            return finish_invocation()
+        if bun_mode == 'test':
+            # Match vp test run after a non-literal cd; filters are not scripts.
+            for target in args:
+                if target.startswith('-') or directory is None and not (os.path.isabs(target) or target.startswith(('~/', '$HOME/', '${HOME}/'))):
+                    continue
+                path = script_path(target, directory, binary)
+                if path.is_file():
+                    add(target, directory, binary, test_target=target)
+            return finish_invocation()
+        if bun_mode and bun_mode != 'script':
+            return finish_invocation()
         if binary == 'ssh':
             remote = list(args)
             while remote and remote[0].startswith('-'):
