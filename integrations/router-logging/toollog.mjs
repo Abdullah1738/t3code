@@ -108,7 +108,7 @@ export function recordFailure(component, name, error, fields = {}) {
       scan.seen.add(error);
     }
     const phase = failurePhases.get(error);
-    emit(component, name, { ...fields, props:{...fields.props, ...replicaProps(error), ...connection,
+    emit(component, name, { ...fields, props:{...fields.props, ...replicaProps(error), ...httpProps(error), ...connection,
       ...(phase ? {phase} : {}), ...(connection ? {step:phase ?? fields.props?.step ?? name} : {})},
       kind:'error', ok:false, error:connection ? {tag:connection.errno} : failure(error) });
   } catch { /* Logging must preserve the original error. */ }
@@ -117,9 +117,10 @@ export function recordConnectionFailure(component, name, error, fields) {
   if (connectionFailures.has(error)) recordFailure(component, name, error, fields);
 }
 const props = new Set(['model','size','count','status','enabled','locked','limited','reloginNeeded','state','action','tag','dryRun','complete','cost','hour','exitCode','attempt','source','failed','total','fourxx','fivexx','phase','durationMaxMs','omitted']);
-for (const prop of ['target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs', 'ok', 'loopBlockMaxMs', 'longestSyncOp', 'longestSyncMs']) props.add(prop);
+for (const prop of ['target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs', 'ok', 'loopBlockMaxMs', 'longestSyncOp', 'longestSyncMs', 'httpStatus']) props.add(prop);
 const numericScanProps = new Set(['loopBlockMaxMs', 'longestSyncMs']);
 const safeProp = (key, value) => {
+  if (key === 'httpStatus') return Number.isFinite(value);
   if (numericScanProps.has(key)) return Number.isFinite(value) && value >= 0;
   if (key === 'longestSyncOp') return Boolean(token(value));
   if (key === 'step') return Boolean(token(value));
@@ -146,6 +147,7 @@ const errorMessage = (value, tag) => messages.has(value) ? value.slice(0, 300) :
 const replicaProps = value => Object.fromEntries(['replicaGeneration', 'replicaAgeMs', 'threadAheadMs', 'deferredThreads', 'maxThreadAheadMs']
   .filter(key => value?.[key] !== undefined)
   .map(key => [key, Number.isFinite(value[key]) ? value[key] : 'unknown']));
+const httpProps = value => Number.isFinite(value?.httpStatus) ? { httpStatus: value.httpStatus } : {};
 export function failure(value, result = false) {
   try {
     const fetchFailed = !result && value?.name === 'TypeError' && value?.message === 'fetch failed';

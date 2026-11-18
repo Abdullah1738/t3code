@@ -651,7 +651,7 @@ test('claim established while gathering prevents a restart send and queue releas
 
 test('unavailable cutover status holds recovery without any side effect or handled receipt', async () => {
   const fake = fakeIo({ runs: [run('batch')], threads });
-  fake.io.harnessCutoverStatus = async () => { throw new Error('status unavailable'); };
+  fake.io.harnessCutoverStatus = async () => { throw Object.assign(new Error('status unavailable'), { code: 'TEST_CUTOVER_UNAVAILABLE' }); };
   const state = { handled: {}, servers: [] };
   await assert.rejects(() => restartScan(scanArgs(state), fake.io), /status unavailable/);
   assert.deepEqual(fake.calls.send, []);
@@ -875,7 +875,7 @@ test('incremental task retry uses its durable receipt even if send succeeded bef
     io.sendToThread = async (threadId, text, opts) => {
       await send(threadId, text, opts);
       receipt = opts.clientRequestId;
-      throw new Error('reply lost after accept');
+      throw Object.assign(new Error('reply lost after accept'), { code: 'TEST_SEND_FAILED' });
     };
     io.restartNoteRun = (_db, _id, requestId) => requestId === receipt ? 'receipt-run' : null;
     await restartScan(scanArgs(state, { now: T0 + 65_000 }), io);
@@ -903,7 +903,7 @@ test('a main-note receipt only covers the delegated IDs captured before that sen
       await send(id, text, opts);
       if (!opts.clientRequestId.includes(':delegated:')) {
         mainReceipt = true;
-        throw new Error('main send accepted but reply lost');
+        throw Object.assign(new Error('main send accepted but reply lost'), { code: 'TEST_SEND_FAILED' });
       }
     };
     io.restartNoteRun = (_db, _thread, id) => mainReceipt && !id.includes(':delegated:') ? 'main-note-run' : null;
@@ -933,7 +933,7 @@ test('late-note send exhaustion identifies the undelivered task in the summary',
     const [late] = dbIo.cancelledDelegatedTasksSince(db, iso(T0));
     late.completed_at = iso(T0 + 40_000);
     delegated.push(late);
-    io.sendToThread = async () => { throw new Error('service unavailable'); };
+    io.sendToThread = async () => { throw Object.assign(new Error('service unavailable'), { code: 'TEST_SEND_FAILED' }); };
     for (const at of [65_000, 70_000, 95_000]) await restartScan(scanArgs(state, { now: T0 + at }), io);
     assert.equal(calls.telegram.length, 1);
     assert.match(calls.telegram[0].text, /delegated task node:delegated-task:undelivered not noted/);
@@ -960,7 +960,7 @@ test('late delegated delivery retries a missing receipt and never includes a tas
     const send = io.sendToThread;
     let failure = true;
     io.sendToThread = async (...args) => {
-      if (failure) { failure = false; throw new Error('unavailable before accept'); }
+      if (failure) { failure = false; throw Object.assign(new Error('unavailable before accept'), { code: 'TEST_SEND_FAILED' }); }
       return send(...args);
     };
     await restartScan(scanArgs(state, { now: T0 + 65_000 }), io);
@@ -1060,7 +1060,7 @@ test('queue retry after a sent note never sends the note again', async () => {
     held: { arch: [{ run_id: 'held', held: true, requested_at: iso(T0) }] },
   });
   let tries = 0;
-  io.dispatchCommand = async (command) => { calls.commands.push(command); if (++tries === 1) throw new Error('lost queue reply'); };
+  io.dispatchCommand = async (command) => { calls.commands.push(command); if (++tries === 1) throw Object.assign(new Error('lost queue reply'), { code: 'TEST_DISPATCH_FAILED' }); };
   const state = { handled: {}, servers: [] };
   await restartScan(scanArgs(state), io);
   assert.equal(calls.send.length, 1);
@@ -1133,7 +1133,7 @@ test('deferral neither consumes failure retries nor expires at the discovery loo
   thread.activeRunId = null;
   thread.status = 'completed';
   const send = io.sendToThread;
-  io.sendToThread = async () => { throw new Error('one transient failure'); };
+  io.sendToThread = async () => { throw Object.assign(new Error('one transient failure'), { code: 'TEST_SEND_FAILED' }); };
   const args = scanArgs(state, { now: T0 + 8 * 3_600_000, sinceIso: iso(T0 + 5 * 3_600_000), floorMs: T0 + 2 * 3_600_000 });
   await restartScan(args, io);
   assert.equal(Object.values(state.handled)[0].done, false);
@@ -1149,7 +1149,7 @@ test('an exhausted failing thread does not finalize its still-busy sibling', asy
   const busy = { title: 'Arch', activeRunId: 'fresh', status: 'running' };
   const { io, calls } = fakeIo({ runs: [run('arch'), run('broken')], threads: { arch: busy, broken: { title: 'Broken' } } });
   const send = io.sendToThread;
-  io.sendToThread = async (id, text, opts) => { if (id === 'broken') throw new Error('down'); return send(id, text, opts); };
+  io.sendToThread = async (id, text, opts) => { if (id === 'broken') throw Object.assign(new Error('down'), { code: 'TEST_SEND_FAILED' }); return send(id, text, opts); };
   const state = { handled: {}, servers: [] };
   for (let i = 0; i < 4; i++) await restartScan(scanArgs(state), io);
   assert.equal(Object.values(state.handled)[0].done, false);
@@ -1175,7 +1175,7 @@ test('successful thread delivery is not retried when a sibling fails', async () 
   const send = io.sendToThread;
   let failed = false;
   io.sendToThread = async (id, text, opts) => {
-    if (id === 'other' && !failed) { failed = true; throw new Error('temporarily down'); }
+    if (id === 'other' && !failed) { failed = true; throw Object.assign(new Error('temporarily down'), { code: 'TEST_SEND_FAILED' }); }
     return send(id, text, opts);
   };
   const state = { handled: {}, servers: [] };
