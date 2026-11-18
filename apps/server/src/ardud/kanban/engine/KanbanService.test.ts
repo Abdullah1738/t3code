@@ -17066,12 +17066,20 @@ it.effect("the owner's own question and a pick on an evaluator's go where they b
       // The owner parks a working card with a question; his reply wakes its worker.
       const mine = yield* kanban.createCard(board.id, { prompt: "A", title: "A" }, owner);
       yield* kanban.dispatchNow;
+      const mineThread = (yield* kanban.card(mine.id)).card.activeThreadId!;
       yield* kanban.moveCard(mine.id, "needs_owner", "owner", owner, { question: "Hold on" });
       const mineTalk = yield* kanban.cardDiscussion(mine.id);
       yield* kanban.post(mineTalk.id, owner, [{ _tag: "md", text: "Use 3%" }]);
       const woken = (yield* kanban.card(mine.id)).card;
-      assert.strictEqual(woken.stage, "todo");
-      assert.include(woken.wakeNote ?? "", "Use 3%");
+      assert.strictEqual(woken.stage, "working");
+      assert.strictEqual(woken.activeThreadId, mineThread);
+      assert.isNull(woken.wakeNote);
+      assert.lengthOf(
+        (yield* Ref.get(fake.threads))
+          .get(mineThread)!
+          .messages.filter((text) => text.includes("Use 3%")),
+        1,
+      );
 
       // An evaluator's approval as a pick: the card goes back where it was.
       const evaluator: KanbanActor = { _tag: "evaluator", threadId: ThreadId.make("eval") };
@@ -17852,8 +17860,15 @@ it.effect("the owner makes an ask blocking: the card waits, then wakes with his 
       const talk = yield* kanban.cardDiscussion(card.id);
       yield* kanban.answer(talk.id, asked.asks[0]!.seq!, "q1", ["o1"], owner);
       const woken = (yield* kanban.card(card.id)).card;
-      assert.strictEqual(woken.stage, "todo");
-      assert.include(woken.wakeNote ?? "", "Yes");
+      assert.strictEqual(woken.stage, "working");
+      assert.strictEqual(woken.activeThreadId, threadId);
+      assert.isNull(woken.wakeNote);
+      assert.lengthOf(
+        (yield* Ref.get(fake.threads))
+          .get(threadId)!
+          .messages.filter((text) => text.includes("Picked: Yes")),
+        1,
+      );
       assert.isNotNull(woken.asks[0]!.closedAt);
       yield* kanban.dispatchNow;
       const resumed = (yield* kanban.card(card.id)).card;
@@ -17900,9 +17915,15 @@ it.effect("a multi ask posts a tick-several pick and wakes the card with every p
 
       yield* kanban.answer(talk.id, asked.asks.at(-1)!.seq!, "q2", ["o1", "o3"], owner);
       const woken = (yield* kanban.card(card.id)).card;
-      assert.strictEqual(woken.stage, "todo");
-      assert.include(woken.wakeNote ?? "", "A");
-      assert.include(woken.wakeNote ?? "", "C");
+      assert.strictEqual(woken.stage, "working");
+      assert.strictEqual(woken.activeThreadId, threadId);
+      assert.isNull(woken.wakeNote);
+      assert.lengthOf(
+        (yield* Ref.get(fake.threads))
+          .get(threadId)!
+          .messages.filter((text) => text.includes("Picked: A; C")),
+        1,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );
@@ -17924,7 +17945,6 @@ it.effect("his own words on a blocked pick close it and wake the card", () =>
       );
       yield* kanban.changeAsk(card.id, "q1", "block", owner, "owner");
 
-      // Words are not a pick: they are a reply on the ask, which still holds the card.
       const talk = yield* kanban.cardDiscussion(card.id);
       const shown = yield* kanban.answer(
         talk.id,
@@ -17935,15 +17955,18 @@ it.effect("his own words on a blocked pick close it and wake the card", () =>
         "Wait for Monday",
       );
       assert.strictEqual(shown.answers[0]?.text, "Wait for Monday");
-      const held = (yield* kanban.card(card.id)).card;
-      assert.strictEqual(held.stage, "todo");
-      assert.isNotNull(held.asks[0]!.closedAt);
-      assert.strictEqual(held.asks[0]!.answer?.verdict, "text");
-
       const woken = (yield* kanban.card(card.id)).card;
-      assert.strictEqual(woken.stage, "todo");
-      assert.include(woken.wakeNote ?? "", "Wait for Monday");
+      assert.strictEqual(woken.stage, "working");
+      assert.strictEqual(woken.activeThreadId, threadId);
+      assert.isNull(woken.wakeNote);
       assert.isNotNull(woken.asks[0]!.closedAt);
+      assert.strictEqual(woken.asks[0]!.answer?.verdict, "text");
+      assert.lengthOf(
+        (yield* Ref.get(fake.threads))
+          .get(threadId)!
+          .messages.filter((text) => text.includes("Wait for Monday")),
+        1,
+      );
     }).pipe(Effect.provide(testLayer(fake.layer)));
   }),
 );

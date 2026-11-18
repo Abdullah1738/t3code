@@ -1977,7 +1977,12 @@ const make = Effect.gen(function* () {
     const prior = detachedDispatchSkips.get(card.id);
     if (prior?.reason === reason && prior.movedAt === card.movedAt && at - prior.at < 60_000)
       return;
-    detachedDispatchSkips.set(card.id, { boardId: card.boardId, reason, movedAt: card.movedAt, at });
+    detachedDispatchSkips.set(card.id, {
+      boardId: card.boardId,
+      reason,
+      movedAt: card.movedAt,
+      at,
+    });
     yield* recordAnalytics({
       kind: "kanban.dispatch_skipped",
       boardId: card.boardId,
