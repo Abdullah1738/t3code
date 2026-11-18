@@ -230,6 +230,28 @@ layer("CommandOutputHub", (it) => {
       ),
   );
 
+  it.effect(
+    "output activity survives tail eviction, ignores empty chunks and clears on settle",
+    () =>
+      Effect.gen(function* () {
+        const hub = yield* CommandOutputHub.CommandOutputHub;
+        const threadId = yield* seedThread;
+        yield* hub.append({ threadId, itemId: ITEM_ID, chunk: "progress" });
+        const first = (yield* hub.activity(threadId)).get(ITEM_ID);
+        yield* TestClock.adjust("1 second");
+        yield* hub.append({ threadId, itemId: ITEM_ID, chunk: "" });
+        assert.equal((yield* hub.activity(threadId)).get(ITEM_ID), first);
+        for (let index = 0; index < 65; index++)
+          yield* hub.append({ threadId, itemId: TurnItemId.make(`other-${index}`), chunk: "." });
+        assert.equal((yield* hub.activity(threadId)).get(ITEM_ID), first);
+        yield* hub.append({ threadId, itemId: ITEM_ID, chunk: "more" });
+        assert.equal((yield* hub.activity(threadId)).get(ITEM_ID), (first ?? 0) + 1_000);
+        yield* hub.finish({ threadId, itemId: ITEM_ID });
+        assert.isFalse((yield* hub.activity(threadId)).has(ITEM_ID));
+        yield* hub.forgetThread(threadId);
+        assert.equal((yield* hub.activity(threadId)).size, 0);
+      }),
+  );
   it.effect("a row that is not a known command fails instead of waiting forever", () =>
     Effect.gen(function* () {
       const hub = yield* CommandOutputHub.CommandOutputHub;

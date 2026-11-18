@@ -1,3 +1,4 @@
+import * as ClaudeApiDiagnostics from "../../providers/ClaudeApiDiagnostics.ts";
 import { kanbanReasonClass } from "../../analytics/McpFailureReason.ts";
 import { backgroundCommandWakeKey } from "../../../orchestration-v2/backgroundCommandWake.ts";
 import * as CardNextMetrics from "../../analytics/CardNextMetrics.ts";
@@ -12955,6 +12956,10 @@ const make = Effect.gen(function* () {
       return next;
     });
     const failure = lastFailure.success;
+    const failureMessage =
+      failure?.claudeApiError !== undefined && failure.code !== "model_refusal"
+        ? ClaudeApiDiagnostics.describe(failure, failure.claudeApiError).message
+        : failure?.message;
     const failureEvent = {
       failedThreadId: threadId,
       ...(failure?.runId == null ? {} : { runId: failure.runId }),
@@ -13143,7 +13148,7 @@ const make = Effect.gen(function* () {
       const recovered = yield* Ref.get(recoveredThreads);
       const runId = outage.runId ?? null;
       if (!recovered.has(threadId) || runId === null || recovered.get(threadId) !== runId) {
-        yield* pauseThread(link, model, outage.message, runId);
+        yield* pauseThread(link, model, failureMessage!, runId);
       }
     } else if (link.paused !== null) yield* store.putThreadLink({ ...link, paused: null });
     // Discussions the thread evaluates, or is still typing or owing in after
@@ -13306,14 +13311,14 @@ const make = Effect.gen(function* () {
         return;
       }
       if (entry !== undefined || Rules.isContextFull(failure)) {
-        yield* evaluatorGiveUp(link, failure.message, recoveryPost ?? undefined);
+        yield* evaluatorGiveUp(link, failureMessage!, recoveryPost ?? undefined);
         return;
       }
       const dueAt = (yield* nowMillis) + Rules.EVALUATOR_RETRY_MS;
       yield* Ref.update(evaluatorFailures, (all) =>
         new Map(all).set(threadId, {
           dueAt,
-          message: failure.message,
+          message: failureMessage!,
           state: "retry",
           runId: failure.runId ?? null,
           ...(ownerDiscussion === null ? {} : { ownerDiscussion }),
