@@ -157,6 +157,8 @@ const CHATS_DIR = "chats";
 
 /** The iMessage router's backend on Robob's control API. Accepts thread ids and OpenCode `ses_` ids alike. */
 export class RobobBackend implements ChatBackend {
+  get linkAvailable(): boolean { return this.client.linkGate?.available ?? true; }
+
   readonly brand = { app: "Robob" };
   readonly client: ControlClient;
   private readonly chatRoot: string;
@@ -211,7 +213,7 @@ export class RobobBackend implements ChatBackend {
     if (!options.chatRoot.startsWith("/") || options.chatRoot.includes("\0")) throw new Error("Invalid iMessage chat root");
     this.chatRoot = options.chatRoot.replace(/\/+$/, "");
     if (options.subdir !== undefined && !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/.test(options.subdir)) throw new Error("Invalid iMessage chat folder");
-    this.client = options.client ?? new ControlClient(options);
+    this.client = options.client ?? new ControlClient({ ...options, linkGate: options.linkGate ?? true });
     this.directories = new ThreadDirectories(this.client);
     this.messageCache = new MessageCache(this.client);
     this.finishes = options.finishes ?? opencodeFinishes();

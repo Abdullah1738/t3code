@@ -4,13 +4,14 @@ import { logDirectory } from "./log-directory.ts";
 import { randomUUID } from "node:crypto";
 import type { LogLine } from "./toollog.ts";
 
-export const LINK_CAUSES = ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT"] as const;
+export const LINK_CAUSES = ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "FETCH_FAILED", "HTTP_503"] as const;
 export type LinkCause = typeof LINK_CAUSES[number];
 export type RobobLink = {
   outageId: string; firstFailureAt: string; cause: LinkCause; route: string;
   failedCalls: number; suppressedCalls: number; causes: Partial<Record<LinkCause, number>>;
   inboundReceivedDuringOutage: number; inboundAckedDuringOutage: number; inboundAnsweredAfter: number; inboundAnsweredDuringOutage: number;
-  downMs?: number; recoveredAt?: string; firstReplyAt?: string;
+  skippedCalls?: number; failedProbes?: number; bySite?: Record<string, number>;
+  downMs?: number; recoveredAt?: string; firstReplyAt?: string; summaryAt?: string;
 };
 const iso = (value: unknown): value is string => typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value) && Number.isFinite(Date.parse(value));
 export function cleanRobobLink(value: RobobLink | undefined): RobobLink | undefined {
@@ -18,15 +19,17 @@ export function cleanRobobLink(value: RobobLink | undefined): RobobLink | undefi
     || !LINK_CAUSES.includes(value.cause) || !/^(?:\/(?:[a-z-]+|:id))*$/.test(value.route)) return;
   const result: RobobLink = { outageId: value.outageId, firstFailureAt: value.firstFailureAt, cause: value.cause, route: value.route,
     failedCalls: 0, suppressedCalls: 0, causes: {}, inboundReceivedDuringOutage: 0, inboundAckedDuringOutage: 0, inboundAnsweredAfter: 0, inboundAnsweredDuringOutage: 0 };
-  for (const key of ["failedCalls", "suppressedCalls", "inboundReceivedDuringOutage", "inboundAckedDuringOutage", "inboundAnsweredAfter", "inboundAnsweredDuringOutage", "downMs"] as const) {
+  for (const key of ["failedCalls", "suppressedCalls", "inboundReceivedDuringOutage", "inboundAckedDuringOutage", "inboundAnsweredAfter", "inboundAnsweredDuringOutage", "downMs", "skippedCalls", "failedProbes"] as const) {
     const n = value[key];
     if (typeof n === "number" && Number.isSafeInteger(n) && n >= 0) result[key] = n;
   }
+  if (value.bySite) result.bySite = Object.fromEntries(Object.entries(value.bySite).filter(([site, count]) =>
+    /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/.test(site) && Number.isSafeInteger(count) && count >= 0).slice(0, 100));
   for (const cause of LINK_CAUSES) {
     const n = value.causes?.[cause];
     if (typeof n === "number" && Number.isSafeInteger(n) && n > 0) result.causes[cause] = n;
   }
-  for (const key of ["recoveredAt", "firstReplyAt"] as const) if (iso(value[key])) result[key] = value[key];
+  for (const key of ["recoveredAt", "firstReplyAt", "summaryAt"] as const) if (iso(value[key])) result[key] = value[key];
   return result;
 }
 
@@ -42,6 +45,7 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
   checkpoint?: () => JournalPosition } = {}) {
   const now = options.now ?? Date.now;
   let active: Outage | undefined;
+  let gatedOutage: string | undefined;
   const recovered = new Map<string, Outage>();
   let loadedRoot: string | undefined;
   let resumePending = false;
@@ -137,7 +141,7 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
               const line = JSON.parse(text) as LogLine;
               if (line.component === "robob" && line.name === "robob.link_reset") {
                 if (line.ids?.outageId === active?.link.outageId) active = undefined;
-              } else if (line.component === "robob" && ["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply"].includes(line.name)) {
+              } else if (line.component === "robob" && ["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply"].includes(line.name)) {
                 const link = cleanRobobLink(line.link);
                 if (!link || now() - Date.parse(link.firstFailureAt) > RETENTION_MS) continue;
                 const item = active?.link.outageId === link.outageId ? active : recovered.get(link.outageId)
@@ -202,6 +206,7 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
       }
       return { events, keepDetail };
     }
+    if (line.props?.linkGated === true && active?.down) gatedOutage = active.link.outageId;
     const cause = line.props?.linkCause as LinkCause | undefined;
     if (line.ok === false && cause && LINK_CAUSES.includes(cause)) {
       if (replaying && line.ids?.outageId && (recovered.has(line.ids.outageId)
@@ -212,10 +217,15 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
         failedCalls: 0, suppressedCalls: 0, causes: {}, inboundReceivedDuringOutage: 0, inboundAckedDuringOutage: 0, inboundAnsweredAfter: 0, inboundAnsweredDuringOutage: 0 },
         waiting: new Set(), answered: new Set(), acked: new Set(), down: false, dirty: false };
       line.ids = { ...line.ids, outageId: active.link.outageId };
+      if (line.props?.linkGated === true) {
+        gatedOutage = active.link.outageId;
+        if (line.props.linkProbe === true) active.link.failedProbes = (active.link.failedProbes ?? 0) + 1;
+      }
       active.link.failedCalls++;
       line.props = { ...line.props, linkFailureCount: active.link.failedCalls };
       active.link.causes[cause] = (active.link.causes[cause] ?? 0) + 1;
       keepDetail = active.link.failedCalls <= 5;
+      if (line.props?.linkGated === true && active.down) keepDetail = firstAtSite(`control.${String(line.props.route).replace(/[^a-zA-Z]/g, ".")}`);
       if (!keepDetail) active.link.suppressedCalls++;
       active.dirty = true; stateDirty = true;
       if (resumePending) {
@@ -228,7 +238,8 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
         active.down = true; events.push(event("robob.link_down", active, line.ts)); active.dirty = false;
       }
     } else if (active) {
-      if (line.ok === true && (active.down || resumePending)) {
+      if (line.ok === true && (active.down || resumePending)
+        && (line.props?.linkGated !== true || line.props.linkProbe === true || line.props.linkGateDown === false)) {
         active.link.recoveredAt = line.ts;
         active.link.downMs = Math.max(0, Date.parse(line.ts) - Date.parse(active.link.firstFailureAt));
         events.push(event("robob.link_up", active, line.ts));
@@ -243,20 +254,45 @@ export function createRobobLinkState(options: { root?: string | (() => string); 
       }
     }
     for (const [id, item] of recovered) if (!item.waiting.size) recovered.delete(id);
+    if (gatedOutage && active?.down) events.push(...flush(() => Date.parse(line.ts)));
     if (!replaying && !options.checkpoint) save();
     return { events, keepDetail };
   }
   function flush(now: () => number): LogLine[] {
     if (!active?.down || !active.dirty) return [];
-    const ts = new Date(now()).toISOString();
+    const at = now();
+    if (gatedOutage === active.link.outageId && at - Date.parse(active.link.summaryAt ?? active.link.firstFailureAt) < 60_000) return [];
+    const ts = new Date(at).toISOString();
     active.dirty = false;
-    return [event("robob.link_state", active, ts)];
+    if (gatedOutage === active.link.outageId) { active.link.summaryAt = ts; stateDirty = true; }
+    const line = event(gatedOutage === active.link.outageId ? "robob.link_down_summary" : "robob.link_state", active, ts);
+    if (line.name === "robob.link_down_summary") line.props = { downMs: Math.max(0, at - Date.parse(active.link.firstFailureAt)),
+      skippedCalls: active.link.skippedCalls ?? 0, failedProbes: active.link.failedProbes ?? 0 };
+    return [line];
   }
   function save() {
     if (replaying) return;
     persist(stopping); stopping = false;
   }
-  return { accept, flush, save };
+  function firstAtSite(site: string): boolean {
+    if (!active?.down || !/^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/.test(site)) return true;
+    active.link.bySite ??= {};
+    const previous = active.link.bySite[site] ?? 0;
+    if (Object.keys(active.link.bySite).length < 100 || site in active.link.bySite) active.link.bySite[site] = previous + 1;
+    active.dirty = true; stateDirty = true;
+    return previous === 0;
+  }
+  function skip(site: string): LogLine[] {
+    load();
+    if (!active?.down) return [];
+    gatedOutage = active.link.outageId;
+    active.link.skippedCalls = (active.link.skippedCalls ?? 0) + 1;
+    firstAtSite(site);
+    const events = flush(now);
+    if (!options.checkpoint) save();
+    return events;
+  }
+  return { accept, flush, save, firstAtSite, skip, down: () => { load(); return active?.down === true; } };
 }
 
 export function createRobobLinkAggregation() {
@@ -284,7 +320,7 @@ export function createRobobLinkAggregation() {
       }
       messages.set(key, item);
     }
-    if (line.component !== "robob" || !["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply"].includes(line.name) || !line.link) return;
+    if (line.component !== "robob" || !["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_down_summary", "robob.link_reply"].includes(line.name) || !line.link) return;
     const previous = outages.get(line.link.outageId);
     if (!previous || line.ts >= previous.observedAt) outages.set(line.link.outageId, { link: line.link, observedAt: line.ts,
       recoveredOrder: line.name === "robob.link_up" ? order : previous?.recoveredOrder });

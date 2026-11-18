@@ -11,7 +11,7 @@ const NAMES = new Set([
   "IMessageError", "APIError", "FetchError", "HTTPError", "NetworkError", "ZodError",
   "AbortError", "TimeoutError", "BoundedTimeout", "SystemError", "SQLiteError", "SqliteError", "DOMException",
   "JudgeError", "TransportError", "PublishError", "CliError", "SttError", "SecretError", "ShareError",
-  "HttpError", "ApiError", "ControlError", "LineError", "SendblueError", "ValidationError", "UnknownError",
+  "HttpError", "ApiError", "ControlError", "RobobLinkDown", "LineError", "SendblueError", "ValidationError", "UnknownError",
 ]);
 const SYSTEM_CODES = new Set([
   ...Object.keys(osConstants.errno),
@@ -54,7 +54,7 @@ HTTP3ProtocolError HTTP3HeaderEncodingError DNSResolutionFailed HTTP3StreamReset
 InvalidCRL UnsupportedProxyProtocol UnsupportedProtocol ProxyConnectFailed TLSHandshakeFailed`.split(/\s+/));
 // Stack strings can be provider-controlled. Only code-owned filenames/modules may survive.
 const SOURCE_FILES = new Set(`bounded.ts prompt-probe.ts log-prompt-probes.ts access.ts api.ts apps.ts backend.ts card-preview.ts card-text.ts chats.ts cli.ts commands.ts config.ts
-control.ts delivery.ts formatting.ts group-gate.ts group-judge.ts guest-calendar.ts guest-desk.ts guest-evidence.ts
+control.ts robob-link-gate.ts delivery.ts formatting.ts group-gate.ts group-judge.ts guest-calendar.ts guest-desk.ts guest-evidence.ts
 guest-flight.ts guest-providers.ts guest-responder.ts guests.ts inbound-failure.ts inbound-files.ts ingress.ts line.ts
 local-attachments.ts lock.ts log-calls.ts log-directory.ts log-error.ts log-rollup.ts main.ts meds-fold.ts openchamber.ts opencode-steps.ts
 origin-backfill.ts photon.ts poll-match.ts preferred-model.ts publish.ts replyCheck.ts robob.ts router.ts runtime.ts

@@ -27,7 +27,7 @@ function setup(status: number, reason?: string, retrySafe = false, admitted = fa
     });
   } });
   servers.push(server);
-  const backend = new RobobBackend({ chatRoot: "/chats", url: server.url.origin, token: "test-token" });
+  const backend = new RobobBackend({ chatRoot: "/chats", url: server.url.origin, token: "test-token", linkGate: false });
   return { backend, id, prompt, calls, holder, failReads: () => { readFails = true; }, pending: () => { pendingRequests = [{ requestId: "request" }]; } };
 }
 
@@ -114,7 +114,7 @@ test.each(["truncated", "reset", "timeout"].flatMap(failure => ["question", "per
     return readable ? Response.json({ ok: true, thread: { pendingRequests: [] } }) : Response.json({ ok: false }, { status: 503 });
   }) as typeof fetch);
   try {
-    const backend = new RobobBackend({ chatRoot: "/chats", url: "http://127.0.0.1:1", token: "test-token" });
+    const backend = new RobobBackend({ chatRoot: "/chats", url: "http://127.0.0.1:1", token: "test-token", linkGate: false });
     const result = kind === "question"
       ? backend.questionReply({ id: "request", sessionID: "thread-test", title: "Choice", questions: [{ key: "q", header: "Choice", question: "Choose", options: [{ label: "A" }] }] }, "/chats", [["A"]], "human")
       : backend.permissionReply("thread-test", "request", "/chats", "once", "human");
