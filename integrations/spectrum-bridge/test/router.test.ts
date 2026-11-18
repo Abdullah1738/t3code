@@ -10494,7 +10494,7 @@ test("unanswered Telegram failures retry three times across ticks and persist ac
   expect(calls).toBe(3);
 });
 
-test("unanswered watchdog requeues one sealed human batch and excludes every member of an outage notice", async () => {
+test("unanswered watchdog requeues one sealed human batch even when an outage notice was sent", async () => {
   const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
   const h = setup();
   for (const id of ["first", "second"]) h.input(id, id, { source: "typed" });
@@ -10508,12 +10508,18 @@ test("unanswered watchdog requeues one sealed human batch and excludes every mem
   for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
   expect(inbounds(h.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt !== undefined)).toBe(true);
 
-  const other = setup();
+  const alerts: string[][] = [];
+  const other = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
   for (const id of ["held", "held-member"]) other.input(id, id, { source: "typed" });
   await other.router.tick();
   other.store.enqueue({ id: "outage:notice", kind: "control", text: "Technical problem", replyTo: "held" });
-  setSystemTime(start + 11 * 60_000); await other.router.checkUnanswered();
-  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).unanswered === undefined)).toBe(true);
+  other.store.outboxState("outage:notice", "sent");
+  setSystemTime(start + 16 * 60_000);
+  const logs = await captureLogs(async () => { await other.router.checkUnanswered(); });
+  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt === undefined)).toBe(true);
+  expect(logs.filter(row => row.name === "inbound.overdue").map(row => row.ids?.inboundId)).toEqual(["held", "held-member"]);
+  expect(alerts.map(args => args[2])).toEqual(["imessage-unanswered:held", "imessage-unanswered:held-member"]);
+  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).unanswered?.overdueAt !== undefined)).toBe(true);
 });
 
 test("unanswered watchdog rechecks later candidates after an alert awaits while their reply sends", async () => {
@@ -10709,4 +10715,20 @@ test("reaction before a queued legacy full reply preserves first answeredAt and 
   await upgraded.tick(); expect(h.backend.prompts).toHaveLength(0);
   h.input("new-request", "New request", { source: "typed" }); await upgraded.tick();
   expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["New request"]);
+});
+
+
+test.each(["/status", "/Status", "/new", "/New"])("outage telemetry: substantive %s command response covers only its own human row", async command => {
+  const h = setup();
+  h.input("earlier", "Earlier question", { source: "typed" });
+  await h.router.tick();
+  h.input("command", command, { source: "typed" });
+  await h.router.tick();
+  const op = h.controls().find(op => op.replyTo === "command")!;
+  expect(op.answersInbound).toBe(true);
+  expect(h.store.get<string[]>(`reply-covered:${op.id}`)).toEqual(["command"]);
+  h.store.outboxState(op.id, "sent");
+  const payloads = inbounds(h.store).map(row => row.payload as import("../src/unanswered.ts").AnsweredInput);
+  expect(payloads.find(input => input.id === "command")?.answeredAt).toBeNumber();
+  expect(payloads.find(input => input.id === "earlier")?.answeredAt).toBeUndefined();
 });

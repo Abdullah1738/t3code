@@ -4,7 +4,7 @@ import { percentiles } from "./log-calls.ts";
 export function createChainAggregation() {
   const chainsById = new Map<string, { chat: string; received?: number; started?: number; replied?: number }>();
   function accept(line: LogLine, followupOnly = false) {
-    const field = line.name === "msg.received" ? "received" : line.name === "turn.start" ? "started" : line.name === "reply.sent" && line.ok === true ? "replied" : undefined;
+    const field = line.name === "msg.received" ? "received" : line.name === "turn.start" ? "started" : line.name === "reply.sent" && line.ok === true && (line.props?.kind !== "control" || line.props?.answersInbound === true) ? "replied" : undefined;
     const chat = line.ids?.chat;
     const id = field === "received" ? line.ids?.messageId : line.ids?.inboundId;
     if (followupOnly && (field === "received" || !chainsById.has(`${chat}\0${id}`))) return;
