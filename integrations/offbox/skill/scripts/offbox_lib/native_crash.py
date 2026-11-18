@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 import offbox_disk_space as disk
+import offbox_protocol as protocol
 from . import common, unfit
 
 AFTER_START = 'this box crashed native programs during setup; treat this failure as infra and re-run on another box'
@@ -29,14 +30,14 @@ def after_start_code(row, code, path):
     if code >= 128:
         return code
     if path.exists():
-        _, started, output = path.read_text(errors='replace').partition(runs.COMMAND_STARTED_MARKER)
-        if started and 'SIGSEGV' in output:
+        output = protocol.for_run(row, path).after_start(path.read_text(errors='replace'))
+        if output is not None and 'SIGSEGV' in output:
             return code
     if dict(row).get('command_id'):
         stderr = runs.complete_stream(row, 'stderr')
         if stderr is not None:
-            _, started, output = stderr.partition(runs.COMMAND_STARTED_MARKER)
-            if started:
+            output = protocol.for_run(row, path).after_start(stderr)
+            if output is not None:
                 stdout = runs.complete_stream(row, 'stdout') if 'SIGSEGV' not in output else ''
                 if 'SIGSEGV' in output or stdout is not None and 'SIGSEGV' in stdout:
                     return code
@@ -75,7 +76,7 @@ def before_start(row, code, path):
     if code != 90 or disk.result(path, code).get('infra_failure') != 'native_crash':
         return False
     text = runs.complete_stderr(row)
-    if text is None or runs.COMMAND_STARTED_MARKER in text:
+    if text is None or protocol.for_run(row, path).blocks_replay(text):
         return False
     with tempfile.TemporaryDirectory() as tmp:
         evidence = Path(tmp) / 'stderr'

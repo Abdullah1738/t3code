@@ -69,6 +69,8 @@ except ImportError:
     import offbox_disk_space
     import offbox_protection
 
+import offbox_protocol as protocol
+
 VAR = Path(os.environ.get("BOATD_VAR", "/var/lib/boatd"))
 ETC = Path(os.environ.get("BOATD_ETC", "/etc/boatd"))
 CMDS = VAR / "cmds"
@@ -215,7 +217,7 @@ def migrate(con) -> None:
     have = _cols(con, "commands")
     for col in ("retry_interrupted INTEGER DEFAULT 0", "attempt INTEGER DEFAULT 1", "boot_id TEXT",
                 "interrupted_at REAL", "sync INTEGER NOT NULL DEFAULT 0", "timeout_s REAL",
-                "killed INTEGER NOT NULL DEFAULT 0"):
+                "killed INTEGER NOT NULL DEFAULT 0", "protocol_nonce TEXT"):
         if col.split()[0] not in have:
             con.execute(f"ALTER TABLE commands ADD COLUMN {col}")
     con.execute("CREATE INDEX IF NOT EXISTS commands_cpu_start ON commands(sync, started_at)")
@@ -1575,10 +1577,10 @@ def queue_cmd(con, box_id, body, owner):
     sync = not bool(body.get("detached"))
     timeout_s = int(body.get("timeoutSeconds") or 60) if sync else None
     con.execute("INSERT INTO commands (box_id, pid, command_id, command, cwd, status, created_at, kind, repo, run_id, "
-                "retry_interrupted, attempt, sync, timeout_s, holder) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)",
+                "retry_interrupted, attempt, sync, timeout_s, protocol_nonce, holder) VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?)",
                 (box_id, pid, cid, command, body.get("cwd") or "/home/user", "queued", now(),
                  meta.get("kind") or guess_kind(command), meta.get("repo"), meta.get("run_id"), retry,
-                 int(sync), timeout_s, offbox_protection.caller().get('holder')))
+                 int(sync), timeout_s, meta.get("protocol_nonce"), offbox_protection.caller().get('holder')))
     if body.get('detached'):
         box_event(con, box_id, 'hand_out', 'command admitted', guard_snapshot, run_id=meta.get('run_id'))
     con.execute("COMMIT")
@@ -2649,7 +2651,8 @@ def _run_cmd(box_id: str, pid: int) -> int:
         sig = sig or ("SIGKILL" if code == 137 else "SIGTERM")
     status = "lost" if kill == "lost" or (code == 255 and not ct_running(box_id)) else "exited"
     disk = offbox_disk_space.command_result(d / f'{pid}.out', d / f'{pid}.err', code,
-                                            stdout_offset=out_offset, stderr_offset=err_offset)
+                                            stdout_offset=out_offset, stderr_offset=err_offset,
+                                            identity=protocol.Protocol(r['run_id'] or '', r['protocol_nonce'] or ''))
     write_stderr(box_id, pid, (offbox_disk_space.MARKER + json.dumps(
         dict(phase='result', attempt=attempt, record=disk)) + '\n').encode(), errf)
     # The result goes to disk first: if boatd or this runner is gone before the database has it, the next
@@ -2836,11 +2839,12 @@ def command_was_started(c) -> bool:
         return True
     if (cmd_dir(c['box_id']) / f"{c['pid']}.{c['attempt'] or 1}.invocations.json").exists():
         return True
+    identity = protocol.Protocol(c['run_id'] or '', c['protocol_nonce'] or '')
     for ext in ('out', 'err'):
         path = cmd_dir(c['box_id']) / f"{c['pid']}.{ext}"
         if path.exists():
-            with path.open('rb') as f:
-                if any(b'offbox-command-started:' in line for line in f):
+            with path.open(errors='replace') as f:
+                if any(identity.blocks_replay(line) for line in f):
                     return True
     return False
 
@@ -2887,7 +2891,8 @@ def record_guest(con, c, result) -> str:
         start = d / f'{pid}.output-start.json'
         offsets = json.loads(start.read_text()) if start.exists() else [0, 0]
         disk = offbox_disk_space.command_result(d / f'{pid}.out', d / f'{pid}.err', code,
-                                              stdout_offset=offsets[0], stderr_offset=offsets[1])
+                                              stdout_offset=offsets[0], stderr_offset=offsets[1],
+                                              identity=protocol.Protocol(c['run_id'] or '', c['protocol_nonce'] or ''))
         metrics.update(disk)
         metrics.update(queued_s=c['queued_s'], recovered=True, host_boxes=host_boxes)
         if status == 'exited':
@@ -3185,9 +3190,13 @@ def reconcile(con) -> dict:
         if (json.loads(c['metrics'] or '{}').get('interruption') or {}).get('stream_state') == 'ended':
             continue
         text = tail(cmd_dir(c['box_id']) / f"{c['pid']}.err", 8192)
-        boundaries = [m.end() for m in re.finditer(
-            r'(?m)^offbox-server: the server restarted while this run was going \(attempt \d+ is lost\); '
-            r'it is queued again as attempt \d+\s*$', text)]
+        identity = protocol.Protocol(c['run_id'] or '', c['protocol_nonce'] or '')
+        boundaries, offset = [], 0
+        for line in text.split('\n'):
+            offset += len(line) + 1
+            marker = identity.parse(line)
+            if marker and marker.kind == 'retry':
+                boundaries.append(offset)
         if boundaries:
             text = text[boundaries[-1]:]
         elif (c['attempt'] or 1) > 1:

@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import offbox_protocol
 from offbox_lib import common, misc, run_evidence, runs
 from test_capacity import Isolated
 
@@ -49,7 +51,7 @@ class EvidenceScriptTests(unittest.TestCase):
                 self.assertEqual(receipt, '90')
                 self.assertIn(f'signal={signal} step=2', trace)
                 self.assertNotIn('start step=3', trace)
-                self.assertIn(f'caught {signal} at step 2', run_evidence.describe(trace))
+                self.assertIn(f'caught {signal} at step 2', run_evidence.describe(trace, trace=True))
 
     def test_wrapper_signals_record_a_receipt_and_current_step(self):
         for signal, code in (('HUP', 129), ('INT', 130), ('TERM', 143)):
@@ -64,13 +66,13 @@ class EvidenceScriptTests(unittest.TestCase):
             lambda script: script.replace('__offbox_current=3', 'kill -KILL "$PPID" $$\n__offbox_current=3'))
         self.assertNotEqual(proc.returncode, 0)
         self.assertIsNone(receipt)
-        self.assertEqual(run_evidence.describe(trace), 'step 1 rc=124, step 2 rc=0; wrapper vanished before step 3')
+        self.assertEqual(run_evidence.describe(trace, trace=True), 'step 1 rc=124, step 2 rc=0; wrapper vanished before step 3')
         self.assertNotIn('signal=KILL', trace)
 
     def test_kill_in_a_quiet_step_is_distinct_from_before_step(self):
         proc, trace, receipt = self.invoke(['true', 'true', 'kill -KILL "$PPID" $$'])
         self.assertIsNone(receipt)
-        self.assertIn('wrapper vanished during step 3', run_evidence.describe(trace))
+        self.assertIn('wrapper vanished during step 3', run_evidence.describe(trace, trace=True))
 
     def test_preclaim_signals_cannot_overwrite_another_owners_receipt(self):
         for signal in ('HUP', 'INT', 'TERM'):
@@ -103,7 +105,7 @@ class EvidenceDescriptionTests(unittest.TestCase):
         for reset in ('offbox evidence begin pid=2 planned=3', 'offbox-command-started: run-x',
                       'offbox-server: the server restarted while this run was going (attempt 1 is lost); it is queued again as attempt 2'):
             with self.subTest(reset=reset):
-                self.assertNotIn('step 2 rc=0', run_evidence.describe(first + reset + '\n', 3))
+                self.assertNotIn('step 2 rc=0', run_evidence.describe(first + reset + '\n', 3, offbox_protocol.Protocol('run-x')))
 
     def test_gaps_never_look_like_all_results_completed(self):
         for planned, results, gap in ((3, (1, 3), 2), (3, (2, 3), 1), (4, (1, 2, 4), 3)):
@@ -112,7 +114,7 @@ class EvidenceDescriptionTests(unittest.TestCase):
                     text = f'begin pid=4 planned={planned}\n' + ''.join(f'end step={n} rc=0\n' for n in results)
                     if prefixed:
                         text = '\n'.join('offbox evidence ' + line for line in text.splitlines())
-                    description = run_evidence.describe(text)
+                    description = run_evidence.describe(text, trace=True)
                     self.assertIn(f'missing end markers for step {gap}', description)
                     self.assertNotIn('after all step results', description)
 

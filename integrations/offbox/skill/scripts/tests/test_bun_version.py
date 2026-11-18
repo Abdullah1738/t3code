@@ -304,7 +304,7 @@ class IntegrationTests(unittest.TestCase):
         started = runs.COMMAND_STARTED_MARKER + ' test\n'
         retry = ('offbox-server: the server restarted while this run was going (attempt 1 is lost); '
                  'it is queued again as attempt 2\n')
-        self.assertIsNotNone(runs.STEP_RETRY.fullmatch(retry.strip()))
+        self.assertEqual(runs.protocol.Protocol('test').parse(retry).kind, 'retry')
         cases = [(failed, 99), ('', None), (started + failed, None),
                  (failed + retry, None), (failed + retry + failed, 99)]
         with tempfile.TemporaryDirectory() as tmp:

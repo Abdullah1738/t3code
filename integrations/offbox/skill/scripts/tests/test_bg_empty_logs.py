@@ -524,7 +524,7 @@ class BackgroundStartTests(Isolated):
         def start(box, command, **kwargs):
             self.assertTrue(runner.log_path.exists())
             return dict(processId=7, commandId='cmd_a')
-        marker = f'{runs.COMMAND_STARTED_MARKER} {runner.run_id}\n'
+        marker = f'{runs.COMMAND_STARTED_MARKER} {runner.run_id} [n={runner.protocol_nonce}]\n'
         with patch.object(api, 'call', side_effect=AssertionError('offline: no API calls')), \
                 patch.object(pool, 'acquire', return_value=dict(box_id='bx', remote_dir='w/r', size='large')), \
                 patch.object(runs.Runner, '_prepare_box', return_value=None), patch.object(runs, '_ttl_keeper'), \

@@ -178,7 +178,7 @@ class HomeRunObservation(unittest.TestCase):
             ('running', 'offbox-server: waiting for earlier runs in the queue', False),
             (None, 'offbox-server: waiting for earlier runs in the queue', True),
             (None, 'offbox-server: waiting; position 2 of 2; memory', True),
-            (None, 'offbox-server: waiting\noffbox-command-started: yes', False),
+            (None, 'offbox-server: waiting\noffbox-command-started: run-test', False),
             (None, 'offbox-server: waiting\noffbox-space: {"phase": "start"}', False),
             (None, '', False),
         ]
@@ -214,7 +214,7 @@ class HomeRunObservation(unittest.TestCase):
         common.LOGS_DIR.mkdir(exist_ok=True)
         def frames():
             yield dict(type='hello', attempt=1, status='queued')
-            yield dict(type='stdout', data='offbox-command-started: yes\n' + 'x' * 70000)
+            yield dict(type='stdout', data='offbox-command-started: run-test\n' + 'x' * 70000)
             yield dict(type='heartbeat', status='running')
             read = json.loads((common.LOGS_DIR / 'run-test.home-read.json').read_text())
             self.assertEqual(read['status'], 'running')
@@ -229,18 +229,18 @@ class HomeRunObservation(unittest.TestCase):
             self.assertEqual(runs.follow('bx_home', 1, log, echo=False, run_id='run-test'), 0)
 
     def test_current_attempt_status_and_legacy_log_evidence_matrix(self):
-        old = 'offbox-space: {"phase": "attempt", "attempt": 1}\noffbox-command-started: yes\n'
+        old = 'offbox-space: {"phase": "attempt", "attempt": 1}\noffbox-command-started: run-test\n'
         new = 'offbox-space: {"phase": "attempt", "attempt": 2}\n'
         queue = 'offbox-server: waiting; position 1 of 1; memory\n'
-        retry = 'offbox-server: the server restarted; it is queued again as attempt 2\n'
+        retry = 'offbox-server: the server restarted while this run was going (attempt 1 is lost); it is queued again as attempt 2\n'
         cases = [
             ('explicit_queued_old_start', dict(status='queued', attempt=2), old, True),
             ('explicit_running_old_queue', dict(status='running', attempt=2), old + new + queue, False),
             ('legacy_new_attempt_queued', dict(attempt=2), old + new + queue, True),
-            ('legacy_new_attempt_running', dict(attempt=2), old + new + queue + 'offbox-command-started: yes', False),
+            ('legacy_new_attempt_running', dict(attempt=2), old + new + queue + 'offbox-command-started: run-test', False),
             ('legacy_retry_boundary', dict(attempt=2), old + retry + queue, True),
             ('legacy_stale_attempt', dict(attempt=2), old + queue, False),
-            ('legacy_first_attempt_running', {}, queue + 'offbox-command-started: yes', False),
+            ('legacy_first_attempt_running', {}, queue + 'offbox-command-started: run-test', False),
         ]
         common.LOGS_DIR.mkdir(exist_ok=True)
         for name, read, log, expected in cases:
