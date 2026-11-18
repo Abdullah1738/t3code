@@ -8,8 +8,10 @@ import {
   type KanbanCardEvent,
   type KanbanThreadLink,
 } from "@t3tools/contracts";
+import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as Sqlite from "../../../persistence/Sqlite.ts";
@@ -298,6 +300,9 @@ it.effect(
           legacyCompactMs: Math.round(legacyRendered - legacyRolled),
           legacyBoundaryRows: legacy.readinessBefore.length + legacy.after.length,
         }),
+      ).pipe(
+        Effect.provide(Logger.layer([Logger.defaultLogger])),
+        Effect.provideService(Console.Console, globalThis.console),
       );
       assert.lengthOf(read.cards, 4700);
       assert.lengthOf(read.events, 150);

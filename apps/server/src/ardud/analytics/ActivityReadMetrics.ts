@@ -3,14 +3,14 @@ import { McpCall } from "./McpCall.ts";
 
 type Stage = NonNullable<McpCall["Service"]["activityStages"]>[number]["stage"];
 
-export const step = <A, E, R>(stage: Stage, effect: Effect.Effect<A, E, R>) =>
+const measure = (stage: Stage) =>
   Effect.fn(
     stage === "load"
       ? "KanbanService.activity.load"
       : stage === "rollup" || stage === "compact"
         ? `Activity.${stage}`
         : `KanbanService.activity.load.${stage}`,
-  )(function* () {
+  )(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
     const call = yield* Effect.serviceOption(McpCall);
     if (call._tag === "None") return yield* effect;
     const rows = (call.value.activityStages ??= []);
@@ -31,4 +31,23 @@ export const step = <A, E, R>(stage: Stage, effect: Effect.Effect<A, E, R>) =>
         }),
       ),
     );
-  })();
+  });
+
+const stages = {
+  load: measure("load"),
+  cards: measure("cards"),
+  events: measure("events"),
+  history: measure("history"),
+  threads: measure("threads"),
+  slots: measure("slots"),
+  board: measure("board"),
+  pools: measure("pools"),
+  evaluatorEvents: measure("evaluatorEvents"),
+  dispatch: measure("dispatch"),
+  analytics: measure("analytics"),
+  rollup: measure("rollup"),
+  compact: measure("compact"),
+} satisfies Record<Stage, ReturnType<typeof measure>>;
+
+export const step = <A, E, R>(stage: Stage, effect: Effect.Effect<A, E, R>) =>
+  stages[stage](effect);
