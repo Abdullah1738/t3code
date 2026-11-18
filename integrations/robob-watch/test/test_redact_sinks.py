@@ -1,11 +1,14 @@
 """Offline proofs for message collectors and wake helpers; no real inbox reads."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import contextlib
 import hashlib
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys

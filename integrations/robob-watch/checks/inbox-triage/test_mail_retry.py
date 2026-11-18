@@ -1,4 +1,8 @@
 """Offline run_mail retry/deadline checks; no worker processes or mail queries."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import copy
 import importlib.util
 import json

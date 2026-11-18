@@ -52,6 +52,8 @@ export class McpCall extends Context.Service<
     denyReason?: AnalyticsEvent["denyReason"];
     reasonClass?: AnalyticsEvent["reasonClass"];
     invalidField?: string;
+    errorFields?: ReadonlyArray<string>;
+    parameterIssue?: SchemaIssue.Issue;
     refusedAt?: AnalyticsEvent["refusedAt"];
     boardWrite?: boolean;
     boardAdmitted?: boolean;
@@ -224,6 +226,7 @@ function failureMetadata(error: Record<string, unknown>, state: McpCall["Service
 export const parameterFailure = Effect.fnUntraced(function* (issue: SchemaIssue.Issue) {
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "Some") {
+    call.value.parameterIssue = issue;
     failureMetadata(schemaReason(issue), call.value);
     if (!call.value.readOnly && call.value.taskLookup === undefined && call.value.saved !== true)
       call.value.saved = false;

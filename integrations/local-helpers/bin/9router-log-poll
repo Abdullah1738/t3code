@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /usr/bin/python3 -I "$HOME/.local/share/router-logging/run.py" poll "$@"
+exec /usr/bin/python3 -I "$HOME/.local/share/router-logging/run.py" guard "$@"

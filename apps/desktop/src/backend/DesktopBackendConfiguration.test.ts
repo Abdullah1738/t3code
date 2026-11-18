@@ -260,11 +260,12 @@ describe("DesktopBackendConfiguration", () => {
         const second = yield* configuration.resolvePrimary;
 
         assert.equal(first.executablePath, process.execPath);
-        assert.deepEqual(first.args.slice(0, 4), [
-          "--max-old-space-size=6144",
+        assert.deepEqual(first.args, [
           "--require",
           environment.compileCachePath,
           environment.backendEntryPath,
+          "--bootstrap-fd",
+          "3",
         ]);
         assert.equal(first.entryPath, environment.backendEntryPath);
         assert.equal(first.cwd, environment.backendCwd);

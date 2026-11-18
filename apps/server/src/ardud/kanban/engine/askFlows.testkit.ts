@@ -41,6 +41,12 @@ export const FAIL_LAUNCH = "[fail-launch]";
 export const owner: KanbanActor = { _tag: "owner" };
 
 interface FakeThread {
+  readonly archived?: boolean;
+  readonly latestStatus?: string;
+  readonly modelMissing?: boolean;
+  readonly runStatus?: string;
+  readonly state?: KanbanThreadView["state"];
+  readonly runStartedAt?: string | null;
   readonly title: string;
   readonly model: ModelSelection;
   readonly messages: Array<string>;
@@ -57,15 +63,17 @@ export const makeFake = Effect.gen(function* () {
           threadId,
           projectId: ProjectId.make("project-1"),
           title: thread.title,
-          state: "idle",
+          state: thread.state ?? "idle",
           updatedAt: "2026-11-10T10:00:00.000Z",
           quietSince: "2026-11-10T10:00:00.000Z",
-          runStartedAt: null,
+          runStartedAt: thread.runStartedAt ?? null,
           lastActivityAt: null,
           backgroundWork: 0,
           prWatches: 0,
           prs: [],
-          archived: false,
+          archived: thread.archived ?? false,
+          runId: null,
+          runStatus: thread.runStatus ?? null,
         };
       }),
     );
@@ -96,17 +104,37 @@ export const makeFake = Effect.gen(function* () {
             }),
       send: (input) =>
         Ref.update(threads, (all) => {
-          all.get(input.threadId)?.messages.push(input.text);
-          return all;
+          const thread = all.get(input.threadId);
+          thread?.messages.push(input.text);
+          return thread !== undefined && input.model !== undefined
+            ? new Map(all).set(input.threadId, { ...thread, model: input.model })
+            : all;
         }),
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
-      latestRun: () => Effect.succeed(null),
+      latestRun: (threadId) =>
+        Ref.get(threads).pipe(
+          Effect.map((all) => {
+            const thread = all.get(threadId);
+            return thread?.latestStatus === undefined
+              ? null
+              : {
+                  runId: `run:${threadId}`,
+                  status: thread.latestStatus,
+                  message: null,
+                  model: thread.model,
+                };
+          }),
+        ),
       backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       model: (threadId) =>
-        Ref.get(threads).pipe(Effect.map((all) => all.get(threadId)?.model ?? null)),
+        Ref.get(threads).pipe(
+          Effect.map((all) =>
+            all.get(threadId)?.modelMissing ? null : (all.get(threadId)?.model ?? null),
+          ),
+        ),
       withdraw: () => Effect.void,
       setModel: (threadId, model) =>
         Ref.update(threads, (all) => {

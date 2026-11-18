@@ -123,6 +123,14 @@ describe("analytics ingest contract", () => {
     expect(input.events).toEqual([event]);
     expect(decode({ events: Array.from({ length: 100 }, () => event) }).events).toHaveLength(100);
   });
+  it.each(["limit", "events.limit", "private_token"])(
+    "strips server-derived errorFields %s from client ingest",
+    (field) => {
+      expect(
+        decode({ events: [{ ...event, kind: "mcp.call", errorFields: [field] }] }).events,
+      ).toEqual([{ ...event, kind: "mcp.call" }]);
+    },
+  );
   it.each([
     ["empty", []],
     ["too many", Array.from({ length: 101 }, () => event)],
@@ -428,4 +436,22 @@ it("accepts tick attribution, rejects negative measurements and strips non-label
     decodeEvent({ ...input, props: { byStep: { "private words": { count: 1, ms: 25 } } } }).props
       ?.byStep,
   ).toEqual({});
+});
+
+it("bounds MCP error paths and accepts nested schema fields without values", () => {
+  const row = {
+    ...event,
+    kind: "mcp.call",
+    tool: "card_get",
+    errorFields: ["events.limit", "items.0.name"],
+  };
+  expect(decodeEvent(row).errorFields).toEqual(row.errorFields);
+  for (const errorFields of [
+    ["x".repeat(65)],
+    Array(6).fill("limit"),
+    ["private value"],
+    ["events[0]"],
+    [""],
+  ])
+    expect(() => decodeEvent({ ...row, errorFields })).toThrow();
 });

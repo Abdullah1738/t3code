@@ -2854,6 +2854,7 @@ it.effect(
       const fake = makeFake();
       let fail = false;
       let depth = 0;
+      let failedCommits = 0;
       const sqlLayer = Layer.effect(
         SqlClient.SqlClient,
         Effect.map(SqlClient.SqlClient, (sql) => {
@@ -2862,13 +2863,25 @@ it.effect(
               const outer = depth++ === 0;
               return sql
                 .withTransaction(
-                  effect.pipe(
-                    Effect.tap(() =>
+                  Effect.gen(function* () {
+                    // Snapshot reads also use transactions; inject only after a write.
+                    const before =
                       outer && fail
-                        ? Effect.die(new Error("commit failed after card write"))
-                        : Effect.void,
-                    ),
-                  ),
+                        ? (yield* sql<{ changes: number }>`SELECT total_changes() AS changes`)[0]
+                            ?.changes
+                        : undefined;
+                    const result = yield* effect;
+                    if (before !== undefined) {
+                      const after = yield* sql<{ changes: number }>`
+                        SELECT total_changes() AS changes
+                      `;
+                      if (Number(after[0]?.changes) > before) {
+                        failedCommits++;
+                        return yield* Effect.die(new Error("commit failed after card write"));
+                      }
+                    }
+                    return result;
+                  }),
                 )
                 .pipe(
                   Effect.ensuring(
@@ -2897,6 +2910,7 @@ it.effect(
           ),
         );
         assert.isTrue(Exit.isFailure(result));
+        assert.strictEqual(failedCommits, 1);
         const detail = yield* now;
         assert.deepStrictEqual(detail.card.stalled, card.stalled);
         assert.deepStrictEqual(detail.card.subtasks, card.subtasks);
