@@ -21,6 +21,7 @@ NATIVE_KEYS = {"CLAUDE_CODE_SESSION_ID": "claudeAgent", "CODEX_THREAD_ID": "code
 THREAD_KEYS = {"T3_THREAD_ID", "T3CODE_THREAD_ID", "ROBOB_THREAD_ID"}
 TERMINAL = {"completed", "cancelled", "failed", "interrupted"}
 OWNER_CALL_TIMEOUT = 20
+RECOVERY_PAGE_LIMIT = 10
 OBSERVATION_BUDGET = 10 * 60
 BROWSER_EXIT_GRACE = 5
 OWNER_ENDPOINTS = ("by_native", "detail", "recovery")
@@ -263,7 +264,7 @@ def owner(binding, calls=None):
     # Recovery pages are ordered by thread id. The strict prefix cursor starts
     # before this exact owner; never infer the owner's absence from a page.
     recovery = control("/recovery/snapshot?" + urllib.parse.urlencode({
-        "active": "false", "cursor": tid[:-1], "limit": 500}), calls=calls)
+        "active": "false", "cursor": tid[:-1], "limit": RECOVERY_PAGE_LIMIT}), calls=calls)
     entries = recovery.get("threads")
     if not isinstance(entries, list):
         return None
