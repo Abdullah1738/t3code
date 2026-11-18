@@ -333,10 +333,12 @@ class BackgroundQueueTests(Isolated):
                         self.until(lambda: path.exists() and path.read_bytes().startswith(prefix))
                         release_history.set()
                         expected = (queue + live + marker + resume if first == 'stdout' else queue + marker + live + resume).encode()
-                        self.until(lambda: path.read_bytes() == expected)
+                        committed = dict(stdoutOffset=len(live + resume), stderrOffset=len(queue + marker), logBytes=len(expected))
+                        # Log bytes are flushed before the checkpoint rename makes them committed.
+                        self.until(lambda: path.read_bytes() == expected and common.checkpoint(path) == committed)
                         elapsed = time.monotonic() - began
                         self.assertLess(elapsed, 10)
-                        self.assertEqual(common.checkpoint(path), dict(stdoutOffset=len(live + resume), stderrOffset=len(queue + marker), logBytes=len(expected)))
+                        self.assertEqual(common.checkpoint(path), committed)
                         self.assertTrue(misc._client_alive(row['client_pid'], row['start_at']))
                         streams = [q for p, q in requests if p.endswith('/stream')]
                         self.assertEqual((int(streams[-1]['stdoutOffset'][0]), int(streams[-1]['stderrOffset'][0])),

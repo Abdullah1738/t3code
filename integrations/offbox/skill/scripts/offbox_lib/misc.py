@@ -1136,6 +1136,8 @@ def _recover_live_suffix(r, path, ck, length, deadline, stats):
 def _catch_up_live(r, path, budget, stats, *, recovery_base=None):
     from . import live_logs, node_version
     from .runs import _commit, remember_interruption
+    # Staging has its own display checkpoint, but Node provenance belongs to the run's stderr stream.
+    node_path = LOGS_DIR / f"{r['run_id']}.log"
     deadline = time.time() + (10 if budget is None else budget)
     ck = checkpoint(path)
     length = path.stat().st_size
@@ -1169,7 +1171,7 @@ def _catch_up_live(r, path, budget, stats, *, recovery_base=None):
                            **{('logBytes' if recovery_base is None else 'staged_bytes'): dst.tell()})
         while True:
             # Metadata can lag a display checkpoint written by an older client.
-            read_offsets = [offsets[0], min(offsets[1], node_version.stderr_offset(path))]
+            read_offsets = [offsets[0], min(offsets[1], node_version.stderr_offset(node_path))]
             replay = False
             with contextlib.closing(live_logs.pages(r['box_id'], r['command_id'], read_offsets,
                                                    until=deadline, stats=stats)) as history:
@@ -1184,7 +1186,7 @@ def _catch_up_live(r, path, budget, stats, *, recovery_base=None):
                     if time.time() > before_observation and time.time() >= deadline:
                         errors.append('timeout')
                         break
-                    if i == 1 and read_offsets[i] > node_version.stderr_offset(path):
+                    if i == 1 and read_offsets[i] > node_version.stderr_offset(node_path):
                         replay = True
                         break
                     if api.BACKEND == 'server' and page.get('status'):
@@ -1193,7 +1195,7 @@ def _catch_up_live(r, path, budget, stats, *, recovery_base=None):
                     data = (page.get('data') or '').encode()
                     observed = int(page.get('nextOffset', read_offsets[i] + len(data)))
                     if i == 1:
-                        node_version.capture_stderr(path, data, read_offsets[i])
+                        node_version.capture_stderr(node_path, data, read_offsets[i])
                     visible = data[max(0, offsets[i] - read_offsets[i]):]
                     if visible:
                         flush(i, visible)

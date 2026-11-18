@@ -658,6 +658,43 @@ class LiveLogsTests(Isolated):
                     self.assertEqual(offsets, sorted(set(offsets[:-1])) + [offsets[-1]])
 
     @both_history_orders
+    def test_staging_keeps_retry_node_capture_on_the_run_stream(self):
+        from offbox_lib import node_version, resources
+        from test_node_version import node_receipt
+        _, old = node_receipt('v24.22.1', 'run-live')
+        facts, current = node_receipt('v24.22.3', 'run-live')
+        first = (old + 'offbox-command-started: run-live\n').encode()
+        stderr = first + (current + 'offbox-command-started: run-live\n').encode() + b'e' * (4 * live_logs.PAGE_BYTES)
+        original = b'prefix\n' + stderr
+        self.path.write_bytes(original)
+        runs._commit(self.path, 7, 0, 7)
+        requests = []
+        def history(box, command, stream, offset, **kw):
+            requests.append((stream, offset))
+            raw = b'prefix\nnew output\n' if stream == 'stdout' else stderr
+            data = raw[offset:offset + kw['limit_bytes']]
+            return dict(data=data.decode(), nextOffset=offset + len(data), size=len(raw),
+                        commandId='cmd-live', attempt=2, nodeSetup=dict(stderrOffset=len(first)))
+        with patch.object(api, 'history_logs', history):
+            for _ in range(6):
+                result = misc._catch_up_log(self.row(), budget=10, live=True)
+                if result == 'caught_up':
+                    break
+                self.assertTrue(result.startswith('incomplete:'), result)
+                self.assertEqual(self.path.read_bytes(), original)
+            else:
+                self.fail('bounded staging failed to publish')
+        resources.finalize(dict(self.row()), node_only=True)
+        self.assertEqual(common.read_json(self.path.with_suffix('.state.json'), {})['node'], facts)
+        self.assertEqual(node_version.stderr_offset(self.path), len(stderr))
+        self.assertEqual(common.checkpoint(self.path), dict(stdoutOffset=18, stderrOffset=len(stderr),
+                                                          logBytes=18 + len(stderr)))
+        self.assertEqual(self.path.read_bytes().count(b'new output\n'), 1)
+        offsets = [offset for stream, offset in requests if stream == 'stderr']
+        self.assertEqual(offsets, sorted(set(offsets)))
+        self.assertFalse(self.path.with_name(self.path.name + '.node-stream.json').exists())
+
+    @both_history_orders
     def test_interleaved_frames_after_failed_checkpoints_keep_recovery_progress(self):
         half = live_logs.PAGE_BYTES // 2
         cases = (
