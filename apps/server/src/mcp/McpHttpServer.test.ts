@@ -1,4 +1,5 @@
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as Clock from "effect/Clock";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import { expect, it } from "@effect/vitest";
 import { NodeHttpServer } from "@effect/platform-node";
@@ -18,6 +19,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -320,6 +322,51 @@ const delegationProbe = (
     }),
   ).pipe(Layer.provideMerge(McpServer.McpServer.layer));
 };
+
+it.effect("records an in-flight receipt as pending with fence-to-reply time", () =>
+  Effect.gen(function* () {
+    const recorded = yield* Deferred.make<AnalyticsEvent>();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const receipt = { ...delegationReceipt, status: "creating", startPending: true };
+    const response = Effect.gen(function* () {
+      const state = Option.getOrThrow(yield* Effect.serviceOption(McpCallAnalytics.McpCall));
+      state.dispatchFenceAt = yield* Clock.monotonicTimeNanos;
+      yield* McpCallAnalytics.setSaved("pending_create");
+      yield* Deferred.succeed(entered, undefined);
+      yield* Deferred.await(release);
+      return receipt;
+    });
+    yield* Effect.gen(function* () {
+      const pending = yield* callTool("delegate_task", {}).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("2 seconds");
+      yield* Deferred.succeed(release, undefined);
+      const result = yield* Fiber.join(pending);
+      expect(result.isError).toBe(false);
+      expect(result.structuredContent).toEqual(receipt);
+      const row = yield* Deferred.await(recorded);
+      expect(yield* decodeAnalyticsEvent(row)).toMatchObject({
+        outcome: "ok",
+        saved: "pending_create",
+        fenceToReplyMs: 2000,
+      });
+    }).pipe(
+      Effect.provide(
+        delegationProbe(response).pipe(
+          Layer.provide(
+            Layer.mock(Analytics.Analytics)({
+              record: (row) =>
+                row.kind === "mcp.call"
+                  ? Deferred.succeed(recorded, row).pipe(Effect.asVoid)
+                  : Effect.void,
+            }),
+          ),
+        ),
+      ),
+    );
+  }),
+);
 
 it.effect.each([
   ["empty object", {}],

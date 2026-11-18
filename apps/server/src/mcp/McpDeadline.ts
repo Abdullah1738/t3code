@@ -202,6 +202,8 @@ export const withDeadline = Effect.fnUntraced(function* <A, E, R>(
       orElse: Effect.fn("McpDeadline.expired")(function* () {
         const now = yield* Clock.monotonicTimeNanos;
         deadline.firedAt = now;
+        const call = yield* Effect.serviceOption(McpCallAnalytics.McpCall);
+        if (input.stage === "dispatch" && Option.isSome(call)) call.value.dispatchFenceAt = now;
         yield* McpCallAnalytics.failedPhase(input.stage);
         yield* Effect.logWarning("MCP operation timed out", {
           code: input.code,

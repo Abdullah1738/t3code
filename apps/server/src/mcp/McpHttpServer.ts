@@ -1414,6 +1414,14 @@ const withToolAnalytics =
                         ...(callState.requestTiming === undefined
                           ? {}
                           : { requestTiming: callState.requestTiming }),
+                        ...(callState.dispatchFenceAt === undefined
+                          ? {}
+                          : {
+                              fenceToReplyMs: Math.max(
+                                0,
+                                Number(ended - callState.dispatchFenceAt) / 1e6,
+                              ),
+                            }),
                         callerResolved: callState.callerResolved,
                         callerResolveMs:
                           callState.callerResolveMs +
