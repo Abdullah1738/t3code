@@ -7,7 +7,7 @@ import datetime as dt
 
 from . import api, capacity
 from .common import (CAP_PATH, OffboxError, atomic_write_json, db, event, file_lock, kv_get, kv_set, month_key, month_start_utc,
-                     now, read_json, say)
+                     now, read_json)
 from .identity import telegram
 
 CAP_DOLLARS = 1200.0
@@ -94,13 +94,13 @@ def stop_all(reason: str) -> int:
     for b in api.list_boxes():
         if b.get("state") in api.LIVE_STATES or b.get("state") in api.STARTING_STATES:
             try:
-                api.stop(b["id"])
+                from . import lease
+                lease.request_stop(con, b['id'], reason)
             except OffboxError as e:
                 event(con, b["id"], "stop_failed", f"{reason}: {e}")
                 continue
             con.execute("UPDATE leases SET state='stopped' WHERE box_id=? AND state='running'", (b["id"],))
             con.commit()
-            event(con, b["id"], "stop", reason)
             n += 1
             # The hold is released only if boat confirms the box is stopped under its lock; a pending stop keeps it.
             from .lease import release_if_confirmed

@@ -1,7 +1,10 @@
 """took.py skip: records a skipped dose in moved.json, never in taken.json."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import datetime as dt
 import json
-import os
 import shutil
 import subprocess
 import sys

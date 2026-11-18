@@ -238,7 +238,8 @@ class InventoryLoggingTests(unittest.TestCase):
                 before = jobs.read_state('disk-inventory')
                 with jobs.inventory_lock():
                     if deep:
-                        deep_inventory.run_pass([self.root], lambda *a, **k: self.fail('locked'))
+                        with patch.object(deep_inventory, 'DEEP_LOCK_WAIT_S', 0):
+                            deep_inventory.run_pass([self.root], lambda *a, **k: self.fail('locked'))
                     else:
                         jobs.directory_inventory([self.root], lambda *a, **k: self.fail('locked'))
                 self.assertEqual(jobs.read_state('disk-inventory'), before)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import offbox_disk_space
+import offbox_protection
 
 import base64
 import contextlib
@@ -24,7 +25,7 @@ from types import SimpleNamespace
 
 from . import native_crash
 from . import home, api, capacity, identity, lease, node_tools, node_version, package_manager, pnpm_version, pool, ssh_sync, run_evidence, quint_tools
-from . import bun_version, command_usage, common, containers, java_version, prune, prepare, userns
+from . import bun_version, command_usage, common, containers, java_version, prune, prepare, userns, toolchain
 from . import resources, box_disk, queue_lifecycle
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
                      RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, checkpoint, db, db_retry, event, file_lock, local_error, log, new_id, now,
@@ -329,13 +330,16 @@ def clickhouse_suite_warning(repo_key: str, size: str, cmd: str) -> str | None:
 
 GO_ARCHIVE_CURL_LIMITS = "--connect-timeout 20 --speed-limit 10240 --speed-time 60 --max-time 900"
 
-GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
+GO_REPAIR = toolchain.INFRA_STOP + r'''# Box-local, not just client-local: SSH/manual invocations can overlap pooled runs.
 (
   _offbox_fail() {
     if [ "${_offbox_needs_go:-1}" = 1 ]; then
       echo "offbox: Go repair: $*" >&2
     else
       echo "offbox: Go repair failed ($*); continuing because this run doesn't use Go" >&2
+    fi
+    if [ "${_offbox_needs_go:-1}" = 1 ] && [ "${_offbox_inventory_crash:-0}" = 1 ]; then
+      __offbox_infra_stop native_crash go_inventory_crash 'a native tool crashed checking the Go inventory; this is a box/host fault, not your repo.'
     fi
     exit 97
   }
@@ -368,6 +372,7 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
   [ -n "$_offbox_goroot" ] || exit 0
   _offbox_version=$(head -n 1 "$_offbox_goroot/VERSION") || _offbox_fail 'cannot read GOROOT/VERSION'
   _offbox_reason=
+  _offbox_overlay=0
   if [ ! -s "$_offbox_goroot/src/unsafe/unsafe.go" ] || [ -e "$_offbox_goroot/go" ] ||
      [ ! -x "$_offbox_goroot/bin/go" ]; then
     _offbox_reason=broken
@@ -377,8 +382,7 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     _offbox_minor=$((10#${BASH_REMATCH[2]}))
     if (( _offbox_major > 1 || (_offbox_major == 1 && _offbox_minor >= 25) )); then
       if [ -f "$_offbox_goroot/src/runtime/traceexp.go" ]; then
-        echo 'offbox: removing stale Go runtime/traceexp.go overlay' >&2
-        sudo -n rm -f -- "$_offbox_goroot/src/runtime/traceexp.go" || _offbox_fail 'stale overlay removal failed'
+        _offbox_overlay=1
       fi
       if (( _offbox_major == 1 && _offbox_minor >= 26 )) &&
          { [ -f "$_offbox_goroot/src/strconv/ctoa.go" ] || [ -f "$_offbox_goroot/src/syscall/syscall_linux_accept4.go" ]; }; then
@@ -388,21 +392,90 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
   fi
   _offbox_inventory() (
     set -o pipefail
-    cd "$1" || exit 1
+    cd "$1" || { echo "offbox: Go check: cannot inventory $1 (cannot enter directory)" >&2; exit 2; }
+    local errors statuses failed=0 crashed=0 i tool
+    errors=$(mktemp) || { echo "offbox: Go check: cannot inventory $1 (cannot capture diagnostics)" >&2; exit 2; }
     # Include paths, types, sizes and symlink targets; exclude only our own root stamp.
     # NUL records keep filenames unambiguous. No file contents or mtimes are scanned.
-    LC_ALL=C find . ! -type d ! -path './.offbox-manifest' -printf '%P\t%y\t%s\t%l\0' |
-      LC_ALL=C sort -z | sha256sum
+    {
+      LC_ALL=C find . ! -type d ! -path './.offbox-manifest' -printf '%P\t%y\t%s\t%l\0' |
+        LC_ALL=C sort -z | sha256sum
+      statuses=("${PIPESTATUS[@]}")
+    } 2>"$errors"
+    cat "$errors" >&2
+    for i in 0 1 2; do
+      [ "${statuses[i]}" = 0 ] || failed=1
+    done
+    if (( failed )); then
+      echo "offbox: Go check: cannot inventory $1 (find rc=${statuses[0]} sort rc=${statuses[1]} sha256sum rc=${statuses[2]})" >&2
+      for i in 0 1 2; do
+        if (( statuses[i] >= 128 )); then
+          case $i in 0) tool=find;; 1) tool=sort;; 2) tool=sha256sum;; esac
+          echo "offbox: box-health: native-crash tool=$tool rc=${statuses[i]} stage=go-inventory" >&2
+          crashed=1
+        fi
+      done
+      if (( crashed )); then
+        if LC_ALL=C grep -qF '*** stack smashing detected ***' "$errors"; then
+          echo 'offbox: box-health: native-crash signature=stack-smashing stage=go-inventory' >&2
+        fi
+        # Command substitutions cannot update the caller's variables. This token is
+        # read only on failure, so successful manifest bytes stay unchanged.
+        echo native_crash
+      fi
+      rm -f -- "$errors"
+      exit 2
+    fi
+    rm -f -- "$errors"
+    exit 0
   )
+  _offbox_read_inventory() {
+    local rc
+    _offbox_manifest=$(_offbox_inventory "$1") && return 0
+    rc=$?
+    [[ $_offbox_manifest != *native_crash* ]] || _offbox_inventory_crash=1
+    return "$rc"
+  }
   _offbox_manifest_matches() {
     [ -f "$1/.offbox-manifest" ] && [ ! -L "$1/.offbox-manifest" ] || return 1
-    local inventory
-    inventory=$(_offbox_inventory "$1") || return 1
-    [ "$(cat "$1/.offbox-manifest")" = "offbox-go-tree-v1 $_offbox_version $inventory" ]
+    _offbox_read_inventory "$1" || return 2
+    local stamp
+    stamp=$(cat "$1/.offbox-manifest") || {
+      echo "offbox: Go check: cannot read manifest $1/.offbox-manifest" >&2
+      return 2
+    }
+    [ "$stamp" = "offbox-go-tree-v1 $_offbox_version $_offbox_manifest" ]
   }
   # Missing stamps are untrusted legacy installs: never bless their current file list.
-  if [ "$_offbox_goroot" = /usr/local/go ] && [ -z "$_offbox_reason" ] &&
-     ! _offbox_manifest_matches "$_offbox_goroot"; then
+  _offbox_old=missing
+  if [ "$_offbox_goroot" = /usr/local/go ]; then
+    if _offbox_manifest_matches "$_offbox_goroot"; then
+      _offbox_old=ok
+    else
+      _offbox_match_rc=$?
+      if [ "$_offbox_match_rc" = 2 ]; then
+        _offbox_old=unreadable
+      elif [ -f "$_offbox_goroot/.offbox-manifest" ]; then
+        _offbox_old=mismatch
+      fi
+    fi
+    if [ "$_offbox_old" = unreadable ]; then
+      [ -z "$_offbox_reason" ] || echo 'offbox: Go repair: old tree manifest=unreadable; GOROOT untouched' >&2
+      _offbox_fail 'inventory unreadable; GOROOT unverified and untouched'
+    fi
+  fi
+  if [ "${_offbox_overlay:-0}" = 1 ]; then
+    echo 'offbox: removing stale Go runtime/traceexp.go overlay' >&2
+    sudo -n rm -f -- "$_offbox_goroot/src/runtime/traceexp.go" || _offbox_fail 'stale overlay removal failed'
+    if [ "$_offbox_goroot" = /usr/local/go ]; then
+      if _offbox_manifest_matches "$_offbox_goroot"; then
+        _offbox_old=ok
+      elif [ "$?" = 2 ]; then
+        _offbox_fail 'inventory unreadable after overlay removal; GOROOT unverified'
+      fi
+    fi
+  fi
+  if [ "$_offbox_goroot" = /usr/local/go ] && [ -z "$_offbox_reason" ] && [ "$_offbox_old" != ok ]; then
     _offbox_reason=mixed
   fi
   _offbox_valid() {
@@ -415,9 +488,6 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
   if [ -n "$_offbox_reason" ]; then
     [[ $_offbox_version =~ ^go1\.[0-9]+\.[0-9]+$ ]] || _offbox_fail "unsupported release $_offbox_version"
     [ "$_offbox_goroot" = /usr/local/go ] && [ ! -L /usr/local/go ] || _offbox_fail "refusing to replace unmanaged GOROOT $_offbox_goroot"
-    if [ ! -f "$_offbox_goroot/.offbox-manifest" ]; then _offbox_old=missing
-    elif _offbox_manifest_matches "$_offbox_goroot"; then _offbox_old=ok
-    else _offbox_old=mismatch; fi
     _offbox_marks=no
     { [ -f "$_offbox_goroot/src/strconv/ctoa.go" ] || [ -f "$_offbox_goroot/src/syscall/syscall_linux_accept4.go" ]; } && _offbox_marks=yes
     echo "offbox: Go repair: old tree manifest=$_offbox_old old-release-files=$_offbox_marks version_written=$(stat -c %z "$_offbox_goroot/VERSION" 2>/dev/null | cut -c1-16) manifest_written=$(stat -c %z "$_offbox_goroot/.offbox-manifest" 2>/dev/null | cut -c1-16)" >&2
@@ -428,6 +498,9 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     _offbox_tree_id=
     _offbox_cleanup() {
       _offbox_rc=$?
+      # Secondary cleanup errors must not hide a native crash from box routing.
+      _offbox_cleanup_failure_rc=97
+      [ "$_offbox_rc" != 90 ] || _offbox_cleanup_failure_rc=90
       trap - EXIT HUP INT TERM
       if (( !_offbox_installed )) && { (( _offbox_saved )) || [ ! -e /usr/local/go ]; } &&
          sudo -n test -d "$_offbox_stage/old"; then
@@ -436,20 +509,20 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
           if [ -z "$_offbox_tree_id" ] || [ -L /usr/local/go ] ||
              [ "$(stat -c '%d:%i' /usr/local/go 2>/dev/null)" != "$_offbox_tree_id" ]; then
             echo "offbox: Go repair: destination changed; backup retained at $_offbox_stage/old" >&2
-            exit 97
+            exit "$_offbox_cleanup_failure_rc"
           fi
-          sudo -n rm -rf -- /usr/local/go || exit 97
+          sudo -n rm -rf -- /usr/local/go || exit "$_offbox_cleanup_failure_rc"
         fi
         if ! sudo -n mv -T -- "$_offbox_stage/old" /usr/local/go; then
           echo "offbox: Go repair: rollback failed; backup retained at $_offbox_stage/old" >&2
-          exit 97
+          exit "$_offbox_cleanup_failure_rc"
         fi
       fi
       # If the first rename failed, retain any partial backup for diagnosis/recovery.
       if (( !_offbox_saved )) && sudo -n test -e "$_offbox_stage/old"; then
         echo "offbox: Go repair: failed backup retained at $_offbox_stage/old" >&2
       else
-        sudo -n rm -rf -- "$_offbox_stage" || _offbox_rc=97
+        sudo -n rm -rf -- "$_offbox_stage" || _offbox_rc=$_offbox_cleanup_failure_rc
       fi
       exit "$_offbox_rc"
     }
@@ -459,9 +532,13 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     echo "offbox: replacing $_offbox_reason $_offbox_version GOROOT from official archive" >&2
     curl -fsSL --retry 3 @GO_ARCHIVE_CURL_LIMITS@ "https://go.dev/dl/${_offbox_version}.linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" -o "$_offbox_stage/go.tgz" || _offbox_fail 'official archive download failed'
     tar -xzf "$_offbox_stage/go.tgz" -C "$_offbox_stage" || _offbox_fail 'official archive extraction failed'
-    _offbox_manifest=$(_offbox_inventory "$_offbox_stage/go") || _offbox_fail 'archive inventory failed'
+    _offbox_read_inventory "$_offbox_stage/go" || _offbox_fail 'archive inventory unreadable; GOROOT untouched'
     printf 'offbox-go-tree-v1 %s %s\n' "$_offbox_version" "$_offbox_manifest" > "$_offbox_stage/go/.offbox-manifest" || _offbox_fail 'cannot write official tree manifest'
-    _offbox_valid "$_offbox_stage/go" || _offbox_fail 'archive verification failed; GOROOT untouched'
+    _offbox_valid "$_offbox_stage/go" || {
+      _offbox_valid_rc=$?
+      [ "$_offbox_valid_rc" != 2 ] || _offbox_fail 'archive inventory unreadable; GOROOT untouched'
+      _offbox_fail 'archive verification failed; GOROOT untouched'
+    }
     sudo -n chown -R --no-dereference root:root "$_offbox_stage/go" || _offbox_fail 'cannot set replacement tree ownership'
     _offbox_tree_id=$(stat -c '%d:%i' "$_offbox_stage/go") || _offbox_fail 'cannot identify replacement tree'
     [ ! -e "$_offbox_stage/old" ] && [ ! -L "$_offbox_stage/old" ] || _offbox_fail 'backup destination exists'
@@ -469,19 +546,31 @@ GO_REPAIR = r'''# Box-local, not just client-local: SSH/manual invocations can o
     _offbox_saved=1
     [ ! -e /usr/local/go ] && [ ! -L /usr/local/go ] || _offbox_fail 'install destination exists'
     sudo -n mv -T -- "$_offbox_stage/go" /usr/local/go || _offbox_fail 'GOROOT install rename failed'
-    _offbox_valid /usr/local/go || _offbox_fail 'post-swap verification failed'
+    _offbox_valid /usr/local/go || {
+      _offbox_valid_rc=$?
+      [ "$_offbox_valid_rc" != 2 ] || _offbox_fail 'post-swap inventory unreadable'
+      _offbox_fail 'post-swap verification failed'
+    }
     _offbox_installed=1
     echo "offbox: Go repair: verified $_offbox_version GOROOT" >&2
   elif (( ${#_offbox_stale[@]} )); then
     # Never discard the last recoverable tree just because VERSION looks healthy.
     [ "$_offbox_goroot" = /usr/local/go ] || exit 0
-    _offbox_valid /usr/local/go || _offbox_fail 'verification failed; stale backups retained'
+    _offbox_valid /usr/local/go || {
+      _offbox_valid_rc=$?
+      [ "$_offbox_valid_rc" != 2 ] || _offbox_fail 'inventory unreadable; stale backups retained'
+      _offbox_fail 'verification failed; stale backups retained'
+    }
   fi
   for _offbox_dir in "${_offbox_stale[@]}"; do
     sudo -n rm -rf -- "$_offbox_dir" || _offbox_fail "cannot remove stale staging directory $_offbox_dir"
   done
 ) || {
-  if [ "${_offbox_needs_go:-1}" = 1 ]; then echo offbox-setup-failed >&2; exit 97; fi
+  _offbox_repair_rc=$?
+  if [ "${_offbox_needs_go:-1}" = 1 ]; then
+    [ "$_offbox_repair_rc" != 90 ] || exit 90
+    echo offbox-setup-failed >&2; exit 97
+  fi
 }'''.replace('@GO_ARCHIVE_CURL_LIMITS@', GO_ARCHIVE_CURL_LIMITS)
 
 # Old base images imported uid 1001 from the Node archive. Leave user-installed files alone,
@@ -1290,6 +1379,18 @@ def confirmed_lost(box_id: str, run_id: str, timeout: float = 20, *, record: boo
             if box is None or box.get('state') in (*api.STOPPED_STATES, 'error', 'cancelled'):
                 if history_unknown:
                     return None
+                if api.BACKEND == 'server':
+                    try:
+                        with api.budget(min(5, left())):
+                            if not lease.holder_gone(box_id, run_id):
+                                return None
+                    except OffboxError:
+                        return None
+                    if record:
+                        common.event_once(con, box_id, 'lease_free', json.dumps(offbox_protection.envelope(
+                            'lease_free', 'server receipt/process probe confirmed holder gone',
+                            lease.protection(con, box_id), run_id=run_id)), 'holder_gone:' + run_id)
+                    return dict(status='lost', running=False, exitCode=None)
                 if record:
                     con.execute('INSERT OR REPLACE INTO kv(k,v) VALUES (?,?)', (f'lost_confirmed:{run_id}', 'box'))
                     con.commit()
@@ -3328,6 +3429,15 @@ def finish(run_id: str, code: int | None, status: str | None = None, *, catch_up
                     log_row = claim_terminal_log(con, r)
                     if terminal_result(r):
                         con.execute('DELETE FROM kv WHERE k=?', (f'start_unknown:{run_id}',))
+                    if r['box_id']:
+                        import offbox_protection
+                        snapshot = lease.protection(con, r['box_id'])
+                        held = bool(snapshot['holds'])
+                        action = 'lease_held' if held else 'lease_free'
+                        common.event_once(con, r['box_id'], action, json.dumps(offbox_protection.envelope(
+                            action, 'terminal record; liveness unconfirmed' if held else 'terminal receipt received',
+                            snapshot, run_id=run_id, exit_code=r['exit_code'], holder=r['owner'])),
+                            action + '_logged:' + run_id)
             return r
         finally:
             con.close()
@@ -3417,7 +3527,9 @@ def _background(a, me: dict) -> int:
     try:
         ready_r, ready_w = os.pipe()
         accept_r, accept_w = os.pipe()
+        import offbox_protection
         payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  caller=offbox_protection.caller(),
                                   home_wait_deadline=home.wait_budget_end(),
                                   ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
         boot_env = {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR')}
@@ -3520,6 +3632,13 @@ def _background_queue(run_id: str, payload: dict) -> int:
     finally:
         con.close()
     os.environ[BACKGROUND_RUN_ENV] = run_id
+    import offbox_protection
+    # The adoption check above binds the payload to this worker and its durable owner.
+    # Preserve the original command's parent/thread attribution across detachment.
+    supplied = payload.get('caller') or {}
+    context = offbox_protection.request_caller(supplied, me['owner'], None)
+    context.update(actor='client:run', holder=me['owner'], run_id=run_id, worker_pid=os.getpid())
+    offbox_protection.CALLER.set(context)
     with home.wait_budget(payload.get('home_wait_deadline')):
         return background_client(a, me, ready=payload['ready_fd'], accept=payload['accept_fd'],
                                  signal_mask=payload['signal_mask'], source_failure=source_failure)

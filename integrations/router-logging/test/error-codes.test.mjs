@@ -6,7 +6,7 @@ import childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { syncBuiltinESMExports } from 'node:module';
-import { observed, clean } from '../toollog.mjs';
+import { observed, clean, recordFailure } from '../toollog.mjs';
 import { fixture } from './support.mjs';
 import * as recovery from '../../stream-recovery/lib/io.mjs';
 import { parseCutoverStatus } from '../../stream-recovery/lib/harness.mjs';
@@ -54,6 +54,9 @@ test('HTTP status is a finite number on thrown errors and explicit props', async
     const expected = Number.isFinite(value) ? {httpStatus:value} : undefined;
     assert.deepEqual(rows().at(-1).props, expected);
     assert.deepEqual(clean({component:'test',name:'fixture.http',kind:'error',props:{httpStatus:value}}).props, expected);
+    assert.deepEqual(rows().at(-1).error, {tag:'CONTROL_HTTP',message:'CONTROL_HTTP'});
+    recordFailure('test', 'fixture.direct', error);
+    assert.deepEqual(rows().at(-1).props, expected);
     assert.deepEqual(rows().at(-1).error, {tag:'CONTROL_HTTP',message:'CONTROL_HTTP'});
   }
 });
@@ -109,8 +112,9 @@ for (const [code,event] of [
   ['CONTROL_WS_DEFECT',{type:'message',data:JSON.stringify({_tag:'Defect',message:privateText})}],
   ['CONTROL_WS_ERROR',{type:'error',message:privateText}],
   ['CONTROL_WS_CLOSED',{type:'close'}],
+  ['ECONNREFUSED',{type:'error',error:Object.assign(new Error(privateText), {code:'ECONNREFUSED',syscall:'connect'})}],
 ]) test(`both control WebSocket clients emit ${code}`, async t => {
-  const {rejects} = setup(t);
+  const {rejects,rows} = setup(t);
   class Socket extends EventTarget {
     constructor() {
       super();
@@ -129,8 +133,23 @@ for (const [code,event] of [
   const original = globalThis.WebSocket;
   globalThis.WebSocket = Socket;
   t.after(() => { globalThis.WebSocket = original; });
-  await rejects(code, () => recovery.dispatchCommand({type:privateText}, {timeoutMs:1}));
-  await rejects(code, () => catalog.refreshProviders({timeoutMs:1}));
+  if (code === 'ECONNREFUSED') {
+    for (const work of [() => recovery.dispatchCommand({type:privateText}, {timeoutMs:1}),
+      () => catalog.refreshProviders({timeoutMs:1})]) {
+      await assert.rejects(observed('test', 'fixture.socket', work), error => error.code === 'CONTROL_WS_ERROR');
+      const row = rows().at(-1);
+      assert.deepEqual(row.error, {tag:'ECONNREFUSED',message:'ECONNREFUSED'});
+      assert.equal(row.props.errno, 'ECONNREFUSED');
+      assert.equal(row.props.target, 'ws://fixture.invalid:80');
+      assert.equal(row.props.syscall, 'connect');
+      assert.equal(row.props.attemptNo, 1);
+      assert.equal(row.props.step, 'fixture.socket');
+      assert.ok(!JSON.stringify(row).includes(privateText));
+    }
+  } else {
+    await rejects(code, () => recovery.dispatchCommand({type:privateText}, {timeoutMs:1}));
+    await rejects(code, () => catalog.refreshProviders({timeoutMs:1}));
+  }
 });
 
 const model = {instanceId:'opencode',model:'opus/cx/gpt-6.1-terra',variant:'max'};

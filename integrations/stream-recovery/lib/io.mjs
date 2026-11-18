@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { emit, failure } from './logging.mjs';
+import { emit, failure, tagConnectionFailure, recordConnectionFailure, connectionWebSocket } from './logging.mjs';
 import { assertRecoveryActive, loadControl, recoveryElapsed } from './pause.mjs';
 import { isOpenCodeSessionId, parseCutoverStatus } from './harness.mjs';
 import { assertReplicaPath, guardReplica, registerReplica, replicaPath } from './readonly-db.mjs';
@@ -395,17 +395,32 @@ export async function harnessCutoverStatus({ withClaims = false } = {}) {
 }
 
 const staleSocketTags = new Set(['EPIPE', 'ECONNRESET', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED']);
+const responseAttempts = new WeakMap();
+async function responseText(response, url) {
+  try { return await response.text(); }
+  catch (error) { throw tagConnectionFailure(error, url, responseAttempts.get(response) ?? 1); }
+}
 
 export async function fetchIdempotent(target, url, init = {}, timeoutMs) {
   // Keep fetch looked up at call time so node:test can replace it, as the other
   // transport tests do. Each attempt owns a fresh timeout signal.
-  const attempt = () => fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  let attemptNo = 0;
+  const attempt = async () => {
+    attemptNo++;
+    try {
+      const response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+      responseAttempts.set(response, attemptNo);
+      return response;
+    }
+    catch (error) { throw tagConnectionFailure(error, url, attemptNo); }
+  };
   try { return await attempt(); }
   catch (error) {
     if ((init.method ?? 'GET').toUpperCase() !== 'GET' || init.body != null
       || !(error instanceof TypeError) || error.message !== 'fetch failed') throw error;
     const tag = failure(error).tag;
     if (!staleSocketTags.has(tag) || error.cause?.code !== tag) throw error;
+    recordConnectionFailure('stream-recovery', 'http.attempt', error, {props:{step:`${target}.fetch`}});
     let ok = false;
     try {
       const response = await attempt();
@@ -425,7 +440,7 @@ async function api(method, path, body) {
     headers: { authorization: `Bearer ${token}`, ...(body ? { "content-type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   }, 15_000);
-  const data = parse(await res.text());
+  const data = parse(await responseText(res, `${url}${path}`));
   if (!res.ok || data.ok === false) {
     const e = Object.assign(new Error(`control ${method} ${path}: ${res.status} ${data.error?.message || data.message || ""}`.trim()), { code: 'CONTROL_HTTP' });
     e.status = res.status;
@@ -448,7 +463,8 @@ export async function robobHealthy() {
   try {
     await ctl("GET", "/health");
     return true;
-  } catch {
+  } catch (error) {
+    recordConnectionFailure('stream-recovery', 'health.check', error, {props:{step:'robobHealthy'}});
     return false;
   }
 }
@@ -530,7 +546,7 @@ export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
   const { url, token } = control();
   const wsUrl = `${url.replace(/^http/, "ws")}/ws?orchestrationProtocol=2`;
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl, { headers: { authorization: `Bearer ${token}` } });
+    const ws = connectionWebSocket(wsUrl, { headers: { authorization: `Bearer ${token}` } });
     ws.binaryType = "arraybuffer";
     let done = false;
     const finish = (fn, v) => {
@@ -560,7 +576,8 @@ export function dispatchCommand(command, { timeoutMs = 20_000 } = {}) {
         } else if (msg._tag === "Defect") finish(reject, Object.assign(new Error(`ws ${command.type}: defect ${JSON.stringify(msg).slice(0, 300)}`), { code: 'CONTROL_WS_DEFECT' }));
       }
     });
-    ws.addEventListener("error", (ev) => finish(reject, Object.assign(new Error(`ws ${command.type}: ${ev.message || "error"}`), { code: 'CONTROL_WS_ERROR' })));
+    ws.addEventListener("error", (ev) => finish(reject, tagConnectionFailure(
+      Object.assign(new Error(`ws ${command.type}: socket error`, {cause:ev.error ?? ev}), { code: 'CONTROL_WS_ERROR' }), wsUrl)));
     ws.addEventListener("close", () => finish(reject, Object.assign(new Error(`ws ${command.type}: closed before reply`), { code: 'CONTROL_WS_CLOSED' })));
   });
 }
@@ -581,7 +598,7 @@ async function oc(path, init = {}) {
   }, 20_000);
   if (res.status === 404) return null;
   if (!res.ok) throw Object.assign(new Error(`opencode ${path}: ${res.status}`), { code: 'OPENCODE_HTTP', httpStatus: res.status });
-  return parse(await res.text());
+  return parse(await responseText(res, `${OC_URL}${path}`));
 }
 
 export async function activeSessions() {

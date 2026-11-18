@@ -28,15 +28,14 @@ const fixture = Effect.gen(function* () {
   const release = yield* Deferred.make<void>();
   let gate = false;
   let config = `file:${gitDir}/config\0remote.team/fork.url\nhttps://github.com/a/repo\0`;
+  let refs =
+    "refs/heads/main\0a\0team/fork/main\0team/fork\0refs/heads/main\0\n" +
+    "refs/remotes/team/fork/main\0a\0\0\0\0\n";
   const driver = Layer.mock(GitVcsDriver.GitVcsDriver)({
     execute: (input) =>
       Effect.gen(function* () {
         calls.push(input.args[0]!);
-        const stdout =
-          input.args[0] === "config"
-            ? config
-            : "refs/heads/main\0a\0team/fork/main\0team/fork\0refs/heads/main\0\n" +
-              "refs/remotes/team/fork/main\0a\0\0\0\0\n";
+        const stdout = input.args[0] === "config" ? config : refs;
         if (gate) {
           gate = false;
           yield* Deferred.succeed(started, undefined);
@@ -69,8 +68,89 @@ const fixture = Effect.gen(function* () {
     config: (value: string) => {
       config = value;
     },
+    refs: (value: string) => {
+      refs = value;
+    },
   };
 });
+
+const largeRefs = (count: number) =>
+  "refs/heads/main\0a\0\0\0\0\0\nrefs/remotes/team/fork/main\0a\0\0\0\0\0\n" +
+  Array.from(
+    { length: count },
+    (_, index) => `refs/heads/${"x".repeat(1000)}/${index}\0${"a".repeat(40)}\0\0\0\0\0\n`,
+  ).join("");
+
+it.effect("evicts old branch ref graphs by bytes while keeping recent discoveries warm", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    f.refs(largeRefs(4_000));
+    const oldest = yield* f.discovery.read(f.cwd, "main", true);
+    for (const branch of ["second", "third", "fourth"])
+      yield* f.discovery.read(f.cwd, branch, true);
+    const recent = yield* f.discovery.read(f.cwd, "fourth");
+    f.calls.length = 0;
+    expect(yield* f.discovery.read(f.cwd, "fourth")).toBe(recent);
+    expect(f.calls).toEqual([]);
+    const reloaded = yield* f.discovery.read(f.cwd, "main");
+    expect(reloaded).not.toBe(oldest);
+    expect(reloaded.refs).toBe(recent.refs);
+    expect(reloaded.refs.size).toBe(4_002);
+    expect(f.calls).toEqual([]);
+    yield* f.discovery.invalidate(f.cwd);
+    yield* f.discovery.read(f.cwd, "main");
+    expect(f.calls).toEqual(["config", "for-each-ref"]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("returns an oversized ref graph intact without caching either copy", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    f.refs(largeRefs(14_000));
+    const first = yield* f.discovery.read(f.cwd, "main");
+    f.calls.length = 0;
+    const second = yield* f.discovery.read(f.cwd, "main");
+    expect(second.refs.size).toBe(14_002);
+    expect(second.refs).not.toBe(first.refs);
+    expect(second.refs.get("refs/heads/main")?.oid).toBe("a");
+    expect(f.calls).toEqual(["for-each-ref"]);
+    f.refs("refs/heads/main\0b\0\0\0\0\0\n");
+    const small = yield* f.discovery.read(f.cwd, "main", true);
+    f.calls.length = 0;
+    expect(yield* f.discovery.read(f.cwd, "main")).toBe(small);
+    expect(f.calls).toEqual([]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("bounds raw ref reuse across repositories and reclaims the budget on invalidation", () =>
+  Effect.gen(function* () {
+    const f = yield* fixture;
+    f.refs(largeRefs(4_000));
+    const repositories: string[] = [];
+    for (let index = 0; index < 4; index++) {
+      const cwd = `${f.cwd}/repository-${index}`;
+      const gitDir = `${cwd}/.git`;
+      yield* f.fs.makeDirectory(`${gitDir}/refs/heads`, { recursive: true });
+      yield* f.fs.makeDirectory(`${gitDir}/refs/remotes/team/fork`, { recursive: true });
+      yield* f.fs.writeFileString(`${gitDir}/HEAD`, "ref: refs/heads/main\n");
+      yield* f.fs.writeFileString(`${gitDir}/config`, "config\n");
+      yield* f.fs.writeFileString(`${gitDir}/refs/heads/main`, "a\n");
+      yield* f.fs.writeFileString(`${gitDir}/refs/remotes/team/fork/main`, "a\n");
+      repositories.push(cwd);
+      yield* f.discovery.read(cwd, "main");
+    }
+    f.calls.length = 0;
+    yield* f.discovery.read(repositories[3]!, "another");
+    expect(f.calls).toEqual([]);
+    yield* f.discovery.read(repositories[0]!, "another");
+    expect(f.calls).toEqual(["for-each-ref"]);
+    for (const cwd of repositories) yield* f.discovery.invalidate(cwd);
+    for (const cwd of repositories.slice(0, 3)) yield* f.discovery.read(cwd, "main");
+    f.calls.length = 0;
+    for (const cwd of repositories.slice(0, 3)) yield* f.discovery.read(cwd, "other");
+    expect(f.calls).toEqual([]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect("concurrent cold reads share two launches; unchanged sweeps launch zero git", () =>
   Effect.gen(function* () {
