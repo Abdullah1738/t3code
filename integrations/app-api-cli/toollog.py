@@ -41,13 +41,15 @@ _NAMES = {
     'order_watch.item_drop_check', 'order_watch.can_report',
     'collector.hold_seen', 'collector.hold_cleared',
     'bridge.error',
+    'track.checkout_link', 'track.checkout_auto_add', 'track.checkout_mismatch',
 }
 _ENUMS = {
     'route': {'cdp', 'phone', 'unspecified'},
     'field': {'card_name', 'card_number', 'card_expiry', 'card_cvc'},
     'cardNickname': {'Marriott', 'MashreqNoon', 'Skywards', 'Mashreq'},
     'reason': DELEGATION_REASONS | {'expired_at_write'},
-    'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage'},
+    'refusal': {'none', 'invalid_id', 'not_registered', 'invalid_registration', 'not_running_or_held', 'usage',
+                'checkout_unavailable', 'checkout_untracked'},
     'busStatus': {'open', 'pending', 'timed_out'},
     'lane': {'food', 'minutes', 'nownow', 'main', 'supermall', 'marketplace', 'careem', 'uber',
              'quik', 'shops', 'box', 'same-day'},
@@ -1107,12 +1109,12 @@ def consumed(fn):
 
 def registration(fn):
     @functools.wraps(fn)
-    def wrapped(argv=None, _locked=False):
+    def wrapped(argv=None, _locked=False, **kwargs):
         import sys
         args = sys.argv[1:] if argv is None else argv
         with deferred():
             try:
-                return fn(argv, _locked=_locked)
+                return fn(argv, _locked=_locked, **kwargs)
             except Exception as exc:
                 if args[:1] == ['add'] and not _locked:
                     def option(flag, default=None):

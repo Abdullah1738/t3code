@@ -11,6 +11,7 @@ import argparse
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
+from decimal import Decimal
 import email
 import email.policy
 from email.utils import parsedate_to_datetime
@@ -232,6 +233,27 @@ def _manifest_section(section, oid):
     return items, valid, complete
 
 
+def confirmation_details(section):
+    """Project product rows and the order total only from the proven template."""
+    before, tail = re.split(r'(?im)^\s*(?:Order )?Total\s*:?\s*$', section, maxsplit=1)
+    lines = [x.strip() for x in before.splitlines() if x.strip()][2:]
+    money = re.compile(r'^(?:(AED|USD|GBP|EUR|SAR)\s*([\d,]+(?:\.\d{1,2})?)|([\d,]+(?:\.\d{1,2})?)\s*(AED|USD|GBP|EUR|SAR))$')
+    def amount(text):
+        match = money.fullmatch(text)
+        if not match:
+            return None
+        return match[1] or match[4], str(Decimal((match[2] or match[3]).replace(',', '')))
+    total = amount(next(x.strip() for x in tail.splitlines() if x.strip()))
+    rows = []
+    for i in range(0, len(lines), 3):
+        price = amount(lines[i + 2])
+        if not price or not total or price[0] != total[0]:
+            return None
+        rows.append({'name': lines[i].removeprefix('* ').strip()[:600],
+                     'qty': int(lines[i + 1].split(':')[1]), 'price': price[1]})
+    return {'items': rows, 'amount': total[1], 'currency': total[0]} if total else None
+
+
 def parse_message(raw, *, account='unknown', folder='unknown', uid=None, observed_at=None):
     """Return safe exact-order events from one RFC822 message, with no I/O.
 
@@ -310,6 +332,9 @@ def parse_message(raw, *, account='unknown', folder='unknown', uid=None, observe
                  'manifest_complete': complete, 'warnings': warnings.copy()}
         if stage == 'confirmed' and not complete:
             event['warnings'].append('confirmation_manifest_unproven')
+        if stage == 'confirmed':
+            event['checkout_id'] = 'amazon-checkout-' + digest('|'.join(sorted(ids)))[:24]
+            event['order_details'] = confirmation_details(section) if complete else None
         if scope == 'shipment' and len(shipments) != 1:
             event['warnings'].append('shipment_identity_unproven')
         events.append(event)
@@ -406,7 +431,9 @@ def aggregate_order(order_id, events, *, scan_complete=True):
         status = reliable[-1]['stage']
     else:
         status = 'unknown'
+    checkout = checkout_details(order_id, events)
     return {'app': 'amazon', 'order_id': order_id, 'source': SOURCE, 'status': status,
+            'checkout': checkout,
             'whole_order_delivered': whole, 'terminal': whole,
             'latest_event': reliable[-1]['stage'] if reliable else 'unknown',
             'manifest': {'complete': manifest_complete, 'items': _item_list(manifest),
@@ -415,6 +442,22 @@ def aggregate_order(order_id, events, *, scan_complete=True):
             'coverage': {'scan_complete': scan_complete, 'all_items_delivered': whole,
                          'reasons': sorted(set(reasons)),
                          'delivered_package_evidence': 'delivered' in stages}}
+
+
+def checkout_details(order_id, events):
+    confirmations = [e for e in events if e['stage'] == 'confirmed' and e.get('evidence_at')
+                     and order_id in e.get('related_order_ids', []) and e.get('checkout_id')]
+    if not confirmations:
+        return None
+    groups = {e['checkout_id'] for e in confirmations}
+    ids = sorted({oid for e in confirmations for oid in e['related_order_ids']})
+    rows = []
+    for oid in ids:
+        details = [e.get('order_details') for e in confirmations if e['order_id'] == oid]
+        consistent = bool(details) and details[0] and all(d == details[0] for d in details)
+        rows.append({'order': oid, **(details[0] if consistent else {})})
+    return {'id': confirmations[0]['checkout_id'], 'order_ids': ids, 'orders': rows,
+            'complete': len(groups) == 1 and all('amount' in row for row in rows)}
 
 
 def _clean_env():
