@@ -2,12 +2,13 @@ import argparse
 from collections import Counter, defaultdict
 import datetime as dt
 import json
+import ipaddress
 import math
 import os
 import re
 from pathlib import Path
 import tempfile
-from toollog import directory, safe_target, CONNECTION_ERRNOS
+from toollog import directory, safe_target, token, CONNECTION_ERRNOS, SYSCALLS
 from volume import REASONS, integer
 from listener_rollup import windows as listener_windows
 
@@ -28,6 +29,19 @@ def proxy_key_id(value):
                                   or re.fullmatch(r'(?:[a-f0-9]{16}|unreg:[a-f0-9]{12})', value)):
         return value
     return 'unknown'
+
+
+def socket_listener(props):
+    address = props.get('localAddress')
+    try:
+        address = str(ipaddress.ip_address(address)) if isinstance(address, str) and len(address) <= 64 else None
+    except ValueError:
+        address = None
+    port = props.get('localPort')
+    port = port if type(port) is int and 0 < port <= 65535 else None
+    syscall = props.get('syscall')
+    syscall = syscall if isinstance(syscall, str) and syscall in SYSCALLS else None
+    return address, port, syscall
 
 
 def caller_breakdown(groups, dimension):
@@ -69,6 +83,9 @@ def rollup(day, root=None, now=None):
     counts, kinds, tags = Counter(), Counter(), Counter()
     times, samples = defaultdict(list), {}
     targets = defaultdict(Counter)
+    target_components = defaultdict(Counter)
+    inbound_sockets = Counter()
+    inbound_components = defaultdict(Counter)
     proxy = {}
     models = defaultdict(lambda: dict(count=0, aborted=0))
     clients = defaultdict(lambda: dict(count=0, aborted=0))
@@ -178,14 +195,29 @@ def rollup(day, root=None, now=None):
                     ms = row.get('durationMs')
                     if isinstance(ms, (int, float)) and math.isfinite(ms) and ms >= 0:
                         times[row['name']].append(ms)
-                    tag = row.get('error', {}).get('tag')
+                    inbound = row.get('component') == 'proxy' and row['name'] == 'client.socket_closed'
+                    tag = None if inbound else row.get('error', {}).get('tag')
+                    if inbound and row['kind'] == 'error':
+                        props = row.get('props', {})
+                        code = props.get('code') or row.get('error', {}).get('tag')
+                        if isinstance(code, str) and code in CONNECTION_ERRNOS:
+                            address, port, syscall = socket_listener(props)
+                            component = 'proxy'
+                            # Peer ports are ephemeral: keep them in event rows, not rollup dimensions.
+                            inbound_sockets[(component, code, address, port, syscall)] += 1
+                            inbound_components[component]['count'] += 1
+                            inbound_components[component]['unknownEndpointCount'] += address is None or port is None
                     if tag:
                         props = row.get('props', {})
                         count = props.get('count', 1) if tag in CONNECTION_ERRNOS else 1
                         count = count if type(count) is int and 0 < count <= 9007199254740991 else 1
                         tags[tag] += count
                         if tag in CONNECTION_ERRNOS:
-                            targets[tag][safe_target(props.get('target')) or 'unknown'] += count
+                            target = safe_target(props.get('target')) or 'unknown'
+                            component = token(row.get('component')) or 'unknown'
+                            targets[tag][(component, target)] += count
+                            target_components[component]['count'] += count
+                            target_components[component]['unknownTargetCount'] += count if target == 'unknown' else 0
                         samples.setdefault(tag, row.get('ids', {}))
                     if row['name'] in ('account.lock', 'account.unlock'):
                         props = row.get('props', {})
@@ -260,7 +292,19 @@ def rollup(day, root=None, now=None):
     result.update(generatedAt=generated.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), complete=generated >= next_day)
     for error in result['topErrors']:
         if error['tag'] in CONNECTION_ERRNOS:
-            error['byTarget'] = [dict(target=target, count=count) for target, count in targets[error['tag']].most_common()]
+            error['byTarget'] = [dict(component=component, target=target, count=count)
+                                 for (component, target), count in targets[error['tag']].most_common()]
+    result['connectionTargetsByComponent'] = [dict(component=component, **group,
+        unknownTargetShare=group['unknownTargetCount'] / group['count'])
+        for component, group in sorted(target_components.items())]
+    result['inboundSockets'] = dict(
+        count=sum(inbound_sockets.values()),
+        byListener=[dict(component=component, code=code, localAddress=address, localPort=port, syscall=syscall, count=count)
+                    for (component, code, address, port, syscall), count in inbound_sockets.most_common()],
+        byComponent=[dict(component=component, **group,
+                          unknownEndpointShare=group['unknownEndpointCount'] / group['count'])
+                     for component, group in sorted(inbound_components.items())],
+    )
     result['proxy'] = []
     for (model, route, stream), group in sorted(proxy.items()):
         result['proxy'].append(dict(
