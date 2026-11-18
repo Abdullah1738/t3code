@@ -9,9 +9,12 @@ if sys.argv[1:2] == ['guard']:
 elif sys.argv[1:2] == ['poll']:
     from poller import poll
     raise SystemExit(poll())
+elif sys.argv[1:2] == ['pool-alerts']:
+    from pool_alerts import serve
+    serve()
 elif sys.argv[1:2] == ['rollup']:
     from rollup import main
     del sys.argv[1]
     main()
 else:
-    raise SystemExit('usage: run.py guard|poll|rollup')
+    raise SystemExit('usage: run.py guard|poll|pool-alerts|rollup')
