@@ -338,13 +338,18 @@ class Instrumentation(Isolated):
         self.assertEqual(self.rows('run.request')[0]['props']['envCount'],1)
 
     def test_sync_pull_and_upload_outcomes(self):
-        stats={'sent':123,'files':4}
-        with patch.object(ssh_sync,'_push_files',return_value=stats), patch.object(ssh_sync,'tracked_secret_matches',return_value=['.env']):
+        stats={'sent':123,'files':4,'tracked_total':10,'tracked_heavy':3,'tracked_heavy_sent':2,
+               'tracked_node_modules_sent':1,'tracked_secret_sent':1,
+               'tracked_left_out':{'secret':1},'tracked_left_out_first':['.env']}
+        with patch.object(ssh_sync,'_push_files',return_value=stats):
             ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work',run_id='run-fixture')
         with patch.object(ssh_sync,'_push_files',side_effect=common.OffboxError('private error')):
             with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work')
         self.outcomes('run.sync')
-        self.assertEqual(self.rows('run.sync')[0]['props'],{'bytes':123,'files':4,'skipped':1})
+        self.assertEqual(self.rows('run.sync')[0]['props'],{'bytes':123,'files':4,'skipped':1,
+                         'tracked_total':10,'tracked_heavy':3,'tracked_heavy_sent':2,
+                         'tracked_node_modules_sent':1,'tracked_secret_sent':1,
+                         'tracked_left_out':{'secret':1},'tracked_left_out_first':['.env']})
         for rc in (0,23):
             with patch.object(ssh_sync,'ssh_base',return_value=['ssh']),patch.object(ssh_sync.subprocess,'run',return_value=subprocess.CompletedProcess([],rc,'Total bytes received: 40\nNumber of regular files transferred: 2','failure')):
                 ssh_sync.pull('bx_fixture','work','.','artifact',Path(self.tmp.name))

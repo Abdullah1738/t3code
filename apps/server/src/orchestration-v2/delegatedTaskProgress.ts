@@ -6,6 +6,25 @@ import type {
 import * as DateTime from "effect/DateTime";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 15 * 60_000;
+export function parentTaskCancellationRequest(
+  runId: OrchestrationV2Run["id"] | undefined,
+  items: ReadonlyArray<OrchestrationV2TurnItem>,
+) {
+  return items
+    .filter((item) => item.type === "run_interrupt_request")
+    .findLast((item) => item.runId === runId);
+}
+
+export function restartInterrupted(task: {
+  readonly status: string;
+  readonly cancelReason?: string | undefined;
+}): boolean {
+  return (
+    (task.status === "cancelled" || task.status === "interrupted") &&
+    (task.cancelReason === "server_shutdown" || task.cancelReason === "server_restart")
+  );
+}
+
 export function normalizeIdleTimeout(value?: number): number {
   return value === undefined || value === 0 || !Number.isFinite(value)
     ? DEFAULT_IDLE_TIMEOUT_MS

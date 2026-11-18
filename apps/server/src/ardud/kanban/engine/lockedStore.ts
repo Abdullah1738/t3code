@@ -14,30 +14,31 @@ export const wrap = (
     write = false,
     collection = false,
   ) =>
-    store.card(id).pipe(
-      locks.dispatchRead,
-      Effect.flatMap((row) =>
-        row
-          ? locks.access(row.boardId, effect, write, collection ? undefined : `card:${id}`)
-          : effect,
-      ),
-    );
+    store
+      .card(id)
+      .pipe(
+        Effect.flatMap((row) =>
+          row
+            ? locks.access(row.boardId, effect, write, collection ? undefined : `card:${id}`)
+            : effect,
+        ),
+      );
   const discussion = <A, E, R>(
     id: Parameters<KanbanStoreShape["discussion"]>[0],
     effect: Effect.Effect<A, E, R>,
     write = false,
   ) =>
-    store.discussion(id).pipe(
-      locks.dispatchRead,
-      Effect.flatMap((row) =>
-        row ? locks.access(row.boardId, effect, write, `discussion:${id}`) : effect,
-      ),
-    );
+    store
+      .discussion(id)
+      .pipe(
+        Effect.flatMap((row) =>
+          row ? locks.access(row.boardId, effect, write, `discussion:${id}`) : effect,
+        ),
+      );
   const thread = <A, E, R>(id: string, effect: Effect.Effect<A, E, R>) =>
-    store.threadLink(id).pipe(
-      locks.dispatchRead,
-      Effect.flatMap((row) => (row ? locks.access(row.boardId, effect) : effect)),
-    );
+    store
+      .threadLink(id)
+      .pipe(Effect.flatMap((row) => (row ? locks.access(row.boardId, effect) : effect)));
   return {
     ...store,
     boards: locks.observe(store.boards),

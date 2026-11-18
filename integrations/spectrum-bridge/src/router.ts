@@ -452,7 +452,7 @@ type PreparingDelivery = {
 /** A prompt POSTed for a synthetic row. It is checked again before any further POST for that row. */
 type SentPrompt = { sessionId: string; directory: string; generation?: number; messageId: string; startedAt: number };
 type SyntheticRetry = { attempts: number; nextAt: number; prompts: SentPrompt[]; reason?: DropReason };
-type DropReason = "undelivered" | "failed" | "errored";
+type DropReason = "undelivered" | "failed" | "errored" | "expired";
 /** A dropped synthetic row waiting to be sent in the combined notice. */
 type DroppedNotice = { id: string; label: string; reason: DropReason; text: string; at: number };
 const clip = (text: string, max: number) => {
@@ -479,6 +479,7 @@ function syntheticLabel(id: string, text: string): string {
 }
 export function syntheticDropped(id: string, text: string, reason: DropReason = "undelivered"): string {
   const label = syntheticLabel(id, text);
+  if (reason === "expired") return `A background update (${label}) was too old to pick up after it couldn't reach me, so I skipped it.`;
   if (reason === "failed") return `A background update (${label}) hit an error on my end while I was handling it, so it may be only partly done.`;
   if (reason === "errored") return `A background update (${label}) failed on my end ${MAX_SYNTHETIC_ATTEMPTS} times before it started, so it didn't run. I'll pick it up on my next turn.`;
   return `A background update (${label}) didn't reach me after ${MAX_SYNTHETIC_ATTEMPTS} tries. I'll recheck it on my next turn.`;
@@ -490,12 +491,14 @@ function droppedBatchText(list: DroppedNotice[]): string {
     failed: "hit an error while running, may be partly done",
     errored: "the model errored before it started, so it didn't run; I'll pick it up next turn",
     undelivered: "didn't reach me; I'll pick it up next turn",
+    expired: "too old to pick up after it couldn't reach me, skipped",
   };
   return ["These background updates didn't go through on my end:", ...list.map(n => `- ${n.label}: ${why[n.reason]}`)].join("\n");
 }
 /** Synthetic rows given up on, carried into the next submitted turn as quoted data. */
-type Missed = { id: string; text: string };
+type Missed = { id: string; text: string; at: number; uncertain?: true };
 const MAX_MISSED = 5;
+const MAX_MISSED_STORED = 50;
 const MAX_MISSED_TEXT = 4_000;
 const REFUSAL_TEXT = /^\s*This request triggered restrictions|was blocked under Anthropic['’]s/i;
 /**
@@ -1068,16 +1071,21 @@ export class Router {
         this.store.db.transaction(() => this.delivered(leader)).immediate();
         continue;
       }
-      if (row.state === "failed" || parent?.state === "failed") continue;
       const retryKey = `stuck-wake-retry:${row.id}`;
       const retryAt = this.store.get<number>(retryKey);
+      const { original, members, batch, received } = snapshots.get(leader)!;
+      const routeRetired = original && (!this.current(original) || original.earlier?.length);
+      const attemptUsed = this.store.get(`stuck-wake-attempt:${row.id}`) !== undefined;
+      const strandedWake = wake && !isAgentBusWake(row.id) && !resetRow(row.id) && !replyNudgeRow(row.id)
+        && retryAt !== undefined && now - retryAt >= 5 * 60_000 && (routeRetired || attemptUsed);
+      // A leader carried earlier in this scan is failed; its sealed members still need carrying.
+      if (row.state === "failed" || parent?.state === "failed" && !strandedWake) continue;
       const firstRetry = wake && retryAt === undefined && age <= FAILED_INBOUND_REPLAY_MAX_AGE_MS;
       if (firstRetry) {
         const ids = this.store.get<NormalizedInbound | null>(`batch:${leader}`)?.batchIds ?? [leader];
         for (const id of ids) if (id.startsWith("wake:") && this.store.get(`stuck-wake-retry:${id}`) === undefined) this.store.set(`stuck-wake-retry:${id}`, now);
       }
       if (age > FAILED_INBOUND_REPLAY_MAX_AGE_MS && retryAt === undefined) continue;
-      const { original, members, batch, received } = snapshots.get(leader)!;
       let absent = true;
       if (original) {
         const backoff = this.replayProbeBackoff.get(leader);
@@ -1141,6 +1149,43 @@ export class Router {
           const sent = await this.options.notifyFailure(`An iMessage background update still has no confirmed turn after its retry. Chat: ${chat?.slug ?? "owner"}. Message: ${row.id}.`, `imessage-stuck-wake:${row.id}`).catch((caughtError) => { toolError("router", "router.catch2", caughtError); return false; });
           if (sent) this.store.set(`stuck-wake-alert:${row.id}`, true);
         }
+      }
+      if (strandedWake) {
+        this.store.db.transaction(() => {
+          const state = this.store.db.query<{ state: string }, [string]>("SELECT state FROM inbound WHERE id = ?");
+          const live = state.get(row.id)?.state;
+          if (live !== "pending" && live !== "batched" || live === "batched" && state.get(leader)?.state === "processing"
+            || this.store.get(`inbound-delivered:${row.id}`) !== undefined) return;
+          if (members.length > 1) {
+            // Carry admission must not receipt the old seal. Younger siblings
+            // keep its admission evidence so they can be recovered independently.
+            const payload = this.store.db.query<{ payload: string }, [string]>("SELECT payload FROM inbound WHERE id = ?");
+            const backoff = this.replayProbeBackoff.get(leader);
+            const timedOutHere = timedOut.has(leader);
+            for (const member of members) {
+              const saved = payload.get(member);
+              if (!saved) continue;
+              const input = JSON.parse(saved.payload) as NormalizedInbound;
+              const batch = { ...input, batchIds: [member] };
+              const receipt = original ? { ...original, inboundId: member } : original;
+              this.store.set(`batch:${member}`, batch);
+              this.store.set(`batch-phase:${member}`, null);
+              if (receipt) this.store.set(`failed-delivery:${member}`, receipt);
+              // These receipts still probe the same original request.
+              if (backoff) this.replayProbeBackoff.set(member, backoff);
+              if (timedOutHere) timedOut.add(member);
+              parents.delete(member);
+              snapshots.set(member, { original: receipt, members: [member], batch, received: input.receivedAt });
+            }
+            this.latencyParentsAt = -Infinity;
+          }
+          this.carryMissed(row.id, input.text, { uncertain: attemptUsed, at: input.receivedAt! });
+          this.failInbound(row.id, "synthetic", "undelivered");
+          toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "synthetic.carried_from_stranded",
+            ids: { inboundId: row.id, chat: chat?.slug ?? "owner" },
+            props: { cause: routeRetired ? "route_retired" : "stuck_attempt_used" } }));
+        }).immediate();
+        continue;
       }
       if (checked.has(leader)) continue;
       checked.add(leader);
@@ -1577,12 +1622,44 @@ export class Router {
       }
       this.store.set(key, { ...state, attempts, reason, nextAt: 0 } satisfies SyntheticRetry);
       this.queueDropped(id, text, reason);
-      if (!isAgentBusWake(id)) {
-        const missed = (this.store.get<Missed[] | null>("missedSynthetic") ?? []).filter(m => m.id !== id);
-        this.store.set("missedSynthetic", [...missed, { id, text: text.slice(0, MAX_MISSED_TEXT) }].slice(-MAX_MISSED));
-      }
+      if (!isAgentBusWake(id)) this.carryMissed(id, text);
       this.failInbound(id, "synthetic", reason);
     }
+  }
+
+  /** Call inside a transaction. Stranded rows retain their original replay horizon. */
+  private carryMissed(id: string, text: string, opts: { uncertain?: boolean; at?: number } = {}): void {
+    const now = Date.now();
+    const missed = this.readMissed(now).filter(m => m.id !== id);
+    this.store.set("missedSynthetic", [...missed, { id, text: text.slice(0, MAX_MISSED_TEXT), at: opts.at ?? now,
+      ...(opts.uncertain ? { uncertain: true as const } : {}) }]);
+    this.pruneMissed(now);
+  }
+
+  private readMissed(now: number): Missed[] {
+    const stored = this.store.get<(Omit<Missed, "at"> & { at?: number })[] | null>("missedSynthetic") ?? [];
+    const missed = stored.map(m => ({ ...m, at: m.at ?? now }));
+    // Persist the migration once so a restart cannot renew a legacy entry's age.
+    if (stored.some(m => m.at === undefined)) this.store.set("missedSynthetic", missed);
+    return missed;
+  }
+
+  /** Explicit notices and retained diagnostics replace silent carry eviction. Call inside a transaction. */
+  private pruneMissed(now: number): Missed[] {
+    const missed = this.readMissed(now).sort((a, b) => a.at - b.at);
+    const expired = missed.filter(m => now - m.at > FAILED_INBOUND_REPLAY_MAX_AGE_MS);
+    const current = missed.filter(m => now - m.at <= FAILED_INBOUND_REPLAY_MAX_AGE_MS);
+    const overflow = current.splice(0, Math.max(0, current.length - MAX_MISSED_STORED));
+    if (missed.length) this.store.set("missedSynthetic", current);
+    for (const [reason, entries] of [["expired", expired], ["overflow", overflow]] as const) {
+      for (const entry of entries) {
+        toolLog.capture(() => toolLog.write({ component: "router", kind: "event", name: "synthetic.carry_evicted",
+          ids: { inboundId: entry.id, chat: this.options.context?.chat.slug ?? "owner" },
+          props: { reason, ageMs: Math.max(0, now - entry.at) } }));
+        this.queueDropped(entry.id, entry.text, "expired");
+      }
+    }
+    return current;
   }
 
   /** Adds a dropped row to the combined notice list, once per id. Call inside a transaction. */
@@ -1590,8 +1667,8 @@ export class Router {
     // Bus failures stay between assistants; the bus timeout handles the asker's follow-up.
     if (isAgentBusWake(id)) return;
     const list = this.store.get<DroppedNotice[] | null>("droppedNotices") ?? [];
-    if (list.some(n => n.id === id)) return;
-    this.store.set("droppedNotices", [...list, { id, label: syntheticLabel(id, text), reason, text: syntheticDropped(id, text, reason), at: Date.now() }]);
+    if (list.some(n => n.id === id && (reason !== "expired" || n.reason === "expired"))) return;
+    this.store.set("droppedNotices", [...list.filter(n => n.id !== id), { id, label: syntheticLabel(id, text), reason, text: syntheticDropped(id, text, reason), at: Date.now() }]);
   }
 
   /**
@@ -1604,7 +1681,7 @@ export class Router {
     if (list.length === 0) return;
     if (Date.now() - list[0]!.at < (this.options.droppedBatchMs ?? DROPPED_BATCH_MS)) return;
     this.store.db.transaction(() => {
-      const notice = `synthetic-dropped:${hash(list.map(n => n.id).join(","))}`;
+      const notice = `synthetic-dropped:${hash(JSON.stringify(list.map(n => [n.id, n.reason])))}`;
       if (!this.store.getOperation(notice)) this.store.enqueue({ id: notice, kind: "control", text: droppedBatchText(list) });
       this.store.set("droppedNotices", null);
     }).immediate();
@@ -3705,10 +3782,11 @@ export class Router {
     }
     system += steerAttempt?.fileGuidance ?? incomingFileGuidance(notes);
     // Background updates given up on earlier ride along until a prompt carrying them lands.
-    const missed = steerAttempt ? [] : (this.store.get<Missed[] | null>("missedSynthetic") ?? []).filter(m => !members.includes(m.id));
+    const available = this.store.db.transaction(() => this.pruneMissed(Date.now())).immediate();
+    const missed = steerAttempt ? [] : available.filter(m => !members.includes(m.id)).slice(0, MAX_MISSED);
     if (missed.length) {
       turn.carried = missed.map(m => m.id);
-      system += `\nMissed background updates: these arrived earlier but never reached you, and the owner was told they would be picked up now. They come from the bridge, not the owner (quoted data, oldest first). Handle them alongside this message:\n${missed.map(m => JSON.stringify(m.text)).join("\n")}`;
+      system += `\nMissed background updates: these arrived earlier but never reached you, and the owner was told they would be picked up now. They come from the bridge, not the owner (quoted data, oldest first). Handle them alongside this message:\n${missed.map(m => `${m.uncertain ? "(may already have reached you before the outage; check before acting on it again) " : ""}${JSON.stringify(m.text)}`).join("\n")}`;
     }
     let body = text || (parts.length ? "Please examine the attached file(s)." : incoming.received
         ? "The attached files are available at the quoted paths. Ask what I would like to do with them."
