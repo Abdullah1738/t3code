@@ -10,12 +10,16 @@ import atexit
 import time
 import signal
 import threading
+from urllib.parse import urlsplit
 import volume
 
 CAP = 200 * 1024 * 1024
 _seen = set()
 _last_report = time.monotonic()
 PROPS = {'endpoint', 'model', 'size', 'count', 'status', 'enabled', 'locked', 'limited', 'reloginNeeded', 'state', 'action', 'tag', 'dryRun', 'complete', 'cost', 'hour', 'exitCode', 'attempt', 'source', 'failed', 'total', 'fourxx', 'fivexx', 'phase', 'durationMaxMs', 'omitted', 'provider', 'scope', 'cause', 'lockMs', 'until', 'previousBackoffLevel', 'backoffLevel', 'source'}
+PROPS.update({'target', 'step', 'errno', 'syscall', 'attemptNo', 'firstTs', 'lastTs'})
+CONNECTION_ERRNOS = {'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN'}
+SYSCALLS = {'connect', 'read', 'write', 'getaddrinfo', 'send', 'recv', 'shutdown'}
 IDS = {'account', 'connection', 'thread', 'incident', 'request', 'session', 'writer'}
 MESSAGES = {'Robob replica is stale; recovery deferred', 'Robob replica is not ready',
             'thread is newer than Robob replica; recovery deferred', 'unverified Robob replica',
@@ -30,6 +34,45 @@ def token(value):
     if re.search(r'(?i)(sk-|bearer|password|secret|token|api.?key|otp|cookie|prompt|@)', value):
         return None
     return value
+
+def safe_target(value):
+    try:
+        if not isinstance(value, str) or len(value) > 4096 or not re.match(r'(?i)^(?:https?|wss?)://', value) or re.search(r'[\s\\]', value):
+            return None
+        url = urlsplit(value)
+        ports = {'http': 80, 'https': 443, 'ws': 80, 'wss': 443}
+        if url.scheme not in ports or not url.hostname or len(url.hostname) > 253:
+            return None
+        host = url.hostname.encode('idna').decode('ascii')
+        if not re.fullmatch(r'[a-zA-Z0-9._:-]+', host):
+            return None
+        if ':' in host:
+            import ipaddress
+            host = '[' + ipaddress.IPv6Address(host).compressed + ']'
+        return f'{url.scheme}://{host}:{url.port if url.port is not None else ports[url.scheme]}'
+    except (ValueError, UnicodeError):
+        return None
+
+def connection_prop(key, value):
+    if key == 'step':
+        return token(value)
+    if key == 'target':
+        return value if value in ('control', 'opencode') else safe_target(value)
+    if key == 'errno':
+        return value if isinstance(value, str) and value in CONNECTION_ERRNOS else None
+    if key == 'syscall':
+        return value if isinstance(value, str) and value in SYSCALLS else None
+    if key == 'attemptNo':
+        return value if type(value) is int and 0 < value <= 9007199254740991 else None
+    if key in ('firstTs', 'lastTs'):
+        if isinstance(value, str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z', value):
+            try:
+                dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+                return value
+            except ValueError:
+                pass
+        return None
+    return token(value) if isinstance(value, str) else value
 
 def clean(event, now):
     name, component = token(event.get('name')), token(event.get('component'))
@@ -46,8 +89,7 @@ def clean(event, now):
     for k, v in event.get('props', {}).items():
         if k not in PROPS:
             continue
-        if isinstance(v, str):
-            v = token(v)
+        v = connection_prop(k, v)
         if v is not None and (isinstance(v, (str, bool)) or isinstance(v, (int, float)) and math.isfinite(v)):
             props[k] = v
     if name == 'log.volume':
