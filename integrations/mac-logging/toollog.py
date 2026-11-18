@@ -21,6 +21,7 @@ NUMBERS.update('rootsOk rootsTimeout rootsDenied scanMs'.split())
 NUMBERS.update(('unreadableCount', 'turn', 'cachedCount', 'rootsComplete', 'rootsPartial',
                 'childrenCached', 'oldestChildAgeS', 'unmeasuredCount', 'limitedCount', 'lagS'))
 NUMBERS.update(('deltaGb', 'deltaWindowS', 'purgeableGb', 'localSnapshotCount'))
+NUMBERS.update(('freeGb', 'floorGb', 'lowForS'))
 NUMBERS.update(('lockAgeS', 'lockPid', 'completedCount', 'failedCount',
                 'windowStart', 'windowEnd', 'windowS', 'skippedS', 'chunks', 'chunksDone', 'observedAt'))
 NUMBERS.update(('lockHolderPpid', 'lockHolderStartedAgoS', 'lastGoodSnapshotAgeS',
@@ -69,6 +70,7 @@ for i in range(1, 6):
 for i in range(1, 4):
     TEXT.add('topMover%dPath' % i)
     NUMBERS.add('topMover%dGbDelta' % i)
+    NUMBERS.add('topMover%dGb' % i)
 PROBE_ERRORS = {prefix+field for prefix in ('internal', 'external')
                 for field in ('PurgeableError', 'SnapshotError')}
 TEXT.update('blockedIn samplePath skipped storagekitdStat diskarbitrationdStat'.split())
@@ -559,6 +561,8 @@ def safe_fields(values, event=None):
                 'invalid_timestamp', 'current_unavailable'):
             result[key] = value
         elif key == 'volume' and value in ('internal', 'external'):
+            result[key] = value
+        elif event == 'disk.low_cleared' and key == 'reason' and value == 'emergency_recovery':
             result[key] = value
         elif key in ('previousTs', 'sampleTs', 'deltaFromTs', 'internalDeltaFromTs', 'externalDeltaFromTs') and isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z', value):
             result[key] = value
