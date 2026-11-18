@@ -1235,7 +1235,7 @@ export class CheckShutdownError extends Error {
   constructor() { super("Runner is shutting down"); }
 }
 
-/** Yield only while acquiring: nested admission/spawn guards must finish before this transaction commits. */
+/** Yield only while acquiring: nested admission/spawn guards must finish before releasing the mutex. */
 export function withRelayLockAsync<T>(fn: () => T): Promise<Awaited<T>> {
   const attempt = (): Promise<Awaited<T>> => {
     if (stoppingChecks || shutdownStarted) return Promise.reject(new CheckShutdownError());
@@ -1255,7 +1255,11 @@ export function withRelayLockAsync<T>(fn: () => T): Promise<Awaited<T>> {
     relayLockDepth++;
     try { return Promise.resolve(fn()); }
     catch (error) { return Promise.reject(error); }
-    finally { relayLockDepth--; try { db.exec("COMMIT"); } finally { db.close(); } }
+    finally {
+      relayLockDepth--;
+      // This database is only a mutex; committing would needlessly upgrade past concurrent readers.
+      try { db.exec("ROLLBACK"); } finally { db.close(); }
+    }
   };
   return attempt();
 }

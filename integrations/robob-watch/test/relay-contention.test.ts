@@ -55,3 +55,35 @@ test("ordinary Python admission contention delays ticks without runner or owner-
     rmSync(sandbox, { recursive: true, force: true });
   }
 }, 15000);
+
+for (const initialized of [false, true]) for (const throws of [false, true]) {
+  test(`releasing admission tolerates a concurrent reader (initialized=${initialized}, throws=${throws})`, () => {
+    const sandbox = mkdtempSync(join(tmpdir(), "watch-admission-reader-"));
+    const root = join(sandbox, "root");
+    try {
+      const child = Bun.spawnSync([process.execPath, "-e", `
+        import {Database} from "bun:sqlite";
+        import {appendFileSync,mkdirSync,readFileSync} from "node:fs";
+        import {withRelayLockAsync} from ${JSON.stringify(join(import.meta.dir, "../src/lib.ts"))};
+        mkdirSync(${JSON.stringify(root)},{recursive:true});
+        const path=${JSON.stringify(join(root, "relay-lock.sqlite"))};
+        ${initialized ? 'const seed=new Database(path);seed.exec("CREATE TABLE seed(x)");seed.close();' : ""}
+        let reader,calls=0,received;
+        try {
+          received=await withRelayLockAsync(()=>{
+            calls++;
+            appendFileSync(${JSON.stringify(join(sandbox, "effects"))},"effect\\n");
+            reader=new Database(path);reader.exec("BEGIN");
+            reader.query("SELECT count(*) FROM sqlite_master").get();
+            ${throws ? 'throw new Error("callback marker");' : 'return "ok";'}
+          });
+        } catch(error) {received=error.message;}
+        finally {reader?.exec("ROLLBACK");reader?.close();}
+        console.log(JSON.stringify({received,calls,effects:readFileSync(${JSON.stringify(join(sandbox, "effects"))},"utf8")}));
+      `], { env: { ...process.env, BUN_INSPECT: undefined, ROBOB_TEST: "1", ROBOB_WATCH_ROOT: root, TOOLLOG_DIR: join(sandbox, "logs") } });
+      expect(child.stderr.toString()).toBe("");
+      expect(child.exitCode).toBe(0);
+      expect(JSON.parse(child.stdout.toString())).toEqual({ received: throws ? "callback marker" : "ok", calls: 1, effects: "effect\n" });
+    } finally { rmSync(sandbox, { recursive: true, force: true }); }
+  });
+}

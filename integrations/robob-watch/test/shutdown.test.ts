@@ -113,8 +113,8 @@ for (const [signal, leaderExits] of [["SIGTERM", false], ["SIGTERM", true], ["EX
   }, 8000);
 }
 
-for (const owner of ["runner", "library"] as const) for (const release of [false, true]) {
-  test(`relay contention preserves shutdown and retries (owner=${owner}, release=${release})`, async () => {
+for (const owner of ["runner", "library"] as const) for (const release of [false, true]) for (const lockMode of ["IMMEDIATE", "EXCLUSIVE"]) {
+  test(`relay contention preserves shutdown and retries (owner=${owner}, release=${release}, lock=${lockMode})`, async () => {
     const sandbox = mkdtempSync(join(tmpdir(), "watch-locked-shutdown-"));
     const root = join(sandbox, "root"), held = join(root, "watchers", "held"), blocked = join(root, "watchers", "blocked");
     for (const [id, dir, check] of [
@@ -147,7 +147,7 @@ for (const owner of ["runner", "library"] as const) for (const release of [false
       expect(await until(() => !!recordedPid(join(held, "check.pid")) && !!recordedPid(join(held, "descendant.pid")), 3000)).toBe(true);
       pid = recordedPid(join(held, "check.pid")); descendant = recordedPid(join(held, "descendant.pid"));
       lock = new Database(join(root, "relay-lock.sqlite"));
-      lock.exec("BEGIN IMMEDIATE");
+      lock.exec(`BEGIN ${lockMode}`);
       child.stdin.write("attempt\n");
       expect(await until(() => existsSync(attempted), 1000)).toBe(true);
       expect(await until(() => existsSync(responsive), 1000)).toBe(true);
