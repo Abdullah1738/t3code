@@ -201,7 +201,8 @@ def dry_environment(args):
         scratch_tree(wd, wd)
     updates = {'WATCH_DIR': str(wd), 'PYTHONDONTWRITEBYTECODE': '1', 'INBOX_TRIAGE_DRY_RUN': '1'}
     for key, fallback in (('TOOLLOG_DIR', wd / 'diagnostics/tools/watchers'),
-                          ('ROBOB_TOOL_LOG_DIR', wd / 'diagnostics/tools')):
+                          ('ROBOB_TOOL_LOG_DIR', wd / 'diagnostics/tools'),
+                          ('MSGS_LOG_DIR', wd / 'diagnostics/archive')):
         requested = Path(os.environ.get(key, str(fallback))).resolve()
         updates[key] = str(requested if wd in requested.parents or requested == wd else fallback)
         if wd not in Path(updates[key]).resolve().parents and Path(updates[key]).resolve() != wd:
@@ -687,6 +688,9 @@ def archive_reads(mc, dry):
 def dry_archive_worker(argv):
     if not argv or argv[0] not in ('search', 'show'):
         raise ValueError('dry archive worker only permits search and show')
+    # Archive search now records timing even for reads; keep that child log in scratch.
+    logs = os.environ.get('TOOLLOG_DIR') or str(Path(os.environ['WATCH_DIR']) / 'diagnostics/archive')
+    os.environ['MSGS_LOG_DIR'] = logs
     source = Path(__file__).resolve().parents[3] / 'message-archive/src/msgs.py'
     if not source.is_file():
         source = HOME / '.local/share/message-archive/src/msgs.py'
@@ -1018,6 +1022,10 @@ class MailAuthRejected(RuntimeError):
 
 def mail_credentials(account, refresh=False):
     mail = load_module('triage_mail_credentials', HOME / '.local/bin/mailsearch')
+    if os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1':
+        if refresh:
+            raise RuntimeError('mail: skipped (dry run, credential refresh disabled)')
+        return dry_mail_credential(mail, account, 7)
     if account == 'icloud':
         return mail.secret([mail.KC_READ, 'himalaya-icloud', 'himalaya'], 15)
     oauth = mail.mail_oauth
@@ -1063,12 +1071,22 @@ def cached_mail_credential(account, seconds):
         return None
 
 
-def prepare_mail_credentials(account, seconds, diagnostics=None, *, refresh=False):
+def prepare_mail_credentials(account, seconds, diagnostics=None, *, refresh=False, dry=False):
     # The runner kills its entire process group. A refresh must survive that too,
     # not just the narrower mail-worker timeout. Only the wait is bounded here.
     command = [sys.executable, str(Path(__file__).resolve()), '--mail-credentials', account]
     if refresh:
         command.append('--refresh-mail-credentials')
+    if dry or os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1':
+        if refresh:
+            raise RuntimeError('mail: skipped (dry run, credential refresh disabled)')
+        response = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=seconds, env={**os.environ, 'INBOX_TRIAGE_DRY_RUN': '1',
+                                                       'PYTHONDONTWRITEBYTECODE': '1'})
+        if response.returncode or not response.stdout.strip():
+            # The credential child emits only fixed dry-mode errors, never the token.
+            raise RuntimeError(response.stderr.strip() or 'mail: skipped (dry run, cached credential unavailable)')
+        return response.stdout.strip()
     path = credential_guard_path(account)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a+') as guard:
@@ -1122,10 +1140,9 @@ def mail_auth_transport(factory, *args, **kwargs):
     return connection
 
 
-def dry_mail_connect(mail, account, timeout):
-    cfg = mail.ACCOUNTS[account]
-    if cfg['auth'] == 'icloud':
-        return mail.connect(account, timeout)
+def dry_mail_credential(mail, account, timeout):
+    if mail.ACCOUNTS[account]['auth'] == 'icloud':
+        return mail.secret([mail.KC_READ, 'himalaya-icloud', 'himalaya'], timeout)
     # ortie token show can refresh. Read only the stored access token; the normal OAuth
     # connection also writes heal/good-IP state, so replay authenticates directly.
     response = subprocess.run([mail.KC_READ, f'ortie-{account}'], capture_output=True, text=True,
@@ -1140,6 +1157,14 @@ def dry_mail_connect(mail, account, timeout):
             raise RuntimeError('mail: skipped (dry run, cached token expired)')
     except (ValueError, TypeError, AttributeError):
         raise RuntimeError('mail: skipped (dry run, cached credential unavailable)') from None
+    return token
+
+
+def dry_mail_connect(mail, account, timeout, credential=None):
+    cfg = mail.ACCOUNTS[account]
+    if cfg['auth'] == 'icloud':
+        return mail.connect(account, timeout)
+    token = credential if credential is not None else dry_mail_credential(mail, account, timeout)
     connection = mail.imaplib.IMAP4_SSL(cfg['host'], timeout=timeout)
     try:
         connection.authenticate('XOAUTH2', lambda _: f'user={cfg["user"]}\x01auth=Bearer {token}\x01\x01'.encode())
@@ -1158,7 +1183,8 @@ def mail_worker(account, request):
     # Credentials only cross stdin. No refresh-capable command runs in this process.
     credential = request['credential']
     mail.secret = lambda *_: credential
-    if account != 'icloud':
+    dry = request.get('since') is not None or os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1'
+    if account != 'icloud' and not dry:
         oauth = mail.mail_oauth
         oauth.get_token = lambda *_: credential
         def refresh_outside_fetch(*_, **__):
@@ -1180,11 +1206,14 @@ def mail_worker(account, request):
         if result is not None:
             progress['result'] = copy.deepcopy(result)
         if request.get('progress_path'):
-            atomic(Path(request['progress_path']), progress)
+            path = Path(request['progress_path'])
+            if dry:
+                scratch_destination(path, Path(os.environ['WATCH_DIR']))
+            atomic(path, progress)
     stage_started = time.monotonic()
     save('connect')
     connect_start = time.monotonic()
-    M = dry_mail_connect(mail, account, 7) if since is not None else mail.connect(account, 7)
+    M = dry_mail_connect(mail, account, 7, credential) if dry else mail.connect(account, 7)
     progress['connect_ms'] = round((time.monotonic() - connect_start) * 1000)
     stage_started = time.monotonic()
     try:
@@ -1262,10 +1291,12 @@ def run_mail(account, request):
             'credential_refresh_attempts': 0,
             'timed_out': False, 'stage': 'credential', 'connect_ms': None}
     payload = dict(request)
+    dry = request.get('since') is not None or os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1'
     wd = Path(os.environ.get('WATCH_DIR', Path(__file__).resolve().parent))
-    path = wd / f'mail-progress-{account}.json' if request.get('since') is None else None
-    if path:
-        payload['progress_path'] = str(path)
+    path = wd / f'mail-progress-{account}.json'
+    if dry:
+        scratch_destination(path, wd)
+    payload['progress_path'] = str(path)
     def saved():
         record = read_json(path, {}) if path else {}
         return record if record.get('cursor_before') == request.get('cursor') else {}
@@ -1282,7 +1313,8 @@ def run_mail(account, request):
             if remaining <= 0:
                 raise TimeoutError('mail credential budget exceeded')
             payload['credential'] = prepare_mail_credentials(
-                account, min(5 if request.get('fast') else 8, remaining), info, refresh=refresh)
+                account, min(5 if request.get('fast') else 8, remaining), info, refresh=refresh,
+                **({'dry': True} if dry else {}))
         except Exception as error:
             info['credential_error'] = ('refresh_inflight' if str(error) == 'refresh_inflight' else
                                         f'{type(error).__name__}: {clean(str(error), 160)}')
@@ -1291,7 +1323,7 @@ def run_mail(account, request):
             info['credential_ms'] += round((time.monotonic()-credential_start)*1000)
         info['stage'] = 'connect'
     try:
-        old = saved()
+        old = saved() if not dry else {}
         if old.get('result'):
             info.update(stage='recovered', credential_ms=0)
             return complete(old['result'])
@@ -1299,6 +1331,8 @@ def run_mail(account, request):
         try:
             result = run_mail_fetch(account, payload, deadline=deadline)
         except MailAuthRejected:
+            if dry:
+                raise RuntimeError('mail: skipped (dry run, cached credential rejected)') from None
             info['credential_refresh_attempts'] = 1
             credentials(refresh=True)
             payload['credential_refreshed'] = True
@@ -2855,8 +2889,9 @@ def main():
     args = parser.parse_args()
     if args.dry_archive_worker is not None:
         return dry_archive_worker(args.dry_archive_worker)
-    if args.dry_run_hours is not None and (args.expect_auth or args.mail_worker):
-        parser.error('--dry-run-hours cannot be combined with --expect-auth or --mail-worker')
+    if args.dry_run_hours is not None and (args.expect_auth or args.mail_worker or args.mail_credentials
+                                           or args.refresh_mail_credentials):
+        parser.error('--dry-run-hours cannot be combined with auth or mail worker options')
     if args.expect_auth:
         expect_auth(args.expect_auth, args.account)
         return 0
@@ -2865,7 +2900,9 @@ def main():
             return 75
         try:
             print(mail_credentials(args.mail_credentials, refresh=args.refresh_mail_credentials))
-        except Exception:
+        except Exception as error:
+            if os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1':
+                print(str(error), file=sys.stderr)
             return 1
         return 0
     if args.mail_worker:

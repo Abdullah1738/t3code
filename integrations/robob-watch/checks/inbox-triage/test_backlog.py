@@ -327,6 +327,7 @@ class BacklogTests(unittest.TestCase):
 
     def oauth_healing(self, account, fast, *, still_rejected=False, accept_frontend=None,
                       transport_errors=(), reject_old=True, pinned=False, outer_retry=False):
+        (self.root / f'mail-progress-{account}.json').unlink(missing_ok=True)
         helper_path = Path(t.__file__).resolve().parents[3] / 'local-helpers/libexec/mail/mail_oauth.py'
         real_load = t.load_module
         state = {'token': 'rejected-fixture', 'fetching': False, 'refreshes': 0,
@@ -385,7 +386,7 @@ class BacklogTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 1, '', f'{type(error).__name__}: {error}')
             finally:
                 state['fetching'] = False
-        request = {**self.request, 'fast': fast, 'since': 1000}
+        request = {**self.request, 'fast': fast}
         # HOME prevents the real helper from reading the owner's preferred Outlook IP.
         with patch.dict(os.environ, {'HOME': str(self.root)}), \
              patch.object(t, 'load_module', side_effect=load), \
@@ -404,7 +405,7 @@ class BacklogTests(unittest.TestCase):
             else:
                 result = t.run_mail(account, request)
                 info = result['mail_progress']
-                self.assertEqual(result['cursor']['uid'], 100)
+                self.assertEqual(result['cursor']['uid'], t.MAIL_LIMIT)
             refreshed = reject_old or bool(accept_frontend)
             self.assertEqual(state['refreshes'], int(refreshed))
             self.assertEqual(workers.call_count, 2 if refreshed or outer_retry else 1)
@@ -538,6 +539,7 @@ class BacklogTests(unittest.TestCase):
         self.assertEqual(normal, fast)
 
     def test_real_oauth_refresh_lock_completes_while_watcher_guard_is_held(self):
+        (self.root / f'mail-progress-{account}.json').unlink(missing_ok=True)
         helper_path = Path(t.__file__).resolve().parents[3] / 'local-helpers/libexec/mail/mail_oauth.py'
         oauth = t.load_module('guard_test_oauth', helper_path)
         calls = []

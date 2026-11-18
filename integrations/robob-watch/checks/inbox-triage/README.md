@@ -55,6 +55,6 @@ WATCH_DIR="$triage_replay_dir" TOOLLOG_DIR="$triage_replay_dir/tool-logs" \
   /usr/bin/python3 -B triage.py --dry-run-hours 2 --report "$triage_replay_dir/replay.json"
 ```
 
-Dry runs require an explicit scratch `WATCH_DIR` and refuse the live watch directory.
+Dry runs require an explicit scratch `WATCH_DIR` and refuse the live watch directory. Mail uses cached credentials only; expired or rejected credentials become source errors without refresh or healing. Worker progress and archive timing logs stay in scratch.
 
 Usage and cost are logged per real run; empty batches have no model cost. The ordinary schedule has up to 288 checks/day, not necessarily 288 model calls. The independent fast poll makes no model calls. Review actual token/USD usage before estimating a monthly total.

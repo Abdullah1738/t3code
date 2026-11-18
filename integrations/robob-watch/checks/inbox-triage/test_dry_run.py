@@ -292,6 +292,87 @@ class DryRunTests(unittest.TestCase):
         self.assertIn('mail: skipped (dry run, cached token expired)', json.loads(report.read_text())['source_errors']['gmail'])
         mail.connect.assert_not_called()
 
+    def test_cached_mail_failures_never_refresh_or_write_outside_scratch(self):
+        for fast in (False, True):
+            for failure in ('expired', 'missing', 'rejected'):
+                with self.subTest(fast=fast, failure=failure):
+                    mail = DryMailTests().mail()
+                    mail.imaplib.IMAP4_SSL.return_value.authenticate.side_effect = t.imaplib.IMAP4.error('private rejection')
+                    blob = {'access_token': 'synthetic-fixture', 'issued_at': self.now, 'expires_in': 3600}
+                    if failure == 'expired':
+                        blob['issued_at'] = 1
+                    elif failure == 'missing':
+                        blob = {}
+                    calls = []
+                    base_load = t.load_module
+                    def load(name, path):
+                        return mail if Path(path) == self.home / '.local/bin/mailsearch' else base_load(name, path)
+                    def process(command, **kwargs):
+                        calls.append(command)
+                        if command[0] == mail.KC_READ:
+                            return subprocess.CompletedProcess(command, 0, json.dumps(blob), '')
+                        if '--mail-credentials' in command:
+                            self.assertNotIn('--refresh-mail-credentials', command)
+                            env = kwargs['env']
+                            self.assertEqual(env['PYTHONDONTWRITEBYTECODE'], '1')
+                            self.assertEqual(env['INBOX_TRIAGE_DRY_RUN'], '1')
+                            self.assertIn(self.scratch.resolve(), Path(env['TOOLLOG_DIR']).resolve().parents)
+                            self.assertNotIn('ROBOB_ADMISSION_PATH', env)
+                            with patch.dict(os.environ, env):
+                                try:
+                                    credential = t.mail_credentials('gmail')
+                                    return subprocess.CompletedProcess(command, 0, credential, '')
+                                except Exception as error:
+                                    return subprocess.CompletedProcess(command, 1, '', str(error))
+                        if '--mail-worker' in command:
+                            request = json.loads(kwargs['input'])
+                            self.assertEqual(Path(request['progress_path']).resolve(), self.scratch.resolve() / 'mail-progress-gmail.json')
+                            try:
+                                result = t.mail_worker('gmail', request)
+                                return subprocess.CompletedProcess(command, 0, json.dumps(result), '')
+                            except Exception as error:
+                                return subprocess.CompletedProcess(command, 1, '', f'{type(error).__name__}: {error}')
+                        return self.helper(command, **kwargs)
+                    empty = {'cursor': 0, 'items': [], 'drops': {}, 'scanned': 0}
+                    report = self.scratch / 'cached-mail.json'
+                    args = ['triage.py', '--dry-run-hours', '1', '--report', str(report)]
+                    if fast:
+                        args.append('--fast-only')
+                    with patch.object(t, 'ACCOUNTS', ('gmail',)), patch.object(t, 'load_module', side_effect=load), \
+                         patch.object(t, 'active_watchers', return_value=[]), patch.object(t, 'noise_rules', return_value=[]), \
+                         patch.object(t.subprocess, 'run', side_effect=process), \
+                         patch.object(t.subprocess, 'Popen', side_effect=AssertionError('must not launch refresh')) as detached, \
+                         patch.object(t, 'collect_whatsapp', return_value=empty), patch.object(t, 'collect_imessage', return_value=empty), \
+                         patch.object(sys, 'argv', args), contextlib.redirect_stdout(io.StringIO()):
+                        before = snapshot(self.root, self.scratch)
+                        self.assertEqual(t.main(), 0 if fast else 1)
+                        self.assertEqual(snapshot(self.root, self.scratch), before)
+                    if not fast:
+                        message = {'expired': 'cached token expired', 'missing': 'cached credential unavailable',
+                                   'rejected': 'cached credential rejected'}[failure]
+                        self.assertIn(message, json.loads(report.read_text())['source_errors']['gmail'])
+                    detached.assert_not_called()
+                    mail.connect.assert_not_called()
+                    self.assertEqual(sum('--mail-credentials' in c for c in calls), 1)
+                    self.assertFalse(any('--refresh-mail-credentials' in c for c in calls))
+                    self.assertFalse((self.scratch / 'credential-gmail.lock').exists())
+
+    def test_dry_parent_refuses_auth_refresh_signal_and_overrides_progress_path(self):
+        for fast in (False, True):
+            with self.subTest(fast=fast), t.dry_environment(types.SimpleNamespace(dry_run_hours=1, report=None)), \
+                 patch.object(t, 'prepare_mail_credentials', return_value='fixture') as credentials, \
+                 patch.object(t, 'run_mail_fetch', side_effect=t.MailAuthRejected('fixture')) as fetch:
+                before = snapshot(self.root, self.scratch)
+                with self.assertRaisesRegex(RuntimeError, 'cached credential rejected') as caught:
+                    t.run_mail('gmail', {'since': self.now - 3600, 'now': self.now, 'fast': fast,
+                                        'progress_path': str(self.live / 'mail-progress-gmail.json')})
+                self.assertEqual(snapshot(self.root, self.scratch), before)
+                self.assertEqual(credentials.call_count, 1)
+                self.assertFalse(credentials.call_args.kwargs['refresh'])
+                self.assertTrue(credentials.call_args.kwargs['dry'])
+                self.assertEqual(fetch.call_args.args[1]['progress_path'], str(self.scratch.resolve() / 'mail-progress-gmail.json'))
+                self.assertEqual(caught.exception.mail_progress['credential_refresh_attempts'], 0)
+
     def test_live_money_entry_points_keep_default_live_books(self):
         charge = self.item('mail:charge', 'EmiratesNBD',
                            'Purchase of EUR 100 with Credit Card ending 1111 at Acme, Amsterdam. Avl Cr. Limit')
@@ -369,7 +450,7 @@ class DrySQLiteTests(unittest.TestCase):
                         self.assertEqual(wa.resolve(reader, '1@s.whatsapp.net'), ['1@s.whatsapp.net', '99@lid'])
                         self.assertEqual(wa.name_of(reader, '1@s.whatsapp.net'), 'Fixture contact')
                 self.assertEqual(self.unchanged(), before)
-                self.assertEqual(set(self.root.rglob('*')), names)
+                self.assertEqual({p for p in self.root.rglob('*') if p != self.scratch and self.scratch not in p.parents}, names)
                 self.assertEqual(Path(str(path) + '-shm').exists(), wal)
 
     def test_archive_search_and_show_use_same_boundary_in_isolated_worker(self):
@@ -397,14 +478,14 @@ class DrySQLiteTests(unittest.TestCase):
                     for suffix in ('-wal', '-shm'):
                         Path(str(archive / 'index.db') + suffix).unlink(missing_ok=True)
                 before = self.unchanged()
-                names = set(self.root.rglob('*'))
+                names = {p for p in self.root.rglob('*') if p != self.scratch and self.scratch not in p.parents}
                 with patch.dict(os.environ, {'MSGS_ROOT': str(archive)}), t.archive_reads(mc, dry=True):
                     rows = mc.charges.search('withdrawal', '1970-01-01', source='email')
                     self.assertEqual(len(rows), 1)
                     self.assertIn('Offline fixture', mc.charges.show(rows[0]))
                 self.assertIs(mc.charges.msgs, original)
                 self.assertEqual(self.unchanged(), before)
-                self.assertEqual(set(self.root.rglob('*')), names)
+                self.assertEqual({p for p in self.root.rglob('*') if p != self.scratch and self.scratch not in p.parents}, names)
 
     def test_wal_without_shared_memory_refuses_instead_of_creating_it(self):
         path = self.root / 'missing-shm.db'
@@ -446,6 +527,18 @@ class DryMailTests(unittest.TestCase):
                 mail.connect.assert_not_called()
                 mail.imaplib.IMAP4_SSL.assert_not_called()
 
+    def test_cached_credential_entrypoint_refuses_explicit_refresh(self):
+        mail = self.mail()
+        with patch.dict(os.environ, {'INBOX_TRIAGE_DRY_RUN': '1'}), \
+             patch.object(t, 'load_module', return_value=mail), \
+             patch.object(t.subprocess, 'run') as read, patch.object(t.subprocess, 'Popen') as detached:
+            for entry in (lambda: t.mail_credentials('gmail', refresh=True),
+                          lambda: t.prepare_mail_credentials('gmail', 7, refresh=True)):
+                with self.assertRaisesRegex(RuntimeError, 'credential refresh disabled'):
+                    entry()
+            read.assert_not_called()
+            detached.assert_not_called()
+
     def test_icloud_still_uses_only_its_read_only_password_path(self):
         mail = self.mail()
         self.assertIs(t.dry_mail_connect(mail, 'icloud', 7), mail.connect.return_value)
@@ -465,17 +558,18 @@ class DryMailTests(unittest.TestCase):
         mail.connect.assert_not_called()
 
     def test_worker_selects_read_only_auth_only_for_replay(self):
-        request = {'now': time.time(), 'since': 1, 'initialized_at': 1, 'baseline': True}
+        request = {'credential': 'synthetic-fixture', 'now': time.time(), 'since': 1, 'initialized_at': 1, 'baseline': True}
         connection = Mock()
         connection.select.return_value = ('OK', [])
         connection.response.side_effect = lambda key: (key, [b'2' if key == 'UIDVALIDITY' else b'3'])
         connection.uid.return_value = ('OK', [b''])
         mail = self.mail()
+        mail.mail_oauth = types.SimpleNamespace(imaplib=types.SimpleNamespace(IMAP4_SSL=Mock()), _PinnedIMAP=Mock())
         mail.connect.return_value = connection
         with patch.object(t, 'load_module', return_value=mail), \
              patch.object(t, 'dry_mail_connect', return_value=connection) as dry_connect:
             self.assertEqual(t.mail_worker('gmail', request)['scanned'], 0)
-            dry_connect.assert_called_once_with(mail, 'gmail', 7)
+            dry_connect.assert_called_once_with(mail, 'gmail', 7, 'synthetic-fixture')
             mail.connect.assert_not_called()
             dry_connect.reset_mock()
             t.mail_worker('gmail', {**request, 'since': None})
