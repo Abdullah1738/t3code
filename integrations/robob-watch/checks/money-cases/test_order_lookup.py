@@ -1,9 +1,12 @@
 """Window proofs, source limits and sanitized persistent detail caching."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import datetime as dt
 import fcntl
 import importlib.util
 import json
-import os
 from pathlib import Path
 import sys
 import subprocess

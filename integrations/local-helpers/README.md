@@ -5,6 +5,8 @@ mail OAuth heal and OTP watcher, the shared link-preview helper, the quick
 card builder, the MacBook power alerts and the Juno proxy. Edit them here,
 then install.
 
+`qcard --send CHAT --session ID` targets CHAT: own-chat app reply, `app --to` for another local chat, or an `agent-ask` link relay for a remote chat. Without `--session`, it only publishes/shares. The default key is `qcard:SLUG:CHAT`; retain `--key` across retries. Tests can set `QCARD_BRIDGE` (shell-split command) and `QCARD_BRIDGE_STATE` (bridge state directory).
+
 | Source | Installed as | Used by |
 | --- | --- | --- |
 | `bin/opencode`, `libexec/opencode/` | `~/.local/bin/opencode`, `~/.local/libexec/opencode/` | terminal CLI shim; shares the service binary path with `opencode-web` |
@@ -112,6 +114,19 @@ Nothing is sent unless that file was written.
 Tests: `/usr/bin/python3 -m unittest discover -s tests` (each install test runs
 the installer from a throwaway git copy of this package, with a temp `HOME` and
 a fake `launchctl`; the power alert tests use a fake `pmset` and notifier).
+
+## timeout
+
+macOS has no `timeout(1)`, and agents write `timeout 40 cmd` out of Linux habit.
+`bin/timeout` is a GNU-compatible Perl shim installed as `~/.local/bin/timeout`:
+`timeout [-s SIG] [-k DUR] [--preserve-status] [--foreground] [-v] DURATION CMD...`,
+durations take `s`/`m`/`h`/`d`, and it exits 124 on timeout, 137 when KILL was
+needed, 125/126/127 for its own, can't-run and not-found errors. The command
+runs in its own process group so the signal also reaches its children; TERM,
+INT, HUP and QUIT sent to timeout are passed on. When timeout owns the terminal
+it hands it to that group (so the command can read it) and takes it back after;
+Ctrl-Z stops both. Tests:
+`/usr/bin/python3 -B -m unittest discover -s tests -p test_timeout.py`.
 
 ## Quint
 

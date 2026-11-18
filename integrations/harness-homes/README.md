@@ -8,8 +8,8 @@ Claude Code and Codex agents Robob runs do not use the personal `~/.claude` or
 - Codex home: `~/.robob/harness-homes/codex` (`CODEX_HOME`)
 - Codex Terra home: `~/.robob/harness-homes/codex-cu` (`CODEX_HOME`)
 
-The generator uses only Python's stdlib; shared servers reuse their installed
-MCP SDK venvs. Auth is never written here: credentials come from each
+The generator uses only Python's stdlib; shared servers use dedicated Python
+runtimes. Auth is never written here: credentials come from each
 instance's environment, and OAuth state stays in the home it was created in.
 
 ## Files
@@ -21,7 +21,7 @@ instance's environment, and OAuth state stays in the home it was created in.
   idempotently (atomic writes, one line per changed file). `check [--home-root DIR]`
   compares their owned contents with the manifest and catalog. `mcp-diff`
   compares the manifest's MCPs with OpenCode's (see "MCP parity with OpenCode").
-- `vendor/codex-models-0.166.0.json`: Codex's model catalog at rust-v0.166.0
+- `vendor/codex-models-0.169.1.json`: Codex's model catalog at rust-v0.169.1
   (Apache-2.0). `vendor/README.md` has the URL and sha256.
 - `overlays/claude.md`, `overlays/codex.md`, `overlays/codex-cu.md`:
   per-harness instructions. `codex-cu` gets the shared Codex overlay first,
@@ -38,7 +38,10 @@ instance's environment, and OAuth state stays in the home it was created in.
 
 Flighty uses a private copy of its venv's base Python at
 `~/.local/share/shared-mcp-flighty/python`, with packages from the existing venv.
-InBody keeps its existing venv. They serve `127.0.0.1:18766/mcp` and
+InBody uses Homebrew Python 3.14 with a dedicated venv at
+`~/.local/share/shared-mcp-inbody/python`. Its package and locked dependencies
+are installed non-editably from an internal-disk staging copy; runtime imports
+never use the ExternalSSD source or venv. They serve `127.0.0.1:18766/mcp` and
 `127.0.0.1:18767/mcp`. Their LaunchAgents restart failed servers; `install.zsh
 --check` also calls Flighty's `search_airports` to catch database access errors.
 cua-driver retains a separate MCP connection per client because its transport
@@ -57,7 +60,7 @@ Run these steps in order from `integrations/harness-homes`:
 2. Add the printed binary in **System Settings > Privacy & Security > Full Disk
    Access**. Grant access to this copy only; the shared uv interpreter is used
    by other projects.
-3. `/bin/zsh -f install.zsh` syncs the copy before loading the services, then
+3. `/bin/zsh -f install.zsh` prepares both runtimes before loading the services, then
    checks them before switching config. A failed install restores the previous
    package/config/jobs and leaves the dedicated copy in place.
 4. `install.zsh --check` verifies the installed homes, plists, jobs and endpoints.
@@ -67,6 +70,12 @@ a new grant. InBody's check lists tools without calling its authenticated API.
 The temporary servers started by `shared/smoke.py` use the same interpreters as
 the LaunchAgents, but inherit the caller's access. Only the installed service's
 health check proves Flighty's database is readable under launchd.
+
+`install.zsh --inbody-python` prepares only InBody (no jobs or harness config).
+Normal install preflights both runtimes; `--dry-run` writes neither. Unchanged
+InBody build inputs leave its runtime untouched. `--check` rejects shared MCP
+startup paths/interpreters on `/Volumes/`; failed startup prints the jobs' last
+20 error-log lines without changing the logs.
 
 ## Source parity checks
 
@@ -145,6 +154,12 @@ cd integrations/harness-homes
 /opt/homebrew/bin/python3 tests/test_generate_homes.py
 ```
 
+Run the package suite offbox from the repo root, including its MCP HTTP fixtures:
+
+```sh
+offbox run -- 'uv run --no-project --with pytest==9.0.2 --with mcp==1.27.2 --with httpx==0.28.1 python -m pytest integrations/harness-homes/tests -q'
+```
+
 To verify the packaged draft without touching live homes, use a fresh temporary
 root outside the configured homes:
 
@@ -170,7 +185,7 @@ the homes until the release; the evaluator installs them.
 - Refuses a home inside `~/.claude`, `~/.codex` or `/Volumes/ExternalSSD/codex`.
 - Skill links never delete a real directory or a symlink pointing elsewhere.
   Two skills with the same name stop the run with both paths.
-- The Codex catalog changes only the three extended slugs. The CU catalog retains
+- The Codex catalog changes only the extended slugs (GPT-6.2 Sol/Astra, 6 Astra, 6.1 Sol/Terra). The CU catalog retains
   those entries, raises Terra to 1,050,000, and adds its prefixed alias using
   the original Terra metadata. Compaction is 450,000.
 - Shared MCPs, skills and Codex-scoped hooks also go to `codex-cu`; native

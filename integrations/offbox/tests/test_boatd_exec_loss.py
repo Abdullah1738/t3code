@@ -22,21 +22,31 @@ class ExecLoss(Base):
         return b, p
 
     def execute(self, b, p, *, error=None, rc=1, text='', view=None):
-        def process(args, **kw):
-            if args[0] != 'incus':
-                return REAL_POPEN(args, **kw)
-            if 'stdout' in kw:
-                kw['stderr'].write(text.encode())
-            return Mock(wait=Mock(return_value=rc))
-        with patch.object(boatd, 'load_cfg'), patch.object(boatd, 'admit', return_value=0), \
-             patch.object(boatd, 'ct_exec', side_effect=error), \
-             patch.object(boatd, 'disk_preflight', return_value=0), \
-             patch.object(boatd.subprocess, 'Popen', side_effect=process), \
-             patch.object(boatd, 'snapshot'), patch.object(boatd, 'prune_snaps'), \
-             patch.object(boatd, 'recover_probe', return_value=view or self.clean()), \
-             patch.object(boatd, 'command_probe', return_value=view or self.clean()):
-            boatd.run_cmd(b, p)
-        return dict(self.status(b, p))
+        # These stream-loss records come from the pre-receipt foreground launcher. Recovery must
+        # still accept them, but no new command is dispatched through that transport.
+        row = self.status(b,p)
+        transport = error is not None or boatd.stream_failure(text) or rc < 0
+        if transport and (row['started_at'] is not None or error is None):
+            cause = 'incus_unavailable' if 'shutting down' in str(error).lower() else ('runner_restart' if rc < 0 else 'exec_stream_lost')
+            info = boatd.interruption(row,cause)
+            info['phase'] = 'running'
+            (boatd.cmd_dir(b)/f'{p}.err').write_text(text)
+            if row['started_at'] is None:
+                self.con.execute("UPDATE commands SET status='running',started_at=? WHERE box_id=? AND pid=?",(boatd.now(),b,p))
+            row = self.status(b,p)
+            result = dict(attempt=row['attempt'],started_at=row['started_at'],interruption=info)
+            view = view or self.clean()
+            boatd.toollog.emit('boatd','run.exec_stream_lost',kind='error',ok=False,
+                              ids={'box':b,'run':row['run_id']},props={'incusRc':rc})
+            boatd.settle_transport(self.con,row,result,view=view)
+        else:
+            def complete(con,c,**kwargs):
+                boatd.record_guest(con,c,dict(state='exited',exit_code=rc))
+            with patch.object(boatd,'guest_command',return_value={'state':'absent'}), \
+                 patch.object(boatd,'ct_exec',side_effect=error),patch.object(boatd,'follow_guest',side_effect=complete), \
+                 patch.object(boatd,'disk_preflight',return_value=0),patch.object(boatd,'admit',return_value=0):
+                boatd.run_cmd(b,p)
+        return dict(self.status(b,p))
 
     def clean(self, rc=None):
         return dict(readable=True, pids=[], box_rc=rc)
@@ -53,10 +63,23 @@ class ExecLoss(Base):
         self.assertEqual(boatd.read_result(b,p,1)['reason'], 'before_spawn')
         self.assertFalse(self.f.spawned)
 
-    def test_retry_receipt_sql_gap_requeues_next_attempt_once(self):
-        for unavailable in (False,True):
-            with self.subTest(unavailable=unavailable):
-                self.retry_receipt_gap(unavailable)
+    def test_retry_preference_cannot_replay_after_result_sql_gap(self):
+        b,p=self.command(retry=1,prior=True)
+        con=self.con
+        class InterruptedCommit:
+            def execute(self,sql,*args):
+                if sql.startswith('UPDATE commands SET status='):
+                    raise OSError('interrupted after receipt')
+                return con.execute(sql,*args)
+        c=self.status(b,p)
+        result=dict(attempt=1,interruption=boatd.interruption(c,'exec_stream_lost'))
+        with self.assertRaises(OSError):
+            boatd.settle_transport(InterruptedCommit(),c,result,view=self.clean(141))
+        self.assertFalse(boatd.read_result(b,p,1)['interruption']['retry'])
+        with patch.object(boatd,'command_probe',return_value=self.clean(141)):
+            boatd.reconcile(self.con)
+        self.assertEqual((self.status(b,p)['status'],self.status(b,p)['attempt']),('interrupted',1))
+        self.assertEqual(self.f.spawned,[])
 
     def retry_receipt_gap(self,unavailable):
         b=self.box(f'bx_retrygap{unavailable}');p=self.cmd(b,retry=1)
@@ -124,21 +147,54 @@ class ExecLoss(Base):
         for rc in (None,0,1):
             with self.subTest(rc=rc):
                 b=self.box(f'bx_deleted{rc}');p=self.cmd(b)
+                boatd.write_json(boatd.cmd_dir(b)/f'{p}.context.json', {})
                 if rc is not None:
                     boatd.write_json(boatd.result_path(b,p),dict(attempt=1,status='exited',exit_code=rc,ended_at=110))
                 with patch.object(boatd.threading,'Thread',CapturedThread),patch.object(boatd,'run_processes',return_value=[]):
-                    boatd.delete_box(self.con,b)
+                    token=boatd.offbox_protection.CALLER.set(dict(override=True,holder='ardud',actor='client:release'))
+                    try: boatd.delete_box(self.con,b)
+                    finally: boatd.offbox_protection.CALLER.reset(token)
                 missing=subprocess.CompletedProcess([],1,b'',b'Error: Instance not found\n')
                 def probe(c):
                     with patch.object(boatd,'incus',return_value=missing):
                         return REAL_PROBE(c)
-                with patch.object(boatd,'command_probe',side_effect=probe):
+                with patch.object(boatd,'command_probe',side_effect=probe), patch.object(boatd,'incus',return_value=missing):
                     boatd.settle_cmd(self.con,self.status(b,p))
                     boatd.settle_cmd(self.con,self.status(b,p))
+                    boatd.reconcile(self.con)
                 row=self.status(b,p)
                 self.assertEqual((row['status'],row['exit_code']),('lost',143) if rc is None else ('exited',rc))
                 self.assertEqual(json.loads(row['metrics'])['kill']['remaining'],0)
                 self.assertFalse(json.loads(row['metrics']).get('kill_request'))
+                self.assertIn('box deleted; only output copied before deletion is available',
+                              (boatd.cmd_dir(b)/f'{p}.err').read_text())
+
+    def test_kill_keeps_modern_signal_receipt_before_host_completion(self):
+        for rc in (141,143):
+            for reattached in (False,True):
+                for pending in (False,True):
+                    with self.subTest(rc=rc,reattached=reattached,pending=pending):
+                        b=self.box(f'bx_modern_signal_{rc}_{reattached}_{pending}'); p=self.cmd(b)
+                        root=self.tmp/f'proc-{b}'/'42/root/run/boatd'; root.mkdir(parents=True)
+                        (root/f'{p}.1.started').write_text(json.dumps(dict(pid=10,attempt=1,cgroup_joined=True)))
+                        receipt=root/f'{p}.receipt'; receipt.mkdir(); (receipt/'exit').write_text(str(rc))
+                        if reattached: boatd.record_guest(self.con,self.status(b,p),{'state':'alive'})
+                        self.f.guests[b,p]={'state':'exited','exit_code':rc}
+                        answer=subprocess.CompletedProcess([],0,b'{"status":"Running","pid":42}')
+                        def probe(c):
+                            with patch.object(boatd,'PROC_ROOT',root.parents[3]), patch.object(boatd,'incus',return_value=answer), \
+                                    patch.object(boatd,'run_processes',return_value=None if pending else []):
+                                view=REAL_PROBE(c)
+                            self.assertEqual(view['receipt_kind'],'guest')
+                            return view
+                        boatd.stage_kill(self.con,b,p,False)
+                        with patch.object(boatd,'command_probe',side_effect=probe):
+                            boatd.restore_kill_result(self.con,self.status(b,p),{})
+                        if pending:
+                            self.assertEqual(self.status(b,p)['status'],'running')
+                            with patch.object(boatd,'command_probe',return_value=self.clean(None)):
+                                boatd.restore_kill_result(self.con,self.status(b,p),{})
+                        self.assertEqual((self.status(b,p)['status'],self.status(b,p)['exit_code']),('exited',rc))
 
     def test_missing_instance_responses_are_distinct_from_unavailable_daemon(self):
         b,p=self.command(prior=True)
@@ -157,8 +213,10 @@ class ExecLoss(Base):
                 self.assertEqual(view.get('readable',False),missing)
                 if missing:
                     self.assertEqual(view['pids'],[])
+                    self.assertEqual(boatd.guest_command(self.status(b,p)),{'state':'gone','deleted':True})
                 else:
                     self.assertEqual(view['reason'],'incus_unavailable')
+                    with self.assertRaises(boatd.Fail): boatd.guest_command(self.status(b,p))
 
     def test_failed_delete_keeps_box_and_pending_kill_unconfirmed(self):
         b,p=self.command(prior=True)
@@ -167,66 +225,67 @@ class ExecLoss(Base):
             def start(self): pass
         with patch.object(boatd.threading,'Thread',CapturedThread),patch.object(boatd,'run_processes',return_value=[]), \
              patch.object(boatd,'incus',return_value=subprocess.CompletedProcess([],1,b'',b'Error: Incus is shutting down')):
-            with self.assertRaises(boatd.Fail):
-                boatd.delete_box(self.con,b)
+            token=boatd.offbox_protection.CALLER.set(dict(override=True,holder='ardud',actor='client:release'))
+            try:
+                with self.assertRaises(boatd.Fail) as failed: boatd.delete_box(self.con,b)
+                self.assertEqual(failed.exception.code,'incus_failed')
+            finally: boatd.offbox_protection.CALLER.reset(token)
         self.assertIsNone(self.state(b)['deleted_at'])
         with patch.object(boatd,'command_probe',return_value={'reason':'incus_unavailable'}):
             boatd.settle_cmd(self.con,self.status(b,p))
         self.assertEqual(self.status(b,p)['status'],'running')
 
-    def test_29bd_replacement_preserves_original_start_and_both_invocations(self):
-        b,p = self.command(prior=True)
-        started = 1794636298.0  # 06:04:58Z, not the replacement's 06:08:17Z.
+    def test_29bd_replacement_follows_original_without_upload_or_admission(self):
+        b,p=self.command(prior=True)
+        started=1794636298.0
         self.con.execute('UPDATE commands SET started_at=? WHERE box_id=? AND pid=?',(started,b,p))
-        (boatd.cmd_dir(b)/f'{p}.out').write_text('base-1 preflight 135s\n')
-        r = self.execute(b,p,error=boatd.Fail(500,'incus_failed','Incus is shutting down'))
-        self.assertEqual((r['status'],r['started_at']), ('interrupted',started))
-        res = boatd.read_result(b,p,1)
-        self.assertEqual(res['status'],'interrupted')
-        self.assertEqual(res['interruption']['cause'],'incus_unavailable')
-        self.assertEqual(res['interruption']['phase'],'running')
-        self.assertEqual(res['invocations'][0]['previous_started_at'],started)
+        with patch.object(boatd,'follow_guest') as follow,patch.object(boatd,'ct_exec') as execute,patch.object(boatd,'admit') as admit:
+            boatd.run_cmd(b,p)
+        follow.assert_called_once();execute.assert_not_called();admit.assert_not_called()
+        self.assertEqual(self.status(b,p)['started_at'],started)
 
-    def test_incus_rejects_wrapper_exec_before_guest_marker(self):
+    def test_unanswered_launch_is_not_a_failed_start(self):
         b,p=self.command()
-        r=self.execute(b,p,text='Error: exec /usr/local/sbin/boatd-wrap: no such file or directory')
-        self.assertEqual((r['status'],r['exit_code']),('exited',90))
-        self.assertIn('nothing ran, safe to retry',(boatd.cmd_dir(b)/f'{p}.err').read_text())
+        calls=[]
+        def execute(box,command,**kwargs):
+            calls.append(command)
+            if 'nohup' in command: raise OSError('launch response lost')
+        with patch.object(boatd,'guest_command',return_value={'state':'absent'}),patch.object(boatd,'ct_exec',side_effect=execute), \
+             patch.object(boatd,'admit',return_value=0),patch.object(boatd,'disk_preflight',return_value=0),patch.object(boatd,'follow_guest') as follow:
+            boatd.run_cmd(b,p)
+        follow.assert_called_once()
+        self.assertIsNone(self.status(b,p)['exit_code'])
+        self.assertFalse(boatd.result_path(b,p).exists())
 
     def test_existing_box_receives_current_wrapper_without_evaluating_command(self):
         b,p=self.command()
-        guest=self.tmp/'guest/run/boatd'
-        marker=self.tmp/'must-not-exist'
-        command=f"echo 'quoted input' $(touch {marker})\n" + '#' * 200000
+        command="echo 'quoted input' $(must-not-run)\n"+'#'*200000
         self.con.execute('UPDATE commands SET command=? WHERE box_id=? AND pid=?',(command,b,p))
-        def transfer(box, text, input=None, **kwargs):
-            if input is None:
-                return subprocess.CompletedProcess([],0,b'',b'')
-            text=text.replace('/run/boatd',str(guest))
-            return REAL_RUN(['bash','-c',text],input=input,capture_output=True,check=True)
-        self.execute(b,p,rc=0,error=transfer)
-        self.assertEqual((guest/f'{p}.sh').read_text(),command)
-        expected=boatd.SELF.with_name('boatd-wrap').read_text().replace('/run/boatd',str(guest))
-        self.assertEqual((guest/f'{p}.1.boatd-wrap').read_text(),expected)
-        self.assertFalse(marker.exists())
+        with patch.object(boatd,'guest_command',return_value={'state':'absent'}),patch.object(boatd,'ct_exec') as transfer, \
+             patch.object(boatd,'admit',return_value=0),patch.object(boatd,'disk_preflight',return_value=0),patch.object(boatd,'follow_guest'):
+            boatd.run_cmd(b,p)
+        self.assertEqual(transfer.call_args_list[0].kwargs['input'],command.encode())
+        self.assertEqual(transfer.call_args_list[1].kwargs['input'],boatd.SELF.with_name('boatd-wrap').read_bytes())
+        self.assertNotIn(command,transfer.call_args_list[0].args[1])
 
     def test_existing_output_is_prior_start_evidence_even_if_db_is_queued(self):
-        b,p = self.command()
+        b,p=self.command()
         (boatd.cmd_dir(b)/f'{p}.err').write_text('offbox-command-started: run-fixture\n')
-        r = self.execute(b,p,error=RuntimeError('Incus is shutting down'))
-        self.assertEqual(r['status'],'interrupted')
+        with patch.object(boatd,'follow_guest') as follow,patch.object(boatd,'ct_exec') as execute:
+            boatd.run_cmd(b,p)
+        follow.assert_called_once();execute.assert_not_called()
 
     def test_guest_start_marker_is_prior_start_evidence(self):
-        b,p = self.command()
-        view=self.clean();view['marker']={'pid':10,'time':1794636298,'cgroup_joined':True}
-        r=self.execute(b,p,error=RuntimeError('Incus is shutting down'),view=view)
-        self.assertEqual(r['status'],'interrupted')
-        self.assertEqual(boatd.read_result(b,p,1)['started_at'],1794636298)
+        b,p=self.command()
+        with patch.object(boatd,'guest_command',return_value={'state':'alive'}),patch.object(boatd,'follow_guest') as follow, \
+             patch.object(boatd,'ct_exec') as execute,patch.object(boatd,'admit') as admit:
+            boatd.run_cmd(b,p)
+        execute.assert_not_called();admit.assert_not_called();follow.assert_called_once()
 
     def test_48d3_uses_box_sigpipe_and_logs_interruption(self):
         b,p = self.command()
         r=self.execute(b,p,text='Error: Lost connection to the event listener: websocket: close 1006: unexpected EOF',view=self.clean(141))
-        self.assertEqual((r['status'],r['exit_code']),('interrupted',None))
+        self.assertEqual((r['status'],r['exit_code']),('interrupted',94))
         info=json.loads(r['metrics'])['interruption']
         self.assertEqual((info['box_rc'],info['cleanup'],info['leftover_killed']),(141,'clean',0))
         ev=self.events('run.interrupted')[0]['props']
@@ -266,16 +325,12 @@ class ExecLoss(Base):
                 self.assertEqual(json.loads(r['metrics'])['interruption']['reason'],view['reason'])
                 self.assertTrue(boatd.cmd_status_json(self.con,b,p)['running'])
 
-    def test_retry_once_and_second_interruption_finishes(self):
+    def test_retry_preference_never_reexecutes_started_command(self):
         b,p=self.command(retry=1)
-        r=self.execute(b,p,text='websocket: close 1006',view=self.clean(141))
-        self.assertEqual((r['status'],r['attempt']),('queued',2))
-        self.assertEqual(self.f.spawned,[(b,p,2)])
-        self.f.active_units.clear()
-        self.con.execute("UPDATE commands SET status='running' WHERE box_id=? AND pid=?",(b,p))
-        r=self.execute(b,p,text='websocket: close 1006',view=self.clean(141))
-        self.assertEqual((r['status'],r['attempt']),('interrupted',2))
-        self.assertEqual(len(self.f.spawned),1)
+        row=self.execute(b,p,text='websocket: close 1006',view=self.clean(141))
+        self.assertEqual((row['status'],row['attempt']),('interrupted',1))
+        self.assertEqual(self.f.spawned,[])
+        self.assertFalse(json.loads(row['metrics'])['interruption']['retry'])
 
     def test_plain_test_failure_remains_exit_one(self):
         b,p=self.command()
@@ -304,30 +359,26 @@ class ExecLoss(Base):
 
     def test_unknown_restart_rechecks_surviving_command_before_cleanup(self):
         b,p=self.command(prior=True)
-        with patch.object(boatd,'command_probe',return_value={'reason':'incus_unavailable'}):
-            self.assertEqual(boatd.settle_cmd(self.con,self.status(b,p)),'following')
-        with patch.object(boatd,'command_probe',return_value=dict(readable=True,pids=[101215],box_rc=None)), \
-             patch.object(boatd,'cleanup_run') as cleanup:
-            self.assertEqual(boatd.settle_cmd(self.con,self.status(b,p)),'following')
+        with patch.object(boatd,'guest_command',side_effect=boatd.Fail(503,'command_probe_pending','Incus unavailable')):
+            with self.assertRaises(boatd.Fail): boatd.settle_cmd(self.con,self.status(b,p))
+        self.assertEqual((self.status(b,p)['status'],self.status(b,p)['exit_code']),('running',None))
+        with patch.object(boatd,'guest_command',return_value={'state':'alive'}),patch.object(boatd,'cleanup_run') as cleanup:
+            self.assertEqual(boatd.settle_cmd(self.con,self.status(b,p)),'reattached')
             cleanup.assert_not_called()
         self.assertEqual(json.loads(self.status(b,p)['metrics'])['interruption']['stream_state'],'reattached')
 
     def test_recovery_between_restart_probes_never_kills_a_survivor(self):
         b,p=self.command(prior=True)
-        views=[dict(reason='incus_unavailable'),dict(readable=True,pids=[101215],box_rc=None)]
-        with patch.object(boatd,'command_probe',side_effect=views),patch.object(boatd,'cleanup_run') as cleanup:
-            self.assertEqual(boatd.settle_cmd(self.con,self.status(b,p)),'following')
+        with patch.object(boatd,'guest_command',return_value={'state':'alive'}),patch.object(boatd,'cleanup_run') as cleanup:
+            self.assertEqual(boatd.settle_cmd(self.con,self.status(b,p)),'reattached')
             cleanup.assert_not_called()
         self.assertEqual(self.status(b,p)['status'],'running')
 
     def test_replacement_preflight_rejection_follows_original_start(self):
         b,p=self.command(prior=True)
-        started=self.status(b,p)['started_at']
-        view=dict(readable=True,pids=[101215],box_rc=None)
-        with patch.object(boatd,'load_cfg'),patch.object(boatd,'disk_preflight',return_value=90), \
-             patch.object(boatd,'recover_probe',return_value=view),patch.object(boatd,'command_probe',return_value=view):
+        with patch.object(boatd,'follow_guest') as follow,patch.object(boatd,'disk_preflight') as preflight:
             boatd.run_cmd(b,p)
-        self.assertEqual((self.status(b,p)['status'],self.status(b,p)['started_at']),('running',started))
+        follow.assert_called_once();preflight.assert_not_called()
 
     def test_failed_retry_dispatch_does_not_wait_for_a_never_created_group(self):
         b,p=self.command()
@@ -362,7 +413,7 @@ class ExecLoss(Base):
                 (boatd.cmd_dir(b)/f'{p}.kill').write_text('kill')
                 boatd.settle_cmd(self.con,self.status(b,p))
                 row=self.status(b,p)
-                self.assertEqual((row['status'],row['exit_code'],row['started_at'],row['ended_at']),(status,rc,100,110))
+                self.assertEqual((row['status'],row['exit_code'],row['started_at'],row['ended_at']),(status,94 if status == 'interrupted' else rc,100,110))
 
     def test_delayed_kill_uses_same_terminal_result_matrix(self):
         callbacks=[]
@@ -380,7 +431,7 @@ class ExecLoss(Base):
                 with patch.object(boatd.time,'sleep'),patch.object(boatd.subprocess,'run'):
                     callbacks.pop()()
                 row=self.status(b,p)
-                self.assertEqual((row['status'],row['exit_code'],row['started_at'],row['ended_at']),(status,rc,100,110))
+                self.assertEqual((row['status'],row['exit_code'],row['started_at'],row['ended_at']),(status,94 if status == 'interrupted' else rc,100,110))
 
     def test_delayed_unknown_cleanup_holds_completion_during_file_db_gap(self):
         callbacks=[]
@@ -422,21 +473,15 @@ class ExecLoss(Base):
                 with patch.object(boatd.time,'sleep'),patch.object(boatd.subprocess,'run'):
                     callbacks.pop()()
                 row=self.status(b,p)
-                self.assertEqual((row['status'],row['exit_code'],row['started_at'],row['ended_at']),(status,rc,100,110))
+                self.assertEqual((row['status'],row['exit_code'],row['started_at'],row['ended_at']),(status,94 if status == 'interrupted' else rc,100,110))
 
     def test_runner_known_cleanup_lost_kill_preserves_observed_zero_or_one(self):
         for rc in (0,1):
-            with self.subTest(rc=rc):
-                b=self.box(f'bx_runnerlost{rc}');p=self.cmd(b,status='queued')
-                def process(args, **kwargs):
-                    (boatd.cmd_dir(b)/f'{p}.kill').write_text('lost')
-                    return Mock(wait=Mock(return_value=rc))
-                with patch.object(boatd,'load_cfg'),patch.object(boatd,'admit',return_value=0), \
-                     patch.object(boatd,'ct_exec'),patch.object(boatd,'disk_preflight',return_value=0), \
-                     patch.object(boatd.subprocess,'Popen',side_effect=process):
-                    boatd.run_cmd(b,p)
-                row=self.status(b,p)
-                self.assertEqual((row['status'],row['exit_code']),('exited',rc))
+            b=self.box(f'bx_runnerlost{rc}');p=self.cmd(b)
+            (boatd.cmd_dir(b)/f'{p}.kill').write_text('lost')
+            with patch.object(boatd,'cleanup_run',return_value=dict(cleanup='clean',leftover_killed=0,remaining=0)):
+                boatd.record_guest(self.con,self.status(b,p),dict(state='exited',exit_code=rc))
+            self.assertEqual((self.status(b,p)['status'],self.status(b,p)['exit_code']),('exited',rc))
 
     def test_late_attempt_one_result_cannot_overwrite_current_attempt_two(self):
         b,p=self.command()
@@ -610,7 +655,7 @@ class ExecLoss(Base):
                     boatd.settle_cmd(self.con,self.status(b,p))
                 row=self.status(b,p)
                 self.assertEqual((row['status'],row['exit_code'],row['ended_at']),
-                                 ('interrupted' if rc==141 else 'exited',None if rc==141 else rc,ended))
+                                 ('interrupted' if rc==141 else 'exited',94 if rc==141 else rc,ended))
 
     def test_stale_attempt_cannot_probe_or_kill_current_attempt_group(self):
         b,p=self.command(prior=True)
@@ -627,15 +672,15 @@ class ExecLoss(Base):
         self.assertEqual((self.status(b,p)['status'],self.status(b,p)['attempt']),('running',2))
 
     def test_cancel_during_script_upload_prevents_exec_dispatch(self):
-        b,p=self.command(prior=True)
-        def upload(*args,**kwargs):
+        b,p=self.command()
+        calls=[]
+        def upload(box,command,**kwargs):
+            calls.append(command)
             boatd.stage_kill(self.con,b,p,False)
-            return subprocess.CompletedProcess([],0)
-        with patch.object(boatd,'load_cfg'),patch.object(boatd,'disk_preflight',return_value=0), \
-             patch.object(boatd,'ct_exec',side_effect=upload),patch.object(boatd.subprocess,'Popen') as process, \
-             patch.object(boatd,'cleanup_run',return_value=dict(cleanup='unknown',leftover_killed=None,remaining=None)):
+        with patch.object(boatd,'guest_command',return_value={'state':'absent'}),patch.object(boatd,'ct_exec',side_effect=upload), \
+             patch.object(boatd,'admit',return_value=0),patch.object(boatd,'disk_preflight',return_value=0):
             boatd.run_cmd(b,p)
-        process.assert_not_called()
+        self.assertFalse(any('nohup' in command for command in calls))
         self.assertEqual(boatd.held_runs(self.con,b),['run-fixture'])
 
     def test_kill_preserves_new_guest_receipt_first_seen_by_cleanup(self):
@@ -649,7 +694,7 @@ class ExecLoss(Base):
                 with patch.object(boatd,'command_probe',return_value=self.clean(rc)):
                     boatd.settle_cmd(self.con,self.status(b,p))
                 row=self.status(b,p)
-                self.assertEqual((row['status'],row['exit_code']),('interrupted' if rc==141 else 'exited',None if rc==141 else rc))
+                self.assertEqual((row['status'],row['exit_code']),('interrupted' if rc==141 else 'exited',94 if rc==141 else rc))
                 if rc==141:
                     self.assertEqual(self.events('run.interrupted')[-1]['props']['boxRc'],141)
 
@@ -689,9 +734,8 @@ class ExecLoss(Base):
 
     def test_host_launch_failure_never_dispatched_is_safe_to_retry(self):
         b,p=self.command(retry=1)
-        with patch.object(boatd,'load_cfg'),patch.object(boatd,'admit',return_value=0), \
-             patch.object(boatd,'disk_preflight',return_value=0),patch.object(boatd,'ct_exec'), \
-             patch.object(boatd.subprocess,'Popen',side_effect=FileNotFoundError('incus missing')):
+        with patch.object(boatd,'guest_command',return_value={'state':'absent'}),patch.object(boatd,'admit',return_value=0), \
+             patch.object(boatd,'disk_preflight',return_value=0),patch.object(boatd,'ct_exec',side_effect=FileNotFoundError('incus missing')):
             boatd.run_cmd(b,p)
         self.assertEqual((self.status(b,p)['status'],self.status(b,p)['exit_code']),('exited',90))
         self.assertIn('nothing ran, safe to retry',(boatd.cmd_dir(b)/f'{p}.err').read_text())
@@ -768,22 +812,15 @@ class ExecLoss(Base):
 
     def test_runner_unknown_kill_retains_observed_exit_until_cleanup(self):
         for rc in (0,1):
-            with self.subTest(rc=rc):
-                b=self.box(f'bx_runnerhold{rc}');p=self.cmd(b,status='queued')
-                def process(args, **kwargs):
-                    (boatd.cmd_dir(b)/f'{p}.kill').write_text('kill')
-                    return Mock(wait=Mock(return_value=rc))
-                with patch.object(boatd,'load_cfg'),patch.object(boatd,'admit',return_value=0), \
-                     patch.object(boatd,'ct_exec'),patch.object(boatd,'disk_preflight',return_value=0), \
-                     patch.object(boatd.subprocess,'Popen',side_effect=process), \
-                     patch.object(boatd,'cleanup_run',return_value=dict(cleanup='unknown',leftover_killed=None,remaining=None)):
-                    boatd.run_cmd(b,p)
-                res=boatd.read_result(b,p,1)
-                self.assertEqual(res['held_result']['exit_code'],rc)
-                with patch.object(boatd,'cleanup_run',return_value=dict(cleanup='clean',leftover_killed=0,remaining=0)):
-                    boatd.settle_cmd(self.con,self.status(b,p))
-                row=self.status(b,p)
-                self.assertEqual((row['status'],row['exit_code'],row['ended_at']),('exited',rc,res['held_result']['ended_at']))
+            b=self.box(f'bx_runnerhold{rc}');p=self.cmd(b)
+            (boatd.cmd_dir(b)/f'{p}.kill').write_text('kill')
+            with patch.object(boatd,'cleanup_run',return_value=dict(cleanup='unknown',leftover_killed=None,remaining=None)):
+                boatd.record_guest(self.con,self.status(b,p),dict(state='exited',exit_code=rc))
+            res=boatd.read_result(b,p,1)
+            self.assertEqual(res['held_result']['exit_code'],rc)
+            with patch.object(boatd,'cleanup_run',return_value=dict(cleanup='clean',leftover_killed=0,remaining=0)):
+                boatd.settle_cmd(self.con,self.status(b,p))
+            self.assertEqual(self.status(b,p)['exit_code'],rc)
 
     def test_kill_intent_is_retried_before_reattachment_even_if_unit_active(self):
         b,p=self.command(prior=True)
@@ -799,11 +836,14 @@ class ExecLoss(Base):
             cleanup.assert_called_once()
         self.assertEqual((self.status(b,p)['status'],self.status(b,p)['exit_code']),('exited',143))
 
-    def test_new_attempt_does_not_reclassify_old_stream_error_as_its_test_failure(self):
+    def test_settled_interruption_cannot_be_replaced_by_another_invocation(self):
         b,p=self.command(retry=1)
         self.execute(b,p,text='websocket: close 1006',view=self.clean(141))
-        r=self.execute(b,p,rc=1,text='ordinary assertion failed')
-        self.assertEqual((r['status'],r['exit_code'],r['attempt']),('exited',1,2))
+        with patch.object(boatd,'ct_exec') as execute,patch.object(boatd,'follow_guest') as follow:
+            boatd.run_cmd(b,p)
+        execute.assert_not_called();follow.assert_not_called()
+        row=self.status(b,p)
+        self.assertEqual((row['status'],row['exit_code'],row['attempt']),('interrupted',94,1))
 
     def test_observed_receipt_survives_unknown_cleanup_then_container_stop(self):
         for rc, expected in ((0,'exited'),(1,'exited'),(141,'interrupted')):
@@ -817,7 +857,7 @@ class ExecLoss(Base):
                 row=self.status(b,p)
                 self.assertEqual(row['status'],expected)
                 self.assertEqual(json.loads(row['metrics'])['interruption']['box_rc'],rc)
-                self.assertEqual(row['exit_code'],rc if expected=='exited' else None)
+                self.assertEqual(row['exit_code'],rc if expected=='exited' else 94)
 
     def test_cleanup_counts_only_confirmed_stops_and_unknown_is_not_zero(self):
         b,p=self.command()

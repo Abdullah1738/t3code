@@ -1,11 +1,14 @@
 """Case book, deadline pings, ended reply watchers, outbox replay and the brief line."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import datetime as dt
 import fcntl
 import importlib.util
 import hashlib
 import io
 import json
-import os
 import re
 from pathlib import Path
 import subprocess

@@ -1,11 +1,14 @@
 """Offline cursor, credential-isolation and classifier budget regressions."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import concurrent.futures
 import contextlib
 import copy
 import importlib.util
 import imaplib
 import json
-import os
 from pathlib import Path
 import signal
 import ssl
@@ -327,6 +330,7 @@ class BacklogTests(unittest.TestCase):
 
     def oauth_healing(self, account, fast, *, still_rejected=False, accept_frontend=None,
                       transport_errors=(), reject_old=True, pinned=False, outer_retry=False):
+        (self.root / f'mail-progress-{account}.json').unlink(missing_ok=True)
         helper_path = Path(t.__file__).resolve().parents[3] / 'local-helpers/libexec/mail/mail_oauth.py'
         real_load = t.load_module
         state = {'token': 'rejected-fixture', 'fetching': False, 'refreshes': 0,
@@ -385,7 +389,7 @@ class BacklogTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 1, '', f'{type(error).__name__}: {error}')
             finally:
                 state['fetching'] = False
-        request = {**self.request, 'fast': fast, 'since': 1000}
+        request = {**self.request, 'fast': fast}
         # HOME prevents the real helper from reading the owner's preferred Outlook IP.
         with patch.dict(os.environ, {'HOME': str(self.root)}), \
              patch.object(t, 'load_module', side_effect=load), \
@@ -404,7 +408,7 @@ class BacklogTests(unittest.TestCase):
             else:
                 result = t.run_mail(account, request)
                 info = result['mail_progress']
-                self.assertEqual(result['cursor']['uid'], 100)
+                self.assertEqual(result['cursor']['uid'], t.MAIL_LIMIT)
             refreshed = reject_old or bool(accept_frontend)
             self.assertEqual(state['refreshes'], int(refreshed))
             self.assertEqual(workers.call_count, 2 if refreshed or outer_retry else 1)
@@ -620,11 +624,11 @@ class ClassifierTests(unittest.TestCase):
 
     def test_retry_exhaustion_and_http_errors_log_specific_cause(self):
         for error, expected, attempts in (
-            (TimeoutError(), 'socket_timeout', 2),
-            (urllib.error.HTTPError(t.CLASSIFIER_ENDPOINT, 503, '', {}, None), 'http_status=503', 2),
-            (urllib.error.HTTPError(t.CLASSIFIER_ENDPOINT, 401, '', {}, None), 'http_status=401', 1),
-            (urllib.error.URLError(OSError()), 'url_error=OSError', 2),
-            (ValueError('private response body'), 'ValueError', 1),
+            (TimeoutError('private response body'), 'socket_timeout', 2),
+            (urllib.error.HTTPError(t.CLASSIFIER_ENDPOINT, 503, 'private response body', {}, None), 'http_status=503', 2),
+            (urllib.error.HTTPError(t.CLASSIFIER_ENDPOINT, 401, 'private response body', {}, None), 'http_status=401', 1),
+            (urllib.error.URLError(OSError('private response body')), 'url_error=OSError', 2),
+            (ValueError('fixture validation; password="private response body"'), 'ValueError: fixture validation;', 1),
         ):
             with self.subTest(cause=expected), patch.object(t, 'classify', side_effect=error):
                 hits, meta = t.classify_batch([{'id': 'a'}], {}, 20)

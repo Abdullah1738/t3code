@@ -6601,6 +6601,62 @@ it.effect("releases an expired diff nobody reads again", () =>
   }),
 );
 
+it.effect.each([false, true])(
+  "a detail cache lookup releases its caller's facts (failure=%s)",
+  (failure) =>
+    Effect.gen(function* () {
+      NodeV8.setFlagsFromString("--expose-gc");
+      const collect = NodeVM.runInNewContext("gc") as () => void;
+      let reads = 0;
+      const service = yield* makeService({
+        projects: [
+          project({ id: "p1", title: "web", workspaceRoot: "/a", repository: "acme/web" }),
+        ],
+        providers: [
+          fakeProvider(SourceControlProviderKind.make("github"), {
+            getChangeRequest: () =>
+              Effect.suspend(() => {
+                reads += 1;
+                return failure
+                  ? Effect.fail(requestFailed)
+                  : Effect.succeed(hostedChangeRequest("body"));
+              }),
+          }),
+        ],
+      });
+      const input = {
+        projectId: "p1" as ProjectId,
+        repository: "acme/web",
+        number: 1,
+        allowStale: false,
+      };
+      const call = () =>
+        Effect.gen(function* () {
+          const facts = { cards: Array.from({ length: 10_000 }, (_, id) => ({ id })) };
+          const reference = new WeakRef(facts);
+          const request = Effect.fn("WaitFacts.detail")(function* () {
+            const result = yield* Effect.exit(service.detail(input));
+            assert.strictEqual(Exit.isFailure(result), failure);
+            return facts.cards.length;
+          });
+          assert.strictEqual(yield* request(), 10_000);
+          return reference;
+        });
+      const facts = yield* call();
+      yield* Effect.promise(async () => {
+        for (let turn = 0; turn < 3; turn++) {
+          await new Promise((resolve) => setImmediate(resolve));
+          collect();
+        }
+      });
+      assert.isUndefined(facts.deref());
+      const before = reads;
+      const result = yield* Effect.exit(service.detail(input));
+      assert.strictEqual(Exit.isFailure(result), failure);
+      assert.strictEqual(reads, before + (failure ? 1 : 0));
+    }),
+);
+
 const environmentViewedProvider = (
   revisions: Map<string, string>,
   asked: Array<ReadonlyArray<string>>,

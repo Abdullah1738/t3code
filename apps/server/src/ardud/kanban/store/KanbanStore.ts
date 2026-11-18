@@ -49,6 +49,14 @@ export class KanbanStoreError extends Schema.TaggedError<KanbanStoreError>()("Ka
   }
 }
 
+export class KanbanJsonTooLarge extends Schema.TaggedError<KanbanJsonTooLarge>()(
+  "KanbanJsonTooLarge",
+  { table: Schema.String, id: Schema.String, bytes: Schema.Number, limit: Schema.Number },
+) {}
+
+// Bound UTF-8 transferred from SQLite before a worker creates the JS strings.
+const JSON_CHUNK_BYTES = 4 * 1024 * 1024;
+
 const codec = <S extends Schema.Top>(schema: S) => {
   const json = Schema.fromJsonString(schema);
   return {
@@ -109,6 +117,10 @@ interface KeyedVersionRow extends EntityVersionRow {
   readonly board_id: string;
 }
 interface KeyedJsonRow extends KeyedVersionRow, JsonRow {}
+interface GuardedJsonRow extends KeyedVersionRow {
+  readonly json: string | null;
+  readonly json_bytes: number;
+}
 interface IdJsonRow extends JsonRow {
   readonly id: number;
 }
@@ -161,6 +173,7 @@ export interface DecodeCacheStats {
   readonly misses: number;
   readonly evictions: number;
   readonly entries: number;
+  readonly sourceBytes: number;
 }
 
 export interface KanbanStoreShape {
@@ -232,6 +245,13 @@ export interface KanbanStoreShape {
     boardId: KanbanBoardId,
   ) => Effect.Effect<Set<KanbanCardId>, never, Scope.Scope>;
   readonly dispatchCards: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly tickCards: (
+    boardId: KanbanBoardId,
+    liveThreadIds?: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
+  readonly goalStoryCards: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanCard>, KanbanStoreError>;
   readonly openCards: (
@@ -355,6 +375,9 @@ export interface KanbanStoreShape {
     groups: ReadonlyArray<KanbanGroup>,
   ) => Effect.Effect<void, KanbanStoreError>;
 
+  readonly settlingDiscussions: (
+    boardId: KanbanBoardId,
+  ) => Effect.Effect<ReadonlyArray<KanbanDiscussion>, KanbanStoreError>;
   readonly discussions: (
     boardId: KanbanBoardId,
   ) => Effect.Effect<ReadonlyArray<KanbanDiscussion>, KanbanStoreError>;
@@ -649,8 +672,9 @@ const make = Effect.gen(function* () {
   const jsonFetchCounters = Context.Reference<{
     jsonRowsFetched: number;
     jsonBytesFetched: number;
+    maxJsonChunkBytes: number;
   }>("KanbanJsonFetchCounters", {
-    defaultValue: () => ({ jsonRowsFetched: 0, jsonBytesFetched: 0 }),
+    defaultValue: () => ({ jsonRowsFetched: 0, jsonBytesFetched: 0, maxJsonChunkBytes: 0 }),
   });
 
   // Observers exist only while a dispatch pass is alive; no card data or
@@ -689,7 +713,11 @@ const make = Effect.gen(function* () {
   const poolKey = (row: KeyedVersionRow) => JSON.stringify([row.board_id, row.id]);
   const decoders = {
     board: cached("board", Board.decode, rowKey),
-    card: cached("card", Card.decode, rowKey),
+    // The live open-card working set charges about 176 MiB at json.length * 2.
+    card: makeDecodeCache("card", Card.decode, rowKey, readCounters, {
+      maxEntries: 8_192,
+      maxBytes: 320 * 1024 * 1024,
+    }),
     feed: cached("feed", Card.decode, rowKey),
     scheduling: cached("scheduling", SchedulingCard.decode, rowKey),
     summary: cached("summary", Summary.decode, rowKey),
@@ -767,6 +795,7 @@ const make = Effect.gen(function* () {
       ) => Effect.Effect<A, E>;
     },
     reconcile?: (rows: ReadonlyArray<KeyedVersionRow>) => Effect.Effect<void>,
+    oversized: "skip" | "fail" = "skip",
   ) {
     // Check before our read transaction: caller-owned transactions must neither
     // consume nor publish shared revisions, since rollback can reuse a version.
@@ -778,6 +807,7 @@ const make = Effect.gen(function* () {
         const counters = yield* readCounters;
         const counts = (counters[decoder.name] ??= { hits: 0, misses: 0, evictions: 0 });
         const values = new Map<string, A>();
+        const skipped = new Set<string>();
         const missing: string[] = [];
         for (const row of rows) {
           const hit = decoder.lookup(row, counts, shared);
@@ -785,14 +815,57 @@ const make = Effect.gen(function* () {
           else values.set(row.id, hit.value);
         }
         for (let offset = 0; offset < missing.length; offset += 128) {
-          const ids = missing.slice(offset, offset + 128);
-          const fetched = yield* sql<KeyedJsonRow>`
-          SELECT id, board_id, cache_version, json FROM ${sql(table)} WHERE ${sql.in("id", ids)}
-        `;
-          const decoded = yield* decodeAll(fetched, decoder, shared);
-          for (let i = 0; i < fetched.length; i++) values.set(fetched[i]!.id, decoded[i]!);
+          let ids = missing.slice(offset, offset + 128);
+          while (ids.length > 0) {
+            // The materialized CTE contains lengths only. CASE avoids reading TEXT
+            // into V8 for rows past this reply's byte budget, including one huge row.
+            const page = yield* sql<GuardedJsonRow>`
+              WITH sizes AS MATERIALIZED (
+                SELECT id, board_id, cache_version, length(CAST(json AS BLOB)) AS json_bytes
+                FROM ${sql(table)} WHERE ${sql.in("id", ids)}
+              ), page AS (
+                SELECT *, sum(json_bytes) OVER (ORDER BY id) AS page_bytes FROM sizes
+              )
+              SELECT id, board_id, cache_version, json_bytes,
+                CASE WHEN page_bytes <= ${JSON_CHUNK_BYTES} THEN
+                  (SELECT json FROM ${sql(table)} AS source WHERE source.id = page.id)
+                END AS json
+              FROM page ORDER BY id
+            `;
+            const fetched: KeyedJsonRow[] = [];
+            const deferred: string[] = [];
+            let bytes = 0;
+            for (const row of page) {
+              if (row.json === null) {
+                if (row.json_bytes > JSON_CHUNK_BYTES) {
+                  const error = new KanbanJsonTooLarge({
+                    table,
+                    id: row.id,
+                    bytes: row.json_bytes,
+                    limit: JSON_CHUNK_BYTES,
+                  });
+                  if (oversized === "fail") return yield* Effect.fail(error);
+                  skipped.add(row.id);
+                  yield* Effect.logWarning("Kanban JSON row exceeds hydration limit; skipped", {
+                    table,
+                    id: row.id,
+                    bytes: row.json_bytes,
+                    limit: JSON_CHUNK_BYTES,
+                  });
+                } else deferred.push(row.id);
+              } else {
+                fetched.push({ ...row, json: row.json });
+                bytes += row.json_bytes;
+              }
+            }
+            const counters = yield* jsonFetchCounters;
+            counters.maxJsonChunkBytes = Math.max(counters.maxJsonChunkBytes, bytes);
+            const decoded = yield* decodeAll(fetched, decoder, shared);
+            for (let i = 0; i < fetched.length; i++) values.set(fetched[i]!.id, decoded[i]!);
+            ids = deferred;
+          }
         }
-        return rows.map((row) => values.get(row.id)!);
+        return rows.filter((row) => !skipped.has(row.id)).map((row) => values.get(row.id)!);
       }),
     );
   });
@@ -806,7 +879,7 @@ const make = Effect.gen(function* () {
   const runRead = <A, E>(operation: string, effect: Effect.Effect<A, E>) =>
     Effect.suspend(() => {
       const counters: Record<string, { hits: number; misses: number; evictions: number }> = {};
-      const fetched = { jsonRowsFetched: 0, jsonBytesFetched: 0 };
+      const fetched = { jsonRowsFetched: 0, jsonBytesFetched: 0, maxJsonChunkBytes: 0 };
       return SavedWrite.stage(
         Effect.gen(function* () {
           // A SELECT within a mutation or an existing transaction must not open
@@ -1011,6 +1084,44 @@ const make = Effect.gen(function* () {
         decoders.card,
       ),
     );
+  const tickCards: KanbanStoreShape["tickCards"] = (boardId, liveThreadIds = []) =>
+    runRead(
+      "read tick cards",
+      readCollection(
+        sql<KeyedVersionRow>`
+        SELECT id, board_id, cache_version FROM ardud_kanban_cards c
+        WHERE board_id = ${boardId} AND (
+          (json_extract(c.json, '$.settledAt') IS NULL AND stage NOT IN ('completed', 'deployed', 'verified'))
+          OR active_thread_id IS NOT NULL
+          OR (json_extract(c.json, '$.settledAt') IS NULL AND json_extract(c.json, '$.stalled.by._tag') = 'system')
+          OR json_extract(c.json, '$.wait') IS NOT NULL
+          OR json_extract(c.json, '$.deciding') IS NOT NULL
+          OR EXISTS (SELECT 1 FROM json_each(c.json, '$.asks') WHERE json_extract(value, '$.closedAt') IS NULL)
+          OR (json_extract(c.json, '$.settledAt') IS NULL AND EXISTS
+            (SELECT 1 FROM json_each(c.json, '$.subtasks') WHERE json_extract(value, '$.state') = 'open'))
+          OR json_extract(c.json, '$.workThreadId') IN (SELECT value FROM json_each(${JSON.stringify(liveThreadIds)}))
+          OR json_extract(c.json, '$.reviewThreadId') IN (SELECT value FROM json_each(${JSON.stringify(liveThreadIds)}))
+        ) ORDER BY number
+      `,
+        "ardud_kanban_cards",
+        decoders.card,
+      ),
+    );
+  const goalStoryCards: KanbanStoreShape["goalStoryCards"] = (boardId) =>
+    runRead(
+      "read goal story cards",
+      readCollection(
+        sql<KeyedVersionRow>`
+        SELECT id, board_id, cache_version FROM ardud_kanban_cards
+        WHERE board_id = ${boardId} AND (
+          json_extract(json, '$.goalId') IN (SELECT id FROM ardud_kanban_goals WHERE board_id = ${boardId} AND json_extract(json, '$.status') = 'active')
+          OR (json_extract(json, '$.goalId') IS NULL AND json_extract(json, '$.settledAt') IS NULL AND stage NOT IN ('completed', 'deployed', 'verified'))
+        ) ORDER BY number
+      `,
+        "ardud_kanban_cards",
+        decoders.card,
+      ),
+    );
   const dispatchCards = (boardId: KanbanBoardId) =>
     runRead(
       "read dispatch cards",
@@ -1070,12 +1181,32 @@ const make = Effect.gen(function* () {
     runRead(
       "read card page",
       readCollection(
-        sql<KeyedVersionRow>`
-          SELECT id, board_id, cache_version, number FROM ardud_kanban_cards
-          WHERE board_id = ${boardId} AND number > ${page.after}
-            ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
-          ORDER BY number LIMIT ${page.limit}
-        `,
+        Effect.gen(function* () {
+          // Exclude oversized rows before LIMIT, so an empty degraded page cannot
+          // hide the good cards after it or prevent a caller's cursor advancing.
+          const rows = yield* sql<KeyedVersionRow & { readonly number: number }>`
+            SELECT id, board_id, cache_version, number FROM ardud_kanban_cards
+            WHERE board_id = ${boardId} AND number > ${page.after}
+              ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
+              AND length(CAST(json AS BLOB)) <= ${JSON_CHUNK_BYTES}
+            ORDER BY number LIMIT ${page.limit}
+          `;
+          const skipped = yield* sql<{ readonly id: string; readonly bytes: number }>`
+            SELECT id, length(CAST(json AS BLOB)) AS bytes FROM ardud_kanban_cards
+            WHERE board_id = ${boardId} AND number > ${page.after}
+              ${rows.length === page.limit ? sql`AND number <= ${rows.at(-1)!.number}` : sql``}
+              ${page.open ? sql`AND json_extract(json, '$.settledAt') IS NULL` : sql``}
+              AND length(CAST(json AS BLOB)) > ${JSON_CHUNK_BYTES}
+          `;
+          for (const row of skipped)
+            yield* Effect.logWarning("Kanban JSON row exceeds hydration limit; skipped", {
+              table: "ardud_kanban_cards",
+              id: row.id,
+              bytes: row.bytes,
+              limit: JSON_CHUNK_BYTES,
+            });
+          return rows;
+        }),
         "ardud_kanban_cards",
         decoders.card,
       ),
@@ -1127,22 +1258,34 @@ const make = Effect.gen(function* () {
     runRead(
       "read card",
       Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE id = ${cardId}`,
-        (rows) =>
+        readCollection(
+          sql<KeyedVersionRow>`SELECT id, board_id, cache_version FROM ardud_kanban_cards WHERE id = ${cardId}`,
+          "ardud_kanban_cards",
+          decoders.card,
+          undefined,
+          "fail",
+        ),
+        (cards) =>
           Effect.gen(function* () {
-            if (rows.length === 0)
+            if (cards.length === 0)
               for (const decoder of [decoders.card, decoders.feed, decoders.summary])
                 yield* decoder.drop(cardId);
-            return first(yield* decodeAll(rows, decoders.card));
+            return first(cards);
           }),
       ),
     );
   const cardByNumber = (boardId: KanbanBoardId, number: number) =>
     runRead(
       "read card by number",
-      Effect.flatMap(
-        sql<KeyedJsonRow>`SELECT id, board_id, cache_version, json FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
-        (rows) => Effect.map(decodeAll(rows, decoders.card), first),
+      Effect.map(
+        readCollection(
+          sql<KeyedVersionRow>`SELECT id, board_id, cache_version FROM ardud_kanban_cards WHERE board_id = ${boardId} AND number = ${number}`,
+          "ardud_kanban_cards",
+          decoders.card,
+          undefined,
+          "fail",
+        ),
+        first,
       ),
     );
   const schedulingCards = (boardId: KanbanBoardId) =>
@@ -1706,6 +1849,23 @@ const make = Effect.gen(function* () {
         (rows) => decoders.discussion.reconcile(boardId, new Set(rows.map(rowKey))),
       ),
     );
+  const settlingDiscussions: KanbanStoreShape["settlingDiscussions"] = (boardId) =>
+    runRead(
+      "read settling discussions",
+      readCollection(
+        sql<KeyedVersionRow>`
+        SELECT d.id, d.board_id, d.cache_version FROM ardud_kanban_discussions d
+        LEFT JOIN ardud_kanban_cards c ON c.id = d.card_id
+        WHERE d.board_id = ${boardId}
+          AND json_extract(d.json, '$.settledAt') IS NULL
+          AND json_extract(d.json, '$.archivedAt') IS NULL
+          AND (c.id IS NULL OR c.stage = 'verified')
+        ORDER BY d.rowid
+      `,
+        "ardud_kanban_discussions",
+        decoders.discussion,
+      ),
+    );
   const openDiscussions = (boardId: KanbanBoardId) =>
     runRead(
       "read open discussions",
@@ -2143,6 +2303,8 @@ const make = Effect.gen(function* () {
     finishBoardPurgeThread,
     putBoardWithPools,
     cards,
+    tickCards,
+    goalStoryCards,
     openCards,
     dispatchCards,
     watchCardWrites,
@@ -2195,6 +2357,7 @@ const make = Effect.gen(function* () {
     putGroups,
     discussions,
     openDiscussions,
+    settlingDiscussions,
     discussion,
     latestSystemDiscussion,
     discussionByEvaluator,

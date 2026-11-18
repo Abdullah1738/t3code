@@ -1,3 +1,4 @@
+import './log-dir.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
@@ -55,11 +56,17 @@ for (const [target, client] of Object.entries(clients)) {
       assert.equal(calls.length, 2);
       assert.notEqual(calls[0].signal, calls[1].signal);
       assert.deepEqual(timeouts, [client.timeout, client.timeout]);
-      assert.equal(rows().length, 1);
-      assert.equal(rows()[0].component, 'stream-recovery');
-      assert.equal(rows()[0].name, 'http.retry');
-      assert.deepEqual(rows()[0].props, {target, tag, ok:true});
-      for (const text of ['fixture.invalid', 'example.invalid', 'password', 'sk-private', '/private', 'message', 'url']) {
+      const retries = rows().filter(row => row.name === 'http.retry');
+      assert.equal(retries.length, 1);
+      assert.deepEqual(retries[0].props, {target, tag, ok:true});
+      const errors = rows().filter(row => row.kind === 'error');
+      assert.equal(errors.length, ['EPIPE','ECONNRESET'].includes(tag) ? 1 : 0);
+      if (errors.length) {
+        assert.equal(errors[0].props.errno, tag);
+        assert.equal(errors[0].props.attemptNo, 1);
+        assert.equal(errors[0].props.target, target === 'control' ? 'http://fixture.invalid:80' : 'http://127.0.0.1:49374');
+      }
+      for (const text of ['example.invalid', 'password', 'sk-private', '/private', 'url']) {
         assert.ok(!JSON.stringify(rows()).includes(text));
       }
     });
@@ -111,7 +118,9 @@ for (const [target, client] of Object.entries(clients)) {
     const retries = rows().filter(row => row.name === 'http.retry');
     assert.equal(retries.length, 1);
     assert.deepEqual(retries[0].props, {target, tag:'EPIPE', ok:false});
-    assert.equal(rows().find(row => row.name === 'stall.scan').error.tag, 'ECONNRESET');
+    const errors = rows().filter(row => row.kind === 'error');
+    assert.deepEqual(errors.map(row => row.error.tag), ['EPIPE','ECONNRESET']);
+    assert.deepEqual(errors.map(row => row.props.attemptNo), [1,2]);
   });
 
   test(`${target} does not retry a retry's HTTP 500`, async t => {
@@ -123,7 +132,7 @@ for (const [target, client] of Object.entries(clients)) {
     });
     await assert.rejects(client.get(), /500/);
     assert.equal(stub.mock.callCount(), 2);
-    assert.deepEqual(rows()[0].props, {target, tag:'EPIPE', ok:false});
+    assert.deepEqual(rows().find(row => row.name === 'http.retry').props, {target, tag:'EPIPE', ok:false});
   });
 }
 

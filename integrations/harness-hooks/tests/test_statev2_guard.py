@@ -5844,6 +5844,153 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
                 with self.subTest(command=command):
                     self.assertEqual(self.classify(command), SCRIPT)
 
+    def fixture_wrapper_commands(self):
+        script, root = 'tmp/fixture.sh', str(self.root)
+        return (
+            f'bash {script} | tail -3', f'bash {script} 2>&1 | tail -n 3', f'bash {script} | tail -n3',
+            f'bash {script} 2>&1 | head -5', f'bash {script} | grep -v noise',
+            f'bash {script} 2>&1 | grep -Ei "pass|fail" | tail -5', f"bash {script} | grep -E 'ok|FAIL'",
+            f'bash {script}; echo "exit=$?"', f'bash {script}; echo $?', f'bash {script} && echo ok',
+            f'bash {script} 2>&1 | tail -5; echo "exit=$?"',
+            f'cd {root} && bash {script}', f'cd {root} && bash {script} 2>&1 | tail -3',
+            'cd ./tmp && bash fixture.sh | tail -3', f'cd ./tmp && bash {root}/{script} && echo ok',
+            # Quoted punctuation keeps a whole pattern literal, globs included.
+            f'bash {script} 2>&1 | grep -E "PASS|FAIL.*" | tail -5', f"bash {script} | grep -v '[x]|y*'",
+            f"bash {script} | grep 'files/*'", f'bash {script} | grep "files/[ab]"',
+            f'/bin/bash {root}/{script} 2>&1 | tail -3',
+            f'offbox run -- bash {script} 2>&1 | tail -3', f'offbox run --bg -- bash {script}; echo $?',
+        )
+
+    def test_fixture_wrappers_keep_fixture_proof(self):
+        # Agents pipe test runs into tail or cd first; the run is unchanged.
+        self.write_plain_subpath_fixture()
+        original = (self.root / 'tmp/fixture.sh').read_text()
+        _, _, inherited = self.repo_node_pin()
+        for label, environment in (('no-bash-env', {}), ('inherited-bash-env', inherited)):
+            with patch.dict(os.environ, environment):
+                self.write('tmp/fixture.sh', original)
+                for command in self.fixture_wrapper_commands():
+                    with self.subTest(case=label, command=command):
+                        self.assertIsNone(self.classify(command))
+                # The same wrappers never excuse a fixture that reads a live path.
+                self.write('tmp/fixture.sh', original + '\ncat "' + LIVE + '"\n')
+                for command in self.fixture_wrapper_commands():
+                    with self.subTest(case=label + ':live-fixture', command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_fixture_wrapper_refusals(self):
+        self.write_plain_subpath_fixture()
+        _, _, inherited = self.repo_node_pin()
+        run, root = 'bash tmp/fixture.sh', str(self.root)
+        live = '~/' + '.ro' + 'bob/userdata/' + 'state' + 'v2.sqlite'
+        rows = [
+            # Other stages, redirects, substitutions, background, statements.
+            run + ' | tee out', run + ' | sh', run + ' | xargs cat', run + ' > out', run + ' 2>&1 > out',
+            run + ' | tail -3 > out 2>&1', run + ' | grep -f file', run + ' | grep --file=file x',
+            run + ' | grep -e x', run + ' | grep -r x', run + ' | grep x file', run + ' | tail 3', run + ' | tail -f',
+            run + ' | head -c 5', run + ' | tail -3 | head -2 | grep x', run + ' |& tail -3', run + ' 2 >&1 | tail',
+            run + ' x | tail -3', run + ' &', run + ' | tail -3 &', run + ' | grep &', run + ' | grep -v ;',
+            '(' + run + ') | tail -3', run + ' || echo ok', run + '; echo ok', run + '; echo $HOME',
+            run + ' && echo $(id)', run + ' | grep "$(id)"', run + ' | grep "`id`"', run + ' | grep "$X"',
+            run + ' | grep "a|$X"', run + ' $(id) | tail -3',
+            run + ' | tail -3 # comment', run + ' | tail -3\nls', run + ' | tail -3; ls', 'ls; ' + run, 'ls tmp/; ' + run,
+            # Only one literal, anchored cd.
+            'cd "$X" && ' + run, 'cd - && ' + run, 'cd tmp && bash fixture.sh',
+            'cd ' + root + ' && cd ' + root + ' && ' + run, 'cd /tm* && ' + run, 'CDPATH=' + root + ' cd ./tmp && bash fixture.sh',
+            'cd ./tmp; bash fixture.sh', 'pushd ' + root + ' && ' + run, 'cd ' + root + ' && offbox run -- ' + run,
+            # `..` in a cd target: Bash's logical cd and the resolved path differ.
+            'cd ../' + self.root.name + ' && ' + run, 'cd ./tmp/.. && ' + run, 'cd ' + root + '/tmp/.. && ' + run,
+            # Unquoted expansion turns one pattern into pattern + file operands.
+            run + ' | grep files/*', run + ' 2>&1 | grep -v files/? | tail -3', run + ' | grep files/[ab]',
+            run + ' | grep {x,files/b}', run + ' | grep ~', run + ' | grep -E files/*',
+            "bash tmp/fixture.s? | tail -3", "bash tmp/{fixture.sh,x} | tail -3",
+            # Quoting only part of the pattern leaves the rest to expand.
+            run + ' | grep files/"*"x*', run + " | grep 'a'\"b\"*",
+            # A live read in a later stage is refused on its own.
+            run + ' | grep x ' + live, run + ' | tail -3; cat ' + live,
+        ]
+        # The glob's second match is a protected-path marker.
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        self.write('files/a', '')
+        (self.root / 'files/b').symlink_to(marker)
+        for label, environment in (('no-bash-env', {}), ('inherited-bash-env', inherited)):
+            with patch.dict(os.environ, environment):
+                for command in rows:
+                    with self.subTest(case=label, command=command):
+                        self.assertIsNotNone(self.classify(command))
+        # `~` follows HOME; point it at the fixture's parent so the cd lands.
+        tilde = 'cd ~/' + self.root.name + ' && ' + run
+        with patch.dict(os.environ, {'HOME': str(self.root.parent)}):
+            self.assertEqual(self.classify(tilde), SCRIPT)
+        rows.append(tilde)
+        # The grammar itself rejects each row, except where only the run
+        # check refuses: an extra script argument, and a cd before offbox,
+        # whose remote cwd the proof does not follow.
+        passes_grammar = {run + ' x | tail -3': (None, ['bash', 'tmp/fixture.sh', 'x']),
+                          'cd ' + root + ' && offbox run -- ' + run: (root, ['offbox', 'run', '--', 'bash', 'tmp/fixture.sh'])}
+        for command in rows + ['$(echo bash) tmp/fixture.sh | tail -3']:
+            with self.subTest(grammar=command):
+                self.assertEqual(guard._fixture_wrapped_invocation(command), passes_grammar.get(command))
+
+    def test_fixture_wrapper_cd_reproves_selector_inputs(self):
+        # A cd moves the selector walk; both the target and the caller's
+        # starting cwd must be clean.
+        self.write_plain_subpath_fixture()
+        _, _, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        for directory in ('good', 'bad'):
+            (self.root / directory).mkdir()
+        (self.root / 'bad/.nvmrc').symlink_to(marker)
+        good, bad = str(self.root / 'good'), str(self.root / 'bad')
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(guard.classify(f'cd {good} && bash ../tmp/fixture.sh | tail -3', str(self.root)))
+            self.assertEqual(guard.classify(f'cd {bad} && bash ../tmp/fixture.sh | tail -3', str(self.root)), SCRIPT)
+            self.assertEqual(guard.classify(f'cd {good} && bash ../tmp/fixture.sh | tail -3', bad), SCRIPT)
+            self.assertEqual(guard.classify('bash ../tmp/fixture.sh | tail -3', bad), SCRIPT)
+        # Without BASH_ENV there is no selector, so the cd target is all that moves.
+        self.assertIsNone(guard.classify(f'cd {good} && bash ../tmp/fixture.sh | tail -3', bad))
+
+    def test_fixture_wrapper_cd_logical_parent(self):
+        # Bash's logical cd resolves `alias/..` to start/bad, not the parent of
+        # alias's physical target; start/bad's selector input must not be missed.
+        self.write_plain_subpath_fixture()
+        _, _, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        (self.root / 'physical/deep').mkdir(parents=True)
+        (self.root / 'start/bad').mkdir(parents=True)
+        (self.root / 'start/bad/alias').symlink_to(self.root / 'physical/deep')
+        (self.root / 'start/bad/.nvmrc').symlink_to(marker)
+        start, fixture = str(self.root / 'start'), str(self.root / 'tmp/fixture.sh')
+        with patch.dict(os.environ, environment):
+            for target in ('./bad/alias/..', start + '/bad/alias/..', './bad/alias/../alias/..'):
+                with self.subTest(target=target):
+                    self.assertEqual(guard.classify(f'cd {target} && bash {fixture} | tail -3', start), SCRIPT)
+            # A symlinked target is walked on both its logical and physical chains.
+            self.assertEqual(guard.classify(f'cd ./bad/alias && bash {fixture} | tail -3', start), SCRIPT)
+            self.assertIsNone(guard.classify(f'cd {self.root}/physical/deep && bash {fixture} | tail -3', start))
+
+    def test_fixture_wrapper_cd_logical_script_here(self):
+        # A relative script's HERE cd ($0/..) also runs against the logical
+        # $PWD: from start/parent/alias it reaches start/parent/other, not
+        # physical/other.
+        self.write_plain_subpath_fixture()
+        source = (self.root / 'tmp/fixture.sh').read_text()
+        _, _, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        self.write('physical/other/tests/fixture.sh', source)
+        (self.root / 'physical/deep').mkdir(parents=True)
+        (self.root / 'start/parent/other').mkdir(parents=True)
+        (self.root / 'start/parent/alias').symlink_to(self.root / 'physical/deep')
+        start = str(self.root / 'start')
+        command = 'cd ./parent/alias && bash ../other/tests/fixture.sh | tail -3'
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(guard.classify(command, start))
+            (self.root / 'start/parent/other/.nvmrc').symlink_to(marker)
+            self.assertEqual(guard.classify(command, start), SCRIPT)
+            self.assertEqual(guard.classify(command.replace(' | tail -3', ''), start), SCRIPT)
+        # Without BASH_ENV no selector runs, so the fixture proof stands.
+        self.assertIsNone(guard.classify(command, start))
+
     def test_repo_node_pin_hashes_cover_fork_helpers(self):
         # Editing local-helpers' repo-node-pin turns the fixture proof off
         # until the guard reviews and pins the new bytes.
@@ -7162,6 +7309,226 @@ class LiveDatabaseGuardTests(unittest.TestCase):
         self.assertEqual(result["context"]["rule"], "live-database-unavailable")
         self.assertNotIn("private error", result["reason"])
         self.assertNotIn("private error", (self.root / "state/decisions.jsonl").read_text())
+
+
+class ZshStartupTests(unittest.TestCase):
+    REPORTERS = (
+        '/Users/ardud/.robob/worktrees/t3code-fork/installer-backups/integrations/run-cloud/install.zsh',
+        '/Users/ardud/.robob/worktrees/t3code-fork/fix-offbox-pinned-hold-254/integrations/offbox/install.zsh',
+        '/Users/ardud/.robob/release-builds/release-20261113.13-s13/build/build.zsh',
+        '/Volumes/ExternalSSD/t3code-wt/mac-read-watchdog-bounded-probe/integrations/local-helpers/bin/robob-read-watchdog',
+        '/Volumes/ExternalSSD/t3code-fork/integrations/local-helpers/bin/opencode-web',
+        '/Users/ardud/.robob/install-20261113.14-sup/run-install.zsh',
+    )
+
+    def setUp(self):
+        clean = isolated_source_cases.fixture_environment_patch()
+        clean.start()
+        self.addCleanup(clean.stop)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.global_env = self.root / 'zshenv'
+        global_path = patch.object(guard, 'ZSH_GLOBAL_ENV', str(self.global_env))
+        global_path.start()
+        self.addCleanup(global_path.stop)
+        # Classification must not depend on zsh being installed on the box.
+        which = guard.shutil.which
+        lookup = patch.object(guard.shutil, 'which', side_effect=lambda name, *a, **kw:
+                              '/bin/zsh' if name == 'zsh' else which(name, *a, **kw))
+        lookup.start()
+        self.addCleanup(lookup.stop)
+        self.script = self.root / 'check.zsh'
+        self.script.write_text('echo ok\n')
+
+    def test_zsh_no_rcs_parse_only_forms(self):
+        rows = [
+            '/bin/zsh -f -n ' + str(self.script),
+            'zsh -fn check.zsh', 'zsh -nf check.zsh', 'zsh -efn check.zsh', 'zsh -n -f check.zsh',
+            '/bin/zsh --no-rcs -n ' + str(self.script),
+            'zsh --norcs -n check.zsh', 'zsh -o norcs -n check.zsh',
+            'zsh +o rcs -n check.zsh', 'zsh -f -n -- check.zsh',
+            *(f'zsh {flags} check.zsh' for flags in
+              ('-dfn', '-dnf', '-fdn', '-fnd', '-ndf', '-nfd', '-d -fn', '-f -d -n', '-fn -d')),
+            '/bin/zsh -dfn /Users/ardud/.robob/install-20261113.14-sup/run-install.zsh',
+            *('/bin/zsh -f -n ' + target for target in self.REPORTERS),
+        ]
+        lstat = os.lstat
+        root_file = os.stat_result((stat.S_IFREG | 0o644, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+        for present in (False, True):
+            with self.subTest(global_env_present=present):
+                def global_stat(path, *args, **kwargs):
+                    return root_file if present and os.fspath(path) == str(self.global_env) else lstat(path, *args, **kwargs)
+                with patch.object(os, 'lstat', side_effect=global_stat):
+                    for command in rows:
+                        with self.subTest(command=command):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_zsh_startup_options_remain_bounded(self):
+        rows = ('-n', '-n check.zsh', '-l -f -n', '--login -f -n', '-i -f -n',
+                '-f -o rcs -n', '-f +o norcs -n', '-f +f -n', '-f --unknown -n',
+                '-o rcs -f -n', '-f -o unknown -n', '-fln', '-fin', '-n check.zsh -f',
+                '-dn', '-d -n', '-gfn', '-hfn', '-dgfn', '-fD -n', '-d -f -o rcs -n')
+        for options in rows:
+            with self.subTest(options=options):
+                rule, cause = guard.classify_detail('zsh ' + options + ' check.zsh', str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('zsh: implicit startup unproved', cause)
+                message = guard.refusal_reason(rule, cause, str(self.root))
+                self.assertIn('zsh -f -n', message)
+                self.assertIn('one file per call', message)
+                self.assertNotIn('literal absolute script path', message)
+
+        command = '/bin/zsh -n /Volumes/ExternalSSD/t3code-fork/integrations/local-helpers/bin/opencode-web'
+        rule, cause = guard.classify_detail(command, str(self.root))
+        self.assertEqual(rule, UNRESOLVED, cause)
+        self.assertIn('zsh: implicit startup unproved', cause)
+
+    def test_zsh_global_startup_file_trust(self):
+        for mode, uid in ((stat.S_IFREG | 0o664, 0), (stat.S_IFREG | 0o646, 0),
+                          (stat.S_IFREG | 0o644, 501), (stat.S_IFLNK | 0o777, 0),
+                          (stat.S_IFDIR | 0o755, 0), (stat.S_IFIFO | 0o600, 0)):
+            info = os.stat_result((mode, 1, 1, 1, uid, 0, 0, 0, 0, 0))
+            lstat = os.lstat
+            with self.subTest(mode=mode, uid=uid), patch.object(os, 'lstat', side_effect=lambda path, *a, **kw:
+                    info if os.fspath(path) == str(self.global_env) else lstat(path, *a, **kw)):
+                rule, cause = guard.classify_detail('zsh -f -n check.zsh', str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('zsh: /etc/zshenv startup unproved', cause)
+                message = guard.refusal_reason(rule, cause, str(self.root))
+                self.assertNotIn('literal absolute script path', message)
+                self.assertNotIn('Use zsh -f -n', message)
+        for error in (PermissionError('unreadable'), OSError('unavailable')):
+            lstat = os.lstat
+            def global_error(path, *args, **kwargs):
+                if os.fspath(path) == str(self.global_env):
+                    raise error
+                return lstat(path, *args, **kwargs)
+            with self.subTest(error=type(error).__name__), patch.object(os, 'lstat', side_effect=global_error):
+                self.assertEqual(guard.classify('zsh -f -n check.zsh', str(self.root)), UNRESOLVED)
+
+    def test_zsh_preserves_environment_and_mutation_checks(self):
+        for prefix in ('ZDOTDIR=/tmp/x ', 'ENV=/tmp/x ', 'BASH_ENV=/tmp/x ', 'DYLD_INSERT_LIBRARIES=/tmp/x '):
+            with self.subTest(prefix=prefix):
+                rule, cause = guard.classify_detail(prefix + 'zsh -f -n check.zsh', str(self.root))
+                self.assertEqual(rule, UNRESOLVED)
+                self.assertNotIn('literal absolute script path', guard.refusal_reason(rule, cause, str(self.root)))
+        with patch.dict(os.environ, {'ZDOTDIR': '/tmp/x'}):
+            self.assertEqual(guard.classify('zsh -f -n check.zsh', str(self.root)), UNRESOLVED)
+        for prefix in ('cp replacement ' + str(self.global_env), 'echo changed > ' + str(self.global_env),
+                       'cp replacement /bin/zsh'):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(guard.classify(prefix + '\nzsh -f -n check.zsh', str(self.root)), UNRESOLVED)
+        self.assertEqual(guard.classify('zsh -f -n ' + LIVE, str(self.root)), READ)
+        (self.root / 'database-alias').symlink_to(LIVE)
+        self.assertEqual(guard.classify('zsh -f -n database-alias', str(self.root)), READ)
+        self.script.write_text('cat ' + LIVE + '\n')
+        self.assertEqual(guard.classify('zsh -f check.zsh', str(self.root)), SCRIPT)
+        self.assertEqual(guard.classify('zsh -f -c ' + shlex.quote('cat ' + LIVE), str(self.root)), READ)
+
+    def test_zsh_execution_option_forms_scan_source(self):
+        source = 'cat ' + LIVE + '\n'
+        self.script.write_text(source)
+        options = ('-f -e', '-e -f', '-fe', '-ef', '-e -o norcs', '-o norcs -e',
+                   '-e +o rcs', '+o rcs -e', '--no-rcs -e', '-e --no-rcs',
+                   '-f -u', '-fu', '-uf', '-f -v', '-fv', '-vf', '-f -x', '-fx', '-xf')
+        writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+        for flags in options:
+            for prefix in ('', writer):
+                with self.subTest(flags=flags, same_call=bool(prefix)):
+                    command = prefix + '/bin/zsh ' + flags + ' check.zsh'
+                    self.assertEqual(guard.classify(command, str(self.root)), SCRIPT)
+            with self.subTest(flags=flags, mode='inline'):
+                command = '/bin/zsh ' + flags + ' -c ' + shlex.quote(source)
+                self.assertEqual(guard.classify(command, str(self.root)), READ)
+            with self.subTest(flags=flags, mode='stdin'):
+                command = '/bin/zsh ' + flags + " -s <<'SOURCE'\n" + source + 'SOURCE\n'
+                self.assertEqual(guard.classify(command, str(self.root)), READ)
+        self.script.write_text('echo ok\n')
+        for flags in options:
+            with self.subTest(flags=flags, mode='safe script'):
+                self.assertEqual(guard.classify('/bin/zsh ' + flags + ' check.zsh', str(self.root)), None)
+
+    def test_zsh_no_global_rcs_keeps_startup_and_execution_checks(self):
+        source = 'cat ' + LIVE + '\n'
+        self.script.write_text(source)
+        writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+        for flags in ('-df', '-fd', '-d -f', '-f -d'):
+            for prefix in ('', writer):
+                with self.subTest(flags=flags, same_call=bool(prefix)):
+                    self.assertEqual(guard.classify(prefix + '/bin/zsh ' + flags + ' check.zsh', str(self.root)), SCRIPT)
+            with self.subTest(flags=flags, inline=True):
+                self.assertEqual(guard.classify('/bin/zsh ' + flags + ' -c ' + shlex.quote(source), str(self.root)), READ)
+        info = os.stat_result((stat.S_IFREG | 0o666, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+        lstat = os.lstat
+        with patch.object(os, 'lstat', side_effect=lambda path, *a, **kw:
+                          info if os.fspath(path) == str(self.global_env) else lstat(path, *a, **kw)):
+            rule, cause = guard.classify_detail('/bin/zsh -dfn check.zsh', str(self.root))
+            self.assertEqual(rule, UNRESOLVED, cause)
+            self.assertIn('zsh: /etc/zshenv startup unproved', cause)
+        self.assertEqual(guard.classify('ZDOTDIR=/tmp/x /bin/zsh -dfn check.zsh', str(self.root)), UNRESOLVED)
+        self.assertEqual(guard.classify('/bin/zsh -dfn ' + LIVE, str(self.root)), READ)
+
+    def test_zsh_option_terminators_preserve_script_and_stdin_checks(self):
+        options = ('-f -', '-f -e -', '-ef -', '-f -n -', '-fn -',
+                   '-f -- -', '-f -e -- -', '-f -n -- -')
+        for source in ('echo ok\n', 'cat ' + LIVE + '\n'):
+            self.script.write_text(source)
+            writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+            for flags in options:
+                for prefix in ('', writer):
+                    with self.subTest(flags=flags, source=source, same_call=bool(prefix)):
+                        rule, cause = guard.classify_detail(prefix + '/bin/zsh ' + flags + ' check.zsh', str(self.root))
+                        self.assertEqual(rule, UNRESOLVED, cause)
+                        self.assertIn('bare dash input unproved', cause)
+        for target in ('check.zsh', '-e', '-n'):
+            (self.root / target).write_text('cat ' + LIVE + '\n')
+            with self.subTest(target=target):
+                self.assertEqual(guard.classify('/bin/zsh -f -- ' + target, str(self.root)), SCRIPT)
+        for flags in ('-f', '-f -', '-f --', '-f -- -'):
+            for source, rule in (('echo ok\n', None), ('cat ' + LIVE + '\n', READ)):
+                with self.subTest(flags=flags, stdin=source):
+                    command = '/bin/zsh ' + flags + " <<'SOURCE'\n" + source + 'SOURCE\n'
+                    self.assertEqual(guard.classify(command, str(self.root)), rule)
+
+    def test_zsh_post_c_options_cannot_hide_command_or_change_execution(self):
+        options = ('-f -c', '-fc', '-cf', '-fnc', '-fcn', '-nfc', '-f -nc', '-dfc', '-dcf', '-dfnc', '-d -f -c',
+                   '--no-rcs -c', '-o norcs -c', '+o rcs -c')
+        trailing = ('+n', '-e', '-u', '-v', '-x', '-n', '-f', '+f',
+                    '-o rcs', '+o norcs', '-o norcs', '+o rcs',
+                    '--rcs', '--no-rcs', '-l', '-i', '--unknown', '--', '-', '+')
+        for source in ('echo ok\n', 'cat ' + LIVE + '\n'):
+            self.script.write_text(source)
+            writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+            for flags in options:
+                for after_c in trailing:
+                    for prefix in ('', writer):
+                        with self.subTest(flags=flags, after_c=after_c, source=source, same_call=bool(prefix)):
+                            command = prefix + '/bin/zsh ' + flags + ' ' + after_c + " 'source check.zsh'"
+                            rule, cause = guard.classify_detail(command, str(self.root))
+                            self.assertEqual(rule, UNRESOLVED, cause)
+                            self.assertIn('zsh: options after -c unproved', cause)
+        for flags in options:
+            with self.subTest(flags=flags, missing_command=True):
+                rule, cause = guard.classify_detail('/bin/zsh ' + flags, str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('zsh: options after -c unproved', cause)
+
+    def test_zsh_literal_c_commands_keep_source_and_argument_boundaries(self):
+        for flags in ('-f -c', '-fc', '-cf', '--no-rcs -c', '-o norcs -c', '+o rcs -c'):
+            for source, expected in (('echo ok\n', None), ('cat ' + LIVE + '\n', SCRIPT)):
+                self.script.write_text(source)
+                writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+                for prefix in ('', writer):
+                    for arguments in ('', ' +n', ' -e', ' -o rcs'):
+                        with self.subTest(flags=flags, source=source, same_call=bool(prefix), arguments=arguments):
+                            command = prefix + '/bin/zsh ' + flags + " 'source check.zsh'" + arguments
+                            self.assertEqual(guard.classify(command, str(self.root)), expected)
+            with self.subTest(flags=flags, inline_read=True):
+                command = '/bin/zsh ' + flags + ' ' + shlex.quote('cat ' + LIVE)
+                self.assertEqual(guard.classify(command, str(self.root)), READ)
+            with self.subTest(flags=flags, empty_command=True):
+                self.assertEqual(guard.classify('/bin/zsh ' + flags + " ''", str(self.root)), None)
 
 
 if __name__ == "__main__":

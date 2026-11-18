@@ -5,7 +5,16 @@ from pathlib import Path
 EXIT_TOOLCHAIN = 99
 FETCH = (Path(__file__).resolve().parents[2] / "templates/tools/fetch.sh").read_text()
 
-SHELL = FETCH + r'''
+INFRA_STOP = r'''
+__offbox_infra_stop() {
+  printf 'offbox-space: {"phase":"toolchain","infra_failure":"%s","infra_reason":"%s"}\n' "$1" "$2" >&2
+  shift 2
+  echo "offbox: $* Nothing ran (exit 90)." >&2
+  exit 90
+}
+'''
+
+SHELL = FETCH + INFRA_STOP + r'''
 __offbox_curl() {
   local attempt rc=1 retries=0 option previous=
   for option in "${OFFBOX_FETCH_BOUNDS[@]}"; do
@@ -39,12 +48,6 @@ __offbox_unpack_attempt() {
   statuses=("${PIPESTATUS[@]}")
   [ "${statuses[0]}" = 0 ] || return "${statuses[0]}"
   return "${statuses[1]}"
-}
-__offbox_infra_stop() {
-  printf 'offbox-space: {"phase":"toolchain","infra_failure":"%s","infra_reason":"%s"}\n' "$1" "$2" >&2
-  shift 2
-  echo "offbox: $* Nothing ran (exit 90)." >&2
-  exit 90
 }
 __offbox_pin_command() {
   local entry tail=$PATH rest= sep=

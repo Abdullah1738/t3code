@@ -1351,6 +1351,40 @@ it.effect.each(["clean", "signal"] as const)(
 );
 
 describe("CodexAdapterV2 native protocol logging", () => {
+  it.effect.each([
+    {
+      config: { mcp_servers: { probe: { command: "node", args: ["--connection=private-value"] } } },
+    },
+    {
+      config: {
+        mcp_servers: { probe: { env: { DATABASE_URL: "postgres://private-value@host" } } },
+      },
+    },
+    { config: { arbitrary: "private-value" } },
+    { layers: [{ config: { arbitrary: "private-value" } }] },
+  ])("omits arbitrary config values before native persistence (%j)", (result) =>
+    Effect.gen(function* () {
+      const writes: unknown[] = [];
+      const log = CodexAdapterV2.makeCodexAppServerProtocolLogger({
+        nativeEventLogger: {
+          filePath: "/tmp/events.log",
+          write: (event) =>
+            Effect.sync(() => {
+              writes.push(event);
+            }),
+          close: () => Effect.void,
+        },
+        threadId: ThreadId.make("inventory-config"),
+        providerSessionId: ProviderSessionId.make("inventory-config"),
+      });
+      assert.exists(log);
+      yield* log!({ direction: "incoming", stage: "decoded", payload: { id: 7, result } });
+      assert.lengthOf(writes, 1);
+      assert.notInclude(JSON.stringify(writes), "private-value");
+      assert.include(JSON.stringify(writes), "[REDACTED]");
+    }),
+  );
+
   it.effect("logs decoded app-server frames once with credentials redacted", () =>
     Effect.gen(function* () {
       const writes: Array<{
@@ -2047,9 +2081,21 @@ function withReplayRequestId(
 }
 
 describe("CodexAdapterV2 session initialize", () => {
+  const withoutInventoryTags = <A>(params: A): A => {
+    if (!Predicate.isObject(params)) return params;
+    const config: unknown = Reflect.get(params, "config");
+    if (!Predicate.isObject(config)) return params;
+    return {
+      ...params,
+      config: Object.fromEntries(
+        Object.entries(config).filter(([key]) => !key.includes(".env.ROBOB_")),
+      ),
+    } as A;
+  };
   const openReplaySession = (
     transcript: CodexReplay.CodexAppServerReplayTranscript,
     beforeEmitInbound?: CodexReplay.CodexAppServerReplayDriver["beforeEmitInbound"],
+    inventory = false,
   ) =>
     Effect.gen(function* () {
       const driver = yield* CodexReplay.makeReplayDriver(
@@ -2072,17 +2118,44 @@ describe("CodexAdapterV2 session initialize", () => {
                 (client) =>
                   ({
                     ...client,
+                    ...(inventory
+                      ? {
+                          runtimePid: 20,
+                          spawnedAtMs: 1000,
+                          runtimeIsRunning: Effect.succeed(true),
+                        }
+                      : {}),
                     request: (method, params) =>
                       Effect.sync(() => {
                         if (method === "initialize") initializeRequests++;
                         requests.push({ method, params });
-                      }).pipe(Effect.andThen(client.request(method, params))),
+                      }).pipe(
+                        Effect.andThen(
+                          client.request(method, inventory ? withoutInventoryTags(params) : params),
+                        ),
+                      ),
                     raw: {
                       ...client.raw,
                       request: (method, params) =>
                         Effect.sync(() => {
                           requests.push({ method, params });
-                        }).pipe(Effect.andThen(client.raw.request(method, params))),
+                        }).pipe(
+                          Effect.andThen(
+                            inventory && method === "config/read"
+                              ? Effect.succeed({
+                                  config: {
+                                    mcp_servers: {
+                                      fixture: { command: "node" },
+                                      http: { url: "https://example.test" },
+                                    },
+                                  },
+                                })
+                              : client.raw.request(
+                                  method,
+                                  inventory ? withoutInventoryTags(params) : params,
+                                ),
+                          ),
+                        ),
                     },
                   }) satisfies CodexClient.CodexAppServerClient["Service"],
               ),
@@ -2123,6 +2196,78 @@ describe("CodexAdapterV2 session initialize", () => {
 
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
+
+  it.effect(
+    "inventory binds start and fork response ids and preserves the token on a loaded resume",
+    () =>
+      Effect.gen(function* () {
+        const preamble = replayPreamble("inventory-start");
+        const transcript = makeCodexReplayTranscript({
+          scenario: "inventory-loads",
+          entries: [
+            ...preamble.slice(0, 5),
+            {
+              type: "expect_outbound",
+              frame: {
+                id: 3,
+                method: "thread/resume",
+                params: {
+                  threadId: "inventory-start",
+                  excludeTurns: true,
+                  config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                },
+              },
+            },
+            withReplayRequestId(preamble[4]!, 3),
+            {
+              type: "expect_outbound",
+              frame: {
+                id: 4,
+                method: "thread/fork",
+                params: { threadId: "inventory-start", config: CodexAdapterV2.CODEX_THREAD_CONFIG },
+              },
+            },
+            withReplayRequestId(replayPreamble("inventory-fork")[4]!, 4),
+          ],
+        });
+        const session = yield* openReplaySession(transcript, undefined, true);
+        const original = yield* session.ensureThread("same-robob-id");
+        const first = (yield* session.runtime.runtimeInventory!)!.loads[0]!;
+        yield* session.runtime.resumeThread({ providerThread: original });
+        assert.deepEqual((yield* session.runtime.runtimeInventory!).loads, [first]);
+        yield* session.runtime.forkThread({
+          sourceProviderThread: original,
+          targetThreadId: ThreadId.make("same-robob-id"),
+        });
+        const loads = (yield* session.runtime.runtimeInventory!).loads;
+        assert.deepEqual(
+          loads.map((load) => [load.nativeThreadId, load.threadId]),
+          [
+            ["inventory-start", "same-robob-id"],
+            ["inventory-fork", "same-robob-id"],
+          ],
+        );
+        assert.notEqual(loads[0]!.loadId, loads[1]!.loadId);
+        const requests = session.requests.filter((request) =>
+          ["thread/start", "thread/resume", "thread/fork"].includes(request.method),
+        );
+        for (const [index, request] of requests.entries()) {
+          const config = Reflect.get(request.params as object, "config");
+          assert.equal(config["mcp_servers.fixture.env.ROBOB_THREAD_ID"], "same-robob-id");
+          assert.equal(
+            config["mcp_servers.fixture.env.ROBOB_NATIVE_THREAD_ID"],
+            index === 1 ? "inventory-start" : "",
+          );
+          assert.isString(config["mcp_servers.fixture.env.ROBOB_THREAD_LOAD_ID"]);
+          assert.isUndefined(config["mcp_servers.http.env.ROBOB_THREAD_ID"]);
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
 
   it.effect("marks native background work as ending with the app-server", () =>
     Effect.gen(function* () {
@@ -2815,6 +2960,50 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         firstTerminal: Deferred.await(firstTerminal),
       };
     });
+
+  it.effect("read-only background observation does not refresh or taint retained state", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        let reads = 0;
+        const harness = yield* makeCodexReplayHarness(
+          makeCodexReplayTranscript({
+            scenario: "inventory-no-rollout-refresh",
+            entries: codexReplayPreamble({
+              nativeThreadId: "inventory-readonly",
+              nativeTurnId: "unused",
+              prompt: "unused",
+            }).slice(0, 5),
+          }),
+        ).pipe(
+          Effect.provideService(FileSystem.FileSystem, {
+            ...fs,
+            open: (...args) => {
+              if (args[0] !== "/tmp/inventory-readonly.jsonl") return fs.open(...args);
+              reads++;
+              return Effect.die("rollout read must not run during inventory");
+            },
+          }),
+        );
+        assert.isFalse(
+          yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread, {
+            readOnly: true,
+            includeSubagents: true,
+          }),
+        );
+        assert.strictEqual(reads, 0);
+        assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+        assert.isTrue(
+          yield* harness.runtime.hasPendingBackgroundWorkForThread!(harness.providerThread),
+        );
+        assert.strictEqual(reads, 1);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
 
   it.effect.each(
     (["completed", "failed", "interrupted"] as const).flatMap((status) =>
@@ -15224,3 +15413,46 @@ it.each([
     assert.equal(failure !== null, expected);
   },
 );
+
+it.each([
+  ["probe", true],
+  ["launch-probe", true],
+  ["under_score", true],
+  ["123", true],
+  ['"quoted"', true],
+  ["dot.name", false],
+  [".leading", false],
+  ["trailing.", false],
+  ["two..dots", false],
+] as const)("tags only an unambiguous Codex override segment: %s", (name, tagged) => {
+  const params = CodexAdapterV2.codexThreadRuntimeParams({
+    mcpSession: undefined,
+    attribution: {
+      threadId: "robob-one",
+      loadId: "load-one",
+      nativeThreadId: "native-one",
+      servers: [name],
+    },
+  });
+  assert.deepEqual(params.config, {
+    ...CodexAdapterV2.CODEX_THREAD_CONFIG,
+    ...(tagged
+      ? {
+          [`mcp_servers.${name}.env.ROBOB_THREAD_ID`]: "robob-one",
+          [`mcp_servers.${name}.env.ROBOB_THREAD_LOAD_ID`]: "load-one",
+          [`mcp_servers.${name}.env.ROBOB_NATIVE_THREAD_ID`]: "native-one",
+        }
+      : {}),
+  });
+});
+
+it("leaves command, args and sibling servers intact when tagging a fresh load", () => {
+  const fresh = CodexAdapterV2.codexThreadRuntimeParams({
+    mcpSession: undefined,
+    attribution: { threadId: "same-robob", loadId: "fresh-fork", servers: ["probe"] },
+  });
+  assert.strictEqual(fresh.config["mcp_servers.probe.env.ROBOB_NATIVE_THREAD_ID"], "");
+  assert.isUndefined(fresh.config["mcp_servers.probe"]);
+  assert.isUndefined(fresh.config["mcp_servers.probe.command"]);
+  assert.strictEqual(fresh.config.service_tier, "default");
+});

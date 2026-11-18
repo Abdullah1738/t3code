@@ -76,7 +76,7 @@ function fixture(opted = true, extra: Record<string, unknown> = {}) {
       Date.now=()=>Date.parse("2026-11-16T07:51:00Z")+${minute}*60_000;
       const state=lib.loadState("critical");state.next_at=0;lib.saveState("critical",state);
       await tickOne("critical");await alerts.drainOwnerAlerts();
-      ${persistResult ? 'alerts.applyOwnerAlertResults("critical");alerts.dispatchOwnerAlerts("critical");await alerts.drainOwnerAlerts();alerts.applyOwnerAlertResults("critical");' : ""}
+      ${persistResult ? 'await alerts.applyOwnerAlertResults("critical");alerts.dispatchOwnerAlerts("critical");await alerts.drainOwnerAlerts();await alerts.applyOwnerAlertResults("critical");' : ""}
     `);
   };
   const resume = () => {

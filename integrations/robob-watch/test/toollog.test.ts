@@ -21,6 +21,50 @@ test("test default stays outside the home log tree when the override is absent",
 const dirs: string[] = [];
 const fixture = () => { const dir = mkdtempSync(join(tmpdir(), "toollog-")); dirs.push(dir); process.env.TOOLLOG_DIR = dir; return dir; };
 
+const credentialErrors = [
+  { form: "unquoted assignment", error: "failed password=alpha", expected: "failed password=[redacted]" },
+  { form: "unquoted separators", error: "token=alpha, retry; secret=beta; done", expected: "token=[redacted], retry; secret=[redacted]; done" },
+  { form: "double quoted whitespace", error: 'password="alpha beta" retry', expected: "password=[redacted] retry" },
+  { form: "single quoted whitespace", error: "secret='alpha beta' retry", expected: "secret=[redacted] retry" },
+  { form: "double quoted punctuation", error: 'api_key="alpha, beta; gamma" retry', expected: "api_key=[redacted] retry" },
+  { form: "single quoted punctuation", error: "api-key='alpha, beta; gamma' retry", expected: "api-key=[redacted] retry" },
+  { form: "JSON field", error: '{"token": "alpha beta, gamma; delta"}', expected: '{"token": [redacted]}' },
+  { form: "single quoted field", error: "'secret': 'alpha beta'", expected: "'secret': [redacted]" },
+  { form: "case and colon", error: 'APIKEY : "alpha beta"', expected: "APIKEY : [redacted]" },
+  { form: "escaped double quote", error: 'password="alpha \\"beta, gamma" retry', expected: "password=[redacted] retry" },
+  { form: "escaped single quote", error: "password='alpha \\'beta; gamma' retry", expected: "password=[redacted] retry" },
+  { form: "empty quoted value", error: 'password="" retry', expected: "password=[redacted] retry" },
+  { form: "unterminated double quote", error: 'password="alpha beta, gamma;', expected: "password=[redacted]" },
+  { form: "unterminated single quote", error: "secret='alpha beta, gamma;", expected: "secret=[redacted]" },
+  { form: "trailing escape", error: 'token="alpha beta\\', expected: "token=[redacted]" },
+  { form: "authorization scheme", error: 'authorization="Bearer alpha beta" retry', expected: "authorization=[redacted] retry" },
+];
+test.each(credentialErrors)("probe logs redact credentials: $form", ({error, expected}) => {
+  const dir = fixture();
+  toolLog({ component: "runner", kind: "error", name: "watch.pause_probe", props: { error_first_line: error } });
+  expect(rows(dir)[0].props).toEqual({ error_first_line: expected });
+});
+
+test("cleaned classifier errors survive both sinks only in the triage classifier scope", () => {
+  const dir = fixture();
+  const error = "TypeError: fixture shape mismatch; at classify:1234; endpoint=https://openrouter.ai/api/v1/chat/completions; elapsed_ms=2; attempts=1";
+  const entries = [
+    { component: "triage", name: "triage.classify", props: { classifier_error: error } },
+    { component: "runner", name: "triage.classify", props: { classifier_error: error } },
+    { component: "triage", name: "triage.run", props: { classifier_error: error } },
+    ...[null, 1, {}, "x".repeat(401), "invalid\nmessage"].map(value => ({ component: "triage", name: "triage.classify", props: { classifier_error: value } })),
+  ].map(entry => ({ ...entry, kind: "perf" as const }));
+  for (const entry of entries) toolLog(entry);
+  const script = `import json, sys\nsys.path.insert(0, "helpers")\nfrom toollog import tool_log\nfor entry in json.loads(sys.argv[1]): tool_log(entry)\n`;
+  const result = Bun.spawnSync(["python3", "-I", "-B", "-c", script, JSON.stringify(entries)], { env: { ...process.env, TOOLLOG_DIR: dir } });
+  expect(result.exitCode).toBe(0);
+  const all = rows(dir);
+  for (const offset of [0, entries.length]) {
+    expect(all[offset].props).toEqual({ classifier_error: error });
+    expect(all.slice(offset + 1, offset + entries.length).every(row => row.props === undefined)).toBe(true);
+  }
+});
+
 test("auth log-only metadata is allowlisted identically in Python and TypeScript", () => {
   const dir = fixture();
   const entries = [

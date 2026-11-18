@@ -297,8 +297,9 @@ returns infra exit 90 (internal exit 98); its log is `~/.offbox/repo-setup-<repo
 ## Save state for later (do this!)
 
 Stopped boxes are free, but boat deletes a stopped box's data 14 days after its last stop. Bases and templates
-are also kept as boat saved snapshots (no expiry; the plan includes 50, offbox never pays for more), and the reaper
-resumes+stops pinned leases and unsaved bases/templates before day 14. Save generously:
+are also kept as boat saved snapshots (no expiry; the plan includes 50, offbox never pays for more). The reaper
+refreshes unsaved bases/templates before day 14. A stopped pinned lease is kept in a free saved snapshot;
+if no slot is free, a pinned box may be resumed and kept running until its pin expires. Save generously:
 
 - After an expensive setup (the repo-selected install above, `go mod download`, harness images pulled, a seeded database), run
   `offbox save --default --note "repo deps installed at <sha>"`. New threads on this repo then start from that state and
@@ -307,8 +308,10 @@ resumes+stops pinned leases and unsaved bases/templates before day 14. Save gene
   later with `offbox run --base pg-seeded -- ...` (only for a new lease).
 - `offbox bases` lists saved bases and whether each is kept (saved snapshot), box-only (with the date boat deletes
   it) or EXPIRED; `offbox base rm <name>` removes one. Bases are never auto-deleted by offbox.
-- `offbox keep --days 30` pins your current lease so the reaper never deletes it and keeps its disk past boat's
-  14 days (it still stops when idle). Unpinned leases stopped 14 days are gone; the next run starts a new box.
+- `offbox keep --days 30` pins your current lease until the expiry it shows. While pinned, automatic cleanup never
+  stops, archives, deletes or reuses the box, and other callers can't stop or delete it without
+  `--override-protection`. `offbox status` lists pins expiring within 24 h with their holder; renew before then if
+  you still need the box. Unpinned leases stopped 14 days are gone; the next run starts a new box.
 - Leases are deleted only when their thread has been archived for 7 days, or unused for 30 days and not pinned.
 
 A saved base retains its checkout path in project build state. When offbox relocates that checkout for another local path, it clears project `.gradle` directories before the move, including nested Gradle builds; shared Gradle user-home dependency caches and module build outputs stay warm. For a lease created before this fix, move aside the project's `.gradle` once before rerunning Gradle. When a base is restored under a new directory, offbox removes CMake caches that name the old path.
@@ -472,7 +475,7 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 
 - Python/boto3 suites that take hours with idle pytest workers on a box: AWS instance-metadata lookups. Offbox now sets `AWS_EC2_METADATA_DISABLED=true` on every box run; older notes that say to pass `--env AWS_EC2_METADATA_DISABLED` by hand are no longer needed.
 - Go `unsafeTraceExpWriter redeclared`: stale overlay sources; the run preamble removes `runtime/traceexp.go` for Go 1.25+ and replaces mixed Go 1.26+ trees from the exact official release; template installs replace GOROOT, never overlay it.
-- Managed Go trees carry an official path/type/size manifest; a missing or mismatched manifest triggers a clean reinstall, verified with `go build std`. Healthy runs only scan the inventory, not compile it. Each repair first prints the old tree's state (`old tree manifest=missing|mismatch|ok`).
+- Managed Go trees carry an official path/type/size manifest; a missing or mismatched manifest triggers a clean reinstall, verified with `go build std`. An inventory that cannot run is unreadable, never triggers a reinstall, and a crashed inventory tool is an infra failure (exit 90) for runs that need Go. Healthy runs only scan the inventory, not compile it. Each repair first prints the old tree's state (`old tree manifest=missing|mismatch|ok|unreadable`).
 - Go `package unsafe is not in std` or `build constraints exclude all Go files in /usr/local/go/src/...` while other go commands in the same run pass: a box read glitch seen on the first run after a resume, not your code and not a repair race (one run per box). offbox prints a hint and logs a `go_std_glitch` event; rerun the same command. A nested `/usr/local/go/go` is a half-swapped GOROOT; the next run repairs it under a box-local lock and verifies the replacement.
 - Docker won't start on a box (`docker.service` 203/EXEC, `/usr/local/bin/sync-docker-firewall` missing): boat's Docker firewall hook was lost when the box resumed from an older snapshot. Every `offbox run` restores it from `templates/boat-sync-docker-firewall` and restarts a failed Docker; for an `offbox ssh` session, run any `offbox run -- true` first.
 - Python `libpq library not found` / psycopg `no pq wrapper available` (or `cannot open shared object file` for a library that is installed): the box resumed with a stale linker cache (`/etc/ld.so.cache`). Every `offbox run` runs `sudo ldconfig` first when an installed library is missing from the cache; in an `offbox ssh` session, run `sudo ldconfig` yourself. Reinstalling the package is not needed.
@@ -492,6 +495,8 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 - Hung box run: `offbox kill <run>` first (it confirms the stop on boat), then `offbox release --delete` if the box
   is still in the way, then rerun (fresh lease from base/template). Don't pkill on the box.
 - Weird box with no active run: `offbox release --delete`, then rerun (fresh lease from base/template).
+- If release/stop/delete refuses because another holder pins or holds the box, or a command on it is still alive,
+  it names the holder. Leave it alone; use `--override-protection` only when you know the holder is gone.
 - A bg run that settled while nobody followed it gets its log completed from boat's history the next time you run `offbox logs` or `offbox wait`; if that fails, offbox says the output is incomplete.
 - When asked for progress, plain `offbox logs <id>` once fetches and saves available output when no follower owns the box. For completion, follow **Waiting for a run**; do not loop logs or timed waits.
 - Logs and state: `~/.local/share/offbox/` (`offbox.log`, `offbox.db`, `logs/<run>.log`). Code:

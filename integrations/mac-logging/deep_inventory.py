@@ -12,6 +12,9 @@ import jobs
 from toollog import emit
 
 BUDGET_S = 90*60
+# Hourly inventory holds the lock for minutes and drifts onto 03:30; skipping
+# the daily deep pass then loses the whole day.
+DEEP_LOCK_WAIT_S = 15*60
 SLOW_ROOTS = ('wt', 't3code-wt', 'board-wt', 'coord-wt')
 
 
@@ -81,8 +84,6 @@ class BackgroundDu:
 
 
 def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
-    started, wall_started = time.monotonic(), time.time()
-    deadline, wall_deadline = started+budget, wall_started+budget
     measured = partial = bytes_measured = 0
     metrics = dict(timeouts=0, secondsInTimeouts=0, probeTimeouts=0, secondsInProbeTimeouts=0, probeAllowances=[], childrenDescended=set(), partsMeasured=0)
     metrics.update(cpuSecondsDu=0, wallSecondsDu=0, firstAttempts=0, firstAttemptTimeouts=0, secondsWasted=0)
@@ -98,17 +99,34 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
         return dict(loadAvg1Start=load_start, loadAvg1End=load_end, loadAvg1Max=load_max,
                     **{key: metrics[key] for key in ('cpuSecondsDu', 'wallSecondsDu',
                        'firstAttempts', 'firstAttemptTimeouts', 'secondsWasted')})
+    seconds_by_root = {}
     roots = list(jobs.DIRECTORY_ROOTS if paths is None else paths)
     priorities = {str(Path('/Volumes/ExternalSSD')/name): i for i, name in enumerate(SLOW_ROOTS)}
     roots.sort(key=lambda p: (priorities.get(str(p), len(priorities)), str(p)))
-    with jobs.inventory_lock() as lock_fd:
-        if lock_fd is False:
-            jobs.inventory_skipped_logs(roots, jobs.read_state('disk-inventory'), 'lock_held')
-            emit('disk', 'event', 'disk.deep.end', props=dict(duMode='links', skipReason='lock_held',
+    lock_wait_started = None
+
+    def waiting():
+        nonlocal lock_wait_started
+        lock_wait_started = time.monotonic()
+
+    with jobs.inventory_lock(wait_s=DEEP_LOCK_WAIT_S, stopped=stopped, on_wait=waiting) as lock_fd:
+        lock_wait_ms = (max(0, (time.monotonic()-lock_wait_started)*1000)
+                        if lock_wait_started is not None else 0)
+        if lock_wait_ms > 0:
+            emit('disk', 'event', 'disk.deep.lock_wait', props=dict(
+                waitedMs=lock_wait_ms, acquired=lock_fd is not False))
+        killed = stopped()
+        if lock_fd is False or killed:
+            reason = dict(stopReason='killed') if killed else dict(skipReason='lock_held')
+            if not killed:
+                jobs.inventory_skipped_logs(roots, jobs.read_state('disk-inventory'), 'lock_held')
+            emit('disk', 'event', 'disk.deep.end', props=dict(duMode='links', lockWaitMs=lock_wait_ms, **reason,
                  timeouts=0, secondsInTimeouts=0, probeTimeouts=0, secondsInProbeTimeouts=0,
                  probeAllowanceMedianS=0, childrenDescended=0, partsMeasured=0,
                  spawnPolicy='nice-10-utility-io-throttle', **contention_props()))
             return
+        started, wall_started = time.monotonic(), time.time()
+        deadline, wall_deadline = started+budget, wall_started+budget
         state = jobs.read_state('disk-inventory')
         cursor = state.get('deepNextRoot')
         if cursor in [str(path) for path in roots]:
@@ -167,7 +185,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
         initial = copy.deepcopy(child_state)
 
         def props():
-            return dict(duMode='links', durationMs=max(0, (time.time()-wall_started)*1000),
+            return dict(duMode='links', durationMs=max(0, (time.time()-wall_started)*1000), lockWaitMs=lock_wait_ms,
                         childrenMeasured=measured, childrenPartial=partial,
                         childrenRemaining=remaining(), bytesMeasured=bytes_measured, stopReason=stop_reason,
                         rootsPartial=sum(not listed for entries, listed in listings.values()),
@@ -195,6 +213,14 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                        for root, (entries, listed) in listings.items() for entry in entries)
         queue = list(roots)
         try:
+            if paths is None:
+                from disk_budgets import deep_refresh, load_budgets
+                # Extra targets share this pass's lock and wall/monotonic budget.
+                try:
+                    deep_refresh(load_budgets(), state, runner,
+                                 min(deadline, time.monotonic()+max(0, wall_deadline-time.time())), stopped)
+                except Exception:
+                    emit('disk', 'error', 'disk.budget.failed', ok=False, error_tag='disk.budget_failed')
             while queue:
                 path = queue.pop(0)
                 key = str(path)
@@ -241,7 +267,9 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                                                      descend=lambda: not part_work[key] or not healthy_pending(),
                                                      inventory_log=inventory_logs[key])
                 finally:
-                    inventory_logs[key].elapsed_ms += max(0, (time.monotonic()-scan_started)*1000)
+                    elapsed = max(0, time.monotonic()-scan_started)
+                    inventory_logs[key].elapsed_ms += elapsed*1000
+                    seconds_by_root[key] = seconds_by_root.get(key, 0)+elapsed
                 checkpoint(*result)
                 # Yield after 60 s or four cheap batches; an expensive parts
                 # command is capped at 600 s across this child for the pass.
@@ -287,6 +315,8 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                 emit('disk', 'event', 'disk.deep.root', props=dict(duMode='links', source=key,
                      completedCount=complete, partial=not listed or complete != len(entries),
                      failedCount=len(entries)-complete, ageS=max(ages, default=0),
+                     completeWithDenied=status['completeWithDenied'],
+                     **jobs.inventory_diagnostics(cache, time.time()),
                      childrenWithPartsInProgress=sum(isinstance(v.get('parts'), dict)
                          and v.get('partial') is not False for v in cache.values())))
             state['sourceErrors'] = len(state['partials'])
@@ -295,7 +325,8 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
             if stop_reason == 'done' and (time.monotonic() >= deadline or time.time() >= wall_deadline):
                 stop_reason = 'budget'
             sample_load()
-            emit('disk', 'perf', 'disk.deep.end', duration_ms=(time.monotonic()-started)*1000, props=props())
+            emit('disk', 'perf', 'disk.deep.end', duration_ms=(time.monotonic()-started)*1000,
+                 props=dict(props(), secondsByRoot=seconds_by_root))
 
 
 def main():

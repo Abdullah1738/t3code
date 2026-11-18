@@ -10,6 +10,60 @@ from pathlib import Path
 import tempfile
 from toollog import directory, private_dir, safe_fields, finite_number, memory_command
 from status import report
+from jobs import INVENTORY_PARTS_FRESH_S
+
+
+def budget_rows(source):
+    try:
+        with source.open() as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                    if row.get('tool') != 'mac' or row.get('name') != 'disk.budget':
+                        continue
+                    props = safe_fields(row.get('props'), 'disk.budget')
+                    at = dt.datetime.fromisoformat(row['ts'].replace('Z', '+00:00'))
+                    if (at.tzinfo is not None and props.get('path') and props.get('owner')
+                            and finite_number(props.get('sizeGb')) and props.get('source') in ('inventory', 'deep')
+                            and finite_number(props.get('sizeAgeS'))
+                            and finite_number(props.get('budgetGb'))):
+                        yield at.timestamp(), props
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue
+    except OSError:
+        return
+
+
+def budget_rollup(day, root):
+    date = dt.date.fromisoformat(day)
+    current = list(budget_rows(root/(day+'.ndjson')))
+    history = list(current)
+    # Decomposed sizes can be 72h old while fresh. Their 24h baseline can
+    # predate that again, plus the two-hour comparison tolerance.
+    history_days = math.ceil((INVENTORY_PARTS_FRESH_S+26*3600)/86400)
+    for delta in range(1, history_days+1):
+        history.extend(budget_rows(root/((date-dt.timedelta(days=delta)).isoformat()+'.ndjson')))
+    latest, by_path = {}, defaultdict(list)
+    for at, props in history:
+        by_path[props['path']].append((at-props['sizeAgeS'], props))
+    for at, props in current:
+        if at > latest.get(props['path'], (float('-inf'), {}))[0]:
+            latest[props['path']] = at, props
+    over = []
+    for path, (at, props) in latest.items():
+        if props['sizeGb'] <= props['budgetGb']:
+            continue
+        # Never call the first/last samples of a short day "24h growth".
+        measured_at = at-props['sizeAgeS']
+        baselines = [(abs(measured_at-old_at-86400), old_at, old) for old_at, old in by_path[path]
+                     if abs(measured_at-old_at-86400) <= 7200]
+        baseline = min(baselines, key=lambda b: b[:2]) if baselines else None
+        over.append(dict(props, overBy=max(0, props['sizeGb']-props['budgetGb']),
+                         sampleTs=dt.datetime.fromtimestamp(at, dt.timezone.utc).isoformat(),
+                         sizeTs=dt.datetime.fromtimestamp(measured_at, dt.timezone.utc).isoformat(),
+                         growth24hGb=props['sizeGb']-baseline[2]['sizeGb'] if baseline else None,
+                         growthWindowS=measured_at-baseline[1] if baseline else None))
+    return dict(pathsMeasured=len(latest), topOverBudget=sorted(over, key=lambda p: (-p['overBy'], p['path']))[:10])
 
 
 def rollup(day, root=None):
@@ -147,6 +201,7 @@ def rollup(day, root=None):
     end = dt.datetime.combine(date + dt.timedelta(days=1), dt.time(), dt.timezone.utc)
     cadence = report(end, root, day=date)
     result.update(jobs=cadence['jobs'], missingJobs=cadence['missingJobs'])
+    result['diskBudgets'] = budget_rollup(day, root)
     result['uEpisodes'] = [dict(start=ep['start'], end=ep['end'], lastSeen=ep['lastSeen'],
                               peakCount=ep['peakCount'], volumes=ep['volumes'], topComms=ep['topComms'])
                            for _, (_, ep) in sorted(u_episodes.items())]

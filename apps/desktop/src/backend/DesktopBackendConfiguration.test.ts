@@ -260,13 +260,17 @@ describe("DesktopBackendConfiguration", () => {
         const second = yield* configuration.resolvePrimary;
 
         assert.equal(first.executablePath, process.execPath);
-        assert.deepEqual(first.args.slice(0, 4), [
-          "--max-old-space-size=6144",
+        assert.deepEqual(first.args, [
           "--require",
           environment.compileCachePath,
           environment.backendEntryPath,
+          "--base-dir",
+          environment.baseDir,
+          "--bootstrap-fd",
+          "3",
         ]);
         assert.equal(first.entryPath, environment.backendEntryPath);
+        assert.equal(first.manageProcessShutdown, true);
         assert.equal(first.cwd, environment.backendCwd);
         assert.equal(first.captureOutput, true);
         assert.equal(first.env.ELECTRON_RUN_AS_NODE, "1");
@@ -1068,6 +1072,8 @@ describe("DesktopBackendConfiguration", () => {
         const config = yield* configuration.resolvePrimary;
         assert.equal(config.captureOutput, true);
         assert.notInclude(config.args, "--require");
+        assert.notInclude(config.args, "--base-dir");
+        assert.equal(config.manageProcessShutdown, false);
       }).pipe(
         Effect.provide(
           layerBackendConfiguration().pipe(

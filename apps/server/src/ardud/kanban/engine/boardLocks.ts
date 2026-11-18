@@ -74,6 +74,7 @@ interface Operation {
   boardId: string | undefined;
   waiting: { readonly target: WaitingOn; readonly started: number } | undefined;
   stale: boolean;
+  validating: boolean;
   readBudgetExceeded: "dispatch" | "board" | undefined;
   readonly staleFences: Array<string>;
   committed: boolean;
@@ -618,6 +619,29 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
     op.held = undefined;
     yield* Effect.forEach(held.releases.toReversed(), (release) => release, { discard: true });
   }, Effect.uninterruptible);
+  // Validation may read another service outside the gate. Its reacquisition must
+  // check fences without recursively validating the snapshot being assembled.
+  const validate = Effect.fnUntraced(function* (
+    op: Operation,
+    boardId: string,
+    valid: Effect.Effect<boolean>,
+  ) {
+    if (op.validating) return true;
+    const board = boardOf(boardId);
+    const generation = board.generation;
+    const migrationBefore = migrationGeneration;
+    op.validating = true;
+    const result = yield* valid.pipe(
+      Effect.provideService(SavedWrite.writing, false),
+      Effect.ensuring(
+        Effect.sync(() => {
+          op.validating = false;
+        }),
+      ),
+    );
+    // Inputs read before an outside call must still describe the reacquired gate.
+    return result && generation === board.generation && migrationBefore === migrationGeneration;
+  });
   const acquire = (op: Operation, boardId: string, reconcile = false) =>
     Effect.uninterruptible(
       Effect.gen(function* () {
@@ -678,8 +702,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           op.dependencies.delete(boardId);
         }
         // Revalidation remains a bounded admission read when a masked write reacquires.
-        if (scoped && !(yield* scoped.valid.pipe(Effect.provideService(SavedWrite.writing, false))))
-          op.stale = true;
+        if (scoped && !(yield* validate(op, boardId, scoped.valid))) op.stale = true;
         if (!scoped && (expected !== undefined || !op.dependencies.has(boardId)))
           seen.set(boardId, version(held));
         yield* check(op);
@@ -710,6 +733,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           boardId: undefined,
           waiting: undefined,
           stale: false,
+          validating: false,
           readBudgetExceeded: undefined,
           staleFences: [],
           committed: false,
@@ -1035,7 +1059,7 @@ export const make = Effect.fn("KanbanBoardLocks.make")(function* () {
           }),
         ),
       );
-      if (!(yield* valid.pipe(Effect.provideService(SavedWrite.writing, false)))) {
+      if (!(yield* validate(op, boardId, valid))) {
         op.stale = true;
         yield* check(op);
       }

@@ -52,6 +52,8 @@ export class McpCall extends Context.Service<
     denyReason?: AnalyticsEvent["denyReason"];
     reasonClass?: AnalyticsEvent["reasonClass"];
     invalidField?: string;
+    errorFields?: ReadonlyArray<string>;
+    parameterIssue?: SchemaIssue.Issue;
     refusedAt?: AnalyticsEvent["refusedAt"];
     boardWrite?: boolean;
     boardAdmitted?: boolean;
@@ -123,7 +125,8 @@ export class McpCall extends Context.Service<
     waitStage?: "lookup.caller" | "lookup.target" | "waiting";
     waitLookupMs?: number;
     phase: Phase;
-    saved: boolean | "unknown";
+    saved: boolean | "unknown" | "pending_create";
+    dispatchFenceAt?: bigint;
     dispatchFenceRecovered?: boolean;
     retryPath?: "receipt_fast" | "attached_pending" | "dispatched";
     taskLookup?: TaskLookup;
@@ -224,6 +227,7 @@ function failureMetadata(error: Record<string, unknown>, state: McpCall["Service
 export const parameterFailure = Effect.fnUntraced(function* (issue: SchemaIssue.Issue) {
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "Some") {
+    call.value.parameterIssue = issue;
     failureMetadata(schemaReason(issue), call.value);
     if (!call.value.readOnly && call.value.taskLookup === undefined && call.value.saved !== true)
       call.value.saved = false;
@@ -279,7 +283,7 @@ export const failedPhase = Effect.fnUntraced(function* (phase: string) {
 });
 
 // Dispatch owns the commit span; observing the receipt must not add per-event spans.
-export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
+export const setSaved = Effect.fnUntraced(function* (saved: boolean | "pending_create") {
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "Some" && call.value.saved !== true) call.value.saved = saved;
 });

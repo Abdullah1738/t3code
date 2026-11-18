@@ -13,6 +13,7 @@ export function claudeHarness(root: string, executable: string, model: string, c
     catch { unavailable(); return false; }
   };
   return { ready, async run(input) {
+    input.signal?.throwIfAborted();
     if (!ready()) throw new Error(ROUTER_KEY_ERROR);
     const settings = routerSettings(root, router.routerKeyFile);
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -34,10 +35,20 @@ export function claudeHarness(root: string, executable: string, model: string, c
     const abort = () => child.kill("SIGTERM");
     input.signal?.addEventListener("abort", abort, { once: true });
     if (input.signal?.aborted) abort();
-    child.stdin.write(input.text); child.stdin.end();
+    const resultRead = Promise.all([new Response(child.stdout).text(), child.exited, stderrTail(child.stderr)]);
     let output: string, exit: number, tail: Uint8Array;
-    try { [output, exit, tail] = await Promise.all([new Response(child.stdout).text(), child.exited, stderrTail(child.stderr)]); }
-    finally { input.signal?.removeEventListener("abort", abort); }
+    try {
+      input.signal?.throwIfAborted();
+      child.stdin.write(input.text); await child.stdin.end();
+      input.onStarted?.();
+      [output, exit, tail] = await resultRead;
+    } catch (error) {
+      if (child.exitCode === null) child.kill("SIGTERM");
+      await resultRead.catch(() => {});
+      throw error;
+    } finally {
+      input.signal?.removeEventListener("abort", abort);
+    }
     const detail = { exitCode: exit, signal: child.signalCode ?? null, stderrBytes: tail.length };
     let result: { is_error?: boolean; result?: unknown } | undefined;
     try { if (exit === 0) result = JSON.parse(output); } catch { /* Private output never enters an exception. */ }

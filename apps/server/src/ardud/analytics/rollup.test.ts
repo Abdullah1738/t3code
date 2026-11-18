@@ -365,7 +365,11 @@ describe("analytics rollups", () => {
     for (const row of [
       call({ ts: "2026-11-13T13:01:00.000Z", build: "new", outcome: "ok", durationMs: 40 }),
       call({ ts: "2026-11-13T12:02:00.000Z", outcome: "timeout", durationMs: 30 }),
-      call({ ts: "2026-11-13T12:01:00.000Z", durationMs: 20 }),
+      call({
+        ts: "2026-11-13T12:01:00.000Z",
+        durationMs: 20,
+        errorFields: ["limit", "events.limit", "limit"],
+      }),
       call({ callerThreadId: "other", outcome: "ok" }),
       call({ tool: "card_move", outcome: "ok" }),
       call({
@@ -373,6 +377,7 @@ describe("analytics rollups", () => {
         outcome: "refused",
         errorTag: "board_busy",
         errorPhase: "handler",
+        errorFields: ["limit"],
       }),
     ])
       accumulate(accumulator, row);
@@ -391,6 +396,7 @@ describe("analytics rollups", () => {
       retrySucceeded: 1,
     });
     assert.deepEqual(old.outcomes, { error: 1, timeout: 1, ok: 1, refused: 1 });
+    assert.deepEqual(old.errorFields, { limit: 2, "events.limit": 1 });
     assert.deepEqual(old.errors, [
       { errorTag: "caller_unresolved", errorPhase: "caller", count: 2 },
       { errorTag: "board_busy", errorPhase: "handler", count: 1 },
@@ -1470,4 +1476,16 @@ describe("restart admission rollup", () => {
     assert.strictEqual(result.groups.length, 128);
     assert.strictEqual(result.overflow, 12);
   });
+});
+
+it("counts a pending create receipt separately from saved and unknown without a dispatch failure", () => {
+  const { errorPhase: _errorPhase, ...pendingCall } = timeoutCall({
+    outcome: "ok",
+    saved: "pending_create",
+    fenceToReplyMs: 2000,
+  });
+  const rows = finishDetached([pendingCall, detachedResult()]).mcpCalls;
+  assert.deepEqual(rows[0]!.savedCounts, { pending_create: 1 });
+  assert.equal(rows[0]!.failures, 0);
+  assert.deepEqual(rows[0]!.dispatchTimeouts, { committed: 0, failed: 0, capped: 0, noOutcome: 0 });
 });

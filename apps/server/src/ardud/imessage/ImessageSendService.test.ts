@@ -356,10 +356,10 @@ describe("imessage_send", () => {
           { file: "/tmp/a.png", effect: "confetti" },
         ];
         for (const args of invalid) {
-          // Schema failures come back as MCP InvalidParams, before the handler runs.
-          const exit = yield* Effect.exit(call(caller(imessageRoot), args));
-          const rejected = exit._tag === "Failure" || exit.value.isError;
-          expect(rejected, JSON.stringify(args).slice(0, 80)).toBe(true);
+          const result = yield* call(caller(imessageRoot), args);
+          expect(result.isError, JSON.stringify(args).slice(0, 80)).toBe(true);
+          expect(result.structured).toMatchObject({ code: "invalid_request" });
+          expect(result.structured?.invalidFields).toEqual(expect.any(Array));
         }
         expect(harness.calls).toHaveLength(0);
       }),

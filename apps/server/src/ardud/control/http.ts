@@ -1,3 +1,4 @@
+import * as ProviderRuntimeInventory from "../providers/ProviderRuntimeInventory.ts";
 import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
 import { bootId, continuationReport } from "../fast-install/report.ts";
 import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
@@ -480,6 +481,9 @@ const makeRoutes = Effect.gen(function* () {
   const identities = yield* ExecutionIdentity.ExecutionIdentity;
   const observeControl = yield* ControlRequestAnalytics.make;
   const recovery = yield* RecoverySnapshot.RecoverySnapshot;
+  const providerInventory = yield* Effect.serviceOption(
+    ProviderRuntimeInventory.ProviderRuntimeInventory,
+  );
   const crypto = yield* Crypto.Crypto;
   const eventStore = yield* OrchestrationEventStore.OrchestrationEventStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -893,6 +897,13 @@ const makeRoutes = Effect.gen(function* () {
   });
 
   // Read-only recovery view for stream-recovery; see ardud/recovery/RecoverySnapshot.ts.
+  const runtimeInventory = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    if (Option.isNone(providerInventory))
+      return yield* fail("internal", "Provider runtime inventory unavailable.");
+    return json({ ok: true, ...(yield* providerInventory.value.snapshot) });
+  });
+
   const recoverySnapshot = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const params = yield* searchParams;
@@ -1024,8 +1035,7 @@ const makeRoutes = Effect.gen(function* () {
     });
   });
 
-  const listThreads = Effect.gen(function* () {
-    yield* authenticate(AuthOrchestrationReadScope);
+  const threadListPage = Effect.gen(function* () {
     const params = yield* searchParams;
     const cursor = yield* decodeThreadListCursor(params.get("cursor"));
     const archived = boolParam(params.get("archived")) === true;
@@ -1062,51 +1072,60 @@ const makeRoutes = Effect.gen(function* () {
         cursor,
       });
     }
-    const candidateIds =
-      ids ??
-      (yield* store
-        .liveThreadIds()
-        .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))));
-    const candidates = yield* shellsFor(candidateIds, location);
-    let shells = candidates.filter(
-      (shell) =>
-        shell.deletedAt === null &&
-        (includeSubagents ||
-          parentThreadId !== null ||
-          shell.lineage.relationshipToParent !== "subagent") &&
-        (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
-        (projectId === null || shell.projectId === projectId) &&
-        (creationSources === undefined || creationSources.includes(shell.creationSource)) &&
-        (ids === undefined || ids.includes(shell.id)) &&
-        (since === undefined || DateTime.toEpochMillis(shell.updatedAt) > since),
-    );
-    if (active !== undefined) {
-      shells = shells.filter((shell) => (stateFromShell(shell) !== "idle") === active);
-    }
-    if (states !== undefined) {
-      shells = shells.filter((shell) => states.includes(stateFromShell(shell)));
-    }
-    if (origin !== null) shells = yield* filterByOrigin(shells, origin);
-    const total = shells.length;
-    const page = shells
-      .filter((shell) => afterThreadListCursor(shell, cursor))
-      .toSorted(compareThreadListShells)
-      .slice(0, limit + 1);
-    const summaries = yield* summarize(page.slice(0, limit));
-    return yield* encoded({
-      ok: true,
-      total,
-      threads: summaries,
-      nextCursor: nextThreadListCursor(page, limit),
+    const readPage = Effect.gen(function* () {
+      const candidateIds =
+        ids ??
+        (yield* store
+          .liveThreadIds()
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause)))));
+      const candidates = yield* shellsFor(candidateIds, location);
+      let shells = candidates.filter(
+        (shell) =>
+          shell.deletedAt === null &&
+          (includeSubagents ||
+            parentThreadId !== null ||
+            shell.lineage.relationshipToParent !== "subagent") &&
+          (parentThreadId === null || shell.lineage.parentThreadId === parentThreadId) &&
+          (projectId === null || shell.projectId === projectId) &&
+          (creationSources === undefined || creationSources.includes(shell.creationSource)) &&
+          (ids === undefined || ids.includes(shell.id)) &&
+          (since === undefined || DateTime.toEpochMillis(shell.updatedAt) > since),
+      );
+      if (active !== undefined) {
+        shells = shells.filter((shell) => (stateFromShell(shell) !== "idle") === active);
+      }
+      if (states !== undefined) {
+        shells = shells.filter((shell) => states.includes(stateFromShell(shell)));
+      }
+      if (origin !== null) shells = yield* filterByOrigin(shells, origin);
+      const total = shells.length;
+      const page = shells
+        .filter((shell) => afterThreadListCursor(shell, cursor))
+        .toSorted(compareThreadListShells)
+        .slice(0, limit + 1);
+      const summaries = yield* summarize(page.slice(0, limit));
+      return yield* encoded({
+        ok: true,
+        total,
+        threads: summaries,
+        nextCursor: nextThreadListCursor(page, limit),
+      });
     });
-  }).pipe(NodeSqliteClient.backgroundReads);
+    return yield* readPage;
+  }).pipe(NodeSqliteClient.foregroundReads);
+
+  const listThreads = Effect.gen(function* () {
+    yield* authenticate(AuthOrchestrationReadScope);
+    // Candidate pages (including deep health) must bypass background sweeps too.
+    // One shared permit leaves a foreground reader for the UI during list bursts.
+    return yield* ReplyBuilders.bounded(threadListPage, "controlRead");
+  });
 
   const getThread = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
     // ardud: bridges poll this per chat (the iMessage reply path). Admit it on the
-    // poll lane like /messages and read on the foreground reader, not behind sweeps
-    // and thread lists on the background lane (p95 wait 10-115 s on 11 Nov 2026).
+    // poll lane and read on the foreground reader, not behind background sweeps.
     const thread = yield* ReplyBuilders.bounded(
       threadDetail(threadId).pipe(NodeSqliteClient.foregroundReads),
       "poll",
@@ -1275,55 +1294,63 @@ const makeRoutes = Effect.gen(function* () {
     yield* authenticate(AuthOrchestrationReadScope);
     const threadId = yield* param("threadId");
     const runId = yield* param("runId");
-    yield* getShell(threadId);
-    const records = yield* threads
-      .getThreadRecords(
-        ThreadId.make(threadId),
-        ["runs", "messages", "turnItems", "attempts", "providerTurns"],
-        {
-          runIds: [RunId.make(runId)],
-          messageRunIds: [RunId.make(runId)],
-          turnItemRunIds: [RunId.make(runId)],
-        },
-      )
-      .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
-    const run = records.runs.find((candidate) => candidate.id === runId);
-    if (run === undefined) {
-      return yield* fail("not_found", `Run ${runId} was not found on thread ${threadId}.`);
-    }
-    // A provider turn is this run's only when its attempt belongs to the run. Each native
-    // stream must have settled for the run's tool absence to be proven (see providerTurnsSettled).
-    const attemptIds = new Set(
-      records.attempts.filter((attempt) => attempt.runId === run.id).map((attempt) => attempt.id),
+    const evidence = yield* ReplyBuilders.bounded(
+      Effect.gen(function* () {
+        yield* getShell(threadId);
+        const records = yield* threads
+          .getThreadRecords(
+            ThreadId.make(threadId),
+            ["runs", "messages", "turnItems", "attempts", "providerTurns"],
+            {
+              runIds: [RunId.make(runId)],
+              messageRunIds: [RunId.make(runId)],
+              turnItemRunIds: [RunId.make(runId)],
+            },
+          )
+          .pipe(Effect.mapError((cause) => fail("internal", errorDetail(cause))));
+        const run = records.runs.find((candidate) => candidate.id === runId);
+        if (run === undefined) {
+          return yield* fail("not_found", `Run ${runId} was not found on thread ${threadId}.`);
+        }
+        // A provider turn is this run's only when its attempt belongs to the run. Each native
+        // stream must have settled for the run's tool absence to be proven (see providerTurnsSettled).
+        const attemptIds = new Set(
+          records.attempts
+            .filter((attempt) => attempt.runId === run.id)
+            .map((attempt) => attempt.id),
+        );
+        const runTurns = records.providerTurns.filter(
+          (turn) => turn.runAttemptId !== null && attemptIds.has(turn.runAttemptId),
+        );
+        const messages = records.messages
+          .filter((message) => message.runId === run.id && message.role === "assistant")
+          .toSorted(
+            (left, right) =>
+              DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
+              left.id.localeCompare(right.id),
+          );
+        const evidence = runToolEvidence({
+          runStatus: run.status,
+          turnItems: records.turnItems.filter((item) => item.runId === run.id),
+          itemsComplete: providerTurnsSettled(runTurns),
+        });
+        return {
+          ok: true,
+          threadId,
+          runId: run.id,
+          status: run.status,
+          toolEvidence: evidence.toolEvidence,
+          complete: evidence.complete,
+          messages: messages.map((message) => ({
+            id: message.id,
+            phase: message.phase,
+            text: messagePreview(message),
+          })),
+        };
+      }).pipe(NodeSqliteClient.foregroundReads),
+      "controlRead",
     );
-    const runTurns = records.providerTurns.filter(
-      (turn) => turn.runAttemptId !== null && attemptIds.has(turn.runAttemptId),
-    );
-    const messages = records.messages
-      .filter((message) => message.runId === run.id && message.role === "assistant")
-      .toSorted(
-        (left, right) =>
-          DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
-          left.id.localeCompare(right.id),
-      );
-    const evidence = runToolEvidence({
-      runStatus: run.status,
-      turnItems: records.turnItems.filter((item) => item.runId === run.id),
-      itemsComplete: providerTurnsSettled(runTurns),
-    });
-    return json({
-      ok: true,
-      threadId,
-      runId: run.id,
-      status: run.status,
-      toolEvidence: evidence.toolEvidence,
-      complete: evidence.complete,
-      messages: messages.map((message) => ({
-        id: message.id,
-        phase: message.phase,
-        text: messagePreview(message),
-      })),
-    });
+    return yield* encoded(evidence);
   });
 
   const send = Effect.gen(function* () {
@@ -1986,6 +2013,7 @@ const makeRoutes = Effect.gen(function* () {
     route("GET", `${p}/threads/by-native/:sessionId`, handle(byNative)),
     route("GET", `${p}/identity/resolve`, handle(identityResolve), "control.identity.resolve"),
     route("GET", `${p}/recovery/snapshot`, handle(recoverySnapshot)),
+    route("GET", `${p}/provider-runtimes/inventory`, handle(runtimeInventory)),
     route("GET", `${p}/threads/:threadId`, handle(getThread), "control.thread"),
     route("PATCH", `${p}/threads/:threadId`, handle(patchThread)),
     route("POST", `${p}/threads/:threadId/archive-if-idle`, handle(archiveThreadIfIdle)),

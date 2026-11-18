@@ -295,6 +295,34 @@ class UvCacheTests(Isolated):
 
 
 class UvCacheRecoveredOutputTests(background._BackgroundOutputFixture):
+    def test_finished_logs_reports_once(self):
+        self.con.execute("UPDATE runs SET exit_code=2,status='failed'")
+        self.con.commit()
+        self.path.write_text(AA00)
+        with patch.object(misc, '_catch_up_log', return_value='complete'), \
+                patch.object(uv_cache, 'report', wraps=uv_cache.report) as report, \
+                patch.object(uv_cache, 'repair', return_value=uv_cache.RepairResult(True, 'cleared', 'moved')) as repair:
+            code, _, err = self.invoke()
+        self.assertEqual(code, 0)
+        report.assert_called_once_with('bx_a', 'run-x', self.path, 2, until=None)
+        repair.assert_called_once_with('bx_a', 'mZwmaowx3NLXC838', 'click', timeout=20)
+        self.assertEqual(err.count('the uv cache on'), 1)
+        self.assertEqual(self.con.execute(
+            "SELECT COUNT(*) FROM events WHERE kind='uv_cache_corrupt'").fetchone()[0], 1)
+        self.assertEqual(self.row()['exit_code'], 2)
+
+    def test_stuck_holder_repair_keeps_the_wait_deadline(self):
+        self.path.write_text(AA00)
+        with patch.object(misc, 'now', return_value=100), \
+                patch.object(uv_cache.common, 'now', return_value=100), \
+                patch.object(uv_cache, 'report', wraps=uv_cache.report) as report, \
+                patch.object(uv_cache, 'repair', return_value=uv_cache.RepairResult(True, 'cleared', 'moved')) as repair, \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            code = misc._holder_stuck(self.row(), {'exitCode': 2}, self.path, 0, False, deadline=103)
+        self.assertEqual(code, 2)
+        report.assert_called_once_with('bx_a', 'run-x', self.path, 2, until=103)
+        repair.assert_called_once_with('bx_a', 'mZwmaowx3NLXC838', 'click', timeout=3)
+
     def test_settled_logs_follow_and_wait_use_recovered_output(self):
         self.con.execute("UPDATE runs SET exit_code=2,status='failed'")
         self.con.commit()
@@ -307,10 +335,12 @@ class UvCacheRecoveredOutputTests(background._BackgroundOutputFixture):
                 recovered.write_text(AA00)
                 with patch.object(misc, '_catch_up_log', return_value='complete'), \
                         patch.object(misc, '_raw_log', return_value=recovered), \
+                        patch.object(uv_cache, 'report', wraps=uv_cache.report) as report, \
                         patch.object(uv_cache, 'repair', return_value=uv_cache.RepairResult(True, 'cleared', 'moved')) as repair:
                     code, _, err = self.invoke(wait=method == 'wait', follow=method == 'follow')
                 self.assertEqual(code, 2 if method == 'wait' else 0)
-                self.assertIn('it was moved aside', err)
+                self.assertEqual(err.count('it was moved aside'), 1)
+                report.assert_called_once_with('bx_a', 'run-x', recovered, 2, until=None)
                 repair.assert_called_once_with('bx_a', 'mZwmaowx3NLXC838', 'click', timeout=20)
 
     def test_fresh_process_selects_management_only_endpoint_within_budget(self):
