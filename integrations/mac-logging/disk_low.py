@@ -1,18 +1,21 @@
 #!/usr/bin/python3
 """Cheap floor detection; bounded attribution runs in a separate child."""
 import fcntl
+import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
 from jobs import (SourceFailure, deadline_call, disk_throttle, du_total,
-                  opencode_inventory_size, read_state, save_state, size_movers, state_path)
-from toollog import emit, finite_number
+                  opencode_inventory_size, read_state, save_state, size_movers)
+from toollog import directory, emit, finite_number
 
 # Robob's DBs and agent temp files need headroom: opencode.db alone is 67 GB
 # and growing. This severe floor is independent of the 150 GB advisory guard.
@@ -22,42 +25,70 @@ CHECK_EVERY_S = 120
 MOVER_BUDGET_S = 6
 CHILD_BUDGET_S = .5
 RECENT_S = 24*3600
+STATE_IO_BUDGET_S = .25
+EMERGENCY_STATE = Path('/Volumes/ExternalSSD/.mac-upkeep/disk-low.json')
 VOLUMES = (('internal', '/System/Volumes/Data', INTERNAL_FREE_FLOOR_GB),
            ('external', '/Volumes/ExternalSSD', EXTERNAL_FREE_FLOOR_GB))
 
 
+@contextmanager
 def lock_file():
-    lock = state_path('disk-low').with_suffix('.lock').open('a')
-    os.chmod(lock.name, 0o600)
+    # Lock an existing directory inode: even creating a zero-byte lock file
+    # can fail with ENOSPC. Atomic state replacement leaves this inode intact.
+    root = directory()
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    fd = os.open(root, os.O_RDONLY)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock.close()
-        return None
-    return lock
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield None
+            return
+        yield fd
+    finally:
+        os.close(fd)
 
 
-def launch_worker(fd):
+def launch_worker(fd, state):
     # The inherited flock prevents another tick from adding children if this
     # one is stalled. The sampler never waits for attribution or traverses SSD.
-    subprocess.Popen([sys.executable, str(Path(__file__).absolute()), 'pending', str(fd)],
+    # argv carries the small snapshot without a tempfile or a blocking pipe.
+    subprocess.Popen([sys.executable, str(Path(__file__).absolute()), 'pending', str(fd), json.dumps(state)],
                      pass_fds=(fd,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def save_primary(name, state):
+    try:
+        save_state(name, state)
+        return True
+    except OSError as exc:
+        emit('disk', 'error', 'disk.state_failed', ok=False,
+             props=dict(source=name, errno=exc.errno), error_tag='disk.state_unavailable')
+        return False
+
+
+def episode_key(volume, healthy_at):
+    # Repeated detections must agree even if neither disk can checkpoint.
+    # A persisted healthy observation re-arms the next episode.
+    return 'disk-low:'+volume+':'+uuid.uuid5(uuid.NAMESPACE_URL, '%s:%s' % (volume, healthy_at)).hex
 
 
 def check(now=None, launch=launch_worker):
     """Minute sampler entry: once per two-minute bucket, statvfs disk reads."""
     now = time.time() if now is None else now
-    lock = lock_file()
-    if lock is None:
-        return
-    with lock:
+    with lock_file() as fd:
+        if fd is None:
+            return
         state = read_state('disk-low')
         at = state.get('checkedAt')
         if finite_number(at) and now >= at and int(now//CHECK_EVERY_S) == int(at//CHECK_EVERY_S):
             return
         episodes = state.setdefault('episodes', {})
+        healthy = state.setdefault('healthyAt', {})
         props, errors = {}, 0
+        state['readings'] = readings = {}
+        state['clearedKeys'] = []
         for volume, path, floor in VOLUMES:
             try:
                 value = os.statvfs(path)
@@ -66,25 +97,33 @@ def check(now=None, launch=launch_worker):
                 errors += 1
                 continue  # An unavailable volume is not a recovery.
             props[volume+'FreeGb'] = round(free, 3)
+            readings[volume] = dict(freeGb=free, floorGb=floor)
             episode = episodes.get(volume)
             if free < floor:
                 if episode is None:
-                    episode = dict(start=now, key='disk-low:'+volume+':'+uuid.uuid4().hex,
+                    episode = dict(start=now, key=episode_key(volume, healthy.get(volume, 0)),
                                    sent=False, logged=False)
                     episodes[volume] = episode
                 episode.update(freeGb=free, floorGb=floor)
-            elif episode is not None:
-                emit('disk', 'event', 'disk.low_cleared',
-                     props=dict(volume=volume, lowForS=max(0, now-episode['start'])))
-                del episodes[volume]
+            else:
+                healthy[volume] = now
+                if episode is not None:
+                    emit('disk', 'event', 'disk.low_cleared',
+                         props=dict(volume=volume, lowForS=max(0, now-episode['start'])))
+                    state['clearedKeys'].append(episode['key'])
+                    del episodes[volume]
         state['checkedAt'] = now
-        save_state('disk-low', state)
+        saved = save_primary('disk-low', state)
         emit('disk', 'event' if not errors else 'error', 'disk.floor_check', ok=not errors,
              props=dict(props, sourceErrors=errors),
              error_tag='disk.source_unavailable' if errors else None)
-        if any(not entry.get('sent') for entry in episodes.values()):
+        # A sent receipt may exist only in the emergency checkpoint. The
+        # child reconciles it without measuring movers or notifying again.
+        # A missing checkpoint can also hide an episode that has recovered.
+        reconcile = not finite_number(at) or now-at > CHECK_EVERY_S*1.5
+        if episodes or not saved or reconcile:
             try:
-                launch(lock.fileno())
+                launch(fd, state)
             except OSError:
                 emit('disk', 'error', 'disk.alert', ok=False, props=dict(exitCode=127),
                      error_tag='disk.alert_failed')
@@ -129,14 +168,16 @@ def bounded_command(command, timeout, text=False, env=None, **kwargs):
 def recent_temp_sizes(root, now, run, deadline):
     sizes, recent = {}, []
     # Limit enumeration as well as du; TMPDIR has had 160k direct children.
-    with deadline_call(deadline, os.scandir, root) as entries:
-        for entry in entries:
-            try:
-                info = deadline_call(deadline, entry.stat, follow_symlinks=False)
-            except OSError:
-                continue  # Scratch entries can disappear while enumerating.
-            if info.st_mtime >= now-RECENT_S and not stat.S_ISLNK(info.st_mode):
-                recent.append((stat.S_ISDIR(info.st_mode), info.st_mtime, entry.path))
+    def listing():
+        with os.scandir(root) as entries:
+            for entry in entries:
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue  # Scratch entries can disappear while enumerating.
+                if info.st_mtime >= now-RECENT_S and not stat.S_ISLNK(info.st_mode):
+                    recent.append((stat.S_ISDIR(info.st_mode), info.st_mtime, entry.path))
+    deadline_call(deadline, listing)
     # Recent directories first: thousands of tiny shell receipt files must not
     # consume the scan allowance before a new transfer/snapshot directory.
     for _, _, path in sorted(recent, reverse=True):
@@ -181,7 +222,7 @@ def movers(volume, now, run=bounded_command, temp_dir=None):
         if finite_number(cached.get('at')) and 0 <= now-cached['at'] <= RECENT_S:
             old_sizes.update(cached.get('sizes', {}))
         sizes.update(recent)
-        save_state('disk-low-movers', dict(at=now, sizes=recent))
+        save_primary('disk-low-movers', dict(at=now, sizes=recent))
     sizes = {path: size for path, size in sizes.items() if isinstance(path, str)
              and Path(path).is_relative_to('/Volumes/ExternalSSD') == (volume == 'external')
              and finite_number(size)}
@@ -201,10 +242,84 @@ def movers(volume, now, run=bounded_command, temp_dir=None):
     return props
 
 
-def pending(run=bounded_command, now=None):
+def emergency_io(operation, *args):
+    try:
+        return deadline_call(time.monotonic()+STATE_IO_BUDGET_S, operation, *args)
+    except (OSError, SourceFailure, ValueError):
+        emit('disk', 'event', 'disk.state_skipped', props=dict(source='emergency', skipped='budget_or_unavailable'))
+
+
+def read_emergency():
+    try:
+        with EMERGENCY_STATE.open() as stream:
+            value = json.loads(stream.read(16384))
+        if not isinstance(value, dict) or not isinstance(value.get('episodes', {}), dict):
+            raise ValueError('invalid emergency episodes')
+        healthy = value.get('healthyAt', {})
+        if not isinstance(healthy, dict) or any(not finite_number(at) for at in healthy.values()):
+            raise ValueError('invalid emergency recovery')
+        for episode in value.get('episodes', {}).values():
+            if (not isinstance(episode, dict) or not isinstance(episode.get('key'), str)
+                    or not finite_number(episode.get('start'))
+                    or type(episode.get('sent', False)) is not bool
+                    or type(episode.get('logged', False)) is not bool
+                    or episode.get('logged') and not isinstance(episode.get('text'), str)):
+                raise ValueError('invalid emergency episode')
+        return value
+    except FileNotFoundError:
+        return {}
+
+
+def write_emergency(state):
+    EMERGENCY_STATE.parent.mkdir(mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.disk-low-', dir=EMERGENCY_STATE.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(state, stream)
+        os.replace(tmp, EMERGENCY_STATE)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def checkpoint(state, backup_ok):
+    if save_primary('disk-low', state):
+        if backup_ok:
+            emergency_io(lambda: EMERGENCY_STATE.unlink(missing_ok=True))
+    elif backup_ok:
+        emergency_io(write_emergency, state)
+
+
+def pending(run=bounded_command, now=None, state=None):
     """Called only with the detector's inherited episode lock held."""
     now = time.time() if now is None else now
-    state = read_state('disk-low')
+    state = read_state('disk-low') if state is None else state
+    external = state.get('readings', {}).get('external', {})
+    # This code runs only in the child. Never create a shadow directory on
+    # the internal disk when the SSD is unmounted, or write to a low SSD.
+    backup_ok = (external.get('freeGb', 0) >= EXTERNAL_FREE_FLOOR_GB and
+                 emergency_io(os.path.ismount, '/Volumes/ExternalSSD'))
+    if not backup_ok:
+        emit('disk', 'event', 'disk.state_skipped', props=dict(source='emergency', skipped='budget_or_unavailable'))
+    cached = (emergency_io(read_emergency) or {}) if backup_ok else {}
+    for volume, prior in cached.get('episodes', {}).items():
+        recovered = state.get('healthyAt', {}).get(volume, 0)
+        if recovered >= prior['start'] and prior['key'] not in state.get('clearedKeys', []):
+            emit('disk', 'event', 'disk.low_cleared',
+                 props=dict(volume=volume, lowForS=max(0, recovered-prior['start'])))
+            state.setdefault('clearedKeys', []).append(prior['key'])
+    for volume, episode in list(state.get('episodes', {}).items()):
+        prior = cached.get('episodes', {}).get(volume, {})
+        recovered = cached.get('healthyAt', {}).get(volume, 0)
+        if recovered > state.get('healthyAt', {}).get(volume, 0):
+            state.setdefault('healthyAt', {})[volume] = recovered
+            episode.update(start=now, key=episode_key(volume, recovered), sent=False, logged=False)
+            episode.pop('text', None)
+        if prior.get('key') == episode['key']:
+            # Keep the frozen payload and any successful send receipt, while
+            # retaining the detector's latest free-space reading.
+            episode.update({k: prior[k] for k in ('start', 'logged', 'text', 'sent') if k in prior})
+    checkpoint(state, backup_ok)
     for volume, episode in state.get('episodes', {}).items():
         if episode.get('sent'):
             continue
@@ -223,7 +338,7 @@ def pending(run=bounded_command, now=None):
                                (volume, episode['freeGb'], episode['floorGb'], '; '.join(names) or 'unavailable'))
             emit('disk', 'event', 'disk.low', props=props)
             episode['logged'] = True
-            save_state('disk-low', state)
+            checkpoint(state, backup_ok)
         # Freeze text/key before the send. A timeout can mean it was queued;
         # Telegram's existing key deduplication makes the next tick safe.
         env = dict(os.environ)
@@ -242,12 +357,14 @@ def pending(run=bounded_command, now=None):
              props=dict(volume=volume, exitCode=code), error_tag=None if code == 0 else 'disk.alert_failed')
         if code == 0:
             episode['sent'] = True
-            save_state('disk-low', state)
+            checkpoint(state, backup_ok)
 
 
 if __name__ == '__main__':
-    if len(sys.argv) == 3 and sys.argv[1] == 'pending':
-        with os.fdopen(int(sys.argv[2]), 'a'):
-            pending()
+    if len(sys.argv) in (3, 4) and sys.argv[1] == 'pending':
+        try:
+            pending(state=json.loads(sys.argv[3]) if len(sys.argv) == 4 else None)
+        finally:
+            os.close(int(sys.argv[2]))
     else:
         check()

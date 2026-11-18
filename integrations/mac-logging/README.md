@@ -232,8 +232,21 @@ directory, reuse the swing inventory and delta calculation. First sightings
 report size without claiming a measured delta. The child emits `disk.low` with
 up to three movers, then sends through the existing Telegram notify command.
 Successful sends happen once per episode; failures log `disk.alert` and retry
-the frozen text/key on the next check. The inherited lock prevents overlapping
-workers. No new watcher or LaunchAgent is needed.
+the frozen text/key on the next check. The inherited directory lock prevents
+overlapping workers without creating a file on an exhausted filesystem.
+No new watcher or LaunchAgent is needed.
+
+Checkpoint failures never block launch or notification: the detector passes its
+observation directly to the child. Only the child can use the small emergency
+checkpoint at `/Volumes/ExternalSSD/.mac-upkeep/disk-low.json`, with a 250 ms
+budget per operation. It skips that copy when the SSD is unmounted, unavailable
+or below its floor. The backup preserves frozen messages and send receipts and
+migrates back to normal state when writes recover. If neither location can be
+written, notification still uses a deterministic episode key; Telegram retains
+the first accepted payload and rejects changed retries. Local event/receipt
+durability then depends on storage recovering. Mover cache writes are optional,
+so failed writes retain attribution already measured. The listing deadline
+covers opening, advancing, statting and closing the iterator.
 
 ## Mac tailnet guard
 
