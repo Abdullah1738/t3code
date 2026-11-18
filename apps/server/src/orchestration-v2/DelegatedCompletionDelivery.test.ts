@@ -1965,6 +1965,158 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
         }),
     );
 
+    it.effect.each([
+      ["server_shutdown", true],
+      ["server_restart", true],
+      ["task_cancel", false],
+      ["user_stop", false],
+    ] as const)(
+      "preserves the persisted %s completion through parent delivery and task status",
+      ([cancelReason, resumable]) =>
+        Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const now = yield* DateTime.now;
+          const threadId = ThreadId.make(`thread:cancel-boundary:${cancelReason}`);
+          const projectId = ProjectId.make(`project:cancel-boundary:${cancelReason}`);
+          const runId = RunId.make(`run:cancel-boundary:${cancelReason}`);
+          const rootNodeId = NodeId.make(`node:cancel-boundary:${cancelReason}`);
+          const partial = "The offbox run passed; I am checking the remaining evidence.";
+          yield* seedParentWithTerminalTask({
+            threadId,
+            projectId,
+            runId,
+            rootNodeId,
+            taskId: NodeId.make(`node:cancel-boundary-seed:${cancelReason}`),
+            deliveryState: "acknowledged",
+            now,
+          });
+          const child = yield* seedRestartCancelledChild({
+            parentThreadId: threadId,
+            projectId,
+            parentRunId: runId,
+            rootNodeId,
+            name: `cancel-boundary-child:${cancelReason}`,
+            completionWake: "always",
+            continuationPending: false,
+            cancelReason,
+            partialResult: partial,
+            now,
+          });
+          yield* orchestrator.recoverDelegatedTasks;
+          const parent = yield* orchestrator.getThreadProjection(threadId);
+          const task = parent.subagents.find((row) => row.id === child.taskId)!;
+          assert.equal(task.status, resumable ? "interrupted" : "cancelled");
+          assert.include(task.result!, partial);
+          assert.notProperty(task, "finalReport");
+          if (resumable) {
+            assert.deepEqual(JSON.parse(task.result!.split("\n")[0]!), {
+              status: "interrupted",
+              cancelReason,
+              resumable: true,
+              childThreadId: child.childThreadId,
+              resumeTool: "t3_thread_send",
+            });
+            assert.include(task.result!, `Partial assistant text:\n${partial}`);
+            assert.notInclude(task.result!, "Child task cancelled; no final report.");
+            assert.notInclude(task.result!, "Partial assistant findings (not a final report)");
+          } else {
+            assert.include(task.result!, "Child task cancelled; no final report.");
+            assert.include(task.result!, `Reason: ${cancelReason}`);
+            assert.include(
+              task.result!,
+              `Partial assistant findings (not a final report):\n${partial}`,
+            );
+            assert.notInclude(task.result!, '"resumable":true');
+            assert.notInclude(task.result!, "Interrupted by restart.");
+          }
+          const delivery = parent.runs.find((row) => row.id === runId)!.delegatedCompletion!
+            .delivery!;
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`command:cancel-boundary-delivery:${cancelReason}`),
+            threadId,
+            messageId: delivery.messageId,
+            text: "Child state available.",
+            attachments: [],
+            createdBy: "agent",
+            creationSource: "server",
+            dispatchMode: { type: "queue_after_active" },
+            delegatedCompletion: {
+              parentRunId: runId,
+              generation: delivery.generation,
+              taskIds: delivery.taskIds,
+            },
+          });
+          const queued = yield* orchestrator.getThreadProjection(threadId);
+          assert.include(
+            queued.messages.find((row) => row.id === delivery.messageId)!.text,
+            task.result!,
+          );
+          const statusLayer = OrchestratorMcpService.layer.pipe(
+            Layer.provide(McpProviderSessions.layer),
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.mock(ThreadManagementService.ThreadManagementService)({
+                  getCallerRow: (id) => Effect.succeed(liveThreadShell(id)),
+                  getThreadShell: (id) => Effect.succeed(liveThreadShell(id)),
+                  getThreadRecords: (id, fields, filter) =>
+                    orchestrator.getThreadRecords(id, fields, filter),
+                  delegatedTaskResultPending: (id, taskId) =>
+                    orchestrator.delegatedTaskResultPending(id, taskId),
+                  dispatch: (command) => orchestrator.dispatch(command),
+                }),
+                Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+                Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+                Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
+                Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({
+                  list: () => Effect.succeed([]),
+                }),
+                Layer.mock(ProjectService.ProjectService)({}),
+                Layer.mock(SecretRequests.SecretRequests)({}),
+                Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+                ServerSettings.layerTest(),
+                NodeServices.layer,
+              ),
+            ),
+          );
+          const status = yield* Effect.gen(function* () {
+            const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+            return yield* service.taskStatus(
+              {
+                environmentId: EnvironmentId.make("cancel-boundary-env"),
+                requestNamespace: "cancel-boundary-test",
+                thread: {
+                  threadId,
+                  providerInstanceId: modelSelection.instanceId,
+                  providerSessionId: "cancel-boundary-session",
+                },
+                client: undefined,
+                capabilities: new Set(["orchestration"]),
+                issuedAt: 1,
+              },
+              child.taskId,
+            );
+          }).pipe(Effect.provide(statusLayer));
+          assert.equal(status.status, task.status);
+          assert.equal(status.summary, task.result);
+          assert.equal(status.cancelReason, cancelReason);
+          assert.equal(status.workState, "result_available");
+          assert.isFalse(status.hasPendingChildRuns);
+          assert.notProperty(status, "finalReport");
+          if (resumable) {
+            assert.isTrue(status.resumable);
+            assert.equal(status.resumeThreadId, child.childThreadId);
+          } else {
+            assert.notProperty(status, "resumable");
+            assert.notProperty(status, "resumeThreadId");
+          }
+          yield* orchestrator.recoverDelegatedTasks;
+          const again = yield* orchestrator.getThreadProjection(threadId);
+          assert.equal(again.subagents.find((row) => row.id === child.taskId)!.result, task.result);
+          assert.lengthOf(again.contextTransfers, 1);
+        }),
+    );
+
     it.effect.each(["restart_admission", "provider", "provider_events_lost"] as const)(
       "settles a completion exactly once after %s start expiry",
       (phase) =>

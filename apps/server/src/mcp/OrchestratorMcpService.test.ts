@@ -437,7 +437,7 @@ describe("OrchestratorMcpService", () => {
             getThreadRecords: (id, fields, filter) => {
               if (id === childThreadId && filter?.messageRoles?.includes("user")) {
                 assert.isTrue(fields?.some((field) => field === "turnItems"));
-                assert.deepEqual(filter.turnItemTypes, ["error"]);
+                assert.deepEqual(filter.turnItemTypes, ["error", "run_interrupt_request"]);
               }
               if (partial && id === childThreadId && filter?.messageRoles?.includes("assistant")) {
                 return Deferred.succeed(blocked, undefined).pipe(
