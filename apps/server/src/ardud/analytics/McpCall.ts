@@ -123,7 +123,8 @@ export class McpCall extends Context.Service<
     waitStage?: "lookup.caller" | "lookup.target" | "waiting";
     waitLookupMs?: number;
     phase: Phase;
-    saved: boolean | "unknown";
+    saved: boolean | "unknown" | "pending_create";
+    dispatchFenceAt?: bigint;
     dispatchFenceRecovered?: boolean;
     retryPath?: "receipt_fast" | "attached_pending" | "dispatched";
     taskLookup?: TaskLookup;
@@ -279,7 +280,7 @@ export const failedPhase = Effect.fnUntraced(function* (phase: string) {
 });
 
 // Dispatch owns the commit span; observing the receipt must not add per-event spans.
-export const setSaved = Effect.fnUntraced(function* (saved: boolean) {
+export const setSaved = Effect.fnUntraced(function* (saved: boolean | "pending_create") {
   const call = yield* Effect.serviceOption(McpCall);
   if (call._tag === "Some" && call.value.saved !== true) call.value.saved = saved;
 });

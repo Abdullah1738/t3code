@@ -1471,3 +1471,15 @@ describe("restart admission rollup", () => {
     assert.strictEqual(result.overflow, 12);
   });
 });
+
+it("counts a pending create receipt separately from saved and unknown without a dispatch failure", () => {
+  const { errorPhase: _errorPhase, ...pendingCall } = timeoutCall({
+    outcome: "ok",
+    saved: "pending_create",
+    fenceToReplyMs: 2000,
+  });
+  const rows = finishDetached([pendingCall, detachedResult()]).mcpCalls;
+  assert.deepEqual(rows[0]!.savedCounts, { pending_create: 1 });
+  assert.equal(rows[0]!.failures, 0);
+  assert.deepEqual(rows[0]!.dispatchTimeouts, { committed: 0, failed: 0, capped: 0, noOutcome: 0 });
+});

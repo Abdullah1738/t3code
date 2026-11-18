@@ -299,6 +299,7 @@ const GeneralEvent = Schema.Struct({
   authMs: Schema.optionalKey(Measurement),
   dispatchMs: Schema.optionalKey(Measurement),
   preHandlerMs: Schema.optionalKey(Measurement),
+  fenceToReplyMs: Schema.optionalKey(Measurement),
   totalMs: Schema.optionalKey(Measurement),
   clientRequestId: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/))),
   outcome: Schema.optionalKey(EventOutcome),
@@ -307,7 +308,9 @@ const GeneralEvent = Schema.Struct({
   reuseMissReason: Schema.optionalKey(EvaluatorReuseMissReason),
   errorTag: Schema.optionalKey(Label),
   errorPhase: Schema.optionalKey(McpPhase),
-  saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+  saved: Schema.optionalKey(
+    Schema.Union([Schema.Boolean, Schema.Literals(["unknown", "pending_create"])]),
+  ),
   responseDelivery: Schema.optionalKey(Schema.Literals(["pending", "finished", "closed"])),
   responseElapsedMs: Schema.optionalKey(Measurement),
   responseCloseReason: Schema.optionalKey(
@@ -490,7 +493,9 @@ const GeneralEvent = Schema.Struct({
       code: Schema.optionalKey(Label),
       boardId: Schema.optionalKey(Id),
       cardNumber: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
-      saved: Schema.optionalKey(Schema.Union([Schema.Boolean, Schema.Literal("unknown")])),
+      saved: Schema.optionalKey(
+        Schema.Union([Schema.Boolean, Schema.Literals(["unknown", "pending_create"])]),
+      ),
       foundBy: Schema.optionalKey(
         Schema.Literals(["subagents", "receipt", "request_key_recovery", "none"]),
       ),
