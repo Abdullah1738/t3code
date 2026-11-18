@@ -228,6 +228,9 @@ def error_line(line):
     return not line.startswith((MARKER, 'offbox: warning:')) and bool(ENOSPC.search(line))
 
 
+NATIVE_CRASH_REASONS = {'toolchain_unpack_crash', 'go_inventory_crash'}
+
+
 def result(path, code, *, offset=0):
     phases, matches, seen_attempt, final = {}, False, 0, None
     probe_error, traceback_line, string_trace, command_started = None, None, 0, False
@@ -276,9 +279,9 @@ def result(path, code, *, offset=0):
                             continue
                         if phase == 'server_start':
                             phases = {}
-                            native_crash = False
+                            native_reason = None
                         elif phase == 'start':
-                            native_crash = False
+                            native_reason = None
                             server_start = phases.get('server_start') if set(phases) == {'server_start'} else None
                             phases = {'server_start': server_start} if server_start is not None else {}
                         phases[phase] = space
@@ -338,6 +341,8 @@ def result(path, code, *, offset=0):
             probe_crashed = final[1].get('infra_failure') == 'disk_probe'
         if probe_crashed:
             out.update(infra_failure='disk_probe', infra_reason='probe_crashed', command_exit_code=None)
+    if not authoritative:
+        native_crash = native_reason is not None
     if native_crash:
         out['setup_native_crash'] = True
     if code == 90 and native_crash and native_reason:

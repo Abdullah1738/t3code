@@ -1,7 +1,10 @@
 """Regression coverage for duplicate pings, ownership and incomplete evidence."""
+import os
+
+# Before any helper loads: the send guards refuse live sends under this marker, and conftest.py sets it for pytest only.
+os.environ.setdefault("ROBOB_TEST", "1")
 import io
 import json
-import os
 from contextlib import redirect_stdout
 from unittest.mock import patch
 

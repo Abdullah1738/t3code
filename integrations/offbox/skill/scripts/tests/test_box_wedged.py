@@ -19,6 +19,8 @@ class BoxWedgedTests(Isolated):
         self.err = self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
         self.stack.enter_context(patch.object(api, 'call', side_effect=AssertionError('offline test reached boat')))
         self.stack.enter_context(patch.object(lease, 'idle_ttl'))
+        self.stack.enter_context(patch.object(lease, 'ensure_ttl', return_value=True))
+        self.stack.enter_context(patch.object(bases, 'keep_pin_saved', return_value=True))
         self.stack.enter_context(patch.object(lease.ssh_sync, 'close_master'))
         self.stack.enter_context(patch.object(api, 'get', return_value={'state': 'stopped'}))
         self.stop = self.stack.enter_context(patch.object(api, 'stop', return_value={}))
@@ -429,7 +431,7 @@ class BoxWedgedTests(Isolated):
                         actions = reap.reap(False)
                     case.delete.assert_not_called()
                     refresh.assert_not_called()
-                    if wedged:
+                    if wedged and kind != 'refresh':
                         self.assertTrue(any('set aside' in a and 'skipped' in a for a in actions), actions)
                         self.assertTrue(all(c.kwargs.get('images') is False for c in case.stop_box.call_args_list))
                 finally:

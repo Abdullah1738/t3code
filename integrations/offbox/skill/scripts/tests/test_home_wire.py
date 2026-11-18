@@ -61,6 +61,7 @@ class Wire(Isolated):
     def test_the_retry_flag_reaches_the_server_only_when_asked(self):
         box = self.srv.make_box("ardud")
         a = api.cmd_start(box, "make test", meta={"repo": "r", "kind": "make test", "run_id": "run-1"}, retry_interrupted=True)
+        self.end(box, a['processId'], 0)
         b = api.cmd_start(box, "make deploy")
         rows = {r["pid"]: r for r in self.srv.con.execute("SELECT * FROM commands WHERE box_id=?", (box,))}
         self.assertEqual((rows[a["processId"]]["retry_interrupted"], rows[b["processId"]]["retry_interrupted"]), (1, 0))

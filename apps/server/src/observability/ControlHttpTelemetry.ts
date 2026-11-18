@@ -72,7 +72,7 @@ const clientLabel = (value: string) => {
 };
 
 // Keep the product/version useful for attribution without comments, URLs or arbitrary header text.
-const userAgent = (value: string | undefined) => {
+export const userAgent = (value: string | undefined) => {
   if (!value) return "missing";
   if (value.length > 160) return "other";
   const match =
@@ -128,3 +128,51 @@ export const make = Effect.fn("ControlHttpTelemetry.make")(function* (
       ),
   };
 });
+
+// Retain path structure without arbitrary IDs, credentials, or query values.
+const pathSegments = new Set([
+  "api",
+  "ardud",
+  "control",
+  "kanban",
+  "threads",
+  "messages",
+  "runs",
+  "evidence",
+  "health",
+  "projects",
+  "models",
+  "usage",
+  "requests",
+  "events",
+  "cards",
+  "boards",
+  "discussions",
+  "wiki",
+  "by-native",
+  "send",
+  "interrupt",
+  "origin",
+  "install-report",
+  "recovery-snapshot",
+  "attachments",
+  "mcp",
+  "assets",
+  "auth",
+  "oauth",
+]);
+export const pathHint = (url: string) => {
+  // Node supplies raw origin-form targets, where leading // is still a path.
+  const target = url.split(/[?#]/, 1)[0]!;
+  const path = url.startsWith("/") ? target : (URL.parse(url)?.pathname ?? target);
+  return {
+    pathHint:
+      path
+        .split("/")
+        .slice(0, 20)
+        .map((part) => (part === "" || pathSegments.has(part) ? part : ":value"))
+        .join("/")
+        .slice(0, 160) || "/",
+    pathHash: `sha256:${NodeCrypto.createHash("sha256").update(path).digest("hex")}`,
+  };
+};

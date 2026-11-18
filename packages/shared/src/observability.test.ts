@@ -798,6 +798,47 @@ describe("OtlpHeadersFromString", () => {
 });
 
 nodeServicesIt("local file filtering", (it) => {
+  it.effect("retains fast claimed effects with their lane while summarising empty claims", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const dir = yield* fs.makeTempDirectoryScoped();
+        const filePath = `${dir}/claims.ndjson`;
+        const sink = yield* makeTraceSink({
+          filePath,
+          maxBytes: 1_000_000,
+          maxFiles: 2,
+          batchWindowMs: 1000,
+          fileFilter: { minDurationMs: 2 },
+        });
+        for (const lane of ["general", "control", "start"])
+          for (const result of ["claimed", "empty"])
+            sink.push({
+              ...makeRecord("EffectWorker.claim"),
+              parentSpanId: "worker",
+              durationMs: 0.1,
+              attributes: { lane, result, "effect.id": `effect:${lane}` },
+            });
+        yield* sink.close();
+        const rows = (yield* fs.readFileString(filePath))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        const claims = rows.filter((row) => row.type === "effect-span");
+        expect(claims.map((row) => row.attributes)).toEqual(
+          ["general", "control", "start"].map((lane) => ({
+            lane,
+            result: "claimed",
+            "effect.id": `effect:${lane}`,
+          })),
+        );
+        expect(
+          rows.find((row) => row.type === "span-summary").spans["EffectWorker.claim"].count,
+        ).toBe(3);
+      }),
+    ),
+  );
+
   it.effect(
     "summarises fast children each minute and at close while preserving protected spans",
     () =>

@@ -1,11 +1,13 @@
 """Local edits, concurrent settlers and pull receipts. No live SSH or state."""
 import contextlib
 import errno
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -422,7 +424,8 @@ class PullSafetyTests(Isolated):
             self.write_file('f.txt', 'pushed')
             self.assertFalse(pulls.baseline_path('run-pull').exists())
             return dict(seconds=0, sent=0)
-        with patch.object(ssh_sync, 'push', side_effect=push), patch.object(ssh_sync, 'put_file'):
+        with patch.object(ssh_sync, 'push', side_effect=push), patch.object(ssh_sync, 'put_file'), \
+                patch.object(runs.quint_tools, 'ensure_archive'):
             runs.Runner._sync_box(runner, self.con, a, 'w/project', 'env', b'')
         self.assertEqual(common.read_json(pulls.baseline_path('run-pull'), {})['files']['f.txt'], before)
 
@@ -439,20 +442,30 @@ class PullSafetyTests(Isolated):
 
     def test_detached_pusher_records_its_own_snapshot(self):
         root = Path(self.tmp.name)
-        self.write_file('f.txt', 'initial')
-        proc = subprocess.run([sys.executable, '-I', str(Path(__file__).resolve()), '--push-fixture', str(root)],
-                              capture_output=True, text=True, timeout=10)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        rid = proc.stdout.strip().splitlines()[-1]
-        end = time.monotonic()+10
-        while not (root / 'push-complete').exists() and time.monotonic() < end:
-            time.sleep(.01)
-        self.assertTrue((root / 'push-complete').exists())
-        self.assertTrue((root / 'starts').exists())
-        snapshot = common.read_json(pulls.baseline_path(rid), {})
-        self.assertEqual(snapshot['files']['f.txt'], pulls.fingerprint(root / 'f.txt'))
-        self.assertEqual((root / 'push-pid').read_text(), str(self.con.execute(
-            'SELECT client_pid FROM runs WHERE run_id=?', (rid,)).fetchone()[0]))
+        for backend, content in ((backend, content) for backend in ('boat', 'server')
+                                 for content in ('', 'initial')):
+            with self.subTest(backend=backend, content=content):
+                (root / 'f.txt').write_text(content)
+                expected = dict(sha256=hashlib.sha256(content.encode()).hexdigest(), bytes=len(content.encode()))
+                (root / 'push-complete').unlink(missing_ok=True)
+                proc = subprocess.run([sys.executable, '-I', str(Path(__file__).resolve()),
+                                       '--push-fixture', str(root), backend],
+                                      capture_output=True, text=True, timeout=10)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                rid = proc.stdout.strip().splitlines()[-1]
+                end = time.monotonic()+10
+                while not (root / 'push-complete').exists() and time.monotonic() < end:
+                    time.sleep(.01)
+                self.assertTrue((root / 'push-complete').exists())
+                self.assertEqual((root / 'push-complete').read_text(), str(common.EXIT_DETACHED),
+                                 (root / 'LOGS_DIR' / f'{rid}.client.log').read_text())
+                self.assertIn(rid, (root / 'starts').read_text().splitlines())
+                snapshot = common.read_json(pulls.baseline_path(rid), {})
+                self.assertEqual(snapshot['cwd'], str(root.resolve()))
+                self.assertEqual(snapshot['files']['f.txt'], expected)
+                row = self.con.execute('SELECT * FROM runs WHERE run_id=?', (rid,)).fetchone()
+                self.assertEqual((root / 'push-pid').read_text(), str(row['client_pid']))
+                self.assertEqual((row['status'], row['exit_code']), ('running', None))
 
     def test_failed_row_waits_for_running_pulls_and_timeout_reports_owner(self):
         self.con.execute("UPDATE runs SET status='failed',exit_code=1,pull_state='running',pull_owner=?",
@@ -644,7 +657,8 @@ class PullSafetyTests(Isolated):
             self.write_file('f.txt', 'local edit AFTER push returned')
             return original(*args)
         with patch.object(ssh_sync, 'push', side_effect=pushed), patch.object(ssh_sync, 'put_file'), \
-                patch.object(pulls, 'record_baseline', side_effect=snapshot):
+                patch.object(pulls, 'record_baseline', side_effect=snapshot), \
+                patch.object(runs.quint_tools, 'ensure_archive'):
             runs.Runner._sync_box(runner, self.con, args, 'w/project', 'env', b'')
         with patch.object(ssh_sync, 'pull', side_effect=self.sync):
             pulls.wait('run-pull')
@@ -1330,9 +1344,9 @@ class PullSafetyTests(Isolated):
         self.assertEqual(self.row()['pull_state'],'done')
 
 
-def configure_push_fixture(root):
+def configure_push_fixture(root, backend):
     from test_bg_queue_detach import configure_fixture
-    a, me = configure_fixture(root, 'boat')
+    a, me = configure_fixture(root, backend)
     runs.BG_ENTRY = Path(__file__).resolve()
     a.no_sync = False
     a.pull = ['f.txt']
@@ -1341,20 +1355,23 @@ def configure_push_fixture(root):
         (root / 'push-pid').write_text(str(os.getpid()))
         return dict(seconds=0, sent=0)
     ssh_sync.push = pushed
-    ssh_sync.put_file = lambda *args: None
+    ssh_sync.put_file = lambda *args, **kwargs: None
+    runs.quint_tools.ensure_archive = lambda *args: None
     runs.Runner._prepare_box = runs.Runner._sync_box
+    # This fixture tests the detached push, then releases the retained follower without settling the command.
+    runs.Runner.stream = lambda self, **kwargs: signal.raise_signal(signal.SIGTERM)
     return a, me
 
 
 if __name__ == '__main__' and len(sys.argv) > 1:
     if sys.argv[1] == '--push-fixture':
-        a, me = configure_push_fixture(Path(sys.argv[2]))
+        a, me = configure_push_fixture(Path(sys.argv[2]), sys.argv[3])
         sys.exit(runs.run_remote(a, me))
     elif sys.argv[1] == '_bg-queue':
         payload = json.load(sys.stdin)
         os.environ.clear()
         os.environ.update(payload['env'])
-        configure_push_fixture(Path(os.environ['OFFBOX_TEST_ROOT']))
+        configure_push_fixture(Path(os.environ['OFFBOX_TEST_ROOT']), payload['backend'])
         code = runs.background_queue(sys.argv[2], payload)
-        (Path(os.environ['OFFBOX_TEST_ROOT']) / 'push-complete').write_text('done')
+        (Path(os.environ['OFFBOX_TEST_ROOT']) / 'push-complete').write_text(str(code))
         sys.exit(code)

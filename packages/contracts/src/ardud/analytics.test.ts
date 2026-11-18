@@ -123,6 +123,14 @@ describe("analytics ingest contract", () => {
     expect(input.events).toEqual([event]);
     expect(decode({ events: Array.from({ length: 100 }, () => event) }).events).toHaveLength(100);
   });
+  it.each(["limit", "events.limit", "private_token"])(
+    "strips server-derived errorFields %s from client ingest",
+    (field) => {
+      expect(
+        decode({ events: [{ ...event, kind: "mcp.call", errorFields: [field] }] }).events,
+      ).toEqual([{ ...event, kind: "mcp.call" }]);
+    },
+  );
   it.each([
     ["empty", []],
     ["too many", Array.from({ length: 101 }, () => event)],
@@ -135,6 +143,28 @@ describe("analytics ingest contract", () => {
     ["invalid time", [{ ...event, ts: "tomorrow" }]],
   ])("rejects %s", (_name, events) => {
     expect(() => decode({ events })).toThrow();
+  });
+  it("keeps server Claude excerpts out of client ingest and bounds persisted diagnostics", () => {
+    const claudeApiError = {
+      model: "claude-opus-5-5",
+      host: "router.test",
+      path: "/v1",
+      status: 404,
+      errorCode: "model_not_found",
+      errorType: "not_found_error",
+      errorText: "Model missing",
+      attempt: 1,
+      resume: false,
+    };
+    const row = { ...event, kind: "provider.claude_api_error", surface: "server", claudeApiError };
+    expect(decodeEvent(row)).toEqual(row);
+    expect(() => decode({ events: [{ ...row, surface: "web" }] })).toThrow();
+    expect(() =>
+      decodeEvent({ ...row, claudeApiError: { ...claudeApiError, errorText: "x".repeat(201) } }),
+    ).toThrow();
+    expect(() =>
+      decodeEvent({ ...row, claudeApiError: { ...claudeApiError, path: "/v1?key=private" } }),
+    ).toThrow();
   });
   it("requires an operating grant for client ingest", () => {
     expect(clientRpcRequiredScopes(WS_METHODS.analyticsIngest, {})).toEqual([
@@ -385,4 +415,22 @@ it("decodes runtime samples with exact model ids and bounded hourly rollups", ()
   expect(
     Schema.is(AnalyticsRollup.fields.runtimeSamples)(Array.from({ length: 25 }, () => hour)),
   ).toBe(false);
+});
+
+it("bounds MCP error paths and accepts nested schema fields without values", () => {
+  const row = {
+    ...event,
+    kind: "mcp.call",
+    tool: "card_get",
+    errorFields: ["events.limit", "items.0.name"],
+  };
+  expect(decodeEvent(row).errorFields).toEqual(row.errorFields);
+  for (const errorFields of [
+    ["x".repeat(65)],
+    Array(6).fill("limit"),
+    ["private value"],
+    ["events[0]"],
+    [""],
+  ])
+    expect(() => decodeEvent({ ...row, errorFields })).toThrow();
 });

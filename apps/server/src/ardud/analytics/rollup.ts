@@ -42,6 +42,7 @@ interface McpGroup {
   savedCounts: Map<string, number>;
   reasonClasses: Map<string, number>;
   invalidFields: Map<string, number>;
+  errorFields: Map<string, number>;
   notFoundReasons: Map<string, number>;
   foundByCounts: Map<string, number>;
   idShapeCounts: Map<string, number>;
@@ -344,6 +345,10 @@ export const makeAccumulator = () => ({
     }
   >(),
   evaluatorStartsByTrigger: new Map<string, { boardId: string; trigger: string; count: number }>(),
+  claudeApiErrors: new Map<
+    string,
+    { status: number | null; model: string; host: string; attempts: number; giveUps: number }
+  >(),
   mcp: new Map<string, McpGroup>(),
   retries: new Map<string, RetryAttempt[]>(),
   retryAttempts: 0,
@@ -611,6 +616,19 @@ export function accumulate(
   }
   // Related follow-ups inform a filtered call view without becoming selected events or samples.
   if (correlationOnly) return;
+  if (event.kind === "provider.claude_api_error" && event.claudeApiError !== undefined) {
+    const { status, model, host } = event.claudeApiError;
+    const identity = JSON.stringify([status, model, host]);
+    const key = boundedKey(target.claudeApiErrors, identity);
+    const group = target.claudeApiErrors.get(key) ?? {
+      ...(key === OTHER ? { status: null, model: OTHER, host: OTHER } : { status, model, host }),
+      attempts: 0,
+      giveUps: 0,
+    };
+    if (event.phase === "attempt") group.attempts++;
+    if (event.phase === "give_up") group.giveUps++;
+    target.claudeApiErrors.set(key, group);
+  }
   if (
     event.kind === "server.runtime_sample" &&
     event.props?.runningTurns &&
@@ -995,6 +1013,7 @@ export function accumulate(
         savedCounts: new Map(),
         reasonClasses: new Map(),
         invalidFields: new Map(),
+        errorFields: new Map(),
         notFoundReasons: new Map(),
         foundByCounts: new Map(),
         idShapeCounts: new Map(),
@@ -1010,6 +1029,7 @@ export function accumulate(
     increment(group.savedCounts, String(event.saved ?? "n/a"));
     if (event.reasonClass) increment(group.reasonClasses, event.reasonClass);
     if (event.invalidField) increment(group.invalidFields, event.invalidField);
+    for (const field of new Set(event.errorFields ?? [])) increment(group.errorFields, field);
     if (event.props?.notFoundReason !== undefined)
       increment(group.notFoundReasons, event.props.notFoundReason);
     if (event.props?.foundBy !== undefined) increment(group.foundByCounts, event.props.foundBy);
@@ -1178,6 +1198,7 @@ export function finishRollup(
     total: target.total,
     invalidLines: target.invalidLines,
     kindCounts: Object.fromEntries(target.kinds),
+    claudeApiErrors: [...target.claudeApiErrors.values()],
     runtimeSamples: [...target.runtimeSamples.values()]
       .map(({ runningTurnsSum, ...row }) => ({
         ...row,
@@ -1409,6 +1430,7 @@ export function finishRollup(
         notFoundReasons: Object.fromEntries(group.notFoundReasons),
         foundByCounts: Object.fromEntries(group.foundByCounts),
         idShapeCounts: Object.fromEntries(group.idShapeCounts),
+        errorFields: Object.fromEntries(group.errorFields),
         errors: [...group.errors.values()],
         ...(retries.get(key) ?? { failedThenRetried: 0, retrySucceeded: 0 }),
       }))

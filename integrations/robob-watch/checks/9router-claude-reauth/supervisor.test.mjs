@@ -1099,3 +1099,189 @@ test('a killed fetch without a known outage cannot start a streak or report rout
   assert.equal(h.state().routerUnavailableCount, undefined);
   assert.ok(lines.every(line => !line.includes('router recovered')));
 });
+
+// The clock runs only when a test advances it; neither fetch nor backoff sleeps.
+function deadlineClock() {
+  let time = 0, id = 0;
+  const timers = new Map();
+  const now = () => time;
+  const setTimer = (fn, ms) => { const key = ++id; timers.set(key, { at: time + ms, fn }); return key; };
+  const clearTimer = key => timers.delete(key);
+  const delay = ms => new Promise(resolve => setTimer(resolve, ms));
+  const settle = async work => {
+    let done = false, result, failure;
+    work.then(value => { done = true; result = value; }, error => { done = true; failure = error; });
+    for (let n = 0; n < 100; n++) {
+      for (let i = 0; i < 40; i++) await Promise.resolve();
+      if (done) { if (failure) throw failure; return result; }
+      const next = [...timers].sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+      assert.ok(next, 'unresolved synthetic work without a timer');
+      time = next[1].at; timers.delete(next[0]); next[1].fn();
+    }
+    assert.fail('synthetic clock did not settle');
+  };
+  return { now, setTimer, clearTimer, delay, settle, jump: ms => { time += ms; } };
+}
+
+function deadlineHarness(t, { bootMs = 36_000, outcomes = [{ ms: 5_000 }], backoffMs = 1_000, h = harness(t) } = {}) {
+  const clock = deadlineClock(), f = fetchHarness(t, []), lines = [], errors = [], signals = [], exits = [];
+  let calls = 0;
+  h.ctx.enforceSafetyFence = true;
+  h.ctx.now = () => h.sim.time + clock.now();
+  h.ctx.log = line => lines.push(line);
+  h.ctx.providers = (phase, budget) => liveProviders({ ...f.options, ...budget, phase, log: h.ctx.log,
+    sleep: () => clock.delay(backoffMs),
+    fetch: async (_url, { signal }) => {
+      signals.push(signal);
+      const response = outcomes[calls++];
+      assert.ok(response, 'unexpected budgeted fetch');
+      await clock.delay(response.ms ?? 0);
+      if (response.error) throw response.error;
+      return new Response(JSON.stringify({ connections: [bad()] }), { headers: { 'content-type': 'application/json' } });
+    },
+  });
+  const options = { watchDir: join(h.path, '..'), ...clock, startedAt: h.sim.time - bootMs, wallNow: () => h.sim.time + clock.now(), stderr: line => errors.push(line), exit: code => { exits.push(code); throw new Error(`synthetic supervisor exit ${code}`); } };
+  return { h, clock, lines, errors, signals, exits, options, calls: () => calls, run: () => clock.settle(runObserved(h.ctx, options)) };
+}
+
+test('38-second boot skips a would-be five-second fetch and logs boot without deadline failure', async t => {
+  const d = deadlineHarness(t, { bootMs: 38_000 });
+  await d.run();
+  assert.equal(d.calls(), 0);
+  assert.equal(d.h.state().routerUnavailableCount, 1);
+  assert.equal(d.h.state().routerUnavailableLastAt, d.h.ctx.now());
+  assert.match(d.lines.join('\n'), /phase durations: boot=38000.0ms/);
+  assert.match(d.lines.join('\n'), /below_minimum.*2000ms remaining/);
+  assert.match(d.lines.join('\n'), /skipped this tick/);
+  assert.deepEqual(d.errors, []);
+  const rows = readFileSync(join(testLogDir, new Date().toISOString().slice(0,10) + '.ndjson'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(rows.some(row => row.name === 'supervisor.boot' && row.durationMs === 38_000));
+});
+
+for (const budget of [0, 1, 2_999]) test(`fetch budget ${budget}ms is below minimum and never fetches`, async t => {
+  const d = deadlineHarness(t, { bootMs: SUPERVISOR_DEADLINE_MS - 5_000 - budget });
+  await d.run();
+  assert.equal(d.calls(), 0); assert.equal(d.h.state().routerUnavailableCount, 1);
+  assert.match(d.lines.join('\n'), /skipped this tick/); assert.deepEqual(d.errors, []);
+});
+
+test('budget aborts an in-flight fetch and preserves a pending incident unchanged', async t => {
+  const d = deadlineHarness(t);
+  const state = { version: 1, active: null, incidents: [], detectorIncidents: [{ id: 'pending', kind: 'detector', accountId: 'alpha', marker: bad().reauthRequiredAt, notified: true, alertState: 'pending', mayHaveQueued: true, firstEnqueuedAt: 1 }] };
+  writeState(d.h.path, state);
+  await d.run();
+  assert.equal(d.calls(), 1); assert.equal(d.signals[0].aborted, true);
+  assert.equal(d.clock.now(), 4_000);
+  const { routerUnavailableSince, routerUnavailableLastAt, routerUnavailableCount, ...incidentState } = d.h.state();
+  assert.deepEqual(incidentState, state);
+  assert.equal(routerUnavailableCount, 1); assert.equal(routerUnavailableSince, routerUnavailableLastAt);
+  assert.equal(d.h.sim.alerts.length, 0); assert.deepEqual(d.errors, []);
+});
+
+test('slow first attempt leaves a shortened retry that succeeds and processes markers', async t => {
+  const d = deadlineHarness(t, { bootMs: 25_000, outcomes: [{ ms: 8_000 }, { ms: 5_000 }] });
+  await d.run();
+  assert.equal(d.calls(), 2); assert.equal(d.signals[0].aborted, true); assert.equal(d.signals[1].aborted, false);
+  assert.match(d.lines.join('\n'), /retry_shortened.*8000ms remaining/);
+  assert.match(d.lines.join('\n'), /providers retry success/);
+  assert.equal(d.h.sim.alerts.length, 1); assert.equal(d.h.state().routerUnavailableCount, undefined);
+  assert.equal(d.clock.now(), 12_000); assert.deepEqual(d.errors, []);
+});
+
+test('retry is dropped when backoff would leave less than the minimum budget', async t => {
+  const d = deadlineHarness(t, { bootMs: 31_000, outcomes: [{ ms: 8_000 }] });
+  await d.run();
+  assert.equal(d.calls(), 1); assert.equal(d.clock.now(), 6_000);
+  assert.match(d.lines.join('\n'), /retry_dropped/); assert.match(d.lines.join('\n'), /skipped this tick/);
+});
+
+for (const phase of ['providers:fetch', 'providers:body', 'providers:backoff', 'providers:fetch:retry']) test(`budget expiry during ${phase} uses the skip path`, async t => {
+  const d = deadlineHarness(t);
+  d.h.ctx.providers = mark => { mark(phase); return new Promise(() => {}); };
+  await d.run();
+  assert.equal(d.h.state().routerUnavailableCount, 1);
+  assert.match(d.lines.join('\n'), /skipped this tick/); assert.deepEqual(d.errors, []);
+});
+
+for (const phase of ['providers:fetch', 'providers:body', 'providers:backoff', 'providers:fetch:retry']) test(`late supervisor timer during ${phase} still skips`, async t => {
+  const d = deadlineHarness(t);
+  d.h.ctx.providers = mark => { mark(phase); return new Promise(() => {}); };
+  // Model a delayed event loop where the supervisor callback runs first.
+  d.options.setTimer = (fn, ms) => d.clock.setTimer(fn, ms === 4_000 ? 10_000 : ms);
+  await d.run();
+  assert.equal(d.clock.now(), 9_000);
+  assert.equal(d.h.state().routerUnavailableCount, 1);
+  assert.match(d.lines.join('\n'), /skipped this tick/); assert.deepEqual(d.errors, []);
+});
+
+test('consecutive deadline skips reach the 15-minute outage bound and then recover', async t => {
+  const h = harness(t), admission = h.sim.time;
+  for (let n = 0; n <= 15; n++) {
+    h.sim.time = admission + n * 60_000;
+    const d = deadlineHarness(t, { h });
+    if (n < 15) await d.run();
+    else {
+      await assert.rejects(d.run(), RouterUnavailableError);
+      assert.match(d.errors.join('\n'), /for 15 min/);
+    }
+    assert.equal(h.state().routerUnavailableCount, n + 1);
+    assert.equal(h.state().routerUnavailableSince, admission + 4_000);
+    assert.equal(h.state().routerUnavailableLastAt, h.sim.time + 4_000);
+  }
+  h.sim.time += 60_000;
+  const recovered = deadlineHarness(t, { h, bootMs: 0, outcomes: [{ ms: 10 }] });
+  await recovered.run();
+  assert.match(recovered.lines.join('\n'), /router recovered after 16 consecutive unavailable ticks/);
+  assert.equal(h.state().routerUnavailableCount, undefined); assert.equal(h.sim.alerts.length, 1);
+});
+
+for (const target of ['marker processing', 'marker error', 'save']) test(`deadline during ${target} after a good fetch remains a hard failure`, async t => {
+  const d = deadlineHarness(t, { bootMs: 0, outcomes: [{ ms: 1 }] });
+  if (target === 'save') {
+    const save = d.h.ctx.save;
+    d.h.ctx.save = state => { d.clock.jump(SUPERVISOR_DEADLINE_MS); save(state); };
+  } else d.h.ctx.notificationAvailable = async () => { d.clock.jump(SUPERVISOR_DEADLINE_MS); return target !== 'marker error'; };
+  // The injected exit throws; detector IO catches can intercept that throw.
+  // The live process exits immediately, so assert its code and diagnostic.
+  await assert.rejects(d.run());
+  assert.deepEqual(d.exits, [1]);
+  assert.match(d.errors.join('\n'), /exceeded deadline/);
+  assert.doesNotMatch(d.lines.join('\n'), /skipped this tick/);
+});
+
+for (const remaining of [0, 1, 2_999, 3_000, 3_001]) test(`retry admission rechecks ${remaining}ms after delayed backoff`, async t => {
+  const d = deadlineHarness(t, { bootMs: remaining > 3_000 ? 29_999 : 30_000,
+    backoffMs: remaining > 3_000 ? 1_000 : 4_000 - remaining,
+    outcomes: [{ ms: 8_000 }, { ms: 1 }],
+  });
+  await d.run();
+  const admitted = remaining >= 3_000;
+  assert.equal(d.calls(), admitted ? 2 : 1);
+  assert.equal(d.h.sim.alerts.length, admitted ? 1 : 0);
+  assert.equal(d.h.state().routerUnavailableCount, admitted ? undefined : 1);
+  if (!admitted) assert.match(d.lines.join('\n'), /skipped this tick/);
+  assert.deepEqual(d.errors, []);
+});
+
+for (const [label, status, contentType, transient] of [
+  ['HTTP 400', 400, 'application/json', false],
+  ['HTTP 401', 401, 'application/json', false],
+  ['HTTP 429', 429, 'application/json', false],
+  ['HTTP 502', 502, 'application/json', true],
+  ['HTTP 503', 503, 'application/json', true],
+  ['HTTP 504', 504, 'application/json', true],
+  ['wrong content type', 200, 'text/plain', false],
+  ['missing content type', 200, null, false],
+]) test(`unread response is cancelled before timeout cleanup: ${label}`, async t => {
+  const f = fetchHarness(t, []), signals = [];
+  let cancelled = 0;
+  const call = liveProviders({ ...f.options, fetch: async (_url, { signal }) => {
+    signals.push(signal);
+    const body = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array([123])); }, cancel() { cancelled++; } });
+    return new Response(body, { status, headers: contentType ? { 'content-type': contentType } : {} });
+  } });
+  await assert.rejects(call, transient ? RouterUnavailableError : Error);
+  assert.equal(cancelled, transient ? 2 : 1);
+  assert.equal(signals.length, cancelled);
+  assert.ok(signals.every(signal => signal.aborted));
+});

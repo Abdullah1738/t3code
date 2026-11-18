@@ -79,6 +79,7 @@ import {
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import { detectSourceControlProviderFromRemoteUrl } from "@t3tools/shared/sourceControl";
 
+import { detachStackFrame } from "../git/detachStackFrame.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as PullRequestFilesViewed from "../persistence/PullRequestFilesViewed.ts";
@@ -1064,13 +1065,13 @@ export const make = Effect.gen(function* () {
           const roots =
             viewerRoots.get(host) ?? forHost.map(({ project }) => project.workspaceRoot);
           const key = JSON.stringify([host, api.kind, [...new Set(roots)].sort()]);
-          if (options?.allowPaused === true) return Cache.get(viewerFlights, key);
+          if (options?.allowPaused === true) return detachStackFrame(Cache.get(viewerFlights, key));
           // The pause is checked here rather than inside the lookup, so that it holds back the
           // callers nobody is waiting on without splitting the flight they share with a press.
           // A failed lookup is held nowhere, so letting a background read through would spawn
           // this host's CLI on every refresh for as long as the pause lasted, and re-extend it.
           return rateLimits.check({ provider: api.kind, host }).pipe(
-            Effect.flatMap(() => Cache.get(viewerFlights, key)),
+            Effect.flatMap(() => detachStackFrame(Cache.get(viewerFlights, key))),
             Effect.catch((error) =>
               Effect.succeed<ResolvedViewer>({
                 host,
@@ -2756,10 +2757,9 @@ export const make = Effect.gen(function* () {
         ),
       ),
     );
-    const payload = yield* readCache.get(key, encodedRead, [
-      `project:${input.projectId}`,
-      refScope(input),
-    ]);
+    const payload = yield* detachStackFrame(
+      readCache.get(key, encodedRead, [`project:${input.projectId}`, refScope(input)]),
+    );
     const decoded = yield* Schema.decodeEffect(codec)(payload).pipe(Effect.option);
     return Option.isSome(decoded) ? decoded.value : yield* lookup;
   });
@@ -2856,9 +2856,11 @@ export const make = Effect.gen(function* () {
         : Object.entries(input.cursors).toSorted(([left], [right]) => left.localeCompare(right)),
     ]);
     // A replacement reader can join a lookup still finishing its previous reader's cancellation.
-    return Cache.get(listCache, key).pipe(
+    return detachStackFrame(Cache.get(listCache, key)).pipe(
       Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause) ? Cache.get(listCache, key) : Effect.failCause(cause),
+        Cause.hasInterruptsOnly(cause)
+          ? detachStackFrame(Cache.get(listCache, key))
+          : Effect.failCause(cause),
       ),
     );
   };
@@ -3027,7 +3029,7 @@ export const make = Effect.gen(function* () {
     // Skip the write when that read is older than a later strict summary —
     // display reuse would otherwise keep the regression and never ask the host
     // again.
-    const read = Cache.get(detailCache, key).pipe(
+    const read = detachStackFrame(Cache.get(detailCache, key)).pipe(
       Effect.tap((value) => {
         if (value.state === "merged") noteMerged(input);
         const summary = summaryFromDetail(value, lastGoodSummary.peek(key));
@@ -3071,7 +3073,7 @@ export const make = Effect.gen(function* () {
     return Cache.getSuccess(detailCache, key).pipe(
       Effect.flatMap(
         Option.match({
-          onNone: () => Cache.get(previewCache, key),
+          onNone: () => detachStackFrame(Cache.get(previewCache, key)),
           onSome: (detail) => Effect.succeed(previewFields(detail)),
         }),
       ),
@@ -3079,7 +3081,7 @@ export const make = Effect.gen(function* () {
   };
   const activity: PullRequestService["Service"]["activity"] = (input) => {
     const key = refCacheKey(input);
-    return Cache.get(activityCache, key);
+    return detachStackFrame(Cache.get(activityCache, key));
   };
 
   const diffCache = yield* Cache.makeWith(
@@ -3135,7 +3137,7 @@ export const make = Effect.gen(function* () {
         ? (lastGoodSummary.peek(refCacheKey(input))?.updatedAt ?? null)
         : null,
     ]);
-    const read = Cache.get(diffCache, key).pipe(
+    const read = detachStackFrame(Cache.get(diffCache, key)).pipe(
       Effect.tap((value) =>
         canCacheDiff(value)
           ? Effect.void
@@ -3168,7 +3170,9 @@ export const make = Effect.gen(function* () {
   const filesViewed: PullRequestService["Service"]["filesViewed"] = (input) =>
     canonicalRef(input).pipe(
       Effect.flatMap((ref) =>
-        Cache.get(filesViewedCache, JSON.stringify([refCacheKey(ref), filesViewedEpoch(ref)])),
+        detachStackFrame(
+          Cache.get(filesViewedCache, JSON.stringify([refCacheKey(ref), filesViewedEpoch(ref)])),
+        ),
       ),
     );
 
@@ -3215,9 +3219,11 @@ export const make = Effect.gen(function* () {
     }
     if (missing.size === 0) return { stats: held };
     const key = statsBatchKey(missing.values());
-    const { result, at } = yield* Cache.get(listStatsCache, key).pipe(
+    const { result, at } = yield* detachStackFrame(Cache.get(listStatsCache, key)).pipe(
       Effect.catchCause((cause) =>
-        Cause.hasInterruptsOnly(cause) ? Cache.get(listStatsCache, key) : Effect.failCause(cause),
+        Cause.hasInterruptsOnly(cause)
+          ? detachStackFrame(Cache.get(listStatsCache, key))
+          : Effect.failCause(cause),
       ),
     );
     for (const [key, ref] of missing) {
@@ -3453,9 +3459,11 @@ export const make = Effect.gen(function* () {
     ),
     refreshAfterTurn,
     detail: credentialCached(detail),
-    checks: credentialCached((input) => Cache.get(checksCache, refCacheKey(input))),
+    checks: credentialCached((input) =>
+      detachStackFrame(Cache.get(checksCache, refCacheKey(input))),
+    ),
     watchFingerprint: credentialCached((input) =>
-      Cache.get(watchFingerprintCache, refCacheKey(input)),
+      detachStackFrame(Cache.get(watchFingerprintCache, refCacheKey(input))),
     ),
     activity: credentialCached(activity),
     preview: credentialCached(preview),
