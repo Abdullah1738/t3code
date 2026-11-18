@@ -34,7 +34,7 @@ class ExecTests(Isolated):
         self.con.commit()
         self.result = {"exitCode": 0, "stdout": "hello\n", "stderr": "warning\n", "processId": 123}
         self.call = self.stack.enter_context(patch.object(api, "call", return_value=self.result))
-        self.stack.enter_context(patch.dict(os.environ, {"OFFBOX_TOOL_LOG_DIR": str(Path(self.tmp.name) / "tools")}))
+        self.stack.enter_context(patch.dict(os.environ, {"OFFBOX_LOG_DIR": str(Path(self.tmp.name) / "tools")}))
         self.ssh = self.stack.enter_context(patch.object(ssh_sync, "ssh", side_effect=AssertionError("no SSH")))
         self.setup = self.stack.enter_context(patch.object(ssh_sync, "setup", side_effect=AssertionError("no SSH setup")))
         self.base = self.stack.enter_context(patch.object(ssh_sync, "ssh_base", side_effect=AssertionError("no known_hosts")))
