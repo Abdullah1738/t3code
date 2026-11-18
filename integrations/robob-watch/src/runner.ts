@@ -76,12 +76,13 @@ function finish(watcher: Watcher, state: State, status: State["status"]): void {
 }
 
 async function runPendingCheck(watcher: Watcher, at: number, mainChecked = false): Promise<void> {
+  if (await skipStuckCheck(watcher.id)) return;
   const instance = watcherInstance(watcher.id);
   if (!watcher.pending_check || !instance) return;
   await slots.run(async timing => {
-    if (shuttingDown) return;
+    if (shuttingDown || checkGroups.previous(watcher.id)) return;
     const result = await withRelayLockAsync(() => {
-      if (shuttingDown) return;
+      if (shuttingDown || checkGroups.previous(watcher.id)) return;
       const current = loadWatcher(watcher.id);
       const state = loadState(watcher.id);
       if (!current || watcherInstance(watcher.id) !== instance || held(current) || current.paused || !current.pending_check
@@ -440,7 +441,6 @@ export async function recordStuckGroups(): Promise<void> {
 
 export async function tickOne(id: string): Promise<void> {
   if (shuttingDown) return;
-  if (await skipStuckCheck(id)) return;
   try {
     try {
       await applyOwnerAlertResults(id);
@@ -534,6 +534,7 @@ async function tickWatcher(id: string): Promise<void> {
   if (state.failure_paused_at && !finalCheck) return;
   if (state.batch?.watcher && !sameDestination(state.batch.watcher, watcher)) return;
   if (state.status !== "closing" && !state.reply_handoff && !state.admitted_run && watcher.max_fires !== 0 && state.fires + (state.batch?.events.length ?? 0) >= watcher.max_fires) return;
+  if (await skipStuckCheck(id)) return;
   // Trigger files (e.g. chat.db-wal) run the check as soon as they change; interval_s stays the fallback.
   // A failing watcher keeps its backoff; the signature is recorded before the run so a change mid-run re-triggers.
   let sig: string | undefined;
@@ -588,7 +589,7 @@ async function tickWatcher(id: string): Promise<void> {
     lateMs = Math.max(0, now() - dueAt);
     loadModeAtAdmission = loadMode.high;
     return withRelayLockAsync(() => {
-    if (shuttingDown || !sameInstance()) return undefined;
+    if (shuttingDown || !sameInstance() || checkGroups.previous(id)) return undefined;
     recoverAdmission(id, instance);
     const recovery = loadState(id);
     const unacked = recovery.discarded_run ?? recovery.reply_handoff?.accepted_run

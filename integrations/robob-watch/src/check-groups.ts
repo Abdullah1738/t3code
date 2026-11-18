@@ -6,11 +6,28 @@ export function processGroupAlive(pgid: number): boolean {
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 
+const psStatuses = new Set(["ps pending", "ps unavailable", "ps timed out after 3s", "ps: no group rows", "ps: no safe group rows"]);
+
+export function sanitizeGroupState(raw: string): string {
+  if (psStatuses.has(raw)) return raw;
+  const rows: string[] = [];
+  for (const line of raw.slice(0, 4_000).split(/\r?\n|\s+\|\s+/).slice(0, 64)) {
+    const row = line.trim().match(/^(\d{1,10})\s+([A-Za-z+<>NnsLlEXWPTIUZSRD-]{1,16})\s+([A-Za-z0-9_.?:*-]{1,100})\s+([\d:.-]{1,32})\s+(\S+)/);
+    if (!row) continue;
+    const [, pid, stat, wchan, elapsed, executable] = row;
+    const name = executable!.split("/").at(-1)!;
+    // Arguments can contain credentials or message bodies. Retain only a bounded executable basename.
+    const safeName = /^[A-Za-z0-9_.-]{1,80}$/.test(name) ? name : "[executable]";
+    rows.push(`${pid} ${stat} ${wchan} ${elapsed} ${safeName}`);
+  }
+  return rows.join(" | ").slice(0, 4_000) || "ps: no safe group rows";
+}
+
 export function captureGroupState(pgid: number): Promise<string> {
   return new Promise(resolve => {
     let output = "", done = false;
     // ps must not inherit a cwd on the volume whose opens may be stuck.
-    const child = spawn("/bin/ps", ["-o", "pid,stat,wchan,etime,command", "-g", String(pgid)], {
+    const child = spawn("/bin/ps", ["-o", "pid,stat,wchan,etime,comm", "-g", String(pgid)], {
       cwd: "/", stdio: ["ignore", "pipe", "pipe"], env: { PATH: "/usr/bin:/bin" },
     });
     const finish = (fallback: string) => {
@@ -18,7 +35,7 @@ export function captureGroupState(pgid: number): Promise<string> {
       done = true;
       clearTimeout(timer);
       child.stdout.destroy(); child.stderr.destroy(); child.unref();
-      resolve(output.trim().replace(/\s+/g, " ") || fallback);
+      resolve(output.trim() ? sanitizeGroupState(output) : fallback);
     };
     child.stdout.on("data", chunk => { output = (output + chunk).slice(0, 4_000); });
     child.stderr.on("data", () => {});
@@ -77,9 +94,9 @@ export class CheckGroups {
     group.stuck = true;
     void this.capture(group.pgid).catch(() => "ps unavailable").then(diagnostic => {
       if (this.groups.get(group.pgid) !== group) return;
-      group.diagnostic = diagnostic;
-      this.log(null, `check group ${group.pgid} not reaped after SIGKILL watcher=${group.watcher.id}: ${diagnostic}`);
-      this.emit("watch.stuck_group", group, diagnostic);
+      group.diagnostic = sanitizeGroupState(diagnostic);
+      this.log(null, `check group ${group.pgid} not reaped after SIGKILL watcher=${group.watcher.id}: ${group.diagnostic}`);
+      this.emit("watch.stuck_group", group, group.diagnostic);
     });
   }
 

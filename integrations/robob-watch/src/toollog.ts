@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { constants } from "node:os";
 import { safeDependency } from "./cause.ts";
+import { sanitizeGroupState } from "./check-groups.ts";
 
 export type LogEntry = {
   component: string; kind: "event" | "perf" | "error"; name: string;
@@ -71,7 +72,7 @@ function fields(entry: LogEntry, at: Date) {
     // Only triage supplies a bounded, credential-redacted classifier diagnostic.
     if (entry.component === "triage" && entry.name === "triage.classify" && key === "classifier_error"
       && typeof value === "string" && value.length <= 400 && !/[\x00-\x1f]/.test(value)) props[key] = value;
-    else if (stuckEvent && key === "diagnostic" && typeof value === "string" && value.length <= 4_000 && !/[\x00-\x1f]/.test(value)) props[key] = value;
+    else if (stuckEvent && key === "diagnostic" && typeof value === "string") props[key] = sanitizeGroupState(value);
     else if (stuckEvent && ["pgid", "pid", "killedAt", "ageMs"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;
     else if (fileEvent && key === "path" && typeof value === "string" && value.length <= 1024 && value.startsWith("/") && !/[\x00-\x1f]/.test(value)) props[key] = value;
     else if (fileEvent && (key === "attempts" || key === "ms") && typeof value === "number" && Number.isFinite(value) && value >= 0) props[key] = value;

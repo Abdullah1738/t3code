@@ -25,7 +25,7 @@ test("ps capture detaches from a probe that never exits within three seconds", a
   expect(err).toBe(""); expect(code).toBe(0);
   const result = JSON.parse(out);
   expect(result).toMatchObject({cwd:"/",killed:true,destroyed:true,diagnostic:"ps timed out after 3s"});
-  expect(result.argv).toEqual(["-o","pid,stat,wchan,etime,command","-g","123"]);
+  expect(result.argv).toEqual(["-o","pid,stat,wchan,etime,comm","-g","123"]);
   expect(result.ms).toBeGreaterThanOrEqual(3_000); expect(result.ms).toBeLessThan(4_500);
 });
 
@@ -97,7 +97,7 @@ test.each([false, true])("a live timeout group blocks admission, alerts once and
       writeFileSync(join(dir,"watcher.json"),JSON.stringify(watcher));
       lib.saveState(id,{status:"active",fires:0,consecutive_failures:0,failure_alerted:false});
       let captured; const snapshot=new Promise(resolve=>{captured=resolve;});
-      lib.checkGroups.capture=async()=>{captured();return "PID STAT WCHAN ELAPSED COMMAND 2147483640 D sandboxd 00:31 kernel-hang";};
+      lib.checkGroups.capture=async()=>{captured();return "2147483640 D sandboxd 00:31 kernel-hang";};
       const guard=setTimeout(()=>{console.error("fixture exceeded deadline: groups="+JSON.stringify([...lib.checkGroups.groups.values()].map(g=>({stuck:g.stuck,killed:g.killedAt,alive,spawns}))));process.exit(2);},9000);
       const started=performance.now(); await tickOne(id); const elapsed=performance.now()-started; await snapshot;
       const group=lib.checkGroups.previous(id);
@@ -165,7 +165,7 @@ test("registry alerts active, paused, closing and archived watchers once, and dr
       let clock=Date.now();Date.now=()=>clock;
       const live=new Set();let pgid=2147483600;
       lib.checkGroups.isAlive=pgid=>live.has(pgid);
-      lib.checkGroups.capture=async()=>"D sandboxd";
+      lib.checkGroups.capture=async()=>"123 D sandboxd 00:31 zsh";
       for(const id of ["active","paused","closing","archived","exited"]){
         const dir=lib.watcherDir(id);mkdirSync(dir,{recursive:true});
         const watcher=lib.normalize({id,title:id,mode:"notify",check:"true",paused:id==="paused"});
@@ -191,7 +191,7 @@ test("registry alerts active, paused, closing and archived watchers once, and dr
     expect(notices).toHaveLength(4);
     for (const [index, id] of ["active", "paused", "closing", "archived"].entries()) {
       const notice = notices.find(args => args.includes(`--key=stuck-group:${id}:${2147483601 + index}`));
-      expect(notice?.join(" ")).toContain("30 min after SIGKILL: D sandboxd");
+      expect(notice?.join(" ")).toContain("30 min after SIGKILL: 123 D sandboxd 00:31 zsh");
     }
   } finally { rmSync(sandbox, { recursive: true, force: true }); }
 });
@@ -201,9 +201,12 @@ test("ordinary timeout reaps within grace and permits the next check", async () 
   try {
     const { checkGroups, runCheck } = await import("../src/lib.ts");
     const watcher = normalize({ id: "reaped", title: "Reaped", mode: "notify", check: "exec sleep 30" });
-    const result = await runCheck(watcher, sandbox, {}, 50);
+    const running = runCheck(watcher, sandbox, {}, 50);
+    const group = [...checkGroups.groups.values()].find(group => group.watcher.id === watcher.id)!;
+    const result = await running;
     expect(result.timedOut).toBe(true);
     expect(result.ms).toBeLessThan(2_000);
+    await group.closed;
     expect(checkGroups.previous(watcher.id)).toBeUndefined();
     const next = await runCheck({ ...watcher, check: "echo recovered" }, sandbox);
     expect(next.code).toBe(0); expect(next.stdout.trim()).toBe("recovered");
