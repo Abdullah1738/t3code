@@ -36,7 +36,7 @@ RETRY_PAUSES = (5, 15, 45)
 CHECKOUT_DIR = re.compile(r"^w/[A-Za-z0-9._-]{1,40}-[0-9a-f]{6}$")
 _HOME_PORTS: dict[str, tuple[str, int]] = {}
 
-# Never sent to a box. Excluded paths are also protected from --delete on the box, so remote-only
+# Pass 1 excludes. Eligible tracked files are sent additively in pass 2. Excluded paths are also protected from --delete on the box, so remote-only
 # installs (node_modules, .terraform, caches, build output) survive between runs and resumes.
 SECRET_EXCLUDES = [".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.p8", "*.mobileprovision",
                    ".aws/", ".ssh/", ".netrc", ".npmrc", ".pypirc", ".docker/config.json", "*.tfstate", "*.tfstate.*",
@@ -482,7 +482,14 @@ def _literal_filter_path(path: str, *, wildcard: bool = False) -> str:
     return re.sub(r"([\\*?\[])", r"\\\1", path)
 
 
-def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) -> list[str]:
+def push_filters(root: Path, with_git: bool, includes: list[str] | None = None, *,
+                 dirty: set[str] | None = None) -> list[str]:
+    if includes and any(_offbox_skips(inc.strip("/")) and not (root / inc.strip("/")).is_dir()
+                        for inc in includes):
+        automatic = set(_tracked_skipped(root, set(), with_git, dirty=dirty))
+        # Let pass 2 send tracked excluded files without opening their directories to --delete.
+        includes = [inc for inc in includes if inc.strip("/") not in automatic
+                    or not _offbox_skips(inc.strip("/"))]
     # --git uses a separate portable export. Never send a raw git-dir or pointer,
     # even when --include .git is supplied, or copy private config/hooks/worktrees.
     f = ["--filter=- /.git"]
@@ -602,26 +609,11 @@ def push_filters(root: Path, with_git: bool, includes: list[str] | None = None) 
     return f
 
 
-def tracked_secret_matches(root: Path, includes: list[str] | None) -> list[str]:
-    """Git-tracked files the secret filters skip (e.g. a committed sample configs/.env). Shown as a hint only."""
-    import fnmatch
-    try:
-        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20, cwd=str(root))
-    except Exception:  # noqa: BLE001
-        return []
-    if p.returncode != 0:
-        return []
-    inc = [i.strip("/") for i in includes or []]
-    pats = [x.rstrip("/") for x in SECRET_EXCLUDES]
-    out = []
-    for f in p.stdout.decode(errors="replace").split("\0"):
-        if not f or any(f == i or f.startswith(i + "/") for i in inc):
-            continue
-        parts = f.split("/")
-        if any(fnmatch.fnmatch(seg, pat) for seg in parts for pat in pats) and \
-                not any(fnmatch.fnmatch(parts[-1], t) for t in SAFE_ENV_TEMPLATES):
-            out.append(f)
-    return out
+def tracked_secret_matches(root: Path, includes: list[str] | None, with_git: bool = False, *,
+                           dirty: set[str] | None = None) -> list[str]:
+    stats = {}
+    _tracked_skipped(root, set(), with_git, dirty=dirty, stats=stats, includes=includes)
+    return stats.get("secret_skips", [])
 
 
 # Pass 1 lists every file it considered (-ii) with this prefix, so the tracked files it skipped can be found.
@@ -650,18 +642,88 @@ def _skip_component_pattern(patterns: tuple[str, ...]) -> re.Pattern:
     return re.compile("|".join(fnmatch.translate(os.path.normcase(p)) for p in patterns))
 
 
-def _offbox_skips(path: str) -> bool:
-    """True when the secret or heavy excludes cover the path (a dir rule covers everything below it)."""
+def _matches_excludes(path: str, excludes: list[str]) -> bool:
     import fnmatch
     parts = path.split("/")
     if any(fnmatch.fnmatch(parts[-1], t) for t in SAFE_ENV_TEMPLATES):
         parts = parts[:-1]
-    pats = [x.rstrip("/") for x in SECRET_EXCLUDES + HEAVY_EXCLUDES]
+    pats = [x.rstrip("/") for x in excludes]
     pattern = _skip_component_pattern(tuple(p for p in pats if "/" not in p))
     if any(pattern.match(os.path.normcase(seg)) for seg in parts):
         return True
     joined = "/" + "/".join(parts)
     return any(joined.endswith("/" + pat) or ("/" + pat + "/") in joined for pat in pats if "/" in pat)
+
+
+def _offbox_skips(path: str) -> bool:
+    return _matches_excludes(path, SECRET_EXCLUDES + HEAVY_EXCLUDES)
+
+
+def _dirty_tracked(root: Path) -> set[str]:
+    dirty = set()
+    head = b""
+    for args in (["diff", "--name-only", "-z", "HEAD"], ["ls-files", "-m", "-z"],
+                 ["ls-tree", "-r", "-z", "HEAD"]):
+        try:
+            p = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                               env=git_snapshot._git_env(), timeout=30, cwd=str(root))
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise OffboxError("cannot check tracked secrets against HEAD; nothing ran") from e
+        if p.returncode:
+            raise OffboxError("cannot check tracked secrets against HEAD; nothing ran")
+        if args[0] == "ls-tree":
+            head = p.stdout
+        else:
+            dirty.update(_key(os.fsdecode(raw)) for raw in p.stdout.split(b"\0") if raw)
+    # Index flags and stat caching can hide modified bytes from both dirty queries.
+    # Compare secret candidates directly with HEAD without trusting the index or Git filters.
+    names = {}
+    for raw in head.split(b"\0"):
+        if not raw:
+            continue
+        meta, _, raw_path = raw.partition(b"\t")
+        mode, kind, oid = meta.split()
+        if kind != b"blob":
+            continue
+        path = os.fsdecode(raw_path)
+        real = _disk_path(root, path, names)
+        if not any(_matches_excludes(p, SECRET_EXCLUDES) for p in (path, real or path)):
+            continue
+        algorithm = {40: "sha1", 64: "sha256"}.get(len(oid))
+        if algorithm is None:
+            raise OffboxError("unsupported Git object format; cannot check tracked secrets against HEAD")
+        try:
+            signature = _content_signature(root / (real or path), algorithm) if real is not None else ("missing", "")
+        except OSError as e:
+            raise OffboxError(f"cannot check tracked secret {path!r} against HEAD; nothing ran") from e
+        expected = ("link" if mode == b"120000" else "file", oid.decode("ascii"))
+        if signature != expected:
+            dirty.update(_key(p) for p in (path, real or path))
+    return dirty
+
+
+def _symlink_parent(root: Path, path: str) -> bool:
+    parent = root
+    for part in path.split("/")[:-1]:
+        parent /= part
+        if parent.is_symlink():
+            return True
+    return False
+
+
+def _tracked_class(root: Path, path: str, real: str, with_git: bool,
+                   dirty: set[str]) -> tuple[bool, str]:
+    paths = (path, real)
+    if any("node_modules" in p.split("/") for p in paths):
+        if any(p.split("/")[0] == "node_modules" or _symlink_parent(root, p)
+               or (p.split("/")[-1] == "node_modules" and (root / p).is_symlink()) for p in paths):
+            return False, "node_modules"
+        category = "node_modules"
+    else:
+        category = "heavy" if any(_matches_excludes(p, HEAVY_EXCLUDES) for p in paths) else "ignored"
+    if any(_matches_excludes(p, SECRET_EXCLUDES) for p in paths):
+        return with_git and not any(_key(p) in dirty for p in paths), "secret"
+    return True, category
 
 
 def _same_file(a: Path, b: Path) -> bool:
@@ -703,31 +765,74 @@ def _disk_path(root: Path, rel: str, names: dict[str, list[str]]) -> str | None:
     return "/".join(real)
 
 
-def _tracked_skipped(root: Path, seen: set[str]) -> list[str]:
-    """Git-tracked files pass 1 left out, other than secret/heavy ones. Those are .gitignore matches (a tracked
-    package-lock.json, 31 Oct) or rsync reading .gitignore more broadly than git (`test/*`, `!` lines)."""
+def _tracked_skipped(root: Path, seen: set[str], with_git: bool = False, *,
+                     dirty: set[str] | None = None, stats: dict | None = None,
+                     reasons: dict[str, str] | None = None, includes: list[str] | None = None) -> list[str]:
+    """Tracked files pass 1 left out that can safely be sent without recursing or deleting."""
     try:
-        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, timeout=20, cwd=str(root))
-    except Exception:  # noqa: BLE001 - no git: pass 1 is the whole sync, as before
+        p = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True,
+                           env=git_snapshot._git_env(), timeout=20, cwd=str(root))
+    except (OSError, subprocess.TimeoutExpired):
         return []
     if p.returncode != 0:
         return []
+    dirty = _dirty_tracked(root) if with_git and dirty is None else (dirty or set())
     out, names = [], {}
-    for raw in p.stdout.split(b"\0"):
-        if not raw:
-            continue
-        f = os.fsdecode(raw)
-        # A tracked file deleted in the checkout (or outside a sparse checkout) resolves to None and is skipped.
+    stats = stats if stats is not None else {}
+    reasons = reasons if reasons is not None else {}
+    entries = list(dict.fromkeys(os.fsdecode(raw) for raw in p.stdout.split(b"\0") if raw))
+    stats.update(tracked_total=len(entries), tracked_heavy=0, tracked_heavy_sent=0,
+                 tracked_node_modules_sent=0, tracked_secret_sent=0,
+                 tracked_left_out={}, tracked_left_out_first=[], secret_skips=[])
+    for f in entries:
         real = _disk_path(root, f, names)
-        if real is None:
+        # Preserve missing/sparse/submodule handling; still explain a blocked node_modules ancestor.
+        if real is None and not ("node_modules" in f.split("/") and _symlink_parent(root, f)):
             continue
-        if any(_key(x) in seen for x in (f, real)) or _offbox_skips(f) or _offbox_skips(real):
+        real = real or f
+        if any(_key(x) in seen for x in (f, real)):
+            continue
+        send, reason = _tracked_class(root, f, real, with_git, dirty)
+        if not send:
+            if any(real == i.strip("/") or real.startswith(i.strip("/") + "/") for i in includes or []):
+                continue
+            left = stats["tracked_left_out"]
+            left[reason] = left.get(reason, 0) + 1
+            if len(stats["tracked_left_out_first"]) < 5:
+                stats["tracked_left_out_first"].append(real)
+            if reason == "secret":
+                stats["secret_skips"].append(real)
             continue
         q = root / real
-        # A dir here is a submodule: pass 2 recurses into what it lists, so sending one would bypass its .gitignore.
         if os.path.islink(q) or not os.path.isdir(q):
             out.append(real)
+            reasons[real] = reason
+            if reason == "heavy":
+                stats["tracked_heavy"] += 1
     return out
+
+
+def tracked_left_out_note(st: dict) -> str | None:
+    left = st.get("tracked_left_out") or {}
+    if not left:
+        return None
+    n = sum(left.values())
+    counts = ", ".join(f"{reason}: {count}" for reason, count in sorted(left.items()))
+    paths = ", ".join(json.dumps(p, ensure_ascii=False) for p in st.get("tracked_left_out_first") or [])
+    return (f"{n} tracked files not synced ({counts}): {paths}; "
+            "git status on the box may show them deleted. Use --include <path> to send one.")
+
+
+def verified_note(st: dict) -> str:
+    n = st.get("verified", 0)
+    left = sum((st.get("tracked_left_out") or {}).values())
+    if left:
+        return f"verified {n} of {st.get('tracked_total', n + left)} tracked files ({left} left out, see above)"
+    return f"verified {n} tracked files"
+
+
+TRACKED_SYNC_FIELDS = ("tracked_total", "tracked_heavy", "tracked_heavy_sent", "tracked_node_modules_sent",
+                       "tracked_secret_sent", "tracked_left_out", "tracked_left_out_first")
 
 
 def tracked_ignored_note(st: dict) -> str | None:
@@ -738,7 +843,7 @@ def tracked_ignored_note(st: dict) -> str | None:
         return None
     first = st.get("tracked_ignored_first") or []
     more = f" (+{n - len(first)} more)" if n > len(first) else ""
-    return f"also synced {n} git-tracked file(s) that .gitignore matches: {', '.join(first)}{more}"
+    return f"also synced {n} git-tracked file(s) that sync filters match: {', '.join(first)}{more}"
 
 
 def _stats(out: str) -> dict:
@@ -763,7 +868,8 @@ def push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, timeo
                 raise common.SourceGone(root) from error
             raise
         data["props"].update(bytes=result.get("sent", 0), files=result.get("files", 0),
-                             skipped=result.get("skipped", 0))
+                             skipped=result.get("skipped", 0),
+                             **{k: result[k] for k in TRACKED_SYNC_FIELDS if k in result})
         return result
 
 
@@ -775,41 +881,43 @@ def _push(box_id: str, root: Path, remote_dir: str, with_git: bool = False, time
         raise OffboxError(f"refusing to sync {root} (not a repo). cd into a repo first.", code=2)
     t = time.time()
     with git_snapshot.snapshot(root) if with_git else nullcontext(None) as gitdir:
-        st = _push_files(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates, run_id)
+        dirty = _dirty_tracked(root) if with_git else set()
+        st = _push_files(box_id, root, remote_dir, with_git, timeout, includes, seed_candidates, run_id, dirty=dirty)
         if gitdir is not None:
             extra = _push_git(box_id, gitdir, remote_dir, timeout, run_id=run_id)
             for key, value in extra.items():
                 st[key] = st.get(key, 0) + value
-        verified = _verify_content(box_id, root, remote_dir, _tracked_content(root, includes), timeout, run_id)
+        verified = _verify_content(box_id, root, remote_dir, _tracked_content(root, includes, with_git, dirty=dirty), timeout, run_id)
         for key, value in verified.items():
             st[key] = st.get(key, 0) + value
     st["seconds"] = round(time.time() - t, 2)
-    st["secret_skips"] = tracked_secret_matches(root, includes)
-    st["skipped"] = len(st["secret_skips"])
+    st["skipped"] = sum(st.get("tracked_left_out", {}).values())
     log(f"push {box_id} {root} -> {remote_dir} {st}")
     return st
 
 
-def _content_signature(path: Path) -> tuple[str, str]:
+def _content_signature(path: Path, algorithm: str = "sha1") -> tuple[str, str]:
     try:
         info = path.lstat()
     except (FileNotFoundError, NotADirectoryError):
         return ("missing", "")
     if stat.S_ISLNK(info.st_mode):
         data = os.fsencode(os.readlink(path))
-        return ("link", hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest())
+        return ("link", hashlib.new(algorithm, b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest())
     if stat.S_ISDIR(info.st_mode):
         return ("dir", "")
     if not stat.S_ISREG(info.st_mode):
         return ("other", "")
-    h = hashlib.sha1(b"blob " + str(info.st_size).encode() + b"\0")
+    h = hashlib.new(algorithm, b"blob " + str(info.st_size).encode() + b"\0")
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(chunk)
     return ("file", h.hexdigest())
 
 
-def _tracked_content(root: Path, includes: list[str] | None) -> dict[str, tuple[str, str]]:
+def _tracked_content(root: Path, includes: list[str] | None, with_git: bool = False, *,
+                     dirty: set[str] | None = None) -> dict[str, tuple[str, str]]:
+    dirty = _dirty_tracked(root) if with_git and dirty is None else (dirty or set())
     p = subprocess.run(["git", "-C", str(root), "ls-files", "--stage", "-z"], capture_output=True,
                        env=git_snapshot._git_env(), timeout=30, cwd=str(root))
     if p.returncode:
@@ -846,7 +954,10 @@ def _tracked_content(root: Path, includes: list[str] | None) -> dict[str, tuple[
         if real == ".git" or real.startswith(".git/"):
             continue
         included = any(real == i or real.startswith(i + "/") for i in inc)
-        if not included and (_offbox_skips(path) or (real != path and _offbox_skips(real))):
+        # Missing filtered files were never mirrored; verification must not delete box caches/installs.
+        if not included and _offbox_skips(path) and _disk_path(root, path, names) is None:
+            continue
+        if not included and not _tracked_class(root, path, real, with_git, dirty)[0]:
             continue
         try:
             sig = _content_signature(root / real)
@@ -1333,15 +1444,18 @@ def _seed(box_id: str, remote_dir: str, candidates: list[str]) -> tuple[bool, st
 
 
 def _push_files(box_id: str, root: Path, remote_dir: str, with_git: bool, timeout: float,
-                includes: list[str] | None, seed_candidates: list[str] | None = None, run_id: str | None = None) -> dict:
+                includes: list[str] | None, seed_candidates: list[str] | None = None, run_id: str | None = None, *,
+                dirty: set[str] | None = None) -> dict:
     first, sibling = _seed(box_id, remote_dir, seed_candidates) if seed_candidates is not None else (False, None)
     if sibling:
         log(f"push_seed {box_id} {remote_dir} from={sibling}")
-    return _push_file_passes(box_id, root, remote_dir, with_git, timeout, includes, sibling, run_id)
+    return _push_file_passes(box_id, root, remote_dir, with_git, timeout, includes, sibling, run_id, dirty=dirty)
 
 
 def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, timeout: float,
-                      includes: list[str] | None, sibling: str | None, run_id: str | None = None) -> dict:
+                      includes: list[str] | None, sibling: str | None, run_id: str | None = None, *,
+                      dirty: set[str] | None = None) -> dict:
+    dirty = _dirty_tracked(root) if with_git and dirty is None else (dirty or set())
     ssh_cmd = " ".join(shlex.quote(x) for x in ssh_base(box_id))
     cmd = [RSYNC, "-az", "--delete", "--mkpath", "--no-o", "--no-g", "--omit-dir-times", "--stats",
            "--timeout=120", "-e", ssh_cmd, "-ii", "-8", f"--out-format={ITEM}%i %n"]
@@ -1349,23 +1463,28 @@ def _push_file_passes(box_id: str, root: Path, remote_dir: str, with_git: bool, 
         # --copy-dest otherwise trusts size + whole-second mtime across different working trees.
         cmd.append("--checksum")
         cmd.append(f"--copy-dest=../{sibling.split('/')[-1]}")
-    cmd += push_filters(root, with_git, includes)
+    cmd += push_filters(root, with_git, includes, dirty=dirty)
     cmd += [f"{root}/", f"{box_id}:{remote_dir}/"]
     out = _rsync(box_id, remote_dir, cmd, timeout, source=root, phase="files1", run_id=run_id)
     st = _stats(out)
     # A file git tracks is part of the checkout the command expects, whatever .gitignore says. Pass 2 sends the
     # ones pass 1 skipped, by name and without --delete; pass 1 excludes them, which also keeps them from --delete.
-    extra = _tracked_skipped(root, _seen(out))
+    reasons = {}
+    extra = _tracked_skipped(root, _seen(out), with_git, dirty=dirty, stats=st, reasons=reasons)
     if extra:
         cmd2 = [RSYNC, "-az", "--no-o", "--no-g", "--omit-dir-times", "--stats", "--timeout=120", "-e", ssh_cmd,
                 "-8", "--from0", "--files-from=-", "--ignore-missing-args", "--filter=- /.git"]
-        cmd2 += [f"--filter=+ {t}" for t in SAFE_ENV_TEMPLATES]
-        for x in SECRET_EXCLUDES + HEAVY_EXCLUDES:
-            # Files go by name here, so a dir rule needs its /** form too (`- .aws/` alone lets .aws/creds through).
-            cmd2 += [f"--filter=- {x.rstrip('/')}", f"--filter=- {x.rstrip('/')}/**"]
-        cmd2 += [f"{root}/", f"{box_id}:{remote_dir}/"]
-        st2 = _stats(_rsync(box_id, remote_dir, cmd2, timeout, files="\0".join(extra),
-                            source=root, phase="files2", run_id=run_id))
+        # files-from contains only classified tracked files; no recursion or delete into box installs.
+        cmd2 += ["-ii", f"--out-format={ITEM}%i %n", f"{root}/", f"{box_id}:{remote_dir}/"]
+        out2 = _rsync(box_id, remote_dir, cmd2, timeout, files="\0".join(extra),
+                      source=root, phase="files2", run_id=run_id)
+        st2 = _stats(out2)
+        for line in out2.split("\n"):
+            if line.startswith((ITEM + ">f", ITEM + "<f")):
+                path = re.sub(r"\\#([0-7]{3})", lambda m: chr(int(m[1], 8)), line[len(ITEM) + 12:])
+                reason = reasons.get(path)
+                if reason in ("heavy", "node_modules", "secret"):
+                    st[f"tracked_{reason}_sent"] += 1
         for k in ("sent", "received", "files", "xfer"):
             if k in st2:
                 st[k] = st.get(k, 0) + st2[k]
@@ -1417,16 +1536,19 @@ def _missing_pull(code: int, error: str) -> bool:
     return missing
 
 
-def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800) -> dict:
+def pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800,
+         *, relative: bool = False) -> dict:
     with toollog.span("sync", "run.pull", ids={"box": box_id}, tag="pull_failed") as data:
-        result = _pull(box_id, remote_dir, rel_cwd, path, local_cwd, timeout)
+        options = {'relative': True} if relative else {}
+        result = _pull(box_id, remote_dir, rel_cwd, path, local_cwd, timeout, **options)
         data["ok"] = bool(result.get("ok"))
         data["props"].update(bytes=result.get("received", 0), files=result.get("files", 0),
                              failed=not data["ok"], stale=not data["ok"])
         return result
 
 
-def _pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800) -> dict:
+def _pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path, timeout: float = 1800,
+          *, relative: bool = False) -> dict:
     """Copy <remote cwd>/<path> back to <local cwd>/<path> (file or dir; remote globs allowed)."""
     path = path.rstrip("/") or "."
     if path.startswith("/") or ".." in Path(path).parts:
@@ -1434,10 +1556,11 @@ def _pull(box_id: str, remote_dir: str, rel_cwd: str, path: str, local_cwd: Path
     rbase = f"{remote_dir}/{rel_cwd}".rstrip("/").replace("/./", "/").rstrip(".")
     rbase = rbase.rstrip("/")
     parent = os.path.dirname(path)
-    dest = (local_cwd / parent) if parent else local_cwd
+    dest = local_cwd if relative else (local_cwd / parent) if parent else local_cwd
     dest.mkdir(parents=True, exist_ok=True)
-    cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
-           f"{box_id}:{rbase}/{path}", f"{dest}/"]
+    cmd = [RSYNC, "-az", "--no-o", "--no-g", "--stats", *(['--relative'] if relative else []),
+           "-e", " ".join(shlex.quote(x) for x in ssh_base(box_id)),
+           f"{box_id}:{rbase}/{'./' if relative else ''}{path}", f"{dest}/"]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if p.returncode:
         check_host_key(box_id, p.stderr.encode(errors="replace"))

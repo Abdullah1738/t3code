@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     lr = sp.add_parser("log-rollup", help="roll up shared tool logs for a UTC day")
     lr.add_argument("--day", metavar="YYYY-MM-DD")
+    lr.add_argument("--live-only", action="store_true", help="exclude fixture run IDs; report excluded records")
 
     lg = sp.add_parser("logs")
     lg.add_argument("run_id")
@@ -80,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     lo.add_argument("--list", action="store_true")
     lo.add_argument("--clear", action="store_true")
 
-    li = sp.add_parser("list")
+    li = sp.add_parser("list", aliases=["ps"])
     li.add_argument("--all", action="store_true")
     li.add_argument("--json", action="store_true")
     kl = sp.add_parser("kill", help="stop your box run, including while queued or still syncing/starting",
@@ -107,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     po.add_argument("--reverse", action="store_true",
                     help="expose the Mac's 127.0.0.1:<--local> on the box at 127.0.0.1:<port> instead")
     sp.add_parser("whoami")
-    sp.add_parser("status")
+    sp.add_parser("status", aliases=["doctor"]).add_argument("run_id", nargs="?")
 
     s = sp.add_parser("spend")
     s.add_argument("--json", action="store_true")
@@ -133,8 +134,12 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--box", help="clear your pin on a previous box (with --days 0)")
 
     bx = sp.add_parser("box")
-    bx.add_argument("action", choices=["release-disk-full"])
+    bx.add_argument("action", choices=["release-disk-full", "suspect", "clear"])
     bx.add_argument("box_id")
+    bx.add_argument("--reason")
+    ev = sp.add_parser("events")
+    ev.add_argument("run_id")
+    ev.add_argument("--json", action="store_true")
     t = sp.add_parser("template")
     t.add_argument("action", choices=["build", "list"])
     t.add_argument("name", nargs="?")
@@ -300,7 +305,7 @@ def _run_with_wait_budget(a, me) -> int:
                     last_home_outage = e
                     # Nothing was accepted by the home server. Ordinary work goes to Boat for this one run; a
                     # person's work waits for the home server; a pinned backend keeps today's waiting.
-                    if home.may_fail_over(explicit_base):
+                    if not getattr(a, "_suspect_exclude", None) and home.may_fail_over(explicit_base):
                         why = None
                         if not reprobed and home.network_failure(e):
                             reprobed = True
@@ -412,7 +417,7 @@ def _run_with_wait_budget(a, me) -> int:
 
 
 # Commands that never talk to a box: they work for a person's lease even while the home server is down.
-LOCAL_ONLY = ("whoami", "local", "list", "status", "spend", "stats", "reap", "bases", "log-rollup")
+LOCAL_ONLY = ("whoami", "local", "list", "status", "spend", "stats", "reap", "bases", "log-rollup", "events", "box")
 
 
 def _reap_other_backend(dry_run: bool) -> None:
@@ -453,6 +458,7 @@ def _main_with_trace(argv: list[str] | None = None) -> int:
 def _main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     a = parse_args(argv)
+    a.sub = {"ps": "list", "doctor": "status"}.get(a.sub, a.sub)
     if not a.sub:
         build_parser().print_help()
         return 2
@@ -461,10 +467,11 @@ def _main(argv: list[str] | None = None) -> int:
     from .redact import redact_argv, warn_env_values
     try:
         if a.sub == "log-rollup":
-            print(json.dumps(toollog.rollup(a.day), sort_keys=True))
+            print(json.dumps(toollog.rollup(a.day, live_only=a.live_only), sort_keys=True))
             return 0
         if a.sub == "reap":
             toollog.rollup_previous()
+            toollog.rollup_today()
         me = whoami()
         if a.sub == "exec":
             from . import execute
@@ -492,13 +499,19 @@ def _main(argv: list[str] | None = None) -> int:
             return misc.wait(a.run_id, a.timeout, summary=True)
         if a.sub == "local":
             misc.local_exempt(me, a.reason, a.ttl, a.list, a.clear)
+        elif a.sub == "events":
+            misc.run_events(a.run_id, a.json)
         elif a.sub == "list":
             misc.list_leases(me, a.all, a.json)
         elif a.sub == "kill":
             return misc.kill_run(a.run_id, me)
         elif a.sub == "box":
             from . import box_disk
-            box_disk.release(me, a.box_id)
+            if a.action == "release-disk-full":
+                box_disk.release(me, a.box_id)
+            else:
+                from . import unfit
+                unfit.command(me, a.box_id, a.action, a.reason)
         elif a.sub == "release":
             misc.release(me, a.box_id, a.mine, a.delete)
         elif a.sub == "ssh":
@@ -513,7 +526,7 @@ def _main(argv: list[str] | None = None) -> int:
         elif a.sub == "whoami":
             print(json.dumps(me, indent=1))
         elif a.sub == "status":
-            misc.status(me)
+            misc.status(me, a.run_id)
         elif a.sub == "spend":
             out = spend.check() if a.check else spend.compute()
             spend.print_report(out, a.json)

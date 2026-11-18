@@ -156,6 +156,7 @@ export function makeAntigravityAcpAdapterFlavor(
   return {
     driver: ANTIGRAVITY_PROVIDER,
     runtimeHarness: "Antigravity",
+    backgroundTasksEndWithProcess: true,
     capabilities: AntigravityProviderCapabilitiesV2,
     makeRuntime,
     // Loading history replays every tool call; resume restores the session

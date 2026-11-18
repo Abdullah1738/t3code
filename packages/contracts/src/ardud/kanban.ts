@@ -22,6 +22,7 @@ import {
 import { ChatFileAttachment, ChatImageAttachment } from "../chatAttachment.ts";
 import { ProviderInstanceId } from "../providerInstance.ts";
 import { ModelSelection } from "../modelSelection.ts";
+import { OrchestrationV2RestartAdmissionFailure } from "../orchestrationV2.ts";
 
 const kanbanId = <Brand extends string>(brand: Parameters<typeof Schema.brand<Brand>>[0]) =>
   TrimmedNonEmptyString.pipe(Schema.brand<Brand>(brand));
@@ -1926,6 +1927,9 @@ export const KanbanCardEvent = Schema.Struct({
   fromStage: Schema.NullOr(KanbanStage),
   toStage: Schema.NullOr(KanbanStage),
   body: Schema.NullOr(Schema.String),
+  runId: Schema.optionalKey(Schema.String),
+  admission: Schema.optionalKey(OrchestrationV2RestartAdmissionFailure),
+  failedThreadId: Schema.optionalKey(ThreadId),
   /** Caller of a system-authored evaluator admission sighting. */
   sourceThreadId: Schema.optionalKey(ThreadId),
   /** Original delivery to reconcile when assignment inputs have since changed. */
@@ -2094,6 +2098,7 @@ export type KanbanStandingApproval = typeof KanbanStandingApproval.Type;
 export const KanbanRelease = Schema.Struct({
   service: Schema.optional(Schema.String),
   postHoc: Schema.optional(Schema.Boolean),
+  buildCommit: Schema.optional(Schema.String),
   boardId: KanbanBoardId,
   cardId: KanbanCardId,
   cardNumber: Schema.Number,
@@ -2123,6 +2128,8 @@ export const KanbanBoard = Schema.Struct({
   releaseLedger: Schema.optional(Schema.Array(KanbanRelease)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  /** Evidence from unmarked history is reported without becoming gate input. */
+  historicalReleaseLedger: Schema.optional(Schema.Array(KanbanRelease)),
   standingApprovals: Schema.Array(KanbanStandingApproval).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),

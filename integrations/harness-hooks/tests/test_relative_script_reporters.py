@@ -41,9 +41,13 @@ class RelativeScriptReporterTests(unittest.TestCase):
             patch.object(engine, '_offbox_mode', return_value='off'),
             patch.object(engine, '_log'),
             patch.dict(os.environ, {name:'' for name in (engine.COMMAND_IDENTITY_ENV,)}),
+            patch.dict(os.environ, {'PATH': os.pathsep.join(('/usr/bin', '/bin', os.environ['PATH']))}),
         ):
             mock.start()
             self.addCleanup(mock.stop)
+        tool = isolated_source_cases.trusted_node_environment()
+        tool.__enter__()
+        self.addCleanup(tool.__exit__, None, None, None)
 
     def write(self, name, body):
         path = self.root / name
@@ -81,9 +85,9 @@ class RelativeScriptReporterTests(unittest.TestCase):
                 row = json.loads(file.read_text())
                 if row['payload']['name'] == 'exec':
                     decoded = code_mode_fixture.commands(row['payload']['input'], row['session_cwd'])
-                    for call in row['commands']:
+                    for call_index, call in enumerate(row['commands']):
                         self.assertIn((call['cmd'], call['workdir']), decoded)
-                for call in row['commands']:
+                for call_index, call in enumerate(row['commands']):
                     self.assertEqual(hashlib.sha256(call['cmd'].encode()).hexdigest(), call['sha256'])
                     cwd = call['workdir'] or row['session_cwd']
                     # The Codex runtime invokes the native hook as Bash.command;
@@ -95,12 +99,13 @@ class RelativeScriptReporterTests(unittest.TestCase):
                             event['cwd'] = '/unrelated/session/directory'
                             event['tool_input']['workdir'] = cwd
                         with self.subTest(fixture=file.name, harness=harness, tool=tool):
-                            self.check(event, harness=harness)
+                            expected = 'live-database-script-unresolved' if (file.name in {'s-03.json', 's-04.json', 'o-00.json', 'o-01.json'} or file.name == 't-07.json' and call_index == 1) else None
+                            self.check(event, expected, harness)
                             # Independent real executed statement after inert
                             # data must still be checked by every adapter.
                             key = 'cmd' if tool == 'exec_command' else 'command'
                             event['tool_input'][key] += '\npython3 -c ' + repr(f'open({LIVE!r}).read()')
-                            self.check(event, 'live-database-read', harness)
+                            self.check(event, expected or 'live-database-read', harness)
 
     def test_isolated_migration_and_heredoc_controls_through_hook(self):
         isolated_source_cases.write_migration_helpers(self.root)
@@ -199,21 +204,82 @@ class RelativeScriptReporterTests(unittest.TestCase):
                 raise FileNotFoundError(path)
             return path_stat(path, *args, **kwargs)
         with patch.object(os.path, 'realpath', side_effect=fixture_realpath), patch.object(Path, 'stat', autospec=True, side_effect=fixture_stat):
-            self.check(fixture['hook_event'])
+            self.check(fixture['hook_event'], 'live-database-script-unresolved')
             for database in (LIVE, OPENCODE):
                 twin = command.replace('\nPY\n', f'\nopen({database!r}).read()\nPY\n', 1)
                 self.assertNotEqual(twin, command)
                 event = {**fixture['hook_event'], 'tool_input':{'command':twin}}
-                self.check(event, 'live-database-script')
+                self.check(event, 'live-database-script-unresolved')
 
     def test_retained_reporter_calls_through_both_adapters(self):
         cases = json.loads((FIXTURES / 'reporters.json').read_text())
         cases += json.loads((FIXTURES / 'added-reporters.json').read_text())
         unresolved = {
+            'toolu_019XRY6Gvz9Gtm2htPdzT6qa': 'executable provenance or mutation proof failed',
+            'call_397846cad4494f52b0e9c57a3f85cd7a': 'executable provenance or mutation proof failed',
+            'call_0c82499091334bff8b9eb8a8ed73bcbf': 'python: non-isolated startup',
+            'call_c3593fb888e64c9f8f808246c766402a': 'python: non-isolated startup',
+            'call_c2ba5fc029614e1da361649017985d81': 'python: non-isolated startup',
+            'call_eb023391ca2d4507b811e7a5b6519cb2': 'python: non-isolated startup',
+            'call_3c100fa581a24b9098a56b2236a87e44': 'command wrapper proof failed',
+            'call_f47459aeb9274a549935ac297a7af33f': 'python: non-isolated startup',
+            'call_dbaae78364c64a4cbcc003d103da0884': 'python: non-isolated startup',
+            'call_cb019549a9334bf29225f9aa9504e297': 'command wrapper proof failed',
+            'call_bb309dbe7c3e4ae68be5c42f9aca3bdb': 'python: non-isolated startup',
+            'call_a7f9cb33e7a3402895dd0732a98f6f41': 'python: non-isolated startup',
+            'call_93af2fcd2c7141df8a27c123f19e5dbc': 'python: non-isolated startup',
+            'call_905a54920e644004a50704b6a64c89dc': 'python: non-isolated startup',
+            'call_8d27799cb10d469aaed2f4e0b75b1424': 'python: non-isolated startup',
+            'call_7211522c68dc4cfd9b7a03fd40029981': 'python: non-isolated startup',
+            'call_61f72d3d774e4f1e9c7c3401a85e481e': 'python: non-isolated startup',
+            'call_5e4c0612c07448d6aea87d0fe9a55490': 'python: non-isolated startup',
+            'call_59ff6368a1b44669815d756abdc84f0e': 'python: non-isolated startup',
+            'call_582da943ca854989821aa5605fe0054b': 'python: non-isolated startup',
+            'call_55c5d86ec5f44e27b37fb0ff319eac54': 'python: non-isolated startup',
+            'call_52d93f07d49044ef882f9add81a10542': 'python: non-isolated startup',
+            'call_4f03bb1ff4844c5ba2df34cc593cf77a': 'command wrapper proof failed',
+            'call_45eff52bf94242cd80a3025ccaca3323': 'python: non-isolated startup',
+            'call_3be4afa481b74700ab1cf31ecdbc0f08': 'python: non-isolated startup',
+            'call_3b7b316ae8a84badb82d8037a79f0553': 'python: non-isolated startup',
+            'call_35b6d8c7de6b42fb866df232a5ba3bc1': 'python: non-isolated startup',
+            'call_327d4b73a5654b299c79001ba428fb4f': 'python: non-isolated startup',
+            'call_22a98a2ba5ba4939b62dbdcfa08d3c40': 'python: non-isolated startup',
+            'call_22157186d164452881bbe2b06f2c929f': 'python: non-isolated startup',
+            'call_1f7e696081364ba58aeb494a3c2d4bf8': 'python: non-isolated startup',
+            'call_16e99fd17f1d499caed7880daf547305': 'python: non-isolated startup',
+            'call_1563736b302d4a4098b10921ef0c258a': 'python: non-isolated startup',
+            'call_14650ff2f13743bb967f611aada87e40': 'python: non-isolated startup',
+            'call_13e81ad91ccf4b7988679787560aadb6': 'python: non-isolated startup',
+            'call_118f05114b044489a11ca8ef534c4d14': 'python: non-isolated startup',
+            'call_09f2adc408a64b049b38c8e5cf2bb356': 'python: non-isolated startup',
             # Dynamic paths without a matching source proof stay unresolved.
             'toolu_01LPn1qyRFv4j2FU9XM3ojgT': '$D/scripts/lib/registry-rtl-consumers.mjs',
             'toolu_01Xp2QFFAsiQnUd25VKtmmyT': '$D/scripts/lib/registry-rtl-consumers.mjs',
             'toolu_01EJVS24gL3YVQkyaDpezY74': '$f',
+            'call_363a7f31bc384aab9c301cdb910617c2': 'python: non-isolated startup',
+            # These writers follow unproved commands or unsupported brace words.
+            'call_88af2f048e124c41adcd9a9b768cddd7': 'heredoc writer',
+            'call_8e1318de1e854e688a15d7312d85fcd1': 'heredoc writer',
+            'call_faa5d79b00b34bacba6060455445ed12': 'heredoc writer',
+            'call_cab9209449084c8e97ebeffb3b3d8fce': 'brace expansion',
+            'call_465eeb8f3a754d0ea843010a5d079ab9': 'brace expansion',
+            'call_68b71b26bd4040ad9f01469397760615': 'python: non-isolated startup',
+            'call_d95383413b6242489793635991b4946c': 'heredoc writer',
+            'call_0c02a91a69684e0787a4ed63e50287f2': 'heredoc writer',
+            'call_3eddb5bf6400468fbeec2a7cb065719a': 'heredoc writer',
+            'call_9102f1f55ad34d189446c670febbd584': 'heredoc writer',
+            'call_851993aaf0254922bf6070f859d45aad': 'heredoc writer',
+            # Parse-only exits also require executable history. These calls
+            # first run non-isolated Python or another unproved mutator.
+            'call_50f52d145b4c4d2c9d2023bb8da7a789': 'execution parse-only',
+            'call_7477033acf254d04a969eb0e89ed5de6': 'execution parse-only',
+            'call_a8bbc8750b6745288668da2b1ec0c7b5': 'execution parse-only',
+            'call_a858f338866745a3a7bcb7567b532d03': 'execution parse-only',
+            'call_8090a0cc8647424d8af13d1f66cb731f': 'python: non-isolated startup',
+            'call_92000a57597c4676b7491c07cbbb8994': 'execution parse-only',
+            'call_3f74b20266f541e0ada057e36dbaa07b': 'execution parse-only',
+            'call_595838d98a5a4eedab18d4c6a71aefe8': 'execution parse-only',
+            'call_e2717c195e8a4f70883e426e4c88174a': 'execution parse-only',
         }
         seen = set()
         # Replaying old commands must not read checkouts that still happen to
@@ -285,7 +351,8 @@ class RelativeScriptReporterTests(unittest.TestCase):
             for database in (LIVE, OPENCODE):
                 with self.subTest(name=name, invocation=invocation, database=database):
                     command = f"cat > {name} <<'EOF'\n{body}EOF\n{invocation}"
-                    self.check(self.event(command))
+                    expected = 'live-database-script-unresolved' if name in {'tmp/quint/3464/fix_rules.py', 'tmp/implement.py', 'tmp/followup.cjs', 'tmp/acceptance.sh'} else None
+                    self.check(self.event(command), expected)
                     read = f'open({database!r}).read()' if interpreter == 'python3' else f'require("fs").readFileSync({database!r})' if interpreter == 'node' else 'sqlite3 ' + database + ' .tables'
                     twin = command.replace('\nEOF', '\n' + read + '\nEOF', 1)
                     if not invocation or ' -n ' in invocation:
@@ -318,11 +385,19 @@ class RelativeScriptReporterTests(unittest.TestCase):
                         self.write('scripts/test.mjs', "console.log('ok')")
 
     def test_unresolved_script_names_the_word_and_fix(self):
-        event = self.event('python3 "$UNKNOWN_SCRIPT"')
-        self.check(event, 'live-database-script-unresolved')
-        result = engine.decide(event, 'codex')
-        for text in ('$UNKNOWN_SCRIPT', str(self.root), 'literal absolute script path'):
-            self.assertIn(text, result['reason'])
+        for isolated in (False, True):
+            with self.subTest(isolated=isolated):
+                event = self.event('python3 ' + ('-I ' if isolated else '') + '"$UNKNOWN_SCRIPT"')
+                self.check(event, 'live-database-script-unresolved')
+                result = engine.decide(event, 'codex')
+                for text in ('$UNKNOWN_SCRIPT', str(self.root)):
+                    self.assertIn(text, result['reason'])
+                if isolated:
+                    self.assertIn('literal absolute script path', result['reason'])
+                else:
+                    self.assertIn('non-isolated startup', result['reason'])
+                    self.assertIn('Resolve the named startup input', result['reason'])
+                    self.assertNotIn('literal absolute script path', result['reason'])
 
     def test_interpreter_stdin_data_and_executed_controls(self):
         body = "from pathlib import Path\nPath('tmp/REPORT.md').write_text('''node --test scripts/test-better-stack-alert-evaluator.mjs\npython3 -m unittest terraform/check.py\npython3 tmp/cards/169/verify-downloads.py''')\n"

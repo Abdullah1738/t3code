@@ -11,6 +11,7 @@ import { ChatRegistry, createAgentBus, createSbApi, optOutHealth, type ChatCore 
 import { handleInbound, runIngress, type IngressDeps } from "../src/sb-ingress.ts";
 import { Shares } from "../src/share.ts";
 import { Store, type OutboxOperation } from "../src/store.ts";
+import type { BackendKind } from "../src/backend.ts";
 
 const owner = "+15555550123";
 const moni = "+15555550199";
@@ -59,9 +60,9 @@ function setup(realApi = false) {
   stores.push(ownerStore);
   const line = fakeLine();
   const built: ChatCore[] = [];
-  const registry = (store = ownerStore) => {
+  const registry = (store = ownerStore, backend?: BackendKind) => {
     const made = new ChatRegistry<Parts>({
-      line, owner, ownerStore: store, stateRoot, access: () => access,
+      line, owner, ownerStore: store, stateRoot, access: () => access, backend,
       build: chat => {
         built.push(chat);
         if (chat.store !== store) stores.push(chat.store);
@@ -978,6 +979,25 @@ test("recipient sends, wakes and guest sends report their own message length lim
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual({ error: `message too long: ${(limit + 412).toLocaleString("en-US")} chars, limit ${limit.toLocaleString("en-US")}; split it or send as a card` });
   }
+});
+
+test.each(["robob", "openchamber", undefined] as const)("Sendblue receipts identify backend %s for owner and Moni", async backend => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const h = setup();
+    const deps: IngressDeps = { line: h.line, owner, ownerStore: h.ownerStore, access: async () => access,
+      sink: h.registry(h.ownerStore, backend).sink(async () => {}) };
+    for (const from of [owner, moni]) for (const source of ["live", "backfill"] as const) {
+      const input = message({ handle: `backend-${from === owner ? "owner" : "moni"}-${source}`, from, chat: chatKey.dm(from), text: "PRIVATE_INBOUND" });
+      expect(await handleInbound(deps, input, source)).toBe(true);
+      expect(await handleInbound(deps, input, source)).toBe(false);
+    }
+  });
+  expect(logs.filter(line => line.name === "msg.received").map(line => [line.ids?.chat, line.props?.source, line.props?.backend])).toEqual([
+    ["owner", "live", backend ?? "unknown"], ["owner", "backfill", backend ?? "unknown"],
+    ["moni", "live", backend ?? "unknown"], ["moni", "backfill", backend ?? "unknown"],
+  ]);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_INBOUND");
 });
 
 test("accepted live and backfill ingress logs canonical chat ids and failure tags", async () => {

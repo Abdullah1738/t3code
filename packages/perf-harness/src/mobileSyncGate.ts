@@ -354,11 +354,11 @@ try {
 
   // One socket = one RPC client. `bytes` counts that socket's received frames.
   // oxlint-disable-next-line t3code/prefer-effect-fn -- Standalone harness script; nothing traces it.
-  const withSocket = <A>(
+  const withSocket = <A, E>(
     use: (
       client: Effect.Success<typeof makeWsRpcProtocolClient>,
       received: () => number,
-    ) => Effect.Effect<A, unknown, Scope.Scope>,
+    ) => Effect.Effect<A, E, Scope.Scope>,
   ) =>
     Effect.gen(function* () {
       const wsTicket = (yield* Effect.promise(() => getJson("/api/auth/websocket-ticket", {})))

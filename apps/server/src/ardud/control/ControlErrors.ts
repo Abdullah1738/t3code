@@ -18,6 +18,7 @@ export class ControlError extends Data.TaggedError("ControlError")<{
   readonly code: ControlErrorCode;
   readonly message: string;
   readonly rejection?: ControlRejection;
+  readonly failure?: { readonly errorTag: string; readonly reason: string };
 }> {}
 
 export const fail = (code: ControlErrorCode, message: string, rejection?: ControlRejection) =>
@@ -51,6 +52,8 @@ export function operationFailure(cause: unknown, depth = 0): ControlError {
   const refusal = (reason: ControlRejection["reason"], retrySafe = false) =>
     fail("conflict", message, { reason, retrySafe, holder });
   switch (tagged._tag) {
+    case "ProviderSessionEndedError":
+      return refusal("no_steerable_turn");
     case "ThreadManagementNoSteerableRunError":
       return refusal("no_steerable_turn", true);
     case "ThreadManagementThreadArchivedError":

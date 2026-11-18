@@ -67,6 +67,8 @@ take_lock() {
 
 # repo dir -> live dir. Only files git knows about: keys, tokens, caches and state stay on the live side.
 typeset -A live=(
+  libexec/opencode "$HOME/.local/libexec/opencode"
+  libexec/opencode-reload "$HOME/.local/libexec/opencode-reload"
   libexec/toollog "$HOME/.local/libexec/toollog"
   libexec/image-generation "$HOME/.local/libexec/image-generation"
   libexec/mail "$HOME/.local/libexec/mail"
@@ -411,12 +413,13 @@ smoke sh -n "$HOME/.local/bin/himalaya-heal"
 smoke sh -n "$HOME/.local/bin/mirage-beacon-keepalive"
 smoke sh -n "$lib/mirage/restart.sh"
 smoke sh -n "$HOME/.local/bin/vp"
-for f in worktree.mjs config-snapshot.mjs toolchain-state.mjs toolchain; do smoke node --check "$lib/vp/$f"; done
+for f in child.mjs launcher.mjs events.mjs worktree.mjs config-snapshot.mjs toolchain-state.mjs toolchain; do smoke node --check "$lib/vp/$f"; done
 smoke sh -c 'cd / && "$1" --version >/dev/null 2>&1; [ "$?" = 127 ]' sh "$HOME/.local/bin/vp"
 smoke zsh -n "$HOME/.local/share/lydia-ticks/tunnel.sh"
-for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health robob-read-watchdog quint; do
+for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health robob-read-watchdog quint opencode opencode-web; do
   smoke zsh -n "$HOME/.local/bin/$f"
 done
+smoke zsh -n "$lib/opencode/service-bin.zsh"
 # The way the watchers run it: bare PATH, no nvm.
 if uber_ours; then
   smoke env -i HOME="$HOME" PATH=/usr/bin:/bin /usr/bin/perl -e 'alarm 20; exec @ARGV or die "exec failed: $!\n"' "$uber" --version

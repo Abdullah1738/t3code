@@ -11,6 +11,10 @@ FLOW='10000000-0000-4000-8000-000000000001'
 class PreorderTests(unittest.TestCase):
     def setUp(self):
         approve_test_flows(self)
+        import order_card
+        for field, value in (('LAST4', '2342'), ('NETWORK', 'mastercard')):
+            card = patch.object(order_card, field, value)
+            card.start(); self.addCleanup(card.stop)
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         p=patch.object(j,'ROOT',Path(temp.name).resolve()/'commerce');p.start();self.addCleanup(p.stop)
         j.open_flow(flow_id=FLOW,app='noon',vertical='nownow',account_hash='1'*64,scope_hash='2'*64)

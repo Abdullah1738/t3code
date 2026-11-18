@@ -18,12 +18,89 @@ from offbox_lib import cli, common, home, misc, pool, reap, runs, ssh_sync
 from test_capacity import Isolated
 
 
+class LogIsolation(unittest.TestCase):
+    def child(self, root, code, **values):
+        env = {k: v for k, v in os.environ.items()
+               if k not in {'OFFBOX_LOG_DIR', 'OFFBOX_TOOL_LOG_DIR', 'OFFBOX_TEST'}}
+        env.update(HOME=str(root), **values)
+        result = subprocess.run([sys.executable, '-I', '-c',
+                                 'import sys; sys.path.insert(0, sys.argv[1]); ' + code,
+                                 str(Path(toollog.__file__).parent)],
+                                env=env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_test_runners_without_override_never_write_prune_or_roll_up_live_logs(self):
+        for setup, values in [('import unittest', {}),
+                              ('sys.modules["pytest"] = object()', {}),
+                              ('pass', {'OFFBOX_TEST': '1'})]:
+            with self.subTest(setup=setup, values=values), tempfile.TemporaryDirectory() as task_home:
+                root = Path(task_home)
+                live = root / '.robob/logs/tools/offbox'
+                live.mkdir(parents=True)
+                old = live / '2000-01-01.ndjson'
+                old.write_text('retention sentinel\n')
+                today = live / (datetime.now(timezone.utc).strftime('%Y-%m-%d') + '.ndjson')
+                today.write_text('live sentinel\n')
+                before = {p.name: p.read_bytes() for p in live.iterdir()}
+                self.child(root, setup + '''
+import toollog
+toollog.emit('run', 'run.end', ids={'run': 'run-x'}, duration_ms=1794567779257.172)
+toollog.rollup_previous()
+toollog.rollup_today()
+for live_only in (False, True):
+    try:
+        toollog.rollup('2000-01-01', live_only=live_only)
+    except ValueError as error:
+        assert 'OFFBOX_LOG_DIR' in str(error)
+    else:
+        raise AssertionError('rollup reached the live default')
+''', **values)
+                self.assertEqual({p.name: p.read_bytes() for p in live.iterdir()}, before)
+
+    def test_overrides_and_live_default_in_fresh_processes(self):
+        for variables, expected in [({}, '.robob/logs/tools/offbox'),
+                                    ({'OFFBOX_LOG_DIR': 'new', 'OFFBOX_TEST': '1'}, 'new'),
+                                    ({'OFFBOX_TOOL_LOG_DIR': 'legacy', 'OFFBOX_TEST': '1'}, 'legacy'),
+                                    ({'OFFBOX_LOG_DIR': 'new', 'OFFBOX_TOOL_LOG_DIR': 'legacy'}, 'new')]:
+            with self.subTest(variables=variables), tempfile.TemporaryDirectory() as task_home:
+                root = Path(task_home)
+                values = {k: str(root / v) if k.endswith('_DIR') else v for k, v in variables.items()}
+                self.child(root, '''import toollog
+toollog.emit('run', 'run.end', ids={'run': 'run-x'})
+assert toollog.rollup()['total'] == 1
+''', **values)
+                files = list(root.rglob('*.ndjson'))
+                self.assertEqual([p.parent for p in files], [root / expected])
+
+    def test_test_runner_replaces_inherited_destinations_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as task_home:
+            root = Path(task_home)
+            code = '''import json, os
+from pathlib import Path
+import toollog
+toollog.emit('run', 'run.end', ids={'run': 'run-x'})
+assert len(list(Path(os.environ['OFFBOX_LOG_DIR']).glob('*.ndjson'))) == 1
+assert Path(os.environ['OFFBOX_STATE_DIR']).parent == Path(os.environ['OFFBOX_LOG_DIR']).parent
+print(json.dumps(os.environ['OFFBOX_LOG_DIR']))
+'''
+            scripts = Path(toollog.__file__).parent
+            env = dict(os.environ, HOME=str(root), OFFBOX_LOG_DIR=str(root / 'live'),
+                       OFFBOX_TOOL_LOG_DIR=str(root / 'legacy'))
+            result = subprocess.run([sys.executable, str(scripts / 'test-runner.py'), sys.executable,
+                                     '-I', '-c', 'import sys; sys.path.insert(0, sys.argv[1]); ' + code,
+                                     str(scripts)], env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(Path(json.loads(result.stdout)).exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+
 class Logs(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name) / 'logs'
-        self.env = patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.root))
+        self.env = patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.root))
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -74,7 +151,8 @@ class Logs(unittest.TestCase):
                             'card': secret, 'body': secret, 'health': 90, 'reason': secret,
                             'commandClass': secret}, tag=secret)
         row = self.rows()[0]
-        self.assertEqual(set(row), {'ts','tool','component','kind','name','durationMs','ok','ids','props'})
+        self.assertEqual(set(row), {'ts','tool','component','kind','name','durationMs','ok','ids','props','source'})
+        self.assertEqual(row['source'], 'test')
         self.assertRegex(row['ts'], r'^\d{4}-\d\d-\d\dT.*\.\d{3}Z$')
         self.assertEqual(row['props'], {'bytes': 12, 'repo': toollog.repo_id(secret), 'backend': 'home'})
         self.assertEqual(row['ids'], {'run': 'run-fixture'})
@@ -97,11 +175,12 @@ class Logs(unittest.TestCase):
         today = datetime.now(timezone.utc).date()
         old = (today-timedelta(days=31)).isoformat()
         keep = (today-timedelta(days=30)).isoformat()
-        for name in (old+'.ndjson', 'rollup-'+old+'.json', old+'.cap', keep+'.ndjson', 'unrelated.txt'):
+        for name in (old+'.ndjson', 'rollup-'+old+'.json', 'rollup-live-'+old+'.json', old+'.cap', keep+'.ndjson', 'unrelated.txt'):
             (self.root/name).touch()
         toollog.emit('run', 'run.request')
         self.assertFalse((self.root/(old+'.ndjson')).exists())
         self.assertFalse((self.root/('rollup-'+old+'.json')).exists())
+        self.assertFalse((self.root/('rollup-live-'+old+'.json')).exists())
         self.assertTrue((self.root/(keep+'.ndjson')).exists())
         self.assertTrue((self.root/'unrelated.txt').exists())
 
@@ -179,6 +258,74 @@ class Logs(unittest.TestCase):
         self.assertEqual(result['okRate'], 0)
         self.assertAlmostEqual(result['errorRate'], 1/21)
 
+    def test_live_only_input_shapes(self):
+        cases = [
+            ('old run ID', {'run': 'run-1113-102030-abcd'}, 'run.end', None, True),
+            ('current run ID', {'run': 'run-1113-102030-abcdef01'}, 'run.end', 'live', True),
+            ('fixture ID', {'run': 'run-x'}, 'run.end', None, False),
+            ('fixture non-run event', {'run': 'run-own'}, 'ssh.drop', None, False),
+            ('short date', {'run': 'run-113-102030-abcd'}, 'run.end', None, False),
+            ('short time', {'run': 'run-1113-10203-abcd'}, 'run.end', None, False),
+            ('short suffix', {'run': 'run-1113-102030-abc'}, 'run.end', None, False),
+            ('six hex suffix', {'run': 'run-1113-102030-abcdef'}, 'run.end', None, False),
+            ('uppercase suffix', {'run': 'run-1113-102030-ABCD'}, 'run.end', None, False),
+            ('non-hex suffix', {'run': 'run-1113-102030-abcz'}, 'run.end', None, False),
+            ('newline suffix', {'run': 'run-1113-102030-abcd\n'}, 'run.end', None, False),
+            ('wrong separator', {'run': 'run_1113-102030-abcd'}, 'run.end', None, False),
+            ('absent ids run event', None, 'run.end', None, False),
+            ('empty ids run event', {}, 'run.request', None, False),
+            ('box only run event', {'box': 'bx_a'}, 'run.sync', None, False),
+            ('absent ids other event', None, 'gate.decision', None, True),
+            ('empty ids other event', {}, 'gate.decision', None, True),
+            ('box only other event', {'box': 'bx_a'}, 'ssh.drop', None, True),
+            ('null run', {'run': None}, 'gate.decision', None, False),
+            ('empty run', {'run': ''}, 'gate.decision', None, False),
+            ('non-string run', {'run': 123}, 'gate.decision', None, False),
+            ('malformed ids', [], 'gate.decision', None, False),
+            ('explicit test real ID', {'run': 'run-1113-102030-abcd'}, 'run.end', 'test', False),
+            ('explicit test other event', None, 'gate.decision', 'test', False),
+        ]
+        self.root.mkdir()
+        path = self.root / '2026-11-13.ndjson'
+        for label, ids, name, source, included in cases:
+            with self.subTest(label=label):
+                row = dict(tool='offbox', name=name, kind='perf')
+                if ids is not None:
+                    row['ids'] = ids
+                if source is not None:
+                    row['source'] = source
+                path.write_text(json.dumps(row) + '\n')
+                result = toollog.rollup(path.stem, live_only=True)
+                self.assertEqual(result['records'], int(included))
+                self.assertEqual(result['excludedRecords'], int(not included))
+                self.assertEqual(result['malformedLines'], 0)
+
+    def test_live_only_cli_counts_rows_separately_from_sampling_and_preserves_inputs(self):
+        self.root.mkdir()
+        path = self.root / '2026-11-13.ndjson'
+        rows = [dict(tool='offbox', name='run.end', kind='perf', ok=True, durationMs=5,
+                     ids={'run': 'run-1113-102030-abcd'}),
+                dict(tool='offbox', name='gate.decision', kind='perf', ok=True, props={'sample': 20}),
+                dict(tool='offbox', name='run.end', kind='error', ok=False,
+                     durationMs=1794567779257.172, ids={'run': 'run-x'}, props={'sample': 20}),
+                dict(tool='offbox', name='run.request', kind='error', ok=False),
+                dict(tool='offbox', name='gate.decision', kind='error', source='test', ok=False)]
+        original = ''.join(json.dumps(row) + '\n' for row in rows) + 'malformed\n'
+        path.write_text(original)
+        ordinary = self.root / 'rollup-2026-11-13.json'
+        ordinary.write_text('ordinary rollup sentinel\n')
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(cli.main(['log-rollup', '--day', path.stem, '--live-only']), 0)
+        result = json.loads(out.getvalue())
+        self.assertEqual((result['records'], result['excludedRecords'], result['malformedLines']), (2, 3, 1))
+        self.assertEqual(result['total'], 21)
+        self.assertEqual(result['errorRate'], 0)
+        self.assertEqual(result['durationMs'], {'run.end': {'p50': 5, 'p95': 5, 'max': 5}})
+        self.assertTrue(result['liveOnly'])
+        self.assertEqual(json.loads((self.root / 'rollup-live-2026-11-13.json').read_text()), result)
+        self.assertEqual(path.read_text(), original)
+        self.assertEqual(ordinary.read_text(), 'ordinary rollup sentinel\n')
+
     def test_rollup_cli_and_first_recurring_tick_after_0005(self):
         toollog.emit('run','run.request',ok=True)
         day=next(self.root.glob('*.ndjson')).stem
@@ -198,6 +345,101 @@ class Logs(unittest.TestCase):
             self.assertEqual(roll.call_count,1)
             self.assertEqual(roll.call_args.args,('2026-11-12',))
 
+    def clock(self, value):
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return value
+        return patch.object(toollog, 'datetime', Clock)
+
+    def test_rollup_marks_completed_days_only_after_midnight_grace(self):
+        cases = [('2026-11-12', 0, 2, False), ('2026-11-12', 0, 5, True),
+                 ('2026-11-12', 0, 10, True), ('2026-11-13', 0, 10, False),
+                 ('2026-11-14', 12, 0, False), ('2026-11-12', 20, 0, True)]
+        for day, hour, minute, complete in cases:
+            for live_only in (False, True):
+                with self.subTest(day=day, hour=hour, minute=minute, live_only=live_only):
+                    now = datetime(2026, 11, 13, hour, minute, tzinfo=timezone.utc)
+                    with self.clock(now):
+                        result = toollog.rollup(day, live_only=live_only)
+                    self.assertIs(result['complete'], complete)
+                    self.assertEqual(result['generatedAt'], now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+                    prefix = 'rollup-live-' if live_only else 'rollup-'
+                    self.assertEqual(json.loads((self.root / (prefix + day + '.json')).read_text()), result)
+
+    def test_previous_repairs_partial_old_and_corrupt_rollups_once(self):
+        values = ['missing', '{broken', 'null', '[]', '{}', '{"complete": false}', '{"complete": 1}']
+        self.root.mkdir()
+        path = self.root / 'rollup-2026-11-12.json'
+        row = dict(tool='offbox', name='gate.decision', kind='perf', ok=True, props={'sample': 20})
+        (self.root / '2026-11-12.ndjson').write_text(json.dumps(row) + '\n')
+        for value in values:
+            with self.subTest(value=value), self.clock(datetime(2026, 11, 13, 0, 10, tzinfo=timezone.utc)):
+                path.unlink(missing_ok=True)
+                if value != 'missing':
+                    path.write_text(value)
+                toollog.rollup_previous()
+                result = json.loads(path.read_text())
+                self.assertIs(result['complete'], True)
+                self.assertEqual(result['total'], 20)
+                self.assertTrue(result['sampled'])
+                before = (path.stat().st_mtime_ns, path.read_bytes())
+                with patch.object(toollog, 'rollup', wraps=toollog.rollup) as roll:
+                    toollog.rollup_previous()
+                    roll.assert_not_called()
+                self.assertEqual((path.stat().st_mtime_ns, path.read_bytes()), before)
+
+    def test_today_refreshes_missing_then_only_when_an_hour_old(self):
+        now = datetime(2026, 11, 13, 20, 0, tzinfo=timezone.utc)
+        path = self.root / 'rollup-2026-11-13.json'
+        with self.clock(now), patch.object(toollog, 'rollup', wraps=toollog.rollup) as roll:
+            toollog.rollup_today()
+            self.assertEqual(roll.call_count, 1)
+            self.assertIs(json.loads(path.read_text())['complete'], False)
+            os.utime(path, (now.timestamp() - 3599,) * 2)
+            before = (path.stat().st_mtime_ns, path.read_bytes())
+            toollog.rollup_today()
+            self.assertEqual(roll.call_count, 1)
+            self.assertEqual((path.stat().st_mtime_ns, path.read_bytes()), before)
+            os.utime(path, (now.timestamp() - 3600,) * 2)
+            toollog.rollup_today()
+            self.assertEqual(roll.call_count, 2)
+            os.utime(path, (now.timestamp() - 60,) * 2)
+            toollog.rollup_today(max_age_s=60)
+            self.assertEqual(roll.call_count, 3)
+
+    def test_recurring_rollups_fail_open(self):
+        with patch.object(toollog, 'directory', side_effect=OSError('unreadable')):
+            toollog.rollup_previous()
+            toollog.rollup_today()
+        with patch.object(toollog, 'rollup', side_effect=OSError('unwritable')):
+            with self.clock(datetime(2026, 11, 13, 20, tzinfo=timezone.utc)):
+                toollog.rollup_previous()
+                toollog.rollup_today()
+
+    def test_mac_monitor_refreshes_rollups_on_ticks_and_dry_run_leaves_them_untouched(self):
+        import monitor
+        con = monitor.connect(':memory:')
+        self.addCleanup(con.close)
+        now = datetime(2026, 11, 13, 20, tzinfo=timezone.utc)
+        pressure = dict(active=False, load1=0, swap_gb=0, free_pct=90)
+        with self.clock(now), contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(monitor, 'pressure', return_value=pressure))
+            stack.enter_context(patch.object(monitor, 'sample_processes', return_value=({}, {}, 0)))
+            stack.enter_context(patch.object(monitor, 'log'))
+            monitor.tick(con, dry_run=True)
+            self.assertFalse(self.root.exists())
+            monitor.tick(con)
+            previous = self.root / 'rollup-2026-11-12.json'
+            today = self.root / 'rollup-2026-11-13.json'
+            self.assertIs(json.loads(previous.read_text())['complete'], True)
+            self.assertIs(json.loads(today.read_text())['complete'], False)
+            row = dict(tool='offbox', name='gate.decision', kind='perf', props={'sample': 20})
+            (self.root / '2026-11-13.ndjson').write_text(json.dumps(row) + '\n')
+            os.utime(today, (now.timestamp() - 3600,) * 2)
+            monitor.tick(con)
+            self.assertEqual(json.loads(today.read_text())['total'], 20)
+
 
 class Instrumentation(Isolated):
     # Exercise the logging wrappers; the failover test stubs _probe and traps execve.
@@ -209,7 +451,7 @@ class Instrumentation(Isolated):
             self.stack.enter_context(patch.object(ssh_sync, name, Path(self.tmp.name)/name))
         ssh_sync.SSH_DIR.mkdir(exist_ok=True)
         self.logdir = Path(self.tmp.name)/'shared-logs'
-        self.stack.enter_context(patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.logdir)))
+        self.stack.enter_context(patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.logdir)))
         self.stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
         self.stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
 
@@ -247,13 +489,18 @@ class Instrumentation(Isolated):
         self.assertEqual(self.rows('run.request')[0]['props']['envCount'],1)
 
     def test_sync_pull_and_upload_outcomes(self):
-        stats={'sent':123,'files':4}
-        with patch.object(ssh_sync,'_push_files',return_value=stats), patch.object(ssh_sync,'tracked_secret_matches',return_value=['.env']):
+        stats={'sent':123,'files':4,'tracked_total':10,'tracked_heavy':3,'tracked_heavy_sent':2,
+               'tracked_node_modules_sent':1,'tracked_secret_sent':1,
+               'tracked_left_out':{'secret':1},'tracked_left_out_first':['.env']}
+        with patch.object(ssh_sync,'_push_files',return_value=stats):
             ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work',run_id='run-fixture')
         with patch.object(ssh_sync,'_push_files',side_effect=common.OffboxError('private error')):
             with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work')
         self.outcomes('run.sync')
-        self.assertEqual(self.rows('run.sync')[0]['props'],{'bytes':123,'files':4,'skipped':1})
+        self.assertEqual(self.rows('run.sync')[0]['props'],{'bytes':123,'files':4,'skipped':1,
+                         'tracked_total':10,'tracked_heavy':3,'tracked_heavy_sent':2,
+                         'tracked_node_modules_sent':1,'tracked_secret_sent':1,
+                         'tracked_left_out':{'secret':1},'tracked_left_out_first':['.env']})
         for rc in (0,23):
             with patch.object(ssh_sync,'ssh_base',return_value=['ssh']),patch.object(ssh_sync.subprocess,'run',return_value=subprocess.CompletedProcess([],rc,'Total bytes received: 40\nNumber of regular files transferred: 2','failure')):
                 ssh_sync.pull('bx_fixture','work','.','artifact',Path(self.tmp.name))

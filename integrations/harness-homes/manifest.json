@@ -20,7 +20,7 @@
     {"id": "inbody", "url": "http://127.0.0.1:18767/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30, "opencodeTimeoutMs": 120000},
     {"id": "flighty", "url": "http://127.0.0.1:18766/mcp", "toolTimeoutSec": 120, "startupTimeoutSec": 30, "opencodeTimeoutMs": 120000},
     {"id": "cua-driver", "command": "/Users/ardud/.local/bin/cua-driver", "args": ["mcp"], "env": {}, "toolTimeoutSec": 120, "startupTimeoutSec": 30},
-    {"id": "dia", "command": "/Users/ardud/.nvm/versions/node/v26.2.0/bin/node", "args": ["/Users/ardud/.config/opencode/dia-agent-bridge/src/server.js"], "env": {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"}, "toolTimeoutSec": 120, "startupTimeoutSec": 30}
+    {"id": "dia", "command": "/Users/ardud/.nvm/versions/node/v26.2.0/bin/node", "args": ["--max-semi-space-size=1", "/Users/ardud/.config/opencode/dia-agent-bridge/src/server.js"], "env": {"DIA_CDP_ENDPOINT": "http://127.0.0.1:9222"}, "toolTimeoutSec": 120, "startupTimeoutSec": 30}
   ],
   "mcpParity": {
     "opencodeConfig": "~/.config/opencode/opencode.jsonc",
@@ -87,6 +87,18 @@
       {
         "source": "../opencode-plugins/plugin/rootwide-search-guard.ts",
         "installed": "~/.config/opencode/plugin/rootwide-search-guard.ts"
+      }
+    ],
+    "shared-dependencies": [
+      "../harness-hooks/src/shared_deps_guard.py",
+      "../harness-hooks/src/engine.py",
+      {
+        "source": "../local-helpers/libexec/repo-node-pin/shared-deps.sh",
+        "installed": "~/.local/libexec/repo-node-pin/shared-deps.sh"
+      },
+      {
+        "source": "../opencode-plugins/plugin/shared-deps-guard.ts",
+        "installed": "~/.config/opencode/plugin/shared-deps-guard.ts"
       }
     ],
     "quint-verify": [

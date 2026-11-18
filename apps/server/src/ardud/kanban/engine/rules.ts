@@ -18,6 +18,9 @@ import {
   kanbanWaiting,
   kanbanWaitStale,
   kanbanWaitsOnEvaluator,
+  kanbanStepSubtasks,
+  kanbanWaitExpired,
+  type KanbanOwnerAsk,
   kanbanReviewAlreadyDone,
   type KanbanBoard,
   type KanbanCard,
@@ -29,7 +32,9 @@ import {
   type KanbanStage,
   type ModelSelection,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import { selectionEffort } from "@t3tools/client-runtime/ardud/models/harnessRouting";
+import { releaseWindow } from "./subtasks.ts";
 import { heldForRetry, NO_VERDICT_REASON, REFUSED_VERDICT_PREFIX } from "./retries.ts";
 
 /**
@@ -224,6 +229,83 @@ export function applyReviewResult(
 export const reviewFinished = (card: KanbanCard, chainLength: number) =>
   card.reviewStep >= Math.max(chainLength, 1);
 
+export const IDLE_EVALUATOR_HOURS = 6;
+
+export const isNotice = (ask: Pick<KanbanOwnerAsk, "kind">) => ask.kind === "notice";
+
+export type IdleEvaluatorBoard = Pick<KanbanBoard, "id" | "standingApprovals" | "releaseLedger"> & {
+  readonly nextReleaseWindowAt?: string | null;
+  readonly nextReleaseWindowByService?: Readonly<Record<string, string>>;
+};
+
+export const idleEvaluatorStall = (
+  card: KanbanCard & { readonly lastEventAt?: string },
+  nowMs: number,
+  board: IdleEvaluatorBoard,
+): {
+  step: number;
+  openEvaluatorSubtasks: string[];
+  idleSinceAt: string;
+  reason: string;
+} | null => {
+  if (
+    card.settledAt !== null ||
+    (card.stage !== "completed" && card.stage !== "deployed") ||
+    card.stalled !== null ||
+    (kanbanWaiting(card) &&
+      card.wait !== undefined &&
+      !kanbanWaitExpired(card.wait, nowMs) &&
+      !(
+        card.wait.on === "time" &&
+        card.wait.until !== null &&
+        Date.parse(card.wait.until) <= nowMs
+      )) ||
+    card.asks.some((ask) => ask.closedAt === null && ask.to !== "evaluator" && !isNotice(ask)) ||
+    !kanbanWaitsOnEvaluator({ ...card, stage: "todo" })
+  )
+    return null;
+  const open = kanbanStepSubtasks(card);
+  if (open.length === 0 || open.some((subtask) => subtask.owner !== "evaluator")) return null;
+  const localWindow = releaseWindow({
+    approvals: board.standingApprovals,
+    ledger: board.releaseLedger ?? [],
+    boardId: board.id,
+    at: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
+  });
+  if (
+    open.some((subtask) => {
+      if (!subtask.interrupting) return false;
+      const next =
+        subtask.service === undefined
+          ? (board.nextReleaseWindowAt ?? localWindow?.next)
+          : (board.nextReleaseWindowByService?.[subtask.service] ??
+            releaseWindow(
+              {
+                approvals: board.standingApprovals,
+                ledger: board.releaseLedger ?? [],
+                boardId: board.id,
+                at: DateTime.formatIso(DateTime.makeUnsafe(nowMs)),
+              },
+              subtask.service,
+            )?.next);
+      return next !== undefined && next !== null && Date.parse(next) > nowMs;
+    })
+  ) {
+    // An interrupting release legitimately parks the step until its pacing window opens.
+    return null;
+  }
+  // Callers supply the latest stored event, including events outside the activity window.
+  const idleSinceAt = card.lastEventAt ?? card.updatedAt;
+  if (!(nowMs - Date.parse(idleSinceAt) >= IDLE_EVALUATOR_HOURS * 60 * 60_000)) return null;
+  const ids = open.map((subtask) => subtask.id);
+  return {
+    step: open[0]!.step,
+    openEvaluatorSubtasks: ids,
+    idleSinceAt,
+    reason: `Idle evaluator step ${ids.join(", ")}`,
+  };
+};
+
 const REVIEW_EVALUATOR_WAKE_MS = 6 * 60 * 60_000;
 
 /** All remaining steps, including later ones, must belong to the evaluator or scripts. */
@@ -324,7 +406,7 @@ export function workerHandoffNudged(
       Date.parse(event.at) >= since &&
       (event.body === WORKER_NUDGE_EVENT ||
         event.body === "Interrupted: stuck on its own question" ||
-        event.body?.startsWith("No activity for ")),
+        isSilentRunStop(event.body)),
   );
   return latest === undefined || latest.body === WORKER_NUDGE_EVENT;
 }
@@ -339,6 +421,16 @@ export function workerWorkDone(card: KanbanCard): boolean {
 }
 
 export const RUN_SILENT_MS = 30 * 60 * 1000;
+export const RUN_OPEN_TOOL_MAX_MS = (4 * 60 + 15) * 60 * 1000;
+
+export const isSilentRunStop = (body: string | null | undefined): boolean =>
+  body?.startsWith("No activity for ") === true || body?.startsWith("Tool call open ") === true;
+
+export const openToolHoldsRun = (
+  view: { readonly openToolSince?: string | null },
+  nowMs: number,
+): boolean =>
+  view.openToolSince != null && nowMs - Date.parse(view.openToolSince) < RUN_OPEN_TOOL_MAX_MS;
 
 export function runSilentDue(
   card: KanbanCard,
@@ -346,6 +438,7 @@ export function runSilentDue(
     readonly state: string;
     readonly lastActivityAt: string | null;
     readonly backgroundWork: number;
+    readonly openToolSince?: string | null;
   },
   nowMs: number,
 ): boolean {
@@ -359,6 +452,7 @@ export function runSilentDue(
     card.stalled !== null ||
     view.state !== "running" ||
     view.backgroundWork !== 0 ||
+    openToolHoldsRun(view, nowMs) ||
     view.lastActivityAt === null
   )
     return false;
@@ -1128,12 +1222,20 @@ export interface ClaimContext {
   readonly pools?: ReadonlyArray<KanbanPool>;
   /** Now: a card held for its evaluator is let go when the time to decide runs out. */
   readonly nowMs?: number;
+  /**
+   * The card is being created and taken by its own work thread in one call
+   * (card_create assignToSelf): the plan is the caller's, so an open step that
+   * is the evaluator's is not a reason to refuse the take.
+   */
+  readonly takeAtOnce?: boolean;
 }
 
 /**
  * A work thread may take a todo card that runs on its pool and project, isn't
  * running, stalled or kept for another work thread, and isn't blocked by work
- * outside the thread or awaiting review or merge.
+ * outside the thread or awaiting review or merge. A card it creates and takes in
+ * one call (`takeAtOnce`) is its own plan, so an open step owned by the
+ * evaluator or a script does not hold it back.
  */
 export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimContext): MoveCheck {
   // Same hold as planDispatch: no card work starts while the board's setup runs.
@@ -1166,7 +1268,7 @@ export function checkClaim(board: KanbanBoard, card: KanbanCard, ctx: ClaimConte
       "evaluator_decision_pending",
     );
   }
-  if (kanbanWaitsOnEvaluator(card)) {
+  if (!ctx.takeAtOnce && kanbanWaitsOnEvaluator(card)) {
     return no(
       `card #${card.number} waits on ${kanbanScriptStep(card) ? "a script's" : "an evaluator's"} subtask first`,
       "evaluator_step_pending",

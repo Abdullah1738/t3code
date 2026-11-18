@@ -603,8 +603,12 @@ class HintAndPullTests(Isolated):
                 p=subprocess.CompletedProcess([],code,'',error)
                 err=io.StringIO()
                 with patch.object(ssh_sync.subprocess,'run',return_value=p), contextlib.redirect_stderr(err):
-                    runs.do_pulls('B',{'remote_dir':'/home/user/w/repo','rel_cwd':'.','local_cwd':self.tmp.name},['out.txt'])
+                    row = dict(run_id='run-missing', box_id='B', remote_dir='/home/user/w/repo', rel_cwd='.',
+                               local_cwd=self.tmp.name, _pull_owner=dict(pid=1, role='wait'),
+                               _pull_started_at=common.now(), _pull_summary=dict(files=0,bytes=0,conflicts=0,errors=0))
+                    runs.do_pulls('B', row, ['out.txt'])
                 if quiet:
-                    self.assertEqual(err.getvalue(),'offbox: pull out.txt: not created on the box\n')
+                    self.assertEqual(err.getvalue(), 'offbox: run-missing: no pull baseline (older client or --no-sync); pulling with overwrite enabled\n'
+                                     'offbox: run-missing: pull out.txt: not created on the box\n')
                 else:
                     self.assertIn('pull out.txt failed:',err.getvalue())

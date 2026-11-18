@@ -19,6 +19,7 @@ import * as Path from "effect/Path";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
 import * as Tracer from "effect/Tracer";
+import * as TestClock from "effect/testing/TestClock";
 import { vi } from "vite-plus/test";
 
 import {
@@ -52,6 +53,9 @@ import { ensureKanbanCacheVersions } from "../../persistence/kanbanCacheVersions
 import { summaries, tallyBoards } from "../engine/summaries.ts";
 import * as KanbanStore from "./KanbanStore.ts";
 import * as Rules from "../engine/rules.ts";
+import { boardReleaseSummary } from "../engine/boardReplies.ts";
+import { releaseWindow } from "../engine/subtasks.ts";
+import { backfillRelease12 } from "./releaseBackfill.ts";
 
 const TestLayer = KanbanStore.layer.pipe(Layer.provideMerge(Sqlite.layerMemory));
 
@@ -147,6 +151,178 @@ const card = (number: number, stage: KanbanCard["stage"]): KanbanCard => ({
   updatedAt: at,
   movedAt: at,
 });
+
+it.effect.each([
+  { name: "before the window", joinedAt: "2026-10-24T12:59:59.999Z", included: true },
+  { name: "at the window start", joinedAt: "2026-10-24T13:00:00.000Z", included: true },
+  { name: "just before the cutoff", joinedAt: "2026-10-25T12:59:59.999Z", included: true },
+  { name: "at the cutoff", joinedAt: at, included: false },
+  { name: "after the cutoff", joinedAt: "2026-10-25T13:00:00.001Z", included: false },
+])("thread cards joined $name respect an exclusive cutoff", ({ joinedAt, included }) =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const carried = card(1, "completed");
+    const unrelated = card(2, "completed");
+    yield* store.addThreadCard("worker", carried.id, joinedAt);
+    yield* store.addThreadCard("other-worker", unrelated.id, joinedAt);
+    assert.deepStrictEqual(
+      yield* store.threadCards("worker", { before: at }),
+      included ? [carried.id] : [],
+    );
+    assert.deepStrictEqual(yield* store.threadCards("worker"), [carried.id]);
+    assert.deepStrictEqual(yield* store.threadCards("worker", {}), [carried.id]);
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each([
+  { local: 4, peer: 96 },
+  { local: 96, peer: 4 },
+  { local: 4, peer: 4 },
+])(
+  "backfills .12 as audit history without changing gates (local $local h, peer $peer h)",
+  ({ local, peer }) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const releaseBoard: KanbanBoard = {
+        ...board,
+        id: KanbanBoardId.make("board-robob"),
+        standingApprovals: [
+          {
+            id: "sa-release12",
+            gate: "deploy",
+            minIntervalHours: local,
+            quote: "Board releases itself",
+            sourceThreadId: "owner",
+            saidAt: at,
+            approvedAsk: { cardId: "source", askId: "q1" },
+            recordedAt: at,
+            recordedBy: "evaluator",
+            revokedAt: null,
+            revokedBy: null,
+            revokeReason: null,
+          },
+        ],
+      };
+      const peerBoard = {
+        ...releaseBoard,
+        id: KanbanBoardId.make("board-peer"),
+        slug: "peer",
+        standingApprovals: releaseBoard.standingApprovals.map((approval) => ({
+          ...approval,
+          minIntervalHours: peer,
+        })),
+      };
+      const releaseCard = {
+        ...card(1460, "verified"),
+        id: KanbanCardId.make("card-9b02ad5e-c58b-4893-8474-8437cf436063"),
+        boardId: releaseBoard.id,
+        subtasks: [
+          {
+            id: "s4",
+            step: 4,
+            owner: "evaluator" as const,
+            text: "Install Robob",
+            state: "done" as const,
+            note: null,
+            doneBy: null,
+            doneAt: "2026-11-14T22:47:28.946Z",
+          },
+        ],
+      };
+      yield* store.putBoard(releaseBoard);
+      yield* store.putBoard(peerBoard);
+      yield* store.putCard(releaseCard);
+      yield* TestClock.setTime(Date.parse("2026-11-17T00:00:00.000Z"));
+      yield* backfillRelease12(sql);
+      assert.deepStrictEqual((yield* store.board(releaseBoard.id))!.releaseLedger, []);
+      assert.isUndefined((yield* store.board(releaseBoard.id))!.historicalReleaseLedger);
+      yield* store.addCardEvent({
+        cardId: releaseCard.id,
+        at: "2026-11-14T22:47:28.947Z",
+        actor: { _tag: "evaluator", threadId: ThreadId.make("release-evaluator") },
+        kind: "subtask",
+        fromStage: null,
+        toStage: null,
+        head: null,
+        body: "s4 done: Install Robob (Installed 22:33Z from a new Terminal.app window. Healthy 22:43:13Z; health buildCommit d86aed779b94; cleared by standing approval sa-release12)",
+      });
+      const repaired = yield* Effect.gen(function* () {
+        const restarted = yield* KanbanStore.KanbanStore;
+        assert.notStrictEqual(restarted, store);
+        return (yield* restarted.board(releaseBoard.id))!;
+      }).pipe(Effect.provide(Layer.fresh(KanbanStore.layer)));
+      assert.deepStrictEqual(repaired.releaseLedger, []);
+      assert.deepStrictEqual(repaired.historicalReleaseLedger, [
+        {
+          boardId: releaseBoard.id,
+          cardId: releaseCard.id,
+          cardNumber: 1460,
+          subtaskId: "s4",
+          service: "robob",
+          at: "2026-11-14T22:33:00.000Z",
+          buildCommit: "d86aed779b94",
+          postHoc: true,
+          critical: null,
+          approvalId: "sa-release12",
+        },
+      ]);
+      assert.strictEqual(
+        boardReleaseSummary(repaired, "2026-11-17T00:00:00.000Z").nextReleaseWindowAt,
+        local === 4 ? null : "2026-11-18T22:33:00.000Z",
+      );
+      assert.strictEqual(
+        boardReleaseSummary(repaired, "2026-11-15T01:00:00.000Z").nextReleaseWindowAt,
+        local === 4 ? "2026-11-15T02:33:00.000Z" : "2026-11-18T22:33:00.000Z",
+      );
+      assert.deepStrictEqual(
+        boardReleaseSummary(repaired).releaseLedger,
+        repaired.historicalReleaseLedger,
+      );
+      const boards = yield* store.boards;
+      for (const consuming of boards) {
+        for (const service of [undefined, "robob", "recall"]) {
+          assert.strictEqual(
+            releaseWindow(
+              {
+                approvals: consuming.standingApprovals,
+                ledger: boards.flatMap((entry) => entry.releaseLedger ?? []),
+                boardId: consuming.id,
+                at: "2026-11-17T00:00:00.000Z",
+              },
+              service,
+            ),
+            null,
+          );
+        }
+        // Evaluator readiness uses the same inputs as admission, not audit history.
+        assert.deepStrictEqual(
+          boardReleaseSummary(consuming, "2026-11-17T00:00:00.000Z", boards, false),
+          { releaseLedger: [], nextReleaseWindowAt: null, nextReleaseWindowByService: {} },
+        );
+      }
+      assert.deepStrictEqual((yield* store.card(releaseCard.id))!.subtasks, releaseCard.subtasks);
+      yield* backfillRelease12(sql);
+      assert.deepStrictEqual(yield* store.board(releaseBoard.id), repaired);
+      // A corrected receipt remains authoritative on subsequent starts.
+      yield* store.putBoard({
+        ...repaired,
+        releaseLedger: repaired.historicalReleaseLedger!.map((row) => ({
+          ...row,
+          at: "2026-11-14T22:33:54.000Z",
+        })),
+      });
+      yield* backfillRelease12(sql);
+      assert.strictEqual(
+        (yield* store.board(releaseBoard.id))!.releaseLedger![0]!.at,
+        "2026-11-14T22:33:54.000Z",
+      );
+      assert.strictEqual(
+        boardReleaseSummary((yield* store.board(releaseBoard.id))!).releaseLedger[0]!.at,
+        "2026-11-14T22:33:54.000Z",
+      );
+    }).pipe(Effect.provide(TestLayer)),
+);
 
 it.effect("loads open review links with their cards, including missing cards, in one read", () =>
   Effect.gen(function* () {
@@ -3070,6 +3246,173 @@ it.effect("reopened caller attribution follows nested subagents and stops at for
     }).pipe(Effect.provideService(Statement.CurrentTransformer, observe));
     assert.deepEqual(queries, []);
   }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect("#1616 nested caller rollback discards only its own metadata", () =>
+  Effect.gen(function* () {
+    const store = yield* KanbanStore.KanbanStore;
+    const sql = yield* SqlClient.SqlClient;
+    const current = card(4336, "working");
+    const other = card(4337, "todo");
+    const id = ThreadId.make("nested-worker");
+    const link: KanbanThreadLink = {
+      threadId: id,
+      boardId,
+      cardId: current.id,
+      role: "work",
+      purpose: null,
+      discussionId: null,
+      model,
+      startedAt: at,
+      endedAt: null,
+      paused: null,
+    };
+    yield* store.putCard(current);
+    yield* store.putCard(other);
+    yield* store.putThreadLink(link);
+    yield* store.observeCallerWrites(
+      sql.withTransaction(
+        Effect.gen(function* () {
+          yield* store.putCard({ ...current, stage: "in_review" });
+          yield* store
+            .observeCallerWrites(
+              sql.withTransaction(
+                Effect.gen(function* () {
+                  yield* store.putCard({ ...current, stage: "needs_review" });
+                  yield* store.putThreadLink({ ...link, role: "review" });
+                  return yield* Effect.fail("rollback");
+                }),
+              ),
+            )
+            .pipe(Effect.ignore);
+          yield* store.putCard({ ...other, stage: "working" });
+        }),
+      ),
+    );
+    const savedCard = yield* store.card(current.id);
+    const savedLink = yield* store.threadLink(id);
+    assert.equal(savedCard?.stage, "in_review");
+    assert.equal(savedLink?.role, "work");
+    assert.equal((yield* store.card(other.id))?.stage, "working");
+    assert.deepEqual(store.callerAnalytics!(id), {
+      boardId,
+      cardId: current.id,
+      cardNumber: current.number,
+      cardStage: "in_review",
+      callerRole: "work",
+    });
+  }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each(["rekey", "selection"] as const)(
+  "#1616 nested %s rollback preserves earlier outer metadata",
+  (mode) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const current = card(4336, "working");
+      const other = card(4337, "todo");
+      const id = ThreadId.make("nested-bulk-worker");
+      const link: KanbanThreadLink = {
+        threadId: id,
+        boardId,
+        cardId: current.id,
+        role: "work",
+        purpose: null,
+        discussionId: null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      };
+      yield* store.putCard(current);
+      yield* store.putCard(other);
+      yield* store.putThreadLink(link);
+      const changed = { ...current, stage: "needs_review" as const };
+      const bulk =
+        mode === "rekey"
+          ? store
+              .rekeyBoard(boardId, [], [changed])
+              .pipe(Effect.andThen(store.putThreadLink({ ...link, role: "review" })))
+          : store.migrateBoardSelections({
+              board,
+              pools: [],
+              oldPoolKeys: [],
+              cards: [changed],
+              threadLinks: [{ ...link, role: "review" }],
+            });
+      yield* store.observeCallerWrites(
+        sql.withTransaction(
+          Effect.gen(function* () {
+            yield* store.putCard({ ...current, stage: "in_review" });
+            const nested = yield* store
+              .observeCallerWrites(
+                sql.withTransaction(bulk.pipe(Effect.andThen(Effect.fail("rollback")))),
+              )
+              .pipe(Effect.exit);
+            assert.equal(nested._tag, "Failure");
+            yield* store.putCard({ ...other, stage: "working" });
+          }),
+        ),
+      );
+      const savedCard = yield* store.card(current.id);
+      const savedLink = yield* store.threadLink(id);
+      assert.equal(savedCard?.stage, "in_review");
+      assert.equal(savedLink?.role, "work");
+      assert.equal((yield* store.card(other.id))?.stage, "working");
+      assert.equal(store.callerAnalytics!(id)?.cardStage, savedCard?.stage);
+      assert.equal(store.callerAnalytics!(id)?.callerRole, savedLink?.role);
+    }).pipe(Effect.provide(TestLayer)),
+);
+
+it.effect.each(["commit", "rollback"] as const)(
+  "#1616 successful nested metadata follows the outer %s",
+  (outcome) =>
+    Effect.gen(function* () {
+      const store = yield* KanbanStore.KanbanStore;
+      const sql = yield* SqlClient.SqlClient;
+      const current = card(4336, "working");
+      const id = ThreadId.make("successful-nested-worker");
+      const link: KanbanThreadLink = {
+        threadId: id,
+        boardId,
+        cardId: current.id,
+        role: "work",
+        purpose: null,
+        discussionId: null,
+        model,
+        startedAt: at,
+        endedAt: null,
+        paused: null,
+      };
+      yield* store.putCard(current);
+      yield* store.putThreadLink(link);
+      const result = yield* store
+        .observeCallerWrites(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              yield* store.observeCallerWrites(
+                sql.withTransaction(
+                  store
+                    .putCard({ ...current, stage: "needs_review" })
+                    .pipe(Effect.andThen(store.putThreadLink({ ...link, role: "review" }))),
+                ),
+              );
+              assert.equal(store.callerAnalytics!(id)?.cardStage, "working");
+              assert.equal(store.callerAnalytics!(id)?.callerRole, "work");
+              if (outcome === "rollback") return yield* Effect.fail("outer rollback");
+            }),
+          ),
+        )
+        .pipe(Effect.exit);
+      assert.equal(result._tag, outcome === "commit" ? "Success" : "Failure");
+      const savedCard = yield* store.card(current.id);
+      const savedLink = yield* store.threadLink(id);
+      assert.equal(savedCard?.stage, outcome === "commit" ? "needs_review" : "working");
+      assert.equal(savedLink?.role, outcome === "commit" ? "review" : "work");
+      assert.equal(store.callerAnalytics!(id)?.cardStage, savedCard?.stage);
+      assert.equal(store.callerAnalytics!(id)?.callerRole, savedLink?.role);
+    }).pipe(Effect.provide(TestLayer)),
 );
 
 it.effect.each(["rekey", "selection"] as const)(

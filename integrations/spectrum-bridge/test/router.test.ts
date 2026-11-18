@@ -14,18 +14,19 @@ import { OpenChamber, type FilePart, type MessageRecord, type OwnerWords, type P
 type Assistant = Extract<MessageRecord, { type: "assistant" }>;
 import { TransportError, type NormalizedInbound, type Photon } from "../src/photon.ts";
 import type { Message } from "@photon-ai/advanced-imessage/grpc";
-import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, OUTAGE_NOTICE_AFTER_MS, pendingOrders, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance } from "../src/router.ts";
+import { imessageGuidance, MAX_SYNTHETIC_ATTEMPTS, NEW_CHAT_NUDGE, newChatNudge, ACCEPT_WAIT_MS, OUTAGE_NOTICE_AFTER_MS, pendingOrders, READ_WAIT_MS, REPLY_NUDGE, replyQuote, replyText, ROTATE_NUDGE, rotateNudge, Router, sendblueContextPrompt, SYNTHETIC_RETRY_MS, syntheticDropped, TOOL_MODE_MARKER, toolReplyRules, wakeGuidance, SEND_WAIT_MS } from "../src/router.ts";
 import { replyModeConfig } from "../src/config.ts";
 import { Store } from "../src/store.ts";
-import { ChatRegistry, createAgentBus } from "../src/runtime.ts";
+import { ChatRegistry, createAgentBus, createSbApi } from "../src/runtime.ts";
 import { Delivery } from "../src/delivery.ts";
 import { ReplyGapMonitor } from "../src/reply-gap.ts";
 import { recordsFromThread, RobobBackend, sentMessagePrefix } from "../src/robob.ts";
-import type { ControlMessage, ThreadDetail } from "../src/control.ts";
+import { ControlError, type ControlMessage, type ThreadDetail } from "../src/control.ts";
 import type { SttInput } from "../src/stt.ts";
 import { robobSubagentNotice, opencodeSubagentNotice } from "./fixtures/subagent-notices.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { legacySteerStart, restoreLegacySteer } from "./fixtures/legacy-steer-upgrade.ts";
+import { turnMembers } from "../src/unanswered.ts";
 import { toolLog } from "../src/toollog.ts";
 
 type Prompt = { id: string; directory: string; messageId: string; text: string; system?: string; files: readonly FilePart[]; model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }; owner?: OwnerWords };
@@ -59,7 +60,7 @@ class Backend extends OpenChamber {
   permissionReads = 0;
   promptBehavior?: (call: Prompt) => Promise<void>;
   createBehavior?: () => Promise<{ id: string; directory: string }>;
-  messagesBehavior?: () => Promise<MessageRecord[]>;
+  messagesBehavior?: (options?: Parameters<OpenChamber["messages"]>[2]) => Promise<MessageRecord[]>;
   permissionBehavior?: () => Promise<PermissionRequest[]>;
   questionBehavior?: () => Promise<QuestionRequest[]>;
   permissionReplyBehavior?: () => Promise<boolean>;
@@ -87,9 +88,9 @@ class Backend extends OpenChamber {
     if (this.promptBehavior) await this.promptBehavior(call);
     else this.accept(call);
   }
-  override async messages(id: string, directory: string) {
+  override async messages(id: string, directory: string, options?: Parameters<OpenChamber["messages"]>[2]) {
     this.reads.push(["messages", id, directory]);
-    return this.messagesBehavior ? this.messagesBehavior() : this.records;
+    return this.messagesBehavior ? this.messagesBehavior(options) : this.records;
   }
   /** Sessions waiting on background work with no child session (Robob's `waiting`): idle to statuses(), blocked for a reset. */
   waitingRoots = new Set<string>();
@@ -232,6 +233,241 @@ test("prompts carry the OpenCode-config preferred model, and fall back when it i
   setSystemTime(10_000 + 2 * (15_000 + 1));
   await new Router(second.store, second.backend, second.transport, second.routerOptions).tick();
   expect(second.backend.prompts.map(prompt => prompt.model)).toEqual([undefined]);
+});
+
+// Persist the pre-upgrade delivery state without running today's coverage reconciliation.
+function legacyOutboxState(store: Store, id: string, state: string) {
+  store.db.query("UPDATE outbox SET state = ? WHERE id = ?").run(state, id);
+}
+
+async function legacySteeredTurn(leader: "human" | "wake", replyMode: "final" | "tool", beforeAcceptance?: (h: ReturnType<typeof setup>, id: string) => void) {
+  const directory = mkdtempSync(join(tmpdir(), "spectrum-legacy-steers-"));
+  directories.push(directory);
+  const path = join(directory, "store.sqlite");
+  const h = setup(path, { replyMode });
+  const root = leader === "wake" ? "wake:old" : "root";
+  h.input(root, "Original work"); await h.router.tick();
+  for (const id of ["first-steer", "second-steer"]) {
+    h.input(id, `${id} question`); h.input(`${id}-member`, `${id} context`);
+    h.store.set(`batch:${id}`, { id, text: `${id} question\n${id} context`, attachments: [], isAudioMessage: false,
+      receivedAt: Date.now(), batchIds: [id, `${id}-member`] } satisfies NormalizedInbound);
+    beforeAcceptance?.(h, id);
+    for (const member of [id, `${id}-member`]) {
+      h.store.updateInbound(member, "done");
+      h.store.set(`inbound-delivered:${member}`, Date.now());
+    }
+    h.store.set(`batch-phase:${id}`, "accepted");
+    h.backend.records.push({ id: messageId(id), type: "user", text: `${id} question`, time: { created: Date.now() } });
+  }
+  const route = h.store.get<{ id: string; directory: string; generation: number }>("route")!;
+  // Before coverage tracking, consumeSteer stored only prompt IDs and admission receipts.
+  h.store.set("activeTurn", { ...route, inboundId: root, messageId: messageId(root), startedAt: Date.now(), phase: "running", outbox: 0,
+    steered: [messageId("first-steer"), messageId("second-steer")], steeredAt: Date.now(),
+    ...(leader === "wake" ? { typed: true, replyInboundId: "first-steer" } : {}) });
+  h.store.db.query("DELETE FROM kv WHERE key = ?").run(`turn-human:${messageId(root)}`);
+  return { ...h, path, root };
+}
+
+for (const leader of ["human", "wake"] as const) for (const replyMode of ["final", "tool"] as const) {
+  for (const outcome of ["no_reply", "failed", "restored-failed", "replied"] as const) test(`pre-upgrade accepted steers settle every batch after restart (${leader}, ${replyMode}, ${outcome})`, async () => {
+    const h = await legacySteeredTurn(leader, replyMode);
+    if (outcome === "restored-failed") {
+      h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), phase: "failed" });
+      h.store.set(`log-turn-end:${messageId(h.root)}`, true);
+      h.backend.failed();
+    }
+    h.store.close();
+    const reopened = new Store(h.path); stores.push(reopened);
+    const router = new Router(reopened, h.backend, h.transport, h.routerOptions);
+    if (outcome === "restored-failed") {
+      expect(reopened.get<number>("human-retries:first-steer")).toBe(1);
+      expect(reopened.get<number>("human-retries:second-steer")).toBe(1);
+    }
+    // A second startup must not infer ownership again from the legacy receipts.
+    new Router(reopened, h.backend, h.transport, h.routerOptions);
+    if (outcome === "replied" && replyMode === "tool") agentSends({ ...h, store: reopened }, "legacy-handled", "Handled");
+    if (outcome === "failed") h.backend.failed();
+    else if (outcome !== "restored-failed") h.backend.final(outcome === "replied" ? "Handled" : "NO_REPLY");
+    await router.tick(); await router.tick();
+    if (outcome === "replied") {
+      const replies = reopened.pendingOutbox().filter(op => op.kind === "conversation");
+      expect(replies.map(op => op.text)).toEqual(["Handled"]);
+      expect(reopened.get<string[]>(`reply-covered:${replies[0]!.id}`)).toEqual(expect.arrayContaining([
+        "first-steer", "first-steer-member", "second-steer", "second-steer-member",
+      ]));
+      for (const op of replies) reopened.outboxState(op.id, "sent");
+      await router.tick();
+      expect(h.backend.prompts).toHaveLength(1);
+    }
+    for (const id of ["first-steer", "second-steer"]) {
+      expect(reopened.get<number>(`human-retries:${id}`) ?? 0).toBe(outcome === "replied" ? 0 : 1);
+      expect(reopened.get<NormalizedInbound>(`batch:${id}`)?.batchIds).toEqual([id, `${id}-member`]);
+      expect(inbounds(reopened).filter(row => row.id === id || row.id === `${id}-member`).every(row => outcome === "replied" ? row.state === "done" : row.state !== "done")).toBe(true);
+    }
+    if (outcome !== "replied") expect(h.backend.prompts.at(-1)?.text).toContain("first-steer question");
+  });
+}
+
+for (const leader of ["human", "wake"] as const) for (const sent of [false, true]) {
+  test(`pre-upgrade accepted steers preserve an earlier legacy reply (${leader}, sent=${sent})`, async () => {
+    const h = await legacySteeredTurn(leader, "final");
+    h.store.enqueue({ id: "send:legacy", kind: "conversation", text: "First handled", sessionId: "ses_1", generation: 1, replyTo: "first-steer" });
+    h.store.db.query("DELETE FROM kv WHERE key = ?").run("reply-covered:send:legacy");
+    if (sent) legacyOutboxState(h.store, "send:legacy", "sent");
+    h.store.close();
+    const reopened = new Store(h.path); stores.push(reopened);
+    const logs = await captureLogs(async () => {
+      const router = new Router(reopened, h.backend, h.transport, h.routerOptions);
+      h.backend.final("NO_REPLY"); await router.tick(); await router.tick();
+    });
+    expect(reopened.get<number>("human-retries:first-steer")).toBeUndefined();
+    expect(reopened.get<number>("human-retries:second-steer")).toBe(1);
+    expect(inbounds(reopened).filter(row => row.id.startsWith("first-steer")).map(row => row.state)).toEqual(["done", "done"]);
+    expect(reopened.get<string[]>("reply-covered:send:legacy")).toBeUndefined();
+    expect(logs.filter(log => log.name === "inbound.unanswered" && log.ids?.inboundId?.startsWith("first-steer"))).toEqual([]);
+  });
+}
+
+for (const prefix of ["send", "file", "app", "poll", "secret-form"] as const) for (const state of ["pending", "sent", "uncertain"] as const) for (const failed of [false, true]) {
+  test(`pre-upgrade tool reply protects its attributed batch (${prefix}, ${state}, failed=${failed})`, async () => {
+    const h = await legacySteeredTurn("wake", "tool", (h, leader) => {
+      if (leader === "first-steer") h.store.attributeSteeredReplies(leader, "ses_1", 1, 0, "wake:old");
+    });
+    const id = `${prefix}:actual-old-tool`;
+    h.store.enqueue({ id, kind: "conversation", text: "First handled", sessionId: "ses_1", generation: 1,
+      ...(prefix === "file" ? { attachment: { sha256: h.store.putBlob(new Uint8Array([1])), name: "answer.png", mimeType: "image/png", size: 1 } } : {}),
+      ...(prefix === "app" || prefix === "secret-form" ? { app: { url: "https://example.com/answer", caption: "Answer" } } : {}),
+      ...(prefix === "poll" ? { poll: { title: "Choose", options: ["A", "B"] } } : {}),
+    });
+    h.store.db.query("DELETE FROM kv WHERE key = ?").run(`reply-covered:${id}`);
+    legacyOutboxState(h.store, id, state);
+    expect(h.store.getOperation(id)?.replyTo).toBeUndefined();
+    expect(h.store.get<string>(`log-inbound-id:${id}`)).toBe("first-steer");
+    if (failed) h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), phase: "failed" });
+    h.store.close();
+    const reopened = new Store(h.path); stores.push(reopened);
+    const logs = await captureLogs(async () => {
+      const router = new Router(reopened, h.backend, h.transport, h.routerOptions);
+      new Router(reopened, h.backend, h.transport, h.routerOptions);
+      if (!failed) h.backend.final("NO_REPLY");
+      await router.tick(); await router.tick();
+    });
+    expect(reopened.get<string[]>(`reply-covered:${id}`)).toEqual(["first-steer", "first-steer-member"]);
+    expect(reopened.get<number>("human-retries:first-steer")).toBeUndefined();
+    expect(reopened.get<number>("human-retries:second-steer")).toBe(1);
+    expect(inbounds(reopened).filter(row => row.id.startsWith("first-steer")).map(row => row.state)).toEqual(["done", "done"]);
+    expect(h.backend.prompts.map(call => call.text)).toEqual(["Original work", "second-steer question\nsecond-steer context"]);
+    expect(logs.filter(log => log.name === "inbound.unanswered" && log.ids?.inboundId?.startsWith("first-steer"))).toEqual([]);
+  });
+}
+
+test("pre-upgrade tool reply warns once for trusted legacy attribution and never for modern replyTo coverage", async () => {
+  for (const modern of [false, true]) {
+    const h = await legacySteeredTurn("wake", "tool");
+    const id = "send:warning-check";
+    h.store.enqueue({ id, kind: "conversation", text: "First handled", sessionId: "ses_1", generation: 1,
+      ...(modern ? { replyTo: "first-steer" } : {}) });
+    if (modern) h.store.set(`reply-covered:${id}`, ["first-steer", "first-steer-member"]);
+    else h.store.db.query("DELETE FROM kv WHERE key = ?").run(`reply-covered:${id}`);
+    legacyOutboxState(h.store, id, "sent");
+    h.store.close();
+    const reopened = new Store(h.path); stores.push(reopened);
+    const logs = await captureLogs(async () => {
+      const router = new Router(reopened, h.backend, h.transport, h.routerOptions);
+      new Router(reopened, h.backend, h.transport, h.routerOptions);
+      h.backend.final("NO_REPLY"); await router.tick(); await router.tick();
+    });
+    const warnings = logs.filter(line => line.name === "inbound.legacy_attribution_trusted");
+    expect(warnings).toHaveLength(modern ? 0 : 1);
+    if (!modern) expect(warnings[0]).toMatchObject({ kind: "event", level: "warn",
+      ids: { inboundId: "first-steer", outboxId: id, threadId: "ses_1", messageId: messageId("wake:old") }, props: { generation: 1 } });
+    expect(JSON.stringify(warnings)).not.toContain("First handled");
+    expect(reopened.get<number>("human-retries:first-steer")).toBeUndefined();
+    expect(reopened.get<number>("human-retries:second-steer")).toBe(1);
+  }
+});
+
+for (const state of ["pending", "sent"] as const) test(`pre-upgrade tool reply rejects wake sends retagged before acceptance (${state})`, async () => {
+  setSystemTime(1_800_000_000_000);
+  const id = "send:retagged-wake";
+  const h = await legacySteeredTurn("wake", "tool", (h, leader) => {
+    if (leader !== "first-steer") return;
+    h.store.updateInbound(leader, "processing"); h.store.updateInbound(`${leader}-member`, "batched");
+    h.store.set(`batch-phase:${leader}`, "steering");
+    h.store.enqueue({ id, kind: "conversation", text: "Unrelated wake status", sessionId: "ses_1", generation: 1 });
+    h.store.db.query("DELETE FROM kv WHERE key = ?").run(`reply-covered:${id}`);
+    legacyOutboxState(h.store, id, state);
+    expect(h.store.get<string>(`log-inbound-id:${id}`)).toBe("wake:old");
+    // This is the same logging rewrite performed by the old consumeSteer before delivered().
+    h.store.attributeSteeredReplies(leader, "ses_1", 1, 0, "wake:old");
+    expect(h.store.get<string>(`log-inbound-id:${id}`)).toBe("first-steer");
+  });
+  expect(h.store.get<number>(`log-queued:${id}`)).toBe(h.store.get<number>("inbound-delivered:first-steer")!);
+  h.store.close();
+  const reopened = new Store(h.path); stores.push(reopened);
+  const router = new Router(reopened, h.backend, h.transport, h.routerOptions);
+  h.backend.final("NO_REPLY"); await router.tick(); await router.tick();
+  expect(reopened.get<string[]>(`reply-covered:${id}`)).toBeUndefined();
+  expect(reopened.get<number>("human-retries:first-steer")).toBe(1);
+  expect(reopened.get<number>("human-retries:second-steer")).toBe(1);
+});
+
+test.each(["other-session", "other-generation", "before-turn", "before-outbox-mark", "unrelated-source", "explicit-empty", "failed-send", "cancelled-send", "missing-source", "missing-receipt"])(
+  "pre-upgrade tool reply excludes %s evidence", async boundary => {
+    const h = await legacySteeredTurn("wake", "tool");
+    const id = "send:unmatched-old-tool";
+    h.store.enqueue({ id, kind: "conversation", text: "Unrelated response", sessionId: boundary === "other-session" ? "ses_other" : "ses_1",
+      generation: boundary === "other-generation" ? 2 : 1 });
+    if (boundary !== "explicit-empty") h.store.db.query("DELETE FROM kv WHERE key = ?").run(`reply-covered:${id}`);
+    else h.store.set(`reply-covered:${id}`, []);
+    h.store.set(`log-inbound-id:${id}`, boundary === "unrelated-source" ? "wake:old" : "first-steer");
+    legacyOutboxState(h.store, id, boundary === "failed-send" ? "failed" : boundary === "cancelled-send" ? "cancelled" : "sent");
+    if (boundary === "missing-source") h.store.db.query("DELETE FROM kv WHERE key = ?").run(`log-inbound-id:${id}`);
+    if (boundary === "missing-receipt") h.store.db.query("DELETE FROM kv WHERE key = ?").run("inbound-delivered:first-steer");
+    if (boundary === "before-turn") h.store.set(`log-queued:${id}`, h.store.get<{ startedAt: number }>("activeTurn")!.startedAt - 1);
+    if (boundary === "before-outbox-mark") {
+      const mark = h.store.db.query<{ rowid: number }, [string]>("SELECT rowid FROM outbox WHERE id = ?").get(id)!.rowid;
+      h.store.set("activeTurn", { ...h.store.get<object>("activeTurn"), outbox: mark });
+    }
+    h.store.close();
+    const reopened = new Store(h.path); stores.push(reopened);
+    const router = new Router(reopened, h.backend, h.transport, h.routerOptions);
+    h.backend.final("NO_REPLY"); await router.tick(); await router.tick();
+    expect(reopened.get<string[]>(`reply-covered:${id}`) ?? []).toEqual([]);
+    expect(reopened.get<number>("human-retries:first-steer")).toBe(1);
+    expect(reopened.get<number>("human-retries:second-steer")).toBe(1);
+  },
+);
+
+test("pre-upgrade accepted steers migrate only matching accepted human batches", async () => {
+  const h = await legacySteeredTurn("human", "final");
+  for (const [id, state, phase] of [
+    ["unrelated", "done", "accepted"], ["uncertain", "processing", "steering"],
+    ["not-accepted", "done", "queued-steer"], ["cancelled", "cancelled", "accepted"],
+    ["wake:synthetic", "done", "accepted"],
+  ] as const) {
+    h.input(id, id); h.store.updateInbound(id, state); h.store.set(`batch-phase:${id}`, phase);
+  }
+  h.input("cancelled-member", "Cancelled context"); h.store.updateInbound("cancelled-member", "cancelled");
+  h.input("mixed", "Mixed batch"); h.store.updateInbound("mixed", "done"); h.store.set("batch-phase:mixed", "accepted");
+  h.store.set("batch:mixed", { batchIds: ["mixed", "cancelled-member"] });
+  const turn = h.store.get<{ steered: string[] }>("activeTurn")!;
+  h.store.set("activeTurn", { ...turn, steered: [...turn.steered, ...["uncertain", "not-accepted", "cancelled", "mixed", "wake:synthetic"].map(messageId)] });
+  const before = inbounds(h.store);
+  new Router(h.store, h.backend, h.transport, h.routerOptions);
+  expect(h.store.get<{ covered: string[] }>("activeTurn")?.covered).toEqual(["first-steer", "first-steer-member", "second-steer", "second-steer-member"]);
+  expect(h.store.get<string[]>(`turn-human:${messageId(h.root)}`)).toEqual(["first-steer", "second-steer"]);
+  expect(inbounds(h.store)).toEqual(before);
+});
+
+test.each(["current-coverage", "stale-generation"])("pre-upgrade accepted steers leave %s untouched", async guard => {
+  const h = await legacySteeredTurn("human", "final");
+  const turn = h.store.get<{ generation: number }>("activeTurn")!;
+  h.store.set("activeTurn", { ...turn, ...(guard === "current-coverage" ? { covered: ["first-steer"] } : { generation: turn.generation + 1 }) });
+  const before = h.store.get<object>("activeTurn");
+  new Router(h.store, h.backend, h.transport, h.routerOptions);
+  expect(h.store.get<object>("activeTurn")).toEqual(before);
+  expect(h.store.get<string[]>(`turn-human:${messageId(h.root)}`)).toBeUndefined();
 });
 
 test("a configured imessage prompt replaces the built-in iMessage guidance", async () => {
@@ -1022,6 +1258,62 @@ test("a steer the server refuses goes out once as its own turn after the current
   expect(steers).toHaveLength(1);
 });
 
+for (const replyMode of ["final", "tool"] as const) for (const readback of ["accepted", "absent", "unreadable"] as const) {
+  test(`refused steer reads acceptance before structured requeue (${replyMode}, ${readback})`, async () => {
+    const h = setup(":memory:", { replyMode });
+    const order: string[] = [];
+    const failure = new ControlError(409, "conflict", { reason: "no_steerable_turn", retrySafe: false, holder: { runId: "run-holder" } });
+    Object.assign(h.backend, {
+      async steer(_id: string, _directory: string, prompt: string, text: string, _guidance?: string, _files?: readonly FilePart[], guard?: SteerGuard): Promise<SteerDelivery> {
+        order.push("post");
+        guard?.onFailure?.(failure);
+        if (readback === "accepted") h.backend.records.push({ id: prompt, type: "user", text, time: { created: Date.now() } });
+        return "refused";
+      },
+    });
+    h.input("first", "Original");
+    await h.router.tick();
+    const promptAccepted = h.backend.promptAccepted.bind(h.backend);
+    spyOn(h.backend, "promptAccepted").mockImplementation(async (id, directory, prompt) => {
+      if (prompt !== messageId("followup")) return promptAccepted(id, directory, prompt);
+      order.push("readback");
+      expect(h.store.get<boolean>("human-own-turn:followup")).not.toBe(true);
+      expect(h.store.get("steer-attempt:followup")).toBeTruthy();
+      if (readback === "unreadable") throw new Error("readback unavailable");
+      return readback === "accepted";
+    });
+    h.input("followup", "Please answer");
+    h.input("member", "And this");
+    const logs = await captureLogs(async () => { await h.router.tick(); });
+    expect(order).toEqual(["post", "readback"]);
+    expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Original"]);
+    const requeued = logs.filter(line => line.name === "inbound.requeued");
+    const refused = logs.filter(line => line.name === "steer-refused");
+    if (readback === "absent") {
+      expect(inbounds(h.store).map(row => [row.id, row.state])).toEqual([["first", "done"], ["followup", "pending"], ["member", "batched"]]);
+      expect(h.store.get<boolean>("human-own-turn:followup")).toBe(true);
+      expect(h.store.get("steer-attempt:followup")).toBeNull();
+      expect(requeued).toHaveLength(1);
+      expect(requeued[0]).toMatchObject({ ids: { inboundId: "followup" }, props: { reason: "steer_failed", controlReason: "no_steerable_turn", retrySafe: false, holderRunId: "run-holder" } });
+      expect(refused).toHaveLength(1);
+      expect(refused[0]?.props).toMatchObject({ controlReason: "no_steerable_turn", retrySafe: false, holderRunId: "run-holder" });
+    } else {
+      expect(requeued).toEqual([]);
+      expect(refused).toEqual([]);
+      if (readback === "accepted") {
+        expect(inbounds(h.store).slice(1).map(row => row.state)).toEqual(["admitted", "admitted"]);
+        expect(h.store.get<boolean>("human-own-turn:followup")).toBe(false);
+        expect(h.store.get("steer-attempt:followup")).toBeNull();
+        expect(h.store.get<{ covered: string[] }>("activeTurn")?.covered).toEqual(["followup", "member"]);
+      } else {
+        expect(inbounds(h.store).slice(1).map(row => row.state)).toEqual(["processing", "batched"]);
+        expect(h.store.get("steer-attempt:followup")).toBeTruthy();
+        expect(h.store.get<boolean>("human-own-turn:followup")).not.toBe(true);
+      }
+    }
+  });
+}
+
 test("an uncertain steer is reconciled before another steer or fallback turn", async () => {
   const h = setup();
   const steers = steering(h.backend, async call => {
@@ -1035,7 +1327,7 @@ test("an uncertain steer is reconciled before another steer or fallback turn", a
   expect(steers).toHaveLength(1);
   await h.router.tick();
   expect(steers).toHaveLength(1);
-  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("admitted");
   h.backend.final("Both done");
   await h.router.tick();
   expect(h.backend.prompts).toHaveLength(1);
@@ -1054,7 +1346,7 @@ test("uncertain steer retains its route for reconciliation after the foreground 
   await h.router.tick();
   expect(steers).toHaveLength(1);
   expect(h.backend.prompts).toHaveLength(1);
-  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("admitted");
 });
 
 test("commands and watcher wakes mid-turn are never steered", async () => {
@@ -1621,7 +1913,7 @@ test("permissions are asked one at a time and answered by plain yes/no once deli
   h.input("second-answer", "Ok!");
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_1", "/Chats/ses_1", "reject"], ["perm_2", "/Chats/ses_1", "once"]]);
-  expect(inbounds(h.store).filter(row => row.id.endsWith("-answer")).map(row => row.state)).toEqual(["done", "done"]);
+  expect(inbounds(h.store).filter(row => row.id.endsWith("-answer")).map(row => row.state)).toEqual(["admitted", "admitted"]);
   expect(h.backend.prompts).toHaveLength(1);
   // A new generation drops the old attention entirely.
   h.backend.permissionRequests = [permission("perm_3")];
@@ -1690,7 +1982,7 @@ test("uncertain permission replies are not repeated on retry or restart", async 
   await new Router(h.store, h.backend, h.transport, options).tick();
   expect(h.backend.permissionReplies).toHaveLength(1);
   expect(h.controls().filter(c => c.replyTo === "approve" || c.replyTo === "again").map(c => c.text)).toEqual([
-    "I couldn't pass that answer along. If I get stuck, send /new and ask again.", "Nothing is waiting on that right now.",
+    "Nothing is waiting on that right now.",
   ]);
   expect(h.controls().some(c => c.text.includes("SECRET"))).toBe(false);
 });
@@ -1770,7 +2062,7 @@ test.each([
   await h.router.tick();
   expect(h.backend.reads.filter(r => r[0] === "questions").length).toBeGreaterThan(reads + 1);
   expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [[answer]]]]);
-  expect(inbounds(h.store).find(row => row.id === "answer")!.state).toBe("done");
+  expect(inbounds(h.store).find(row => row.id === "answer")!.state).toBe("admitted");
   expect(h.backend.prompts).toHaveLength(1);
   expect(h.backend.permissionReplies).toEqual([]);
   // The next request is asked only once the first is answered.
@@ -1861,7 +2153,7 @@ test("multi-question requests are asked one step at a time and submitted togethe
   h.input("step-2", "Also bring snacks");
   await h.router.tick();
   expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [["B"], ["Also bring snacks"]]]]);
-  expect(inbounds(h.store).filter(row => row.id.startsWith("step-")).map(row => row.state)).toEqual(["done", "done"]);
+  expect(inbounds(h.store).filter(row => row.id.startsWith("step-")).map(row => row.state)).toEqual(["admitted", "admitted"]);
   // Then the next request is asked.
   expect(prompts()).toHaveLength(3);
   expect(prompts()[2]!.poll).toEqual({ title: "Which?", options: ["A", "B"] });
@@ -2178,7 +2470,7 @@ test("a watcher turn that errored before any tool is retried, then reported once
   await h.router.tick();
   expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
   expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "errored")]);
-  expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([{ id: wake, text: wakeBody() }]);
+  expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([{ id: wake, text: wakeBody(), at: Date.now() }]);
 });
 
 test("a first-call provider error with no tool evidence is reported once and never retried, through the backend", async () => {
@@ -2576,7 +2868,7 @@ test.each(["final", "tool"] as const)("an unaccepted watcher wake goes back to i
   setSystemTime(start + 2 * ACCEPT_WAIT_MS + 1000);
   await h.router.tick();
   expect(h.backend.prompts.at(-1)!.text).toBe("Are you there?");
-  expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("done");
+  expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("admitted");
 });
 
 test("a person waiting behind a wake that provably did not land is not kept waiting for its retry", async () => {
@@ -2987,7 +3279,7 @@ test("uncertain native question replies remain fenced on retry and restart", asy
   h.backend.questionReplyBehavior = async () => { throw new Error("PRIVATE"); };
   h.input("answer", "B");
   await h.router.tick();
-  expect(h.controls().filter(c => c.replyTo === "answer").map(c => c.text)).toEqual(["I couldn't pass that answer along. If I get stuck, send /new and ask again."]);
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("pending");
   h.input("retry", "B");
   h.input("explicit", '/answer q_1 [["B"]]');
   await new Router(h.store, h.backend, h.transport, options).tick();
@@ -4236,7 +4528,7 @@ test("status, redirect controls, and native approvals stay immediate with the de
   await h.router.tick();
   expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [["B"]]]]);
   expect(h.controls().map(op => op.replyTo)).toEqual(["status", "list", "snooze", "cancel"]);
-  expect(inbounds(h.store).filter(row => ["approve", "answer"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+  expect(inbounds(h.store).filter(row => ["approve", "answer"].includes(row.id)).map(row => row.state)).toEqual(["admitted", "admitted"]);
   expect(h.store.pendingInbound().map(row => row.id)).toEqual(["queued"]);
   expect(h.backend.prompts).toHaveLength(1);
 });
@@ -4961,7 +5253,7 @@ test("a poll vote answers the single-select question it asks; retracted and stal
   vote("vote", "B", "voted");
   await h.router.tick();
   expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [["B"]]]]);
-  expect(inbounds(h.store).find(row => row.id === "vote")!.state).toBe("done");
+  expect(inbounds(h.store).find(row => row.id === "vote")!.state).toBe("admitted");
   expect(h.controls().filter(c => c.id.startsWith("control:"))).toEqual([]);
   expect(h.backend.prompts).toHaveLength(1);
 });
@@ -5070,16 +5362,21 @@ test("a failed answer to a request that then goes away does not hold a request-o
   await h.router.tick();
   setSystemTime(start + 5_000);
   await h.router.tick();
-  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request" });
-  // Still inside the resubmit window, the entry keeps its unknown outcome.
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: "yes" });
   expect(h.router.routerStatus().pending).toMatchObject([{ id: "perm_bg", state: "unknown" }]);
   setSystemTime(start + 20_000);
   await h.router.tick();
-  expect(h.store.get("activeTurn")).toBeNull();
-  expect(h.store.get("pendingApprovals")).toBeNull();
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: "yes" });
+  expect(h.router.routerStatus().pending).toMatchObject([{ id: "perm_bg", state: "unknown" }]);
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Run the audit in the background", "go"]);
+  setSystemTime(start + 31_000);
+  h.backend.final("Approved work has finished");
+  await h.router.tick();
+  // The vanished child watcher keeps its existing post-answer grace.
+  setSystemTime(start + 47_000); await h.router.tick();
   h.input("again", "Hello again");
   await h.router.tick();
-  expect(h.backend.prompts.map(p => p.text)).toEqual(["Run the audit in the background", "Hello again"]);
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["Run the audit in the background", "go", "Hello again"]);
 });
 
 test("an answer of unknown outcome to a request that went away expires after the resubmit window", async () => {
@@ -5105,7 +5402,7 @@ test("an answer of unknown outcome to a request that went away expires after the
   expect(h.router.routerStatus().pending).toMatchObject([{ id: "perm_1", state: "expired" }]);
 });
 
-test("an answer of unknown outcome to a request that is still open keeps the turn and is asked again", async () => {
+test("a failed answer gets its own turn while the old request is still open", async () => {
   const start = Date.parse("2026-09-10T12:00:00Z");
   setSystemTime(start);
   const h = setup(":memory:", { watchMs: 0 });
@@ -5123,10 +5420,12 @@ test("an answer of unknown outcome to a request that is still open keeps the tur
   h.backend.permissionReplyBehavior = async () => { throw new Error("PRIVATE_FAILURE"); };
   h.input("yes", "go");
   await h.router.tick();
-  // The request stays open: the turn waits well past the grace, then asks again.
+  // The old request cannot hold the human text behind its watcher.
   setSystemTime(start + 40_000);
   await h.router.tick();
-  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request" });
+  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: "yes" });
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Run the audit in the background", "go"]);
+  expect(h.backend.permissionReplies).toHaveLength(1);
   expect(h.router.routerStatus().pending).toMatchObject([{ id: "perm_bg", state: "pending" }]);
 });
 
@@ -7124,7 +7423,7 @@ test("a subagent's permission request is asked in the conversation and answered 
   await h.router.tick();
   expect(h.backend.permissionReplies).toEqual([["perm_child", "/Chats/ses_child", "once"]]);
   expect(h.backend.permissionReplySessions).toEqual(["ses_child"]);
-  expect(inbounds(h.store).find(row => row.id === "yes")!.state).toBe("done");
+  expect(inbounds(h.store).find(row => row.id === "yes")!.state).toBe("admitted");
   expect(h.backend.prompts).toHaveLength(1);
 });
 
@@ -7243,7 +7542,7 @@ test.each(["single", "multi", "restart", "busy", "status", "quoted", "file", "re
   expect(fallback).toMatchObject({ id: steers[0]!.id, text: originalBody, files: [] });
   expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(sealed.batchIds);
   expect(inbounds(h.store).find(row => row.id === "newer")?.state).toBe("pending");
-  for (const id of sealed.batchIds!) expect(inbounds(h.store).find(row => row.id === id)?.state).toBe("done");
+  for (const id of sealed.batchIds!) expect(inbounds(h.store).find(row => row.id === id)?.state).toBe("admitted");
   if (kind === "context") {
     expect(fallback.system).not.toContain("UNIQUE_MISSED_UPDATE");
     expect(h.store.get<unknown[]>("missedSynthetic")).toHaveLength(1);
@@ -7298,154 +7597,20 @@ test("queued steer fallback survives reopening the store with its original membe
   await restarted.tick();
   expect(h.backend.prompts.at(-1)).toMatchObject({ id: original.id, messageId: original.messageId, text: original.text });
   expect(reopened.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(["followup", "member"]);
-  expect(inbounds(reopened).filter(row => ["followup", "member", "newer"].includes(row.id)).map(row => row.state)).toEqual(["done", "done", "pending"]);
+  expect(inbounds(reopened).filter(row => ["followup", "member", "newer"].includes(row.id)).map(row => row.state)).toEqual(["admitted", "admitted", "pending"]);
 });
 
-// A wake no longer runs ahead of typed text, so only a secure-form notice can intervene here.
-test.each(["secret"])("an intervening %s cannot rotate an unresolved steer into a second execution", async kind => {
-  const h = setup(":memory:", { rotateAfterMs: 1, watchMs: 0 });
-  const start = Date.now();
-  setSystemTime(start);
-  const records = new Map<string, MessageRecord[]>();
-  const admitted = new Set<string>();
-  h.backend.createBehavior = async () => {
-    const id = `ses_${h.backend.creates.length}`;
-    h.backend.records = [];
-    records.set(id, h.backend.records);
-    return { id, directory: `/Chats/${id}` };
-  };
-  h.backend.messages = async id => records.get(id) ?? [];
-  h.backend.promptAccepted = async (id, _directory, messageId) => admitted.has(`${id}:${messageId}`);
-  h.backend.promptBehavior = async call => {
-    const key = `${call.id}:${call.messageId}`;
-    if (admitted.has(key)) return;
-    admitted.add(key);
-    records.get(call.id)!.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
-  };
+test("a pending human fallback runs before a secure-form event without rotating its uncertain identity", async () => {
+  const h = setup(":memory:", { rotateAfterMs: 1 });
   const steers = steering(h.backend, async () => { throw new Error("lost response"); });
-  h.input("first", "Original work");
-  await h.router.tick();
-  const syntheticBody = "Filled in the secure form callback";
-  h.input(`${kind}:before-steer`, syntheticBody);
-  h.input("followup", "Earlier follow-up");
-  h.input("member", "Another original line");
-  await h.router.tick();
-  expect(steers).toHaveLength(1);
+  h.input("first", "Original work"); await h.router.tick();
+  h.input("secret:event", "Secure form callback");
+  h.input("followup", "Earlier follow-up"); await h.router.tick();
   const original = steers[0]!;
-  h.backend.final("NO_REPLY");
-  setSystemTime(start + 120_000);
-  await h.router.tick();
-  const watcher = h.backend.prompts.at(-1)!;
-  expect(watcher.text).toBe(syntheticBody);
-  // The old steer commits after its readback, while the intervening watcher runs.
-  admitted.add(`${original.id}:${original.messageId}`);
-  records.get(original.id)!.push({ id: original.messageId, type: "user", text: original.text, time: { created: Date.now() } });
-  h.backend.records = records.get(watcher.id)!;
-  h.backend.final("NO_REPLY");
-  await h.router.tick();
-  const deliveries = [...records].flatMap(([id, rows]) => rows.filter(row => row.type === "user" && row.id === original.messageId).map(() => id));
-  expect(deliveries).toEqual([original.id]);
-  // The watcher settled this accepted steer too, so its receipt never needs another POST.
-  expect(h.backend.prompts.filter(prompt => prompt.messageId === original.messageId)).toEqual([]);
-  expect(inbounds(h.store).filter(row => ["followup", "member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
-  // Once the steer is accepted, ordinary future turns may rotate again.
-  h.backend.final("NO_REPLY");
-  await h.router.tick();
-  h.input("later", "New work");
-  await h.router.tick();
-  expect(h.backend.prompts.at(-1)!.id).not.toBe(original.id);
-});
-
-test("review633r2: late accepted steer after the first turn closes still forwards its answer", async () => {
-  const h = setup(":memory:", { watchMs: 0 });
-  const start = Date.now();
-  setSystemTime(start);
-  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
-  h.input("first", "Original question");
-  await h.router.tick();
-  h.input("followup", "Follow-up question");
-  await h.router.tick();
-  expect(steers).toHaveLength(1);
-  h.backend.final("Original answer");
-  const read = h.backend.promptAccepted.bind(h.backend);
-  let landed = false;
-  h.backend.promptAccepted = async (id, directory, promptId) => {
-    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && promptId === messageId("followup") && !landed) {
-      // The old turn finishes in poll(); the pending steer commits before
-      // the subsequent acceptance read, starting its own run.
-      landed = true;
-      h.backend.records.push({ id: promptId, type: "user", text: "Follow-up question", time: { created: Date.now() } });
-    }
-    return read(id, directory, promptId);
-  };
-  setSystemTime(start + 120_000);
-  await h.router.tick();
-  expect(inbounds(h.store).find(row => row.id === "followup")!.state).toBe("done");
-  expect(h.store.get<object>("activeTurn")).toMatchObject({
-    id: steers[0]!.id, directory: "/Chats/ses_1", generation: 1,
-    inboundId: "followup", messageId: steers[0]!.messageId, phase: "running",
-  });
-  h.backend.final("Follow-up answer");
-  await h.router.tick();
-  await h.router.tick();
-  expect(h.conversations().map(op => op.text)).toEqual(["Original answer", "Follow-up answer"]);
-});
-
-
-test.each(["running", "completed", "multi", "failed-foreground", "legacy-route-only", "reset-during-read"])("accepted steer after foreground settlement retains reply ownership (%s)", async kind => {
-  const h = setup();
-  const start = Date.now();
-  setSystemTime(start);
-  const steers = steering(h.backend, async () => { throw new Error("lost response"); });
-  h.input("first", "Original question");
-  await h.router.tick();
-  h.input("followup", "Follow-up question");
-  if (kind === "multi") h.input("member", "Second original line");
-  await h.router.tick();
-  const original = steers[0]!;
-  const firstAnswer = h.backend.final("Original answer");
-  if (kind === "legacy-route-only") {
-    const kept = h.store.get<{ id: string; directory: string; generation: number }>("steer-attempt:followup")!;
-    h.store.set("steer-attempt:followup", { id: kept.id, directory: kept.directory, generation: kept.generation });
-  }
-  const read = h.backend.promptAccepted.bind(h.backend);
-  h.backend.promptAccepted = async (id, directory, promptId) => {
-    if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first" && promptId === original.messageId && !h.backend.records.some(record => record.id === promptId)) {
-      h.backend.records.push({ id: promptId, type: "user", text: original.text, time: { created: Date.now() } });
-      if (kind === "completed") h.backend.final("Follow-up answer");
-      if (kind === "failed-foreground") h.store.set("activeTurn", { ...h.store.get<object>("route"), messageId: "failed-run", startedAt: start, phase: "failed" });
-      if (kind === "reset-during-read") {
-        const route = h.store.get<{ id: string; directory: string; generation: number }>("route")!;
-        h.store.set("route", { ...route, generation: route.generation + 1 });
-        h.store.set("activeTurn", null);
-        h.store.updateInbound("followup", "cancelled");
-      }
-    }
-    return read(id, directory, promptId);
-  };
-  setSystemTime(start + 120_000);
-  await h.router.tick();
-  if (kind === "reset-during-read") {
-    h.backend.final("Old follow-up answer");
-    await h.router.tick();
-    expect(h.store.get<object | null>("activeTurn")).toBeNull();
-    expect(inbounds(h.store).find(row => row.id === "followup")!.state).toBe("cancelled");
-    expect(h.conversations().map(op => op.text)).toEqual(["Original answer"]);
-    return;
-  }
-  expect(h.store.get<object>("activeTurn")).toMatchObject({ id: original.id, messageId: original.messageId, inboundId: "followup", phase: "running" });
-  expect(h.store.get<NormalizedInbound>("batch:followup")!.batchIds).toEqual(kind === "multi" ? ["followup", "member"] : ["followup"]);
-  expect(h.conversations().map(op => op.id)).toEqual([`reply:1:${firstAnswer.id}`]);
-  if (kind !== "completed") h.backend.final("Follow-up answer");
-  await h.router.tick();
-  await h.router.tick();
-  expect(h.conversations().map(op => [op.text, op.replyTo, op.sessionId, op.generation])).toEqual([
-    ["Original answer", "first", original.id, 1], ["Follow-up answer", "followup", original.id, 1],
-  ]);
-  expect(h.backend.prompts).toHaveLength(1);
-  expect(new Set(steers.map(call => call.messageId))).toEqual(new Set([messageId("followup")]));
-  expect(h.backend.records.filter(record => record.type === "user" && record.id === messageId("followup"))).toHaveLength(1);
-  if (kind === "multi") expect(inbounds(h.store).filter(row => ["followup", "member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+  h.backend.final("Original answer"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Original work", "Earlier follow-up"]);
+  expect(h.backend.prompts[1]).toMatchObject({ id: original.id, messageId: original.messageId });
+  expect(inbounds(h.store).find(row => row.id === "secret:event")?.state).toBe("pending");
 });
 
 test("late accepted steer reply ownership survives closing and reopening the bridge store", async () => {
@@ -7538,8 +7703,13 @@ test.each(["same-run", "own-run", "multi", "quiet"])("a lost-response steer alre
   for (let i = 0; i < 3; i++) await h.router.tick();
   expect(h.conversations().map(op => [op.text, op.replyTo])).toEqual(kind === "quiet" ? []
     : kind === "own-run" ? [["Original answer", "first"], ["Both answered", "first"]] : [["Both answered", "first"]]);
+  if (kind === "quiet") {
+    expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Original question", "Follow-up question"]);
+    expect(h.backend.prompts[1]!.messageId).not.toBe(steers[0]!.messageId);
+    return;
+  }
   expect(h.store.get<object | null>("activeTurn")).toBeNull();
-  expect(inbounds(h.store).map(row => row.state)).toEqual(kind === "multi" ? ["done", "done", "done"] : ["done", "done"]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(kind === "multi" ? ["done", "admitted", "admitted"] : ["done", "admitted"]);
   expect(h.backend.prompts).toHaveLength(1);
   expect(steers).toHaveLength(1);
 });
@@ -7567,10 +7737,10 @@ test.each(["single", "multi", "own-run"])("a queued steer covered by settlement 
   await h.router.tick();
   for (let i = 0; i < 3; i++) await h.router.tick();
   expect(h.conversations().map(op => [op.text, op.replyTo])).toEqual(kind === "own-run"
-    ? [["Original answer", "first"], ["Both answered", "followup"]] : [["Both answered", "first"]]);
+    ? [["Original answer", "first"], ["Both answered", "first"]] : [["Both answered", "first"]]);
   expect(h.store.get<object | null>("activeTurn")).toBeNull();
-  expect(inbounds(h.store).map(row => row.state)).toEqual(kind === "multi" ? ["done", "done", "done"] : ["done", "done"]);
-  expect(h.backend.prompts).toHaveLength(kind === "own-run" ? 2 : 1);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(kind === "multi" ? ["done", "admitted", "admitted"] : ["done", "admitted"]);
+  expect(h.backend.prompts).toHaveLength(1);
 });
 
 test.each(["normal", "reversed"])("late steer replies follow accepted record order (%s)", async order => {
@@ -7607,7 +7777,7 @@ test.each(["normal", "reversed"])("late steer replies follow accepted record ord
   await h.router.tick();
   expect(h.conversations().map(op => op.text)).toEqual(order === "normal"
     ? ["Original answer", "Second answer", "Third answer"] : ["Original answer", "Third answer", "Second answer"]);
-  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done", "done"]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "admitted", "admitted"]);
   expect(h.store.get<object | null>("activeTurn")).toBeNull();
   expect(h.backend.prompts).toHaveLength(1);
 });
@@ -7649,7 +7819,7 @@ test.each(lateSteerOrders.map(order => ({ order })))("all accepted late-steer ru
   setSystemTime(start + 240_000);
   await h.router.tick();
   expect(h.conversations().map(op => op.text)).toEqual(["Original answer", ...order.map(inbound => `${inbound} answer`)]);
-  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "done", "done", "done"]);
+  expect(inbounds(h.store).map(row => row.state)).toEqual(["done", "admitted", "admitted", "admitted"]);
   expect(h.store.get<object | null>("activeTurn")).toBeNull();
   expect(h.backend.prompts).toHaveLength(1);
 });
@@ -7797,10 +7967,20 @@ test.each((["final", "tool"] as const).flatMap(replyMode => ["generic", "model-e
   }
   for (let i = 0; i < 4; i++) await h.router.tick();
   expect(h.conversations().map(op => op.text)).toEqual(replyMode === "tool" ? [] : ["Original answer", "Second successful answer"]);
-  expect(inbounds(h.store).filter(row => ["second", "second-member"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+  expect(inbounds(h.store).filter(row => ["second", "second-member"].includes(row.id)).map(row => row.state))
+    .toEqual(["admitted", "admitted"]);
   expect(h.store.get<object>("watermark")).toMatchObject({ id: lastIdle });
   expect(h.controls()).toHaveLength(1);
-  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(replyMode === "tool"
+    ? ["Original question", "Second question\nAnother part of the successful question"] : ["Original question", "Third question"]);
+  if (replyMode === "tool") {
+    // Assistant text alone did not answer either human row; the earlier batch gets its own turn first.
+    agentSends(h, "second-retry", "Second question answered");
+    h.backend.final("NO_REPLY");
+    await h.router.tick();
+    await h.router.tick();
+    expect(h.backend.prompts.at(-1)!.text).toBe("Third question");
+  }
   expect(new Set(steers.map(call => call.messageId)).size).toBe(2);
 });
 
@@ -7878,38 +8058,31 @@ test("tool mode: final and earlier assistant text never reach the chat, and the 
   expect(h.backend.prompts.map(p => p.text)).toEqual(["What's on today?", "Thanks"]);
 });
 
-test("tool mode: a text typed while a watcher wake runs is steered into it, not queued behind it", async () => {
-  const h = toolSetup();
+test("tool mode: a text typed while a watcher wake runs waits for its own turn", async () => {
+  const h = toolSetup({ failureNoticeMs: 0, droppedBatchMs: 0 });
   const steers = steering(h.backend);
-  const wake = `wake:${"f".repeat(64)}`;
-  h.input(wake, wakeBody());
+  h.input("wake:test", wakeBody());
   await h.router.tick();
-  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody()]);
   h.input("typed", "Are you there?");
   await h.router.tick();
-  await h.router.tick();
-  // It reached the agent mid-wake, under the id a turn of its own would use, and was never sent again.
-  expect(steers.map(call => [call.text, call.messageId])).toEqual([["Are you there?", messageId("typed")]]);
-  expect(steers[0]!.guidance).toContain("Answer it with imessage_send");
-  expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("done");
-  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: wake, typed: true, replyInboundId: "typed" });
-  // The wake ends without a text: because someone typed into it, the agent is asked once whether that was meant.
-  h.backend.final("Logged it.");
+  expect(steers).toEqual([]);
+  expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("pending");
+  h.backend.final("NO_REPLY");
   await h.router.tick();
   await h.router.tick();
-  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), REPLY_NUDGE]);
-  expect(nudgeRows(h.store)).toHaveLength(1);
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Are you there?"]);
 });
 
-test("gap monitoring attributes an accepted tool reply to the human steered into its watcher turn", async () => {
+test("gap monitoring attributes an accepted tool reply to the human foreground turn", async () => {
   const h = toolSetup();
   const at = Date.parse("2026-11-11T12:00:00Z");
   setSystemTime(at);
   steering(h.backend);
   const notify = mock(async () => true);
   const monitor = new ReplyGapMonitor(h.store, { chat: "owner", notify });
-  h.input(`wake:${"d".repeat(64)}`, wakeBody());
+  h.input("human-root", wakeBody());
   await h.router.tick();
+  h.backend.final("NO_REPLY");
   h.input("human-steer", "Are you there?");
   await h.router.tick();
   await h.router.tick();
@@ -8246,7 +8419,10 @@ test.each(["silent", "sent-before-adoption", "sent-after-adoption"])("tool mode:
     if (h.store.get<{ inboundId?: string } | null>("activeTurn")?.inboundId !== "first"
       && promptId === messageId("followup") && !h.backend.records.some(record => record.id === promptId)) {
       h.backend.records.push({ id: promptId, type: "user", text: "Follow-up question", time: { created: Date.now() } });
-      if (kind === "sent-before-adoption") agentSends(h, "late-followup", "Follow-up answer");
+      if (kind === "sent-before-adoption") {
+        agentSends(h, "late-followup", "Follow-up answer");
+        h.store.outboxState("send:late-followup", "sent");
+      }
     }
     return read(id, directory, promptId);
   };
@@ -8259,13 +8435,13 @@ test.each(["silent", "sent-before-adoption", "sent-after-adoption"])("tool mode:
   h.backend.final("Internal follow-up note");
   await h.router.tick();
   await h.router.tick();
-  expect(h.conversations().map(op => [op.id, op.text])).toEqual(kind === "silent" ? [] : [["send:late-followup", "Follow-up answer"]]);
+  expect(h.store.getOperation("send:late-followup")?.text).toBe(kind === "silent" ? undefined : "Follow-up answer");
   expect(nudgeRows(h.store)).toHaveLength(kind === "silent" ? 1 : 0);
-  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(kind === "silent" ? ["Original question", REPLY_NUDGE] : ["Original question"]);
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(kind === "sent-after-adoption" ? ["Original question"] : ["Original question", "Follow-up question"]);
   h.backend.final("NO_REPLY");
   for (let i = 0; i < 3; i++) await h.router.tick();
   expect(nudgeRows(h.store)).toHaveLength(kind === "silent" ? 1 : 0);
-  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("admitted");
 });
 
 test.each(["pending", "sent", "uncertain"] as const)("sealed steer fallback retains the original early-send dedupe window (%s)", async state => {
@@ -8393,20 +8569,19 @@ test("a person's text does not wait for a watcher wake stuck in preparation", as
   expect(h.controls()).toEqual([]);
 });
 
-test("tool mode: a text steered into a watcher wake that then fails gets the usual failure notice", async () => {
+test("tool mode: a text waiting for a watcher wake that then fails gets its own turn", async () => {
   const h = toolSetup({ failureNoticeMs: 0, droppedBatchMs: 0 });
-  steering(h.backend);
-  const wake = `wake:${"d".repeat(64)}`;
-  h.input(wake, wakeBody());
+  const steers = steering(h.backend);
+  h.input("wake:test", wakeBody());
   await h.router.tick();
   h.input("typed", "Are you there?");
   await h.router.tick();
-  await h.router.tick();
-  expect(h.store.get("activeTurn")).toMatchObject({ inboundId: wake, typed: true });
-  h.backend.step("checking", "tool-calls");
+  expect(steers).toEqual([]);
+  expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("pending");
   h.backend.failed();
-  for (let i = 0; i < 3; i++) await h.router.tick();
-  expect(h.controls().map(op => op.text)).toContain("Something went wrong on my end with that one. Mind trying again?");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Are you there?"]);
 });
 
 test("tool mode: a steer the backend refused leaves the watcher wake a plain wake", async () => {
@@ -8440,20 +8615,19 @@ test("tool mode: a reply reminder overtaken by a new text is dropped instead of 
   expect(nudgeRows(h.store).map(row => row.state)).toEqual(["failed"]);
 });
 
-test("tool mode: a text steered into a watcher wake whose model call errors is told at once, before the wake's retry", async () => {
-  const h = toolSetup();
-  steering(h.backend);
-  const wake = `wake:${"1".repeat(64)}`;
-  h.input(wake, wakeBody());
+test("tool mode: a text waiting for a watcher wake whose model call errors runs before the wake's retry", async () => {
+  const h = toolSetup({ failureNoticeMs: 0, droppedBatchMs: 0 });
+  const steers = steering(h.backend);
+  h.input("wake:test", wakeBody());
   await h.router.tick();
   h.input("typed", "Are you there?");
   await h.router.tick();
-  await h.router.tick();
+  expect(steers).toEqual([]);
+  expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("pending");
   h.backend.failed();
   await h.router.tick();
-  // The wake itself is retried later; the person is not left waiting for that.
-  expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("pending");
-  expect(h.controls().map(op => op.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Are you there?"]);
 });
 
 async function failedTick(router: Router): Promise<void> {
@@ -9740,7 +9914,7 @@ test.each((["succeeded", "failed", "interrupted"] as const).flatMap(previousOutc
 });
 
 
-test("steering: a photo caption arriving during wake retry reaches that running turn with the photo", async () => {
+test("steering: a photo caption arriving during wake retry waits for its own turn with the photo", async () => {
   setSystemTime(1_000_000);
   const h = toolSetup();
   const directory = mkdtempSync(join(tmpdir(), "bridge-steer-photo-"));
@@ -9761,12 +9935,13 @@ test("steering: a photo caption arriving during wake retry reaches that running 
   h.backend.states.ses_1 = { type: "busy" };
   h.input("following", "Also check this", { source: "typed" });
   await h.router.tick();
-  expect(steers).toHaveLength(1);
-  expect(steers[0]).toMatchObject({ messageId: messageId("photo"), text: "Add these flights\nAlso check this", files: [{ type: "file", mime: "image/png" }] });
-  expect(steers[0]!.guidance).toContain("Incoming files:");
-  expect(h.backend.records.filter(r => r.id === messageId("photo"))).toHaveLength(1);
-  expect(inbounds(h.store).filter(r => ["photo", "following"].includes(r.id)).map(r => r.state)).toEqual(["done", "done"]);
-  expect(h.backend.prompts).toHaveLength(2);
+  expect(steers).toEqual([]);
+  h.backend.states = {};
+  h.backend.promptBehavior = undefined;
+  h.backend.final("NO_REPLY");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.at(-1)).toMatchObject({ text: "Add these flights\nAlso check this", files: [{ type: "file", mime: "image/png" }] });
 });
 
 test.each([false, true])("steering: uncertain acceptance is read before a blocked poll, landed=%s", async landed => {
@@ -9789,9 +9964,9 @@ test.each([false, true])("steering: uncertain acceptance is read before a blocke
   poll.resolve(h.backend.records);
   await ticking;
   expect(readBeforePoll).toBe(true);
-  expect(steers.map(s => s.messageId)).toEqual(Array(landed ? 1 : 2).fill(messageId("followup")));
-  expect(h.backend.records.filter(r => r.id === messageId("followup"))).toHaveLength(1);
-  expect(inbounds(h.store).find(r => r.id === "followup")?.state).toBe("done");
+  expect(steers.map(s => s.messageId)).toEqual([messageId("followup")]);
+  expect(h.backend.records.filter(r => r.id === messageId("followup"))).toHaveLength(landed ? 1 : 0);
+  expect(inbounds(h.store).find(r => r.id === "followup")?.state).toBe(landed ? "admitted" : "pending");
 });
 
 
@@ -9802,7 +9977,7 @@ test.each([
   { reason: "request-turn", patch: { origin: "request" } },
   { reason: "missing-inbound", patch: { inboundId: undefined } },
   { reason: "synthetic", patch: { inboundId: "reset:1" } },
-  { reason: "final-mode-wake", patch: { inboundId: "wake:test" } },
+  { reason: "wake", patch: { inboundId: "wake:test" } },
   { reason: "pending-question", patch: {} },
 ])("steering: a blocked row logs $reason once across ticks", async ({ reason, patch }) => {
   setSystemTime(1_000_000);
@@ -9831,7 +10006,7 @@ test("steering: an unavailable acceptance read never permits a resend", async ()
   await h.router.tick();
   expect(steers).toHaveLength(1);
   expect(h.backend.prompts).toHaveLength(1);
-  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("processing");
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("pending");
   expect(logs).toContain("steer-readback-unknown id=followup");
 });
 
@@ -9846,7 +10021,7 @@ test.each(["refusal-backoff", "group-wake", "detached"])("steering: logs %s once
     h.input("refused", "Follow up"); await h.router.tick();
     await h.router.tick(); await h.router.tick();
     expect(steers).toHaveLength(1);
-    expect(logs.filter(l => l.startsWith("steer-skip"))).toEqual(["steer-skip id=refused reason=refusal-backoff"]);
+    expect(logs.filter(l => l.startsWith("steer-skip"))).toEqual(["steer-skip id=refused reason=own-turn"]);
     return;
   }
   if (reason === "group-wake") {
@@ -9867,7 +10042,7 @@ test.each(["refusal-backoff", "group-wake", "detached"])("steering: logs %s once
   const router = new Router(h.store, h.backend, h.transport, h.routerOptions);
   h.backend.messagesBehavior = async () => { throw new Error("unavailable"); };
   await router.tick(); await router.tick();
-  expect(logs.filter(l => l.startsWith("steer-skip"))).toEqual([`steer-skip id=blocked reason=${reason}`]);
+  expect(logs.filter(l => l.startsWith("steer-skip"))).toEqual([`steer-skip id=blocked reason=${reason === "group-wake" ? "wake" : reason}`]);
   expect(inbounds(h.store).find(r => r.id === "blocked")?.state).toBe("pending");
 });
 
@@ -9888,11 +10063,11 @@ test.each([false, true])("steering: photo uncertainty survives router restart wi
   h.transport.downloadAttachment = async () => { throw new Error("must use sealed files"); };
   const restarted = new Router(h.store, h.backend, h.transport, h.routerOptions);
   await restarted.tick();
-  expect(steers).toHaveLength(landed ? 1 : 2);
+  expect(steers).toHaveLength(1);
   expect(steers[0]!.files).toHaveLength(1);
-  if (!landed) expect(steers[1]).toEqual(steers[0]);
-  expect(h.backend.records.filter(r => r.id === messageId("photo"))).toHaveLength(1);
-  expect(inbounds(h.store).find(r => r.id === "photo")?.state).toBe("done");
+
+  expect(h.backend.records.filter(r => r.id === messageId("photo"))).toHaveLength(landed ? 1 : 0);
+  expect(inbounds(h.store).find(r => r.id === "photo")?.state).toBe(landed ? "admitted" : "pending");
 });
 
 
@@ -9917,7 +10092,7 @@ test.each([
   expect(admitted).toHaveLength(1);
   if (caption) expect(admitted[0]!.text).toBe(text);
   expect(admitted[0]!.files?.length ?? 0).toBe(file ? 1 : 0);
-  expect(inbounds(h.store).find(r => r.id === "followup")?.state).toBe("done");
+  expect(inbounds(h.store).find(r => r.id === "followup")?.state).toBe("admitted");
 });
 
 test("steering: a newly opened question blocks pre-poll dispatch", async () => {
@@ -10045,7 +10220,7 @@ test("steering: upload admission deferral does not spend the backend refusal coo
   h.backend.questionRequests = [];
   await h.router.tick();
   expect(posts).toBe(1);
-  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("admitted");
 });
 
 
@@ -10128,10 +10303,11 @@ test.each(["pending", "sent"])("an uncertain human steer repairs %s replies afte
   const delivery = new Delivery(h.store, { sendText: async () => ({ providerId: "accepted" }) }, {
     projectScope: "test", chat: "owner", enabled: () => true, chatGuid: () => options.chatGuid,
   });
-  const wake = `wake:${"b".repeat(64)}`;
+  const wake = "root-human";
   let replyId = "";
   steering(h.backend, async call => {
     h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    h.store.updateInbound(wake, "done", { id: wake, text: "Work", receivedAt: at + 90_000, attachments: [], isAudioMessage: false });
     setSystemTime(at + 90_000);
     const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
       chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
@@ -10172,7 +10348,7 @@ test("queued-steer settlement uses its saved admission marker and keeps earlier 
   h.backend.promptBehavior = async call => {
     if (!h.backend.records.some(record => record.id === call.messageId)) h.backend.accept(call);
   };
-  const wake = `wake:${"c".repeat(64)}`;
+  const wake = "root-human";
   h.input(wake, wakeBody());
   await h.router.tick();
   const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
@@ -10205,11 +10381,11 @@ test("queued-steer settlement uses its saved admission marker and keeps earlier 
   expect(notify).toHaveBeenCalledTimes(1);
 });
 
-test.each([["wake:intervening", 2], ["secret:intervening", 1]] as const)("a retained steer keeps its source after %s becomes active", async (intervening, attempts) => {
+test.each([["wake:intervening", 1], ["secret:intervening", 1]] as const)("a retained steer keeps its source after %s becomes active", async (intervening, attempts) => {
   const h = toolSetup();
   const at = Date.parse("2026-11-11T12:00:00Z");
   setSystemTime(at);
-  const originalRoot = `wake:${"e".repeat(64)}`;
+  const originalRoot = "root-human";
   const steers = steering(h.backend, async call => {
     if (steers.length === 1) throw new Error("lost response");
     h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
@@ -10243,7 +10419,7 @@ test.each([["wake:intervening", 2], ["secret:intervening", 1]] as const)("a reta
     h.backend.final("NO_REPLY");
     await resumed.tick();
     expect(steers).toHaveLength(1);
-    expect(inbounds(h.store).find(row => row.id === "human-retained")?.state).toBe("done");
+    expect(inbounds(h.store).find(row => row.id === "human-retained")?.state).toBe("admitted");
   }
   expect(h.store.get<string>(`log-inbound-id:${proactive}`)).toBe(intervening);
   expect(h.store.get(`reply-gap-recheck:${proactive}`)).toBeUndefined();
@@ -10264,10 +10440,15 @@ test.each([
   await h.router.tick(); deliver(h.store);
   h.backend.final("Root complete"); await h.router.checkCompletion();
   h.input("answer", text); await h.router.tick(); await h.router.tick();
-  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
   if (kind === "question") expect(h.backend.questionReplies).toEqual([["q_child", "/Chats/ses_child", [["A"]]]]);
   else expect(h.backend.permissionReplies).toEqual([["p_child", "/Chats/ses_child", "once"]]);
-  expect(h.backend.prompts).toHaveLength(1);
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me", text]);
+  const parent = h.conversations().find(op => op.text === "Root complete")!;
+  expect(parent).toBeDefined();
+  expect(h.store.get<string[]>(`reply-covered:${parent.id}`)).not.toContain("answer");
+  h.store.outboxState(parent.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
   expect(h.controls().some(item => item.text.includes("Couldn't check that question"))).toBeFalse();
 });
 
@@ -10342,20 +10523,19 @@ test.each(busFailureCases)("agent-bus failures stay private ($kind, $replyMode, 
   expect(inbounds(h.store).find(row => row.id === wake.id)?.state).toBe("failed");
 });
 
-test("agent-bus failure still answers a human steered into the turn", async () => {
+test("agent-bus failure runs the waiting human separately", async () => {
   const h = toolSetup({ failureNoticeMs: 0, droppedBatchMs: 0 });
-  steering(h.backend);
-  h.input("wake:agent-bus:steered", "[Agent request, not typed by anyone here.]\nPRIVATE_BUS_REQUEST");
+  const steers = steering(h.backend);
+  h.input("wake:agent-bus:test", wakeBody());
   await h.router.tick();
   h.input("typed", "Are you there?");
   await h.router.tick();
-  await h.router.tick();
-  expect(h.store.get("activeTurn")).toMatchObject({ typed: true });
-  h.backend.step("checking", "tool-calls");
+  expect(steers).toEqual([]);
+  expect(inbounds(h.store).find(row => row.id === "typed")?.state).toBe("pending");
   h.backend.failed();
-  for (let i = 0; i < 3; i++) await h.router.tick();
-  expect(h.controls().map(op => op.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
-  expect(JSON.stringify(h.store.pendingOutbox())).not.toContain("PRIVATE_BUS_REQUEST");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Are you there?"]);
 });
 
 
@@ -10380,37 +10560,1542 @@ test.each(["watcher", "bus"] as const)("mixed agent-bus/watcher failure preserve
   expect(JSON.stringify(h.store.pendingOutbox())).not.toContain(privateText);
 });
 
-test.each([false, true])("late human steer confirmation survives agent-bus failure, restart=%s", async restart => {
-  const at = Date.parse("2026-11-15T00:00:00Z");
-  setSystemTime(at);
-  const h = toolSetup({ failureNoticeMs: 1_000, droppedBatchMs: 0 });
-  const steers = steering(h.backend, async () => { throw new Error("lost steer response"); });
-  h.input("wake:agent-bus:late-steer", "[Agent request, not typed by anyone here.]\nPRIVATE_BUS_REQUEST");
+test.each([false, true])("human waiting behind failed agent-bus wake survives restart=%s", async restart => {
+  const h = toolSetup();
+  const steers = steering(h.backend);
+  h.input("wake:agent-bus:failure", "PRIVATE_BUS_REQUEST");
   await h.router.tick();
-  h.input("late-human", "Are you there?", { source: "typed" });
+  h.input("human", "Are you there?");
   await h.router.tick();
-  await h.router.tick();
-  expect(steers.length).toBeGreaterThan(0);
-  expect(h.store.get<{ typed?: boolean }>("activeTurn")?.typed).not.toBe(true);
+  expect(steers).toEqual([]);
   h.backend.failed();
-  Object.assign(h.backend, { runToolEvidence: async () => {
-    const steer = steers[0]!;
-    h.backend.records.push({ id: steer.messageId, type: "user", text: steer.text, time: { created: Date.now() } });
-    setSystemTime(at + 120_001);
-    await h.router.checkInboundLatency();
-    expect(h.store.get("activeTurn")).toMatchObject({ typed: true });
-    expect(inbounds(h.store).find(row => row.id === "late-human")?.state).toBe("done");
-    return "unknown" as const;
-  } });
-  await h.router.tick();
-  expect(h.store.get("deferredNotice")).toMatchObject({ turn: { typed: true } });
-  expect(h.store.get("activeTurn")).toMatchObject({ typed: true, phase: "failed" });
-  expect(h.controls()).toEqual([]);
   const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
-  setSystemTime(at + 121_002);
   await router.tick();
-  expect(h.controls().map(op => op.text)).toEqual(["Something went wrong on my end with that one. Mind trying again?"]);
-  expect(JSON.stringify(h.store.pendingOutbox())).not.toContain("PRIVATE_BUS_REQUEST");
+  await router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual(["PRIVATE_BUS_REQUEST", "Are you there?"]);
+});
+
+test.each(["final", "tool"] as const)("wake recovery: %s human waits for its own turn and outranks pending wakes", async replyMode => {
+  const h = setup(":memory:", { replyMode });
+  const steers = steering(h.backend);
+  const logs = await captureLogs(async () => {
+    h.input("wake:first", wakeBody());
+    await h.router.tick();
+    h.backend.questionRequests = [question()];
+    await h.router.tick();
+    deliver(h.store);
+    h.input("wake:older", wakeBody());
+    h.input("human", "Status?", { source: "typed" });
+    await h.router.tick();
+    await h.router.tick();
+    expect(steers).toEqual([]);
+    expect(h.backend.questionReplies).toEqual([]);
+    expect(inbounds(h.store).find(row => row.id === "human")?.state).toBe("pending");
+    h.backend.questionRequests = [];
+    h.backend.final("NO_REPLY");
+    await h.router.tick();
+    setSystemTime(Date.now() + 16_000);
+    await h.router.tick();
+    expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Status?"]);
+    if (replyMode === "tool") {
+      const route = h.store.get<{ id: string; generation: number }>("route")!;
+      h.store.enqueue({ id: "send:human", kind: "conversation", text: "Here", sessionId: route.id, generation: route.generation, replyTo: "human" });
+    }
+    h.backend.final("Here");
+    await h.router.tick();
+    expect(h.conversations().some(op => op.replyTo === "human")).toBe(true);
+  });
+  expect(logs.filter(l => l.name === "msg.batched" && l.ids?.inboundId === "human").map(l => [l.props?.route, l.props?.leaderKind])).toEqual([["held_for_wake", "wake"], ["new_turn", "human"]]);
+  expect(logs.filter(l => l.name === "inbound.unanswered")).toEqual([]);
+});
+
+test.each(["throw", "409", "false"])("wake recovery: question response %s requeues once and starts its own turn", async failure => {
+  const h = setup();
+  const logs = await captureLogs(async () => {
+    h.input("first", "Ask me");
+    await h.router.tick();
+    h.backend.questionRequests = [question()];
+    await h.router.tick();
+    deliver(h.store);
+    h.backend.questionReplyBehavior = async () => {
+      if (failure === "false") return false;
+      throw Object.assign(new Error("ControlError"), { name: "ControlError", ...(failure === "409" ? { status: 409 } : {}) });
+    };
+    h.input("answer", "B", { source: "typed" });
+    await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("pending");
+    await new Router(h.store, h.backend, h.transport, options).tick();
+    expect(h.backend.questionReplies).toHaveLength(1);
+    h.backend.questionRequests = [];
+    h.backend.final("Done");
+    await h.router.tick();
+    setSystemTime(Date.now() + 16_000);
+    await h.router.tick();
+    await h.router.tick();
+    expect(h.backend.prompts.map(p => p.text)).toEqual(["Ask me", "B"]);
+    h.backend.final("Answered");
+    await h.router.tick();
+    expect(h.conversations().some(op => op.replyTo === "answer")).toBe(true);
+  });
+  expect(logs.filter(l => l.name === "inbound.requeued").map(l => [l.ids?.inboundId, l.props?.reason])).toEqual([["answer", "respond_failed"]]);
+  expect(logs.find(l => l.name === "msg.batched" && l.props?.route === "question_answer")?.ids?.inboundId).toBe("answer");
+});
+
+test("wake recovery: failed wake leaves the waiting human ahead of its retry", async () => {
+  const h = toolSetup();
+  steering(h.backend);
+  h.input("wake:failed", wakeBody());
+  await h.router.tick();
+  h.input("wake:older", wakeBody());
+  h.input("human", "Are you there?");
+  await h.router.tick();
+  h.backend.failed("The provider could not start this turn");
+  await h.router.tick();
+  await h.router.tick();
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Are you there?"]);
+});
+
+test.each(["no_reply", "failed"])("wake recovery: persisted accepted human handoff is requeued on %s", async outcome => {
+  const h = setup();
+  h.input("wake:old", wakeBody());
+  await h.router.tick();
+  h.input("human", "Please answer");
+  h.store.updateInbound("human", "done");
+  const turn = h.store.get<{ messageId: string }>("activeTurn")!;
+  h.store.set(`turn-human:${turn.messageId}`, ["human"]);
+  const logs = await captureLogs(async () => {
+    if (outcome === "failed") h.backend.failed(); else h.backend.final("NO_REPLY");
+    await h.router.tick();
+    await h.router.tick();
+  });
+  expect(h.backend.prompts.map(p => p.text)).toEqual([wakeBody(), "Please answer"]);
+  expect(logs.find(l => l.name === "inbound.requeued")?.props?.reason).toBe(outcome === "failed" ? "turn_failed" : "background_no_reply");
+  expect(logs.some(l => l.name === "inbound.unanswered" && l.ids?.inboundId === "human")).toBe(false);
+});
+
+
+test.each(["throw", "refused"])("wake recovery: steer %s requeues with its identity and no steer retry", async failure => {
+  const h = setup();
+  const steers = steering(h.backend, async () => {
+    if (failure === "throw") throw Object.assign(new Error("control failed"), { name: "ControlError" });
+    return "refused";
+  });
+  const logs = await captureLogs(async () => {
+    h.input("first", "Original"); await h.router.tick();
+    h.input("followup", "Please answer"); await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("pending");
+    await h.router.tick();
+    expect(steers).toHaveLength(1);
+    h.backend.final("Original answered"); await h.router.tick(); await h.router.tick();
+    expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Original", "Please answer"]);
+    expect(h.backend.prompts[1]!.messageId).toBe(steers[0]!.messageId);
+    h.backend.final("Follow-up answered"); await h.router.tick();
+    expect(h.conversations().some(reply => reply.replyTo === "followup")).toBe(true);
+  });
+  expect(logs.filter(log => log.name === "inbound.requeued").map(log => [log.ids?.inboundId, log.props?.reason])).toEqual([["followup", "steer_failed"]]);
+});
+
+test.each(["no_reply", "failed", "missing_input"])("wake recovery: admitted steer stays open and recovers %s with a fresh identity", async outcome => {
+  const h = setup();
+  const steers = steering(h.backend, outcome === "missing_input" ? async () => "steered" : undefined);
+  const logs = await captureLogs(async () => {
+    h.input("first", "Original"); await h.router.tick();
+    h.input("followup", "Please answer"); await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("admitted");
+    expect(h.store.get<{ covered: string[] }>("activeTurn")?.covered).toContain("followup");
+    if (outcome === "missing_input") setSystemTime(Date.now() + 121_000);
+    if (outcome === "failed") h.backend.failed();
+    else h.backend.final(outcome === "missing_input" ? "Original answered" : "NO_REPLY");
+    await h.router.tick(); await h.router.tick();
+    expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Original", "Please answer"]);
+    expect(h.backend.prompts[1]!.messageId).not.toBe(steers[0]!.messageId);
+  });
+  expect(logs.filter(log => log.name === "inbound.requeued" && log.ids?.inboundId === "followup")).toHaveLength(1);
+  expect(logs.some(log => log.name === "inbound.unanswered" && log.ids?.inboundId === "followup")).toBe(false);
+});
+
+test.each(["final", "tool"] as const)("wake recovery: %s handoff becomes done only when its covered reply is sent", async replyMode => {
+  const h = setup(":memory:", { replyMode });
+  steering(h.backend);
+  h.input("first", "Original"); await h.router.tick();
+  h.input("followup", "Please answer"); await h.router.tick();
+  if (replyMode === "tool") agentSends(h, "covered", "Both answered");
+  h.backend.final("Both answered"); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("admitted");
+  const reply = h.conversations()[0]!;
+  expect(h.store.get<string[]>(`reply-covered:${reply.id}`)).toContain("followup");
+  h.store.outboxState(reply.id, "sent", "provider-covered");
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+});
+
+test("wake recovery: terminal silence emits the unanswered diagnostic once without message text", async () => {
+  const h = setup();
+  const logs = await captureLogs(async () => {
+    h.input("human", "PRIVATE_UNANSWERED"); await h.router.tick();
+    h.backend.final("NO_REPLY"); await h.router.tick(); await h.router.tick();
+  });
+  expect(logs.filter(log => log.name === "inbound.unanswered")).toMatchObject([{ kind: "error", ids: { inboundId: "human" } }]);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_UNANSWERED");
+});
+
+test("wake recovery: terminal failed human without a reply emits the unanswered diagnostic", async () => {
+  const h = setup();
+  const logs = await captureLogs(async () => {
+    h.input("human", "PRIVATE_FAILED_UNANSWERED"); await h.router.tick();
+    h.backend.failed(); await h.router.tick();
+  });
+  expect(logs.filter(log => log.name === "inbound.unanswered")).toMatchObject([{ kind: "error", ids: { inboundId: "human" } }]);
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_FAILED_UNANSWERED");
+});
+
+test("failure readback adopts a newly exposed successful steer before capturing its reply coverage", async () => {
+  const h = setup(":memory:", { failureNoticeMs: 0 });
+  steering(h.backend, async () => { throw new Error("lost result"); });
+  h.input("root", "Original"); await h.router.tick();
+  h.input("second", "Successful follow up"); await h.router.tick();
+  h.input("third", "Failed follow up"); await h.router.tick();
+  let exposed = false;
+  h.backend.messagesBehavior = async () => {
+    if (!exposed) {
+      exposed = true;
+      h.backend.final("Original answer");
+      h.backend.records.push({ id: messageId("second"), type: "user", text: "Successful follow up", time: { created: Date.now() } });
+      h.backend.final("Second answer");
+      h.backend.records.push({ id: messageId("third"), type: "user", text: "Failed follow up", time: { created: Date.now() } });
+      h.backend.failed();
+    }
+    return h.backend.records;
+  };
+  await h.router.checkCompletion(); await h.router.tick(); await h.router.tick();
+  const reply = h.conversations().find(op => op.text.includes("Second answer"))!;
+  expect(reply).toBeDefined();
+  expect(h.store.get<string[]>(`reply-covered:${reply.id}`)).toContain("second");
+  expect(h.store.get(`human-retry-prompt:second`)).toBeUndefined();
+  expect(inbounds(h.store).find(row => row.id === "second")?.state).toBe("admitted");
+  h.store.outboxState(reply.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "second")?.state).toBe("done");
+});
+
+test.each(["startup_unavailable", "send_timeout"])("control recovery: %s retries a steer with its original identity and mode", async reason => {
+  const h = setup();
+  const steers = steering(h.backend, async call => {
+    if (steers.length === 1) throw new ControlError(503, "unavailable", { reason, retrySafe: true });
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    return "steered";
+  });
+  h.input("root", "Original"); await h.router.tick();
+  h.input("human", "Follow up"); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "human")?.state).toBe("processing");
+  await h.router.tick();
+  expect(steers).toHaveLength(2);
+  expect(steers[1]).toEqual(steers[0]);
+  expect(h.backend.prompts).toHaveLength(1);
+  h.backend.final("Both answered"); await h.router.tick();
+  expect(h.conversations().map(reply => reply.text)).toEqual(["Both answered"]);
+});
+
+test.each(["startup_unavailable", "send_timeout"].flatMap(reason => ["readback", "upload"].flatMap(stage => [false, true].map(restart => ({ reason, stage, restart })))))("control recovery: $reason steer retry yields to reset during $stage (restart=$restart)", async ({ reason, stage, restart }) => {
+  const h = setup();
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const posts: { id: string; text: string }[] = [];
+  let retrying = false;
+  Object.assign(h.backend, { async steer(_id: string, _directory: string, id: string, text: string, _guidance?: string, _files?: readonly FilePart[], guard?: SteerGuard): Promise<SteerDelivery> {
+    if (retrying && stage === "upload") { entered.resolve(); await release.promise; }
+    if (guard && (guard.signal.aborted || !await guard.beforeSend() || guard.signal.aborted)) return "refused";
+    posts.push({ id, text });
+    throw new ControlError(503, "Unavailable", { reason, retrySafe: true });
+  } });
+  h.input("root", "Original"); await h.router.tick();
+  h.input("human", "Follow up"); await h.router.tick();
+  expect(posts).toEqual([{ id: messageId("human"), text: "Follow up" }]);
+  const original = h.store.get<object>("steer-attempt:human");
+  const accepted = h.backend.promptAccepted.bind(h.backend);
+  h.backend.promptAccepted = async (id, directory, prompt) => {
+    if (retrying && stage === "readback" && prompt === messageId("human")) { entered.resolve(); await release.promise; return false; }
+    return accepted(id, directory, prompt);
+  };
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  retrying = true;
+  const ticking = router.tick(); await entered.promise;
+  h.input("reset", "/new"); release.resolve(); await ticking;
+  expect(posts).toHaveLength(1);
+  expect(h.store.get<object>("steer-attempt:human")).toEqual(original);
+  retrying = false;
+  await router.tick();
+  expect(inbounds(h.store).find(row => row.id === "human")?.state).toBe("cancelled");
+  expect(posts).toHaveLength(1);
+  expect(h.backend.prompts.some(prompt => prompt.text === "Follow up")).toBe(false);
+});
+
+test.each(["startup_unavailable", "send_timeout"].flatMap(reason => ["root", "child"].flatMap(target => ["question", "permission", "legacy-question", "legacy-permission"].flatMap(kind => [false, true].map(restart => ({ reason, target, kind, restart }))))))("control recovery: $reason $target $kind response retry yields to reset during mark-read (restart=$restart)", async ({ reason, target, kind, restart }) => {
+  const context: ChatContext = {
+    chat: { key: "dm:+15555550123", slug: "owner", kind: "owner", title: "Owner" },
+    typing: () => false, react: async () => {}, roleOf: () => ({ role: "admin", name: "Owner" }),
+  };
+  const h = setup(":memory:", { context, chatGuid: context.chat.key });
+  h.input("root", "Ask me"); await h.router.tick();
+  const destination = target === "child" ? "ses_child" : "ses_1";
+  if (target === "child") {
+    h.backend.states.ses_child = { type: "busy" };
+    h.backend.childSessions = [{ id: destination, directory: "/Chats/child", parentID: "ses_1", time: { created: Date.now(), updated: Date.now() } }];
+  }
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission("perm_1", destination)];
+  else h.backend.questionRequests = [{ ...question(), sessionID: destination }];
+  await h.router.tick(); deliver(h.store);
+  const unavailable = async () => { throw new ControlError(503, "Unavailable", { reason, retrySafe: true }); };
+  if (approval) h.backend.permissionReplyBehavior = unavailable; else h.backend.questionReplyBehavior = unavailable;
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  h.input("answer", text); await h.router.tick();
+  const posts = () => h.backend.questionReplies.length + h.backend.permissionReplies.length;
+  const before = posts(); expect(before).toBeGreaterThan(0);
+  const original = h.store.get<object>("steer-attempt:answer");
+  expect(original).toHaveProperty("response.retry");
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  h.transport.read = async () => { entered.resolve(); await release.promise; };
+  // A new unread row makes the existing Router await mark-read as well as a restarted one.
+  h.input("later", "Keep going");
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  const ticking = router.tick(); await entered.promise;
+  h.input("reset", "/new"); release.resolve(); await ticking;
+  expect(posts()).toBe(before);
+  expect(h.store.get<object>("steer-attempt:answer")).toEqual(original);
+  expect(h.backend.prompts).toHaveLength(1);
+  h.transport.read = async () => {};
+  await router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("cancelled");
+  expect(posts()).toBe(before);
+  expect(h.backend.prompts.some(prompt => prompt.text === text)).toBe(false);
+});
+
+test("control recovery: uncertain conflict waits for admission readback before requeue", async () => {
+  const h = setup();
+  const steers = steering(h.backend, async () => { throw new ControlError(409, "conflict", { reason: "command_id_conflict", retrySafe: false }); });
+  h.input("root", "Original"); await h.router.tick();
+  h.input("human", "Follow up"); await h.router.tick();
+  h.backend.promptAccepted = async () => { throw new Error("read unavailable"); };
+  h.backend.final("Original answered");
+  await h.router.tick(); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "human")?.state).toBe("processing");
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(steers).toHaveLength(1);
+  h.backend.promptAccepted = async (_id, _directory, prompt) => h.backend.records.some(record => record.id === prompt);
+  const nextAt = h.store.get<{ nextAt: number }>("replay-probe-backoff:human")!.nextAt;
+  setSystemTime(nextAt - 1);
+  await h.router.tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  setSystemTime(nextAt);
+  await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["Original", "Follow up"]);
+});
+
+test("control recovery: a resolved question requeues its human text without repeating respond", async () => {
+  const h = setup();
+  h.input("root", "Ask me"); await h.router.tick();
+  h.backend.questionRequests = [question()]; await h.router.tick(); deliver(h.store);
+  h.backend.questionReplyBehavior = async () => { throw new ControlError(409, "conflict", { reason: "request_resolved", retrySafe: false }); };
+  const logs = await captureLogs(async () => {
+    h.input("answer", "B"); await h.router.tick(); await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("pending");
+    expect(h.backend.questionReplies).toHaveLength(1);
+  });
+  expect(logs.find(line => line.name === "inbound.requeued")?.props).toMatchObject({ reason: "respond_failed", controlReason: "request_resolved", retrySafe: false });
+});
+
+test.each(["root", "child"])("control recovery: deferred %s response reads the request and retains parent reply ownership", async target => {
+  const h = setup();
+  h.input("root", "Ask me"); await h.router.tick();
+  const destination = target === "child" ? "ses_child" : "ses_1";
+  if (target === "child") {
+    h.backend.states.ses_child = { type: "busy" };
+    h.backend.childSessions = [{ id: destination, directory: "/Chats/child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  }
+  h.backend.questionRequests = [{ ...question(), sessionID: destination }];
+  await h.router.tick(); deliver(h.store);
+  let readable = false;
+  const reads: string[] = [];
+  Object.assign(h.backend, { responseResolved: async (session: string) => {
+    reads.push(session);
+    if (!readable) throw new Error("read unavailable");
+    return true;
+  } });
+  h.backend.questionReplyBehavior = async () => {
+    h.backend.questionRequests = [];
+    throw new ControlError(503, "unavailable", { reason: "reader_unavailable", retrySafe: false });
+  };
+  h.input("answer", "B"); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("processing");
+  readable = true; await h.router.tick();
+  expect(reads.length).toBeGreaterThan(0);
+  expect(new Set(reads)).toEqual(new Set([destination]));
+  expect(h.store.get<{ covered?: string[] }>("activeTurn")?.covered ?? []).not.toContain("answer");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("pending");
+  h.backend.states = {};
+  h.backend.final("Root finished"); await h.router.tick();
+  setSystemTime(Date.now() + 16_000); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me", "B"]);
+  expect(h.backend.questionReplies).toHaveLength(1);
+});
+
+test.each(["final", "tool"] as const)("wake recovery: %s request watcher retains wake provenance after root completion", async replyMode => {
+  const h = setup(":memory:", { replyMode, watchMs: 0 });
+  const steers = steering(h.backend);
+  h.input("wake:root", wakeBody()); await h.router.tick();
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await h.router.tick(); deliver(h.store);
+  h.backend.final("NO_REPLY"); await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request", leaderId: "wake:root" });
+  h.input("human", "B"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.questionReplies).toEqual([]);
+  expect(steers).toEqual([]);
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), "B"]);
+});
+
+test.each([0, 200].flatMap(status => ["root", "child"].flatMap(target => ["question", "permission", "legacy-question", "legacy-permission"].map(kind => ({ status, target, kind })))))("transport response uncertainty preserves $target $kind operation across restart (status=$status)", async ({ status, target, kind }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const destination = target === "child" ? "ses_child" : "ses_1";
+  if (target === "child") {
+    h.backend.states.ses_child = { type: "busy" };
+    h.backend.childSessions = [{ id: destination, directory: "/Chats/child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  }
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [{ ...permission(), sessionID: destination }];
+  else h.backend.questionRequests = [{ ...question(), sessionID: destination }];
+  await h.router.tick(); deliver(h.store);
+  let readable = false;
+  const reads: string[] = [];
+  Object.assign(h.backend, { responseResolved: async (session: string) => {
+    reads.push(session);
+    if (!readable) throw new Error("read unavailable");
+    return true;
+  } });
+  const respond = async () => {
+    h.backend.permissionRequests = []; h.backend.questionRequests = [];
+    throw new ControlError(status, "connection_reset");
+  };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  h.input("answer", text); await h.router.tick();
+  const original = h.store.get<object>("steer-attempt:answer")!;
+  expect(original).toMatchObject({ id: "ses_1", response: { sessionId: destination, requestId: approval ? "perm_1" : "q_1",
+    operation: { request: { sessionID: destination }, answers: approval ? [] : [["B"]] } } });
+  const router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await router.tick(); await router.tick();
+  expect(h.store.get<object>("steer-attempt:answer")).toEqual(original);
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("processing");
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me"]);
+  expect(h.backend.permissionReplies.length + h.backend.questionReplies.length).toBe(1);
+  expect(new Set(reads)).toEqual(new Set([destination]));
+  readable = true; await router.tick();
+  expect(h.store.get("steer-attempt:answer")).toBeNull();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("pending");
+  h.backend.states = {}; h.backend.final("Root finished"); await router.tick();
+  setSystemTime(Date.now() + 16_000); await router.tick(); await router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me", text]);
+  expect(h.backend.permissionReplies.length + h.backend.questionReplies.length).toBe(1);
+});
+
+test.each(["startup_unavailable", "send_timeout"])("control recovery: %s stays a steer across failure, sweep and restart", async reason => {
+  const h = setup(); const start = Date.now(); setSystemTime(start);
+  let ready = false;
+  const steers = steering(h.backend, async call => {
+    if (!ready) throw new ControlError(503, "unavailable", { reason, retrySafe: true });
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    return "steered";
+  });
+  h.input("root", "Original"); await h.router.tick();
+  h.input("human", "Follow up"); await h.router.tick();
+  h.backend.failed(); await h.router.tick();
+  setSystemTime(start + 130_000); await h.router.checkInboundLatency();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Original"]);
+  ready = true;
+  await new Router(h.store, h.backend, h.transport, options).tick();
+  expect(steers.length).toBeGreaterThan(1);
+  expect(steers.every(call => JSON.stringify(call) === JSON.stringify(steers[0]))).toBe(true);
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Original"]);
+  expect(inbounds(h.store).find(row => row.id === "human")?.state).toBe("admitted");
+});
+
+test.each(["startup_unavailable", "send_timeout"].flatMap(reason => ["question", "permission"].flatMap(kind => [false, true].map(restart => ({ reason, kind, restart })))))("control recovery: $reason settles behind a $kind watcher (restart=$restart)", async ({ reason, kind, restart }) => {
+  const h = setup(":memory:", { watchMs: 0 });
+  let ready = false;
+  const steers = steering(h.backend, async () => {
+    if (!ready) throw new ControlError(503, "unavailable", { reason, retrySafe: true });
+    return "refused";
+  });
+  h.input("root", "Original"); await h.router.tick();
+  h.input("human", "Follow up"); await h.router.tick();
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: Date.now(), updated: Date.now() } }];
+  if (kind === "question") h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  else h.backend.permissionRequests = [permission("perm_1", "ses_child")];
+  await h.router.tick(); deliver(h.store);
+  h.backend.final("Original answered"); await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request" });
+  ready = true;
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  await router.tick(); await router.tick();
+  expect(steers.length).toBeGreaterThan(1);
+  expect(steers.every(call => JSON.stringify(call) === JSON.stringify(steers[0]))).toBe(true);
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Original", "Follow up"]);
+  expect(h.backend.questionReplies).toEqual([]);
+  expect(h.backend.permissionReplies).toEqual([]);
+  h.backend.questionRequests = []; h.backend.permissionRequests = [];
+  h.backend.final("Follow-up answer"); await router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "human")?.state).toBe("done");
+});
+
+test.each(["final", "tool"] as const)("wake recovery: %s discovers a wake child's question after completion without consuming human text", async replyMode => {
+  const h = setup(":memory:", { replyMode, watchMs: 0 });
+  h.input("wake:root", wakeBody()); await h.router.tick();
+  h.backend.final("NO_REPLY"); await h.router.tick();
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: Date.now(), updated: Date.now() } }];
+  h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await h.router.tick(); await h.router.tick(); deliver(h.store);
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request", leaderId: "wake:root" });
+  h.input("human", "B"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.questionReplies).toEqual([]);
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), "B"]);
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["no_reply", "failed"].map(outcome => ({ replyMode, outcome }))))("wake recovery: own-turn fallback remains covered after $outcome in $replyMode", async ({ replyMode, outcome }) => {
+  const h = setup(":memory:", { replyMode });
+  steering(h.backend, async () => "refused");
+  h.input("root", "Original"); await h.router.tick();
+  h.input("human", "Follow up"); await h.router.tick();
+  h.backend.final("Original answered"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Follow up");
+  const firstRetry = h.backend.prompts.at(-1)!.messageId;
+  expect(h.store.get<{ covered: string[] }>("activeTurn")?.covered).toContain("human");
+  if (outcome === "failed") h.backend.failed(); else h.backend.final("NO_REPLY");
+  const router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await router.tick(); await router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Follow up");
+  expect(h.backend.prompts.at(-1)!.messageId).not.toBe(firstRetry);
+  expect(inbounds(h.store).find(row => row.id === "human")?.state).toBe("admitted");
+});
+
+test.each(["pending", "sent"].flatMap(state => ["question", "permission", "legacy-question", "legacy-permission"].map(kind => ({ state, kind }))))("control recovery: $state unrelated reply before $kind return cannot gain coverage", async ({ state, kind }) => {
+  const h = toolSetup();
+  h.input("root", "Ask me"); await h.router.tick();
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission()]; else h.backend.questionRequests = [question()];
+  await h.router.tick(); deliver(h.store);
+  const entered = Promise.withResolvers<void>(), accepted = Promise.withResolvers<void>();
+  const respond = async () => {
+    entered.resolve(); await accepted.promise;
+    h.backend.permissionRequests = []; h.backend.questionRequests = [];
+    return true;
+  };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  h.input("answer", text); const ticking = h.router.tick(); await entered.promise;
+  agentSends(h, "response", "Unrelated root reply");
+  if (state === "sent") h.store.outboxState("send:response", "sent");
+  accepted.resolve(); await ticking;
+  expect(h.store.get<string[]>("reply-covered:send:response")).not.toContain("answer");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  h.backend.final("NO_REPLY"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me", text]);
+  agentSends(h, "own-response", "Own answer"); h.store.outboxState("send:own-response", "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+});
+
+test.each(["question", "permission", "legacy-question", "legacy-permission"])("control recovery: parent final before child %s acceptance cannot answer the human", async kind => {
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("root", "Ask me"); await h.router.tick();
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission("perm_1", "ses_child")];
+  else h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await h.router.tick(); deliver(h.store);
+  const entered = Promise.withResolvers<void>(), accepted = Promise.withResolvers<void>();
+  const respond = async () => {
+    entered.resolve(); await accepted.promise;
+    h.backend.permissionRequests = []; h.backend.questionRequests = []; h.backend.states = {};
+    return true;
+  };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  h.input("answer", text); const ticking = h.router.tick(); await entered.promise;
+  h.backend.final("Unrelated parent answer"); accepted.resolve(); await ticking;
+  await h.router.tick(); await h.router.tick();
+  const parent = h.conversations().find(op => op.text === "Unrelated parent answer")!;
+  expect(parent).toBeDefined();
+  expect(h.store.get<string[]>(`reply-covered:${parent.id}`)).not.toContain("answer");
+  h.store.outboxState(parent.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).not.toBe("done");
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me", text]);
+  h.backend.final("Own answer"); await h.router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+});
+
+test.each(["question", "permission", "legacy-question", "legacy-permission"].flatMap(kind => [false, true].map(reuse => ({ kind, reuse }))))("control recovery: early parent reply before $kind acceptance excludes the answer (reuse=$reuse)", async ({ kind, reuse }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission("perm_1", "ses_child")];
+  else h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await h.router.tick(); deliver(h.store);
+  const entered = Promise.withResolvers<void>(), accepted = Promise.withResolvers<void>();
+  const respond = async () => {
+    entered.resolve(); await accepted.promise;
+    h.backend.permissionRequests = []; h.backend.questionRequests = []; h.backend.states = {};
+    return true;
+  };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  h.backend.messagesBehavior = async () => {
+    if (reuse && h.store.get<{ covered?: string[] }>("activeTurn")?.covered?.includes("answer")) {
+      agentSends(h, "parent", "Unrelated parent answer");
+      h.store.set("api:send:send:parent", { queuedAt: Date.now() });
+    }
+    return h.backend.records;
+  };
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  h.input("answer", text); const ticking = h.router.tick(); await entered.promise;
+  h.backend.step("Unrelated parent answer").continued = true;
+  accepted.resolve(); await ticking; await h.router.tick();
+  const parent = h.conversations().find(op => op.text === "Unrelated parent answer")!;
+  expect(parent).toBeDefined();
+  expect(h.store.get<string[]>(`reply-covered:${parent.id}`)).not.toContain("answer");
+  expect(h.store.get<{ earlyOutbox?: string }>("activeTurn")?.earlyOutbox).toBe(parent.id);
+  h.store.outboxState(parent.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  h.backend.messagesBehavior = undefined;
+  h.backend.final("NO_REPLY"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me", text]);
+  h.backend.final("Own answer"); await h.router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+});
+
+test("control recovery: second steer cannot claim an earlier sent reply mapped to the first steer", async () => {
+  const h = toolSetup();
+  const steers = steering(h.backend, async call => {
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    if (steers.length === 2) {
+      agentSends(h, "second-response", "Both followups answered");
+      h.store.outboxState("send:second-response", "sent");
+      throw new Error("lost receipt");
+    }
+    return "steered";
+  });
+  h.input("root", "Original"); await h.router.tick();
+  h.input("first", "First follow up"); await h.router.tick();
+  h.input("second", "Second follow up"); await h.router.tick(); await h.router.tick();
+  expect(h.store.get<string[]>("reply-covered:send:second-response")).not.toContain("second");
+  expect(inbounds(h.store).find(row => row.id === "second")?.state).toBe("admitted");
+  h.backend.failed(); await h.router.tick();
+  expect(h.store.get<string>("human-retry-prompt:second")).toBeString();
+});
+
+test.each(([false, true] as const).flatMap(fold => (["pending", "sent"] as const).map(state => ({ fold, state }))))("late steer cannot claim A's $state tool reply (fold=$fold)", async ({ fold, state }) => {
+  const h = toolSetup();
+  let enter!: () => void, admit!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const admission = new Promise<void>(resolve => { admit = resolve; });
+  const steers = steering(h.backend, async call => {
+    enter(); await admission;
+    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
+    return "steered";
+  });
+  h.input("first", "Original question"); await h.router.tick();
+  h.input("followup", "Follow-up question"); const ticking = h.router.tick(); await entered;
+  let releaseFold!: () => void, enterFold!: () => void;
+  const folded = new Promise<void>(resolve => { enterFold = resolve; });
+  const folding = new Promise<void>(resolve => { releaseFold = resolve; });
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}),
+    ...(fold ? { foldText: async (text: string) => { enterFold(); await folding; return text; } } : {}) });
+  const sending = api(new Request("http://bridge/send", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Original answer", dedupeKey: "earlier-answer", sessionId: "ses_1" }) }));
+  if (fold) { await folded; releaseFold(); }
+  const response = await sending; expect(response.status).toBe(202);
+  const reply = (await response.json() as { id: string }).id;
+  if (state === "sent") h.store.outboxState(reply, "sent");
+  admit(); await ticking;
+  expect(h.store.get<string[]>(`reply-covered:${reply}`)).toEqual(["first"]);
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("admitted");
+  h.backend.final("NO_REPLY"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Original question", "Follow-up question"]);
+  expect(h.backend.prompts[1]!.messageId).not.toBe(steers[0]!.messageId);
+  h.store.outboxState(reply, "sent");
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).not.toBe("done");
+});
+
+test("wake recovery: a silent fallback retains every sealed member for the next retry", async () => {
+  const h = setup(); steering(h.backend, async () => "refused");
+  h.input("root", "Original"); await h.router.tick();
+  h.input("first", "First part"); h.input("member", "Second part"); await h.router.tick();
+  h.backend.final("Original answered"); await h.router.tick(); await h.router.tick();
+  const firstAttempt = h.backend.prompts.at(-1)!;
+  expect(firstAttempt.text).toBe("First part\nSecond part");
+  h.backend.final("NO_REPLY"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe(firstAttempt.text);
+  expect(h.backend.prompts.at(-1)!.messageId).not.toBe(firstAttempt.messageId);
+  expect(h.store.get<NormalizedInbound>("batch:first")?.batchIds).toEqual(["first", "member"]);
+  expect(inbounds(h.store).filter(row => row.id !== "root").map(row => row.state)).toEqual(["admitted", "admitted"]);
+});
+
+test("wake recovery: a completed retry cannot adopt its old admission during the latency sweep", async () => {
+  const h = setup(); steering(h.backend);
+  const start = Date.now(); setSystemTime(start);
+  h.input("root", "Original"); await h.router.tick();
+  h.input("human", "Follow up", { source: "typed", receivedAt: start - 130_000 }); await h.router.tick();
+  h.store.set("failed-delivery:human", { ...h.store.get<object>("route"), inboundId: "human", messageId: messageId("human"), phase: "unknown", startedAt: start });
+  h.router.requeueHuman("human", "background_no_reply", true);
+  const fresh = h.store.get<string>("human-retry-prompt:human")!;
+  expect(h.store.get("failed-delivery:human")).toBeNull();
+  h.store.set("activeTurn", null); h.backend.final("NO_REPLY");
+  setSystemTime(start + 130_000); await h.router.checkInboundLatency(); await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.messageId).toBe(fresh);
+  expect(h.store.get<{ messageId: string }>("activeTurn")?.messageId).toBe(fresh);
+});
+
+test("wake recovery: ordinary background resumption retains its wake leader", async () => {
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("wake:root", wakeBody()); await h.router.tick();
+  h.backend.final("NO_REPLY"); await h.router.tick();
+  h.backend.states.ses_1 = { type: "busy" };
+  h.backend.step("Background resumed"); await h.router.tick();
+  h.backend.questionRequests = [question()]; await h.router.tick(); deliver(h.store);
+  expect(h.store.get("activeTurn")).toMatchObject({ background: true, leaderId: "wake:root" });
+  h.input("human", "B"); await h.router.tick();
+  expect(h.backend.questionReplies).toEqual([]);
+  h.backend.questionRequests = []; h.backend.states = {}; h.backend.final("NO_REPLY");
+  await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("B");
+});
+
+test("wake recovery: a child's creation time keeps its wake provenance during newer human work", async () => {
+  const h = setup(":memory:", { watchMs: 0 }); const start = Date.now(); setSystemTime(start);
+  h.input("wake:root", wakeBody()); await h.router.tick();
+  h.backend.final("NO_REPLY"); await h.router.tick();
+  setSystemTime(start + 2_000); h.input("first-human", "Original human question"); await h.router.tick();
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: start + 500, updated: start + 3_000 } }];
+  h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await h.router.tick(); deliver(h.store);
+  h.input("second-human", "B"); await h.router.tick();
+  expect(h.backend.questionReplies).toEqual([]);
+  h.backend.final("Human answer"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), "Original human question", "B"]);
+});
+
+test.each(["final", "tool"] as const)("wake recovery: %s late wake question after human completion releases the next human", async replyMode => {
+  const h = setup(":memory:", { replyMode, watchMs: 0 }); const start = Date.now(); setSystemTime(start);
+  h.input("wake:root", wakeBody()); await h.router.tick();
+  h.backend.final("NO_REPLY"); await h.router.tick();
+  setSystemTime(start + 2_000); h.input("first-human", "Original human question"); await h.router.tick();
+  if (replyMode === "tool") agentSends(h, "first-human", "Human answer");
+  h.backend.final("Human answer"); await h.router.tick(); deliver(h.store);
+  setSystemTime(start + 4_000);
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: start + 500, updated: start + 4_000 } }];
+  h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await h.router.tick(); await h.router.tick(); deliver(h.store);
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request", leaderId: "wake:root" });
+  h.input("second-human", "B"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.questionReplies).toEqual([]);
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), "Original human question", "B"]);
+  if (replyMode === "tool") agentSends(h, "second-human", "Own answer");
+  h.backend.final("Own answer"); await h.router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "second-human")?.state).toBe("done");
+});
+
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["question", "permission"].flatMap(kind => [false, true].map(restart => ({ replyMode, kind, restart })))))("wake recovery: mixed $kind leaders release the next human ($replyMode, restart=$restart)", async ({ replyMode, kind, restart }) => {
+  const h = setup(":memory:", { replyMode, watchMs: 0 }); const start = Date.now(); setSystemTime(start);
+  h.input("wake:root", wakeBody()); await h.router.tick();
+  h.backend.states.ses_wake = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_wake", directory: "/Chats/wake", parentID: "ses_1", time: { created: start + 1, updated: start + 1 } }];
+  if (kind === "question") h.backend.questionRequests = [{ ...question({}, "q_wake"), sessionID: "ses_wake" }];
+  else h.backend.permissionRequests = [permission("p_wake", "ses_wake")];
+  await h.router.tick(); deliver(h.store); h.backend.final("NO_REPLY"); await h.router.tick();
+  setSystemTime(start + 2_000); h.input("first-human", "First human work"); await h.router.tick(); await h.router.tick();
+  h.backend.states.ses_human = { type: "busy" };
+  h.backend.childSessions.push({ id: "ses_human", directory: "/Chats/human", parentID: "ses_1", time: { created: start + 2_500, updated: start + 2_500 } });
+  if (kind === "question") h.backend.questionRequests.push({ ...question({}, "q_human"), sessionID: "ses_human" });
+  else h.backend.permissionRequests.push(permission("p_human", "ses_human"));
+  await h.router.tick(); deliver(h.store);
+  if (replyMode === "tool") agentSends(h, "human", "First human answer");
+  h.backend.final("First human answer"); await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request", leaderId: "first-human" });
+  const pending = h.store.get<{ leaderId: string; state: string }[]>("pendingApprovals")!;
+  expect(pending.filter(entry => entry.state === "pending").map(entry => entry.leaderId)).toEqual(["wake:root", "first-human"]);
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  h.input("second-human", "Next human work"); await router.tick(); await router.tick();
+  expect(h.backend.questionReplies).toEqual([]);
+  expect(h.backend.permissionReplies).toEqual([]);
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), "First human work", "Next human work"]);
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["question", "permission", "legacy-question", "legacy-permission"].flatMap(kind => [false, true].flatMap(child => [false, true].flatMap(restart => (child ? [false, true] : [false]).map(replacement => ({ replyMode, kind, child, restart, replacement })))))))("wake recovery: pre-upgrade $kind watcher keeps human text out ($replyMode, child=$child, restart=$restart, replacement=$replacement)", async ({ replyMode, kind, child, restart, replacement }) => {
+  const h = setup(":memory:", { replyMode, watchMs: 0 });
+  h.input("wake:root", wakeBody()); await h.router.tick();
+  const sessionID = child ? "ses_child" : "ses_1";
+  if (child) {
+    h.backend.states.ses_child = { type: "busy" };
+    h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: Date.now(), updated: Date.now() } }];
+  }
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission("perm_1", sessionID)];
+  else h.backend.questionRequests = [{ ...question(), sessionID }];
+  await h.router.tick(); deliver(h.store);
+  h.backend.final("NO_REPLY"); await h.router.tick();
+  const turn = h.store.get<Record<string, unknown>>("activeTurn")!;
+  expect(turn).toMatchObject({ background: true, origin: "request" });
+  delete turn.leaderId; delete turn.inboundId;
+  h.store.set("activeTurn", turn);
+  const entries = h.store.get<Record<string, unknown>[]>("pendingApprovals")!;
+  for (const entry of entries) delete entry.leaderId;
+  h.store.set("pendingApprovals", entries);
+  h.store.db.query("DELETE FROM kv WHERE key GLOB 'route-leader:*' OR key GLOB 'request-leader:*' OR key GLOB 'child-leader:*' OR key GLOB 'leader-history:*'").run();
+  const router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  h.input("human", text); await router.tick(); await router.tick();
+  expect(h.backend.questionReplies).toEqual([]);
+  expect(h.backend.permissionReplies).toEqual([]);
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), text]);
+  expect(h.store.get<{ leaderId?: string }[]>("pendingApprovals")!.every(entry => entry.leaderId?.startsWith("wake:"))).toBe(true);
+  if (replacement) {
+    if (approval) h.backend.permissionRequests = [permission("perm_2", sessionID)];
+    else h.backend.questionRequests = [{ ...question({}, "q_2"), sessionID }];
+  }
+  const followupText = replacement ? kind === "legacy-permission" ? "/approve perm_2 once" : kind === "legacy-question" ? '/answer q_2 [["B"]]' : text : text;
+  const followupRouter = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : router;
+  if (replacement) { await followupRouter.tick(); deliver(h.store); }
+  h.input("followup", followupText); await followupRouter.tick(); await followupRouter.tick();
+  expect(h.backend.questionReplies).toEqual([]);
+  expect(h.backend.permissionReplies).toEqual([]);
+  expect(h.store.get<boolean>("human-own-turn:followup")).toBe(true);
+  if (replyMode === "tool") agentSends(h, "own", "Own answer");
+  h.backend.final("Own answer"); await followupRouter.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "human")?.state).toBe("done");
+  await followupRouter.tick(); await followupRouter.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), text, followupText]);
+  expect(h.backend.questionReplies).toEqual([]);
+  expect(h.backend.permissionReplies).toEqual([]);
+  if (replyMode === "tool") agentSends(h, "followup", "Follow-up answer");
+  h.backend.final("Follow-up answer"); await followupRouter.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("done");
+});
+
+test("a secure form delayed by publication keeps its original coverage across an admitted retry", async () => {
+  const h = toolSetup(); steering(h.backend, async () => "refused");
+  h.input("first", "Help me sign in"); await h.router.tick();
+  const entered = Promise.withResolvers<void>(), published = Promise.withResolvers<string>();
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router,
+    chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}),
+    secrets: { stateRoot: "/unused", publishApps: () => { entered.resolve(); return published.promise; } } });
+  const form = api(new Request("http://bridge/secret-request", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ purpose: "Sign in", fields: [{ name: "code", label: "Code", type: "otp" }], dedupeKey: "first-form", sessionId: "ses_1@1" }) }));
+  await entered.promise;
+  h.input("second", "New work"); await h.router.tick();
+  agentSends(h, "first", "Signing in"); h.store.outboxState("send:first", "sent");
+  h.backend.final("NO_REPLY"); await h.router.tick(); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "second")?.state).toBe("admitted");
+  const prompt = h.backend.prompts.at(-1)!.messageId;
+  published.resolve("https://forms.tail"); expect((await form).status).toBe(202);
+  const op = h.conversations().find(op => op.app?.caption === "Secure form")!;
+  expect(h.store.get<string[]>(`reply-covered:${op.id}`)).toEqual(["first"]);
+  h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "second")?.state).toBe("admitted");
+  h.backend.final("NO_REPLY"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Help me sign in", "New work", "New work"]);
+  expect(h.backend.prompts.at(-1)!.messageId).not.toBe(prompt);
+});
+
+test.each(["root", "child"].flatMap(target => ["question", "permission", "legacy-question", "legacy-permission"].map(kind => ({ target, kind }))))("response recovery without an optional hook reconciles $target $kind after restart", async ({ target, kind }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const destination = target === "child" ? "ses_child" : "ses_1";
+  if (target === "child") {
+    h.backend.states.ses_child = { type: "busy" };
+    h.backend.childSessions = [{ id: destination, directory: "/Chats/child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  }
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission("perm_1", destination)];
+  else h.backend.questionRequests = [{ ...question(), sessionID: destination }];
+  await h.router.tick(); deliver(h.store);
+  let readable = true;
+  h.backend.questionBehavior = async () => { if (!readable) throw new Error("unavailable"); return h.backend.questionRequests; };
+  h.backend.permissionBehavior = async () => { if (!readable) throw new Error("unavailable"); return h.backend.permissionRequests; };
+  const respond = async () => { readable = false; h.backend.questionRequests = []; h.backend.permissionRequests = []; throw new ControlError(0, "connection_reset"); };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  h.input("answer", text); await h.router.tick();
+  const original = h.store.get<object>("steer-attempt:answer"); expect(original).toBeDefined();
+  const router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  await router.tick(); expect(h.store.get<object>("steer-attempt:answer")).toEqual(original);
+  readable = true; await router.tick();
+  expect(h.store.get("steer-attempt:answer")).toBeNull();
+  h.backend.states = {}; h.backend.final("Root finished"); await router.tick(); await router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me", text]);
+  expect(h.backend.questionReplies.length + h.backend.permissionReplies.length).toBe(1);
+});
+
+test.each(["startup_unavailable", "send_timeout"].flatMap(reason => ["question", "permission", "legacy-question", "legacy-permission"].map(kind => ({ reason, kind }))))("control recovery: $reason keeps a $kind response across restart", async ({ reason, kind }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission()]; else h.backend.questionRequests = [question()];
+  await h.router.tick(); deliver(h.store);
+  let unavailable = true;
+  const respond = async () => {
+    if (unavailable) throw new ControlError(503, "unavailable", { reason, retrySafe: true });
+    h.backend.permissionRequests = []; h.backend.questionRequests = [];
+    return true;
+  };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  h.input("answer", text); await h.router.tick();
+  expect(h.store.get("steer-attempt:answer")).toMatchObject({ response: { requestId: approval ? "perm_1" : "q_1", retry: { answers: approval ? [] : [["B"]] } } });
+  unavailable = false;
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(h.backend.prompts).toHaveLength(1);
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  const replies = approval ? h.backend.permissionReplies : h.backend.questionReplies;
+  expect(replies.length).toBeGreaterThan(1);
+  expect(replies.every(call => JSON.stringify(call) === JSON.stringify(replies[0]))).toBe(true);
+  h.backend.final("Answered"); await h.router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+});
+
+
+test.each(["NO_REPLY", ""])("late own-run silence %s cannot be answered by an earlier run's reply", async silence => {
+  const h = setup(); const steers = steering(h.backend, async () => { throw new Error("receipt lost"); });
+  h.input("first", "First question"); await h.router.tick();
+  h.input("followup", "Second question"); h.input("member", "Second part"); await h.router.tick();
+  h.backend.final("First answer");
+  const steer = steers[0]!;
+  h.backend.records.push({ id: steer.messageId, type: "user", text: steer.text, time: { created: Date.now() } });
+  h.backend.final(silence);
+  await h.router.tick(); await h.router.tick();
+  const reply = h.conversations().find(op => op.text === "First answer")!;
+  expect(h.store.get<string[]>(`reply-covered:${reply.id}`) ?? []).not.toContain("followup");
+  expect(h.store.get<string[]>(`reply-covered:${reply.id}`) ?? []).not.toContain("member");
+  h.store.outboxState(reply.id, "sent");
+  expect(h.backend.prompts.at(-1)!.text).toBe("Second question\nSecond part");
+  expect(h.backend.prompts.at(-1)!.messageId).not.toBe(steer.messageId);
+  expect(inbounds(h.store).filter(row => row.id !== "first").map(row => row.state)).toEqual(["admitted", "admitted"]);
+});
+
+test.each(["question", "permission"].flatMap(kind => ["success", "startup_unavailable", "send_timeout"].map(outcome => ({ kind, outcome }))))("a delayed $kind response keeps its operation through a local timeout and late $outcome", async ({ kind, outcome }) => {
+  const h = toolSetup(); h.input("root", "Ask me"); await h.router.tick();
+  const approval = kind === "permission";
+  if (approval) h.backend.permissionRequests = [permission()]; else h.backend.questionRequests = [question()];
+  await h.router.tick(); deliver(h.store);
+  const entered = Promise.withResolvers<void>(), result = Promise.withResolvers<boolean>();
+  const timed = Promise.withResolvers<() => void>();
+  const changed = Promise.withResolvers<void>();
+  let calls = 0;
+  const originalSet = h.store.set.bind(h.store);
+  const storeSet = spyOn(h.store, "set").mockImplementation((key, value) => {
+    originalSet(key, value);
+    if (calls > 0 && key === "steer-attempt:answer" && (value === null || !!(value as { response?: { retry?: unknown } })?.response?.retry)) changed.resolve();
+  });
+  const respond = async () => { calls++; entered.resolve(); return calls === 1 ? result.promise : true; };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const originalTimer = globalThis.setTimeout;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((handler: TimerHandler, ms?: number, ...args: unknown[]) => {
+    if (ms === SEND_WAIT_MS && typeof handler === "function") timed.resolve(() => handler(...args));
+    return originalTimer(handler, ms, ...args);
+  }) as typeof globalThis.setTimeout);
+  try {
+    h.input("answer", approval ? "yes" : "B"); const tick = h.router.tick();
+    await entered.promise; (await timed.promise)(); await tick;
+    expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("processing");
+    expect(h.store.get("steer-attempt:answer")).toMatchObject({ response: { requestId: approval ? "perm_1" : "q_1" } });
+    expect(h.backend.prompts).toHaveLength(1);
+    if (outcome === "success") {
+      agentSends(h, "delayed", "Answer delivered"); h.store.outboxState("send:delayed", "sent");
+      result.resolve(true); await changed.promise;
+      await h.router.tick();
+      expect(h.store.get<string[]>("reply-covered:send:delayed")).not.toContain("answer");
+      expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+      agentSends(h, "confirmed", "Confirmed answer"); h.store.outboxState("send:confirmed", "sent");
+      expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+    } else {
+      result.reject(new ControlError(503, "unavailable", { reason: outcome, retrySafe: true })); await changed.promise;
+      await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+      expect(calls).toBe(2);
+      expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+    }
+    expect(h.backend.prompts).toHaveLength(1);
+  } finally { timer.mockRestore(); storeSet.mockRestore(); }
+});
+
+test.each(["question", "permission", "legacy-question", "legacy-permission"])("a late %s ACK cannot revive an answer reset during its snapshot", async kind => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: Date.now(), updated: Date.now() } }];
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission("perm_1", "ses_child")]; else h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await h.router.tick(); deliver(h.store);
+  const entered = Promise.withResolvers<void>(), result = Promise.withResolvers<boolean>();
+  const snapshot = Promise.withResolvers<void>(), release = Promise.withResolvers<MessageRecord[]>();
+  const timed = Promise.withResolvers<() => void>(), finished = Promise.withResolvers<void>();
+  const respond = async () => { entered.resolve(); return result.promise; };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const originalTimer = globalThis.setTimeout;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((handler: TimerHandler, ms?: number, ...args: unknown[]) => {
+    if (ms === SEND_WAIT_MS && typeof handler === "function") timed.resolve(() => handler(...args));
+    return originalTimer(handler, ms, ...args);
+  }) as typeof globalThis.setTimeout);
+  const flights = (h.router as unknown as { responsesInFlight: Set<string> }).responsesInFlight;
+  const remove = flights.delete.bind(flights);
+  const settlement = spyOn(flights, "delete").mockImplementation(id => { const removed = remove(id); finished.resolve(); return removed; });
+  try {
+    const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+    h.input("answer", text); const ticking = h.router.tick();
+    await entered.promise; (await timed.promise)(); await ticking;
+    h.backend.messagesBehavior = async () => { h.backend.messagesBehavior = undefined; snapshot.resolve(); return release.promise; };
+    result.resolve(true); await snapshot.promise;
+    h.backend.questionRequests = []; h.backend.permissionRequests = [];
+    h.input("reset", "/new"); await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("cancelled");
+    release.resolve([]); await finished.promise;
+    await h.router.tick();
+    expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("cancelled");
+    expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me"]);
+    expect(h.store.get("human-response-before:answer")).toBeUndefined();
+  } finally { release.resolve([]); timer.mockRestore(); settlement.mockRestore(); }
+});
+
+test.each(["pending-notice", "unsupported"].flatMap(form => ["question", "permission"].map(kind => ({ form, kind }))))("pre-upgrade $kind watcher releases plain text with $form", async ({ form, kind }) => {
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("wake:root", wakeBody()); await h.router.tick();
+  if (kind === "permission") h.backend.permissionRequests = [permission()];
+  else h.backend.questionRequests = [{ ...question(), ...(form === "unsupported" ? { unsupported: true } : {}) }];
+  await h.router.tick();
+  h.backend.final("NO_REPLY"); await h.router.tick();
+  const turn = h.store.get<Record<string, unknown>>("activeTurn")!;
+  expect(turn).toMatchObject({ background: true, origin: "request" });
+  delete turn.leaderId; delete turn.inboundId; h.store.set("activeTurn", turn);
+  const entries = h.store.get<Record<string, unknown>[]>("pendingApprovals")!;
+  for (const entry of entries) { delete entry.leaderId; if (form === "unsupported") entry.unsupported = true; }
+  h.store.set("pendingApprovals", entries);
+  h.store.db.query("DELETE FROM kv WHERE key GLOB 'route-leader:*' OR key GLOB 'request-leader:*' OR key GLOB 'child-leader:*' OR key GLOB 'leader-history:*'").run();
+  const router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  h.input("human", "Help with something else"); await router.tick(); await router.tick();
+  expect(h.backend.questionReplies).toEqual([]); expect(h.backend.permissionReplies).toEqual([]);
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), "Help with something else"]);
+});
+
+test.each(["refused", "disappeared"].flatMap(outcome => [false, true].map(restart => ({ outcome, restart }))))("multi-question recovery preserves every answer after $outcome (restart=$restart)", async ({ outcome, restart }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const multiple = question(); multiple.questions.push({ key: "q1", question: "Anything else?", header: "Else", options: [] });
+  h.backend.questionRequests = [multiple]; await h.router.tick(); deliver(h.store);
+  h.input("step-1", "B"); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "step-1")?.state).toBe("batched");
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  if (outcome === "refused") {
+    deliver(h.store);
+    h.backend.questionReplyBehavior = async () => { h.backend.questionRequests = []; throw new ControlError(409, "request_resolved", { reason: "request_resolved", retrySafe: false }); };
+    h.input("step-2", "Also bring snacks"); await router.tick();
+    expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [["B"], ["Also bring snacks"]]]]);
+  } else h.backend.questionRequests = [];
+  h.backend.final("NO_REPLY"); await router.tick(); await router.tick(); await router.tick();
+  const fallback = h.backend.prompts.at(-1)!;
+  expect(fallback.text).toContain("Which?\nB");
+  if (outcome === "refused") expect(fallback.text).toContain("Anything else?\nAlso bring snacks");
+  expect(inbounds(h.store).filter(row => row.id.startsWith("step-")).map(row => row.state)).toEqual(outcome === "refused" ? ["admitted", "admitted"] : ["admitted"]);
+  h.backend.final("Answers handled"); await router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).filter(row => row.id.startsWith("step-")).every(row => row.state === "done")).toBe(true);
+});
+
+test.each(["failed", "interrupted"].flatMap(outcome => [false, true].map(restart => ({ outcome, restart }))))("partial form answer recovers after $outcome (restart=$restart)", async ({ outcome, restart }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const multiple = question(); multiple.questions.push({ key: "q1", question: "Anything else?", header: "Else", options: [] });
+  h.backend.questionRequests = [multiple]; await h.router.tick(); deliver(h.store);
+  h.input("partial", "B"); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "partial")?.state).toBe("batched");
+  if (outcome === "failed") h.backend.failed(); else { h.backend.step("NO_REPLY"); h.backend.settle("interrupted"); }
+  await h.router.tick();
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  await router.tick(); await router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toContain("Which?\nB");
+  expect(inbounds(h.store).find(row => row.id === "partial")?.state).toBe("admitted");
+  h.backend.questionRequests = []; h.backend.final("B handled"); await router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "partial")?.state).toBe("done");
+});
+
+test.each(["success", "refused"].flatMap(outcome => [false, true].map(restart => ({ outcome, restart }))))("legacy form completion settles collected answers after $outcome (restart=$restart)", async ({ outcome, restart }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const multiple = question(); multiple.questions.push({ key: "q1", question: "Anything else?", header: "Else", options: [] });
+  h.backend.questionRequests = [multiple]; await h.router.tick(); deliver(h.store);
+  h.input("partial", "B"); await h.router.tick(); deliver(h.store);
+  h.backend.questionReplyBehavior = async () => {
+    h.backend.questionRequests = [];
+    if (outcome === "refused") throw new ControlError(409, "refused");
+    return true;
+  };
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  h.input("command", '/answer q_1 [["B"],["Also bring snacks"]]'); await router.tick();
+  expect(h.backend.questionReplies).toEqual([["q_1", "/Chats/ses_1", [["B"], ["Also bring snacks"]]]]);
+  if (outcome === "refused") {
+    h.backend.final("NO_REPLY"); await router.tick(); await router.tick();
+    expect(h.backend.prompts.at(-1)!.text).toContain("Which?\nB");
+    expect(h.backend.prompts.at(-1)!.text).toContain("Anything else?\nAlso bring snacks");
+  }
+  h.backend.final("All answers handled"); await router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).filter(row => ["partial", "command"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["photon", "sendblue"].flatMap(apiKind => [false, true].map(failed => ({ replyMode, apiKind, failed })))))("explicit $apiKind reaction settles admitted input ($replyMode, failed=$failed)", async ({ replyMode, apiKind, failed }) => {
+  const h = setup(":memory:", { replyMode }); steering(h.backend);
+  h.input("root", "Original"); await h.router.tick();
+  h.input("followup", "Thanks"); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe("admitted");
+  const react = async () => { if (failed) throw new Error("Reaction failed"); };
+  let api = createApi({ store: h.store, photon: { react }, router: () => h.router, chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  if (apiKind === "sendblue") {
+    const stateRoot = mkdtempSync(join(tmpdir(), "reaction-recovery-")); directories.push(stateRoot);
+    const registry = new ChatRegistry({ owner: options.owner, ownerStore: h.store, stateRoot, line: { react },
+      access: () => ({ people: [], groups: [] }), build: () => ({ api }) });
+    registry.restore();
+    api = createSbApi({ registry, line: { react } as unknown as Parameters<typeof createSbApi>[0]["line"], accessPath: join(stateRoot, "access.json"), enabled: () => true, health: () => ({}) });
+  }
+  const response = await api(new Request("http://bridge/react", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ target: "followup", kind: "love" }) }));
+  expect(response.status).toBe(failed ? apiKind === "sendblue" ? 500 : 409 : 200);
+  h.backend.final("NO_REPLY"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(failed ? ["Original", "Thanks"] : ["Original"]);
+  expect(inbounds(h.store).find(row => row.id === "followup")?.state).toBe(failed ? "admitted" : "done");
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["photon", "sendblue"].flatMap(apiKind => [false, true].map(restart => ({ replyMode, apiKind, restart })))))("an in-flight $apiKind reaction cannot answer a later admitted steer ($replyMode, restart=$restart)", async ({ replyMode, apiKind, restart }) => {
+  const start = Date.parse("2026-11-17T17:00:00Z"); setSystemTime(start);
+  const h = setup(":memory:", { replyMode }); steering(h.backend);
+  const logs = await captureLogs(async () => {
+    h.input("react-root", "Thanks", { source: "typed" }); await h.router.tick();
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const react = async () => { entered.resolve(); await release.promise; };
+    let api = createApi({ store: h.store, photon: { react }, router: () => h.router, chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+    if (apiKind === "sendblue") {
+      const stateRoot = mkdtempSync(join(tmpdir(), "reaction-race-")); directories.push(stateRoot);
+      const registry = new ChatRegistry({ owner: options.owner, ownerStore: h.store, stateRoot, line: { react },
+        access: () => ({ people: [], groups: [] }), build: () => ({ api }) });
+      registry.restore();
+      api = createSbApi({ registry, line: { react } as unknown as Parameters<typeof createSbApi>[0]["line"], accessPath: join(stateRoot, "access.json"), enabled: () => true, health: () => ({}) });
+    }
+    const reacting = api(new Request("http://bridge/react", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ target: "react-root", kind: "love" }) }));
+    await entered.promise;
+    try {
+      h.input("react-later", "Please run my next task", { source: "typed" });
+      h.input("react-member", "And this detail", { source: "typed" }); await h.router.tick();
+      expect(h.store.get<{ covered: string[] }>("activeTurn")!.covered).toContain("react-later");
+      expect(inbounds(h.store).filter(row => row.id !== "react-root").map(row => row.state)).toEqual(["admitted", "admitted"]);
+    } finally { release.resolve(); }
+    expect((await reacting).status).toBe(200);
+    const answeredAt = (id: string) => (inbounds(h.store).find(row => row.id === id)!.payload as { answeredAt?: number }).answeredAt;
+    expect(answeredAt("react-root")).toBeNumber();
+    for (const id of ["react-later", "react-member"]) expect(answeredAt(id)).toBeUndefined();
+    const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+    h.backend.final("NO_REPLY"); await router.tick(); await router.tick();
+    expect(h.backend.prompts.map(call => call.text)).toEqual(["Thanks", "Please run my next task\nAnd this detail"]);
+    expect(h.store.get<number>("human-retries:react-later")).toBe(1);
+    setSystemTime(start + 11 * 60_000); await router.checkUnanswered(); await router.tick();
+    expect(h.backend.prompts).toHaveLength(2);
+    for (const id of ["react-later", "react-member"]) expect(answeredAt(id)).toBeUndefined();
+    if (replyMode === "tool") agentSends(h, "react-own", "Next task handled");
+    h.backend.final("Next task handled"); await router.tick();
+    for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+    expect(inbounds(h.store).filter(row => row.id !== "react-root").map(row => row.state)).toEqual(["done", "done"]);
+  });
+  expect(logs.filter(line => line.name === "inbound.requeued" && line.ids?.inboundId === "react-later")).toHaveLength(1);
+  expect(logs.filter(line => line.name === "inbound.unanswered")).toEqual([]);
+});
+
+test.each(["failed", "interrupted"].flatMap(outcome => [false, true].map(restart => ({ outcome, restart }))))("a reaction to the latest partial cannot discard earlier answers after $outcome (restart=$restart)", async ({ outcome, restart }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const multiple = question();
+  multiple.questions.push({ key: "q1", question: "Anything else?", header: "Else", options: [] }, { key: "q2", question: "When?", header: "When", options: [] });
+  h.backend.questionRequests = [multiple]; await h.router.tick(); deliver(h.store);
+  h.input("partial-1", "B"); await h.router.tick(); deliver(h.store);
+  h.input("partial-2", "Bring snacks"); await h.router.tick();
+  const api = createApi({ store: h.store, photon: { react: async () => {} }, router: () => h.router, chatGuid: () => options.chatGuid, enabled: () => true, health: () => ({}) });
+  expect((await api(new Request("http://bridge/react", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ target: "partial-2", kind: "like" }) }))).status).toBe(200);
+  if (outcome === "failed") h.backend.failed(); else { h.backend.step("NO_REPLY"); h.backend.settle("interrupted"); }
+  await h.router.tick();
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  await router.tick(); await router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toContain("Which?\nB");
+  expect(inbounds(h.store).find(row => row.id === "partial-1")?.state).toBe("admitted");
+  h.backend.questionRequests = []; h.backend.final("All handled"); await router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).filter(row => row.id.startsWith("partial-")).map(row => row.state)).toEqual(["done", "done"]);
+});
+
+test.each(["final", "tool"] as const)("reset cancels admitted steer members across restart (%s)", async replyMode => {
+  const h = setup(":memory:", { replyMode }); steering(h.backend);
+  h.input("root", "Original"); await h.router.tick();
+  h.input("second", "New question"); h.input("third", "More detail"); await h.router.tick();
+  expect(inbounds(h.store).filter(row => ["second", "third"].includes(row.id)).map(row => row.state)).toEqual(["admitted", "admitted"]);
+  h.input("reset", "/new"); await h.router.tick();
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(inbounds(h.store).filter(row => ["second", "third"].includes(row.id)).map(row => row.state)).toEqual(["cancelled", "cancelled"]);
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Original"]);
+});
+
+test.each(["failed", "interrupted"].flatMap(outcome => ["question", "permission"].flatMap(kind => [0, 503].map(status => ({ outcome, kind, status })))))("unresolved child $kind response survives parent $outcome and restart (status=$status)", async ({ outcome, kind, status }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: 0, updated: 0 } }];
+  const approval = kind === "permission";
+  if (approval) h.backend.permissionRequests = [permission("perm_1", "ses_child")];
+  else h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await h.router.tick(); deliver(h.store);
+  let readable = false;
+  Object.assign(h.backend, { responseResolved: async () => { if (!readable) throw new Error("read unavailable"); return true; } });
+  const respond = async () => {
+    h.backend.questionRequests = []; h.backend.permissionRequests = [];
+    throw new ControlError(status, "unavailable", status === 503 ? { reason: "reader_unavailable", retrySafe: false } : undefined);
+  };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const text = approval ? "yes" : "B";
+  h.input("answer", text); await h.router.tick();
+  const operation = h.store.get<object>("steer-attempt:answer");
+  expect(operation).toMatchObject({ response: { sessionId: "ses_child", directory: "/Chats/child", operation: { answers: approval ? [] : [["B"]] } } });
+  if (outcome === "failed") h.backend.failed(); else { h.backend.step("NO_REPLY"); h.backend.settle("interrupted"); }
+  await h.router.tick();
+  const router = new Router(h.store, h.backend, h.transport, h.routerOptions); await router.tick();
+  expect(h.store.get<object>("steer-attempt:answer")).toEqual(operation);
+  expect(h.store.get("human-retry-prompt:answer")).toBeUndefined();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me"]);
+  expect(h.backend.questionReplies.length + h.backend.permissionReplies.length).toBe(1);
+  readable = true; await router.tick(); await router.tick();
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me", text]);
+  expect(h.backend.questionReplies.length + h.backend.permissionReplies.length).toBe(1);
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => [false, true].map(restart => ({ replyMode, restart }))))("releasing mixed watcher recovers its admitted answer ($replyMode, restart=$restart)", async ({ replyMode, restart }) => {
+  const h = setup(":memory:", { replyMode, watchMs: 0 });
+  const start = Date.now(); setSystemTime(start);
+  h.input("wake:root", wakeBody()); await h.router.tick(); h.backend.final("NO_REPLY"); await h.router.tick();
+  setSystemTime(start + 2_000); h.input("human", "Ask me"); await h.router.tick(); await h.router.tick();
+  h.backend.states.ses_human = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_human", directory: "/Chats/human", parentID: "ses_1", time: { created: start + 2_500, updated: start + 2_500 } }];
+  h.backend.questionRequests = [{ ...question({}, "q_human"), sessionID: "ses_human" }];
+  await h.router.tick(); deliver(h.store);
+  if (replyMode === "tool") agentSends(h, "root-answer", "Original handled");
+  h.backend.final("Original handled"); await h.router.tick();
+  expect(h.store.get("activeTurn")).toMatchObject({ origin: "request", leaderId: "human" });
+  h.input("answer", "B"); await h.router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("admitted");
+  h.backend.states.ses_wake = { type: "busy" };
+  h.backend.childSessions.push({ id: "ses_wake", directory: "/Chats/wake", parentID: "ses_1", time: { created: start + 500, updated: start + 4_000 } });
+  h.backend.questionRequests = [{ ...question({}, "q_wake"), sessionID: "ses_wake" }];
+  await h.router.tick(); deliver(h.store);
+  expect(h.store.get<{ leaderId: string }[]>("pendingApprovals")?.some(entry => entry.leaderId === "wake:root")).toBe(true);
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  h.input("next", "Next work"); await router.tick(); await router.tick(); await router.tick();
+  expect(h.backend.questionReplies).toEqual([["q_human", "/Chats/human", [["B"]]]]);
+  expect(h.backend.prompts.at(-1)!.text).toBe("B");
+  h.backend.questionRequests = []; h.backend.states = {};
+  if (replyMode === "tool") agentSends(h, "own-answer", "B handled");
+  h.backend.final("B handled"); await router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  await router.tick(); await router.tick();
+  expect(h.backend.prompts.at(-1)!.text).toBe("Next work");
+  if (replyMode === "tool") agentSends(h, "next-answer", "Next handled");
+  h.backend.final("Next handled"); await router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).filter(row => ["answer", "next"].includes(row.id)).map(row => row.state)).toEqual(["done", "done"]);
+});
+
+test.each([false, true].flatMap(restart => ["wake:next", "human-next"].map(nextId => ({ restart, nextId }))))("completion pagination reaches the old watermark before $nextId (restart=$restart)", async ({ restart, nextId }) => {
+  const start = Date.now(); setSystemTime(start);
+  const h = setup(":memory:", { watchMs: 0 });
+  h.input("root", "Ask a delegate"); await h.router.tick();
+  h.backend.final("Working on it"); await h.router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  const watermark = h.store.get<{ id: string }>("watermark")!.id;
+  h.backend.promptBehavior = async call => {
+    setSystemTime(start + 500);
+    const boundary = h.backend.records.length;
+    nativeNoticeReply(h, "opencode", "completed", "Delegate result");
+    h.backend.records.splice(boundary + 1, 0, ...Array.from({ length: 120 }, (_, index): MessageRecord => ({
+      id: `delegate-progress-${index}`, type: "assistant", answer: false,
+      content: [{ type: "text", text: "Progress" }], finish: "stop", time: { created: start + 500, completed: start + 500 },
+    })));
+    setSystemTime(start + 1_000); h.backend.accept(call);
+  };
+  setSystemTime(start + 1_000);
+  h.input(nextId, nextId.startsWith("wake:") ? wakeBody() : "New human work"); await h.router.tick();
+  delete h.backend.promptBehavior;
+  setSystemTime(start + 1_100); h.backend.final(nextId.startsWith("wake:") ? "NO_REPLY" : "New work handled");
+  const pages: string[][] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+    const url = new URL(request.url);
+    const offset = Number(url.searchParams.get("cursor") ?? 0), limit = Number(url.searchParams.get("limit"));
+    const newest = [...h.backend.records].reverse(), data = newest.slice(offset, offset + limit);
+    pages.push(data.map(record => record.id));
+    return Response.json({ data, cursor: offset + limit < newest.length ? { next: String(offset + limit) } : {} });
+  } });
+  const pager = new OpenChamber(server.url.origin);
+  Object.assign(h.backend, { messages: pager.messages.bind(pager) });
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  try {
+    await router.tick(); await router.tick();
+    expect(pages.length).toBeGreaterThan(1);
+    expect(pages.flat()).toContain(watermark);
+    expect(h.conversations().map(op => op.text)).toEqual(nextId.startsWith("wake:") ? ["Delegate result"] : ["Delegate result", "New work handled"]);
+    for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+    await router.tick(); expect(h.conversations()).toEqual([]);
+  } finally { await server.stop(true); }
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["question", "permission", "legacy-question", "legacy-permission"].flatMap(kind => [false, true].flatMap(restart => [false, true].flatMap(replacement => [false, true].map(discovered => ({ replyMode, kind, restart, replacement, discovered })))))))("wake child retains ownership after in-place reset refusal ($replyMode, $kind, restart=$restart, replacement=$replacement, discovered=$discovered)", async ({ replyMode, kind, restart, replacement, discovered }) => {
+  const start = Date.now(); setSystemTime(start);
+  const h = setup(":memory:", { replyMode, watchMs: 0 }); h.backend.resets = true;
+  h.input("wake:root", wakeBody()); await h.router.tick();
+  setSystemTime(start + 100);
+  h.backend.states.ses_child = { type: "busy" };
+  const child = { id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: Date.now(), updated: Date.now() } };
+  if (discovered) h.backend.childSessions = [child];
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission("perm_1", "ses_child")];
+  else h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await h.router.tick(); deliver(h.store);
+  h.backend.final("NO_REPLY"); await h.router.tick();
+  setSystemTime(start + 200);
+  h.input("reset", "/new"); await h.router.tick(); await h.router.tick();
+  expect(h.backend.creates).toHaveLength(1);
+  expect(h.store.get<{ generation: number }>("route")!.generation).toBe(2);
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  h.backend.childSessions = [child];
+  if (replyMode === "tool") agentSends(h, "reset-refused", "Can't reset while background work is waiting", 2);
+  h.backend.final("Can't reset while background work is waiting"); await router.tick(); deliver(h.store);
+  if (replacement) {
+    if (approval) h.backend.permissionRequests = [permission("perm_2", "ses_child")];
+    else h.backend.questionRequests = [{ ...question({}, "q_2"), sessionID: "ses_child" }];
+    await router.tick(); deliver(h.store);
+  }
+  const requestId = approval ? replacement ? "perm_2" : "perm_1" : replacement ? "q_2" : "q_1";
+  const text = kind === "legacy-permission" ? `/approve ${requestId} once` : kind === "legacy-question" ? `/answer ${requestId} [["B"]]` : approval ? "yes" : "B";
+  h.input("human", text); await router.tick(); await router.tick();
+  expect(h.backend.questionReplies).toEqual([]); expect(h.backend.permissionReplies).toEqual([]);
+  expect(h.backend.prompts.map(call => call.text)).toEqual([wakeBody(), newChatNudge(replyMode), text]);
+  if (replyMode === "tool") agentSends(h, "own-human", "Human handled", 2);
+  h.backend.final("Human handled"); await router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  expect(inbounds(h.store).find(row => row.id === "human")?.state).toBe("done");
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => [false, true].map(inPlace => ({ replyMode, inPlace }))))("reset preserves delivered form members ($replyMode, inPlace=$inPlace)", async ({ replyMode, inPlace }) => {
+  const h = setup(":memory:", { replyMode }); h.backend.resets = inPlace;
+  h.input("root", "Ask me"); await h.router.tick();
+  const multiple = question(); multiple.questions.push({ key: "q1", question: "Anything else?", header: "Else", options: [] });
+  h.backend.questionRequests = [multiple]; await h.router.tick(); deliver(h.store);
+  h.input("first-answer", "B"); await h.router.tick(); deliver(h.store);
+  h.input("second-answer", "Bring snacks"); await h.router.tick();
+  expect(inbounds(h.store).filter(row => row.id.endsWith("-answer")).map(row => row.state)).toEqual(["admitted", "admitted"]);
+  agentSends(h, "form-reply", "Got both answers"); h.store.outboxState("send:form-reply", "sent");
+  expect(inbounds(h.store).filter(row => row.id.endsWith("-answer")).map(row => row.state)).toEqual(["done", "done"]);
+  h.input("reset", "/new"); await h.router.tick();
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(inbounds(h.store).filter(row => row.id.endsWith("-answer")).map(row => row.state)).toEqual(["done", "done"]);
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => [false, true].map(inPlace => ({ replyMode, inPlace }))))("reset preserves a delivered form fallback leader ($replyMode, inPlace=$inPlace)", async ({ replyMode, inPlace }) => {
+  const h = setup(":memory:", { replyMode }); h.backend.resets = inPlace;
+  h.input("root", "Ask me"); await h.router.tick();
+  const multiple = question(); multiple.questions.push({ key: "q1", question: "Anything else?", header: "Else", options: [] });
+  h.backend.questionRequests = [multiple]; await h.router.tick(); deliver(h.store);
+  h.input("first-answer", "B"); await h.router.tick(); deliver(h.store);
+  h.backend.questionReplyBehavior = async () => { h.backend.questionRequests = []; throw new ControlError(409, "refused"); };
+  h.input("second-answer", "Bring snacks"); await h.router.tick();
+  h.backend.final("NO_REPLY"); await h.router.tick(); await h.router.tick();
+  expect(h.store.get<{ inboundId: string }>("activeTurn")!.inboundId).toBe("second-answer");
+  expect(h.backend.prompts.at(-1)!.text).toContain("Which?\nB");
+  expect(h.backend.prompts.at(-1)!.text).toContain("Anything else?\nBring snacks");
+  agentSends(h, "form-reply", "Got both answers"); h.store.outboxState("send:form-reply", "sent");
+  expect(inbounds(h.store).filter(row => row.id.endsWith("-answer")).map(row => row.state)).toEqual(["done", "done"]);
+  h.input("reset", "/new"); await h.router.tick();
+  await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+  expect(inbounds(h.store).filter(row => row.id.endsWith("-answer")).map(row => row.state)).toEqual(["done", "done"]);
+});
+
+test.each(["question", "permission", "legacy-question", "legacy-permission"].flatMap(kind => [false, true].map(restart => ({ kind, restart }))))("a fast root $kind continuation before response ACK settles once (restart=$restart)", async ({ kind, restart }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission()]; else h.backend.questionRequests = [question()];
+  await h.router.tick(); deliver(h.store);
+  const respond = async () => {
+    h.backend.questionRequests = []; h.backend.permissionRequests = [];
+    h.backend.final("Answer handled");
+    return true;
+  };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  h.input("answer", text); await h.router.tick();
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  await router.tick();
+  const replies = h.conversations(); expect(replies.map(op => op.text)).toEqual(["Answer handled"]);
+  expect(h.store.get<string[]>(`reply-covered:${replies[0]!.id}`)).toContain("answer");
+  for (const op of replies) h.store.outboxState(op.id, "sent");
+  await router.tick();
+  expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+  expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me"]);
+  expect(h.backend.questionReplies.length + h.backend.permissionReplies.length).toBe(1);
+});
+
+test.each((["final", "tool"] as const).flatMap(replyMode => ["question", "permission"].flatMap(kind => [false, true].map(restart => ({ replyMode, kind, restart })))))("late older steer admission retains newer wake child ownership ($replyMode, $kind, restart=$restart)", async ({ replyMode, kind, restart }) => {
+  const start = Date.now(); setSystemTime(start);
+  const h = setup(":memory:", { replyMode, watchMs: 0 });
+  h.input("root", "Original work"); await h.router.tick();
+  const route = h.store.get<{ id: string; directory: string; generation: number }>("route")!;
+  if (replyMode === "tool") agentSends(h, "original-reply", "Original handled");
+  h.backend.final("Original handled"); await h.router.tick();
+  setSystemTime(start + 200);
+  h.input("wake:later", wakeBody()); await h.router.tick();
+  h.backend.final("NO_REPLY"); await h.router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  // Restore an older uncertain steer whose admission only became readable after the wake settled.
+  h.input("late", "Earlier follow up"); h.store.updateInbound("late", "processing");
+  h.store.set("batch-phase:late", "steering");
+  h.store.set("steer-attempt:late", { ...route, inboundId: "root", startedAt: start + 100, outbox: 0 });
+  h.backend.records.push({ id: messageId("late"), type: "user", text: "Earlier follow up", time: { created: start + 100 } });
+  setSystemTime(start + 400); await h.router.tick();
+  expect(h.store.get<{ inboundId: string }>("activeTurn")!.inboundId).toBe("late");
+  const history = h.store.get<{ id: string; at: number }[]>("leader-history:ses_1")!;
+  expect(history.map(entry => entry.id)).toEqual(["root", "late", "wake:later"]);
+  if (replyMode === "tool") agentSends(h, "late-reply", "Earlier handled");
+  h.backend.final("Earlier handled"); await h.router.tick();
+  for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+  const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+  h.backend.states.ses_child = { type: "busy" };
+  h.backend.childSessions = [{ id: "ses_child", directory: "/Chats/child", parentID: "ses_1", time: { created: start + 300, updated: start + 400 } }];
+  if (kind === "permission") h.backend.permissionRequests = [permission("perm_1", "ses_child")];
+  else h.backend.questionRequests = [{ ...question(), sessionID: "ses_child" }];
+  await router.tick(); deliver(h.store);
+  h.input("human", kind === "permission" ? "yes" : "B"); await router.tick(); await router.tick();
+  expect(h.backend.questionReplies).toEqual([]); expect(h.backend.permissionReplies).toEqual([]);
+  expect(h.store.get<string>("child-leader:ses_1:ses_child")).toBe("wake:later");
+  expect(h.backend.prompts.at(-1)!.text).toBe(kind === "permission" ? "yes" : "B");
+});
+
+test.each(["timed-out", "failed"].flatMap(read => ["question", "permission", "legacy-question", "legacy-permission"].flatMap(kind => [false, true].map(restart => ({ read, kind, restart })))))("a $read root $kind preflight waits for a readable boundary (restart=$restart)", async ({ read, kind, restart }) => {
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission()]; else h.backend.questionRequests = [question()];
+  await h.router.tick(); deliver(h.store);
+  const snapshot = Promise.withResolvers<void>(), timeout = Promise.withResolvers<() => void>();
+  const localTimeout = Promise.withResolvers<() => void>(), finished = Promise.withResolvers<void>();
+  const never = Promise.withResolvers<MessageRecord[]>();
+  let readable = false, snapshotEntered = false;
+  h.backend.messagesBehavior = async options => {
+    if (readable || options?.limit !== 200) return h.backend.records;
+    snapshotEntered = true;
+    snapshot.resolve();
+    if (read === "failed") throw new Error("Read unavailable");
+    return never.promise;
+  };
+  const originalTimer = globalThis.setTimeout;
+  const timer = spyOn(globalThis, "setTimeout").mockImplementation(((handler: TimerHandler, ms?: number, ...args: unknown[]) => {
+    if (snapshotEntered && typeof handler === "function") {
+      if (ms === READ_WAIT_MS) timeout.resolve(() => handler(...args));
+      if (ms === SEND_WAIT_MS) localTimeout.resolve(() => handler(...args));
+    }
+    return originalTimer(handler, ms, ...args);
+  }) as typeof globalThis.setTimeout);
+  const flights = (h.router as unknown as { responsesInFlight: Set<string> }).responsesInFlight;
+  const remove = flights.delete.bind(flights);
+  const settlement = spyOn(flights, "delete").mockImplementation(id => { const removed = remove(id); finished.resolve(); return removed; });
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  try {
+    h.input("answer", text); const ticking = h.router.tick();
+    await snapshot.promise;
+    if (read === "timed-out") (await localTimeout.promise)();
+    await ticking;
+    if (read === "timed-out") { (await timeout.promise)(); await finished.promise; }
+    expect(h.backend.questionReplies.length + h.backend.permissionReplies.length).toBe(0);
+    expect(h.store.get("steer-attempt:answer")).toMatchObject({ response: { preflight: true, sessionId: "ses_1" } });
+    readable = true; never.resolve(h.backend.records); timer.mockRestore();
+    let unavailable = true;
+    const respond = async () => {
+      if (unavailable) throw new ControlError(503, "Unavailable", { reason: "send_timeout", retrySafe: true });
+      h.backend.questionRequests = []; h.backend.permissionRequests = [];
+      h.backend.final("Answer handled"); return true;
+    };
+    if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+    const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+    await router.tick();
+    expect(h.store.get("steer-attempt:answer")).toMatchObject({ response: { retry: { before: [] } } });
+    const refused = h.backend.questionReplies.length + h.backend.permissionReplies.length;
+    expect(refused).toBeGreaterThan(0);
+    unavailable = false;
+    await new Router(h.store, h.backend, h.transport, h.routerOptions).tick();
+    await router.tick();
+    const replies = h.conversations(); expect(replies.map(op => op.text)).toEqual(["Answer handled"]);
+    for (const op of replies) h.store.outboxState(op.id, "sent");
+    await router.tick();
+    expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+    expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me"]);
+    expect(h.backend.questionReplies.length + h.backend.permissionReplies.length).toBe(refused + 1);
+    const calls = approval ? h.backend.permissionReplies : h.backend.questionReplies;
+    expect(calls.every(call => JSON.stringify(call) === JSON.stringify(calls[0]))).toBe(true);
+  } finally { timer.mockRestore(); settlement.mockRestore(); never.resolve([]); }
+});
+
+test.each(["question", "permission", "legacy-question", "legacy-permission"].flatMap(kind => [false, true].map(restart => ({ kind, restart }))))("a healthy slow root $kind preflight consumes its eventual snapshot (restart=$restart)", async ({ kind, restart }) => {
+  const start = Date.now(); setSystemTime(start);
+  const h = setup(); h.input("root", "Ask me"); await h.router.tick();
+  const approval = kind.endsWith("permission");
+  if (approval) h.backend.permissionRequests = [permission()]; else h.backend.questionRequests = [question()];
+  await h.router.tick(); deliver(h.store);
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<MessageRecord[]>();
+  const timer = spyOn(globalThis, "setTimeout");
+  let slowReads = 0;
+  h.backend.messagesBehavior = async options => {
+    if (options?.limit !== 200) return h.backend.records;
+    slowReads++; entered.resolve(); return release.promise;
+  };
+  let unavailable = true;
+  const respond = async () => {
+    if (unavailable) throw new ControlError(503, "Unavailable", { reason: "startup_unavailable", retrySafe: true });
+    h.backend.questionRequests = []; h.backend.permissionRequests = [];
+    h.backend.final("Answer handled"); return true;
+  };
+  if (approval) h.backend.permissionReplyBehavior = respond; else h.backend.questionReplyBehavior = respond;
+  const text = kind === "legacy-permission" ? "/approve perm_1 once" : kind === "legacy-question" ? '/answer q_1 [["B"]]' : approval ? "yes" : "B";
+  try {
+    h.input("answer", text); const ticking = h.router.tick(); await entered.promise;
+    // Exercise the old 100 ms cutoff without waiting on wall-clock timers.
+    setSystemTime(start + 200);
+    for (const [handler, ms, ...args] of timer.mock.calls) if (ms === 100 && typeof handler === "function") handler(...args);
+    expect(h.backend.questionReplies.length + h.backend.permissionReplies.length).toBe(0);
+    release.resolve(h.backend.records); await ticking;
+    expect(slowReads).toBe(1);
+    expect(h.store.get("steer-attempt:answer")).toMatchObject({ response: { retry: { before: [] } } });
+    const refused = h.backend.questionReplies.length + h.backend.permissionReplies.length;
+    expect(refused).toBeGreaterThan(0);
+    unavailable = false;
+    const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+    await router.tick(); await router.tick();
+    for (const op of h.conversations()) h.store.outboxState(op.id, "sent");
+    await router.tick();
+    expect(inbounds(h.store).find(row => row.id === "answer")?.state).toBe("done");
+    expect(h.backend.prompts.map(call => call.text)).toEqual(["Ask me"]);
+    expect(h.backend.questionReplies.length + h.backend.permissionReplies.length).toBe(refused + 1);
+    const calls = approval ? h.backend.permissionReplies : h.backend.questionReplies;
+    expect(calls.every(call => JSON.stringify(call) === JSON.stringify(calls[0]))).toBe(true);
+    expect(slowReads).toBe(1);
+  } finally { timer.mockRestore(); release.resolve([]); }
 });
 
 test("unanswered watchdog recovers the 16 Nov accepted human row after a wake ends NO_REPLY", async () => {
@@ -10494,7 +12179,7 @@ test("unanswered Telegram failures retry three times across ticks and persist ac
   expect(calls).toBe(3);
 });
 
-test("unanswered watchdog requeues one sealed human batch and excludes every member of an outage notice", async () => {
+test("unanswered watchdog requeues one sealed human batch even when an outage notice was sent", async () => {
   const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
   const h = setup();
   for (const id of ["first", "second"]) h.input(id, id, { source: "typed" });
@@ -10508,12 +12193,18 @@ test("unanswered watchdog requeues one sealed human batch and excludes every mem
   for (const op of h.store.pendingOutbox()) h.store.outboxState(op.id, "sent");
   expect(inbounds(h.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt !== undefined)).toBe(true);
 
-  const other = setup();
+  const alerts: string[][] = [];
+  const other = setup(":memory:", { notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
   for (const id of ["held", "held-member"]) other.input(id, id, { source: "typed" });
   await other.router.tick();
   other.store.enqueue({ id: "outage:notice", kind: "control", text: "Technical problem", replyTo: "held" });
-  setSystemTime(start + 11 * 60_000); await other.router.checkUnanswered();
-  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).unanswered === undefined)).toBe(true);
+  other.store.outboxState("outage:notice", "sent");
+  setSystemTime(start + 16 * 60_000);
+  const logs = await captureLogs(async () => { await other.router.checkUnanswered(); });
+  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).answeredAt === undefined)).toBe(true);
+  expect(logs.filter(row => row.name === "inbound.overdue").map(row => row.ids?.inboundId)).toEqual(["held", "held-member"]);
+  expect(alerts.map(args => args[2])).toEqual(["imessage-unanswered:held", "imessage-unanswered:held-member"]);
+  expect(inbounds(other.store).every(row => (row.payload as import("../src/unanswered.ts").AnsweredInput).unanswered?.overdueAt !== undefined)).toBe(true);
 });
 
 test("unanswered watchdog rechecks later candidates after an alert awaits while their reply sends", async () => {
@@ -10529,30 +12220,41 @@ test("unanswered watchdog rechecks later candidates after an alert awaits while 
   expect((inbounds(h.store)[1]!.payload as import("../src/unanswered.ts").AnsweredInput).unanswered).toBeUndefined();
 });
 
-test("unanswered watchdog heals a lost-response steer admitted into a silent wake without the wake absorption fix", async () => {
+test("unanswered watchdog heals a legacy lost-response steer admitted into a silent wake", async () => {
   const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
   const alerts: string[][] = [];
   const h = setup(":memory:", { replyMode: "tool", notifyUnanswered: async (...args) => { alerts.push(args); return true; } });
-  const steers = steering(h.backend, async call => {
-    h.backend.records.push({ id: call.messageId, type: "user", text: call.text, time: { created: Date.now() } });
-    throw new Error("respond failed after admission");
-  });
   h.input("wake:nov16", "Watcher event", { source: "composed" }); await h.router.tick();
-  h.input("nov16-owner", "PRIVATE_NOV16_WORDS", { source: "typed" }); await h.router.tick();
-  expect(steers).toHaveLength(1);
+  h.input("nov16-owner", "PRIVATE_NOV16_WORDS", { source: "typed" });
+  const accepted = messageId("nov16-owner");
+  // Recreate the old admitted-but-unanswered state; current routing prevents this steer.
+  h.backend.records.push({ id: accepted, type: "user", text: "PRIVATE_NOV16_WORDS", time: { created: start } });
+  h.store.updateInbound("nov16-owner", "done");
+  h.store.set("batch:nov16-owner", { id: "nov16-owner", text: "PRIVATE_NOV16_WORDS", attachments: [], isAudioMessage: false,
+    source: "typed", receivedAt: start, batchIds: ["nov16-owner"] } satisfies NormalizedInbound);
+  h.store.set("batch-phase:nov16-owner", "accepted"); h.store.set("inbound-delivered:nov16-owner", start);
+  const wake = h.store.get<Record<string, unknown>>("activeTurn")!;
+  const { covered: _covered, ...legacyWake } = wake;
+  h.store.set("activeTurn", { ...legacyWake, steered: [accepted], typed: true, replyInboundId: "nov16-owner" });
+  const router = new Router(h.store, h.backend, h.transport, h.routerOptions);
+  expect(h.backend.records.filter(record => record.id === accepted)).toHaveLength(1);
   expect(h.store.get<{ inboundId: string }>("activeTurn")?.inboundId).toBe("wake:nov16");
-  h.backend.step("NO_REPLY"); h.backend.settle(); await h.router.tick();
-  h.input("wake:later-nov16", "Later wake", { source: "composed" });
-  setSystemTime(start + 5 * 60_000);
-  const logs = await captureLogs(async () => { await h.router.checkUnanswered(); });
-  expect(logs.find(line => line.name === "inbound.requeued")?.props?.reason).toBe("watchdog_overdue");
-  await h.router.tick();
+  h.backend.step("NO_REPLY"); h.backend.settle();
+  const logs = await captureLogs(async () => {
+    await router.tick();
+    h.input("wake:later-nov16", "Later wake", { source: "composed" });
+    setSystemTime(start + 5 * 60_000); await router.checkUnanswered();
+  });
+  expect(logs.filter(line => line.name === "inbound.requeued")).toHaveLength(1);
+  expect(logs.find(line => line.name === "inbound.requeued")?.props?.reason).toBe("background_no_reply");
+  expect(logs.some(line => line.name === "inbound.unanswered")).toBe(false);
+  await router.tick();
   expect(h.backend.prompts.at(-1)?.text).toContain("PRIVATE_NOV16_WORDS");
-  expect(h.backend.prompts.at(-1)?.messageId).not.toBe(steers[0]!.messageId);
+  expect(h.backend.prompts.at(-1)?.messageId).not.toBe(accepted);
   const route = h.store.get<{ id: string; generation: number }>("route")!;
   h.store.enqueue({ id: "nov16-reply", kind: "conversation", text: "Done", sessionId: route.id, generation: route.generation });
   h.store.outboxState("nov16-reply", "sent");
-  setSystemTime(start + 10 * 60_000); await h.router.checkUnanswered();
+  setSystemTime(start + 10 * 60_000); await router.checkUnanswered();
   expect(alerts).toHaveLength(0);
 });
 
@@ -10633,8 +12335,9 @@ test("upgrade of a real pre-watchdog running human turn protects its steered bat
   setSystemTime(legacySteerStart + 420_000);
   const h = setup(); restoreLegacySteer(h.store, "running");
   const upgraded = new Router(h.store, h.backend, h.transport, h.routerOptions);
-  const active = h.store.get<{ messageId: string; covered: string[]; steered: string[] }>("activeTurn")!;
-  expect(active.covered).toEqual(["legacy-root", "legacy-followup", "legacy-member"]);
+  const active = h.store.get<{ id: string; generation: number; inboundId: string; phase: string; messageId: string; covered: string[]; steered: string[] }>("activeTurn")!;
+  expect(turnMembers(h.store, active))
+    .toEqual(["legacy-root", "legacy-followup", "legacy-member"]);
   const logs = await captureLogs(async () => { await upgraded.checkUnanswered(); });
   expect(logs.filter(line => line.name === "inbound.overdue").map(line => [line.ids?.inboundId, line.props?.action]))
     .toEqual([["legacy-root", "in_turn"], ["legacy-followup", "in_turn"], ["legacy-member", "in_turn"]]);
@@ -10709,4 +12412,48 @@ test("reaction before a queued legacy full reply preserves first answeredAt and 
   await upgraded.tick(); expect(h.backend.prompts).toHaveLength(0);
   h.input("new-request", "New request", { source: "typed" }); await upgraded.tick();
   expect(h.backend.prompts.map(prompt => prompt.text)).toEqual(["New request"]);
+});
+
+
+for (const retained of ["response", "sameMode", "reconcileOnly"] as const) for (const restart of [false, true]) {
+  test(`unanswered watchdog preserves a sealed ${retained} operation (restart=${restart})`, async () => {
+    const start = Date.parse("2026-11-16T11:30:17Z"); setSystemTime(start);
+    const h = setup();
+    h.input("wake:watchdog", "Watcher event", { source: "composed" }); await h.router.tick();
+    h.input("retained-leader", "First", { source: "typed" });
+    h.input("retained-member", "Second", { source: "typed" });
+    h.store.set("batch:retained-leader", { id: "retained-member", text: "First\nSecond", attachments: [], isAudioMessage: false,
+      source: "typed", receivedAt: start, batchIds: ["retained-leader", "retained-member"] } satisfies NormalizedInbound);
+    h.store.updateInbound("retained-leader", "processing"); h.store.updateInbound("retained-member", "batched");
+    h.store.set("batch-phase:retained-leader", "steering");
+    const route = h.store.get<{ id: string; directory: string; generation: number }>("route")!;
+    const original = { ...route, inboundId: "retained-leader", messageId: messageId("retained-leader"),
+      text: "First\nSecond", guidance: "Original guidance", startedAt: start, outbox: 0,
+      ...(retained === "response" ? { response: { sessionId: "ses_child", directory: "/Chats/ses_child", requestId: "q_child",
+        turn: h.store.get("activeTurn"), operation: { request: question({}, "q_child"), answers: [["A"]], typedReply: "First\nSecond" } } } : { [retained]: true }) };
+    h.store.set("steer-attempt:retained-leader", original);
+    const router = restart ? new Router(h.store, h.backend, h.transport, h.routerOptions) : h.router;
+    setSystemTime(start + 6 * 60_000);
+    const logs = await captureLogs(async () => { await router.checkUnanswered(); await router.checkUnanswered(); });
+    expect(inbounds(h.store).filter(row => row.id.startsWith("retained-")).map(row => row.state)).toEqual(["processing", "batched"]);
+    expect(h.store.get<typeof original>("steer-attempt:retained-leader")).toEqual(original);
+    expect(h.store.get("human-retry-prompt:retained-leader")).toBeUndefined();
+    expect(h.backend.prompts.map(call => call.text)).toEqual(["Watcher event"]);
+    expect(logs.some(line => line.name === "inbound.requeued" || line.name === "inbound.unanswered")).toBe(false);
+  });
+}
+
+test.each(["/status", "/Status", "/new", "/New"])("outage telemetry: substantive %s command response covers only its own human row", async command => {
+  const h = setup();
+  h.input("earlier", "Earlier question", { source: "typed" });
+  await h.router.tick();
+  h.input("command", command, { source: "typed" });
+  await h.router.tick();
+  const op = h.controls().find(op => op.replyTo === "command")!;
+  expect(op.answersInbound).toBe(true);
+  expect(h.store.get<string[]>(`reply-covered:${op.id}`)).toEqual(["command"]);
+  h.store.outboxState(op.id, "sent");
+  const payloads = inbounds(h.store).map(row => row.payload as import("../src/unanswered.ts").AnsweredInput);
+  expect(payloads.find(input => input.id === "command")?.answeredAt).toBeNumber();
+  expect(payloads.find(input => input.id === "earlier")?.answeredAt).toBeUndefined();
 });

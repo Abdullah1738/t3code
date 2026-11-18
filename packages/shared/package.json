@@ -8,6 +8,7 @@
       "import": "./src/sqlDiagnostics.ts"
     },
     "./nodeSqliteErrors": "./src/nodeSqliteErrors.ts",
+    "./desktopQuitContext": "./src/desktopQuitContext.ts",
     "./ownedProcessTree": "./src/ownedProcessTree.ts",
     "./githubMarkdownLinks": {
       "types": "./src/githubMarkdownLinks.ts",

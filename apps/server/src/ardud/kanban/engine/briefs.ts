@@ -7,6 +7,7 @@ import {
   type KanbanReviewChain,
   type KanbanStage,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 
 import { reviewRetryNote } from "./retries.ts";
 import { MAX_BATCH, workerWorkDone } from "./rules.ts";
@@ -243,6 +244,7 @@ export type EvaluatorPurpose =
       readonly discussionId?: string;
       readonly day?: string;
       readonly scheduled?: boolean;
+      readonly lastRunAt?: string;
     }
   | { readonly kind: "stalled" }
   | { readonly kind: "completed" }
@@ -289,7 +291,7 @@ const purposeText = (purpose: EvaluatorPurpose) => {
     case "nightly":
       return "Nightly review";
     case "stalled":
-      return "Stalled sweep: find cards that stopped moving (idle Working threads, flagged cards, review threads with no verdict). Read their threads, then steer, restart, split, re-route or escalate. Clear the stalled flag when fixed.";
+      return "Stalled sweep: find cards that stopped moving (idle Working threads, flagged cards, review threads with no verdict, completed/deployed cards whose evaluator step went idle). Read their threads, then steer, restart, split, re-route or escalate. Clear the stalled flag when fixed.";
     case "completed":
       return "Completed batch: for each Completed card, check the change is deployed where it should be. Move deployed ones to deployed; open a card for anything missing. Cards are completed and deployed only once the card's review passed. Leave a card alone while its current step is a board script's.";
     case "deployed":
@@ -308,22 +310,28 @@ const purposeText = (purpose: EvaluatorPurpose) => {
 export const nightlyBrief = (
   board: KanbanBoard,
   purpose: Extract<EvaluatorPurpose, { kind: "nightly" }>,
-) =>
-  lines(
+) => {
+  const until = purpose.lastRunAt ?? board.nightlyReview?.lastRunAt ?? board.createdAt;
+  const since = DateTime.formatIso(
+    DateTime.makeUnsafe(DateTime.toEpochMillis(DateTime.makeUnsafe(until)) - 24 * 60 * 60 * 1000),
+  );
+  return lines(
     `You run the nightly review of the "${board.name}" Missions board (boardId ${board.id}). Treat its tool as a product built for the owner.`,
     `Read and follow this board's instructions:\n${JSON.stringify(board.instructions)}`,
-    "Read the last 24 hours through paged calls, each small enough to read whole: board_activity first (each ask's minutes from asked to answered, review rounds and verdicts per card, time in each stage, stalls, run failures by model, thread restarts, cards left without a thread, slot use per hour); then board_get with since set to 24 hours ago for one short row per card active in the window, settled cards included (follow board.page.nextAfter with after while hasMore); card_get for the cards worth a closer look (latest 20 events; events {before: olderEvents} pages back); discussions and owner messages with discussion_read and limit: 40 (use the supplied discussion IDs; earlierBefore pages older messages). Quote ask-to-answer times and review rounds from board_activity. Read the wiki with wiki_read. Skim t3_thread_read for card threads active in this window; do not read whole transcripts. Read every log and analytics source available for this board's tool. On Robob use analytics_read for the summary and section index, then fetch section by name and follow cursor with the same filters while hasMore; tool boards use their tool's own logs. If a source or read tool is unavailable, record that information gap, never invent evidence.",
-    "Complete the read pass before filing findings. Start board_get without after (or after: 0); only use nextAfter returned by the preceding page for this same board and since. Keep since unchanged while paging, and continue until hasMore is false; a full page is not the whole day. Do not choose a starting card number or skip early cards. Read every supplied active discussion through the window, and skim each active card thread. wiki_read without a slug returns only the index: read the pages relevant to this review by slug or slugs. Keep calls and transcript excerpts small, but do not turn this review into a skim to save calls.",
+    `Window: use since: "${since}" and until: "${until}" on board_activity, and the same since on board_get. Keep these literal ISO times unchanged for all pages.`,
+    "Read the last 24 hours through paged calls, each small enough to read whole: board_activity first (each ask's minutes from asked to answered, review rounds and verdicts per card, time in each stage, stalls, run failures by model, thread restarts, cards left without a thread, slot use per hour); then board_get with since set to the literal ISO time above for one short row per card active in the window, settled cards included (follow board.page.nextAfter with after while hasMore); card_get for the cards worth a closer look (latest 20 events; events {before: olderEvents} pages back); discussion and thread digests as described below, followed by required deep reads with discussion_read and limit: 40 (use the digest discussion IDs; earlierBefore pages older messages). Quote ask-to-answer times and review rounds from board_activity. Read the wiki with wiki_read. Use t3_thread_read for the required thread deep reads below (newest messages only); do not read whole transcripts. Read every log and analytics source available for this board's tool. On Robob use analytics_read for the summary and section index, then fetch section by name and follow cursor with the same filters while hasMore; tool boards use their tool's own logs. If a source or read tool is unavailable, record that information gap, never invent evidence.",
+    'Complete the read pass before filing findings. Start board_get without after (or after: 0); only use nextAfter returned by the preceding page for this same board and since. Keep since unchanged while paging, and continue until hasMore is false; a full page is not the whole day. Do not choose a starting card number or skip early cards. Read board_activity with digest:"discussions" and then digest:"threads", each paged until hasMore is false; that covers every discussion and thread. Follow activity.page.nextAfter with after, keeping since and until unchanged; count distinct discussionId/threadId values, including owner-message continuations. Then open with discussion_read (limit 40) every discussion that has an owner message or an open ask in the window, and t3_thread_read (newest messages only; use lastAssistant.itemId as itemId when present) every thread flagged run_failed, restarted, stalled or refused_call. Read others only when a finding needs them. wiki_read without a slug returns only the index: read the pages relevant to this review by slug or slugs. Keep calls and transcript excerpts small, but do not turn this review into a skim to save calls.',
     "For a transient read failure (ECONNRESET, timeout or connection reset), retry the same read once before calling the source unavailable; continue the other reads either way. If board_activity or since is unsupported on the running build, fall back to board_get without since, starting at after: 0 and paging to hasMore false, then use card_get histories for the window. Record the unsupported tool or argument as an information gap. A failed wiki read must not end the board, discussion or thread reads.",
     "Do the following in order:",
     "1. Information gaps first. What information do I not have access to? What did I need today and couldn't see? Which questions about how this tool is used, how fast it is, or why it failed cannot the current logs and analytics answer? Could I add more detailed logs or analytics to better optimize this tool for the owner? Search for duplicates with card_search, including settled cards, then file a card for each real gap: events, fields, timings, error context, rollups or read tools. Write full packets and subtasks first, in todo at P3. Put this instrumentation work ahead of other improvements and make dependent improvements wait on it.",
     "2. Improvements and tools to build. Use evidence from the data you read. Search with card_search for duplicates, including settled cards, before filing. Create cards in todo at P3 with full packets (problem, evidence, files, steps, focused tests, done criteria) and work/review/evaluator subtasks. Add evidence to an existing card when it covers the problem.",
     "3. Cross-board routing. A finding that belongs to another board's scope (the board instructions name each board's scope) goes there with evaluator_start (kind request, your evidence), not as a card here. Robob scheduling, pools, ticks and the board tools themselves are the robob board. Apply this to information gaps as well as improvements: choose the destination before filing a local card, pass the finding and evidence to its request evaluator, and include the returned handoff in this review. Do not leave a finding only as a suggestion that someone else should route it.",
     "4. Proposals needing the owner's OK. Use one card_ask per item, options Approve / Change / Drop, at most 5 a night, most valuable first. Read existing open asks first and do not repeat a pending question. Keep unapproved work waiting on its blocking ask.",
-    `5. Post a short "Nightly review, ${purpose.day ?? "<date>"}" summary with discussion_post${purpose.discussionId ? ` in discussionId ${purpose.discussionId}` : " on this board"}: what you saw, information gaps, cards filed, cross-board handoffs and what you ask. State coverage: active cards read and whether pagination finished, discussions read, thread skims and wiki pages read. If a read still failed after retry, name the exact call and the unread portion; do not claim a complete review. Link the evidence and cards.`,
+    `5. Post a short "Nightly review, ${purpose.day ?? "<date>"}" summary with discussion_post${purpose.discussionId ? ` in discussionId ${purpose.discussionId}` : " on this board"}: what you saw, information gaps, cards filed, cross-board handoffs and what you ask. State coverage: a review is complete when board_activity, board_get and both digests were read to the end (follow page.nextAfter wherever hasMore is present), analytics was read, and the required discussion/thread deep reads above were done. Report active cards, distinct discussion/thread digest rows, deep reads done/needed, and wiki pages read. Call it partial only if one of those required reads is missing, and name it. If a read still failed after retry, name the exact call and the unread portion; do not claim a complete review. Link the evidence and cards.`,
     "Scope: read, file cards within this board's scope, route other findings with evaluator_start (kind request), ask the owner and post this review. Do not merge, deploy, make purchases, message anyone but the owner, or edit rules, skills or agent prompts. Do not change board instructions, model routing, pools or nightly settings. Do not implement the findings in this run.",
     LINKS_LINE,
   );
+};
 
 export const evaluatorBrief = (board: KanbanBoard, purpose: EvaluatorPurpose) =>
   purpose.kind === "nightly"
@@ -404,9 +412,9 @@ export const priorAskerText = (threadIds: ReadonlyArray<string>) =>
     )
     .join("\n");
 
-export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>) => {
+export const nudgeWorkText = (cards: ReadonlyArray<KanbanCard>, boardStop?: string) => {
   const names = cards.map((card) => `#${card.number}`).join(", ");
-  const instruction = `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} still in Working and your turn ended. A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait (a durable watcher, offbox runs you're blocked on, another card, a time), set it yourself with card_wait on your card (on time with until, script, or card) and end your turn; clear it if something else wakes you first. Wait inside your turn only for a short step that nothing can wake you for.`;
+  const instruction = `${cards.length === 1 ? `Card ${names} is` : `Cards ${names} are`} ${boardStop ? `still in Working. ${boardStop}` : "still in Working and your turn ended."} A card can't stay in Working while you are stopped, so do one of these now for each: if it is done, card_move to needs_review; if you need the owner's answer to go on, card_ask with blocking true (the card waits in Needs Owner); if you can't go on, card_flag with the reason (it goes back to To Do and the evaluator is told); otherwise keep working on it now. Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait (a durable watcher, offbox runs you're blocked on, another card, a time), set it yourself with card_wait on your card (on time with until, script, or card) and end your turn; clear it if something else wakes you first. Wait inside your turn only for a short step that nothing can wake you for.`;
   return lines(
     instruction,
     ...cards.map((card) =>

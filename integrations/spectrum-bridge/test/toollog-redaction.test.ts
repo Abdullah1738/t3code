@@ -12,8 +12,12 @@ const day = "2026-11-13";
 const at = Date.parse(`${day}T12:00:00Z`);
 let root: string;
 let previous: string | undefined;
-beforeEach(() => {
+beforeEach(async () => {
+  // End any previous test's outage before checking that a fresh failure retains its native cause.
+  toolLog.write({ component: "robob", kind: "perf", name: "turn.robob_call", ok: true, durationMs: 1,
+    props: { method: "GET", route: "/health", failureFormat: "single" } });
   toolLog.flush();
+  await toolLog.settled();
   root = mkdtempSync(join(tmpdir(), "toollog-redaction-"));
   previous = process.env.TOOLLOG_DIR;
   process.env.TOOLLOG_DIR = root;

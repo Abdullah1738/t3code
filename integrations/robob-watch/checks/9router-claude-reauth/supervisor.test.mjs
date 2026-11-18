@@ -8,7 +8,7 @@ import test, { after } from 'node:test';
 import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { acquireLease, leaseOwner, releaseLease } from './lease.mjs';
-import { assertCleared, assertIncident, lazyControlClient, liveProviders, notificationId, notificationState, pendingConnections, phaseReporter, readState, RouterUnavailableError, ROUTER_UNAVAILABLE_LIMIT_MS, runBoundedCommand, runObserved, SUPERVISOR_DEADLINE_MS, telegramHealthy, threadIdFor, tick, workerPrompt, writeState } from './supervisor.mjs';
+import { assertCleared, assertIncident, lazyControlClient, liveProviders, notificationId, notificationState, pendingConnections, phaseReporter, readState, RouterUnavailableError, ROUTER_UNAVAILABLE_LIMIT_MS, ROUTER_STREAK_GAP_MS, runBoundedCommand, runObserved, SUPERVISOR_DEADLINE_MS, telegramHealthy, threadIdFor, tick, workerPrompt, writeState } from './supervisor.mjs';
 
 const HAS_LOCKF = process.platform === 'darwin' && existsSync('/usr/bin/lockf');
 const LOCKF_SKIP_REASON = 'needs macOS /usr/bin/lockf (watcher is macOS-only)';
@@ -761,26 +761,35 @@ test('telegram output remains complete across pipe buffers, unicode, and child e
   await assert.rejects(call, /aborted/);
 });
 
-test('code-only installer preserves definition, state, lease, lock inode and phase marker', t => {
+test('installer updates monitoring settings and preserves registration, state, lease and lock inode', t => {
   const dir = mkdtempSync(join(tmpdir(), 'reauth-install-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const names = ['watcher.json', 'supervisor-state.json', 'state.json', 'log', '.run-ok', 'supervisor.lock', 'recovery.lease.guard', 'ENABLE_REQUIRED', '.phase'];
+  writeFileSync(join(dir, 'watcher.json'), JSON.stringify({ id: '9router-claude-reauth', max_consecutive_failures: 5, timeout_s: 90, paused: true, created_at: 'keep', serial: false }));
+  const names = ['supervisor-state.json', 'state.json', 'log', '.run-ok', 'supervisor.lock', 'recovery.lease.guard', 'ENABLE_REQUIRED', '.phase'];
   for (const name of names) writeFileSync(join(dir, name), `keep ${name}`);
-  const py = `import importlib.util, pathlib, os
+  const py = `import importlib.util, pathlib, os, json
 spec = importlib.util.spec_from_file_location('installer', ${JSON.stringify(fileURLToPath(new URL('./install.py', import.meta.url)))})
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 live = pathlib.Path(${JSON.stringify(dir)})
 os.symlink('manual-owner', live / 'recovery.lease')
-before = {p.name: (p.stat().st_ino, p.read_bytes()) for p in live.iterdir() if not p.is_symlink()}
+before = {p.name: (p.stat().st_ino, p.read_bytes()) for p in live.iterdir() if not p.is_symlink() and p.name != 'watcher.json'}
 m.install(live=live)
 assert before == {name: ((live / name).stat().st_ino, (live / name).read_bytes()) for name in before}
+definition = json.loads((live / 'watcher.json').read_text())
+assert definition == {'id': '9router-claude-reauth', 'max_consecutive_failures': 0, 'timeout_s': 90, 'paused': True, 'created_at': 'keep', 'serial': False}
+for timeout in [None, 120]:
+    if timeout is None: definition.pop('timeout_s')
+    else: definition['timeout_s'] = timeout
+    (live / 'watcher.json').write_text(json.dumps(definition))
+    m.install(live=live)
+    assert json.loads((live / 'watcher.json').read_text())['timeout_s'] == (90 if timeout is None else timeout)
 assert os.readlink(live / 'recovery.lease') == 'manual-owner'
 assert (live / 'check.sh').read_bytes() == (m.SOURCE / 'check.sh').read_bytes()
 assert (live / 'supervisor.mjs').read_bytes() == (m.SOURCE / 'supervisor.mjs').read_bytes()
 assert (live / 'check.sh').stat().st_mode & 0o777 == 0o700
 assert (live / 'supervisor.mjs').stat().st_mode & 0o777 == 0o600
 `;
-  const r = spawnSync('/usr/bin/python3', ['-B', '-c', py], { encoding: 'utf8', timeout: 5_000 });
+  const r = spawnSync('/usr/bin/python3', ['-I', '-B', '-c', py], { encoding: 'utf8', timeout: 5_000 });
   assert.equal(r.status, 0, r.stderr);
 });
 
@@ -876,7 +885,7 @@ test('first fetch times out then retry processes markers, logs both durations an
   assert.ok(rows.some(r => r.name === 'providers.fetch.retry' && r.props?.firstAttemptMs === 6000 && r.props?.retryAttemptMs === 7000 && r.props?.outcome === 'success'));
 });
 
-test('two timeouts skip without any incident, worker or pending notice changes, then fail at 15 minutes', async t => {
+test('two-hour outage skips until 15 minutes then fails, preserving incidents, workers and pending notices', async t => {
   const h = harness(t);
   // Include a legacy worker, account budget, unresolved marker and ambiguous
   // queued alert: none may be treated as repaired by an unavailable snapshot.
@@ -886,7 +895,7 @@ test('two timeouts skip without any incident, worker or pending notice changes, 
   writeState(h.path, state);
   const started = h.sim.time;
   const rows = [];
-  for (let n = 0; n <= 15; n++) {
+  for (let n = 0; n <= 120; n++) {
     h.sim.time = started + n * 60_000;
     const f = fetchHarness(t, [{ error: timeoutError(), ms: 6_000 }, { error: timeoutError(), ms: 15_000 }]);
     routerTick(h, f);
@@ -898,12 +907,13 @@ test('two timeouts skip without any incident, worker or pending notice changes, 
       assert.equal(JSON.parse(readFileSync(join(h.path, '../.phase'))).phase, 'done');
     } else {
       await assert.rejects(observed, RouterUnavailableError);
-      assert.match(lines.at(-1), /providers:fetch:retry failed; router, notification delivery, journal or prior-worker state unavailable\. for 15 min/);
+      assert.ok(lines.at(-1).endsWith(`providers:fetch:retry failed; router, notification delivery, journal or prior-worker state unavailable. for ${n} min`));
       assert.equal(JSON.parse(readFileSync(join(h.path, '../.phase'))).phase, 'failed');
       rows.push(lines.at(-1));
     }
     assert.equal(f.elapsed(), 22_000); assert.ok(f.elapsed() < SUPERVISOR_DEADLINE_MS);
-    const { routerUnavailableSince, routerUnavailableCount, ...incidents } = h.state();
+    const { routerUnavailableSince, routerUnavailableCount, routerUnavailableLastAt, ...incidents } = h.state();
+    assert.equal(routerUnavailableLastAt, h.sim.time);
     assert.equal(routerUnavailableSince, started); assert.equal(routerUnavailableCount, n + 1);
     assert.deepEqual(incidents, state);
     assert.equal(h.sim.alerts.length, 0); assert.equal(h.sim.creates.length, 0); assert.equal(h.sim.lookups.length, 0);
@@ -917,7 +927,8 @@ test('first valid snapshot after skipped ticks resets availability state and pro
   const h = harness(t);
   writeState(h.path, { version: 1, incidents: [], active: null, routerUnavailableSince: 0, routerUnavailableCount: 9 });
   const f = fetchHarness(t, [{ ms: 1_000 }]); routerTick(h, f); await h.tick();
-  assert.equal(f.calls(), 1); assert.deepEqual(f.sleeps, []); assert.deepEqual(f.lines, []);
+  assert.equal(f.calls(), 1); assert.deepEqual(f.sleeps, []); assert.match(f.lines.at(-1), /router recovered after 9 consecutive unavailable ticks/);
+  assert.equal(h.state().routerUnavailableLastAt, undefined);
   assert.equal(h.state().routerUnavailableSince, undefined); assert.equal(h.state().routerUnavailableCount, undefined);
   assert.equal(h.sim.alerts.length, 1);
 });
@@ -954,8 +965,323 @@ test('nontransient retry result fails immediately and does not advance availabil
 
 test('invalid availability journal is an error rather than a fresh grace period', t => {
   const h = harness(t);
-  for (const availability of [{ routerUnavailableSince: 1 }, { routerUnavailableCount: 1 }, { routerUnavailableSince: -1, routerUnavailableCount: 1 }, { routerUnavailableSince: 1, routerUnavailableCount: 0 }]) {
+  for (const availability of [{ routerUnavailableSince: 1 }, { routerUnavailableCount: 1 }, { routerUnavailableSince: -1, routerUnavailableCount: 1 }, { routerUnavailableSince: 1, routerUnavailableCount: 0 }, { routerUnavailableLastAt: 1 }, { routerUnavailableSince: 2, routerUnavailableCount: 1, routerUnavailableLastAt: 1 }, { routerUnavailableSince: 1, routerUnavailableCount: 1, routerUnavailableLastAt: 'bad' }]) {
     writeState(h.path, { version: 1, incidents: [], active: null, ...availability });
     assert.throws(() => h.state(), /state unavailable or invalid/);
   }
+});
+
+for (const [label, gap, legacy, resets] of [
+  ['13-hour gap', 13 * 60 * 60_000, false, true],
+  ['over continuity allowance', ROUTER_STREAK_GAP_MS + 1, false, true],
+  ['exactly at continuity allowance', ROUTER_STREAK_GAP_MS, false, false],
+  ['under continuity allowance', ROUTER_STREAK_GAP_MS - 1, false, false],
+  ['five-minute backoff plus 22-second check', 322_000, false, false],
+  ['five-minute backoff plus check and four-minute queue', 562_000, false, false],
+  ['backwards clock', -1, false, true],
+  ['legacy without last tick', 60_000, true, true],
+]) test(`unavailable streak continuity: ${label}`, async t => {
+  const h = harness(t), started = h.sim.time, lines = [];
+  h.ctx.providers = async () => { throw new RouterUnavailableError([6000, 15000]); };
+  h.ctx.log = s => lines.push(s);
+  // Build the stored outage through real tick/save/read IO, not a seeded journal.
+  for (let n = 0; n < 15; n++) { h.sim.time = started + n * 60_000; await h.tick(); }
+  if (legacy) {
+    const old = h.state(); delete old.routerUnavailableLastAt; writeState(h.path, old);
+  }
+  const initial = h.state(); h.sim.time += gap;
+  h.ctx.providers = async () => {
+    // A stale checkpoint must be compared before any admission refresh.
+    if (resets) assert.equal(h.state().routerUnavailableLastAt, initial.routerUnavailableLastAt);
+    throw new RouterUnavailableError([6000, 15000]);
+  };
+  if (resets) {
+    await h.tick();
+    assert.match(lines.at(-1), /skipped this tick \(1 consecutive, since /);
+    assert.equal(h.state().routerUnavailableSince, h.sim.time);
+    assert.equal(h.state().routerUnavailableCount, 1);
+  } else {
+    await assert.rejects(h.tick(), RouterUnavailableError);
+    assert.equal(h.state().routerUnavailableSince, initial.routerUnavailableSince);
+    assert.equal(h.state().routerUnavailableCount, 16);
+  }
+  assert.equal(h.state().routerUnavailableLastAt, h.sim.time);
+});
+
+test('ticks four minutes apart still reach the unavailable bound, then a valid snapshot resets the streak', async t => {
+  const h = harness(t), started = h.sim.time, lines = [];
+  h.ctx.enforceSafetyFence = true; h.ctx.log = s => lines.push(s);
+  h.ctx.providers = async () => { throw new RouterUnavailableError([6000, 15000]); };
+  for (let n = 0; n < 4; n++) { h.sim.time = started + n * 4 * 60_000; await h.tick(); }
+  h.sim.time += 4 * 60_000;
+  await assert.rejects(h.tick(), RouterUnavailableError);
+  h.ctx.providers = async () => ({ connections: [] }); await h.tick();
+  assert.match(lines.at(-1), /router recovered after 5 consecutive unavailable ticks/);
+  assert.equal(h.state().routerUnavailableSince, undefined);
+  assert.equal(h.state().routerUnavailableLastAt, undefined);
+  assert.equal(h.state().routerUnavailableCount, undefined);
+  h.sim.time += 60_000;
+  h.ctx.providers = async () => { throw new RouterUnavailableError([6000, 15000]); };
+  await h.tick(); assert.equal(h.state().routerUnavailableSince, h.sim.time);
+  assert.equal(h.state().routerUnavailableCount, 1);
+});
+
+for (const [label, durationMs, queueMs] of [
+  ['22-second check', 22_000, 0],
+  ['22-second check and four-minute queue', 22_000, 240_000],
+  ['near-deadline check and four-minute queue', 44_000, 240_000],
+  ['90-second check', 90_000, 0],
+  ['90-second check and four-minute queue', 90_000, 240_000],
+]) test(`outage stays failed with advancing completion clock: ${label}`, async t => {
+  const h = harness(t), started = h.sim.time;
+  let failures = 0, ticks = 0, since;
+  h.ctx.providers = async () => {
+    h.sim.time += durationMs;
+    throw new RouterUnavailableError([6_000, 15_000]);
+  };
+  while (h.sim.time - started < 2 * 60 * 60_000) {
+    const checkStarted = h.sim.time;
+    if (failures || h.sim.time - started >= ROUTER_UNAVAILABLE_LIMIT_MS) {
+      await assert.rejects(h.tick(), RouterUnavailableError);
+      failures++;
+    } else {
+      await h.tick();
+    }
+    ticks++;
+    since ??= h.state().routerUnavailableSince;
+    assert.equal(h.state().routerUnavailableSince, since, 'outage never reset without a valid snapshot');
+    assert.equal(h.state().routerUnavailableCount, ticks);
+    assert.equal(h.state().routerUnavailableLastAt, h.sim.time);
+    // Successful skips schedule from admission; failures back off after completion.
+    h.sim.time = failures
+      ? h.sim.time + Math.min(60_000 * 2 ** Math.min(failures - 1, 8), 300_000) + queueMs
+      : Math.max(h.sim.time, checkStarted + 60_000);
+  }
+  assert.ok(failures > 5, 'outage must remain failed past the default pause threshold');
+});
+
+test('a runner-killed fetch checkpoints an ongoing outage before providers resolve', async t => {
+  const h = harness(t); h.sim.time += 60 * 60_000;
+  const started = h.sim.time, since = started - 30 * 60_000;
+  writeState(h.path, { version: 1, incidents: [], active: null,
+    routerUnavailableSince: since, routerUnavailableLastAt: started, routerUnavailableCount: 20 });
+  h.sim.time += 300_000 + 240_000;
+  const admission = h.sim.time;
+  let entered;
+  const fetching = new Promise(resolve => { entered = resolve; });
+  h.ctx.providers = () => { entered(); return new Promise(() => {}); };
+  void h.tick(); await fetching;
+  assert.equal(h.state().routerUnavailableLastAt, admission, 'checkpoint must precede a fetch that may be killed');
+  assert.equal(h.state().routerUnavailableSince, since);
+  assert.equal(h.state().routerUnavailableCount, 20);
+  // The killed check spends 90s, timeout retry waits 120s, then queues for 240s.
+  h.sim.time += 90_000 + 120_000 + 240_000;
+  h.ctx.providers = async () => { h.sim.time += 22_000; throw new RouterUnavailableError([6_000, 15_000]); };
+  await assert.rejects(h.tick(), RouterUnavailableError);
+  assert.equal(h.state().routerUnavailableSince, since);
+  assert.equal(h.state().routerUnavailableCount, 21);
+});
+
+test('a killed fetch without a known outage cannot start a streak or report router recovery', async t => {
+  const h = harness(t), lines = []; h.ctx.enforceSafetyFence = true; h.ctx.log = s => lines.push(s);
+  let entered, saves = 0;
+  const save = h.ctx.save; h.ctx.save = s => { saves++; save(s); };
+  const fetching = new Promise(resolve => { entered = resolve; });
+  h.ctx.providers = () => { entered(); return new Promise(() => {}); };
+  void h.tick(); await fetching;
+  assert.equal(saves, 0, 'no outage checkpoint exists before any unavailable result');
+  assert.equal(h.state().routerUnavailableSince, undefined);
+  assert.equal(h.state().routerUnavailableLastAt, undefined);
+  h.sim.time += 90_000 + 120_000;
+  h.ctx.providers = async () => ({ connections: [] }); await h.tick();
+  assert.equal(h.state().routerUnavailableSince, undefined);
+  assert.equal(h.state().routerUnavailableLastAt, undefined);
+  assert.equal(h.state().routerUnavailableCount, undefined);
+  assert.ok(lines.every(line => !line.includes('router recovered')));
+});
+
+// The clock runs only when a test advances it; neither fetch nor backoff sleeps.
+function deadlineClock() {
+  let time = 0, id = 0;
+  const timers = new Map();
+  const now = () => time;
+  const setTimer = (fn, ms) => { const key = ++id; timers.set(key, { at: time + ms, fn }); return key; };
+  const clearTimer = key => timers.delete(key);
+  const delay = ms => new Promise(resolve => setTimer(resolve, ms));
+  const settle = async work => {
+    let done = false, result, failure;
+    work.then(value => { done = true; result = value; }, error => { done = true; failure = error; });
+    for (let n = 0; n < 100; n++) {
+      for (let i = 0; i < 40; i++) await Promise.resolve();
+      if (done) { if (failure) throw failure; return result; }
+      const next = [...timers].sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+      assert.ok(next, 'unresolved synthetic work without a timer');
+      time = next[1].at; timers.delete(next[0]); next[1].fn();
+    }
+    assert.fail('synthetic clock did not settle');
+  };
+  return { now, setTimer, clearTimer, delay, settle, jump: ms => { time += ms; } };
+}
+
+function deadlineHarness(t, { bootMs = 36_000, outcomes = [{ ms: 5_000 }], backoffMs = 1_000, h = harness(t) } = {}) {
+  const clock = deadlineClock(), f = fetchHarness(t, []), lines = [], errors = [], signals = [], exits = [];
+  let calls = 0;
+  h.ctx.enforceSafetyFence = true;
+  h.ctx.now = () => h.sim.time + clock.now();
+  h.ctx.log = line => lines.push(line);
+  h.ctx.providers = (phase, budget) => liveProviders({ ...f.options, ...budget, phase, log: h.ctx.log,
+    sleep: () => clock.delay(backoffMs),
+    fetch: async (_url, { signal }) => {
+      signals.push(signal);
+      const response = outcomes[calls++];
+      assert.ok(response, 'unexpected budgeted fetch');
+      await clock.delay(response.ms ?? 0);
+      if (response.error) throw response.error;
+      return new Response(JSON.stringify({ connections: [bad()] }), { headers: { 'content-type': 'application/json' } });
+    },
+  });
+  const options = { watchDir: join(h.path, '..'), ...clock, startedAt: h.sim.time - bootMs, wallNow: () => h.sim.time + clock.now(), stderr: line => errors.push(line), exit: code => { exits.push(code); throw new Error(`synthetic supervisor exit ${code}`); } };
+  return { h, clock, lines, errors, signals, exits, options, calls: () => calls, run: () => clock.settle(runObserved(h.ctx, options)) };
+}
+
+test('38-second boot skips a would-be five-second fetch and logs boot without deadline failure', async t => {
+  const d = deadlineHarness(t, { bootMs: 38_000 });
+  await d.run();
+  assert.equal(d.calls(), 0);
+  assert.equal(d.h.state().routerUnavailableCount, 1);
+  assert.equal(d.h.state().routerUnavailableLastAt, d.h.ctx.now());
+  assert.match(d.lines.join('\n'), /phase durations: boot=38000.0ms/);
+  assert.match(d.lines.join('\n'), /below_minimum.*2000ms remaining/);
+  assert.match(d.lines.join('\n'), /skipped this tick/);
+  assert.deepEqual(d.errors, []);
+  const rows = readFileSync(join(testLogDir, new Date().toISOString().slice(0,10) + '.ndjson'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(rows.some(row => row.name === 'supervisor.boot' && row.durationMs === 38_000));
+});
+
+for (const budget of [0, 1, 2_999]) test(`fetch budget ${budget}ms is below minimum and never fetches`, async t => {
+  const d = deadlineHarness(t, { bootMs: SUPERVISOR_DEADLINE_MS - 5_000 - budget });
+  await d.run();
+  assert.equal(d.calls(), 0); assert.equal(d.h.state().routerUnavailableCount, 1);
+  assert.match(d.lines.join('\n'), /skipped this tick/); assert.deepEqual(d.errors, []);
+});
+
+test('budget aborts an in-flight fetch and preserves a pending incident unchanged', async t => {
+  const d = deadlineHarness(t);
+  const state = { version: 1, active: null, incidents: [], detectorIncidents: [{ id: 'pending', kind: 'detector', accountId: 'alpha', marker: bad().reauthRequiredAt, notified: true, alertState: 'pending', mayHaveQueued: true, firstEnqueuedAt: 1 }] };
+  writeState(d.h.path, state);
+  await d.run();
+  assert.equal(d.calls(), 1); assert.equal(d.signals[0].aborted, true);
+  assert.equal(d.clock.now(), 4_000);
+  const { routerUnavailableSince, routerUnavailableLastAt, routerUnavailableCount, ...incidentState } = d.h.state();
+  assert.deepEqual(incidentState, state);
+  assert.equal(routerUnavailableCount, 1); assert.equal(routerUnavailableSince, routerUnavailableLastAt);
+  assert.equal(d.h.sim.alerts.length, 0); assert.deepEqual(d.errors, []);
+});
+
+test('slow first attempt leaves a shortened retry that succeeds and processes markers', async t => {
+  const d = deadlineHarness(t, { bootMs: 25_000, outcomes: [{ ms: 8_000 }, { ms: 5_000 }] });
+  await d.run();
+  assert.equal(d.calls(), 2); assert.equal(d.signals[0].aborted, true); assert.equal(d.signals[1].aborted, false);
+  assert.match(d.lines.join('\n'), /retry_shortened.*8000ms remaining/);
+  assert.match(d.lines.join('\n'), /providers retry success/);
+  assert.equal(d.h.sim.alerts.length, 1); assert.equal(d.h.state().routerUnavailableCount, undefined);
+  assert.equal(d.clock.now(), 12_000); assert.deepEqual(d.errors, []);
+});
+
+test('retry is dropped when backoff would leave less than the minimum budget', async t => {
+  const d = deadlineHarness(t, { bootMs: 31_000, outcomes: [{ ms: 8_000 }] });
+  await d.run();
+  assert.equal(d.calls(), 1); assert.equal(d.clock.now(), 6_000);
+  assert.match(d.lines.join('\n'), /retry_dropped/); assert.match(d.lines.join('\n'), /skipped this tick/);
+});
+
+for (const phase of ['providers:fetch', 'providers:body', 'providers:backoff', 'providers:fetch:retry']) test(`budget expiry during ${phase} uses the skip path`, async t => {
+  const d = deadlineHarness(t);
+  d.h.ctx.providers = mark => { mark(phase); return new Promise(() => {}); };
+  await d.run();
+  assert.equal(d.h.state().routerUnavailableCount, 1);
+  assert.match(d.lines.join('\n'), /skipped this tick/); assert.deepEqual(d.errors, []);
+});
+
+for (const phase of ['providers:fetch', 'providers:body', 'providers:backoff', 'providers:fetch:retry']) test(`late supervisor timer during ${phase} still skips`, async t => {
+  const d = deadlineHarness(t);
+  d.h.ctx.providers = mark => { mark(phase); return new Promise(() => {}); };
+  // Model a delayed event loop where the supervisor callback runs first.
+  d.options.setTimer = (fn, ms) => d.clock.setTimer(fn, ms === 4_000 ? 10_000 : ms);
+  await d.run();
+  assert.equal(d.clock.now(), 9_000);
+  assert.equal(d.h.state().routerUnavailableCount, 1);
+  assert.match(d.lines.join('\n'), /skipped this tick/); assert.deepEqual(d.errors, []);
+});
+
+test('consecutive deadline skips reach the 15-minute outage bound and then recover', async t => {
+  const h = harness(t), admission = h.sim.time;
+  for (let n = 0; n <= 15; n++) {
+    h.sim.time = admission + n * 60_000;
+    const d = deadlineHarness(t, { h });
+    if (n < 15) await d.run();
+    else {
+      await assert.rejects(d.run(), RouterUnavailableError);
+      assert.match(d.errors.join('\n'), /for 15 min/);
+    }
+    assert.equal(h.state().routerUnavailableCount, n + 1);
+    assert.equal(h.state().routerUnavailableSince, admission + 4_000);
+    assert.equal(h.state().routerUnavailableLastAt, h.sim.time + 4_000);
+  }
+  h.sim.time += 60_000;
+  const recovered = deadlineHarness(t, { h, bootMs: 0, outcomes: [{ ms: 10 }] });
+  await recovered.run();
+  assert.match(recovered.lines.join('\n'), /router recovered after 16 consecutive unavailable ticks/);
+  assert.equal(h.state().routerUnavailableCount, undefined); assert.equal(h.sim.alerts.length, 1);
+});
+
+for (const target of ['marker processing', 'marker error', 'save']) test(`deadline during ${target} after a good fetch remains a hard failure`, async t => {
+  const d = deadlineHarness(t, { bootMs: 0, outcomes: [{ ms: 1 }] });
+  if (target === 'save') {
+    const save = d.h.ctx.save;
+    d.h.ctx.save = state => { d.clock.jump(SUPERVISOR_DEADLINE_MS); save(state); };
+  } else d.h.ctx.notificationAvailable = async () => { d.clock.jump(SUPERVISOR_DEADLINE_MS); return target !== 'marker error'; };
+  // The injected exit throws; detector IO catches can intercept that throw.
+  // The live process exits immediately, so assert its code and diagnostic.
+  await assert.rejects(d.run());
+  assert.deepEqual(d.exits, [1]);
+  assert.match(d.errors.join('\n'), /exceeded deadline/);
+  assert.doesNotMatch(d.lines.join('\n'), /skipped this tick/);
+});
+
+for (const remaining of [0, 1, 2_999, 3_000, 3_001]) test(`retry admission rechecks ${remaining}ms after delayed backoff`, async t => {
+  const d = deadlineHarness(t, { bootMs: remaining > 3_000 ? 29_999 : 30_000,
+    backoffMs: remaining > 3_000 ? 1_000 : 4_000 - remaining,
+    outcomes: [{ ms: 8_000 }, { ms: 1 }],
+  });
+  await d.run();
+  const admitted = remaining >= 3_000;
+  assert.equal(d.calls(), admitted ? 2 : 1);
+  assert.equal(d.h.sim.alerts.length, admitted ? 1 : 0);
+  assert.equal(d.h.state().routerUnavailableCount, admitted ? undefined : 1);
+  if (!admitted) assert.match(d.lines.join('\n'), /skipped this tick/);
+  assert.deepEqual(d.errors, []);
+});
+
+for (const [label, status, contentType, transient] of [
+  ['HTTP 400', 400, 'application/json', false],
+  ['HTTP 401', 401, 'application/json', false],
+  ['HTTP 429', 429, 'application/json', false],
+  ['HTTP 502', 502, 'application/json', true],
+  ['HTTP 503', 503, 'application/json', true],
+  ['HTTP 504', 504, 'application/json', true],
+  ['wrong content type', 200, 'text/plain', false],
+  ['missing content type', 200, null, false],
+]) test(`unread response is cancelled before timeout cleanup: ${label}`, async t => {
+  const f = fetchHarness(t, []), signals = [];
+  let cancelled = 0;
+  const call = liveProviders({ ...f.options, fetch: async (_url, { signal }) => {
+    signals.push(signal);
+    const body = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array([123])); }, cancel() { cancelled++; } });
+    return new Response(body, { status, headers: contentType ? { 'content-type': contentType } : {} });
+  } });
+  await assert.rejects(call, transient ? RouterUnavailableError : Error);
+  assert.equal(cancelled, transient ? 2 : 1);
+  assert.equal(signals.length, cancelled);
+  assert.ok(signals.every(signal => signal.aborted));
 });

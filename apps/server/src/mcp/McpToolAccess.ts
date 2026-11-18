@@ -132,12 +132,33 @@ const requireThreadCaller = McpInvocationContext.McpInvocationContext.pipe(
 export const reads = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
   declare((params: P) => handle(params));
 
-export const readsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
-  declare((params: P) => requireThreadCaller.pipe(Effect.flatMap(() => handle(params))));
+type InputCheck<P> = (params: P) => OrchestratorMcpFailure | undefined;
 
-export const actsAsCaller = <P, A, E, R>(handle: (params: P) => Effect.Effect<A, E, R>) =>
+const checkInput = <P>(params: P, check?: InputCheck<P>) =>
+  Effect.suspend(() => {
+    const failure = check?.(params);
+    return failure === undefined ? Effect.void : Effect.fail(failure);
+  });
+
+export const readsAsCaller = <P, A, E, R>(
+  handle: (params: P) => Effect.Effect<A, E, R>,
+  check?: InputCheck<P>,
+) =>
   declare((params: P) =>
     requireThreadCaller.pipe(
+      Effect.andThen(checkInput(params, check)),
+      Effect.flatMap(() => handle(params)),
+    ),
+  );
+
+export const actsAsCaller = <P, A, E, R>(
+  handle: (params: P) => Effect.Effect<A, E, R>,
+  check?: InputCheck<P>,
+) =>
+  declare((params: P) =>
+    requireThreadCaller.pipe(
+      // Stateless refusals must not queue behind the caller's SQLite reader.
+      Effect.andThen(checkInput(params, check)),
       Effect.flatMap(() => writingCaller),
       Effect.flatMap(() => handle(params)),
     ),

@@ -10,6 +10,30 @@ const clean: (() => void)[] = [];
 afterEach(() => clean.splice(0).reverse().forEach(f => f()));
 const quote = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'";
 
+test.each([
+  { name: "inherited", runtimeDir: "/custom/runtime", expected: "/custom/runtime" },
+  { name: "unset", runtimeDir: undefined, expected: `/run/user/${process.getuid?.() ?? 1000}` },
+])("real watcher check uses the $name runtime directory without inheriting secrets", async ({ runtimeDir, expected }) => {
+  const env = { XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY };
+  clean.push(() => {
+    for (const [key, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+  if (runtimeDir === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = runtimeDir;
+  process.env.ANTHROPIC_API_KEY = "test-parent-secret";
+  const root = mkdtempSync(join(tmpdir(), "box-watch-env-")); clean.push(() => rmSync(root, { recursive: true, force: true }));
+  const now = Date.now();
+  const runner = new BoxRunner({ root, boxId: "bx_test", epoch: "test", token: "a".repeat(40), callbackToken: "b".repeat(40), privateKey: "unused", callbackUrl: "unused", system: "system" },
+    { run: async () => "NO_REPLY" }, { now: () => now, callbackReady: async () => true }); clean.push(() => runner.db.close());
+  const watches = new BoxWatchers(runner);
+  watches.add({ id: "env-check", check: `printf '%s\\n%s' "$XDG_RUNTIME_DIR" "\${ANTHROPIC_API_KEY+present}" > "$WATCH_DIR/env.txt"`,
+    interval: 5, context: "notify", expiresAt: now + 86400000, maxFires: 0 });
+  await runner.handle(new Request("http://box/lease", { method: "POST", headers: { authorization: `Bearer ${"a".repeat(40)}` }, body: JSON.stringify({ boxId: "bx_test", epoch: "test" }) }));
+  await watches.tick();
+  expect(readFileSync(join(root, "watchers/env-check/env.txt"), "utf8")).toBe(`${expected}\n`);
+});
+
 test("real wa-db outbox replays after a failed check without losing or duplicating the reply", async () => {
   const root = mkdtempSync(join(tmpdir(), "box-wa-replay-")); clean.push(() => rmSync(root, { recursive: true, force: true }));
   const store = join(root, "wa"); mkdirSync(store);

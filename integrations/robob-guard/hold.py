@@ -10,7 +10,8 @@ import sys
 import time
 import uuid
 
-from guard import atomic_json, pid_alive, read_json, valid_hold
+from guard import HOLD_MAX_AGE, atomic_json, finite_number, pid_alive, read_json, valid_hold
+from quit_reason import write_reason, desktop_pid
 
 
 class Holds:
@@ -37,35 +38,69 @@ class Holds:
             if not self.matches(by, pid) or not pid_alive(pid) or (token and meta.get("token") != token):
                 return False
             hold = read_json(self.path, {})
-            hold["beatAt"] = time.time()
+            now = time.time()
+            if not finite_number(hold.get("startedAt")) or not 0 <= now - hold["startedAt"] < HOLD_MAX_AGE:
+                return False
+            hold["beatAt"] = now
             atomic_json(self.path, hold)
             return True
 
     def start(self, by, pid):
         with self.locked():
-            if not pid_alive(pid):
-                raise ValueError("install PID is not alive")
-            now = time.time()
-            old = read_json(self.path, {})
-            if valid_hold(old, now, pid_alive(old.get("pid")) if isinstance(old, dict) else False):
-                if not self.matches(by, pid):
-                    raise ValueError("another live installer owns the hold")
-                meta = read_json(self.meta, {})
-                if self.beater_is_ours(meta):
-                    return meta["beaterPid"]
-            token = uuid.uuid4().hex
-            atomic_json(self.path, dict(by=by, pid=pid, startedAt=now, beatAt=now))
-            command = [sys.executable, str(Path(__file__).resolve()), "_beater", "--by", by,
-                       "--pid", str(pid), "--token", token]
-            try:
-                child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
-                                         env=dict(os.environ, HOME=str(self.home), PYTHONDONTWRITEBYTECODE="1"))
-                atomic_json(self.meta, dict(by=by, pid=pid, token=token, beaterPid=child.pid))
-            except Exception:
-                self.path.unlink(missing_ok=True)
-                raise
-            return child.pid
+            beater_pid, created_token = self._start_locked(by, pid)
+        # Userdata can block on SSD/TCC; provenance must not own the guard's lock.
+        try:
+            self.record_quit_reason(by, pid)
+        except Exception:
+            if created_token is not None:
+                with self.locked():
+                    meta = read_json(self.meta, {})
+                    if (self.matches(by, pid) and isinstance(meta, dict)
+                            and meta.get("token") == created_token):
+                        self.path.unlink(missing_ok=True)
+            raise
+        return beater_pid
+
+    def _start_locked(self, by, pid):
+        if not pid_alive(pid):
+            raise ValueError("install PID is not alive")
+        now = time.time()
+        old = read_json(self.path, {})
+        if (isinstance(old, dict) and not self.matches(by, pid) and pid_alive(old.get("pid"))):
+            raise ValueError("another live installer owns the hold; stop its cycle before starting another")
+        started = now
+        if self.matches(by, pid):
+            started = old.get("startedAt")
+            if not finite_number(started) or not 0 <= now - started < HOLD_MAX_AGE:
+                raise ValueError("hold expired; stop the old cycle before starting another")
+        if valid_hold(old, now, pid_alive(old.get("pid")) if isinstance(old, dict) else False):
+            if not self.matches(by, pid):
+                raise ValueError("another live installer owns the hold")
+            meta = read_json(self.meta, {})
+            if self.beater_is_ours(meta):
+                return meta["beaterPid"], None
+        token = uuid.uuid4().hex
+        atomic_json(self.path, dict(by=by, pid=pid, startedAt=started, beatAt=now))
+        command = [sys.executable, str(Path(__file__).resolve()), "_beater", "--by", by,
+                   "--pid", str(pid), "--token", token]
+        try:
+            child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+                                     env=dict(os.environ, HOME=str(self.home), PYTHONDONTWRITEBYTECODE="1"))
+            atomic_json(self.meta, dict(by=by, pid=pid, token=token, beaterPid=child.pid))
+        except Exception:
+            self.path.unlink(missing_ok=True)
+            raise
+        return child.pid, token
+
+    def record_quit_reason(self, by, pid):
+        # This watchdog holds immediately before its AppleEvent/SIGTERM fallback.
+        # Other holders may still be doing build preflight, so they opt in later.
+        if by == "overload-restart":
+            target = desktop_pid()
+            if target is None:
+                raise ValueError("expected one Robob desktop before watchdog quit")
+            write_reason(self.home, "watchdog", by, pid, target)
 
     def beater_is_ours(self, meta):
         if not isinstance(meta, dict) or not pid_alive(meta.get("beaterPid")) or not meta.get("token"):

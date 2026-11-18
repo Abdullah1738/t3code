@@ -4268,6 +4268,189 @@ it.effect("fails the run when its event stream ends without a root terminal", ()
   }),
 );
 
+it.effect.each(
+  (["interrupted", "failed", "completed", "cancelled", "rolled_back"] as const).flatMap((status) =>
+    (["command", "held-text", "message", "node"] as const).flatMap((kind) =>
+      (["before-terminal", "unowned-terminal", "rejected-terminal"] as const).map((phase) => ({
+        status,
+        kind,
+        phase,
+      })),
+    ),
+  ),
+)(
+  "drops late activity and stops the exact provider turn of an externally $status run ($kind, $phase)",
+  ({ status, kind, phase }) =>
+    Effect.gen(function* () {
+      const stops: ProviderTurnId[] = [];
+      const logs: unknown[] = [];
+      const now = yield* DateTime.now;
+      let guarded = false;
+      let settled = phase === "before-terminal";
+      const result = yield* captureRootRunTermination({
+        key: `late-settled:${status}`,
+        shouldFinalizeRun: () => Effect.succeed(phase === "rejected-terminal"),
+        rejectTerminalWrite: phase === "rejected-terminal",
+        loadRunSettlement: () =>
+          Effect.succeed({
+            status: settled ? status : "running",
+            completedAt: settled ? now : null,
+          }),
+        responseStreamingMode: "turn",
+        events: (ids) => {
+          const event = backgroundTurnItemEvent(ids, "command_execution", "running", 1);
+          if (event.type !== "turn_item.updated") throw new Error("Expected turn item");
+          const item = {
+            ...event.turnItem,
+            id: TurnItemId.make(`${event.turnItem.id}:held`),
+            type: "assistant_message" as const,
+            text: "Still working",
+            streaming: true,
+          };
+          const late =
+            kind === "command"
+              ? event
+              : kind === "held-text"
+                ? { ...event, turnItem: item }
+                : kind === "message"
+                  ? {
+                      type: "message.updated" as const,
+                      driver,
+                      message: {
+                        id: MessageId.make("late-message"),
+                        threadId: ids.threadId,
+                        runId: ids.runId,
+                        role: "assistant" as const,
+                        text: "Finished",
+                        streaming: false,
+                      },
+                    }
+                  : {
+                      type: "node.updated" as const,
+                      driver,
+                      node: {
+                        id: ids.rootNodeId,
+                        threadId: ids.threadId,
+                        runId: ids.runId,
+                        kind: "command_execution",
+                        status: "running",
+                      },
+                    };
+          const lateEvents = Stream.make(
+            late,
+            late,
+          ) as Stream.Stream<ProviderAdapter.ProviderAdapterV2Event>;
+          return phase === "before-terminal"
+            ? lateEvents
+            : Stream.make(event).pipe(
+                Stream.concat(
+                  Stream.fromEffect(
+                    Effect.sync(() => {
+                      settled = true;
+                      return rootTerminalEvent(ids, "completed");
+                    }),
+                  ),
+                ),
+                Stream.concat(lateEvents),
+              );
+        },
+        ingestNormalized: (input) =>
+          Effect.sync(() => {
+            if (input.event.type !== "turn.terminal")
+              guarded = input.writeIfRunCurrent?.expectedStatus === "running";
+            return [];
+          }),
+        interruptTurn: (input) =>
+          Effect.sync(() => {
+            assert.isTrue(input.stopBackgroundWork);
+            stops.push(input.providerTurnId);
+          }),
+      }).pipe(
+        Effect.provide(
+          Logger.layer([
+            Logger.make(({ message }) => {
+              logs.push(message);
+            }),
+          ]),
+        ),
+      );
+      assert.equal(guarded, kind !== "held-text" || phase !== "before-terminal");
+      assert.deepEqual(stops, [`provider-turn:late-settled:${status}`]);
+      assert.isEmpty(result.written);
+      assert.isEmpty(result.observed);
+      assert.isTrue(result.previewActivityEnded);
+      assert.lengthOf(
+        logs.filter((m) => String(m).includes("provider item after run settlement")),
+        1,
+      );
+      const warning = logs
+        .flatMap((entry) => (Array.isArray(entry) ? entry : [entry]))
+        .find(
+          (entry) =>
+            typeof entry === "object" && entry !== null && "secondsSinceSettlement" in entry,
+        );
+      assert.deepInclude(warning, {
+        threadId: `thread:late-settled:${status}`,
+        runId: `run:late-settled:${status}`,
+        ordinal: 1,
+        providerTurnId: `provider-turn:late-settled:${status}`,
+        secondsSinceSettlement: 0,
+      });
+    }),
+);
+
+it.effect("stops a settled run by exact attempt when late activity precedes its turn id", () =>
+  Effect.gen(function* () {
+    const stops: string[] = [];
+    const result = yield* captureRootRunTermination({
+      key: "late-before-turn-id",
+      unobservedProviderTurn: true,
+      shouldFinalizeRun: () => Effect.succeed(false),
+      loadRunSettlement: () => Effect.succeed({ status: "interrupted", completedAt: null }),
+      events: (ids) => Stream.make(backgroundTurnItemEvent(ids, "command_execution", "running", 1)),
+      interruptStartingRun: (input) =>
+        Effect.sync(() => {
+          assert.isTrue(input.stopBackgroundWork);
+          stops.push(`${input.runId}:${input.attemptId}`);
+        }),
+      interruptTurn: () => Effect.die("No provider turn id is available"),
+    });
+    assert.deepEqual(stops, ["run:late-before-turn-id:attempt:late-before-turn-id"]);
+    assert.isEmpty(result.written);
+    assert.isEmpty(result.observed);
+  }),
+);
+
+it.effect("keeps confirmed background completions after the root run settles", () =>
+  Effect.gen(function* () {
+    let settled = false;
+    const items: string[] = [];
+    yield* captureRootRunTermination({
+      key: "confirmed-completion",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      loadRunSettlement: () =>
+        Effect.succeed({ status: settled ? "completed" : "running", completedAt: null }),
+      onTerminalRun: Effect.sync(() => {
+        settled = true;
+      }),
+      events: (ids) =>
+        Stream.make(
+          backgroundTurnItemEvent(ids, "command_execution", "running", 1),
+          rootTerminalEvent(ids, "completed"),
+          backgroundTurnItemEvent(ids, "command_execution", "completed", 2),
+        ),
+      ingestNormalized: ({ event }) =>
+        Effect.sync(() => {
+          if (event.type === "turn_item.updated") items.push(event.turnItem.status);
+          return [];
+        }),
+      interruptTurn: () =>
+        Effect.die("Confirmed background completion must not interrupt the turn"),
+    });
+    assert.deepEqual(items, ["running", "completed"]);
+  }),
+);
+
 // ardud (9 Nov): a failed projection read failed the run while the Claude turn
 // kept running unread, and the next send was refused as "previous turn is
 // still running". A failed run must stop its provider turn.
@@ -5430,12 +5613,75 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
   }),
 );
 
+it.effect.each([
+  { provider: "codex", processOwned: true },
+  { provider: "cursor", processOwned: true },
+  { provider: "grok", processOwned: true },
+  { provider: "antigravity", processOwned: true },
+  { provider: "opencode", processOwned: false },
+] as const)(
+  "applies $provider child lifetime on live subscriber failure",
+  ({ provider, processOwned }) =>
+    Effect.gen(function* () {
+      const key = `session-subscriber-failure:${provider}`;
+      const ids = backgroundScenarioIds(key);
+      const providerDriver = ProviderDriverKind.make(provider);
+      const result = yield* captureRootRunTermination({
+        key,
+        providerDriver,
+        backgroundTasksEndWithProcess: processOwned,
+        shouldFinalizeRun: () => Effect.succeed(true),
+        awaitSessionExit: Effect.void,
+        subscribeEvents: () =>
+          Effect.succeed({
+            events: Stream.make(
+              subagentEvent(ids, "running"),
+              {
+                type: "node.updated",
+                driver: providerDriver,
+                node: makeRunOwnedSubagentNodeFixture({ ids, status: "running" }),
+              },
+              backgroundTurnItemEvent(ids, "subagent", "running", 1),
+            ).pipe(
+              Stream.concat(
+                Stream.fail(
+                  new ProviderAdapter.ProviderAdapterEventStreamError({
+                    driver: providerDriver,
+                    providerSessionId: ProviderSessionId.make(`session:${key}`),
+                    cause: "Provider session released: runtime_error.",
+                  }),
+                ),
+              ),
+            ),
+            close: Effect.void,
+          }),
+      });
+      assert.deepEqual(result.observed, ["run:failed", "pull-requests-refreshed"]);
+      const childEvents = result.finalEvents.filter(
+        (event) =>
+          event.type === "subagent.updated" ||
+          (event.type === "node.updated" && event.payload.id === ids.subagentNodeId) ||
+          (event.type === "turn-item.updated" && event.payload.type === "subagent"),
+      );
+      assert.lengthOf(childEvents, processOwned ? 3 : 0);
+      for (const event of childEvents) {
+        if (
+          event.type === "subagent.updated" ||
+          event.type === "node.updated" ||
+          event.type === "turn-item.updated"
+        )
+          assert.equal(event.payload.status, "failed");
+      }
+    }),
+);
+
 function captureRootRunTermination(input: {
   readonly key: string;
   readonly cancelMetadata?: Pick<OrchestrationV2Run, "cancelReason" | "cancelDetail">;
   readonly loadCancelMetadata?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRunCancelMetadata"];
   readonly unobservedProviderTurn?: boolean;
   readonly providerDriver?: ProviderDriverKind;
+  readonly backgroundTasksEndWithProcess?: boolean;
   readonly onTerminalRun?: Effect.Effect<void>;
   readonly delegated?: boolean;
   readonly legacyOwnership?:
@@ -5446,6 +5692,7 @@ function captureRootRunTermination(input: {
     | "other_task"
     | "read_error";
   readonly recoveryRun?: OrchestrationV2Run["transientRecovery"];
+  readonly stallRecovery?: OrchestrationV2Run["delegatedTaskStallRecovery"];
   readonly providerStartDeadlineAt?: OrchestrationV2Run["providerStartDeadlineAt"];
   readonly responseStreamingMode?: "turn" | "paragraph";
   readonly launchRecovery?: OrchestrationV2Run["launchRecovery"];
@@ -5459,6 +5706,7 @@ function captureRootRunTermination(input: {
   readonly rejectRecoveryWrite?: boolean;
   readonly loadDelegatedTask?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadDelegatedTask"];
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, ProjectionStore.ProjectionStoreV2Error>;
+  readonly loadRunSettlement?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["loadRunSettlement"];
   readonly rejectTerminalWriteForAttempt?: RunAttemptId;
   readonly runStart?: (
     start: Effect.Effect<void, RunExecutionService.RunExecutionServiceV2Error>,
@@ -5636,6 +5884,9 @@ function captureRootRunTermination(input: {
         } as OrchestrationV2AppThread,
         providerSessionId: input.sharedSessionId ?? ProviderSessionId.make(`session:${input.key}`),
         session: {
+          ...(input.backgroundTasksEndWithProcess === false
+            ? {}
+            : { backgroundTasksEndWithProcess: true }),
           events: Stream.empty,
           subscribeEvents: (
             input.subscribeEvents?.(ids) ??
@@ -5698,6 +5949,7 @@ function captureRootRunTermination(input: {
           startedAt: input.recordUsage ? usageStartedAt : null,
           providerInstanceId,
           transientRecovery: input.recoveryRun,
+          delegatedTaskStallRecovery: input.stallRecovery,
           providerStartDeadlineAt: input.providerStartDeadlineAt,
           launchRecovery: input.launchRecovery,
           modelSelection: { instanceId: providerInstanceId, model: input.model ?? "gpt-5.4" },
@@ -5765,6 +6017,9 @@ function captureRootRunTermination(input: {
           ? {}
           : { loadDelegatedTask: input.loadDelegatedTask }),
         shouldFinalizeRun: input.shouldFinalizeRun,
+        ...(input.loadRunSettlement === undefined
+          ? {}
+          : { loadRunSettlement: input.loadRunSettlement }),
         loadRunCancelMetadata:
           input.loadCancelMetadata ?? (() => Effect.succeed(input.cancelMetadata)),
         ...(input.durableRefusal === undefined && input.refusalRead === undefined
@@ -6757,6 +7012,129 @@ it.effect.each([
   }),
 );
 
+it.effect.each(
+  ["claude_no_response_budget", "claude_retry_flap", "claude_network_error"].flatMap((code) =>
+    [true, false].map((retryable) => ({ code, retryable })),
+  ),
+)(
+  "resumes a coded Claude failure once only when retryable: $code/$retryable",
+  ({ code, retryable }) =>
+    Effect.gen(function* () {
+      for (const resumed of [false, true]) {
+        const result = yield* captureRootRunTermination({
+          key: `${code}-${retryable}-${resumed}`,
+          delegated: true,
+          ...(resumed
+            ? {
+                recoveryRun: {
+                  firstError: {
+                    class: "transport_error" as const,
+                    category: "transient" as const,
+                    code,
+                    retryable: true,
+                    message: "First: Request timed out",
+                  },
+                  since: DateTime.formatIso(yield* DateTime.now),
+                },
+              }
+            : {}),
+          shouldFinalizeRun: () => Effect.succeed(true),
+          events: (ids) =>
+            Stream.make({
+              ...rootTerminalEvent(ids, "failed"),
+              status: "failed" as const,
+              failureItemOrdinal: 101,
+              threadDisposition: "reusable" as const,
+              failure: {
+                class: "transport_error" as const,
+                category: "transient" as const,
+                code,
+                retryable,
+                message: "Second: upstream connection lost",
+              },
+            }),
+        });
+        assert.lengthOf(
+          result.committedEffects.filter((effect) =>
+            effect.id.startsWith("effect:delegated-transient-resume:"),
+          ),
+          resumed || !retryable ? 0 : 1,
+        );
+        if (resumed) {
+          const errors = result.finalEvents.filter(
+            (event) => event.type === "turn-item.updated" && event.payload.type === "error",
+          );
+          assert.isTrue(
+            errors.some(
+              (event) =>
+                event.type === "turn-item.updated" &&
+                event.payload.type === "error" &&
+                event.payload.failure.message.includes("First: Request timed out") &&
+                event.payload.failure.message.includes("Second: upstream connection lost"),
+            ),
+          );
+        }
+      }
+    }),
+);
+
+it.effect.each(
+  ["claude_no_response_budget", "claude_retry_flap", "claude_network_error"].flatMap((code) =>
+    (["first_event", "post_tool"] as const).flatMap((phase) =>
+      [undefined, "Please relay: ready", "[Watcher event from build] Ready"].map((relayText) => ({
+        code,
+        phase,
+        relayText,
+      })),
+    ),
+  ),
+)(
+  "a previous silent recovery blocks coded network and relay replay: $phase/$code/$relayText",
+  ({ code, phase, relayText }) =>
+    Effect.gen(function* () {
+      const result = yield* captureRootRunTermination({
+        key: `silent-then-network-${phase}-${code}-${relayText ?? "work"}`,
+        delegated: true,
+        providerDriver: ProviderDriverKind.make("claudeAgent"),
+        model: "claude-haiku-5-5",
+        ...(relayText === undefined ? {} : { relayText }),
+        stallRecovery: {
+          phase,
+          lastProgressAt: DateTime.formatIso(yield* DateTime.now),
+          attemptId: null,
+        },
+        shouldFinalizeRun: () => Effect.succeed(true),
+        events: (ids) =>
+          Stream.make({
+            ...rootTerminalEvent(ids, "failed"),
+            status: "failed" as const,
+            failureItemOrdinal: 101,
+            threadDisposition: "reusable" as const,
+            failure: {
+              class: "transport_error" as const,
+              category: "transient" as const,
+              code,
+              retryable: true,
+              message: "Connection dropped (ECONNRESET)",
+              claudeAccess: {
+                status: null,
+                beforeResponse: true,
+                refusalFree: true,
+                refused: false,
+              },
+            },
+          }),
+      });
+      assert.isFalse(
+        result.committedEffects.some((effect) => effect.request.type === "provider-turn.start"),
+      );
+      const run = result.finalEvents.findLast((event) => event.type === "run.updated");
+      assert.equal(run?.payload.status, "failed");
+      assert.isUndefined(run?.payload.transientRecovery);
+      assert.isUndefined(run?.payload.launchRecovery);
+    }),
+);
+
 it.effect.each([
   "app_owned",
   "provider_native",
@@ -7003,6 +7381,52 @@ it.effect.each([
           assert.isAtLeast(request.retryDelayMs ?? 0, 20_000);
       }
     }),
+);
+
+it.effect.each(
+  ["[Watcher event from build] Ready", "Please relay: ready"].flatMap((relayText) =>
+    [null, 401, 403, 404, 429].map((status) => ({ relayText, status })),
+  ),
+)("honors permanent relay evidence in the outbox: $relayText/$status", ({ relayText, status }) =>
+  Effect.gen(function* () {
+    for (const delegated of [false, true]) {
+      for (const retryable of [false, true]) {
+        const result = yield* captureRootRunTermination({
+          key: `relay-veto-${relayText}-${status}-${delegated}-${retryable}`,
+          relayText,
+          delegated,
+          model: "claude-haiku-5-5",
+          providerDriver: ProviderDriverKind.make("claudeAgent"),
+          shouldFinalizeRun: () => Effect.succeed(true),
+          events: (ids) =>
+            Stream.make({
+              ...rootTerminalEvent(ids, "failed"),
+              status: "failed" as const,
+              failureItemOrdinal: 101,
+              threadDisposition: "reusable" as const,
+              failure: {
+                class: "transport_error" as const,
+                category: "transient" as const,
+                code: "claude_network_error",
+                retryable,
+                message: "Request timed out.",
+                claudeAccess: { status, beforeResponse: true, refusalFree: true, refused: false },
+              },
+            }),
+        });
+        assert.lengthOf(
+          result.committedEffects.filter((effect) => effect.request.type === "provider-turn.start"),
+          retryable ? 1 : 0,
+        );
+        if (!retryable) {
+          const run = result.finalEvents.findLast((event) => event.type === "run.updated");
+          assert.equal(run?.payload.status, "failed");
+          assert.isUndefined(run?.payload.transientRecovery);
+          assert.isUndefined(run?.payload.launchRecovery);
+        }
+      }
+    }
+  }),
 );
 
 it.effect.each([false, true])("retries an unsent relay once, refusal=%s", (refused) =>

@@ -16,6 +16,8 @@ agent_dir=$HOME/person/agent
 [[ -x $bun_bin && -r $agent_dir/config.json ]] || { echo 'Provide box config and pinned Bun before installing' >&2; exit 1; }
 "$bun_bin" -e 'const fs=require("fs");const c=JSON.parse(fs.readFileSync(process.env.HOME+"/person/agent/config.json","utf8"));for(const k of ["tokenFile","callbackTokenFile","privateKeyFile","systemFile"])fs.accessSync(c[k]);fs.accessSync(c.claude,fs.constants.X_OK)'
 "$bun_bin" "$agent_dir/code/integrations/moni-box-runner/src/router-auth.ts" --check-config "$agent_dir/config.json"
+# The supervisor owns separate loopback forwards: router 19465 -> 20128, livez 19466 -> 20129.
+# Validate configured overrides above; do not require tunnels before installing the paused runner.
 mkdir -p "$HOME/.config/systemd/user" "$HOME/person/bin"
 cat > "$HOME/.config/systemd/user/moni-box-runner.service" <<UNIT
 [Unit]
@@ -39,3 +41,4 @@ sudo loginctl enable-linger "$(id -un)"
 systemctl --user daemon-reload
 systemctl --user enable --now moni-box-runner
 BOXSETUP
+print 'After supervisor reload, verify on the box: curl -fsS http://127.0.0.1:19466/livez (HTTP 200, ready true; use boxLivezPort if overridden)'

@@ -23,13 +23,20 @@ This packet does not alter or restart 9router.
 
 The notification-only detector GETs `/api/providers`
 with local CLI auth every 60 seconds.
+The `boot` phase and private `supervisor.boot` event show shell-to-Node latency.
+Fetches share the remaining 45-second budget minus a 5-second journal reserve; exhausted budgets skip the tick through the same 15-minute outage bound. Deadlines after a valid fetch remain failures.
 The first fetch has a 6-second timeout. Transient timeouts, refused/reset sockets
 and HTTP 502/503/504 get one retry after 1 second, bounded at 15 seconds.
 Two transient failures skip that tick without changing incidents or pending
-notices; the journal keeps the first unavailable time and consecutive count.
-A valid snapshot resets that counter. After 15 minutes without one, the check
-fails through the runner's normal alert/pause path. Auth, JSON and schema errors
-fail immediately. Retry outcomes and skipped ticks go to the watcher log and
+notices; the journal keeps the first and last unavailable times and consecutive
+count. An ongoing outage is checkpointed before fetching, so a runner-killed
+check does not break continuity. A gap over twelve minutes before the next
+check starts a fresh streak: five-minute backoff, four-minute queue wait,
+90-second runner timeout and 90 seconds of slack. A valid snapshot logs
+recovery and resets it.
+This watcher never auto-pauses; sustained unavailability fails after 15 minutes.
+The runner alerts after two failures; Telegram coalesces reminders to at most hourly.
+Auth, JSON and schema errors fail immediately. Retry outcomes and skipped ticks go to the watcher log and
 the private 9router tool log; successful ticks emit no wake event.
 It selects only `provider=claude`, `authType=oauth`, `isActive=true`, and a
 truthy effective `reauthRequiredAt`; the server has already reconciled stale
@@ -95,7 +102,7 @@ row stays UNKNOWN. Service failures exit nonzero for robob-watch
 backoff, not healthy. robob-watch has its own failure alerts in addition to
 incident attention when a service stays down. Per-tick queueing is limited to
 three new incidents. The detector stops itself at 45 seconds, before the
-runner's 60-second limit; remaining incidents are persisted and processed on
+runner's 90-second limit; remaining incidents are persisted and processed on
 later ticks.
 
 If a future fenced implementation enables recovery, the worker is instructed to verify the real account identity independent of
@@ -244,25 +251,29 @@ not spend another failure or pause the watcher at its failure limit. The `done`
 and `failed` markers prevent a stall warning on the next run.
 
 The 45-second timer includes shell-to-Node startup when invoked by `check.sh`.
-It does not unref; an unresolved provider promise still fails with the phase
-name. Fetch retains a six-second abort across headers and JSON body. Telegram
+It does not unref; an unresolved fetch skips within its reserved budget, while
+other unresolved work fails with the phase name. Fetch aborts cover both headers and JSON body. Telegram
 commands retain an eight-second cap, kill their own spawned process group and
 resolve on child exit without waiting for inherited stdout pipes. The whole-run
 deadline also cancels an active command. A blocked synchronous filesystem call
 or a process starved by the OS cannot run a Node timer: the phase marker is the
 backstop when the runner kills that process. No global runner timeout changes.
 
-After review and explicit owner approval, update this existing watcher using:
+After review, update this existing watcher under the board's standing install
+approval using:
 
 ```sh
 /usr/bin/python3 -B integrations/robob-watch/checks/9router-claude-reauth/install.py
 ```
 
 The installer holds the existing `supervisor.lock` inode and atomically copies
-only its allowlisted code, tests, installer and README. It never replaces the
-watcher definition, journal, marker, lock, lease, deployment hold or runtime
-state. It neither registers/resumes the watcher nor restarts the runner.
-`watcher.json` and `watcher-definition.json` are imported reference definitions;
+its allowlisted code, tests, installer and README, plus the source definition's
+`max_consecutive_failures` into the live `watcher.json`. It preserves all other
+registration fields, including an existing `timeout_s` (defaults to 90 seconds
+when absent), and leaves the journal, marker, lock, lease, deployment hold and
+runtime state intact. It neither registers/resumes the watcher nor restarts
+the runner.
+`watcher-definition.json` is the reference for new registration;
 registration remains a separate owner-approved operation. `deploy.zsh
 robob-watch` excludes live `watchers/`, so it does not install this check.
 Verify code readback and observe natural runner executions after installation;

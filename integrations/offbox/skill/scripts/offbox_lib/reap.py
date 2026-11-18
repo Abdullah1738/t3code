@@ -138,7 +138,7 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
     capacity.schema(con)
     # Cleanup can declare an absent client/box lost before _check_unlocked ever sees its runs.
     # A saved result is stronger evidence, including for a placeholder left by an earlier pass.
-    from .runs import finish, restore_run_state, terminal_result
+    from .runs import finish, restore_run_state, terminal_result, settle_pulls
     recovered, unowned = set(), set()
     owned = f"(r.box_id IS NULL OR (l.box_id IS NOT NULL AND {mine('l')}))" if owner_scoped() else '1=1'
     for run in con.execute("SELECT r.* FROM runs r LEFT JOIN leases l USING(box_id) "
@@ -158,6 +158,8 @@ def _reap(con, dry: bool, actions: list[str]) -> list[str]:
         if terminal_result(saved):
             recovered.add(run['run_id'])
             if not dry:
+                if not settle_pulls(run['run_id'], 'reap', foreign=True):
+                    continue
                 finish(run['run_id'], saved['exit_code'], saved['status'], catch_up=False)
             actions.append(f"{'would repair' if dry else 'repair'} run {run['run_id']} exit={saved['exit_code']}")
     # Local runs (local-first or fallback) whose offbox process died without recording an end.
@@ -497,14 +499,19 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
         con.commit()
         lease._release_locked(con, bid)
     if not dry:
-        reconcile_lost(con, bid, state=state, foreign=True)
+        reconcile_lost(con, bid, state=state, foreign=True, role='reap')
     from .runs import EXIT_REPO_SETUP, REPO_SETUP_FAILED_MARKER
     for run in con.execute("SELECT * FROM runs WHERE box_id=? AND (status IN ('starting','running') OR "
-                           "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)))",
+                           "(status='infra' AND EXISTS (SELECT 1 FROM kv WHERE k='start_unknown:' || runs.run_id)) OR "
+                           "(exit_code IS NOT NULL AND pulls IS NOT NULL AND pulls!='[]' AND "
+                           "(pull_state IS NULL OR pull_state IN ('pending','running'))))",
                            (bid,)).fetchall():
         saved = restore_run_state(run)
         if terminal_result(saved):
             if not dry:
+                from .runs import settle_pulls
+                if not settle_pulls(run['run_id'], 'reap', foreign=True):
+                    continue
                 finish(run['run_id'], saved['exit_code'], saved['status'])
             actions.append(f"{'would repair' if dry else 'repair'} run {run['run_id']} exit={saved['exit_code']}")
             continue
@@ -530,7 +537,7 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 if modern or result.code is not None:
                     start_check.settle(con, run, result, run['error'] or 'client ended before the command started',
                                        until=None if api.left() is None else now() + max(0, api.left()),
-                                       foreign=True)
+                                       foreign=True, role='reap')
                     actions.append(f"settled run {run['run_id']} on {bid}: {result.verdict} exit={result.code}")
                     continue
             if state in api.LIVE_STATES and not pid:
@@ -607,15 +614,10 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 killed = killed_result(run['run_id'], wait=True, row=run, known_code=code) if code in (None, 137, 143) else None
                 if killed is not None and killed['process_id']:
                     status, code = 'killed', killed['exit_code']
-                if run['mode'] == 'bg' and status in ('done','failed','killed') and run['pulls']:
-                    import json
-                    from .runs import do_pulls
-                    try:
-                        do_pulls(bid, dict(run), json.loads(run['pulls']), foreign=True)
-                    except (OffboxError, OSError, sqlite3.Error) as error:
-                        if killed is None:
-                            raise
-                        say(f"warning: {run['run_id']}: artifact pull after offbox kill failed ({error})")
+                if status in ('done','failed','interrupted','killed','lost') and run['pulls']:
+                    from .runs import settle_pulls
+                    if not settle_pulls(run['run_id'], 'reap', foreign=True):
+                        continue
                 from .runs import planned_steps
                 code = finish(run['run_id'], code, status, run=run, bookkeeping=False, report=True)
                 try:
@@ -634,6 +636,8 @@ def _check_unlocked(con, bid: str, state: str, dry: bool, actions: list[str], bu
                 try:
                     from .misc import _catch_up_finished
                     _catch_up_finished(con, run['run_id'])
+                    from . import quint_tools, runs
+                    quint_tools.record(con, run, runs.LOGS_DIR / (run['run_id'] + '.log'), api.BACKEND)
                     event(con, bid, "run_reaped", f"{run['run_id']} {status} exit={code}")
                     if state in api.LIVE_STATES:
                         from .runs import settle_docker

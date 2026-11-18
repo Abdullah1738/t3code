@@ -166,17 +166,20 @@ class PrepareTests(Isolated):
     def test_resume_post_that_never_returns_moves_once(self):
         # SIGALRM interrupts an actual blocking system call, rather than a fake timeout exception.
         log = self.acquire_after_stall(lambda *args: signal.pause(), {'state': 'archived', 'type': 'large'})
-        self.assertIn('resume_stuck old resume_request', log)
+        self.assertIn('resume_stuck old {', log)
+        self.assertIn('"phase":"resume_request"', log)
 
     def test_acknowledged_resume_staying_stopped_is_bounded(self):
         log = self.acquire_after_stall(lambda *args: {}, {'state': 'archived', 'type': 'large'})
-        self.assertIn('resume_stuck old bring_up', log)
+        self.assertIn('resume_stuck old {', log)
+        self.assertIn('"phase":"bring_up"', log)
 
     def test_unanswered_resume_confirmation_is_bounded(self):
         def unanswered(*args):
             raise api.NetworkError('no answer')
         log = self.acquire_after_stall(unanswered, {'state': 'archived', 'type': 'large'})
-        self.assertIn('resume_stuck old resume_confirm', log)
+        self.assertIn('resume_stuck old {', log)
+        self.assertIn('"phase":"resume_confirm"', log)
 
     def test_second_stalled_box_exits_infra_without_third_allocation(self):
         self.box('old', 'stopped', member=True)

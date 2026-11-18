@@ -284,6 +284,7 @@ it.effect.each([
           Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
             getByCommandId: (readCommandId) =>
               Effect.gen(function* () {
+                if (readCommandId === `delegation-lost:${commandId}`) return Option.none();
                 reads.push(readCommandId);
                 assert.equal(readCommandId, commandId);
                 if (reads.length === 2) {
