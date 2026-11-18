@@ -3024,6 +3024,7 @@ test("first attempt landing during the retry POST still admits one prompt and se
 test("watchdog notices even when normal poll reads fail, and never retries an unreadable outcome", async () => {
   const h = setup();
   const start = Date.now();
+  setSystemTime(start);
   h.backend.promptBehavior = async () => { throw new Error("offline"); };
   h.input("first", "Question");
   await h.router.tick();
