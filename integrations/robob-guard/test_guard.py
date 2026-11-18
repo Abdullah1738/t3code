@@ -144,15 +144,16 @@ class DecisionTests(unittest.TestCase):
 
 class IOTests(unittest.TestCase):
     def test_bounded_process_diagnostics_and_failed_reads(self):
-        output = "malformed\n1 0 /sbin/launchd /sbin/launchd\n42 1 %s desktop\n" % guard.EXECUTABLE
-        output += "\n".join("%s 43 %s %s" % (pid, guard.EXECUTABLE, "x" * 300) for pid in range(43, 53))
+        output = "malformed\n1 0 /sbin/launchd /sbin/launchd\n42 1 /Applications/Ro %s\n" % guard.EXECUTABLE
+        output += "\n".join("%s 43 /Applications/Ro %s %s" % (pid, guard.EXECUTABLE, "x" * 300) for pid in range(43, 53))
         with patch('quit_reason.registered_desktop_pids',return_value={42}), \
                 patch('guard.subprocess.run',return_value=subprocess.CompletedProcess('ps',0,stdout=output)):
             detail=json.loads(guard.process_diagnostics().removeprefix('processes='))
         self.assertEqual(detail['lsappinfo_pid'],42)
         self.assertTrue(detail['lsappinfo_alive'])
-        self.assertEqual([p['pid'] for p in detail['robob_processes']],list(range(43,48)))
-        self.assertTrue(all(len(p['args'])==160 and p['ppid']==43 for p in detail['robob_processes']))
+        self.assertEqual([p['pid'] for p in detail['robob_processes']],list(range(42,47)))
+        self.assertEqual(detail['robob_processes'][0]['role'],'desktop')
+        self.assertTrue(all(len(p['args'])==160 and p['ppid']==43 for p in detail['robob_processes'][1:]))
         with patch('quit_reason.registered_desktop_pids',side_effect=OSError('lsa')), \
                 patch('guard.subprocess.run',side_effect=subprocess.TimeoutExpired('ps',5)):
             detail=guard.process_diagnostics()
