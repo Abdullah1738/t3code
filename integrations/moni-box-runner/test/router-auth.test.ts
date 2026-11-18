@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { claudeHarness } from "../src/claude.ts";
-import { routerConfig, routerReachable, ROUTER_KEY_ERROR } from "../src/router-auth.ts";
+import { routerConfig, routerReady, ROUTER_KEY_ERROR } from "../src/router-auth.ts";
 import { BoxRunner } from "../src/runner.ts";
 import { opaqueId } from "../../spectrum-bridge/src/remote-protocol.ts";
 import { brotliCompressSync, deflateSync, gzipSync } from "node:zlib";
@@ -78,12 +78,12 @@ writeFileSync('status',String(response.status));process.exit(response.ok?0:1);\n
 test("lease reports router readiness separately while admission waits for the HTTP round trip", async () => {
   const dir = root(); let healthy = false, calls = 0;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: req => {
-    expect(new URL(req.url).pathname).toBe("/api/health"); expect(req.headers.get("x-api-key")).toBeNull();
-    return new Response(null, { status: healthy ? 200 : 503 });
+    expect(new URL(req.url).pathname).toBe("/livez"); expect(req.headers.get("x-api-key")).toBeNull();
+    return Response.json({ ready: healthy, reason: "not_ready" }, { status: healthy ? 200 : 503 });
   } }); clean.push(() => { server.stop(true); }); const port = server.port;
   const config = { root: dir, boxId: "bx_test", epoch: "test", token: "t".repeat(32), callbackToken: "c".repeat(32), callbackUrl: "http://box", privateKey: "unused", system: "system" };
   const runner = new BoxRunner(config, { run: async () => { calls++; return "NO_REPLY"; } }, {
-    modelReady: () => routerReachable(routerConfig({ boxRouterPort: port })), callbackReady: async () => true,
+    modelReady: () => routerReady(routerConfig({ boxLivezPort: port })), callbackReady: async () => true,
     fetch: async () => Response.json({ accepted: true }),
   }); clean.push(() => runner.db.close());
   const lease = () => runner.handle(new Request("http://box/lease", { method: "POST", headers: { authorization: `Bearer ${config.token}` }, body: JSON.stringify({ boxId: config.boxId, epoch: config.epoch }) }));
@@ -193,9 +193,11 @@ test("missing, empty or unsafe router keys keep turns pending, emit one fixed co
 });
 
 test("router config defaults and port validation cannot introduce other hosts or SSH arguments", () => {
-  expect(routerConfig({})).toEqual({ boxRouterPort: 19465, macRouterPort: 20128, routerKeyFile: "/home/user/person/secrets/9router-key" });
-  for (const value of [null, true, "19465", "19465:owner:22", 0, 1023, 65536]) {
-    for (const field of ["boxRouterPort", "macRouterPort"]) expect(() => routerConfig({ [field]: value })).toThrow("Invalid router configuration");
+  for (const port of [1024, 19465, 65535]) expect(() => routerConfig({ boxRouterPort: port, boxLivezPort: port })).toThrow("Invalid router configuration");
+  expect(routerConfig({ boxLivezPort: 19476, macLivezPort: 20139 })).toMatchObject({ boxLivezPort: 19476, macLivezPort: 20139 });
+  expect(routerConfig({})).toEqual({ boxRouterPort: 19465, macRouterPort: 20128, boxLivezPort: 19466, macLivezPort: 20129, routerKeyFile: "/home/user/person/secrets/9router-key" });
+  for (const value of [null, true, "19465", "19465:owner:22", 0, 1023, 65536, 19465.5, NaN, Infinity]) {
+    for (const field of ["boxRouterPort", "macRouterPort", "boxLivezPort", "macLivezPort"]) expect(() => routerConfig({ [field]: value })).toThrow("Invalid router configuration");
   }
 });
 

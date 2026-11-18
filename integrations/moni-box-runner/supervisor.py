@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import threading
@@ -15,8 +16,12 @@ import urllib.error
 import urllib.request
 
 
-TUNNELS = ('runner', 'callback', 'router')
+TUNNELS = ('runner', 'callback', 'router', 'livez')
 LEASE_TIMEOUT_SECONDS = 12
+
+
+def livez_reason(value):
+    return value if isinstance(value, str) and value in ('no_worker', 'not_ready', 'heartbeat_stale', 'shutting_down') else 'unknown'
 
 
 def log_event(event, **fields):
@@ -93,10 +98,18 @@ def capture_tunnel(operation):
 
 
 def router_ports(config):
-    ports = (config.get('boxRouterPort', 19465), config.get('macRouterPort', 20128))
+    ports = (config.get('boxRouterPort', 19465), config.get('macRouterPort', 20128),
+             config.get('boxLivezPort', 19466), config.get('macLivezPort', 20129))
     if any(type(port) is not int or not 1024 <= port <= 65535 for port in ports):
         raise RuntimeError('invalid_router_port')
-    return ports
+    if ports[0] == ports[2]:
+        raise RuntimeError('invalid_router_port')
+    return ports[:2]
+
+
+def livez_ports(config):
+    router_ports(config)
+    return config.get('boxLivezPort', 19466), config.get('macLivezPort', 20129)
 
 
 class Supervisor:
@@ -160,6 +173,7 @@ class Supervisor:
             started = self.clock()
             try:
                 self._children[name] = (self.deps.router_tunnel(box) if name == 'router'
+                                        else self.deps.livez_tunnel(box) if name == 'livez'
                                         else self.deps.tunnel(box, name == 'callback'))
                 created.append(name)
             except BaseException as error:
@@ -211,6 +225,7 @@ class Supervisor:
                 phase = (error.phase if isinstance(error, ReadinessError)
                          else 'ssh-transport' if isinstance(error, ConnectionRefusedError) else 'runner-http')
                 repair = phase == 'ssh-transport'
+                repair_target = target
                 if target in ('router', 'callback') and phase != 'ssh-transport':
                     # Compare the Mac endpoint before blaming its healthy SSH process.
                     direct_started = self.clock()
@@ -218,12 +233,17 @@ class Supervisor:
                     self.log('moni-supervisor-direct-probe', 'direct-http', target, direct_started,
                              ready=direct_ready)
                     repair = direct_ready
-                    if not repair:
+                    if target == 'router':
+                        # Model unreadiness is not evidence of a broken forward. Only a refused box TCP port is.
+                        repair_target = 'livez'
+                        repair = direct_ready and self.deps.livez_refused()
+                    if not direct_ready:
                         self.log('moni-supervisor-router-slow' if target == 'router' else 'moni-supervisor-callback-unready',
-                                 'direct-http', target, started, error, latency_ms=latency_ms)
+                                 'direct-http', target, started, error, latency_ms=latency_ms,
+                                 **({'reason': livez_reason(getattr(self.deps, 'direct_router_reason', None))} if target == 'router' else {}))
                 if repair:
-                    stopped = self.stop_tunnels((target,))
-                    self.log('moni-supervisor-reconnect', 'runner-lease', target, started, error, stopped,
+                    stopped = self.stop_tunnels((repair_target,))
+                    self.log('moni-supervisor-reconnect', 'runner-lease', repair_target, started, error, stopped,
                              latency_ms=latency_ms)
                     self.start_missing_tunnels()
             return False
@@ -350,6 +370,24 @@ class OffboxDeps:
         # SSH runs on the Mac; -R binds only the box loopback and targets only this Mac loopback port.
         return capture_tunnel(lambda: self.ssh_sync.tunnel(box, box_port, mac_port, True))
 
+    def livez_tunnel(self, box):
+        box_port, mac_port = livez_ports(self.config)
+        return capture_tunnel(lambda: self.ssh_sync.tunnel(box, box_port, mac_port, True))
+
+    def livez_refused(self):
+        port, _ = livez_ports(self.config)
+        # A failed SSH command or a TCP timeout is inconclusive, not permission to tear down a healthy child.
+        probe = ('import errno,socket,sys; s=socket.socket(); s.settimeout(1.5); '
+                 f'code=s.connect_ex(("127.0.0.1",{port})); s.close(); sys.exit(42 if code==errno.ECONNREFUSED else 0)')
+        try:
+            with quiet_offbox():
+                result = subprocess.run(self.ssh_sync.ssh_base(self.config['boxId']) +
+                                        [self.config['boxId'], 'python3 -c ' + shlex.quote(probe)],
+                                        timeout=5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return result.returncode == 42
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
     def post(self, base, token_file, path, body):
         token = Path(token_file).read_text().strip()
         req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
@@ -392,15 +430,28 @@ class OffboxDeps:
                 raise ReadinessError(target, 200, 'DependencyUnavailable')
 
     def direct_ready(self, target):
+        if target == 'router':
+            self.direct_router_reason = 'unknown'
         try:
             if target == 'router':
-                _, port = router_ports(self.config)
-                with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health', timeout=5) as response:
-                    return response.status == 200
+                _, port = livez_ports(self.config)
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/livez', timeout=1.5) as response:
+                    body = json.loads(response.read(4096))
+                    return response.status == 200 and isinstance(body, dict) and body.get('ready') is True
             if target == 'callback':
                 result = self.post(f"http://127.0.0.1:{self.config['callbackPort']}", self.config['callbackTokenFile'],
                                    '/ready', {'epoch': self.config['epoch']})
                 return result.get('epoch') == self.config['epoch']
+        except urllib.error.HTTPError as error:
+            try:
+                if target == 'router' and error.code == 503:
+                    body = json.loads(error.read(4096))
+                    self.direct_router_reason = livez_reason(body.get('reason') if isinstance(body, dict) else None)
+            except (OSError, ValueError):
+                pass
+            finally:
+                error.close()
+            return False
         except (OSError, ValueError, urllib.error.URLError):
             return False
         return False
