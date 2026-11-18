@@ -18,6 +18,42 @@ import urllib.request
 
 TUNNELS = ('runner', 'callback', 'router', 'livez')
 LEASE_TIMEOUT_SECONDS = 12
+INTERRUPTION_REASONS = ('authority-expired', 'disabled', 'harness-exit')
+
+
+def clean_runner_stats(value):
+    def number(value):
+        if type(value) is not int or not 0 <= value <= 9007199254740991:
+            raise ValueError('invalid_runner_stats')
+        return value
+    try:
+        counts = {window: {reason: number(value['interruptions'][window][reason]) for reason in INTERRUPTION_REASONS}
+                  for window in ('total', 'last24h')}
+        if any(counts['last24h'][reason] > counts['total'][reason] for reason in INTERRUPTION_REASONS):
+            return None
+        at, reason = value['lastInterruptionAt'], value['lastInterruptionReason']
+        if at is not None:
+            at = number(at)
+        if reason is not None and reason not in INTERRUPTION_REASONS or (at is None) != (reason is None):
+            return None
+        return {'interruptions': counts, 'autoRetry': {'retried': number(value['autoRetry']['retried'])},
+                'lastInterruptionAt': at, 'lastInterruptionReason': reason, 'stuck': number(value['stuck']),
+                'historySince': number(value['historySince']), 'legacyRetained': number(value['legacyRetained'])}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def stats_delta(current, previous):
+    if (previous is None or current['historySince'] != previous['historySince']
+            or current['legacyRetained'] != previous['legacyRetained']
+            or current['autoRetry']['retried'] < previous['autoRetry']['retried']
+            or any(current['interruptions']['total'][reason] < previous['interruptions']['total'][reason]
+                   for reason in INTERRUPTION_REASONS)):
+        return None
+    return {'interruptions': {window: {reason: current['interruptions'][window][reason] - previous['interruptions'][window][reason]
+                                      for reason in INTERRUPTION_REASONS} for window in ('total', 'last24h')},
+            'autoRetry': {'retried': current['autoRetry']['retried'] - previous['autoRetry']['retried']},
+            'stuck': current['stuck'] - previous['stuck']}
 
 
 def livez_reason(value):
@@ -431,6 +467,11 @@ class OffboxDeps:
             raise ReadinessError('runner', None, 'TimeoutError', 'runner-http') from None
         if result.get('boxId') != self.config['boxId'] or result.get('epoch') != self.config['epoch']:
             raise ReadinessError('runner', 200, 'ReadinessError')
+        stats = clean_runner_stats(result.get('stats'))
+        previous = getattr(self, '_last_runner_stats', None)
+        if stats is not None and stats != previous:
+            log_event('moni-box-runner-stats', stats=stats, deltas=stats_delta(stats, previous))
+            self._last_runner_stats = stats
         for target in ('router', 'callback'):
             if result.get(target + 'Ready') is False:
                 raise ReadinessError(target, 200, 'DependencyUnavailable')
