@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shlex
+import signal
 import socket
 import struct
 import subprocess
@@ -15,6 +16,11 @@ import urllib.parse
 from pathlib import Path
 
 import active_sessions
+
+STOP_XCODE_BUILDS_DEFAULT = False
+XCODE_WINDOW = 60
+XCODE_LOG_GRACE = 30 * 60
+XCODE_TERM_GRACE = 10
 
 IDLE_GRACE = 2 * 60 * 60
 NATIVE_KEYS = {"CLAUDE_CODE_SESSION_ID": "claudeAgent", "CODEX_THREAD_ID": "codex"}
@@ -160,6 +166,8 @@ def family(row):
         program = os.path.basename(shlex.split(row["args"])[0]).lower()
     except (ValueError, IndexError):
         return None
+    if program == "xcodebuild":
+        return "xcode-build"
     if program.startswith(("python", "next-server")):
         return program
     if program in {"node", "cua-driver", "claude", "codex", "opencode", "npx", "bun"}:
@@ -400,7 +408,7 @@ def detect(rows, memory, labels, roster, keep=(), inspect=probe, resolve=owner,
     ordered, ranks = ordered_processes(rows, cursor, cwd_hints or {})
     for row in ordered:
         program = family(row)
-        if not program:
+        if not program or program == "xcode-build":
             continue
         chain = parent_chain(row, rows)
         item = {key: row[key] for key in ("pid", "ppid", "start", "tty")}
@@ -732,8 +740,9 @@ def reap_agent_browsers(report, *, rescan=None, close=close_agent_browser, refre
 
 def report_summary(report):
     result = {key: report[key] for key in ("candidates", "problems", "checked", "skipped", "budget_skipped", "owner_calls")}
-    if "agent_browser" in report:
-        result["agent_browser"] = report["agent_browser"]
+    for key in ("agent_browser", "xcode_builds"):
+        if key in report:
+            result[key] = report[key]
     return result
 
 
@@ -749,9 +758,290 @@ def scan(roster, keep=(), cursor=0):
         report = detect(rows, memory, labels, roster, keep, deadline=time.monotonic() + OBSERVATION_BUDGET,
                         cursor=cursor, cwd_hints=hints)
         report["agent_browser"] = scan_agent_browsers(roster, keep)
+        report["xcode_builds"] = scan_xcode_builds(roster, keep)
         return report
     except Exception as exc:
         return {"report_only": True, "inventory": [], "candidates": [],
                 "problems": ["process_inventory_unavailable: " + type(exc).__name__],
                 "checked": 0, "skipped": 0, "budget_skipped": 0, "next_cursor": cursor,
                 "owner_calls": owner_call_summary({})}
+
+
+def process_identity(row):
+    return tuple(row.get(k) for k in ("pid", "ppid", "start", "tty", "args")) if row else None
+
+
+def xcode_roots(rows):
+    return [row for row in rows.values() if family(row) == "xcode-build"
+            and not any(family(p) == "xcode-build" for p in parent_chain(row, rows) if not p.get("missing"))]
+
+
+def xcode_stalled(before, after, root_pid, *, age_s, log_mtime, now, window_s):
+    """Pure stall predicate shared with the fast guard; incomplete evidence keeps."""
+    tree = descendants(root_pid, before) | {root_pid}
+    if window_s < XCODE_WINDOW or tree != descendants(root_pid, after) | {root_pid}:
+        return False
+    for pid in tree:
+        first, last = before.get(pid), after.get(pid)
+        if not first or not last or process_identity(first) != process_identity(last):
+            return False
+        values = [first.get("cpu_seconds"), last.get("cpu_seconds")]
+        if any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in values):
+            return False
+        if values[1] != values[0]:
+            return False
+    if not math.isfinite(age_s) or age_s < XCODE_LOG_GRACE:
+        return False
+    return (now - log_mtime > XCODE_LOG_GRACE if log_mtime is not None else age_s > IDLE_GRACE)
+
+
+def home_redact(value):
+    return redact(value.replace(str(Path.home()), "~")) if value is not None else None
+
+
+def xcode_metadata(row, rows):
+    chain = [row] + [p for p in parent_chain(row, rows) if not p.get("missing") and p["pid"] > 1]
+    hints = cwd_inventory({p["pid"]: p for p in chain})
+    cwd = hints.get(row["pid"])
+    if not cwd:
+        raise ValueError("build cwd unavailable")
+    worktree = next((p for p in (Path(cwd), *Path(cwd).parents)
+                     if (p / '.git').exists() or (p / 'tmp/build/state').is_dir()), Path(cwd))
+    bindings = {}
+    for process in chain:
+        for key, value in (native_binding(process["pid"]) or {}).items():
+            if key in bindings and bindings[key] != value:
+                raise ValueError("conflicting launcher bindings")
+            bindings[key] = value
+    state = worktree / 'tmp/build/state'
+    state_pid = None
+    if (state / 'pid').is_file() and not (state / 'exit').exists():
+        try:
+            recorded_pid = int((state / 'pid').read_text().strip())
+        except ValueError:
+            recorded_pid = None
+        if recorded_pid in {p['pid'] for p in chain}:
+            state_pid = recorded_pid
+    # Detached state survives completion. Only a current pid-linked launcher
+    # may supply state metadata; subsequent builds use their own bindings/fds.
+    logs = set()
+    for key in ('log', 'log_path') if state_pid is not None else ():
+        path = state / key
+        if path.is_file():
+            value = Path(path.read_text().strip())
+            logs.add(value if value.is_absolute() else worktree / value)
+    # A pid-linked detached launcher bounds this build's logs. Otherwise stop
+    # at the first shared service or ancestor outside this worktree; its own
+    # stdout/stderr can stay busy long after the build has stalled.
+    log_pids = {row['pid']}
+    if state_pid != row['pid']:
+        for ancestor in chain[1:]:
+            if state_pid is None:
+                ancestor_cwd = hints.get(ancestor['pid'])
+                if (not ancestor_cwd or not Path(ancestor_cwd).is_relative_to(worktree)
+                        or keep_reason(ancestor, [], {}, ())):
+                    break
+            log_pids.add(ancestor['pid'])
+            if ancestor['pid'] == state_pid:
+                break
+    raw = run(['/usr/sbin/lsof', '-b', '-w', '-a', '-p', ','.join(str(pid) for pid in sorted(log_pids)),
+               '-d', '1,2', '-Fpftn'], allow_empty=True)
+    regular, log_pid = False, None
+    for line in raw.splitlines():
+        if line.startswith('p'):
+            log_pid = int(line[1:])
+            regular = False
+        elif line.startswith('f'):
+            regular = False
+        elif line.startswith('t'):
+            regular = line == 'tREG'
+        elif regular and log_pid in log_pids and line.startswith('n/'):
+            logs.add(Path(line[1:]))
+    existing = [(p, p.stat().st_mtime) for p in logs if p.is_file()]
+    log, mtime = max(existing, key=lambda entry: entry[1]) if existing else (None, None)
+    argv = shlex.split(row['args'])
+    derived = argv[argv.index('-derivedDataPath') + 1] if '-derivedDataPath' in argv else None
+    return dict(cwd=cwd, worktree=str(worktree), state_pid=state_pid, binding=bindings or None,
+                log_path=str(log) if log else None, log_mtime=mtime, derived_data=derived)
+
+
+def xcode_owner_state(own, roster):
+    if not own or own.get('keep_reason') == 'owner_deleted':
+        return 'unknown'
+    thread = own['thread']
+    if own.get('keep_reason') == 'owner_has_work_or_not_ended':
+        return 'live-owner'
+    if thread.get('state') is not None and thread.get('status') is not None:
+        if thread['state'] != 'idle' or thread['status'] not in TERMINAL:
+            return 'live-owner'
+        if not own.get('keep_reason') and owner_clear(own, roster):
+            return 'ended-owner'
+    return 'unknown'
+
+
+def xcode_stop_enabled():
+    return os.environ.get('DEV_JANITOR_STOP_XCODE_BUILDS', '1' if STOP_XCODE_BUILDS_DEFAULT else '0') == '1'
+
+
+def detect_xcode_builds(rows, before, after, roster, labels, keep=(), *, metadata=xcode_metadata,
+                        resolve=owner, now=None, window_s=0):
+    report = dict(inventory=[], candidates=[], problems=[], actions=[], stop_enabled=xcode_stop_enabled())
+    now = time.time() if now is None else now
+    calls = {}
+    if resolve is owner:
+        resolve = lambda binding: owner(binding, calls=calls)
+    for row in xcode_roots(rows):
+        chain = parent_chain(row, rows)
+        tree = descendants(row['pid'], before) | {row['pid']}
+        item = {**row, 'args': home_redact(row['args']), 'candidate': False, 'owner_state': 'unknown', 'owner': None,
+                'launcher_chain': [{**{k: p[k] for k in ('pid', 'ppid', 'start', 'tty') if k in p},
+                                    'command': home_redact(p.get('args', '')), 'missing': p.get('missing', False)} for p in chain],
+                'children': [], 'child_counts': {}, 'cpu_gained_s': None, 'window_s': window_s}
+        report['inventory'].append(item)
+        try:
+            item['age_s'] = now - time.mktime(time.strptime(row['start'], '%a %b %d %H:%M:%S %Y'))
+            reason = None
+            # Xcode's toolchain binaries live inside Xcode.app too; exempt the
+            # actual GUI launcher, not every executable in that application bundle.
+            if any(p.get('tty', '??') not in {'??', '?', '-'} or
+                   re.search(r'/(?:Xcode|Terminal|iTerm2?)\.app/Contents/MacOS/', p.get('args', ''), re.I)
+                   for p in [row] + chain):
+                reason = 'interactive_launcher'
+            elif any(p.get('missing') for p in chain):
+                reason = 'parent_chain_incomplete'
+            elif row['pid'] in labels:
+                reason = 'launchd_registered'
+            if reason:
+                item['keep_reason'] = reason
+                continue
+            details = metadata(row, rows)
+            item.update({k: home_redact(v) if isinstance(v, str) else v for k, v in details.items()})
+            if not roster['complete']:
+                reason = 'observation_incomplete'
+            elif any(k and (k == str(row['pid']) or k in row['args'] or
+                            k in {details['cwd'], details['worktree']}) for k in keep):
+                reason = 'keep_file'
+            binding = details['binding']
+            # Only a pid-linked detached state can use the unique exact worktree
+            # owner as fallback. Workspace proximity alone is not ownership.
+            if not binding and details.get('state_pid') is not None:
+                matches = [tid for tid, path in roster.get('workspaces', {}).items() if path == details['worktree']]
+                if len(matches) == 1:
+                    binding = {'T3_THREAD_ID': matches[0]}
+            own = resolve(binding) if binding else None
+            item['owner_state'] = xcode_owner_state(own, roster)
+            item['owner'] = own['thread']['threadId'] if own else None
+            for pid in sorted(tree - {row['pid']}):
+                child = before[pid]
+                name = os.path.basename(shlex.split(child['args'])[0])
+                item['child_counts'][name] = item['child_counts'].get(name, 0) + 1
+                item['children'].append({**{k: child[k] for k in ('pid', 'ppid', 'start', 'tty')},
+                                         'command': home_redact(child['args']), 'cpu_seconds': after.get(pid, {}).get('cpu_seconds')})
+            if all(pid in before and pid in after for pid in tree):
+                item['cpu_gained_s'] = sum(after[p]['cpu_seconds'] - before[p]['cpu_seconds'] for p in tree)
+                item['cpu_seconds'] = after[row['pid']]['cpu_seconds']
+            if item['owner_state'] == 'unknown':
+                reason = reason or 'unknown_owner'
+            if process_identity(before.get(row['pid'])) != process_identity(row):
+                reason = reason or 'process_identity_changed'
+            if not reason and xcode_stalled(before, after, row['pid'], age_s=item['age_s'],
+                                            log_mtime=details['log_mtime'], now=now, window_s=window_s):
+                item.update(candidate=True, evidence='stale_log_and_flat_tree_cpu' if details['log_mtime'] is not None
+                            else 'no_log_old_tree_and_flat_cpu')
+                report['candidates'].append(dict(item))
+            else:
+                item['keep_reason'] = reason or 'not_stalled_or_observation_incomplete'
+        except Exception as exc:
+            item['keep_reason'] = 'observation_unavailable: ' + type(exc).__name__
+    report['owner_calls'] = owner_call_summary(calls)
+    return report
+
+
+def scan_xcode_builds(roster, keep=()):
+    try:
+        before = cpu_processes()
+        if not xcode_roots(before):
+            return detect_xcode_builds(before, before, before, roster, {}, keep)
+        started = time.monotonic()
+        run(['/usr/bin/top', '-l', '2', '-s', str(XCODE_WINDOW), '-stats', 'pid,cpu'], timeout=XCODE_WINDOW + 15)
+        after = cpu_processes()
+        return detect_xcode_builds(before, before, after, roster, launch_services(), keep,
+                                   now=time.time(), window_s=time.monotonic() - started)
+    except Exception as exc:
+        return dict(inventory=[], candidates=[], actions=[], stop_enabled=xcode_stop_enabled(),
+                    problems=['xcode_observation_unavailable: ' + type(exc).__name__])
+
+
+def xcode_candidate_identity(item):
+    return (tuple(item.get(k) for k in ('pid', 'ppid', 'start', 'tty', 'args', 'owner', 'owner_state',
+                                       'worktree', 'state_pid', 'binding', 'log_path', 'log_mtime')),
+            item['launcher_chain'], [{k: v for k, v in c.items() if k != 'cpu_seconds'} for c in item['children']])
+
+
+def stop_xcode_builds(report, *, rescan=None, observe=cpu_processes, send=os.kill, pause=time.sleep):
+    if not xcode_stop_enabled():
+        return []
+    if rescan is None:
+        rescan = lambda: scan_xcode_builds(active_sessions.checked_snapshot())
+    actions = []
+    for original in report.get('candidates', []):
+        entry = dict(pid=original['pid'], action='kept', ok=False, signals=[])
+        try:
+            fresh = rescan()
+            item = next((c for c in fresh['candidates'] if xcode_candidate_identity(c) == xcode_candidate_identity(original)), None)
+            if fresh.get('problems') or item is None:
+                entry['reason'] = 'changed_before_stop'
+            else:
+                rows = observe()
+                tree = descendants(item['pid'], rows) | {item['pid']}
+                expected = {item['pid']} | {c['pid'] for c in item['children']}
+                saved = {item['pid']: item, **{c['pid']: {**c, 'args': c['command']} for c in item['children']}}
+                def same(pid, current):
+                    old, new = saved[pid], current.get(pid)
+                    return bool(new and all(new[k] == old[k] for k in ('start', 'tty'))
+                                and home_redact(new['args']) == old['args'])
+                def unchanged_tree(current):
+                    return (descendants(item['pid'], current) | {item['pid']} == expected
+                            and all(same(pid, current)
+                                    and current[pid]['ppid'] == saved[pid]['ppid']
+                                    and current[pid]['cpu_seconds'] == saved[pid]['cpu_seconds']
+                                    for pid in expected))
+                if not unchanged_tree(rows):
+                    entry['reason'] = 'tree_changed_before_stop'
+                else:
+                    targets = [item['pid']]
+                    services = [pid for pid in sorted(tree - {item['pid']}) if
+                                os.path.basename(shlex.split(rows[pid]['args'])[0]) in {'SWBBuildService', 'XCBBuildService'}]
+                    def signal_exact(pid, sig):
+                        current = observe()
+                        if pid == item['pid'] and sig == signal.SIGTERM and not unchanged_tree(current):
+                            return False
+                        if same(pid, current):
+                            send(pid, sig)
+                            entry['signals'].append(dict(pid=pid, signal=sig.name))
+                            return True
+                        return False
+                    if not signal_exact(item['pid'], signal.SIGTERM):
+                        entry['reason'] = 'root_changed_before_term'
+                        actions.append(entry)
+                        continue
+                    entry['action'] = 'stop'
+                    pause(XCODE_TERM_GRACE)
+                    for pid in services:
+                        signal_exact(pid, signal.SIGTERM)
+                        targets.append(pid)
+                    pause(XCODE_TERM_GRACE)
+                    # Only targets that received TERM may receive KILL; never use
+                    # a process group or a name match that can reach another build.
+                    termed = {s['pid'] for s in entry['signals'] if s['signal'] == 'SIGTERM'}
+                    for pid in targets:
+                        if pid in termed:
+                            signal_exact(pid, signal.SIGKILL)
+                    pause(1)
+                    entry['ok'] = not any(same(pid, observe()) for pid in tree)
+                    if not entry['ok']:
+                        entry['reason'] = 'stop_incomplete'
+        except Exception as exc:
+            entry['reason'] = type(exc).__name__
+        actions.append(entry)
+    return actions
