@@ -36,7 +36,8 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Schema from "effect/Schema";
-import type * as Effect from "effect/Effect";
+import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
 import type * as Scope from "effect/Scope";
 import type * as Stream from "effect/Stream";
 
@@ -143,7 +144,17 @@ export const ProviderAdapterV2Event = Schema.Union([
     plan: OrchestrationV2PlanArtifact,
   }),
   Schema.Struct({
+    /** Native settlement can follow an already-emitted local failure terminal. */
+    type: Schema.Literal("turn.native-ended"),
+    driver: ProviderDriverKind,
+    providerThreadId: ProviderThreadId,
+    providerTurnId: ProviderTurnId,
+    attemptId: RunAttemptId,
+  }),
+  Schema.Struct({
     type: Schema.Literal("turn.terminal"),
+    /** A native result or authoritative idle observation, never local terminalization. */
+    nativeWorkEnded: Schema.optional(Schema.Literal(true)),
     driver: ProviderDriverKind,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
@@ -154,6 +165,7 @@ export const ProviderAdapterV2Event = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("turn.terminal"),
+    nativeWorkEnded: Schema.optional(Schema.Literal(true)),
     driver: ProviderDriverKind,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
@@ -435,6 +447,39 @@ export const ProviderAdapterV2Error = Schema.Union([
 ]);
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 
+// Start cancellation and the durable timeout effect can reach the same adapter
+// concurrently. They must share its native Stop and completion waiter.
+export const makeTurnStopJoiner = () => {
+  const pending = new Map<ProviderTurnId, Deferred.Deferred<void, ProviderAdapterV2Error>>();
+  return Effect.fn("ProviderAdapter.joinTurnStop")(
+    (
+      turnId: ProviderTurnId,
+      stop: Effect.Effect<void, ProviderAdapterV2Error>,
+      runAfterJoin = false,
+    ) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          while (true) {
+            const existing = pending.get(turnId);
+            if (existing === undefined) break;
+            if (!runAfterJoin) return yield* restore(Deferred.await(existing));
+            // A full Stop must still clean up background work after joining a turn-only Stop.
+            yield* restore(Deferred.await(existing).pipe(Effect.ignore));
+          }
+          const completion = yield* Deferred.make<void, ProviderAdapterV2Error>();
+          pending.set(turnId, completion);
+          return yield* restore(stop).pipe(
+            Effect.onExit((exit) =>
+              Effect.sync(() => pending.delete(turnId)).pipe(
+                Effect.andThen(Deferred.done(completion, exit)),
+              ),
+            ),
+          );
+        }),
+      ),
+  );
+};
+
 export interface ProviderAdapterV2OpenSessionInput {
   readonly threadId: ThreadId;
   readonly providerSessionId: ProviderSessionId;
@@ -628,14 +673,21 @@ export interface ProviderAdapterV2SessionRuntime {
   /**
    * ardud: all work the session holds for this provider thread, including what
    * hasPendingBackgroundWorkForThread leaves out, such as a buffered wake or a
-   * continuation being handed off. Answer from one synchronous read so work
-   * moving between those states is never missed. Archive-if-idle asks
+   * continuation being handed off. Read local work synchronously so work moving
+   * between states is never missed; native idle probes must recheck local work
+   * after their reply. Archive-if-idle asks
    * hasPendingBackgroundWorkForThread first and then this; this one must not
    * decide run subscriptions.
    */
   readonly holdsWorkForThread?: (
     providerThread: OrchestrationV2ProviderThread,
   ) => Effect.Effect<boolean>;
+  /** Raw adapter terminal evidence, independent of run failure and buffered wake output. */
+  readonly hasObservedTurnEnd?: (target: {
+    readonly providerThreadId: ProviderThreadId;
+    readonly providerTurnId: ProviderTurnId;
+    readonly attemptId?: RunAttemptId;
+  }) => Effect.Effect<boolean>;
   /**
    * Set when every background task this session lists on its provider threads
    * runs inside the session's own process and ends when it closes. Leave unset

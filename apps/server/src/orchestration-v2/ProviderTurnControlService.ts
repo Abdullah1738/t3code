@@ -4,6 +4,7 @@ import {
   ProviderSessionId,
   ProviderThreadId,
   ProviderTurnId,
+  RunId,
   RunAttemptId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -14,6 +15,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -51,10 +53,17 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
 ) {}
 
 const isProviderTurnControlError = Schema.is(ProviderTurnControlError);
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
 const isSteerRunError = Schema.is(ProviderAdapter.ProviderAdapterSteerRunError);
 
 export interface ProviderTurnControlServiceV2Shape {
   readonly interrupt: (input: {
+    readonly confirmStopped?: boolean;
+    readonly startingRun?: {
+      readonly runId: RunId;
+      readonly attemptId: RunAttemptId;
+      readonly runOrdinal: number;
+    };
     readonly stopBackgroundWork?: boolean;
     readonly replacementProviderSessionId?: ProviderSessionId;
     readonly subagent?: {
@@ -102,6 +111,85 @@ export const layer: Layer.Layer<
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
+
+    const stopAndConfirm = Effect.fn("ProviderTurnControlService.stopAndConfirm")(function* (
+      runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+      input: Parameters<ProviderTurnControlServiceV2Shape["interrupt"]>[0],
+      providerThread: Parameters<
+        ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"]
+      >[0]["providerThread"],
+      stop: Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>,
+    ) {
+      // Subscribe before sending Stop: adapters can emit the terminal synchronously.
+      const subscription =
+        runtime.subscribeEvents === undefined ? undefined : yield* runtime.subscribeEvents;
+      const observedEnd =
+        runtime.hasObservedTurnEnd?.({
+          providerThreadId: input.providerThreadId,
+          providerTurnId: input.providerTurnId,
+          ...(input.startingRun === undefined ? {} : { attemptId: input.startingRun.attemptId }),
+        }) ?? Effect.succeed(false);
+      yield* Effect.gen(function* () {
+        const stopped = yield* Effect.result(stop);
+        // Missing local ownership also follows ambiguous provider failures.
+        // A no-op Stop still needs native settlement evidence.
+        if (stopped._tag === "Failure" && !isTurnNotActiveError(stopped.failure))
+          return yield* stopped.failure;
+        if (yield* observedEnd) return;
+        if (
+          input.replacementProviderSessionId === undefined &&
+          runtime.holdsWorkForThread !== undefined &&
+          !(yield* runtime.holdsWorkForThread(providerThread))
+        )
+          return;
+        if (subscription === undefined)
+          return yield* new ProviderTurnControlError({
+            threadId: input.threadId,
+            operation: "interrupt",
+            providerTurnId: input.providerTurnId,
+            cause: "The provider cannot observe stop settlement.",
+          });
+        const targetTurns = new Set([input.providerTurnId]);
+        const terminal = yield* subscription.events.pipe(
+          Stream.filterEffect((event) =>
+            Effect.gen(function* () {
+              if (
+                event.type === "provider_session.updated" &&
+                event.providerSession.id === input.providerSessionId &&
+                event.providerSession.status === "stopped"
+              )
+                return true;
+              if (
+                event.type === "provider_turn.updated" &&
+                input.startingRun !== undefined &&
+                event.providerTurn.providerThreadId === input.providerThreadId &&
+                event.providerTurn.runAttemptId === input.startingRun.attemptId
+              ) {
+                targetTurns.add(event.providerTurn.id);
+                return yield* observedEnd;
+              }
+              if (
+                (event.type !== "turn.native-ended" &&
+                  (event.type !== "turn.terminal" || event.nativeWorkEnded !== true)) ||
+                event.providerThreadId !== input.providerThreadId
+              )
+                return false;
+              // The turn update may predate this subscription. The manager's
+              // exact-attempt cache observes native ends before publishing them.
+              return targetTurns.has(event.providerTurnId) || (yield* observedEnd);
+            }),
+          ),
+          Stream.runHead,
+        );
+        if (Option.isNone(terminal))
+          return yield* new ProviderTurnControlError({
+            threadId: input.threadId,
+            operation: "interrupt",
+            providerTurnId: input.providerTurnId,
+            cause: "The provider stream ended without confirming that the expired turn stopped.",
+          });
+      }).pipe(Effect.ensuring(subscription?.close ?? Effect.void));
+    });
 
     const load = Effect.fn("ProviderTurnControlService.load")(function* (input: {
       readonly threadId: ThreadId;
@@ -223,6 +311,38 @@ export const layer: Layer.Layer<
     return ProviderTurnControlServiceV2.of({
       interrupt: Effect.fn("ProviderTurnControlService.interrupt")(
         function* (input) {
+          if (input.startingRun !== undefined) {
+            const { providerThread } = yield* projections.getProviderControlContext(
+              input.threadId,
+              input,
+            );
+            if (providerThread?.providerSessionId !== input.providerSessionId)
+              return yield* new ProviderTurnControlError({
+                threadId: input.threadId,
+                operation: "interrupt",
+                providerTurnId: input.providerTurnId,
+                cause: "The expired starting run's session binding changed.",
+              });
+            const runtime = yield* sessions.get(input.providerSessionId);
+            if (Option.isNone(runtime)) return;
+            if (runtime.value.interruptStartingRun === undefined)
+              return yield* new ProviderTurnControlError({
+                threadId: input.threadId,
+                operation: "interrupt",
+                providerTurnId: input.providerTurnId,
+                cause: "The adapter cannot stop an unregistered starting turn.",
+              });
+            return yield* stopAndConfirm(
+              runtime.value,
+              input,
+              providerThread,
+              runtime.value.interruptStartingRun({
+                providerThread,
+                ...input.startingRun,
+                stopBackgroundWork: false,
+              }),
+            ).pipe(Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS));
+          }
           const loaded = yield* load({
             ...input,
             operation: "interrupt",
@@ -268,6 +388,14 @@ export const layer: Layer.Layer<
             requestRuntimeRestart: input.stopBackgroundWork ?? true,
             ...(input.stopBackgroundWork === false ? { stopBackgroundWork: false } : {}),
           });
+          if (input.confirmStopped === true) {
+            return yield* stopAndConfirm(
+              session.value,
+              input,
+              loaded.providerThread,
+              interrupt,
+            ).pipe(Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS));
+          }
           yield* input.stopBackgroundWork === false
             ? interrupt.pipe(Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS))
             : interrupt;
