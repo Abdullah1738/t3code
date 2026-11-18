@@ -15,3 +15,5 @@
 - Never open live `statev2.sqlite` or `opencode.db` from shell commands or
   scripts, including read-only SQL. Use the T3 tools/APIs, recall, logs, or an
   existing isolated copy. A fresh copy/VACUUM reads the live DB too; ask first.
+  Ask Abdullah on your card (card_ask), then run
+  `live-db-snapshot --card <id> --ask <id> --db <path>` once he approves.

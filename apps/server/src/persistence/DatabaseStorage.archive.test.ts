@@ -51,13 +51,15 @@ it.effect("delays archive work until after startup and paces passes, including f
     assert.equal(archive.pass.mock.calls.length, 0);
     yield* TestClock.adjust("1 millis");
     assert.equal(archive.pass.mock.calls.length, 1);
-    // Passes never run back to back: the default minimum gap is 250 ms.
-    yield* TestClock.adjust("249 millis");
+    // Passes never run back to back: the default minimum gap is 5 s.
+    yield* TestClock.adjust("4999 millis");
     assert.equal(archive.pass.mock.calls.length, 1);
     yield* TestClock.adjust("1 millis");
     assert.equal(archive.pass.mock.calls.length, 2);
-    yield* TestClock.adjust("250 millis");
+    yield* TestClock.adjust("5000 millis");
     assert.equal(archive.pass.mock.calls.length, 3);
+    yield* TestClock.adjust("49999 millis");
+    assert.equal(archive.pass.mock.calls.length, 12);
   }).pipe(Effect.provide(layer)),
 );
 
@@ -82,7 +84,7 @@ it.effect("backs off after contended passes, doubling until a clean pass", () =>
     yield* TestClock.adjust("1 millis");
     assert.equal(archive.pass.mock.calls.length, 3);
     // A clean pass resets to the paced gap.
-    yield* TestClock.adjust("250 millis");
+    yield* TestClock.adjust("5000 millis");
     assert.equal(archive.pass.mock.calls.length, 4);
   }).pipe(Effect.provide(layer)),
 );

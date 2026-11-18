@@ -1,3 +1,8 @@
+if __package__:
+    from . import test_environment
+else:
+    import test_environment
+
 import datetime
 import hashlib
 import hmac
@@ -128,7 +133,7 @@ class EngineTests(unittest.TestCase):
         return event
 
     def run_adapter(self, harness, event, **env):
-        child_env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+        child_env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV") and not k.startswith("BASH_FUNC_")}
         child_env.update(env)
         run = subprocess.run([sys.executable, str(SRC / (harness + ".py"))], input=json.dumps(event),
                              text=True, capture_output=True, env=child_env, timeout=5, check=True)
@@ -234,7 +239,7 @@ class EngineTests(unittest.TestCase):
         command = result["context"].get("updatedInput", {}).get("command", "")
         # Read the token through the shell exactly as offbox does, including the
         # wrapper's per-command export and restoration of inherited context.
-        env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV")}
+        env = {k: v for k, v in os.environ.items() if k not in ("BASH_ENV", "ENV") and not k.startswith("BASH_FUNC_")}
         env["CLAUDE_CODE_SESSION_ID"] = session
         run = subprocess.run(["/bin/bash", "-c", command], env=env, text=True, capture_output=True, check=True)
         return run.stdout.strip()
@@ -314,7 +319,8 @@ class EngineTests(unittest.TestCase):
             result = engine.decide(self.identity_probe(), "claude")
             wrapped = result["context"].get("updatedInput", {}).get("command", "")
             self.assertNotIn(engine.COMMAND_IDENTITY_ENV + "=", wrapped)
-        engine.decide(self.identity_probe(), "claude")
+        with patch.object(engine.time, "time", return_value=time.time() + engine._IDENTITY_UNAVAILABLE_TTL):
+            engine.decide(self.identity_probe(), "claude")
         self.age_identity_cache(3600)
         with patch.object(engine, "_get", side_effect=TimeoutError("stalled")):
             self.assertEqual(self.token_identity(engine.decide(self.identity_probe(), "claude"))["robobThreadId"], "child")
@@ -331,7 +337,7 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
 
     def test_claude_cache_expired_or_invalid_is_not_used(self):
-        for age in (engine._CLAUDE_IDENTITY_TTL + 1, -60):
+        for age in (engine._IDENTITY_FALLBACK_TTL + 1, -60):
             with self.subTest(age=age):
                 engine.decide(self.identity_probe(), "claude")
                 self.age_identity_cache(age)
@@ -366,7 +372,7 @@ class EngineTests(unittest.TestCase):
 
     def test_claude_binding_expiring_during_lookup_is_not_used(self):
         engine.decide(self.identity_probe(), "claude")
-        self.age_identity_cache(engine._CLAUDE_IDENTITY_TTL - 1)
+        self.age_identity_cache(engine._IDENTITY_FALLBACK_TTL - 1)
         now = time.time()
         with patch.object(engine.time, "time", side_effect=[now, now + 5]), \
              patch.object(engine, "_lookup_identity", side_effect=TimeoutError("stalled")):
@@ -396,7 +402,8 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(engine.resolve_identity(self.identity_probe(), "claude")["resolution"], "unavailable")
         self.assertEqual(deadlines, [103.0, 104.5])
         identity = self.state.identities[("session", "agent-child")]
-        with patch.object(engine, "_get", side_effect=[ConnectionRefusedError("retry"), {"identity": identity}]) as get:
+        with patch.object(engine.time, "time", return_value=time.time() + engine._IDENTITY_UNAVAILABLE_TTL), \
+             patch.object(engine, "_get", side_effect=[ConnectionRefusedError("retry"), {"identity": identity}]) as get:
             result = engine.decide(self.identity_probe(), "claude")
             self.assertEqual(get.call_count, 2)
             self.assertEqual(self.token_identity(result)["robobThreadId"], "child")
@@ -590,6 +597,49 @@ class EngineTests(unittest.TestCase):
         self.assertEqual({r["ok"] for r in rows}, {True, False})
         self.assertNotIn("private-message", text)
         self.assertNotIn("private-token", text)
+
+    def test_light_allowed_offbox_logs_are_sampled(self):
+        for harness in ("claude", "codex"):
+            for draw, written in ((0.0, True), (0.049, True), (0.05, False), (0.99, False)):
+                with self.subTest(harness=harness, draw=draw):
+                    logdir = self.root / f"sample-{harness}-{draw}"
+                    with patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(logdir)), \
+                            patch.object(engine.random, "random", return_value=draw):
+                        result = engine.decide(self.event("echo fixture", session="root", agent=None), harness)
+                    self.assertEqual(result["decision"], "allow")
+                    rows = [json.loads(line) for p in logdir.glob("*.ndjson") for line in p.read_text().splitlines()]
+                    self.assertEqual(len(rows), int(written))
+                    if written:
+                        self.assertEqual(rows[0]["props"], {"harness": "claudeAgent" if harness == "claude" else harness,
+                            "decision": "allowed", "commandClass": "light", "sample": 20})
+
+    def test_other_offbox_logs_are_never_sampled(self):
+        for harness in ("claude", "codex"):
+            for mode, exempt, failed, decision, kind, command_class in (
+                    ("enforce", False, False, "denied", "perf", "js-test"),
+                    ("enforce", True, False, "local-override", "perf", "js-test"),
+                    ("observe", False, False, "allowed", "perf", "js-test"),
+                    ("enforce", False, True, "allowed", "error", "unknown"),
+                    ("off", False, False, "allowed", "event", "unknown")):
+                with self.subTest(harness=harness, mode=mode, exempt=exempt, failed=failed):
+                    logdir = self.root / f"full-{harness}-{mode}-{exempt}-{failed}"
+                    with patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(logdir), OFFBOX_GATE_MODE=mode), \
+                            patch.object(engine.random, "random", return_value=0.99), \
+                            patch.object(engine, "_exempt", return_value=exempt), \
+                            patch.object(engine, "_classify_offbox", return_value={"heavy": True, "class": "js-test", "rule": "js-test", "why": "fixture", "rewrite": "offbox run -- npm ci"},
+                                         side_effect=ValueError("fixture") if failed else None):
+                        engine.decide(self.event("npm ci", session="root", agent=None), harness)
+                    rows = [json.loads(line) for p in logdir.glob("*.ndjson") for line in p.read_text().splitlines()]
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0]["props"], {"harness": "claudeAgent" if harness == "claude" else harness,
+                        "decision": decision, "commandClass": command_class})
+                    self.assertEqual(rows[0]["kind"], kind)
+                    if failed:
+                        self.assertEqual(rows[0]["error"]["tag"], "gate_failed")
+
+    def test_sampling_failure_does_not_escape_logging(self):
+        with patch.object(engine.random, "random", side_effect=RuntimeError("fixture")):
+            engine._tool_log(kind="perf", ok=True, props={"decision": "allowed", "commandClass": "light"})
 
     def test_native_and_mcp_shell_aliases_enforce_offbox(self):
         self.add_identity("codex-child", "child", parent="parent", model="claude-haiku-5-5")

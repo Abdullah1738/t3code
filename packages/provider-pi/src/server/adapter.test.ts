@@ -380,8 +380,11 @@ const openRuntime = Effect.fnUntraced(function* (
     runtimePolicy,
   });
   const emitted = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+  const allEvents: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
   yield* runtime.events.pipe(
-    Stream.runForEach((event) => Queue.offer(emitted, event)),
+    Stream.runForEach((event) =>
+      Effect.sync(() => allEvents.push(event)).pipe(Effect.andThen(Queue.offer(emitted, event))),
+    ),
     Effect.forkScoped,
   );
   const takeEvent = (predicate: (event: ProviderAdapter.ProviderAdapterV2Event) => boolean) =>
@@ -391,7 +394,7 @@ const openRuntime = Effect.fnUntraced(function* (
         if (predicate(event)) return event;
       }
     });
-  return { runtime, takeEvent };
+  return { runtime, takeEvent, allEvents };
 });
 
 const makeAppThread = Effect.fnUntraced(function* (model: string, threadId = THREAD_ID) {
@@ -495,6 +498,199 @@ const expectModelFailure = (errorMessage: string) =>
   }).pipe(Effect.scoped, Effect.provide(layerTest));
 
 describe("PiAdapterV2", () => {
+  it.effect.each(["manual compaction", "queued prompt"] as const)(
+    "timeout cleanup preserves an older Pi wake behind %s",
+    (kind) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const offers =
+          yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+        const { runtime, takeEvent } = yield* openRuntime(
+          fake,
+          "default",
+          THREAD_ID,
+          SESSION_ID,
+          undefined,
+          { offer: (request) => Queue.offer(offers, request).pipe(Effect.asVoid) },
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* fake.emit({ type: "agent_start" });
+        yield* Queue.take(offers);
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          kind === "manual compaction" ? "/compact" : "New input",
+        );
+        yield* fake.takeRequest(kind === "manual compaction" ? "compact" : "prompt");
+        const turn = yield* takeEvent((event) => event.type === "provider_turn.updated");
+        assert.isTrue(turn.type === "provider_turn.updated");
+        if (turn.type !== "provider_turn.updated") return;
+        const stopping = yield* runtime
+          .interruptTurn({
+            providerThread,
+            providerTurnId: turn.providerTurn.id,
+            stopBackgroundWork: false,
+          })
+          .pipe(Effect.result);
+        assert.equal(stopping._tag, "Failure");
+        assert.isFalse(fake.allRequests().some((request) => request["type"] === "abort"));
+        // A native round trip proves the inherited process still serves work.
+        yield* runtime.readThreadSnapshot({ providerThread });
+        yield* fake.takeRequest("get_messages");
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect("acknowledges a long manual Pi compaction at native compaction_start", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      const { runtime, takeEvent, allEvents } = yield* openRuntime(fake);
+      const providerThread = yield* runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection("default"),
+        runtimePolicy,
+      });
+      yield* startTurn(runtime, providerThread, "default", [], "/compact");
+      yield* fake.takeRequest("compact");
+      yield* fake.emit({ type: "compaction_start", reason: "manual" });
+      yield* takeEvent(
+        (event) => event.type === "turn_item.updated" && event.turnItem.type === "compaction",
+      );
+      assert.isTrue(
+        allEvents.some(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.promptAcceptedAt !== undefined,
+        ),
+      );
+      yield* TestClock.adjust("11 minutes");
+      assert.isFalse(allEvents.some((event) => event.type === "turn.terminal"));
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([false, true])(
+    "keeps fresh input unaccepted after replaying an older wake, settled=%s",
+    (settled) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const offers =
+          yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+        const { runtime, takeEvent, allEvents } = yield* openRuntime(
+          fake,
+          "default",
+          THREAD_ID,
+          SESSION_ID,
+          undefined,
+          {
+            offer: (request) => Queue.offer(offers, request).pipe(Effect.asVoid),
+          },
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* fake.emit({ type: "agent_start" });
+        yield* Queue.take(offers);
+        if (settled) {
+          yield* fake.emit({ type: "agent_settled" });
+          yield* takeEvent(
+            (event) =>
+              event.type === "provider_session.updated" && event.providerSession.status === "ready",
+          );
+        }
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({
+          type: "extension_ui_request",
+          id: "fresh-input",
+          method: "confirm",
+          title: "Continue?",
+        });
+        yield* takeEvent((event) => event.type === "runtime_request.updated");
+        assert.isFalse(
+          allEvents.some(
+            (event) =>
+              event.type === "provider_turn.updated" &&
+              event.providerTurn.promptAcceptedAt !== undefined,
+          ),
+        );
+        yield* fake.emit(
+          settled
+            ? { type: "response", command: "prompt", success: true }
+            : { type: "agent_start" },
+        );
+        yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.promptAcceptedAt !== undefined,
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each([false, true])(
+    "acknowledges native agent_start without output, adopted wake=%s",
+    (adoptedWake) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const offers =
+          yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+        const { runtime, takeEvent } = yield* openRuntime(
+          fake,
+          "default",
+          THREAD_ID,
+          SESSION_ID,
+          undefined,
+          { offer: (request) => Queue.offer(offers, request).pipe(Effect.asVoid) },
+        );
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        if (adoptedWake) {
+          yield* fake.emit({ type: "agent_start" });
+          yield* Queue.take(offers);
+        }
+        yield* startTurn(
+          runtime,
+          providerThread,
+          "default",
+          [],
+          "Hello pi",
+          undefined,
+          1,
+          THREAD_ID,
+          adoptedWake,
+        );
+        const registration = yield* takeEvent((event) => event.type === "provider_turn.updated");
+        assert.isTrue(registration.type === "provider_turn.updated");
+        if (registration.type !== "provider_turn.updated") return;
+        assert.isUndefined(registration.providerTurn.promptAcceptedAt);
+        if (!adoptedWake) {
+          yield* fake.takeRequest("prompt");
+          yield* fake.emit({ type: "agent_start" });
+        }
+        const ack = yield* takeEvent(
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.promptAcceptedAt !== undefined,
+        );
+        assert.isTrue(ack.type === "provider_turn.updated");
+        if (ack.type !== "provider_turn.updated") return;
+        assert.equal(ack.providerTurn.id, registration.providerTurn.id);
+        assert.equal(
+          fake.allRequests().filter((request) => request["type"] === "prompt").length,
+          adoptedWake ? 0 : 1,
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect.each([false, true])(
     "completes a resumed user turn before native wake events arrive, Pi streaming=%s",
     (streaming) =>
@@ -1390,6 +1586,7 @@ describe("PiAdapterV2", () => {
         environmentId: EnvironmentId.make("environment-pi-mcp"),
         threadId: THREAD_ID,
         providerSessionId: "mcp-session-pi",
+        runtimeProviderSessionId: SESSION_ID,
         providerInstanceId: PI_INSTANCE_ID,
         endpoint: "http://127.0.0.1:43123/mcp",
         authorizationHeader: "Bearer secret-pi-token",
@@ -1900,6 +2097,59 @@ describe("PiAdapterV2", () => {
         forkFile,
       );
     }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
+  it.effect.each(
+    ["bash", "powershell", "mcp__test__empty"].flatMap((toolName) =>
+      [undefined, [], [{ type: "text", text: "" }]].map((content) => ({
+        toolName,
+        content,
+        label: JSON.stringify(content) ?? "absent",
+      })),
+    ),
+  )(
+    "retains completion evidence for failed $toolName with $label content",
+    ({ toolName, content }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakePi;
+        const { runtime, takeEvent } = yield* openRuntime(fake);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        yield* startTurn(runtime, providerThread);
+        yield* fake.takeRequest("prompt");
+        yield* fake.emit({ type: "agent_start" });
+        for (const type of ["tool_execution_start", "tool_execution_end"] as const) {
+          yield* fake.emit({
+            type,
+            toolCallId: "empty-failure",
+            toolName,
+            args: { command: "empty failed command" },
+            result: content === undefined ? {} : { content },
+            isError: true,
+          });
+          const event = yield* takeEvent(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              (event.turnItem.type === "command_execution" ||
+                event.turnItem.type === "dynamic_tool"),
+          );
+          if (
+            event.type !== "turn_item.updated" ||
+            (event.turnItem.type !== "command_execution" && event.turnItem.type !== "dynamic_tool")
+          )
+            return yield* Effect.die("Expected a tool item");
+          const item = event.turnItem;
+          assert.equal(item.status, type === "tool_execution_end" ? "failed" : "running");
+          assert.equal(item.toolResultIncomplete, type !== "tool_execution_end");
+          assert.isUndefined(item.output);
+          if (item.type === "command_execution") {
+            assert.isUndefined(item.exitCode);
+          }
+        }
+      }).pipe(Effect.scoped, Effect.provide(layerTest)),
   );
 
   it.effect("presents explicitly namespaced MCP extension tools", () =>

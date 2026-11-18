@@ -68,7 +68,8 @@ export async function handleInbound(deps: IngressDeps, message: LineInbound, sou
     return false;
   }
   const target = deps.sink.acceptInto(message.chat, message.groupName, message.from);
-  const accepted = target.accept({ ...inboundFromLine(message), logSource: source });
+  const accepted = target.accept({ ...inboundFromLine(message), logSource: source,
+    ...(chatKey.isGroup(message.chat) && message.participants.length ? { participants: message.participants } : {}) });
   if (accepted) deps.sink.setTyping(message.chat, message.from, false, message.sentAt);
   return accepted;
 }

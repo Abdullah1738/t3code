@@ -1,5 +1,7 @@
+import * as ProviderProcessRegistry from "./ardud/providers/ProviderProcessRegistry.ts";
 import { emptyDelegatedRecoveryCounts } from "./ardud/observability/StartupPhaseLog.ts";
 import { assert, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -13,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
 import * as ConfigProvider from "effect/ConfigProvider";
@@ -66,6 +69,8 @@ it.effect.each([
   "project-failure",
   "slow-recovery",
   "stuck-delegated",
+  "stuck-runless-repair",
+  "index-maintenance",
 ] as const)("keeps bootstrap launch failures separate from project failures: %s", (scenario) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -92,6 +97,17 @@ it.effect.each([
       };
       const recoveryStarted = yield* Deferred.make<void>();
       const releaseRecovery = yield* Deferred.make<void>();
+      const maintenanceStarted = yield* Deferred.make<void>();
+      if (scenario === "index-maintenance") {
+        const mock = vi.spyOn(NodeSqliteClient, "idleIndexBuild").mockImplementation(() =>
+          Effect.gen(function* () {
+            assert.isTrue(events.some((event) => event.type === "ready"));
+            yield* Deferred.succeed(maintenanceStarted, undefined);
+            return yield* Effect.never;
+          }),
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(() => mock.mockRestore()));
+      }
       const recovery = {
         terminalizedRuns: 0,
         stoppedSessions: 0,
@@ -103,6 +119,10 @@ it.effect.each([
       };
       const imports = { importedThreadCount: 0, importedMessageCount: 0 };
       const dependencies = Layer.mergeAll(
+        scenario === "index-maintenance"
+          ? NodeSqliteClient.layer({ filename: ":memory:" })
+          : Layer.empty,
+        ProviderProcessRegistry.ProviderProcessRegistry.layerTest,
         NodeCrypto.layer,
         Path.layer,
         FileSystem.layerNoop({}),
@@ -158,10 +178,26 @@ it.effect.each([
           reconcile: () => Effect.succeed(recovery),
         }),
         Layer.mock(Orchestrator.OrchestratorV2)({
+          repairRunlessProviderTurns: Effect.gen(function* () {
+            assert.isTrue(events.some((event) => event.type === "ready"));
+            assert.isTrue(
+              records.some(
+                (record) =>
+                  record.phase === "orchestration-v2.recovery" && record.outcome === "success",
+              ),
+            );
+            if (scenario === "stuck-runless-repair") {
+              yield* Deferred.succeed(recoveryStarted, undefined);
+              return yield* Effect.never;
+            }
+            return { candidates: 0, turnsEnded: 0 };
+          }),
           recoverDelegatedTasks:
             scenario === "stuck-delegated"
               ? Deferred.succeed(recoveryStarted, undefined).pipe(Effect.andThen(Effect.never))
-              : Effect.succeed(emptyDelegatedRecoveryCounts),
+              : Deferred.succeed(recoveryStarted, undefined).pipe(
+                  Effect.as(emptyDelegatedRecoveryCounts),
+                ),
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
           shutdown: Effect.void,
@@ -300,6 +336,15 @@ it.effect.each([
         }
         const ready = yield* Effect.exit(startup.awaitCommandReady);
         assert.equal(Exit.isSuccess(ready), scenario !== "project-failure");
+        if (scenario === "index-maintenance") {
+          yield* Deferred.await(maintenanceStarted);
+          yield* Deferred.await(recoveryStarted);
+          assert.isTrue(events.some((event) => event.type === "ready"));
+        }
+        if (scenario === "stuck-runless-repair") {
+          yield* Deferred.await(recoveryStarted);
+          assert.isTrue(events.some((event) => event.type === "ready"));
+        }
         if (scenario === "stuck-delegated") {
           yield* Deferred.await(recoveryStarted);
           assert.isTrue(events.some((event) => event.type === "ready"));
@@ -346,13 +391,14 @@ it.effect("starts without scanning or rebuilding projection history", () =>
     const record = (label: string) => Ref.update(calls, (current) => [...current, label]);
 
     const result = yield* ServerRuntimeStartup.runOrderedV2StartupPhases({
+      reapProviderProcesses: record("reap"),
       importLegacyShells: record("import"),
       recover: record("recover").pipe(Effect.as({ closedRequests: 2 })),
       startEffectWorker: record("worker"),
       autoBootstrap: record("bootstrap").pipe(Effect.as({ projectId: "project-1" })),
     });
 
-    assert.deepEqual(yield* Ref.get(calls), ["recover", "import", "worker", "bootstrap"]);
+    assert.deepEqual(yield* Ref.get(calls), ["reap", "recover", "import", "worker", "bootstrap"]);
     assert.deepEqual(result, {
       recovery: { closedRequests: 2 },
       bootstrap: { projectId: "project-1" },
@@ -633,4 +679,25 @@ it.effect("closes admissions again after a ready server begins shutdown", () =>
       );
     }),
   ),
+);
+
+it.effect("does not recover or dispatch when orphan reaping fails", () =>
+  Effect.gen(function* () {
+    const calls: string[] = [];
+    const record = (label: string) =>
+      Effect.sync(() => {
+        calls.push(label);
+      });
+    const exit = yield* Effect.exit(
+      ServerRuntimeStartup.runOrderedV2StartupPhases({
+        reapProviderProcesses: Effect.die("cannot establish process identity"),
+        recover: record("recover"),
+        importLegacyShells: record("import"),
+        startEffectWorker: record("worker"),
+        autoBootstrap: record("bootstrap"),
+      }),
+    );
+    assert.equal(exit._tag, "Failure");
+    assert.deepEqual(calls, []);
+  }),
 );

@@ -69,7 +69,11 @@ class DeepInventoryTests(unittest.TestCase):
             with self.subTest(slow=slow), patch.dict(os.environ, TOOLLOG_DIR=str(self.logs/str(slow))):
                 self.clock[0] = 0
                 calls = []
-                deep.run_pass(roots, self.runner(lambda p: 700 if slow else .034, calls))
+                if slow:
+                    for root in roots:
+                        for child in root.iterdir():
+                            (child/'blocked').touch()
+                deep.run_pass(roots, self.runner(lambda p: 700 if slow else .034, calls), budget=2700)
                 state = jobs.read_state('disk-inventory')
                 measured = sum('bytes' in v for cache in state['childState'].values() for v in cache.values())
                 end = [r for p in (self.logs/str(slow)).glob('*.ndjson')
@@ -146,13 +150,15 @@ class DeepInventoryTests(unittest.TestCase):
         calls=[]
         deep.run_pass(roots,self.runner(lambda p:1,calls))
         selected=[Path(c[-1]).name for c,_ in calls]
-        self.assertEqual(selected,['0006','0005','0003','0004','0001','0002'])
+        self.assertEqual(selected,['0006','0005','0003','0004','0001'])
+        self.assertIn('parts',jobs.read_state('disk-inventory')['childState'][str(root)][str(root/'0002')])
         self.assertFalse(jobs.read_state('disk-inventory')['partials'])
 
     def test_timeout_and_permission_partial_never_total_as_complete(self):
         root = self.roots([('partial',3)])[0]
         calls=[]
-        normal=self.runner(lambda p:700 if p.name=='0000' else 1,calls)
+        (root/'0000'/'blocked').touch()
+        normal=self.runner(lambda p:700 if p.name in ('0000','blocked') else 1,calls)
         def run(command,**kwargs):
             if command[-1].endswith('0001'):
                 self.clock[0]+=1
@@ -168,7 +174,8 @@ class DeepInventoryTests(unittest.TestCase):
 
     def test_hourly_skips_inventory_while_deep_holds_lock_but_collects_crashes(self):
         root=self.roots([('lock',1)])[0]
-        jobs.save_state('disk-inventory',dict(duMode='links',sizes={str(root):1024},partials={}))
+        jobs.save_state('disk-inventory',dict(duMode='links',sizes={str(root):1024},partials={},
+            childState={str(root): {str(root/'0000'): dict(bytes=1024, at=self.now, partial=False)}}))
         with jobs.inventory_lock() as acquired:
             self.assertIsNot(acquired,False)
             with patch.object(collector,'collect') as crash, patch.object(collector,'disk_wait'), \
@@ -188,13 +195,15 @@ class DeepInventoryTests(unittest.TestCase):
     def test_graceful_stop_checkpoints_current_batch(self):
         root=self.roots([('stop',130)])[0]
         killed=[False]
-        normal=self.runner(lambda p:1)
+        normal=self.runner(lambda p:.01)
         def run(command,**kwargs):
             result=normal(command,**kwargs)
             killed[0]=True
             return result
+        jobs.save_state('disk-inventory', dict(duMode='links', childState={str(root): {
+            str(p): dict(partial=True, elapsedMs=10) for p in root.iterdir()}}))
         deep.run_pass([root],run,stopped=lambda:killed[0])
-        self.assertEqual(len(jobs.read_state('disk-inventory')['childState'][str(root)]),128)
+        self.assertEqual(sum('bytes' in v for v in jobs.read_state('disk-inventory')['childState'][str(root)].values()),128)
         end=self.rows('disk.deep.end')[-1]['props']
         self.assertEqual(end['stopReason'],'killed')
         self.assertEqual(end['childrenRemaining'],2)
@@ -202,8 +211,10 @@ class DeepInventoryTests(unittest.TestCase):
     def test_one_oversized_child_does_not_hide_other_roots_or_repeat_in_same_pass(self):
         roots=self.roots([('a-slow',1),('b-slow',1),('c-fast',130)])
         calls=[]
-        deep.run_pass(roots,self.runner(lambda p:700 if p.parent in roots[:2] else .034,calls))
-        self.assertEqual(sum(len(command)-2 for command,_ in calls),132)
+        for root in roots[:2]:
+            (root/'0000'/'blocked').touch()
+        deep.run_pass(roots,self.runner(lambda p:700 if any(root in p.parents for root in roots[:2]) else .034,calls))
+        self.assertEqual(sum(len(command)-2 for command,_ in calls),134)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenRemaining'],2)
         self.assertEqual(self.rows('disk.deep.end')[-1]['props']['childrenPartial'],2)
         self.assertLess(self.clock[0],2700)
@@ -212,6 +223,7 @@ class DeepInventoryTests(unittest.TestCase):
     def test_limited_hint_clears_only_on_complete_measurement(self):
         root=self.roots([('hints',1)])[0]
         child=str(root/'0000')
+        (root/'0000'/'leaf').touch()
         cases=[('complete',0,'1\t'+child+'\n','',False),
                ('permission',1,'1\t'+child+'\n','du: child: Permission denied',True),
                ('operation',1,'1\t'+child+'\n','du: child: Operation not permitted',True),
@@ -226,7 +238,7 @@ class DeepInventoryTests(unittest.TestCase):
                 def run(command,**kwargs):
                     if code is None:
                         raise subprocess.TimeoutExpired(command,kwargs['timeout'])
-                    return SimpleNamespace(returncode=code,stdout=output,stderr=stderr)
+                    return SimpleNamespace(returncode=code,stdout=output.replace(child,command[-1]),stderr=stderr)
                 deep.run_pass([root],run)
                 value=jobs.read_state('disk-inventory')['childState'][str(root)][child]
                 self.assertEqual(value.get('limited',False),keep)
@@ -244,7 +256,7 @@ class DeepInventoryTests(unittest.TestCase):
                (0,'du: child: Permission denied\ndu: child: Input/output error',True,True)]
         for code,stderr,partial,failed in cases:
             with self.subTest(code=code,stderr=stderr):
-                cache={str(child):dict(bytes=4096,at=self.now-86400,attemptedAt=0,partial=False)
+                cache={str(child):dict(bytes=4096,at=self.now-86400,attemptedAt=0,partial=False,elapsedMs=10)
                        for child in root.iterdir()}
                 original=copy.deepcopy(cache)
                 def run(command,**kwargs):
@@ -326,6 +338,7 @@ class DeepInventoryTests(unittest.TestCase):
         roots=self.roots([('a-slow',1),('b-unknown',1),('z-stale',1)])
         jobs.save_state('disk-inventory',dict(duMode='links',at=self.now,sizes={str(roots[2]):1024},
             childState={str(roots[2]):{str(roots[2]/'0000'):dict(bytes=1024,at=self.now-86400,partial=False)}}))
+        (roots[0]/'0000'/'blocked').touch()
         original=jobs.inventory_listing
         with patch.object(jobs,'inventory_listing',side_effect=lambda p,d:([],False) if p==roots[1] else original(p,d)):
             deep.run_pass(roots,self.runner(lambda p:700),budget=600)
@@ -353,7 +366,7 @@ class DeepInventoryTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired) as error:
                 runner(['/usr/bin/du','-skl','/fixture/child'],timeout=600,text=True)
             self.assertEqual(error.exception.stdout,'1\t/fixture/child\n')
-            self.assertEqual(popen.call_args.args[0][:5],['/usr/bin/nice','-n','10','/usr/sbin/taskpolicy','-b'])
+            self.assertEqual(popen.call_args.args[0][:8],['/usr/bin/nice','-n','10','/usr/sbin/taskpolicy','-c','utility','-d','throttle'])
             self.assertEqual(popen.call_args.kwargs['pass_fds'],(42,))
             kill.assert_called_once_with(12345,signal.SIGKILL)
 
@@ -363,7 +376,7 @@ class BackgroundProcessTests(unittest.TestCase):
         popen=subprocess.Popen
         processes=[]
         def spawn(command,**kwargs):
-            process=popen(command[5:],**kwargs)
+            process=popen(command[8:],**kwargs)
             processes.append(process)
             return process
         with tempfile.TemporaryDirectory() as directory:

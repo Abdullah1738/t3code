@@ -1,3 +1,4 @@
+import * as ControlHttpTelemetry from "./observability/ControlHttpTelemetry.ts";
 import * as Mime from "effect/http/Mime";
 import { interruptionProps } from "./observability/analyticsInterruption.ts";
 import {
@@ -276,6 +277,11 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
         const clock = yield* Clock.Clock;
         const started = clock.monotonicTimeNanosUnsafe();
         const originKind = yield* AnalyticsOriginKind;
+        const requestUrl = HttpServerRequest.toURL(request);
+        const control =
+          Option.isSome(requestUrl) && requestUrl.value.pathname.startsWith("/api/ardud/control/")
+            ? yield* ControlHttpTelemetry.make(requestUrl.value.href, request.headers["user-agent"])
+            : undefined;
         let interruption: ReturnType<typeof interruptionProps> = {};
         let errorTag: string | undefined;
         let recorded = false;
@@ -304,6 +310,7 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
                     ),
                     props: {
                       ...interruption,
+                      ...control?.props(),
                       method: request.method,
                       status: response.status,
                       originKind,
@@ -349,7 +356,7 @@ export const httpAnalyticsMiddleware = Effect.gen(function* () {
             return response;
           }),
         );
-        return yield* app.pipe(
+        return yield* (control ? control.observe(app) : app).pipe(
           Effect.onExit((exit) =>
             Effect.sync(() => {
               if (Exit.isFailure(exit)) {

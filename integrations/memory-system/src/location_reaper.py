@@ -81,8 +81,10 @@ def last_activity_by_dir():
 
 
 def running_dirs(sid_dir):
-    _, active = api("GET", "/api/session/active")
-    ids = list((active or {}).get("data", {}).keys())
+    status, active = api("GET", "/api/session/active")
+    if status != 200 or not isinstance(active, dict) or not isinstance(active.get("data"), dict):
+        raise ValueError("invalid active sessions response")
+    ids = list(active["data"])
     unknown = [s for s in ids if s not in sid_dir]
     if unknown:
         with closing(backend.robob_readonly.native_ro(OC_DB, timeout=20, require_destructive=True)) as con:
@@ -161,6 +163,13 @@ def main():
         if KEEP_FILE.exists():
             keep = {l.strip() for l in KEEP_FILE.read_text().splitlines()
                     if l.strip() and not l.startswith("#")}
+        if backend.is_robob():
+            # Import here: config_drift shares this module's API and idle rules.
+            import config_drift
+            st["config_drift"] = config_drift.run(locs, last, sid_dir, keep, dry_run=a.dry_run)
+            if st["config_drift"]["state"] == "error":
+                st["errors"].append("config drift pass failed; see config_drift_last.json")
+                st["state"] = "error"
         idle_ms, active_ms = a.idle_min * 60000, ACTIVE_MIN * 60000
         for d in loaded:
             try:

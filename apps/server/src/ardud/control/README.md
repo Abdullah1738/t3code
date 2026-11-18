@@ -43,8 +43,17 @@ t3ctl's.
 - JSON in and out. Success is `{ "ok": true, ... }`. Failure is
   `{ "ok": false, "error": { "code", "message" } }` with HTTP 400 `invalid_request`,
   401 `unauthorized`, 403 `forbidden`, 404 `not_found`, 409 `conflict` (the
-  orchestrator rejected the command; the message says why), 503 `unavailable`,
-  or 500 `internal`.
+  orchestrator rejected the command), 503 `unavailable`, or 500 `internal`.
+  Every 409 also carries `error.reason`, `error.retrySafe`, and `error.holder`
+  (the observed thread/run/request, or null). `retrySafe: true` permits retrying
+  the identical request with its original `clientRequestId`; it does not
+  authorize a new id or delivery mode. False means reconcile or alert first.
+  Send preflight uses `no_steerable_turn` or `thread_archived`; a terminal
+  approval/question uses `request_resolved`. Other reasons include
+  `attempt_changed`, `run_not_interruptible`, `run_not_found`,
+  `command_id_conflict`, `command_rejected`, and `operation_conflict`.
+  Startup/send deadlines return 503 with `startup_unavailable`/`send_timeout`
+  and the same-id retry flag. Storage failures return 500, not 409.
 - Ids are opaque strings and can contain `:` and `%`. Always `encodeURIComponent`
   them in paths (the client does).
 - `clientRequestId` (optional on every mutation) makes retries safe: the same
@@ -87,29 +96,30 @@ t3ctl's.
 
 All paths are under `/api/ardud/control`.
 
-| Method | Path                                                     | What it does                                                                                                                                                                                                                 |
-| ------ | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| GET    | `/health`                                                | Token check plus the latest event sequence.                                                                                                                                                                                  |
-| GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                                                                                                                                      |
-| GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                                                                                                                                |
-| GET    | `/usage`                                                 | Usage records in a time range, with optional board filter and cursor pagination.                                                                                                                                             |
-| GET    | `/threads`                                               | List threads (see filters below).                                                                                                                                                                                            |
-| POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                                                                                                                             |
-| GET    | `/threads/by-native/:sesId?driver=`                      | Thread for a native session id; `driver` qualifies it. Null on cross-thread ambiguity.                                                                                                                                       |
-| GET    | `/identity/resolve?nativeId=&driver=&instance=&agentId=` | Any native id (OpenCode, Claude child by `agentId`, Codex child) to its exact Robob execution. `t3ctl identity`.                                                                                                             |
-| GET    | `/recovery/snapshot?active=true\|false&cursor=&limit=`   | Read-only per-thread recovery view: current run and attempt, runtime `present`/`absent`/`unknown` (peek only, never loads or touches a session), held work, pending requests, children. Pages by thread id; `limit` max 500. |
-| GET    | `/threads/:id`                                           | Detail: state, current run, recent runs, pending requests.                                                                                                                                                                   |
-| PATCH  | `/threads/:id`                                           | Change `runtimeMode`, `interactionMode`, model selection, `title`, `archived`, `settled`.                                                                                                                                    |
-| POST   | `/threads/:id/archive-if-idle`                           | Archive only if the thread is still idle; otherwise refuse and leave it alone.                                                                                                                                               |
-| GET    | `/threads/:id/messages`                                  | Messages plus `lastAssistant`.                                                                                                                                                                                               |
-| GET    | `/threads/:id/wait`                                      | Long-poll until not running (or needs input).                                                                                                                                                                                |
-| POST   | `/threads/:id/send`                                      | Send a message.                                                                                                                                                                                                              |
-| POST   | `/threads/:id/interrupt`                                 | Stop the active turn; optional `expectedRunId` and `expectedAttemptId` reject a mismatch with 409.                                                                                                                           |
-| POST   | `/threads/:id/requests/:requestId/respond`               | Answer an approval or a question.                                                                                                                                                                                            |
-| PUT    | `/threads/:id/origin`                                    | Set or clear the origin.                                                                                                                                                                                                     |
-| GET    | `/requests`                                              | Every pending approval and question across active threads.                                                                                                                                                                   |
-| POST   | `/attachments`                                           | Get a signed upload URL for a file to attach.                                                                                                                                                                                |
-| GET    | `/events`                                                | Server-sent events (SSE).                                                                                                                                                                                                    |
+| Method | Path                                                     | What it does                                                                                                                                                                                                                                                      |
+| ------ | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/health`                                                | Token check plus the latest event sequence.                                                                                                                                                                                                                       |
+| GET    | `/projects`                                              | Registered projects (`projectId`, `title`, `workspaceRoot`, `scratch`).                                                                                                                                                                                           |
+| GET    | `/models`                                                | Default model and runtime mode, plus each provider's models, option descriptors and variants.                                                                                                                                                                     |
+| GET    | `/messages?since=<ISO or epoch ms>&role=&threadIds=&cursor=&limit=`       | Messages across non-deleted threads, including archived threads; role defaults to user (also assistant, system, all); optional comma-separated threadIds (max 50); default 200, max 1000 per page.                                                                                                                                                     |
+| GET    | `/usage`                                                 | Usage records in a time range, with optional board filter and cursor pagination.                                                                                                                                                                                  |
+| GET    | `/threads`                                               | List threads (see filters below).                                                                                                                                                                                                                                 |
+| POST   | `/threads`                                               | Create a thread, optionally with a first prompt.                                                                                                                                                                                                                  |
+| GET    | `/threads/by-native/:sesId?driver=`                      | Thread for a native session id; `driver` qualifies it. `view=owner` returns `id`, `threadId`, `title`, `projectId`, `state`, `status`, `archived`, `deleted` (including deleted owners), without history; omit for full detail. Unknown/ambiguous ids return 404. |
+| GET    | `/identity/resolve?nativeId=&driver=&instance=&agentId=` | Any native id (OpenCode, Claude child by `agentId`, Codex child) to its exact Robob execution. `t3ctl identity`.                                                                                                                                                  |
+| GET    | `/recovery/snapshot?active=true\|false&cursor=&limit=`   | Read-only per-thread recovery view: current run and attempt, runtime `present`/`absent`/`unknown` (peek only, never loads or touches a session), held work, pending requests, children. Pages by thread id; `limit` max 500.                                      |
+| GET    | `/threads/:id`                                           | Detail: state, current run, recent runs, pending requests.                                                                                                                                                                                                        |
+| PATCH  | `/threads/:id`                                           | Change `runtimeMode`, `interactionMode`, model selection, `title`, `archived`, `settled`.                                                                                                                                                                         |
+| POST   | `/threads/:id/archive-if-idle`                           | Archive only if the thread is still idle; otherwise refuse and leave it alone.                                                                                                                                                                                    |
+| GET    | `/threads/:id/messages`                                  | Messages plus `lastAssistant`.                                                                                                                                                                                                                                    |
+| GET    | `/threads/:id/wait`                                      | Long-poll until not running (or needs input).                                                                                                                                                                                                                     |
+| POST   | `/threads/:id/send`                                      | Send a message.                                                                                                                                                                                                                                                   |
+| POST   | `/threads/:id/interrupt`                                 | Stop the active turn; optional `expectedRunId` and `expectedAttemptId` reject a mismatch with 409.                                                                                                                                                                |
+| POST   | `/threads/:id/requests/:requestId/respond`               | Answer an approval or a question.                                                                                                                                                                                                                                 |
+| PUT    | `/threads/:id/origin`                                    | Set or clear the origin.                                                                                                                                                                                                                                          |
+| GET    | `/requests`                                              | Every pending approval and question across active threads.                                                                                                                                                                                                        |
+| POST   | `/attachments`                                           | Get a signed upload URL for a file to attach.                                                                                                                                                                                                                     |
+| GET    | `/events`                                                | Server-sent events (SSE).                                                                                                                                                                                                                                         |
 
 `expectedAttemptId` requires `expectedRunId`. An expected run that is already terminal
 returns `already_terminal` without interrupting. Run and attempt checks happen before
@@ -123,8 +133,8 @@ previous page with the same filters). The window is at most 72 hours; `until`
 defaults to the time of the first request and stays fixed across its pages.
 `limit` defaults to 1,000 and is capped at 5,000. Returns
 `{ ok: true, items: [...], nextCursor: string | null }`;
-`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor })`
-fetches one page.
+`null` means there are no more pages. `client.usage({ since, until, boardId, limit, cursor }, { timeoutMs })`
+fetches one page with an optional request deadline (default 30 seconds).
 
 Items contain `threadId`, `rootThreadId`, `parentThreadId`, `boardId`, `cardId`,
 `workspace`, `providerInstanceId`, `driver`, `model`, `effort`, `startedAt`,
@@ -141,9 +151,13 @@ Pages are live reads, not a snapshot. A running turn may complete or move in the
 ordering while paging; consumers should periodically re-read overlapping windows
 and must not treat a partially paged result as a complete accounting snapshot.
 
-`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages]`
+`t3ctl usage --since ISO|MS [--until ISO|MS] [--board ID] [--limit N] [--all-pages] [--cursor CURSOR] [--timeout-ms MS]`
 prints one JSON page by default. `--all-pages` follows every cursor and prints one
-JSON object with all `items` and `nextCursor: null`.
+JSON object with all `items` and `nextCursor: null`, using 1,000 rows per page unless
+`--limit` is given. `--timeout-ms` overrides the per-page deadline, including
+`--request-timeout`. On failure, stderr names the page, cursor and number of items
+read; stdout remains empty. Resume with `--cursor` and the same window and board
+filters. A resumed result contains only the remaining rows.
 
 ### GET /threads
 
@@ -152,11 +166,19 @@ Query: `origin` (a value, or `none` for threads without one), `active=true|false
 epoch ms), `projectId`, `creationSource=provider,web,...` (exact match on the thread's creation source;
 `provider` is a provider-native child), `parentThreadId`, `ids=a,b`, `includeSubagents=true`,
 `archived=true` (the archive instead of active threads), `limit` (default 50,
-max 500). Newest first. Each item is a thread summary: `threadId`, `projectId`,
+max 500), `cursor` (the previous page's opaque `nextCursor`, with the same filters).
+Returns `{ ok: true, total, threads, nextCursor }`; `total` is the full filtered
+count on every page and `nextCursor: null` marks the last page. Order is
+`updatedAt` descending, then thread id descending for ties. Each item is a thread summary: `threadId`, `projectId`,
 `title`, `state`, `status`, `origin`, `nativeSessionId`, `model`, `runtimeMode`,
 `interactionMode`, `parentThreadId`, `rootThreadId`, `worktreePath`,
-`pendingRequest`, `latestMessage`, `lastError`, `archived`, `settled`,
+`pendingRequest`, `latestMessage`, `lastError`, `archived`, `archivedAt` (ISO time or null), `settled`,
 `createdAt`, `updatedAt`.
+
+`archived=false` (the default) and `archived=true` are separate listings; fetch
+both for full history. Pages are live reads: threads updated during a scan may
+move ahead of its cursor, so re-read overlapping windows when reconciling history.
+`t3ctl threads --limit 500 --cursor <nextCursor>` fetches the next page.
 
 ### POST /threads
 
@@ -237,6 +259,8 @@ JSON-quoted incoming message ID in an iMessage channel-guidance context record,
 or null. Synthetic bridge IDs (`wake:`, `reset:`, `secret:`) are preserved so
 callers can distinguish them from relayed owner messages.
 
+Thread summaries and details include `changeMarker`, the latest V2 thread event sequence (0 if none). Compare it for incremental polling; `updatedAt` and `updatedSince` can miss timestamp ties. Poll known ids without `updatedSince`, then read changed messages with an overlapping `since` watermark.
+
 ### GET /threads/:id/wait
 
 Query: `timeoutMs` (default 10 min, max 60 min), `runId` (wait for that run),
@@ -289,9 +313,27 @@ server's compression middleware leaves it alone. Frames go out as they happen,
 with a `: ping` comment every 15 s. Each frame carries `id: <sequence>` and
 `event: <type>`. `data` is JSON with `type`, `threadId`, and `origin`.
 
-Start: the stream opens at the live head with an `event: ready` frame carrying
-`sequence`. Resume with the `Last-Event-ID` header or `?after=<sequence>` to
-replay everything since. The client reconnects and resumes on its own.
+Start: without a cursor the stream opens at the live head. Its `ready` frame
+carries `sequence` and `resumed:false`; fetch current state while buffering new
+events. Reconnect with `Last-Event-ID` or `?after=<sequence>` (the header wins).
+A decimal safe integer cursor at or below the head is honoured when its replay
+range has no compaction tombstones: `ready.resumed:true` means replay of matching
+events strictly after that cursor, then live events, with no gap or duplicate at
+the boundary. Keep the same filters when resuming. Invalid, future or compacted
+cursors start at the head with `resumed:false` and require a refetch.
+
+Failures send `event:error` with `type:error`, an optional `code`, and the last
+emitted sequence as `id`. Codes are `buffer_overflow`, `event_read_failed`,
+`origin_lookup_failed`, `history_compacted`, and `unknown`. Normal disconnects
+send no error. Reconnect from the last received id after transient failures;
+`history_compacted` means maintenance raced replay, so refetch current state.
+The client reconnects and resumes on its own.
+
+Control analytics records `events.stream_failed` with `props.code` and an
+`events.stream_failed.<code>` error tag, so existing analytics reads expose both
+the total and per-code counts. `events.stream_connected` and
+`events.stream_closed` record connection counts and lifetime separately from
+request setup latency.
 
 Filters: `threadId`, `origin` (or `none`), `types=a,b`.
 
@@ -304,7 +346,7 @@ Filters: `threadId`, `origin` (or `none`), `types=a,b`.
 | `thread.updated`                      | `change`: archived, settled, renamed, runtime mode or model changed, ...                  |
 
 A turn is finished when `thread.status` arrives with `state` `waiting` or
-`idle`. Read the reply from `message.completed` or `/messages`.
+`idle`. Read the reply from `message.completed` or `/threads/:id/messages`.
 
 ### POST /attachments
 
@@ -314,6 +356,34 @@ A turn is finished when `thread.status` arrives with `state` `waiting` or
 (no auth; the URL is signed). Then pass
 `{ attachmentId, name, mimeType, sizeBytes, type }` in `attachments` on create
 or send. `client.upload({ name, mimeType, bytes })` does all of this.
+
+## Cross-thread user messages
+
+`GET /messages` requires `since` (ISO timestamp or epoch milliseconds) and
+`orchestration:read`. It returns messages with `role=user` and `updatedAt > since`,
+ordered by updated time ascending, then message id in SQLite binary order.
+Every row reuses the per-thread message summary, including `createdBy`,
+`creationSource`, `automated` and `inboundMessageId` (always present, possibly null),
+plus `threadId`, `threadTitle` and `threadArchived`.
+
+The response is `{ ok: true, total, messages, nextCursor }`. Pass the opaque
+`nextCursor` with the same `since` until it is null. `total` counts the whole
+window, ignoring the cursor; it remains constant while the underlying data is
+unchanged. Pages are live reads, not a snapshot: edits during paging can move a
+message later in the order, so callers can deduplicate by `messageId`.
+
+This read uses only persisted projections. It does not hydrate imported OpenCode
+transcripts per thread; those historical transcripts are outside recent polling
+windows. Use `/threads/:threadId/messages` when imported history is needed.
+
+```js
+let cursor;
+do {
+  const page = await client.listUserMessages({ since, cursor, limit: 1000 });
+  for (const message of page.messages) consume(message);
+  cursor = page.nextCursor;
+} while (cursor);
+```
 
 ## Client and CLI
 
@@ -398,22 +468,22 @@ stored `ses_` route ids resolve with `/threads/by-native`.
 
 Agents inside t3 threads already get the T3 MCP server. Equivalents:
 
-| openchamber action                             | T3 MCP tool                                                                                                                     | Notes                                                                                 |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `projects.list`                                | `t3_project_list`                                                                                                               |                                                                                       |
-| `models.list`                                  | `orchestrator_capabilities`                                                                                                     | Lists providers, models and options. No favourites or recents.                        |
-| `session.list`                                 | `t3_thread_list`                                                                                                                | Calling project only. `t3_thread_search` searches finished messages (5 s budget; `complete: false` means partial, `searchedBackTo` is the oldest timestamp examined). Narrow the query or pass `projectId`.                 |
-| `session.create`                               | `t3_thread_launch` (`message` optional, `scratch`, `workspaceStrategy`) or `create_threads`                                     |                                                                                       |
-| `session.dispatch`                             | `t3_thread_launch` with `message`, or `create_threads` with `prompt`                                                            | Both return without waiting.                                                          |
-| `session.send`                                 | `t3_thread_send`                                                                                                                | `mode` auto, queue, steer, restart                                                    |
-| `session.fork`                                 | `t3_thread_fork`                                                                                                                | Forks the calling thread only.                                                        |
-| `session.status`                               | `t3_thread_read` (thread detail)                                                                                                |                                                                                       |
-| `session.messages` (+ `wait`, `lastAssistant`) | `t3_thread_read` (+ `t3_thread_wait`)                                                                                           |                                                                                       |
-| `schedule.list/create/delete/toggle/run`       | `list_scheduled_tasks`, `schedule_task`, `delete_scheduled_task`, `update_scheduled_task { enabled }`, `run_scheduled_task_now` | Calling project only. Cron and timezone schedules come from the schedule-cron branch. |
-| `file.open`                                    | Gap; `preview_open` covers web pages only.                                                                                      |                                                                                       |
-| goal mode                                      | dropped (owner decision)                                                                                                        |                                                                                       |
-| `openchamber_web` `browser.*`                  | `preview_*` tools                                                                                                               |                                                                                       |
-| `memory.*`                                     | memory MCP (separate)                                                                                                           |                                                                                       |
+| openchamber action                             | T3 MCP tool                                                                                                                     | Notes                                                                                                                                                                                                       |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `projects.list`                                | `t3_project_list`                                                                                                               |                                                                                                                                                                                                             |
+| `models.list`                                  | `orchestrator_capabilities`                                                                                                     | Lists providers, models and options. No favourites or recents.                                                                                                                                              |
+| `session.list`                                 | `t3_thread_list`                                                                                                                | Calling project only. `t3_thread_search` searches finished messages (5 s budget; `complete: false` means partial, `searchedBackTo` is the oldest timestamp examined). Narrow the query or pass `projectId`. |
+| `session.create`                               | `t3_thread_launch` (`message` optional, `scratch`, `workspaceStrategy`) or `create_threads`                                     |                                                                                                                                                                                                             |
+| `session.dispatch`                             | `t3_thread_launch` with `message`, or `create_threads` with `prompt`                                                            | Both return without waiting.                                                                                                                                                                                |
+| `session.send`                                 | `t3_thread_send`                                                                                                                | `mode` auto, queue, steer, restart                                                                                                                                                                          |
+| `session.fork`                                 | `t3_thread_fork`                                                                                                                | Forks the calling thread only.                                                                                                                                                                              |
+| `session.status`                               | `t3_thread_read` (thread detail)                                                                                                |                                                                                                                                                                                                             |
+| `session.messages` (+ `wait`, `lastAssistant`) | `t3_thread_read` (+ `t3_thread_wait`)                                                                                           |                                                                                                                                                                                                             |
+| `schedule.list/create/delete/toggle/run`       | `list_scheduled_tasks`, `schedule_task`, `delete_scheduled_task`, `update_scheduled_task { enabled }`, `run_scheduled_task_now` | Calling project only. Cron and timezone schedules come from the schedule-cron branch.                                                                                                                       |
+| `file.open`                                    | Gap; `preview_open` covers web pages only.                                                                                      |                                                                                                                                                                                                             |
+| goal mode                                      | dropped (owner decision)                                                                                                        |                                                                                                                                                                                                             |
+| `openchamber_web` `browser.*`                  | `preview_*` tools                                                                                                               |                                                                                                                                                                                                             |
+| `memory.*`                                     | memory MCP (separate)                                                                                                           |                                                                                                                                                                                                             |
 
 Gaps for the agent tool: cross-project thread listing and sending (MCP is scoped
 to the calling project; outside a thread, use `t3ctl`), `file.open`, model

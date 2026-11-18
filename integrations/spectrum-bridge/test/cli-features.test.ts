@@ -9,6 +9,15 @@ import { EFFECTS } from "../src/photon.ts";
 
 const session = ["--session", "s-1", "--key", "k-1"];
 
+test("opt-in maps a required chat and optional session to the owner route", () => {
+  expect(parseCommand(["opt-in", "--chat", "moni"])).toEqual({ method: "POST", path: "/opt-in", body: { chat: "moni" } });
+  expect(parseCommand(["opt-in", "--chat", "moni", "--session", "s-1@2"]))
+    .toEqual({ method: "POST", path: "/opt-in", body: { chat: "moni", sessionId: "s-1@2" } });
+  expect(() => parseCommand(["opt-in"])).toThrow("--chat is required");
+  expect(() => parseCommand(["opt-in", "--chat", "../moni"])).toThrow("Invalid chat slug");
+  expect(() => parseCommand(["opt-in", "--chat", "moni", "--session", "invalid session"])).toThrow("Invalid --session");
+});
+
 describe("send, poll, and app commands", () => {
   test("CLI effect names match the SDK list", () => {
     expect([...EFFECT_NAMES]).toEqual(EFFECTS);
@@ -23,7 +32,7 @@ describe("send, poll, and app commands", () => {
 
   test("send validates text, effect, subject, and session", () => {
     expect(() => parseCommand(["send", ...session])).toThrow("--text is required");
-    expect(() => parseCommand(["send", "--text", "x".repeat(12_001), ...session])).toThrow("--text must be at most");
+    expect(() => parseCommand(["send", "--text", "x".repeat(12_001), ...session])).toThrow("message too long: 12,001 chars, limit 12,000");
     expect(() => parseCommand(["send", "--text", "Hi", ...session, "--effect", "rainbow"])).toThrow("--effect must be one of slam");
     expect(() => parseCommand(["send", "--text", "Hi", ...session, "--subject", "a\nb"])).toThrow("--subject must be");
     expect(() => parseCommand(["send", "--text", "Hi", "--key", "k"])).toThrow("--session is required");
@@ -48,7 +57,7 @@ describe("send, poll, and app commands", () => {
     expect(parseCommand(["wake", "--text", "Nik replied", "--source", "robob-watch nik", "--key", "nik:3"])).toEqual({
       method: "POST", path: "/wake", body: { text: "Nik replied", source: "robob-watch nik", dedupeKey: "nik:3" } });
     expect(() => parseCommand(["wake", "--source", "s", "--key", "k"])).toThrow("--text is required");
-    expect(() => parseCommand(["wake", "--text", "x".repeat(12_001), "--source", "s", "--key", "k"])).toThrow("--text must be at most");
+    expect(() => parseCommand(["wake", "--text", "x".repeat(12_001), "--source", "s", "--key", "k"])).toThrow("message too long: 12,001 chars, limit 12,000");
     expect(() => parseCommand(["wake", "--text", "t", "--key", "k"])).toThrow("--source is required");
     expect(() => parseCommand(["wake", "--text", "t", "--source", "a\nb", "--key", "k"])).toThrow("--source must be");
     expect(() => parseCommand(["wake", "--text", "t", "--source", "s"])).toThrow("--key is required");

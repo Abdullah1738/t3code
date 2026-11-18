@@ -6,6 +6,7 @@ import {
   KANBAN_BACKLOG,
   KanbanAnswer,
   KanbanBoard,
+  KanbanStandingApproval,
   KanbanNightlyReview,
   KanbanCard,
   KanbanCardEvent,
@@ -22,6 +23,7 @@ import {
   kanbanSchedule,
   kanbanScriptStep,
   kanbanWaitsOnEvaluator,
+  kanbanWorkStep,
   KANBAN_AGING_STEP_MS,
   KANBAN_RETRY_BACKOFF_MS,
   KanbanBoardIconImage,
@@ -44,6 +46,8 @@ import {
   KanbanThreadLink,
 } from "./kanban.ts";
 import { KanbanCardDetail } from "./kanbanRpc.ts";
+
+const decodeSubtask = Schema.decodeUnknownSync(KanbanSubtask);
 
 type CardPatch = Partial<Omit<KanbanCard, "blockedBy">> & { readonly blockedBy?: string[] };
 
@@ -567,6 +571,103 @@ describe("kanbanHeldUpBy", () => {
     }
   });
 
+  it.each([
+    "Land: rebase on master, fast-forward and push master",
+    "fast-forward master to the PR head",
+    "fast forward master to the PR head",
+    "MERGE into main",
+    "Rebase; land it",
+    "Rebase: land it",
+    "Rebase, land it",
+    "Rebase. land it",
+    "Rebase and land it",
+    "Rebase then fast-forward it",
+  ])("holds for an unmarked landing action: %s", (text) => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-b" as never,
+      subtasks: [evaluatorSubtask(text)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+  });
+
+  it.each([
+    "After the install, check the blocker's merge subtask",
+    "Check the landing subtask",
+    "Check whether it landed",
+    "landing after review",
+    "landed on master",
+    "deploy after fast-forward completes",
+  ])("does not guess a landing action from a mention: %s", (text) => {
+    const blocker = card("b", { stage: "completed", subtasks: [evaluatorSubtask(text)] });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it.each(["work", "review", "evaluator", "script"] as const)(
+    "holds for an explicitly marked %s subtask, but never for an explicit false",
+    (owner) => {
+      const marked = { ...evaluatorSubtask("Ship it"), owner, holdsDependents: true };
+      const blocker = card("b", { stage: "completed", subtasks: [marked] });
+      expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+      const optedOut = {
+        ...blocker,
+        subtasks: [{ ...marked, text: mergeText, holdsDependents: false }],
+      };
+      expect(kanbanHeldUpBy(waiter, byId(optedOut))).toBeUndefined();
+      const unmarked = { ...blocker, subtasks: [{ ...evaluatorSubtask(mergeText), owner }] };
+      expect(kanbanHeldUpBy(waiter, byId(unmarked)) === unmarked).toBe(
+        owner === "evaluator" || owner === "script",
+      );
+    },
+  );
+
+  it.each(["done", "skipped"] as const)("releases a %s marked subtask", (state) => {
+    const blocker = card("b", {
+      stage: "completed",
+      subtasks: [{ ...evaluatorSubtask("Ship it"), state, holdsDependents: true }],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+  });
+
+  it.each(["deployed", "verified"] as const)(
+    "does not hold a %s blocker even when marked",
+    (stage) => {
+      const blocker = card("b", {
+        stage,
+        subtasks: [{ ...evaluatorSubtask("Ship it"), holdsDependents: true }],
+      });
+      expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
+    },
+  );
+
+  it("holds a marked completed blocker even on its dependent's thread", () => {
+    const blocker = card("b", {
+      stage: "completed",
+      workThreadId: "thread-w" as never,
+      subtasks: [{ ...evaluatorSubtask("Ship it"), holdsDependents: true }],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(blocker);
+  });
+
+  it.each([true, undefined])("release wording holds only when marked (%s)", (holdsDependents) => {
+    const blocker = card("b", {
+      stage: "completed",
+      subtasks: [
+        {
+          ...evaluatorSubtask("Host release via #99, then live read-back"),
+          ...(holdsDependents === undefined ? {} : { holdsDependents }),
+        },
+      ],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(holdsDependents ? blocker : undefined);
+  });
+
+  it("decodes a stored subtask without a hold mark without adding one", () => {
+    const decoded = decodeSubtask(evaluatorSubtask("Ship it"));
+    expect(decoded.holdsDependents).toBeUndefined();
+    expect(decoded).not.toHaveProperty("holdsDependents");
+  });
+
   it("doesn't hold a waiter on a completed blocker with only a deploy step open", () => {
     const blocker = card("b", {
       stage: "completed",
@@ -585,11 +686,29 @@ describe("kanbanHeldUpBy", () => {
     expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
   });
 
-  it("doesn't hold a waiter on the same thread as a completed blocker awaiting merge", () => {
+  it.each([
+    ["todo", false],
+    ["working", false],
+    ["needs_review", true],
+    ["in_review", true],
+    ["needs_owner", true],
+    ["completed", true],
+    ["deployed", false],
+    ["verified", false],
+  ] as const)("same-thread blocker in %s: held = %s", (stage, held) => {
+    const blocker = card("b", {
+      stage,
+      workThreadId: "thread-w" as never,
+      subtasks: stage === "todo" || stage === "working" ? [] : [evaluatorSubtask(mergeText)],
+    });
+    expect(kanbanHeldUpBy(waiter, byId(blocker))).toBe(held ? blocker : undefined);
+  });
+
+  it("releases a same-thread completed blocker once its merge is done", () => {
     const blocker = card("b", {
       stage: "completed",
       workThreadId: "thread-w" as never,
-      subtasks: [evaluatorSubtask(mergeText)],
+      subtasks: [evaluatorSubtask(mergeText, "done")],
     });
     expect(kanbanHeldUpBy(waiter, byId(blocker))).toBeUndefined();
   });
@@ -1073,6 +1192,21 @@ describe("KanbanCard wait", () => {
     );
   });
 
+  it("round-trips optional wait target metadata and still reads old waits", () => {
+    const original = card("stored", { wait: wait({ on: "card", card: "foreign" as never }) });
+    const roundTrip = (value: KanbanCard) =>
+      Schema.decodeUnknownSync(KanbanCard)(Schema.encodeSync(KanbanCard)(value));
+    expect(roundTrip(original).wait?.cardTarget).toBeUndefined();
+    const cardTarget = {
+      id: "foreign" as never,
+      number: 73,
+      boardId: "board-foreign" as never,
+      boardName: "Foreign",
+    };
+    const shown = { ...original, wait: { ...original.wait!, cardTarget } };
+    expect(roundTrip(shown).wait?.cardTarget).toEqual(cardTarget);
+  });
+
   it("drops the wait key, not sets it to undefined", () => {
     const cleared = kanbanWithoutWait(card("w", { wait: wait() }));
     expect("wait" in cleared).toBe(false);
@@ -1128,38 +1262,27 @@ describe("worker dispatch uses the current step", () => {
   });
 });
 
-it("pending findings survive note consumption but never bypass evaluator or script steps", () => {
-  expect(
-    kanbanWaitsOnEvaluator({
-      stage: "todo",
-      wakeNote: null,
-      reviewFindingsPending: true,
-      subtasks: [scriptSubtask("s2", 2, "Review", "review")],
-    }),
-  ).toBe(false);
-  expect(
-    kanbanWaitsOnEvaluator({
-      stage: "todo",
-      wakeNote: null,
-      reviewFindingsPending: true,
-      subtasks: [
-        scriptSubtask("s3", 3, "Hold", "evaluator"),
-        scriptSubtask("s4", 4, "Review", "review"),
-      ],
-    }),
-  ).toBe(true);
-  expect(
-    kanbanWaitsOnEvaluator({
-      stage: "todo",
-      wakeNote: null,
-      reviewFindingsPending: true,
-      subtasks: [
-        scriptSubtask("s3", 3, "Hold", "script"),
-        scriptSubtask("s4", 4, "Review", "review"),
-      ],
-    }),
-  ).toBe(true);
-});
+it.each([["evaluator"], ["evaluator", "script"], ["script"], ["review"]] as const)(
+  "pending findings are worker work on a %j step",
+  (...owners) => {
+    for (const reviewFindingsPending of [false, true]) {
+      for (const wakeNote of [null, "Review findings (round 1): old words"]) {
+        const input = {
+          stage: "todo" as const,
+          wakeNote,
+          reviewFindingsPending,
+          subtasks: [
+            { ...scriptSubtask("s1", 1, "Build", "work"), state: "done" as const },
+            ...owners.map((owner, index) => scriptSubtask(`s${index + 2}`, 2, "Hold", owner)),
+            scriptSubtask("s4", 3, "Review", "review"),
+          ],
+        };
+        expect(kanbanWorkStep(input)).toBe(reviewFindingsPending);
+        expect(kanbanWaitsOnEvaluator(input)).toBe(!reviewFindingsPending);
+      }
+    }
+  },
+);
 
 it.each([false, true])(
   "an explicit pending-findings verdict %s overrides a legacy header",
@@ -1202,4 +1325,49 @@ describe("nightly review configuration", () => {
   it("rejects a zone that cannot be scheduled", () => {
     expect(() => decode({ enabled: true, timeZone: "Not/AZone" })).toThrow();
   });
+});
+
+const decodeStandingApproval = Schema.decodeUnknownSync(KanbanStandingApproval);
+
+it("old standing approvals decode with a four-hour interval", () => {
+  const record = {
+    id: "sa-old",
+    gate: "deploy",
+    quote: "Boards may release",
+    sourceThreadId: "owner-thread",
+    saidAt: "2026-11-13T17:25:00.000Z",
+    approvedAsk: { cardId: "card-one", askId: "q1" },
+    recordedAt: "2026-11-13T18:00:00.000Z",
+    recordedBy: "evaluator",
+    revokedAt: null,
+    revokedBy: null,
+    revokeReason: null,
+  };
+  expect(decodeStandingApproval(record).minIntervalHours).toBe(4);
+  expect(decodeStandingApproval({ ...record, minIntervalHours: 6 }).minIntervalHours).toBe(6);
+});
+
+it("stored subtasks decode with or without a gate skip record", () => {
+  const legacy = {
+    id: "s3",
+    step: 3,
+    text: "Edit fork source",
+    owner: "evaluator",
+    gate: "deploy",
+    gateSource: "set",
+    state: "skipped",
+    note: "Only edits fork code",
+    doneBy: { _tag: "owner" },
+    doneAt: "2026-11-14T00:00:00.000Z",
+  };
+  const decode = Schema.decodeUnknownSync(KanbanSubtask);
+  expect(decode(legacy).gateSkipped).toBeUndefined();
+  const gateSkipped = {
+    gate: "deploy",
+    reason: "Only edits fork code",
+    by: { _tag: "evaluator", threadId: "evaluator" },
+    at: "2026-11-14T00:00:00.000Z",
+    text: legacy.text,
+  };
+  expect(decode({ ...legacy, gateSkipped }).gateSkipped).toEqual(gateSkipped);
 });

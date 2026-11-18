@@ -558,7 +558,42 @@ const OrchestrationV2DelegatedTaskStall = Schema.Struct({
   idleTimeoutMs: Schema.Finite,
   lastProgressAt: Schema.DateTimeUtc,
   lastProgressKind: Schema.String,
+  phase: Schema.optional(Schema.Literals(["post_tool", "first_event", "mid_turn"])),
+  lastProgressTool: Schema.optional(Schema.String),
+  silentSeconds: Schema.optional(Schema.Finite),
 });
+
+const DelegatedTaskStallRecovery = Schema.Struct({
+  phase: Schema.Literals(["post_tool", "first_event"]),
+  lastProgressAt: IsoDateTime,
+  attemptId: Schema.NullOr(RunAttemptId),
+});
+
+export const OrchestrationV2CancelReason = Schema.Literals([
+  "server_shutdown",
+  "server_restart",
+  "user_stop",
+  "thread_reset",
+  "thread_archive",
+  "thread_settle",
+  "thread_delete",
+  "workspace_change",
+  "runtime_mode_change",
+  "session_detach",
+  "card_stop",
+  "superseded",
+  "promoted_to_steer",
+  "task_cancel",
+  "delegated_parent_cancelled",
+  "queued_cancel",
+  "provider_cancelled",
+  "provider_interrupted",
+  "task_stalled",
+  "unknown",
+]);
+export type OrchestrationV2CancelReason = typeof OrchestrationV2CancelReason.Type;
+
+const CancelDetail = Schema.String.check(Schema.isMaxLength(500));
 
 export const OrchestrationV2Run = Schema.Struct({
   id: RunId,
@@ -571,6 +606,9 @@ export const OrchestrationV2Run = Schema.Struct({
   rootNodeId: Schema.NullOr(NodeId),
   activeAttemptId: Schema.NullOr(RunAttemptId),
   status: OrchestrationV2RunStatus,
+  failure: Schema.optional(Schema.suspend(() => OrchestrationV2ProviderFailure)),
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
+  cancelDetail: Schema.optional(CancelDetail),
   queuePosition: Schema.optional(Schema.NullOr(PositiveInt)),
   queueHeld: Schema.optional(Schema.Boolean),
   requestedAt: Schema.DateTimeUtc,
@@ -581,8 +619,29 @@ export const OrchestrationV2Run = Schema.Struct({
   restartContinuationOfRunId: Schema.optional(RunId),
   delegatedTaskId: Schema.optional(NodeId),
   delegatedTaskStall: Schema.optional(OrchestrationV2DelegatedTaskStall),
+  delegatedTaskStallRecovery: Schema.optional(DelegatedTaskStallRecovery),
+  providerStartDeadlineAt: Schema.optional(Schema.DateTimeUtc),
+  providerRestartCleanup: Schema.optional(
+    Schema.Struct({
+      providerSessionId: ProviderSessionId,
+      providerThreadId: ProviderThreadId,
+      providerTurnId: ProviderTurnId,
+      replacementProviderSessionId: Schema.optional(ProviderSessionId),
+      completed: Schema.Boolean,
+    }),
+  ),
   workStartedAt: Schema.optional(Schema.DateTimeUtc),
   lastActivityAt: Schema.optional(Schema.DateTimeUtc),
+  /** Projection-owned running tools; lifecycle snapshots must not replace this map. */
+  openTools: Schema.optional(
+    Schema.Record(
+      Schema.String,
+      Schema.Struct({
+        kind: Schema.Literals(["command_execution", "dynamic_tool"]),
+        since: IsoDateTime,
+      }),
+    ),
+  ),
   restartCancelledBackgroundWork: Schema.optional(
     Schema.Array(OrchestrationV2RestartCancelledBackgroundWork),
   ),
@@ -761,6 +820,9 @@ export const OrchestrationV2Subagent = Schema.Struct({
   completionWake: Schema.optional(Schema.Literals(["always", "settled_only"])),
   selectionRouting: Schema.optional(ModelSelectionRouting),
   completionDelivery: Schema.optional(OrchestrationV2DelegatedCompletionTaskDelivery),
+  lastAnnouncedStatus: Schema.optional(
+    Schema.Literals(["completed", "failed", "cancelled", "interrupted"]),
+  ),
   status: Schema.Literals([
     "idle",
     "pending",
@@ -773,6 +835,8 @@ export const OrchestrationV2Subagent = Schema.Struct({
   ]),
   idleTimeoutMs: Schema.optional(Schema.Finite),
   failureReason: Schema.optional(Schema.Literal("stalled")),
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
+  cancelDetail: Schema.optional(CancelDetail),
   progress: Schema.optional(Schema.String),
   workflow: Schema.optional(OrchestrationV2SubagentWorkflow),
   result: Schema.NullOr(Schema.String),
@@ -821,6 +885,7 @@ export const OrchestrationV2ProviderSessionDetached = Schema.Struct({
   providerSessionId: ProviderSessionId,
   detachedAt: Schema.DateTimeUtc,
   reason: Schema.optional(Schema.String),
+  cancelReason: Schema.optional(OrchestrationV2CancelReason),
 });
 export type OrchestrationV2ProviderSessionDetached =
   typeof OrchestrationV2ProviderSessionDetached.Type;
@@ -1358,6 +1423,16 @@ export const OrchestrationV2ProviderFailureCategory = Schema.Literals([
 export type OrchestrationV2ProviderFailureCategory =
   typeof OrchestrationV2ProviderFailureCategory.Type;
 
+export const OrchestrationV2RestartAdmissionFailure = Schema.Struct({
+  queuedAtMs: NonNegativeInt,
+  waitedMs: NonNegativeInt,
+  positionAtFailure: NonNegativeInt,
+  totalAtFailure: NonNegativeInt,
+  rule: Schema.Literals(["no_progress", "absolute_backstop"]),
+});
+export type OrchestrationV2RestartAdmissionFailure =
+  typeof OrchestrationV2RestartAdmissionFailure.Type;
+
 /**
  * Producers must redact credentials before constructing this value.
  */
@@ -1366,6 +1441,7 @@ export const OrchestrationV2ProviderFailure = Schema.Struct({
   message: OrchestrationV2ProviderFailureMessage,
   code: Schema.NullOr(OrchestrationV2ProviderFailureCode),
   retryable: Schema.NullOr(Schema.Boolean),
+  admission: Schema.optional(OrchestrationV2RestartAdmissionFailure),
   claudeAccess: Schema.optional(
     Schema.Struct({
       status: Schema.NullOr(Schema.Number),
@@ -1546,6 +1622,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("command_execution"),
+    /** No tool result was received; this item may represent cleanup or a synthetic notice. */
+    toolResultIncomplete: Schema.optional(Schema.Boolean),
     input: Schema.String,
     output: Schema.optional(Schema.String),
     /** Set on the wire when output was withheld; fetch it with getTurnItem. */
@@ -1584,6 +1662,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("run_interrupt_request"),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
     message: Schema.String,
   }),
   Schema.Struct({
@@ -1675,6 +1754,8 @@ export const OrchestrationV2TurnItem = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemBaseFields,
     type: Schema.Literal("dynamic_tool"),
+    /** No tool result was received; this item may represent cleanup or a synthetic notice. */
+    toolResultIncomplete: Schema.optional(Schema.Boolean),
     toolName: Schema.NullOr(TrimmedNonEmptyString),
     viewedImagePath: Schema.optional(TrimmedNonEmptyString),
     input: Schema.Unknown,
@@ -2134,6 +2215,7 @@ export const OrchestrationV2RunJson = OrchestrationV2Run.mapFields((fields) => (
   requestedAt: Schema.DateTimeUtcFromString,
   startedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   completedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  providerStartDeadlineAt: Schema.optional(Schema.DateTimeUtcFromString),
   workStartedAt: Schema.optional(Schema.DateTimeUtcFromString),
   lastActivityAt: Schema.optional(Schema.DateTimeUtcFromString),
   // ardud: the restart work list is stored as JSON, so the child's start time is a string there.
@@ -2336,6 +2418,8 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("command_execution"),
+    /** No tool result was received; this item may represent cleanup or a synthetic notice. */
+    toolResultIncomplete: Schema.optional(Schema.Boolean),
     input: Schema.String,
     output: Schema.optional(Schema.String),
     /** Set on the wire when output was withheld; fetch it with getTurnItem. */
@@ -2374,6 +2458,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("run_interrupt_request"),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
     message: Schema.String,
   }),
   Schema.Struct({
@@ -2465,6 +2550,8 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2TurnItemJsonBaseFields,
     type: Schema.Literal("dynamic_tool"),
+    /** No tool result was received; this item may represent cleanup or a synthetic notice. */
+    toolResultIncomplete: Schema.optional(Schema.Boolean),
     toolName: Schema.NullOr(TrimmedNonEmptyString),
     viewedImagePath: Schema.optional(TrimmedNonEmptyString),
     input: Schema.Unknown,
@@ -2749,6 +2836,7 @@ export type OrchestrationV2StoredEventJson = typeof OrchestrationV2StoredEventJs
 export const OrchestrationV2Command = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("thread.stop"),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
     commandId: CommandId,
     threadId: ThreadId,
     reason: Schema.optional(Schema.String),
@@ -2981,6 +3069,7 @@ export const OrchestrationV2Command = Schema.Union([
     threadId: ThreadId,
     providerSessionId: ProviderSessionId,
     reason: Schema.optional(Schema.String),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
   }),
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
@@ -3002,6 +3091,7 @@ export const OrchestrationV2Command = Schema.Union([
     manualContinuationOfRunId: Schema.optional(RunId),
     usageLimitRecoveryRequestId: Schema.optional(CommandId),
     deliveryIntent: Schema.optional(Schema.Literals(["auto", "steer", "restart"])),
+    delegatedTaskStallRecovery: Schema.optional(DelegatedTaskStallRecovery),
     /** ardud: start this message on a fresh provider thread, with the message as its only context. */
     contextReset: Schema.optional(Schema.Boolean),
     delegatedCompletion: Schema.optional(
@@ -3068,6 +3158,7 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("run.interrupt"),
+    cancelReason: Schema.optional(OrchestrationV2CancelReason),
     commandId: CommandId,
     threadId: ThreadId,
     runId: RunId,
@@ -3099,6 +3190,8 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("queued-run.cancel"),
+    reason: Schema.optional(OrchestrationV2CancelReason),
+    detail: Schema.optional(CancelDetail),
     commandId: CommandId,
     threadId: ThreadId,
     runId: RunId,
@@ -3169,6 +3262,8 @@ export const OrchestrationV2Command = Schema.Union([
     parentRunId: RunId,
     parentNodeId: NodeId,
     task: TrimmedNonEmptyString,
+    parentAdmittedAt: Schema.optional(Schema.DateTimeUtc),
+    parentProviderSessionId: Schema.optional(ProviderSessionId),
     idleTimeoutMs: Schema.optional(Schema.Finite),
     title: Schema.optional(TrimmedNonEmptyString),
     modelSelection: ModelSelection,
@@ -3228,6 +3323,25 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  */
 const OrchestrationV2InternalCommand = Schema.Union([
   Schema.Struct({
+    type: Schema.Literal("run.start-expire"),
+    phase: Schema.Literals(["provider", "restart_admission", "restart_cleanup"]),
+    commandId: CommandId,
+    threadId: ThreadId,
+    runId: RunId,
+    expectedAttemptId: Schema.NullOr(RunAttemptId),
+    deadline: Schema.DateTimeUtc,
+    admission: Schema.optional(OrchestrationV2RestartAdmissionFailure),
+    nativeEvidence: Schema.optional(
+      Schema.Struct({
+        runId: RunId,
+        attemptId: RunAttemptId,
+        nativeSessionId: Schema.NullOr(Schema.String),
+        acceptedAt: Schema.DateTimeUtc,
+      }),
+    ),
+  }),
+
+  Schema.Struct({
     type: Schema.Literal("queue.cutover-release"),
     commandId: CommandId,
     threadId: ThreadId,
@@ -3271,6 +3385,9 @@ const OrchestrationV2InternalCommand = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("thread.background-work.settle"),
+    runOnly: Schema.optional(Schema.Boolean),
+    releasedAt: Schema.optional(Schema.DateTimeUtc),
+    preserveBackgroundWork: Schema.optional(Schema.Boolean),
     commandId: CommandId,
     threadId: ThreadId,
     providerThreadId: ProviderThreadId,
@@ -3286,6 +3403,14 @@ const OrchestrationV2InternalCommand = Schema.Union([
         }),
       }),
     ),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.provider-root.settle"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    providerThreadId: ProviderThreadId,
+    nodeId: NodeId,
+    startedAt: Schema.NullOr(Schema.DateTimeUtc),
   }),
   /**
    * Internal so no client can mark a request saved without the value being

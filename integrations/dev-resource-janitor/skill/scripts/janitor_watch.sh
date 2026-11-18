@@ -1,15 +1,22 @@
 #!/bin/zsh
 # robob-watch check for the hourly dev janitor (watcher id: dev-janitor).
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-S="$HOME/.config/opencode/skills/dev-resource-janitor/scripts/dev_janitor.py"
-PY=/opt/homebrew/bin/python3
+S="${DEV_JANITOR_SCRIPT_DIR:-${0:A:h}}"
+PY="${DEV_JANITOR_PYTHON:-/opt/homebrew/bin/python3}"
+LOG_DIR="${DEV_JANITOR_LOG_DIR:-$HOME/.local/share/dev-janitor}"
+# robob-watch passes no per-watcher env. The hourly run closes orphaned agent-browser daemons under the owner's
+# 16 Nov standing authority (#85, #91 q1); the module default stays off for manual and test runs.
+export DEV_JANITOR_REAP_AGENT_BROWSER="${DEV_JANITOR_REAP_AGENT_BROWSER:-1}"
+mkdir -p "$LOG_DIR"
+# robob-watch forwards stdout to iMessage. Keep all check output local, including subprocess diagnostics.
+exec >/dev/null 2>>"$LOG_DIR/watch.err"
 
 # The tmpdir prune is separate from the resource janitor and can also outlast the check deadline.
-TP="${S:h}/tmpdir_prune.py"
-TL="$HOME/.local/share/dev-janitor/tmpdir-prune"
+TP="$S/tmpdir_prune.py"
+TL="$LOG_DIR/tmpdir-prune"
 mkdir -p "$TL"
 if [[ -s "$TL/rc" && "$(<"$TL/rc")" != 0 ]]; then
-  echo "dev-janitor: tmpdir prune exited $(<"$TL/rc"): $(tail -c 300 "$TL/err" | tr '\n' ' ')"
+  "$PY" "$S/janitor_watch.py" alert tmpdir_prune "dev-janitor: tmpdir prune exited $(<"$TL/rc"): $(tail -c 300 "$TL/err" | tr '\n' ' ')"
 fi
 if ! { [[ -f "$TL/pid" ]] && kill -0 "$(<"$TL/pid")" 2>/dev/null; }; then
   rm -f "$TL/rc"
@@ -17,6 +24,6 @@ if ! { [[ -f "$TL/pid" ]] && kill -0 "$(<"$TL/pid")" 2>/dev/null; }; then
   echo $! > "$TL/pid"
 fi
 
-# This only starts a detached, single-flight cycle and reports the previous failure. The worker calls apply(),
+# This only starts a detached, single-flight cycle and alerts the previous failure. The worker calls apply(),
 # which takes a fresh snapshot before each action, outside robob-watch's 60-second check budget.
-"$PY" "${S:h}/janitor_watch.py" check
+"$PY" "$S/janitor_watch.py" check

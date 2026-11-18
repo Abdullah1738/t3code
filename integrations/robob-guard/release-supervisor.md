@@ -1,5 +1,9 @@
 # External release supervisor hold
 
+Every hold now expires **30 minutes after creation**, even while its owner
+and beater remain alive. The recovery waits below do not extend that bound;
+repair or rollback must finish before it, or the guard can recover Robob itself.
+
 The retry supervisor currently lives outside the fork:
 `/Users/ardud/.robob/install-20261111.2-sup/install-retry.zsh`.
 It writes `~/.robob/install-20261111.2.ndjson` and
@@ -54,10 +58,10 @@ The existing pre-quit clone-race `continue` keeps the same hold between
 attempts. The `zshexit` hook releases it only after `supervisor_finish`
 observes health. The helper's beater watches the supervisor PID. If the
 supervisor is killed or crashes, its PID dies and the guard recovers Robob;
-there is no permanent hold switch.
+the same happens at the 30-minute age cap. There is no permanent hold switch.
 
 The fork installer also checks authenticated health before releasing its own
-hold after any quit, outside its three-minute attempt clock. Post-swap checks
+hold after any quit, outside its configured readiness budget (180 s by default). Post-swap checks
 require a new boot identity. If it is waiting after a failed launch, the log
 and Telegram alert request repair or compatible rollback from another
 Terminal while the installer remains alive. Pass the hold name/PID printed

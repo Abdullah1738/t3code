@@ -251,13 +251,33 @@ class PushResumeTests(Isolated):
         row = rn.start()
         self.assertEqual(row['remote_dir'], 'w/caller-abcdef')
         self.assertIs(row['_guard'], self.guard)
-        self.resume.assert_called_once_with(unittest.mock.ANY, 'box', common.RUN_TTL_S, None, retry=True)
+        self.resume.assert_called_once_with(unittest.mock.ANY, 'box', common.RUN_TTL_S, None,
+                                            retry=True, watch=unittest.mock.ANY)
+        self.assertIsInstance(self.resume.call_args.kwargs['watch'], lease._ResumeWatch)
         self.bring_up.assert_called_once()
         self.assertEqual(self.push.call_count, 2)
         self.assertEqual(self.put_file.call_count, 2)
         self.command.assert_called_once()
         self.assertTrue(rn.started)
         self.log.assert_called_once_with('push_box_stopped_resumed box')
+
+    def test_sync_state_and_one_left_out_line(self):
+        stats = dict(tracked_total=10, tracked_heavy=2, tracked_heavy_sent=2,
+                     tracked_node_modules_sent=1, tracked_secret_sent=1,
+                     tracked_left_out={"secret": 1}, tracked_left_out_first=["fixtures/key.pem"],
+                     verified=9, seconds=1, files=4)
+        self.push.return_value = stats
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            rn = self.runner()
+            rn.start()
+        state = runs.read_json(runs.LOGS_DIR / f"{rn.run_id}.state.json", {})
+        for key in ssh_sync.TRACKED_SYNC_FIELDS:
+            self.assertEqual(state[key], stats[key])
+        text = output.getvalue()
+        self.assertEqual(text.count("tracked files not synced"), 1)
+        self.assertIn("verified 9 of 10 tracked files (1 left out, see above)", text)
+        self.assertNotIn("not synced (secret filter)", text)
 
     def test_stopped_during_push_resumes_once_then_starts_command(self):
         self.assert_resumed_start()

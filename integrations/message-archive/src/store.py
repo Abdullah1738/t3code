@@ -1,57 +1,183 @@
 """The index database: one `items` row per message plus an external-content FTS5 index."""
 import contextlib
 import json
+import itertools
 import os
 import sqlite3
 import threading
 import time
 
 import common
+import timing
+
+
+LOCK_WAIT_SECONDS = 120
+SQLITE_WAIT_SECONDS = 30
+LONG_HOLD_SECONDS = 60
+WRITE_BATCH = 100
+WRITE_BATCH_SECONDS = 5
+
+
+class LockTimeout(RuntimeError):
+    def __init__(self, waited, holder="unknown", held=0):
+        self.waited, self.holder, self.held = waited, holder, held
+        super().__init__(f"lock wait {waited:.1f}s, holder={holder} held={held:.1f}s")
 
 
 class FairLock:
-    """FIFO lock. SQLite's own busy wait polls, so a thread that commits and starts again at once
-    can starve the others for minutes; the daemon's sync threads take turns through this instead."""
+    """FIFO tickets, including cancellation of waiters that time out or are interrupted."""
 
     def __init__(self):
         self._cv = threading.Condition()
         self._next = 0
         self._serving = 0
+        self._abandoned = set()
+        self._holder = None
+        self._reported = False
 
-    def acquire(self):
+    def _skip_abandoned(self):
+        while self._serving in self._abandoned:
+            self._abandoned.remove(self._serving)
+            self._serving += 1
+
+    def _snapshot(self):
+        if self._holder is None:
+            return dict(source="unknown", thread=None, since=None, held=0, phase="idle")
+        source, thread, since, metrics = self._holder
+        return dict(source=source, thread=thread.name, since=since,
+                    held=time.monotonic() - since,
+                    phase=(metrics.thread_phase(thread.ident) if metrics else None) or "db_write")
+
+    def snapshot(self):
+        with self._cv:
+            return self._snapshot()
+
+    def acquire(self, timeout=None):
+        started = time.monotonic()
+        deadline = None if timeout is None else started + timeout
         with self._cv:
             ticket = self._next
             self._next += 1
-            while ticket != self._serving:
-                self._cv.wait()
+            try:
+                while ticket != self._serving:
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        holder = self._snapshot()
+                        raise LockTimeout(time.monotonic() - started, holder["source"], holder["held"])
+                    self._cv.wait(remaining)
+                metrics = timing.CURRENT.get()
+                self._holder = (metrics.source if metrics else "archive", threading.current_thread(),
+                                time.monotonic(), metrics)
+                self._reported = False
+            except BaseException:
+                self._abandoned.add(ticket)
+                self._skip_abandoned()
+                self._cv.notify_all()
+                raise
+        return True
+
+    def _long_hold(self):
+        holder = self._snapshot()
+        if holder["held"] >= LONG_HOLD_SECONDS and not self._reported:
+            self._reported = True
+            return holder
+
+    @staticmethod
+    def _log_hold(holder):
+        if holder:
+            common.log(f"write lock held {holder['held']:.1f}s by {holder['source']} in {holder['phase']} "
+                       f"(thread={holder['thread']})")
+
+    def check_hold(self):
+        with self._cv:
+            holder = self._long_hold()
+        # Logging must never hold the condition's mutex and prevent timeout/abandon.
+        self._log_hold(holder)
 
     def release(self):
         with self._cv:
+            holder = self._long_hold()
+            self._holder = None
             self._serving += 1
+            self._skip_abandoned()
             self._cv.notify_all()
+        self._log_hold(holder)
 
 
 WRITE = FairLock()
 
 
 @contextlib.contextmanager
-def writing(db):
-    """One write transaction, serialized with the other threads in this process. Commits on exit."""
-    WRITE.acquire()
+def waiting(lock, holder="unknown"):
+    """Bound auxiliary sync locks too, especially the Gmail token refresh mutex."""
+    started = time.monotonic()
+    with timing.phase("lock_wait"):
+        acquired = lock.acquire(timeout=LOCK_WAIT_SECONDS)
+    if not acquired:
+        raise LockTimeout(time.monotonic() - started, holder)
     try:
-        if db.in_transaction:
-            db.commit()
-        # Take the write lock up front: a deferred transaction that upgrades from a stale read
-        # snapshot fails with "database is locked" at once instead of waiting.
-        db.execute("BEGIN IMMEDIATE")
+        yield
+    finally:
+        lock.release()
+
+
+@contextlib.contextmanager
+def _writer():
+    started = time.monotonic()
+    try:
+        with timing.write_lock(WRITE, timeout=LOCK_WAIT_SECONDS):
+            yield
+    except sqlite3.OperationalError as e:
+        if "locked" not in str(e).lower() and "busy" not in str(e).lower():
+            raise
+        # WRITE was acquired by us; contention here is another process, whose source is unknown.
+        raise LockTimeout(time.monotonic() - started) from e
+
+
+@contextlib.contextmanager
+def writing(db):
+    """One bounded write transaction; roll back even when BEGIN or COMMIT fails."""
+    with _writer():
         try:
+            if db.in_transaction:
+                db.commit()
+            db.execute("BEGIN IMMEDIATE")
             yield db
             db.commit()
         except BaseException:
             db.rollback()
             raise
-    finally:
-        WRITE.release()
+
+
+def write_batches(db, values, apply):
+    """Yield WRITE between small batches, sooner when a loaded disk makes rows slow."""
+    values = iter(values)
+    while batch := list(itertools.islice(values, WRITE_BATCH)):
+        offset = 0
+        while offset < len(batch):
+            with writing(db):
+                started = time.monotonic()
+                while offset < len(batch):
+                    apply(batch[offset])
+                    offset += 1
+                    if time.monotonic() - started >= WRITE_BATCH_SECONDS:
+                        break
+
+
+def upsert_many(db, items, stats):
+    def apply(item):
+        stats[upsert(db, item)] += 1
+    write_batches(db, items, apply)
+
+
+def reconcile(db, source, account, gone=(), back=()):
+    deleted = 0
+    def remove(ext):
+        nonlocal deleted
+        deleted += mark_deleted(db, source, account, [ext])
+    write_batches(db, gone, remove)
+    write_batches(db, back, lambda ext: undelete(db, source, account, [ext]))
+    return deleted
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -118,23 +244,36 @@ def connect(readonly=False):
     if readonly:
         if not os.path.exists(common.DB_PATH):
             raise common.NotMounted(f"no archive at {common.DB_PATH} (is {common.VOLUME} mounted?)")
-        db = sqlite3.connect(f"file:{common.DB_PATH}?mode=ro", uri=True, timeout=30)
+        db = sqlite3.connect(f"file:{common.DB_PATH}?mode=ro", uri=True, timeout=0.25)
+        db.execute("PRAGMA query_only=ON")
+        # Short-lived searches otherwise use SQLite's 2 MiB cache and no mapping.
+        # SQLite clamps this to its compiled mapping limit (about 2 GiB on this Mac).
+        db.execute("PRAGMA cache_size=-16384")
+        db.execute("PRAGMA mmap_size=4294967296")
     else:
         common.require_volume()
-        db = sqlite3.connect(common.DB_PATH, timeout=60)
-        db.execute("PRAGMA busy_timeout=60000")
-        # FTS5 segment merges reread big parts of the index; the 2 MB default cache turns every
-        # merge into a stream of small reads and spills on the USB disk.
-        db.execute("PRAGMA cache_size=-131072")
-        db.execute("PRAGMA mmap_size=1073741824")
-        WRITE.acquire()
+        db = None
         try:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA synchronous=NORMAL")
-            db.executescript(SCHEMA)
-        finally:
-            WRITE.release()
-    db.execute("PRAGMA busy_timeout=60000")
+            with _writer():
+                db = sqlite3.connect(common.DB_PATH, timeout=SQLITE_WAIT_SECONDS, factory=timing.Connection)
+                db.execute(f"PRAGMA busy_timeout={int(SQLITE_WAIT_SECONDS * 1000)}")
+                # FTS5 segment merges reread big parts of the index; the 2 MB default cache turns every
+                # merge into a stream of small reads and spills on the USB disk.
+                db.execute("PRAGMA cache_size=-131072")
+                db.execute("PRAGMA mmap_size=1073741824")
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA synchronous=NORMAL")
+                db.executescript(SCHEMA)
+                # The unique key covers known IDs, but checking deleted_at through it fetches
+                # every message row in an account while all other sync threads wait.
+                db.execute("CREATE INDEX IF NOT EXISTS items_deleted ON items(source, account, ext_id) "
+                           "WHERE deleted_at IS NOT NULL")
+        except BaseException:
+            if db is not None:
+                db.close()
+            raise
+    if readonly:
+        db.execute("PRAGMA busy_timeout=250")
     db.row_factory = sqlite3.Row
     return db
 
@@ -226,3 +365,13 @@ def known_ext_ids(db, source, account, prefix=None):
     else:
         rows = db.execute("SELECT ext_id FROM items WHERE source=? AND account=?", (source, account))
     return {r[0] for r in rows}
+
+
+def existing_ext_ids(db, source, account, ext_ids):
+    ids = iter(ext_ids)
+    found = set()
+    while chunk := list(itertools.islice(ids, 500)):
+        rows = db.execute("SELECT ext_id FROM items WHERE source=? AND account=? AND ext_id IN ("
+                          + ", ".join("?" for _ in chunk) + ")", (source, account, *chunk))
+        found.update(r[0] for r in rows)
+    return found

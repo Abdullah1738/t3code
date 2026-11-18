@@ -21,6 +21,7 @@ import * as HttpServerRequest from "effect/http/HttpServerRequest";
 import * as SqlClient from "effect/sql/SqlClient";
 
 import * as SessionOrigins from "../ardud/auth/SessionOrigins.ts";
+import { AuthenticatedClientObserver } from "../observability/ControlHttpTelemetry.ts";
 import { CONTROL_ROUTE_PREFIX, controlRouteLayer } from "../ardud/control/http.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -317,6 +318,35 @@ it.live("authenticates control, websocket, and MCP clients while an unrelated wr
 );
 
 it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
+  it.effect("observes the verified client label without changing authentication", () =>
+    Effect.gen(function* () {
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const issued = yield* auth.issueSession({ label: "component spectrum-bridge" });
+      const labels: Array<string | undefined> = [];
+      const session = yield* auth.authenticateHttpRequest(makeBearerRequest(issued.token)).pipe(
+        Effect.provideService(AuthenticatedClientObserver, (client) => {
+          labels.push(client.clientLabel);
+        }),
+      );
+      expect(labels).toEqual(["component spectrum-bridge"]);
+      expect(session.sessionId).toBe(issued.sessionId);
+      const withBrokenObserver = yield* auth
+        .authenticateHttpRequest(makeBearerRequest(issued.token))
+        .pipe(
+          Effect.provideService(AuthenticatedClientObserver, () => {
+            throw new Error("observer");
+          }),
+        );
+      expect(withBrokenObserver.sessionId).toBe(issued.sessionId);
+      yield* Effect.flip(auth.authenticateHttpRequest(makeBearerRequest("invalid"))).pipe(
+        Effect.provideService(AuthenticatedClientObserver, (client) => {
+          labels.push(client.clientLabel);
+        }),
+      );
+      expect(labels).toHaveLength(1);
+    }).pipe(Effect.provide(layerEnvironmentAuth())),
+  );
+
   it.effect("uses the reusable dev cookie without overriding a normal scoped cookie", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;

@@ -1,6 +1,7 @@
 """Exercise deploy.zsh against synthetic source files and an isolated HOME."""
 
 import os
+import plistlib
 from pathlib import Path
 import shlex
 import shutil
@@ -29,6 +30,10 @@ class DeployTest(unittest.TestCase):
         self.source = self.pkg / "robob-watch"
         self.source.mkdir()
         (self.source / "worker.py").write_text("payload\n")
+        for relative in ("meds-nag/check.py", "meds-nag/took.py", "forge-workouts/check.py", "gym-nudge/check.py", "activity-digest/check.sh", "activity-digest/summarize.py"):
+            path = self.source / "watchers" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n")
         self.dst = self.home / ".local/share/robob-watch"
         self.dst.mkdir(parents=True)
         self.env = {
@@ -73,6 +78,47 @@ class DeployTest(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[-1], "dry run: robob-watch")
         self.assertEqual(list(self.dst.iterdir()), [])
 
+    def test_marker_runs_only_after_success_and_never_blocks_deploy(self):
+        bun = self.home / ".bun/bin/bun"
+        bun.parent.mkdir(parents=True)
+        calls = self.root / "marker-calls"
+        bun.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$MARKER_CALLS"\nexit 9\n')
+        bun.chmod(0o755)
+        self.env["MARKER_CALLS"] = str(calls)
+        result = self.run_deploy("robob-watch", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(calls.exists())
+        result = self.run_deploy("robob-watch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("log-marker\n--service\nrobob-watch\n--sha\n", calls.read_text())
+        self.assertIn("--step\ndeploy.complete\n", calls.read_text())
+        count = calls.read_text().count("log-marker")
+        (self.home / ".local/share/coord").write_text("blocked")
+        (self.pkg / "coord").mkdir()
+        result = self.run_deploy("coord")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls.read_text().count("log-marker"), count)
+
+    def test_installed_robob_guard_starts_with_granted_shell(self):
+        source = self.pkg / "robob-guard"
+        (source / "scripts").mkdir(parents=True)
+        (source / "bin").mkdir()
+        (source / "bin/robob-install-hold").write_text("#!/bin/sh\nexit 0\n")
+        relative = "scripts/com.ardud.robob-guard.plist"
+        shutil.copy2(INTEGRATIONS / "robob-guard" / relative, source / relative)
+        result = self.run_deploy("robob-guard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = self.home / "Library/LaunchAgents/com.ardud.robob-guard.plist"
+        with installed.open("rb") as stream:
+            plist = plistlib.load(stream)
+        # Preserve the granted launchd entrypoint and pass script paths as argv.
+        self.assertEqual(plist["ProgramArguments"], [
+            "/bin/zsh", "-fc", 'exec /usr/bin/python3 "$@"', "--",
+            "/Users/ardud/.local/share/robob-guard/guard.py",
+        ])
+        self.assertEqual(plist["StartInterval"], 30)
+        self.assertTrue(plist["RunAtLoad"])
+
     def test_usage_returns_two_for_missing_or_unknown_name(self):
         self.enable_node_hook()
         for args in ((), ("unknown",)):
@@ -106,8 +152,15 @@ class DeployTest(unittest.TestCase):
         self.assertNotIn("dry run:", result.stdout)
 
     def test_memory_system_reports_success_only_after_extra_installs(self):
+        # Exercise the install steps inside the outer backup fence.
+        self.env["MEMORY_DEPLOY_FENCED"] = "1"
         scripts = self.pkg / "memory-system/scripts"
         scripts.mkdir(parents=True)
+        control = self.pkg / "memory-system/src/backup_control.py"
+        control.parent.mkdir()
+        control.write_text("import sys\nif sys.argv[1] == 'fence':\n    raise AssertionError('inner install test')\n")
+        self.env["MEMORY_DEPLOY_FENCED"] = "1"
+        (scripts / "com.abdullah.opencode-readonly.plist").write_text("fixture plist\n")
         (scripts / "recall").write_text("#!/bin/sh\necho recall\n")
         installer = scripts / "install_launchagent.sh"
         installer.write_text('echo "launchagent ${1:-install}"\nexit "${FAKE_INSTALL_RC:-0}"\n')
@@ -133,6 +186,39 @@ class DeployTest(unittest.TestCase):
         result = self.run_deploy("memory-system")
         self.assertEqual(result.returncode, 7, result.stderr)
         self.assertNotIn("deployed ", result.stdout)
+
+    def test_memory_system_without_fence_refuses_before_touching_lock_or_log(self):
+        source = self.pkg / "memory-system"
+        (source / "src").mkdir(parents=True)
+        (source / "src/backup_control.py").write_text("raise AssertionError('legacy guard must not run')\n")
+        scripts = source / "scripts"
+        scripts.mkdir()
+        (scripts / "install_launchagent.sh").write_text("exit 0\n")
+        destination = self.home / ".local/share/memory-system"
+        logs = destination / "logs"
+        message = ("memory-system: this tree's backup_control.py has no backup fence; "
+                   "memory-system deploys come from an export of robob/recall-golive")
+
+        for fenced in ("", "1"):
+            self.env["MEMORY_DEPLOY_FENCED"] = fenced
+            for arguments in ((), ("--no-fence",)):
+                with self.subTest(fenced=fenced, arguments=arguments):
+                    result = self.run_deploy("memory-system", *arguments)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertEqual(result.stderr.strip(), message)
+                    self.assertEqual(result.stdout, "")
+                    self.assertFalse((logs / "backup.lock").exists())
+                    self.assertFalse((logs / "backup.lock.flock").exists())
+                    self.assertEqual(list(logs.glob("backup-*.log")), [])
+                    self.assertFalse(destination.exists())
+
+            for arguments in (("--dry-run",), ("--dry-run", "--no-fence"), ("--no-fence", "--dry-run")):
+                with self.subTest(fenced=fenced, arguments=arguments):
+                    result = self.run_deploy("memory-system", *arguments)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn(message, result.stderr)
+                    self.assertEqual(result.stdout.splitlines()[-1], "dry run: memory-system")
+                    self.assertFalse(destination.exists())
 
 
 if __name__ == "__main__":

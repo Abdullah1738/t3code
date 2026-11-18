@@ -3,21 +3,58 @@ import {
   cleanupOwnedTree,
   survivingOwned,
 } from "../../../packages/shared/src/ownedProcessTree.ts";
-import { execFile, spawn } from "node:child_process";
-import { promisify } from "node:util";
-import fs from "node:fs/promises";
-import path from "node:path";
-import os from "node:os";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeUtil from "node:util";
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
+import * as NodeOS from "node:os";
 import * as NodeHttp from "node:http";
 import * as NodeHttps from "node:https";
-import { fileURLToPath } from "node:url";
+import * as NodeURL from "node:url";
 
 import { acquireInstallHold, finishInstallHold } from "./robob-install-hold.mjs";
+import {
+  validateReadyBudget,
+  installCommandTimeout,
+  installBackupTimeout,
+  waitForInstallReadiness,
+  readBootPhase,
+} from "./install-readiness.mjs";
+export { installCommandTimeout } from "./install-readiness.mjs";
 
 // Exit 75: the bundle is installed, but sustained reads did not pass. Do not reinstall.
 export const READ_CHECK_FAILED = 75;
-const exec = promisify(execFile);
-export const INSTALL_DATABASE_FILE = /^(statev2|boards)\.sqlite(?:-wal)?$/;
+const exec = NodeUtil.promisify(NodeChildProcess.execFile);
+export const INSTALL_DATABASE_FILE = /^(statev2|boards|archive)\.sqlite(?:-wal)?$/;
+
+// Clones share data blocks; reserve metadata headroom and never fall back to a full copy.
+export const BACKUP_FREE_BYTES = 1024 ** 3;
+export async function cloneClosedDatabases({
+  data, destination, timeoutMs, run, fs: io = NodeFSP,
+}) {
+  await io.mkdir(destination, { recursive: true, mode: 0o700 });
+  const names = (await io.readdir(data)).filter((name) => INSTALL_DATABASE_FILE.test(name)).sort();
+  if (!names.includes("statev2.sqlite")) throw new Error("Missing state database");
+  const target = await io.stat(destination);
+  const space = await io.statfs(destination, { bigint: true });
+  if (space.bavail * space.bsize < BigInt(BACKUP_FREE_BYTES))
+    throw new Error("Install backup requires at least 1 GiB free for clone metadata");
+  for (const name of names) {
+    const source = await io.lstat(NodePath.join(data, name));
+    if (!source.isFile() || source.dev !== target.dev)
+      throw new Error(`Install backup requires regular files on the same volume: ${name}`);
+  }
+  for (const name of names) {
+    // cp -c can silently copy; Node's FICLONE_FORCE is unsupported on macOS.
+    // clonefile fails rather than falling back when the filesystem cannot clone.
+    // A child process keeps a stalled filesystem operation inside the aggregate backup deadline.
+    await run("/usr/bin/python3", ["-I", "-c",
+      "import ctypes, os, sys\nclone = ctypes.CDLL(None, use_errno=True).clonefile\nclone.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]\nclone.restype = ctypes.c_int\nif clone(os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2]), 0):\n error = ctypes.get_errno()\n raise OSError(error, os.strerror(error))",
+      NodePath.join(data, name), NodePath.join(destination, name),
+    ], timeoutMs());
+  }
+  return names;
+}
 
 export const INSTALL_PLAN = [
   "pre-stage",
@@ -32,7 +69,7 @@ export const INSTALL_PLAN = [
   "read-ready",
   "read-check (5 healthy minutes, up to 30 minutes)",
   "continuation-report",
-  "prune-old-backups",
+  "prune-old-backups (also after verified recovery)",
 ];
 
 // Robob builds are Developer ID signed but not notarized, so `spctl --assess`
@@ -93,23 +130,174 @@ export async function install(ops, { rollback = false } = {}) {
     await ops.prune().catch((error) => ops.phase("prune_failed", { error: String(error) }));
 }
 
-export function installCommandTimeout(timeout, quitAt, startupComplete, now = Date.now()) {
-  const remaining =
-    quitAt === undefined || startupComplete ? timeout : Math.min(timeout, 180_000 - (now - quitAt));
-  if (remaining <= 0) throw new Error("Install exceeded the 3 minute limit");
-  return remaining;
+export async function requestInstallerQuit({
+  home, pid, rollback = false, run, now = Date.now(), requesterPid = process.pid, fs: io = NodeFSP,
+}) {
+  const file = NodePath.join(home, ".robob/userdata/logs/desktop-quit-request.json");
+  await io.mkdir(NodePath.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${requesterPid}.tmp`;
+  await io.writeFile(temporary, JSON.stringify({
+    at: now, targetPid: pid, requesterPid, initiator: "installer",
+    reason: rollback ? "release-rollback" : "release-install",
+  }), { mode: 0o600 });
+  await io.rename(temporary, file);
+  try {
+    await run("/usr/bin/osascript", ["-e", 'tell application "Robob" to quit'], 2000);
+  } catch {}
+}
+
+async function writeBackupMarker(file, value, io) {
+  const handle = await io.open(file, "w", 0o600);
+  try {
+    await handle.writeFile(JSON.stringify(value));
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function cloneBackup({ backupRoot, stamp, clone, fs: io = NodeFSP }) {
+  await io.mkdir(backupRoot, { recursive: true, mode: 0o700 });
+  const destination = NodePath.join(backupRoot, stamp);
+  try {
+    const files = await clone(destination);
+    await writeBackupMarker(NodePath.join(destination, ".complete"), {
+      stamp, completedAt: new Date().toISOString(), files,
+    }, io);
+  } catch (error) {
+    // Rename rather than delete large clones inside the outage window.
+    await io.rename(destination, NodePath.join(backupRoot, `partial-${stamp}`)).catch(() => {});
+    throw error;
+  }
+}
+
+async function backupInventory(backupRoot, io) {
+  const stat = (file) => io.stat(file).catch((error) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  const entries = await io.readdir(backupRoot, { withFileTypes: true }).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  const backups = [];
+  for (const entry of entries) {
+    const partial = entry.name.startsWith("partial-");
+    if (!entry.isDirectory() || (!partial && !/^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.\d{3}Z$/.test(entry.name)))
+      continue;
+    const directory = NodePath.join(backupRoot, entry.name);
+    backups.push({
+      name: entry.name,
+      partial,
+      marked: !partial && Boolean((await stat(NodePath.join(directory, ".complete")))?.isFile()),
+      pinned: Boolean(await stat(NodePath.join(directory, ".pinned"))),
+    });
+  }
+  backups.sort((a, b) => a.name < b.name ? 1 : a.name > b.name ? -1 : 0);
+  const oldestMarked = backups.findLast((backup) => backup.marked)?.name;
+  for (const backup of backups) {
+    backup.usable = backup.marked;
+    if (!backup.partial && !backup.marked && (!oldestMarked || backup.name < oldestMarked)) {
+      const database = await stat(NodePath.join(backupRoot, backup.name, "statev2.sqlite"));
+      backup.usable = Boolean(database?.isFile() && database.size > 0);
+    }
+  }
+  return backups;
+}
+
+export async function pruneBackups({ backupRoot, currentStamp, trigger, phase, fs: io = NodeFSP }) {
+  await phase("prune_started", { trigger });
+  const backups = await backupInventory(backupRoot, io);
+  const usable = backups.filter((backup) => backup.usable);
+  const pinned = backups.filter((backup) => backup.pinned).map((backup) => backup.name);
+  const incomplete = backups.filter((backup) => !backup.usable).map((backup) => backup.name);
+  const keep = new Set([
+    ...usable.filter((backup) => !backup.pinned).slice(0, 2).map((backup) => backup.name),
+    ...pinned,
+    ...usable.filter((backup) => backup.name === currentStamp).map((backup) => backup.name),
+  ]);
+  const removed = [];
+  for (const backup of backups) {
+    // With no proven rollback, preserve timestamp directories for manual inspection.
+    if (keep.has(backup.name) || (!usable.length && !backup.partial)) continue;
+    await io.rm(NodePath.join(backupRoot, backup.name), { recursive: true });
+    removed.push(backup.name);
+  }
+  const details = {
+    trigger, removed, kept: backups.filter((backup) => !removed.includes(backup.name)).map((backup) => backup.name),
+    pinned, incomplete,
+  };
+  if (!usable.length) await phase("prune_skipped", { ...details, reason: "no_usable_backup" });
+  else await phase("backups_pruned", details);
+}
+
+export function createBackupRetention({ backupRoot, currentStamp, phase, fs: io = NodeFSP }) {
+  let pruned = false;
+  let pinnedByRun = false;
+  const pin = async (error) => {
+    try {
+      const backups = await backupInventory(backupRoot, io);
+      const current = backups.find((backup) => backup.name === currentStamp);
+      if (!current?.usable || current.pinned) return;
+      await writeBackupMarker(NodePath.join(backupRoot, currentStamp, ".pinned"), {
+        stamp: currentStamp, reason: "install_failed", error: String(error), at: new Date().toISOString(),
+      }, io);
+      pinnedByRun = true;
+      await phase("backup_pinned", { stamp: currentStamp });
+    } catch (error) {
+      await phase("backup_pin_failed", { stamp: currentStamp, error: String(error) });
+    }
+  };
+  const prune = async (trigger = "ready") => {
+    if (pruned) return;
+    pruned = true;
+    try {
+      if (pinnedByRun) {
+        await io.rm(NodePath.join(backupRoot, currentStamp, ".pinned"));
+        pinnedByRun = false;
+        await phase("backup_unpinned", { stamp: currentStamp });
+      }
+      await pruneBackups({ backupRoot, currentStamp, trigger, phase, fs: io });
+    } catch (error) {
+      await phase("prune_failed", { trigger, error: String(error) });
+    }
+  };
+  return {
+    pin,
+    prune,
+    finish: async ({ swapped, failure, ...hold }) => {
+      try {
+        await finishInstallHold(hold);
+      } catch (error) {
+        if (!pruned) {
+          pruned = true;
+          await phase("prune_skipped", { reason: "not_healthy", error: String(error) });
+        }
+        // Recovery bookkeeping must not replace the original install error.
+        if (!failure) throw error;
+        return;
+      }
+      if (pruned) return;
+      if (!hold.quitStarted) {
+        pruned = true;
+        await phase("prune_skipped", { reason: "failed_before_quit" });
+        return;
+      }
+      await prune(swapped ? "recovered" : "relaunched");
+    },
+  };
 }
 
 export function createDmgStage({
   run = exec,
   phase,
-  mkdtemp = fs.mkdtemp,
-  rmdir = fs.rmdir,
+  mkdtemp = NodeFSP.mkdtemp,
+  rmdir = NodeFSP.rmdir,
 }) {
   let mount;
   const detach = async () => {
     if (!mount) return;
-    // Cleanup must still run after the install's three-minute startup deadline.
+    // Cleanup must still run after the install's startup deadline.
     const options = { timeout: 30_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20 };
     try {
       await run("/usr/bin/hdiutil", ["detach", "-quiet", mount], options);
@@ -130,7 +318,7 @@ export function createDmgStage({
   };
   return {
     stage: async (dmg, copy) => {
-      mount = await mkdtemp(path.join(os.tmpdir(), "robob-fast-dmg-"));
+      mount = await mkdtemp(NodePath.join(NodeOS.tmpdir(), "robob-fast-dmg-"));
       await run(
         "/usr/bin/hdiutil",
         ["attach", "-nobrowse", "-readonly", "-mountpoint", mount, dmg],
@@ -152,7 +340,7 @@ export async function checkSustainedReads({
   const started = now();
   try {
     const result = await run(
-      env.ROBOB_READ_CHECK || path.join(os.homedir(), ".local/bin/robob-read-watchdog"),
+      env.ROBOB_READ_CHECK || NodePath.join(NodeOS.homedir(), ".local/bin/robob-read-watchdog"),
       ["--sustain", "300", "--every", "30", "--give-up", "1800"],
       // Allow the final in-flight probe to finish after the watchdog's 30 minute bound.
       { timeout: 1_840_000, killSignal: "SIGKILL", maxBuffer: 2 ** 20, env },
@@ -304,7 +492,7 @@ export function probeDirectory(dir, timeoutMs = 10_000, command = ["/bin/ls", ["
     let settled = false;
     let stdout = "";
     let stderr = "";
-    const child = spawn(command[0], command[1], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = NodeChildProcess.spawn(command[0], command[1], { stdio: ["ignore", "pipe", "pipe"] });
     const finish = (value) => {
       if (settled) return;
       settled = true;
@@ -350,7 +538,7 @@ export async function probeCheckouts(checkoutsDir, probe = probeDirectory) {
     .split("\n")
     .find((entry) => entry && entry !== "." && entry !== ".." && !entry.startsWith("."));
   if (name === undefined) return { state: "ok", dir: checkoutsDir, empty: true };
-  const inner = await probe(path.join(checkoutsDir, name));
+  const inner = await probe(NodePath.join(checkoutsDir, name));
   return inner.state === "ok" ? { state: "ok", dir: inner.dir } : inner;
 }
 
@@ -553,8 +741,20 @@ export async function clearStaleStaging({
   return "removed";
 }
 
-async function main(args) {
+export async function main(args, {
+  home = NodeOS.homedir(),
+  env = process.env,
+  acquireHold = acquireInstallHold,
+  phase = async (phase, extra = {}) =>
+    console.log(JSON.stringify({ phase, at: new Date().toISOString(), ...extra })),
+} = {}) {
   const rollback = args.includes("--rollback");
+  const readyIndex = args.indexOf("--ready-budget-s");
+  if (args.filter((arg) => arg === "--ready-budget-s").length > 1)
+    throw new Error("--ready-budget-s must be given once");
+  if (readyIndex >= 0 && args[readyIndex + 1] === undefined)
+    throw new Error("--ready-budget-s requires a value");
+  const readyBudgetS = validateReadyBudget(readyIndex < 0 ? undefined : args[readyIndex + 1]);
   const dmgIndex = args.indexOf("--dmg");
   const skipIndex = args.indexOf("--skip-migration-check");
   // The pre-quit check clones the live database, and that clone stalls the running server's
@@ -567,7 +767,7 @@ async function main(args) {
   if (rollback && skipMigrationCheck !== undefined)
     throw new Error("--skip-migration-check cannot be used with --rollback");
   for (let i = 0; i < args.length; i++) {
-    if ((args[i] === "--dmg" || args[i] === "--skip-migration-check") && args[i + 1]) {
+    if (["--dmg", "--skip-migration-check", "--ready-budget-s"].includes(args[i]) && args[i + 1]) {
       i++;
       continue;
     }
@@ -578,29 +778,33 @@ async function main(args) {
     console.log(
       JSON.stringify({
         rollback,
+        readyBudgetS,
         skipMigrationCheck: skipMigrationCheck ?? null,
         steps: INSTALL_PLAN,
       }),
     );
     return;
   }
-  if (!process.env.TMUX) throw new Error("Use the zsh wrapper: installs must run in tmux");
+  if (!env.TMUX) throw new Error("Use the zsh wrapper: installs must run in tmux");
+  await phase("install_started", { readyBudgetS });
   const app = "/Applications/Robob.app";
   const next = "/Applications/.Robob.next.app";
   const prev = "/Applications/.Robob.prev.app";
-  const data = await fs.realpath(path.join(os.homedir(), ".robob/userdata"));
+  const data = await NodeFSP.realpath(NodePath.join(home, ".robob/userdata"));
   const stamp = new Date().toISOString().replaceAll(":", "-");
-  const backupRoot = path.join(path.dirname(data), "fast-install-backups");
-  const phase = async (phase, extra = {}) =>
-    console.log(JSON.stringify({ phase, at: new Date().toISOString(), ...extra }));
+  const backupRoot = NodePath.join(NodePath.dirname(data), "fast-install-backups");
+  const retention = createBackupRetention({ backupRoot, currentStamp: stamp, phase });
+  let backupDone = false;
+  let installFailure;
+  let cleanupFailure;
   let quitAt;
   let startupComplete = false;
-  const run = (cmd, args, timeout = 20_000, env = process.env) => {
-    const remaining = installCommandTimeout(timeout, quitAt, startupComplete);
-    return exec(cmd, args, { timeout: remaining, maxBuffer: 2 ** 20, env });
+  const run = (cmd, args, timeout = 20_000, commandEnv = env) => {
+    const remaining = installCommandTimeout(timeout, quitAt, startupComplete, Date.now(), readyBudgetS);
+    return exec(cmd, args, { timeout: remaining, maxBuffer: 2 ** 20, env: commandEnv });
   };
   const exists = async (p) =>
-    fs.access(p).then(
+    NodeFSP.access(p).then(
       () => true,
       () => false,
     );
@@ -608,21 +812,12 @@ async function main(args) {
   const inputs = async () =>
     // Exact names only: the 226 GB statev2.pre-shrink-*.sqlite copy matched the old prefix pattern
     // and was cloned on every install (11 Nov 2026).
-    (await fs.readdir(data)).filter((name) => INSTALL_DATABASE_FILE.test(name));
-  const clone = async (destination, timeoutMs) => {
-    await fs.mkdir(destination, { recursive: true, mode: 0o700 });
-    const names = await inputs();
-    if (!names.includes("statev2.sqlite")) throw new Error("Missing state database");
-    for (const name of names)
-      await run(
-        "/bin/cp",
-        ["-c", path.join(data, name), path.join(destination, name)],
-        timeoutMs(),
-      );
-  };
+    (await NodeFSP.readdir(data)).filter((name) => INSTALL_DATABASE_FILE.test(name));
+  const clone = (destination, timeoutMs) =>
+    cloneClosedDatabases({ data, destination, timeoutMs, run });
   const cfg = JSON.parse(
-    await fs.readFile(
-      process.env.T3_CONTROL_TOKEN_FILE || path.join(os.homedir(), ".robob/components/t3ctl.json"),
+    await NodeFSP.readFile(
+      env.T3_CONTROL_TOKEN_FILE || NodePath.join(home, ".robob/components/t3ctl.json"),
       "utf8",
     ),
   );
@@ -637,19 +832,11 @@ async function main(args) {
   let quitTree;
   let ownsStaging = false;
   let swapped = false;
-  const poll = async (fn) => {
-    for (;;) {
-      if (Date.now() - quitAt >= 180_000) throw new Error("Install exceeded the 3 minute limit");
-      try {
-        if (await fn()) return;
-      } catch {}
-      await sleep(200);
-    }
-  };
+  const poll = (fn) => waitForInstallReadiness(fn, { quitAt, readyBudgetS });
   const launch = () =>
     run(
       "/bin/zsh",
-      [path.join(path.dirname(fileURLToPath(import.meta.url)), "open-robob-clean.zsh"), app],
+      [NodePath.join(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "open-robob-clean.zsh"), app],
       35_000,
     );
   const verifyBundle = async (bundle) => {
@@ -662,7 +849,7 @@ async function main(args) {
     phase,
     stage: async () => {
       const dmg = args[dmgIndex + 1];
-      if (dmgIndex < 0 || !path.isAbsolute(dmg)) throw new Error("--dmg requires an absolute path");
+      if (dmgIndex < 0 || !NodePath.isAbsolute(dmg)) throw new Error("--dmg requires an absolute path");
       // A failed run can leave its staging copy; replace it only when provably stale.
       await clearStaleStaging({
         next,
@@ -675,23 +862,23 @@ async function main(args) {
               "-extract",
               "CFBundleIdentifier",
               "raw",
-              path.join(bundle, "Contents/Info.plist"),
+              NodePath.join(bundle, "Contents/Info.plist"),
             ])
           ).stdout.trim(),
-        topLevel: (bundle) => fs.readdir(bundle),
+        topLevel: (bundle) => NodeFSP.readdir(bundle),
         otherInstallers: async () =>
           otherInstallerPids((await run("/bin/ps", ["-axo", "pid=,command="], 5000)).stdout),
         runningFrom: async (bundle) =>
           pidsRunningFrom((await run("/bin/ps", ["-axo", "pid=,comm="], 5000)).stdout, bundle),
-        rename: fs.rename,
-        remove: (target) => fs.rm(target, { recursive: true, force: true }),
-        stat: fs.stat,
+        rename: NodeFSP.rename,
+        remove: (target) => NodeFSP.rm(target, { recursive: true, force: true }),
+        stat: NodeFSP.stat,
       });
       await dmgStage.stage(dmg, async (mount) => {
         if (await exists(next))
           throw new Error(`Staging bundle already exists: ${next}; inspect it before retrying`);
         ownsStaging = true;
-        await run("/usr/bin/ditto", [path.join(mount, "Robob.app"), next], 120_000);
+        await run("/usr/bin/ditto", [NodePath.join(mount, "Robob.app"), next], 120_000);
       });
     },
     verify: () => verifyBundle(next),
@@ -700,13 +887,13 @@ async function main(args) {
         await phase("migration_check_skipped", { reason: skipMigrationCheck });
         return;
       }
-      const sandbox = await fs.mkdtemp(path.join(path.dirname(data), ".install-clone-"));
+      const sandbox = await NodeFSP.mkdtemp(NodePath.join(NodePath.dirname(data), ".install-clone-"));
       try {
         const fingerprint = async () =>
           JSON.stringify(
             await Promise.all(
               (await inputs()).sort().map(async (n) => {
-                const s = await fs.stat(path.join(data, n));
+                const s = await NodeFSP.stat(NodePath.join(data, n));
                 return [n, s.size, s.mtimeMs, s.ino];
               }),
             ),
@@ -715,27 +902,27 @@ async function main(args) {
         await clone(sandbox, () => 3000);
         if (before !== (await fingerprint()))
           throw new Error("Database changed during preflight clone; retry before quitting");
-        await fs.writeFile(path.join(sandbox, ".install-clone"), "", { mode: 0o600 });
+        await NodeFSP.writeFile(NodePath.join(sandbox, ".install-clone"), "", { mode: 0o600 });
         const candidate = rollback ? prev : next;
-        const entry = path.join(candidate, "Contents/Resources/app.asar/apps/server/dist/bin.mjs");
+        const entry = NodePath.join(candidate, "Contents/Resources/app.asar/apps/server/dist/bin.mjs");
         const result = await run(
-          path.join(candidate, "Contents/MacOS/Robob"),
+          NodePath.join(candidate, "Contents/MacOS/Robob"),
           [entry, "__install-migration-check", sandbox],
           migrationCheckTimeoutMs(),
-          { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+          { ...env, ELECTRON_RUN_AS_NODE: "1" },
         );
         if (!result.stdout.includes('"migrationCheck":"passed"'))
           throw new Error("Candidate did not confirm migration compatibility");
         console.log(result.stdout);
       } finally {
-        await fs.rm(sandbox, { recursive: true, force: true });
+        await NodeFSP.rm(sandbox, { recursive: true, force: true });
       }
     },
     verifyPrevious: () => verifyBundle(prev),
     hostPreflight: async () => {
-      const ovnfs = path.join(os.homedir(), ".local/bin/ovnfs");
+      const ovnfs = NodePath.join(home, ".local/bin/ovnfs");
       await hostPreflight({
-        checkoutsDir: path.join(os.homedir(), "checkouts"),
+        checkoutsDir: NodePath.join(home, "checkouts"),
         log: phase,
         // Keep-mount restart (ovnfs >= 0.3.0). Never `ovnfs stop`: it unmounts
         // and can wedge the kernel mount point while processes still use it.
@@ -757,12 +944,10 @@ async function main(args) {
         pid,
         new Set(),
         quitAbort,
-        path.join(app, "Contents/MacOS/Robob"),
+        NodePath.join(app, "Contents/MacOS/Robob"),
       );
       quitTree = tree;
-      try {
-        await run("/usr/bin/osascript", ["-e", 'tell application "Robob" to quit'], 2000);
-      } catch {}
+      await requestInstallerQuit({ home, pid, rollback, run });
       while ((await survivingOwned(tree, true, quitAbort)).length && Date.now() - quitAt < 12_000)
         await sleep(100);
       await cleanupOwnedTree(tree, 250, true, Math.max(1, 15_000 - (Date.now() - quitAt)));
@@ -772,56 +957,34 @@ async function main(args) {
         throw new Error("Robob processes survived the shutdown bound");
     },
     backup: async () => {
-      await fs.mkdir(backupRoot, { recursive: true, mode: 0o700 });
       // No writer is left after the quit, so the clone only waits on APFS, not on the server.
-      // Leave at least 60 s of the 3 minute window for swap, launch and readiness: a backup that
+      // Leave at least 60 s of the readiness budget for swap, launch and readiness: a backup that
       // ate the window would fail the launch after the swap, where nothing relaunches either app.
-      const budget = () => {
-        const ms = Math.min(120_000, 180_000 - (Date.now() - quitAt) - 60_000);
-        if (ms <= 0) throw new Error("No time left for the backup before the swap");
-        return ms;
-      };
-      const destination = path.join(backupRoot, stamp);
-      try {
-        await clone(destination, budget);
-      } catch (error) {
-        // A partial folder would count as one of the two kept backups on the next prune. Rename it
-        // (instant) rather than delete it (tens of seconds) so the old app relaunches sooner;
-        // the next successful install's prune removes it.
-        await fs.rename(destination, path.join(backupRoot, `partial-${stamp}`)).catch(() => {});
-        throw error;
-      }
+      const backupDeadline = Date.now() + 120_000;
+      const budget = () => installBackupTimeout(quitAt, Date.now(), readyBudgetS, backupDeadline);
+      await cloneBackup({ backupRoot, stamp, clone: (destination) => clone(destination, budget) });
+      backupDone = true;
     },
     // Deleting old clones of a fragmented 160 GB file takes tens of seconds; it runs after
     // the new server is ready instead of inside the outage window.
-    prune: async () => {
-      const old = (await fs.readdir(backupRoot))
-        .filter((n) => /^\d{4}-/.test(n))
-        .sort()
-        .reverse()
-        .slice(2);
-      const partial = (await fs.readdir(backupRoot)).filter((n) => n.startsWith("partial-"));
-      for (const name of [...old, ...partial])
-        await fs.rm(path.join(backupRoot, name), { recursive: true });
-      await phase("backups_pruned", { removed: [...old, ...partial] });
-    },
+    prune: () => retention.prune("ready"),
     swap: async (rollback) => {
       if (rollback) {
-        await fs.rename(app, next);
+        await NodeFSP.rename(app, next);
         try {
-          await fs.rename(prev, app);
+          await NodeFSP.rename(prev, app);
         } catch (e) {
-          await fs.rename(next, app);
+          await NodeFSP.rename(next, app);
           throw e;
         }
-        await fs.rename(next, prev);
+        await NodeFSP.rename(next, prev);
       } else {
-        await fs.rm(prev, { recursive: true, force: true });
-        await fs.rename(app, prev);
+        await NodeFSP.rm(prev, { recursive: true, force: true });
+        await NodeFSP.rename(app, prev);
         try {
-          await fs.rename(next, app);
+          await NodeFSP.rename(next, app);
         } catch (e) {
-          await fs.rename(prev, app);
+          await NodeFSP.rename(prev, app);
           throw e;
         }
       }
@@ -875,11 +1038,18 @@ async function main(args) {
       });
     },
   };
-  const hold = await acquireInstallHold();
+  let hold;
   try {
+    hold = await acquireHold({ home, env });
     await install(ops, { rollback });
   } catch (e) {
-    await phase("failed", { error: String(e), swapped });
+    installFailure = e;
+    await phase("failed", { error: String(e), swapped,
+      ...(e.code === "READINESS_BUDGET_EXCEEDED" ? {
+        readyBudgetS, boot: await readBootPhase(NodePath.join(data, "logs/boot.ndjson"), oldBootId),
+      } : {}),
+    });
+    if (swapped || backupDone) await retention.pin(e);
     // Before the swap no new binary has touched the data. Reopen the existing app,
     // but only once every old process is gone (its server holds the owner lock).
     // After the swap, a rollback must pass the previous binary's migration preflight.
@@ -898,11 +1068,11 @@ async function main(args) {
                 ).stdout,
                 app,
               ),
-        // Not bounded by the 3 minute install clock: waiting for the old tree can outlast it.
+        // Waiting for the old tree can outlast the readiness budget.
         launch: () =>
           exec(
             "/bin/zsh",
-            [path.join(path.dirname(fileURLToPath(import.meta.url)), "open-robob-clean.zsh"), app],
+            [NodePath.join(NodePath.dirname(NodeURL.fileURLToPath(import.meta.url)), "open-robob-clean.zsh"), app],
             { timeout: 35_000, maxBuffer: 2 ** 20 },
           ),
         log: phase,
@@ -932,12 +1102,18 @@ async function main(args) {
       // Our own unswapped staging copy is useless after a failure; drop it so the
       // next run does not trip on it, but only while the live app is in place.
       if (ownsStaging && !swapped && (quitAt === undefined || (await exists(app)))) {
-        await fs.rm(next, { recursive: true, force: true });
+        await NodeFSP.rm(next, { recursive: true, force: true });
         if (quitAt !== undefined) await phase("staging_removed", { path: next });
       }
+    } catch (error) {
+      await phase("cleanup_failed", { error: String(error) });
+      cleanupFailure = error;
     } finally {
-      await finishInstallHold({
-        release: hold.release,
+      await retention.finish({
+        swapped,
+        failure: installFailure ?? cleanupFailure,
+        // A rejected acquisition owns no hold and must not stop another installer.
+        release: hold?.release ?? (async () => {}),
         quitStarted: quitAt !== undefined,
         healthy: async () => {
           const health = await get("/api/ardud/control/health");
@@ -949,9 +1125,11 @@ async function main(args) {
         onWaiting: async () => {
           await phase("recovery_waiting", {
             swapped,
+            readyBudgetS,
+            boot: await readBootPhase(NodePath.join(data, "logs/boot.ndjson"), oldBootId),
             message: "Keeping install heartbeat until Robob is healthy. Repair or complete a compatible rollback from another Terminal; keep this installer running.",
-            holdBy: hold.by,
-            holdPid: hold.pid,
+            holdBy: hold?.by,
+            holdPid: hold?.pid,
           });
           await exec(
             "/Users/ardud/.bun/bin/bun",
@@ -967,6 +1145,7 @@ async function main(args) {
       });
     }
   }
+  if (cleanupFailure) throw cleanupFailure;
 }
 export async function runInstaller(args, run = main) {
   try {
@@ -976,6 +1155,6 @@ export async function runInstaller(args, run = main) {
     process.exitCode = error.exitCode === READ_CHECK_FAILED ? READ_CHECK_FAILED : 1;
   }
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && NodePath.resolve(process.argv[1]) === NodeURL.fileURLToPath(import.meta.url)) {
   await runInstaller(process.argv.slice(2));
 }

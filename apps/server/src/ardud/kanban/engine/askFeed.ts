@@ -33,8 +33,6 @@ export const CLOSED_ASKS_MAX = 200;
 /** At most this many of an ask's newest messages, plus the one that asked it. */
 export const ASK_MESSAGES_MAX = 50;
 
-const ASK_MESSAGE_MARK = '"askId":"';
-
 const FeedCard = Schema.Struct({
   id: KanbanCard.fields.id,
   boardId: KanbanCard.fields.boardId,
@@ -60,6 +58,73 @@ export interface AskFeedInput {
   readonly closedSince?: string | undefined;
 }
 
+// The expression index makes even a discussion made entirely of ask replies bounded.
+const readAskMessages = Effect.fn("KanbanAskFeed.messages")(function* (
+  sql: SqlClient.SqlClient,
+  cards: ReadonlyArray<FeedCard>,
+  history: boolean,
+) {
+  const discussions = new Set<string>();
+  const askedPairs = new Map<string, readonly [string, number]>();
+  const askPairs: Array<readonly [string, string]> = [];
+  for (const card of cards) {
+    if (card.discussionId === null) continue;
+    discussions.add(card.discussionId);
+    for (const ask of card.asks) {
+      askPairs.push([card.discussionId, ask.id]);
+      for (const seq of [ask.seq, ask.firstSeq]) {
+        if (seq !== null && seq !== undefined)
+          askedPairs.set(`${card.discussionId}:${seq}`, [card.discussionId, seq]);
+      }
+    }
+  }
+  yield* Effect.annotateCurrentSpan({
+    discussions: discussions.size,
+    askedPairs: askedPairs.size,
+    history,
+    rowsReturned: 0,
+  });
+  if (discussions.size === 0) return [];
+  // @effect-diagnostics-next-line preferSchemaOverJson:off -- SQL table-valued input.
+  const askedList = JSON.stringify([...askedPairs.values()]);
+  // @effect-diagnostics-next-line preferSchemaOverJson:off -- SQL table-valued input.
+  const askList = JSON.stringify(askPairs);
+  const rows = yield* sql<JsonRow>`
+    SELECT m.discussion_id, m.seq, m.json
+    FROM json_each(${askedList}) wanted
+    CROSS JOIN ardud_kanban_messages m
+    WHERE m.discussion_id = json_extract(wanted.value, '$[0]')
+      AND m.seq = json_extract(wanted.value, '$[1]')
+    UNION
+    SELECT m.discussion_id, m.seq, m.json
+    FROM json_each(${askList}) wanted
+    CROSS JOIN ardud_kanban_messages m
+    WHERE m.discussion_id = json_extract(wanted.value, '$[0]')
+      AND m.seq IN (
+        SELECT seq FROM ardud_kanban_messages INDEXED BY ardud_kanban_messages_ask_marked
+        WHERE discussion_id = json_extract(wanted.value, '$[0]')
+          AND json_extract(json, '$.askId') = json_extract(wanted.value, '$[1]')
+          AND instr(json, '"askId":"') > 0
+        ORDER BY seq LIMIT 1
+      )
+    UNION
+    SELECT m.discussion_id, m.seq, m.json
+    FROM json_each(${askList}) wanted
+    CROSS JOIN ardud_kanban_messages m
+    WHERE m.discussion_id = json_extract(wanted.value, '$[0]')
+      AND m.seq IN (
+        SELECT seq FROM ardud_kanban_messages INDEXED BY ardud_kanban_messages_ask_marked
+        WHERE discussion_id = json_extract(wanted.value, '$[0]')
+          AND json_extract(json, '$.askId') = json_extract(wanted.value, '$[1]')
+          AND instr(json, '"askId":"') > 0
+        ORDER BY seq DESC LIMIT ${ASK_MESSAGES_MAX}
+      )
+    ORDER BY m.discussion_id, m.seq
+  `;
+  yield* Effect.annotateCurrentSpan("rowsReturned", rows.length);
+  return rows;
+});
+
 export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
   sql: SqlClient.SqlClient,
   input: AskFeedInput,
@@ -74,19 +139,22 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
       input.boardId === undefined
         ? sql`(board_id, number) > (${boardAfter}, ${numberAfter})`
         : sql`board_id = ${input.boardId} AND number > ${numberAfter}`;
+    const liveBoard = sql`board_id IN (
+      SELECT id FROM ardud_kanban_boards WHERE json_extract(json, '$.archivedAt') IS NULL
+    )`;
     // Literal predicates match the partial indexes in kanbanDDL. UNION merges
     // their ordered ranges and deduplicates cards that have both kinds of ask.
     // Pin each range so SQLite cannot choose the full board/number index.
     const cardRows = yield* sql<{ boardId: string; number: number; json: string }>`
       WITH page AS MATERIALIZED (
         SELECT id, board_id, number FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_open_asks
-        WHERE instr(json, '"closedAt":null') > 0 AND ${after}
+        WHERE instr(json, '"closedAt":null') > 0 AND ${after} AND ${liveBoard}
         ${
           since === null
             ? sql``
             : sql`UNION
                 SELECT id, board_id, number FROM ardud_kanban_cards INDEXED BY ardud_kanban_cards_closed_asks
-                WHERE instr(json, '"closedAt":"') > 0 AND ${after}`
+                WHERE instr(json, '"closedAt":"') > 0 AND ${after} AND ${liveBoard}`
         }
         ORDER BY board_id, number LIMIT 64
       )
@@ -178,49 +246,33 @@ export const readAskFeed = Effect.fn("KanbanAskFeed.read")(function* (
     }
   }
 
-  // Each ask's own discussion: the message that asked it, and every message posted on it.
-  const discussionIds = [
-    ...new Set(cards.flatMap((card) => (card.discussionId === null ? [] : [card.discussionId]))),
-  ];
-  const messages = new Map<string, Array<KanbanMessage>>();
-  if (discussionIds.length > 0) {
-    const asked = cards.flatMap((card) =>
-      card.discussionId === null
-        ? []
-        : card.asks.flatMap((ask) =>
-            [ask.seq, ask.firstSeq].flatMap((seq) =>
-              seq === null || seq === undefined ? [] : [[card.discussionId, seq]],
-            ),
-          ),
+  // Apply the existing history cap before reading any discussion messages. Stable
+  // sorting preserves card/ask order when several asks closed at the same instant.
+  const newestClosed = cards
+    .flatMap((card) => card.asks.filter((ask) => ask.closedAt !== null))
+    .sort((a, b) => (b.closedAt ?? "").localeCompare(a.closedAt ?? ""))
+    .slice(0, CLOSED_ASKS_MAX);
+  const keptClosed = new Set(newestClosed);
+  const selectedCards = cards.flatMap((card) => {
+    const asks = card.asks.filter((ask) =>
+      ask.closedAt === null ? card.settledAt === null : keptClosed.has(ask),
     );
-    // @effect-diagnostics-next-line preferSchemaOverJson:off
-    const idList = JSON.stringify(discussionIds);
-    // @effect-diagnostics-next-line preferSchemaOverJson:off
-    const askedList = JSON.stringify(asked);
-    const rows = yield* sql<JsonRow>`
-      SELECT m.json FROM ardud_kanban_messages m
-      WHERE m.discussion_id IN (SELECT value FROM json_each(${idList}))
-        AND (instr(m.json, ${ASK_MESSAGE_MARK}) > 0
-          OR EXISTS (
-            SELECT 1 FROM json_each(${askedList}) AS wanted
-            WHERE json_extract(wanted.value, '$[0]') = m.discussion_id
-              AND json_extract(wanted.value, '$[1]') = m.seq
-          ))
-      ORDER BY m.discussion_id, m.seq
-    `;
-    for (const row of rows) {
-      // A list read: a page or long text comes as a stub, whole on the single-ask read.
-      const message = stubMessageAt(yield* decodeMessage(row.json), ASK_LIMITS.inlineBytes);
-      const list = messages.get(message.discussionId) ?? [];
-      list.push(message);
-      messages.set(message.discussionId, list);
-    }
+    return asks.length === 0 ? [] : [{ ...card, asks }];
+  });
+  const messages = new Map<string, Array<KanbanMessage>>();
+  const rows = yield* readAskMessages(sql, selectedCards, since !== null);
+  for (const row of rows) {
+    // A list read: a page or long text comes as a stub, whole on the single-ask read.
+    const message = stubMessageAt(yield* decodeMessage(row.json), ASK_LIMITS.inlineBytes);
+    const list = messages.get(message.discussionId) ?? [];
+    list.push(message);
+    messages.set(message.discussionId, list);
   }
 
   const nowMs = Date.parse(at);
   const open: Array<KanbanAskFeedItem> = [];
   const closed: Array<KanbanAskFeedItem> = [];
-  for (const card of cards) {
+  for (const card of selectedCards) {
     const board = boards.get(card.boardId);
     const slug = board?.slug ?? card.boardId;
     const thread = card.discussionId === null ? [] : (messages.get(card.discussionId) ?? []);

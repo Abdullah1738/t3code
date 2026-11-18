@@ -16,8 +16,24 @@ def clean_env(**overrides):
     return env
 
 
+def require_shim_interpreter(test, shim):
+    shim = Path(shim)
+    with shim.open() as source:
+        header = source.readline().strip()
+    test.assertTrue(header.startswith("#!") and header[2:].strip(), f"{shim} has no shebang")
+    interpreter = header[2:].split()[0]
+    if not os.access(interpreter, os.X_OK):
+        test.skipTest(f"blockers/{shim.name} needs {interpreter}, which this box doesn't have "
+                      "(offbox-base built before Offbox #206; rebuild is #265; or use --template generic)")
+
+
 def isolate_boat(stack):
-    from offbox_lib import api, capacity
+    from offbox_lib import api, capacity, box_disk
+
+    # Disk probes are guest I/O, just like the API boundary. Disk tests opt back in explicitly.
+    stack.enter_context(patch.object(box_disk, "measure", return_value={}))
+    stack.enter_context(patch.object(box_disk, "reclaim", return_value={}))
+    stack.enter_context(patch.object(box_disk, "safe_to_stop", return_value=False))
 
     # These values are cached at import, before a fixture can pin OFFBOX_BACKEND.
     for name, value in (("BACKEND", "boat"), ("NAME", "boat"), ("API", "https://boat.dev/api/v1"),
@@ -35,6 +51,7 @@ def isolate_home(stack, root, *, guard_failover=True):
                            ("BACKEND_PATH", "backend"), ("HOME_FAILURES", "home-failures.jsonl")):
         stack.enter_context(patch.object(common, name, root / filename))
     stack.enter_context(patch.object(common, "_BACKEND", None))
+    stack.enter_context(patch.object(home, "slow_read_reachable", return_value=False))
     if guard_failover:
         stack.enter_context(patch.object(home, "probe", return_value=None))
         stack.enter_context(patch.object(home, "fail_over", side_effect=AssertionError(

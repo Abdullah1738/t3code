@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   MessageId,
+  EventId,
   NodeId,
   ProjectId,
   ProviderDriverKind,
@@ -33,6 +34,7 @@ import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as EffectWorker from "./EffectWorker.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
+import { OrchestratorProjectionError } from "./Orchestrator.ts";
 
 const threadId = ThreadId.make("thread:restart");
 const runId = RunId.make("run:restart");
@@ -1131,6 +1133,92 @@ const cutMidTurn = (extra: Record<string, unknown> = {}) => {
   } as unknown as OrchestrationV2ThreadProjection;
 };
 
+it.effect.each([
+  { name: "admitted", admitted: true, parent: "unpublished", expected: 1 },
+  { name: "late Stop no-op", admitted: false, parent: "unpublished", expected: 0 },
+  { name: "fallback already published", admitted: true, parent: "notified", expected: 0 },
+  { name: "parent read failed", admitted: true, parent: "failed", expected: 0 },
+  { name: "no-op after fallback with failed read", admitted: false, parent: "failed", expected: 0 },
+] as const)("logs restart child resumption for $name", (row) =>
+  Effect.gen(function* () {
+    const parentThreadId = ThreadId.make("thread:restart-parent");
+    const taskId = NodeId.make("node:restart-child");
+    const base = cutMidTurn({ cancelReason: "server_shutdown" });
+    const child = {
+      ...base,
+      thread: {
+        ...base.thread,
+        lineage: { parentThreadId, relationshipToParent: "subagent" },
+        forkedFrom: { type: "node", nodeId: taskId },
+      },
+    } as unknown as OrchestrationV2ThreadProjection;
+    const logs: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      const [name, fields] = Array.isArray(message) ? message : [message];
+      if (name === "delegated-task.restart_interrupted") logs.push(fields);
+    });
+    yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Logger.layer([logger]),
+          ServerSettings.layerTest({ continueThreadsAfterServerUpdate: true }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: (id) =>
+              id !== parentThreadId
+                ? Effect.succeed(child)
+                : row.parent === "failed"
+                  ? Effect.fail(new OrchestratorProjectionError({ threadId: id }))
+                  : Effect.succeed({
+                      ...base,
+                      subagents: [
+                        {
+                          id: taskId,
+                          status: row.parent === "notified" ? "interrupted" : "running",
+                          cancelReason: "server_shutdown",
+                          result: row.parent === "notified" ? "Resumable notice" : null,
+                        } as never,
+                      ],
+                    }),
+            dispatch: (command) =>
+              Effect.succeed({
+                sequence: 1,
+                storedEvents: row.admitted
+                  ? [
+                      {
+                        sequence: 1,
+                        commandId: command.commandId,
+                        event: {
+                          id: EventId.make("event:restart-admitted"),
+                          type: "run.created" as const,
+                          threadId,
+                          occurredAt: now,
+                          payload: {
+                            ...base.runs[0]!,
+                            id: RunId.make("run:continuation"),
+                            restartContinuationOfRunId: runId,
+                          },
+                        },
+                      },
+                    ]
+                  : [],
+              }),
+            recoverDelegatedTask: () => Effect.void,
+          }),
+        ),
+      ),
+    );
+    assert.lengthOf(logs, row.expected);
+    if (row.expected === 1)
+      assert.deepEqual(logs[0], {
+        taskId,
+        parentThreadId,
+        childThreadId: threadId,
+        runId,
+        action: "resumed",
+      });
+  }),
+);
+
 const queuedFollowUp = {
   id: RunId.make("run:queued"),
   ordinal: 2,
@@ -1508,7 +1596,11 @@ it.effect(
         const commands: Parameters<
           ThreadManagementService.ThreadManagementService["Service"]["dispatch"]
         >[0][] = [];
-        yield* continueRestartedRun({ threadId, sourceRunId: runId }).pipe(
+        yield* continueRestartedRun({
+          threadId,
+          sourceRunId: runId,
+          beforeDispatch: Effect.die("A declined continuation must not acquire admission"),
+        }).pipe(
           Effect.provide(
             Layer.merge(
               Layer.mock(ThreadManagementService.ThreadManagementService)({

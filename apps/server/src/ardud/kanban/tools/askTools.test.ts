@@ -79,6 +79,7 @@ const testLayer = () => {
   const threads = Layer.succeed(
     KanbanThreads,
     KanbanThreads.of({
+      remove: () => Effect.void,
       pendingUserInputs: () => Effect.succeed([]),
       claimContext: () => Effect.succeed(null),
       view: (threadId) =>
@@ -100,6 +101,7 @@ const testLayer = () => {
       lastFailure: () => Effect.succeed(null),
       findLastFailure: () => Effect.succeed(null),
       latestRun: () => Effect.succeed(null),
+      backgroundStoppedSince: () => Effect.succeed(false),
       runSettled: () => Effect.succeed(true),
       compactRun: () => Effect.succeed(null),
       launch: () => Effect.sync(() => ThreadId.make(`thread-${++launched}`)),
@@ -156,6 +158,224 @@ const setup = Effect.gen(function* () {
   );
   return { kanban, board, card };
 });
+
+it.effect("card_ask warns when an ask cannot clear an open evaluator gate", () =>
+  Effect.gen(function* () {
+    const { kanban, board } = yield* setup;
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Merge",
+        prompt: "Work",
+        subtasks: [
+          { text: "Write code", owner: "work" },
+          { text: "Review", owner: "review" },
+          { text: "Check CI", owner: "evaluator" },
+          { text: "Merge after review (no deploy)", owner: "evaluator", gate: "deploy" },
+        ],
+      },
+      owner,
+    );
+    const unnamed = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "signoff",
+      question: "Do you approve the merge?",
+      title: "Sign off: PR #1288 merged into native-v1 (CI/test only)",
+    });
+    assert.isFalse(unnamed.isError, unnamed.text);
+    assert.strictEqual(
+      unnamed.structured.note,
+      "This ask won't clear s4 (deploy). Name s4 in the text if it should.",
+    );
+    assert.strictEqual((yield* kanban.card(card.id)).card.asks.length, 1);
+    for (const fields of [
+      { question: "Approve s4: merge PR #1288" },
+      { question: "Approve the merge?", title: "Approve s4" },
+      { question: "Approve the merge?", action: { summary: "Approve s4" } },
+      { question: "Deploy the build?" },
+    ]) {
+      const named = yield* call(evaluator, "card_ask", { card: card.id, ...fields });
+      assert.isFalse(named.isError, named.text);
+      assert.notProperty(named.structured, "note");
+    }
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(
+  (["evaluator", "worker"] as const).flatMap((role) =>
+    (["decision", "change", "action"] as const).map((kind) => ({ role, kind })),
+  ),
+)("#1580 $role gets gate notes on $kind ask creation and edits", ({ role, kind }) =>
+  Effect.gen(function* () {
+    const { kanban, card } = yield* setup;
+    yield* kanban.editCard(
+      card.id,
+      {
+        subtasks: [
+          { text: "Write code", owner: "work" },
+          { text: "Run paid image check", owner: "evaluator", gate: "money" },
+        ],
+      },
+      owner,
+    );
+    let caller = evaluator;
+    if (role === "worker") {
+      yield* kanban.dispatchNow;
+      caller = (yield* kanban.card(card.id)).card.activeThreadId!;
+      assert.isNotNull(caller);
+    }
+    const asked = yield* call(caller, "card_ask", {
+      card: card.id,
+      kind,
+      question: "May I run the check?",
+      title: "Approve s2: one paid test image (up to $4)",
+      ...(kind === "change" ? { changes: [{ label: "Text", before: "Old", after: "New" }] } : {}),
+      ...(kind === "action" ? { action: { summary: "Run one paid image check" } } : {}),
+      options: [
+        { id: "go", label: "Sounds good" },
+        { id: "drop", label: "Drop" },
+      ],
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.include(asked.structured.note, "No option here clears s2 (money)");
+    const fixed = yield* call(caller, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      options: [
+        { id: "go", label: "Approve both" },
+        { id: "drop", label: "Drop" },
+      ],
+    });
+    assert.isFalse(fixed.isError, fixed.text);
+    assert.notProperty(fixed.structured, "note");
+    const broken = yield* call(caller, "card_ask_change", {
+      card: card.id,
+      ask: "q1",
+      options: [
+        { id: "go", label: "Sounds good" },
+        { id: "drop", label: "Drop" },
+      ],
+    });
+    assert.isFalse(broken.isError, broken.text);
+    assert.include(broken.structured.note, "No option here clears s2 (money)");
+    assert.strictEqual((yield* kanban.card(card.id)).card.asks[0]!.kind, kind);
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect('#94: card_ask warns about kind "secret" for approval without changing its preset', () =>
+  Effect.gen(function* () {
+    const { kanban, board } = yield* setup;
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Approve finished work",
+        prompt: "Work",
+        subtasks: [
+          { text: "Write code", owner: "work" },
+          { text: "Review", owner: "review" },
+          { text: "Check access", owner: "evaluator", gate: "secret" },
+        ],
+      },
+      owner,
+    );
+    const warning =
+      'Kind "secret" asks Abdullah to type a secret value. To approve s3, ask a decision naming s3 instead.';
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "secret",
+      question: "Approve s3?",
+      title: "Approve the completed step",
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.strictEqual(asked.structured.note, warning);
+    const stored = (yield* kanban.card(card.id)).card.asks.at(-1)!;
+    assert.strictEqual(stored.kind, "secret");
+    assert.isNull(stored.closedAt);
+    assert.deepStrictEqual(stored.respond?.fields, [
+      { id: "secret", label: "Approve the completed step", type: "secret", required: true },
+    ]);
+
+    const unnamed = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "secret",
+      question: "Close the card?",
+    });
+    assert.isFalse(unnamed.isError, unnamed.text);
+    assert.strictEqual(
+      unnamed.structured.note,
+      `This ask won't clear s3 (secret). Name s3 in the text if it should. ${warning}`,
+    );
+
+    const decision = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "decision",
+      question: "Approve s3?",
+      options: ["Approve", "Hold"],
+    });
+    assert.isFalse(decision.isError, decision.text);
+    assert.notProperty(decision.structured, "note");
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("card_ask permits a real secret request on an ungated card without a warning", () =>
+  Effect.gen(function* () {
+    const { card } = yield* setup;
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      kind: "secret",
+      question: "What is the mirror job token?",
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.notProperty(asked.structured, "note");
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("card_ask has no gate warning for work, review or ungated steps", () =>
+  Effect.gen(function* () {
+    const { kanban, board } = yield* setup;
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Work",
+        prompt: "Work",
+        subtasks: [
+          { text: "Fix the deploy code", owner: "work" },
+          { text: "Review the deploy code", owner: "review" },
+          { text: "Check CI", owner: "evaluator" },
+        ],
+      },
+      owner,
+    );
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Close the card?",
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.notProperty(asked.structured, "note");
+  }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect("card_ask respects the board's disabled guessed gates", () =>
+  Effect.gen(function* () {
+    const { kanban, board } = yield* setup;
+    yield* kanban.updateBoard(board.id, { guessedGates: [] });
+    const card = yield* kanban.createCard(
+      board.id,
+      {
+        title: "Work",
+        prompt: "Work",
+        subtasks: [{ text: "Deploy the build", owner: "script" }],
+      },
+      owner,
+    );
+    const asked = yield* call(evaluator, "card_ask", {
+      card: card.id,
+      question: "Close the card?",
+    });
+    assert.isFalse(asked.isError, asked.text);
+    assert.notProperty(asked.structured, "note");
+  }).pipe(Effect.provide(testLayer())),
+);
 
 it.effect("card_ask takes a template with blocks and answers with a small summary", () =>
   Effect.gen(function* () {
@@ -249,6 +469,7 @@ it.effect(
         action: { summary: "Deploy build 42", command: "make deploy", undo: "make rollback" },
         basis: "build 42",
         revisionNote: "Newer build",
+        blocking: false,
       });
       assert.isFalse(edited.isError, edited.text);
       assert.deepStrictEqual(edited.structured.card.ask, {
@@ -271,8 +492,9 @@ it.effect(
         ask: "q1",
         blocking: false,
       });
-      assert.isTrue(async.isError);
-      assert.include(async.text, "can't be made async");
+      assert.isFalse(async.isError, async.text);
+      assert.deepStrictEqual(async.structured.card.ask, edited.structured.card.ask);
+      assert.deepStrictEqual((yield* kanban.card(card.id)).card.asks[0], ask);
 
       // Edit and block in one call, then the old operations.
       const blocked = yield* call(evaluator, "card_ask_change", {
@@ -290,6 +512,14 @@ it.effect(
         ],
         ["needs_owner", true, 2],
       );
+      const makeAsync = yield* call(evaluator, "card_ask_change", {
+        card: card.id,
+        ask: "q1",
+        blocking: false,
+      });
+      assert.isTrue(makeAsync.isError);
+      assert.include(makeAsync.text, "can't be made async");
+      assert.isTrue((yield* kanban.card(card.id)).card.asks[0]!.blocking);
       const dropped = yield* call(evaluator, "card_ask_change", {
         card: card.id,
         ask: "q1",
@@ -308,6 +538,30 @@ it.effect(
       assert.isFalse(operation.isError, operation.text);
       assert.isTrue(operation.structured.card.ask.blocking);
     }).pipe(Effect.provide(testLayer())),
+);
+
+it.effect.each(
+  (["missing", "closed async", "closed blocking"] as const).flatMap((state) =>
+    [false, true].map((edits) => ({ state, edits })),
+  ),
+)("card_ask_change keeps existing errors for $state asks with edits=$edits", ({ state, edits }) =>
+  Effect.gen(function* () {
+    const { card } = yield* setup;
+    if (state !== "missing") {
+      yield* call(evaluator, "card_ask", {
+        card: card.id,
+        question: "Deploy?",
+        blocking: state === "closed blocking",
+      });
+      yield* call(evaluator, "card_ask_change", { card: card.id, ask: "q1", action: "drop" });
+    }
+    const input = { card: card.id, ask: "q1", ...(edits ? { title: "Deploy go" } : {}) };
+    const original = yield* call(evaluator, "card_ask_change", input);
+    const explicitAsync = yield* call(evaluator, "card_ask_change", { ...input, blocking: false });
+    assert.isTrue(original.isError);
+    assert.isTrue(explicitAsync.isError);
+    assert.strictEqual(explicitAsync.text, original.text);
+  }).pipe(Effect.provide(testLayer())),
 );
 
 it.effect("owner free-text closes an ask, while discussion_post keeps agent replies open", () =>
@@ -490,10 +744,13 @@ it("the card_ask description says what he can give back, and stays short", () =>
     "blocks",
     "html",
     "alt text",
+    "Kind secret asks him to type a secret value",
+    "ask a decision or action naming its id",
   ]) {
     assert.include(description, word);
   }
-  assert.isBelow(description.length, 1_800);
+  assert.include(description, "card accepts an id or #number; omit it for your own card.");
+  assert.isBelow(description.length, 2_100);
   // The tool and any page that shows it read the same constant.
   assert.strictEqual(description, CARD_ASK_TOOL_DESCRIPTION);
   assert.include(CARD_ASK_TOOL_DESCRIPTION, "and then for what you do after it");

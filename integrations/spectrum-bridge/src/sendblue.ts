@@ -7,7 +7,7 @@ import { toolError, toolLog } from "./toollog.ts";
 import { CARD_TEXT_FIELDS, cardLayout, cardSafeText, type CardText } from "./card-text.ts";
 import type { SendblueOptions } from "./chats.ts";
 import { SPECTRUM_CARD_APP, type CardApp } from "./config.ts";
-import { chatKey, LineError, sendblueFailureCode, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineNoFix, type LineOutbound, type SendOptions, type TypingOptions } from "./line.ts";
+import { chatKey, LineError, sendblueErrorKey, sendblueFailureCode, type ChatKey, type Line, type LineAppCard, type LineEvent, type LineFile, type LineInbound, type LineLocation, type LineNoFix, type LineOutbound, type SendOptions, type TypingOptions } from "./line.ts";
 
 const BASE = "https://api.sendblue.com";
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -87,7 +87,8 @@ export function toOutbound(message: Json): LineOutbound {
     chat: chatOf(message, false),
     text: str(message.content) ?? "",
     mediaUrl: str(message.media_url),
-    ...(isObject(message.app_card) && str(message.app_card.url) ? { card: { url: str(message.app_card.url)!, layout: storedLayout(message.app_card.layout) } } : {}),
+    ...(isObject(message.app_card) && str(message.app_card.url) ? { card: { url: str(message.app_card.url)!, layout: storedLayout(message.app_card.layout),
+      sessionIdentifier: str(message.app_card.sessionIdentifier), updateMessageHandle: str(message.app_card.updateMessageHandle) } } : {}),
     sentAt: timeMs(message.date_sent) ?? Date.now(),
     status: str(message.status) ?? "",
   };
@@ -104,9 +105,9 @@ function handleOf(response: unknown): string {
 
 function errorCodeOf(message: Json): string | undefined {
   const key = str(message.error_key);
-  if (key) return key;
+  if (key) return sendblueErrorKey(key);
   const code = num(message.error_code);
-  return code === undefined ? undefined : String(code);
+  return sendblueErrorKey(code === undefined ? undefined : String(code));
 }
 
 type Frame = { id?: string; event?: string; data: string };
@@ -201,7 +202,7 @@ export class Sendblue implements Line {
 
   /**
    * `send` marks requests that create a message: a network failure or a 5xx
-   * after the request left may still have sent it (no idempotency key), so the
+   * after the request left may still have sent it, so the
    * error is flagged uncertain for the caller's reconciliation.
    */
   async #call(method: "GET" | "POST" | "DELETE", path: string, options: { query?: Record<string, string>; json?: Json; form?: FormData; send?: boolean; allow404?: boolean } = {}): Promise<unknown> {
@@ -234,10 +235,9 @@ export class Sendblue implements Line {
     if (response.ok) return parsed;
 
     const status = response.status;
-    const detail = isObject(parsed) ? (str(parsed.message) ?? str(parsed.error_reason) ?? str(parsed.error)) : undefined;
-    const errorKey = isObject(parsed) ? (str(parsed.error_key) ?? str(parsed.error) ?? (num(parsed.error_code) === undefined ? undefined : String(parsed.error_code))) : undefined;
-    const code = sendblueFailureCode(status, errorKey);
-    const message = `Sendblue ${method} ${path} returned ${status}${detail ? `: ${detail.slice(0, 200)}` : ""}`;
+    const rawKey = isObject(parsed) ? (str(parsed.error_key) ?? str(parsed.error) ?? (num(parsed.error_code) === undefined ? undefined : String(parsed.error_code))) : undefined;
+    const code = sendblueFailureCode(status, rawKey);
+    const message = `Sendblue ${method} ${path} returned ${status}`;
     if (status === 429) throw new LineError(message, code, true, false);
     if (status >= 500) throw new LineError(message, code, true, send);
     throw new LineError(message, code, false, false);
@@ -414,6 +414,23 @@ export class Sendblue implements Line {
     return { handle: handleOf(response) };
   }
 
+  async updateApp(originalHandle: string, card: LineAppCard, key: string): Promise<{ handle: string }> {
+    const text = cardLayout(card);
+    if (!text || !card.imageUrl || !key || key.length > 255) throw new LineError("Invalid app continuation", "invalid_app_card", false, false);
+    try {
+      const response = await this.#call("POST", `/api/messages/${encodeURIComponent(originalHandle)}/update-app-card`, {
+        json: { url: card.url, interactive: false, layout: { ...text, imageUrl: card.imageUrl }, idempotency_key: key }, send: true,
+      });
+      return { handle: handleOf(response) };
+    } catch (error) {
+      // The provider deduplicates continuations by original handle + key, including a lost response.
+      if (error instanceof LineError && (error.code.startsWith("http_409") || error.code.startsWith("http_408"))) {
+        throw new LineError("App continuation is not ready", error.code, true, error.uncertain);
+      }
+      throw error;
+    }
+  }
+
   async react(handle: string, reaction: string): Promise<void> {
     const at = performance.now();
     let ok = false;
@@ -475,6 +492,10 @@ export class Sendblue implements Line {
     // A placeholder 0,0 fix arrives without coordinates; that is still "no fix yet".
     const fix = isObject(response.location) ? toLocation(response.location) : undefined;
     return fix ?? { state: "shared_no_fix_yet" };
+  }
+
+  async setOptOut(address: string, optedOut: boolean): Promise<void> {
+    await this.#call("POST", "/api/v2/contacts/opt-out", { json: { number: address, opted_out: optedOut }, send: false });
   }
 
   async download(url: string, maxBytes: number, timeoutMs: number): Promise<LineFile> {

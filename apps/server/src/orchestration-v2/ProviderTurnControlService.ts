@@ -19,6 +19,12 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { providerUserMessageText } from "./ProviderMessageText.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
+import { PROVIDER_START_CLEANUP_TIMEOUT_MS } from "./providerStartDeadlinePolicy.ts";
+import * as KanbanStore from "../ardud/kanban/store/KanbanStore.ts";
+import {
+  postRecoveryIdentity,
+  postRecoveryPending,
+} from "../ardud/kanban/engine/ownerReplyWake.ts";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
   Effect.andThen(
@@ -38,6 +44,7 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
     operation: Schema.Literals(["interrupt", "restart", "steer"]),
     providerTurnId: ProviderTurnId,
     turnCompleted: Schema.optional(Schema.Boolean),
+    turnEnded: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
@@ -46,6 +53,8 @@ const isProviderTurnControlError = Schema.is(ProviderTurnControlError);
 
 export interface ProviderTurnControlServiceV2Shape {
   readonly interrupt: (input: {
+    readonly stopBackgroundWork?: boolean;
+    readonly replacementProviderSessionId?: ProviderSessionId;
     readonly subagent?: {
       readonly id: NodeId;
       readonly nativeTaskId: string;
@@ -90,11 +99,13 @@ export const layer: Layer.Layer<
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const kanban = yield* Effect.serviceOption(KanbanStore.KanbanStore);
 
     const load = Effect.fn("ProviderTurnControlService.load")(function* (input: {
       readonly threadId: ThreadId;
       readonly providerSessionId: ProviderSessionId;
       readonly replacementProviderSessionId?: ProviderSessionId;
+      readonly allowReplacementInterrupt?: boolean;
       readonly providerThreadId: ProviderThreadId;
       readonly providerTurnId: ProviderTurnId;
       readonly operation: "interrupt" | "restart" | "steer";
@@ -104,15 +115,38 @@ export const layer: Layer.Layer<
       const { providerThread, providerTurn } = context;
       const targetsRecordedSession = providerThread?.providerSessionId === input.providerSessionId;
       const targetsCommittedReplacement =
-        input.operation === "restart" &&
+        (input.operation === "restart" || input.allowReplacementInterrupt === true) &&
         input.replacementProviderSessionId !== undefined &&
         providerThread?.providerSessionId === input.replacementProviderSessionId;
       if (
         providerThread === undefined ||
         providerTurn === undefined ||
-        (!targetsRecordedSession && !targetsCommittedReplacement) ||
         providerTurn.providerThreadId !== providerThread.id
       ) {
+        return yield* new ProviderTurnControlError({
+          threadId: input.threadId,
+          operation: input.operation,
+          providerTurnId: input.providerTurnId,
+          cause: "The recorded provider execution target is no longer valid.",
+        });
+      }
+      const steerSession =
+        input.operation === "steer" ? yield* sessions.get(input.providerSessionId) : undefined;
+      if (steerSession !== undefined && Option.isNone(steerSession)) {
+        return yield* new ProviderTurnControlError({
+          threadId: input.threadId,
+          operation: "steer",
+          providerTurnId: input.providerTurnId,
+          cause: new ProviderSessionManager.ProviderSessionEndedError({
+            providerSessionId: input.providerSessionId,
+            ...(context.run === undefined ? {} : { runId: context.run.id }),
+          }),
+        });
+      }
+      // A later restart can rebind this thread before an accepted steer runs.
+      // Recover the saved message if its original session ended, while keeping
+      // live adapter calls guarded by the recorded binding.
+      if (!targetsRecordedSession && !targetsCommittedReplacement) {
         return yield* new ProviderTurnControlError({
           threadId: input.threadId,
           operation: input.operation,
@@ -134,6 +168,7 @@ export const layer: Layer.Layer<
             operation: "steer",
             providerTurnId: input.providerTurnId,
             turnCompleted: providerTurn.status === "completed",
+            turnEnded: true,
             cause: "The provider turn ended before the steering message was delivered.",
           });
         }
@@ -144,7 +179,7 @@ export const layer: Layer.Layer<
           session: Option.none(),
         };
       }
-      const session = yield* sessions.get(input.providerSessionId);
+      const session = steerSession ?? (yield* sessions.get(input.providerSessionId));
       if (Option.isNone(session)) {
         // Interrupt/restart against a already-released session must not fail
         // the durable effect (and retry 5x). The turn may still look running
@@ -172,7 +207,10 @@ export const layer: Layer.Layer<
           threadId: input.threadId,
           operation: input.operation,
           providerTurnId: input.providerTurnId,
-          cause: `Provider session ${input.providerSessionId} is not active.`,
+          cause: new ProviderSessionManager.ProviderSessionEndedError({
+            providerSessionId: input.providerSessionId,
+            ...(context.run === undefined ? {} : { runId: context.run.id }),
+          }),
         });
       }
       return { context, providerThread: interruptProviderThread, providerTurn, session };
@@ -181,7 +219,11 @@ export const layer: Layer.Layer<
     return ProviderTurnControlServiceV2.of({
       interrupt: Effect.fn("ProviderTurnControlService.interrupt")(
         function* (input) {
-          const loaded = yield* load({ ...input, operation: "interrupt" });
+          const loaded = yield* load({
+            ...input,
+            operation: "interrupt",
+            allowReplacementInterrupt: input.stopBackgroundWork === false,
+          });
           const session = Option.isSome(loaded.session)
             ? loaded.session
             : yield* sessions.get(input.providerSessionId);
@@ -216,11 +258,15 @@ export const layer: Layer.Layer<
           // A settled turn reaches its adapter too: only the adapter knows
           // whether it still runs work for the thread, and each one either
           // stops it or reports there is nothing left to stop.
-          yield* session.value.interruptTurn({
+          const interrupt = session.value.interruptTurn({
             providerThread: loaded.providerThread,
             providerTurnId: loaded.providerTurn.id,
-            requestRuntimeRestart: true,
+            requestRuntimeRestart: input.stopBackgroundWork ?? true,
+            ...(input.stopBackgroundWork === false ? { stopBackgroundWork: false } : {}),
           });
+          yield* input.stopBackgroundWork === false
+            ? interrupt.pipe(Effect.timeout(PROVIDER_START_CLEANUP_TIMEOUT_MS))
+            : interrupt;
           // The wait is real time: ingestion runs on other fibers and never
           // advances a test clock, so a test clock would hold Stop forever.
           yield* Effect.gen(function* () {
@@ -344,6 +390,7 @@ export const layer: Layer.Layer<
           }
           const loaded = yield* load({ ...input, operation: "steer" });
           if (Option.isNone(loaded.session)) return;
+          const runtime = loaded.session.value;
           const { message, run } = loaded.context;
           if (message === undefined || run === undefined) {
             return yield* new ProviderTurnControlError({
@@ -354,7 +401,16 @@ export const layer: Layer.Layer<
             });
           }
           const text = yield* providerUserMessageText(message);
-          yield* loaded.session.value
+          // Running turns receive steering without passing provider-start admission.
+          const recovery = postRecoveryIdentity(input.messageId);
+          if (
+            input.messageId.startsWith("kanban:post-recovery:") &&
+            Option.isSome(kanban) &&
+            (recovery === null ||
+              !(yield* postRecoveryPending(kanban.value, recovery.discussionId, recovery.seq)))
+          )
+            return;
+          yield* runtime
             .steerTurn({
               threadId: input.threadId,
               runId: run.id,
@@ -377,6 +433,20 @@ export const layer: Layer.Layer<
             .pipe(
               Effect.catch((cause) =>
                 Effect.gen(function* () {
+                  // Release removes the runtime before its durable recovery marker commits.
+                  // Compare the captured runtime too: a reopened shared ID owns different work.
+                  const session = yield* sessions.get(input.providerSessionId);
+                  if (Option.isNone(session) || session.value !== runtime) {
+                    return yield* new ProviderTurnControlError({
+                      threadId: input.threadId,
+                      operation: "steer",
+                      providerTurnId: input.providerTurnId,
+                      cause: new ProviderSessionManager.ProviderSessionEndedError({
+                        providerSessionId: input.providerSessionId,
+                        runId: run.id,
+                      }),
+                    });
+                  }
                   const current = yield* projections.getProviderControlContext(
                     input.threadId,
                     input,

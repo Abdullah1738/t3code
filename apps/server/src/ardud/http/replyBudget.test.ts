@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { jsonExceedsBudget, MAX_REPLY_BYTES } from "./replyBudget.ts";
+import { jsonBytesUpToLimit, jsonExceedsBudget, MAX_REPLY_BYTES } from "./replyBudget.ts";
 
 describe("reply budget", () => {
   it("counts JSON escapes and UTF-8 without allocating the JSON body", () => {
@@ -15,6 +15,7 @@ describe("reply budget", () => {
       { a: ["x", null], absent: undefined },
     ]) {
       const bytes = Buffer.byteLength(JSON.stringify(value));
+      expect(jsonBytesUpToLimit(value)).toBe(bytes);
       expect(jsonExceedsBudget(value, bytes)).toBe(false);
       expect(jsonExceedsBudget(value, bytes - 1)).toBe(true);
     }

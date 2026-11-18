@@ -1,3 +1,4 @@
+import { setSaved } from "../../../ardud/analytics/McpCall.ts";
 import { MessageId, ThreadId, OrchestratorMcpFailure, ProjectId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -21,7 +22,18 @@ function projectFailure(error: Project.ProjectServiceError) {
       : error._tag === "ProjectConflictError"
         ? "The workspace is already registered to a project."
         : "The project is not empty; force=true is required to delete it.";
-  return new OrchestratorMcpFailure({ code: "invalid_request", message });
+  return new OrchestratorMcpFailure({
+    reason: "invalid_args",
+    code: "invalid_request",
+    message,
+    reasonClass:
+      error._tag === "ProjectNotFoundError"
+        ? "not_found"
+        : error._tag === "ProjectConflictError"
+          ? "conflict"
+          : "not_allowed",
+    ...(error._tag === "ProjectNotFoundError" ? { invalidField: "projectId" } : {}),
+  });
 }
 
 /**
@@ -40,7 +52,10 @@ const assertProjectWorktree = Effect.fn("mcp.assertProjectWorktree")(function* (
   );
   if (!worktrees.includes(yield* real(worktreePath)))
     return yield* new OrchestratorMcpFailure({
+      reason: "invalid_args",
       code: "invalid_request",
+      reasonClass: "bad_reference",
+      invalidField: "workspaceStrategy",
       message:
         "worktreePath must be one of the project's git worktrees. t3_worktree_list shows them.",
     });
@@ -63,7 +78,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
         const attachments = input.attachments ?? [];
         if (attachments.some((attachment) => !Claims.attachmentIsPendingUpload(attachment)))
           return yield* new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
+            reasonClass: "bad_reference",
+            invalidField: "attachments",
             message: "A new thread accepts only pending attachment uploads.",
           });
         if (
@@ -71,7 +89,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           (input.projectId !== undefined || input.workspaceStrategy !== undefined)
         )
           return yield* new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
+            reasonClass: "conflict",
+            invalidField: "scratch",
             message:
               "scratch:true picks its own project and folder; omit projectId and workspaceStrategy.",
           });
@@ -97,7 +118,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           const project = yield* readProject;
           if (project === undefined)
             return yield* new OrchestratorMcpFailure({
+              reason: "invalid_args",
               code: "invalid_request",
+              reasonClass: "not_found",
+              invalidField: "projectId",
               message: "The project was not found.",
             });
           yield* assertProjectWorktree(project.workspaceRoot, input.workspaceStrategy.worktreePath);
@@ -113,7 +137,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             Effect.mapError(
               (error) =>
                 new OrchestratorMcpFailure({
+                  reason: "invalid_args",
                   code: "invalid_request",
+                  reasonClass: "bad_reference",
+                  invalidField: "workspaceStrategy",
                   message: `${error.message} No thread was created. Pass a branch, tag, or commit that exists there${
                     strategy.startFromOrigin === true
                       ? "; the project has no usable remote to fetch it from."
@@ -129,7 +156,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           undefined;
         if (modelSelection === undefined)
           return yield* new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
+            reasonClass: "missing_required",
+            invalidField: "modelSelection",
             message:
               "Pass modelSelection: the project has no default model. orchestrator_capabilities lists providers and models.",
           });
@@ -164,6 +194,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
             }
             if (error._tag === "ThreadManagementProviderInstanceDisabledError") {
               return new OrchestratorMcpFailure({
+                reason: "invalid_args",
                 code: "invalid_request",
                 message: error.message,
               });
@@ -198,7 +229,10 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
       const result = yield* projects.getById(input.projectId).pipe(Effect.mapError(unavailable));
       if (Option.isNone(result))
         return yield* new OrchestratorMcpFailure({
+          reason: "invalid_args",
           code: "invalid_request",
+          reasonClass: "not_found",
+          invalidField: "projectId",
           message: "The project was not found.",
         });
       return result.value;
@@ -214,12 +248,17 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
           input.scripts !== undefined ||
           input.createWorkspaceRootIfMissing !== undefined ||
           input.defaultModelSelection !== undefined
-        )
+        ) {
+          yield* setSaved(false);
           return yield* new OrchestratorMcpFailure({
+            reason: "invalid_args",
             code: "invalid_request",
+            reasonClass: "conflict",
+            invalidField: "workspaceRoot",
             message:
               "A project started from its title takes only a title; set scripts or defaultModelSelection afterwards with t3_project_update.",
           });
+        }
         const folders = yield* ManagedProjectFolders.ManagedProjectFolders;
         const created = yield* folders
           .createNamedProject({ name: input.title })
@@ -245,23 +284,37 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
       const commandId = yield* newCommandId();
       return yield* projects
         .create({ ...input, workspaceRoot, commandId, projectId: ProjectId.make(commandId) })
-        .pipe(Effect.mapError(projectFailure));
+        .pipe(
+          Effect.tapError((error) =>
+            error._tag === "ProjectConflictError" ? setSaved(false) : Effect.void,
+          ),
+          Effect.mapError(projectFailure),
+        );
     }),
   ),
   t3_project_update: McpToolAccess.writesEnvironment((input) =>
     Effect.gen(function* () {
       const projects = yield* Project.ProjectService;
-      return yield* projects
-        .update({ ...input, commandId: yield* newCommandId() })
-        .pipe(Effect.mapError(projectFailure));
+      return yield* projects.update({ ...input, commandId: yield* newCommandId() }).pipe(
+        Effect.tapError((error) =>
+          error._tag === "ProjectNotFoundError" || error._tag === "ProjectConflictError"
+            ? setSaved(false)
+            : Effect.void,
+        ),
+        Effect.mapError(projectFailure),
+      );
     }),
   ),
   t3_project_delete: McpToolAccess.writesEnvironment((input) =>
     Effect.gen(function* () {
       const projects = yield* Project.ProjectService;
-      return yield* projects
-        .delete({ ...input, commandId: yield* newCommandId() })
-        .pipe(Effect.mapError(projectFailure));
+      return yield* projects.delete({ ...input, commandId: yield* newCommandId() }).pipe(
+        // A forced cascade may delete children before a later project refusal.
+        Effect.tapError((error) =>
+          error._tag === "ProjectNotEmptyError" ? setSaved(false) : Effect.void,
+        ),
+        Effect.mapError(projectFailure),
+      );
     }),
   ),
   t3_project_clone: McpToolAccess.writesEnvironment((input) =>

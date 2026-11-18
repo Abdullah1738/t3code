@@ -1,11 +1,13 @@
 import { assert, it } from "@effect/vitest";
-import { OrchestratorMcpFailure, ThreadId } from "@t3tools/contracts";
+import { OrchestratorMcpFailure, ThreadId, type AnalyticsEvent } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Logger from "effect/Logger";
 import * as TestClock from "effect/testing/TestClock";
 import * as McpDeadline from "./McpDeadline.ts";
+import * as Analytics from "../ardud/analytics/Analytics.ts";
+import * as McpCallAnalytics from "../ardud/analytics/McpCall.ts";
 
 it.effect("a fail-fast caller error retains the same-key retry instruction", () =>
   Effect.gen(function* () {
@@ -208,7 +210,7 @@ it.effect.each([
     stage: "dispatch",
     taskId: "task",
     message:
-      "delegate_task timed out during dispatch for thread caller. Task task may still be created; check it with task_status. Retry only with the same clientRequestId: retry.",
+      "delegate_task timed out during dispatch for thread caller. Task task may still be created; use task_status to check whether it was saved. Retry only with the same clientRequestId: retry.",
   },
   {
     code: "delegation_timeout",
@@ -278,6 +280,30 @@ it.effect.each(["catalog", "request_key", "receipt", "settings", "selection", "w
     }),
 );
 
+const testCallState = (): McpCallAnalytics.McpCall["Service"] => ({
+  callerResolved: true,
+  callerResolveMs: 0,
+  readerLane: "test",
+  phase: "handler",
+  saved: "unknown",
+  detachedAnalytics: {
+    tool: "delegate_task",
+    callerIdentity: "caller",
+    callerThreadId: "caller",
+    startedAt: "1970-01-01T00:00:00.000Z",
+    build: "test",
+    bootId: "boot",
+  },
+});
+const analyticsRecorder = (
+  record: Analytics.Analytics["Service"]["record"],
+): Analytics.Analytics["Service"] => ({
+  record,
+  flush: Effect.void,
+  ingest: () => Effect.void,
+  read: () => Effect.die("unused"),
+});
+
 it.effect.each([
   { outcome: "committed", masked: false },
   { outcome: "failed", masked: false },
@@ -292,6 +318,8 @@ it.effect.each([
       const stopped = yield* Deferred.make<void>();
       const capLogged = yield* Deferred.make<void>();
       const settled = yield* Deferred.make<void>();
+      const eventRecorded = yield* Deferred.make<void>();
+      const events: AnalyticsEvent[] = [];
       const logs: Array<Record<string, unknown>> = [];
       const logger = Logger.make(({ message }) => {
         if (!Array.isArray(message) || message[0] !== "MCP detached operation finished") return;
@@ -329,6 +357,16 @@ it.effect.each([
         },
       ).pipe(
         Effect.flip,
+        Effect.provideService(McpCallAnalytics.McpCall, testCallState()),
+        Effect.provideService(
+          Analytics.Analytics,
+          analyticsRecorder((event) =>
+            Effect.sync(() => {
+              events.push(event);
+              if (event.outcome !== "capped") Deferred.doneUnsafe(eventRecorded, Effect.void);
+            }),
+          ),
+        ),
         Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
         Effect.forkChild,
       );
@@ -342,25 +380,190 @@ it.effect.each([
         yield* Deferred.await(capLogged);
         assert.deepEqual(logs[0], {
           outcome: "capped",
+          timedOut: true,
           requestKey: "retry",
           taskId: "task",
           cancellationPending: true,
         });
         if (masked) assert.isFalse(yield* Deferred.isDone(stopped));
       }
+      if (outcome !== "capped") yield* TestClock.adjust("2 seconds");
       yield* Deferred.succeed(release, undefined);
       yield* Deferred.await(settled);
       yield* Deferred.await(stopped);
+      yield* Deferred.await(eventRecorded);
+      assert.lengthOf(events, outcome === "capped" ? 2 : 1);
+      for (const event of events) {
+        assert.deepInclude(event, {
+          kind: "mcp.detached",
+          tool: "delegate_task",
+          callerThreadId: "caller",
+          clientRequestId: McpCallAnalytics.callIdentifiers({ clientRequestId: "retry" }, "caller")
+            .clientRequestId!,
+          startedAt: "1970-01-01T00:00:00.000Z",
+          build: "test",
+          bootId: "boot",
+        });
+        assert.isAbove(event.lateMs!, 0);
+        assert.notInclude(JSON.stringify(event), "retry");
+      }
+      if (outcome === "capped") {
+        assert.equal(events[0]!.outcome, "capped");
+        assert.isTrue(events[1]!.afterCap);
+        if (!masked) assert.equal(events[1]!.props?.cause, "unknown");
+      } else assert.equal(events[0]!.outcome, outcome);
       const expectedCommits = outcome === "committed" || masked ? 1 : 0;
       assert.equal(commits, expectedCommits);
       if (outcome === "capped") {
         assert.lengthOf(logs, 2);
         assert.deepInclude(logs[1], { requestKey: "retry", taskId: "task", afterCap: true });
-        assert.oneOf(logs[1]!.outcome, ["committed", "failed"]);
-      } else assert.deepEqual(logs, [{ outcome, requestKey: "retry", taskId: "task" }]);
+        if (!masked)
+          assert.deepInclude(logs[1], {
+            outcome: "failed",
+            cause: "interrupt",
+            wait: "dispatch",
+          });
+        else assert.oneOf(logs[1]!.outcome, ["committed", "failed"]);
+      } else
+        assert.deepEqual(logs, [
+          {
+            outcome,
+            timedOut: true,
+            requestKey: "retry",
+            taskId: "task",
+            ...(outcome === "failed"
+              ? {
+                  cause: "failure: OrchestratorMcpFailure: create failed",
+                  wait: "dispatch",
+                }
+              : {}),
+          },
+        ]);
       const logCount = logs.length;
       yield* TestClock.adjust("2 minutes");
       assert.equal(commits, expectedCommits);
       assert.equal(logs.length, logCount);
+    }),
+);
+
+it.effect.each(["failure", "defect"] as const)(
+  "a detached %s logs its bounded cause and last wait",
+  (kind) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const settled = yield* Deferred.make<void>();
+      const logs: Array<Record<string, unknown>> = [];
+      const logger = Logger.make(({ message }) => {
+        if (!Array.isArray(message) || message[0] !== "MCP detached operation finished") return;
+        const fields: unknown = message[1];
+        if (typeof fields !== "object" || fields === null) return;
+        logs.push({ ...fields });
+        Deferred.doneUnsafe(settled, Effect.void);
+      });
+      const message = "create failed " + "x".repeat(400);
+      const operation = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(McpDeadline.waitingOn(Deferred.await(release), "create gate")),
+        Effect.andThen(
+          kind === "failure"
+            ? Effect.fail(new OrchestratorMcpFailure({ code: "orchestration_error", message }))
+            : Effect.die(new Error(message)),
+        ),
+      );
+      const pending = yield* McpDeadline.withDeadline(operation, {
+        code: "delegation_timeout",
+        stage: "dispatch",
+        onTimeout: "detach",
+        threadId: ThreadId.make("caller"),
+        requestKey: "retry",
+        taskId: "task",
+      }).pipe(
+        Effect.flip,
+        Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust("10 seconds");
+      assert.equal((yield* Fiber.join(pending)).code, "delegation_timeout");
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(settled);
+      assert.deepEqual(logs, [
+        {
+          outcome: "failed",
+          timedOut: true,
+          requestKey: "retry",
+          taskId: "task",
+          wait: "create gate",
+          cause:
+            `${kind}: ${kind === "failure" ? "OrchestratorMcpFailure" : "Error"}: ${message}`.slice(
+              0,
+              300,
+            ),
+        },
+      ]);
+    }),
+);
+
+it.effect("a detach-mode create before its deadline emits no follow-up", () =>
+  Effect.gen(function* () {
+    const events: AnalyticsEvent[] = [];
+    const logs: unknown[] = [];
+    const logger = Logger.make(({ message }) => {
+      if (Array.isArray(message) && message[0] === "MCP detached operation finished")
+        logs.push(message[1]);
+    });
+    const result = yield* McpDeadline.withDeadline(Effect.succeed("saved"), {
+      code: "delegation_timeout",
+      threadId: ThreadId.make("caller"),
+      stage: "dispatch",
+      onTimeout: "detach",
+      requestKey: "retry",
+    }).pipe(
+      Effect.provideService(McpCallAnalytics.McpCall, testCallState()),
+      Effect.provideService(
+        Analytics.Analytics,
+        analyticsRecorder((event) =>
+          Effect.sync(() => {
+            events.push(event);
+          }),
+        ),
+      ),
+      Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
+    );
+    assert.equal(result, "saved");
+    yield* TestClock.adjust("2 minutes");
+    assert.deepEqual(events, []);
+    assert.deepEqual(logs, [
+      { outcome: "committed", timedOut: false, requestKey: "retry", taskId: "unknown" },
+    ]);
+  }),
+);
+
+it.effect.each(["blocked", "defect"] as const)(
+  "analytics %s cannot block or fail a detached commit",
+  (kind) =>
+    Effect.gen(function* () {
+      const recording = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const record = Deferred.succeed(recording, undefined).pipe(
+        Effect.andThen(
+          kind === "blocked" ? Deferred.await(release) : Effect.die("analytics unavailable"),
+        ),
+      );
+      const result = yield* McpDeadline.awaitInterruptibly(Effect.succeed("saved"), {
+        onTimeout: "detach",
+        startedAt: 0n,
+        requestKey: "retry",
+        deadline: { firedAt: 0n },
+      }).pipe(
+        Effect.provideService(McpCallAnalytics.McpCall, testCallState()),
+        Effect.provideService(
+          Analytics.Analytics,
+          analyticsRecorder(() => record),
+        ),
+      );
+      assert.equal(result, "saved");
+      yield* Deferred.await(recording);
+      yield* Deferred.succeed(release, undefined);
     }),
 );

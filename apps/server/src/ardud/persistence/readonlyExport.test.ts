@@ -4,8 +4,14 @@ import * as NodePath from "node:path";
 import * as NodeOS from "node:os";
 import * as NodeSqlite from "node:sqlite";
 import * as NodeWorkerThreads from "node:worker_threads";
+import * as NodeChildProcess from "node:child_process";
 import { afterEach, expect, test, vi } from "vite-plus/test";
-import { createReadonlyReplica } from "./readonlyExport.ts";
+import {
+  createReadonlyReplica,
+  type ReadonlyExportDiagnosticEvent,
+  type ReadonlyRebuildEvent,
+} from "./readonlyExport.ts";
+import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -13,7 +19,7 @@ afterEach(() => {
   for (const cleanup of cleanups.splice(0).toReversed()) cleanup();
 });
 
-function fixture(batchSize = 2) {
+function fixture(batchSize = 2, setup?: (source: NodeSqlite.DatabaseSync) => void) {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "readonly-export-"));
   cleanups.push(() => NodeFS.rmSync(dir, { recursive: true, force: true }));
   const sourcePath = NodePath.join(dir, "source.sqlite");
@@ -34,6 +40,7 @@ function fixture(batchSize = 2) {
     CREATE TABLE ardud_opencode_import (native_session_id TEXT PRIMARY KEY, thread_id TEXT);
     CREATE TABLE ardud_kanban_cards (id TEXT PRIMARY KEY, active_thread_id TEXT, json TEXT);
     CREATE TABLE ardud_kanban_threads (thread_id TEXT PRIMARY KEY, ended INTEGER);
+    CREATE TABLE ardud_kanban_slot_events (id INTEGER PRIMARY KEY AUTOINCREMENT, board_id TEXT NOT NULL, pool_key TEXT NOT NULL, thread_id TEXT NOT NULL, card_id TEXT, kind TEXT NOT NULL CHECK (kind IN ('take','release')), at TEXT NOT NULL, why TEXT NOT NULL);
     INSERT INTO orchestration_events VALUES (1,'thread.created','a','{"id":"a"}');
     INSERT INTO orchestration_v2_projection_threads VALUES ('a','{"title":"old"}');
     INSERT INTO orchestration_v2_projection_threads VALUES ('b','{}');
@@ -43,8 +50,17 @@ function fixture(batchSize = 2) {
   cleanups.push(() => {
     if (source.isOpen) source.close();
   });
+  setup?.(source);
+  const diagnostics: ReadonlyExportDiagnosticEvent[] = [];
+  const rebuilds: ReadonlyRebuildEvent[] = [];
   const options = { sourcePath, replicaPath, batchSize };
-  let exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, options);
+  const open = () =>
+    createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+      ...options,
+      onDiagnosticEvent: (event) => diagnostics.push(event),
+      onRebuildEvent: (event) => rebuilds.push(event),
+    });
+  let exporter = open();
   cleanups.push(() => exporter.close());
   const connect = () => {
     const db = new NodeSqlite.DatabaseSync(replicaPath, { readOnly: true });
@@ -61,6 +77,8 @@ function fixture(batchSize = 2) {
   return {
     source,
     options,
+    diagnostics,
+    rebuilds,
     connect,
     finish,
     get exporter() {
@@ -68,10 +86,200 @@ function fixture(batchSize = 2) {
     },
     restart() {
       exporter.close();
-      exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, options);
+      exporter = open();
     },
   };
 }
+
+test("statement metrics cover source reads and replica writes without counting a drain twice", () => {
+  const f = fixture();
+  f.finish();
+  const rows = f.exporter.takeMetrics().statements!;
+  expect(
+    rows.some(
+      (row) => row.database === f.options.sourcePath && row.rows > 0 && row.connection === "export",
+    ),
+  ).toBe(true);
+  expect(
+    rows.some((row) => row.database === f.options.replicaPath && /INSERT/i.test(row.sql)),
+  ).toBe(true);
+  expect(rows.every((row) => row.calls! > 0 && row.executionMs >= row.maxMs!)).toBe(true);
+  expect(f.exporter.takeMetrics().statements).toEqual([]);
+});
+
+test.each(["gap", "empty_page"])(
+  "an unexplained %s preserves the published generation throughout reset",
+  (reason) => {
+    let now = Date.parse("2026-11-15T09:47:40Z");
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture(1);
+    f.finish();
+    const out = f.connect();
+    const generation = metaValue(out, "generation");
+    const watermark = metaValue(out, "updated_at");
+    f.rebuilds.length = 0;
+    f.source
+      .exec(`UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"after"}' WHERE thread_id='a';
+    INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}');
+    DELETE FROM orchestration_events WHERE sequence=2`);
+    if (reason === "empty_page") {
+      f.source.exec(
+        "INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{}')",
+      );
+      f.exporter.step();
+      f.source.exec("DELETE FROM orchestration_events WHERE sequence>1");
+    }
+    for (let step = 0; ; step++) {
+      expect(metaValue(out, "ready")).toBe("1");
+      expect(metaValue(out, "generation")).toBe(generation);
+      expect(metaValue(out, "updated_at")).toBe(watermark);
+      expect(
+        out
+          .prepare(
+            "SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'",
+          )
+          .get()?.payload_json,
+      ).toBe('{"title":"old"}');
+      now += 30_000;
+      if (!f.exporter.step()) break;
+      if (f.rebuilds.length) {
+        const sidecar = JSON.parse(
+          NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8"),
+        );
+        expect(sidecar.rebuild_started_at).toBe(metaValue(out, "rebuild_started_at"));
+        const progress = JSON.parse(sidecar.rebuild_progress);
+        expect(progress.kind).toBe("events_reset");
+        expect(
+          now - Date.parse(sidecar.rebuild_started_at) - progress.elapsedMs,
+        ).toBeLessThanOrEqual(30_000);
+      }
+      if (step > 100) throw new Error("reset did not converge");
+    }
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(Number(metaValue(out, "generation"))).toBe(Number(generation) + 1);
+    expect(metaValue(out, "sequence")).toBe(reason === "gap" ? "3" : "1");
+    expect(f.rebuilds[0]).toMatchObject({
+      event: "start",
+      kind: "events_reset",
+      reason,
+      cursor: 1,
+      cycleTarget: 3,
+      firstMissingSequence: 2,
+      rowsReturned: reason === "gap" ? 1 : 0,
+    });
+    expect(f.rebuilds.some((event) => event.event === "progress")).toBe(true);
+    const sidecar = JSON.parse(
+      NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8"),
+    );
+    expect(JSON.parse(sidecar.rebuild_progress)).toMatchObject({
+      event: "publish",
+      kind: "events_reset",
+    });
+    const phases = f.exporter.takeMetrics().phaseSteps;
+    expect(phases.resetDelete).toBeGreaterThan(0);
+    expect(phases.resetScan).toBeGreaterThan(0);
+  },
+);
+
+test("closing an events reset rolls back every partial page", () => {
+  const f = fixture(1);
+  f.finish();
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  f.source.exec(`INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{}');
+    UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"after"}' WHERE thread_id='a'`);
+  for (let i = 0; i < 4; i++) f.exporter.step();
+  f.exporter.close();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(
+    out
+      .prepare("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+      .get()?.payload_json,
+  ).toBe('{"title":"old"}');
+  f.restart();
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "sequence")).toBe("3");
+});
+
+test("a journalled prefix cannot hide a later unexplained hole", () => {
+  const f = fixture(2, (source) =>
+    source.exec(`CREATE TABLE ardud_history_compacted_events (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT, sequence INTEGER NOT NULL UNIQUE)`),
+  );
+  f.finish();
+  f.rebuilds.length = 0;
+  f.source
+    .exec(`INSERT INTO orchestration_events VALUES (4,'thread.metadata-updated','a','{}'),(5,'thread.metadata-updated','a','{}');
+    INSERT INTO ardud_history_compacted_events(sequence) VALUES (2)`);
+  const out = f.connect();
+  for (let i = 0; f.exporter.step(); i++) {
+    expect(metaValue(out, "ready")).toBe("1");
+    if (i > 100) throw new Error("reset did not converge");
+  }
+  expect(f.rebuilds[0]).toMatchObject({ reason: "gap", cursor: 1, firstMissingSequence: 3 });
+  expect(metaValue(out, "sequence")).toBe("5");
+});
+
+test("journalled compaction between target selection and page read needs no reset", () => {
+  const f = fixture(2, (source) =>
+    source.exec(`CREATE TABLE ardud_history_compacted_events (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT, sequence INTEGER NOT NULL UNIQUE)`),
+  );
+  f.finish();
+  const out = f.connect();
+  f.rebuilds.length = 0;
+  f.source
+    .exec(`INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}');
+    UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"after"}' WHERE thread_id='a'`);
+  f.exporter.step();
+  f.source.exec(`BEGIN; INSERT INTO ardud_history_compacted_events(sequence) VALUES (2);
+    DELETE FROM orchestration_events WHERE sequence=2; COMMIT`);
+  for (let step = 0; f.exporter.step(); step++) {
+    expect(metaValue(out, "ready")).toBe("1");
+    if (step > 100) throw new Error("catchup did not converge");
+  }
+  expect(metaValue(out, "sequence")).toBe("3");
+  expect(f.rebuilds).toEqual([]);
+  expect(
+    out.prepare("SELECT sequence FROM orchestration_events WHERE sequence=2").get(),
+  ).toBeUndefined();
+  expect(
+    out
+      .prepare("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+      .get()?.payload_json,
+  ).toBe('{"title":"after"}');
+});
+
+test("compaction journal revisions remove already exported events even in reverse sequence order", () => {
+  const f = fixture(2);
+  f.source.exec(
+    `INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}')`,
+  );
+  f.finish();
+  const out = f.connect();
+  f.source
+    .exec(`CREATE TABLE ardud_history_compacted_events (revision INTEGER PRIMARY KEY AUTOINCREMENT, sequence INTEGER NOT NULL UNIQUE);
+    INSERT INTO ardud_history_compacted_events(sequence) VALUES (3);
+    DELETE FROM orchestration_events WHERE sequence=3`);
+  f.finish();
+  expect(metaValue(out, "sequence")).toBe("3");
+  expect(
+    out
+      .prepare(
+        "SELECT sequence FROM orchestration_events WHERE sequence=3 AND event_type!='readonly.watermark'",
+      )
+      .get(),
+  ).toBeUndefined();
+  f.source.exec(`INSERT INTO ardud_history_compacted_events(sequence) VALUES (2);
+    DELETE FROM orchestration_events WHERE sequence=2`);
+  f.finish();
+  expect(
+    out.prepare("SELECT sequence FROM orchestration_events WHERE sequence=2").get(),
+  ).toBeUndefined();
+  expect(f.rebuilds.some((event) => event.kind === "events_reset")).toBe(false);
+});
 
 test("bootstrap is paged, resumable and never blocks the writer", () => {
   const f = fixture();
@@ -164,6 +372,208 @@ test("a published reader snapshot stays fixed while the next generation is in fl
 const metaValue = (db: NodeSqlite.DatabaseSync, key: string) =>
   db.prepare("SELECT value FROM ardud_readonly_meta WHERE key=?").get(key)?.value;
 
+function recoveryIndexFixture() {
+  return fixture(100, (source) => {
+    source.exec(`
+      ALTER TABLE orchestration_v2_projection_runs ADD COLUMN status TEXT;
+      ALTER TABLE orchestration_v2_projection_runs ADD COLUMN completed_at TEXT;
+      ALTER TABLE orchestration_v2_projection_runs ADD COLUMN ordinal INTEGER;
+      ALTER TABLE orchestration_v2_projection_runs ADD COLUMN requested_at TEXT;
+      ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN run_id TEXT;
+      ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN provider_thread_id TEXT;
+      ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN started_at TEXT;
+      ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN completed_at TEXT;
+      ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN status TEXT;
+      ALTER TABLE orchestration_v2_projection_subagents ADD COLUMN origin TEXT;
+      ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN run_id TEXT;
+      ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN updated_at TEXT;
+      CREATE INDEX turn_items_run_ordinal_idx ON orchestration_v2_projection_turn_items(run_id,ordinal);
+      CREATE INDEX runs_thread_ordinal_idx ON orchestration_v2_projection_runs(thread_id,ordinal);
+      CREATE INDEX subagents_thread_started_idx ON orchestration_v2_projection_subagents(thread_id,started_at,subagent_id);
+    `);
+    const run = source.prepare(`INSERT INTO orchestration_v2_projection_runs
+      (run_id,thread_id,payload_json,status,completed_at,ordinal,requested_at) VALUES (?,'a','{}',?,?,?,'2026-11-14T00:00:00Z')`);
+    const subagent = source.prepare(`INSERT INTO orchestration_v2_projection_subagents
+      (subagent_id,thread_id,child_thread_id,payload_json,run_id,status,origin,started_at,completed_at)
+      VALUES (?,'a','child','{}',?,?,?,'2026-11-14T00:00:00Z',?)`);
+    const item = source.prepare(`INSERT INTO orchestration_v2_projection_turn_items
+      (turn_item_id,type,payload_json,run_id,updated_at) VALUES (?,?,'{}',?,'2026-11-15T00:00:00Z')`);
+    for (let i = 0; i < 200; i++) {
+      const id = `run-${i}`;
+      const status = ["completed", "failed", "cancelled", "interrupted"][i % 4]!;
+      const completed = i < 196 ? "2026-11-14T00:00:00Z" : "2026-11-15T00:00:00Z";
+      run.run(id, status, completed, i);
+      subagent.run(
+        `node:delegated-task:${i}`,
+        id,
+        status,
+        i % 2 ? "provider_native" : "app_owned",
+        completed,
+      );
+      for (const type of ["user_message", "error", "run_interrupt_request"])
+        item.run(`${id}-${type}`, type, id);
+    }
+  });
+}
+
+const recoveryIndexNames = [
+  "items_thread",
+  "seen_generation",
+  "runs_restart_completed",
+  "runs_failed_completed",
+  "subagents_cancelled_completed",
+  "subagents_failed_completed",
+  "items_run_interrupt",
+  "items_run_user_message",
+  "items_run_error",
+]
+  .map((suffix) => `ardud_readonly_${suffix}`)
+  .sort();
+const exportIndexNames = (db: NodeSqlite.DatabaseSync) =>
+  db
+    .prepare(
+      "SELECT name FROM sqlite_schema WHERE type='index' AND name GLOB 'ardud_readonly_*' ORDER BY name",
+    )
+    .all()
+    .map((row) => row.name);
+
+// SQL copied from integrations/stream-recovery/lib/io.mjs; predicates must match its partial indexes.
+const recoveryDiscoveryQueries = [
+  {
+    name: "failedRunsSince",
+    sql: `select run_id, thread_id, ordinal, requested_at, completed_at,
+              json_extract(payload_json,'$.activeAttemptId') attempt,
+              json_extract(payload_json,'$.userMessageId') user_message_id,
+              json_extract(payload_json,'$.startedAt') started_at
+         from orchestration_v2_projection_runs
+        where status='failed' and completed_at >= ? order by completed_at`,
+    indexes: ["runs_failed_completed"],
+  },
+  {
+    name: "failedSubagentsSince",
+    sql: `select subagent_id, thread_id, run_id, provider_thread_id, child_thread_id, completed_at,
+              json_extract(payload_json,'$.result') result, json_extract(payload_json,'$.title') title
+         from orchestration_v2_projection_subagents
+        where status='failed' and completed_at >= ? order by completed_at`,
+    indexes: ["subagents_failed_completed"],
+  },
+  {
+    name: "cancelledSubagentsSince",
+    sql: `select subagent_id, thread_id, run_id, provider_thread_id, child_thread_id, started_at, completed_at,
+              json_extract(payload_json,'$.result') result, json_extract(payload_json,'$.title') title,
+              json_extract(payload_json,'$.prompt') prompt, json_extract(payload_json,'$.model') model
+         from orchestration_v2_projection_subagents s
+        where origin='provider_native' and completed_at >= ?
+          and status in ('cancelled','interrupted')
+          and not exists(select 1 from orchestration_v2_projection_turn_items i
+            where i.run_id=s.run_id and i.type='run_interrupt_request')
+        order by completed_at`,
+    indexes: ["subagents_cancelled_completed", "items_run_interrupt"],
+  },
+  {
+    name: "cancelledDelegatedTasksSince",
+    sql: `select s.subagent_id, s.thread_id, s.run_id, s.provider_thread_id, s.child_thread_id, s.started_at, s.completed_at,
+            json_extract(s.payload_json,'$.result') result, json_extract(s.payload_json,'$.title') title,
+            json_extract(s.payload_json,'$.prompt') prompt, json_extract(s.payload_json,'$.model') model,
+            json_extract(s.payload_json,'$.clientRequestId') client_request_id
+       from orchestration_v2_projection_subagents s
+      where s.origin='app_owned' and s.subagent_id glob 'node:delegated-task:*'
+        and s.completed_at >= ? and s.status in ('cancelled','interrupted')
+        and coalesce(json_extract(s.payload_json,'$.completionDelivery.state'),'') != 'disposed'
+        and not exists(select 1 from orchestration_v2_projection_turn_items i
+          where i.run_id=s.run_id and i.type='run_interrupt_request' and i.updated_at >= s.started_at)
+      order by s.completed_at`,
+    indexes: ["subagents_cancelled_completed", "items_run_interrupt"],
+  },
+  {
+    name: "restartRunsSince",
+    sql: `select r.run_id, r.thread_id, r.ordinal, r.status, r.requested_at, r.completed_at,
+            json_extract(r.payload_json,'$.modelSelection.instanceId') instance_id,
+            json_extract(r.payload_json,'$.startedAt') started_at,
+            exists(select 1 from orchestration_v2_projection_turn_items i
+              where i.run_id=r.run_id and i.type='user_message') dispatched,
+            exists(select 1 from orchestration_v2_projection_turn_items i
+              where i.run_id=r.run_id and i.type='run_interrupt_request') stop_requested
+       from orchestration_v2_projection_runs r
+       join orchestration_v2_projection_threads t on t.thread_id=r.thread_id
+      where r.completed_at >= ? and r.status in ('cancelled','failed','interrupted')
+        and (r.status='failed' or json_extract(r.payload_json,'$.startedAt') is not null
+          or exists(select 1 from orchestration_v2_projection_turn_items i
+            where i.run_id=r.run_id and i.type='user_message'))
+        and json_extract(t.payload_json,'$.lineage.parentThreadId') is null
+        and r.thread_id not like 'thread:provider:%'
+      order by r.completed_at`,
+    indexes: ["runs_restart_completed", "items_run_user_message", "items_run_interrupt"],
+  },
+  {
+    name: "failedRunsSince error lookup",
+    sql: `select json_extract(payload_json,'$.failure.message') m from orchestration_v2_projection_turn_items
+      where run_id=? and type='error' limit 1`,
+    indexes: ["items_run_error"],
+  },
+];
+
+test("stream-recovery indexes belong to the replica and reopening stays incremental", () => {
+  const f = recoveryIndexFixture();
+  f.finish();
+  const out = f.connect();
+  expect(exportIndexNames(out)).toEqual(recoveryIndexNames);
+  expect(exportIndexNames(f.source)).toEqual([]);
+  const started = metaValue(out, "rebuild_started_at");
+  const marker = NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8");
+  f.restart();
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+  expect(metaValue(out, "rebuild_started_at")).toBe(started);
+  expect(NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8")).toBe(marker);
+  expect(exportIndexNames(out)).toEqual(recoveryIndexNames);
+});
+
+test.each(recoveryDiscoveryQueries)(
+  "stream-recovery $name uses the export indexes",
+  ({ sql, indexes }) => {
+    const f = recoveryIndexFixture();
+    f.finish();
+    const plan = f
+      .connect()
+      .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+      .all("2026-11-15T00:00:00Z")
+      .map((row) => String(row.detail))
+      .join("\n");
+    for (const index of indexes)
+      expect(plan).toMatch(new RegExp(`USING (?:COVERING )?INDEX ardud_readonly_${index}\\b`));
+    expect(plan).not.toMatch(/SCAN (?:r|s|orchestration_v2_projection_(?:runs|subagents))\b/);
+  },
+);
+
+test("stream-recovery indexes survive a full rebuild and an auxiliary schema refresh", () => {
+  const f = recoveryIndexFixture();
+  f.finish();
+  const out = f.connect();
+  // An ardud_ source index is still restrictive; only ardud_readonly_ is export-owned.
+  f.source
+    .exec(`CREATE INDEX ardud_caller_active_run_idx ON orchestration_v2_projection_runs(thread_id)
+    WHERE status='running'`);
+  f.restart();
+  f.finish();
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_runs",
+  );
+  expect(exportIndexNames(out)).toEqual(recoveryIndexNames);
+  expect(
+    out.prepare("SELECT name FROM sqlite_schema WHERE name='ardud_caller_active_run_idx'").get(),
+  ).toBeDefined();
+  const started = metaValue(out, "rebuild_started_at");
+  f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0");
+  f.finish();
+  expect(JSON.parse(String(metaValue(out, "last_aux_schema_refresh"))).tables).toEqual([
+    "scheduled_tasks",
+  ]);
+  expect(metaValue(out, "rebuild_started_at")).toBe(started);
+  expect(exportIndexNames(out)).toEqual(recoveryIndexNames);
+});
+
 test("first bootstrap stays unready until every projection is exported", () => {
   const f = fixture();
   const out = f.connect();
@@ -223,24 +633,25 @@ test("routine refresh cycles keep ready=1 and only advance updated_at at cycle e
   expect(metaValue(out, "updated_at")).toBe("2026-11-06T10:00:30.000Z");
 });
 
-test("a compacted event gap clears readiness until the reset and rebuild finish", () => {
+test("an unexplained event gap retains readiness across reset and worker restart", () => {
   const f = fixture();
   f.finish();
   const out = f.connect();
   const published = metaValue(out, "updated_at");
   const revision = Number(metaValue(out, "lineage_repair_revision"));
+  const resetting = metaValue(out, "resetting_events");
   f.source.exec("INSERT INTO orchestration_events VALUES (4,'thread.deleted','a','{}')");
   expect(f.exporter.step()).toBe(true);
-  expect(metaValue(out, "ready")).toBe("0");
-  expect(metaValue(out, "resetting_events")).toBe("1");
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "resetting_events")).toBe(resetting);
   expect(metaValue(out, "updated_at")).toBe(published);
-  expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision + 1);
-  // A worker restart in the middle of the reset must not republish it.
+  expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(revision);
+  // Restart discards the private pages; the completed generation stays readable.
   f.restart();
-  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "ready")).toBe("1");
   let steps = 0;
   while (f.exporter.step()) {
-    expect(metaValue(out, "ready")).toBe("0");
+    expect(metaValue(out, "ready")).toBe("1");
     if (++steps > 500) throw new Error("export did not converge");
   }
   expect(metaValue(out, "ready")).toBe("1");
@@ -274,27 +685,568 @@ test("reopening a published replica keeps it ready; an abandoned cycle is discar
   expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(1);
 });
 
-test("a source schema change mid-cycle discards the cycle, then the reopen rebuilds", () => {
+const auxiliaryTables = [
+  { name: "scheduled_tasks", key: "task_id", row: "'task','a'" },
+  { name: "ardud_opencode_import", key: "native_session_id", row: "'task','a'" },
+  { name: "ardud_kanban_cards", key: "id", row: "'task','a','{}'" },
+  { name: "ardud_kanban_threads", key: "thread_id", row: "'task',0" },
+];
+
+for (const phase of ["delete", "copy", "prune"] as const) {
+  for (const terminal of ["publish", "close"] as const) {
+    for (const gap of ["single", "nested"] as const) {
+      test.each(auxiliaryTables)(
+        `$name auxiliary changes during reset ${phase} preserve the old generation until ${terminal} (${gap})`,
+        ({ name, row }) => {
+          let now = Date.parse("2026-11-15T09:47:40Z");
+          vi.spyOn(Date, "now").mockImplementation(() => now);
+          const f = fixture(1);
+          const advance = () => {
+            now += 1_000;
+            return f.exporter.step();
+          };
+          f.source.exec(`INSERT INTO ${name} VALUES (${row});
+          INSERT INTO orchestration_events VALUES
+          (2,'thread.metadata-updated','a','{}'),(3,'thread.metadata-updated','a','{}'),
+          (4,'thread.metadata-updated','a','{}'),(5,'thread.metadata-updated','a','{}'),
+          (6,'thread.metadata-updated','a','{}')`);
+          f.finish();
+          const out = f.connect();
+          let generation = metaValue(out, "generation");
+          const watermark = metaValue(out, "updated_at");
+          const revision = metaValue(out, "lineage_repair_revision");
+          const events = out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all();
+          const schema = out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql;
+          const checkPublished = () => {
+            expect(metaValue(out, "ready")).toBe("1");
+            expect(metaValue(out, "generation")).toBe(generation);
+            expect(metaValue(out, "updated_at")).toBe(watermark);
+            expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+            expect(
+              out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all(),
+            ).toEqual(events);
+            expect(out.prepare("SELECT sql FROM sqlite_schema WHERE name=?").get(name)?.sql).toBe(
+              schema,
+            );
+          };
+          f.exporter.takeMetrics();
+          f.source.exec(
+            "INSERT INTO orchestration_events VALUES (8,'thread.metadata-updated','a','{}')",
+          );
+          let scans = 0;
+          for (let step = 0; ; step++) {
+            expect(advance()).toBe(true);
+            const metrics = f.exporter.takeMetrics();
+            scans += metrics.phaseSteps.resetScan ?? 0;
+            if (
+              (phase === "delete" && metrics.phaseSteps.resetDelete) ||
+              (phase === "copy" && scans >= 1) ||
+              (phase === "prune" && scans >= 5)
+            )
+              break;
+            if (step > 100) throw new Error("reset phase was not reached");
+          }
+          checkPublished();
+          const started = metaValue(out, "rebuild_started_at");
+          f.source.exec(`ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 7`);
+          expect(advance()).toBe(true);
+          checkPublished();
+          expect(
+            f.rebuilds.filter((event) => event.kind === "events_reset" && event.event === "start"),
+          ).toHaveLength(1);
+          if (gap === "nested") {
+            f.source.exec(
+              "INSERT INTO orchestration_events VALUES (10,'thread.metadata-updated','a','{}')",
+            );
+            for (let step = 0; ; step++) {
+              expect(advance()).toBe(true);
+              checkPublished();
+              const starts = f.rebuilds.filter(
+                (event) => event.kind === "events_reset" && event.event === "start",
+              );
+              if (starts.length === 2) {
+                expect(starts.map((event) => event.firstMissingSequence)).toEqual([7, 9]);
+                expect(metaValue(out, "rebuild_started_at")).toBe(started);
+                const sidecar = JSON.parse(
+                  NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8"),
+                );
+                expect(sidecar.rebuild_started_at).toBe(metaValue(out, "rebuild_started_at"));
+                break;
+              }
+              if (step > 500) throw new Error("nested gap was not reached");
+            }
+          }
+          if (terminal === "close") {
+            f.exporter.close();
+            checkPublished();
+            f.restart();
+            generation = metaValue(out, "generation");
+          }
+          for (let step = 0; advance(); step++) {
+            checkPublished();
+            if (step > 500) throw new Error("schema refresh reset did not converge");
+          }
+          expect(metaValue(out, "ready")).toBe("1");
+          expect(metaValue(out, "sequence")).toBe(gap === "nested" ? "10" : "8");
+          expect(Number(metaValue(out, "lineage_repair_revision"))).toBe(
+            Number(revision) + (gap === "nested" && terminal === "publish" ? 2 : 1),
+          );
+          expect(out.prepare(`SELECT cache_version FROM ${name}`).all()).toEqual([
+            { cache_version: 7 },
+          ]);
+        },
+      );
+    }
+  }
+}
+
+for (const mode of ["reopen", "staging", "catchup"] as const) {
+  test.each(auxiliaryTables)(
+    `$name schema refresh preserves the published replica (${mode})`,
+    ({ name, key, row }) => {
+      const f = fixture();
+      f.source.exec(
+        `INSERT INTO ${name} VALUES (${row}); CREATE INDEX aux_lookup ON ${name}(${key})`,
+      );
+      f.finish();
+      const out = f.connect();
+      const rows = out.prepare("SELECT * FROM orchestration_v2_projection_threads").all();
+      const progress = out
+        .prepare(
+          "SELECT * FROM ardud_readonly_progress WHERE name NOT LIKE 'reconcile:%' ORDER BY name",
+        )
+        .all();
+      const events = out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all();
+      const auxiliaryRows = out.prepare(`SELECT * FROM ${name}`).all();
+      const auxiliarySchema = metaValue(out, `schema:${name}`);
+      const lastRefresh = metaValue(out, "last_aux_schema_refresh");
+      const revision = metaValue(out, "lineage_repair_revision");
+      const rebuild = metaValue(out, "last_rebuild_reason");
+      const generation = Number(metaValue(out, "generation"));
+      if (mode === "staging") f.exporter.step();
+      if (mode === "catchup") {
+        // More than one event page keeps the publication transaction open.
+        for (let i = 0; i < 40; i++)
+          f.source.exec(
+            "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
+          );
+        for (let i = 0; f.exporter.pollIdentities(); i++) {
+          if (i > 500) throw new Error("identity export did not converge");
+        }
+        for (let i = 0; i < 10; i++) expect(f.exporter.step()).toBe(true);
+      }
+      const identity = out
+        .prepare("SELECT * FROM ardud_readonly_meta WHERE key LIKE 'identity_%' ORDER BY key")
+        .all();
+      f.source.exec(`ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+      UPDATE ${name} SET cache_version=7;
+      CREATE INDEX aux_version ON ${name}(cache_version)`);
+      if (mode === "reopen") f.restart();
+      else f.exporter.pollIdentities();
+      expect(metaValue(out, "ready")).toBe("1");
+      // Reopening and completing a cycle each allocate a normal generation.
+      const currentGeneration = generation + (mode === "reopen" ? 1 : 0);
+      expect(Number(metaValue(out, "generation"))).toBe(currentGeneration);
+      expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+      expect(metaValue(out, "last_rebuild_reason")).toBe(rebuild);
+      expect(out.prepare("SELECT * FROM orchestration_v2_projection_threads").all()).toEqual(rows);
+      expect(
+        out
+          .prepare(
+            "SELECT * FROM ardud_readonly_progress WHERE name NOT LIKE 'reconcile:%' ORDER BY name",
+          )
+          .all(),
+      ).toEqual(progress);
+      expect(out.prepare("SELECT * FROM orchestration_events ORDER BY sequence").all()).toEqual(
+        events,
+      );
+      expect(
+        out
+          .prepare("SELECT * FROM ardud_readonly_meta WHERE key LIKE 'identity_%' ORDER BY key")
+          .all(),
+      ).toEqual(identity);
+      expect(metaValue(out, "last_aux_schema_refresh")).toBe(lastRefresh);
+      expect(metaValue(out, `schema:${name}`)).toBe(auxiliarySchema);
+      expect(out.prepare(`SELECT * FROM ${name}`).all()).toEqual(auxiliaryRows);
+      let steps = 0;
+      while (f.exporter.step()) {
+        expect(metaValue(out, "ready")).toBe("1");
+        expect(Number(metaValue(out, "generation"))).toBe(currentGeneration);
+        expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+        expect(out.prepare(`SELECT * FROM ${name}`).all()).toEqual(auxiliaryRows);
+        expect(metaValue(out, `schema:${name}`)).toBe(auxiliarySchema);
+        expect(metaValue(out, "last_aux_schema_refresh")).toBe(lastRefresh);
+        if (++steps > 500) throw new Error("export did not converge");
+      }
+      expect(JSON.parse(String(metaValue(out, "last_aux_schema_refresh"))).tables).toEqual([name]);
+      expect(metaValue(out, `schema:${name}`)).toContain("cache_version");
+      expect(out.prepare(`SELECT ${key}, cache_version FROM ${name}`).all()).toEqual([
+        { [key]: "task", cache_version: 7 },
+      ]);
+      expect(
+        out
+          .prepare(
+            "SELECT name FROM sqlite_schema WHERE type='index' AND name IN ('aux_lookup','aux_version') ORDER BY name",
+          )
+          .all(),
+      ).toEqual([{ name: "aux_lookup" }, { name: "aux_version" }]);
+      expect(metaValue(out, "ready")).toBe("1");
+      expect(Number(metaValue(out, "generation"))).toBe(currentGeneration + 1);
+      expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+      expect(metaValue(out, "last_rebuild_reason")).toBe(rebuild);
+    },
+  );
+}
+
+test.each(["bootstrap", "reset"])(
+  "auxiliary schema changes publish atomically during %s recovery",
+  (mode) => {
+    const f = fixture();
+    if (mode === "reset") f.finish();
+    for (const { name, row } of auxiliaryTables) {
+      f.source.exec(`INSERT INTO ${name} VALUES (${row});
+        ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+        UPDATE ${name} SET cache_version=7`);
+    }
+    if (mode === "reset")
+      f.source.exec(
+        "INSERT INTO orchestration_events VALUES (4,'thread.metadata-updated','a','{}')",
+      );
+    expect(f.exporter.step()).toBe(true);
+    const out = f.connect();
+    expect(metaValue(out, "ready")).toBe(mode === "reset" ? "1" : "0");
+    // Pending schemas must also survive reopening an incomplete publication.
+    f.restart();
+    let steps = 0;
+    while (f.exporter.step()) {
+      expect(metaValue(out, "ready")).toBe(mode === "reset" ? "1" : "0");
+      if (++steps > 500) throw new Error("export did not converge");
+    }
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+    for (const { name } of auxiliaryTables)
+      expect(out.prepare(`SELECT cache_version FROM ${name}`).all()).toEqual([
+        { cache_version: 7 },
+      ]);
+  },
+);
+
+const reaperProtections = (replicaPath: string) => {
+  const reader = NodeChildProcess.spawnSync(
+    "/usr/bin/python3",
+    [
+      "-I",
+      "-c",
+      `
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import backend, robob_readonly
+with robob_readonly.state_ro(sys.argv[2]) as con:
+    robob_readonly.ready_generation(con)
+    print(json.dumps({
+        "scheduled": sorted(backend.scheduled_task_session_ids(con)),
+        "kanban": sorted(backend.kanban_session_ids(con)),
+    }))
+`,
+      NodePath.resolve(import.meta.dirname, "../../../../../integrations/memory-system/src"),
+      replicaPath,
+    ],
+    { encoding: "utf8", timeout: 5000 },
+  );
+  if (reader.error) throw reader.error;
+  if (reader.status !== 0) throw new Error(reader.stderr);
+  return JSON.parse(reader.stdout);
+};
+
+test.each(["reopen", "midrun", "restart", "failed_publish"])(
+  "real reaper readers retain task/card/thread/import protections during schema refresh (%s)",
+  (mode) => {
+    const f = fixture(2, (source) =>
+      source.exec(`
+      ALTER TABLE orchestration_v2_projection_messages ADD COLUMN role TEXT;
+      ALTER TABLE orchestration_v2_projection_messages ADD COLUMN created_at TEXT;
+      ALTER TABLE orchestration_v2_projection_messages ADD COLUMN thread_id TEXT;
+      INSERT INTO scheduled_tasks VALUES ('task','a');
+      INSERT INTO ardud_opencode_import VALUES ('ses_import','a');
+      INSERT INTO ardud_kanban_cards VALUES ('card','b','{"workThreadId":"b","settledAt":null}');
+      INSERT INTO ardud_kanban_threads VALUES ('c',0);
+      INSERT INTO orchestration_v2_projection_provider_threads VALUES ('p-b','{"nativeThreadRef":{"nativeId":"ses_card"}}','b');
+      INSERT INTO orchestration_v2_projection_provider_threads VALUES ('p-c','{"nativeThreadRef":{"nativeId":"ses_link"}}','c');
+    `),
+    );
+    f.finish();
+    const out = f.connect();
+    const expected = { scheduled: ["ses_import"], kanban: ["ses_card", "ses_link"] };
+    const checkReader = () => {
+      expect(metaValue(out, "ready")).toBe("1");
+      expect(reaperProtections(f.options.replicaPath)).toEqual(expected);
+    };
+    checkReader();
+    // A reader holding a WAL snapshot keeps its complete old schema and rows.
+    const snapshot = f.connect();
+    snapshot.exec("BEGIN");
+    const oldTasks = snapshot.prepare("SELECT * FROM scheduled_tasks").all();
+    for (const { name } of auxiliaryTables)
+      f.source.exec(`ALTER TABLE ${name} ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+        UPDATE ${name} SET cache_version=7`);
+    if (mode === "reopen") f.restart();
+    else f.exporter.pollIdentities();
+    checkReader();
+    if (mode === "restart") {
+      f.exporter.step();
+      f.restart();
+      checkReader();
+    }
+    if (mode === "failed_publish") {
+      const writable = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+      cleanups.push(() => writable.close());
+      writable.exec(`CREATE TRIGGER reject_publication BEFORE INSERT ON orchestration_events
+        BEGIN SELECT RAISE(ABORT, 'blocked publication'); END`);
+      expect(() => f.finish()).toThrow("blocked publication");
+      checkReader();
+      expect(metaValue(out, "last_aux_schema_refresh")).toBeUndefined();
+      expect(
+        out
+          .prepare("PRAGMA table_info(scheduled_tasks)")
+          .all()
+          .map((row) => row.name),
+      ).not.toContain("cache_version");
+      writable.exec("DROP TRIGGER reject_publication");
+      f.restart();
+      checkReader();
+    }
+    let steps = 0;
+    while (f.exporter.step()) {
+      checkReader();
+      if (++steps > 500) throw new Error("export did not converge");
+    }
+    checkReader();
+    for (const { name } of auxiliaryTables)
+      expect(out.prepare(`SELECT cache_version FROM ${name}`).all()).toEqual([
+        { cache_version: 7 },
+      ]);
+    expect(snapshot.prepare("SELECT * FROM scheduled_tasks").all()).toEqual(oldTasks);
+    expect(
+      snapshot
+        .prepare("PRAGMA table_info(scheduled_tasks)")
+        .all()
+        .map((row) => row.name),
+    ).not.toContain("cache_version");
+    snapshot.exec("ROLLBACK");
+    expect(snapshot.prepare("SELECT cache_version FROM scheduled_tasks").get()?.cache_version).toBe(
+      7,
+    );
+  },
+);
+
+test("auxiliary schemas in the split boards database refresh without a main schema change", () => {
+  const f = fixture();
+  f.exporter.close();
+  const boardPath = NodePath.join(NodePath.dirname(f.options.sourcePath), "boards.sqlite");
+  const boards = new NodeSqlite.DatabaseSync(boardPath);
+  cleanups.push(() => boards.close());
+  boards.exec(`PRAGMA journal_mode=WAL;
+    CREATE TABLE ardud_boards_migration(table_name TEXT PRIMARY KEY, completed INTEGER);
+    INSERT INTO ardud_boards_migration VALUES ('*',1);
+    CREATE TABLE ardud_kanban_cards (id TEXT PRIMARY KEY, active_thread_id TEXT, json TEXT);
+    CREATE TABLE ardud_kanban_threads (thread_id TEXT PRIMARY KEY, ended INTEGER);
+    INSERT INTO ardud_kanban_cards VALUES ('card','a','{}');
+    INSERT INTO ardud_kanban_threads VALUES ('a',0)`);
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, { ...f.options, boardPath });
+  cleanups.push(() => exporter.close());
+  drive(exporter);
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  const revision = metaValue(out, "lineage_repair_revision");
+  const mainVersion = f.source.prepare("PRAGMA schema_version").get();
+  exporter.step();
+  boards.exec(`ALTER TABLE ardud_kanban_cards ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE ardud_kanban_threads ADD COLUMN cache_version INTEGER NOT NULL DEFAULT 0;
+    UPDATE ardud_kanban_cards SET cache_version=3;
+    UPDATE ardud_kanban_threads SET cache_version=4`);
+  exporter.pollIdentities();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(metaValue(out, "lineage_repair_revision")).toBe(revision);
+  expect(f.source.prepare("PRAGMA schema_version").get()).toEqual(mainVersion);
+  expect(metaValue(out, "last_aux_schema_refresh")).toBeUndefined();
+  expect(out.prepare("SELECT * FROM ardud_kanban_cards").all()).toEqual([
+    { id: "card", active_thread_id: "a", json: "{}" },
+  ]);
+  drive(exporter);
+  expect(JSON.parse(String(metaValue(out, "last_aux_schema_refresh"))).tables).toEqual([
+    "ardud_kanban_cards",
+    "ardud_kanban_threads",
+  ]);
+  expect(out.prepare("SELECT id,cache_version FROM ardud_kanban_cards").all()).toEqual([
+    { id: "card", cache_version: 3 },
+  ]);
+  expect(out.prepare("SELECT thread_id,cache_version FROM ardud_kanban_threads").all()).toEqual([
+    { thread_id: "a", cache_version: 4 },
+  ]);
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+});
+
+for (const mode of ["reopen", "midrun"] as const) {
+  test.each([
+    [
+      "added unique",
+      "",
+      "UPDATE scheduled_tasks SET thread_id=task_id; CREATE UNIQUE INDEX aux_constraint ON scheduled_tasks(thread_id)",
+    ],
+    [
+      "removed unique",
+      "CREATE UNIQUE INDEX aux_constraint ON scheduled_tasks(thread_id)",
+      "DROP INDEX aux_constraint; UPDATE scheduled_tasks SET thread_id='duplicate'",
+    ],
+    [
+      "downgraded unique",
+      "CREATE UNIQUE INDEX aux_constraint ON scheduled_tasks(thread_id)",
+      "DROP INDEX aux_constraint; CREATE INDEX aux_constraint ON scheduled_tasks(thread_id); UPDATE scheduled_tasks SET thread_id='duplicate'",
+    ],
+    [
+      "removed expression",
+      "CREATE INDEX aux_constraint ON scheduled_tasks(json_extract(thread_id,'$.v'))",
+      "DROP INDEX aux_constraint; UPDATE scheduled_tasks SET thread_id='duplicate'",
+    ],
+    [
+      "removed partial",
+      "CREATE INDEX aux_constraint ON scheduled_tasks(task_id) WHERE json_extract(thread_id,'$.v')>0",
+      "DROP INDEX aux_constraint; UPDATE scheduled_tasks SET thread_id='duplicate'",
+    ],
+  ])(`an auxiliary %s index uses localized publication (${mode})`, (kind, previous, mutation) => {
+    const f = fixture(1, (source) =>
+      source.exec(
+        `INSERT INTO scheduled_tasks VALUES ('one','{"v":1}'),('two','{"v":2}'); ${previous}`,
+      ),
+    );
+    f.finish();
+    const out = f.connect();
+    const generation = Number(metaValue(out, "generation")) + (mode === "reopen" ? 1 : 0);
+    const previousRows = out.prepare("SELECT * FROM scheduled_tasks ORDER BY task_id").all();
+    const progress = out
+      .prepare(
+        "SELECT * FROM ardud_readonly_progress WHERE name NOT LIKE 'reconcile:%' ORDER BY name",
+      )
+      .all();
+    const schema = metaValue(out, "schema:scheduled_tasks");
+    if (mode === "midrun") f.exporter.step();
+    f.source.exec(mutation);
+    expect(
+      f.source.prepare("SELECT sql FROM sqlite_schema WHERE name='scheduled_tasks'").get()?.sql,
+    ).toBe(schema);
+    if (mode === "reopen") f.restart();
+    else f.exporter.pollIdentities();
+    let steps = 0;
+    do {
+      expect(metaValue(out, "ready")).toBe("1");
+      expect(Number(metaValue(out, "generation"))).toBe(generation);
+      expect(metaValue(out, "last_aux_schema_refresh")).toBeUndefined();
+      expect(out.prepare("SELECT * FROM scheduled_tasks ORDER BY task_id").all()).toEqual(
+        previousRows,
+      );
+      if (++steps > 500) throw new Error("export did not converge");
+    } while (f.exporter.step());
+    expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+    expect(JSON.parse(String(metaValue(out, "last_aux_schema_refresh"))).tables).toEqual([
+      "scheduled_tasks",
+    ]);
+    expect(Number(metaValue(out, "generation"))).toBe(generation + 1);
+    expect(out.prepare("SELECT thread_id FROM scheduled_tasks ORDER BY task_id").all()).toEqual(
+      kind === "added unique"
+        ? [{ thread_id: "one" }, { thread_id: "two" }]
+        : [{ thread_id: "duplicate" }, { thread_id: "duplicate" }],
+    );
+    expect(
+      out
+        .prepare(
+          "SELECT * FROM ardud_readonly_progress WHERE name NOT LIKE 'reconcile:%' ORDER BY name",
+        )
+        .all(),
+    ).toEqual(progress);
+  });
+}
+
+test("a projection change alongside an auxiliary change still fully rebuilds", () => {
+  const f = fixture();
+  f.finish();
+  f.source.exec(`ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT;
+    ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN extra TEXT CHECK(extra IS NULL)`);
+  f.restart();
+  const out = f.connect();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_turn_items",
+  );
+  expect(metaValue(out, "last_aux_schema_refresh")).toBeUndefined();
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+test("successive auxiliary changes replace the current schema without a rebuild", () => {
+  const f = fixture();
+  f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+  f.finish();
+  const out = f.connect();
+  f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT DEFAULT 'new'");
+  f.finish();
+  expect(out.prepare("SELECT extra FROM scheduled_tasks").get()?.extra).toBe("new");
+  const generation = metaValue(out, "generation");
+  f.source.exec("ALTER TABLE scheduled_tasks DROP COLUMN extra");
+  f.exporter.pollIdentities();
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(metaValue(out, "ready")).toBe("1");
+  f.finish();
+  expect(
+    out
+      .prepare("PRAGMA table_info(scheduled_tasks)")
+      .all()
+      .map((row) => row.name),
+  ).toEqual(["task_id", "thread_id"]);
+  expect(out.prepare("SELECT task_id FROM scheduled_tasks").all()).toEqual([{ task_id: "task" }]);
+  expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+});
+
+test("an auxiliary change does not hide a regressed event sequence", () => {
+  const f = fixture();
+  f.finish();
+  f.source.exec(`ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT;
+    DELETE FROM orchestration_events`);
+  f.restart();
+  const out = f.connect();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "last_rebuild_reason")).toBe("source event sequence regressed");
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+test("an additive schema change mid-cycle discards the cycle, then backfills without unpublishing", () => {
   const f = fixture();
   f.finish();
   const out = f.connect();
   f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
   expect(f.exporter.step()).toBe(true);
-  f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT");
+  f.source.exec("ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN extra TEXT");
   expect(() => f.exporter.step()).toThrow("schema changed");
-  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "ready")).toBe("1");
   expect(metaValue(out, "last_error")).toContain("schema changed");
   expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
   expect(() => f.exporter.step()).toThrow("schema changed");
   // Before 2026-11-10 every reopen threw here until someone deleted the file.
   f.restart();
-  expect(metaValue(out, "last_rebuild_reason")).toBe("source schema changed: scheduled_tasks");
-  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+  expect(metaValue(out, "ready")).toBe("1");
+  f.finish(); // The column-only pass leaves newly inserted rows unpublished.
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
   f.finish();
   expect(metaValue(out, "ready")).toBe("1");
-  expect(f.connect().prepare("SELECT task_id, extra FROM scheduled_tasks").all()).toEqual([
-    { task_id: "task", extra: null },
-  ]);
+  expect(
+    f
+      .connect()
+      .prepare("SELECT turn_item_id, extra FROM orchestration_v2_projection_turn_items")
+      .all(),
+  ).toEqual([{ turn_item_id: "stop", extra: null }]);
   expect(
     f.connect().prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n,
   ).toBe(3);
@@ -366,6 +1318,27 @@ test("a regressed event history rebuilds instead of failing every open", () => {
   ).toBe(4);
 });
 
+test("a midrun event regression retains the completed generation until its rebuild publishes", () => {
+  const f = fixture(1);
+  f.finish();
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  const watermark = metaValue(out, "updated_at");
+  f.source.exec("DELETE FROM orchestration_events");
+  expect(() => f.exporter.step()).toThrow("event sequence regressed");
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(metaValue(out, "updated_at")).toBe(watermark);
+  f.restart();
+  do {
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(metaValue(out, "generation")).toBe(generation);
+    expect(metaValue(out, "updated_at")).toBe(watermark);
+  } while (f.exporter.step());
+  expect(Number(metaValue(out, "generation"))).toBe(Number(generation) + 1);
+  expect(metaValue(out, "sequence")).toBe("0");
+});
+
 test("small table deletions and a compacted event gap converge without publishing partial data", () => {
   const f = fixture();
   f.source.exec("INSERT INTO scheduled_tasks VALUES ('gone','a')");
@@ -376,7 +1349,7 @@ test("small table deletions and a compacted event gap converge without publishin
   f.exporter.step();
   expect(
     f.connect().prepare("SELECT value FROM ardud_readonly_meta WHERE key='ready'").get()?.value,
-  ).toBe("0");
+  ).toBe("1");
   f.finish();
   const out = f.connect();
   expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(0);
@@ -488,7 +1461,7 @@ test("archive journal removes an old item but cannot erase its later update", ()
   ).toBe("2");
 });
 
-test("catchup merges archived events by sequence and keeps newer live duplicates", () => {
+test("archive movement after target selection keeps the contiguous prefix and live duplicates", () => {
   const f = fixture();
   f.finish();
   f.exporter.close();
@@ -497,21 +1470,29 @@ test("catchup merges archived events by sequence and keeps newer live duplicates
   cleanups.push(() => cold.close());
   cold.exec(`PRAGMA journal_mode=WAL; CREATE TABLE ardud_identity(identity TEXT PRIMARY KEY); INSERT INTO ardud_identity VALUES ('test');
     CREATE TABLE ardud_events(sequence INTEGER PRIMARY KEY,event_type TEXT,stream_id TEXT,payload_json TEXT);
-    INSERT INTO ardud_events VALUES (2,'thread.metadata-updated','a','{"id":"a","cold":true}');
     INSERT INTO ardud_events VALUES (3,'thread.metadata-updated','a','{"id":"a","cold":true}');`);
   f.source
     .exec(`CREATE TABLE ardud_history_archive_identity(identity TEXT PRIMARY KEY); INSERT INTO ardud_history_archive_identity VALUES ('test');
-    INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{"id":"a","live":true}');
+    INSERT INTO orchestration_events VALUES (2,'thread.metadata-updated','a','{"id":"a","cold":true}'),(3,'thread.metadata-updated','a','{"id":"a","live":true}');
     UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"new"}' WHERE thread_id='a'`);
+  f.rebuilds.length = 0;
   const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
     ...f.options,
     archivePath,
+    onRebuildEvent: (event) => f.rebuilds.push(event),
   });
   cleanups.push(() => exporter.close());
+  exporter.step();
+  cold.exec(
+    "INSERT INTO ardud_events VALUES (2,'thread.metadata-updated','a','{\"id\":\"a\",\"cold\":true}')",
+  );
+  f.source.exec("DELETE FROM orchestration_events WHERE sequence=2");
+  const out = f.connect();
   for (let i = 0; exporter.step(); i++) {
+    expect(metaValue(out, "ready")).toBe("1");
     if (i > 500) throw Error("no converge");
   }
-  const out = f.connect();
+  expect(f.rebuilds).toEqual([]);
   expect(
     out.prepare("SELECT payload_json FROM orchestration_events WHERE sequence=3").get()
       ?.payload_json,
@@ -750,13 +1731,14 @@ test("replacing main rebuilds the replica from the new file", () => {
   const replacement = new NodeSqlite.DatabaseSync(f.options.sourcePath);
   cleanups.push(() => replacement.close());
   replacement.exec(`PRAGMA journal_mode=WAL;
+    ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT;
     DELETE FROM orchestration_v2_projection_threads WHERE thread_id='c';
     INSERT INTO orchestration_v2_projection_threads VALUES ('new','{}');`);
   const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, f.options);
   cleanups.push(() => exporter.close());
   const out = f.connect();
   expect(metaValue(out, "last_rebuild_reason")).toBe("source database was replaced");
-  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "ready")).toBe("1");
   for (let i = 0; exporter.step(); i++) {
     if (i > 500) throw new Error("export did not converge");
   }
@@ -768,28 +1750,23 @@ test("replacing main rebuilds the replica from the new file", () => {
   ).toEqual([{ thread_id: "a" }, { thread_id: "b" }, { thread_id: "new" }]);
 });
 
-test("slow catchup cannot make old auxiliary rows look fresh", () => {
+test("slow catchup refreshes old auxiliary rows before advancing their watermark", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
   const f = fixture();
   f.finish();
-  let now = Date.now();
-  vi.spyOn(Date, "now").mockImplementation(() => now);
-  const started = now;
+  now += 1_000;
   f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
   f.exporter.step();
   f.source.exec("UPDATE scheduled_tasks SET thread_id='b' WHERE task_id='task'");
   now += 180_000;
   f.source.exec(
-    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{\"id\":\"a\"}')",
+    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
   );
   f.finish();
   const out = f.connect();
-  expect(
-    Date.parse(
-      String(
-        out.prepare("SELECT value FROM ardud_readonly_meta WHERE key='updated_at'").get()?.value,
-      ),
-    ),
-  ).toBeLessThanOrEqual(started + 1);
+  expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe("b");
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(now);
 });
 
 test("reads split boards when supplied, never stale legacy board tables", () => {
@@ -832,7 +1809,7 @@ test("the packaged worker function has no external runtime dependencies", async 
   const worker = new NodeWorkerThreads.Worker(
     `
     const {parentPort,workerData}=require('node:worker_threads');
-    const exporter=(${createReadonlyReplica.toString()})(require('node:sqlite'),require('node:fs'),require('node:path'),workerData);
+    const exporter=(${createReadonlyReplica.toString()})(require('node:sqlite'),require('node:fs'),require('node:path'),workerData,(${resolveHistoryBasePath.toString()}));
     exporter.step(); exporter.close(); parentPort.postMessage('ok');
   `,
     { eval: true, execArgv: [], workerData: f.options },
@@ -891,7 +1868,7 @@ test("a regression that persists after a rebuild does not rebuild again inside t
   expect(held?.code).toBe("READONLY_REBUILD_HELD");
   expect(held?.notify).toBe(true);
   expect(held?.message).toContain("source event sequence regressed");
-  expect(metaValue(out, "ready")).toBe("0");
+  expect(metaValue(out, "ready")).toBe("1");
   expect(metaValue(out, "last_error")).toContain("Automatic rebuild held back");
   expect(metaValue(out, "rebuild_held_until")).toBe("2026-11-10T16:00:00.000Z");
   expect(metaValue(out, "last_rebuild_at")).toBe("2026-11-10T10:00:00.000Z");
@@ -936,6 +1913,28 @@ test("after the backoff window the same reason may rebuild once more", () => {
   expect(() => openExporter(f)).toThrow("Automatic rebuild held back");
 });
 
+test("projection schema rebuilds retain the six-hour backoff", () => {
+  const f = fixture();
+  f.finish();
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN extra TEXT CHECK(extra IS NULL)",
+  );
+  f.restart();
+  const out = f.connect();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(
+    out.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n,
+  ).toBe(3);
+  f.finish();
+  const rebuiltAt = metaValue(out, "last_rebuild_at");
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN second TEXT CHECK(second IS NULL)",
+  );
+  expect(() => f.restart()).toThrow(expect.objectContaining({ code: "READONLY_REBUILD_HELD" }));
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "last_rebuild_at")).toBe(rebuiltAt);
+});
+
 test("a different rebuild reason is not held back by the window", () => {
   let now = Date.parse("2026-11-10T10:00:00.000Z");
   vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -943,46 +1942,51 @@ test("a different rebuild reason is not held back by the window", () => {
   f.source.exec("DELETE FROM orchestration_events WHERE sequence>=3");
   drive(openExporter(f));
   now += HOUR;
-  f.source.exec("ALTER TABLE scheduled_tasks ADD COLUMN extra TEXT");
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_turn_items ADD COLUMN extra TEXT CHECK(extra IS NULL)",
+  );
   drive(openExporter(f));
   const out = f.connect();
-  expect(metaValue(out, "last_rebuild_reason")).toBe("source schema changed: scheduled_tasks");
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_turn_items",
+  );
   expect(metaValue(out, "ready")).toBe("1");
 });
 
-test("a rebuild pages the source exactly like a first bootstrap", () => {
+test("a full rebuild pages privately while old and new readers retain the completed generation", () => {
   const f = fixture();
-  for (let i = 0; i < 9; i++)
-    f.source
-      .prepare("INSERT INTO orchestration_v2_projection_threads VALUES (?,'{}')")
-      .run(`t${i}`);
   f.finish();
-  const before = f.connect();
-  const epoch = metaValue(before, "last_rebuild_at");
-  const watermark = metaValue(before, "updated_at");
+  const old = f.connect();
+  old.exec("BEGIN");
+  const generation = metaValue(old, "generation");
   f.exporter.close();
-  f.source.exec("DELETE FROM orchestration_events");
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json; INSERT INTO orchestration_v2_projection_run_attempts VALUES ('new','a')",
+  );
   const exporter = openExporter(f);
-  const out = f.connect();
-  expect(metaValue(out, "ready")).toBe("0");
-  expect(metaValue(out, "last_rebuild_at")).not.toBe(epoch);
-  expect(metaValue(out, "lineage_repair_watermark")).toBe(watermark);
-  const count = () =>
-    Number(out.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_threads").get()?.n);
-  expect(count()).toBe(0);
   let steps = 0;
-  let previous = 0;
   while (exporter.step()) {
-    // One bounded page per step (batch size 2 here, 100 in production),
-    // committed on its own: the same page size and the same worker yield
-    // between steps as the normal catchup.
-    expect(count() - previous).toBeLessThanOrEqual(2);
-    previous = count();
+    expect(metaValue(old, "ready")).toBe("1");
+    expect(metaValue(old, "generation")).toBe(generation);
+    const fresh = f.connect();
+    expect(metaValue(fresh, "ready")).toBe("1");
+    expect(
+      fresh.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_run_attempts").get()?.n,
+    ).toBe(0);
     if (++steps > 500) throw new Error("export did not converge");
   }
-  expect(count()).toBe(12);
-  expect(steps).toBeGreaterThanOrEqual(6);
-  expect(metaValue(out, "lineage_repair_watermark")).toBe(metaValue(out, "updated_at"));
+  expect(steps).toBeGreaterThan(3);
+  expect(
+    old.prepare("SELECT count(*) AS n FROM orchestration_v2_projection_run_attempts").get()?.n,
+  ).toBe(0);
+  const fresh = f.connect();
+  expect(metaValue(fresh, "ready")).toBe("1");
+  expect(Number(metaValue(fresh, "generation"))).toBe(Number(generation) + 1);
+  expect(
+    fresh.prepare("SELECT owner_payload_json FROM orchestration_v2_projection_run_attempts").get()
+      ?.owner_payload_json,
+  ).toBe("a");
+  expect(metaValue(fresh, "rebuild_finished_at")).toBeTruthy();
 });
 
 test("a busy source cannot hold a cycle open; updated_at tracks what was confirmed", () => {
@@ -1065,6 +2069,251 @@ test("a publish backlog beyond the drain budget keeps its pages and converges", 
   }
   expect(metaValue(out, "sequence")).toBe("201");
   expect(out.prepare("SELECT max(sequence) AS n FROM orchestration_events").get()?.n).toBe(201);
+});
+
+test("a full rebuild heartbeats between archive pages inside one publish drain", () => {
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture(1, (source) =>
+    source.exec(
+      "CREATE TABLE ardud_history_archive_deletions(sequence INTEGER PRIMARY KEY,table_name TEXT,row_key TEXT,through_event_sequence INTEGER,archived_at TEXT)",
+    ),
+  );
+  f.finish();
+  f.exporter.close();
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
+  );
+  const events: Array<{ event: string; elapsedMs: number }> = [];
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+    ...f.options,
+    onRebuildEvent: (event) => events.push(event),
+  });
+  cleanups.push(() => exporter.close());
+  const prepare = NodeSqlite.DatabaseSync.prototype.prepare;
+  let injected = false;
+  let pages = 0;
+  vi.spyOn(NodeSqlite.DatabaseSync.prototype, "prepare").mockImplementation(function (
+    this: NodeSqlite.DatabaseSync,
+    sql,
+  ) {
+    const statement = prepare.call(this, sql);
+    if (
+      sql.includes(
+        "SELECT sequence,table_name,row_key,through_event_sequence FROM ardud_history_archive_deletions",
+      )
+    ) {
+      const all = statement.all.bind(statement);
+      vi.spyOn(statement, "all").mockImplementation((...args) => {
+        const rows = all(...args);
+        if (!injected && !rows.length) {
+          injected = true;
+          f.source.exec(`INSERT INTO ardud_history_archive_deletions VALUES
+            (1,'ignored','one',1,'now'),(2,'ignored','two',1,'now'),
+            (3,'ignored','three',1,'now'),(4,'ignored','four',1,'now')`);
+        } else if (rows.length) {
+          pages++;
+          now += 31_000;
+        }
+        return rows;
+      });
+    }
+    return statement;
+  });
+  let mostProgressInOneStep = 0;
+  for (let i = 0; i < 100; i++) {
+    const before = events.filter(({ event }) => event === "progress").length;
+    const more = exporter.step();
+    mostProgressInOneStep = Math.max(
+      mostProgressInOneStep,
+      events.filter(({ event }) => event === "progress").length - before,
+    );
+    if (!more) break;
+    if (i === 99) throw new Error("export did not converge");
+  }
+  expect(pages).toBe(4);
+  expect(mostProgressInOneStep).toBe(4);
+  expect(events.at(-1)).toMatchObject({ event: "publish", elapsedMs: 124_000 });
+});
+
+test("an auxiliary sweep delayed across many steps is refreshed at publication", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture(1);
+  f.finish();
+  const out = f.connect();
+  for (let i = 0; i < 20; i++)
+    f.source.prepare("INSERT INTO scheduled_tasks VALUES (?,'a')").run(`task${i}`);
+  now += 1_000;
+  f.exporter.takeMetrics();
+  let steps = 0;
+  while (f.exporter.step()) {
+    now += 3_000;
+    if (++steps > 100) throw new Error("export did not converge");
+  }
+  expect(steps).toBeGreaterThan(20);
+  expect(now - Date.parse(String(metaValue(out, "updated_at")))).toBeLessThanOrEqual(15_000);
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBeLessThanOrEqual(now);
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(20);
+  expect(f.exporter.takeMetrics()).toMatchObject({ updatedAtLagMs: 0, auxiliaryWindowMs: 0 });
+});
+
+test("a recent auxiliary capture remains the honest watermark after its row changes", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  now += 1_000;
+  const capturedAt = now;
+  f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+  expect(f.exporter.step()).toBe(true);
+  now += 1_000;
+  f.source.exec("UPDATE scheduled_tasks SET thread_id='b'");
+  f.finish();
+  expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe("a");
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(capturedAt);
+});
+
+test.each([15_000, 15_001])(
+  "auxiliary capture age %i uses the bounded refresh threshold",
+  (age) => {
+    let now = Date.parse("2026-11-15T12:00:00Z");
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture();
+    f.finish();
+    const out = f.connect();
+    now += 1_000;
+    const capturedAt = now;
+    f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+    f.exporter.step();
+    now += age;
+    f.source.exec("UPDATE scheduled_tasks SET thread_id='b'");
+    f.finish();
+    expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe(
+      age > 15_000 ? "b" : "a",
+    );
+    expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(age > 15_000 ? now : capturedAt);
+  },
+);
+
+test("a refreshed auxiliary snapshot never covers a mutation after its capture", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  now += 1_000;
+  f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+  f.exporter.step();
+  now += 60_000;
+  f.source.exec("UPDATE scheduled_tasks SET thread_id='b'");
+  const capturedAt = now;
+  const all = NodeSqlite.StatementSync.prototype.all;
+  let changed = false;
+  vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
+    this: NodeSqlite.StatementSync,
+    ...args: Parameters<typeof all>
+  ) {
+    const rows = all.apply(this, args);
+    if (!changed && rows.some((row) => row.task_id === "task")) {
+      changed = true;
+      now += 1_000;
+      f.source.exec("UPDATE scheduled_tasks SET thread_id='c'");
+    }
+    return rows;
+  });
+  f.finish();
+  expect(changed).toBe(true);
+  expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe("b");
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(capturedAt);
+  expect(f.exporter.takeMetrics()).toMatchObject({
+    updatedAtLagMs: 1_000,
+    auxiliaryWindowMs: 1_000,
+  });
+});
+
+test("a stale split-board sweep refreshes all auxiliary tables in a board snapshot", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture(1);
+  f.exporter.close();
+  const boardPath = NodePath.join(NodePath.dirname(f.options.sourcePath), "boards.sqlite");
+  const boards = new NodeSqlite.DatabaseSync(boardPath);
+  cleanups.push(() => boards.close());
+  boards.exec(`PRAGMA journal_mode=WAL;
+    CREATE TABLE ardud_boards_migration(table_name TEXT PRIMARY KEY, completed INTEGER);
+    INSERT INTO ardud_boards_migration VALUES ('*',1);
+    CREATE TABLE ardud_kanban_cards(id TEXT PRIMARY KEY, active_thread_id TEXT, json TEXT);
+    CREATE TABLE ardud_kanban_threads(thread_id TEXT PRIMARY KEY, ended INTEGER);
+    INSERT INTO ardud_kanban_cards VALUES ('card','a','old');
+    INSERT INTO ardud_kanban_threads VALUES ('a',0)`);
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, { ...f.options, boardPath });
+  cleanups.push(() => exporter.close());
+  drive(exporter);
+  now += 1_000;
+  f.source.exec(
+    "INSERT INTO scheduled_tasks VALUES ('task','a'); INSERT INTO ardud_opencode_import VALUES ('native','a')",
+  );
+  for (let i = 0; i < 6; i++) exporter.step();
+  now += 60_000;
+  f.source.exec(
+    "UPDATE scheduled_tasks SET thread_id='b'; UPDATE ardud_opencode_import SET thread_id='b'",
+  );
+  boards.exec(
+    "UPDATE ardud_kanban_cards SET json='fresh'; UPDATE ardud_kanban_threads SET ended=1",
+  );
+  const capturedAt = now;
+  const all = NodeSqlite.StatementSync.prototype.all;
+  let changed = false;
+  vi.spyOn(NodeSqlite.StatementSync.prototype, "all").mockImplementation(function (
+    this: NodeSqlite.StatementSync,
+    ...args: Parameters<typeof all>
+  ) {
+    const rows = all.apply(this, args);
+    if (!changed && rows.some((row) => row.id === "card" && row.json === "fresh")) {
+      changed = true;
+      now += 1_000;
+      boards.exec(
+        "UPDATE ardud_kanban_cards SET json='later'; UPDATE ardud_kanban_threads SET ended=2",
+      );
+    }
+    return rows;
+  });
+  drive(exporter);
+  const out = f.connect();
+  expect(changed).toBe(true);
+  expect(out.prepare("SELECT thread_id FROM scheduled_tasks").get()?.thread_id).toBe("b");
+  expect(out.prepare("SELECT thread_id FROM ardud_opencode_import").get()?.thread_id).toBe("b");
+  expect(out.prepare("SELECT json FROM ardud_kanban_cards").get()?.json).toBe("fresh");
+  expect(out.prepare("SELECT ended FROM ardud_kanban_threads").get()?.ended).toBe(1);
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(capturedAt);
+});
+
+test("a stale 36k-row auxiliary sweep converges without another paged cycle", () => {
+  let now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture(100);
+  f.finish();
+  const insert = f.source.prepare("INSERT INTO scheduled_tasks VALUES (?,'a')");
+  f.source.exec("BEGIN");
+  for (let i = 0; i < 36_200; i++) insert.run(`task${i}`);
+  f.source.exec("COMMIT");
+  now += 1_000;
+  f.exporter.step();
+  now += 60_000;
+  expect(f.finish()).toBeLessThan(370);
+  const out = f.connect();
+  expect(out.prepare("SELECT count(*) AS n FROM scheduled_tasks").get()?.n).toBe(36_200);
+  expect(Date.parse(String(metaValue(out, "updated_at")))).toBe(now);
+});
+
+test("repeated publications cannot advance updated_at past a frozen source clock", () => {
+  const now = Date.parse("2026-11-15T12:00:00Z");
+  vi.spyOn(Date, "now").mockReturnValue(now);
+  const f = fixture();
+  for (let i = 0; i < 5; i++) f.finish();
+  expect(Date.parse(String(metaValue(f.connect(), "updated_at")))).toBe(now);
 });
 
 test("identical rows are not rewritten into the replica", () => {
@@ -2023,6 +3272,27 @@ test("upgrading a published replica catches identities committed before the new 
   expect(metaValue(out, "sequence")).toBe("1");
 });
 
+test("exports slot ledger appends across generations and exporter restarts", () => {
+  const f = fixture();
+  f.source.exec(
+    "INSERT INTO ardud_kanban_slot_events VALUES (1,'b','p','t','c','take','2026-11-13T01:00:00.000Z','start')",
+  );
+  f.finish();
+  const out = f.connect();
+  expect(out.prepare("SELECT kind FROM ardud_kanban_slot_events ORDER BY id").all()).toEqual([
+    { kind: "take" },
+  ]);
+  f.source.exec(
+    "INSERT INTO ardud_kanban_slot_events VALUES (2,'b','p','t',NULL,'release','2026-11-13T02:00:00.000Z','hold_end')",
+  );
+  f.restart();
+  f.finish();
+  expect(out.prepare("SELECT kind FROM ardud_kanban_slot_events ORDER BY id").all()).toEqual([
+    { kind: "take" },
+    { kind: "release" },
+  ]);
+});
+
 test.each([
   { table: "threads", key: "thread_id", event: "thread.created" },
   { table: "provider_threads", key: "provider_thread_id", event: "provider-thread.updated" },
@@ -2192,7 +3462,18 @@ test.each([60_000, 60_001])(
     // Empty idle polls must not lose the completed scan high-water either.
     now += 1_000;
     expect(f.exporter.pollIdentities()).toBe(false);
+    const rebuildProgress = metaValue(out, "rebuild_progress");
+    f.diagnostics.length = 0;
     f.restart();
+    expect(f.diagnostics).toEqual([
+      {
+        event: "open",
+        sequence: events + 1,
+        identitySequence: events + 1,
+        sourceSequence: events + 1,
+      },
+    ]);
+    expect(metaValue(out, "rebuild_progress")).toBe(rebuildProgress);
     f.source
       .exec(`UPDATE orchestration_v2_projection_provider_threads SET payload_json='{"nativeThreadRef":{"nativeId":"after-restart"}}' WHERE provider_thread_id='binding';
       INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('provider-thread.updated','a','{"id":"binding"}');`);
@@ -2206,8 +3487,28 @@ test.each([60_000, 60_001])(
     ).toContain('"after-restart"');
     expect(metaValue(out, "sequence")).toBe(String(events + 1));
     expect(metaValue(out, "identity_sequence")).toBe(String(events + 2));
+    expect(f.diagnostics).toContainEqual({ event: "replay", replayEvents: 1, replayMs: 0 });
+    now += 1_000;
+    f.exporter.pollIdentities();
+    expect(f.diagnostics.filter(({ event }) => event === "replay")).toHaveLength(1);
   },
 );
+
+test("an idle restart reports an empty replay once without changing rebuild diagnostics", () => {
+  const f = fixture();
+  f.finish();
+  const out = f.connect();
+  const rebuildProgress = metaValue(out, "rebuild_progress");
+  f.diagnostics.length = 0;
+  f.restart();
+  expect(f.exporter.pollIdentities()).toBe(false);
+  expect(f.exporter.pollIdentities()).toBe(false);
+  expect(f.diagnostics).toEqual([
+    { event: "open", sequence: 1, identitySequence: 1, sourceSequence: 1 },
+    { event: "replay", replayEvents: 0, replayMs: expect.any(Number) },
+  ]);
+  expect(metaValue(out, "rebuild_progress")).toBe(rebuildProgress);
+});
 
 test("an abandoned cycle retains the committed identity cursor and replays a pending binding on restart", () => {
   const f = fixture(2);
@@ -2236,8 +3537,18 @@ test("an abandoned cycle retains the committed identity cursor and replays a pen
   f.exporter.pollIdentities();
   expect(metaValue(out, "identity_sequence")).toBe(cursor);
   expect(metaValue(out, "sequence")).toBe("1");
+  f.diagnostics.length = 0;
   f.restart();
-  for (let page = 0; page < 22; page++) f.exporter.pollIdentities();
+  expect(f.diagnostics).toEqual([
+    { event: "open", sequence: 1, identitySequence: Number(cursor), sourceSequence: 42 },
+  ]);
+  for (let page = 0; page < 22; page++) {
+    now += 10;
+    f.exporter.pollIdentities();
+    if (page < 20) expect(f.diagnostics).toHaveLength(1);
+  }
+  expect(f.diagnostics).toContainEqual({ event: "replay", replayEvents: 41, replayMs: 210 });
+  expect(f.diagnostics.filter(({ event }) => event === "replay")).toHaveLength(1);
   expect(
     out
       .prepare(
@@ -2250,4 +3561,1644 @@ test("an abandoned cycle retains the committed identity cursor and replays a pen
   f.finish();
   expect(metaValue(out, "identity_sequence")).toBe("42");
   expect(metaValue(out, "sequence")).toBe("42");
+});
+
+test.each([
+  "extra TEXT",
+  "extra TEXT DEFAULT 'default, value'",
+  "extra TEXT NOT NULL DEFAULT 'value'",
+])(
+  "additive column %s only backfills its table and keeps the published generation",
+  (definition) => {
+    const f = fixture(1);
+    f.source.exec(
+      "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','a'),('two','a'); INSERT INTO orchestration_v2_projection_messages VALUES ('message','{\"old\":true}')",
+    );
+    f.finish();
+    const out = f.connect();
+    const generation = metaValue(out, "generation");
+    f.exporter.close();
+    f.source.exec(
+      `ALTER TABLE orchestration_v2_projection_run_attempts ADD COLUMN ${definition}; UPDATE orchestration_v2_projection_run_attempts SET extra='backfilled'`,
+    );
+    // This unrelated, eventless update must not be swept by the column backfill.
+    f.source.exec("UPDATE orchestration_v2_projection_messages SET payload_json='{}'");
+    const events: Array<{ kind: string; event: string; rows: number }> = [];
+    const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+      ...f.options,
+      onRebuildEvent: (event) => events.push(event),
+    });
+    cleanups.push(() => exporter.close());
+    do {
+      expect(metaValue(out, "ready")).toBe("1");
+      expect(metaValue(out, "generation")).toBe(generation);
+    } while (exporter.step());
+    expect(
+      out
+        .prepare("SELECT extra FROM orchestration_v2_projection_run_attempts ORDER BY attempt_id")
+        .all(),
+    ).toEqual([{ extra: "backfilled" }, { extra: "backfilled" }]);
+    expect(
+      out.prepare("SELECT payload_json FROM orchestration_v2_projection_messages").get()
+        ?.payload_json,
+    ).toBe('{"old":true}');
+    expect(metaValue(out, "schema:orchestration_v2_projection_run_attempts")).toContain(definition);
+    expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+    expect(events.map((event) => [event.kind, event.event])).toEqual([
+      ["additive", "start"],
+      ["additive", "publish"],
+    ]);
+    expect(events.at(-1)?.rows).toBe(2);
+  },
+);
+
+test("an unready schema rebuild gets one immediate retry, then the persisted loop guard holds", () => {
+  const f = fixture();
+  f.finish();
+  f.exporter.close();
+  const db = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+  cleanups.push(() => db.close());
+  const reason = "source schema changed: orchestration_v2_projection_run_attempts";
+  db.prepare("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)").run(
+    "last_rebuild_reason",
+    reason,
+  );
+  db.prepare("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)").run(
+    "last_rebuild_at",
+    new Date().toISOString(),
+  );
+  db.prepare("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'").run();
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
+  );
+  const retry = openExporter(f);
+  expect(() => retry.step()).not.toThrow();
+  retry.close();
+  expect(() => openExporter(f)).toThrow("Automatic rebuild held back");
+});
+
+test("rebuild logs bounded page progress and aborts, without publishing a scan epoch", () => {
+  let now = Date.parse("2026-11-14T12:00:00Z");
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  const f = fixture(1);
+  f.finish();
+  f.exporter.close();
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
+  );
+  const events: Array<{ event: string; pages: number; elapsedMs: number }> = [];
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+    ...f.options,
+    onRebuildEvent: (event) => events.push(event),
+  });
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  const diagnosticsPath = f.options.replicaPath + ".rebuild.json";
+  NodeFS.utimesSync(diagnosticsPath, 0, 0);
+  now += 31_000;
+  exporter.step();
+  expect(NodeFS.statSync(diagnosticsPath).mtimeMs).toBeGreaterThan(0);
+  expect(events.map((event) => event.event)).toEqual(["start", "progress"]);
+  expect(events[1]).toMatchObject({ pages: 1, elapsedMs: 31_000 });
+  NodeFS.utimesSync(diagnosticsPath, 0, 0);
+  now += 29_000;
+  exporter.step();
+  expect(NodeFS.statSync(diagnosticsPath).mtimeMs).toBe(0);
+  now += 1_000;
+  exporter.step();
+  expect(NodeFS.statSync(diagnosticsPath).mtimeMs).toBeGreaterThan(0);
+  expect(events.at(-1)).toMatchObject({ event: "progress", pages: 3, elapsedMs: 61_000 });
+  expect(metaValue(out, "generation")).toBe(generation);
+  exporter.close();
+  expect(events.at(-1)?.event).toBe("abort");
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+test.each(["source replacement", "retained replica index"])(
+  "the shell control expression-index transition requires a full generation (%s)",
+  (mode) => {
+    // 99da707ad3 replaced 58512e5380's index; no thread columns changed.
+    const oldIndex = `CREATE INDEX ardud_control_thread_candidates_idx
+      ON orchestration_v2_projection_threads(
+        updated_at DESC, thread_id ASC, deleted_at, project_id,
+        json_extract(payload_json, '$.archivedAt') IS NOT NULL,
+        json_extract(payload_json, '$.lineage.relationshipToParent'),
+        json_extract(payload_json, '$.lineage.parentThreadId'),
+        json_extract(payload_json, '$.lineage.rootThreadId'),
+        json_extract(payload_json, '$.creationSource'))`;
+    const newIndex = `CREATE INDEX IF NOT EXISTS ardud_control_thread_candidates_desc_idx
+      ON orchestration_v2_projection_threads(
+        CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) DESC,
+        thread_id DESC, updated_at, deleted_at, project_id,
+        json_extract(payload_json, '$.archivedAt') IS NOT NULL,
+        json_extract(payload_json, '$.lineage.relationshipToParent'),
+        json_extract(payload_json, '$.lineage.parentThreadId'),
+        json_extract(payload_json, '$.lineage.rootThreadId'),
+        json_extract(payload_json, '$.creationSource'))`;
+    const f = fixture(1, (source) => {
+      source.exec(`DROP TABLE orchestration_v2_projection_threads;
+        CREATE TABLE orchestration_v2_projection_threads (
+          thread_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL,
+          default_provider TEXT NOT NULL, runtime_mode TEXT NOT NULL, interaction_mode TEXT NOT NULL,
+          active_provider_thread_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          archived_at TEXT, deleted_at TEXT, payload_json TEXT NOT NULL, provider_instance_id TEXT
+        );
+        INSERT INTO orchestration_v2_projection_threads
+          (thread_id,project_id,title,default_provider,runtime_mode,interaction_mode,created_at,updated_at,payload_json)
+          VALUES ('a','p','A','codex','full-access','default','2026-11-14T22:33:50Z','2026-11-14T22:33:50Z','{}'),
+                 ('b','p','B','codex','full-access','default','2026-11-14T22:33:50Z','2026-11-14T22:33:50Z','{}');
+        ${oldIndex};`);
+    });
+    f.finish();
+    f.exporter.close();
+    const out = f.connect();
+    const generation = metaValue(out, "generation");
+    const updated = metaValue(out, "updated_at");
+    f.source.exec(`${newIndex}; DROP INDEX IF EXISTS ardud_control_thread_candidates_idx;`);
+    if (mode === "retained replica index") {
+      const previousExporterOutput = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+      previousExporterOutput.exec(newIndex);
+      previousExporterOutput.close();
+    }
+    const exporter = openExporter(f);
+    expect(metaValue(out, "rebuild_kind")).toBe("full");
+    expect(metaValue(out, "last_rebuild_reason")).toBe(
+      "source schema changed: orchestration_v2_projection_threads",
+    );
+    while (exporter.step()) {
+      expect(metaValue(out, "ready")).toBe("1");
+      expect(metaValue(out, "generation")).toBe(generation);
+      expect(metaValue(out, "updated_at")).toBe(updated);
+    }
+    expect(Number(metaValue(out, "generation"))).toBe(Number(generation) + 1);
+    expect(
+      out
+        .prepare("SELECT name FROM sqlite_schema WHERE name='ardud_control_thread_candidates_idx'")
+        .get(),
+    ).toBeUndefined();
+    expect(
+      out
+        .prepare(
+          "SELECT name FROM sqlite_schema WHERE name='ardud_control_thread_candidates_desc_idx'",
+        )
+        .get(),
+    ).toBeDefined();
+  },
+);
+
+test.each(["publish", "abort"])(
+  "full rebuild diagnostics reach a separate Python reader before %s",
+  (terminal) => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture(1);
+    f.finish();
+    f.exporter.close();
+    const writer = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+    writer.exec("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'");
+    writer.close();
+    f.source.exec(
+      "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
+    );
+    const exporter = openExporter(f);
+    const out = f.connect();
+    const generation = metaValue(out, "generation");
+    out.exec("BEGIN");
+    expect(JSON.parse(String(metaValue(out, "rebuild_progress")))).toMatchObject({
+      event: "start",
+      table: "",
+      rows: 0,
+    });
+    now += 31_000;
+    exporter.step();
+    expect(metaValue(out, "ready")).toBe("0");
+    expect(metaValue(out, "generation")).toBe(generation);
+    expect(JSON.parse(String(metaValue(out, "rebuild_progress")))).toMatchObject({
+      event: "start",
+    });
+    const diagnosticsPath = f.options.replicaPath + ".rebuild.json";
+    const diagnostics = () => JSON.parse(NodeFS.readFileSync(diagnosticsPath, "utf8"));
+    expect(JSON.parse(diagnostics().rebuild_progress)).toMatchObject({
+      event: "progress",
+      table: "orchestration_v2_projection_threads",
+      rows: 1,
+      pages: 1,
+      elapsedMs: 31_000,
+    });
+    expect(NodeFS.statSync(diagnosticsPath).mode & 0o777).toBe(0o600);
+    const reader = NodeChildProcess.spawnSync(
+      "/usr/bin/python3",
+      [
+        "-I",
+        "-c",
+        `
+import sys
+sys.path.insert(0, sys.argv[1])
+import robob_readonly as ro
+try:
+    ro.state_ro(sys.argv[2])
+except ro.ReplicaNotReady as exc:
+    print(exc)
+else:
+    raise AssertionError("unready replica was accepted")
+`,
+        NodePath.resolve(import.meta.dirname, "../../../../../integrations/memory-system/src"),
+        f.options.replicaPath,
+      ],
+      { encoding: "utf8", timeout: 5000 },
+    );
+    expect(reader.error).toBeUndefined();
+    expect(reader.status, reader.stderr).toBe(0);
+    expect(reader.stdout).toContain("table orchestration_v2_projection_threads, 1 rows");
+    if (terminal === "publish") drive(exporter);
+    else exporter.close();
+    expect(JSON.parse(diagnostics().rebuild_progress).event).toBe(terminal);
+    expect(Boolean(diagnostics().rebuild_finished_at)).toBe(terminal === "publish");
+    out.exec("ROLLBACK");
+  },
+);
+
+test.each([
+  ["dropped column", "attempt_id TEXT PRIMARY KEY"],
+  ["renamed column", "attempt_id TEXT PRIMARY KEY, owner_payload_json TEXT"],
+  ["changed type", "attempt_id TEXT PRIMARY KEY, payload_json INTEGER"],
+  ["new primary key", "attempt_id TEXT, payload_json TEXT PRIMARY KEY"],
+  [
+    "new constraint",
+    "attempt_id TEXT PRIMARY KEY, payload_json TEXT CHECK(length(payload_json)>0)",
+  ],
+])("a %s takes the full publication path", (_kind, definition) => {
+  const f = fixture();
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  const generation = Number(metaValue(out, "generation"));
+  f.source.exec(
+    `DROP TABLE orchestration_v2_projection_run_attempts; CREATE TABLE orchestration_v2_projection_run_attempts (${definition})`,
+  );
+  f.source.exec(
+    "INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES ('thread.metadata-updated','a','{}')",
+  );
+  f.diagnostics.length = 0;
+  const events: ReadonlyRebuildEvent[] = [];
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+    ...f.options,
+    onDiagnosticEvent: (event) => f.diagnostics.push(event),
+    onRebuildEvent: (event) => {
+      events.push(event);
+      if (event.event === "publish") {
+        expect(event.sequence).toBe(Number(metaValue(out, "sequence")));
+        expect(event.identitySequence).toBe(Number(metaValue(out, "identity_sequence")));
+      }
+    },
+  });
+  cleanups.push(() => exporter.close());
+  expect(f.diagnostics).toEqual([
+    { event: "open", sequence: 1, identitySequence: 1, sourceSequence: 2 },
+  ]);
+  drive(exporter);
+  expect(events.map(({ kind, event }) => [kind, event])).toEqual([
+    ["full", "start"],
+    ["full", "publish"],
+  ]);
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(Number(metaValue(out, "generation"))).toBe(generation + 1);
+  expect(events.at(-1)).toMatchObject({ sequence: 2, identitySequence: 2 });
+});
+
+test("a column backfill resumes after a worker restart without changing generation", () => {
+  const f = fixture(1);
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','a'),('two','b')",
+  );
+  f.finish();
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_run_attempts ADD COLUMN extra TEXT; UPDATE orchestration_v2_projection_run_attempts SET extra=payload_json",
+  );
+  f.restart();
+  expect(f.exporter.step()).toBe(true);
+  f.restart();
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(
+    out
+      .prepare("SELECT extra FROM orchestration_v2_projection_run_attempts ORDER BY attempt_id")
+      .all(),
+  ).toEqual([{ extra: "a" }, { extra: "b" }]);
+});
+
+test("repeated gaps during a full schema rebuild cannot publish a partial reset", () => {
+  const f = fixture(1);
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
+  );
+  const exporter = openExporter(f);
+  exporter.step();
+  f.source.exec("INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{}')");
+  let gaps = 0;
+  const stepMetrics = exporter.takeMetrics.bind(exporter);
+  for (let i = 0; exporter.step(); i++) {
+    expect(metaValue(out, "ready")).toBe("1");
+    if (stepMetrics().phaseSteps.resetDelete && gaps++ === 0)
+      f.source.exec(
+        "INSERT INTO orchestration_events VALUES (5,'thread.metadata-updated','a','{}')",
+      );
+    if (i > 500) throw new Error("export did not converge");
+  }
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(metaValue(out, "sequence")).toBe("5");
+});
+
+test.each(["published", "full", "bootstrap"])(
+  "nested gaps during %s report the original published readiness",
+  (mode) => {
+    const f = fixture(1);
+    if (mode !== "bootstrap") f.finish();
+    const out = f.connect();
+    const generation = metaValue(out, "generation");
+    const updated = new Date(Date.now() - 10 * 60_000).toISOString();
+    let exporter = f.exporter;
+    if (mode === "full") {
+      f.exporter.close();
+      const writer = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+      writer.prepare("UPDATE ardud_readonly_meta SET value=? WHERE key='updated_at'").run(updated);
+      writer.close();
+      f.source.exec(
+        "ALTER TABLE orchestration_v2_projection_run_attempts RENAME COLUMN payload_json TO owner_payload_json",
+      );
+      exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+        ...f.options,
+        onRebuildEvent: (event) => f.rebuilds.push(event),
+      });
+      cleanups.push(() => exporter.close());
+    }
+    const started = metaValue(out, "rebuild_started_at");
+    const readPreviousSnapshot = () => {
+      expect(metaValue(out, "rebuild_kind")).toBe("full");
+      expect(metaValue(out, "rebuild_started_at")).toBe(started);
+      const reader = NodeChildProcess.spawnSync(
+        "/usr/bin/python3",
+        [
+          "-I",
+          "-c",
+          `
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import robob_readonly as ro
+with ro.state_ro(sys.argv[2], allow_rebuild=True) as con:
+    meta = dict(con.execute("SELECT key,value FROM ardud_readonly_meta"))
+    assert meta["ready"] == "1"
+    assert meta["updated_at"] == sys.argv[3]
+    assert meta["generation"] == sys.argv[4]
+    assert meta["rebuild_started_at"] == sys.argv[5]
+    assert json.loads(con.execute("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'").fetchone()[0])["title"] == "old"
+    assert sys.argv[3] in con.replica_warning
+    assert sys.argv[5] in con.replica_warning
+`,
+          NodePath.resolve(import.meta.dirname, "../../../../../integrations/memory-system/src"),
+          f.options.replicaPath,
+          updated,
+          String(generation),
+          String(started),
+        ],
+        { encoding: "utf8", timeout: 5000 },
+      );
+      expect(reader.error).toBeUndefined();
+      expect(reader.status, reader.stderr).toBe(0);
+    };
+    if (mode === "full") readPreviousSnapshot();
+    f.rebuilds.length = 0;
+    exporter.step();
+    f.source.exec("INSERT INTO orchestration_events VALUES (3,'thread.metadata-updated','a','{}')");
+    let addedGap = false;
+    let verifiedResets = 0;
+    for (let step = 0; exporter.step(); step++) {
+      expect(metaValue(out, "ready")).toBe(mode === "bootstrap" ? "0" : "1");
+      if (mode === "full") {
+        const resets = f.rebuilds.filter(
+          (event) => event.kind === "events_reset" && event.event === "start",
+        ).length;
+        if (resets > verifiedResets) {
+          const sidecar = JSON.parse(
+            NodeFS.readFileSync(f.options.replicaPath + ".rebuild.json", "utf8"),
+          );
+          expect(JSON.parse(sidecar.rebuild_progress).kind).toBe("events_reset");
+          readPreviousSnapshot();
+          verifiedResets = resets;
+        }
+      }
+      if (!addedGap && f.rebuilds.some((event) => event.kind === "events_reset")) {
+        f.source.exec(
+          "INSERT INTO orchestration_events VALUES (5,'thread.metadata-updated','a','{}')",
+        );
+        addedGap = true;
+      }
+      if (step > 500) throw new Error("nested resets did not converge");
+    }
+    const starts = f.rebuilds.filter(
+      (event) => event.kind === "events_reset" && event.event === "start",
+    );
+    expect(starts).toHaveLength(2);
+    if (mode === "full") expect(verifiedResets).toBe(2);
+    expect(starts.map((event) => event.firstMissingSequence)).toEqual([2, 4]);
+    expect(starts.map((event) => event.publishedReady)).toEqual(
+      mode === "bootstrap" ? ["0", "0"] : ["1", "1"],
+    );
+    expect(metaValue(out, "ready")).toBe("1");
+  },
+);
+
+test("column backfill cannot publish a run transition without its matching Stop item", () => {
+  const f = fixture(1);
+  f.source.exec(
+    `INSERT INTO orchestration_v2_projection_runs VALUES ('run','a','{"status":"running"}')`,
+  );
+  f.finish();
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  const watermark = metaValue(out, "updated_at");
+  f.source.exec(`ALTER TABLE orchestration_v2_projection_runs ADD COLUMN extra TEXT;
+    UPDATE orchestration_v2_projection_runs SET extra='backfilled',payload_json='{"status":"interrupted"}';
+    INSERT INTO orchestration_v2_projection_runs VALUES ('new-run','a','{"status":"interrupted"}','new');
+    INSERT INTO orchestration_v2_projection_turn_items(turn_item_id,type,payload_json) VALUES ('new-stop','run_interrupt_request','{}');
+    INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES
+      ('run.updated','a','{"id":"run"}'),('run.created','a','{"id":"new-run"}'),('turn-item.updated','a','{"id":"new-stop"}');`);
+  f.restart();
+  do {
+    expect(metaValue(out, "generation")).toBe(generation);
+    expect(metaValue(out, "sequence")).toBe("1");
+    expect(metaValue(out, "updated_at")).toBe(watermark);
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(
+      out
+        .prepare("SELECT payload_json FROM orchestration_v2_projection_runs WHERE run_id='run'")
+        .get()?.payload_json,
+    ).toBe('{"status":"running"}');
+    expect(
+      out.prepare("SELECT 1 FROM orchestration_v2_projection_runs WHERE run_id='new-run'").get(),
+    ).toBeUndefined();
+    expect(
+      out
+        .prepare(
+          "SELECT 1 FROM orchestration_v2_projection_turn_items WHERE turn_item_id='new-stop'",
+        )
+        .get(),
+    ).toBeUndefined();
+  } while (f.exporter.step());
+  expect(
+    out.prepare("SELECT extra FROM orchestration_v2_projection_runs WHERE run_id='run'").get()
+      ?.extra,
+  ).toBe("backfilled");
+  f.finish();
+  expect(
+    out
+      .prepare("SELECT payload_json FROM orchestration_v2_projection_runs WHERE run_id='run'")
+      .get()?.payload_json,
+  ).toBe('{"status":"interrupted"}');
+  expect(
+    out.prepare("SELECT 1 FROM orchestration_v2_projection_runs WHERE run_id='new-run'").get(),
+  ).toBeDefined();
+  expect(
+    out
+      .prepare("SELECT 1 FROM orchestration_v2_projection_turn_items WHERE turn_item_id='new-stop'")
+      .get(),
+  ).toBeDefined();
+});
+
+test("identity polling cannot publish old fields or new rows during a projection column backfill", () => {
+  const f = fixture(1);
+  f.finish();
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  const watermark = metaValue(out, "updated_at");
+  f.source.exec(`ALTER TABLE orchestration_v2_projection_threads ADD COLUMN extra TEXT;
+    UPDATE orchestration_v2_projection_threads SET extra='backfilled';
+    UPDATE orchestration_v2_projection_threads SET payload_json='{"title":"new"}' WHERE thread_id='a';
+    INSERT INTO orchestration_v2_projection_threads VALUES ('new','{}','new-row');
+    INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES
+      ('thread.metadata-updated','a','{}'),('thread.created','new','{}')`);
+  f.restart();
+  do {
+    expect(f.exporter.pollIdentities()).toBe(false);
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(metaValue(out, "generation")).toBe(generation);
+    expect(metaValue(out, "updated_at")).toBe(watermark);
+    expect(metaValue(out, "sequence")).toBe("1");
+    expect(
+      out
+        .prepare("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+        .get()?.payload_json,
+    ).toBe('{"title":"old"}');
+    expect(
+      out.prepare("SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id='new'").get(),
+    ).toBeUndefined();
+  } while (f.exporter.step());
+  expect(
+    out.prepare("SELECT extra FROM orchestration_v2_projection_threads WHERE thread_id='a'").get()
+      ?.extra,
+  ).toBe("backfilled");
+  f.finish();
+  expect(
+    out
+      .prepare("SELECT payload_json FROM orchestration_v2_projection_threads WHERE thread_id='a'")
+      .get()?.payload_json,
+  ).toBe('{"title":"new"}');
+  expect(
+    out.prepare("SELECT extra FROM orchestration_v2_projection_threads WHERE thread_id='new'").get()
+      ?.extra,
+  ).toBe("new-row");
+});
+
+test.each([
+  ["inline UNIQUE", "extra TEXT UNIQUE", ""],
+  ["named inline UNIQUE", "extra TEXT CONSTRAINT extra_unique UNIQUE", ""],
+  [
+    "unique index",
+    "extra TEXT NOT NULL DEFAULT 'pending'",
+    "CREATE UNIQUE INDEX extra_unique ON orchestration_v2_projection_run_attempts(extra)",
+  ],
+  [
+    "unique expression index",
+    "extra TEXT NOT NULL DEFAULT 'pending'",
+    "CREATE UNIQUE INDEX extra_unique ON orchestration_v2_projection_run_attempts(lower(extra))",
+  ],
+  [
+    "partial unique index",
+    "extra TEXT NOT NULL DEFAULT 'pending'",
+    "CREATE UNIQUE INDEX extra_unique ON orchestration_v2_projection_run_attempts(extra) WHERE extra IS NOT NULL",
+  ],
+  ["dependent CHECK", "extra TEXT CHECK(extra=payload_json)", ""],
+])("%s added with a column uses a full rebuild", (_kind, definition, index) => {
+  const f = fixture(1);
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','one'),('two','two')",
+  );
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  f.source.exec(`DROP TABLE orchestration_v2_projection_run_attempts;
+    CREATE TABLE orchestration_v2_projection_run_attempts (attempt_id TEXT PRIMARY KEY, payload_json TEXT, ${definition});
+    INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','one','one'),('two','two','two'); ${index}`);
+  const events: Array<{ kind: string; event: string }> = [];
+  const exporter = createReadonlyReplica(NodeSqlite, NodeFS, NodePath, {
+    ...f.options,
+    onRebuildEvent: (event) => events.push(event),
+  });
+  cleanups.push(() => exporter.close());
+  drive(exporter);
+  expect(events[0]?.kind).toBe("full");
+  expect(events.at(-1)?.event).toBe("publish");
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(
+    out
+      .prepare("SELECT extra FROM orchestration_v2_projection_run_attempts ORDER BY attempt_id")
+      .all(),
+  ).toEqual([{ extra: "one" }, { extra: "two" }]);
+});
+
+test("a reused index name cannot hide a new uniqueness constraint", () => {
+  const f = fixture(2, (source) =>
+    source.exec(
+      "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','one'),('two','two'); CREATE INDEX extra_unique ON orchestration_v2_projection_run_attempts(payload_json)",
+    ),
+  );
+  f.finish();
+  f.exporter.close();
+  f.source
+    .exec(`DROP TABLE orchestration_v2_projection_run_attempts; CREATE TABLE orchestration_v2_projection_run_attempts (attempt_id TEXT PRIMARY KEY, payload_json TEXT, extra TEXT NOT NULL DEFAULT 'pending');
+    INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','one','one'),('two','two','two'); CREATE UNIQUE INDEX extra_unique ON orchestration_v2_projection_run_attempts(extra)`);
+  drive(openExporter(f));
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_run_attempts",
+  );
+  expect(
+    out.prepare("SELECT sql FROM sqlite_schema WHERE name='extra_unique'").get()?.sql,
+  ).toContain("UNIQUE");
+});
+
+test("new expression indexes use a complete generation instead of temporary defaults", () => {
+  const f = fixture(1);
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','a'),('two','a')",
+  );
+  f.finish();
+  f.source
+    .exec(`ALTER TABLE orchestration_v2_projection_run_attempts ADD COLUMN extra TEXT DEFAULT 'pending'; UPDATE orchestration_v2_projection_run_attempts SET extra='{"valid":true}';
+    CREATE INDEX extra_expression ON orchestration_v2_projection_run_attempts(json_extract(extra,'$.valid'))`);
+  f.restart();
+  f.finish();
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_run_attempts",
+  );
+  expect(
+    out.prepare("SELECT 1 FROM sqlite_schema WHERE name='extra_expression'").get(),
+  ).toBeDefined();
+});
+
+test("another additive migration retains unfinished column backfills", () => {
+  const f = fixture(1);
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','a'),('two','b')",
+  );
+  f.finish();
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_run_attempts ADD COLUMN first TEXT; UPDATE orchestration_v2_projection_run_attempts SET first=payload_json",
+  );
+  f.restart();
+  f.exporter.step();
+  f.source.exec(
+    "ALTER TABLE orchestration_v2_projection_run_attempts ADD COLUMN second TEXT; UPDATE orchestration_v2_projection_run_attempts SET second=payload_json",
+  );
+  f.restart();
+  f.finish();
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(
+    out
+      .prepare(
+        "SELECT first,second FROM orchestration_v2_projection_run_attempts ORDER BY attempt_id",
+      )
+      .all(),
+  ).toEqual([
+    { first: "a", second: "a" },
+    { first: "b", second: "b" },
+  ]);
+});
+
+test.each(["CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "(1 + 2)"])(
+  "a nonconstant default %s uses full rebuild without getting stuck on reopen",
+  (expression) => {
+    const f = fixture();
+    f.source.exec("INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','a')");
+    f.finish();
+    f.exporter.close();
+    const out = f.connect();
+    f.source
+      .exec(`DROP TABLE orchestration_v2_projection_run_attempts; CREATE TABLE orchestration_v2_projection_run_attempts (attempt_id TEXT PRIMARY KEY, payload_json TEXT, extra TEXT DEFAULT ${expression});
+    INSERT INTO orchestration_v2_projection_run_attempts(attempt_id,payload_json) VALUES ('one','a')`);
+    const expected = f.source
+      .prepare("SELECT extra FROM orchestration_v2_projection_run_attempts")
+      .get()?.extra;
+    const exporter = openExporter(f);
+    drive(exporter);
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(
+      out.prepare("SELECT extra FROM orchestration_v2_projection_run_attempts").get()?.extra,
+    ).toBe(expected);
+    expect(metaValue(out, "last_rebuild_reason")).toBe(
+      "source schema changed: orchestration_v2_projection_run_attempts",
+    );
+    exporter.close();
+    expect(() => openExporter(f)).not.toThrow();
+  },
+);
+
+test.each([
+  "CREATE INDEX extra_expression ON orchestration_v2_projection_run_attempts(json_extract(extra,'$.valid'))",
+  "CREATE INDEX extra_partial ON orchestration_v2_projection_run_attempts(extra) WHERE json_extract(extra,'$.valid')=1",
+])("a deleted row's temporary default cannot poison %s", (index) => {
+  const f = fixture();
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','a'),('deleted','a')",
+  );
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  f.source
+    .exec(`ALTER TABLE orchestration_v2_projection_run_attempts ADD COLUMN extra TEXT DEFAULT 'pending';
+    UPDATE orchestration_v2_projection_run_attempts SET extra='{"valid":true}'; DELETE FROM orchestration_v2_projection_run_attempts WHERE attempt_id='deleted'; ${index}`);
+  const exporter = openExporter(f);
+  drive(exporter);
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(
+    out.prepare("SELECT attempt_id,extra FROM orchestration_v2_projection_run_attempts").all(),
+  ).toEqual([{ attempt_id: "one", extra: '{"valid":true}' }]);
+  exporter.close();
+  expect(() => openExporter(f)).not.toThrow();
+});
+
+test("a plain nonunique index preserves the additive path, including rows awaiting deletion", () => {
+  const f = fixture();
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','a'),('deleted','a')",
+  );
+  f.finish();
+  const out = f.connect();
+  const generation = metaValue(out, "generation");
+  f.source
+    .exec(`ALTER TABLE orchestration_v2_projection_run_attempts ADD COLUMN extra TEXT DEFAULT 'pending'; UPDATE orchestration_v2_projection_run_attempts SET extra='backfilled';
+    DELETE FROM orchestration_v2_projection_run_attempts WHERE attempt_id='deleted'; CREATE INDEX extra_plain ON orchestration_v2_projection_run_attempts(extra)`);
+  f.restart();
+  f.finish();
+  expect(metaValue(out, "generation")).toBe(generation);
+  expect(metaValue(out, "last_rebuild_reason")).toBeUndefined();
+  expect(out.prepare("SELECT 1 FROM sqlite_schema WHERE name='extra_plain'").get()).toBeDefined();
+  for (let cycle = 0; cycle < 3; cycle++) f.finish();
+  expect(
+    out.prepare("SELECT attempt_id FROM orchestration_v2_projection_run_attempts").all(),
+  ).toEqual([{ attempt_id: "one" }]);
+});
+
+test.each([
+  [
+    "removed unique",
+    "CREATE UNIQUE INDEX old_constraint ON orchestration_v2_projection_run_attempts(payload_json)",
+    "",
+  ],
+  [
+    "downgraded unique",
+    "CREATE UNIQUE INDEX old_constraint ON orchestration_v2_projection_run_attempts(payload_json)",
+    "CREATE INDEX old_constraint ON orchestration_v2_projection_run_attempts(payload_json)",
+  ],
+  [
+    "removed expression",
+    "CREATE INDEX old_constraint ON orchestration_v2_projection_run_attempts(json_extract(payload_json,'$.v'))",
+    "",
+  ],
+  [
+    "removed partial",
+    "CREATE INDEX old_constraint ON orchestration_v2_projection_run_attempts(attempt_id) WHERE json_extract(payload_json,'$.v')>0",
+    "",
+  ],
+])("a %s index cannot strand subsequent publications", (_kind, previous, current) => {
+  const f = fixture(2, (source) =>
+    source.exec(
+      `INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','{"v":1}'),('two','{"v":2}'); ${previous}`,
+    ),
+  );
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  expect(
+    out.prepare("SELECT 1 FROM sqlite_schema WHERE name='old_constraint'").get(),
+  ).toBeDefined();
+  f.source
+    .exec(`ALTER TABLE orchestration_v2_projection_run_attempts ADD COLUMN extra TEXT; DROP INDEX old_constraint;
+    UPDATE orchestration_v2_projection_run_attempts SET payload_json='duplicate non-json'; ${current}`);
+  const exporter = openExporter(f);
+  drive(exporter);
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_run_attempts",
+  );
+  expect(
+    out.prepare("SELECT payload_json FROM orchestration_v2_projection_run_attempts").all(),
+  ).toEqual([{ payload_json: "duplicate non-json" }, { payload_json: "duplicate non-json" }]);
+  drive(exporter);
+  exporter.close();
+  const reopened = openExporter(f);
+  drive(reopened);
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+test.each(["earlier parent", "later parent", "cyclic parents"])(
+  "new foreign keys with %s publish as a complete generation",
+  (kind) => {
+    const f = fixture();
+    f.source.exec(
+      "INSERT INTO orchestration_v2_projection_messages VALUES ('message','{}'); INSERT INTO orchestration_v2_projection_runs VALUES ('run','a','{}')",
+    );
+    f.finish();
+    f.exporter.close();
+    const out = f.connect();
+    if (kind === "later parent") {
+      f.source
+        .exec(`ALTER TABLE orchestration_v2_projection_messages ADD COLUMN owner_item TEXT REFERENCES orchestration_v2_projection_turn_items(turn_item_id);
+      INSERT INTO orchestration_v2_projection_turn_items(turn_item_id,type,payload_json) VALUES ('new-parent','user_message','{}');
+      UPDATE orchestration_v2_projection_messages SET owner_item='new-parent'`);
+    } else {
+      f.source
+        .exec(`ALTER TABLE orchestration_v2_projection_messages ADD COLUMN owner_run TEXT REFERENCES orchestration_v2_projection_runs(run_id);
+      INSERT INTO orchestration_v2_projection_runs VALUES ('new-parent','a','{}');
+      UPDATE orchestration_v2_projection_messages SET owner_run='new-parent'`);
+      if (kind === "cyclic parents")
+        f.source
+          .exec(`ALTER TABLE orchestration_v2_projection_runs ADD COLUMN owner_message TEXT REFERENCES orchestration_v2_projection_messages(message_id);
+      UPDATE orchestration_v2_projection_runs SET owner_message='message'`);
+    }
+    const exporter = openExporter(f);
+    drive(exporter);
+    expect(metaValue(out, "ready")).toBe("1");
+    expect(metaValue(out, "last_rebuild_reason")).toContain("source schema changed:");
+    expect(out.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    drive(exporter);
+    exporter.close();
+    drive(openExporter(f));
+    expect(metaValue(out, "ready")).toBe("1");
+  },
+);
+
+test("auxiliary foreign keys use main constraints and publish parents and children together", () => {
+  const f = fixture();
+  f.source.exec("INSERT INTO scheduled_tasks VALUES ('task','a')");
+  f.finish();
+  const out = f.connect();
+  f.source
+    .exec(`ALTER TABLE scheduled_tasks ADD COLUMN owner_import TEXT REFERENCES ardud_opencode_import(native_session_id);
+    INSERT INTO ardud_opencode_import VALUES ('parent','a'); UPDATE scheduled_tasks SET owner_import='parent'`);
+  f.restart();
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+  expect(out.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  f.source.exec(`INSERT INTO ardud_opencode_import VALUES ('next-parent','a');
+    UPDATE scheduled_tasks SET owner_import='next-parent'; DELETE FROM ardud_opencode_import WHERE native_session_id='parent'`);
+  f.finish();
+  expect(out.prepare("SELECT owner_import FROM scheduled_tasks").get()?.owner_import).toBe(
+    "next-parent",
+  );
+  expect(out.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+  f.restart();
+  f.finish();
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+test.each([
+  [
+    "unique",
+    "CREATE UNIQUE INDEX resumed_index ON orchestration_v2_projection_run_attempts(extra)",
+  ],
+  [
+    "expression",
+    "CREATE INDEX resumed_index ON orchestration_v2_projection_run_attempts(json_extract(extra,'$.valid'))",
+  ],
+  [
+    "partial",
+    "CREATE INDEX resumed_index ON orchestration_v2_projection_run_attempts(extra) WHERE json_extract(extra,'$.valid')=1",
+  ],
+])("a new %s index during a paused column backfill selects full rebuild", (kind, index) => {
+  const f = fixture(1);
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('keep','a'),('deleted1','a'),('deleted2','a')",
+  );
+  f.finish();
+  f.source
+    .exec(`ALTER TABLE orchestration_v2_projection_run_attempts ADD COLUMN extra TEXT DEFAULT 'pending';
+    UPDATE orchestration_v2_projection_run_attempts SET extra=${kind === "unique" ? "attempt_id" : "'{\"valid\":true}'"}`);
+  f.restart();
+  f.exporter.step();
+  f.exporter.close();
+  f.source.exec(
+    `DELETE FROM orchestration_v2_projection_run_attempts WHERE attempt_id<>'keep'; ${index}`,
+  );
+  const exporter = openExporter(f);
+  drive(exporter);
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_run_attempts",
+  );
+  expect(
+    out.prepare("SELECT attempt_id FROM orchestration_v2_projection_run_attempts").all(),
+  ).toEqual([{ attempt_id: "keep" }]);
+  exporter.close();
+  drive(openExporter(f));
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+test.each([
+  [
+    "added unique",
+    "",
+    "UPDATE orchestration_v2_projection_run_attempts SET payload_json=attempt_id; CREATE UNIQUE INDEX index_only ON orchestration_v2_projection_run_attempts(payload_json)",
+  ],
+  [
+    "removed unique",
+    "CREATE UNIQUE INDEX index_only ON orchestration_v2_projection_run_attempts(payload_json)",
+    "DROP INDEX index_only; UPDATE orchestration_v2_projection_run_attempts SET payload_json='duplicate'",
+  ],
+  [
+    "downgraded unique",
+    "CREATE UNIQUE INDEX index_only ON orchestration_v2_projection_run_attempts(payload_json)",
+    "DROP INDEX index_only; CREATE INDEX index_only ON orchestration_v2_projection_run_attempts(payload_json); UPDATE orchestration_v2_projection_run_attempts SET payload_json='duplicate'",
+  ],
+  [
+    "removed expression",
+    "CREATE INDEX index_only ON orchestration_v2_projection_run_attempts(json_extract(payload_json,'$.v'))",
+    "DROP INDEX index_only; UPDATE orchestration_v2_projection_run_attempts SET payload_json='duplicate'",
+  ],
+  [
+    "removed partial",
+    "CREATE INDEX index_only ON orchestration_v2_projection_run_attempts(attempt_id) WHERE json_extract(payload_json,'$.v')>0",
+    "DROP INDEX index_only; UPDATE orchestration_v2_projection_run_attempts SET payload_json='duplicate'",
+  ],
+])("%s without any table SQL change cannot strand the export", (kind, previous, mutation) => {
+  const f = fixture(2, (source) =>
+    source.exec(
+      `INSERT INTO orchestration_v2_projection_run_attempts VALUES ('one','{"v":1}'),('two','{"v":${kind === "added unique" ? 1 : 2}}'); ${previous}`,
+    ),
+  );
+  f.finish();
+  f.exporter.close();
+  const schema = f.source
+    .prepare("SELECT sql FROM sqlite_schema WHERE name='orchestration_v2_projection_run_attempts'")
+    .get()?.sql;
+  f.source.exec(mutation);
+  expect(
+    f.source
+      .prepare(
+        "SELECT sql FROM sqlite_schema WHERE name='orchestration_v2_projection_run_attempts'",
+      )
+      .get()?.sql,
+  ).toBe(schema);
+  const exporter = openExporter(f);
+  drive(exporter);
+  const out = f.connect();
+  expect(metaValue(out, "last_rebuild_reason")).toBe(
+    "source schema changed: orchestration_v2_projection_run_attempts",
+  );
+  expect(
+    out
+      .prepare(
+        "SELECT payload_json FROM orchestration_v2_projection_run_attempts ORDER BY attempt_id",
+      )
+      .all(),
+  ).toEqual(
+    kind === "added unique"
+      ? [{ payload_json: "one" }, { payload_json: "two" }]
+      : [{ payload_json: "duplicate" }, { payload_json: "duplicate" }],
+  );
+  exporter.close();
+  drive(openExporter(f));
+  expect(metaValue(out, "ready")).toBe("1");
+});
+
+const identityVersionTables = [
+  ["orchestration_v2_projection_threads", "thread_id", "threads"],
+  ["orchestration_v2_projection_provider_threads", "provider_thread_id", "providers"],
+  ["orchestration_v2_projection_provider_turns", "provider_turn_id", "turns"],
+  ["orchestration_v2_projection_subagents", "subagent_id", "subagents"],
+  ["ardud_opencode_import", "native_session_id", "imports"],
+] as const;
+
+function identityVersionFixture(batchSize = 100) {
+  return fixture(batchSize, (source) => {
+    for (const [name, primary] of identityVersionTables) {
+      if (name === "ardud_opencode_import")
+        source.exec(`DROP TABLE ${name}; CREATE TABLE ${name} (
+          native_session_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL UNIQUE,
+          imported_at TEXT NOT NULL, payload_json TEXT DEFAULT '{}'
+        )`);
+      source.exec(`ALTER TABLE ${name} ADD COLUMN identity_scalar TEXT DEFAULT 'before';
+        ALTER TABLE ${name} ADD COLUMN updated_at TEXT DEFAULT '2026-11-14T00:00:00Z';
+        ALTER TABLE ${name} ADD COLUMN deleted_at TEXT`);
+      if (name.endsWith("_provider_turns"))
+        source.exec(`ALTER TABLE ${name} ADD COLUMN thread_id TEXT;
+          ALTER TABLE ${name} ADD COLUMN node_id TEXT`);
+      for (const id of ["version-main", "version-peer"]) {
+        if (name === "ardud_opencode_import")
+          source
+            .prepare(
+              `INSERT INTO ${name}(native_session_id,thread_id,imported_at) VALUES (?,?,'2026-11-14T00:00:00Z')`,
+            )
+            .run(id, `${id}-owner`);
+        else source.prepare(`INSERT INTO ${name}(${primary},payload_json) VALUES (?,'{}')`).run(id);
+      }
+    }
+  });
+}
+
+const identityCensus = (db: NodeSqlite.DatabaseSync) =>
+  db
+    .prepare(
+      "SELECT table_name,row_id,version FROM ardud_readonly_identity_versions ORDER BY table_name,row_id",
+    )
+    .all();
+const identityVersion = (db: NodeSqlite.DatabaseSync, name: string, id = "version-main") =>
+  Number(
+    db
+      .prepare(
+        "SELECT version FROM ardud_readonly_identity_versions WHERE table_name=? AND row_id=?",
+      )
+      .get(name, id)?.version,
+  );
+const identitySequenceValue = (db: NodeSqlite.DatabaseSync) =>
+  Number(
+    db
+      .prepare("SELECT seq FROM sqlite_sequence WHERE name='ardud_readonly_identity_versions'")
+      .get()?.seq ?? 0,
+  );
+function expectIdentityCoverage(db: NodeSqlite.DatabaseSync) {
+  expect(metaValue(db, "identity_versions_schema")).toBe("1");
+  expect(
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ardud_readonly_identity_versions'",
+      )
+      .get(),
+  ).toBeDefined();
+  expect(
+    db
+      .prepare(
+        "SELECT name FROM sqlite_schema WHERE type='trigger' AND name GLOB 'ardud_identity_*' ORDER BY name",
+      )
+      .all()
+      .map((r) => r.name),
+  ).toEqual(
+    identityVersionTables
+      .flatMap(([, , suffix]) =>
+        ["insert", "update", "delete"].map((action) => `ardud_identity_${suffix}_${action}`),
+      )
+      .sort(),
+  );
+  expect(identityCensus(db).map(({ table_name, row_id }) => ({ table_name, row_id }))).toEqual(
+    identityVersionTables
+      .flatMap(([name, primary]) =>
+        db
+          .prepare(
+            `SELECT '${name}' AS table_name,${primary} AS row_id FROM ${name} ORDER BY ${primary}`,
+          )
+          .all(),
+      )
+      .sort(
+        (a, b) =>
+          String(a.table_name).localeCompare(String(b.table_name)) ||
+          String(a.row_id).localeCompare(String(b.row_id)),
+      ),
+  );
+}
+function emitIdentityEvent(source: NodeSqlite.DatabaseSync, suffix: string, id = "version-main") {
+  const event =
+    suffix === "threads"
+      ? "thread.metadata-updated"
+      : suffix === "providers"
+        ? "provider-thread.updated"
+        : suffix === "turns"
+          ? "provider-turn.updated"
+          : "subagent.updated";
+  source
+    .prepare("INSERT INTO orchestration_events(event_type,stream_id,payload_json) VALUES (?,?,?)")
+    .run(event, id, JSON.stringify({ id }));
+}
+function writeReplica(f: ReturnType<typeof fixture>, body: (db: NodeSqlite.DatabaseSync) => void) {
+  const db = new NodeSqlite.DatabaseSync(f.options.replicaPath);
+  try {
+    body(db);
+  } finally {
+    db.close();
+  }
+}
+
+test("identity versions: fresh publication covers all five tables, including deleted and unbound rows", () => {
+  const f = identityVersionFixture();
+  f.source.exec(
+    "UPDATE orchestration_v2_projection_threads SET deleted_at='deleted' WHERE thread_id='version-main'",
+  );
+  f.finish();
+  const out = f.connect();
+  expectIdentityCoverage(out);
+  expect(identityCensus(out)).toHaveLength(13);
+  expect(
+    f.source
+      .prepare(
+        "SELECT name FROM sqlite_schema WHERE name LIKE 'ardud_identity_%' OR name='ardud_readonly_identity_versions'",
+      )
+      .all(),
+  ).toEqual([]);
+});
+
+test("identity versions: upgrade backfills existing rows without changing payloads or lineage metadata", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  const payloads = identityVersionTables.map(([name]) =>
+    out.prepare(`SELECT * FROM ${name}`).all(),
+  );
+  const lineage = out
+    .prepare("SELECT * FROM ardud_readonly_meta WHERE key LIKE 'lineage_%' ORDER BY key")
+    .all();
+  writeReplica(f, (db) => {
+    for (const [, , suffix] of identityVersionTables)
+      for (const action of ["insert", "update", "delete"])
+        db.exec(`DROP TRIGGER ardud_identity_${suffix}_${action}`);
+    db.exec(
+      "DROP TABLE ardud_readonly_identity_versions; DELETE FROM ardud_readonly_meta WHERE key='identity_versions_schema'",
+    );
+  });
+  f.restart();
+  expectIdentityCoverage(out);
+  expect(identityVersionTables.map(([name]) => out.prepare(`SELECT * FROM ${name}`).all())).toEqual(
+    payloads,
+  );
+  expect(
+    out.prepare("SELECT * FROM ardud_readonly_meta WHERE key LIKE 'lineage_%' ORDER BY key").all(),
+  ).toEqual(lineage);
+});
+
+for (const [name, primary, suffix] of identityVersionTables) {
+  test.each(["identity_scalar", "payload_json"])(
+    `identity versions: same-timestamp ${suffix} %s edit changes only its row`,
+    (column) => {
+      const f = identityVersionFixture();
+      f.finish();
+      const out = f.connect();
+      const before = identityCensus(out);
+      const version = identityVersion(out, name);
+      f.source
+        .prepare(`UPDATE ${name} SET ${column}=? WHERE ${primary}='version-main'`)
+        .run(column === "payload_json" ? '{"edited":true}' : "after");
+      if (suffix !== "imports") emitIdentityEvent(f.source, suffix);
+      f.finish();
+      expect(identityVersion(out, name)).toBeGreaterThan(version);
+      expect(
+        identityCensus(out).filter(
+          (row) => row.table_name !== name || row.row_id !== "version-main",
+        ),
+      ).toEqual(before.filter((row) => row.table_name !== name || row.row_id !== "version-main"));
+      expect(
+        out.prepare(`SELECT updated_at FROM ${name} WHERE ${primary}='version-main'`).get()
+          ?.updated_at,
+      ).toBe("2026-11-14T00:00:00Z");
+      expectIdentityCoverage(out);
+    },
+  );
+}
+
+test("identity versions: mutable provider turn owner and node upsert gets a fresh version", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const name = identityVersionTables[2][0];
+  const before = identityVersion(out, name);
+  f.source.exec(
+    `INSERT INTO ${name}(provider_turn_id,thread_id,node_id,payload_json) VALUES ('version-main','new-owner','new-node','{}') ON CONFLICT(provider_turn_id) DO UPDATE SET thread_id=excluded.thread_id,node_id=excluded.node_id`,
+  );
+  emitIdentityEvent(f.source, "turns");
+  f.finish();
+  expect(identityVersion(out, name)).toBeGreaterThan(before);
+  expect(
+    out
+      .prepare(`SELECT thread_id,node_id FROM ${name} WHERE provider_turn_id='version-main'`)
+      .get(),
+  ).toEqual({ thread_id: "new-owner", node_id: "new-node" });
+});
+
+test("identity versions: soft deletes advance and hard deletes reconcile away", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const before = identityVersionTables.map(([name]) => identityVersion(out, name));
+  for (const [name, primary, suffix] of identityVersionTables) {
+    f.source.exec(`UPDATE ${name} SET deleted_at='deleted' WHERE ${primary}='version-main'`);
+    if (suffix !== "imports") emitIdentityEvent(f.source, suffix);
+  }
+  f.finish();
+  identityVersionTables.forEach(([name], i) =>
+    expect(identityVersion(out, name)).toBeGreaterThan(before[i]!),
+  );
+  for (const [name, primary] of identityVersionTables)
+    f.source.exec(`DELETE FROM ${name} WHERE ${primary}='version-main'`);
+  for (let i = 0; i < 8; i++) f.finish();
+  expectIdentityCoverage(out);
+  expect(identityCensus(out).some((row) => row.row_id === "version-main")).toBe(false);
+});
+
+test("identity versions: delete/reinsert and source rowid reuse keep the exact key set", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const name = identityVersionTables[0][0];
+  const before = identityVersion(out, name);
+  const rowid = f.source
+    .prepare(`SELECT rowid FROM ${name} WHERE thread_id='version-main'`)
+    .get()?.rowid;
+  f.source.exec(`DELETE FROM ${name} WHERE thread_id='version-main'`);
+  emitIdentityEvent(f.source, "threads");
+  f.finish();
+  expect(Number.isNaN(identityVersion(out, name))).toBe(true);
+  f.source
+    .prepare(`INSERT INTO ${name}(rowid,thread_id,payload_json) VALUES (?,'version-main','{}')`)
+    .run(rowid!);
+  emitIdentityEvent(f.source, "threads");
+  f.finish();
+  expect(identityVersion(out, name)).toBeGreaterThan(before);
+  f.source.exec(`DELETE FROM ${name} WHERE thread_id='version-main'`);
+  f.source
+    .prepare(`INSERT INTO ${name}(rowid,thread_id,payload_json) VALUES (?,'reused','{}')`)
+    .run(rowid!);
+  emitIdentityEvent(f.source, "threads");
+  emitIdentityEvent(f.source, "threads", "reused");
+  f.finish();
+  expect(Number.isNaN(identityVersion(out, name))).toBe(true);
+  expect(identityVersion(out, name, "reused")).toBeGreaterThan(before);
+  expectIdentityCoverage(out);
+});
+
+test.each(identityVersionTables)(
+  "identity versions: %s primary key updates remove OLD and NEW stale keys",
+  (name, primary) => {
+    const f = identityVersionFixture();
+    f.finish();
+    const out = f.connect();
+    const before = identityVersion(out, name);
+    writeReplica(f, (db) => {
+      db.prepare(
+        "INSERT INTO ardud_readonly_identity_versions(table_name,row_id) VALUES (?,'renamed')",
+      ).run(name);
+      db.exec(`UPDATE ${name} SET ${primary}='renamed' WHERE ${primary}='version-main'`);
+    });
+    expect(Number.isNaN(identityVersion(out, name))).toBe(true);
+    expect(identityVersion(out, name, "renamed")).toBeGreaterThan(before);
+    expectIdentityCoverage(out);
+  },
+);
+
+test("identity versions: auxiliary replacement updates and deletes converge", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const name = identityVersionTables[4][0];
+  const before = identityVersion(out, name);
+  f.source.exec(
+    `UPDATE ${name} SET payload_json='{"new":true}' WHERE native_session_id='version-main'; DELETE FROM ${name} WHERE native_session_id='version-peer'`,
+  );
+  f.finish();
+  expect(identityVersion(out, name)).toBeGreaterThan(before);
+  expect(Number.isNaN(identityVersion(out, name, "version-peer"))).toBe(true);
+  const updated = identityVersion(out, name);
+  f.source.exec(
+    `INSERT OR REPLACE INTO ${name}(native_session_id,thread_id,imported_at) VALUES ('version-main','replacement-owner','2026-11-14T00:00:00Z')`,
+  );
+  f.finish();
+  expect(identityVersion(out, name)).toBeGreaterThan(updated);
+  expectIdentityCoverage(out);
+});
+
+const importReplacements = [
+  {
+    kind: "new session takes an existing owner",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('replacement','version-main-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["replacement", "version-main-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["replacement"],
+    removed: ["version-main"],
+  },
+  {
+    kind: "existing session takes another session's owner",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-main','version-peer-owner','2026-11-14T00:00:00Z')",
+    expected: [["version-main", "version-peer-owner"]],
+    changed: ["version-main"],
+    removed: ["version-peer"],
+  },
+  {
+    kind: "existing session changes to an unused owner",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-main','unused-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["version-main", "unused-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["version-main"],
+    removed: [],
+  },
+  {
+    kind: "existing session keeps its owner and changes payload",
+    mutation: `INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at,payload_json) VALUES ('version-main','version-main-owner','2026-11-14T00:00:00Z','{"replacement":true}')`,
+    expected: [
+      ["version-main", "version-main-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["version-main"],
+    removed: [],
+  },
+  {
+    kind: "surviving sessions swap owners",
+    mutation:
+      "INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-main','version-peer-owner','2026-11-14T00:00:00Z'); INSERT OR REPLACE INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('version-peer','version-main-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["version-main", "version-peer-owner"],
+      ["version-peer", "version-main-owner"],
+    ],
+    changed: ["version-main", "version-peer"],
+    removed: [],
+  },
+  {
+    kind: "new session takes an owner released by a surviving session",
+    mutation:
+      "UPDATE ardud_opencode_import SET thread_id='unused-owner' WHERE native_session_id='version-main'; INSERT INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('replacement','version-main-owner','2026-11-14T00:00:00Z')",
+    expected: [
+      ["replacement", "version-main-owner"],
+      ["version-main", "unused-owner"],
+      ["version-peer", "version-peer-owner"],
+    ],
+    changed: ["replacement", "version-main"],
+    removed: [],
+  },
+];
+
+test.each(importReplacements)(
+  "identity versions: import replacement when $kind is atomic",
+  ({ mutation, expected, changed, removed }) => {
+    const f = identityVersionFixture(1);
+    const name = identityVersionTables[4][0];
+    f.source.exec(
+      "INSERT INTO ardud_opencode_import(native_session_id,thread_id,imported_at) VALUES ('stable','stable-owner','2026-11-14T00:00:00Z')",
+    );
+    f.finish();
+    const out = f.connect();
+    const pinned = f.connect();
+    pinned.exec("BEGIN");
+    const before = identityCensus(pinned);
+    const sequence = identitySequenceValue(pinned);
+    f.source.exec(mutation);
+    let steps = 0;
+    while (f.exporter.step()) {
+      expectIdentityCoverage(out);
+      expect(identityCensus(out)).toEqual(before);
+      if (++steps > 500) throw new Error("import replacement did not converge");
+    }
+    expect(steps).toBeGreaterThan(1);
+    expect(identityCensus(pinned)).toEqual(before);
+    pinned.exec("ROLLBACK");
+    expect(
+      out
+        .prepare(
+          "SELECT native_session_id,thread_id FROM ardud_opencode_import ORDER BY native_session_id",
+        )
+        .all(),
+    ).toEqual(
+      [...expected, ["stable", "stable-owner"]]
+        .sort(([a], [b]) => a!.localeCompare(b!))
+        .map(([native_session_id, thread_id]) => ({ native_session_id, thread_id })),
+    );
+    expectIdentityCoverage(out);
+    for (const id of changed) expect(identityVersion(out, name, id)).toBeGreaterThan(sequence);
+    for (const id of removed) expect(Number.isNaN(identityVersion(out, name, id))).toBe(true);
+    expect(
+      identityCensus(out).filter(
+        (r) =>
+          r.table_name !== name ||
+          (!changed.includes(String(r.row_id)) && !removed.includes(String(r.row_id))),
+      ),
+    ).toEqual(
+      before.filter(
+        (r) =>
+          r.table_name !== name ||
+          (!changed.includes(String(r.row_id)) && !removed.includes(String(r.row_id))),
+      ),
+    );
+    const committed = identityCensus(out);
+    f.restart();
+    f.finish();
+    expect(identityCensus(out)).toEqual(committed);
+  },
+);
+
+test("identity versions: a throwing exporter publication rolls back row versions and sequence together", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const before = identityCensus(out);
+  const sequence = identitySequenceValue(out);
+  const imports = out
+    .prepare("SELECT * FROM ardud_opencode_import ORDER BY native_session_id")
+    .all();
+  writeReplica(f, (db) =>
+    db.exec(
+      "CREATE TRIGGER fail_import BEFORE INSERT ON ardud_opencode_import WHEN NEW.native_session_id='version-main' BEGIN SELECT RAISE(ABORT,'injected publication failure'); END",
+    ),
+  );
+  f.source.exec(
+    `UPDATE orchestration_v2_projection_threads SET payload_json='{"pending":true}' WHERE thread_id='version-main'; UPDATE ardud_opencode_import SET thread_id='fail' WHERE native_session_id='version-main'`,
+  );
+  emitIdentityEvent(f.source, "threads");
+  expect(() => f.finish()).toThrow("injected publication failure");
+  expect(identityCensus(out)).toEqual(before);
+  expect(identitySequenceValue(out)).toBe(sequence);
+  expect(
+    out.prepare("SELECT * FROM ardud_opencode_import ORDER BY native_session_id").all(),
+  ).toEqual(imports);
+  expectIdentityCoverage(out);
+  writeReplica(f, (db) => db.exec("DROP TRIGGER fail_import"));
+  f.restart();
+  f.finish();
+  expect(identityVersion(out, identityVersionTables[0][0])).toBeGreaterThan(
+    Number(
+      before.find(
+        (r) => r.table_name === identityVersionTables[0][0] && r.row_id === "version-main",
+      )?.version,
+    ),
+  );
+});
+
+test("identity versions: fast-lane companion copies and suspended cycle replay retain fresh exact versions", () => {
+  const f = identityVersionFixture(1);
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  f.finish();
+  const out = f.connect();
+  const before = identityVersion(out, identityVersionTables[2][0]);
+  f.source.exec(
+    `UPDATE orchestration_v2_projection_provider_turns SET thread_id='pending' WHERE provider_turn_id='version-main'`,
+  );
+  emitIdentityEvent(f.source, "turns");
+  f.exporter.takeMetrics();
+  let caughtUp = false;
+  for (let i = 0; i < 40; i++) {
+    f.exporter.step();
+    if (f.exporter.takeMetrics().phaseSteps.eventCatchup) {
+      caughtUp = true;
+      break;
+    }
+  }
+  expect(caughtUp).toBe(true);
+  const stamp = metaValue(out, "updated_at");
+  for (const id of ["ahead1", "ahead2", "child"])
+    f.source
+      .prepare(
+        "INSERT INTO orchestration_v2_projection_threads(thread_id,payload_json) VALUES (?,'{}')",
+      )
+      .run(id);
+  f.source.exec(
+    "INSERT INTO orchestration_v2_projection_provider_threads(provider_thread_id,payload_json,thread_id) VALUES ('companion','{}','child')",
+  );
+  now += 1_000;
+  expect(f.exporter.pollIdentities()).toBe(true);
+  expect(identityVersion(out, identityVersionTables[0][0], "child")).toBeGreaterThan(0);
+  expect(identityVersion(out, identityVersionTables[1][0], "companion")).toBeGreaterThan(0);
+  const companionVersion = identityVersion(out, identityVersionTables[1][0], "companion");
+  expect(metaValue(out, "updated_at")).toBe(stamp);
+  f.finish();
+  expect(identityVersion(out, identityVersionTables[2][0])).toBeGreaterThan(before);
+  expect(identityVersion(out, identityVersionTables[1][0], "companion")).toBe(companionVersion);
+  expectIdentityCoverage(out);
+});
+
+test.each(["full", "additive"])(
+  "identity versions: %s rebuild publishes complete coverage and retains sequence history",
+  (kind) => {
+    const f = identityVersionFixture();
+    f.finish();
+    const out = f.connect();
+    const before = identityCensus(out);
+    const sequence = identitySequenceValue(out);
+    out.exec("BEGIN");
+    expectIdentityCoverage(out);
+    f.source.exec(
+      `ALTER TABLE orchestration_v2_projection_threads ADD COLUMN extra TEXT ${kind === "full" ? "CHECK(extra IS NULL)" : "DEFAULT 'backfill'"}`,
+    );
+    f.restart();
+    let steps = 0;
+    while (f.exporter.step()) {
+      expectIdentityCoverage(out);
+      expect(identityCensus(out)).toEqual(before);
+      if (++steps > 500) throw new Error("identity rebuild did not converge");
+    }
+    expect(identityCensus(out)).toEqual(before);
+    out.exec("ROLLBACK");
+    expect(metaValue(out, "ready")).toBe("1");
+    expectIdentityCoverage(out);
+    expect(identitySequenceValue(out)).toBeGreaterThanOrEqual(sequence);
+    if (kind === "full")
+      expect(identityVersion(out, identityVersionTables[0][0])).toBeGreaterThan(sequence);
+    else {
+      expect(identityVersion(out, identityVersionTables[1][0])).toBe(
+        identityVersionFrom(before, identityVersionTables[1][0]),
+      );
+      const version = identityVersion(out, identityVersionTables[0][0]);
+      f.source.exec(
+        "UPDATE orchestration_v2_projection_threads SET extra='edited' WHERE thread_id='version-main'",
+      );
+      emitIdentityEvent(f.source, "threads");
+      f.finish();
+      expect(identityVersion(out, identityVersionTables[0][0])).toBeGreaterThan(version);
+    }
+  },
+);
+const identityVersionFrom = (census: ReturnType<typeof identityCensus>, name: string) =>
+  Number(census.find((r) => r.table_name === name && r.row_id === "version-main")?.version);
+
+test.each(["reopen", "midrun"])(
+  "identity versions: covered auxiliary table recreation on %s replaces its census atomically",
+  (mode) => {
+    const f = identityVersionFixture();
+    f.finish();
+    const out = f.connect();
+    const before = identityCensus(out);
+    const sequence = identitySequenceValue(out);
+    f.source.exec(
+      "ALTER TABLE ardud_opencode_import ADD COLUMN extra TEXT; DELETE FROM ardud_opencode_import WHERE native_session_id='version-main'",
+    );
+    if (mode === "reopen") f.restart();
+    let steps = 0;
+    while (f.exporter.step()) {
+      expectIdentityCoverage(out);
+      expect(identityCensus(out)).toEqual(before);
+      if (++steps > 500) throw new Error("identity auxiliary refresh did not converge");
+    }
+    expectIdentityCoverage(out);
+    expect(identityVersion(out, identityVersionTables[4][0], "version-peer")).toBeGreaterThan(
+      sequence,
+    );
+    expect(Number.isNaN(identityVersion(out, identityVersionTables[4][0]))).toBe(true);
+    expect(identityVersion(out, identityVersionTables[0][0])).toBe(
+      identityVersionFrom(before, identityVersionTables[0][0]),
+    );
+  },
+);
+
+test("identity versions: reopen and no-op refresh keep versions and the sequence unchanged", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  const out = f.connect();
+  const before = identityCensus(out);
+  const sequence = identitySequenceValue(out);
+  for (let i = 0; i < 3; i++) {
+    f.restart();
+    expect(identityCensus(out)).toEqual(before);
+    f.finish();
+    expectIdentityCoverage(out);
+    expect(identityCensus(out)).toEqual(before);
+    expect(identitySequenceValue(out)).toBe(sequence);
+  }
+});
+
+test("identity versions: reopen repairs a lost trigger and stale census without certifying partial coverage", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  const before = identityCensus(out);
+  writeReplica(f, (db) =>
+    db.exec(
+      "DROP TRIGGER ardud_identity_threads_delete; DELETE FROM orchestration_v2_projection_threads WHERE thread_id='version-main'",
+    ),
+  );
+  out.exec("BEGIN");
+  expect(
+    out.prepare("SELECT name FROM sqlite_schema WHERE name='ardud_identity_threads_delete'").get(),
+  ).toBeUndefined();
+  f.restart();
+  expect(
+    out.prepare("SELECT name FROM sqlite_schema WHERE name='ardud_identity_threads_delete'").get(),
+  ).toBeUndefined();
+  out.exec("ROLLBACK");
+  expectIdentityCoverage(out);
+  expect(Number.isNaN(identityVersion(out, identityVersionTables[0][0]))).toBe(true);
+  expect(identityVersion(out, identityVersionTables[1][0])).toBe(
+    identityVersionFrom(before, identityVersionTables[1][0]),
+  );
+});
+
+test("identity versions: scalar census over thousands of rows uses the covering unique index", () => {
+  const f = identityVersionFixture(500);
+  f.source.exec(
+    "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4000) INSERT INTO orchestration_v2_projection_threads(thread_id,payload_json) SELECT 'bulk-'||x,json_object('body',printf('%2000s','payload')) FROM n",
+  );
+  f.finish();
+  const out = f.connect();
+  expectIdentityCoverage(out);
+  const plan = out
+    .prepare(
+      "EXPLAIN QUERY PLAN SELECT row_id,version FROM ardud_readonly_identity_versions WHERE table_name=? ORDER BY row_id",
+    )
+    .all(identityVersionTables[0][0])
+    .map((row) => String(row.detail))
+    .join(" ");
+  expect(plan).toContain("USING COVERING INDEX");
+  expect(plan).not.toMatch(/SCAN |TEMP B-TREE/);
+  expect(
+    out
+      .prepare(
+        "SELECT row_id,version FROM ardud_readonly_identity_versions WHERE table_name=? ORDER BY row_id",
+      )
+      .all(identityVersionTables[0][0]),
+  ).toHaveLength(4005);
+});
+
+test("identity versions: reset sweep pruning removes versions for vanished source keys", () => {
+  const f = identityVersionFixture(1);
+  f.finish();
+  const out = f.connect();
+  const sequence = identitySequenceValue(out);
+  for (const [name, primary] of identityVersionTables)
+    f.source.exec(`DELETE FROM ${name} WHERE ${primary}='version-main'`);
+  f.source.exec("INSERT INTO orchestration_events VALUES (4,'thread.deleted','version-main','{}')");
+  f.finish();
+  expectIdentityCoverage(out);
+  expect(identityCensus(out).some((row) => row.row_id === "version-main")).toBe(false);
+  expect(identitySequenceValue(out)).toBeGreaterThanOrEqual(sequence);
+});
+
+test("identity versions: table loss reinstalls a complete census with a new schema epoch", () => {
+  const f = identityVersionFixture();
+  f.finish();
+  f.exporter.close();
+  const out = f.connect();
+  const epoch = out.prepare("PRAGMA schema_version").get()?.schema_version;
+  writeReplica(f, (db) => db.exec("DROP TABLE ardud_readonly_identity_versions"));
+  f.restart();
+  expectIdentityCoverage(out);
+  expect(out.prepare("PRAGMA schema_version").get()?.schema_version).not.toBe(epoch);
 });

@@ -8,20 +8,8 @@ export const elapsed = (at: string, since: string) => {
   return Number.isFinite(value) ? Math.max(0, value) : 0;
 };
 
-export function reasonClass(text: string, category?: string): string {
-  if (/variant unavailable/i.test(text)) return "variant_unavailable";
-  if (/provider blocked|content.filter|flagged.*cybersecurity/i.test(text))
-    return "provider_blocked";
-  if (/reviewer.*verdict/i.test(text)) return "no_verdict";
-  if (/interrupt|stopped|cancel/i.test(text)) return "interrupted";
-  if (/context|prompt is too long|too many tokens/i.test(text)) return "context_exhausted";
-  if (/quota|usage.limit|rate.limit|overloaded/i.test(text)) return "provider_capacity";
-  if (/auth|token.*expired/i.test(text)) return "authentication";
-  if (/model.*unavailable|model.*refused|model.*version|no.route/i.test(text))
-    return "model_unavailable";
-  if (/timeout|timed out/i.test(text)) return "timeout";
-  if (/thread start failed/i.test(text)) return "thread_start";
-  if (/run failed/i.test(text)) return "run_failed";
+export function reasonClass(text: string, category?: string, source?: KanbanActor["_tag"]): string {
+  if (source !== undefined && source !== "system") return "manual_flag";
   switch (category) {
     case "content_filter":
       return "provider_blocked";
@@ -36,9 +24,26 @@ export function reasonClass(text: string, category?: string): string {
       return "provider_capacity";
     case "config":
       return "configuration";
-    default:
-      return "other";
   }
+  if (text === "Stale queued runs on the thread") return "stale_queued_runs";
+  if (text === "Run went silent twice") return "run_silent";
+  if (text === "No project set for this card") return "missing_project";
+  if (text.startsWith("Thread model differs from card model:")) return "thread_model_differs";
+  if (text.startsWith("Review verdict refused:")) return "verdict_refused";
+  if (/variant unavailable/i.test(text)) return "variant_unavailable";
+  if (/provider blocked|content.filter|flagged.*cybersecurity/i.test(text))
+    return "provider_blocked";
+  if (/reviewer.*verdict/i.test(text)) return "no_verdict";
+  if (/interrupt|stopped|cancel/i.test(text)) return "interrupted";
+  if (/context|prompt is too long|too many tokens/i.test(text)) return "context_exhausted";
+  if (/quota|usage.limit|rate.limit|overloaded/i.test(text)) return "provider_capacity";
+  if (/auth|token.*expired/i.test(text)) return "authentication";
+  if (/model.*unavailable|model.*refused|model.*version|no.route/i.test(text))
+    return "model_unavailable";
+  if (/timeout|timed out/i.test(text)) return "timeout";
+  if (/thread start failed/i.test(text)) return "thread_start";
+  if (/run failed/i.test(text)) return "run_failed";
+  return "other";
 }
 
 // Compare committed card snapshots so every entry point and reverse transition is covered.
@@ -67,15 +72,20 @@ export function cardEvents(
     });
   if (
     before.stalled?.at !== after.stalled?.at ||
-    before.stalled?.reason !== after.stalled?.reason
+    before.stalled?.reason !== after.stalled?.reason ||
+    before.stalled?.by._tag !== after.stalled?.by._tag
   ) {
     if (before.stalled)
       events.push({
         ...common,
         kind: "kanban.stall",
+        durationMs: elapsed(after.updatedAt, before.stalled.at),
         props: {
           action: "clear",
-          reasonClass: reasonClass(before.stalled.reason),
+          number: after.number,
+          actor: before.stalled.by._tag,
+          from: before.stage,
+          reasonClass: reasonClass(before.stalled.reason, undefined, before.stalled.by._tag),
           ageMs: elapsed(after.updatedAt, before.stalled.at),
         },
       });
@@ -83,7 +93,14 @@ export function cardEvents(
       events.push({
         ...common,
         kind: "kanban.stall",
-        props: { action: "set", reasonClass: reasonClass(after.stalled.reason), ageMs: 0 },
+        props: {
+          action: "set",
+          number: after.number,
+          actor: after.stalled.by._tag,
+          from: after.stage,
+          reasonClass: reasonClass(after.stalled.reason, undefined, after.stalled.by._tag),
+          ageMs: 0,
+        },
       });
   }
   if (
@@ -110,6 +127,12 @@ export function cardEvents(
       kind: label(ask.kind ?? "question"),
       blocking: ask.blocking,
       createdAt: ask.at,
+      ...(ask.timing?.openAsksAtCreation === undefined
+        ? {}
+        : { openAsksAtCreation: ask.timing.openAsksAtCreation }),
+      ...(ask.timing?.openNoticesAtCreation === undefined
+        ? {}
+        : { openNoticesAtCreation: ask.timing.openNoticesAtCreation }),
     };
     if (ask.closedAt === null && (!old || old.closedAt !== null))
       events.push({ ...common, kind: "kanban.ask_opened", props });

@@ -30,6 +30,39 @@ class Logs(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for path in self.root.glob('*.ndjson') for line in path.read_text().splitlines()]
 
+    def test_missing_stderr_metadata_survives_serialization(self):
+        props = dict(stream='stderr', backend='boat', reason='history_empty')
+        toollog.emit('run', 'run.log_stream_missing', kind='error', ok=False, ids={'run': 'run-fixture'}, props=props)
+        self.assertEqual(self.rows()[0]['props'], props)
+
+    def test_command_transport_fields_survive_serialization(self):
+        for mode in ('argv', 'file'):
+            for name in ('run.start', 'run.command'):
+                toollog.emit('run', name, props={'cmd_bytes': 140111, 'cmd_via': mode, 'step_count': 39})
+        self.assertEqual([row['props'] for row in self.rows()],
+                         [{'cmd_bytes': 140111, 'cmd_via': mode, 'step_count': 39}
+                          for mode in ('argv', 'file') for name in ('run.start', 'run.command')])
+
+    def test_disk_attempt_and_space_metadata_survive_the_logger_filter(self):
+        props = dict(tmp_free_bytes=123, tmp_size_bytes=456, tmp_fstype='tmpfs',
+                     workspace_free_bytes=789, workspace_size_bytes=1024, workspace_fstype='zfs',
+                     command_exit_code=2, wrapper_exit_code=2, disk_attempt=2,
+                     infra_failure='enospc', infra_reason='disk_exhausted')
+        toollog.emit('run', 'run.disk_space', props={**props, 'disk_space': {'path': '/private/secret'}})
+        self.assertEqual(self.rows()[0]['props'], props)
+
+    def test_toolchain_crash_metadata_survives_filter(self):
+        props = dict(infra_failure='native_crash', infra_reason='toolchain_unpack_crash', wrapper_exit_code=90)
+        toollog.emit('run', 'run.disk_space', ids={'box': 'bx_fixture'}, props=props)
+        self.assertEqual(self.rows()[0]['props'], props)
+        self.assertEqual(self.rows()[0]['ids'], {'box': 'bx_fixture'})
+
+    def test_queue_resume_fields_survive_serialization_including_unknown_places(self):
+        for place in (1, None):
+            props = dict(outageS=15, waitedMs=31000, placeBefore=place, placeAfter=place, deadlineKept=True)
+            toollog.emit('pool', 'run.queue_resumed', ids={'run': 'run-A'}, props=props)
+            self.assertEqual(self.rows()[-1]['props'], props)
+
     def test_format_private_modes_and_only_allowed_metadata(self):
         secret = 'password=secret-1234567890123456'
         toollog.emit('run', 'run.request', ok=True, duration_ms=1.2345,
@@ -102,8 +135,47 @@ class Logs(unittest.TestCase):
         self.assertEqual(len(result['topErrors']),20)
         self.assertEqual(result['topErrors'][0]['sampleIds'], {'run':'run-fixture'})
         self.assertEqual(result['malformedLines'],1)
+        self.assertFalse(result['sampled'])
         self.assertEqual(next(self.root.glob('rollup-*')).stat().st_mode & 0o777,0o600)
         with self.assertRaises(ValueError): toollog.rollup('../2026-01-01')
+
+    def test_rollup_weights_sampled_counts_and_rates_but_not_percentiles(self):
+        for ms, sampled, failed in ((1, True, False), (2, True, False), (3, True, True),
+                                    (4, False, False), (5, False, True)):
+            toollog.emit('gate', 'gate.decision', kind='error' if failed else 'perf',
+                         ok=not failed, duration_ms=ms, props={'sample': 20} if sampled else {},
+                         tag='gate_failed' if failed else None)
+        path = next(self.root.glob('*.ndjson'))
+        result = toollog.rollup(path.stem)
+        self.assertEqual(result['total'], 62)
+        self.assertEqual(result['countsByName'], {'gate.decision': 62})
+        self.assertEqual(result['countsByKind'], {'perf': 41, 'error': 21})
+        self.assertTrue(result['sampled'])
+        self.assertAlmostEqual(result['okRate'], 41/62)
+        self.assertAlmostEqual(result['errorRate'], 21/62)
+        self.assertEqual(result['topErrors'][0]['count'], 21)
+        self.assertEqual(result['durationMs']['gate.decision'], {'p50': 3, 'p95': 5, 'max': 5})
+        self.assertEqual(result['malformedLines'], 0)
+
+    def test_rollup_defaults_invalid_sample_weights_to_one(self):
+        weights = (None, True, False, 0, -20, 2.5, '20', [], {})
+        self.root.mkdir()
+        path = self.root / '2026-11-14.ndjson'
+        path.write_text(''.join(json.dumps({'tool': 'offbox', 'name': 'gate.decision', 'kind': 'perf',
+                                           'ok': True, 'props': {'sample': weight}}) + '\n' for weight in weights))
+        result = toollog.rollup(path.stem)
+        self.assertEqual(result['total'], len(weights))
+        self.assertFalse(result['sampled'])
+        self.assertEqual(result['okRate'], 1)
+        self.assertEqual(result['malformedLines'], 0)
+
+    def test_rollup_weights_only_explicit_ok_values_in_ok_rate(self):
+        toollog.emit('gate', 'gate.decision', kind='perf', props={'sample': 20})
+        toollog.emit('gate', 'gate.decision', kind='error', ok=False, tag='gate_failed')
+        result = toollog.rollup(next(self.root.glob('*.ndjson')).stem)
+        self.assertEqual(result['total'], 21)
+        self.assertEqual(result['okRate'], 0)
+        self.assertAlmostEqual(result['errorRate'], 1/21)
 
     def test_rollup_cli_and_first_recurring_tick_after_0005(self):
         toollog.emit('run','run.request',ok=True)
@@ -123,6 +195,99 @@ class Logs(unittest.TestCase):
             toollog.rollup_previous()
             self.assertEqual(roll.call_count,1)
             self.assertEqual(roll.call_args.args,('2026-11-12',))
+
+    def clock(self, value):
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return value
+        return patch.object(toollog, 'datetime', Clock)
+
+    def test_rollup_marks_completed_days_only_after_midnight_grace(self):
+        cases = [('2026-11-12', 0, 2, False), ('2026-11-12', 0, 5, True),
+                 ('2026-11-12', 0, 10, True), ('2026-11-13', 0, 10, False),
+                 ('2026-11-14', 12, 0, False), ('2026-11-12', 20, 0, True)]
+        for day, hour, minute, complete in cases:
+            with self.subTest(day=day, hour=hour, minute=minute):
+                now = datetime(2026, 11, 13, hour, minute, tzinfo=timezone.utc)
+                with self.clock(now):
+                    result = toollog.rollup(day)
+                self.assertIs(result['complete'], complete)
+                self.assertEqual(result['generatedAt'], now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+                self.assertEqual(json.loads((self.root / ('rollup-' + day + '.json')).read_text()), result)
+
+    def test_previous_repairs_partial_old_and_corrupt_rollups_once(self):
+        values = ['missing', '{broken', 'null', '[]', '{}', '{"complete": false}', '{"complete": 1}']
+        self.root.mkdir()
+        path = self.root / 'rollup-2026-11-12.json'
+        row = dict(tool='offbox', name='gate.decision', kind='perf', ok=True, props={'sample': 20})
+        (self.root / '2026-11-12.ndjson').write_text(json.dumps(row) + '\n')
+        for value in values:
+            with self.subTest(value=value), self.clock(datetime(2026, 11, 13, 0, 10, tzinfo=timezone.utc)):
+                path.unlink(missing_ok=True)
+                if value != 'missing':
+                    path.write_text(value)
+                toollog.rollup_previous()
+                result = json.loads(path.read_text())
+                self.assertIs(result['complete'], True)
+                self.assertEqual(result['total'], 20)
+                self.assertTrue(result['sampled'])
+                before = (path.stat().st_mtime_ns, path.read_bytes())
+                with patch.object(toollog, 'rollup', wraps=toollog.rollup) as roll:
+                    toollog.rollup_previous()
+                    roll.assert_not_called()
+                self.assertEqual((path.stat().st_mtime_ns, path.read_bytes()), before)
+
+    def test_today_refreshes_missing_then_only_when_an_hour_old(self):
+        now = datetime(2026, 11, 13, 20, 0, tzinfo=timezone.utc)
+        path = self.root / 'rollup-2026-11-13.json'
+        with self.clock(now), patch.object(toollog, 'rollup', wraps=toollog.rollup) as roll:
+            toollog.rollup_today()
+            self.assertEqual(roll.call_count, 1)
+            self.assertIs(json.loads(path.read_text())['complete'], False)
+            os.utime(path, (now.timestamp() - 3599,) * 2)
+            before = (path.stat().st_mtime_ns, path.read_bytes())
+            toollog.rollup_today()
+            self.assertEqual(roll.call_count, 1)
+            self.assertEqual((path.stat().st_mtime_ns, path.read_bytes()), before)
+            os.utime(path, (now.timestamp() - 3600,) * 2)
+            toollog.rollup_today()
+            self.assertEqual(roll.call_count, 2)
+            os.utime(path, (now.timestamp() - 60,) * 2)
+            toollog.rollup_today(max_age_s=60)
+            self.assertEqual(roll.call_count, 3)
+
+    def test_recurring_rollups_fail_open(self):
+        with patch.object(toollog, 'directory', side_effect=OSError('unreadable')):
+            toollog.rollup_previous()
+            toollog.rollup_today()
+        with patch.object(toollog, 'rollup', side_effect=OSError('unwritable')):
+            with self.clock(datetime(2026, 11, 13, 20, tzinfo=timezone.utc)):
+                toollog.rollup_previous()
+                toollog.rollup_today()
+
+    def test_mac_monitor_refreshes_rollups_on_ticks_and_dry_run_leaves_them_untouched(self):
+        import monitor
+        con = monitor.connect(':memory:')
+        self.addCleanup(con.close)
+        now = datetime(2026, 11, 13, 20, tzinfo=timezone.utc)
+        pressure = dict(active=False, load1=0, swap_gb=0, free_pct=90)
+        with self.clock(now), contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(monitor, 'pressure', return_value=pressure))
+            stack.enter_context(patch.object(monitor, 'sample_processes', return_value=({}, {}, 0)))
+            stack.enter_context(patch.object(monitor, 'log'))
+            monitor.tick(con, dry_run=True)
+            self.assertFalse(self.root.exists())
+            monitor.tick(con)
+            previous = self.root / 'rollup-2026-11-12.json'
+            today = self.root / 'rollup-2026-11-13.json'
+            self.assertIs(json.loads(previous.read_text())['complete'], True)
+            self.assertIs(json.loads(today.read_text())['complete'], False)
+            row = dict(tool='offbox', name='gate.decision', kind='perf', props={'sample': 20})
+            (self.root / '2026-11-13.ndjson').write_text(json.dumps(row) + '\n')
+            os.utime(today, (now.timestamp() - 3600,) * 2)
+            monitor.tick(con)
+            self.assertEqual(json.loads(today.read_text())['total'], 20)
 
 
 class Instrumentation(Isolated):
@@ -173,13 +338,18 @@ class Instrumentation(Isolated):
         self.assertEqual(self.rows('run.request')[0]['props']['envCount'],1)
 
     def test_sync_pull_and_upload_outcomes(self):
-        stats={'sent':123,'files':4}
-        with patch.object(ssh_sync,'_push_files',return_value=stats), patch.object(ssh_sync,'tracked_secret_matches',return_value=['.env']):
-            ssh_sync.push('bx_fixture',Path('/checkout/repo'),'work',run_id='run-fixture')
+        stats={'sent':123,'files':4,'tracked_total':10,'tracked_heavy':3,'tracked_heavy_sent':2,
+               'tracked_node_modules_sent':1,'tracked_secret_sent':1,
+               'tracked_left_out':{'secret':1},'tracked_left_out_first':['.env']}
+        with patch.object(ssh_sync,'_push_files',return_value=stats):
+            ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work',run_id='run-fixture')
         with patch.object(ssh_sync,'_push_files',side_effect=common.OffboxError('private error')):
-            with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path('/checkout/repo'),'work')
+            with self.assertRaises(common.OffboxError): ssh_sync.push('bx_fixture',Path(self.me['repo_root']),'work')
         self.outcomes('run.sync')
-        self.assertEqual(self.rows('run.sync')[0]['props'],{'bytes':123,'files':4,'skipped':1})
+        self.assertEqual(self.rows('run.sync')[0]['props'],{'bytes':123,'files':4,'skipped':1,
+                         'tracked_total':10,'tracked_heavy':3,'tracked_heavy_sent':2,
+                         'tracked_node_modules_sent':1,'tracked_secret_sent':1,
+                         'tracked_left_out':{'secret':1},'tracked_left_out_first':['.env']})
         for rc in (0,23):
             with patch.object(ssh_sync,'ssh_base',return_value=['ssh']),patch.object(ssh_sync.subprocess,'run',return_value=subprocess.CompletedProcess([],rc,'Total bytes received: 40\nNumber of regular files transferred: 2','failure')):
                 ssh_sync.pull('bx_fixture','work','.','artifact',Path(self.tmp.name))

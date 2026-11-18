@@ -1,6 +1,7 @@
 import * as Brand from "effect/Brand";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -30,6 +31,7 @@ import {
 import { waitForHttpReady as waitForHttpReadyShared } from "@t3tools/shared/httpReadiness";
 
 import * as DesktopObservability from "../app/DesktopObservability.ts";
+import * as DesktopState from "../app/DesktopState.ts";
 import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublisher.ts";
 import * as DesktopBrowserHost from "../preview/DesktopBrowserHost.ts";
 import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
@@ -47,7 +49,7 @@ const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT = Duration.seconds(1);
 const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(10);
 const DEFAULT_BACKEND_OUTPUT_DRAIN_TIMEOUT = Duration.seconds(5);
 const BACKEND_READINESS_PATH = "/.well-known/t3/environment";
-const { logWarning: logBackendProcessWarning } =
+const { logWarning: logBackendProcessWarning, logInfo: logBackendProcessInfo } =
   DesktopObservability.makeComponentLogger("desktop-backend-process");
 
 type BackendProcessLayerServices = ChildProcessSpawner.ChildProcessSpawner | HttpClient.HttpClient;
@@ -200,7 +202,9 @@ interface RunBackendProcessOptions extends DesktopBackendStartConfig {
   readonly readinessTimeout?: Duration.Duration;
   readonly outputDrainTimeout?: Duration.Duration;
   readonly onStarted?: (pid: number) => Effect.Effect<void>;
-  readonly onExitObserved?: () => Effect.Effect<void>;
+  readonly onExitObserved?: (
+    exit: Exit.Exit<BackendProcessExit, BackendProcessError>,
+  ) => Effect.Effect<void>;
   readonly onReady?: () => Effect.Effect<void>;
   readonly onReadinessFailure?: (
     error: BackendReadinessTimeoutError,
@@ -573,6 +577,18 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
       readinessTimedOut && LogLevel.Order(minimumLogLevel, "Error") < 0 ? "Error" : minimumLogLevel;
     return yield* probe.pipe(
       Effect.provideService(References.MinimumLogLevel, probeLogLevel),
+      Effect.tap(() =>
+        readinessTimedOut
+          ? Clock.monotonicTimeNanos.pipe(
+              Effect.flatMap((now) =>
+                logBackendProcessInfo("backend readiness recovered after timeout", {
+                  pid: Number(handle.pid),
+                  elapsedMs: Number(now - startedAt) / 1_000_000,
+                }),
+              ),
+            )
+          : Effect.void,
+      ),
       Effect.flatMap(() => options.onReady?.() ?? Effect.void),
       Effect.as(true),
       Effect.catchTags({
@@ -625,7 +641,7 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
     }),
     Effect.exit,
   );
-  yield* options.onExitObserved?.() ?? Effect.void;
+  yield* options.onExitObserved?.(exit) ?? Effect.void;
   yield* Effect.forEach(outputFibers, Fiber.await, {
     concurrency: "unbounded",
     discard: true,
@@ -657,6 +673,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const backendOutputLogFactory = yield* DesktopObservability.DesktopBackendOutputLogFactory;
   const backendOutputLog = yield* backendOutputLogFactory.forInstance(spec.id);
+  const desktopState = yield* Effect.serviceOption(DesktopState.DesktopState);
   const desktopTelemetryPublisher = yield* DesktopTelemetryPublisher.DesktopTelemetryPublisher;
   const desktopBrowserHost = yield* DesktopBrowserHost.DesktopBrowserHost;
   const wslEnvironment = yield* DesktopWslEnvironment.DesktopWslEnvironment;
@@ -665,8 +682,11 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
   const state = yield* Ref.make(initialState);
   const mutex = yield* Semaphore.make(1);
 
-  const { logWarning: logInstanceWarning, logError: logInstanceError } =
-    DesktopObservability.makeComponentLogger(`desktop-backend-instance:${spec.id}`);
+  const {
+    logInfo: logInstanceInfo,
+    logWarning: logInstanceWarning,
+    logError: logInstanceError,
+  } = DesktopObservability.makeComponentLogger(`desktop-backend-instance:${spec.id}`);
 
   const updateActiveRun = (runId: number, f: (run: ActiveBackendRun) => ActiveBackendRun) =>
     Ref.update(state, withActiveRun(runId, f));
@@ -823,6 +843,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           },
         ]);
 
+        let signalQuitContext: DesktopObservability.DesktopLogAnnotations | undefined;
         const finalizeRun = Effect.fn("desktop.backendInstance.finalizeRun")(function* (
           reason: string,
           exitCode?: number,
@@ -884,8 +905,12 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
                 yield* desktopTelemetryPublisher.removeControlSource(spec.id);
                 if (Option.isSome(pid)) {
                   if (exitObserved && !stopRequested) {
+                    yield* Effect.annotateCurrentSpan(signalQuitContext ?? {});
                     yield* backendOutputLog.persistFailure({
                       details: `pid=${pid.value} ${reason}`,
+                      ...(signalQuitContext === undefined
+                        ? {}
+                        : { annotations: signalQuitContext }),
                     });
                   } else {
                     yield* backendOutputLog.discardSession;
@@ -924,11 +949,42 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               details: `pid=${pid} port=${config.value.bootstrap.port} cwd=${config.value.cwd}`,
             });
           }),
-          onExitObserved: () =>
-            updateActiveRun(runId, (run) => ({
+          onExitObserved: Effect.fn("desktop.backendInstance.onExitObserved")(function* (exit) {
+            if (Exit.isSuccess(exit) && exit.value.reason.startsWith("killed by SIG")) {
+              const observedAt = yield* DateTime.now;
+              const quit = Option.isSome(desktopState)
+                ? yield* Ref.get(desktopState.value.quitTrigger)
+                : undefined;
+              // Output can drain for five seconds after death. Freeze receipt
+              // ordering here; Electron's quit trigger cannot identify a sender.
+              signalQuitContext = {
+                backendExitObservedAt: DateTime.formatIso(observedAt),
+                appQuitContextAvailable: Option.isSome(desktopState),
+                appQuitReceived: quit !== undefined,
+                ...(quit === undefined
+                  ? {}
+                  : {
+                      appQuitTrigger: quit.trigger,
+                      appQuitAt: quit.at,
+                      appQuitAgeMs: DateTime.toEpochMillis(observedAt) - Date.parse(quit.at),
+                      ...(quit.trigger === "signal"
+                        ? { appQuitSignal: quit.signal }
+                        : quit.trigger === "ipc-relaunch"
+                          ? { appQuitReason: quit.reason }
+                          : {}),
+                    }),
+              };
+              yield* Effect.annotateCurrentSpan(signalQuitContext);
+              yield* logInstanceInfo("backend child signal exit observed", {
+                reason: exit.value.reason,
+                ...signalQuitContext,
+              });
+            }
+            yield* updateActiveRun(runId, (run) => ({
               ...run,
               exitObserved: true,
-            })),
+            }));
+          }),
           onReady: Effect.fn("desktop.backendInstance.onReady")(function* () {
             const isCurrentRun = yield* Ref.modify(state, (latest) => {
               const activeRun = Option.getOrUndefined(latest.active);

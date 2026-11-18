@@ -2,6 +2,7 @@ import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, read
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { STREAM_END_KINDS, STREAM_ERROR_CODE } from "./stream-telemetry.ts";
 
 export type LogEntry = {
   component: string; kind: "event" | "perf" | "error"; name: string;
@@ -36,7 +37,13 @@ function fields(entry: LogEntry, at: Date) {
   const props: Record<string, string | number | boolean | null> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
     if (key === "exitCode" && value === null) props[key] = null;
+    else if (entry.name === "tg.robob.streamEnd" && key === "kind" && STREAM_END_KINDS.includes(value as typeof STREAM_END_KINDS[number])) props[key] = String(value);
+    else if (entry.name === "tg.robob.streamEnd" && key === "connectedMs"
+      && (value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0))) props[key] = value;
+    else if (entry.name === "tg.robob.streamEnd" && key === "code" && typeof value === "string" && STREAM_ERROR_CODE.test(value)) props[key] = value;
     else if (key === "cause" && safeCause(value)) props[key] = value;
+    else if (key === "detail" && safeDetail(value)) props[key] = value;
+    else if (key === "errorClass" && typeof value === "string" && errorClasses.has(value)) props[key] = value;
     else if (numeric.has(key) && typeof value === "number" && Number.isFinite(value)) props[key] = value;
     else if (boolean.has(key) && typeof value === "boolean") props[key] = value;
     else if (typeof value === "string" && values[key]?.includes(value)) props[key] = value;
@@ -87,33 +94,86 @@ export function toolLog(entry: LogEntry): void {
   } catch { /* Logging cannot affect the caller. */ }
 }
 
-// Only code-owned classes and known errno values are safe; arbitrary error codes can be secrets.
-const causeCodes = new Set(["unknown", "abort", "timeout", "decode", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ENOENT", "ENOTDIR", "EACCES", "EPERM", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE", "ENETUNREACH", "EHOSTUNREACH"]);
+// Diagnostics are vocabulary, never exception text (even constructor names can be private).
+const causeCodes = new Set(["unclassified", "abort", "timeout", "decode", "schema", "socket_closed", "non_error", "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "ENOENT", "ENOTDIR", "EACCES", "EPERM", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE", "ENETUNREACH", "EHOSTUNREACH"]);
+const errorClasses = new Set(["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "EvalError", "AggregateError", "DOMException", "AssertionError", "ControlError", "ApiError", "TransportError", "GrammyError", "HttpError", "ZodError", "ValidationError", "SchemaError", "ParseError", "Object", "Array", "String", "Number", "Boolean", "BigInt", "Symbol", "Function", "Null", "Undefined"]);
+const schemaClasses = new Set(["ZodError", "ValidationError", "SchemaError", "ParseError"]);
+const cancellationCodes = new Set(["ABORT_ERR", "ERR_CANCELED"]);
+const socketCodes = new Set(["ERR_SOCKET_CLOSED", "ERR_STREAM_PREMATURE_CLOSE", "UND_ERR_SOCKET", "ConnectionClosed", "SocketClosed"]);
+// Bun reports errno 0 for both refused TCP and missing Unix sockets, so ENOENT cannot be inferred.
+const bunFetchCauses = new Map([["ConnectionRefused", "ECONNREFUSED"], ["FailedToOpenSocket", "ECONNREFUSED"]]);
+const detailValues = new Set([...causeCodes, ...errorClasses, ...cancellationCodes, ...socketCodes, ...bunFetchCauses.keys(), "AbortError", "TimeoutError"]);
 export type ErrorCause = string | number;
+export type ErrorInfo = { cause: ErrorCause; detail: string; errorClass?: string };
 function safeCause(value: unknown): value is ErrorCause {
   return typeof value === "number" ? Number.isInteger(value) && value >= 100 && value <= 599
     : typeof value === "string" && causeCodes.has(value);
 }
+function safeDetail(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 80 && (detailValues.has(value) || /^HTTP [1-5][0-9]{2}$/.test(value));
+}
+function constructorClass(error: unknown): string {
+  if (error === null) return "Null";
+  if (error === undefined) return "Undefined";
+  const primitiveClasses: Record<string, string> = { string: "String", number: "Number", boolean: "Boolean", bigint: "BigInt", symbol: "Symbol", function: "Function" };
+  const primitive = primitiveClasses[typeof error];
+  if (primitive) return primitive;
+  try {
+    const name: unknown = Object.getPrototypeOf(error)?.constructor?.name;
+    if (typeof name === "string" && errorClasses.has(name)) return name;
+    // Custom classes are reduced to their base class rather than logging a possibly private name.
+    return error instanceof Error ? "Error" : "Object";
+  } catch { return "Object"; }
+}
+function infoForCause(cause: ErrorCause, error: unknown, detail?: unknown): ErrorInfo {
+  const errorClass = constructorClass(error);
+  return { cause, detail: safeDetail(detail) ? detail : typeof cause === "number" ? `HTTP ${cause}` : cause === "unclassified" ? errorClass : cause,
+    ...(cause === "unclassified" ? { errorClass } : {}) };
+}
 
-export function errorCause(error: unknown): ErrorCause {
+export function errorInfo(error: unknown): ErrorInfo {
+  const chain: Array<{ code?: unknown; name?: unknown }> = [];
   try {
     let current = error;
     for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
-      const row = current as { causeClass?: unknown; status?: unknown; code?: unknown; name?: unknown; cause?: unknown };
-      if (safeCause(row.causeClass)) return row.causeClass;
-      if (row.name === "TimeoutError") return "timeout";
-      if (row.name === "AbortError") return "abort";
-      if (row.name === "SyntaxError" || row.name === "AssertionError" || row.name === "URIError") return "decode";
-      if (typeof row.status === "number" && safeCause(row.status)) return row.status;
-      if (typeof row.code === "string" && causeCodes.has(row.code)) return row.code;
+      const row = current as { causeClass?: unknown; diagnostic?: ErrorInfo; status?: unknown; code?: unknown; name?: unknown; cause?: unknown };
+      chain.push(row);
+      if (safeCause(row.causeClass)) {
+        const saved = row.diagnostic;
+        if (saved?.cause === row.causeClass && safeDetail(saved.detail)
+          && (saved.cause !== "unclassified" || (typeof saved.errorClass === "string" && errorClasses.has(saved.errorClass)))) {
+          return { cause: saved.cause, detail: saved.detail, ...(saved.cause === "unclassified" ? { errorClass: saved.errorClass } : {}) };
+        }
+        return infoForCause(row.causeClass, current);
+      }
+      if (row.name === "TimeoutError") return infoForCause("timeout", current, row.name);
+      if (row.name === "AbortError") return infoForCause("abort", current, row.name);
+      if (row.name === "SyntaxError" || row.name === "AssertionError" || row.name === "URIError") return infoForCause("decode", current, row.name);
+      if (typeof row.status === "number" && safeCause(row.status)) return infoForCause(row.status, current);
+      if (typeof row.code === "string" && causeCodes.has(row.code)) return infoForCause(row.code, current, row.code);
+      if (typeof row.code === "string") {
+        const cause = bunFetchCauses.get(row.code);
+        if (cause) return infoForCause(cause, current, row.code);
+      }
       current = row.cause;
     }
+    // Existing cause precedence wins, including a known errno nested inside a new error shape.
+    for (const row of chain) {
+      if (typeof row.name === "string" && schemaClasses.has(row.name)) return infoForCause("schema", error, row.name);
+      if (typeof row.code === "string" && cancellationCodes.has(row.code)) return infoForCause("abort", error, row.code);
+      if (typeof row.code === "string" && socketCodes.has(row.code)) return infoForCause("socket_closed", error, row.code);
+    }
   } catch { /* Error properties need not be safe to read. */ }
-  return "unknown";
+  if (error === null || (typeof error !== "object")) return infoForCause("non_error", error, constructorClass(error));
+  return infoForCause("unclassified", error);
+}
+
+export function errorCause(error: unknown): ErrorCause {
+  return errorInfo(error).cause;
 }
 
 export function toolError(component: string, tag: string, ids?: Record<string, unknown>, error?: unknown): void {
-  toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, props: { cause: errorCause(error) }, error: { tag } });
+  toolLog({ component, kind: "error", name: `${component}.error`, ok: false, ids, props: errorInfo(error), error: { tag } });
 }
 
 export async function rollup(day: string, dir = logDirectory()) {

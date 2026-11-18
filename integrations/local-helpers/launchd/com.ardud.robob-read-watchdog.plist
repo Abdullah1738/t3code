@@ -6,6 +6,8 @@
 	<string>com.ardud.robob-read-watchdog</string>
 	<key>ProgramArguments</key>
 	<array>
+		<string>/bin/zsh</string>
+		<string>-f</string>
 		<string>/Users/ardud/.local/bin/robob-read-watchdog</string>
 	</array>
 	<key>StartInterval</key>

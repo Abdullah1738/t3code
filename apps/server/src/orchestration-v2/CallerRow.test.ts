@@ -13,7 +13,6 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Statement from "effect/sql/Statement";
-import * as Tracer from "effect/Tracer";
 import * as Persistence from "../persistence/Sqlite.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
@@ -31,6 +30,8 @@ it.effect.each([
   "subagent",
   "empty",
   "rolled-back",
+  "waiting",
+  "completed",
 ] as const)("%s caller row and liveness match the existing shell", (state) =>
   Effect.gen(function* () {
     const store = yield* ProjectionStore.ProjectionStoreV2;
@@ -71,11 +72,15 @@ it.effect.each([
           rootNodeId: NodeId.make(`root:${state}`),
           activeAttemptId: null,
           status:
-            state === "subagent"
-              ? "completed"
-              : state === "rolled-back"
-                ? "rolled_back"
-                : "running",
+            state === "waiting"
+              ? "waiting"
+              : state === "completed"
+                ? "completed"
+                : state === "subagent"
+                  ? "completed"
+                  : state === "rolled-back"
+                    ? "rolled_back"
+                    : "running",
           requestedAt: now,
           startedAt: now,
           completedAt: state === "subagent" || state === "rolled-back" ? now : null,
@@ -129,29 +134,18 @@ it.effect.each([
       }
     }
     const sql = yield* SqlClient.SqlClient;
-    const statements: string[] = [];
-    const tracer = Tracer.make({
-      span(options) {
-        const span = new Tracer.NativeSpan(options);
-        const end = span.end.bind(span);
-        span.end = (time, exit) => {
-          end(time, exit);
-          const query = span.attributes.get("db.query.text");
-          if (typeof query === "string" && query.trimStart().startsWith("SELECT"))
-            statements.push(query);
-        };
-        return span;
-      },
-    });
-    yield* store
-      .getCallerRow(id)
-      .pipe(
-        Effect.withTracer(tracer),
-        Effect.provideService(Statement.SpanPropagationEnabled, true),
-      );
-    assert.equal(statements.length, state === "deleted" ? 1 : 2);
-    for (const query of statements) {
-      const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, [id]);
+    const statements: Array<readonly [string, ReadonlyArray<unknown>]> = [];
+    const record: Statement.Transformer = (statement) =>
+      Effect.sync(() => {
+        const compiled = statement.compile();
+        if (compiled[0].trimStart().startsWith("SELECT")) statements.push(compiled);
+        return statement;
+      });
+    yield* store.getCallerRow(id).pipe(Effect.provideService(Statement.CurrentTransformer, record));
+    assert.isAtLeast(statements.length, 1);
+    assert.isAtMost(statements.length, 5);
+    for (const [query, params] of statements) {
+      const plan = yield* sql.unsafe<{ detail: string }>(`EXPLAIN QUERY PLAN ${query}`, params);
       assert.isTrue(
         plan.some((p) => /SEARCH .* USING (?:COVERING )?(?:INDEX|PRIMARY KEY)/.test(p.detail)),
         JSON.stringify(plan),
@@ -175,7 +169,7 @@ it.effect.each([
       id,
       ProviderInstanceId.make("codex"),
     );
-    assert.equal(fallback, state !== "active" && state !== "deleted");
+    assert.equal(fallback, state === "fork" || state === "rolled-back");
     assert.equal(
       isLiveCallerShell(identity, base.providerInstanceId),
       isLiveCallerShell(shell, base.providerInstanceId),

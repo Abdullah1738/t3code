@@ -2,6 +2,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
 import * as NodePath from "node:path";
+import { guardLaunchContext, previousQuit } from "@t3tools/shared/desktopQuitContext";
 
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -42,6 +43,7 @@ export type StartupPhase =
   | "server.opencode-import"
   | "server.kanban"
   | "server.readonly-replica"
+  | "server.backup-snapshot"
   | "server.project-settings-sweep"
   | "server.workspace"
   | "server.vcs"
@@ -149,6 +151,8 @@ export function makeStartupPhaseLog(
   let bootBytes = 0;
   let droppedRecords = 0;
   let persistenceFailed = false;
+  let previousBootAt = 0;
+  let bootContextWritten = false;
   // Compact once per boot, atomically. Phase markers only append, so the start
   // of an expensive synchronous operation is visible even if it never returns.
   try {
@@ -172,8 +176,21 @@ export function makeStartupPhaseLog(
     const boots = new Map<string, { lines: string[]; bytes: number }>();
     for (const line of previous.split("\n")) {
       try {
-        const record = JSON.parse(line) as { bootId?: unknown };
+        const record = JSON.parse(line) as {
+          bootId?: unknown;
+          phase?: unknown;
+          at?: unknown;
+          outcome?: unknown;
+        };
         if (typeof record.bootId !== "string" || record.bootId === bootId) continue;
+        if (
+          record.phase === "boot" &&
+          record.outcome === "start" &&
+          typeof record.at === "string"
+        ) {
+          const at = Date.parse(record.at);
+          if (Number.isFinite(at)) previousBootAt = Math.max(previousBootAt, at);
+        }
         const retained = boots.get(record.bootId) ?? { lines: [], bytes: 0 };
         const bytes = Buffer.byteLength(line) + 1;
         if (retained.bytes + bytes <= STARTUP_LOG_BOOT_MAX_BYTES) {
@@ -238,7 +255,18 @@ export function makeStartupPhaseLog(
         phase,
         at: iso(at),
         outcome: "start",
+        ...(phase === "boot" && !bootContextWritten
+          ? {
+              previousQuit: previousQuit(logsDir, previousBootAt, at),
+              launchContext: guardLaunchContext(
+                process.env.ROBOB_LAUNCH_INITIATOR,
+                previousBootAt,
+                at,
+              ),
+            }
+          : {}),
       });
+      if (phase === "boot") bootContextWritten = true;
       return id;
     },
     end: (phase, at, durationMs, outcome, counts, id) => {

@@ -1,0 +1,13 @@
+{
+  "id": "external-status-example",
+  "title": "External status changed",
+  "check": "output-changed --show --label 'External status' -- ./read-status.sh",
+  "interval_s": 300,
+  "timeout_s": 45,
+  "mode": "wake",
+  "expires_at": "3d",
+  "max_fires": 1,
+  "relays": [],
+  "created_by_session": "REPLACE_WITH_CURRENT_SESSION_ID",
+  "context": "Read the new status and tell the owner if it needs action. Waiting for an external status change; replace this with the exact item, source, current status and next step. Do not submit, pay, re-sign or message anyone else."
+}

@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import common
 import mailparse
 import store
+import timing
 
 sys.path.insert(0, common.MAIL_LIBEXEC)
 import mail_oauth  # noqa: E402
@@ -40,17 +41,23 @@ class Api:
         self.checked = 0.0
 
     def _token(self):
-        with self.lock:
+        with store.waiting(self.lock, self.acct):
             if self.token is None or time.time() - self.checked > 300:
-                mail_oauth.ensure_fresh(self.acct)
+                try:
+                    mail_oauth.ensure_fresh(self.acct, lock_timeout=store.LOCK_WAIT_SECONDS)
+                except mail_oauth.RefreshLockTimeout as e:
+                    raise store.LockTimeout(e.waited) from e
                 self.token = mail_oauth.get_token(self.acct)
                 self.checked = time.time()
             return self.token
 
     def _renew(self, stale):
-        with self.lock:
+        with store.waiting(self.lock, self.acct):
             if self.token == stale:
-                mail_oauth.refresh(self.acct, reason="gmail api 401")
+                try:
+                    mail_oauth.refresh(self.acct, reason="gmail api 401", lock_timeout=store.LOCK_WAIT_SECONDS)
+                except mail_oauth.RefreshLockTimeout as e:
+                    raise store.LockTimeout(e.waited) from e
                 self.token = mail_oauth.get_token(self.acct)
                 self.checked = time.time()
 
@@ -64,6 +71,7 @@ class Api:
             self.local.conn = c
         return c
 
+    @timing.timed("fetch")
     def get(self, path, params=None):
         q = "?" + urllib.parse.urlencode(params, doseq=True) if params else ""
         url = f"/gmail/v1/users/me/{path}{q}"
@@ -123,8 +131,15 @@ def _fetch(api, acct, mid, names, me):
         if e.status == 404:
             return None
         return Skipped(mid, e)
+    except store.LockTimeout:
+        raise
     except (RuntimeError, KeyError, ValueError) as e:
         return Skipped(mid, e)
+    with timing.phase("parse"):
+        return _parse_message(m, raw, acct, mid, names, me)
+
+
+def _parse_message(m, raw, acct, mid, names, me):
     p = mailparse.parse(raw)
     ts = int(m.get("internalDate", 0)) // 1000 or p["ts"]
     rel = mailparse.raw_path(acct, ts, mid)
@@ -143,19 +158,17 @@ def _fetch_many(db, api, acct, ids, names, stats, stop):
             if stop is not None and stop.is_set():
                 return False
             chunk = ids[i:i + BATCH]
-            got = [x for x in pool.map(lambda mid: _fetch(api, acct, mid, names, me), chunk) if x]
+            got = [x for x in pool.map(timing.worker(lambda mid: _fetch(api, acct, mid, names, me)), chunk) if x]
             bad = [x for x in got if isinstance(x, Skipped)]
             items = [x for x in got if not isinstance(x, Skipped)]
             if bad and len(bad) * 2 > len(chunk):
                 # Most of the batch failed: an outage, not bad messages. Retry the pass later.
                 raise RuntimeError(f"{acct}: {len(bad)}/{len(chunk)} fetches failed, e.g. {bad[0].err}")
             for b in bad:
-                common.log(f"{acct}: skipped message {b.mid} this pass ({b.err})")
-            with store.writing(db):
-                for it in items:
-                    stats[store.upsert(db, it)] += 1
+                timing.log(f"{acct}: skipped message {b.mid} this pass ({b.err})")
+            store.upsert_many(db, items, stats)
             if len(ids) > BATCH:
-                common.log(f"{acct}: fetched {min(i + BATCH, len(ids))}/{len(ids)}")
+                timing.log(f"{acct}: fetched {min(i + BATCH, len(ids))}/{len(ids)}")
     return True
 
 
@@ -177,16 +190,14 @@ def _full(db, api, acct, names, stats, stop):
     listed = _list_all(api)
     known = store.known_ext_ids(db, "email", acct)
     missing = [m for m in listed if m not in known]
-    common.log(f"{acct}: {len(listed)} on server, {len(missing)} to fetch")
+    timing.log(f"{acct}: {len(listed)} on server, {len(missing)} to fetch")
     if not _fetch_many(db, api, acct, missing, names, stats, stop):
         return None
     listed = set(listed)
     gone = known - listed
-    with store.writing(db):
-        if listed or not known:  # an empty listing is never read as "everything was deleted"
-            stats["deleted"] += store.mark_deleted(db, "email", acct, gone)
-        # A message the listing missed earlier (pagination shifts while mail arrives) comes back here.
-        store.undelete(db, "email", acct, store.deleted_ext_ids(db, "email", acct) & listed)
+    back = store.deleted_ext_ids(db, "email", acct) & listed
+    stats["deleted"] += store.reconcile(db, "email", acct,
+                                        gone if listed or not known else (), back)
     return start
 
 
@@ -216,16 +227,18 @@ def _incremental(db, api, acct, since, names, stats, stop):
         token = page.get("nextPageToken")
         if not token:
             break
-    known = store.known_ext_ids(db, "email", acct)
-    new = [m for m in dict.fromkeys(added) if m not in known and m not in deleted]
+    candidates = dict.fromkeys(added)
+    known = store.existing_ext_ids(db, "email", acct, candidates)
+    new = [m for m in candidates if m not in known and m not in deleted]
     if not _fetch_many(db, api, acct, new, names, stats, stop):
         return None
-    with store.writing(db):
-        store.undelete(db, "email", acct, {m for m in added if m in known and m not in deleted})
-        for mid, labels in relabel.items():
-            if mid not in deleted and _relabel(db, acct, mid, labels, names):
-                stats["updated"] += 1
-        stats["deleted"] += store.mark_deleted(db, "email", acct, deleted)
+    store.reconcile(db, "email", acct, back={m for m in added if m in known and m not in deleted})
+    def relabel_one(change):
+        mid, labels = change
+        if mid not in deleted and _relabel(db, acct, mid, labels, names):
+            stats["updated"] += 1
+    store.write_batches(db, relabel.items(), relabel_one)
+    stats["deleted"] += store.reconcile(db, "email", acct, gone=deleted)
     return latest
 
 
@@ -243,7 +256,7 @@ def sync(acct, db, stop=None):
         except HttpError as e:
             if e.status != 404:
                 raise
-            common.log(f"{acct}: history {st['history_id']} expired, doing a full listing")
+            timing.log(f"{acct}: history {st['history_id']} expired, doing a full listing")
     if hist is None and not (stop is not None and stop.is_set()):
         hist = _full(db, api, acct, names, stats, stop)
         st["last_full"] = int(time.time())

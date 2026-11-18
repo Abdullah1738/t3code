@@ -1,4 +1,6 @@
 # Sourced by zsh and bash. Never replaces the safe-chain pnpm function.
+# Agent shells are noninteractive and do not read the vendor's .zshrc/.bashrc hooks.
+[ ! -r "$HOME/.safe-chain/scripts/init-posix.sh" ] || . "$HOME/.safe-chain/scripts/init-posix.sh"
 _repo_node_refresh() {
     [ "${_repo_node_busy:-}" = 1 ] && return 0
     [ "${_repo_node_seen_pwd:-}" = "$PWD" ] && [ "${_repo_node_seen_path:-}" = "$PATH" ] && return 0
@@ -92,7 +94,8 @@ if [ "${_repo_node_hooked:-}" != 1 ]; then
     if [ -n "${ZSH_VERSION:-}" ]; then
         # chpwd covers `cd repo && pnpm ...`; preexec covers interactive PATH changes.
         eval 'chpwd_functions+=(_repo_node_hook); preexec_functions+=(_repo_node_hook); precmd_functions+=(_repo_node_hook)'
-        if [ ! -o interactive ]; then
+        # zsh's `[` does not implement the -o shell-option test; `[[` does.
+        if [[ ! -o interactive ]]; then
             # Claude restores its snapshot PATH after .zshenv. Refresh before its next command.
             if typeset -f TRAPDEBUG >/dev/null; then
                 functions -c TRAPDEBUG _repo_node_previous_debug

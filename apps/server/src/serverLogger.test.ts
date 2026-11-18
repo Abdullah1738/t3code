@@ -1,8 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as FileSystem from "effect/FileSystem";
-import * as NodePath from "@effect/platform-node/NodePath";
 import { assert, describe, it, vi } from "@effect/vitest";
-import * as NodeOS from "node:os";
 import * as NodeUtil from "node:util";
 
 import { KanbanError, ExternalLauncherBrowserSpawnError } from "@t3tools/contracts";
@@ -18,6 +16,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Redactable from "effect/Redactable";
+import * as References from "effect/References";
 import * as Path from "effect/Path";
 import * as Tracer from "effect/Tracer";
 import * as HttpClient from "effect/http/HttpClient";
@@ -62,8 +61,10 @@ const layerConfig = (overrides: Partial<ServerConfig.ServerConfig["Service"]>) =
   Layer.effect(
     ServerConfig.ServerConfig,
     Effect.gen(function* () {
-      const path = yield* Path.Path;
-      const baseDir = path.join(NodeOS.tmpdir(), "t3-server-logger-test");
+      const fs = yield* FileSystem.FileSystem;
+      const baseDir = yield* fs
+        .makeTempDirectoryScoped({ prefix: "t3-server-logger-test-" })
+        .pipe(Effect.orDie);
       const derivedPaths = yield* ServerConfig.deriveServerPaths(baseDir, undefined);
       return ServerConfig.make({
         logLevel: "Info",
@@ -102,7 +103,7 @@ const layerConfig = (overrides: Partial<ServerConfig.ServerConfig["Service"]>) =
         ...overrides,
       });
     }),
-  ).pipe(Layer.provide(NodePath.layer));
+  ).pipe(Layer.provideMerge(NodeServices.layer));
 
 /**
  * The export is asserted after the layer's scope closes, which is where the
@@ -179,6 +180,43 @@ const printThroughConsole = (fields: object) =>
   });
 
 describe("ServerLoggerLive", () => {
+  it.effect("persists Info and higher after a readiness timeout without OTLP or a span", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "server-log-lifetime-" });
+      yield* Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const child = yield* Effect.gen(function* () {
+          yield* Effect.logInfo("before readiness timeout");
+          yield* Deferred.succeed(started, undefined);
+          yield* Effect.never.pipe(Effect.timeout("3 minutes"), Effect.ignore);
+          yield* Effect.logInfo("orchestration-v2.claude-steer-offered", { threadId: "thread-1" });
+          yield* Effect.logWarning("orchestration-v2.claude-steer-unconfirmed");
+          yield* Effect.logError("orchestration-v2.claude-steer-offer-failed");
+          yield* Effect.logDebug("debug marker");
+        }).pipe(Effect.forkChild);
+        yield* Deferred.await(started);
+        yield* TestClock.adjust("3 minutes");
+        yield* Fiber.join(child);
+      }).pipe(
+        Effect.provide(
+          ServerLogger.layer.pipe(
+            Layer.provide(layerConfig({ logsDir: root })),
+            Layer.provide(layerCollector([])),
+          ),
+        ),
+      );
+      const text = yield* fs.readFileString(path.join(root, "server.log"));
+      assert.include(text, "before readiness timeout");
+      assert.include(text, "orchestration-v2.claude-steer-offered");
+      assert.include(text, "orchestration-v2.claude-steer-unconfirmed");
+      assert.include(text, "orchestration-v2.claude-steer-offer-failed");
+      assert.notInclude(text, "debug marker");
+      assert.lengthOf(text.trimEnd().split("\n"), 4);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("exports log records to the configured logs endpoint", () =>
     Effect.gen(function* () {
       const requests = yield* logThrough({
@@ -416,6 +454,67 @@ it.effect("persists board lock warnings without OTLP or a recorded span", () =>
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.effect("persists holder JSON in both lock and server logs even with logging disabled", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "board-hold-log-" });
+    yield* Effect.gen(function* () {
+      const unmarked = '{"event":"kanban board lock long hold","board.id":"unmarked"}';
+      yield* Effect.logWarning(unmarked).pipe(
+        Effect.provideService(References.MinimumLogLevel, "Warn"),
+      );
+      const locks = yield* BoardLocks.make();
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const holder = yield* Effect.forkChild(
+        locks
+          .board(
+            "board-orders",
+            Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(finish))),
+          )
+          .pipe(Effect.provideService(BoardLocks.operationName, "card.reviewResult")),
+      );
+      yield* Deferred.await(entered);
+      yield* TestClock.adjust(5_000);
+      yield* Deferred.succeed(finish, undefined);
+      yield* Fiber.join(holder);
+    }).pipe(
+      Effect.provide(
+        ServerLogger.layer.pipe(
+          Layer.provide(layerConfig({ logsDir: root, logLevel: "None", otlpLogsUrl: undefined })),
+          Layer.provide(layerCollector([])),
+        ),
+      ),
+    );
+    const text = yield* fs.readFileString(path.join(root, "board-locks.ndjson"));
+    assert.isTrue(text.endsWith("\n"));
+    const lines = text.trimEnd().split("\n");
+    assert.lengthOf(lines, 1);
+    const hold = JSON.parse(lines[0]!);
+    assert.deepStrictEqual(hold, {
+      event: "kanban board lock long hold",
+      "board.observed_at_ms": 5_000,
+      "board.id": "board-orders",
+      "board.holder": "card.reviewResult",
+      "board.card_id": null,
+      "board.lock": "gate",
+      "board.mode": "exclusive",
+      "board.acquired_at_ms": 0,
+      "board.held_ms": 5_000,
+      "board.waiters": 0,
+    });
+    const serverLines = (yield* fs.readFileString(path.join(root, "server.log")))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const warning = serverLines.find((line) => String(line.message) === lines[0]);
+    assert.isDefined(warning);
+    assert.strictEqual(warning.level, "WARN");
+    assert.deepStrictEqual(JSON.parse(String(warning.message)), hold);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect(
   "a throwing diagnostic sink preserves the board admission timeout and retry response",
   () =>
@@ -446,8 +545,10 @@ it.effect(
           const error = Cause.squash(result.cause);
           assert.instanceOf(error, KanbanError);
           assert.strictEqual((error as KanbanError).saved, false);
-          assert.include(String(error), "Board busy: not written (held 2m0s by");
-          assert.include(String(error), "Safe to retry once.");
+          assert.strictEqual(
+            (error as KanbanError).detail,
+            "Board busy: not written (held 120000ms by KanbanBoardLocks.run; waited 120000ms behind 0; most time: KanbanBoardLocks.run 120s). Safe to retry once.",
+          );
         }
         yield* Fiber.interrupt(holder);
         assert.deepStrictEqual(yield* locks.holders, []);

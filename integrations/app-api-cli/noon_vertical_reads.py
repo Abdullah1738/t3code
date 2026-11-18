@@ -52,9 +52,12 @@ def _headers(service, deadline):
     return headers
 
 
-def _read(route, headers, deadline, order=None):
+def _read(route, headers, deadline, order=None, *, page=None):
     """Literal read allowlist; arbitrary URLs, payloads and redirects forbidden."""
     body = None
+    if page is not None and (route not in ('food_orders', 'nownow_orders')
+                            or type(page) is not int or not 1 <= page <= 100):
+        raise NoonError('INVALID_READ_PAGE')
     if route == 'marketplace_manifest' and isinstance(order, str) and MARKETPLACE_ORDER.fullmatch(order):
         host, path = 'api-app.noon.com', '/_svc/order-v2/order/' + order
     elif route == 'food_track' and isinstance(order, str) and FOOD_ORDER.fullmatch(order):
@@ -64,7 +67,7 @@ def _read(route, headers, deadline, order=None):
         body = json.dumps({'orderNr': order}).encode()
     elif route == 'food_orders' and order is None:
         host, path = 'api-app-fd.noon.com', '/_svc/mp-food-api-mpnoon/order/orders'
-        body = b'{}'
+        body = json.dumps({'page': page, 'limit': 10}).encode() if page is not None else b'{}'
     elif route in ('nownow_track', 'nownow_detail') and isinstance(order, str) and NOWNOW_ORDER.fullmatch(order):
         host = 'api-app-fd.noon.com'
         path = '/_svc/mp-shop-api-mpnoon/v1/order/'
@@ -75,7 +78,7 @@ def _read(route, headers, deadline, order=None):
             body = json.dumps({'orderNr': order}).encode()
     elif route == 'nownow_orders' and order is None:
         host, path = 'api-app-fd.noon.com', '/_svc/mp-shop-api-mpnoon/v1/order/history'
-        body = b'{}'
+        body = json.dumps({'page': page, 'limit': 10}).encode() if page is not None else b'{}'
     else:
         raise NoonError('ENDPOINT_OR_ORDER_DENIED')
     headers = dict(headers)
@@ -332,11 +335,45 @@ def track(order, service, timeout=10, *, deadline=None):
     return out
 
 
+def placed_time(row):
+    """These two legacy order APIs carry local wall time plus a separate offset."""
+    value = row.get('createdAt') or row.get('placedAt')
+    if not isinstance(value, str) or not re.fullmatch(
+            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?', value):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            # Only the independently corroborated UAE offset is certified.
+            if row.get('timeZone') != '+04:00':
+                return None
+            parsed = parsed.replace(tzinfo=core.DUBAI)
+        return parsed.isoformat()
+    except ValueError:
+        return None
+
+
+def list_coverage(data, page, count):
+    pages = data.get('pages')
+    if page is None:
+        return {'default_page_only': True, 'exhaustive': False,
+                'reported_pages': pages if type(pages) is int else None}
+    if (type(pages) is not int or pages < 1 or count > 10
+            or (page < pages and count != 10) or (page > pages and count != 0)):
+        raise NoonError('PAGINATION_SCHEMA_CHANGED')
+    return {'default_page_only': False, 'paging_verified': True, 'page': page,
+            'total_pages': pages, 'reported_pages': pages,
+            'exhaustive': page >= pages, 'ordered_by_placed_at': True}
+
+
 @toollog.timed("noon", "provider.orders", lane="food")
-def food_orders(timeout=10):
+def food_orders(timeout=10, *, page=None):
+    if page is not None and (type(page) is not int or not 1 <= page <= 100):
+        raise NoonError('INVALID_READ_PAGE')
     deadline = _deadline(timeout)
     headers = _headers('food', deadline)
-    data = _food_data(_read('food_orders', headers, deadline))
+    data = _food_data(_read('food_orders', headers, deadline, page=page))
+    toollog.order_page(data.get('orders'))
     if not isinstance(data.get('orders'), list):
         raise NoonError('SCHEMA_CHANGED')
     rows, seen = [], set()
@@ -351,19 +388,21 @@ def food_orders(timeout=10):
         out = core.base(order, 'food', True)
         delivered = raw == 'delivered' and row.get('isDelivered') is True and row.get('logisticsStatusCode') == 'delivered'
         out.update(raw_status=raw, status='delivered' if delivered else 'unknown', scope='order',
-                   coverage='native_food_default_list_page')
+                   coverage='native_food_list_page', placed_at=placed_time(row))
         rows.append(out)
     core.remaining(deadline)
     return {'ok': True, 'app': 'noon', 'source': 'native_order_api', 'orders': rows,
-            'coverage': {'food': {'default_page_only': True, 'exhaustive': False,
-                                  'reported_pages': data.get('pages') if type(data.get('pages')) is int else None}}}
+            'coverage': {'food': list_coverage(data, page, len(rows))}}
 
 
 @toollog.timed("noon", "provider.orders", lane="nownow")
-def nownow_orders(timeout=10):
+def nownow_orders(timeout=10, *, page=None):
+    if page is not None and (type(page) is not int or not 1 <= page <= 100):
+        raise NoonError('INVALID_READ_PAGE')
     deadline = _deadline(timeout)
     headers = _headers('nownow', deadline)
-    data = _nownow_data(_read('nownow_orders', headers, deadline))
+    data = _nownow_data(_read('nownow_orders', headers, deadline, page=page))
+    toollog.order_page(data.get('orders'))
     if not isinstance(data.get('orders'), list):
         raise NoonError('SCHEMA_CHANGED')
     rows, seen = [], set()
@@ -380,9 +419,8 @@ def nownow_orders(timeout=10):
         agreement = row.get('logisticsStatusCode') == raw == row.get('customerStatusCode')
         out = core.base(order, 'nownow', True)
         out.update(raw_status=raw, status=NOWNOW_STAGES.get(raw, 'unknown') if agreement else 'unknown',
-                   scope='order', coverage='native_nownow_default_list_page')
+                   scope='order', coverage='native_nownow_list_page', placed_at=placed_time(row))
         rows.append(out)
     core.remaining(deadline)
     return {'ok': True, 'app': 'noon', 'source': 'native_order_api', 'orders': rows,
-            'coverage': {'nownow': {'default_page_only': True, 'exhaustive': False,
-                                  'reported_pages': data.get('pages') if type(data.get('pages')) is int else None}}}
+            'coverage': {'nownow': list_coverage(data, page, len(rows))}}

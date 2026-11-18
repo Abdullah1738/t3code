@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import { decide, slugFor, roleOf, chatInfo } from "../src/access.ts";
 import type { Access } from "../src/chats.ts";
-import { chatKey, LineError, type ChatKey, type Line, type LineInbound, type LineOutbound } from "../src/line.ts";
+import { chatKey, isOptedOut, LineError, type ChatKey, type Line, type LineInbound, type LineOutbound } from "../src/line.ts";
 import { handleInbound, type IngressDeps } from "../src/sb-ingress.ts";
 import { classifyDownloadFailure, classifySendFailure, TransportError } from "../src/photon.ts";
 import { inboundFromLine, sbTransport } from "../src/sb-transport.ts";
@@ -11,13 +12,25 @@ import { Store } from "../src/store.ts";
 import { cardLayout } from "../src/card-text.ts";
 
 const owner = "+15555550123";
+
+for (const status of [408, 409, 429, 500, 400, 404]) {
+  test(`continuation HTTP ${status} retains its failure semantics`, async () => {
+    const line = new Sendblue({keyId:"test", secret:"test", number:"+15555550001", fetch: (async () =>
+      Response.json({ error: "provider failure" }, {status})) as unknown as typeof fetch});
+    const error = await line.updateApp("original", {url:"https://card.example/", caption:"Delivery tracking",
+      imageUrl:"https://cdn.example/stage.png"}, "stable-stage-key").catch(error => error);
+    expect(error).toBeInstanceOf(LineError);
+    expect(error.retryable).toBe([408, 409, 429, 500].includes(status));
+    expect(error.uncertain).toBe(status === 500);
+  });
+}
 const moni = "+15555550199";
 const access: Access = {
   people: [{ name: "Moni", role: "admin", addresses: [moni, "moni@example.com"] }],
   groups: [{ id: "grp-allowed", name: "Family" }],
 };
 const stores: Store[] = [];
-afterEach(() => { for (const store of stores.splice(0)) store.close(); });
+afterEach(() => { setSystemTime(); for (const store of stores.splice(0)) store.close(); });
 const store = () => { const s = new Store(":memory:"); stores.push(s); return s; };
 
 function inbound(overrides: Partial<LineInbound> = {}): LineInbound {
@@ -47,6 +60,7 @@ function fakeLine(overrides: Partial<Line> = {}): Line & { sent: { chat: ChatKey
     read: async () => {},
     requestLocation: async () => {},
     location: async () => undefined,
+    setOptOut: async () => {},
     download: async () => ({ data: new Uint8Array([1]), name: "a.jpg", mimeType: "image/jpeg" }),
   };
   return Object.assign({ ...base, ...overrides }, { sent });
@@ -192,7 +206,7 @@ describe("transport shim", () => {
       clock += 119_000;
       await expect(transport.sendText({ id: "late", chatGuid: "x", text: "Later" })).rejects.toMatchObject({ code: "sendUnconfirmed" });
       clock += 1_000;
-      expect(await transport.sendText({ id: "late", chatGuid: "x", text: "Later" })).toEqual({ providerId: "second" });
+      expect(await transport.sendText({ id: "late", chatGuid: "x", text: "Later" })).toMatchObject({ providerId: "second" });
       expect(s.get<unknown>("sent-attempt:late")).toEqual({ first: 30_000, last: 150_000 });
     });
 
@@ -269,7 +283,7 @@ describe("transport shim", () => {
       clock = 30_000;
       await expect(transport.sendApp(arrived)).rejects.toMatchObject({ ambiguous: true });
       clock = 200_000;
-      expect(await transport.sendApp(approaching)).toEqual({ providerId: "h3" });
+      expect(await transport.sendApp(approaching)).toMatchObject({ providerId: "h3" });
       expect(await transport.sendApp(arrived)).toEqual({ providerId: "h2", duplicate: true });
       expect(sends).toEqual(["Driver approaching", "Driver 3 min away", "Driver approaching"]);
     });
@@ -304,7 +318,7 @@ describe("transport shim", () => {
       await expect(transport.sendText({ id: "op", chatGuid: "x", text: "hi" })).rejects.toMatchObject({ code: "http_429", ambiguous: false });
       expect(s.get("sent-attempt:op")).toBeUndefined();
       clock = 5_000;
-      expect(await transport.sendText({ id: "op", chatGuid: "x", text: "hi" })).toEqual({ providerId: "ok" });
+      expect(await transport.sendText({ id: "op", chatGuid: "x", text: "hi" })).toMatchObject({ providerId: "ok" });
       expect(looked).toEqual([]);
     });
 
@@ -323,7 +337,7 @@ describe("transport shim", () => {
       clock = 110_000;
       await expect(transport.sendApp(card)).rejects.toMatchObject({ code: "sendUnconfirmed" });
       clock = 220_000;
-      expect(await transport.sendApp(card)).toEqual({ providerId: "new-card" });
+      expect(await transport.sendApp(card)).toMatchObject({ providerId: "new-card" });
       expect(looked).toEqual([40_000, 40_000]);
     });
 
@@ -422,9 +436,13 @@ describe("transport shim", () => {
   test("line failure codes reach the logs and keep their flags; free text in an HTTP error key does not", async () => {
     const fail = (error: LineError) => sbTransport(fakeLine({ typing: async () => { throw error; } }), chatKey.dm(owner), store()).typing("x", true);
     await expect(fail(new LineError("x", "http_400:invalid_number", false, false))).rejects.toMatchObject({ code: "http_400:invalid_number", retryable: false });
+    await expect(fail(new LineError("x", "http_400:opted_out", false, false))).rejects.toMatchObject({ code: "http_400:opted_out", retryable: false });
     await expect(fail(new LineError("x", "http_400:Number is not valid, see https://x", false, false))).rejects.toMatchObject({ code: "http_400:provider_error" });
     await expect(fail(new LineError("x", "weird\ncode", true, true))).rejects.toMatchObject({ code: "lineFailure", retryable: true, ambiguous: true });
     expect(classifySendFailure(new TransportError("http_400:invalid_number", false, false))).toEqual({ retryable: false, uncertain: false, code: "http_400:invalid_number" });
+    expect(classifySendFailure(new TransportError("http_400:opted_out", false, false))).toEqual({ retryable: false, uncertain: false, code: "http_400:opted_out" });
+    expect(["http_400:opted_out", "http_499:opted_out", "http_500:opted_out", "http_400", "http_400:OPTED_OUT"].map(isOptedOut))
+      .toEqual([true, true, false, false, false]);
     expect(classifySendFailure(new TransportError("network", true, true))).toEqual({ retryable: true, uncertain: true, code: "network" });
     expect(classifySendFailure(new TransportError("http_429", true, false))).toEqual({ retryable: true, uncertain: false, code: "http_429" });
     expect(classifyDownloadFailure(new TransportError("too_large"))).toEqual({ retryable: false, code: "attachmentTooLarge" });
@@ -435,7 +453,7 @@ describe("transport shim", () => {
     const s = store();
     const line = fakeLine();
     const transport = sbTransport(line, chatKey.dm(owner), s);
-    expect(await transport.sendText({ id: "op-2", chatGuid: "x", text: "yo" })).toEqual({ providerId: "out-1" });
+    expect(await transport.sendText({ id: "op-2", chatGuid: "x", text: "yo" })).toMatchObject({ providerId: "out-1" });
     expect(await transport.sendText({ id: "op-2", chatGuid: "x", text: "yo" })).toEqual({ providerId: "out-1", duplicate: true });
     expect(line.sent).toHaveLength(1);
   });
@@ -582,6 +600,88 @@ test("outboundStatuses maps Sendblue's status by handle", async () => {
   });
   const transport = sbTransport(line, chatKey.dm(owner), store(), () => 200);
   expect([...(await transport.outboundStatuses(0))]).toEqual([["h1", "ERROR"]]);
+});
+
+test("a static-card rejection after opt-in is fenced at the actual line request, not preview start", async () => {
+  const s = store();
+  let releasePreview!: () => void;
+  let previewStarted!: () => void;
+  const previewReady = new Promise<void>(resolve => { previewStarted = resolve; });
+  const line = fakeLine({ sendApp: async () => { throw new LineError("refused", "http_400:opted_out", false, false); } });
+  const transport = sbTransport(line, chatKey.dm(owner), s, () => Date.now(), { static: true, previewImage: async () => {
+    previewStarted();
+    await new Promise<void>(resolve => { releasePreview = resolve; });
+    return "https://cdn.example/p.png";
+  } });
+  const delivery = new Delivery(s, transport, {
+    projectScope: "scope", chatGuid: () => chatKey.dm(owner), enabled: () => true, sleep: async () => {},
+  });
+  s.enqueue({ id: "card", kind: "conversation", text: "", app: { url: "https://example.com/", caption: "Card" } });
+  const tick = delivery.tick();
+  await previewReady;
+  s.set("optInRevision", 1);
+  releasePreview();
+  await tick;
+  expect(s.getOperation("card")?.state).toBe("failed");
+  expect(s.get<unknown>("optedOut")).toMatchObject({ failures: 1 });
+});
+
+test("a delayed old line rejection retains its original opt-in revision", async () => {
+  const s = store();
+  let rejectSend!: (error: Error) => void;
+  let started!: () => void;
+  const entered = new Promise<void>(resolve => { started = resolve; });
+  const line = fakeLine({ sendText: () => {
+    started();
+    return new Promise((_resolve, reject) => { rejectSend = reject; });
+  } });
+  const delivery = new Delivery(s, sbTransport(line, chatKey.dm(owner), s), {
+    projectScope: "scope", chatGuid: () => chatKey.dm(owner), enabled: () => true, sleep: async () => {},
+  });
+  s.enqueue({ id: "old", kind: "conversation", text: "hello" });
+  const tick = delivery.tick();
+  await entered;
+  s.set("optInRevision", 1);
+  rejectSend(new LineError("refused", "http_400:opted_out", false, false));
+  await tick;
+  expect(s.getOperation("old")?.state).toBe("failed");
+  expect(s.get("optedOut")).toBeUndefined();
+});
+
+test("a retry rejected after opt-in during history reconciliation uses the line-request revision", async () => {
+  const start = Date.parse("2026-10-29T12:00:00Z");
+  setSystemTime(start);
+  try {
+    const s = store();
+    let attempts = 0;
+    let releaseHistory!: () => void;
+    let historyStarted!: () => void;
+    const historyReady = new Promise<void>(resolve => { historyStarted = resolve; });
+    const line = fakeLine({
+      sendText: async () => {
+        if (++attempts === 1) throw new LineError("lost", "network", true, true);
+        throw new LineError("refused", "http_400:opted_out", false, false);
+      },
+      outbound: async () => {
+        historyStarted();
+        await new Promise<void>(resolve => { releaseHistory = resolve; });
+        return [];
+      },
+    });
+    const delivery = new Delivery(s, sbTransport(line, chatKey.dm(owner), s), {
+      projectScope: "scope", chatGuid: () => chatKey.dm(owner), enabled: () => true, sleep: async () => {},
+    });
+    s.enqueue({ id: "retry", kind: "conversation", text: "hello" });
+    await delivery.tick();
+    setSystemTime(start + 180_000);
+    const tick = delivery.tick();
+    await historyReady;
+    s.set("optInRevision", 1);
+    releaseHistory();
+    await tick;
+    expect(attempts).toBe(2);
+    expect(s.get<unknown>("optedOut")).toMatchObject({ failures: 1 });
+  } finally { setSystemTime(); }
 });
 
 test("a threaded reply whose response was lost but landed is resent unthreaded when Sendblue later fails it", async () => {
@@ -739,6 +839,10 @@ const providerFailureCases = [
   { field: "error_reason", value: "private_message_sentinel", tag: "http_400", private: true },
   { field: "error_key", value: "invalid_number", tag: "http_400:invalid_number", private: false },
   { field: "error_key", value: "worker_unavailable", tag: "http_400:worker_unavailable", private: false },
+  { field: "error_key", value: "OPTED_OUT", tag: "http_400:opted_out", private: false },
+  { field: "error_key", value: "opted_out", tag: "http_400:opted_out", private: false },
+  { field: "error_key", value: "Opted_Out", tag: "http_400:opted_out", private: false },
+  { field: "error_key", value: "opted_out_private_sentinel", tag: "http_400:provider_error", private: true },
   { field: "error_key", value: "stop_opt_out", tag: "http_400:stop_opt_out", private: false },
   { field: "error_key", value: "STOP", tag: "http_400:stop_opt_out", private: false },
   { field: "error_code", value: 5504, tag: "http_400:5504", private: false },
@@ -765,4 +869,49 @@ test.each(providerFailureCases)("provider failure $field=$value stays private th
     expect(JSON.stringify(logs)).not.toContain(String(fixture.value));
     expect(rollup).not.toContain(String(fixture.value));
   }
+});
+
+
+test("line send errors keep main's safe diagnostics before transport classification", async () => {
+  const { captureLogs } = await import("./log-fixture.ts");
+  const logs = await captureLogs(async () => {
+    const line = fakeLine({ sendText: async () => {
+      throw Object.assign(new Error("connect ECONNRESET PRIVATE_PROVIDER_TEXT"), { code: "ECONNRESET" });
+    } });
+    await expect(sbTransport(line, chatKey.dm(owner), store()).sendText({ id: "diagnostic", chatGuid: "x", text: "test" }))
+      .rejects.toMatchObject({ code: "operationFailed" });
+  });
+  expect(logs.find(line => line.error?.tag === "sb-transport.catch1")?.error)
+    .toMatchObject({ code: "ECONNRESET", message: "connect ECONNRESET [redacted]" });
+  expect(JSON.stringify(logs)).not.toContain("PRIVATE_PROVIDER_TEXT");
+});
+
+test.each(["accepted", "opted_out"] as const)("card session update %s keeps dispatch snapshot and opt-in fencing", async outcome => {
+  const s = store();
+  const app = { url: "https://card.example/", caption: "Preparing" };
+  s.enqueue({ id: "original", kind: "conversation", text: "", app });
+  s.outboxState("original", "sent", "original-handle");
+  s.set("optInRevision", 2);
+  s.set("optOutAwaitingSend", [{ since: 100, failures: 1, alerted: true }]);
+  const updates: unknown[] = [];
+  const line = fakeLine({
+    getMessage: async () => ({ handle: "original-handle", chat: chatKey.dm(owner), text: "", status: "DELIVERED", sentAt: 1,
+      card: { url: app.url, layout: { caption: app.caption }, sessionIdentifier: "card-session" } }),
+    sendApp: async () => { throw new Error("Unexpected new card"); },
+    updateApp: async (...args) => {
+      updates.push(args);
+      if (outcome === "opted_out") throw new LineError("PRIVATE_PROVIDER_TEXT", "http_400:opted_out", false, false);
+      return { handle: "update-handle" };
+    },
+  });
+  const transport = sbTransport(line, chatKey.dm(owner), s);
+  const input = { id: "update", chatGuid: "x", updateOf: "original", url: app.url, caption: "Delivered", imageUrl: "https://cdn.example/stage.png" };
+  if (outcome === "accepted") {
+    expect(await transport.sendApp(input)).toEqual({ providerId: "update-handle", optOutAtDispatch: { since: undefined, awaiting: [100] } });
+    expect(await transport.sendApp(input)).toEqual({ providerId: "update-handle", duplicate: true });
+  } else {
+    await expect(transport.sendApp(input)).rejects.toMatchObject({ code: "http_400:opted_out", optInRevision: 2 });
+  }
+  expect(updates).toEqual([["original-handle", { url: app.url, caption: "Delivered", imageUrl: input.imageUrl, interactive: false }, createHash("sha256").update(input.id).digest("hex")]]);
+  expect(s.get<unknown>("app-session:original")).toEqual({ handle: "original-handle", sessionIdentifier: "card-session" });
 });

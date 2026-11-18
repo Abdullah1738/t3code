@@ -71,12 +71,12 @@ export type LineAppCard = {
 export type LineOutbound = {
   handle: string; chat: ChatKey; text: string; mediaUrl?: string;
   /** An app card: its page and the text its bubble shows, as sendApp cleaned it. */
-  card?: { url: string; layout: CardText };
+  card?: { url: string; layout: CardText; sessionIdentifier?: string; updateMessageHandle?: string };
   sentAt: number; status: string;
 };
 
 // Provider strings can be message text, even when they look like machine keys.
-const SENDBLUE_ERROR_KEYS = new Set(["invalid_number", "worker_unavailable", "stop_opt_out", "5504", "provider_error"]);
+const SENDBLUE_ERROR_KEYS = new Set(["invalid_number", "worker_unavailable", "stop_opt_out", "opted_out", "5504", "provider_error"]);
 export function sendblueErrorKey(value: unknown): string | undefined {
   if (typeof value !== "string" || value.length > 40) return;
   const key = value.toLowerCase();
@@ -95,7 +95,8 @@ export function safeLineFailureCode(code: string): string {
   return LINE_FAILURE_CODE.test(code) ? code : "lineFailure";
 }
 
-export const LINE_FAILURE_CODE = /^(network|bad_response|no_handle|no_media_url|unsupported|invalid_app_card|card_preview_unavailable|too_large|download_failed|lineFailure|sendUnconfirmed|http_[1-5]\d{2}(?::(?:invalid_number|worker_unavailable|stop_opt_out|5504|provider_error))?)$/;
+export const LINE_FAILURE_CODE = /^(network|bad_response|no_handle|no_media_url|unsupported|invalid_app_card|card_preview_unavailable|too_large|download_failed|lineFailure|sendUnconfirmed|http_[1-5]\d{2}(?::(?:invalid_number|worker_unavailable|stop_opt_out|opted_out|5504|provider_error))?)$/;
+export const isOptedOut = (code: string): boolean => /^http_4\d\d:opted_out$/.test(code);
 
 export type SendOptions = { replyTo?: string; sendStyle?: string; /** From upload(). */ mediaUrl?: string };
 
@@ -115,6 +116,7 @@ export interface Line {
   /** One message by handle (inbound or outbound), for reply context. */
   getMessage(handle: string): Promise<LineInbound | LineOutbound | undefined>;
   sendApp(chat: ChatKey, card: LineAppCard): Promise<{ handle: string }>;
+  updateApp?(originalHandle: string, card: LineAppCard, key: string): Promise<{ handle: string }>;
   /** Tapback name (love, like, dislike, laugh, emphasize, question) or a single emoji. Inbound messages only. */
   react(handle: string, reaction: string): Promise<void>;
   /** Shows (default) or clears our typing bubble. 1:1 only; a no-op for groups. */
@@ -125,6 +127,7 @@ export interface Line {
   requestLocation(chat: ChatKey): Promise<void>;
   /** Latest shared location for a person; a LineNoFix says why there is none, undefined if unknown. */
   location(address: string): Promise<LineLocation | LineNoFix | undefined>;
+  setOptOut(address: string, optedOut: boolean): Promise<void>;
   download(url: string, maxBytes: number, timeoutMs: number): Promise<LineFile>;
 }
 

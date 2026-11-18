@@ -7,8 +7,9 @@ export function sampleMix(limit: number, kind?: string, admittedKinds: readonly 
   for (const admitted of admittedKinds.slice(0, 128)) groups.set(admitted, []);
   const cap = kind === undefined ? Math.min(50, limit) : limit;
   let order = 0;
+  // AnalyticsEvent validates fixed-width UTC timestamps, so lexical order is chronological.
   const newest = (a: Sample, b: Sample) =>
-    b.event.ts.localeCompare(a.event.ts) || b.order - a.order;
+    a.event.ts > b.event.ts ? -1 : a.event.ts < b.event.ts ? 1 : b.order - a.order;
   const priority = (kind: string) =>
     kind.startsWith("kanban.") || kind.startsWith("ask.")
       ? 0
@@ -33,9 +34,18 @@ export function sampleMix(limit: number, kind?: string, admittedKinds: readonly 
       if (!groups.has(event.kind) && groups.size >= 128) return;
       order = Math.max(order, sequence + 1);
       const rows = groups.get(event.kind) ?? [];
-      rows.push({ event, order: sequence });
-      rows.sort(newest);
-      if (rows.length > cap) rows.pop();
+      const row = { event, order: sequence };
+      let low = 0;
+      let high = rows.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (newest(row, rows[middle]!) < 0) high = middle;
+        else low = middle + 1;
+      }
+      if (low < cap) {
+        rows.splice(low, 0, row);
+        if (rows.length > cap) rows.pop();
+      }
       groups.set(event.kind, rows);
     },
     entries,

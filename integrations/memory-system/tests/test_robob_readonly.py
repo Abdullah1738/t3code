@@ -9,6 +9,7 @@ import time
 import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from itertools import product
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,6 +28,7 @@ from replica_fixture import ready
 
 class ReadonlyTest(unittest.TestCase):
     def setUp(self):
+        ro.reset_replica_warnings()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
@@ -181,6 +183,222 @@ class ReadonlyTest(unittest.TestCase):
                 self.assertEqual(reader.execute("SELECT value FROM marker").fetchone(), ("replica",))
                 with self.assertRaises(ro.UnsafeStateDatabase):
                     ro.state_ro(self.replica)
+
+    def test_not_ready_includes_rebuild_start_and_progress(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+            con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("rebuild_started_at", "2026-11-14T11:35:38.457Z"),
+                ("rebuild_progress", json.dumps({"table": "ardud_kanban_cards", "rows": 250})),
+            ])
+        with self.assertRaisesRegex(ro.ReplicaNotReady, r"rebuilding since 2026-11-14T11:35:38.457Z \(table ardud_kanban_cards, 250 rows\)"):
+            ro.state_ro(self.replica)
+
+    def test_published_but_aged_replica_is_reported_as_stale(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            ready(con, updated_at=(datetime.now(timezone.utc) - timedelta(seconds=121)).isoformat())
+        with self.assertRaisesRegex(ro.ReplicaNotReady, "recall replica stale"):
+            ro.state_ro(self.replica)
+
+    def rebuild_snapshot(self, *, age=180):
+        self.make_replica()
+        now = datetime.now(timezone.utc)
+        updated = (now - timedelta(seconds=age)).isoformat()
+        started = (now - timedelta(seconds=60)).isoformat()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            ready(con, updated_at=updated)
+            con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("rebuild_kind", "full"), ("rebuild_started_at", started),
+                ("rebuild_finished_at", ""),
+            ])
+        diagnostics = {
+            "replica_identity": list(ro.file_identity(self.replica)),
+            "rebuild_started_at": started, "rebuild_finished_at": "",
+            "rebuild_progress": json.dumps({"kind": "full", "event": "progress", "table": "threads", "rows": 250}),
+        }
+        sidecar = self.replica.with_name(self.replica.name + ".rebuild.json")
+        sidecar.write_text(json.dumps(diagnostics))
+        return updated, diagnostics, sidecar
+
+    def test_live_full_rebuild_serves_labelled_previous_snapshot_for_content(self):
+        updated, _, _ = self.rebuild_snapshot()
+        with closing(ro.state_ro(self.replica, allow_rebuild=True)) as con:
+            self.assertEqual(con.execute("SELECT value FROM marker").fetchone(), ("replica",))
+            self.assertIn(f"replica as of {updated}; rebuild in progress since", con.replica_warning)
+            self.assertIn("threads, 250 rows", con.replica_warning)
+            self.assertIn(con.replica_warning, ro.annotate_result("answer"))
+            result = ro.annotate_result({"answer": "answer", "sources": []})
+            self.assertIn(con.replica_warning, result["answer"])
+            self.assertEqual(result["replica_warnings"][0]["rows"], 250)
+            self.assertIn(con.replica_warning, ro.annotate_result({"note": "recalled context"})["note"])
+        ro.reset_replica_warnings()
+        self.assertEqual(ro.annotate_result("fresh answer"), "fresh answer")
+        # Maintenance and native/destructive readers retain their freshness bound.
+        with self.assertRaises(ro.ReplicaNotReady):
+            ro.state_ro(self.replica)
+        with self.assertRaises(ro.ReplicaNotReady):
+            ro.native_ro(self.replica)
+
+    def test_content_rebuild_exception_requires_every_liveness_condition(self):
+        _, original, sidecar = self.rebuild_snapshot()
+        cases = [
+            ("no rebuild", "no_rebuild", {"rebuild_started_at": ""}, {}, None),
+            ("not ready", "not_ready", {"ready": "0"}, {}, None),
+            ("over six hours", "age_cap", {"updated_at": (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()}, {}, None),
+            ("old sidecar", "sidecar_stale", {}, {}, time.time() - 301),
+            ("future sidecar", "sidecar_stale", {}, {}, time.time() + 60),
+            ("wrong inode", "identity_mismatch", {}, {"replica_identity": [0, 0]}, None),
+            ("wrong start", "start_mismatch", {}, {"rebuild_started_at": "other"}, None),
+            ("SQL finished", "rebuild_finished", {"rebuild_finished_at": datetime.now(timezone.utc).isoformat()}, {}, None),
+            ("SQL abort", "sql_rebuild_terminal", {"rebuild_progress": json.dumps({"event": "abort"})}, {}, None),
+            ("SQL publish", "sql_rebuild_terminal", {"rebuild_progress": json.dumps({"event": "publish"})}, {}, None),
+            ("sidecar finished", "rebuild_finished", {}, {"rebuild_finished_at": datetime.now(timezone.utc).isoformat()}, None),
+            ("additive", "not_full_rebuild", {}, {"rebuild_progress": json.dumps({"kind": "additive", "event": "progress"})}, None),
+            ("abort", "not_in_progress", {}, {"rebuild_progress": json.dumps({"kind": "full", "event": "abort"})}, None),
+            ("publish", "not_in_progress", {}, {"rebuild_progress": json.dumps({"kind": "full", "event": "publish"})}, None),
+            ("invalid progress", "invalid_rebuild_evidence", {}, {"rebuild_progress": "{"}, None),
+            ("no progress", "invalid_rebuild_evidence", {}, {"rebuild_progress": None}, None),
+        ]
+        for kind, (name, reason, metadata, diagnostic, mtime) in product(("full", "events_reset"), cases):
+            with self.subTest(kind=kind, name=name):
+                if kind == "events_reset" and ("rebuild_progress" not in diagnostic or name in ("abort", "publish")):
+                    diagnostic = {**diagnostic, "rebuild_progress": json.dumps({
+                        "kind": kind, "event": name if name in ("abort", "publish") else "progress",
+                    })}
+                with closing(sqlite3.connect(self.replica)) as con, con:
+                    ready(con, updated_at=(datetime.now(timezone.utc) - timedelta(seconds=180)).isoformat())
+                    con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                        ("rebuild_started_at", original["rebuild_started_at"]), ("rebuild_finished_at", ""),
+                        ("rebuild_progress", "{}"),
+                        *metadata.items(),
+                    ])
+                sidecar.write_text(json.dumps({**original, **diagnostic}))
+                if mtime is not None:
+                    os.utime(sidecar, (mtime, mtime))
+                with patch.object(ro, "_log_stale") as log:
+                    with self.assertRaises(ro.ReplicaNotReady):
+                        ro.state_ro(self.replica, allow_rebuild=True)
+                    self.assertEqual(log.call_args.kwargs["reason"], reason)
+        sidecar.unlink()
+        with self.assertRaises(ro.ReplicaNotReady), patch.object(ro, "_log_stale") as log:
+            ro.state_ro(self.replica, allow_rebuild=True)
+        self.assertEqual(log.call_args.kwargs["reason"], "sidecar_missing")
+
+    def test_nested_reset_requires_a_live_published_full_parent(self):
+        _, original, sidecar = self.rebuild_snapshot()
+        reset = {**original, "rebuild_progress": json.dumps({
+            "kind": "events_reset", "event": "progress", "table": "orchestration_events", "rows": 10,
+        })}
+        cases = [
+            ("full parent", "1", "full", None, True),
+            ("standalone reset", "1", "events_reset", None, False),
+            ("unknown parent", "1", None, None, False),
+            ("additive parent", "1", "additive", None, False),
+            ("unready parent", "0", "full", None, False),
+            ("expired heartbeat", "1", "full", time.time() - 301, False),
+        ]
+        for name, flag, parent, mtime, allowed in cases:
+            with self.subTest(name=name):
+                with closing(sqlite3.connect(self.replica)) as con, con:
+                    con.execute("UPDATE ardud_readonly_meta SET value=? WHERE key='ready'", (flag,))
+                    con.execute("DELETE FROM ardud_readonly_meta WHERE key='rebuild_kind'")
+                    if parent:
+                        con.execute("INSERT INTO ardud_readonly_meta VALUES ('rebuild_kind',?)", (parent,))
+                sidecar.write_text(json.dumps(reset))
+                if mtime:
+                    os.utime(sidecar, (mtime, mtime))
+                if allowed:
+                    with closing(ro.state_ro(self.replica, allow_rebuild=True)) as con:
+                        self.assertIn("orchestration_events, 10 rows", con.replica_warning)
+                        self.assertEqual(con.execute("SELECT value FROM marker").fetchone(), ("replica",))
+                else:
+                    with self.assertRaises(ro.ReplicaNotReady):
+                        ro.state_ro(self.replica, allow_rebuild=True)
+
+    def test_stale_snapshot_is_logged_once_per_connection(self):
+        self.rebuild_snapshot()
+        with patch.object(ro, "_log_stale") as log, closing(ro.state_ro(self.replica, allow_rebuild=True)) as con:
+            ro.ready_generation(con, allow_rebuild=True)
+            self.assertEqual(log.call_count, 1)
+            self.assertEqual(log.call_args.args[0], "stale-served")
+
+    def test_fresh_snapshot_clears_only_its_own_rebuild_warning(self):
+        self.rebuild_snapshot()
+        with closing(ro.state_ro(self.replica, allow_rebuild=True)):
+            pass
+        self.assertIsNotNone(ro.replica_warning(self.replica))
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            ready(con)
+        with closing(ro.state_ro(self.replica, allow_rebuild=True)):
+            pass
+        self.assertIsNone(ro.replica_warning(self.replica))
+
+    def test_unready_bootstrap_diagnostics_without_a_watermark(self):
+        self.make_replica()
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("DELETE FROM ardud_readonly_meta WHERE key='updated_at'")
+            con.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+            con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("rebuild_started_at", "2026-11-14T11:35:38.457Z"),
+                ("rebuild_progress", json.dumps({"table": "threads", "rows": 3})),
+            ])
+        with self.assertRaisesRegex(ro.ReplicaNotReady, r"updated_at missing, ready 0.*rebuilding since 2026-11-14T11:35:38.457Z \(table threads, 3 rows\)"):
+            ro.state_ro(self.replica)
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("UPDATE ardud_readonly_meta SET value='1' WHERE key='ready'")
+        with self.assertRaises(ro.UnsafeStateDatabase):
+            ro.state_ro(self.replica)
+
+    def test_diagnostic_sidecar_identity_lifecycle_and_fallbacks(self):
+        self.make_replica()
+        started = "2026-11-14T11:35:38.457Z"
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
+            con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("rebuild_started_at", started),
+                ("rebuild_progress", json.dumps({"table": "pending", "rows": 0})),
+            ])
+        diagnostic = {
+            "replica_identity": list(ro.file_identity(self.replica)),
+            "rebuild_started_at": started,
+            "rebuild_finished_at": "",
+            "rebuild_progress": json.dumps({"event": "progress", "table": "threads", "rows": 250}),
+            # These must never override the SQLite readiness decision.
+            "ready": "1", "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        cases = [
+            ("progress", diagnostic, "rebuilding since", "threads, 250 rows"),
+            ("abort", {**diagnostic, "rebuild_progress": json.dumps({"event": "abort", "table": "threads", "rows": 250})}, "rebuild aborted since", "threads, 250 rows"),
+            ("old inode", {**diagnostic, "replica_identity": [0, 0]}, "rebuilding since", "pending, 0 rows"),
+            ("old rebuild", {**diagnostic, "rebuild_started_at": "old"}, "rebuilding since", "pending, 0 rows"),
+            ("incomplete", {"replica_identity": diagnostic["replica_identity"], "rebuild_started_at": started}, "rebuilding since", "pending, 0 rows"),
+            ("invalid progress", {**diagnostic, "rebuild_progress": "{"}, "rebuilding since", ""),
+            ("invalid JSON", "{", "rebuilding since", "pending, 0 rows"),
+            ("wrong JSON type", [], "rebuilding since", "pending, 0 rows"),
+            ("published", {**diagnostic, "rebuild_finished_at": started}, "", ""),
+        ]
+        sidecar = self.replica.with_name(self.replica.name + ".rebuild.json")
+        for name, value, status, progress in cases:
+            with self.subTest(name=name):
+                sidecar.write_text(value if isinstance(value, str) else json.dumps(value))
+                with self.assertRaises(ro.ReplicaNotReady) as error:
+                    ro.state_ro(self.replica)
+                self.assertIn("ready 0", str(error.exception))
+                if status:
+                    self.assertIn(status, str(error.exception))
+                    self.assertIn(progress, str(error.exception))
+                else:
+                    self.assertNotIn("rebuilding since", str(error.exception))
+        # Publication may commit just before the diagnostic rename, or a pinned
+        # reader may still see the previous sidecar. SQL completion wins.
+        sidecar.write_text(json.dumps(diagnostic))
+        with closing(sqlite3.connect(self.replica)) as con, con:
+            con.execute("INSERT INTO ardud_readonly_meta VALUES ('rebuild_finished_at',?)", (started,))
+        with self.assertRaises(ro.ReplicaNotReady) as error:
+            ro.state_ro(self.replica)
+        self.assertNotIn("rebuilding since", str(error.exception))
 
     def test_native_freshness_uses_metadata_not_file_mtime(self):
         self.make_replica()
@@ -350,6 +568,7 @@ class ReadonlyTest(unittest.TestCase):
 
 class RecallReplicaTest(unittest.TestCase):
     def setUp(self):
+        ro.reset_replica_warnings()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "export.sqlite"
@@ -397,6 +616,26 @@ class RecallReplicaTest(unittest.TestCase):
             con.execute("UPDATE ardud_readonly_meta SET value='0' WHERE key='ready'")
         with self.assertRaises(ro.UnsafeStateDatabase):
             recall_core._state_cache()
+
+    def test_rebuild_keeps_known_lineage_but_rejects_newer_caller_specifically(self):
+        now = datetime.now(timezone.utc)
+        started = (now - timedelta(seconds=30)).isoformat()
+        with closing(sqlite3.connect(self.path)) as con, con:
+            con.executescript("CREATE TABLE ardud_opencode_import(native_session_id TEXT,thread_id TEXT); CREATE TABLE orchestration_v2_projection_subagents(thread_id TEXT,child_thread_id TEXT,payload_json TEXT,subagent_id TEXT)")
+            ready(con, updated_at=(now - timedelta(minutes=10)).isoformat())
+            con.executemany("INSERT OR REPLACE INTO ardud_readonly_meta VALUES (?,?)", [
+                ("rebuild_kind", "full"), ("rebuild_started_at", started), ("rebuild_finished_at", ""),
+            ])
+        sidecar = self.path.with_name(self.path.name + ".rebuild.json")
+        sidecar.write_text(json.dumps({
+            "replica_identity": list(ro.file_identity(self.path)), "rebuild_started_at": started,
+            "rebuild_finished_at": "", "rebuild_progress": json.dumps({"kind": "full", "event": "progress"}),
+        }))
+        self.assertIn("thread", recall_core._state_cache(caller="thread").lineage)
+        self.assertEqual(recall_core._state_tree({"thread:new"}, caller="thread:new"), set())
+        os.utime(sidecar, (time.time() - 301, time.time() - 301))
+        with self.assertRaises(ro.ReplicaNotReady):
+            recall_core._state_cache(caller="thread")
 
 
 if __name__ == "__main__":

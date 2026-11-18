@@ -1,11 +1,13 @@
-import { toolLog, toolError, rollup } from "./toollog.ts";
+import { queueOwnerRecovery } from "./owner-alerts.ts";
+import { assertMacWatcher } from "./person-box.ts";
+import { toolLog, toolError, rollup, logMarker } from "./toollog.ts";
 import { stderrCause } from "./cause.ts";
-import { cpSync, existsSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import {
-  heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, ARCHIVE, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
+  checkWakeRoute, trackConfirmation, watcherInstance, retiredWatcher, pollingWatcher, heldByMaintenance, loadMaintenance, MAINTENANCE_FILE, validDepends, type Dependency, addStop, editContext, editWatcher, removeWatcher, contactKey, deliver, ensureDirs, family, iso, listIds, loadState, loadWatcher, log, normalize, relayCheck, runCheck,
   saveState, sendNotes, type State, type Stop, stopFor, unscopedSender, validId, type Watcher, watcherDir, WATCHERS, withRelayLock, writeJson,
 } from "./lib.ts";
 
@@ -14,13 +16,14 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch add --id ID --title TEXT --check CMD [--interval 30] [--mode wake|notify]
                   (--context TEXT | --context-file PATH) [--expires 14d|ISO] [--max-fires 1] [--serial]
                   [--session CURRENT_SESSION_ID] [--trigger FILE]... [--replace] [--no-prime] [--owner-only]
-                  [--depends ssd,phone]
+                  [--depends ssd,phone] [--inflight-check CMD]
                   [--chat SLUG]  (wake that bridge chat, e.g. moni, instead of the owner's; her own data)
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, timeout_s, max_consecutive_failures, failure_notice_after, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
+                                         expires_at, max_fires, inflight_check, timeout_s, max_consecutive_failures, failure_notice_after, owner_imessage_alerts, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
-  robob-watch context ID                 full saved context (wakes carry only its start)
+  robob-watch context ID [--json FILE|- | --context TEXT | --context-file PATH] [--replace]
+                                         read context, or merge keys/append lists (replace overwrites)
   robob-watch logs ID [-n 40]
   robob-watch test ID                    run the check once on a scratch copy of its state; no delivery
   robob-watch fire-test ID               deliver a clearly-marked test event through the watcher's mode
@@ -29,12 +32,14 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
   robob-watch maintenance on --for 2h [--depends ssd,phone] [--reason "SSD swap"]
   robob-watch maintenance off            end maintenance now
   robob-watch maintenance                JSON state and held watcher ids
-  robob-watch remove ID                  archive and stop it
+  robob-watch remove|rm ID [--now]       cancel; explicit --inflight-check gets 15 min reply grace
   robob-watch relay-ok ID --to JID [--eta ISO]   may this fire message JID now? "ok" (exit 0) counts it; "no" exits 3
   robob-watch relays-off ID [--to JID] --quote TEXT   the owner stopped updates to JID (default everyone), on every
                                          watcher sharing ID's trip
   robob-watch unscoped                   watchers whose text mentions wa draft/send but lists no relays (info only)
   robob-watch log-rollup [--day YYYY-MM-DD]   roll up a UTC day (default yesterday)
+  robob-watch log-rollup --since ISO --until ISO [--out PATH]   roll up [since, until), stdout by default
+  robob-watch log-marker --service NAME --sha SHA --step NAME   best-effort release marker
   robob-watch runner                     LaunchAgent status
 
 Check contract: a zsh command run in the watcher dir with WATCH_DIR set. Print nothing when there is nothing new;
@@ -43,7 +48,8 @@ watcher.json failure_notice_after overrides 2 (1 = every failure); pause and ale
 watcher.json max_consecutive_failures overrides 5 (0 = backoff only); resume clears the failure pause and count.
 Keep your own state in $WATCH_DIR. Helpers on PATH: whatsapp-new-message, output-changed, email-new-message.
 Default interval 15s (min 5s). --trigger FILE runs the check within ~1s of FILE changing (push instead of poll),
-e.g. --trigger ~/Library/Messages/chat.db-wal for iMessage; the interval stays as the fallback.`;
+e.g. --trigger ~/Library/Messages/chat.db-wal for iMessage; the interval stays as the fallback.
+Trigger files may appear later; the interval runs the check until they exist.`;
 
 class CliError extends Error {}
 
@@ -77,6 +83,7 @@ const ago = (value?: string) => {
 };
 
 function statusLabel(watcher: Watcher, state: State): string {
+  watcher = pollingWatcher(watcher, state) ?? watcher;
   return state.failure_paused_at ? `paused (failing since ${state.failing_since ?? state.failure_paused_at})`
     : watcher.paused ? "paused" : state.status;
 }
@@ -87,11 +94,11 @@ function dependencies(value: string): Dependency[] {
   return [...new Set(items)];
 }
 
-async function scratchRun(watcher: Watcher) {
+async function scratchRun(watcher: Watcher, closing: boolean) {
   const scratch = mkdtempSync(join(tmpdir(), `robob-watch-${watcher.id}-`));
   try {
     cpSync(watcherDir(watcher.id), scratch, { recursive: true });
-    return await runCheck(watcher, scratch);
+    return await runCheck(watcher, scratch, { WATCH_CLOSING: closing ? "1" : "0" });
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -99,23 +106,35 @@ async function scratchRun(watcher: Watcher) {
 
 async function main(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
+  if (command === "log-marker") {
+    try {
+      const { values } = parseArgs({ args: rest, strict: true, options: {
+        service: { type: "string" }, sha: { type: "string" }, step: { type: "string" },
+      } });
+      logMarker(values);
+    } catch { /* Even malformed marker invocations must not interrupt a release. */ }
+    return;
+  }
   const { values, positionals } = parseArgs({
     args: rest, allowPositionals: true, strict: true,
     options: {
-      day: { type: "string" }, id: { type: "string" }, title: { type: "string" }, check: { type: "string" }, interval: { type: "string" },
+      since: { type: "string" }, until: { type: "string" }, out: { type: "string" },
+      day: { type: "string" }, "inflight-check": { type: "string" }, id: { type: "string" }, title: { type: "string" }, check: { type: "string" }, interval: { type: "string" },
       mode: { type: "string" }, context: { type: "string" }, "context-file": { type: "string" }, expires: { type: "string" },
       "max-fires": { type: "string" }, serial: { type: "boolean" }, session: { type: "string" }, replace: { type: "boolean" },
-      "no-prime": { type: "boolean" }, trigger: { type: "string", multiple: true }, json: { type: "string" }, n: { type: "string" }, help: { type: "boolean", short: "h" },
+      "no-prime": { type: "boolean" }, trigger: { type: "string", multiple: true }, json: { type: "string" }, n: { type: "string" }, help: { type: "boolean", short: "h" }, now: { type: "boolean" },
       depends: { type: "string" }, for: { type: "string" }, reason: { type: "string" },
       chat: { type: "string" }, to: { type: "string" }, eta: { type: "string" }, quote: { type: "string" }, "owner-only": { type: "boolean" },
     },
   });
-  ensureDirs();
+  if (command !== "log-rollup") ensureDirs();
   switch (command) {
     case "log-rollup": {
       const day = values.day ?? new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
-      const result = await rollup(day);
-      if (!result) throw new CliError("Could not roll up UTC day");
+      const window = values.since !== undefined || values.until !== undefined;
+      if (window && (values.day !== undefined || values.since === undefined || values.until === undefined)) throw new CliError("Use --since and --until together, without --day");
+      const result = await rollup(window ? { since: values.since!, until: values.until! } : day, undefined, values.out);
+      if (!result) throw new CliError(window ? "Could not roll up time window" : "Could not roll up UTC day");
       console.log(JSON.stringify(result));
       return;
     }
@@ -139,39 +158,64 @@ async function main(argv: string[]): Promise<void> {
           ...(values["owner-only"] ? { relays: [] } : {}),
         };
       }
+      assertMacWatcher(input.chat);
       if (values.expires !== undefined) input.expires_at = duration(values.expires);
       if (input.expires_at === undefined) input.expires_at = duration("14d");
       if (values["owner-only"]) input.relays = [];
-      const previous = values.replace && validId(input.id) ? loadWatcher(input.id as string) : undefined;
-      // Flags can't express relays, so a flag --replace keeps the ones the owner already allowed. Stops live
-      // outside watcher.json, so no replace can lift one.
-      if (values.json === undefined && previous?.relays && !values["owner-only"]) input.relays = previous.relays;
-      if (values.json === undefined && previous?.timeout_s !== undefined) input.timeout_s = previous.timeout_s;
-      if (values.json === undefined && previous?.pending_check !== undefined) input.pending_check = previous.pending_check;
-      if (values.json === undefined && previous?.depends) input.depends = previous.depends;
-      if (values.json === undefined && previous?.max_consecutive_failures !== undefined) input.max_consecutive_failures = previous.max_consecutive_failures;
-      if (values.json === undefined && previous?.failure_notice_after !== undefined) input.failure_notice_after = previous.failure_notice_after;
-      if (values.json === undefined && previous?.trip) input.trip = previous.trip;
-      if (values.json === undefined && previous?.chat && values.chat === undefined) input.chat = previous.chat;
-      if (values.depends !== undefined) input.depends = values.depends === "none" ? [] : dependencies(values.depends);
-      let watcher: Watcher;
-      try { watcher = normalize(input as Partial<Watcher> & Record<string, unknown>); } catch (error) { toolError("cli", "watch.invalid_definition", undefined, { stderrClass: "usage_error" }); throw new CliError((error as Error).message); }
-      const dir = watcherDir(watcher.id);
-      const replacingExisting = existsSync(join(dir, "watcher.json"));
-      if (replacingExisting) {
-        if (!values.replace) throw new CliError(`Watcher ${watcher.id} exists; use --replace to overwrite its definition (state is kept)`);
-        const existing = loadWatcher(watcher.id)!;
-        watcher.created_at = existing.created_at;
-        if (existing.headsup && values.json === undefined) watcher.headsup = true;
-        if (existing.quiet && values.json === undefined) watcher.quiet = existing.quiet;
+      if (values["inflight-check"] !== undefined) input.inflight_check = values["inflight-check"];
+      const prepare = () => {
+        const candidate = { ...input };
+        const previous = values.replace && validId(candidate.id) ? loadWatcher(candidate.id as string) : undefined;
+        assertMacWatcher(candidate.chat ?? previous?.chat);
+        // Flags can't express relays, so a flag --replace keeps the ones the owner already allowed. Stops live
+        // outside watcher.json, so no replace can lift one.
+        if (values.json === undefined && previous?.relays && !values["owner-only"]) candidate.relays = previous.relays;
+        if (values.json === undefined && previous?.inflight_check && values["inflight-check"] === undefined) candidate.inflight_check = previous.inflight_check;
+        if (values.json === undefined && previous?.timeout_s !== undefined) candidate.timeout_s = previous.timeout_s;
+        if (values.json === undefined && previous?.pending_check !== undefined) candidate.pending_check = previous.pending_check;
+        if (values.json === undefined && previous?.depends) candidate.depends = previous.depends;
+        if (values.json === undefined && previous?.max_consecutive_failures !== undefined) candidate.max_consecutive_failures = previous.max_consecutive_failures;
+        if (values.json === undefined && previous?.failure_notice_after !== undefined) candidate.failure_notice_after = previous.failure_notice_after;
+        if (values.json === undefined && previous?.owner_imessage_alerts) candidate.owner_imessage_alerts = true;
+        if (values.json === undefined && previous?.trip) candidate.trip = previous.trip;
+        if (values.json === undefined && previous?.chat && values.chat === undefined) candidate.chat = previous.chat;
+        if (values.depends !== undefined) candidate.depends = values.depends === "none" ? [] : dependencies(values.depends);
+        let watcher: Watcher;
+        try { watcher = normalize(candidate as Partial<Watcher> & Record<string, unknown>); } catch (error) { toolError("cli", "watch.invalid_definition", undefined, { stderrClass: "usage_error" }); throw new CliError((error as Error).message); }
+        const dir = watcherDir(watcher.id);
+        const replacingExisting = existsSync(join(dir, "watcher.json"));
+        if (retiredWatcher(watcher.id)) throw new CliError(`Watcher ${watcher.id} was removed; use a new ID`);
+        if (replacingExisting) {
+          if (!values.replace) throw new CliError(`Watcher ${watcher.id} exists; use --replace to overwrite its definition (state is kept)`);
+          const existing = loadWatcher(watcher.id)!;
+          watcher.created_at = existing.created_at;
+          if (existing.headsup && values.json === undefined) watcher.headsup = true;
+          if (existing.quiet && values.json === undefined) watcher.quiet = existing.quiet;
+        }
+        return { watcher, dir, replacingExisting };
+      };
+      const prepared = withRelayLock(prepare);
+      const wakeRoute = await checkWakeRoute(prepared.watcher);
+      if (wakeRoute?.route === "refused") {
+        toolError("cli", "watch.invalid_definition", { watcher: prepared.watcher.id }, { stderrClass: "usage_error" });
+        throw new CliError(wakeRoute.note);
       }
-      Bun.spawnSync(["/bin/mkdir", "-p", dir]);
-      writeJson(join(dir, "watcher.json"), watcher);
-      const state = loadState(watcher.id);
-      state.next_at = 0;
-      saveState(watcher.id, state);
+      const { watcher, dir, replacingExisting } = withRelayLock(() => {
+        const current = prepare();
+        const { watcher, dir } = current;
+        // A replacement may inherit a chat changed by another process while the route was checked.
+        if (watcher.mode !== prepared.watcher.mode || watcher.chat !== prepared.watcher.chat
+          || watcher.created_by_session !== prepared.watcher.created_by_session) throw new CliError("Watcher route changed during validation; retry add");
+        Bun.spawnSync(["/bin/mkdir", "-p", dir]);
+        writeJson(join(dir, "watcher.json"), watcher);
+        const state = loadState(watcher.id);
+        state.next_at = 0;
+        saveState(watcher.id, state);
+        return current;
+      });
       log(watcher.id, `${values.replace ? "replaced" : "added"} by ${watcher.created_by_session ?? "unknown session"}`);
       for (const note of sendNotes(watcher)) process.stderr.write(`Note for ${watcher.id}: ${note}.\n`);
+      if (wakeRoute) process.stderr.write(`Note for ${watcher.id}: ${wakeRoute.note}\n`);
       let prime = "";
       // --replace keeps the existing baseline, so don't prime: a real reply landing during a prime run would be
       // recorded as "seen" and never delivered (Dynamic reply swallowed 1 Oct 2026 16:18). New watchers still prime.
@@ -186,15 +230,14 @@ async function main(argv: string[]): Promise<void> {
         log(watcher.id, prime);
       }
       console.log(JSON.stringify({ added: watcher.id, mode: watcher.mode, interval_s: watcher.interval_s, expires_at: watcher.expires_at,
-        max_fires: watcher.max_fires, serial: watcher.serial, dir, prime }, null, 2));
+        max_fires: watcher.max_fires, serial: watcher.serial, dir, prime, ...(wakeRoute ? { wake_route: wakeRoute } : {}) }, null, 2));
       return;
     }
     case "depends": {
       const w = need(positionals[0]);
       if (positionals.length !== 2) throw new CliError("depends needs ID and ssd,phone or none");
-      w.depends = positionals[1] === "none" ? [] : dependencies(positionals[1]!);
-      writeJson(join(watcherDir(w.id), "watcher.json"), normalize(w));
-      console.log(JSON.stringify({ id: w.id, depends: w.depends }));
+      const next = editWatcher(w.id, current => ({ ...current, depends: positionals[1] === "none" ? [] : dependencies(positionals[1]!) }));
+      console.log(JSON.stringify({ id: next.id, depends: next.depends }));
       return;
     }
     case "maintenance": {
@@ -210,9 +253,9 @@ async function main(argv: string[]): Promise<void> {
       } else if (positionals.length) throw new CliError("maintenance accepts on, off, or no action");
       const maintenance = loadMaintenance();
       const held = listIds().filter(id => {
-        const w = loadWatcher(id)!;
         const s = loadState(id);
-        return s.status === "active" && !w.paused && !s.failure_paused_at && heldByMaintenance(w, maintenance);
+        const w = pollingWatcher(loadWatcher(id)!, s);
+        return !!w && (s.status === "active" || s.status === "closing") && !w.paused && !s.failure_paused_at && heldByMaintenance(w, maintenance);
       });
       console.log(JSON.stringify({ maintenance: maintenance ?? null, held }, null, 2));
       return;
@@ -224,21 +267,31 @@ async function main(argv: string[]): Promise<void> {
         const w = loadWatcher(id)!;
         const s = loadState(id);
         const status = statusLabel(w, s);
-        console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${w.triggers?.length ? "+trigger" : ""}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}${s.load_timeouts ? `  load-timeouts ${s.load_timeouts}` : ""}\n    ${w.title}`);
+        const triggerHint = w.triggers?.length ? (s.trigger_missing?.paths.length ? "+trigger(waiting)" : "+trigger") : "";
+        console.log(`${id}  [${status}] ${w.mode} every ${w.interval_s}s${triggerHint}  fires ${s.fires}/${w.max_fires || "inf"}  expires ${w.expires_at?.slice(0, 16) ?? "never"}  last run ${ago(s.last_run_at)}${s.last_run_ms !== undefined ? ` (${(s.last_run_ms / 1000).toFixed(1)}s)` : ""}${s.pending ? "  UNDELIVERED EVENT" : s.batch ? `  BATCHING ${s.batch.events.length} EVENTS` : ""}${s.consecutive_failures ? `  failing x${s.consecutive_failures}` : ""}${s.load_timeouts ? `  load-timeouts ${s.load_timeouts}` : ""}\n    ${w.title}`);
       }
       return;
     }
     case "show": {
       const w = need(positionals[0]);
       const s = loadState(w.id);
-      console.log(JSON.stringify({ watcher: w, state: s, status: statusLabel(w, s), dir: watcherDir(w.id) }, null, 2));
+      const wakeRoute = await checkWakeRoute(w);
+      if (wakeRoute) process.stderr.write(`Note for ${w.id}: ${wakeRoute.route === "refused" ? `wakes go to the owner chat (${wakeRoute.reason}; creator is not a live thread)` : wakeRoute.note}\n`);
+      console.log(JSON.stringify({ watcher: w, state: s, status: statusLabel(w, s), dir: watcherDir(w.id), ...(wakeRoute ? { wake_route: wakeRoute } : {}) }, null, 2));
       if (s.load_timeouts) console.log(`load-timeouts ${s.load_timeouts}`);
       console.log(`--- log (last 20)\n${tail(w.id, 20)}`);
       return;
     }
     case "context": {
       const w = need(positionals[0]);
-      console.log(w.context || "(none)");
+      const patch = values.json !== undefined
+        ? (values.json === "-" ? await new Response(Bun.stdin.stream()).text() : readFileSync(values.json, "utf8"))
+        : values["context-file"] !== undefined ? readFileSync(values["context-file"], "utf8") : values.context ?? positionals[1];
+      if (values.json !== undefined) {
+        const parsed = JSON.parse(patch!);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new CliError("context --json needs an object");
+      }
+      console.log(patch === undefined ? w.context || "(none)" : editContext(w.id, patch, values.replace));
       return;
     }
     case "logs": {
@@ -248,7 +301,10 @@ async function main(argv: string[]): Promise<void> {
     }
     case "test": {
       const w = need(positionals[0]);
-      const result = await scratchRun(w);
+      const state = loadState(w.id);
+      const current = pollingWatcher(w, state);
+      if (!current) throw new CliError("No in-flight reply check configured for this closing watcher");
+      const result = await scratchRun(current, state.status === "closing" || !!state.reply_handoff);
       console.log(JSON.stringify({ id: w.id, exit: result.code, timedOut: result.timedOut, seconds: Math.round(result.ms / 100) / 10, fires: !!result.stdout.trim() && result.code === 0,
         stdout: result.stdout.trim(), stderr: result.stderr.trim().slice(-1000) }, null, 2));
       if (result.code !== 0 || result.timedOut) process.exitCode = 1;
@@ -256,39 +312,63 @@ async function main(argv: string[]): Promise<void> {
     }
     case "fire-test": {
       const w = need(positionals[0]);
+      const instance = watcherInstance(w.id);
       const key = `robob-watch:${w.id}:test:${Date.now()}`;
       const result = await deliver(w, "This is a test fire of the watcher. No real event happened.", key, loadState(w.id), true);
-      log(w.id, `fire-test ok=${result.ok} via=${result.via} ${result.detail}`);
+      if (result.confirmation && loadWatcher(w.id) && watcherInstance(w.id) === instance) {
+        const state = loadState(w.id);
+        trackConfirmation(state, result);
+        state.last_delivery = result.via;
+        saveState(w.id, state);
+      }
+      log(w.id, `fire-test ok=${result.ok} via=${result.via} confirmed=${result.confirmed ?? "n/a"} ${result.detail}`);
       console.log(JSON.stringify(result, null, 2));
-      if (!result.ok) process.exitCode = 1;
+      if (!result.ok && !result.accepted) process.exitCode = 1;
       return;
     }
     case "pause":
     case "resume": {
-      const w = need(positionals[0]);
-      w.paused = command === "pause";
-      toolLog({ component: "cli", kind: "event", name: command === "pause" ? "watch.disabled" : "watch.recovered", ids: { watcher: w.id }, props: { action: command } });
-      if (command === "resume" && values.expires !== undefined) w.expires_at = duration(values.expires);
-      writeJson(join(watcherDir(w.id), "watcher.json"), w);
-      const s: State = loadState(w.id);
-      if (command === "resume" && s.status !== "active") {
-        if (w.expires_at && Date.parse(w.expires_at) <= Date.now()) throw new CliError("Watcher is expired; pass --expires to re-arm it");
-        s.status = "active";
-        s.fires = 0;
-      }
-      if (command === "resume") {
-        delete s.failure_paused_at;
-        delete s.load_timeouts;
-        delete s.load_timeout_since;
-        s.consecutive_failures = 0;
-        s.failure_alerted = false;
-        delete s.failure_escalated;
-        delete s.failing_since;
-        delete s.last_error;
-        delete s.last_error_sources;
-      }
-      s.next_at = 0;
-      saveState(w.id, s);
+      const { w, s } = withRelayLock(() => {
+        const w = need(positionals[0]);
+        w.paused = command === "pause";
+        toolLog({ component: "cli", kind: "event", name: command === "pause" ? "watch.disabled" : "watch.recovered", ids: { watcher: w.id }, props: { action: command } });
+        if (command === "resume" && values.expires !== undefined) w.expires_at = duration(values.expires);
+        writeJson(join(watcherDir(w.id), "watcher.json"), w);
+        const s: State = loadState(w.id);
+        const endedGrace = command === "resume" && s.status === "closing" ? s.closing_relays ?? 0 : undefined;
+        if (command === "resume" && s.status !== "active") {
+          if (w.expires_at && Date.parse(w.expires_at) <= Date.now()) throw new CliError("Watcher is expired; pass --expires to re-arm it");
+          const rearm = s.status !== "closing" || s.closing_from === "done" || s.closing_from === "expired"
+            || (w.max_fires !== 0 && s.fires >= w.max_fires);
+          if (rearm) s.fires = 0;
+          s.status = "active";
+          delete s.closing_relays;
+          delete s.closing_until;
+          delete s.closing_from;
+          delete s.closing_watcher;
+          delete s.closing_final_started;
+          delete s.closing_final_check;
+        }
+        if (command === "resume") {
+          queueOwnerRecovery(w, s);
+          delete s.failure_paused_at;
+          delete s.trigger_error;
+          delete s.load_timeouts;
+          delete s.load_timeout_since;
+          s.consecutive_failures = 0;
+          s.failure_alerted = false;
+          delete s.failure_escalated;
+          delete s.failing_since;
+          delete s.dependency_busy;
+          delete s.failure_episode;
+          delete s.last_error;
+          delete s.last_error_sources;
+        }
+        s.next_at = 0;
+        saveState(w.id, s);
+        if (endedGrace !== undefined) toolLog({ component: "cli", kind: "event", name: "watch.grace_ended", ids: { watcher: w.id }, props: { reason: "resume", relays: endedGrace } });
+        return { w, s };
+      });
       log(w.id, command);
       console.log(JSON.stringify({ id: w.id, paused: w.paused, status: s.status }));
       return;
@@ -324,13 +404,11 @@ async function main(argv: string[]): Promise<void> {
       if (!covered.length) process.exitCode = 3;
       return;
     }
+    case "rm":
     case "remove": {
       toolLog({ component: "cli", kind: "event", name: "watch.disabled", ids: { watcher: positionals[0] }, props: { action: "remove" } });
       const w = need(positionals[0]);
-      log(w.id, "removed");
-      const target = join(ARCHIVE, `${w.id}-${Date.now()}`);
-      renameSync(watcherDir(w.id), target);
-      console.log(JSON.stringify({ removed: w.id, archived: target }));
+      console.log(JSON.stringify({ id: w.id, ...removeWatcher(w.id, values.now) }));
       return;
     }
     case "unscoped": {

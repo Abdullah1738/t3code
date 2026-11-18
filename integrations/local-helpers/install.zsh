@@ -67,12 +67,16 @@ take_lock() {
 
 # repo dir -> live dir. Only files git knows about: keys, tokens, caches and state stay on the live side.
 typeset -A live=(
+  libexec/opencode-reload "$HOME/.local/libexec/opencode-reload"
   libexec/toollog "$HOME/.local/libexec/toollog"
   libexec/image-generation "$HOME/.local/libexec/image-generation"
   libexec/mail "$HOME/.local/libexec/mail"
   libexec/card-preview "$HOME/.local/libexec/card-preview"
   libexec/qcard "$HOME/.local/libexec/qcard"
   libexec/mirage "$HOME/.local/libexec/mirage"
+  libexec/vp "$HOME/.local/libexec/vp"
+  libexec/repo-node-pin "$HOME/.local/libexec/repo-node-pin"
+  libexec/repo-node-pin/pnpm-bin "$HOME/.local/libexec/repo-node-pin/pnpm-bin"
   juno-proxy "$HOME/.local/share/juno-proxy"
   lydia-ticks "$HOME/.local/share/lydia-ticks"
   bin "$HOME/.local/bin"
@@ -407,6 +411,9 @@ for f in "${plists[@]}"; do smoke plutil -lint "$f"; done
 smoke sh -n "$HOME/.local/bin/himalaya-heal"
 smoke sh -n "$HOME/.local/bin/mirage-beacon-keepalive"
 smoke sh -n "$lib/mirage/restart.sh"
+smoke sh -n "$HOME/.local/bin/vp"
+for f in child.mjs launcher.mjs events.mjs worktree.mjs config-snapshot.mjs toolchain-state.mjs toolchain; do smoke node --check "$lib/vp/$f"; done
+smoke sh -c 'cd / && "$1" --version >/dev/null 2>&1; [ "$?" = 127 ]' sh "$HOME/.local/bin/vp"
 smoke zsh -n "$HOME/.local/share/lydia-ticks/tunnel.sh"
 for f in power-unplug-telegram.sh battery-low-telegram.sh cards-tunnel cards-tunnel-setup cards-health robob-read-watchdog quint; do
   smoke zsh -n "$HOME/.local/bin/$f"

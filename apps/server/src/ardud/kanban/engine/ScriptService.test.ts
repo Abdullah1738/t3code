@@ -12,6 +12,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
@@ -28,6 +29,7 @@ import {
   type KanbanActor,
   type KanbanBoard,
   type KanbanCard,
+  type KanbanChange,
   type KanbanScript,
   type KanbanScriptTrigger,
 } from "@t3tools/contracts";
@@ -62,6 +64,7 @@ import type * as Waits from "./waits.ts";
 const threads = Layer.succeed(
   KanbanThreads,
   KanbanThreads.of({
+    remove: () => Effect.void,
     pendingUserInputs: () => Effect.succeed([]),
     claimContext: () => Effect.succeed(null),
     view: () => Effect.succeed(null),
@@ -69,6 +72,7 @@ const threads = Layer.succeed(
     lastFailure: () => Effect.succeed(null),
     findLastFailure: () => Effect.succeed(null),
     latestRun: () => Effect.succeed(null),
+    backgroundStoppedSince: () => Effect.succeed(false),
     runSettled: () => Effect.succeed(true),
     compactRun: () => Effect.succeed(null),
     launch: () => Effect.succeed(ThreadId.make("thread-1")),
@@ -771,6 +775,67 @@ it.effect("supplies the current migration setting and bundled resolver to actual
   }).pipe(Effect.provide(testLayer)),
 );
 
+it.effect.each(["manual", "webhook", "event", "schedule"])(
+  "deleted boards refuse %s script starts and restore keeps the script enabled",
+  (trigger) =>
+    Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile("echo ok\n"));
+      yield* kanban.updateBoard(board.id, { archived: true }, owner);
+      const refused = yield* scripts.run(script.id, trigger).pipe(Effect.flip);
+      assert.strictEqual(refused.code, "denied");
+      assert.deepStrictEqual(yield* scripts.runs(script.id, 10), []);
+      assert.isTrue((yield* scripts.scripts(board.id))[0]!.enabled);
+      yield* kanban.updateBoard(board.id, { archived: false }, owner);
+      yield* scripts.run(script.id, trigger);
+      yield* scripts.idle;
+      assert.strictEqual((yield* scripts.runs(script.id, 10)).length, 1);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("deletion's card-moved events cannot launch a script on the archived board", () =>
+  Effect.gen(function* () {
+    const drained = yield* Deferred.make<void>();
+    const events: Array<{ boardId: KanbanBoardId; change: KanbanChange }> = [];
+    const layer = makeTestLayer(threads, false, (service) => ({
+      ...service,
+      changes: Effect.sync(() =>
+        Stream.concat(
+          Stream.fromIterable(events),
+          Stream.fromEffect(Deferred.succeed(drained, undefined)).pipe(Stream.drain),
+        ),
+      ),
+    }));
+    yield* Effect.gen(function* () {
+      const scripts = yield* ScriptService.KanbanScripts;
+      const kanban = yield* KanbanService.KanbanService;
+      const board = yield* toyBoard;
+      const script = yield* register(board, scriptFile("echo event\n"), {
+        _tag: "event",
+        event: "card.moved",
+      });
+      const card = yield* kanban.createCard(board.id, { prompt: "Work" }, owner);
+      yield* kanban.setPool(board.id, board.defaultCardModel, 1);
+      yield* kanban.dispatchNow;
+      const running = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(running.stage, "working");
+      yield* kanban.updateBoard(board.id, { archived: true }, owner);
+      const stopped = (yield* kanban.card(card.id)).card;
+      assert.strictEqual(stopped.stage, "todo");
+      events.push(
+        { boardId: board.id, change: { _tag: "card", card: running } },
+        { boardId: board.id, change: { _tag: "card", card: stopped } },
+      );
+      yield* scripts.listen;
+      yield* Deferred.await(drained);
+      yield* scripts.idle;
+      assert.deepStrictEqual(yield* scripts.runs(script.id, 10), []);
+    }).pipe(Effect.scoped, Effect.provide(layer));
+  }),
+);
+
 it.effect("lets a webhook start a script only while it is on", () =>
   Effect.gen(function* () {
     const scripts = yield* ScriptService.KanbanScripts;
@@ -957,6 +1022,7 @@ it.effect(
     const recording = Layer.succeed(
       KanbanThreads,
       KanbanThreads.of({
+        remove: () => Effect.void,
         pendingUserInputs: () => Effect.succeed([]),
         claimContext: () => Effect.succeed(null),
         view: () => Effect.succeed(null),
@@ -964,6 +1030,7 @@ it.effect(
         lastFailure: () => Effect.succeed(null),
         findLastFailure: () => Effect.succeed(null),
         latestRun: () => Effect.succeed(null),
+        backgroundStoppedSince: () => Effect.succeed(false),
         runSettled: () => Effect.succeed(true),
         compactRun: () => Effect.succeed(null),
         launch: (input) => {

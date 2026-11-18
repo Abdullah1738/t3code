@@ -1,3 +1,9 @@
+import { isRuntimeFailure } from "../kanban/engine/rules.ts";
+import {
+  latestExecutedRun,
+  latestRootProviderFailure,
+  rootRuntimeLoss,
+} from "@t3tools/shared/orchestrationV2ThreadError";
 import { countsAsUserTurn } from "../control/turns.ts";
 import { isRecoveredQueueRun } from "../fast-install/report.ts";
 import { TurnItemId, type RunId, type ThreadId } from "@t3tools/contracts";
@@ -21,6 +27,16 @@ export interface RestartSource {
   readonly sourceRunId: RunId;
   readonly effectId?: string | undefined;
   readonly activityAt?: number | undefined;
+  readonly classification?: "continuation" | "recovered-queue" | "pending-continuation-race";
+}
+
+export interface RestartWait {
+  readonly total: number;
+  readonly active: number;
+  readonly maxActive: number;
+  readonly spacingMs: number;
+  readonly loadHoldElapsedMs: number;
+  readonly loadHoldRemainingMs: number;
 }
 
 export class RestartPacingStateError extends Schema.TaggedError<RestartPacingStateError>()(
@@ -32,6 +48,11 @@ export class RestartPacingState extends Context.Service<
   RestartPacingState,
   {
     readonly pending: (source: RestartSource) => Effect.Effect<boolean, RestartPacingStateError>;
+    readonly wake: (source: RestartSource) => Effect.Effect<boolean, RestartPacingStateError>;
+    readonly hasSuccessor: (
+      source: RestartSource,
+      runId?: RunId,
+    ) => Effect.Effect<boolean, RestartPacingStateError>;
     readonly sourceForRun: (
       threadId: ThreadId,
       runId: RunId,
@@ -43,10 +64,14 @@ export class RestartPacingState extends Context.Service<
       },
       RestartPacingStateError
     >;
-    readonly active: (source: RestartSource) => Effect.Effect<boolean, RestartPacingStateError>;
+    readonly active: (
+      source: RestartSource,
+      runId?: RunId,
+    ) => Effect.Effect<boolean, RestartPacingStateError>;
     readonly status: (
       source: RestartSource,
       position: number | null,
+      wait?: RestartWait,
     ) => Effect.Effect<boolean, RestartPacingStateError>;
   }
 >()("t3/ardud/restart-pacing/RestartPacingState") {}
@@ -60,6 +85,7 @@ const make = Effect.gen(function* () {
   const ids = yield* IdAllocator.IdAllocatorV2;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
   const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+  const startupAt = yield* DateTime.now;
   const pending = Effect.fn("RestartPacingState.pending")(
     function* (source: RestartSource) {
       if (source.effectId === undefined) return true;
@@ -80,7 +106,15 @@ const make = Effect.gen(function* () {
       if (run?.status !== "starting") return undefined;
       const sourceRunId =
         run.restartContinuationOfRunId ?? (isRecoveredQueueRun(runId) ? runId : undefined);
-      if (sourceRunId !== undefined) return { threadId, sourceRunId };
+      if (sourceRunId !== undefined)
+        return {
+          threadId,
+          sourceRunId,
+          classification:
+            run.restartContinuationOfRunId === undefined
+              ? ("recovered-queue" as const)
+              : ("continuation" as const),
+        };
       const { messages } = yield* projections.getThreadRecords(threadId, ["messages"], {
         messageIds: [run.userMessageId],
       });
@@ -99,11 +133,30 @@ const make = Effect.gen(function* () {
         threadId,
         itemId: TurnItemId.make(`turn-item:restart-pacing:${runId}`),
       });
-      // An automatic wake racing an interrupted thread's durable restart wake
-      // belongs to the same startup backlog, even if the original wake declines.
-      return recorded !== null || (yield* outbox.hasPendingRunContinuation(threadId))
-        ? { threadId, sourceRunId: runId }
-        : undefined;
+      if (recorded === null) {
+        if (
+          !(yield* outbox.hasRunContinuationAt({
+            threadId,
+            requestedAt: run.requestedAt,
+            startupAt,
+          }))
+        )
+          return undefined;
+        const { runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
+        // Only wakes requested after a provider start in this boot are fresh.
+        // A racing wake stays in the backlog even if its start claim arrives later.
+        if (
+          runs.some(
+            (candidate) =>
+              candidate.id !== runId &&
+              candidate.startedAt !== null &&
+              DateTime.isGreaterThanOrEqualTo(candidate.startedAt, startupAt) &&
+              DateTime.isLessThanOrEqualTo(candidate.startedAt, run.requestedAt),
+          )
+        )
+          return undefined;
+      }
+      return { threadId, sourceRunId: runId, classification: "pending-continuation-race" as const };
     },
     Effect.mapError((cause) => new RestartPacingStateError({ cause })),
   );
@@ -132,6 +185,41 @@ const make = Effect.gen(function* () {
       const discussion =
         link === null ? yield* boards.discussionByEvaluator(source.threadId) : null;
       const run = projection.runs.find((candidate) => candidate.id === source.sourceRunId);
+      let runtimeRecovery = false;
+      if (link?.role === "work") {
+        const cards = yield* boards.cardsByThread(source.threadId);
+        if (
+          cards.some(
+            (card) =>
+              card.stage === "working" &&
+              card.activeRole === "work" &&
+              card.activeThreadId === source.threadId &&
+              card.stalled === null,
+          )
+        ) {
+          const executed = latestExecutedRun(
+            projection.runs.filter(
+              (candidate) => candidate.status !== "starting" && candidate.status !== "preparing",
+            ),
+          );
+          if (executed?.status === "failed" || executed?.status === "cancelled") {
+            const { turnItems } = yield* projections.getThreadRecords(
+              source.threadId,
+              ["turnItems"],
+              { turnItemTypes: ["error"] },
+            );
+            const failure =
+              latestRootProviderFailure(executed, turnItems) ??
+              rootRuntimeLoss(executed, turnItems);
+            runtimeRecovery =
+              failure !== null &&
+              isRuntimeFailure(failure) &&
+              (failure.code === "provider.runtime_lost" ||
+                failure.code === "codex.runtime_lost" ||
+                failure.code === "codex.tool_host_lost");
+          }
+        }
+      }
       const pendingUser = relevant.some((candidate) =>
         messages.some(
           (message) =>
@@ -150,11 +238,13 @@ const make = Effect.gen(function* () {
           (Option.isSome(project) && project.value.title === "iMessage") ||
           pendingUser
             ? 0
-            : link?.role === "evaluator" || discussion !== null
-              ? 1
-              : link !== null
-                ? 2
-                : 3,
+            : runtimeRecovery
+              ? 0.5
+              : link?.role === "evaluator" || discussion !== null
+                ? 1
+                : link !== null
+                  ? 2
+                  : 3,
         activityAt:
           source.activityAt ??
           DateTime.toEpochMillis(run?.startedAt ?? run?.requestedAt ?? projection.thread.updatedAt),
@@ -163,15 +253,17 @@ const make = Effect.gen(function* () {
     Effect.mapError((cause) => new RestartPacingStateError({ cause })),
   );
   const active = Effect.fn("RestartPacingState.active")(
-    function* (source: RestartSource) {
+    function* (source: RestartSource, runId?: RunId) {
       const projection = yield* projections.getThreadRecords(source.threadId, [
         "runs",
         "providerTurns",
       ]);
       const run =
-        projection.runs.find(
-          (candidate) => candidate.restartContinuationOfRunId === source.sourceRunId,
-        ) ?? projection.runs.find((candidate) => candidate.id === source.sourceRunId);
+        runId === undefined
+          ? (projection.runs.find(
+              (candidate) => candidate.restartContinuationOfRunId === source.sourceRunId,
+            ) ?? projection.runs.find((candidate) => candidate.id === source.sourceRunId))
+          : projection.runs.find((candidate) => candidate.id === runId);
       // startedAt precedes native acceptance; the startup finalizer owns
       // releasing live reservations.
       if (!run || !["preparing", "starting", "running"].includes(run.status)) return false;
@@ -186,7 +278,7 @@ const make = Effect.gen(function* () {
     Effect.mapError((cause) => new RestartPacingStateError({ cause })),
   );
   const status = Effect.fn("RestartPacingState.status")(
-    function* (source: RestartSource, position: number | null) {
+    function* (source: RestartSource, position: number | null, wait?: RestartWait) {
       const projection = yield* projections.getThreadRecords(source.threadId, ["runs"]);
       const run = projection.runs.find((candidate) => candidate.id === source.sourceRunId);
       if (!run) return true;
@@ -212,6 +304,29 @@ const make = Effect.gen(function* () {
           // An old claim's cleanup must not complete a replacement's wait.
           return false;
       }
+      // Completion replaces the saved item, including its diagnostic detail.
+      const detail =
+        position === null
+          ? previous?.type === "notification"
+            ? previous.detail
+            : undefined
+          : wait === undefined
+            ? undefined
+            : [
+                `Source: ${source.classification ?? "continuation"}.`,
+                `Queue: position ${position} of ${wait.total}.`,
+                ...(wait.active >= wait.maxActive
+                  ? [`Active: ${wait.active}/${wait.maxActive} (maxActive).`]
+                  : []),
+                ...(wait.spacingMs > 0
+                  ? [`Spacing: ${Math.ceil(wait.spacingMs / 1000)}s remaining.`]
+                  : []),
+                ...(wait.loadHoldRemainingMs > 0
+                  ? [
+                      `Load hold: ${Math.floor(wait.loadHoldElapsedMs / 1000)}s elapsed, ${Math.ceil(wait.loadHoldRemainingMs / 1000)}s remaining.`,
+                    ]
+                  : []),
+              ].join(" ");
       const commandId = yield* ids.allocate.command({
         fixtureName: "restart-pacing",
         commandName: "status",
@@ -245,7 +360,8 @@ const make = Effect.gen(function* () {
               summary:
                 position === null
                   ? "Restart wait ended"
-                  : `Resuming after restart (position ${position})`,
+                  : `Resuming after restart (position ${position}${wait ? ` of ${wait.total}` : ""})`,
+              ...(detail === undefined ? {} : { detail }),
               title: null,
               status: position === null ? "completed" : "waiting",
               startedAt: previous?.startedAt ?? now,
@@ -263,6 +379,32 @@ const make = Effect.gen(function* () {
     (effect, source) => threadCommands.withLock(source.threadId, effect),
     Effect.mapError((cause) => new RestartPacingStateError({ cause })),
   );
-  return RestartPacingState.of({ pending, sourceForRun, describe, active, status });
+  const wake = Effect.fn("RestartPacingState.wake")(
+    (source: RestartSource) =>
+      source.effectId === undefined
+        ? Effect.succeed(true)
+        : outbox.wakeRestartEffect(source.effectId),
+    Effect.mapError((cause) => new RestartPacingStateError({ cause })),
+  );
+  const hasSuccessor = Effect.fn("RestartPacingState.hasSuccessor")(
+    function* (source: RestartSource, runId?: RunId) {
+      const { runs } = yield* projections.getThreadRecords(source.threadId, ["runs"]);
+      return runs.some(
+        (run) =>
+          run.id !== (runId ?? source.sourceRunId) &&
+          ["queued", "preparing", "starting", "running", "waiting"].includes(run.status),
+      );
+    },
+    Effect.mapError((cause) => new RestartPacingStateError({ cause })),
+  );
+  return RestartPacingState.of({
+    pending,
+    sourceForRun,
+    describe,
+    active,
+    status,
+    wake,
+    hasSuccessor,
+  });
 });
 export const layer = Layer.effect(RestartPacingState, make);

@@ -73,6 +73,8 @@ import {
 } from "./mcpInjection.ts";
 import { PI_FILE_CHANGE_TOOLS } from "./mcpExtensionSource.ts";
 
+const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+
 export const PI_PROVIDER = ProviderDriverKind.make("pi");
 const PI_DRIVER_KIND = PI_PROVIDER;
 const PI_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(PI_DRIVER_KIND);
@@ -352,7 +354,7 @@ function compactionTitle(status: PiCompactionStatus): string {
 
 interface ActivePiTurn {
   readonly turnInput: ProviderAdapter.ProviderAdapterV2TurnInput;
-  readonly providerTurn: OrchestrationV2ProviderTurn;
+  providerTurn: OrchestrationV2ProviderTurn;
   readonly startedAt: DateTime.Utc;
   readonly itemOrdinals: Map<string, number>;
   nextItemOrdinal: number;
@@ -365,6 +367,7 @@ interface ActivePiTurn {
   sawAgentActivity: boolean;
   adoptedWake: boolean;
   readonly promptMayBeCommandOnly: boolean;
+  readonly manualCompaction: boolean;
   latestCompactionAfterTokens: number | null;
   lastLiveUsedTokens: number | null;
   settleProbeGeneration: number;
@@ -444,7 +447,12 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
     ) {
       const scope = yield* Effect.scope;
       const cwd = input.runtimePolicy.cwd ?? host.paths.cwd;
-      const mcpSession = yield* mcpSessions.read(input.threadId);
+      const mcpSession = yield* McpProviderSessions.readForRuntime(
+        mcpSessions,
+        input.threadId,
+        input.providerSessionId,
+        PI_PROVIDER,
+      );
       const provideCacheFs = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem>) =>
         effect.pipe(
           Effect.provideService(FileSystem.FileSystem, fileSystem),
@@ -1030,6 +1038,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               ...shared,
               title: toolName,
               type: "command_execution",
+              toolResultIncomplete: !completed,
               input: recordString(args, "command") ?? "",
               ...(outputText.length > 0 ? { output: outputText } : {}),
               ...(exitCode === undefined ? {} : { exitCode }),
@@ -1067,6 +1076,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             ...shared,
             title: toolName,
             type: "dynamic_tool",
+            toolResultIncomplete: !completed,
             ...mcpToolPresentation({ toolName }),
             toolName,
             input: args ?? {},
@@ -1636,7 +1646,21 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
         yield* connection.terminate;
       });
 
-      const handleSessionEvent = Effect.fnUntraced(function* (event: PiRpcRecord) {
+      // Native lifecycle events are already traced by the session pump.
+      const confirmPromptAccepted = Effect.fnUntraced(function* (turn: ActivePiTurn) {
+        if (turn.providerTurn.promptAcceptedAt !== undefined) return;
+        turn.providerTurn = { ...turn.providerTurn, promptAcceptedAt: yield* DateTime.now };
+        yield* emit({
+          type: "provider_turn.updated",
+          driver: PI_PROVIDER,
+          threadId: turn.turnInput.threadId,
+          providerTurn: turn.providerTurn,
+        });
+      });
+      const handleSessionEvent = Effect.fnUntraced(function* (
+        event: PiRpcRecord,
+        nativeStartAcknowledgesPrompt = true,
+      ) {
         // Model-selection hooks can await a dialog before startTurn can claim
         // a wake. Keep interactive requests session-scoped until a turn owns
         // them; buffer native output and notifications for that turn.
@@ -1705,6 +1729,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             turn.sawAgentActivity = true;
             turn.nativeAborted = false;
             turn.settleProbeGeneration += 1;
+            if (nativeStartAcknowledgesPrompt) yield* confirmPromptAccepted(turn);
             return;
           }
           case "message_start": {
@@ -1773,6 +1798,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             return;
           case "compaction_start": {
             if (turn === null) return;
+            if (turn.manualCompaction && nativeStartAcknowledgesPrompt)
+              yield* confirmPromptAccepted(turn);
             turn.settleProbeGeneration += 1;
             turn.sawCompaction = true;
             if (turn.activeCompaction !== null) {
@@ -1982,6 +2009,8 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
             const responseTurn =
               pendingPrompt?.providerTurnId === turn?.providerTurn.id ? turn : null;
             if (event["success"] === true) {
+              if (pendingPrompt?.kind === "turn_start" && responseTurn !== null)
+                yield* confirmPromptAccepted(responseTurn);
               // Deferred success ack. Command-only prompts (pure extension
               // slash commands) never start an agent run and never emit
               // `agent_settled`, so probe for idleness. The probe result is
@@ -2507,6 +2536,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               settleWhenIdle: false,
               sawCompaction: false,
               manualCompactInFlight: compactCommand !== null,
+              manualCompaction: compactCommand !== null,
               activeCompaction: null,
               activeProviderRetry: null,
               failure: null,
@@ -2573,7 +2603,7 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
                     activeTurn.settleWhenIdle = true;
                     continue;
                   }
-                  yield* handleSessionEvent(event);
+                  yield* handleSessionEvent(event, continuation);
                 }
               } else if (continuation) {
                 yield* finalizeTurn(state);
@@ -2679,15 +2709,26 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
               return;
             }
             if (turn === null || turn.providerTurn.id !== interruptInput.providerTurnId) {
-              return yield* protocolError(`Pi turn ${interruptInput.providerTurnId} is not active`);
+              return yield* new ProviderAdapter.ProviderAdapterTurnNotActiveError({
+                driver: PI_PROVIDER,
+                providerThreadId: interruptInput.providerThread.id,
+                providerTurnId: interruptInput.providerTurnId,
+              });
             }
-            turn.interrupted = true;
-            if (
+            const requiresProcessStop =
               interruptInput.requestRuntimeRestart === true ||
               turn.settleWhenIdle ||
               turn.activeCompaction !== null ||
-              turn.manualCompactInFlight
-            ) {
+              turn.manualCompactInFlight;
+            if (
+              interruptInput.stopBackgroundWork === false &&
+              (requiresProcessStop || turn.adoptedWake)
+            )
+              return yield* protocolError(
+                "Pi cannot confirm cancellation of this turn without stopping inherited work.",
+              );
+            turn.interrupted = true;
+            if (requiresProcessStop) {
               // Pi's generic abort does not cancel manual compaction. Terminate
               // so Stop covers user /compact as well as detached recovery compact.
               stopRequested = true;
@@ -2714,14 +2755,15 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
           },
           (effect, interruptInput) =>
             effect.pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapter.ProviderAdapterInterruptError({
-                    driver: PI_PROVIDER,
-                    providerThreadId: interruptInput.providerThread.id,
-                    providerTurnId: interruptInput.providerTurnId,
-                    cause,
-                  }),
+              Effect.mapError((cause) =>
+                isTurnNotActiveError(cause)
+                  ? cause
+                  : new ProviderAdapter.ProviderAdapterInterruptError({
+                      driver: PI_PROVIDER,
+                      providerThreadId: interruptInput.providerThread.id,
+                      providerTurnId: interruptInput.providerTurnId,
+                      cause,
+                    }),
               ),
             ),
         ),

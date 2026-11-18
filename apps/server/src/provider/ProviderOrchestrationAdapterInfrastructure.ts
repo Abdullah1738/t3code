@@ -1,4 +1,5 @@
 import * as Layer from "effect/Layer";
+import * as ProviderProcessRegistry from "../ardud/providers/ProviderProcessRegistry.ts";
 
 import * as ClaudeAdapterV2 from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as CodexAdapterV2 from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
@@ -28,4 +29,4 @@ export const layer = Layer.mergeAll(
   CursorKeychain.layer,
   IdAllocator.layer,
   ProviderContinuationRequests.layer,
-);
+).pipe(Layer.provide(ProviderProcessRegistry.layer));

@@ -13,6 +13,7 @@ import time
 
 import common
 import store
+import timing
 
 APPLE_EPOCH = 978307200
 TAPBACK_MIN = 2000
@@ -61,7 +62,7 @@ def load_contacts():
     paths += glob.glob(os.path.join(common.ADDRESSBOOK, "Sources", "*", "AddressBook-v22.abcddb"))
     for p in paths:
         try:
-            db = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+            db = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5, factory=timing.SourceConnection)
             names = {}
             for pk, first, last, org, nick in db.execute(
                     "SELECT Z_PK, ZFIRSTNAME, ZLASTNAME, ZORGANIZATION, ZNICKNAME FROM ZABCDRECORD"):
@@ -99,7 +100,7 @@ class Names:
 
 
 def open_chatdb():
-    return sqlite3.connect(f"file:{common.CHAT_DB}?mode=ro", uri=True, timeout=30)
+    return sqlite3.connect(f"file:{common.CHAT_DB}?mode=ro", uri=True, timeout=30, factory=timing.SourceConnection)
 
 
 def chat_names(src, names):
@@ -145,6 +146,7 @@ def attachments(src, rowids):
     return out
 
 
+@timing.timed("parse")
 def _item(row, chats, names, atts):
     rid, guid, text, ab, date, from_me, service, has_att, edited, retracted, spam, handle, chat_id = row
     body = text if text else decode_attributed(ab)
@@ -164,43 +166,41 @@ def sync(db, stop=None, full=False):
     """Index new rows past the stored ROWID cursor; `full` rescans everything for edits and unsends."""
     stats = {"added": 0, "updated": 0, "same": 0, "deleted": 0}
     src = open_chatdb()
-    names = Names()
-    chats = chat_names(src, names)
-    st = store.get_state(db, "imessage", {})
-    if full and not (names.phone or names.email):
-        # An unreadable AddressBook would rewrite every row with bare numbers; wait for the next one.
-        common.log("imessage: contacts unreadable, skipping the full rescan")
-        full = False
-    cursor = 0 if full else int(st.get("rowid", 0))
-    top = cursor
-    while True:
-        if stop is not None and stop.is_set():
-            break
-        rows = src.execute(QUERY, (cursor, TAPBACK_MIN, 5000)).fetchall()
-        if not rows:
-            break
-        atts = attachments(src, [r[0] for r in rows if r[7]])
-        batch = [_item(row, chats, names, atts) for row in rows]
+    try:
+        names = Names()
+        chats = chat_names(src, names)
+        st = store.get_state(db, "imessage", {})
+        if full and not (names.phone or names.email):
+            # An unreadable AddressBook would rewrite every row with bare numbers; wait for the next one.
+            timing.log("imessage: contacts unreadable, skipping the full rescan")
+            full = False
+        cursor = 0 if full else int(st.get("rowid", 0))
+        top = cursor
+        while True:
+            if stop is not None and stop.is_set():
+                break
+            rows = src.execute(QUERY, (cursor, TAPBACK_MIN, 5000)).fetchall()
+            if not rows:
+                break
+            atts = attachments(src, [r[0] for r in rows if r[7]])
+            batch = [_item(row, chats, names, atts) for row in rows]
+            store.upsert_many(db, (it for it, _, _ in batch), stats)
+            cursor = batch[-1][1]
+            top = max(top, cursor)
+        if not full:
+            # Pick up recent edits and unsends, which change rows below the cursor.
+            recent_ns = int((time.time() - 3 * 86400 - APPLE_EPOCH) * 1_000_000_000)
+            rows = src.execute(QUERY.replace("m.ROWID > ?", "(m.date_edited > ? OR m.date_retracted > ?)"),
+                               (recent_ns, recent_ns, TAPBACK_MIN, 5000)).fetchall()
+            atts = attachments(src, [r[0] for r in rows if r[7]])
+            batch = [_item(row, chats, names, atts) for row in rows]
+            store.upsert_many(db, (it for it, _, _ in batch), stats)
+        st["rowid"] = max(int(st.get("rowid", 0)), top)
+        st["last_ok"] = int(time.time())
+        if full:
+            st["last_full"] = int(time.time())
         with store.writing(db):
-            for it, rid, _ in batch:
-                stats[store.upsert(db, it)] += 1
-        cursor = batch[-1][1]
-        top = max(top, cursor)
-    if not full:
-        # Pick up recent edits and unsends, which change rows below the cursor.
-        recent_ns = int((time.time() - 3 * 86400 - APPLE_EPOCH) * 1_000_000_000)
-        rows = src.execute(QUERY.replace("m.ROWID > ?", "(m.date_edited > ? OR m.date_retracted > ?)"),
-                           (recent_ns, recent_ns, TAPBACK_MIN, 5000)).fetchall()
-        atts = attachments(src, [r[0] for r in rows if r[7]])
-        batch = [_item(row, chats, names, atts) for row in rows]
-        with store.writing(db):
-            for it, _, _ in batch:
-                stats[store.upsert(db, it)] += 1
-    st["rowid"] = max(int(st.get("rowid", 0)), top)
-    st["last_ok"] = int(time.time())
-    if full:
-        st["last_full"] = int(time.time())
-    with store.writing(db):
-        store.set_state(db, "imessage", st)
-    src.close()
+            store.set_state(db, "imessage", st)
+    finally:
+        src.close()
     return stats

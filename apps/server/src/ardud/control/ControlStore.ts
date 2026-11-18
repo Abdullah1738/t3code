@@ -4,10 +4,13 @@
  * that touches these tables, created idempotently, never a numbered migration.
  */
 import {
+  OrchestrationV2ConversationMessageJson,
   OrchestrationV2RuntimeRequestJson,
   OrchestrationV2TurnItemJson,
   type OrchestrationV2RuntimeRequest,
   type OrchestrationV2TurnItem,
+  type OrchestrationV2ConversationMessage,
+  type OrchestrationV2Run,
   type ThreadId,
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -17,8 +20,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import type * as Statement from "effect/sql/Statement";
 
 import * as BoardsDatabase from "../persistence/BoardsDatabase.ts";
+import { importedThreadQuery, providerThreadQuery } from "./nativeLookup.ts";
+import { lastAssistantText, stateFromRunStatus } from "./model.ts";
 
 export class ControlStoreError extends Schema.TaggedError<ControlStoreError>()(
   "ControlStoreError",
@@ -32,6 +38,55 @@ export interface ThreadOriginRow {
 }
 
 export interface ControlStoreShape {
+  readonly ownerShell: (threadId: string) => Effect.Effect<OwnerShell | null, ControlStoreError>;
+  readonly userMessagesSince: (input: {
+    readonly since: number;
+    readonly cursor: { readonly u: number; readonly id: string } | null;
+    readonly limit: number;
+    readonly role?: "user" | "assistant" | "system" | "all";
+    readonly threadIds?: ReadonlyArray<string>;
+  }) => Effect.Effect<
+    {
+      readonly total: number;
+      readonly messages: ReadonlyArray<{
+        readonly message: OrchestrationV2ConversationMessage;
+        readonly threadId: string;
+        readonly threadTitle: string;
+        readonly threadArchived: boolean;
+      }>;
+      readonly next: { readonly u: number; readonly id: string } | null;
+    },
+    ControlStoreError
+  >;
+  readonly changeMarkers: (
+    threadIds: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyMap<string, number>, ControlStoreError>;
+  readonly lastAssistant: (
+    threadId: string,
+    runId: string | null,
+  ) => Effect.Effect<ReturnType<typeof lastAssistantText>, ControlStoreError>;
+  readonly messagePage: (input: {
+    readonly threadId: string;
+    readonly role: string | null;
+    readonly runId: string | null;
+    readonly since: number | undefined;
+    readonly afterMessageId: string | null;
+    readonly limit: number | null;
+  }) => Effect.Effect<
+    {
+      readonly messages: ReadonlyArray<OrchestrationV2ConversationMessage>;
+      readonly total: number;
+      readonly lastAssistant: ReturnType<typeof lastAssistantText>;
+      readonly state: ReturnType<typeof stateFromRunStatus>;
+      readonly status: OrchestrationV2Run["status"] | "idle";
+      readonly runId: string | null;
+    },
+    ControlStoreError
+  >;
+  readonly hasCompactedEvents: (
+    afterSequence: number,
+    throughSequence: number,
+  ) => Effect.Effect<boolean, ControlStoreError>;
   readonly getOrigin: (threadId: string) => Effect.Effect<string | null, ControlStoreError>;
   readonly getOrigins: (
     threadIds: ReadonlyArray<string>,
@@ -49,6 +104,8 @@ export interface ControlStoreShape {
     nativeSessionId: string,
     driver?: string,
   ) => Effect.Effect<string | null, ControlStoreError>;
+  /** Indexed count for slow-lookup diagnostics only. */
+  readonly threadRunCount: (threadId: string) => Effect.Effect<number, ControlStoreError>;
   /**
    * Current native id per thread (its active provider thread), for listings.
    * A migrated thread reports its new id. Threads with no active binding fall
@@ -72,6 +129,10 @@ export interface ControlStoreShape {
    * runtime request. A superset of what the shell calls active, read from
    * the partial recovery indexes so listings skip the full shell snapshot.
    */
+  readonly pageLiveThreadIds: (
+    cursor: string | null,
+    limit: number,
+  ) => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
   readonly liveThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
   /** Threads with a pending runtime request (approval or user input). */
   readonly pendingRequestThreadIds: () => Effect.Effect<ReadonlyArray<string>, ControlStoreError>;
@@ -101,6 +162,16 @@ export interface ThreadCandidateFilter {
   readonly parentThreadId: string | null;
   readonly projectId: string | null;
   readonly creationSources?: ReadonlyArray<string>;
+}
+
+export interface OwnerShell {
+  readonly threadId: string;
+  readonly title: string;
+  readonly projectId: string;
+  readonly status: OrchestrationV2Run["status"] | "idle";
+  readonly pending: boolean;
+  readonly archived: boolean;
+  readonly deleted: boolean;
 }
 
 export interface ThreadCandidateCursor {
@@ -159,6 +230,19 @@ export const make = Effect.gen(function* () {
     }),
   );
 
+  const hasCompactedEvents = Effect.fn("ControlStore.hasCompactedEvents")(
+    function* (afterSequence: number, throughSequence: number) {
+      const table =
+        yield* sql`SELECT 1 FROM sqlite_schema WHERE name = 'ardud_history_compacted_events' AND type = 'table'`;
+      if (table.length === 0) return false;
+      const rows = yield* sql`SELECT 1 FROM ardud_history_compacted_events
+      WHERE sequence > ${afterSequence} AND sequence <= ${throughSequence} LIMIT 1`;
+      return rows.length > 0;
+    },
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-compacted-events")),
+  );
+
   const getOrigins: ControlStoreShape["getOrigins"] = (threadIds) =>
     Effect.forEach(
       chunks([...new Set(threadIds)]),
@@ -173,8 +257,66 @@ export const make = Effect.gen(function* () {
       Effect.mapError(fail("read-origins")),
     );
 
+  const threadRunCount: ControlStoreShape["threadRunCount"] = Effect.fn(
+    "ControlStore.threadRunCount",
+  )(
+    (threadId) =>
+      sql<{ readonly count: number }>`
+      SELECT COUNT(*) AS count FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId}
+    `.pipe(Effect.map((rows) => rows[0]?.count ?? 0)),
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("count-thread-runs")),
+  );
+
   const getOrigin: ControlStoreShape["getOrigin"] = (threadId) =>
     getOrigins([threadId]).pipe(Effect.map((origins) => origins.get(threadId) ?? null));
+
+  const ownerShell: ControlStoreShape["ownerShell"] = Effect.fn("ControlStore.ownerShell")(
+    function* (threadId) {
+      // Ownership needs no transcript, provider enrichment, error history or run
+      // payload. Each status probe is bounded by the thread/status or ordinal index.
+      const rows = yield* sql<{
+        readonly thread_id: string;
+        readonly project_id: string;
+        readonly title: string;
+        readonly status: OwnerShell["status"];
+        readonly pending: number;
+        readonly archived: number;
+        readonly deleted: number;
+      }>`
+        SELECT t.thread_id, t.project_id, t.title,
+          COALESCE(
+            (SELECT status FROM orchestration_v2_projection_runs INDEXED BY orchestration_v2_projection_runs_thread_status_idx
+              WHERE thread_id = t.thread_id AND status IN ('preparing','starting','running')
+              ORDER BY ordinal DESC LIMIT 1),
+            (SELECT status FROM orchestration_v2_projection_runs INDEXED BY orchestration_v2_projection_runs_thread_status_idx
+              WHERE thread_id = t.thread_id AND status = 'waiting' ORDER BY ordinal DESC LIMIT 1),
+            (SELECT status FROM orchestration_v2_projection_runs INDEXED BY orchestration_v2_projection_runs_thread_status_idx
+              WHERE thread_id = t.thread_id AND status = 'queued' ORDER BY ordinal DESC LIMIT 1),
+            (SELECT status FROM orchestration_v2_projection_runs
+              WHERE thread_id = t.thread_id ORDER BY ordinal DESC LIMIT 1),
+            'idle') AS status,
+          EXISTS(SELECT 1 FROM orchestration_v2_projection_runtime_requests
+            WHERE thread_id = t.thread_id AND status = 'pending') AS pending,
+          t.archived_at IS NOT NULL AS archived, t.deleted_at IS NOT NULL AS deleted
+        FROM orchestration_v2_projection_threads t WHERE t.thread_id = ${threadId}
+      `;
+      const row = rows[0];
+      return row === undefined
+        ? null
+        : {
+            threadId: row.thread_id,
+            projectId: row.project_id,
+            title: row.title,
+            status: row.status,
+            pending: row.pending !== 0,
+            archived: row.archived !== 0,
+            deleted: row.deleted !== 0,
+          };
+    },
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-owner-shell")),
+  );
 
   const setOrigin: ControlStoreShape["setOrigin"] = Effect.fn("ControlStore.setOrigin")(
     function* (threadId, origin) {
@@ -198,18 +340,9 @@ export const make = Effect.gen(function* () {
     function* (nativeId, driver) {
       const imported =
         driver === undefined || driver === "opencode"
-          ? yield* controlSql<{ readonly thread_id: string }>`
-              SELECT thread_id FROM ardud_opencode_import WHERE native_session_id = ${nativeId}
-            `
+          ? yield* importedThreadQuery(controlSql, nativeId)
           : [];
-      const live = yield* sql<{ readonly thread_id: string }>`
-        SELECT DISTINCT pt.thread_id
-        FROM orchestration_v2_projection_provider_threads pt
-        WHERE json_extract(pt.payload_json, '$.nativeThreadRef.nativeId') = ${nativeId}
-          AND pt.thread_id IS NOT NULL
-          AND (${driver ?? null} IS NULL
-            OR COALESCE(pt.driver, json_extract(pt.payload_json, '$.driver')) = ${driver ?? null})
-      `;
+      const live = yield* providerThreadQuery(sql, nativeId, driver);
       const threadIds = new Set([
         ...imported.map((row) => row.thread_id),
         ...live.map((row) => row.thread_id),
@@ -278,6 +411,21 @@ export const make = Effect.gen(function* () {
         return out;
       }),
       Effect.mapError(fail("read-native-sessions")),
+    );
+
+  const pageLiveThreadIds: ControlStoreShape["pageLiveThreadIds"] = (cursor, limit) =>
+    sql<{ readonly thread_id: string }>`
+      SELECT thread_id FROM orchestration_v2_projection_runs INDEXED BY ardud_recovery_live_threads_idx
+        WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+          AND thread_id > ${cursor ?? ""}
+        UNION
+        SELECT thread_id FROM orchestration_v2_projection_runtime_requests
+        WHERE status = 'pending' AND thread_id > ${cursor ?? ""}
+      ORDER BY thread_id ASC LIMIT ${limit}
+    `.pipe(
+      NodeSqliteClient.readOnly,
+      Effect.map((rows) => rows.map((row) => row.thread_id)),
+      Effect.mapError(fail("page-live-threads")),
     );
 
   const liveThreadIds: ControlStoreShape["liveThreadIds"] = () =>
@@ -363,8 +511,7 @@ export const make = Effect.gen(function* () {
     ${
       filter.since === null
         ? sql``
-        : sql`AND updated_at > ${DateTime.formatIso(DateTime.makeUnsafe(filter.since - 1_000))}
-      AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) > ${filter.since}`
+        : sql`AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) > ${filter.since}`
     }
     ${filter.includeSubagents || filter.parentThreadId !== null ? sql`` : sql`AND json_extract(payload_json, '$.lineage.relationshipToParent') IS NOT 'subagent'`}
     ${filter.parentThreadId === null ? sql`` : sql`AND json_extract(payload_json, '$.lineage.parentThreadId') = ${filter.parentThreadId}`}
@@ -392,15 +539,15 @@ export const make = Effect.gen(function* () {
           json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
           json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id,
           json_extract(payload_json, '$.creationSource') AS creation_source
-        FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_idx
+        FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_desc_idx
         WHERE ${candidatePredicate(options)}
           ${
             options.after === undefined
               ? sql``
-              : sql`AND updated_at <= ${options.after.updatedAt}
-            AND (updated_at < ${options.after.updatedAt} OR thread_id > ${options.after.threadId})`
+              : sql`AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) <= ${DateTime.toEpochMillis(DateTime.makeUnsafe(options.after.updatedAt))}
+            AND (CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) < ${DateTime.toEpochMillis(DateTime.makeUnsafe(options.after.updatedAt))} OR thread_id < ${options.after.threadId})`
           }
-        ORDER BY updated_at DESC, thread_id ASC
+        ORDER BY CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) DESC, thread_id DESC
         LIMIT ${Math.max(1, Math.min(128, Math.trunc(options.limit)))}
       `;
       return rows.map((row): ControlThreadRow => ({
@@ -424,23 +571,261 @@ export const make = Effect.gen(function* () {
     (filter) =>
       sql<{ readonly total: number }>`
       SELECT COUNT(*) AS total
-      FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_idx
+      FROM orchestration_v2_projection_threads INDEXED BY ardud_control_thread_candidates_desc_idx
       WHERE ${candidatePredicate(filter)}
     `.pipe(Effect.map((rows) => rows[0]?.total ?? 0)),
     NodeSqliteClient.readOnly,
     Effect.mapError(fail("count-thread-candidates")),
   );
 
+  const decodeMessage = Schema.decodeUnknownEffect(
+    Schema.fromJsonString(OrchestrationV2ConversationMessageJson),
+  );
+  const userMessagesSince: ControlStoreShape["userMessagesSince"] = Effect.fn(
+    "ControlStore.userMessagesSince",
+  )(
+    function* ({ since, cursor, limit, role = "user", threadIds }) {
+      const index = sql.literal(
+        role === "user"
+          ? "ardud_control_user_messages_since_idx"
+          : "ardud_control_messages_since_idx",
+      );
+      const predicate = sql`${role === "all" ? sql`1 = 1` : role === "user" ? sql`m.role = 'user'` : sql`m.role = ${role}`}
+        ${threadIds === undefined ? sql`` : sql`AND m.thread_id IN (SELECT value FROM json_each(${encodeIds(threadIds)}))`}
+        AND CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER) > ${since}
+        AND EXISTS (SELECT 1 FROM orchestration_v2_projection_threads t
+          WHERE t.thread_id = m.thread_id AND t.deleted_at IS NULL)`;
+      // Count only index entries and thread existence. Materialize the bounded
+      // page before reading thread metadata or decoding any message payloads.
+      const rows = yield* sql<{
+        readonly total: number;
+        readonly message_id: string | null;
+        readonly thread_id: string | null;
+        readonly u: number | null;
+        readonly payload_json: string | null;
+        readonly title: string | null;
+        readonly archived: number;
+      }>`
+        WITH total AS (
+          SELECT COUNT(*) AS total
+          FROM orchestration_v2_projection_messages m INDEXED BY ${index}
+          WHERE ${predicate}
+        ), page AS MATERIALIZED (
+          SELECT m.message_id, m.thread_id, m.payload_json,
+            CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER) AS u
+          FROM orchestration_v2_projection_messages m INDEXED BY ${index}
+          WHERE ${predicate}
+            ${
+              cursor === null
+                ? sql``
+                : sql`AND CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER) >= ${cursor.u}
+              AND (CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER), m.message_id) > (${cursor.u}, ${cursor.id})`
+            }
+          ORDER BY CAST(ROUND(unixepoch(m.updated_at, 'subsec') * 1000) AS INTEGER), m.message_id
+          LIMIT ${limit + 1}
+        )
+        SELECT total.total, page.*, t.title,
+          json_extract(t.payload_json, '$.archivedAt') IS NOT NULL AS archived
+        FROM total LEFT JOIN page ON TRUE
+        LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = page.thread_id
+        ORDER BY page.u, page.message_id
+      `;
+      const page = rows.filter((row) => row.message_id !== null);
+      const messages = yield* Effect.forEach(page.slice(0, limit), (row) =>
+        decodeMessage(row.payload_json).pipe(
+          Effect.map((message) => ({
+            message,
+            threadId: row.thread_id!,
+            threadTitle: row.title!,
+            threadArchived: Boolean(row.archived),
+          })),
+        ),
+      );
+      const last = page[limit - 1];
+      return {
+        total: rows[0]?.total ?? 0,
+        messages,
+        next:
+          page.length > limit && last !== undefined ? { u: last.u!, id: last.message_id! } : null,
+      };
+    },
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-user-messages-since")),
+  );
+  const changeMarkers: ControlStoreShape["changeMarkers"] = Effect.fn("ControlStore.changeMarkers")(
+    (threadIds) =>
+      Effect.forEach(
+        chunks(threadIds),
+        (ids) =>
+          sql<{ readonly thread_id: string; readonly marker: number }>`
+        SELECT value AS thread_id, COALESCE((
+          SELECT sequence FROM orchestration_events INDEXED BY idx_orchestration_events_agent_stream_sequence
+          WHERE application_event_version = 2 AND aggregate_kind = 'thread' AND stream_id = value
+          ORDER BY sequence DESC LIMIT 1
+        ), 0) AS marker FROM json_each(${encodeIds(ids)})`,
+      ).pipe(
+        Effect.map((pages) => new Map(pages.flat().map((row) => [row.thread_id, row.marker]))),
+      ),
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-change-markers")),
+  );
+  const compareMessageIds = (
+    left: { readonly message_id: string; readonly created_at: string },
+    right: { readonly message_id: string; readonly created_at: string },
+  ) =>
+    DateTime.toEpochMillis(DateTime.makeUnsafe(right.created_at)) -
+      DateTime.toEpochMillis(DateTime.makeUnsafe(left.created_at)) ||
+    right.message_id.localeCompare(left.message_id);
+  const newestMessageIds = Effect.fn("ControlStore.newestMessageIds")(function* (
+    predicate: Statement.Fragment,
+    limit: number,
+  ) {
+    const rows = yield* sql<{ readonly message_id: string; readonly created_at: string }>`
+      SELECT message_id, created_at FROM orchestration_v2_projection_messages WHERE ${predicate}
+      ORDER BY CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) DESC LIMIT ${limit}`;
+    const boundary = rows.at(-1);
+    if (boundary === undefined) return [];
+    // SQLite's binary id order differs from localeCompare. Include every id at
+    // the boundary before choosing the page, without reading their text payloads.
+    const ties = yield* sql<{ readonly message_id: string; readonly created_at: string }>`
+      SELECT message_id, created_at FROM orchestration_v2_projection_messages WHERE ${predicate}
+        AND CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) = ${DateTime.toEpochMillis(DateTime.makeUnsafe(boundary.created_at))}`;
+    const unique = new Map([...rows, ...ties].map((row) => [row.message_id, row]));
+    return [...unique.values()]
+      .toSorted(compareMessageIds)
+      .slice(0, limit)
+      .map((row) => row.message_id);
+  });
+  const lastAssistant: ControlStoreShape["lastAssistant"] = Effect.fn("ControlStore.lastAssistant")(
+    (threadId, runId) =>
+      sql.withTransaction(
+        Effect.gen(function* () {
+          // Sort lightweight metadata using the same epoch/locale order as lastAssistantText.
+          // Keep payloads out of the predicate: even LIMIT 1 would parse the whole history.
+          const candidates = (yield* sql<{
+            readonly message_id: string;
+            readonly created_at: string;
+          }>`
+        SELECT message_id, created_at FROM orchestration_v2_projection_messages
+        WHERE thread_id = ${threadId} AND role = 'assistant'
+          ${runId === null ? sql`` : sql`AND run_id = ${runId}`}`).toSorted(compareMessageIds);
+          let offset = 0;
+          while (offset < candidates.length) {
+            const ids = candidates
+              .slice(offset, offset + (offset === 0 ? 1 : 32))
+              .map((row) => row.message_id);
+            const rows = yield* sql<{ readonly payload_json: string }>`SELECT payload_json
+          FROM orchestration_v2_projection_messages WHERE thread_id = ${threadId}
+            AND message_id IN (SELECT value FROM json_each(${encodeIds(ids)}))`;
+            const latest = lastAssistantText(
+              yield* Effect.forEach(rows, (row) => decodeMessage(row.payload_json)),
+              runId,
+            );
+            if (latest !== null) return latest;
+            offset += ids.length;
+          }
+          return null;
+        }),
+      ),
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-last-assistant")),
+  );
+  const messagePage: ControlStoreShape["messagePage"] = Effect.fn("ControlStore.messagePage")(
+    (input) =>
+      sql.withTransaction(
+        Effect.gen(function* () {
+          const { threadId, role, runId, since, afterMessageId, limit } = input;
+          // Resolve the cursor before role/run/since filters: it may itself be a system message.
+          const anchor =
+            afterMessageId === null
+              ? undefined
+              : (yield* sql<{
+                  readonly created_at: string;
+                  readonly message_id: string;
+                }>`SELECT created_at, message_id FROM orchestration_v2_projection_messages
+        WHERE thread_id = ${threadId} AND message_id = ${afterMessageId}`)[0];
+          const anchorTime =
+            anchor === undefined
+              ? undefined
+              : DateTime.toEpochMillis(DateTime.makeUnsafe(anchor.created_at));
+          const ties =
+            anchorTime === undefined
+              ? []
+              : yield* sql<{ readonly message_id: string }>`
+        SELECT message_id FROM orchestration_v2_projection_messages WHERE thread_id = ${threadId}
+          AND CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) = ${anchorTime}`;
+          const afterIds =
+            anchor === undefined
+              ? []
+              : ties
+                  .filter((row) => row.message_id.localeCompare(anchor.message_id) > 0)
+                  .map((row) => row.message_id);
+          const predicate = sql`thread_id = ${threadId} AND role <> 'system'
+        ${role === null || role === "all" ? sql`` : sql`AND role = ${role}`}
+        ${runId === null ? sql`` : sql`AND run_id = ${runId}`}
+        ${since === undefined ? sql`` : sql`AND CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) > ${since}`}
+        ${
+          anchorTime === undefined
+            ? sql``
+            : sql`AND (CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) > ${anchorTime}
+          OR (CAST(ROUND(unixepoch(created_at, 'subsec') * 1000) AS INTEGER) = ${anchorTime}
+            AND message_id IN (SELECT value FROM json_each(${encodeIds(afterIds)}))))`
+        }`;
+          const count = yield* sql<{ readonly total: number }>`SELECT COUNT(*) AS total
+        FROM orchestration_v2_projection_messages WHERE ${predicate}`;
+          const ids = limit === null ? null : yield* newestMessageIds(predicate, limit);
+          const rows = yield* sql<{ readonly payload_json: string }>`SELECT payload_json
+        FROM orchestration_v2_projection_messages WHERE ${ids === null ? predicate : sql`thread_id = ${threadId} AND message_id IN (SELECT value FROM json_each(${encodeIds(ids)}))`}`;
+          const decoded = yield* Effect.forEach(rows, (row) => decodeMessage(row.payload_json));
+          const messages = decoded.toSorted(
+            (left, right) =>
+              DateTime.toEpochMillis(left.createdAt) - DateTime.toEpochMillis(right.createdAt) ||
+              left.id.localeCompare(right.id),
+          );
+          const latestAssistant = yield* lastAssistant(threadId, runId);
+          const runs = yield* sql<{
+            readonly run_id: string;
+            readonly status: OrchestrationV2Run["status"];
+          }>`
+        SELECT run_id, status FROM orchestration_v2_projection_runs WHERE thread_id = ${threadId}
+        ORDER BY CASE WHEN status IN ('preparing', 'starting', 'running') THEN 0
+          WHEN status = 'waiting' THEN 1 WHEN status = 'queued' THEN 2 ELSE 3 END,
+          ordinal DESC LIMIT 1`;
+          const pending = yield* sql`SELECT 1 FROM orchestration_v2_projection_runtime_requests
+        WHERE thread_id = ${threadId} AND status = 'pending' LIMIT 1`;
+          const run = runs[0];
+          return {
+            messages,
+            total: count[0]?.total ?? 0,
+            lastAssistant: latestAssistant,
+            state: stateFromRunStatus(run?.status ?? null, pending.length > 0),
+            status: run?.status ?? ("idle" as const),
+            runId: run?.run_id ?? null,
+          };
+        }),
+      ),
+    NodeSqliteClient.readOnly,
+    Effect.mapError(fail("read-message-page")),
+  );
+
   return ControlStore.of({
+    hasCompactedEvents,
+    userMessagesSince,
+    lastAssistant,
+    changeMarkers,
+    messagePage,
     threadCandidatePage,
     threadCandidateCount,
     getOrigin,
     getOrigins,
     setOrigin,
     threadIdForNativeSession,
+    threadRunCount,
+    ownerShell,
     nativeSessionIds,
     nativeBindings,
     liveThreadIds,
+    pageLiveThreadIds,
     pendingRequestThreadIds,
     pendingRequestRecords,
   });

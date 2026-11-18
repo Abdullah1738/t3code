@@ -156,6 +156,52 @@ const vote = {
 afterEach(() => tolerateUnknownKanbanBlocks(false));
 
 describe("createKanbanClient", () => {
+  it.each([true, false])(
+    "sends archived=%s through the existing board update",
+    async (archived) => {
+      const fake = fakeTransport();
+      const client = createKanbanClient(fake.transport);
+      const updated = client.updateBoard({ boardId: "board-toy" as never, archived });
+      const request = fake.take("kanban.board.update");
+      expect(request.input).toEqual({ boardId: "board-toy", archived });
+      request.resolve({});
+      await updated;
+    },
+  );
+
+  it("keeps board names live in the open board and boards list after rename", async () => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const board = client.board("board-toy");
+    const stopBoard = board.subscribe(() => {});
+    const stopList = client.boards.subscribe(() => {});
+    fake.push(snapshotEvent(0));
+    const original = board.get()!.board;
+    const entry = {
+      boardId: original.id,
+      board: original,
+      needsOwner: 0,
+      running: 0,
+      unread: 0,
+      threadIds: [],
+    };
+    fake.pushList([entry]);
+    const streams = fake.streams();
+    const renamed = { ...original, name: "Board work" };
+    const save = client.updateBoard({ boardId: original.id, name: renamed.name });
+    const request = fake.take("kanban.board.update");
+    expect(request.input).toEqual({ boardId: original.id, name: renamed.name });
+    fake.push({ _tag: "change", change: { _tag: "board", board: renamed } });
+    fake.pushList([{ ...entry, board: renamed }]);
+    request.resolve(renamed);
+    await save;
+    expect(board.get()?.board.name).toBe("Board work");
+    expect(client.boards.get()?.[0]?.board.name).toBe("Board work");
+    expect(fake.streams()).toBe(streams);
+    stopBoard();
+    stopList();
+  });
+
   it("lets the app read a message that carries a block of a kind its build doesn't know", () => {
     const fromLater = {
       seq: 1,
@@ -901,3 +947,50 @@ describe("discussion preview loader", () => {
     stopB();
   });
 });
+
+it("purges through the guarded board method and removes an open board from the feed", async () => {
+  const fake = fakeTransport(new Set(["kanban.board.purge"]));
+  const client = createKanbanClient(fake.transport);
+  const registry = AtomRegistry.make();
+  expect(registry.get(client.permission("kanban.board.purge"))).toBe(false);
+  const board = client.board("board-toy");
+  const stop = board.subscribe(() => {});
+  fake.push(snapshotEvent(0));
+  expect(board.get()).toBeDefined();
+  fake.push({ _tag: "change", change: { _tag: "boardRemoved", boardId: "board-toy" as never } });
+  expect(board.get()).toBeUndefined();
+  const save = client.purgeBoard("board-toy");
+  const request = fake.take("kanban.board.purge");
+  expect(request.input).toEqual({ boardId: "board-toy" });
+  request.resolve(undefined);
+  await save;
+  stop();
+});
+
+it.each([false, true])(
+  "keeps pending purge threads hidden without board content (previously known=%s)",
+  (known) => {
+    const fake = fakeTransport();
+    const client = createKanbanClient(fake.transport);
+    const stop = client.boardThreads.subscribe(() => {});
+    const pending = {
+      boardId: "gone",
+      board: null,
+      purged: true,
+      threadIds: ["failed-thread"],
+      needsOwner: 0,
+      running: 0,
+      unread: 0,
+    } as never;
+    if (known)
+      fake.pushList([
+        { ...(pending as object), purged: false, board: { id: "gone", name: "Gone" } } as never,
+      ]);
+    fake.pushList([pending]);
+    expect(client.boards.get()).toEqual([]);
+    expect([...client.boardThreads.get()!]).toEqual(["failed-thread"]);
+    fake.pushList([]);
+    expect([...client.boardThreads.get()!]).toEqual([]);
+    stop();
+  },
+);

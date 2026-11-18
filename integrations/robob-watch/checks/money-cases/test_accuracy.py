@@ -197,7 +197,7 @@ class Accuracy(Base):
         from types import SimpleNamespace
         listing = {'ok': True, 'orders': [{'order': 'N1', 'placed_at': '2026-10-23T23:45:00',
                                            'status': 'delivered'}]}
-        def orders(app, service, timeout):
+        def orders(app, service, timeout, page=1):
             self.assertEqual(app, 'noon')
             return listing if service == 'minutes' else {'ok': True, 'orders': []}
         detail = {'ok': True, 'account_verified': True, 'order': 'N1', 'total': 12.34, 'currency': 'EUR'}
@@ -262,19 +262,22 @@ class Accuracy(Base):
                  ('nownow', {'nownow': {'default_page_only': True, 'exhaustive': False}})]
         for service, coverage in forms:
             with self.subTest(service=service, coverage=coverage):
-                def orders(app, service, timeout):
+                def orders(app, service, timeout, page=1):
                     return {'ok': True, 'orders': [], 'coverage': coverage}
                 modules = {'native_orders': SimpleNamespace(orders=orders),
                            'noon_order_details': SimpleNamespace(details=lambda *a, **k: None)}
                 with patch.dict(sys.modules, modules):
-                    result = mc.charges.order_lookup.native('noon', '/unused-test-path')
+                    snapshot = None if service == 'marketplace' else dict(version=1, complete=True,
+                        walked_at=at('2026-10-24T10:00').isoformat(), orders={})
+                    result = mc.charges.order_lookup.native('noon', '/unused-test-path', snapshot=snapshot)
                 self.assertFalse(result['complete'])
                 with patch.object(mc.charges.order_lookup, 'read', return_value=result):
                     rc, msg = mc.ask(self.tmp / service, 'yours?', ALERT.replace('ACME * EATS PENDING', 'NOON'),
                                      BANK, at('2026-10-23T23:47'), now=at('2026-10-24T10:00'),
                                      find=finder(), said=nobody)
                 self.assertEqual(rc, 4)
-                self.assertIn('UNVERIFIED: source orders unreadable', msg)
+                self.assertIn('Marketplace snapshot predates' if service == 'marketplace'
+                              else 'UNVERIFIED: source orders unreadable', msg)
 
 
     def test_receipt_timeout_can_only_use_cached_words_for_abdullah_cards(self):
@@ -299,7 +302,7 @@ class Accuracy(Base):
         import sys
         from types import SimpleNamespace
         # Stop/failure form       Orders listed  Accepted rows retained
-        forms = [('detail_limit', 9, 8), ('between_lanes_timeout', 1, 1),
+        forms = [('detail_limit', 9, 9), ('between_lanes_timeout', 1, 1),
                  ('between_details_timeout', 2, 1), ('late_detail', 2, 1),
                  ('late_lane', 1, 1), ('lane_failure', 1, 1), ('partial_lane', 1, 1),
                  ('detail_failure', 2, 1), ('detail_binding', 2, 1), ('detail_unverified', 2, 1),
@@ -309,7 +312,7 @@ class Accuracy(Base):
         for stop, count, expected in forms:
             with self.subTest(stop=stop):
                 clock, calls = [100.0], []
-                def orders(app, service, timeout):
+                def orders(app, service, timeout, page=1):
                     if service == 'minutes':
                         return {'ok': True, 'orders': [
                             {'order': f'N{i}', 'placed_at': None if i == 1 and stop == 'detail_missing_time'
@@ -323,7 +326,7 @@ class Accuracy(Base):
                 def details(oid, service, timeout):
                     calls.append(oid)
                     if oid == 'N0' and stop in ('between_lanes_timeout', 'between_details_timeout'):
-                        clock[0] = 107.5
+                        clock[0] = 107.99
                     if oid == 'N1' and stop == 'detail_failure':
                         raise ValueError('second detail unavailable')
                     if oid == 'N1' and stop == 'late_detail':
@@ -342,11 +345,11 @@ class Accuracy(Base):
                            'noon_order_details': SimpleNamespace(details=details)}
                 with patch.dict(sys.modules, modules), patch.object(mc.charges.order_lookup.time, 'monotonic',
                                                                    side_effect=lambda: clock[0]):
-                    result = mc.charges.order_lookup.native('noon', '/unused-test-path')
+                    result = mc.charges.order_lookup.native('noon', '/unused-test-path', services=('minutes', 'marketplace', 'food', 'nownow'))
                 self.assertFalse(result['complete'])
                 self.assertEqual(len(result['orders']), expected)
                 self.assertEqual(result['orders'][0]['order'], 'N0')
-                self.assertEqual(len(calls), 8 if stop == 'detail_limit' else 2 if stop.startswith('detail_')
+                self.assertEqual(len(calls), 9 if stop == 'detail_limit' else 1 if stop == 'detail_missing_time' else 2 if stop.startswith('detail_')
                                  or stop == 'late_detail' else 1)
                 for amount, expected_rc in [('12.34', mc.DONT_ASK), ('99.99', 4)]:
                     with patch.object(mc.charges.order_lookup, 'read', return_value=result):
@@ -383,12 +386,13 @@ class Accuracy(Base):
     def test_order_reader_inherits_callers_deadline_and_preserves_partial_output(self):
         import subprocess
         lookup = mc.charges.order_lookup
-        result = {'orders': [{'order': 'N1', 'total': '12.34', 'currency': 'EUR',
+        result = {'orders': [{'service': 'minutes', 'order': 'N1', 'total': '12.34', 'currency': 'EUR',
                               'placed_at': '2026-10-23T23:45:00+04:00'}], 'complete': False}
         with patch.object(lookup.time, 'time', return_value=1000.0), \
+                patch.object(lookup.time, 'monotonic', return_value=0.0), \
                 patch.object(lookup.subprocess, 'run', return_value=subprocess.CompletedProcess(
                     [], 0, json.dumps(result), '')) as run:
             self.assertEqual(lookup.read('noon', deadline=1003.0), result)
         argv = run.call_args.args[0]
-        self.assertEqual(float(argv[-1]), 1002.5)
-        self.assertEqual(run.call_args.kwargs['timeout'], 3.0)
+        self.assertEqual(float(argv[-1]), 1002.4)
+        self.assertEqual(run.call_args.kwargs['timeout'], 2.9)

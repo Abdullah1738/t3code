@@ -102,7 +102,13 @@ const spanAttributes = <A, E>(
         const span = new Tracer.NativeSpan(options);
         const attribute = span.attribute.bind(span);
         const end = span.end.bind(span);
-        const record: Record<string, unknown> = { name: options.name };
+        const record: Record<string, unknown> = {
+          name: options.name,
+          parentName:
+            span.parent._tag === "Some" && span.parent.value._tag === "Span"
+              ? span.parent.value.name
+              : undefined,
+        };
         span.attribute = (key, value) => {
           record[key] = value;
           attribute(key, value);
@@ -122,17 +128,23 @@ const spanAttributes = <A, E>(
     return spans;
   });
 
-for (const lane of ["foreground", "background", "writer", "checkpoint writer"] as const) {
-  const reader = lane === "foreground" || lane === "background";
-  const inLane = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
-    lane === "foreground"
-      ? foreground(effect)
-      : lane === "background"
-        ? background(effect)
-        : effect;
-  const config = { foregroundReaderSlots: 1, checkpointWorker: lane === "checkpoint writer" };
+const statementLanes = (["foreground", "background", "writer", "checkpoint writer"] as const).map(
+  (lane) => {
+    const reader = lane === "foreground" || lane === "background";
+    const inLane = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      lane === "foreground"
+        ? foreground(effect)
+        : lane === "background"
+          ? background(effect)
+          : effect;
+    const config = { foregroundReaderSlots: 1, checkpointWorker: lane === "checkpoint writer" };
+    return { lane, reader, inLane, config };
+  },
+);
 
-  it.effect(`a plain statement interrupted waiting for the ${lane} records its wait`, () =>
+it.effect.each(statementLanes)(
+  "a plain statement interrupted waiting for the $lane records its wait",
+  ({ lane, reader, inLane, config }) =>
     withLanes(config, (sql) =>
       Effect.gen(function* () {
         const held = yield* Deferred.make<void>();
@@ -185,9 +197,11 @@ for (const lane of ["foreground", "background", "writer", "checkpoint writer"] a
         assert.equal(yield* inLane(countEntries(sql)), 1);
       }),
     ),
-  );
+);
 
-  it.effect(`a plain statement acquiring the ${lane} keeps its acquired attributes`, () =>
+it.effect.each(statementLanes)(
+  "a plain statement acquiring the $lane keeps its acquired attributes",
+  ({ lane, reader, inLane, config }) =>
     withLanes(config, (sql) =>
       Effect.gen(function* () {
         const spans = yield* spanAttributes(inLane(countEntries(sql)).pipe(Effect.orDie));
@@ -205,17 +219,16 @@ for (const lane of ["foreground", "background", "writer", "checkpoint writer"] a
           statement["db.reader.acquire_wait_ms"],
           reader ? statement["db.lock_wait_ms"] : undefined,
         );
+        assert.isNumber(statement["db.statement.execution_ms"]);
+        assert.isAtLeast(Number(statement["db.statement.execution_ms"]), 0);
         if (reader) {
-          assert.isNumber(statement["db.statement.execution_ms"]);
           assert.isNumber(statement["db.reader.hold_ms"]);
         } else {
-          assert.isUndefined(statement["db.statement.execution_ms"]);
           assert.isUndefined(statement["db.reader.hold_ms"]);
         }
       }),
     ),
-  );
-}
+);
 
 it.effect(
   "a foreground read does not wait behind a long background read",
@@ -329,7 +342,10 @@ it.effect(
             foreground(sql.withTransaction(countEntries(sql))),
           ]).pipe(Effect.orDie),
         );
-        const reads = spans.filter((span) => span["db.connection"] === "reader");
+        const reads = spans.filter(
+          (span) => span["db.connection"] === "reader" && span["db.connection.reused"] !== true,
+        );
+        assert.lengthOf(reads, 3);
         const lanes = reads.map((span) => span["db.reader.lane"]);
         assert.include(lanes, "foreground");
         assert.include(lanes, "background");
@@ -351,12 +367,28 @@ it.effect(
           assert.isNumber(span["db.statement.execution_ms"]);
         }
         const transaction = spans.find((span) => span.name === "sql.transaction");
+        assert.equal(transaction?.["db.connection"], "reader");
+        assert.isUndefined(transaction?.["db.connection.reused"]);
+        assert.isNumber(transaction?.["db.lock_wait_ms"]);
+        assert.isNumber(transaction?.["db.reader.slot"]);
         assert.equal(transaction?.["db.reader.requested_lane"], "foreground");
         assert.equal(transaction?.["db.reader.effective_lane"], "foreground");
         assert.equal(transaction?.["db.reader.route_reason"], "requested");
         assert.equal(transaction?.["db.reader.waiting"], false);
         assert.equal(transaction?.["db.reader.lane"], "foreground");
         assert.isNumber(transaction?.["db.reader.hold_ms"]);
+        const reused = spans.filter((span) => span["db.connection.reused"] === true);
+        assert.lengthOf(reused, 1);
+        const statement = reused[0]!;
+        assert.equal(statement.name, "sqlite");
+        assert.equal(statement.parentName, "sql.transaction");
+        assert.equal(statement["db.connection"], "reader");
+        assert.equal(statement["db.reader.lane"], "foreground");
+        assert.equal(statement["db.reader.slot"], transaction?.["db.reader.slot"]);
+        assert.isUndefined(statement["db.lock_wait_ms"]);
+        assert.isUndefined(statement["db.reader.acquire_wait_ms"]);
+        assert.isUndefined(statement["db.reader.hold_ms"]);
+        assert.isNumber(statement["db.statement.execution_ms"]);
       }),
     ),
   30_000,

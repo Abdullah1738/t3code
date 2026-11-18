@@ -16,6 +16,7 @@ __offbox_pnpm_source=@SOURCE@
 __offbox_pnpm_fail() { __offbox_stop "pnpm $__offbox_pnpm_pin ($__offbox_pnpm_source; box ${__offbox_pnpm_current:-none}): $*"; }
 export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 export npm_config_manage_package_manager_versions=false
+__offbox_pnpm_path=$PATH
 # A version probe must not let an unconfigured Corepack shim fetch its default/latest package manager.
 __offbox_pnpm_current=$(COREPACK_ENABLE_NETWORK=0 pnpm --version 2>/dev/null) || __offbox_pnpm_current=
 __offbox_pnpm_matches() {
@@ -78,8 +79,28 @@ if ! __offbox_pnpm_matches "$__offbox_pnpm_current"; then
   __offbox_pnpm_matches "$__offbox_pnpm_version" || __offbox_pnpm_fail 'no published version satisfies the pin'
   __offbox_curl -fsSL "https://registry.npmjs.org/pnpm/$__offbox_pnpm_version" -o "$__offbox_pnpm_tmp/meta.json" || __offbox_pnpm_fail 'version lookup failed'
   __offbox_curl -fsSL "https://registry.npmjs.org/pnpm/-/pnpm-$__offbox_pnpm_version.tgz" -o "$__offbox_pnpm_tmp/pnpm.tgz" || __offbox_pnpm_fail 'archive download failed'
-  node -e 'const fs=require("fs"),c=require("crypto"),m=JSON.parse(fs.readFileSync(process.argv[1])),b=fs.readFileSync(process.argv[2]),i=m.dist.integrity; if(!i||!i.startsWith("sha512-")||c.createHash("sha512").update(b).digest("base64")!==i.slice(7))process.exit(1); const h=process.argv[3].split("+")[1]; if(h){const [a,v]=h.split("."); if(!["hex","base64"].some(e=>c.createHash(a).update(b).digest(e)===v))process.exit(1)}' "$__offbox_pnpm_tmp/meta.json" "$__offbox_pnpm_tmp/pnpm.tgz" "$__offbox_pnpm_pin" || __offbox_pnpm_fail 'archive checksum mismatch'
-  tar -xzf "$__offbox_pnpm_tmp/pnpm.tgz" -C "$__offbox_pnpm_tmp" || __offbox_pnpm_fail 'archive extraction failed'
+  __offbox_pnpm_verify_archive() {
+    node -e 'const fs=require("fs"),c=require("crypto"),m=JSON.parse(fs.readFileSync(process.argv[1])),b=fs.readFileSync(process.argv[2]),i=m.dist.integrity; if(!i||!i.startsWith("sha512-")||c.createHash("sha512").update(b).digest("base64")!==i.slice(7))process.exit(1); const h=process.argv[3].split("+")[1]; if(h){const [a,v]=h.split("."); if(!["hex","base64"].some(e=>c.createHash(a).update(b).digest(e)===v))process.exit(1)}' "$__offbox_pnpm_tmp/meta.json" "$__offbox_pnpm_tmp/pnpm.tgz" "$__offbox_pnpm_pin"
+  }
+  __offbox_pnpm_verify_archive || __offbox_pnpm_fail 'archive checksum mismatch'
+  for __offbox_pnpm_attempt in 1 2; do
+    __offbox_pnpm_unpack_rc=0
+    __offbox_unpack_attempt "$__offbox_pnpm_tmp/install.log" tar -xzf "$__offbox_pnpm_tmp/pnpm.tgz" -C "$__offbox_pnpm_tmp" || __offbox_pnpm_unpack_rc=$?
+    if ! __offbox_pnpm_signature=$(__offbox_native_crash "$__offbox_pnpm_tmp/install.log" "$__offbox_pnpm_unpack_rc"); then
+      [ "$__offbox_pnpm_unpack_rc" = 0 ] && break
+      __offbox_pnpm_fail 'archive extraction failed'
+    fi
+    if [ "$__offbox_pnpm_attempt" = 2 ]; then
+      __offbox_infra_stop native_crash toolchain_unpack_crash "box ${OFFBOX_BOX_ID:-<box>} crashed unpacking a checksum-verified pnpm $__offbox_pnpm_version archive twice ($__offbox_pnpm_signature); this is a box/host fault, not your repo."
+    fi
+    echo "offbox: pnpm $__offbox_pnpm_version unpack crashed on this box ($__offbox_pnpm_signature); retrying once" >&2
+    rm -rf -- "$__offbox_pnpm_tmp/package" || __offbox_pnpm_fail 'archive extraction failed'
+    if ! __offbox_pnpm_verify_archive; then
+      __offbox_curl -fsSL "https://registry.npmjs.org/pnpm/-/pnpm-$__offbox_pnpm_version.tgz" -o "$__offbox_pnpm_tmp/pnpm.tgz" || __offbox_pnpm_fail 'archive download failed'
+      __offbox_pnpm_verify_archive || __offbox_pnpm_fail 'archive checksum mismatch'
+    fi
+  done
+  rm -f -- "$__offbox_pnpm_tmp/install.log"
   __offbox_pnpm_bin=$(node -e 'const b=require(process.argv[1]).bin.pnpm; if(!/^bin\/[a-zA-Z0-9.-]+$/.test(b))process.exit(1); console.log(b)' "$__offbox_pnpm_tmp/meta.json") || __offbox_pnpm_fail 'invalid pnpm entry point'
   [ "$(node "$__offbox_pnpm_tmp/package/$__offbox_pnpm_bin" --version)" = "$__offbox_pnpm_version" ] || __offbox_pnpm_fail 'staged pnpm cannot execute'
   mkdir -p "$__offbox_pnpm_tmp/bin"
@@ -87,12 +108,16 @@ if ! __offbox_pnpm_matches "$__offbox_pnpm_current"; then
   printf '#!/bin/sh\nexec node "%s/package/%s" "$@"\n' "$__offbox_pnpm_cache" "$__offbox_pnpm_bin" > "$__offbox_pnpm_tmp/bin/pnpm"
   chmod +x "$__offbox_pnpm_tmp/bin/pnpm"
   mv "$__offbox_pnpm_tmp" "$__offbox_pnpm_cache" || __offbox_pnpm_fail 'cache activation failed'
-  ) || exit 99
+  ) || { [ "$?" != 90 ] || exit 90; exit 99; }
   export PATH="$__offbox_pnpm_cache/bin:$PATH"
   __offbox_pnpm_current=$(pnpm --version 2>/dev/null) || __offbox_pnpm_fail 'activated pnpm cannot execute'
 fi
 __offbox_pnpm_matches "$__offbox_pnpm_current" || __offbox_pnpm_fail 'activated pnpm does not match'
-__offbox_pin_command pnpm "$(command -v pnpm)"
+__offbox_pnpm_command=$(command -v pnpm)
+# Cache bins are only needed for the activation probes; the shim owns pnpm.
+export PATH=$__offbox_pnpm_path
+__offbox_pin_command pnpm "$__offbox_pnpm_command"
+unset __offbox_pnpm_path __offbox_pnpm_command
 echo "offbox: pnpm v$__offbox_pnpm_current ($__offbox_pnpm_source)" >&2
 unset -f __offbox_pnpm_fail __offbox_pnpm_matches
 unset __offbox_pnpm_pin __offbox_pnpm_base __offbox_pnpm_source __offbox_pnpm_current __offbox_pnpm_cache __offbox_pnpm_tmp __offbox_pnpm_version __offbox_pnpm_bin

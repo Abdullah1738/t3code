@@ -16,6 +16,250 @@ import toollog
 
 
 class ToolLogTests(unittest.TestCase):
+    def test_shared_render_root_path_shapes_with_and_without_counters(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as temp:
+            cwd = Path(temp) / 'cwd'
+            cwd.mkdir()
+            cases = [('absolute', str(Path(temp) / 'absolute')), ('relative', 'logs'),
+                     ('dot-relative', './dot-logs'), ('parent-relative', '../parent-logs'),
+                     ('spaces', 'space logs'), ('uri-specials', 'logs?#%'), ('unicode', 'méta-logs')]
+            previous = Path.cwd()
+            try:
+                os.chdir(cwd)
+                for label, root in cases:
+                    with self.subTest(shape=label), patch.dict(os.environ, {'TOOLLOG_ROOT': root}):
+                        directory = toollog.board_dir('imessage')
+                        directory.mkdir(parents=True)
+                        (directory / (self.day + '.ndjson')).write_text(json.dumps({
+                            'component': 'fixture', 'name': 'fixture.start', 'kind': 'event'}) + '\n')
+                        self.assertEqual(toollog.rollup('imessage', self.day)['total'], 1)
+                        with sqlite3.connect(directory / f'renders-{self.day}.sqlite') as db:
+                            db.execute('CREATE TABLE bins (component TEXT, cardKind TEXT, chat TEXT, ms INTEGER, count INTEGER)')
+                            db.execute('INSERT INTO bins VALUES (?, ?, ?, ?, ?)', ('delivery-renderer', 'delivery', 'owner', 7, 3))
+                        result = toollog.rollup('imessage', self.day)
+                        self.assertEqual(result['total'], 4)
+                        self.assertEqual(result['recordedRows'], 1)
+                        self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['count'], 3)
+            finally:
+                os.chdir(previous)
+
+    def test_shared_render_counters_merge_with_legacy_rows_without_counting_them_as_log_lines(self):
+        import sqlite3
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        with sqlite3.connect(directory / f'renders-{self.day}.sqlite') as db:
+            db.execute('CREATE TABLE bins (component TEXT, cardKind TEXT, chat TEXT, ms INTEGER, count INTEGER)')
+            db.executemany('INSERT INTO bins VALUES (?, ?, ?, ?, ?)', [
+                ('delivery-renderer', 'delivery', 'owner', 7, 3),
+                ('delivery-renderer', 'delivery', 'owner', 9, 2),
+                ('PRIVATE', 'delivery', 'owner', 1, 1),
+                ('delivery-renderer', 'PRIVATE', 'owner', 1, 1),
+                ('delivery-renderer', 'delivery', 'PRIVATE', 1, 1),
+                ('delivery-renderer', 'delivery', 'owner', 971501234567, 1),
+            ])
+        legacy = {'component': 'delivery-renderer', 'name': 'card.renders', 'kind': 'perf',
+                  'renders': {'count': 2, 'histogram': [[10, 2]]}}
+        failed = {'component': 'delivery-renderer', 'name': 'card.render', 'kind': 'perf', 'ok': False,
+                  'props': {'failureCode': 'preview_missing'}, 'durationMs': 11}
+        (directory / (self.day + '.ndjson')).write_text(json.dumps(legacy) + '\n' + json.dumps(failed) + '\n')
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual(result['recordedRows'], 2)
+        self.assertEqual(result['byComponent']['delivery-renderer']['card.render'], {
+            'count': 8, 'ok': 7, 'failed': 1, 'errorRate': 1 / 8,
+            'durationMs': {'p50': 9, 'p95': 11, 'max': 11}})
+        self.assertNotIn('PRIVATE', json.dumps(result))
+        self.assertNotIn('971501234567', json.dumps(result))
+
+    def test_imessage_causes_and_render_counters_are_reduced(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        rows = [
+            {'component': 'delivery-renderer', 'kind': 'perf', 'name': 'card.renders', 'ok': True,
+             'renders': {'count': 250, 'histogram': [[10, 250]]}},
+            {'component': 'delivery-renderer', 'kind': 'perf', 'name': 'card.render', 'ok': False,
+             'durationMs': 20, 'props': {'failureCode': 'preview_missing'}},
+        ]
+        for fields in [{'code': 'ECONNRESET'}, {'code': 'ECONNRESET'}, {'errno': -61}, {'status': 503}, {},
+                       {'code': 'PRIVATE_TOKEN'}, {'code': 971501234567},
+                       {'errno': '/Users/private/PRIVATE'}, {'code': 'https://private/?token=PRIVATE'}]:
+            rows.append({'kind': 'error', 'name': 'bridge.catch', 'error': {
+                'tag': 'router.catch1', 'name': 'Error', **fields}})
+        rows.append({'kind': 'error', 'name': 'bridge.catch', 'error': {
+            'tag': 'router.catch49', 'name': 'UnknownError', 'causeKey': 'background_watch'}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertIn({'tag': 'router.catch1', 'causeKey': 'code.ECONNRESET', 'count': 2}, result['topCauses'])
+        self.assertEqual(len(result['topCauses']), 5)
+        self.assertEqual(result['cardRenderFailures'], {'preview_missing': 1})
+        self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['count'], 251)
+        self.assertEqual(result['byComponent']['delivery-renderer']['card.render']['failed'], 1)
+        self.assertNotIn('PRIVATE', json.dumps(result))
+        self.assertNotIn('971501234567', json.dumps(result))
+
+    def test_imessage_replayed_causes_match_shared_typescript_fixtures(self):
+        fixtures = Path(__file__).resolve().parents[2] / 'spectrum-bridge/test/fixtures/rollup-causes.json'
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        for fixture in json.loads(fixtures.read_text()):
+            with self.subTest(shape=fixture['name']):
+                request = fixture.get('request', False)
+                tag = 'control.request_failed' if request else fixture.get('tag', 'fixture.catch')
+                row = {'component': 'robob' if request else 'router', 'kind': 'perf' if request else 'error',
+                       'name': 'turn.robob_call' if request else 'bridge.catch', 'ok': False,
+                       'props': {**fixture.get('props', {}), **({'failureFormat': 'single'} if fixture.get('single') else {})},
+                       'error': {'tag': tag, **fixture['error']}}
+                row.update(fixture.get('row', {}))
+                for field in fixture.get('omit', []):
+                    row.pop(field, None)
+                (directory / (self.day + '.ndjson')).write_text(json.dumps(row) + '\n')
+                result = toollog.rollup('imessage', self.day)
+                expected = [{'tag': fixture.get('expectedTag', tag), 'causeKey': fixture['expected'], 'count': 1}] if fixture['expected'] else []
+                self.assertEqual(result['topCauses'], expected)
+                self.assertNotIn('PRIVATE_', json.dumps(result['topCauses']))
+
+    def test_imessage_failure_formats_do_not_duplicate_legacy_diagnostics(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        def raw(batch, single=False):
+            return {'ts': self.day + 'T12:00:00Z', 'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call',
+                    'ok': False, 'durationMs': 25000, 'ids': {'runId': 'same-run', 'callBatchId': batch},
+                    'props': {'method': 'GET', 'route': '/threads/:id/messages', **({'failureFormat': 'single'} if single else {})},
+                    'error': {'tag': 'control.request_failed', 'name': 'TimeoutError'}}
+        def summary(batch):
+            return {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                    'ids': {'runId': 'same-run', 'callBatchId': batch},
+                    'calls': {'messages': {'ok': 9, 'failed': 1, 'histogram': [[10, 9], [25000, 1]]}}}
+        catch = {'component': 'control', 'kind': 'error', 'name': 'bridge.catch', 'ok': False,
+                 'ids': {'runId': 'same-run'}, 'error': {'tag': 'control.catch1', 'name': 'TimeoutError'}}
+        for shape in ['legacy', 'mixed', 'reversed', 'orphan', 'new_only', 'new_orphan', 'summary_only']:
+            with self.subTest(shape=shape):
+                rows = ([raw('new', True)] if shape == 'new_orphan' else
+                        [raw('new', True), summary('new')] if shape == 'new_only' else
+                        [summary('old')] if shape == 'summary_only' else
+                        [catch, raw('old'), raw('new', True)] if shape == 'orphan' else
+                        [catch, raw('old'), summary('old')] + ([] if shape == 'legacy' else [raw('new', True), summary('new')]))
+                if shape == 'mixed':
+                    for row in rows:
+                        if row.get('ids', {}).get('callBatchId') == 'new':
+                            row['ts'] = self.day + 'T13:00:00Z'
+                if shape == 'reversed':
+                    rows.reverse()
+                (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                result = toollog.rollup('imessage', self.day)
+                total = 1 if shape == 'new_orphan' else 11 if shape == 'legacy' else 3 if shape == 'orphan' else 10 if shape in {'new_only', 'summary_only'} else 21
+                new_only = shape in {'new_only', 'new_orphan'}
+                has_catch = not new_only and shape != 'summary_only'
+                call_failures = 1 if shape in {'legacy', 'summary_only'} or new_only else 2
+                diagnostics = 0 if shape == 'summary_only' else 1 if shape == 'legacy' or new_only else 2
+                self.assertEqual((result['total'], result['recordedRows'], result['errorRate'], result['failedCount']), (total, len(rows), diagnostics / total, call_failures + has_catch))
+                self.assertEqual(result['byComponent']['robob']['messages']['failed'], call_failures)
+                expected = ([] if not has_catch else [('control.catch1', 1)]) + ([] if shape in {'legacy', 'summary_only'} else [('control.request_failed', 1)])
+                self.assertEqual([(item['tag'], item['count']) for item in result['topErrorTags']], expected)
+
+    def test_imessage_already_logged_catches_preserve_volume_without_failure_diagnostics(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True, exist_ok=True)
+        for tag in ['control.request_failed', 'control.invalid_json']:
+            for aggregate in [False, True]:
+                for marker in [True, False, None, 'true', 1]:
+                    with self.subTest(tag=tag, aggregate=aggregate, marker=marker):
+                        request = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                                   'durationMs': 25, 'ids': {'callBatchId': 'batch'},
+                                   'props': {'method': 'GET', 'route': '/threads/:id', 'failureFormat': 'single'},
+                                   'error': {'tag': tag, 'name': 'TimeoutError', 'causeKey': 'TimeoutError'}}
+                        catch = {'component': 'router', 'kind': 'error', 'name': 'bridge.catch', 'ok': False,
+                                 'alreadyLogged': marker, 'error': {'tag': 'router.catch1', 'name': 'TimeoutError',
+                                                                 'causeKey': 'prompt_acceptance_probe'}}
+                        rows = [request, catch]
+                        if aggregate:
+                            rows.append({'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                                         'ids': {'callBatchId': 'batch'},
+                                         'calls': {'thread': {'ok': 0, 'failed': 1, 'histogram': [[25, 1]]}}})
+                        path = directory / (self.day + '.ndjson')
+                        path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                        result = toollog.rollup('imessage', self.day)
+                        deduped = marker is True
+                        self.assertEqual((result['total'], result['recordedRows']), (2, len(rows)))
+                        self.assertEqual(result['dedupedFailures'], int(deduped))
+                        self.assertEqual(result['failedCount'], 1 if deduped else 2)
+                        self.assertEqual(result['errorRate'], .5 if deduped else 1)
+                        self.assertEqual(result['countsByName'], {'turn.robob_call': 1, 'bridge.catch': 1})
+                        self.assertEqual(result['countsByKind'], {'perf': 1, 'error': 1})
+                        self.assertEqual([item['tag'] for item in result['topErrorTags']],
+                                         [tag] if deduped else [tag, 'router.catch1'])
+                        self.assertEqual([item['tag'] for item in result['topCauses']],
+                                         [tag] if deduped else [tag, 'router.catch1'])
+                        self.assertEqual(result['byComponent']['router']['bridge.catch']['failed'], 0 if deduped else 1)
+                        self.assertEqual(len(path.read_text().splitlines()), len(rows))
+
+    def test_imessage_suppressed_outage_details_count_from_summary_once(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        cases = [
+            ('partial_details', 6, 5, 0, False),
+            ('summary_only', 6, 0, 0, False),
+            ('all_details', 6, 6, 0, False),
+            ('reversed', 6, 5, 0, True),
+            ('legacy', 0, 5, 6, False),
+            ('mixed', 3, 5, 3, False),
+            ('old_single_summary', None, 5, 0, False),
+        ]
+        for shape, single, details, legacy, reverse in cases:
+            with self.subTest(shape=shape):
+                detail = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                          'durationMs': 25, 'ids': {'callBatchId': 'batch'},
+                          'props': {'method': 'GET', 'route': '/threads/:id/messages', 'failureFormat': 'single'},
+                          'error': {'tag': 'control.request_failed', 'name': 'TypeError'}}
+                stats = {'ok': 0, 'failed': 6, 'histogram': [[25, 6]]}
+                if single is not None:
+                    stats['singleFailures'] = single
+                rows = [{'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls', 'ids': detail['ids'],
+                         'calls': {'messages': stats}}]
+                rows += [{**detail, 'props': {**detail['props'], 'failureFormat': 'single' if index < (single if single is not None else 6) else ''}}
+                         for index in range(details)]
+                rows += [{'component': 'router', 'kind': 'error', 'name': 'bridge.catch', 'ok': False,
+                          'alreadyLogged': index >= legacy,
+                          'error': {'tag': 'control.catch1' if index < legacy else 'router.catch1', 'name': 'ControlError'}}
+                         for index in range(6)]
+                if reverse:
+                    rows.reverse()
+                (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                result = toollog.rollup('imessage', self.day)
+                self.assertEqual((result['total'], result['recordedRows']), (12, len(rows)))
+                self.assertEqual((result['failedCount'], result['dedupedFailures']), (6 + legacy, 6 - legacy))
+                self.assertEqual(result['errorRate'], ((single if single is not None else details) + legacy) / 12)
+                self.assertEqual(result['countsByName'], {'turn.robob_call': 6, 'bridge.catch': 6})
+                self.assertNotIn('router.catch1', [item['tag'] for item in result['topErrorTags']])
+
+    def test_imessage_outage_batches_without_retained_details_still_count(self):
+        directory = toollog.board_dir('imessage')
+        directory.mkdir(parents=True)
+        rows = []
+        for batch in range(4):
+            rows.append({'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls', 'ids': {'callBatchId': str(batch)},
+                         'calls': {'messages': {'ok': 0, 'failed': 3, 'singleFailures': 3, 'histogram': [[25, 3]]}}})
+            for index in range(3):
+                if batch * 3 + index < 5:
+                    rows.append({'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
+                                 'durationMs': 25, 'ids': {'callBatchId': str(batch)},
+                                 'props': {'method': 'GET', 'route': '/threads/:id/messages', 'failureFormat': 'single'},
+                                 'error': {'tag': 'control.request_failed', 'name': 'TypeError'}})
+                rows.append({'component': 'router', 'kind': 'error', 'name': 'bridge.catch', 'ok': False, 'alreadyLogged': True,
+                             'error': {'tag': 'router.catch1', 'name': 'ControlError'}})
+        (directory / (self.day + '.ndjson')).write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        result = toollog.rollup('imessage', self.day)
+        self.assertEqual((result['failedCount'], result['dedupedFailures'], result['total']), (12, 12, 24))
+        self.assertEqual(result['errorRate'], .5)
+        self.assertEqual([(item['tag'], item['count']) for item in result['topErrorTags']], [('control.request_failed', 5)])
+
+    def test_imessage_single_failure_count_accepts_only_bounded_integers(self):
+        for value in [None, 0, 6, -1, 7, .5, float('nan'), float('inf'), '6', True]:
+            with self.subTest(value=value):
+                stats = toollog._imessage_call_stats({'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_calls',
+                    'calls': {'messages': {'ok': 0, 'failed': 6, 'histogram': [[25, 6]], 'singleFailures': value}}})
+                self.assertEqual(stats['messages'][3], value if type(value) is int and 0 <= value <= 6 else None)
+
     def test_imessage_rollup_summary_appended_after_read_is_never_double_counted(self):
         directory = toollog.board_dir('imessage')
         directory.mkdir(parents=True)
@@ -48,7 +292,8 @@ class ToolLogTests(unittest.TestCase):
                  'histogram': [[10, 2], [1002, 1]]}
         call = {'component': 'robob', 'kind': 'perf', 'name': 'turn.robob_call', 'ok': False,
                 'durationMs': 1002, 'ids': {'runId': 'run-fixture', 'callBatchId': 'batch-fixture'},
-                'props': {'method': 'GET', 'route': '/threads/:id'}}
+                'error': {'tag': 'control.request_failed', 'name': 'TimeoutError'},
+                'props': {'method': 'GET', 'route': '/threads/:id', 'failureFormat': 'single'}}
         rows = [{**call, 'name': 'turn.robob_calls', 'calls': {'thread': stats}}, call,
                 {**call, 'durationMs': 2000, 'ids': {'callBatchId': 'orphan'}},
                 {'component': 'router', 'kind': 'perf', 'name': 'turn.end', 'ok': True}]
@@ -56,6 +301,8 @@ class ToolLogTests(unittest.TestCase):
         result = toollog.rollup('imessage', self.day)
         self.assertEqual((result['total'], result['recordedRows'], result['okCount'], result['failedCount']), (5, 4, 3, 2))
         self.assertEqual(result['countsByName']['turn.robob_call'], 4)
+        self.assertEqual(result['errorRate'], 2 / 5)
+        self.assertEqual(result['topErrorTags'][0]['count'], 2)
         self.assertFalse(result['sampled'])
         self.assertEqual(result['byComponent']['robob']['thread'], {
             'count': 4, 'ok': 2, 'failed': 2, 'errorRate': .5, 'durationMs': {'p50': 10, 'p95': 2000, 'max': 2000}})
@@ -99,6 +346,15 @@ class ToolLogTests(unittest.TestCase):
 
     def rows(self, board='agent-tools'):
         return list(toollog.read(board, self.day))
+
+    def test_hook_identity_source_only_logs_known_values(self):
+        for source in ('cache', 'control', 'negative-cache', 'PRIVATE_FIXTURE', {'secret': 'PRIVATE_FIXTURE'}):
+            toollog.hook('codex', 'shell', 'allowed', 'no-policy', 0.1,
+                         error_tag='identity-unavailable', identity_source=source)
+        rows = self.rows()
+        self.assertEqual([row['props'].get('identity_source') for row in rows],
+                         ['cache', 'control', 'negative-cache', None, None])
+        self.assertNotIn('PRIVATE_FIXTURE', json.dumps(rows))
 
     def test_orders_rollup_preserves_cause_groups_and_merchant_timings(self):
         directory = toollog.board_dir('orders')
@@ -226,15 +482,15 @@ class ToolLogTests(unittest.TestCase):
         for decision in ('allowed', 'rewritten'):
             with patch.object(toollog.random, 'random', side_effect=[0, 1 / toollog.HOOK_SAMPLE_RATE, .99]):
                 for _ in range(3):
-                    toollog.hook('codex', 'shell', decision, 'fixture', 2, ids={'threadId': 'fixture'})
+                    toollog.hook('codex', 'shell', decision, 'fixture', 2, ids={'threadId': 'native:codex:fixture'})
         with patch.object(toollog.random, 'random', return_value=.99):
-            toollog.hook('codex', 'shell', 'denied', 'fixture', 4, ids={'threadId': 'fixture'})
+            toollog.hook('codex', 'shell', 'denied', 'fixture', 4, ids={'threadId': 'native:codex:fixture'})
             toollog.hook('codex', 'shell', 'allowed', 'failure', 4, error_tag='fixture.error')
         rows = self.rows()
         self.assertEqual(len(rows), 4)
         for row in rows[:2]:
             self.assertEqual(row['durationMs'], 2)
-            self.assertEqual(row['ids']['threadId'], 'fixture')
+            self.assertEqual(row['ids']['threadId'], 'native:codex:fixture')
             self.assertEqual(row['props']['sampleRate'], toollog.HOOK_SAMPLE_RATE)
             for key in ('cwdClass', 'matchedRoot', 'argv0Class'):
                 self.assertNotIn(key, row['props'])
@@ -252,9 +508,114 @@ class ToolLogTests(unittest.TestCase):
         self.assertEqual(result['failedCount'], 2)
         self.assertEqual(result['countsByKind'], {'perf': 2 * toollog.HOOK_SAMPLE_RATE, 'error': 2})
         self.assertEqual(result['durationMsByName']['hook.decision'], {'p50': 2, 'p95': 2, 'max': 4})
-        self.assertEqual(result['topThreadsByRule']['fixture'], [{'threadId': 'fixture', 'count': 2 * toollog.HOOK_SAMPLE_RATE + 1}])
-        self.assertEqual(result['repeatLoops'][0]['maxCountInHour'], 2 * toollog.HOOK_SAMPLE_RATE + 1)
+        self.assertEqual(result['topThreadsByRule']['fixture'], [{'threadId': 'native:codex:fixture', 'count': toollog.HOOK_SAMPLE_RATE + 1, 'denied': 1, 'rewritten': toollog.HOOK_SAMPLE_RATE, 'attributed': True, 'sampled': True}])
+        self.assertEqual(result['repeatLoops'][0]['maxCountInHour'], toollog.HOOK_SAMPLE_RATE)
+        self.assertEqual(result['repeatLoops'][0]['decision'], 'rewritten')
+        self.assertTrue(result['repeatLoops'][0]['sampled'])
         self.assertEqual(result['logCaps'], [])
+
+    def hook_rollup(self, rows, top_n=20):
+        path = toollog.board_dir('agent-tools') / (self.day + '.ndjson')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        base = {'ts': self.day + 'T12:00:00Z', 'name': 'hook.decision', 'kind': 'error',
+                'ok': False, 'ids': {'threadId': 'native:codex:refusals'}}
+        path.write_text(''.join(json.dumps({**base, **row}) + '\n' for row in rows))
+        return toollog.rollup('agent-tools', self.day, top_n)
+
+    def test_sampled_allowed_is_not_a_refusal(self):
+        result = self.hook_rollup([{'kind': 'perf', 'ok': True,
+            'props': {'rule': 'retry', 'decision': 'allowed', 'sampleRate': 128}}])
+        self.assertEqual(result['topThreadsByRule'], {})
+        self.assertEqual(result['repeatLoops'], [])
+        self.assertEqual(result['unattributedByRule'], {})
+        self.assertEqual(result['unrecognizedThreadIds'], 0)
+        self.assertEqual((result['total'], result['okCount'], result['countsByName']),
+                         (128, 128, {'hook.decision': 128}))
+
+    def test_denied_loop_and_separate_rewrites(self):
+        result = self.hook_rollup([{'props': {'rule': 'retry', 'decision': decision}}
+                                  for decision in ['denied'] * 25 + ['rewritten'] * 15])
+        self.assertEqual(result['topThreadsByRule']['retry'], [{
+            'threadId': 'native:codex:refusals', 'count': 40, 'denied': 25,
+            'rewritten': 15, 'attributed': True, 'sampled': False}])
+        self.assertEqual(result['repeatLoops'], [{
+            'threadId': 'native:codex:refusals', 'rule': 'retry', 'decision': 'denied',
+            'maxCountInHour': 25, 'repeatLoop': True, 'sampled': False}])
+        split = self.hook_rollup([{'props': {'rule': 'retry', 'decision': decision}}
+                                 for decision in ['denied'] * 15 + ['rewritten'] * 15])
+        self.assertEqual(split['repeatLoops'], [])
+
+    def test_unknown_refusals_visible_without_loops_or_top_limit(self):
+        result = self.hook_rollup([{'ids': {'threadId': 'unknown:codex'},
+                                   'props': {'rule': 'rootwide-search', 'decision': 'denied'}}] * 25, top_n=0)
+        self.assertEqual(result['unattributedByRule']['rootwide-search'], [{
+            'threadId': 'unknown:codex', 'count': 25, 'denied': 25, 'rewritten': 0,
+            'attributed': False, 'sampled': False}])
+        self.assertEqual(result['repeatLoops'], [])
+        self.assertEqual(result['topThreadsByRule'], {})
+
+    def test_ranking_thread_id_shapes(self):
+        uuid = '393a4dd3-d1ca-468e-9367-7c1f1ba1bf32'
+        cases = [(t, True) for t in [uuid, 'mcp:' + uuid, 'mcp:' + uuid + ':fork', 'ardud-control:thread:' + uuid,
+            'ardud-control:thread:nightly-report', 'ardud-control:thread:request%3A2026%2F11',
+            'ardud-opencode-import:thread:ses_e288ff742ffeQTYTEXLuPR3WIO',
+            'import:codex:' + uuid, 'import:claudeAgent:session-id',
+            'thread:mcp:namespace:request%3Akey:0',
+            'thread:delegated-task:command%3Amcp%3Adelegate-task%3Arequest',
+            'thread:project:7273c274-25cd-4aa6-8546-03e45da95f0e:' + uuid,
+            'thread:project:ardud-opencode-import%3Aproject%3A%2FVolumes%2FExternalSSD%2Ft3code-fork:' + uuid,
+            'native:claude:' + uuid, 'native:opencode:ses_e288ff742ffeQTYTEXLuPR3WIO']]
+        cases += [(t, False) for t in ['child', 'parent', 'leaf', 'new-fixture', '',
+            'native:', 'thread:project:fixture:child', 'mcp:fixture', 'sha256:abcd',
+            uuid + '-suffix', 'prefix-' + uuid, 'mcp:' + uuid + ':other', 'ardud-control:thread:',
+            'ardud-opencode-import:thread:', 'ardud-opencode-import:thread:ses_',
+            'import::session', 'import:codex:', 'thread:mcp:namespace:key:child',
+            'thread:delegated-task:']]
+        for thread, recognized in cases:
+            with self.subTest(thread=thread):
+                result = self.hook_rollup([{'ids': {'threadId': thread},
+                    'props': {'rule': 'retry', 'decision': 'denied'}}] * 25)
+                self.assertEqual(result['unrecognizedThreadIds'], 0 if recognized else 25)
+                self.assertFalse(result['unrecognizedThreadIdsSampled'])
+                self.assertEqual(bool(result['topThreadsByRule']), recognized)
+                self.assertEqual(bool(result['repeatLoops']), recognized)
+
+    def test_legacy_decision_fallback_only_when_missing(self):
+        cases = [({'kind': 'error'}, {}, True), ({'kind': 'perf', 'ok': False}, {}, True),
+                 ({'kind': 'perf', 'ok': True}, {}, False),
+                 ({'kind': 'error'}, {'decision': 'allowed'}, False),
+                 ({'kind': 'error'}, {'decision': None}, False),
+                 ({'kind': 'error'}, {'decision': 'other'}, False),
+                 ({'kind': 'error'}, {'decision': ['denied']}, False)]
+        for fields, props, expected in cases:
+            with self.subTest(fields=fields, props=props):
+                result = self.hook_rollup([{**fields, 'props': {'rule': 'retry', **props}}])
+                self.assertEqual(bool(result['topThreadsByRule']), expected)
+
+    def test_unexpected_sampled_refusals_are_labeled(self):
+        for kind in ['error', 'perf']:
+            for thread, block in [('native:codex:refusals', 'topThreadsByRule'),
+                                  ('unknown:codex', 'unattributedByRule')]:
+                with self.subTest(kind=kind, thread=thread):
+                    result = self.hook_rollup([{'kind': kind, 'ids': {'threadId': thread},
+                        'props': {'rule': 'retry', 'decision': 'denied', 'sampleRate': 128}}])
+                    entry = result[block]['retry'][0]
+                    self.assertEqual((entry['count'], entry['denied'], entry['sampled']), (128, 128, True))
+                    self.assertEqual(result['total'], 1 if kind == 'error' else 128)
+
+    def test_unrecognized_refusal_sample_rate_shapes(self):
+        cases = [(None, 1), (True, 1), (False, 1), (0, 1), (-1, 1),
+                 (1.5, 1), ('128', 1), (2**53, 1), (1, 1), (128, 128),
+                 (2**53 - 1, 2**53 - 1)]
+        for rate, weight in cases:
+            with self.subTest(rate=rate):
+                result = self.hook_rollup([{'ids': {'threadId': 'fixture'},
+                    'props': {'rule': 'retry', 'decision': 'denied', 'sampleRate': rate}}])
+                self.assertEqual(result['unrecognizedThreadIds'], weight)
+                self.assertEqual(result['unrecognizedThreadIdsSampled'], weight > 1)
+                self.assertEqual((result['total'], result['sampled']), (1, False))
+                self.assertEqual(result['topThreadsByRule'], {})
+                self.assertEqual(result['repeatLoops'], [])
 
     def test_rollup_legacy_caps_and_sample_rate_shapes(self):
         path = toollog.board_dir('agent-tools') / (self.day + '.ndjson')
@@ -446,15 +807,15 @@ class AttributionTests(unittest.TestCase):
             directory.mkdir()
             rows = []
             base = datetime(2026, 11, 13, 0, 59, tzinfo=timezone.utc)
-            for thread, count, spacing in [('loop',21,10), ('quiet',20,10), ('spread',21,181)]:
+            for thread, count, spacing in [('native:codex:loop',21,10), ('native:codex:quiet',20,10), ('native:codex:spread',21,181)]:
                 for i in range(count):
                     rows.append({'ts':(base+timedelta(seconds=i*spacing)).isoformat(), 'name':'hook.decision',
                         'kind':'error', 'ids':{'threadId':thread}, 'props':{'rule':'rootwide-search','decision':'denied'}})
             rows.append({'name':'other.event', 'ids':{'threadId':'loop'}, 'props':{'rule':'other'}})
             (directory/(day+'.ndjson')).write_text('\n'.join(json.dumps(r) for r in reversed(rows))+'\n')
             result = toollog.rollup('agent-tools',day,2)
-            self.assertEqual(result['topThreadsByRule']['rootwide-search'], [{'threadId':'loop','count':21},{'threadId':'spread','count':21}])
-            self.assertEqual(result['repeatLoops'], [{'threadId':'loop','rule':'rootwide-search','maxCountInHour':21,'repeatLoop':True}])
+            self.assertEqual(result['topThreadsByRule']['rootwide-search'], [{'threadId':t,'count':21,'denied':21,'rewritten':0,'attributed':True,'sampled':False} for t in ['native:codex:loop','native:codex:spread']])
+            self.assertEqual(result['repeatLoops'], [{'threadId':'native:codex:loop','rule':'rootwide-search','decision':'denied','maxCountInHour':21,'repeatLoop':True,'sampled':False}])
 
     def test_attributed_hook_under_point_one_ms(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT':temp}):
@@ -478,11 +839,11 @@ class AttributionTests(unittest.TestCase):
 
     def test_midnight_sampled_loop_estimates(self):
         cases = [
-            ('previous-sampled', 128, 1, -10, 'fixture', 129, True),
-            ('current-sampled', 1, 128, -10, 'fixture', 129, True),
-            ('both-unsampled', 1, 1, -10, 'fixture', 2, False),
-            ('outside-window', 128, 1, -3601, 'fixture', 1, False),
-            ('unrelated-thread', 128, 1, -10, 'other', 1, False),
+            ('previous-sampled', 128, 1, -10, 'native:codex:fixture', 129, True),
+            ('current-sampled', 1, 128, -10, 'native:codex:fixture', 129, True),
+            ('both-unsampled', 1, 1, -10, 'native:codex:fixture', 2, False),
+            ('outside-window', 128, 1, -3601, 'native:codex:fixture', 1, False),
+            ('unrelated-thread', 128, 1, -10, 'native:codex:other', 1, False),
         ]
         for label, previous_rate, current_rate, offset, thread, peak, sampled in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {'TOOLLOG_ROOT': temp}):
@@ -490,9 +851,9 @@ class AttributionTests(unittest.TestCase):
                 directory.mkdir()
                 base = datetime(2026, 11, 14, tzinfo=timezone.utc)
                 for at, rate, identity in [(base + timedelta(seconds=offset), previous_rate, thread),
-                                           (base, current_rate, 'fixture')]:
+                                           (base, current_rate, 'native:codex:fixture')]:
                     row = {'ts': at.isoformat(), 'name': 'hook.decision', 'kind': 'perf',
-                           'ids': {'threadId': identity}, 'props': {'rule': 'fixture', 'sampleRate': rate}}
+                           'ids': {'threadId': identity}, 'props': {'rule': 'fixture', 'sampleRate': rate, 'decision': 'rewritten'}}
                     (directory / (at.strftime('%Y-%m-%d') + '.ndjson')).write_text(json.dumps(row) + '\n')
                 result = toollog.rollup('agent-tools', '2026-11-14')
                 self.assertEqual(result['sampled'], sampled)
@@ -510,7 +871,7 @@ class AttributionTests(unittest.TestCase):
                 base=datetime(2026,11,13,23,59,tzinfo=timezone.utc)
                 for i in range(count):
                     at=base+timedelta(seconds=i*spacing)
-                    row={'ts':at.isoformat(),'name':'hook.decision','ids':{'threadId':'loop'},'props':{'rule':'retry'}}
+                    row={'ts':at.isoformat(),'name':'hook.decision','ids':{'threadId':'native:codex:loop'},'props':{'rule':'retry','decision':'denied'}}
                     with (directory/(at.strftime('%Y-%m-%d')+'.ndjson')).open('a') as dest:
                         dest.write(json.dumps(row)+'\n')
                 result=toollog.rollup('agent-tools','2026-11-14')

@@ -1,0 +1,999 @@
+"""Opt-in QA read access to dev data sources.
+
+Nothing here runs as part of dev Terraform, bootstrap or deploy. Legacy
+provisioning and teardown fail closed until ownership and recovery are wired.
+
+audit-db: DevOps owns reader provisioning and versioned credentials. The
+harness borrows a login role restricted to non-sensitive audit columns;
+qualification reads the catalog and brackets separate read-only controls.
+
+reader-task: a Fargate task definition in the dev VPC that runs one psql
+query as that role and prints the rows as JSON between markers.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
+
+from .async_observers import (
+    AuditExpectation, AuditQueryResult, AuditRecord, ReaderPermissionDenied, query_digest, records_digest,
+)
+from .completion.contract import RequestRole
+from .completion.environment_lease import LeaseError, LeaseSet, validate_lease
+from .completion.observer_source import (
+    RequestTrace, SourceCoverage, SourceQualification, SourceWindow, qualify_source_window,
+)
+from .completion.contract import ArtifactRef
+from .completion.reader_grants import (
+    EffectiveGrantSnapshot, ReaderControl, ReaderGrantReceipt, ReaderGrantSpec,
+    ReaderOwnership, AUDIT_ROLE, AUDIT_DB_NAME, AUDIT_COLUMNS,
+    AUTH_EVENT_VIEW, OWNED_AUTH_EVENT_COLUMNS, OWNED_AUTH_EVENT_VIEWDEF_SHA256,
+)
+from .config import config
+from .envprofile import PROFILE
+
+AUDIT_SECRET_ID = PROFILE.qa_audit_secret_id
+AUDIT_CLUSTER_ID = PROFILE.aurora_cluster_id
+AUDIT_VALID_DAYS = 7
+READER_FAMILY = PROFILE.qa_reader_family
+READER_CONTAINER = "reader"
+READER_LOG_GROUP = PROFILE.qa_reader_log_group
+READER_LOG_PREFIX = "qa-reader"
+# Pinned by digest (multi-arch index) so the reader image cannot drift.
+READER_IMAGE = "postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea"
+EXECUTION_ROLE = PROFILE.execution_role
+MARK = "harness-qa"
+MARK_TAG = {"Key": "Purpose", "Value": MARK}
+# The only account these scripts may touch (the HARNESS_ENV profile's).
+DEV_ACCOUNT_ID = PROFILE.account_id
+EXCLUDED_COLUMNS = (
+    "session_id", "ip", "user_agent", "geo_country", "geo_region", "geo_city",
+    "query_params_jsonb", "body_params_jsonb",
+)
+
+PROBE_SQL = (
+    "SELECT json_build_object("
+    "'user', current_user, "
+    "'read_only', current_setting('transaction_read_only'), "
+    "'can_write', has_table_privilege(current_user, 'backoffice.api_request_audit', 'INSERT,UPDATE,DELETE,TRUNCATE'), "
+    + ", ".join(
+        f"'can_read_{c}', has_column_privilege(current_user, 'backoffice.api_request_audit', '{c}', 'SELECT')"
+        for c in EXCLUDED_COLUMNS
+    )
+    + ", 'rows_last_hour', (SELECT count(*) FROM backoffice.api_request_audit "
+    "WHERE created_at_ms > (extract(epoch from now()) * 1000)::bigint - 3600000));"
+)
+
+
+def probe_violations(row: dict[str, Any]) -> list[str]:
+    """Privileges the QA role must not have. Grants are the control, not the read-only default."""
+    bad = [k for k, v in row.items() if (k == "can_write" or k.startswith("can_read_")) and v is not False]
+    if row.get("user") != AUDIT_ROLE:
+        bad.append("user")
+    return bad
+
+
+BEGIN = "QA_ROWS_BEGIN"
+END = "QA_ROWS_END"
+
+
+class _IdentityPermissionDenied(ReaderPermissionDenied):
+    """A permission failure before connection identity was established."""
+
+
+def scram_verifier(password: str, *, salt: bytes | None = None, iterations: int = 4096) -> str:
+    """Postgres SCRAM-SHA-256 stored-password format (RFC 5802/7677)."""
+    salt = salt if salt is not None else secrets.token_bytes(16)
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    stored_key = hashlib.sha256(client_key).digest()
+    server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+    b64 = lambda b: base64.b64encode(b).decode()  # noqa: E731
+    return f"SCRAM-SHA-256${iterations}:{b64(salt)}${b64(stored_key)}:{b64(server_key)}"
+
+
+def build_audit_role_up_sql(verifier: str, valid_until: str) -> str:
+    if not verifier.startswith("SCRAM-SHA-256$") or "'" in verifier:
+        raise ValueError("expected a SCRAM verifier")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", valid_until):
+        raise ValueError("valid_until must be UTC ISO seconds")
+    cols = ", ".join(AUDIT_COLUMNS)
+    return f"""
+DO $qa$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{AUDIT_ROLE}') THEN
+    CREATE ROLE {AUDIT_ROLE} LOGIN;
+  END IF;
+END
+$qa$;
+ALTER ROLE {AUDIT_ROLE} WITH LOGIN NOCREATEDB NOCREATEROLE NOINHERIT
+  CONNECTION LIMIT 4 PASSWORD '{verifier}' VALID UNTIL '{valid_until}';
+ALTER ROLE {AUDIT_ROLE} SET default_transaction_read_only = on;
+ALTER ROLE {AUDIT_ROLE} SET statement_timeout = '15s';
+COMMENT ON ROLE {AUDIT_ROLE} IS '{MARK}: opt-in QA audit reader';
+GRANT CONNECT ON DATABASE {AUDIT_DB_NAME} TO {AUDIT_ROLE};
+GRANT USAGE ON SCHEMA backoffice TO {AUDIT_ROLE};
+REVOKE ALL ON backoffice.api_request_audit FROM {AUDIT_ROLE};
+GRANT SELECT ({cols}) ON backoffice.api_request_audit TO {AUDIT_ROLE};
+"""
+
+
+def build_audit_role_down_sql() -> str:
+    return f"""
+DO $qa$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{AUDIT_ROLE}') THEN
+    EXECUTE 'REVOKE ALL ON backoffice.api_request_audit FROM {AUDIT_ROLE}';
+    EXECUTE 'REVOKE ALL ON SCHEMA backoffice FROM {AUDIT_ROLE}';
+    EXECUTE 'REVOKE ALL ON DATABASE {AUDIT_DB_NAME} FROM {AUDIT_ROLE}';
+    EXECUTE 'DROP ROLE {AUDIT_ROLE}';
+  END IF;
+END
+$qa$;
+"""
+
+
+def build_audit_role_status_sql() -> str:
+    return f"""
+SELECT 'QA_ROLE:' || coalesce((SELECT rolname || ':' || coalesce(replace(rolvaliduntil::text, ' ', 'T'), 'none')
+  FROM pg_roles WHERE rolname = '{AUDIT_ROLE}'), 'absent');
+SELECT 'QA_GRANT:' || string_agg(column_name, ',' ORDER BY column_name)
+  FROM information_schema.column_privileges
+ WHERE grantee = '{AUDIT_ROLE}' AND table_schema = 'backoffice'
+   AND table_name = 'api_request_audit' AND privilege_type = 'SELECT';
+"""
+
+
+def build_audit_effective_grants_sql(role: str, *, physical_source: str | None = None) -> str:
+    """Read all current-database/shared ACLs, including PUBLIC and native defaults."""
+    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", role):
+        raise ValueError("role must be a canonical PostgreSQL identifier")
+    if physical_source is not None and not re.fullmatch(r"rds:cluster-[A-Za-z0-9]+", physical_source):
+        raise ValueError("invalid RDS cluster resource identity")
+    physical = (f"'{physical_source}'" if physical_source else
+                "'pgsys:' || (SELECT system_identifier::text FROM pg_control_system())")
+    columns = ", ".join(f"'{column}'" for column in AUDIT_COLUMNS)
+    view_columns = ", ".join(f"'{column}'" for column in OWNED_AUTH_EVENT_COLUMNS)
+    return f"""
+SET search_path = pg_catalog, pg_temp;
+WITH RECURSIVE root AS (SELECT oid, rolname FROM pg_roles WHERE rolname = '{role}'),
+members(oid) AS (
+  SELECT oid FROM root UNION SELECT m.roleid FROM pg_auth_members m JOIN members a ON m.member=a.oid
+), reachable AS (SELECT p.* FROM pg_roles p JOIN members m ON m.oid=p.oid),
+auth_event_view AS MATERIALIZED (
+  SELECT c.oid, c.relkind, pg_get_userbyid(c.relowner) AS owner, c.reloptions,
+    d.viewdef_sha256, a.columns, a.column_acl,
+    CASE WHEN c.relkind <> 'v' THEN 'kind'
+      WHEN pg_get_userbyid(c.relowner) <> 'crpko_harness_qa_view_owner'
+        OR c.relowner IN (SELECT oid FROM reachable) THEN 'owner'
+      WHEN c.reloptions IS DISTINCT FROM ARRAY['security_barrier=true'] THEN 'options'
+      WHEN d.viewdef_sha256 IS DISTINCT FROM '{OWNED_AUTH_EVENT_VIEWDEF_SHA256}' THEN 'definition'
+      WHEN a.columns IS DISTINCT FROM ARRAY[{view_columns}]::name[] THEN 'columns'
+      WHEN a.column_acl THEN 'column-acl' END AS failure
+    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    CROSS JOIN LATERAL (SELECT array_agg(attname ORDER BY attnum) AS columns,
+      bool_or(attacl IS NOT NULL) AS column_acl FROM pg_attribute
+      WHERE attrelid=c.oid AND attnum>0 AND NOT attisdropped) a
+    CROSS JOIN LATERAL (SELECT CASE WHEN c.relkind='v' THEN
+      encode(sha256(convert_to(pg_get_viewdef(c.oid, true), 'UTF8')), 'hex') END AS viewdef_sha256) d
+    WHERE n.nspname='harness_qa' AND c.relname='owned_auth_events'
+), parameter_acls AS MATERIALIZED (
+  -- The two constant SELECTs avoid resolving a nonexistent PG14 catalog. No writes.
+  SELECT x.oid, x.parname, x.acl::aclitem[] AS acl FROM XMLTABLE('/table/row' PASSING query_to_xml(
+    CASE WHEN to_regclass('pg_catalog.pg_parameter_acl') IS NULL THEN
+      'SELECT NULL::oid AS oid, NULL::text AS parname, NULL::text AS acl WHERE false'
+    ELSE 'SELECT oid, parname, paracl::text AS acl FROM pg_catalog.pg_parameter_acl' END,
+    false, false, '') COLUMNS oid oid, parname text, acl text) x
+), catalog_acls(classoid, objoid, subid, owner, kind, acl, detail) AS MATERIALIZED (
+  SELECT 'pg_database'::regclass::oid, oid, 0, datdba, 'd'::"char", datacl,
+    jsonb_build_object('name', datname, 'connectable', datallowconn) FROM pg_database
+  UNION ALL SELECT 'pg_namespace'::regclass, oid, 0, nspowner, 'n', nspacl,
+    jsonb_build_object('schema', nspname) FROM pg_namespace
+  UNION ALL SELECT 'pg_class'::regclass, c.oid, 0, relowner,
+    (CASE WHEN relkind='S' THEN 's' ELSE 'r' END)::"char", relacl,
+    jsonb_build_object('schema', nspname, 'name', relname, 'rls', relrowsecurity,
+      'force_rls', relforcerowsecurity) FROM pg_class c JOIN pg_namespace n ON n.oid=relnamespace
+  UNION ALL SELECT 'pg_class'::regclass, c.oid, attnum, relowner, 'c', attacl,
+    jsonb_build_object('schema', nspname, 'name', relname, 'column', attname, 'dropped', attisdropped)
+    FROM pg_attribute a JOIN pg_class c ON c.oid=attrelid JOIN pg_namespace n ON n.oid=relnamespace
+  UNION ALL SELECT 'pg_proc'::regclass, p.oid, 0, proowner, 'f', proacl,
+    jsonb_build_object('schema', nspname, 'name', proname,
+      'identity', {("p.oid < 16384 AND p.oid=to_regprocedure('pg_catalog.pg_control_system()')"
+        " AND prosrc='pg_control_system' AND prolang=(SELECT oid FROM pg_language WHERE lanname='internal')"
+        " AND pronargs=0 AND NOT proretset AND NOT prosecdef") if physical_source is None else "false"},
+      'readonly', p.oid < 16384 AND provolatile IN ('i','s') AND NOT prosecdef)
+    FROM pg_proc p JOIN pg_namespace n ON n.oid=pronamespace
+  UNION ALL SELECT 'pg_type'::regclass, t.oid, 0, typowner, 'T', typacl,
+    jsonb_build_object('schema', nspname, 'name', typname)
+    FROM pg_type t JOIN pg_namespace n ON n.oid=typnamespace
+  UNION ALL SELECT 'pg_language'::regclass, oid, 0, lanowner, 'l', lanacl,
+    jsonb_build_object('name', lanname, 'trusted', lanpltrusted) FROM pg_language
+  UNION ALL SELECT 'pg_largeobject_metadata'::regclass, oid, 0, lomowner, 'L', lomacl,
+    jsonb_build_object() FROM pg_largeobject_metadata
+  UNION ALL SELECT 'pg_foreign_data_wrapper'::regclass, oid, 0, fdwowner, 'F', fdwacl,
+    jsonb_build_object('name', fdwname) FROM pg_foreign_data_wrapper
+  UNION ALL SELECT 'pg_foreign_server'::regclass, oid, 0, srvowner, 'S', srvacl,
+    jsonb_build_object('name', srvname) FROM pg_foreign_server
+  UNION ALL SELECT 'pg_tablespace'::regclass, oid, 0, spcowner, 't', spcacl,
+    jsonb_build_object('name', spcname) FROM pg_tablespace
+  -- Parameters have no owner column; PostgreSQL uses bootstrap superuser OID 10.
+  UNION ALL SELECT to_regclass('pg_catalog.pg_parameter_acl'), oid, 0, 10::oid, 'p', acl,
+    jsonb_build_object('name', parname) FROM parameter_acls
+  UNION ALL SELECT 'pg_default_acl'::regclass, oid, 0, defaclrole,
+    (CASE WHEN defaclobjtype='S' THEN 's' ELSE defaclobjtype END)::"char", defaclacl,
+    jsonb_build_object('namespace', defaclnamespace, 'future', true) FROM pg_default_acl
+), normalized_acls AS MATERIALIZED (
+  SELECT a.*, coalesce(acl, acldefault(kind, owner)) AS effective_acl FROM catalog_acls a
+), safe_rules(kind, privilege, guard, reason) AS (VALUES
+  ('d', 'CONNECT', 'public', 'Entering a database grants no object writes; other databases stay unknown'),
+  ('n', 'USAGE', 'standard-schema', 'Standard PUBLIC namespace lookup grants no CREATE or table access'),
+  ('T', 'USAGE', 'public', 'PUBLIC datatype use grants no data writes or object creation'),
+  ('l', 'USAGE', 'language', 'Trusted language use grants no CREATE; untrusted NULL defaults need superuser'),
+  ('f', 'EXECUTE', 'builtin', 'Only stable/immutable built-in invoker routines; volatile/definer routines denied'),
+  ('f', 'EXECUTE', 'audit-identity', 'Built-in cluster identity read without writes or delegation'),
+  ('r', 'SELECT', 'initial-system', 'Only original PUBLIC system metadata reads with an initial ACL baseline'),
+  ('c', 'SELECT', 'initial-system', 'Only original PUBLIC system column reads with an initial ACL baseline'),
+  ('d', 'CONNECT', 'audit-database', 'Intended audit database connection'),
+  ('n', 'USAGE', 'audit-schema', 'Intended backoffice namespace lookup'),
+  ('n', 'USAGE', 'auth-event-schema', 'Intended auth-event namespace lookup'),
+  ('r', 'SELECT', 'auth-event-view', 'Only the attested owned auth-event view'),
+  ('c', 'SELECT', 'audit-column', 'Only the non-sensitive audit projection; exact scope is checked separately')
+), permissions AS (
+  SELECT 'role-set:' || p.rolname AS item FROM reachable p, root r WHERE p.oid<>r.oid
+  UNION SELECT 'role-attribute:' || p.rolname || ':' || x.attr FROM reachable p
+    CROSS JOIN LATERAL (VALUES ('SUPERUSER', p.rolsuper), ('CREATEDB', p.rolcreatedb),
+      ('CREATEROLE', p.rolcreaterole), ('REPLICATION', p.rolreplication),
+      ('BYPASSRLS', p.rolbypassrls)) x(attr, enabled) WHERE x.enabled
+  UNION SELECT 'database:' || d.datname || ':CONNECT' FROM pg_database d, reachable p
+    WHERE d.datallowconn AND has_database_privilege(p.oid, d.oid, 'CONNECT')
+  UNION SELECT 'schema:backoffice:USAGE' FROM pg_namespace n, reachable p
+    WHERE n.nspname='backoffice' AND has_schema_privilege(p.oid,n.oid,'USAGE')
+  UNION SELECT 'schema:harness_qa:USAGE' FROM pg_namespace n, reachable p
+    WHERE n.nspname='harness_qa' AND has_schema_privilege(p.oid,n.oid,'USAGE')
+  UNION SELECT 'relation:{AUTH_EVENT_VIEW}:SELECT' FROM auth_event_view v, reachable p
+    WHERE v.failure IS NULL AND has_table_privilege(p.oid,v.oid,'SELECT')
+  UNION SELECT 'unattested-relation:{AUTH_EVENT_VIEW}:' || v.failure FROM auth_event_view v, reachable p
+    WHERE v.failure IS NOT NULL AND (has_table_privilege(p.oid,v.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+      OR has_any_column_privilege(p.oid,v.oid,'SELECT,INSERT,UPDATE,REFERENCES'))
+  UNION SELECT 'column:' || a.attname || ':SELECT' FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped,
+    reachable p WHERE n.nspname = 'backoffice' AND c.relname = 'api_request_audit'
+      AND has_column_privilege(p.oid, c.oid, a.attnum, 'SELECT')
+  UNION SELECT (CASE WHEN coalesce(a.detail->>'schema','') ~ '^pg_' OR
+    a.detail->>'schema'='information_schema' THEN 'system-acl:' ELSE 'acl:' END)
+    || a.classoid || ':' || a.objoid || ':' || a.subid || ':' || x.privilege_type
+    || CASE WHEN x.is_grantable THEN ':GRANT' ELSE '' END
+    FROM normalized_acls a CROSS JOIN LATERAL aclexplode(a.effective_acl) x
+    LEFT JOIN pg_init_privs i ON i.classoid=a.classoid AND i.objoid=a.objoid AND i.objsubid=a.subid
+    WHERE (x.grantee=0 OR x.grantee IN (SELECT oid FROM reachable)) AND NOT (
+      NOT x.is_grantable AND EXISTS (SELECT 1 FROM safe_rules r
+        WHERE r.kind=a.kind::text AND r.privilege=x.privilege_type AND CASE r.guard
+        WHEN 'public' THEN x.grantee=0
+        WHEN 'standard-schema' THEN x.grantee=0 AND NOT a.detail ? 'future'
+          AND a.detail->>'schema' IN ('public','pg_catalog','information_schema')
+        WHEN 'language' THEN x.grantee=0 AND (a.acl IS NULL OR (a.detail->>'trusted')::boolean)
+        WHEN 'builtin' THEN x.grantee=0 AND a.detail->>'schema'='pg_catalog'
+          AND (a.detail->>'readonly')::boolean
+        WHEN 'audit-identity' THEN a.detail->>'schema'='pg_catalog' AND (a.detail->>'identity')::boolean
+        WHEN 'initial-system' THEN x.grantee=0 AND
+          (coalesce(a.detail->>'schema','') ~ '^pg_' OR a.detail->>'schema'='information_schema')
+          AND EXISTS (SELECT 1 FROM aclexplode(i.initprivs) b
+            WHERE b.grantee=0 AND b.privilege_type=x.privilege_type)
+        WHEN 'audit-database' THEN a.detail->>'name'=current_database()
+        WHEN 'audit-schema' THEN a.detail->>'schema'='backoffice' AND NOT a.detail ? 'future'
+        WHEN 'auth-event-schema' THEN a.detail->>'schema'='harness_qa' AND NOT a.detail ? 'future'
+        WHEN 'auth-event-view' THEN a.detail->>'schema'='harness_qa' AND a.detail->>'name'='owned_auth_events'
+          AND NOT a.detail ? 'future' AND EXISTS (SELECT 1 FROM auth_event_view v WHERE v.oid=a.objoid AND v.failure IS NULL)
+        WHEN 'audit-column' THEN a.detail->>'schema'='backoffice' AND a.detail->>'name'='api_request_audit'
+          AND a.detail->>'column' IN ({columns}) AND NOT (a.detail->>'dropped')::boolean
+        ELSE false END))
+  UNION SELECT 'owner:' || CASE a.classoid WHEN 'pg_database'::regclass THEN 'database'
+    WHEN 'pg_namespace'::regclass THEN 'schema' WHEN 'pg_class'::regclass THEN 'relation'
+    WHEN 'pg_proc'::regclass THEN 'function' ELSE 'dependency' END || ':' || a.objoid
+    FROM catalog_acls a WHERE a.owner IN (SELECT oid FROM reachable)
+  UNION SELECT 'owner:dependency:' || s.dbid || ':' || s.classid || ':' || s.objid || ':' || s.objsubid
+    FROM pg_shdepend s, reachable p WHERE s.refclassid='pg_authid'::regclass
+      AND s.refobjid=p.oid AND s.deptype='o'
+  UNION SELECT 'credential-column:' || c.relname || '.' || a.attname FROM pg_class c
+    JOIN pg_namespace n ON n.oid=c.relnamespace JOIN pg_attribute a ON a.attrelid=c.oid, reachable p
+    WHERE n.nspname='pg_catalog' AND (c.relname, a.attname) IN
+      (('pg_authid','rolpassword'), ('pg_shadow','passwd'), ('pg_subscription','subconninfo'),
+       ('pg_user_mapping','umoptions'))
+      AND has_column_privilege(p.oid,c.oid,a.attnum,'SELECT')
+), epoch AS (
+  SELECT 'role:' || oid AS key, jsonb_build_array(oid, rolname, rolsuper, rolinherit,
+    rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolconnlimit,
+    rolvaliduntil, rolbypassrls, rolconfig) AS value FROM pg_roles
+  UNION ALL SELECT 'member:' || roleid || ':' || member, to_jsonb(m) FROM pg_auth_members m
+  UNION ALL SELECT 'acl:' || classoid || ':' || objoid || ':' || subid,
+    jsonb_build_array(owner,kind,detail,acl IS NULL,effective_acl) FROM normalized_acls
+  UNION ALL SELECT 'initial-acl:' || classoid || ':' || objoid || ':' || objsubid, to_jsonb(i) FROM pg_init_privs i
+  UNION ALL SELECT 'catalog:pg_parameter_acl', to_jsonb(to_regclass('pg_catalog.pg_parameter_acl') IS NOT NULL)
+)
+SELECT 'QA_EFFECTIVE:' || json_build_object(
+  'role', (SELECT rolname FROM root),
+  'physical_source', {physical},
+  'principal_incarnation', (SELECT oid::text FROM root),
+  'database_oid', (SELECT oid::text FROM pg_database WHERE datname = current_database()),
+  'database', current_database(),
+  'absent_catalogs', CASE WHEN to_regclass('pg_catalog.pg_parameter_acl') IS NULL
+    THEN json_build_array('pg_parameter_acl') ELSE json_build_array() END,
+  'epoch_digest', (SELECT encode(sha256(convert_to(jsonb_agg(jsonb_build_array(key, value)
+    ORDER BY key)::text, 'UTF8')), 'hex') FROM epoch),
+  'permissions', coalesce((SELECT json_agg(item ORDER BY item) FROM permissions), '[]'::json),
+  'other_databases', coalesce((SELECT json_agg(DISTINCT d.datname ORDER BY d.datname) FROM pg_database d, reachable r
+    WHERE d.datname <> current_database() AND d.datallowconn AND has_database_privilege(r.oid, d.oid, 'CONNECT')), '[]'::json),
+  'auth_event_view', (SELECT json_build_object('relkind', relkind, 'owner', owner,
+    'reloptions', reloptions, 'viewdef_sha256', viewdef_sha256, 'columns', columns,
+    'attested', failure IS NULL) FROM auth_event_view),
+  'audit_rls', coalesce((SELECT c.relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+    WHERE n.nspname='backoffice' AND c.relname='api_request_audit'), true),
+  'snapshot_at_ms', floor(extract(epoch FROM statement_timestamp()) * 1000)::bigint,
+  'observed_at_ms', ceil(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+)::text;
+"""
+
+class AuditGrantSnapshot(EffectiveGrantSnapshot):
+    epoch_kind: Literal["bracketed", "unknown"]
+    absent_catalogs: tuple[Literal["pg_parameter_acl"], ...] = ()
+
+
+class AuditGrantReceipt(ReaderGrantReceipt):
+    effective: AuditGrantSnapshot
+
+
+def _audit_catalog(output: str) -> dict[str, Any]:
+    matches = re.findall(r"^[ \t]*QA_EFFECTIVE:(\{[^\n]*\})[ \t]*$", output, re.MULTILINE)
+    if output.count("QA_EFFECTIVE:") != 1 or len(matches) != 1:
+        raise ValueError("effective privilege readback missing or ambiguous")
+    data = json.loads(matches[0])
+    if (set(data) != {"role", "physical_source", "principal_incarnation", "database_oid", "database",
+                     "epoch_digest", "permissions", "other_databases", "audit_rls", "observed_at_ms", "snapshot_at_ms", "absent_catalogs", "auth_event_view"}
+            or not isinstance(data["permissions"], list) or not all(isinstance(p, str) and p for p in data["permissions"])
+            or not isinstance(data["other_databases"], list) or not all(isinstance(p, str) and p for p in data["other_databases"])
+            or data["absent_catalogs"] not in ([], ["pg_parameter_acl"])
+            or type(data["audit_rls"]) is not bool or type(data["observed_at_ms"]) is not int
+            or type(data["snapshot_at_ms"]) is not int or not 0 <= data["snapshot_at_ms"] <= data["observed_at_ms"]
+            or not isinstance(data["physical_source"], str)
+            or not re.fullmatch(r"pgsys:[0-9]+|rds:cluster-[A-Za-z0-9]+", data["physical_source"])
+            or not isinstance(data["database_oid"], str) or not data["database_oid"].isdigit()
+            or not isinstance(data["database"], str) or not data["database"]
+            or not isinstance(data["epoch_digest"], str) or not re.fullmatch(r"[0-9a-f]{64}", data["epoch_digest"])
+            or (data["role"] is not None and (not isinstance(data["role"], str) or not data["role"]))
+            or (data["role"] is None) != (data["principal_incarnation"] is None)
+            or (data["principal_incarnation"] is not None and
+                (not isinstance(data["principal_incarnation"], str) or not data["principal_incarnation"].isdigit()))):
+        raise ValueError("malformed effective privilege readback")
+    view = data["auth_event_view"]
+    if view is not None and (not isinstance(view, dict)
+            or set(view) != {"relkind", "owner", "reloptions", "viewdef_sha256", "columns", "attested"}
+            or type(view["attested"]) is not bool
+            or not isinstance(view["relkind"], str) or len(view["relkind"]) != 1
+            or not isinstance(view["owner"], str) or not view["owner"]
+            or view["reloptions"] is not None and (not isinstance(view["reloptions"], list)
+                or not all(isinstance(x, str) for x in view["reloptions"]))
+            or view["viewdef_sha256"] is not None and (not isinstance(view["viewdef_sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", view["viewdef_sha256"]))
+            or not isinstance(view["columns"], list) or not all(isinstance(x, str) for x in view["columns"])):
+        raise ValueError("malformed auth-event view attestation")
+    return data
+
+
+def _audit_snapshot(before: dict[str, Any], after: dict[str, Any], spec: ReaderGrantSpec,
+                    controls: tuple[ReaderControl, ...], expires_at_ms: int) -> AuditGrantSnapshot:
+    data = after
+    unknown = []
+    if data["role"] is None:
+        unknown.append("audit principal does not exist")
+    if data["audit_rls"]:
+        unknown.append("audit row-level security or table existence is unresolved")
+    databases = sorted(set(before["other_databases"] + after["other_databases"]))
+    if databases:
+        unknown.append("privileges in other connectable databases are not enumerated: " + ", ".join(databases))
+    if data["physical_source"] != spec.physical_source:
+        unknown.append("catalog physical source differs from spec")
+    if data["database"] != AUDIT_DB_NAME or before["database"] != AUDIT_DB_NAME:
+        unknown.append("catalog database differs from audit reader transport")
+    projection = lambda row: {k: v for k, v in row.items() if k not in {"observed_at_ms", "snapshot_at_ms"}}
+    equal = projection(before) == projection(after)
+    if not equal:
+        unknown.append("PostgreSQL catalog changed between epoch brackets")
+    if not before["observed_at_ms"] <= after["snapshot_at_ms"] <= after["observed_at_ms"] < expires_at_ms or any(
+            not before["observed_at_ms"] <= c.observed_at_ms < after["snapshot_at_ms"] for c in controls):
+        unknown.append("reader controls are outside the PostgreSQL epoch bracket")
+    # Retain both credential-free projections, including the bracket timestamps.
+    encoded = json.dumps({"before": before, "after": after}, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(encoded).hexdigest()
+    return AuditGrantSnapshot(schema_version="completion-v1", source_id=spec.source_id,
+        cluster=spec.cluster, incarnation=spec.incarnation, principal=data["role"] or spec.principal,
+        physical_source=data["physical_source"], principal_incarnation=data["principal_incarnation"] or "absent",
+        epoch_kind="bracketed" if equal and not unknown else "unknown", absent_catalogs=tuple(data["absent_catalogs"]),
+        scope_digest=spec.scope_digest, permissions=tuple(data["permissions"]), unknown=tuple(unknown),
+        observed_at_ms=before["observed_at_ms"], expires_at_ms=min(expires_at_ms, after["snapshot_at_ms"]),
+        proof=ArtifactRef(schema_version="completion-v1", ref="postgres-effective:" + digest,
+                          sha256=digest, size_bytes=len(encoded)), controls=controls)
+
+
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_ROUTE_RE = re.compile(r"/[A-Za-z0-9_{}/.:-]*")
+_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+
+
+def build_audit_query_sql(exp: AuditExpectation, *, limit: int = 200) -> str:
+    """Bounded SELECT for one expectation. Refuses unbounded scans."""
+    if exp.occurred_after_ms is None or exp.occurred_before_ms is None:
+        raise ValueError("audit queries need a bounded time window")
+    if exp.occurred_before_ms < exp.occurred_after_ms:
+        raise ValueError("audit window ends before it starts")
+    if exp.occurred_before_ms - exp.occurred_after_ms > 3_600_000:
+        raise ValueError("audit window over one hour")
+    if not exp.actor_id and not exp.route:
+        raise ValueError("audit queries need an actor or a route")
+    if int(limit) < 1:
+        raise ValueError("limit must be positive")
+    where = [
+        f"created_at_ms >= {int(exp.occurred_after_ms)}",
+        f"created_at_ms <= {int(exp.occurred_before_ms)}",
+    ]
+    if exp.actor_id:
+        if not _UUID_RE.fullmatch(exp.actor_id):
+            raise ValueError("actor_id must be a uuid")
+        where.append(f"actor_user_id = '{exp.actor_id}'")
+    if exp.route:
+        if not _ROUTE_RE.fullmatch(exp.route):
+            raise ValueError("route contains unsupported characters")
+        where.append(f"path_template = '{exp.route}'")
+    if exp.method:
+        if exp.method.upper() not in _METHODS:
+            raise ValueError("bad method")
+        where.append(f"method = '{exp.method.upper()}'")
+    cols = ", ".join(AUDIT_COLUMNS)
+    return (
+        f"SELECT row_to_json(r) FROM (SELECT {cols} "
+        f"FROM backoffice.api_request_audit WHERE {' AND '.join(where)} "
+        f"ORDER BY created_at_ms LIMIT {int(limit) + 1}) r;"
+    )
+
+
+def build_audit_batch_sql(actors: list[str], routes: list[str], after_ms: int, before_ms: int, *,
+                          limit: int = 2000) -> str:
+    """One bounded SELECT for many side-effect claims: the run's fixture operators
+    on the routes they called, inside one window of at most an hour."""
+    if not actors:
+        raise ValueError("audit batch needs at least one actor")
+    if before_ms < after_ms or before_ms - after_ms > 3_600_000:
+        raise ValueError("audit batch window must be ordered and at most one hour")
+    if int(limit) < 1:
+        raise ValueError("limit must be positive")
+    for a in actors:
+        if not _UUID_RE.fullmatch(a):
+            raise ValueError("actor ids must be uuids")
+    for r in routes:
+        if not _ROUTE_RE.fullmatch(r):
+            raise ValueError("route contains unsupported characters")
+    where = [f"created_at_ms >= {int(after_ms)}", f"created_at_ms <= {int(before_ms)}",
+             # Contracts 1.2 attribute the actor only "when present": unattributed
+             # rows on the same routes are read so a miss is not misjudged.
+             "(actor_user_id IN (" + ", ".join(f"'{a}'" for a in actors) + ") OR actor_user_id IS NULL)"]
+    if routes:
+        where.append("path_template IN (" + ", ".join(f"'{r}'" for r in routes) + ")")
+    cols = ", ".join(AUDIT_COLUMNS)
+    return (f"SELECT row_to_json(r) FROM (SELECT {cols} FROM backoffice.api_request_audit "
+            f"WHERE {' AND '.join(where)} ORDER BY created_at_ms LIMIT {int(limit) + 1}) r;")
+
+
+def parse_reader_rows(output: str) -> list[dict[str, Any]]:
+    """One JSON object per line between the markers (keeps lines under the log-event limit)."""
+    if BEGIN not in output or END not in output:
+        raise RuntimeError("reader output missing row markers")
+    body = output.split(BEGIN, 1)[1].split(END, 1)[0]
+    rows = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise RuntimeError("reader row is not a JSON object")
+        rows.append(row)
+    return rows
+
+
+def rows_to_records(rows: list[dict[str, Any]]) -> tuple[AuditRecord, ...]:
+    return tuple(
+        AuditRecord(
+            audit_id=str(r["audit_id"]),
+            occurred_at_ms=int(r["created_at_ms"]),
+            actor_id=r.get("actor_user_id"),
+            resource_type=r.get("resource_scope"),
+            resource_id=r.get("resource_id"),
+            route=r.get("path_template"),
+            method=r.get("method"),
+            result=r.get("result"),
+            status_code=r.get("status_code"),
+        )
+        for r in rows
+    )
+
+
+# The reader container gets the QA role's secret as DB_SECRET, writes the SQL
+# from base64 and runs psql in a read-only transaction.
+_READER_COMMAND = (
+    "echo {b64} | base64 -d > /tmp/q.sql; "
+    "H=$(printf %s \"$DB_SECRET\" | tr ',' '\\n' | grep '\"host\"' | cut -d'\"' -f4); "
+    "P=$(printf %s \"$DB_SECRET\" | tr ',' '\\n' | grep '\"port\"' | cut -d: -f2 | tr -dc '0-9'); "
+    "D=$(printf %s \"$DB_SECRET\" | tr ',' '\\n' | grep '\"dbname\"' | cut -d'\"' -f4); "
+    "U=$(printf %s \"$DB_SECRET\" | tr ',' '\\n' | grep '\"username\"' | cut -d'\"' -f4); "
+    "export PGPASSWORD=$(printf %s \"$DB_SECRET\" | tr ',' '\\n' | grep '\"password\"' | cut -d'\"' -f4); "
+    "echo " + BEGIN + "; "
+    "psql \"host=$H port=$P dbname=$D user=$U sslmode=require\" -v VERBOSITY=sqlstate -v ON_ERROR_STOP=1 -At -f /tmp/q.sql "
+    "&& echo " + END
+)
+
+
+def _borrowed_reader(sm: Any, secret_id: str, principal: str,
+                     spec: ReaderGrantSpec) -> ReaderOwnership:
+    if spec.principal != principal:
+        raise ValueError("reader spec principal differs from the DevOps reader")
+    response = sm.get_secret_value(SecretId=secret_id)
+    try:
+        # Preserve pairs so duplicate JSON keys cannot hide an invalid credential.
+        pairs = json.loads(response["SecretString"], object_pairs_hook=lambda items: items)
+        if (not isinstance(pairs, list) or len(pairs) != 2
+                or any(not isinstance(p, tuple) or len(p) != 2 for p in pairs)
+                or {p[0] for p in pairs} != {"username", "password"}):
+            raise ValueError
+        credential = dict(pairs)
+        if any(not isinstance(v, str) or not v.strip() for v in credential.values()):
+            raise ValueError
+        if credential["username"] != principal:
+            raise ValueError
+        version = response["VersionId"]
+        if not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9-]{32,64}", version):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("reader secret must contain exactly username and password for the DevOps reader, with a version") from None
+    # Evidence binds only the reference/version, never credentials or their hash.
+    data = json.dumps({"secret_id": secret_id, "version_id": version}, sort_keys=True).encode()
+    return ReaderOwnership(schema_version="completion-v1", source_id=spec.source_id,
+        cluster=spec.cluster, incarnation=spec.incarnation, physical_source=spec.physical_source,
+        principal=spec.principal, principal_incarnation=spec.principal_incarnation,
+        operation_id="borrow-" + uuid.uuid4().hex, owner_operation_id="devops-provisioning",
+        lease_ref="borrowed:no-exclusive-lease", origin="borrowed",
+        resource_ref=f"principal:{spec.physical_source}:{spec.principal}",
+        proof=ArtifactRef(schema_version="completion-v1", ref=f"secretsmanager:{secret_id}:version:{version}",
+            sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data)))
+
+
+@dataclass
+class QAAccess:
+    """AWS side of the opt-in access. Clients are injectable for tests."""
+
+    ecs: Any = None
+    logs: Any = None
+    sm: Any = None
+    rds: Any = None
+    iam: Any = None
+
+    @classmethod
+    def from_session(cls, session: Any) -> "QAAccess":
+        return cls(
+            ecs=session.client("ecs"),
+            logs=session.client("logs"),
+            sm=session.client("secretsmanager"),
+            rds=session.client("rds"),
+            iam=session.client("iam"),
+        )
+
+    # --- secret ownership ----------------------------------------------
+    def borrowed_reader(self, spec: ReaderGrantSpec) -> ReaderOwnership:
+        """Read DevOps credentials without claiming provisioning or cleanup authority."""
+        return _borrowed_reader(self.sm, AUDIT_SECRET_ID, AUDIT_ROLE, spec)
+
+    def _owned_secret(self) -> dict[str, Any] | None:
+        try:
+            desc = self.sm.describe_secret(SecretId=AUDIT_SECRET_ID)
+        except self.sm.exceptions.ResourceNotFoundException:
+            return None
+        if MARK_TAG not in (desc.get("Tags") or []):
+            raise RuntimeError(f"{AUDIT_SECRET_ID} exists without the {MARK} tag; not touching it")
+        return desc
+
+    # --- audit role -----------------------------------------------------
+    def _audit_inventory(self, seeder: Any, principal: str) -> dict[str, Any]:
+        try:
+            output = seeder._run_sql(build_audit_effective_grants_sql(principal))
+        except Exception as exc:
+            # Aurora may deny or omit pg_control_system. Do not mask other SQL failures.
+            error = str(exc).lower()
+            if "pg_control_system" not in error or not any(
+                    reason in error for reason in ("permission denied", "does not exist", "not supported")):
+                raise
+            clusters = self.rds.describe_db_clusters(DBClusterIdentifier=AUDIT_CLUSTER_ID)["DBClusters"]
+            if (len(clusters) != 1 or clusters[0]["DBClusterIdentifier"] != AUDIT_CLUSTER_ID
+                    or clusters[0]["Engine"] != "aurora-postgresql"):
+                raise ValueError("Aurora cluster identity is unavailable")
+            physical = "rds:" + clusters[0]["DbClusterResourceId"]
+            output = seeder._run_sql(build_audit_effective_grants_sql(principal, physical_source=physical))
+        return _audit_catalog(output)
+
+    def audit_qualify(self, seeder: Any, spec: ReaderGrantSpec, ownership: ReaderOwnership, *,
+                      controls: tuple[ReaderControl, ...], expires_at_ms: int,
+                      read_window: Callable[[], tuple[ReaderControl, ...]] | None = None) -> ReaderGrantReceipt:
+        """Bracket independent read-only controls with credential-free catalog inventories.
+
+        New callers run their probes in read_window. Already collected controls
+        must carry timestamps inside the readback bracket or remain unqualified.
+        DevOps owns reader provisioning; this method never modifies the reader.
+        """
+        try:
+            before = self._audit_inventory(seeder, spec.principal)
+            if read_window is not None:
+                controls = read_window()
+            after = self._audit_inventory(seeder, spec.principal)
+            snapshot = _audit_snapshot(before, after, spec, controls, expires_at_ms)
+        except Exception as exc:
+            # Do not copy raw DB error text or SQL into evidence: it can contain credentials.
+            data = (b"audit privilege readback permission denied" if "permission denied" in str(exc).lower()
+                    else b"audit privilege readback unavailable or malformed")
+            digest = hashlib.sha256(data).hexdigest()
+            snapshot = AuditGrantSnapshot(schema_version="completion-v1", source_id=spec.source_id,
+                epoch_kind="unknown",
+                cluster=spec.cluster, incarnation=spec.incarnation, principal=spec.principal,
+                physical_source=spec.physical_source, principal_incarnation="unobserved",
+                scope_digest=spec.scope_digest, permissions=(), unknown=(data.decode(),),
+                observed_at_ms=0, expires_at_ms=expires_at_ms,
+                proof=ArtifactRef(schema_version="completion-v1", ref="unavailable:" + digest,
+                                  sha256=digest, size_bytes=len(data)), controls=())
+        if spec.principal != AUDIT_ROLE:
+            snapshot = snapshot.model_copy(update={"unknown": (*snapshot.unknown,
+                "audit reader transport is bound to a different principal")})
+        return AuditGrantReceipt(schema_version="completion-v1", spec=spec, effective=snapshot, ownership=ownership)
+
+    def audit_up(self, seeder: Any) -> dict[str, Any]:
+        raise RuntimeError("audit provisioning requires journaled exclusive ownership; legacy command is disabled")
+
+    def audit_down(self, seeder: Any) -> dict[str, Any]:
+        raise RuntimeError("audit teardown requires journaled exclusive ownership; legacy command is disabled")
+
+    def audit_status(self, seeder: Any) -> dict[str, Any]:
+        out = seeder._run_sql(build_audit_role_status_sql())
+        role = re.search(r"QA_ROLE:(\S+)", out)
+        grant = re.search(r"QA_GRANT:(\S*)", out)
+        try:
+            self.sm.describe_secret(SecretId=AUDIT_SECRET_ID)
+            secret = "present"
+        except self.sm.exceptions.ResourceNotFoundException:
+            secret = "absent"
+        return {
+            "role": role.group(1) if role else "unknown",
+            "granted_columns": grant.group(1).split(",") if grant and grant.group(1) else [],
+            "secret": secret,
+        }
+
+    # --- reader task ----------------------------------------------------
+    def reader_up(self) -> dict[str, Any]:
+        raise RuntimeError("reader provisioning requires journaled exclusive ownership; legacy command is disabled")
+
+    def _reader_arns(self) -> list[str]:
+        arns: list[str] = []
+        for status in ("ACTIVE", "INACTIVE"):
+            token = None
+            while True:
+                kw = {"familyPrefix": READER_FAMILY, "status": status}
+                if token:
+                    kw["nextToken"] = token
+                page = self.ecs.list_task_definitions(**kw)
+                arns += page.get("taskDefinitionArns", [])
+                token = page.get("nextToken")
+                if not token:
+                    break
+        # familyPrefix is a prefix match; keep only this exact family.
+        return [a for a in arns if a.rsplit("/", 1)[-1].rsplit(":", 1)[0] == READER_FAMILY]
+
+    def reader_down(self) -> dict[str, Any]:
+        raise RuntimeError("reader teardown requires exact task ownership and a physical lease; legacy command is disabled")
+
+    def reader_status(self) -> dict[str, Any]:
+        active = [
+            a for a in self._reader_arns()
+            if self.ecs.describe_task_definition(taskDefinition=a)["taskDefinition"]["status"] == "ACTIVE"
+        ]
+        groups = self.logs.describe_log_groups(logGroupNamePrefix=READER_LOG_GROUP)["logGroups"]
+        return {"active_task_definitions": active, "log_group": "present" if groups else "absent"}
+
+    def run_query(self, sql: str, timeout_s: int = 240) -> list[dict[str, Any]]:
+        return self._run_query(sql, timeout_s)
+
+    def run_diagnostic_query(self, sql: str, *, exposure: RequestTrace, lease: LeaseSet,
+                             ownership: ReaderOwnership, timeout_s: int = 240) -> list[dict[str, Any]]:
+        """Borrowed reads bind a diagnostic exposure, physical lease and exact secret version."""
+        if not isinstance(exposure, RequestTrace) or exposure.role != RequestRole.DIAGNOSTIC:
+            raise ValueError("audit read requires an explicit diagnostic exposure")
+        validate_lease(lease, lease.authority, lease.backend.now_ms())
+        resource = f"principal:{ownership.physical_source}:{AUDIT_ROLE}"
+        if (ownership.origin != "borrowed" or ownership.principal != AUDIT_ROLE
+                or (ownership.cluster, ownership.incarnation) != (lease.authority.cluster, lease.authority.incarnation)
+                or not any(s.kind == "reader" and s.resource == resource for s in lease.scopes)):
+            raise ValueError("audit read requires the borrowed principal's physical reader lease")
+        prefix = f"secretsmanager:{AUDIT_SECRET_ID}:version:"
+        if not ownership.proof.ref.startswith(prefix):
+            raise ValueError("borrowed audit secret reference differs")
+        version = ownership.proof.ref.removeprefix(prefix)
+        if not re.fullmatch(r"[A-Za-z0-9-]{32,64}", version):
+            raise ValueError("borrowed audit secret version is invalid")
+        secret_arn = self.sm.describe_secret(SecretId=AUDIT_SECRET_ID)["ARN"]
+        td = self.ecs.describe_task_definition(taskDefinition=READER_FAMILY)["taskDefinition"]
+        containers = td["containerDefinitions"]
+        if any(c.get("environmentFiles") for c in containers):
+            raise ValueError("reader task contains an unproved environment file")
+        if any(e["name"] in {"PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE", "PGSYSCONFDIR"}
+               for c in containers for e in c.get("environment", [])):
+            raise ValueError("reader task contains an alternate libpq target")
+        required = [{"name": name, "valueFrom": f"{secret_arn}:{field}::{version}"}
+                    for name, field in (("PGUSER", "username"), ("PGPASSWORD", "password"))]
+        if (len(containers) != 1 or containers[0]["name"] != READER_CONTAINER
+                or containers[0]["image"] != READER_IMAGE or containers[0].get("entryPoint") != ["sh", "-c"]
+                or sorted(containers[0].get("secrets", []), key=lambda r: r["name"]) != sorted(required, key=lambda r: r["name"])):
+            raise ValueError("reader task must bind the pinned borrowed credential fields")
+        cluster = self.rds.describe_db_clusters(DBClusterIdentifier=AUDIT_CLUSTER_ID)["DBClusters"][0]
+        target = "principal:rds:" + cluster["DbClusterResourceId"] + ":" + AUDIT_ROLE
+        if (cluster["DBClusterIdentifier"] != AUDIT_CLUSTER_ID
+                or not any(s.kind == "reader" and s.resource == target for s in lease.scopes)
+                or (ownership.physical_source.startswith("rds:") and
+                    ownership.physical_source != "rds:" + cluster["DbClusterResourceId"])):
+            raise ValueError("reader lease does not cover the actual RDS target")
+        if not re.fullmatch(r"[0-9]+", ownership.principal_incarnation):
+            raise ValueError("reader principal incarnation is unproved")
+        bound = f"current_user::regrole::oid::text = '{ownership.principal_incarnation}'"
+        if re.fullmatch(r"pgsys:[0-9]+", ownership.physical_source):
+            bound += f" AND ('pgsys:' || (SELECT system_identifier::text FROM pg_control_system())) = '{ownership.physical_source}'"
+        elif ownership.physical_source != "rds:" + cluster["DbClusterResourceId"]:
+            raise ValueError("reader physical source is unproved")
+        # One psql connection: an identity failure must never count as a denied control.
+        sql = f"SELECT {bound} AS qa_bound \\gset\n\\if :qa_bound\n\\echo QA_IDENTITY_BOUND\n\\echo {BEGIN}\n{sql}\n\\else\n\\echo QA_IDENTITY_REFUSED\n\\quit 3\n\\endif\n"
+        environment = [{"name": k, "value": str(v)} for k, v in
+            (("PGHOST", cluster["ReaderEndpoint"]), ("PGPORT", cluster["Port"]),
+             ("PGDATABASE", AUDIT_DB_NAME), ("PGSSLMODE", "require"))]
+        command = (f'test "$PGUSER" = {AUDIT_ROLE} || exit 1; '
+            "echo {b64} | base64 -d > /tmp/q.sql; "
+            "export PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=15000 -c search_path=pg_catalog'; "
+            f"psql -X -v VERBOSITY=sqlstate -v ON_ERROR_STOP=1 -At -f /tmp/q.sql && echo {END}")
+        validate_lease(lease, lease.authority, lease.backend.now_ms())
+        return self._run_query(sql, timeout_s, command=command,
+            task_definition=td["taskDefinitionArn"], environment=environment, lease=lease)
+
+    def _run_query(self, sql, timeout_s, *, command=_READER_COMMAND,
+                   task_definition=READER_FAMILY, environment=None, lease=None):
+        b64 = base64.b64encode(sql.encode()).decode()
+        override = {"name": READER_CONTAINER, "command": [command.format(b64=b64)]}
+        if environment is not None:
+            override["environment"] = environment
+        resp = self.ecs.run_task(
+            cluster=config.ecs_cluster,
+            taskDefinition=task_definition,
+            launchType="FARGATE",
+            networkConfiguration={
+                "awsvpcConfiguration": {
+                    "subnets": config.aurora_subnets.split(","),
+                    "securityGroups": [config.aurora_security_group],
+                    "assignPublicIp": "DISABLED",
+                }
+            },
+            overrides={"containerOverrides": [override]},
+            tags=[{"key": "Purpose", "value": MARK}],
+        )
+        if resp.get("failures"):
+            raise RuntimeError(f"reader run_task failed: {resp['failures']}")
+        arn = resp["tasks"][0]["taskArn"]
+        def check():
+            if lease is not None:
+                try:
+                    validate_lease(lease, lease.authority, lease.backend.now_ms())
+                except LeaseError:
+                    self.ecs.stop_task(cluster=config.ecs_cluster, task=arn, reason="reader lease lost")
+                    raise
+        try:
+            check()
+            if lease is None:
+                self.ecs.get_waiter("tasks_stopped").wait(cluster=config.ecs_cluster, tasks=[arn],
+                    WaiterConfig={"Delay": 5, "MaxAttempts": max(1, timeout_s // 5)})
+            else:
+                for _ in range(max(1, timeout_s // 5)):
+                    desc = self.ecs.describe_tasks(cluster=config.ecs_cluster, tasks=[arn])["tasks"][0]
+                    check()
+                    if desc.get("lastStatus") == "STOPPED":
+                        break
+                    time.sleep(5)
+                    check()
+                else:
+                    raise TimeoutError()
+        except LeaseError:
+            raise
+        except Exception:
+            self.ecs.stop_task(cluster=config.ecs_cluster, task=arn, reason=f"{MARK} reader timeout")
+            raise RuntimeError(f"reader task did not finish in {timeout_s}s; stopped it")
+        desc = self.ecs.describe_tasks(cluster=config.ecs_cluster, tasks=[arn])["tasks"][0]
+        check()
+        exit_code = desc["containers"][0].get("exitCode")
+        if exit_code is None:
+            # never started (image pull, secret fetch, networking): no logs to wait for
+            raise RuntimeError(f"reader task never ran: {desc.get('stoppedReason')}")
+        stream = f"{READER_LOG_PREFIX}/{READER_CONTAINER}/{arn.rsplit('/', 1)[-1]}"
+        output = ""
+        for _ in range(12):
+            check()
+            try:
+                ev = self.logs.get_log_events(logGroupName=READER_LOG_GROUP, logStreamName=stream, startFromHead=True)
+                check()
+                output = "\n".join(e["message"] for e in ev["events"])
+                if END in output or "QA_IDENTITY_REFUSED" in output or re.search(r"(?:ERROR|FATAL):\s+42501(?:\s|$)", output):
+                    break
+            except LeaseError:
+                raise
+            except self.logs.exceptions.ResourceNotFoundException:
+                pass
+            time.sleep(5)
+        check()
+        if lease is not None and "QA_IDENTITY_BOUND\n" not in output:
+            if re.search(r"(?:ERROR|FATAL):\s+42501(?:\s|$)", output):
+                raise _IdentityPermissionDenied() from None
+            raise ValueError("borrowed reader connection identity is unproved")
+        if exit_code != 0:
+            if re.search(r"(?:ERROR|FATAL):\s+42501(?:\s|$)", output):
+                raise ReaderPermissionDenied() from None
+            raise RuntimeError(f"reader task exit={exit_code} stopped={desc.get('stoppedReason')}\n{output[-1500:]}")
+        rows = parse_reader_rows(output)
+        check()
+        return rows
+
+
+class ApiRequestAuditSource:
+    """Borrowed audit reader; no audit commit fence is currently qualified."""
+
+    source_name = "backoffice.api_request_audit"
+
+    def __init__(self, access: QAAccess, *, spec: ReaderGrantSpec, seeder: Any,
+                 exposure: RequestTrace, lease: LeaseSet, limit: int = 200):
+        self.access, self.spec, self.seeder = access, spec, seeder
+        self.exposure, self.lease, self.limit = exposure, lease, limit
+        self.positive = None
+
+    async def positive_control(self, sender, request, target_receipt, expectation: AuditExpectation,
+                               *, window: SourceWindow):
+        """Send one authenticated operator GET outside the observed interval.
+
+        Readback is deferred to query's catalog bracket. A successful response
+        alone never qualifies the reader or proves that an audit row was written.
+        """
+        from .completion.dispatch import GuardedTransport
+        if (not isinstance(sender, GuardedTransport) or expectation.method != "GET"
+                or expectation.actor_id != window.actor_id or not expectation.route
+                or request.ownership.actor_ref != window.actor_id
+                or not sender.services.credential_refs
+                or not sender.services.offline_fixture):
+            raise ValueError("audit positive control requires the guarded authenticated operator GET")
+        wire, _ = sender.services.adapter.__self__.wire_request(request)
+        if (wire.method != "GET" or wire.url.path != expectation.route
+                or not wire.headers.get("authorization")):
+            raise ValueError("audit positive control differs from authenticated GET wire")
+        build_audit_query_sql(expectation)
+        start = expectation.occurred_after_ms
+        stop = expectation.occurred_before_ms
+        now = sender.services.clock_ms()
+        if (not start <= now <= stop or not (
+                stop < window.time.start_ms - window.time.uncertainty_ms or
+                start > window.time.stop_ms + window.time.uncertainty_ms + (window.async_tail_ms or 0))):
+            raise ValueError("audit positive control overlaps the test window")
+        # The guarded sender independently validates the bound wire bytes, role,
+        # actor lease and credential reference. Live sends remain refused there.
+        receipt = await sender.send(request, RequestRole.SUPPORT_CONTROL, None, target_receipt)
+        if not start <= sender.services.clock_ms() <= stop:
+            raise ValueError("audit positive control exceeded its readback interval")
+        self.positive = (expectation, receipt, window)
+        return receipt
+
+    async def query(self, expectation: AuditExpectation, *, window: SourceWindow) -> AuditQueryResult:
+        import asyncio
+        if (window.query_digest != query_digest(expectation) or window.source_id != self.spec.source_id
+                or window.incarnation != self.spec.incarnation or window.scope_digest != self.spec.scope_digest
+                or expectation.actor_id != window.actor_id
+                or set(window.read_resources) != set(AUDIT_COLUMNS)
+                or (expectation.occurred_after_ms, expectation.occurred_before_ms) !=
+                   (window.time.start_ms, window.time.stop_ms)):
+            raise ValueError("audit expectation differs from the source window")
+        sql = build_audit_query_sql(expectation, limit=self.limit)
+        ownership = await asyncio.to_thread(self.access.borrowed_reader, self.spec)
+        rows, denied = [], []
+        def read(sql, *, forbidden=False):
+            try:
+                return self.access.run_diagnostic_query(sql, exposure=self.exposure, lease=self.lease, ownership=ownership)
+            except _IdentityPermissionDenied:
+                denied.append(True)
+                raise
+            except ReaderPermissionDenied:
+                if not forbidden:
+                    denied.append(True)
+                raise
+        def controls():
+            result = []
+            def control(kind, capability, resource, allowed, send_ref, payload):
+                raw = json.dumps(payload, sort_keys=True).encode()
+                proof = ArtifactRef(schema_version="completion-v1", ref="audit-control:" + hashlib.sha256(raw).hexdigest(),
+                    sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw))
+                result.append(ReaderControl(schema_version="completion-v1", **{k: getattr(self.spec, k) for k in
+                    ("source_id", "cluster", "incarnation", "physical_source", "principal", "principal_incarnation", "scope_digest")},
+                    kind=kind, capability=capability, resource=resource, api="SELECT column",
+                    expected="ALLOWED" if kind == "permitted_read" else "DENIED", send_ref=send_ref,
+                    evidence=proof, proof=proof, outcome="observed_pass" if allowed else "unobserved",
+                    observed_at_ms=self.lease.backend.now_ms()))
+            if self.positive is not None:
+                exp, sent, control_window = self.positive
+                if control_window != window:
+                    raise ValueError("audit positive control belongs to another window")
+                found = read(build_audit_query_sql(exp, limit=1))
+                matched = [r for r in found if r.get("actor_user_id") == exp.actor_id and
+                    r.get("path_template") == exp.route and r.get("method") == "GET" and
+                    exp.occurred_after_ms <= r.get("created_at_ms", -1) <= exp.occurred_before_ms]
+                control("permitted_read", "column:audit_id:SELECT", "audit_id",
+                    len(found) == len(matched) == 1 and sent.delivery == "known", sent.id, matched)
+            try:
+                read("SELECT session_id FROM backoffice.api_request_audit LIMIT 0;", forbidden=True)
+                forbidden = False
+            except _IdentityPermissionDenied:
+                raise
+            except ReaderPermissionDenied:
+                forbidden = True
+            control("forbidden_access", "column:session_id:SELECT", "session_id", forbidden,
+                    self.exposure.request_id, {"sqlstate": "42501" if forbidden else "unobserved"})
+            try:
+                rows.extend(read(sql))
+            except ReaderPermissionDenied:
+                denied.append(True)
+                raise
+            return tuple(result)
+        grant = await asyncio.to_thread(self.access.audit_qualify, self.seeder, self.spec, ownership,
+            controls=(), expires_at_ms=max(window.time.stop_ms, self.lease.backend.now_ms()) + 3_600_000,
+            read_window=controls)  # The receipt clamps validity to the closing catalog snapshot.
+        if denied:
+            raise ReaderPermissionDenied() from None
+        records = rows_to_records(rows[:self.limit])
+        coverage = SourceCoverage(schema_version="completion-v1", window=window, kind="database",
+            records_digest=records_digest(records), pagination_exhausted=len(rows) <= self.limit,
+            truncated=len(rows) > self.limit, watermark_ms=None, requests=(), journal_exhausted=False,
+            request_journal=ArtifactRef(schema_version="completion-v1", ref="unavailable:request-journal",
+                sha256=hashlib.sha256(b"[]").hexdigest(), size_bytes=2),
+            reader_failure_reason="audit projection fence unproved")
+        qualification: SourceQualification = qualify_source_window(window, grant.observer_grant(), (), coverage)
+        result = AuditQueryResult(records=records, complete=False, source=window.source_id,
+            evidence={"row_count": len(rows), "truncated": coverage.truncated,
+                      "reader_grant": grant.model_dump(mode="json"),
+                      "diagnostic_exposure": self.exposure.model_dump(mode="json")}, qualification=qualification)
+        validate_lease(self.lease, self.lease.authority, self.lease.backend.now_ms())
+        return result
+
+
+def env_confirmed(var: str, value: str) -> bool:
+    return os.environ.get(var) == value
+
+
+def dev_session() -> Any:
+    """boto3 session from harness config, refused unless it resolves to the profile's account."""
+    import boto3
+
+    session = boto3.Session(profile_name=config.aws_profile, region_name=config.aws_region)
+    account = session.client("sts").get_caller_identity()["Account"]
+    if account != DEV_ACCOUNT_ID:
+        raise RuntimeError(f"profile {config.aws_profile} resolves to account {account}, not {PROFILE.name} {DEV_ACCOUNT_ID}")
+    return session

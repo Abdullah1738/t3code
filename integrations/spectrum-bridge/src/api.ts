@@ -1,3 +1,6 @@
+import { markReactionAnswered } from "./unanswered.ts";
+import { parseHealthSidecar } from "./health-receipts.ts";
+import { messageLengthError } from "./message-length.ts";
 import { toolError } from "./toollog.ts";
 import { newFormKeys } from "./secret-crypto.ts";
 import { createHash } from "node:crypto";
@@ -50,7 +53,7 @@ const errors = {
   502: "Tailnet publish failed", 503: "Bridge is not ready",
 } as const;
 class ApiError extends Error {
-  constructor(readonly status: keyof typeof errors) { super(errors[status]); }
+  constructor(readonly status: keyof typeof errors, message: string = errors[status]) { super(message); }
 }
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const string = (value: unknown, max: number): value is string =>
@@ -110,10 +113,12 @@ const validSession = (value: unknown): value is string => string(value, 200) && 
 
 /** Shared card validation for session sends and owner-authorized cross-chat sends. */
 export function appContent(body: Record<string, unknown>): OutboxApp | undefined {
-  const { url, caption, subcaption, trailingCaption, trailingSubcaption, summary } = body;
+  const { url, caption, subcaption, trailingCaption, trailingSubcaption, summary, updateOf, previewPage } = body;
   if (!validAppUrl(url) || !line(caption, 200) || !optionalLine(subcaption, 200) || !optionalLine(trailingCaption, 200)
-    || !optionalLine(trailingSubcaption, 200) || !optionalLine(summary, 500)) return;
-  const optional = { subcaption, trailingCaption, trailingSubcaption, summary } as Record<string, string | undefined>;
+    || !optionalLine(trailingSubcaption, 200) || !optionalLine(summary, 500)
+    || (updateOf !== undefined && (typeof updateOf !== "string" || !/^app:[a-f0-9]{64}$/.test(updateOf)))
+    || (previewPage !== undefined && (!validAppUrl(previewPage) || new URL(previewPage).origin !== new URL(url).origin))) return;
+  const optional = { subcaption, trailingCaption, trailingSubcaption, summary, updateOf, previewPage } as Record<string, string | undefined>;
   return { url, caption, ...Object.fromEntries(Object.entries(optional).filter(([, value]) => value !== undefined)) };
 }
 
@@ -295,9 +300,10 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       if (!enabled() || !chat) throw new ApiError(503);
 
       if (path === "/files") {
-        fields(body, ["base64", "name", "mimeType", "text", "dedupeKey", "sessionId"]);
+        fields(body, ["base64", "name", "mimeType", "text", "dedupeKey", "sessionId", "healthReceipt"]);
         const { base64, name, mimeType, dedupeKey, sessionId } = body;
         const text = body.text === undefined ? "" : body.text;
+        if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         // One-time notification attachments moved to the telegram bridge; only
         // interactive session-bound sends remain here.
         if (sessionId === undefined) throw new ApiError(400);
@@ -311,7 +317,10 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         if (data.toString("base64") !== base64 || data.length === 0) throw new ApiError(400);
         if (data.length > MAX_FILE_BYTES) throw new ApiError(413);
         const attachment = { sha256: createHash("sha256").update(data).digest("hex"), name, mimeType, size: data.length };
-        const { id, created } = queueSession(store, "file", dedupeKey, sessionId, { text, attachment }, () => store.putBlob(data));
+        const healthReceipt = body.healthReceipt === undefined ? undefined : parseHealthSidecar(body.healthReceipt, attachment.sha256);
+        if (body.healthReceipt !== undefined && !healthReceipt) throw new ApiError(400);
+        const { id, created } = queueSession(store, "file", dedupeKey, sessionId,
+          { text, attachment, ...(healthReceipt ? { healthReceipt } : {}) }, () => store.putBlob(data));
         // Durable queue acceptance only; upload and delivery happen outside this handler.
         return json({ id, created, chat: "owner" }, created ? 202 : 200);
       }
@@ -319,6 +328,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       if (path === "/send") {
         fields(body, ["text", "effect", "subject", "dedupeKey", "sessionId"]);
         const { text, effect, subject, dedupeKey, sessionId } = body;
+        if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         if (!string(text, 12_000) || !string(dedupeKey, 200) || !validSession(sessionId)
           || (effect !== undefined && !isEffect(effect)) || !optionalLine(subject, 256)) throw new ApiError(400);
         const turnKey = store.get<{ messageId: string } | undefined>("activeTurn")?.messageId ?? "idle";
@@ -358,6 +368,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         // Watchers wake whichever session is live, so this route is deliberately not session-bound.
         fields(body, ["text", "source", "dedupeKey"]);
         const { text, source, dedupeKey } = body;
+        if (typeof text === "string" && text.length > 12_000) throw new ApiError(400, messageLengthError(text, 12_000));
         if (!string(text, 12_000) || !line(source, 100) || !string(dedupeKey, 200)) throw new ApiError(400);
         const id = `wake:${hash(dedupeKey)}`;
         const created = store.db.transaction(() => {
@@ -386,7 +397,7 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
       }
 
       if (path === "/app") {
-        fields(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "dedupeKey", "sessionId"]);
+        fields(body, ["url", "caption", "subcaption", "trailingCaption", "trailingSubcaption", "summary", "updateOf", "previewPage", "dedupeKey", "sessionId"]);
         const { dedupeKey, sessionId } = body;
         const app = appContent(body);
         if (!app || !string(dedupeKey, 200) || !validSession(sessionId)) throw new ApiError(400);
@@ -456,13 +467,14 @@ export function createApi({ store, photon, router, chatGuid, enabled, health, se
         if (!inbound && !store.byProviderId(target)) throw new ApiError(403);
         const id = `reaction:${hash(target + kind)}`;
         await photon.react(chat, target, kind as ReactionKind, id);
+        markReactionAnswered(store, target);
         return json({ id });
       }
 
       throw new ApiError(404);
     } catch (error) { toolError("api", "api.catch6", error);
       const status = error instanceof ApiError ? error.status : 409;
-      return json({ error: errors[status] }, status);
+      return json({ error: error instanceof ApiError ? error.message : errors[status] }, status);
     }
   };
 }

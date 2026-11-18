@@ -78,7 +78,7 @@ export type MessageRecord =
       time: { created: number; completed?: number };
       [key: string]: unknown;
     }
-  | { id: string; type: "idle"; outcome: "succeeded" | "failed" | "interrupted"; firstTurnFailure?: boolean; modelError?: boolean; time: { created: number }; [key: string]: unknown }
+  | { id: string; type: "idle"; outcome: "succeeded" | "failed" | "interrupted"; firstTurnFailure?: boolean; modelError?: boolean; completedAt?: number; time: { created: number }; [key: string]: unknown }
   | { id: string; type: "agent-switched" | "model-switched" | "location-switched" | "synthetic" | "system" | "skill" | "shell" | "compaction"; time: { created: number }; [key: string]: unknown };
 
 /** A native attachment the router prepared; sent as an OpenCode 2 prompt file (`uri` data URL). */
@@ -337,7 +337,7 @@ export interface ChatBackend {
    * without it (OpenChamber) keep follow-ups as their own turns.
    */
   steer?(id: string, directory: string, messageId: string, text: string, guidance?: string, files?: readonly FilePart[], guard?: SteerGuard): Promise<SteerDelivery>;
-  abort(id: string, directory: string): Promise<boolean>;
+  abort(id: string, directory: string, cancelReason?: "user_stop" | "thread_reset"): Promise<boolean>;
   statuses(complete?: boolean): Promise<Record<string, SessionStatus>>;
   /**
    * Whether one session is busy. Optional because `statuses()` already answers it;

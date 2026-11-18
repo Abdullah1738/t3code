@@ -25,6 +25,17 @@ fixture or real day file and writes a private `rollup-YYYY-MM-DD.json` with name
 and kind counts, rates, duration percentiles and top error tags. The poller makes
 yesterday's rollup on its first successful run after 00:05 UTC. Invalid lines
 are counted and skipped.
+`complete` means `generatedAt` is on or after the next UTC midnight; incomplete rollups are regenerated after 00:05Z, and lock `distinct` counts dedupe account/provider/model/deadline-minute while `count` keeps raw lines.
+
+`account.lock` and `account.unlock` carry hashed account IDs, scope, classifier
+cause, deadline and the source request ID when known. DB expiry is recorded on
+the next connection read; `until` is the actual deadline, not the observation
+time. Legacy locks without duration/cause metadata leave duration unknown.
+`account.locked` samples the active deadlines already exposed by `/api/providers`
+on each poll. RAM-only quota locks appear in router events, not that snapshot.
+The rollup's `locks` section groups sets by provider/model/cause with duration
+percentiles and the five accounts with the most lock sets; snapshots and unlocks
+do not increase lock counts.
 
 Image CLI behavior is unchanged: no paid fallback is enabled. Its request
 function instruments an existing caller-supplied OpenRouter fallback if supplied.

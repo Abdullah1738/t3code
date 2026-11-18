@@ -9,7 +9,7 @@ import { ComposerContextId, ProviderInstanceId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { guidanceContext } from "../imessage/guidance.ts";
 
-import { controlEventFromStored } from "./http.ts";
+import { controlEventFromStored } from "./ControlEvents.ts";
 import {
   formatModel,
   lastAssistantText,
