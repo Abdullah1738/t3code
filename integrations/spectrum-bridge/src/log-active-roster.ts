@@ -32,7 +32,7 @@ export function createRosterAggregation() {
   }
   function accept(line: LogLine): LogLine[] {
     const minute = Math.floor(Date.parse(line.ts) / 60_000) * 60_000;
-    const output = flush(minute);
+    const output = flush(line.name === "bridge.stop" ? Infinity : minute);
     if (line.component !== "robob" || line.name !== "robob.roster_action") return [...output, line];
     if (!group) group = { ts: new Date(minute).toISOString(), tool: "imessage", component: "robob", kind: "perf", name: "robob.active_roster", ids: line.ids,
       props: Object.fromEntries(ROSTER_ACTIONS.filter(key => key !== "duration").map(key => [key, 0])) };

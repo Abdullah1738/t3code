@@ -320,3 +320,23 @@ test("active roster aggregates per minute with reasons, joins, patching, childre
   expect(JSON.stringify(lines())).not.toContain("PRIVATE_ROSTER_EVENT");
   expect(lines().some(line => line.name === "robob.roster_action")).toBe(false);
 });
+
+test.each(["minute tick", "bridge.stop"])("roster and prompt-probe counts both flush once on %s", async boundary => {
+  let time = at;
+  const { log, lines } = setup({ now: () => time });
+  // Prime the hourly rollup so the minute case cannot pass through flushAll().
+  await log.tick();
+  log.write({ component: "robob", kind: "perf", name: "robob.roster_action",
+    props: { rosterAction: "fetches", rows: 2, total: 2 } });
+  log.write({ component: "router", kind: "perf", name: "router.prompt_probe", ids: { threadId: "thread-fixture" },
+    props: { probeOutcome: "accepted", elapsedMs: 15, attempt: 1, msUntilAccepted: 25 } });
+  if (boundary === "minute tick") { time += 60_000; await log.tick(); }
+  else log.write({ component: "process", kind: "event", name: "bridge.stop" });
+  const summaries = () => lines().filter(line => ["robob.active_roster", "router.prompt_probes"].includes(line.name));
+  expect(summaries()).toHaveLength(2);
+  expect(summaries().find(line => line.name === "robob.active_roster")?.props).toMatchObject({ fetches: 1, rows: 2, total: 2 });
+  expect(summaries().find(line => line.name === "router.prompt_probes")?.promptProbe).toMatchObject({ calls: 1, accepted: 1 });
+  // A later explicit flush cannot emit either count again.
+  log.flush();
+  expect(summaries()).toHaveLength(2);
+});
