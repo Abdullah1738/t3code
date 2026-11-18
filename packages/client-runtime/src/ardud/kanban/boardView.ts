@@ -485,7 +485,7 @@ export function createBoardView(): BoardViewEngine {
         kind: "blocked",
         label:
           blocker.stage === "completed"
-            ? `Waits for #${blocker.number} to be merged`
+            ? `Waits for #${blocker.number} to land`
             : `After #${blocker.number}`,
       };
     } else if (waitsOnEvaluator) {

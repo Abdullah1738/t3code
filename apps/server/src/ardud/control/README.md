@@ -43,8 +43,17 @@ t3ctl's.
 - JSON in and out. Success is `{ "ok": true, ... }`. Failure is
   `{ "ok": false, "error": { "code", "message" } }` with HTTP 400 `invalid_request`,
   401 `unauthorized`, 403 `forbidden`, 404 `not_found`, 409 `conflict` (the
-  orchestrator rejected the command; the message says why), 503 `unavailable`,
-  or 500 `internal`.
+  orchestrator rejected the command), 503 `unavailable`, or 500 `internal`.
+  Every 409 also carries `error.reason`, `error.retrySafe`, and `error.holder`
+  (the observed thread/run/request, or null). `retrySafe: true` permits retrying
+  the identical request with its original `clientRequestId`; it does not
+  authorize a new id or delivery mode. False means reconcile or alert first.
+  Send preflight uses `no_steerable_turn` or `thread_archived`; a terminal
+  approval/question uses `request_resolved`. Other reasons include
+  `attempt_changed`, `run_not_interruptible`, `run_not_found`,
+  `command_id_conflict`, `command_rejected`, and `operation_conflict`.
+  Startup/send deadlines return 503 with `startup_unavailable`/`send_timeout`
+  and the same-id retry flag. Storage failures return 500, not 409.
 - Ids are opaque strings and can contain `:` and `%`. Always `encodeURIComponent`
   them in paths (the client does).
 - `clientRequestId` (optional on every mutation) makes retries safe: the same
@@ -263,7 +272,9 @@ thread needs input, so a caller can answer and wait again.
 
 `{ "text", "mode"?: "auto"|"queue"|"steer"|"restart", "providerInstanceId"?, "model"?, "variant"?, "options"?, "attachments"?, "clientRequestId"? }`.
 `auto` (default) starts an idle thread, steers a running turn, or queues behind a
-turn that cannot take steering yet. `queue` always waits for a separate turn.
+turn that cannot take steering yet. `steer` also starts or queues when the active
+turn is absent or has ended; a rejected native steer is delivered as the next turn
+when the provider confirms it was not sent. `queue` always waits for a separate turn.
 The model selection applies to this message's run. Use `PATCH` to change the
 thread's default. Response: `messageId`,
 `runId`, `status`, `delivery` (`started`, `queued`, `steered`, `restarted`).

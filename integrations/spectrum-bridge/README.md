@@ -164,8 +164,13 @@ under `~/.config/spectrum-bridge/`.
   again. If the check itself fails, the retry waits. After 3 attempts the row
   is marked `failed`, the owner gets one notice naming the watcher or form
   (`synthetic-dropped:<hash>`), and the text rides along as quoted data in the
-  next submitted turn's system context (kv `missedSynthetic`) until a prompt
-  carrying it is accepted. A row going back to `pending` does not re-arm
+  submitted turns' system context (kv `missedSynthetic`), oldest first and at
+  most five per prompt, until a prompt carrying it is accepted. Carries older
+  than six hours or beyond the 50-entry bound are skipped with an owner notice
+  and a `synthetic.carry_evicted` log. Unadmitted wakes stranded on a retired
+  route also enter this carry after their retry has waited five minutes. A wake
+  whose replay attempt was already used is labelled as possibly delivered so
+  the agent checks before acting again. A row going back to `pending` does not re-arm
   robob-watch's heads-up: the runner stops tracking a wake once it sees any
   state other than `pending`.
 - A sealed batch with no prompt acceptance gets one retry after 60 seconds,
@@ -339,6 +344,8 @@ The operational setup and private credential handling remain in the local
 directory when changing the bridge.
 
 Tool-log rollups refresh at turn end, hourly, and after the UTC day changes.
+Catch rows marked `alreadyLogged: true` retain their context and request ID but count only toward row volume and `dedupedFailures`, leaving failure rates and top causes to the original request.
+Call summaries retain `singleFailures` so failure rates include outage requests whose individual details were suppressed; older summaries keep their original diagnostic handling.
 `notice.reply` records each completion-notice run's handling path, outcome,
 enqueued reply count and sealed-wake flag, with chat/run ids and no message text.
 Read today's saved rollup with:

@@ -102,7 +102,7 @@ class DiskProbeTests(unittest.TestCase):
         path = self.root / 'offbox_disk_space.py'
         shutil.copyfile(disk.__file__, path)
         module = load_copy(path)
-        source = ('import os,json,subprocess,sys\nfrom pathlib import Path\n'
+        source = ('import os,json,re,subprocess,sys\nfrom pathlib import Path\n'
                   f'WARN_BYTES={module.WARN_BYTES}\nGATE_BYTES={module.GATE_BYTES}\nMARKER={module.MARKER!r}\n'
                   + '\n'.join(inspect.getsource(f) for f in (module.snapshot, module.warning, module.probe)) + '\nprobe()\n')
         before = module.probe_payload()
@@ -248,7 +248,7 @@ class DiskProbeTests(unittest.TestCase):
     def test_diagnostic_logged_once_with_client_start_and_module_mtime(self):
         (self.root / 'run-test.state.json').write_text(json.dumps(dict(client_started_at=123)))
         with patch.object(runs, 'LOGS_DIR', self.root), patch.object(runs, 'log') as log, \
-             patch.dict(os.environ, {'OFFBOX_TOOL_LOG_DIR': str(self.root / 'analytics')}):
+             patch.dict(os.environ, {'OFFBOX_LOG_DIR': str(self.root / 'analytics')}):
             runs.log_probe_error('run-test', 'IndentationError: broken')
             runs.log_probe_error('run-test', 'IndentationError: broken')
         lines = (self.root / 'run-test.client.log').read_text().splitlines()
@@ -268,11 +268,16 @@ class DiskProbeTests(unittest.TestCase):
     def test_queued_plain_and_steps_survive_temp_reinstall(self):
         install = self.root / 'install'
         shutil.copytree(SCRIPTS.parent, install, ignore=shutil.ignore_patterns('tests', '__pycache__'))
+        # install.zsh stages this wrapper outside the scripts tree.
+        (install / 'tools').mkdir(exist_ok=True)
+        shutil.copyfile(runs.quint_tools.wrapper_path(), install / 'tools/quint')
         child = r'''import base64,json,os,subprocess,sys,zlib
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import offbox_disk_space as disk
-from offbox_lib import runs
+from offbox_lib import common, quint_tools, runs
+common.SKILL_DIR = Path(sys.argv[1]).parent
+assert quint_tools.wrapper_path() == common.SKILL_DIR / 'tools/quint'
 before = disk.probe_payload()
 print('queue-ready', flush=True)
 sys.stdin.readline()
@@ -361,7 +366,7 @@ from test_capacity import Isolated
 
 class DiskProbeStateTests(Isolated):
     def test_catch_up_precedes_probe_attribution_for_delayed_command_stderr(self):
-        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_TOOL_LOG_DIR': str(Path(self.tmp.name) / 'analytics')}))
+        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_LOG_DIR': str(Path(self.tmp.name) / 'analytics')}))
         for backend, nested, steps in itertools.product(('boat', 'server'), (False, True), (0, 4)):
             with self.subTest(backend=backend, nested=nested, steps=steps):
                 rid = f'run-delayed-{backend}-{nested}-{steps}'
@@ -400,7 +405,7 @@ class DiskProbeStateTests(Isolated):
 
     def test_reaper_recovers_plain_background_probe_crash_before_settlement(self):
         from offbox_lib import reap, misc, lease, pool
-        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_TOOL_LOG_DIR': str(Path(self.tmp.name) / 'analytics')}))
+        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_LOG_DIR': str(Path(self.tmp.name) / 'analytics')}))
         for backend, caller, fail_once in itertools.product(('boat', 'server'), ('reaper', 'pool'), (False, True)):
             with self.subTest(backend=backend, caller=caller, fail_once=fail_once):
                 label = caller + '-' + backend + '-' + str(fail_once)
@@ -446,7 +451,7 @@ class DiskProbeStateTests(Isolated):
                 self.assertIsNone(record['command_exit_code'])
 
     def test_finish_records_zero_step_probe_crash_as_infra_exit_90(self):
-        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_TOOL_LOG_DIR': str(Path(self.tmp.name) / 'analytics')}))
+        self.stack.enter_context(patch.dict(os.environ, {'OFFBOX_LOG_DIR': str(Path(self.tmp.name) / 'analytics')}))
         for incoming in (None, 90):
             with self.subTest(incoming=incoming):
                 rid = 'run-probe-' + str(incoming)

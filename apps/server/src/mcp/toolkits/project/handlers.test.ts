@@ -1,3 +1,4 @@
+import * as McpCall from "../../../ardud/analytics/McpCall.ts";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
@@ -508,5 +509,90 @@ it.effect("a launch into a new worktree creates nothing when its base ref has no
 
     expect((yield* launchFrom("main")).at(-1)?.result).toMatchObject({ projectId });
     expect(launched).toHaveLength(1);
+  }),
+);
+
+it.effect.each([
+  "missing",
+  "conflict",
+  "not_empty",
+  "operation",
+  "configured",
+  "after_commit_missing",
+] as const)("project %s refusal records only proven prewrite failures as unsaved", (scenario) =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("private-project");
+    const state: McpCall.McpCall["Service"] = {
+      callerResolved: false,
+      callerResolveMs: 0,
+      readerLane: "foreground",
+      phase: "handler",
+      saved: scenario === "after_commit_missing" ? true : "unknown",
+    };
+    const harness = clientLaunchHarness({ runtimeModeCeiling: "full-access", launched: [] });
+    const dependencies = Layer.merge(
+      harness.dependencies,
+      Layer.mock(Project.ProjectService)({
+        update: () =>
+          Effect.fail(
+            scenario === "missing" || scenario === "after_commit_missing"
+              ? new Project.ProjectNotFoundError({ projectId })
+              : new Project.ProjectOperationError({
+                  operation: "dispatch-project-command",
+                  projectId,
+                  cause: "private cause",
+                }),
+          ),
+        create: () =>
+          Effect.fail(
+            new Project.ProjectConflictError({
+              projectId,
+              workspaceRoot: "/private",
+              conflictingProjectId: projectId,
+            }),
+          ),
+        delete: () => Effect.fail(new Project.ProjectNotEmptyError({ projectId })),
+      }),
+    );
+    const toolkit = yield* ProjectToolkit.pipe(
+      Effect.provide(
+        McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(dependencies)),
+      ),
+    );
+    if (scenario === "configured" || scenario === "conflict")
+      yield* toolkit
+        .handle(
+          "t3_project_create",
+          scenario === "configured"
+            ? { title: "private", scripts: [] }
+            : { title: "private", workspaceRoot: "/private" },
+        )
+        .pipe(
+          Stream.unwrap,
+          Stream.runCollect,
+          Effect.provide(dependencies),
+          Effect.provideService(McpCall.McpCall, state),
+        );
+    else if (scenario === "not_empty")
+      yield* toolkit
+        .handle("t3_project_delete", { projectId })
+        .pipe(
+          Stream.unwrap,
+          Stream.runCollect,
+          Effect.provide(dependencies),
+          Effect.provideService(McpCall.McpCall, state),
+        );
+    else
+      yield* toolkit
+        .handle("t3_project_update", { projectId, title: "private" })
+        .pipe(
+          Stream.unwrap,
+          Stream.runCollect,
+          Effect.provide(dependencies),
+          Effect.provideService(McpCall.McpCall, state),
+        );
+    expect(state.saved).toBe(
+      scenario === "after_commit_missing" ? true : scenario === "operation" ? "unknown" : false,
+    );
   }),
 );

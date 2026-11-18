@@ -10,6 +10,13 @@ const event = (type: string, payload: object = {}) =>
   ({ type, threadId: "thread-1", payload }) as unknown as OrchestrationV2DomainEvent;
 
 describe("boardEventRoute", () => {
+  it.each(["thread.pull-request-link-updated", "thread.pull-request-synced"])(
+    "refreshes card PR chips on %s without a work turn",
+    (type) => {
+      assert.strictEqual(boardEventRoute(event(type)), "pullRequestsChanged");
+      assert.strictEqual(threadEventOf(event(type)), "thread-1");
+    },
+  );
   it.each([
     {
       type: "run_interrupt_request",
@@ -79,6 +86,36 @@ describe("boardEventRoute", () => {
       {
         runId: RunId.make("lost"),
         reason: "Native session native-123 produced output that was not ingested",
+      },
+    );
+  });
+
+  it("forwards admission details with the expired run identity", () => {
+    const admission = {
+      queuedAtMs: 1_000,
+      waitedMs: 7_200_000,
+      positionAtFailure: 2,
+      totalAtFailure: 3,
+      rule: "absolute_backstop" as const,
+    };
+    assert.deepEqual(
+      startTimeoutOf(
+        event("turn-item.updated", {
+          type: "error",
+          status: "failed",
+          runId: RunId.make("expired"),
+          failure: {
+            code: "restart_admission_timeout",
+            message: "Restart admission expired",
+            admission,
+          },
+        }),
+      ),
+      {
+        runId: RunId.make("expired"),
+        reason: "Restart admission expired",
+        restartAdmission: true,
+        admission,
       },
     );
   });

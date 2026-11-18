@@ -7,6 +7,7 @@ then install.
 
 | Source | Installed as | Used by |
 | --- | --- | --- |
+| `bin/opencode`, `libexec/opencode/` | `~/.local/bin/opencode`, `~/.local/libexec/opencode/` | terminal CLI shim; shares the service binary path with `opencode-web` |
 | `libexec/toollog/` | `~/.local/libexec/toollog/` | `toollog`, native harness hooks, homes, canaries and rcsim |
 | `libexec/mail/` | `~/.local/libexec/mail/` | `himalaya-heal`, `mailsearch`, otp watchers, message-archive (`MAIL_LIBEXEC`) |
 | `libexec/card-preview/` | `~/.local/libexec/card-preview/` | ride cards (`RIDE_CARD_PREVIEW_LIB`), coordinated-project daily cards |
@@ -15,7 +16,17 @@ then install.
 | `juno-proxy/` | `~/.local/share/juno-proxy/` | `com.abdullah.juno-proxy`: HTTP/CONNECT proxy and `/proxy.pac` on the Tailscale IP, port 8118, so tailnet devices reach Juno hosts through this Mac's VPN |
 | `lydia-ticks/` | `~/.local/share/lydia-ticks/` | `com.ardud.lydia-ticks-server` (Bun, 127.0.0.1:18820: saves each tick on Lydia's checklist and serves the per-day history page) and `com.ardud.lydia-ticks-tunnel` (Cloudflare tunnel for https://lydia.abdullah.fund). `tunnel.json` (tunnel credentials), `history-token` (the private history link) and `ticks.db*` (Lydia's data) stay live-only, never in the repo |
 | `bin/` | `~/.local/bin/` | agents and skills; `power-unplug-telegram.sh` and `battery-low-telegram.sh` for the power agents; `cards-tunnel`, `cards-health` and `cards-tunnel-setup` for the card links; `opencode-web` for the emergency OpenCode web UI; `rclaude` for an interactive Claude Code launched like Robob's claudeAgent threads (pinned harness binary, `~/.robob/harness-homes/claude`, 9router env and model/effort from `~/.robob/userdata/settings.json`; `rclaude --rclaude-print` shows the resolved command) |
-| `launchd/` | `~/Library/LaunchAgents/` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh`, `com.abdullah.juno-proxy`, `com.ardud.power-unplug-telegram` (Telegram when the MacBook is unplugged or plugged back in, every 20s), `com.ardud.battery-low-telegram` (Telegram every 5 min on battery at 20% or less), `com.ardud.cards-tunnel` (the named Cloudflare tunnel for cards.abdullah.fund), `com.ardud.cards-health` (every 5 min: restarts the tunnel when the public link stops answering, Telegram after two misses and when it's back), `com.ardud.lydia-ticks-server` and `com.ardud.lydia-ticks-tunnel` (see `lydia-ticks/` above; code changes restart them), `com.ardud.opencode-web` (always-on `opencode serve` on 127.0.0.1:4096, the emergency web UI at https://opencode.tail, independent of Robob and the OpenCode service; waits for a hand-started copy on the port to exit instead of killing it) |
+| `launchd/` | `~/Library/LaunchAgents/` | `local.ardud.otp-watch`, `local.ardud.otp-idle`, `local.ardud.mail-token-refresh`, `com.abdullah.juno-proxy`, `com.ardud.power-unplug-telegram` (Telegram when the MacBook is unplugged or plugged back in, every 20s), `com.ardud.battery-low-telegram` (Telegram every 5 min on battery at 20% or less), `com.ardud.cards-tunnel` (the named Cloudflare tunnel for cards.abdullah.fund), `com.ardud.cards-health` (every 5 min: restarts the tunnel when the public link stops answering, Telegram after two misses and when it's back), `com.ardud.lydia-ticks-server` and `com.ardud.lydia-ticks-tunnel` (see `lydia-ticks/` above; code changes restart them), `com.ardud.opencode-web` (always-on service-binary `opencode serve` with a major.minor version guard on 127.0.0.1:4096, the emergency web UI at https://opencode.tail, independent of Robob and the OpenCode service; waits for a hand-started copy on the port to exit instead of killing it) |
+
+`opencode` runs `/Volumes/ExternalSSD/opencode2/current/bin/opencode`, the binary
+used by `com.ardud.opencode-service`, forwarding arguments and exit status.
+`opencode-web` uses the same path from `libexec/opencode/service-bin.zsh`.
+Before serving it checks the selected binary against that fixed reference by
+running both with `--version`;
+an unreadable version or different major.minor version logs one refusal line
+and exits nonzero. `OPENCODE_WEB_BIN` can select another binary, subject to the
+same check. This only needs the installed service binary, so the emergency UI
+can still start when Robob and the OpenCode service are down.
 
 `install.zsh` also keeps two links in `~/.local/bin`: `wa` and `mailsend`
 point at the deployed robob-watch helpers (deploy robob-watch first). It
@@ -104,10 +115,9 @@ a fake `launchctl`; the power alert tests use a fake `pmset` and notifier).
 
 ## Quint
 
-`bin/quint` installs as `~/.local/bin/quint`. Run bounded `quint verify` on
-the Mac, rather than offbox. The wrapper checks `java -version` for Java 21+
+`bin/quint` installs as `~/.local/bin/quint`. The wrapper checks `java -version` for Java 21+
 in `QUINT_JAVA_HOME` (an invalid explicit override fails), Homebrew's
-`/opt/homebrew/opt/openjdk`, then `/usr/libexec/java_home -v '21+'`.
+`/opt/homebrew/opt/openjdk`, `JAVA_HOME`, Linux's PATH Java, then `/usr/libexec/java_home -v '21+'`.
 Install a missing JDK with `brew install openjdk`. It finds the real CLI via
 `QUINT_BIN`, PATH (skipping itself and symlinks to itself), then
 `~/.nvm/versions/node/v26.2.0/bin/quint`; the CLI's directory supplies node
@@ -123,10 +133,10 @@ mismatched archive/JAR fails before starting Java. Each verify uses a private
 temporary distribution and `QUINT_HOME`, with a refusing fallback launcher and
 the pinned JAR available to TLC. Quint-side launch/download attempts fail even
 if Quint exits zero. The wrapper stops only its own server and CLI PIDs on
-completion or signals. Port ownership is checked with `lsof` before Quint runs.
+completion or signals. Port ownership is checked with `/proc` on Linux or `lsof` on macOS; v1alpha reflection must answer before Quint runs.
 Pass each backend option once; repeated endpoint/version options, including aliases, are refused.
 
-CVE-2022-3171 affects stock grpc-services 1.41.0's pre-22 reflection gencode, despite its protobuf-java 3.25.8 runtime; #787 aligns gRPC to 1.75.0 and regenerates with 3.25.8.
+CVE-2022-3171 is a protobuf runtime bug; the stock protobuf-java 3.25.8 runtime is patched. Its pre-22 reflection gencode warning is separate; #787 aligns gRPC to 1.75.0, generated with 3.25.8.
 The guard pins archive SHA256 `51e0e9832eb589d346370b54377850697a597e3dfc23dd49246a02df421c9174` and JAR `a90f5802b6cfdb59c548513f0be2725ebd7c53a79cb96277cb349e48ea0b8f66`, always setting `error_on_unsafe_pre22_gencode=true`; unsafe JVM overrides, Java option-file loaders (`@argfile`, `-XX:VMOptionsFile`, `-XX:Flags`), and ambiguous backslash/whitespace spellings are refused. Expand file options explicitly for guarded verify.
 The source patch binds Apalache to `127.0.0.1` only. Quint 0.33.1 requires v1alpha reflection (`dist/src/apalache.js:212,242`), so it remains registered.
 The pre-22 v1alpha gencode warning reported by Crpko #2329 can still appear outside the guarded wrapper; #54 closes that bypass. No reflection classes are regenerated here.
@@ -136,7 +146,9 @@ Upstream Apalache 0.63.0 still has no dependency fix (#787's 11 Nov check); issu
 Agent PATHs put `~/.local/share/quint-guard/bin` immediately after the blocker dirs, before nvm; its only tool is a symlink to `~/.local/bin/quint`.
 The shared shell fence refuses direct npm/Node/package-runner `quint verify`; use `/Users/ardud/.local/bin/quint` or explicitly set `QUINT_ALLOW_VULNERABLE_APALACHE=1`.
 Bare `quint` relies on the managed PATH when the hook cannot see the executing shell's PATH. Other subcommands pass through; the shared `~/.quint` cache is untouched.
-Offbox has no installed wrapper or pinned archive from this change; shipping both remains a separate task.
+Offbox provisions this same wrapper ahead of repo binaries and stages the hash-checked #55 archive under `~/.offbox/quint`; use `offbox run -- quint verify …` (package runners bypass PATH).
+LISTEN alone can precede usable gRPC reflection; the wrapper probes Quint's reflection symbol within the existing 30-second startup deadline, retaining the fallback sentinel.
+Release the offbox client with `integrations/offbox/install.zsh` as well as local-helpers; existing and fresh boxes receive the assets on their next run, without changing `~/.quint`.
 
 Offbox investigation (9 Nov 2026, crpko-devops pool `bx_2vtg2veh`, three
 remote calls including one pre-command failure): Quint 0.33.1 downloads
@@ -146,23 +158,16 @@ Node fetch both returned **504, text/html, 92 bytes**; `file` identified HTML
 starting with `<html><body><h1>504 Gateway Time-out</h1>`. This reproduces the
 invalid-archive cause: GitHub's error response is passed to tar as a tgz.
 It is independent of Java. Successful downloads on other boxes are consistent
-with an intermittent asset failure. Use the Mac's managed cached backend;
+with an intermittent asset failure. The guarded wrapper uses the pinned archive;
 for diagnosing a fresh download use `curl --fail --location`, then `file`
 and `tar tzf` before extraction. A manual cache transfer must use the approved
 patched distribution, not an unguarded stock 0.62.4 download.
 
 The separate offbox signature `Unrecognized VM option 'G1PeriodicGCInterval'`
 indicates an older JVM (Java 11 in the reports); Apalache requires Java 21+.
-Run verify on the Mac for either signature. The box's apt history records
-`openjdk-11-jdk` in the base image install. Offbox selects `crpko-go` for
-crpko-devops (`skill/scripts/offbox_lib/lease.py`); that template doesn't
-provision Java. Saved pool state explains variation: this probe had an
-additional Ubuntu `openjdk-21-jre-headless` package and Java 21 selected via
-`update-alternatives`; its install provenance wasn't in apt history.
-Proposal only: add `openjdk-21-jdk-headless` to `skill/templates/crpko-go.sh`
-and select its java alternative, then refresh the crpko-devops pool's saved
-template/state. Existing saved boxes need that refresh too. No pool or
-template changes are made here; prefer the Mac unless it proves insufficient.
+Current offbox templates include JDK 21 and select a full JDK for Java commands.
+The wrapper checks its selected JDK before launching the backend; use
+`QUINT_JAVA_HOME` to select another Java 21+ installation explicitly.
 
 Card links: the spectrum bridge serves every `share` at `https://cards.abdullah.fund/s/<token>/` from
 127.0.0.1:18793 (its config.json `shareOrigin`). `cards-tunnel` runs the named Cloudflare tunnel that forwards
@@ -171,7 +176,9 @@ picked abdullah.fund: `~/.local/bin/cards-tunnel-setup` creates the tunnel (cred
 `~/.cloudflared/cards-tunnel.json`, never in this repo), points the DNS name at it and starts it.
 
 `robob-read-watchdog` probes `t3ctl threads --active --limit 5` with a 10-second
-request deadline every 30 seconds. After three minutes of failed reads it sends
+request deadline every 30 seconds. A separate 20-second child deadline also
+covers a probe stuck before JavaScript starts (`ROBOB_WD_PROBE_DEADLINE` overrides it).
+After three minutes of failed reads it sends
 one Telegram alert, then one recovery when reads work again. It clears the
 incident quietly while Robob is closed or `tmux -L restart` has the
 `robob-restart` session. State and stderr live in
@@ -184,8 +191,15 @@ Unload with `launchctl bootout gui/$(id -u)/com.ardud.robob-read-watchdog`.
 
 Installers can call `robob-read-watchdog --sustain 300 --every 30 --give-up 1800`
 to require five minutes of consecutive healthy reads. Any failed probe resets
-the healthy window; timeout exits 1. This mode sends no notifications and uses
-no watchdog state. `ROBOB_WD_PROBE`, `ROBOB_WD_NOTIFY`, `ROBOB_WD_APP_RUNNING`,
+the healthy window; timeout exits 1. This mode sends no notifications. All modes
+share probe state: after the child deadline the watchdog sends one TERM, waits
+at most two seconds, then records a surviving child's PID and start time in
+`stuck_probe`. Further runs skip the probe until that identity is gone.
+An unreadable start time keeps suppression in place; an initially unreadable
+identity is recorded as `unknown` and retained until the PID is gone.
+Start-time identities and stuck-time diagnostics use UTC, so manual and launchd
+runs agree even when they have different `TZ` settings.
+`ROBOB_WD_PROBE`, `ROBOB_WD_NOTIFY`, `ROBOB_WD_APP_RUNNING`,
 `ROBOB_WD_RESTARTING` and `ROBOB_WD_SLEEP` accept replacement commands;
 `ROBOB_WD_STATE` overrides the state directory. `ROBOB_WD_NOW` accepts epoch
 seconds or a command returning epoch seconds for an advancing test clock.
@@ -265,3 +279,5 @@ and `oxlint-plugin-t3code` importers, whose runtime dependencies lint loads.
 To try an uninstalled branch, run its absolute `integrations/local-helpers/bin/vp`
 path from the target worktree. Config snapshots and Vite’s cache stay in a
 private temporary directory; the borrowed install is read-only.
+
+`vp` outcomes: `${XDG_STATE_HOME:-~/.local/state}/vp-shim/events.jsonl` (5 MB rotation).

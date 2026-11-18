@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from offbox_lib.startup_health import starting_phase, wait_seconds
+from offbox_lib.startup_health import starting_phase, wait_seconds, accepting_health
 from offbox_lib.health_reachability import tcp_connects, slow_probe_seconds, slow_down_seconds
 
 HOME = Path.home()
@@ -177,6 +177,12 @@ def health_facts(data):
             "starting": bool(starting_phase(data)), "phase": clean(starting_phase(data)),
             "startedAt": number("startedAt"), "snapshot_age_s": number("snapshot_age_s"),
             "refresh_stage": clean(data.get("refresh_stage"))}
+    facts["degraded"] = data.get("degraded") is True
+    if isinstance(data.get("loops"), dict):
+        facts["loops"] = {name: {"stalled": value.get("stalled") is True,
+                                  "last_ok": value.get("last_ok"), "problem": clean(value.get("problem"), 300)}
+                          for name, value in data["loops"].items()
+                          if name in ("reaper", "sampler") and isinstance(value, dict)}
     if disk:
         facts['disk'] = {k: disk[k] for k in ('level', 'disk_low', 'disk_full', 'filesystems', 'sampled_at') if k in disk}
     return facts
@@ -209,7 +215,7 @@ def check_health(url, timeout=None):
     storage = facts.get('disk') or {}
     if data.get('disk_full') or storage.get('disk_full') or storage.get('level') == 'full':
         return {'ok': False, 'error': 'disk_full', 'health': facts}
-    if data.get("ok") is not True:
+    if not accepting_health(data):
         return {"ok": False, "error": "not_ok", "health": facts}
     return {"ok": True, "error": "disk_low" if data.get('disk_low') or storage.get('disk_low') else "", "health": facts}
 
@@ -520,6 +526,15 @@ def step(state, obs, now):
         state.update(state="home_down" if state.pop("starting_from_down", False) else "home_up", since=now)
 
     if check["ok"]:
+        if "loops" in health:
+            alerts = state.setdefault("loop_alerts", {})
+            stalled = {name: value for name, value in health["loops"].items() if value.get("stalled")}
+            for name in list(alerts):
+                if name not in stalled:
+                    events.append(f"loop_recovered loop={name} duration_s={now - alerts.pop(name)['at']:.1f}")
+            for name, value in stalled.items():
+                alerts.setdefault(name, {"at": int(now), "sent": False,
+                    "text": f"Home offbox is degraded: {value.get('problem') or name + ' stalled'}. It still accepts runs."})
         verdict = "good"
         health = check.get("health") or {}
         state["good_streak"] += 1
@@ -727,6 +742,17 @@ def reconcile(state, url, effects, now, verdict, dry_run=False, note=lambda text
                 alert['sent'] = ok
     elif storage.get('level') == 'ok':
         state.pop('disk_alert', None)
+    if verdict == "good":
+        for name, alert in state.get("loop_alerts", {}).items():
+            if not alert["sent"]:
+                key = f"offbox-home-degraded:{name}:{alert['at']}"
+                if dry_run:
+                    actions.append({"action": "telegram-loop-degraded", "would": "send", "key": key, "text": alert["text"]})
+                else:
+                    ok = effects.telegram(alert["text"], key)
+                    alert["sent"] = ok
+                    actions.append({"action": "telegram-loop-degraded", "ok": ok, "key": key})
+                    note(f"action=telegram-loop-degraded ok={ok} key={key}")
     if state["state"] in ("home_slow", "home_starting"):
         return actions
     outage = state.get("outage")
@@ -792,7 +818,7 @@ def reconcile(state, url, effects, now, verdict, dry_run=False, note=lambda text
     alerts = state.setdefault("degraded_alerts", {})
     for key in [k for k, v in alerts.items() if now - v.get("at", 0) > 7 * 86400]:
         del alerts[key]
-    reasons = [r for r in state.get("degraded") or [] if not r.startswith('disk_')]
+    reasons = [r for r in state.get("degraded") or [] if not r.startswith('disk_') and not re.match(r"(?:reaper|sampler) has not completed a pass for ", r)]
     if verdict == "good" and reasons:
         key = degraded_key(reasons)
         record = alerts.get(key)
@@ -827,6 +853,7 @@ def tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac_
     import toollog
     if configured_url(Path(sdir) if sdir is not None else state_dir()) is not None:
         toollog.rollup_previous()
+        toollog.rollup_today()
     return _tick(sdir, dry_run, clock, check, mac, effects, tcp, retry)
 
 
@@ -884,7 +911,9 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
                 classification = "hard"
         if facts.get("peer_online") is False and not result["ok"]:
             classification = "hard"
-        if result.get("error") == "disk_low":
+        if result["ok"] and (result.get("health") or {}).get("degraded"):
+            classification = "degraded"
+        if result.get("error") == "disk_low" and classification != "degraded":
             classification = "disk_low"
         result.update(ms=round(latency_ms, 1), **{"class": classification})
         failures = read_client_failures(sdir, state.get("failures_seen") or now - 900)
@@ -903,6 +932,9 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
                   f" error={clean(result.get('error'))}"
                   f" snapshot_age_s={(result.get('health') or {}).get('snapshot_age_s')}"
                   f" refresh_stage={clean((result.get('health') or {}).get('refresh_stage'))}")
+        if classification == "degraded":
+            stalled = [name for name, value in (health.get("loops") or {}).items() if value.get("stalled")]
+            fields += " loop=" + ",".join(sorted(stalled))
         if "slow_ms" in result:
             fields += f" slow_ms={result['slow_ms']}"
         log(sdir, ("check-good" if result["ok"] else "check-fail") + fields
@@ -915,7 +947,7 @@ def _tick(sdir=None, dry_run=False, clock=time.time, check=check_health, mac=mac
                             "last_good_boatd_uptime_s": (state.get("last_ok_health") or {}).get("boatd_uptime_s"),
                             "errorClass": result.get("error"), **health})
         for event in events:
-            if event.startswith(("state=home_", "startup_ready", "flap ", "flap-summary ")):
+            if event.startswith(("state=home_", "startup_ready", "loop_recovered ", "flap ", "flap-summary ")):
                 log(sdir, event)
                 if event.startswith("flap-summary "):
                     toollog.emit("backend", "backend.home_flaps_daily", props=dict(

@@ -175,6 +175,8 @@ class UvCacheTests(Isolated):
     def test_repair_uses_one_setup_budget_and_freezes_endpoint(self):
         with patch.object(uv_cache.ssh_sync, 'ssh_base', return_value=['ssh']) as base, \
                 patch.object(uv_cache, 'time', SimpleNamespace(monotonic=Mock(side_effect=[100, 101]))), \
+                patch.object(uv_cache.api, 'time', SimpleNamespace(time=lambda: 100)), \
+                patch.object(uv_cache.ssh_sync, 'time', SimpleNamespace(time=lambda: 100)), \
                 patch.object(uv_cache.subprocess, 'run', return_value=subprocess.CompletedProcess(
                     [], 0, b'{"ok":true,"reason":"cleared","archive":"moved"}', b'')) as process:
             self.assertEqual(uv_cache.repair('B', 'mZwmaowx3NLXC838', 'click', timeout=3),
@@ -182,6 +184,27 @@ class UvCacheTests(Isolated):
         base.assert_called_once_with('B')
         self.assertEqual(process.call_args.kwargs['timeout'], 2)
         self.assertIn('timeout -s KILL 1', process.call_args.args[0][-1])
+
+    def test_frozen_endpoint_keeps_the_outer_ssh_deadline(self):
+        clock = SimpleNamespace(time=Mock(return_value=100))
+        for current in (101, 103):
+            with self.subTest(current=current), \
+                    patch.object(uv_cache.api, 'time', clock), \
+                    patch.object(uv_cache.ssh_sync, 'time', clock), \
+                    patch.object(uv_cache.ssh_sync, 'ssh_base') as select_endpoint, \
+                    patch.object(uv_cache.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'', b'')) as process:
+                clock.time.return_value = 100
+                with uv_cache.api.budget(3):
+                    clock.time.return_value = current
+                    if current == 103:
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            uv_cache.ssh_sync.ssh('B', 'repair', timeout=20, base=['ssh', '-p', '22001'])
+                        process.assert_not_called()
+                    else:
+                        uv_cache.ssh_sync.ssh('B', 'repair', timeout=20, base=['ssh', '-p', '22001'])
+                        process.assert_called_once_with(['ssh', '-p', '22001', 'B', 'repair'],
+                                                       input=None, capture_output=True, timeout=2)
+                select_endpoint.assert_not_called()
 
     def test_expired_setup_never_starts_remote_repair(self):
         with patch.object(uv_cache, 'time', SimpleNamespace(monotonic=Mock(side_effect=[100, 121]))), \
@@ -300,6 +323,8 @@ class UvCacheRecoveredOutputTests(background._BackgroundOutputFixture):
         with patch.object(api, 'BACKEND', 'server'), patch.object(ssh_sync, '_HOME_PORTS', {}), \
                 patch.object(ssh_sync, 'cfg_path', return_value=config), \
                 patch.object(uv_cache, 'time', SimpleNamespace(monotonic=Mock(side_effect=[100, 104]))), \
+                patch.object(api, 'time', SimpleNamespace(time=lambda: 100)), \
+                patch.object(ssh_sync, 'time', SimpleNamespace(time=lambda: 100)), \
                 patch.object(ssh_sync.subprocess, 'run', side_effect=[
                     subprocess.CompletedProcess([], 0, b'', b''),
                     subprocess.CompletedProcess([], 0, receipt, b'')]) as process, \

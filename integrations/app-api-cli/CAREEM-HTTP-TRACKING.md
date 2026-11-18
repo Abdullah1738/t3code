@@ -511,7 +511,7 @@ PYTHONDONTWRITEBYTECODE=1 ~/.local/share/uv/tools/mitmproxy/bin/python -B -m uni
 
 ### Parent-only next observation, without sending another SMS
 
-1. Preserve the signed-in original session. Check phone priority-hold before any
+1. Preserve the signed-in original session. Check `ph hold status --json` (present true = wait) before any
    parent phone batch; this lane does not use the phone. Do not log out, edit the
    phone number, reinstall, clone, root, change proxy or modify saved account data.
 2. Establish original app version and whether the owner's successful event was

@@ -11,6 +11,8 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   CommandId,
+  type ControlErrorBody,
+  type ControlRejection,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   MessageId,
   type ModelSelection,
@@ -29,8 +31,8 @@ import {
 } from "@t3tools/contracts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
-import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -47,7 +49,6 @@ import * as OrchestrationEventStore from "../../persistence/OrchestrationEventSt
 import * as ThreadManagementService from "../../orchestration-v2/ThreadManagementService.ts";
 import * as ThreadMessageIntake from "../../orchestration-v2/ThreadMessageIntake.ts";
 import * as SendAcknowledgement from "../orchestration/ThreadSendAcknowledgement.ts";
-import { userFacingDispatchErrorMessage } from "../../orchestration-v2/UserFacingErrors.ts";
 import * as ManagedProjectFolders from "../../project/ManagedProjectFolders.ts";
 import * as ProjectService from "../../project/ProjectService.ts";
 import * as ProviderRegistry from "../../provider/ProviderRegistry.ts";
@@ -57,6 +58,14 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as ControlEvents from "./ControlEvents.ts";
 import * as Analytics from "../analytics/Analytics.ts";
 import * as ControlStore from "./ControlStore.ts";
+import {
+  ControlError,
+  type ControlErrorCode,
+  errorDetail,
+  fail,
+  operationFailure as controlOperationFailure,
+  rejectionDetails,
+} from "./ControlErrors.ts";
 import * as ControlRequestAnalytics from "./ControlRequestAnalytics.ts";
 import * as ControlThreadRead from "./ControlThreadRead.ts";
 import * as Usage from "./usage.ts";
@@ -170,19 +179,16 @@ const nextThreadListCursor = (shells: ReadonlyArray<OrchestrationV2ThreadShell>,
     : null;
 };
 
-type ControlErrorCode =
-  | "unauthorized"
-  | "forbidden"
-  | "invalid_request"
-  | "not_found"
-  | "conflict"
-  | "unavailable"
-  | "internal";
+const withFailure = (error: ControlError, cause: unknown) =>
+  new ControlError({
+    code: error.code,
+    message: error.message,
+    ...(error.rejection === undefined ? {} : { rejection: error.rejection }),
+    failure: ControlRequestAnalytics.failureDetails(cause),
+  });
 
-class ControlError extends Data.TaggedError("ControlError")<{
-  readonly code: ControlErrorCode;
-  readonly message: string;
-}> {}
+const operationFailure = (cause: unknown) =>
+  cause instanceof ControlError ? cause : withFailure(controlOperationFailure(cause), cause);
 
 const STATUS: Record<ControlErrorCode, number> = {
   unauthorized: 401,
@@ -194,8 +200,6 @@ const STATUS: Record<ControlErrorCode, number> = {
   internal: 500,
 };
 
-const fail = (code: ControlErrorCode, message: string) => new ControlError({ code, message });
-
 /** A merged selection, or the conflict as a 400: a stale effort is never silently picked. */
 const selectionOrFail = (
   result:
@@ -205,9 +209,6 @@ const selectionOrFail = (
   result.kind === "selection"
     ? Effect.succeed(result.selection)
     : Effect.fail(fail("invalid_request", result.reason));
-
-const errorDetail = (cause: unknown): string =>
-  userFacingDispatchErrorMessage(cause) ?? (cause instanceof Error ? cause.message : String(cause));
 
 // ardud: the reaper retries a conflict later, so only the orchestrator's own
 // refusals count as one. Its rejections carry a text cause; a storage or read
@@ -239,7 +240,8 @@ const json = (body: unknown, status = 200) => jsonReply(body, status);
 
 // The agent reply lane covers only building the JSON body: every database read
 // and wait happens before it (ReplyBuilders.ts).
-const encoded = (body: unknown) => ReplyBuilders.bounded(Effect.sync(() => json(body)));
+const encoded = (body: unknown) =>
+  ReplyBuilders.bounded(ControlRequestAnalytics.encoding(Effect.sync(() => json(body))));
 
 const chunkIds = (ids: ReadonlyArray<string>, size = 400): Array<ReadonlyArray<string>> => {
   const out: Array<ReadonlyArray<string>> = [];
@@ -251,7 +253,14 @@ const READER_BUSY_MESSAGE = "The database reader is busy; retry shortly.";
 
 const errorResponse = (error: ControlError) => {
   const response = json(
-    { ok: false, error: { code: error.code, message: error.message } },
+    {
+      ok: false,
+      error: {
+        code: error.code,
+        message: error.message,
+        ...rejectionDetails(error),
+      } satisfies ControlErrorBody,
+    },
     STATUS[error.code],
   );
   // "unavailable" is transient (busy reader lane, startup): tell clients when to retry.
@@ -259,6 +268,23 @@ const errorResponse = (error: ControlError) => {
     ? HttpServerResponse.setHeader(response, "retry-after", "1")
     : response;
 };
+
+// The request span already measures the route; retain refusal diagnostics there.
+const logRejection = Effect.fnUntraced(function* (
+  code: string,
+  rejection: ControlRejection,
+  details?: ControlRequestAnalytics.FailureDetails,
+) {
+  yield* Effect.annotateCurrentSpan({
+    "control.reason": rejection.reason,
+    "control.retry_safe": rejection.retrySafe,
+    "control.holder": rejection.holder,
+  });
+  yield* ControlRequestAnalytics.failure(
+    code,
+    details ?? { errorTag: "ControlError", reason: rejection.reason },
+  );
+});
 
 type Scope = typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope;
 
@@ -275,6 +301,7 @@ const param = Effect.fn("ControlHttp.param")(function* (name: string) {
     return yield* fail("invalid_request", `Missing path parameter ${name}.`);
   }
   // The router already percent-decodes path parameters.
+  if (name === "threadId") yield* ControlRequestAnalytics.thread(value);
   return value;
 });
 
@@ -291,6 +318,7 @@ const decodeBody = Effect.fn("ControlHttp.decodeBody")(function* <A>(
       : yield* decodeJsonText(text).pipe(
           Effect.mapError(() => fail("invalid_request", "The request body is not valid JSON.")),
         );
+  yield* ControlRequestAnalytics.sendInput(raw);
   return yield* decode(raw).pipe(
     Effect.mapError((error) => fail("invalid_request", error.message)),
   );
@@ -406,7 +434,6 @@ const decodeOriginBody = Schema.decodeUnknownEffect(OriginBody);
 const decodeSettingsBody = Schema.decodeUnknownEffect(SettingsBody);
 const decodeArchiveIfIdleBody = Schema.decodeUnknownEffect(ArchiveIfIdleBody);
 const decodeUploadBody = Schema.decodeUnknownEffect(UploadBody);
-const isThreadManagementError = Schema.is(ThreadManagementService.ThreadManagementError);
 const decodeUploadInput = Schema.decodeUnknownEffect(AttachmentCreateUploadUrlInput);
 const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown));
 
@@ -547,11 +574,11 @@ const makeRoutes = Effect.gen(function* () {
       .enqueueCommand(
         ThreadMessageIntake.dispatchCommand(command).pipe(Effect.provide(intakeContext)),
       )
-      .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+      .pipe(Effect.mapError(operationFailure));
 
   const getShell = (threadId: string) =>
     threads.getThreadShell(ThreadId.make(threadId)).pipe(
-      Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+      Effect.mapError((cause) => withFailure(fail("internal", errorDetail(cause)), cause)),
       Effect.flatMap((shell) =>
         shell === null || shell.deletedAt !== null
           ? Effect.fail(fail("not_found", `Thread ${threadId} was not found.`))
@@ -757,7 +784,7 @@ const makeRoutes = Effect.gen(function* () {
           workspaceRoot: directory,
           createWorkspaceRootIfMissing: true,
         })
-        .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+        .pipe(Effect.mapError(operationFailure));
       return { projectId: created.project.id, workspaceStrategy: { type: "root" as const } };
     }
     const scratch = yield* folders.ensureScratchProject.pipe(
@@ -836,7 +863,7 @@ const makeRoutes = Effect.gen(function* () {
           creationSource: "server",
         }).pipe(Effect.provide(intakeContext)),
       )
-      .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+      .pipe(Effect.mapError(operationFailure));
     if (body.origin !== undefined && body.origin.trim().length > 0) {
       yield* store
         .setOrigin(launched.threadId, body.origin.trim())
@@ -1084,7 +1111,7 @@ const makeRoutes = Effect.gen(function* () {
       threadDetail(threadId).pipe(NodeSqliteClient.foregroundReads),
       "poll",
     );
-    return json({ ok: true, thread });
+    return yield* ControlRequestAnalytics.encoding(Effect.sync(() => json({ ok: true, thread })));
   });
 
   const byNative = Effect.gen(function* () {
@@ -1178,18 +1205,23 @@ const makeRoutes = Effect.gen(function* () {
                 : fail("internal", errorDetail(cause)),
             ),
           );
-        return json({
-          ok: true,
-          total: page.total,
-          messages: page.messages.map(({ message, ...thread }) => ({
-            ...messageSummary(message),
-            ...thread,
-          })),
-          nextCursor:
-            page.next === null
-              ? null
-              : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
-        });
+        yield* ControlRequestAnalytics.items(page.messages.length, page.total);
+        return yield* ControlRequestAnalytics.encoding(
+          Effect.sync(() =>
+            json({
+              ok: true,
+              total: page.total,
+              messages: page.messages.map(({ message, ...thread }) => ({
+                ...messageSummary(message),
+                ...thread,
+              })),
+              nextCursor:
+                page.next === null
+                  ? null
+                  : Buffer.from(encodeUserMessageCursorJson(page.next)).toString("base64url"),
+            }),
+          ),
+        );
       }).pipe(NodeSqliteClient.foregroundReads),
       "controlRead",
     );
@@ -1224,6 +1256,7 @@ const makeRoutes = Effect.gen(function* () {
       }).pipe(NodeSqliteClient.foregroundReads),
       "controlRead",
     );
+    yield* ControlRequestAnalytics.items(page.messages.length, page.total);
     return yield* encoded({
       ok: true,
       threadId,
@@ -1301,6 +1334,7 @@ const makeRoutes = Effect.gen(function* () {
     const result = yield* SendAcknowledgement.bounded(
       (clientRequestId) =>
         Effect.gen(function* () {
+          yield* ControlRequestAnalytics.sendRequestId(clientRequestId);
           const shell = yield* getShell(threadId);
           const commandId = yield* commandIdFor(`send:${threadId}`, clientRequestId);
           // ardud: channel guidance is framed as the bridge's, so only it may send some.
@@ -1320,7 +1354,7 @@ const makeRoutes = Effect.gen(function* () {
             body.providerInstanceId !== undefined ||
             body.options !== undefined;
           const settings = yield* settingsService.getSettings.pipe(
-            Effect.mapError((cause) => fail("internal", errorDetail(cause))),
+            Effect.mapError((cause) => withFailure(fail("internal", errorDetail(cause)), cause)),
           );
           const modelSelection =
             hasSelection || selectionMigrationApplies(settings)
@@ -1335,9 +1369,7 @@ const makeRoutes = Effect.gen(function* () {
               : undefined;
           // Queue only a readiness marker: a cancelled send must never leave its
           // message effect in the startup worker after the commit lease expires.
-          yield* startup
-            .enqueueCommand(Effect.void)
-            .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+          yield* startup.enqueueCommand(Effect.void).pipe(Effect.mapError(operationFailure));
           const result = yield* ThreadMessageIntake.sendToThread({
             projectId: shell.projectId,
             commandId,
@@ -1355,11 +1387,7 @@ const makeRoutes = Effect.gen(function* () {
             // The captured services can include the route's background reader lane.
             NodeSqliteClient.foregroundReads,
             Effect.provide(intakeContext),
-            Effect.mapError((cause) =>
-              isThreadManagementError(cause) && cause._tag === "ThreadManagementThreadNotFoundError"
-                ? fail("not_found", cause.message)
-                : fail("conflict", errorDetail(cause)),
-            ),
+            Effect.mapError(operationFailure),
           );
           return {
             threadId: shell.id,
@@ -1371,12 +1399,7 @@ const makeRoutes = Effect.gen(function* () {
         }),
       serviceScope,
       body.clientRequestId,
-    ).pipe(
-      Effect.provideService(Crypto.Crypto, crypto),
-      Effect.mapError((cause) =>
-        cause._tag === "ControlError" ? cause : fail("conflict", errorDetail(cause)),
-      ),
-    );
+    ).pipe(Effect.provideService(Crypto.Crypto, crypto), Effect.mapError(operationFailure));
     return json({
       ok: true,
       threadId: result.threadId,
@@ -1413,6 +1436,11 @@ const makeRoutes = Effect.gen(function* () {
         return yield* fail(
           "conflict",
           `Run ${expectedRunId} is on attempt ${run.activeAttemptId}, not ${body.expectedAttemptId}.`,
+          {
+            reason: "attempt_changed",
+            retrySafe: false,
+            holder: { threadId, runId: run.id, status: run.status },
+          },
         );
       }
     }
@@ -1430,7 +1458,7 @@ const makeRoutes = Effect.gen(function* () {
             : { attemptId: RunAttemptId.make(body.expectedAttemptId) }),
         }),
       )
-      .pipe(Effect.mapError((cause) => fail("conflict", errorDetail(cause))));
+      .pipe(Effect.mapError(operationFailure));
     return json({
       ok: true,
       threadId: shell.id,
@@ -1451,7 +1479,19 @@ const makeRoutes = Effect.gen(function* () {
     if (request === undefined) {
       return yield* fail("not_found", `Request ${requestId} was not found on thread ${threadId}.`);
     }
-    const alreadyIs = () => fail("conflict", `Request ${requestId} is already ${request.status}.`);
+    const alreadyIs = () =>
+      fail("conflict", `Request ${requestId} is already ${request.status}.`, {
+        reason: "request_resolved",
+        retrySafe: false,
+        holder: {
+          threadId,
+          runId:
+            records.turnItems.find((item) => "requestId" in item && item.requestId === requestId)
+              ?.runId ?? null,
+          status: request.status,
+          requestId,
+        },
+      });
     if (request.status !== "pending") return yield* alreadyIs();
     const commandId = yield* commandIdFor(`respond:${requestId}`, body.clientRequestId);
     const decision: ProviderApprovalDecision | undefined =
@@ -1634,11 +1674,22 @@ const makeRoutes = Effect.gen(function* () {
         ),
       );
     if (!result.archived) {
+      yield* logRejection("not_idle", {
+        reason: result.reason,
+        retrySafe: true,
+        holder: { threadId, runId: null, status: result.reason },
+      });
       return json(
         {
           ok: false,
           archived: false,
-          error: { code: "not_idle", reason: result.reason, message: result.detail },
+          error: {
+            code: "not_idle",
+            reason: result.reason,
+            message: result.detail,
+            retrySafe: true,
+            holder: { threadId, runId: null, status: result.reason },
+          } satisfies ControlErrorBody,
         },
         STATUS.conflict,
       );
@@ -1862,11 +1913,27 @@ const makeRoutes = Effect.gen(function* () {
     effect: Effect.Effect<HttpServerResponse.HttpServerResponse, ControlError, R>,
   ) =>
     effect.pipe(
-      Effect.catchTags({ ControlError: (error) => Effect.succeed(errorResponse(error)) }),
+      Effect.catchTags({
+        ControlError: (error) =>
+          Effect.gen(function* () {
+            const rejection = rejectionDetails(error);
+            if (rejection !== undefined) {
+              yield* logRejection(error.code, rejection, error.failure);
+            } else {
+              yield* ControlRequestAnalytics.failure(error.code, error.failure);
+            }
+            return errorResponse(error);
+          }),
+      }),
       Effect.catchCause((cause) =>
-        Effect.logWarning("ardud control request failed", { cause }).pipe(
-          Effect.as(errorResponse(fail("internal", "Internal error."))),
-        ),
+        ControlRequestAnalytics.failure("internal", {
+          errorTag: Cause.hasDies(cause)
+            ? "Defect"
+            : Cause.hasInterrupts(cause)
+              ? "Interrupted"
+              : "UnknownError",
+          reason: "unexpected_failure",
+        }).pipe(Effect.as(errorResponse(fail("internal", "Internal error.")))),
       ),
     );
 
@@ -1879,7 +1946,20 @@ const makeRoutes = Effect.gen(function* () {
       .slice(p.length + 1)
       .replaceAll("/", ".")
       .replaceAll(":", "")}`,
-  ) => HttpRouter.route(method, path, observeControl(operation, effect, { path, method }));
+  ) =>
+    HttpRouter.route(
+      method,
+      path,
+      observeControl(
+        operation,
+        Effect.gen(function* () {
+          const params = yield* HttpRouter.params;
+          yield* ControlRequestAnalytics.requestThread(params.threadId);
+          return yield* effect;
+        }),
+        { path, method },
+      ),
+    );
   return [
     // These bridge reads otherwise share the cleanup snapshot's background lane.
     route("GET", `${p}/health`, handle(health.pipe(NodeSqliteClient.foregroundReads))),

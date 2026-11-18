@@ -12,6 +12,7 @@ import {
   PullRequestReviewerRequestInput,
   PullRequestSetFilesViewedInput,
   PullRequestSubmitReviewInput,
+  PullRequestUnavailableError,
   pullRequestHostOf,
   resolvePullRequestAuthorFilter,
 } from "./pullRequest.ts";
@@ -24,6 +25,23 @@ const decodeAction = Schema.decodeUnknownSync(Schema.toCodecJson(PullRequestActi
 const decodeReview = Schema.decodeUnknownSync(Schema.toCodecJson(PullRequestSubmitReviewInput));
 const decodeSetFilesViewed = Schema.decodeUnknownSync(PullRequestSetFilesViewedInput);
 const decodeFilesViewed = Schema.decodeUnknownSync(PullRequestFilesViewedResult);
+const encodeUnavailable = Schema.encodeSync(Schema.toCodecJson(PullRequestUnavailableError));
+const decodeUnavailable = Schema.decodeUnknownSync(Schema.toCodecJson(PullRequestUnavailableError));
+
+it("preserves provider diagnosis in unavailable errors across the wire", () => {
+  const detail = "No fj login matches forgejo.test; tea is unavailable.";
+  const error = new PullRequestUnavailableError({
+    provider: SourceControlProviderKind.make("forgejo"),
+    reason: "cli-unauthenticated",
+    detail,
+  });
+  const decoded = decodeUnavailable(encodeUnavailable(error));
+  expect(decoded.message).toBe(detail);
+  expect(decoded.detail).toBe(detail);
+  expect(new PullRequestUnavailableError({ reason: "cli-missing" }).message).toContain(
+    "not installed",
+  );
+});
 
 const LIST_RESULT: PullRequestListResult = {
   viewers: { "github.com": "bilal", "gitlab.com": "bilal.hassan" },

@@ -24,6 +24,7 @@ export type AgentBusDeps = {
   forSession: (sessionId: string) => ChatInfo | undefined;
   bySlug: (slug: string) => ChatInfo | undefined;
   policyPath?: string;
+  groupMembers: (chat: ChatInfo) => string[];
   /** Deduped by key. All target delivery goes through this boundary, including answers and timeouts. */
   deliver: (target: ChatInfo, text: string, key: string, receipt?: AgentAnswerReceipt) => void;
   receipt: (target: ChatInfo, key: string) => AgentAnswerReceipt | undefined;
@@ -45,9 +46,20 @@ export class AgentBus {
       hop INTEGER NOT NULL, status TEXT NOT NULL, text_chars INTEGER NOT NULL, answer_chars INTEGER,
       created_at INTEGER NOT NULL, answered_at INTEGER, timed_out_at INTEGER
     );
+    CREATE TABLE IF NOT EXISTS agent_operations (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS agent_requests_open ON agent_requests(created_at) WHERE status IN ('open', 'pending', 'timed_out');
     CREATE INDEX IF NOT EXISTS agent_requests_from ON agent_requests(from_slug, created_at DESC);
     CREATE INDEX IF NOT EXISTS agent_requests_to ON agent_requests(to_slug, created_at DESC);`);
+  }
+
+  once(id: string, fingerprint: string, perform: () => SbApiResult): SbApiResult {
+    return this.deps.db.transaction(() => {
+      const old = this.deps.db.query<{ fingerprint: string; result: string }, [string]>("SELECT * FROM agent_operations WHERE id=?").get(id);
+      if (old) return old.fingerprint === fingerprint ? JSON.parse(old.result) : failure(409, "Operation key reused");
+      const result = perform();
+      if (result.status < 400) this.deps.db.query("INSERT INTO agent_operations VALUES (?,?,?)").run(id, fingerprint, JSON.stringify(result));
+      return result;
+    })();
   }
 
   private get(id: string): RequestRow | null {
@@ -96,7 +108,7 @@ export class AgentBus {
       (id, from_slug, to_slug, parent_id, hop, status, text_chars, created_at)
       VALUES (?, ?, ?, ?, ?, 'open', ?, ?)`)
       .run(id, caller.slug, target.slug, input.parent ?? null, hop, input.text.length, at);
-    deps.log("agent-ask", `${caller.slug}>${target.slug} hop=${hop}`);
+    deps.log("agent-ask", `${caller.slug}>${target.slug} hop=${hop}${caller.kind === "group" ? " group=1" : ""}`);
     this.deliverRequest(this.get(id)!, caller, target, input.text, policy, pair);
     return { status: 202, body: { id, created: true } };
   }
@@ -113,7 +125,10 @@ export class AgentBus {
       lines.push("If this request matches one of these, tell Abdullah in one line in this chat after it's done. Otherwise don't mention it.");
     }
     if (pair.answer === "full") lines.push("Answer anything the owner's agent asks, in full. Send the answer back through agent-answer.");
-    if (pair.audience === "group") lines.push("This answer will be posted in a group. Answer only with information that is fine to share in that group.");
+    // A second-hop request still answers the original group's question.
+    const parent = row.parent_id ? this.get(row.parent_id) : null;
+    const origin = caller.kind === "group" || !parent ? caller : this.deps.bySlug(parent.from_slug);
+    if (origin?.kind === "group") lines.push(`This answer will be posted in the group ${JSON.stringify(origin.title)} (members: ${this.deps.groupMembers(origin).join(", ") || "unknown"}). Share only what is fine for everyone there to read. If it's private and the person it belongs to isn't the one asking, say what can be shared instead.`);
     this.deps.deliver(target, lines.join("\n") + `\n${text}`, `agent-ask:${row.id}`);
   }
 

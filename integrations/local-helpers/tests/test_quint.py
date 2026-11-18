@@ -1,17 +1,89 @@
 """Exercise the wrapper with fake toolchains; never starts Apalache or touches ~/.quint."""
+import ast
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import tarfile
 import unittest
 
 
 HERE = Path(__file__).resolve().parents[1]
+
+
+@unittest.skipUnless(shutil.which('node'), 'Node is required for package resolution')
+class ReflectionProbeTest(unittest.TestCase):
+    def test_real_node_resolves_package_for_direct_symlink_and_pnpm_shim(self):
+        source = (HERE / 'bin/quint').read_text().split("<<'PYTHON_GUARD'\n", 1)[1].split('\nPYTHON_GUARD', 1)[0]
+        probe = next(ast.literal_eval(statement.value) for statement in ast.parse(source).body
+                     if isinstance(statement, ast.Assign)
+                     and any(isinstance(target, ast.Name) and target.id == 'REFLECTION_PROBE'
+                             for target in statement.targets))
+        node = shutil.which('node')
+        for layout in ('isolated', 'hoisted'):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory(prefix='quint-node-test-') as tmp:
+                root = Path(tmp)
+                modules = root / 'node_modules'
+                dependencies = modules / '.pnpm/quint-fixture/node_modules' if layout == 'isolated' else modules
+                package = dependencies / '@informalsystems/quint'
+                entry = package / 'dist/src/cli.js'
+                entry.parent.mkdir(parents=True)
+                (package / 'package.json').write_text(json.dumps({'name': '@informalsystems/quint',
+                                                                 'version': '0.33.1'}))
+                entry.write_text('console.log("0.33.1")\n')
+                (entry.parent / 'apalache.js').write_text('')
+                (entry.parent / 'reflection.proto').write_text('quint reflection fixture')
+                if layout == 'isolated':
+                    (modules / '@informalsystems').mkdir()
+                    (modules / '@informalsystems/quint').symlink_to(package, target_is_directory=True)
+                for name, body in {
+                    '@grpc/proto-loader': '''exports.loadSync = file => {
+  if (require('node:fs').readFileSync(file, 'utf8') !== 'quint reflection fixture') throw Error('wrong proto');
+  return {};
+};''',
+                    '@grpc/grpc-js': '''const { EventEmitter } = require('node:events');
+exports.credentials = { createInsecure() {} };
+exports.loadPackageDefinition = () => ({ grpc: { reflection: { v1alpha: {
+  ServerReflection: class {
+    close() {}
+    ServerReflectionInfo() {
+      const call = new EventEmitter();
+      call.cancel = () => {};
+      call.write = request => {
+        if (request.file_containing_symbol !== 'shai.cmdExecutor.CmdExecutor') throw Error('wrong request');
+        queueMicrotask(() => call.emit('data', { file_descriptor_response: { file_descriptor_proto: ['ready'] } }));
+      };
+      return call;
+    }
+  }
+} } } });''',
+                }.items():
+                    dependency = dependencies / name
+                    dependency.mkdir(parents=True)
+                    (dependency / 'index.js').write_text(body)
+                symlink = root / 'bin/quint'
+                symlink.parent.mkdir()
+                symlink.symlink_to(entry)
+                shim = modules / '.bin/quint'
+                shim.parent.mkdir()
+                shim.write_text('#!/bin/sh\nbasedir=$(dirname "$0")\n'
+                                'exec node "$basedir/../@informalsystems/quint/dist/src/cli.js" "$@"\n')
+                shim.chmod(0o755)
+                env = {'PATH': f'{Path(node).parent}:/usr/bin:/bin'}
+                version = subprocess.run([str(shim), '--version'], env=env, capture_output=True, text=True)
+                self.assertEqual(version.returncode, 0, version.stderr)
+                self.assertEqual(version.stdout.strip(), '0.33.1')
+                for cli in (entry, symlink, shim):
+                    with self.subTest(cli=str(cli.relative_to(root))):
+                        result = subprocess.run([node, '-e', probe, str(cli), '127.0.0.1:12345', '1000'],
+                                                env=env, capture_output=True, text=True, timeout=5)
+                        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class QuintTest(unittest.TestCase):
@@ -25,7 +97,8 @@ class QuintTest(unittest.TestCase):
         # Substitute only the two absolute OS probes, so tests never use the Mac's JDK.
         source = (HERE / "bin/quint").read_text().replace(
             "/opt/homebrew/opt/openjdk", str(self.brew)
-        ).replace("/usr/libexec/java_home", str(self.probe))
+        ).replace("/usr/libexec/java_home", str(self.probe)).replace(
+            '"$OSTYPE" == linux*', '"${TEST_PLATFORM:-}" == linux')
         self.archive = self.root / 'patched.tgz'
         with tarfile.open(self.archive, 'w:gz') as bundle:
             for name, data, mode in (
@@ -42,6 +115,15 @@ class QuintTest(unittest.TestCase):
         self.jdk(self.brew)
         self.cli = self.root / "cli" / "quint"
         self.fake_quint(self.cli)
+        self.script(self.cli.parent / 'node', """#!/usr/bin/python3
+import os, socket, sys
+port = int(sys.argv[-2].split(':')[-1])
+with socket.create_connection(('127.0.0.1', port)) as s:
+    s.sendall(b'reflection')
+    s.shutdown(socket.SHUT_WR)
+    if s.recv(32) != b'ready': sys.exit(1)
+""")
+        self.script(self.cli.parent / 'java', '#!/bin/sh\nexit 1\n')
         self.env = {
             "HOME": str(self.root),
             "PATH": f"{self.wrapper.parent}:{self.cli.parent}:/usr/sbin:/usr/bin:/bin",
@@ -61,13 +143,23 @@ if sys.argv[1:] == ['-version']:
     print({version!r}, file=sys.stderr)
     sys.exit({exit_code})
 port = int(sys.argv[2].split('=')[1])
-sock = socket.socket()
-sock.bind(('127.0.0.1', port))
+host = os.environ.get('FAKE_BIND_HOST', '127.0.0.1')
+sock = socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET)
+sock.bind((host, port))
 sock.listen()
 with open(os.environ['FAKE_SERVER_LOG'], 'w') as log:
     json.dump({{'pid': os.getpid(), 'argv': sys.argv[1:], 'jvm_args': os.environ.get('JVM_ARGS'), 'home': os.environ.get('QUINT_HOME'), 'jar': os.environ.get('APALACHE_JAR')}}, log)
 if os.environ.get('FAKE_SERVER_EXIT'): sys.exit(9)
-while True: time.sleep(1)
+connections = []
+while True:
+    conn, _ = sock.accept()
+    connections.append(conn)
+    if conn.recv(32) == b'reflection':
+        if os.environ.get('FAKE_REFLECTION_FAIL'):
+            conn.sendall(b'not-ready')
+        else:
+            open(os.environ['FAKE_SERVER_LOG'] + '.ready', 'w').close()
+            conn.sendall(b'ready')
 ''')
 
     def fake_quint(self, path):
@@ -76,6 +168,8 @@ import json, os, sys, subprocess, time
 print(json.dumps({'argv': sys.argv[1:], 'java_home': os.environ['JAVA_HOME'],
                   'path': os.environ['PATH'], 'cli': sys.argv[0], 'pid': os.getpid(),
                   'quint_home': os.environ.get('QUINT_HOME'), 'jvm_args': os.environ.get('JVM_ARGS')}), flush=True)
+if os.environ.get('FAKE_REQUIRE_READY') and not os.path.exists(os.environ['FAKE_SERVER_LOG'] + '.ready'):
+    sys.exit(7)
 mode = os.environ.get('FAKE_MODE')
 if mode == 'download':
     sys.stdout.write('Downloading '); sys.stdout.flush()
@@ -100,6 +194,41 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
         if '--apalache-version=0.62.4' in data['argv']:
             data['argv'].remove('--apalache-version=0.62.4')
         return data
+
+    def test_listen_alone_does_not_start_client_before_reflection(self):
+        self.result('verify', 'a.qnt', FAKE_REQUIRE_READY='1')
+        self.server_stopped()
+
+    def test_reflection_failure_refuses_without_starting_client(self):
+        r = self.run_cli('verify', 'a.qnt', FAKE_REFLECTION_FAIL='1')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('reflection readiness failed', r.stderr)
+        self.assertEqual(r.stdout, '')
+        self.server_stopped()
+
+    def test_ambient_jdk_is_used_without_homebrew(self):
+        self.jdk(self.brew, 'openjdk version "17"')
+        other = self.root / 'linux-jdk'
+        self.jdk(other)
+        self.assertEqual(self.result('--version', JAVA_HOME=str(other))['java_home'], str(other))
+
+    def test_linux_path_java_resolves_jdk_symlink(self):
+        self.jdk(self.brew, 'openjdk version "17"')
+        other = self.root / 'linux-jdk'
+        self.jdk(other)
+        (self.cli.parent / 'java').unlink()
+        (self.cli.parent / 'java').symlink_to(other / 'bin/java')
+        self.assertEqual(Path(self.result('--version', TEST_PLATFORM='linux')['java_home']), other.resolve())
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux /proc ownership path')
+    def test_linux_refuses_owned_wildcard_and_ipv6_listeners(self):
+        for host in ('0.0.0.0', '::', '::1'):
+            with self.subTest(host=host):
+                r = self.run_cli('verify', 'a.qnt', FAKE_BIND_HOST=host)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn('listener is not IPv4 loopback', r.stderr)
+                self.assertEqual(r.stdout, '')
+                self.server_stopped()
 
     def test_override_wins_over_brew_and_ambient_java_home(self):
         custom = self.root / "custom jdk"
@@ -483,7 +612,7 @@ sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
 
     def test_readiness_requires_owned_ipv4_loopback_listener(self):
         self.wrapper.write_text(self.wrapper.read_text().replace(
-            'time.monotonic() + 30', 'time.monotonic() + .3'))
+            'time.monotonic() + 30', 'time.monotonic() + .3').replace("if sys.platform.startswith('linux'):", 'if False:'))
         lsof = self.root / 'fake-tools/lsof'
         self.script(lsof, """#!/usr/bin/python3
 import os, sys

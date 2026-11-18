@@ -7,6 +7,7 @@ tests/test_node_version.py).
 import json
 import re
 import shlex
+from collections import Counter
 from pathlib import Path
 
 TOP = 10**12
@@ -479,7 +480,17 @@ def _ci_values(text):
     return entries
 
 
-def _ci_want(root):
+def _major_ranges(ranges):
+    merged = []
+    for lo, hi in sorted((lo // 1_000_000, (hi - 1) // 1_000_000 + 1) for lo, hi in ranges):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _ci_want(root, *, within=None):
     signals = []
     workflows = root / '.github/workflows'
     for path in sorted([*workflows.glob('*.yml'), *workflows.glob('*.yaml')]):
@@ -495,30 +506,66 @@ def _ci_want(root):
             if parsed:
                 ranges.extend(parsed)
                 versions.append(value)
+        if within is not None:
+            ranges = _isect(ranges, within)
         if ranges:
             signals.append((ranges, f"{path.relative_to(root).as_posix()} node-version {', '.join(dict.fromkeys(versions))}"))
     if not signals:
         return None
-    # Matrices remain a union; conflicting workflows use the one with the highest major.
-    majors = {max(lo for lo, _ in ranges) // 1_000_000 for ranges, _ in signals}
-    if len(majors) > 1:
-        highest = max(majors)
-        signals = [(ranges, label) for ranges, label in signals
-                   if max(lo for lo, _ in ranges) // 1_000_000 == highest]
-        suffix = f'; workflows disagree, highest major {highest}'
-    else:
-        suffix = ''
+    # Agreeing matrices remain unions; each workflow votes once per supported major.
+    candidates = {major for ranges, _ in signals for lo, hi in ranges
+                  for major in ([lo // 1_000_000, (hi - 1) // 1_000_000]
+                                if hi != TOP else [lo // 1_000_000])}
+    support = [{major for major in candidates
+                if _isect(ranges, [(_key(major), _key(major + 1))])}
+               for ranges, _ in signals]
+    majors = Counter(major for choices in support for major in choices)
+    coverage = [_major_ranges(ranges) for ranges, _ in signals]
+    minority = ''
+    if any(major_ranges != coverage[0] for major_ranges in coverage[1:]):
+        chosen = max(majors, key=lambda major: (majors[major], major))
+        excluded = Counter(max(choices) for choices in support if chosen not in choices)
+        signals = [(_isect(ranges, [(_key(chosen), _key(chosen + 1))]), label)
+                   for (ranges, label), choices in zip(signals, support) if chosen in choices]
+        minority = '; ' + ', '.join(f'{count} workflow{"s" if count != 1 else ""} '
+                                   f'{"use" if count != 1 else "uses"} {major}'
+                                   for major, count in sorted(excluded.items())) if excluded else ''
     label = signals[0][1]
-    if len(signals) > 1:
-        label += f' (+{len(signals) - 1} workflows)'
-    return sorted({r for ranges, _ in signals for r in ranges}), label + suffix
+    if len(signals) > 1 or minority:
+        extra = f'+{len(signals) - 1} workflows' if len(signals) > 1 else ''
+        label += f' ({extra}{minority if extra else minority[2:]})'
+    return sorted({r for ranges, _ in signals for r in ranges}), label
+
+
+def _open_range(ranges):
+    """Whether the union admits more than one major (upper bounds are exclusive)."""
+    return bool(ranges) and (any(hi == TOP for _, hi in ranges) or
+                             min(lo for lo, _ in ranges) // 1_000_000 !=
+                             max(hi - 1 for _, hi in ranges) // 1_000_000)
+
+
+def _selection_label(ranges, label):
+    return label + ('; open range, newest on this box' if _open_range(ranges) else '')
 
 
 def want(root: Path, cwd: Path):
     """(ranges, label) for the repo at root as seen from cwd, or None. Never raises."""
     try:
         root = Path(root)
-        return _want(root, Path(cwd)) or _ci_want(root)
+        pin = _want(root, Path(cwd))
+        if pin is None:
+            return _ci_want(root)
+        ranges, label = pin
+        if _open_range(ranges):
+            try:
+                ci = _ci_want(root, within=ranges)
+            except Exception:
+                return pin
+            if ci is not None:
+                narrowed = _isect(ranges, ci[0])
+                if narrowed:
+                    return narrowed, f'{label}, narrowed by {ci[1]}'
+        return pin
     except Exception:
         return None
 
@@ -528,6 +575,7 @@ def block(w, *, require_nvm=False) -> str:
     if w is None:
         return NO_PIN_BLOCK
     ranges, label = w
+    label = _selection_label(ranges, label)
     rng = " ".join(f"{lo} {hi}" for lo, hi in ranges)
     return toolchain.SHELL + f"__offbox_require_nvm={int(require_nvm)}\n" + (BLOCK.replace("@RANGES@", rng)
             .replace("@WANT@", shlex.quote(label)))

@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).with_name('fixtures')
 DAY = '2026-11-12'
 NEW_FIELDS = ('errorsByComponent', 'failureShare', 'topErrorSamplesByComponent',
-              'topOrderFailuresByComponent', 'pollsByMerchant')
+              'topOrderFailuresByComponent', 'pollsByMerchant', 'canReportByOutcome')
 
 
 def load(label, path):
@@ -70,11 +70,21 @@ class OrdersRollupTests(unittest.TestCase):
                 baseline_bytes = (FIXTURES / ('orders-components-' + label + '-legacy.json')).read_bytes()
                 baseline = json.loads(baseline_bytes)
                 legacy = {key: result[key] for key in baseline}
-                legacy['durationsMs'] = {key: result['durationsMs'][key]
-                                         for key in baseline['durationsMs']}
+                legacy['durationsMs'] = {}
+                for name, stats in baseline['durationsMs'].items():
+                    actual = result['durationsMs'][name]
+                    expected = dict(stats)
+                    if reader is not SHARED and name.startswith('provider.'):
+                        expected['byCaller'] = {'other': {'count': 4, **stats}}
+                    self.assertEqual(actual, expected)
+                    legacy['durationsMs'][name] = {
+                        key: value for key, value in actual.items() if key in stats}
                 self.assertEqual((json.dumps(legacy, separators=(',', ':')) + '\n').encode(),
                                  baseline_bytes)
-                self.assertEqual(set(result) - set(baseline), set(NEW_FIELDS))
+                self.assertEqual(set(result) - set(baseline),
+                                 set(NEW_FIELDS) | ({'countsByCaller'} if reader is not SHARED else set()))
+                if reader is not SHARED:
+                    self.assertEqual(result['countsByCaller'], {'other': 4})
                 self.assertEqual(result['errorsByComponent'], {
                     'noon': {'OPERATION_FAILED': 1}, 'careem': {'OPERATION_FAILED': 1},
                     'amazon': {'TRACK_POLL_SOURCE_ERROR': 1}})
@@ -84,14 +94,33 @@ class OrdersRollupTests(unittest.TestCase):
                     ('careem', 'provider.track', (100, 200, 200, 2)),
                     ('amazon', 'track.poll', (2000, 3000, 3000, 3)),
                 ]:
-                    self.assertEqual(result['durationsMs'][component + ':' + name],
-                                     dict(zip(('p50', 'p95', 'max', 'count'), timings)))
+                    expected = dict(zip(('p50', 'p95', 'max', 'count'), timings))
+                    if reader is not SHARED and name.startswith('provider.'):
+                        expected['byCaller'] = {'other': dict(expected)}
+                    self.assertEqual(result['durationsMs'][component + ':' + name], expected)
                 for component, line in [('noon', 2), ('careem', 4), ('amazon', 7)]:
                     sample, = result['topErrorSamplesByComponent'][component]
                     self.assertEqual(sample['sampleId'], {'file': DAY + '.ndjson', 'line': line})
                 serialized = json.dumps(result)
                 for private in ('private-order', 'private-address', 'private-card', 'private-message'):
                     self.assertNotIn(private, serialized)
+
+    def test_can_report_counts_and_outcomes_in_every_reader(self):
+        self.write([{'ts': DAY + 'T12:00:00Z', 'tool': 'orders', 'component': 'order-watch',
+                     'name': 'order_watch.can_report', 'kind': 'event', 'ok': ok,
+                     'props': {'outcome': 'success' if ok else 'refused',
+                               'refusal': 'none' if ok else 'not_registered',
+                               'untrackable': False, 'eta_given': ok}}
+                    for ok in (True, False, False)])
+        for reader in READERS:
+            with self.subTest(reader=reader.__name__):
+                result = self.rollup(reader)
+                self.assertEqual(result['countsByName'], {'order_watch.can_report': 3})
+                self.assertEqual(result['canReportByOutcome'], {'success': 1, 'refused': 2})
+                self.assertEqual(result['total'], 3)
+                self.assertEqual(result['okRate'], 1 / 3)
+                if reader is not SHARED:
+                    self.assertEqual(result['invalidLines'], 0)
 
     def test_shared_sampling_weights_apply_to_component_denominators_and_timings(self):
         rows = self.fixture()
@@ -154,16 +183,35 @@ class OrdersRollupTests(unittest.TestCase):
                 self.assertEqual(result['errorsByComponent'], {
                     'noon': {'OPERATION_FAILED': 1}, 'careem': {}, 'amazon': {}})
                 self.assertEqual(result['topErrorSamplesByComponent']['careem'], [])
-                self.assertEqual(result['durationsMs']['noon:provider.track'],
-                                 {'p50': 0, 'p95': 0, 'max': 0, 'count': 1})
+                expected = {'p50': 0, 'p95': 0, 'max': 0, 'count': 1}
+                if reader is not SHARED:
+                    expected['byCaller'] = {'other': dict(expected)}
+                self.assertEqual(result['durationsMs']['noon:provider.track'], expected)
                 self.assertNotIn('careem:provider.track', result['durationsMs'])
                 self.assertNotIn('amazon:track.poll', result['durationsMs'])
+
+    def test_provider_durations_split_money_cases_from_other(self):
+        rows = self.fixture()[:2]
+        rows[0]['props']['caller'] = 'money-cases'
+        self.write(rows)
+        for reader in (AUTOMATIC, MONEY):
+            with self.subTest(reader=reader.__name__):
+                result = self.rollup(reader)
+                expected = {
+                    'p50': 10, 'p95': 20, 'max': 20, 'count': 2,
+                    'byCaller': {
+                        'money-cases': {'count': 1, 'p50': 10, 'p95': 10, 'max': 10},
+                        'other': {'count': 1, 'p50': 20, 'p95': 20, 'max': 20}}}
+                self.assertEqual(result['durationsMs']['noon:provider.track'], expected)
+                self.assertEqual(result['durationsMs']['provider.track'],
+                                 {key: value for key, value in expected.items() if key != 'count'})
+                self.assertEqual(result['countsByCaller'], {'money-cases': 1, 'other': 1})
 
     def test_empty_day_has_empty_component_maps(self):
         for reader in READERS:
             result = self.rollup(reader)
             for key in NEW_FIELDS:
-                self.assertEqual(result[key], {})
+                self.assertEqual(result[key], {'success': 0, 'refused': 0} if key == 'canReportByOutcome' else {})
 
     def test_per_order_failure_top_five_and_amazon_poll_share_do_not_duplicate_errors(self):
         def row(order, *, component='order-watch', name='track.poll', ok=False, **props):
@@ -234,6 +282,21 @@ class OrdersRollupTests(unittest.TestCase):
     def test_portable_logger_copies_remain_identical(self):
         self.assertEqual((ROOT / 'app-api-cli/toollog.py').read_bytes(),
                          (ROOT / 'robob-watch/checks/money-cases/toollog.py').read_bytes())
+
+    def test_card_fill_component_and_errors_survive_every_reader(self):
+        rows = [dict(ts=DAY + 'T12:00:00Z', tool='orders', component='card-vault-fill',
+                     name='card.fill', kind='error', ok=False, durationMs=12,
+                     error={'tag': code}, props={'route': 'phone', 'field': 'card_cvc', 'outcome': 'failure'})
+                for code in ('CARD_FILL_TARGET_REQUIRED', 'CARD_FILL_NO_FOCUS', 'CARD_FILL_FAILED')]
+        self.write(rows)
+        for reader in READERS:
+            with self.subTest(reader=reader.__name__):
+                result = self.rollup(reader)
+                self.assertEqual(result['errorsByComponent']['card-vault-fill'],
+                                 {row['error']['tag']: 1 for row in rows})
+                self.assertEqual(result['failureShare']['card-vault-fill'], 1)
+                self.assertEqual(result['durationsMs']['card-vault-fill:card.fill'],
+                                 {'p50': 12, 'p95': 12, 'max': 12, 'count': 3})
 
 
 if __name__ == '__main__':

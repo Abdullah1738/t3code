@@ -1,9 +1,11 @@
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
+import * as Tracer from "effect/Tracer";
 import { SqlError, classifySqliteError } from "effect/sql/SqlError";
 import type { Connection } from "effect/sql/SqlConnection";
 
@@ -20,6 +22,18 @@ import type { Connection } from "effect/sql/SqlConnection";
  *   ahead of interactive work.
  */
 export type ReaderLaneName = "auth" | "identity" | "foreground" | "background";
+
+export interface ReaderContention {
+  readonly lane: ReaderLaneName;
+  readonly slot: number;
+  readonly holder: string;
+  readonly holdMs: number;
+}
+
+/** Reports only lease time overlapping this caller's slot wait, without SQL or bindings. */
+export const ReaderContentionObserver = Context.Reference<
+  ((sample: ReaderContention) => void) | undefined
+>("@t3tools/shared/nodeSqliteClient/ReaderContentionObserver", { defaultValue: () => undefined });
 
 export const ReaderLane = Context.Reference<ReaderLaneName>(
   "@t3tools/shared/nodeSqliteClient/ReaderLane",
@@ -77,6 +91,13 @@ export interface ReaderPoolSlot {
   readonly lock: ReaderSlotLock;
   readonly lane: "foreground" | "background";
   readonly slot: number;
+  readonly snapshot: () => ReaderPoolSnapshot;
+}
+
+export interface ReaderPoolSnapshot {
+  readonly queueDepth: number;
+  readonly oldestInFlightAgeMs: number | null;
+  readonly holder: string | null;
 }
 
 export interface ReaderPool {
@@ -99,6 +120,7 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
   readonly slots: ReadonlyArray<Effect.Effect<Connection | undefined>>;
   readonly queueLimit: number;
 }) {
+  const clock = yield* Clock.Clock;
   let inFlight = 0;
   // Reads between slot choice and permit request (awaiting their worker). Counted
   // for admission and slot choice so concurrent reads spread across slots and a
@@ -111,6 +133,8 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
       semaphore,
       load: 0,
       acquiring: 0,
+      holder: undefined as { started: bigint; span: Tracer.AnySpan | undefined } | undefined,
+      observers: new Map<(sample: ReaderContention) => void, bigint>(),
     })),
   );
   type Entry = (typeof entries)[number];
@@ -125,21 +149,125 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
     inFlight--;
     entry.load--;
   };
+  const beginHold = (entry: Entry) =>
+    Effect.withFiber((fiber) =>
+      Effect.sync(() => {
+        entry.holder = {
+          started: fiber.getRef(Clock.Clock).monotonicTimeNanosUnsafe(),
+          span: Context.getOrUndefined(fiber.context, Tracer.ParentSpan),
+        };
+      }),
+    );
+  const holderName = (held: NonNullable<Entry["holder"]>) => {
+    let span = held.span;
+    for (let depth = 0; span?._tag === "Span" && depth < 32; depth++) {
+      if (span.name !== "sqlite" && span.name !== "sql.transaction") break;
+      span = Option.getOrUndefined(span.parent);
+    }
+    return span?._tag === "Span" && /^[a-zA-Z0-9_.:/#@%+-]{1,160}$/.test(span.name)
+      ? span.name
+      : "database";
+  };
+  const snapshot = (entry: Entry): ReaderPoolSnapshot => {
+    const holders = entries.flatMap((slot) => (slot.holder ? [slot.holder] : []));
+    const oldest = holders.reduce<bigint | undefined>(
+      (oldest, held) => (oldest === undefined || held.started < oldest ? held.started : oldest),
+      undefined,
+    );
+    return {
+      queueDepth: Math.max(0, inFlight + acquiring - holders.length),
+      oldestInFlightAgeMs:
+        oldest === undefined
+          ? null
+          : Math.max(0, Number(clock.monotonicTimeNanosUnsafe() - oldest) / 1e6),
+      holder: entry.holder ? holderName(entry.holder) : null,
+    };
+  };
+  const notify = (
+    entry: Entry,
+    holder: string,
+    heldSince: bigint,
+    ended: bigint,
+    observer: (sample: ReaderContention) => void,
+    waitingSince: bigint,
+  ) => {
+    try {
+      observer({
+        lane: options.lane,
+        slot: entry.slot,
+        holder,
+        holdMs: Math.max(
+          0,
+          Number(ended - (heldSince > waitingSince ? heldSince : waitingSince)) / 1e6,
+        ),
+      });
+    } catch {
+      // A diagnostic callback cannot prevent the slot from being released.
+    }
+  };
+  const endHold = (entry: Entry) =>
+    Effect.withFiber((fiber) =>
+      Effect.sync(() => {
+        const held = entry.holder;
+        entry.holder = undefined;
+        if (held === undefined || entry.observers.size === 0) return;
+        const holder = holderName(held);
+        const ended = fiber.getRef(Clock.Clock).monotonicTimeNanosUnsafe();
+        for (const [observer, waitingSince] of entry.observers)
+          notify(entry, holder, held.started, ended, observer, waitingSince);
+      }),
+    );
+  const waiting = <A, E, R>(entry: Entry, use: (admitted: () => void) => Effect.Effect<A, E, R>) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.withFiber((fiber) => {
+        const observer = fiber.getRef(ReaderContentionObserver);
+        // Each wait gets its own key, including parallel waits in the same request.
+        const callback =
+          observer === undefined ? undefined : (sample: ReaderContention) => observer(sample);
+        const clock = fiber.getRef(Clock.Clock);
+        const started = clock.monotonicTimeNanosUnsafe();
+        if (callback) entry.observers.set(callback, started);
+        const admitted = () => {
+          if (!callback || !entry.observers.delete(callback)) return;
+          // A cancelled waiter still sees the portion of an ongoing lease it waited behind.
+          const held = entry.holder;
+          if (held)
+            notify(
+              entry,
+              holderName(held),
+              held.started,
+              clock.monotonicTimeNanosUnsafe(),
+              callback,
+              started,
+            );
+        };
+        // Cancellation may arrive at a scheduler yield immediately after registration.
+        return restore(use(admitted)).pipe(Effect.ensuring(Effect.sync(admitted)));
+      }),
+    );
   const lockFor = (entry: Entry): ReaderSlotLock => ({
     take: (permits) =>
       Effect.suspend(() => {
         const refused = admit(entry);
         if (refused !== undefined) return Effect.fail(refused);
-        return entry.semaphore
-          .take(permits)
-          .pipe(
-            Effect.onExit((exit) =>
-              Exit.isSuccess(exit) ? Effect.void : Effect.sync(() => leave(entry)),
-            ),
-          );
+        return waiting(entry, (admitted) =>
+          entry.semaphore.take(permits).pipe(
+            Effect.tap(() => {
+              admitted();
+              return beginHold(entry);
+            }),
+          ),
+        ).pipe(
+          Effect.onExit((exit) =>
+            Exit.isSuccess(exit) ? Effect.void : Effect.sync(() => leave(entry)),
+          ),
+        );
       }),
     release: (permits) =>
-      entry.semaphore.release(permits).pipe(Effect.ensuring(Effect.sync(() => leave(entry)))),
+      endHold(entry).pipe(
+        Effect.andThen(entry.semaphore.release(permits)),
+        Effect.ensuring(Effect.sync(() => leave(entry))),
+      ),
     withPermits:
       (permits) =>
       <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -147,9 +275,17 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
           const refused = admit(entry);
           if (refused !== undefined) return Effect.fail(refused);
           // Semaphore's own atomic acquire/finalizer handoff; the count covers waiting and running.
-          return entry.semaphore
-            .withPermits(permits)(effect)
-            .pipe(Effect.ensuring(Effect.sync(() => leave(entry))));
+          return waiting(entry, (admitted) =>
+            entry.semaphore.withPermits(permits)(
+              Effect.suspend(() => {
+                admitted();
+                return beginHold(entry).pipe(
+                  Effect.andThen(effect),
+                  Effect.ensuring(endHold(entry)),
+                );
+              }),
+            ),
+          ).pipe(Effect.ensuring(Effect.sync(() => leave(entry))));
         }),
     withPermitsIfAvailable:
       (permits) =>
@@ -158,7 +294,11 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
           Effect.suspend(() => {
             inFlight++;
             entry.load++;
-            return effect.pipe(Effect.ensuring(Effect.sync(() => leave(entry))));
+            return beginHold(entry).pipe(
+              Effect.andThen(effect),
+              Effect.ensuring(endHold(entry)),
+              Effect.ensuring(Effect.sync(() => leave(entry))),
+            );
           }),
         ),
   });
@@ -187,7 +327,13 @@ export const makeReaderPool = Effect.fnUntraced(function* (options: {
       Effect.map((connection) =>
         connection === undefined
           ? undefined
-          : { connection, lock: locks[entry.slot]!, lane: options.lane, slot: entry.slot },
+          : {
+              connection,
+              lock: locks[entry.slot]!,
+              lane: options.lane,
+              slot: entry.slot,
+              snapshot: () => snapshot(entry),
+            },
       ),
     );
   });

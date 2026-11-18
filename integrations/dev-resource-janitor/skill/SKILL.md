@@ -44,8 +44,24 @@ Keep list (one id, name or cwd per line): `~/.config/opencode/dev-janitor-keep.t
 - Robob's active set is two complete control-API queries, unioned by threadId: every non-idle thread (`active=true`), and provider-native children updated in the last 48 h (`creationSource=provider`), including runless children that appear idle during native work. The active query already covers non-terminal MCP-delegated tasks, so completed task history is excluded. Both queries follow `nextCursor` and perform one paginated catch-up from five seconds before the walk started. If either read is incomplete or fails, everything is kept. Settled history is checked separately.
 - keep file
 
-Liveness failure is recorded as `liveness_unavailable` with its cause. Active
-OpenCode ids resolve directories through `GET /api/session/:id`; native threads
+Liveness failure is recorded as `liveness_unavailable` with its cause.
+OpenCode directory reads retry transport timeouts/connection errors up to three
+times (2 s, then 5 s backoff), within a 300 s overall lookup deadline. The hourly
+scan retains one attempt per id and its 20 s request timeout. The daily reaper
+uses 45 s requests and retries the entire liveness step once after 60 s, reading
+a fresh roster. This also applies immediately before removal. An unresolved id,
+HTTP error (including 404), malformed response or incomplete roster keeps everything;
+partial directory maps never authorize removal. Directory failure reasons name the
+first eight id characters, cause, attempt count and elapsed seconds.
+
+Reaper status includes `liveness` on success and failure: `attempts` counts directory
+HTTP requests across liveness steps and pre-removal checks; `opencode_ids` and
+`resolved` describe the latest lookup; `seconds` totals liveness time including
+roster reads and backoff; `per_id_max_s` is the longest id lookup including retries;
+`retried_step` records a whole-step retry and `last_error` retains the latest error
+even after recovery. `load_avg.start` and `.end` contain the 1/5/15-minute load averages.
+
+Active OpenCode ids resolve directories through `GET /api/session/:id`; native threads
 use their worktree or project workspace. No roster absence proves an ended owner.
 
 ## Scheduled agent flow
@@ -148,7 +164,7 @@ cover its own newest-page total with unique ids; a main row may have an old path
 and new ids can hide a missed row in the union. Either gap retries the listing
 once from scratch with a new catch-up window. A remaining gap fails with
 `short by N after retry` or `catch-up short by N after retry`. A page failure, malformed row/cursor, missing cursor
-after page one, repeated cursor, more than 400 requests, or a 180-second traversal
+after page one, repeated cursor, more than 400 requests, or a 300-second traversal
 deadline keeps that repository report-only with `activity_history_unavailable` and its exact
 reason. The request budget and deadline cover both attempts, including catch-up;
 per-page timeouts are unchanged. Older servers without `nextCursor` on page one

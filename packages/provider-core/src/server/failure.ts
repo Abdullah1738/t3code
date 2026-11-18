@@ -36,6 +36,34 @@ export class ContextHandoffBackgroundWorkError extends Schema.TaggedError<Contex
   }
 }
 
+const CLAUDE_STARTUP_STAGES = {
+  turn_preparation: "turn preparation",
+  skill_discovery: "skill discovery",
+  attachments: "attachment preparation",
+  sdk_open: "SDK session setup",
+  mcp_registration: "MCP registration",
+} as const;
+
+export class ClaudeTurnPreparationTimeoutError extends Schema.TaggedError<ClaudeTurnPreparationTimeoutError>()(
+  "ClaudeTurnPreparationTimeoutError",
+  {
+    stage: Schema.Literals([
+      "turn_preparation",
+      "skill_discovery",
+      "attachments",
+      "sdk_open",
+      "mcp_registration",
+    ]),
+    cause: Schema.Defect(),
+  },
+) {
+  override get message() {
+    return `Claude did not start within 15 s (${CLAUDE_STARTUP_STAGES[this.stage]}); nothing was sent to the model. Retry is safe.`;
+  }
+}
+
+export const isClaudeTurnPreparationTimeoutError = Schema.is(ClaudeTurnPreparationTimeoutError);
+
 export const MAX_PROVIDER_FAILURE_MESSAGE_LENGTH = 4_096;
 export const MAX_PROVIDER_FAILURE_CODE_LENGTH = 128;
 
@@ -84,6 +112,10 @@ function causeMessage(cause: unknown): string | undefined {
       if (typeof cause !== "object") break;
       const tag = (cause as Record<string, unknown>)._tag;
       switch (tag) {
+        case "ClaudeTurnPreparationTimeoutError":
+          if (isClaudeTurnPreparationTimeoutError(cause))
+            return new ClaudeTurnPreparationTimeoutError(cause).message;
+          break;
         case "ContextHandoffBudgetError":
           return new ContextHandoffBudgetError().message;
         case "ContextHandoffBackgroundWorkError":
@@ -317,12 +349,15 @@ export function withPreviousFailure(
 ): OrchestrationV2ProviderFailure {
   if (previous === undefined || failure.message.startsWith("Automatic resume failed."))
     return failure;
-  return makeProviderFailure({
-    ...failure,
-    category: failure.category ?? "unknown",
-    resetAt: failure.resetAt ?? null,
-    message: `Automatic resume failed. First error: ${previous.message.slice(0, 1500)} Resume error: ${failure.message.slice(0, 1500)} Files may be partly written.`,
-  });
+  return {
+    ...makeProviderFailure({
+      ...failure,
+      category: failure.category ?? "unknown",
+      resetAt: failure.resetAt ?? null,
+      message: `Automatic resume failed. First error: ${previous.message.slice(0, 1500)} Resume error: ${failure.message.slice(0, 1500)} Files may be partly written.`,
+    }),
+    ...(failure.claudeApiError === undefined ? {} : { claudeApiError: failure.claudeApiError }),
+  };
 }
 
 export function makeProviderFailureTurnItem(input: {

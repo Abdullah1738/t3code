@@ -4,6 +4,7 @@
 #   install.zsh [--dry-run]         sync skill, gate plugin, boat wrapper, offbox link, both LaunchAgents
 #   install.zsh --check             exit 1 if the live copy differs from this tree or HEAD is not on origin
 #   install.zsh --allow-unpushed    install even with uncommitted or unpushed offbox changes (testing only)
+#   install.zsh --allow-reload      allow watched writes while OpenCode sessions are busy
 #
 # Commit and push first: the live copy must always be a commit on origin/main.
 set -eu
@@ -11,6 +12,9 @@ set -eu
 here="${0:A:h}"
 repo="$(git -C "$here" rev-parse --show-toplevel)"
 prefix="${here#$repo/}"
+reload_helper="$repo/integrations/local-helpers/libexec/opencode-reload/opencode_reload.py"
+reload_sources=(integrations/local-helpers/libexec/opencode-reload integrations/local-helpers/libexec/toollog)
+quint_source="$repo/integrations/local-helpers/bin/quint"
 skill="$HOME/.config/opencode/skills/remote-compute"
 plugin="$HOME/.config/opencode/plugin/offbox-gate.ts"
 boat="$HOME/.local/bin/boat"
@@ -20,24 +24,29 @@ plist="$HOME/Library/LaunchAgents/$label.plist"
 # Home server health monitor: a one-shot every minute, beside the load monitor (README: "Two monitors").
 home_label="com.ardud.offbox-home-monitor"
 home_plist="$HOME/Library/LaunchAgents/$home_label.plist"
-excludes=(--exclude __pycache__ --exclude '*.pyc' --exclude '*.bak*' --exclude tmp --exclude .DS_Store)
+excludes=(--exclude __pycache__ --exclude '*.pyc' --exclude '*.bak*' --exclude tmp --exclude .DS_Store --exclude /tools/)
 
 mode=install
 dry=()
 allow=0
+reload_flags=()
 for arg in "$@"; do
   case "$arg" in
-    --dry-run) dry=(--dry-run) ;;
-    --check) mode=check ;;
+    --check|--dry-run)
+      [[ $mode == install ]] || { print -u2 'choose --check or --dry-run'; exit 2 }
+      mode="${arg#--}"
+      [[ $mode != dry-run ]] || dry=(--dry-run)
+      ;;
     --allow-unpushed) allow=1 ;;
-    *) print -u2 "usage: install.zsh [--dry-run | --check | --allow-unpushed]"; exit 2 ;;
+    --allow-reload) reload_flags=(--allow-reload) ;;
+    *) print -u2 "usage: install.zsh [--dry-run | --check] [--allow-unpushed] [--allow-reload]"; exit 2 ;;
   esac
 done
 
 pushed() {
   local dirty head remote
-  dirty="$(git -C "$repo" status --porcelain -- "$prefix" | grep -v '__pycache__' || true)"
-  [[ -z "$dirty" ]] || { print -u2 "offbox: uncommitted changes under $prefix:"; print -u2 -r -- "$dirty"; return 1 }
+  dirty="$(git -C "$repo" status --porcelain -- "$prefix" "${reload_sources[@]}" integrations/local-helpers/bin/quint | grep -v '__pycache__' || true)"
+  [[ -z "$dirty" ]] || { print -u2 "offbox: uncommitted changes under $prefix or installer dependencies:"; print -u2 -r -- "$dirty"; return 1 }
   head="$(git -C "$repo" rev-parse HEAD)"
   remote="$(git -C "$repo" ls-remote origin refs/heads/main | cut -f1)"
   [[ -n "$remote" ]] || { print -u2 "offbox: cannot read origin/main"; return 1 }
@@ -47,15 +56,31 @@ pushed() {
   fi
 }
 
+# Fail on missing late inputs before the watched batch can replace anything.
+[[ -d "$here/skill" ]] || { print -u2 "offbox: missing source directory: $here/skill"; exit 1 }
+for src in "$here"/skill/**/*(DN.) "$here/lib/toollog.ts" "$here/plugin/offbox-gate.ts" "$here/bin/boat" \
+           "$here/launchd/$label.plist" "$here/launchd/$home_label.plist" "$quint_source" \
+           "$reload_helper" "$repo/integrations/local-helpers/libexec/toollog/toollog.py"; do
+  [[ -f "$src" && -r "$src" ]] || { print -u2 "offbox: missing or unreadable source: $src"; exit 1 }
+done
+
 if [[ $mode == check ]]; then
   rc=0
   pushed || rc=1
   # Content and modes only: mtimes differ after every install and mean nothing here.
-  out="$(rsync -rlp --checksum --dry-run --delete --itemize-changes "${excludes[@]}" "$here/skill/" "$skill/")"
-  [[ -z "$out" ]] || { print -u2 "offbox: live skill differs from the repo:"; print -u2 -r -- "$out"; rc=1 }
+  if [[ ! -d "$skill" ]]; then
+    print -u2 "offbox: skill not installed: $skill"
+    rc=1
+  elif out="$(rsync -rlp --checksum --dry-run --delete --itemize-changes "${excludes[@]}" "$here/skill/" "$skill/")"; then
+    [[ -z "$out" ]] || { print -u2 "offbox: live skill differs from the repo:"; print -u2 -r -- "$out"; rc=1 }
+  else
+    print -u2 "offbox: could not compare the installed skill"
+    rc=1
+  fi
   cmp -s "$here/lib/toollog.ts" "$HOME/.config/opencode/lib/toollog.ts" || { print -u2 "offbox: toollog helper differs"; rc=1 }
   cmp -s "$here/plugin/offbox-gate.ts" "$plugin" || { print -u2 "offbox: $plugin differs"; rc=1 }
   cmp -s "$here/bin/boat" "$boat" || { print -u2 "offbox: $boat differs"; rc=1 }
+  cmp -s "$quint_source" "$skill/tools/quint" || { print -u2 "offbox: guarded Quint wrapper differs"; rc=1 }
   cmp -s "$here/launchd/$label.plist" "$plist" || { print -u2 "offbox: $plist differs"; rc=1 }
   cmp -s "$here/launchd/$home_label.plist" "$home_plist" || { print -u2 "offbox: $home_plist differs"; rc=1 }
   [[ "$(readlink "$link" 2>/dev/null)" == "$skill/scripts/offbox.py" ]] || { print -u2 "offbox: $link is not a link to the skill"; rc=1 }
@@ -65,15 +90,28 @@ if [[ $mode == check ]]; then
   exit $rc
 fi
 
-if ! pushed; then
+if [[ $mode == install ]] && ! pushed; then
   (( allow )) || { print -u2 "offbox: refusing to install. Commit and push, or pass --allow-unpushed for a test install."; exit 1 }
   print -u2 "offbox: installing unpushed changes (--allow-unpushed); commit and push before you finish"
 fi
 
+python3 -B "$reload_helper" --installer offbox "${reload_flags[@]}" "${dry[@]}" \
+  --pair "$here/lib/toollog.ts" "$HOME/.config/opencode/lib/toollog.ts" \
+  --pair "$here/plugin/offbox-gate.ts" "$plugin"
+
 # --delete keeps removed files from lingering; excluded files (tmp/, .bak, caches) on the live side are kept.
-rsync -a --delete --itemize-changes "${dry[@]}" "${excludes[@]}" "$here/skill/" "$skill/"
+(( ${#dry} )) || mkdir -p "${skill:h}"
+if (( ${#dry} )) && [[ ! -d "${skill:h}" ]]; then
+  print "sync $skill"
+else
+  rsync -a --delete --itemize-changes "${dry[@]}" "${excludes[@]}" "$here/skill/" "$skill/"
+fi
+if (( ! ${#dry} )); then
+  mkdir -p "$skill/tools"
+  cp -p "$quint_source" "$skill/tools/quint"
+fi
 home_plist_changed=0
-for pair in "lib/toollog.ts:$HOME/.config/opencode/lib/toollog.ts" "plugin/offbox-gate.ts:$plugin" "bin/boat:$boat" "launchd/$label.plist:$plist" \
+for pair in "bin/boat:$boat" "launchd/$label.plist:$plist" \
             "launchd/$home_label.plist:$home_plist"; do
   src="$here/${pair%%:*}"
   dst="${pair#*:}"
@@ -118,4 +156,3 @@ else
   launchctl kickstart "gui/$(id -u)/$home_label"
 fi
 print "offbox: installed $(git -C "$repo" rev-parse --short HEAD); monitor restarted, home monitor loaded."
-print "The gate plugin loads when OpenCode starts: a plugin change needs an OpenCode restart (ask Abdullah first)."

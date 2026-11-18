@@ -215,7 +215,7 @@ class JavaActivation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, sqlite3.connect(':memory:') as con:
             root = Path(tmp); path = root / 'run.log'; path.write_text(result.stderr)
             con.executescript('CREATE TABLE events(ts REAL,box_id TEXT,kind TEXT,detail TEXT); CREATE TABLE kv(k TEXT PRIMARY KEY,v TEXT);')
-            with patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(root / 'events')):
+            with patch.dict(os.environ, OFFBOX_LOG_DIR=str(root / 'events')):
                 java_version.record(con, dict(run_id='run-fail', box_id='bx_test'), path, 'boat')
             events = [json.loads(line) for file in (root / 'events').glob('*.ndjson') for line in file.read_text().splitlines()]
             self.assertEqual(len(events), 3)

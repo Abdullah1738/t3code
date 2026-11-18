@@ -1,3 +1,4 @@
+import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentId, ThreadId, MessageId, TurnItemId } from "@t3tools/contracts";
@@ -186,7 +187,12 @@ it.effect.each(["same caller", "different callers"] as const)(
               ["caller", "shell", "records", "timeline", "messages", "acknowledgement"],
             );
         }).pipe(
-          Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))),
+          Effect.provide(
+            OrchestratorMcpService.layer.pipe(
+              Layer.provide(McpProviderSessions.layer),
+              Layer.provide(dependencies),
+            ),
+          ),
           Effect.ensuring(Deferred.succeed(release, undefined)),
         );
         yield* Fiber.join(background);

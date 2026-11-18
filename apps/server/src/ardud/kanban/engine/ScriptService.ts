@@ -357,7 +357,9 @@ const make = Effect.gen(function* () {
       return `There's no ${command.model}${namedLevel ? ` ${namedLevel}` : ""} pool on this board.`;
     }
     const resized = yield* Effect.result(
-      service.setPool(script.boardId, pool.model, command.slots),
+      service.setPool(script.boardId, pool.model, command.slots, {
+        actor: { actorKind: "script", actorId: encodeURIComponent(script.name) },
+      }),
     );
     return Result.isSuccess(resized)
       ? `Set the ${command.model} pool to ${command.slots} ${command.slots === 1 ? "slot" : "slots"}.`

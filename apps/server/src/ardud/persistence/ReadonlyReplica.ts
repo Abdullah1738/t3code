@@ -1,5 +1,6 @@
 import { resolveHistoryBasePath } from "./historySourceFiles.ts";
 import { annotateSqliteError, ErrorObserver } from "@t3tools/shared/nodeSqliteErrors";
+import { StatementStats } from "@t3tools/shared/nodeSqliteClient";
 import * as NodeWorkerThreads from "node:worker_threads";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -192,6 +193,7 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
   options: SupervisorOptions = defaultSupervisorOptions,
 ): Effect.fn.Return<never, ReadonlyExportUnavailable> {
   const observer = yield* ErrorObserver;
+  const statementStats = yield* StatementStats;
   const clock = yield* Clock.Clock;
   const stallMs = Duration.toMillis(Duration.fromInputUnsafe(options.stallTimeout));
   let lastBeat = clock.currentTimeMillisUnsafe();
@@ -284,6 +286,13 @@ export const superviseExportWorker = Effect.fn("ReadonlyReplica.superviseExportW
           if (message?.type === "rebuild") rebuildEvents.push(message.rebuild);
           if (message?.type === "diagnostic") diagnosticEvents.push(message.diagnostic);
           if (message?.type === "metrics") {
+            for (const completion of message.metrics.statements ?? []) {
+              try {
+                statementStats?.(completion);
+              } catch {
+                /* Observation cannot stop export. */
+              }
+            }
             for (const [cause, count] of Object.entries(message.metrics.lineageRepairCounts))
               metrics.lineageRepairCounts[cause] =
                 (metrics.lineageRepairCounts[cause] ?? 0) + count;

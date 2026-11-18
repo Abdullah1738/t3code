@@ -1,9 +1,13 @@
 import { assert, it } from "@effect/vitest";
 import {
   NodeId,
+  MessageId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderThreadId,
+  ProviderTurnId,
+  RunId,
   ThreadId,
   type OrchestrationV2ExecutionNode,
 } from "@t3tools/contracts";
@@ -19,6 +23,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as EventSink from "./EventSink.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
@@ -158,4 +163,119 @@ it.effect("gives up once the reader stays gone past the retry budget", () =>
     assert.isTrue(Exit.isFailure(exit));
     assert.equal(yield* Ref.get(writes), 0);
   }),
+);
+
+it.effect.each([
+  { delegated: false, transient: true },
+  { delegated: true, transient: true },
+  { delegated: false, transient: false },
+  { delegated: true, transient: false },
+])(
+  "#1711 retries acknowledgement lookup before persistence (delegated=$delegated transient=$transient)",
+  ({ delegated, transient }) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const runId = RunId.make("run:ack-read");
+      const nodeId = NodeId.make("node:ack-read");
+      const messageId = MessageId.make("message:ack-read");
+      let reads = 0;
+      let writes = 0;
+      const effects: EffectOutbox.PendingOrchestrationEffectV2[] = [];
+      const write = (payload: Parameters<EventSink.EventSinkV2Shape["write"]>[0]) =>
+        Effect.sync(() => {
+          writes += payload.events.length;
+          return [];
+        });
+      const layer = ProviderEventIngestor.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getRunMessage: () =>
+                Effect.suspend(() => {
+                  if (reads++ === 0)
+                    return Effect.fail(
+                      new ProjectionStore.ProjectionStoreReadError({
+                        threadId,
+                        cause: readFailure(
+                          transient ? "Reader lane unavailable" : "no such column: x",
+                        ),
+                      }),
+                    );
+                  return Effect.succeed({
+                    id: messageId,
+                    threadId,
+                    runId,
+                    nodeId,
+                    role: "user" as const,
+                    text: "Task finished",
+                    phase: "unknown" as const,
+                    attachments: [],
+                    streaming: false,
+                    createdBy: "agent" as const,
+                    creationSource: "server" as const,
+                    createdAt: now,
+                    updatedAt: now,
+                    ...(delegated
+                      ? {
+                          delegatedCompletion: {
+                            parentRunId: RunId.make("run:source"),
+                            generation: 1,
+                            taskIds: [nodeId],
+                          },
+                        }
+                      : {}),
+                  });
+                }),
+            }),
+            Layer.mock(EventSink.EventSinkV2)({
+              write,
+              writeWithEffects: (payload) => {
+                effects.push(...(payload.effects ?? []));
+                return write(payload);
+              },
+            }),
+            Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+            Layer.mock(ThreadCommandExecutor.ThreadCommandExecutor)({}),
+            IdAllocator.layer,
+          ),
+        ),
+      );
+      const fiber = yield* Effect.gen(function* () {
+        const ingestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
+        return yield* ingestor.ingestNormalized({
+          providerSessionId: ProviderSessionId.make("session:ack-read"),
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          threadId,
+          runId,
+          nodeId,
+          event: {
+            type: "provider_turn.updated",
+            driver,
+            providerTurn: {
+              id: ProviderTurnId.make("turn:ack-read"),
+              providerThreadId: ProviderThreadId.make("provider-thread:ack-read"),
+              nodeId,
+              runAttemptId: null,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "running",
+              startedAt: now,
+              completedAt: null,
+              promptAcceptedAt: now,
+            },
+          },
+        });
+      }).pipe(Effect.provide(layer), Effect.forkChild);
+      yield* TestClock.adjust("1 minute");
+      const exit = yield* Fiber.await(fiber);
+      assert.equal(Exit.isSuccess(exit), transient);
+      assert.equal(reads, transient ? 2 : 1);
+      assert.equal(writes, transient ? 1 : 0);
+      assert.deepEqual(
+        effects,
+        delegated && transient
+          ? [EffectOutbox.nativeNoticeAcceptanceEffect(threadId, messageId)]
+          : [],
+      );
+    }),
 );

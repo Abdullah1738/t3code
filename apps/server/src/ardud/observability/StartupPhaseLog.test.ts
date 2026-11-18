@@ -19,6 +19,40 @@ const readRecords = (dir: string) =>
     .split("\n")
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 
+it("includes the preceding desktop quit once in the next boot, not again on a backend restart", () => {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "boot-quit-context-"));
+  try {
+    const at = Date.parse("2026-11-17T00:00:00Z");
+    const old = StartupPhaseLog.makeStartupPhaseLog(dir, "old");
+    old.start("boot", at - 2000);
+    NodeFS.writeFileSync(
+      NodePath.join(dir, "desktop-last-quit.json"),
+      JSON.stringify({
+        at: "2026-11-16T23:59:59.000Z",
+        pid: 42,
+        trigger: "before-quit",
+        initiator: "installer",
+        restartReason: "release .13",
+        osShutdownInProgress: false,
+      }),
+    );
+    const next = StartupPhaseLog.makeStartupPhaseLog(dir, "next");
+    next.start("boot", at);
+    next.start("boot", at + 1);
+    const boots = readRecords(dir).filter((row) => row.bootId === "next");
+    assert.deepInclude(boots[0]?.previousQuit, {
+      pid: 42,
+      initiator: "installer",
+      restartReason: "release .13",
+    });
+    assert.notProperty(boots[1], "previousQuit");
+    StartupPhaseLog.makeStartupPhaseLog(dir, "backend-restart").start("boot", at + 2000);
+    assert.isNull(readRecords(dir).at(-1)?.previousQuit);
+  } finally {
+    NodeFS.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 it.effect("records start, success and failure without error text", () => {
   const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "startup-log-"));
   return Effect.gen(function* () {

@@ -435,6 +435,7 @@ if [[ -n $(robob_pids) ]]; then
   ROBOB_TREE=""
   for p in ${(f)"$(robob_pids)"}; do ROBOB_TREE+="$(proc_tree $p)"$'\n'; done
   robob_left() { { still_running $ROBOB_TREE; robob_pids; } | sort -un; }
+  robob_quit_reason install-robob-resume || exit $?
   osascript -e 'tell application "Robob" to quit' >/dev/null 2>&1 || true
   print "Waiting for Robob and everything it started to close..."
   wait_until_closed robob_left 90 Robob

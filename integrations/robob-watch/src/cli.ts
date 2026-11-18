@@ -1,3 +1,5 @@
+import { queueOwnerRecovery } from "./owner-alerts.ts";
+import { assertMacWatcher } from "./person-box.ts";
 import { toolLog, toolError, rollup, logMarker } from "./toollog.ts";
 import { stderrCause } from "./cause.ts";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -17,7 +19,7 @@ const USAGE = `robob-watch: durable watchers that wake the iMessage agent (Robob
                   [--depends ssd,phone] [--inflight-check CMD]
                   [--chat SLUG]  (wake that bridge chat, e.g. moni, instead of the owner's; her own data)
   robob-watch add --json FILE|-          same fields as watcher.json (id, title, check, interval_s, mode, context,
-                                         expires_at, max_fires, inflight_check, timeout_s, max_consecutive_failures, failure_notice_after, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
+                                         expires_at, max_fires, inflight_check, timeout_s, max_consecutive_failures, failure_notice_after, owner_imessage_alerts, depends, serial, triggers, quiet, trip, relays, chat, created_by_session)
   robob-watch list                       all watchers with status
   robob-watch show ID                    definition, state and recent log
   robob-watch context ID [--json FILE|- | --context TEXT | --context-file PATH] [--replace]
@@ -156,6 +158,7 @@ async function main(argv: string[]): Promise<void> {
           ...(values["owner-only"] ? { relays: [] } : {}),
         };
       }
+      assertMacWatcher(input.chat);
       if (values.expires !== undefined) input.expires_at = duration(values.expires);
       if (input.expires_at === undefined) input.expires_at = duration("14d");
       if (values["owner-only"]) input.relays = [];
@@ -163,6 +166,7 @@ async function main(argv: string[]): Promise<void> {
       const prepare = () => {
         const candidate = { ...input };
         const previous = values.replace && validId(candidate.id) ? loadWatcher(candidate.id as string) : undefined;
+        assertMacWatcher(candidate.chat ?? previous?.chat);
         // Flags can't express relays, so a flag --replace keeps the ones the owner already allowed. Stops live
         // outside watcher.json, so no replace can lift one.
         if (values.json === undefined && previous?.relays && !values["owner-only"]) candidate.relays = previous.relays;
@@ -172,6 +176,7 @@ async function main(argv: string[]): Promise<void> {
         if (values.json === undefined && previous?.depends) candidate.depends = previous.depends;
         if (values.json === undefined && previous?.max_consecutive_failures !== undefined) candidate.max_consecutive_failures = previous.max_consecutive_failures;
         if (values.json === undefined && previous?.failure_notice_after !== undefined) candidate.failure_notice_after = previous.failure_notice_after;
+        if (values.json === undefined && previous?.owner_imessage_alerts) candidate.owner_imessage_alerts = true;
         if (values.json === undefined && previous?.trip) candidate.trip = previous.trip;
         if (values.json === undefined && previous?.chat && values.chat === undefined) candidate.chat = previous.chat;
         if (values.depends !== undefined) candidate.depends = values.depends === "none" ? [] : dependencies(values.depends);
@@ -345,6 +350,7 @@ async function main(argv: string[]): Promise<void> {
           delete s.closing_final_check;
         }
         if (command === "resume") {
+          queueOwnerRecovery(w, s);
           delete s.failure_paused_at;
           delete s.trigger_error;
           delete s.load_timeouts;
@@ -353,6 +359,8 @@ async function main(argv: string[]): Promise<void> {
           s.failure_alerted = false;
           delete s.failure_escalated;
           delete s.failing_since;
+          delete s.dependency_busy;
+          delete s.failure_episode;
           delete s.last_error;
           delete s.last_error_sources;
         }

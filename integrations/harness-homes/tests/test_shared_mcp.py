@@ -111,22 +111,29 @@ class SharedMcpTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises((ValueError, gh.HomeError)):
                 opencode.patch(text, self.entries)
 
-    def test_repeated_migrations_preserve_original_rollback_backup(self):
+    def test_repeated_migrations_keep_backup_and_identical_config_untouched(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "opencode.jsonc"
             original = '{"mcp":{"flighty":{"command":["uv"]},"inbody":{"command":["inbody"]}}}'
             path.write_text(original)
-            with mock.patch.object(gh, "load_manifest", return_value=self.manifest), \
+            with mock.patch.dict(os.environ, {'HOME': tmp, 'TOOLLOG_ROOT': tmp + '/logs',
+                    'OPENCODE_RELOAD_INSTANCES': '[{"name":"HOME","url":"http://127.0.0.1:1"}]'}), \
+                    mock.patch.object(gh, "load_manifest", return_value=self.manifest), \
                     mock.patch.object(gh, "opencode_config_path", return_value=str(path)):
-                opencode.main()
-                backup = Path(str(path) + ".before-shared-mcp")
+                opencode.main([])
+                backup, = (Path(tmp) / '.config/opencode/backups/harness-homes-shared-mcp').rglob('*.bak-*')
                 self.assertEqual(backup.read_text(), original)
+                before = path.stat()
+                logs = {p: p.read_bytes() for p in (Path(tmp) / 'logs').rglob('*.ndjson')}
+                opencode.main([])
+                self.assertEqual((path.stat().st_ino, path.stat().st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+                self.assertEqual({p: p.read_bytes() for p in logs}, logs)
                 for formatting in (None, 2, 4):
                     with self.subTest(formatting=formatting):
                         migrated = gh.loads_jsonc(path.read_text())
                         migrated["unrelated"] = "preserve new edits"
                         path.write_text(json.dumps(migrated, indent=formatting))
-                        opencode.main()
+                        opencode.main([])
                         self.assertEqual(backup.read_text(), original)
                         self.assertEqual(gh.loads_jsonc(path.read_text())["unrelated"], "preserve new edits")
 

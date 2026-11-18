@@ -98,6 +98,13 @@ export const ensureShellLookupIndexes = Effect.fn("ensureShellLookupIndexes")(fu
     CREATE INDEX IF NOT EXISTS ardud_v2_threads_updated_idx
     ON orchestration_v2_projection_threads(updated_at DESC, thread_id ASC)
   `;
+  // MCP lists seek within a project and stop before decoding unrelated histories.
+  yield* sql`
+    CREATE INDEX IF NOT EXISTS ardud_mcp_project_recency_idx
+    ON orchestration_v2_projection_threads(project_id,
+      CAST(ROUND(unixepoch(updated_at, 'subsec') * 1000) AS INTEGER) DESC, thread_id DESC)
+    WHERE deleted_at IS NULL AND archived_at IS NULL
+  `;
   // Control pages/counts must not fetch each thread's payload to inspect lineage.
   // Keep the narrow recency index above for other queries; only control opts into this one.
   // Epoch ordering also treats imported ISO dates with and without fractional seconds equally.

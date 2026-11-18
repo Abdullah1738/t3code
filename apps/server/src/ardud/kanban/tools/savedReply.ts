@@ -13,6 +13,12 @@ export const REPLY_BUDGET_MS = 25_000;
 export const ADMISSION_BUDGET_MS = REPLY_BUDGET_MS - 5_000;
 
 export const TOOLS = new Set([
+  "card_claim",
+  "card_create",
+  "card_wait",
+  "card_ask",
+  "card_ask_answer",
+  "card_thread",
   "card_move",
   "card_review_result",
   "subtask_done",
@@ -24,7 +30,7 @@ export const TOOLS = new Set([
   "report_bug",
   "discussion_post",
 ]);
-export const TIMED_TOOLS = new Set([...TOOLS, "card_create", "card_wait", "wiki_read"]);
+export const TIMED_TOOLS = new Set([...TOOLS, "wiki_read"]);
 
 /** Encloses encoding and the reply budget, not just the mutation handler. */
 export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
@@ -42,12 +48,22 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   let stageSince = 0;
   const totals = new Map<SavedWrite.Stage, number>();
   let stageAtTimeout: SavedWrite.Stage | null = null;
+  let deadline: "read" | "reply" | null = null;
+  let readBudgetMs: number | null = null;
   let timerLatenessMs: number | null = null;
   const lockSnapshots = new Map<symbol, (now: number) => Readonly<Record<string, unknown>>>();
+  const readerSnapshots = new Map<symbol, () => NodeSqliteClient.ReaderSnapshot>();
+  const awaitedSnapshots = new Map<symbol, () => ReadonlyArray<string>>();
+  const parentReader = yield* NodeSqliteClient.ReaderSnapshotObserver;
+  let knownLocks: Readonly<Record<string, unknown>> = {};
   let timeoutLocks: Readonly<Record<string, unknown>> = {};
+  let timeoutReaders: ReadonlyArray<NodeSqliteClient.ReaderSnapshot> = [];
+  let timeoutAwaited: ReadonlyArray<string> = [];
   let timeoutElapsedMs = 0;
   let timeoutObservedAtMs = 0;
   let closed = false;
+  const admissions = new Map<symbol, { detail: Effect.Effect<string>; fiberId: number }>();
+  let admissionDetail: string | undefined;
   const updateStage = () => {
     if (closed) return;
     const now = elapsed();
@@ -80,15 +96,27 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
   const parentLookup = yield* SavedWrite.reportLookupObserver;
   const call = yield* Effect.serviceOption(McpCall);
   let slowSubSteps: ReadonlyArray<SavedWrite.SubStep> = [];
+  let wholeCallReported = false;
+  const reportSubSteps = (steps: ReadonlyArray<SavedWrite.SubStep>, wholeCall = false) => {
+    // A whole-call collection already includes the holds; do not count them twice.
+    if (wholeCallReported && !wholeCall) return;
+    wholeCallReported ||= wholeCall;
+    slowSubSteps = [...(wholeCall ? [] : slowSubSteps), ...steps]
+      .sort((a, b) => b.ms - a.ms)
+      .slice(0, 3);
+    span.attribute("kanban.reply.sub_steps", slowSubSteps);
+    if (call._tag === "Some") call.value.replySubSteps = slowSubSteps;
+  };
   let commitStarted = false;
   let receipt: SavedWrite.Saved | undefined;
+  let unverifiedReporter: SavedWrite.UnverifiedReporterReason | undefined;
   let reportLookup: SavedWrite.ReportLookup | undefined;
   // raceFirst joins cancellation before replying. Evaluator admissions and bug
   // sightings publish their receipt inside the masked write, including queue-only saves.
   const savedState = () =>
     receipt !== undefined
       ? true
-      : tool === "evaluator_start" || (tool === "report_bug" && timerLatenessMs !== null)
+      : tool === "evaluator_start" || (tool === "report_bug" && deadline !== null)
         ? false
         : tool === "report_bug" && reportLookup === undefined
           ? false
@@ -97,11 +125,12 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
             : false;
   const attributes = () => ({
     "kanban.reply.stage_at_timeout": stageAtTimeout,
-    "kanban.reply.timed_out": timerLatenessMs !== null,
+    "kanban.reply.timed_out": deadline !== null,
     "kanban.reply.saved": savedState(),
     "kanban.reply.commit_started": commitStarted,
     "kanban.reply.elapsed_ms": elapsed(),
     "kanban.reply.budget_ms": REPLY_BUDGET_MS,
+    "kanban.reply.read_budget_ms": readBudgetMs,
     "kanban.reply.timer_lateness_ms": timerLatenessMs,
   });
   const fallback = (timedOut = false) => {
@@ -126,14 +155,18 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
               : tool === "report_bug" && reportLookup !== undefined
                 ? { lookup: reportLookup }
                 : {};
+    if (tool === "report_bug" && unverifiedReporter !== undefined) {
+      Object.assign(details, { callerVerified: false, callerUnverifiedReason: unverifiedReporter });
+    }
     const saved = savedState();
-    const message =
+    const savedMessage =
       saved === false
-        ? tool === "evaluator_start"
-          ? "Not saved; evaluator not started. Safe to retry with the same arguments."
-          : tool === "report_bug"
-            ? "Nothing was saved; retry with the same arguments."
-            : "Not saved (board busy). Safe to retry."
+        ? (admissionDetail ??
+          (tool === "evaluator_start"
+            ? "Not saved; evaluator not started. Safe to retry with the same arguments."
+            : tool === "report_bug"
+              ? "Nothing was saved; retry with the same arguments."
+              : `Not saved (reply timed out before a save; stage: ${stageAtTimeout ?? stage}). Safe to retry.`))
         : tool === "evaluator_start"
           ? receipt?.kind === "evaluator"
             ? `Saved; evaluator launched as ${receipt.threadId}. Do not retry. Use evaluator_status with this threadId to find its cards.`
@@ -156,39 +189,76 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
                   : "Saved; the sighting is on appendedTo. Read it with card_get."
             : tool === "discussion_post"
               ? receipt === undefined
-                ? "Discussion post reply timed out; the message may have been saved. Read back with discussion_read before retrying."
+                ? "The message may have been saved. Read back with discussion_read before retrying."
                 : "Saved; discussion_read for details."
               : receipt === undefined
-                ? "Board write reply timed out; the write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
+                ? "The write may have been saved. Read back with card_get (evaluator_start: check board threads) before retrying."
                 : "Saved; card_get for details.";
+    const waitMessage = !timedOut
+      ? undefined
+      : stageAtTimeout === "read"
+        ? "Read timed out."
+        : stageAtTimeout === "admission" && typeof timeoutLocks["board.waiting_on"] === "string"
+          ? "Board lock wait timed out."
+          : undefined;
+    const outcomeMessage =
+      waitMessage === undefined ? savedMessage : `${waitMessage} ${savedMessage}`;
+    const message =
+      tool === "report_bug" && saved === true && unverifiedReporter !== undefined
+        ? `${outcomeMessage} Saved with an unverified caller; reporter unverified (${unverifiedReporter}).`
+        : outcomeMessage;
     const fields = attributes();
+    const boardId =
+      (call._tag === "Some" ? call.value.boardId : undefined) ??
+      timeoutLocks["board.id"] ??
+      knownLocks["board.id"] ??
+      (receipt?.kind === "card" ? receipt.card.boardId : null);
+    const cardId =
+      (call._tag === "Some" ? call.value.cardId : undefined) ??
+      timeoutLocks["board.card_id"] ??
+      knownLocks["board.card_id"] ??
+      (receipt?.kind === "card" ? receipt.card.id : null);
+    const operation = timeoutLocks["board.operation"] ?? knownLocks["board.operation"] ?? tool;
+    const diagnostics = {
+      "board.observed_at_ms": timedOut ? timeoutObservedAtMs : clock.currentTimeMillisUnsafe(),
+      "board.waiter": tool,
+      "board.waiting_on": null,
+      "board.waited_ms": timedOut ? timeoutElapsedMs : elapsed(),
+      "board.holders": [],
+      "board.blockers": [],
+      ...timeoutLocks,
+      boardId,
+      operation,
+      cardId,
+      "board.id": boardId,
+      "board.operation": operation,
+      "board.card_id": cardId,
+      "board.reply_phase": stageAtTimeout ?? stage,
+      "board.reply_elapsed_ms": timedOut ? timeoutElapsedMs : elapsed(),
+      awaited: timeoutAwaited,
+      readers: timeoutReaders,
+      subSteps: slowSubSteps,
+    };
     return Effect.annotateCurrentSpan(fields).pipe(
       Effect.andThen(
-        timedOut && saved === false
-          ? Effect.suspend(() => {
-              const diagnostics = {
-                "board.observed_at_ms": timeoutObservedAtMs,
-                "board.waiter": tool,
-                "board.id": call._tag === "Some" ? (call.value.boardId ?? null) : null,
-                "board.card_id": call._tag === "Some" ? (call.value.cardId ?? null) : null,
-                "board.waiting_on": null,
-                "board.waited_ms": timeoutElapsedMs,
-                "board.holders": [],
-                "board.blockers": [],
-                ...timeoutLocks,
-                "board.reply_phase": stageAtTimeout,
-                "board.reply_elapsed_ms": timeoutElapsedMs,
-              };
-              return Effect.logWarning(
-                // Fixed diagnostic fields, as in the lock-admission refusal logger.
-                // @effect-diagnostics-next-line preferSchemaOverJson:off
-                JSON.stringify({ event: "kanban board write refused", ...diagnostics }),
-              ).pipe(
-                Effect.annotateLogs({ ...diagnostics, "board.lock_log": true }),
-                Effect.provideService(References.MinimumLogLevel, "Warn"),
-              );
-            })
-          : Effect.void,
+        Effect.suspend(() =>
+          Effect.logWarning(
+            // Fixed diagnostic fields, as in the lock-admission refusal logger.
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
+            JSON.stringify({
+              event:
+                saved === false
+                  ? "kanban board write refused"
+                  : "kanban saved write reply unavailable",
+              saved,
+              timedOut,
+              ...diagnostics,
+            }),
+          ).pipe(
+            Effect.annotateLogs({ ...diagnostics, "board.lock_log": true }),
+            Effect.provideService(References.MinimumLogLevel, "Warn"),
+          ),
+        ),
       ),
       Effect.andThen(
         Effect.logWarning("kanban saved write reply unavailable", {
@@ -196,6 +266,7 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
           saved,
           commitStarted,
           ...fields,
+          ...diagnostics,
         }),
       ),
       Effect.as(
@@ -214,27 +285,76 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
       ),
     );
   };
+  const captureDeadline = (kind: "read" | "reply", budgetMs?: number) => {
+    if (deadline !== null) return;
+    deadline = kind;
+    readBudgetMs = budgetMs ?? null;
+    stageAtTimeout = kind === "read" ? "read" : stage;
+    timeoutElapsedMs = elapsed();
+    timeoutObservedAtMs = clock.currentTimeMillisUnsafe();
+    timeoutLocks = [...lockSnapshots.values()].at(-1)?.(timeoutObservedAtMs) ?? {};
+    timeoutReaders = [...readerSnapshots.values()].flatMap((snapshot) => {
+      try {
+        return [snapshot()];
+      } catch {
+        return [];
+      }
+    });
+    timeoutAwaited = [...awaitedSnapshots.values()].flatMap((snapshot) => snapshot()).slice(0, 3);
+  };
   const work = effect.pipe(
+    Effect.provideService(BoardLocks.admissionObserver, (detail, fiberId) => {
+      const token = Symbol();
+      admissions.set(token, { detail, fiberId });
+      return () => {
+        admissions.delete(token);
+      };
+    }),
     // Interactive pre-write reads must not queue behind tick and maintenance scans.
     (effect) => (timingOnly ? effect : NodeSqliteClient.foregroundReads(effect)),
     Effect.provideService(SavedWrite.traceObserver, {
       span,
       enter,
       mark,
+      readDeadline: (budgetMs) => captureDeadline("read", budgetMs),
       // Cleared together with stage tracking by SavedWrite.background.
       observeLocks: (snapshot) => {
         const token = Symbol();
         lockSnapshots.set(token, snapshot);
+        knownLocks = { ...knownLocks, ...snapshot(clock.currentTimeMillisUnsafe()) };
         return () => {
+          knownLocks = { ...knownLocks, ...snapshot(clock.currentTimeMillisUnsafe()) };
           lockSnapshots.delete(token);
         };
       },
+      observeAwaited: (snapshot) => {
+        const token = Symbol();
+        awaitedSnapshots.set(token, snapshot);
+        return () => {
+          awaitedSnapshots.delete(token);
+        };
+      },
     }),
-    Effect.provideService(SavedWrite.subStepReporter, (steps) => {
-      slowSubSteps = [...slowSubSteps, ...steps].sort((a, b) => b.ms - a.ms).slice(0, 3);
-      span.attribute("kanban.reply.sub_steps", slowSubSteps);
-      if (call._tag === "Some") call.value.replySubSteps = slowSubSteps;
+    Effect.provideService(NodeSqliteClient.ReaderSnapshotObserver, (snapshot) => {
+      const token = Symbol();
+      readerSnapshots.set(token, snapshot);
+      let stopParent: (() => void) | undefined;
+      try {
+        stopParent = parentReader?.(snapshot);
+      } catch {
+        /* Diagnostic only. */
+      }
+      return () => {
+        readerSnapshots.delete(token);
+        try {
+          stopParent?.();
+        } catch {
+          /* Diagnostic only. */
+        }
+      };
     }),
+    Effect.provideService(SavedWrite.subStepReporter, reportSubSteps),
+    Effect.provideService(SavedWrite.callSubStepReporter, (steps) => reportSubSteps(steps, true)),
     Effect.provideService(
       BoardLocks.writeWaitMs,
       timingOnly ? yield* BoardLocks.writeWaitMs : ADMISSION_BUDGET_MS,
@@ -242,6 +362,9 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     Effect.provideService(SavedWrite.reportLookupObserver, (lookup) => {
       reportLookup = lookup;
       parentLookup(lookup);
+    }),
+    Effect.provideService(SavedWrite.reporterUnverified, (reason) => {
+      unverifiedReporter = reason;
     }),
     Effect.provideService(SavedWrite.commitObserver, () => {
       commitStarted = true;
@@ -280,13 +403,16 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     Effect.flatMap((result) =>
       !timingOnly &&
       !(result instanceof McpSchema.InputRequired) &&
-      result.isError &&
-      receipt !== undefined
-        ? fallback()
+      (deadline === "read" || (result.isError && receipt !== undefined))
+        ? fallback(deadline === "read")
         : Effect.succeed(result),
     ),
     Effect.catchCause((cause) =>
-      timingOnly || receipt === undefined ? Effect.failCause(cause) : fallback(),
+      !timingOnly && deadline === "read"
+        ? fallback(true)
+        : timingOnly || receipt === undefined
+          ? Effect.failCause(cause)
+          : fallback(),
     ),
   );
   // Capture the firing time before raceFirst joins cancellation finalizers. The
@@ -297,12 +423,14 @@ export const protect = Effect.fn("KanbanTools.savedReply")(function* <E, R>(
     return Effect.sleep(REPLY_BUDGET_MS);
   }).pipe(
     Effect.andThen(
-      Effect.sync(() => {
-        stageAtTimeout = stage;
-        timeoutElapsedMs = elapsed();
-        timeoutObservedAtMs = clock.currentTimeMillisUnsafe();
-        timeoutLocks = [...lockSnapshots.values()].at(-1)?.(timeoutObservedAtMs) ?? {};
+      Effect.gen(function* () {
+        captureDeadline("reply");
         timerLatenessMs = Math.max(0, elapsed() - scheduledAt - REPLY_BUDGET_MS);
+        const foreground = [...scopes.values()].findLast((scope) => scope.stage === "admission");
+        const detail = [...admissions.values()].findLast(
+          (entry) => entry.fiberId === foreground?.fiberId,
+        )?.detail;
+        if (stageAtTimeout === "admission" && detail !== undefined) admissionDetail = yield* detail;
       }),
     ),
     Effect.as(Option.none()),

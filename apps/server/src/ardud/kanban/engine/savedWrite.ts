@@ -1,22 +1,64 @@
+import { McpCall, writeCommitting, writeRefused } from "../../analytics/McpCall.ts";
 import type { KanbanCard, KanbanMessage, ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Tracer from "effect/Tracer";
 import * as Clock from "effect/Clock";
 import * as Fiber from "effect/Fiber";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 export const LONG_HOLD_MS = 5_000;
+export type UnverifiedReporterReason = "caller_unresolved" | "parent_not_active";
+export const reporterUnverified = Context.Reference<(reason: UnverifiedReporterReason) => void>(
+  "KanbanSavedWriteReporterUnverified",
+  { defaultValue: () => () => {} },
+);
 export type SubStep = { readonly subStep: string; readonly ms: number };
+// Mutation-internal lookups retain their caller's mask and use the writer.
+export const writing = Context.Reference("KanbanStoreWriting", { defaultValue: () => false });
+export const maskedWrite = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(Effect.provideService(writing, true), Effect.uninterruptible);
+// Applied after the owning fiber decides whether a SELECT runs outside its gate.
+export const readGuard = Context.Reference<
+  (<A, E, R>(read: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>) | undefined
+>("KanbanStoreReadGuard", { defaultValue: () => undefined });
+
+export const read = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
+  if (yield* writing) return yield* effect;
+  const guard = yield* readGuard;
+  return yield* guard === undefined ? effect : guard(effect);
+});
+
+export interface AwaitedDependency {
+  readonly awaited: string;
+  readonly readers: ReadonlyArray<NodeSqliteClient.ReaderSnapshot>;
+}
+// Timeout helpers fork their read. Attribute it to the operation that still owns the gate.
+export const subStepFiber = Context.Reference<number | undefined>("KanbanSavedWriteSubStepFiber", {
+  defaultValue: () => undefined,
+});
 
 export const subStepReporter = Context.Reference<(steps: ReadonlyArray<SubStep>) => void>(
   "KanbanSavedWriteSubStepReporter",
   { defaultValue: () => () => {} },
 );
 
+// Whole-call diagnostics include outside I/O; the board-hold reporter must not.
+export const callSubStepReporter = Context.Reference<(steps: ReadonlyArray<SubStep>) => void>(
+  "KanbanSavedWriteCallSubStepReporter",
+  { defaultValue: () => () => {} },
+);
+
+export interface SubStepCollection {
+  (long: boolean): ReadonlyArray<SubStep> | undefined;
+  readonly snapshot: () => ReadonlyArray<SubStep>;
+  readonly dependencySnapshot: () => AwaitedDependency;
+}
+
 export const subStepObserver = Context.Reference<
   | {
       readonly tracer: Tracer.Tracer;
-      readonly hold: (fiberId: number) => (long: boolean) => ReadonlyArray<SubStep> | undefined;
+      readonly hold: (fiberId: number) => SubStepCollection;
     }
   | undefined
 >("KanbanSavedWriteSubSteps", { defaultValue: () => undefined });
@@ -35,15 +77,37 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
   const startedAt = clock.monotonicTimeNanosUnsafe();
   const now = () => Number(clock.monotonicTimeNanosUnsafe() - startedAt) / 1_000_000;
   const active = new Map<number, Array<Tracer.Span>>();
+  const readers = new Map<
+    symbol,
+    { fiberId: number; snapshot: () => NodeSqliteClient.ReaderSnapshot }
+  >();
+  const parentReader = yield* NodeSqliteClient.ReaderSnapshotObserver;
+  const safeName = (value: string) =>
+    /^[a-zA-Z0-9_.:/#@%+-]{1,160}$/.test(value) ? value : "unknown";
   const holds = new Set<{
     fiberId: number;
     since: number;
     totals: Map<string, number>;
   }>();
+  const awaited = (fiberId: number) => {
+    const span = active.get(fiberId)?.at(-1);
+    // Store SELECTs share one span name; retain their static operation label
+    // so a reader wait identifies the table instead of just "KanbanStore.read".
+    const operation =
+      span?.name === "KanbanStore.read" ? span.attributes.get("kanban.operation") : undefined;
+    return safeName(
+      typeof operation === "string"
+        ? `KanbanStore.${operation.replaceAll(" ", ".")}`
+        : (span?.name ?? name),
+    );
+  };
   const account = (fiberId: number) => {
     if (holds.size === 0) return;
     const at = now();
-    const step = active.get(fiberId)?.at(-1)?.name ?? name;
+    const milestone = active
+      .get(fiberId)
+      ?.findLast((span) => /^(?:read.card|syncPrs.fetch|syncPrs.write|apply)$/.test(span.name));
+    const step = milestone?.name ?? awaited(fiberId);
     for (const hold of holds) {
       if (hold.fiberId !== fiberId) continue;
       const ms = Math.max(0, at - hold.since);
@@ -57,7 +121,8 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
       // Plumbing should not hide the operation that is waiting on it.
       if (/^(?:KanbanBoardLocks\.|KanbanSavedWrite\.|sql\.|sqlite$)/.test(options.name))
         return span;
-      const fiberId = Fiber.getCurrent()?.id;
+      const fiber = Fiber.getCurrent();
+      const fiberId = fiber?.getRef(subStepFiber) ?? fiber?.id;
       if (fiberId === undefined) return span;
       account(fiberId);
       const stack = active.get(fiberId) ?? [];
@@ -78,28 +143,64 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
   const hold = (fiberId: number) => {
     const held = { fiberId, since: now(), totals: new Map<string, number>() };
     holds.add(held);
-    return (long: boolean) => {
+    const snapshot = () => {
       account(fiberId);
-      holds.delete(held);
-      if (!long) return undefined;
       return [...held.totals]
         .sort((a, b) => b[1] - a[1])
         .slice(0, 3)
         .map(([subStep, ms]) => ({
-          subStep:
-            subStep.length <= 160 && /^[a-zA-Z0-9_.:/#@%+-]+$/.test(subStep) ? subStep : "unknown",
+          subStep,
           ms,
         }));
     };
+    return Object.assign(
+      (long: boolean) => {
+        const steps = long ? snapshot() : undefined;
+        holds.delete(held);
+        return steps;
+      },
+      {
+        snapshot,
+        dependencySnapshot: (): AwaitedDependency => ({
+          awaited: awaited(fiberId),
+          readers: [...readers.values()].flatMap((reader) => {
+            if (reader.fiberId !== fiberId) return [];
+            try {
+              return [reader.snapshot()];
+            } catch {
+              return [];
+            }
+          }),
+        }),
+      },
+    );
   };
   const finish = includeOutsideLocks ? hold(yield* Effect.fiberId) : undefined;
-  const report = yield* subStepReporter;
+  const report = yield* callSubStepReporter;
+  const stopObserving = (yield* traceObserver)?.observeAwaited?.(() =>
+    [...active.keys()].map(awaited).slice(0, 3),
+  );
   return yield* effect.pipe(
-    // Lock collectors still return their diagnostics, but only the enclosing
-    // whole-call collector publishes to the reply ledger.
-    (effect) =>
-      includeOutsideLocks ? effect.pipe(Effect.provideService(subStepReporter, () => {})) : effect,
     Effect.withTracer(tracer),
+    Effect.provideService(NodeSqliteClient.ReaderSnapshotObserver, (snapshot) => {
+      const token = Symbol();
+      const fiber = Fiber.getCurrent()!;
+      readers.set(token, { fiberId: fiber.getRef(subStepFiber) ?? fiber.id, snapshot });
+      let stopParent: (() => void) | undefined;
+      try {
+        stopParent = parentReader?.(snapshot);
+      } catch {
+        /* Diagnostic only. */
+      }
+      return () => {
+        readers.delete(token);
+        try {
+          stopParent?.();
+        } catch {
+          /* Diagnostic only. */
+        }
+      };
+    }),
     Effect.provideService(subStepObserver, {
       tracer: parent?.tracer ?? delegate,
       hold,
@@ -108,9 +209,40 @@ export const subSteps = Effect.fnUntraced(function* <A, E, R>(
       Effect.sync(() => {
         const steps = finish?.(now() >= LONG_HOLD_MS);
         if (steps !== undefined) report(steps);
+        stopObserving?.();
       }),
     ),
   );
+});
+
+// The store defers this callback when SQL is inside an enclosing transaction.
+export const afterCommit = Context.Reference<(confirm: () => void) => void>(
+  "KanbanSavedWriteAfterCommit",
+  {
+    defaultValue: () => (confirm) => confirm(),
+  },
+);
+const requestCommitEvidence = Context.Reference<boolean>("KanbanSavedWriteRequestCommitEvidence", {
+  defaultValue: () => true,
+});
+
+// Setup may persist a discussion while the incoming request is still unsaved.
+export const preparatory = Effect.fn("KanbanSavedWrite.preparatory")(function* <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+) {
+  return yield* effect.pipe(
+    Effect.provideService(observer, () => {}),
+    Effect.provideService(requestCommitEvidence, false),
+  );
+});
+
+export const committed = Effect.fnUntraced(function* () {
+  const call = yield* Effect.serviceOption(McpCall);
+  if (call._tag === "Some" && call.value.boardWrite && (yield* requestCommitEvidence))
+    (yield* afterCommit)(() => {
+      call.value.saved = true;
+      delete call.value.refusedAt;
+    });
 });
 
 export type Stage = "caller" | "admission" | "read" | "mutate" | "commit" | "ack";
@@ -123,6 +255,8 @@ export const traceObserver = Context.Reference<
       readonly observeLocks?: (
         snapshot: (now: number) => Readonly<Record<string, unknown>>,
       ) => () => void;
+      readonly observeAwaited?: (snapshot: () => ReadonlyArray<string>) => () => void;
+      readonly readDeadline?: (budgetMs: number) => void;
     }
   | undefined
 >("KanbanSavedWriteTrace", { defaultValue: () => undefined });
@@ -132,6 +266,11 @@ export const stage = Effect.fnUntraced(function* <A, E, R>(
   effect: Effect.Effect<A, E, R>,
   name: Stage,
 ) {
+  effect = effect.pipe(
+    Effect.onError(() =>
+      writeRefused(name === "admission" || name === "caller" ? "pre_lock" : "in_write"),
+    ),
+  );
   const trace = yield* traceObserver;
   if (trace === undefined) return yield* effect;
   const fiberId = yield* Effect.fiberId;
@@ -157,8 +296,12 @@ export const mutating = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Eff
 export const background = Effect.fnUntraced(function* <A, E, R>(effect: Effect.Effect<A, E, R>) {
   const steps = yield* subStepObserver;
   const detached = effect.pipe(
+    Effect.provideService(writing, false),
+    Effect.provideService(readGuard, undefined),
     Effect.provideService(traceObserver, undefined),
     Effect.provideService(subStepObserver, undefined),
+    Effect.provideService(subStepFiber, undefined),
+    Effect.provideService(NodeSqliteClient.ReaderSnapshotObserver, undefined),
   );
   return yield* steps === undefined ? detached : detached.pipe(Effect.withTracer(steps.tracer));
 });
@@ -218,12 +361,14 @@ export const commitObserver = Context.Reference<() => void>("KanbanSavedWriteCom
 
 // Runs at every store write; the enclosing lock operation already supplies its span.
 export const committing = Effect.gen(function* () {
+  if (yield* requestCommitEvidence) yield* writeCommitting();
   const trace = yield* traceObserver;
   trace?.mark("commit", yield* Effect.fiberId);
   (yield* commitObserver)();
 });
 
 export const record = Effect.fn("KanbanSavedWrite.record")(function* (saved: Saved) {
+  yield* committed();
   const trace = yield* traceObserver;
   trace?.mark("ack", yield* Effect.fiberId);
   (yield* observer)(saved);

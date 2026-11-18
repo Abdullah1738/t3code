@@ -5,6 +5,7 @@ import {
   CommandId,
   LONG_TASK_HISTOGRAM_RATIO,
   AnalyticsEvent,
+  AnalyticsReadResult,
   type AnalyticsReadInput,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -26,6 +27,7 @@ import * as ServerConfig from "../../config.ts";
 import * as Analytics from "./Analytics.ts";
 import type { AnalyticsRollup } from "./rollup.ts";
 
+const decodeReadResult = Schema.decodeUnknownSync(AnalyticsReadResult);
 const day = "2026-11-13";
 const ts = `${day}T12:00:00.000Z`;
 const event = (input: Partial<AnalyticsEvent> = {}): AnalyticsEvent => ({
@@ -84,6 +86,244 @@ function open(
 }
 
 describe("Analytics", () => {
+  it.effect(
+    "reads Claude API failures by status, requested model and host without counting give-ups as attempts",
+    () =>
+      Effect.gen(function* () {
+        const setup = yield* fixture;
+        const analytics = yield* open(setup);
+        const detail = {
+          model: "claude-opus-5-5[1m]",
+          host: "router.test",
+          path: "/v1",
+          status: 404,
+          errorCode: "model_not_found",
+          errorType: "not_found_error",
+          errorText: "model unavailable",
+          attempt: 1,
+          resume: true,
+        };
+        for (const row of [
+          event({
+            kind: "provider.claude_api_error",
+            surface: "server",
+            route: "provider",
+            phase: "attempt",
+            claudeApiError: detail,
+          }),
+          event({
+            kind: "provider.claude_api_error",
+            surface: "server",
+            route: "provider",
+            phase: "give_up",
+            claudeApiError: detail,
+          }),
+          event({
+            kind: "provider.claude_api_error",
+            surface: "server",
+            route: "provider",
+            phase: "attempt",
+            claudeApiError: {
+              ...detail,
+              status: 503,
+              model: "claude-sonnet-5-5",
+              host: "api.anthropic.com",
+            },
+          }),
+        ])
+          yield* analytics.record(row);
+        yield* analytics.flush;
+        const result = yield* analytics.read({ day, kind: "provider.claude_api_error" });
+        assert.deepEqual(result.rollup.claudeApiErrors, [
+          {
+            status: 404,
+            model: "claude-opus-5-5[1m]",
+            host: "router.test",
+            attempts: 1,
+            giveUps: 1,
+          },
+          {
+            status: 503,
+            model: "claude-sonnet-5-5",
+            host: "api.anthropic.com",
+            attempts: 1,
+            giveUps: 0,
+          },
+        ]);
+        assert.equal(
+          (yield* readSamples(analytics, { day, kind: "provider.claude_api_error" })).length,
+          3,
+        );
+        const section = yield* analytics.read({ day, section: "claudeApiErrors" });
+        assert.equal(section.rows?.length, 2);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("reads slot and claim decisions in defaults and by kind", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const decisions = [
+        event({
+          kind: "kanban.slot",
+          surface: "server",
+          boardId: "a",
+          cardId: "c",
+          threadId: "t",
+          props: { poolKey: "sol", slot: "take", why: "start", held: false },
+        }),
+        event({
+          kind: "kanban.slot",
+          surface: "server",
+          boardId: "a",
+          threadId: "t",
+          props: { poolKey: "sol", slot: "release", why: "hold_end", held: false },
+        }),
+        event({
+          kind: "kanban.claim_denied",
+          surface: "server",
+          boardId: "a",
+          cardId: "c",
+          threadId: "t",
+          props: {
+            poolKey: "sol",
+            reason: "pool_full",
+            holdsSlot: false,
+            carried: 0,
+            used: 1,
+            slots: 1,
+          },
+        }),
+        event({
+          kind: "kanban.claim",
+          surface: "server",
+          boardId: "a",
+          cardId: "c",
+          threadId: "t",
+          props: {
+            poolKey: "sol",
+            reason: "taken",
+            holdsSlot: true,
+            carried: 0,
+            used: 1,
+            slots: 1,
+          },
+        }),
+        event({
+          kind: "kanban.next",
+          surface: "server",
+          boardId: "a",
+          threadId: "t",
+          props: { holdsSlot: true, candidateCount: 1 },
+        }),
+      ];
+      for (const row of decisions) yield* analytics.record(row);
+      yield* analytics.flush;
+      const cold = yield* open(setup);
+      for (const reader of [analytics, cold]) {
+        assert.sameDeepMembers([...(yield* reader.read({ day, boardId: "a" })).samples], decisions);
+        for (const kind of new Set(decisions.map((row) => row.kind))) {
+          assert.sameDeepMembers(
+            [...(yield* reader.read({ day, kind })).samples],
+            decisions.filter((row) => row.kind === kind),
+          );
+        }
+      }
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("reads silent child stall decisions with their phase and recovery action", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      for (const [phase, action] of [
+        ["post_tool", "resumed"],
+        ["first_event", "restarted"],
+        ["mid_turn", "failed"],
+      ] as const) {
+        yield* analytics.record(
+          event({
+            kind: "delegated_task.stall",
+            surface: "server",
+            route: "provider",
+            threadId: "thread:delegated:child",
+            taskId: "task:child",
+            props: {
+              runId: "run:child",
+              provider: "codex",
+              model: "gpt-6.1-sol",
+              effort: "max",
+              phase,
+              action,
+              lastProgressKind: "run_started",
+              silentSeconds: 900,
+            },
+          }),
+        );
+      }
+      const result = yield* analytics.read({ day, kind: "delegated_task.stall", limit: 10 });
+      assert.lengthOf(result.samples, 3);
+      assert.sameMembers(
+        result.samples.map((row) => row.props?.action),
+        ["resumed", "restarted", "failed"],
+      );
+      assert.sameMembers(
+        result.samples.map((row) => row.props?.phase),
+        ["post_tool", "first_event", "mid_turn"],
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("reads delegated notice delays and terminal status corrections by kind", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const notice = event({
+        ts,
+        surface: "server",
+        route: "delegated-tasks",
+        kind: "delegated.notice",
+        parentThreadId: "thread:parent",
+        parentRunId: "run:parent",
+        noticeMessageId: "message:notice",
+        noticeKind: "mixed",
+        children: [
+          {
+            childTaskId: "node:baseline",
+            status: "completed",
+            terminalAt: `${day}T11:59:48.000Z`,
+            delayMs: 12000,
+          },
+          {
+            childTaskId: "node:review",
+            status: "failed",
+            terminalAt: `${day}T11:59:50.000Z`,
+            delayMs: 10000,
+          },
+        ],
+      });
+      const correction = event({
+        ts,
+        surface: "server",
+        route: "delegated-tasks",
+        kind: "delegated.terminal-status-changed",
+        parentThreadId: "thread:parent",
+        parentRunId: "run:parent",
+        taskId: "node:review",
+        oldStatus: "completed",
+        newStatus: "failed",
+        reason: "child_terminal_reconciled",
+      });
+      yield* analytics.record(notice);
+      yield* analytics.record(correction);
+      yield* analytics.flush;
+      assert.deepEqual(yield* readSamples(analytics, { day, kind: "delegated.notice" }), [notice]);
+      assert.deepEqual(
+        yield* readSamples(analytics, { day, kind: "delegated.terminal-status-changed" }),
+        [correction],
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
   it.effect("prioritises board kinds and ignores board long tasks in samples and rollup", () =>
     Effect.gen(function* () {
       const setup = yield* fixture;
@@ -609,6 +849,36 @@ describe("Analytics", () => {
       assert.isFalse(JSON.stringify(persisted).includes("private"));
     }).pipe(Effect.provide(Sqlite.layerMemory.pipe(Layer.provideMerge(NodeServices.layer)))),
   );
+  it.effect("reads persisted deadline phases in MCP samples and rollup groups", () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const phases = ["parent_records", "receipt", "dispatch", "handler"] as const;
+      for (const errorPhase of phases)
+        yield* analytics.record(
+          event({
+            kind: "mcp.call",
+            surface: "server",
+            tool: "delegate_task",
+            outcome: "timeout",
+            errorTag: "delegation_timeout",
+            errorPhase,
+          }),
+        );
+      yield* analytics.flush;
+      const cold = yield* open(setup);
+      const result = yield* cold.read({ day, kind: "mcp.call", tool: "delegate_task" });
+      assert.deepEqual(decodeReadResult(result), result);
+      assert.sameMembers(
+        result.samples.map((row) => row.errorPhase),
+        [...phases],
+      );
+      assert.sameDeepMembers(
+        [...result.rollup.mcpCalls[0]!.errors],
+        phases.map((errorPhase) => ({ errorTag: "delegation_timeout", errorPhase, count: 1 })),
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
   it.effect(
     "filters MCP samples and rollups by tool and outcome while persisting the full day",
     () =>
@@ -709,7 +979,9 @@ describe("Analytics", () => {
             tool: "task_status",
             saved,
             outcome: "notFoundReason" in props ? "error" : "ok",
-            ...("notFoundReason" in props ? { errorTag: "task_not_found" } : {}),
+            ...("notFoundReason" in props
+              ? { errorTag: "task_not_found", reasonClass: "not_found", invalidField: "taskId" }
+              : {}),
             props: { ...props, idShape: "task_id" },
           }),
         );
@@ -742,7 +1014,9 @@ describe("Analytics", () => {
       const result = yield* analytics.read(input);
       assert.deepInclude(result.rollup.mcpCalls[0], {
         count: 11,
-        savedCounts: { unknown: 7, false: 1, true: 3 },
+        savedCounts: { unknown: 6, false: 1, true: 3, "n/a": 1 },
+        reasonClasses: { not_found: 4 },
+        invalidFields: { taskId: 4 },
         notFoundReasons: {
           non_canonical_id: 2,
           never_saved: 1,
@@ -1507,4 +1781,178 @@ it.effect("#1490 reads persisted evaluator starts for one board and UTC day in o
       [{ boardId: "board-offbox", trigger: "report_bug", count: 1 }],
     );
   }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "correlates detached results in filtered cold and live views without widening samples",
+  () =>
+    Effect.gen(function* () {
+      const setup = yield* fixture;
+      const analytics = yield* open(setup);
+      const call = event({
+        surface: "server",
+        route: "mcp",
+        kind: "mcp.call",
+        tool: "delegate_task",
+        outcome: "timeout",
+        errorPhase: "dispatch",
+        clientRequestId: "a".repeat(64),
+        durationMs: 10000,
+        boardId: "robob",
+        cardNumber: 1559,
+      });
+      yield* analytics.record(call);
+      const input = {
+        day,
+        kind: "mcp.call",
+        tool: "delegate_task",
+        outcome: "timeout",
+        boardId: "robob",
+        cardNumber: 1559,
+      } as const;
+      const before = yield* analytics.read(input);
+      assert.equal(before.rollup.mcpCalls[0]!.dispatchTimeouts!.noOutcome, 1);
+      // Correlation follows the original selected call even if the result has no board attribution.
+      yield* analytics.record(
+        event({
+          surface: "server",
+          route: "mcp",
+          kind: "mcp.detached",
+          tool: "delegate_task",
+          outcome: "committed",
+          clientRequestId: "a".repeat(64),
+          startedAt: ts,
+          ts: `${day}T12:00:15.000Z`,
+          lateMs: 5000,
+        }),
+      );
+      const warm = yield* analytics.read(input);
+      assert.deepEqual(warm.rollup.mcpCalls[0]!.dispatchTimeouts, {
+        committed: 1,
+        failed: 0,
+        capped: 0,
+        noOutcome: 0,
+      });
+      assert.deepEqual(warm.samples, [call]);
+      assert.equal(warm.rollup.total, 1);
+      assert.deepEqual(warm.rollup.kindCounts, { "mcp.call": 1 });
+      const cold = yield* open(setup);
+      assert.deepEqual((yield* cold.read(input)).rollup.mcpCalls, warm.rollup.mcpCalls);
+      const section = yield* analytics.read({ ...input, section: "mcpCalls" });
+      assert.include(JSON.stringify(section.rows), '"committed":1');
+      assert.isBelow(JSON.stringify(section).length, 50000);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("reads a day of runtime samples by kind within the default response cap", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    const samples = Array.from({ length: 1440 }, (_, minute) =>
+      event({
+        ts: `${day}T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}:00.000Z`,
+        kind: "server.runtime_sample",
+        surface: "server",
+        route: "server",
+        props: {
+          runningTurns: { total: 3, byProvider: { codex: 3 }, byModel: { sol: 3, other: 0 } },
+          runningByOrigin: {
+            boardWork: 1,
+            boardReview: 0,
+            boardEvaluator: 0,
+            delegatedChild: 1,
+            scheduledTask: 0,
+            other: 1,
+          },
+          providerSessions: { codex: 1 },
+          host: { load1: 12, load5: 10, load15: 8, rssMiB: 900, heapUsedMiB: 500 },
+          sampleMs: 0.25,
+        },
+      }),
+    );
+    yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe(`${day}T23:59:59.000Z`)));
+    for (const sample of samples) yield* analytics.record(sample);
+    yield* analytics.record(event({ kind: "unrelated.event" }));
+    yield* analytics.flush;
+    const reply = yield* analytics.read({ day, kind: "server.runtime_sample" });
+    assert.equal(reply.rollup.total, 1440);
+    assert.equal(reply.rollup.kindCounts["server.runtime_sample"], 1440);
+    assert.isBelow(JSON.stringify(reply).length, 50_000);
+    const rows = yield* readSamples(analytics, { day, kind: "server.runtime_sample" });
+    // Existing analytics reads retain a bounded latest-500 sample window for each kind.
+    assert.equal(rows.length, 500);
+    assert.isTrue(rows.every((row) => row.kind === "server.runtime_sample"));
+    assert.equal(rows[0]!.props!.runningTurns!.total, 3);
+    const hourly = yield* analytics.read({
+      day,
+      kind: "server.runtime_sample",
+      section: "runtimeSamples",
+    });
+    assert.equal(hourly.rows!.length, 24);
+    assert.isBelow(JSON.stringify(hourly).length, 50_000);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("persists restart-admission facts and exposes their server-wide section", () =>
+  Effect.gen(function* () {
+    const setup = yield* fixture;
+    const analytics = yield* open(setup);
+    const restartAdmission = {
+      sourceRunId: "run:source:ordinal:3",
+      runId: "run:next:ordinal:4",
+      classification: "continuation",
+      queuedAtMs: Date.parse(ts) - 1000,
+      waitedMs: 1000,
+      positionAtEntry: 12,
+      position: 1,
+      total: 3,
+      maxQueueDepth: 12,
+      active: 1,
+      maxActive: 4,
+      loaded: false,
+    };
+    yield* analytics.record(
+      event({
+        kind: "restart.admission.admitted",
+        surface: "server",
+        route: "restart-pacing",
+        threadId: "thread:admitted",
+        bootId: "boot",
+        restartAdmission,
+      }),
+    );
+    yield* analytics.record(
+      event({
+        kind: "restart.admission.failed",
+        surface: "server",
+        route: "restart-pacing",
+        threadId: "thread:failed",
+        bootId: "boot",
+        restartAdmission: {
+          ...restartAdmission,
+          sourceRunId: "run:failed:ordinal:3",
+          rule: "no_progress",
+        },
+      }),
+    );
+    yield* analytics.flush;
+    const result = yield* analytics.read({ day });
+    assert.deepEqual(result.rollup.restartAdmission?.groups[0]?.wait, {
+      count: 1,
+      p50Ms: 1000,
+      p90Ms: 1000,
+      maxMs: 1000,
+      approximate: false,
+    });
+    assert.deepEqual(result.rollup.restartAdmission?.groups[0]?.failuresByRule, { no_progress: 1 });
+    const samples = yield* readSamples(analytics, { day, kind: "restart.admission.failed" });
+    assert.deepEqual(samples[0]?.restartAdmission, {
+      ...restartAdmission,
+      sourceRunId: "run:failed:ordinal:3",
+      rule: "no_progress",
+    });
+    const section = yield* analytics.read({ day, section: "restartAdmission" });
+    assert.strictEqual(section.section, "restartAdmission");
+    assert.isNotEmpty(section.rows);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );

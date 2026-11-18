@@ -97,7 +97,7 @@ describe("board briefs", () => {
   it("tells workers to end their turn for pending wakes without sleeping or polling", () => {
     expect(nudgeWorkText([card])).toContain("end your turn now and let it wake you");
     expect(nudgeWorkText([card])).toContain(
-      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait on another card, a time or a script check, ask your board evaluator to set the wait (card_ask with to: evaluator, giving on, until or target, and the note) and end your turn; the evaluator sets it once your run has ended. Wait inside your turn only for a short step that nothing can wake you for.",
+      "Waiting on CI for a PR: call watch_pull_request on it and end your turn; the board waits while the watch is on and the watch wakes you. If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait (a durable watcher, offbox runs you're blocked on, another card, a time), set it yourself with card_wait on your card (on time with until, script, or card) and end your turn; clear it if something else wakes you first. Wait inside your turn only for a short step that nothing can wake you for.",
     );
   });
 
@@ -107,7 +107,7 @@ describe("board briefs", () => {
       "Waiting on CI for an open or draft PR: call watch_pull_request on it and end your turn; the watch wakes you on CI and review changes, and the board waits for up to 6 hours since your last run while the watch is on.",
     );
     expect(brief).toContain(
-      "If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait on another card, a time or a script check, ask your board evaluator to set the wait (card_ask with to: evaluator, giving on, until or target, and the note) and end your turn; the evaluator sets it once your run has ended. Wait inside your turn only for a short step that nothing can wake you for.",
+      "If something you started will wake you (an async delegate_task child, a background shell command, an offbox run started in the background), end your turn now and let it wake you; don't sleep, poll task_status, or loop on exec waits or offbox wait/logs. For a longer wait (a durable watcher, offbox runs you're blocked on, another card, a time), set it yourself with card_wait on your card (on time with until, script, or card) and end your turn; clear it if something else wakes you first. Wait inside your turn only for a short step that nothing can wake you for.",
     );
     expect(brief).not.toContain("Never end a turn while a card of yours is in Working");
     expect(brief).not.toContain("Wait for CI or a deploy inside the turn");
@@ -301,8 +301,9 @@ it("nightly review requires complete reads, a fresh cursor and recovery from fai
     "Keep since unchanged while paging",
     "continue until hasMore is false",
     "Do not choose a starting card number or skip early cards",
-    "Read every supplied active discussion through the window",
-    "skim each active card thread",
+    'digest:"discussions"',
+    'digest:"threads"',
+    "deep reads done/needed",
     "read the pages relevant to this review by slug or slugs",
     "retry the same read once",
     "continue the other reads either way",
@@ -316,4 +317,33 @@ it("nightly review requires complete reads, a fresh cursor and recovery from fai
   expect(brief.indexOf("Complete the read pass")).toBeLessThan(
     brief.indexOf("1. Information gaps"),
   );
+});
+
+it("nightly review pins the recorded run's ISO window and uses digest coverage", () => {
+  const recorded = {
+    ...board,
+    nightlyReview: {
+      enabled: true,
+      timeOfDay: "00:00",
+      timeZone: "Asia/Dubai",
+      model,
+      lastRunAt: "2026-11-15T20:00:00.000Z",
+      lastRunDay: "2026-11-16",
+      lastDiscussionId: null,
+    },
+  };
+  const brief = evaluatorBrief(recorded, { kind: "nightly" });
+  expect(brief).toContain('use since: "2026-11-14T20:00:00.000Z"');
+  expect(brief).toContain('until: "2026-11-15T20:00:00.000Z"');
+  expect(brief).toContain('digest:"discussions"');
+  expect(brief).toContain('digest:"threads"');
+  expect(brief).toContain("run_failed, restarted, stalled or refused_call");
+  expect(brief).toContain("Call it partial only if one of those required reads is missing");
+  expect(brief).not.toContain("Read every supplied active discussion");
+  const queued = evaluatorBrief(recorded, {
+    kind: "nightly",
+    lastRunAt: "2026-11-14T20:00:00.000Z",
+  });
+  expect(queued).toContain('use since: "2026-11-13T20:00:00.000Z"');
+  expect(brief.indexOf("2. Improvements")).toBeLessThan(brief.indexOf("3. Cross-board routing"));
 });

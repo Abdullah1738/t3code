@@ -115,7 +115,7 @@ class RequestCallerTests(unittest.TestCase):
         self.stack.enter_context(patch.object(inbox_auth, 'WATCHERS', self.root))
         t.atomic(self.wd / 'watcher.json', {'paused': False})
 
-    def test_careem_request_records_before_dispatch_and_suppresses_only_its_otp(self):
+    def test_careem_request_records_before_dispatch_and_marks_only_its_otp_expected(self):
         self.prepare_registry()
         def transport(method, url, *args):
             if url == careem.ROUTES['pow'][1]:
@@ -131,10 +131,14 @@ class RequestCallerTests(unittest.TestCase):
             flow = careem.Bootstrap(careem_fixture.PHONE, mutate=True)
             flow.last_challenge = 'OTP'
             flow.request_otp()
-        self.run_items([item('Careem', 'Your verification code is 123 456.', ts=time.time())])
+        requested = item('Careem', 'Your verification code is 123 456.', ts=time.time())
+        unrelated = item('Apple', 'Your Apple ID Code is 123 456.', id='imsg:other', ts=time.time())
+        with patch.object(t, 'log_decision', wraps=t.log_decision) as decisions:
+            self.run_items([requested])
+            self.run_items([unrelated])
         self.assertEqual(self.notifications(), [])
-        self.run_items([item('Apple', 'Your Apple ID Code is 123 456.', id='imsg:other', ts=time.time())])
-        self.assertEqual(len(self.notifications()), 2)
+        self.assertTrue(any(c.args == (requested, 'otp', 'ignored') for c in decisions.call_args_list))
+        self.assertTrue(any(c.args == (unrelated, 'otp', 'logged') for c in decisions.call_args_list))
         evidence = t.read_json(self.data / 'inflight-actions.json', [])
         self.assertEqual(set(evidence[0]), {'sender', 'account', 'at'})
 
@@ -142,8 +146,12 @@ class RequestCallerTests(unittest.TestCase):
         self.prepare_registry()
         self.stack.enter_context(patch.object(journal, 'ROOT', self.root.resolve() / 'commerce'))
         self.stack.enter_context(patch.object(receipts, 'ROOT', self.root.resolve() / 'commerce'))
-        for last4, sender in (('2342', 'EmiratesNBD'), ('9546', 'Mashreq')):
+        for last4, sender, aliases in (
+            ('2342', 'EmiratesNBD', ('emiratesnbd', 'emirates nbd', 'emirates-nbd')),
+            ('9546', 'Mashreq', ('mashreq',)),
+        ):
             with self.subTest(last4=last4), patch.object(journal.order_card, 'LAST4', last4):
+                t.atomic(self.data / 'inflight-actions.json', [])
                 # The actual Main caller validates the selected card before reserving place.
                 responses = main_fixture.happy_responses(
                     order_status=[{'status': 'pending', 'clientSecret': 'fixture-intent'},
@@ -173,19 +181,34 @@ class RequestCallerTests(unittest.TestCase):
                 flow.prepare_payment()
                 self.approve_flow(flow.flow_id, flow.review['payable_minor'])
                 original_request = wire.request
+                started, dispatched = time.time(), []
                 # Client captured the bound method at construction; wrap that boundary.
                 def request(op, *args, **kwargs):
                     if op.name in ('place', 'payment_complete'):
+                        dispatch_at = time.time()
                         evidence = t.read_json(self.data / 'inflight-actions.json', [])
-                        self.assertIn(sender.casefold(), [a['sender'] for a in evidence])
+                        self.assertEqual(sorted(a['sender'] for a in evidence),
+                                         sorted(aliases * (len(dispatched) + 1)))
+                        for action in evidence:
+                            self.assertEqual(set(action), {'sender', 'account', 'at'})
+                            self.assertIsNone(action['account'])
+                            self.assertIsInstance(action['at'], (int, float))
+                            self.assertLessEqual(started, action['at'])
+                            self.assertLessEqual(action['at'], dispatch_at)
+                            self.assertLessEqual(dispatch_at - action['at'], 600)
+                        dispatched.append(op.name)
                     return original_request(op, *args, **kwargs)
                 with patch.object(flow.client, '_request', side_effect=request), contextlib.redirect_stdout(io.StringIO()):
                     flow.place()
                     flow.await_success(notify=None, sleep=lambda _: None)
                 evidence = t.read_json(self.data / 'inflight-actions.json', [])
+                self.assertEqual(dispatched, ['place', 'payment_complete'])
                 self.assertEqual(sum(a['sender'] == sender.casefold() for a in evidence), 2)
-                self.run_items([item(sender, 'Your OTP for purchase of AED 1200 is 123 456.',
-                                     ts=time.time(), id=f'imsg:bank-{last4}')])
+                otp = item(sender, 'Your OTP for purchase of AED 1200 is 123 456.',
+                           ts=time.time(), id=f'imsg:bank-{last4}')
+                with patch.object(t, 'log_decision', wraps=t.log_decision) as decisions:
+                    self.run_items([otp])
+                decisions.assert_called_once_with(otp, 'otp', 'ignored')
                 self.assertEqual(self.notifications(), [])
 
     def test_registry_failure_stops_careem_before_otp_dispatch(self):
@@ -200,12 +223,15 @@ class RequestCallerTests(unittest.TestCase):
                 flow.request_otp()
             self.assertEqual(transport.call_count, 1)  # read-only proof of work only
 
-    def test_unknown_card_does_not_register_a_bank_or_suppress_auth(self):
+    def test_unknown_card_does_not_register_a_bank_or_mark_auth_expected(self):
         self.prepare_registry()
         inbox_auth.expect_payment('9999')
         self.assertFalse((self.data / 'inflight-actions.json').exists())
-        self.run_items([item('Mashreq', 'Your verification code is 123 456.', ts=time.time())])
-        self.assertEqual(len(self.notifications()), 2)
+        otp = item('Mashreq', 'Your verification code is 123 456.', ts=time.time())
+        with patch.object(t, 'log_decision', wraps=t.log_decision) as decisions:
+            self.run_items([otp])
+        self.assertEqual(self.notifications(), [])
+        self.assertTrue(any(c.args == (otp, 'otp', 'logged') for c in decisions.call_args_list))
 
     def test_registry_failure_rolls_back_financial_consume_before_dispatch(self):
         self.prepare_registry()

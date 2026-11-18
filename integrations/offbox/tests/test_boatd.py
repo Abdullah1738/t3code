@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SERVER = Path(__file__).resolve().parents[1] / "server"
 spec = importlib.util.spec_from_file_location("boatd", SERVER / "boatd.py")
@@ -60,6 +60,9 @@ class Fakes:
         elif args[:1] == ("query",) and "/snapshots" in args[1]:
             name = args[1].split("/")[3]
             out = json.dumps(self.snapshots.get(name, [])).encode()
+        elif args[:1] == ('query',) and args[1].startswith('/1.0/instances/'):
+            bid = args[1].split('/')[3].replace('-', '_')
+            out = json.dumps({'config': {'user.offbox.provision': bid}}).encode()
         elif args[:2] == ("config", "device"):
             out = b"ssh\n"
         p = subprocess.CompletedProcess(args, rc, out, b"refused" if rc else b"")
@@ -86,15 +89,17 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="boatd-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        log_env = patch.dict(os.environ, OFFBOX_TOOL_LOG_DIR=str(self.tmp / "shared-logs"))
+        log_env = patch.dict(os.environ, OFFBOX_LOG_DIR=str(self.tmp / "shared-logs"))
         log_env.start()
         self.addCleanup(log_env.stop)
         self.saved = {k: getattr(boatd, k) for k in (
             "VAR", "ETC", "CMDS", "DB_PATH", "ADMIT_LOCK", "incus", "_sh", "spawn_runner", "unit_active",
-            "ct_running", "_wait_boot", "boot_id", "mem_available", "provision", "log")}
+            "ct_running", "_wait_boot", "boot_id", "mem_available", "provision", "log", "CG_ROOT")}
         self.addCleanup(lambda: [setattr(boatd, k, v) for k, v in self.saved.items()])
         boatd.VAR, boatd.ETC = self.tmp / "var", self.tmp / "etc"
         boatd.CMDS, boatd.DB_PATH, boatd.ADMIT_LOCK = boatd.VAR / "cmds", boatd.VAR / "boatd.db", boatd.VAR / "admit.lock"
+        boatd.CG_ROOT = self.tmp / 'cgroups'
+        boatd.CG_ROOT.mkdir()
         boatd.ETC.mkdir(parents=True)
         self.f = Fakes()
         boatd.incus, boatd._sh, boatd.spawn_runner = self.f.incus, self.f._sh, self.f.spawn_runner
@@ -104,8 +109,21 @@ class Base(unittest.TestCase):
         boatd.boot_id = lambda: "boot-2"
         boatd.log = lambda msg: None
         boatd.load_cfg()
+        # Host storage is faked alongside Incus; focused scratch tests exercise its actual lifecycle.
+        storage = Mock()
+        storage.start.side_effect = lambda bid: boatd.incus('start', boatd.ct(bid), timeout=300)
+        scratch_host = patch.object(boatd, 'scratch', return_value=storage)
+        scratch_host.start()
+        self.addCleanup(scratch_host.stop)
         # Resource inputs are explicit in admission tests, independent of the test runner's host.
         boatd.CFG["cpu_pressure_limit"] = 0
+        memory_input = patch.object(boatd.boatd_memory, 'meminfo', return_value={'MemTotal': 1000 * 2**30})
+        memory_input.start()
+        self.addCleanup(memory_input.stop)
+        for target, values in ((boatd.STATE, {"loops": {}}), (boatd.LOOP_SPECS, {}), (boatd.LOOP_THREADS, {})):
+            fixture = patch.dict(target, values, clear=target is not boatd.STATE)
+            fixture.start()
+            self.addCleanup(fixture.stop)
         boatd.READY.clear()
         boatd._HEALTH.update(ts=0.0, v=None)
         boatd._HEALTH_REFRESH.update(stage="idle", since=None, timings={})
@@ -163,6 +181,7 @@ class Logging(Base):
     def test_memory_admission_logs_queue_before_wait(self):
         b = self.box()
         pid = self.cmd(b, status='queued')
+        self.cmd(b, pid=1002, status='running')
         with patch.object(boatd, 'mem_available', return_value=0), patch.object(boatd.time, 'sleep', side_effect=RuntimeError('stop fixture wait')):
             with self.assertRaises(RuntimeError): boatd.admit(self.con,b,pid,'k',io.BytesIO())
         row = self.rows('run.queue')[0]
@@ -386,7 +405,7 @@ class Queue(Base):
         boatd.CFG["cpu_pressure_limit"] = 50
         self.assertEqual(boatd.admission_cpu_limit(), 0)
 
-    def test_one_hour_escape_only_when_cpu_admission_is_off(self):
+    def test_one_hour_never_bypasses_admission_even_when_cpu_check_is_off(self):
         for limit in (0, 50, None):
             for blocked in ("fifo", "memory", "cap"):
                 with self.subTest(limit=limit, blocked=blocked):
@@ -416,9 +435,9 @@ class Queue(Base):
                         queued_s = boatd.admit(self.con, b, q, "k", io.BytesIO())
                     self.assertEqual(queued_s, 3601)
                     self.assertEqual(waits[:2], [10000, 13600])
-                    self.assertEqual(len(waits), 2 if limit == 0 else 3)
-                    self.assertEqual(self.status(b, q)["status"], "running" if limit == 0 else "queued")
-                    self.assertEqual(self.status(b, q)["started_at"], 13601 if limit == 0 else None)
+                    self.assertEqual(len(waits), 3)
+                    self.assertEqual(self.status(b, q)["status"], "queued")
+                    self.assertEqual(self.status(b, q)["started_at"], None)
                     self.assertEqual(self.status(b, earlier)["status"], earlier_status)
                     self.con.execute("DELETE FROM commands WHERE box_id=?", (b,))
                     self.con.execute("DELETE FROM boxes WHERE id=?", (b,))
@@ -459,6 +478,7 @@ class Queue(Base):
     def test_installer_undo_releases_an_existing_cpu_waiter(self):
         b = self.box()
         q = self.cmd(b, status="queued")
+        self.cmd(b, pid=1002, status="running")
         boatd.CFG["cpu_pressure_limit"] = 50
         (boatd.ETC / "config.json").write_text('{"cpu_pressure_limit":50}')
         (boatd.ETC / "config.json.before-117").write_text('{}')
@@ -480,6 +500,8 @@ class Queue(Base):
             with self.subTest(pressure=pressure):
                 b = self.box(bid="bx_cpuqueue")
                 q = self.cmd(b, status="queued")
+                self.cmd(b, pid=1002, status="running", age=200)
+                self.con.execute("UPDATE commands SET started_at=1 WHERE pid=1002")
                 boatd.CFG["cpu_pressure_limit"] = 50
                 err = io.BytesIO()
                 reading = [pressure]
@@ -638,6 +660,7 @@ class Queue(Base):
         boatd.mem_available = lambda: 1 * 2**30
         b = self.box()
         q = self.cmd(b, status="queued")
+        self.cmd(b, pid=1002, status="running")
         self.assertFalse(self.admit_now(b, q))
 
     def test_retry_interrupted_must_be_asked_for(self):
@@ -748,6 +771,7 @@ class Http(Base):
                 b = self.box("bx_same" if same_box else "bx_exec")
                 queued_box = b if same_box else self.box("bx_queued")
                 queued_pid = self.cmd(queued_box, status="queued")
+                self.cmd(queued_box, pid=1002, status="running")
                 entered, release = threading.Event(), threading.Event()
                 errors = []
                 def hold_admission(_):
@@ -838,7 +862,7 @@ class Http(Base):
         boatd.health(fresh=True)
         st, d = self.call(None, "GET", "/health")
         self.assertEqual(st, 200)
-        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "disk", "disk_full", "disk_low", "host", "mdraid", "mode", "ok", "phase", "pool", "queue", "reasons",
+        self.assertEqual(sorted(d), ["boatd_uptime_s", "boot", "boot_id", "degraded", "disk", "disk_full", "disk_low", "host", "loops", "mdraid", "mode", "ok", "phase", "pool", "problem", "queue", "reasons",
                                      "refresh_stage", "refresh_stage_ms", "refresh_timings_ms", "restartPending", "running", "snapshot_age_s",
                                      "startedAt", "starting", "startupPhases", "up", "uptime_s", "version"])
         self.assertNotIn("moni", json.dumps(d))
@@ -1174,7 +1198,7 @@ unused devices: <none>
         started = []
 
         class NoThread:
-            def __init__(self, target=None, args=(), daemon=None):
+            def __init__(self, target=None, args=(), daemon=None, name=None):
                 self.target, self.args = target, args
 
             def start(self):

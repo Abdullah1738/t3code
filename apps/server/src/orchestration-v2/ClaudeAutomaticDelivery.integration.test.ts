@@ -22,6 +22,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Option from "effect/Option";
+import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -41,6 +43,7 @@ import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as DelegatedTaskProgressGuard from "./DelegatedTaskProgressGuard.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
@@ -503,19 +506,126 @@ it.effect.each(deliveries)(
     ),
 );
 
-it.effect.each([false, true])(
-  "resumes a transient delegated child once (second failure: %s)",
-  (failAgain) =>
+it.effect.each([
+  ...(["exhausted", "network", "silent", "after-access"] as const).flatMap((shape) =>
+    [false, true].map((failAgain) => ({
+      shape,
+      failAgain,
+      sdkStatus: null,
+      networkText: "",
+      terminalReason: "api_error" as const,
+    })),
+  ),
+  ...[undefined, null, 404].flatMap((syntheticStatus) =>
+    [false, true].flatMap((failAgain) =>
+      [false, true].flatMap((retryFirst) =>
+        [false, true].flatMap((health) =>
+          (retryFirst ? [true] : [true, false]).map((nativeFirst) => ({
+            shape: "synthetic-network" as const,
+            failAgain,
+            sdkStatus: null,
+            networkText: "",
+            terminalReason: "api_error" as const,
+            syntheticStatus,
+            retryFirst,
+            health,
+            nativeFirst,
+          })),
+        ),
+      ),
+    ),
+  ),
+  ...[400, 413, 418].flatMap((sdkStatus) =>
+    ["Request timed out.", "Connection dropped (ECONNRESET)"].map((networkText) => ({
+      shape: "permanent" as const,
+      failAgain: false,
+      sdkStatus,
+      networkText,
+      terminalReason: "api_error" as const,
+    })),
+  ),
+  ...(["prompt_too_long", "blocking_limit"] as const).flatMap((terminalReason) =>
+    ["Request timed out.", "Connection dropped (ECONNRESET)"].map((networkText) => ({
+      shape: "context" as const,
+      failAgain: false,
+      sdkStatus: null,
+      networkText,
+      terminalReason,
+    })),
+  ),
+  ...[400, 401, 403, 413, 418, 429].flatMap((sdkStatus) =>
+    ["Request timed out.", "Connection dropped (ECONNRESET)"].flatMap((networkText) =>
+      ["api_error", "missing", "execution", "synthetic-404"].flatMap((terminal) =>
+        [false, true].map((generic) => ({
+          shape: "native-sdk" as const,
+          failAgain: false,
+          sdkStatus,
+          networkText,
+          generic,
+          terminalReason:
+            terminal === "api_error" || terminal === "synthetic-404"
+              ? ("api_error" as const)
+              : null,
+          terminalApiStatus: terminal === "synthetic-404" ? 404 : null,
+          terminalSubtype: terminal === "execution" ? "error_during_execution" : "success",
+        })),
+      ),
+    ),
+  ),
+  ...[400, 413].flatMap((sdkStatus) =>
+    ["Request timed out.", "Connection dropped (ECONNRESET)"].flatMap((networkText) =>
+      ["[Watcher event from build] Ready", "Please relay: ready"].map((relayText) => ({
+        shape: "native-sdk" as const,
+        failAgain: false,
+        sdkStatus,
+        networkText,
+        relayText,
+        generic: true,
+        terminalReason: "api_error" as const,
+        terminalApiStatus: null,
+        terminalSubtype: "success",
+      })),
+    ),
+  ),
+  ...[
+    "usage limit reached",
+    "quota exceeded",
+    "authentication failed",
+    "invalid api key",
+    "401 unauthorized",
+    "403 forbidden",
+    "429 rate limit",
+    "model not found",
+    "502 upstream 429 quota exceeded",
+  ].map((networkText) => ({
+    shape: "native-permanent" as const,
+    failAgain: false,
+    sdkStatus: null,
+    networkText,
+    terminalReason: "api_error" as const,
+  })),
+])(
+  "handles $shape delegated recovery (second: $failAgain, SDK: $sdkStatus, text: $networkText, reason: $terminalReason, subtype: $terminalSubtype, status: $terminalApiStatus, generic: $generic, synthetic: $syntheticStatus, retry: $retryFirst, native first: $nativeFirst, health: $health, relay: $relayText)",
+  (scenario) =>
     Effect.scoped(
       Effect.gen(function* () {
+        const { shape, failAgain, sdkStatus, networkText, terminalReason } = scenario;
+        const selection =
+          shape === "after-access"
+            ? { ...modelSelection, model: "claude-sonnet-5-5" }
+            : modelSelection;
         const cwd = yield* checkpointWorkspace("claude-delegated-recovery");
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const configDir = yield* fs.makeTempDirectoryScoped();
         const queues = new Map<string, Queue.Queue<SDKMessage>>();
         const offers: Array<{ session: string; message: SDKUserMessage }> = [];
+        const healthInterrupts: string[] = [];
         let sessionOrdinal = 0;
         const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
           instanceId: modelSelection.instanceId,
           settings,
-          environment: {},
+          environment: { CLAUDE_CONFIG_DIR: configDir },
           attachmentsDir: cwd,
           fileSystem: yield* FileSystem.FileSystem,
           path: yield* Path.Path,
@@ -539,8 +649,10 @@ it.effect.each([false, true])(
                   setPermissionMode: () => Effect.void,
                   backgroundTasks: () => Effect.succeed(false),
                   stopTask: () => Effect.void,
-                  interrupt: Effect.void,
-                  close: Effect.void,
+                  interrupt: Effect.sync(() => {
+                    healthInterrupts.push(session);
+                  }),
+                  close: Queue.shutdown(queue),
                 };
               }),
             forkSession: () => Effect.die("unused"),
@@ -565,7 +677,7 @@ it.effect.each([false, true])(
             threadId: parentId,
             projectId: ProjectId.make("project:recovery"),
             title: "Recovery",
-            modelSelection,
+            modelSelection: selection,
             runtimeMode: "full-access",
             interactionMode: "default",
             worktreePath: cwd,
@@ -592,8 +704,11 @@ it.effect.each([false, true])(
             parentThreadId: parentId,
             parentRunId: parent.id,
             parentNodeId: parent.rootNodeId!,
-            task: "Write the file",
-            modelSelection,
+            task:
+              "relayText" in scenario && typeof scenario.relayText === "string"
+                ? scenario.relayText
+                : "Write the file",
+            modelSelection: selection,
             runtimeMode: "full-access",
             interactionMode: "default",
             createdBy: "agent",
@@ -603,26 +718,317 @@ it.effect.each([false, true])(
           const task = (yield* orchestrator.getThreadProjection(parentId)).subagents[0]!;
           const childId = task.childThreadId!;
           const before = yield* orchestrator.getThreadProjection(childId);
+          const guard =
+            shape === "silent"
+              ? yield* DelegatedTaskProgressGuard.DelegatedTaskProgressGuard.pipe(
+                  Effect.provide(DelegatedTaskProgressGuard.layer),
+                )
+              : undefined;
+          if (guard !== undefined)
+            yield* guard.handle({
+              id: EventId.make("guard-silent-child"),
+              type: "run.updated",
+              threadId: childId,
+              runId: before.runs[0]!.id,
+              occurredAt: yield* DateTime.now,
+              payload: before.runs[0]!,
+            });
           const nativeId = before.providerThreads[0]!.nativeThreadRef!.nativeId;
           if (nativeId === null) return yield* Effect.die("child has no native session");
-          const queue = queues.get(nativeId)!;
+          let queue = queues.get(nativeId)!;
+          if (shape === "after-access") {
+            const accessRecovery = yield* watch(
+              (event) =>
+                event.threadId === childId &&
+                event.type === "run.updated" &&
+                event.payload.launchRecovery?.kind === "model_access",
+            );
+            yield* Queue.offer(
+              queue,
+              frame({
+                ...result("access-failure", false),
+                session_id: nativeId,
+                is_error: true,
+                terminal_reason: "api_error",
+                api_error_status: 401,
+                result: "API Error: 401 unauthorized",
+              }),
+            );
+            yield* Fiber.join(accessRecovery);
+            const draining = yield* worker.drain().pipe(Effect.forkScoped);
+            yield* TestClock.adjust("40 seconds");
+            yield* Fiber.join(draining);
+            const recovered = yield* orchestrator.getThreadProjection(childId);
+            assert.lengthOf(recovered.attempts, 2);
+            assert.equal(recovered.runs[0]?.launchRecovery?.kind, "model_access");
+            assert.isUndefined(recovered.runs[0]?.transientRecovery);
+            assert.equal(recovered.providerThreads[0]?.nativeThreadRef?.nativeId, nativeId);
+            queue = queues.get(nativeId)!;
+            const toolCompleted = yield* watch(
+              (event) =>
+                event.threadId === childId &&
+                event.type === "turn-item.updated" &&
+                event.payload.type === "command_execution" &&
+                event.payload.status === "completed",
+            );
+            yield* Queue.offerAll(queue, [
+              frame({
+                type: "assistant",
+                uuid: "response-after-access",
+                session_id: nativeId,
+                parent_tool_use_id: null,
+                message: {
+                  id: "tool-after-access",
+                  role: "assistant",
+                  type: "message",
+                  model: selection.model,
+                  content: [
+                    { type: "tool_use", id: "build", name: "Bash", input: { command: "make" } },
+                  ],
+                  stop_reason: "tool_use",
+                  stop_sequence: null,
+                  usage: { input_tokens: 1, output_tokens: 1 },
+                },
+              }),
+              frame({ ...toolResult("build", false), session_id: nativeId }),
+            ]);
+            yield* Fiber.join(toolCompleted);
+          }
+          if (
+            shape === "permanent" ||
+            shape === "context" ||
+            shape === "native-sdk" ||
+            shape === "native-permanent"
+          ) {
+            const completedEnvelope =
+              scenario.shape === "native-sdk" &&
+              scenario.terminalReason === null &&
+              scenario.terminalSubtype === "success";
+            const terminal = yield* watch(
+              (event) =>
+                event.threadId === childId &&
+                event.type === "run.updated" &&
+                event.payload.status === (completedEnvelope ? "waiting" : "failed"),
+            );
+            if (shape !== "permanent") {
+              const dir = path.join(configDir, "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+              yield* fs.makeDirectory(dir, { recursive: true });
+              yield* fs.writeFileString(
+                path.join(dir, `${nativeId}.jsonl`),
+                JSON.stringify({
+                  type: "system",
+                  subtype: "api_error",
+                  timestamp: DateTime.formatIso(yield* DateTime.now),
+                  error: { message: networkText, connection: null },
+                  source: "request_retry",
+                }) + "\n",
+              );
+            }
+            const terminalMessage = {
+              ...result("statusless-network-terminal", false),
+              ...(scenario.shape === "native-sdk" ? { subtype: scenario.terminalSubtype } : {}),
+              session_id: nativeId,
+              is_error: true,
+              terminal_reason: terminalReason,
+              api_error_status: scenario.shape === "native-sdk" ? scenario.terminalApiStatus : null,
+              result: `API Error: ${networkText}`,
+              errors: [networkText],
+            };
+            if (terminalReason === null) Reflect.deleteProperty(terminalMessage, "terminal_reason");
+            yield* Queue.offerAll(queue, [
+              ...(shape === "native-permanent"
+                ? []
+                : [
+                    frame({
+                      type: "system",
+                      subtype: "api_retry",
+                      attempt: 1,
+                      max_retries: 10,
+                      retry_delay_ms: 602,
+                      error: "unknown",
+                      error_status: sdkStatus,
+                      session_id: nativeId,
+                      uuid: "permanent-sdk-retry",
+                    }),
+                  ]),
+              ...(scenario.shape === "native-sdk" && scenario.generic
+                ? [
+                    frame({
+                      type: "system",
+                      subtype: "api_retry",
+                      attempt: 2,
+                      max_retries: 10,
+                      retry_delay_ms: 602,
+                      error: "unknown",
+                      error_status: null,
+                      session_id: nativeId,
+                      uuid: "generic-after-permanent",
+                    }),
+                  ]
+                : []),
+              frame(terminalMessage),
+            ]);
+            yield* Fiber.join(terminal);
+            yield* worker.drain();
+            const after = yield* orchestrator.getThreadProjection(childId);
+            assert.lengthOf(after.attempts, 1);
+            assert.lengthOf(
+              offers.filter((offer) => offer.session === nativeId),
+              1,
+            );
+            assert.isUndefined(after.runs[0]?.transientRecovery);
+            if (completedEnvelope) {
+              assert.equal(after.runs[0]?.status, "completed");
+              return;
+            }
+            const failure = after.turnItems.findLast(
+              (item) => item.type === "error" && item.status === "failed",
+            );
+            if (shape === "native-permanent") {
+              assert.equal(failure?.type === "error" ? failure.failure.category : "", "unknown");
+              assert.include(failure?.type === "error" ? failure.failure.message : "", networkText);
+            } else if (
+              scenario.shape === "native-sdk" &&
+              (scenario.generic ||
+                (scenario.terminalApiStatus === 404 &&
+                  [401, 403, 429].includes(scenario.sdkStatus)))
+            ) {
+              assert.equal(
+                failure?.type === "error" ? failure.failure.code : "",
+                "claude_network_error",
+              );
+              assert.isFalse(failure?.type === "error" ? failure.failure.retryable : true);
+            } else
+              assert.equal(
+                failure?.type === "error" ? failure.failure.code : "",
+                shape === "context" ? terminalReason : `api_error_${sdkStatus}`,
+              );
+            if (shape === "context")
+              assert.equal(
+                failure?.type === "error" ? failure.failure.category : "",
+                "context_exhausted",
+              );
+            return;
+          }
           const recovering = yield* watch(
             (event) =>
               event.threadId === childId &&
               event.type === "run.updated" &&
               event.payload.transientRecovery !== undefined,
           );
-          yield* Queue.offer(
-            queue,
-            frame({
-              ...result("exhausted-first", false),
-              session_id: nativeId,
-              is_error: true,
-              terminal_reason: "api_error",
-              api_error_status: 529,
-              result: "API Error: 529 overloaded_error",
-            }),
-          );
+          let firstHealthCheck = true;
+          const checkHealth = Effect.gen(function* () {
+            if (guard !== undefined && firstHealthCheck) {
+              firstHealthCheck = false;
+              yield* TestClock.adjust("5 minutes");
+              yield* guard.check();
+              assert.lengthOf(healthInterrupts, 1);
+              // Delay the guard's run events until after the old fifteen-minute deadline.
+              yield* TestClock.adjust("10 minutes");
+              yield* guard.check();
+              assert.lengthOf(healthInterrupts, 1);
+              return;
+            }
+            const current = yield* orchestrator.getThreadProjection(childId);
+            const provider = current.providerThreads[0]!;
+            const runtime = yield* (yield* ProviderSessionManager.ProviderSessionManagerV2).get(
+              provider.providerSessionId!,
+            );
+            assert.isTrue(Option.isSome(runtime));
+            if (Option.isNone(runtime)) return;
+            yield* TestClock.adjust("5 minutes");
+            assert.isTrue(
+              yield* runtime.value.checkRetryHealth!({
+                runId: current.runs[0]!.id,
+                attemptId: current.runs[0]!.activeAttemptId,
+                noResponseBudgetMs: 300_000,
+                flapLimit: 20,
+              }),
+            );
+          });
+          if (scenario.shape === "synthetic-network") {
+            const syntheticProcessed = yield* watch(
+              (event) =>
+                event.threadId === childId &&
+                event.type === "turn-item.updated" &&
+                event.payload.nativeItemRef?.nativeId === "synthetic-model-error",
+            );
+            const dir = path.join(configDir, "projects", cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+            yield* fs.makeDirectory(dir, { recursive: true });
+            yield* fs.writeFileString(
+              path.join(dir, `${nativeId}.jsonl`),
+              JSON.stringify({
+                type: "system",
+                subtype: "api_error",
+                timestamp: DateTime.formatIso(yield* DateTime.now),
+                error: {
+                  message: "Connection dropped (ECONNRESET)",
+                  connection: { code: "ECONNRESET" },
+                },
+              }) + "\n",
+            );
+            const file = path.join(dir, `${nativeId}.jsonl`);
+            if (!scenario.nativeFirst) yield* fs.rename(file, `${file}.unavailable`);
+            yield* Queue.offerAll(queue, [
+              ...(scenario.retryFirst
+                ? [
+                    frame({
+                      type: "system",
+                      subtype: "api_retry",
+                      attempt: 1,
+                      max_retries: 10,
+                      retry_delay_ms: 602,
+                      error: "unknown",
+                      error_status: null,
+                      session_id: nativeId,
+                      uuid: "reset-retry",
+                    }),
+                  ]
+                : []),
+              frame({
+                type: "assistant",
+                uuid: "synthetic-model-error",
+                session_id: nativeId,
+                parent_tool_use_id: null,
+                error: "model_not_found",
+                ...(scenario.syntheticStatus === undefined
+                  ? {}
+                  : { api_error_status: scenario.syntheticStatus }),
+                message: {
+                  id: "synthetic",
+                  role: "assistant",
+                  type: "message",
+                  model: "<synthetic>",
+                  content: [{ type: "text", text: "There's an issue with the selected model" }],
+                  stop_reason: "end_turn",
+                  stop_sequence: null,
+                  usage: { input_tokens: 0, output_tokens: 0 },
+                },
+              }),
+            ]);
+            yield* Fiber.join(syntheticProcessed);
+            if (!scenario.nativeFirst) yield* fs.rename(`${file}.unavailable`, file);
+          }
+          const healthCutoff =
+            shape === "silent" ||
+            shape === "after-access" ||
+            (scenario.shape === "synthetic-network" && scenario.health);
+          if (healthCutoff) yield* checkHealth;
+          else
+            yield* Queue.offer(
+              queue,
+              frame({
+                ...result("exhausted-first", false),
+                session_id: nativeId,
+                is_error: true,
+                terminal_reason: "api_error",
+                api_error_status: shape === "network" || shape === "synthetic-network" ? null : 529,
+                result:
+                  shape === "network" || shape === "synthetic-network"
+                    ? "API Error: Connection dropped (ECONNRESET)"
+                    : "API Error: 529 overloaded_error",
+              }),
+            );
           yield* Fiber.join(recovering);
           const draining = yield* worker.drain().pipe(Effect.forkScoped);
           yield* TestClock.adjust(1000);
@@ -630,10 +1036,15 @@ it.effect.each([false, true])(
           const resumed = yield* orchestrator.getThreadProjection(childId);
           assert.equal(resumed.providerThreads[0]?.nativeThreadRef?.nativeId, nativeId);
           assert.deepEqual(resumed.runs[0]?.modelSelection, before.runs[0]?.modelSelection);
-          assert.lengthOf(resumed.attempts, 2);
+          const expectedAttempts = shape === "after-access" ? 3 : 2;
+          assert.lengthOf(resumed.attempts, expectedAttempts);
+          if (guard !== undefined) {
+            assert.lengthOf(healthInterrupts, 1);
+            assert.isUndefined(resumed.runs[0]?.delegatedTaskStallRecovery);
+          }
           assert.lengthOf(
             offers.filter((offer) => offer.session === nativeId),
-            2,
+            expectedAttempts,
           );
           const terminal = yield* watch(
             (event) =>
@@ -641,28 +1052,30 @@ it.effect.each([false, true])(
               event.type === "run.updated" &&
               event.payload.status === (failAgain ? "failed" : "waiting"),
           );
-          yield* Queue.offer(
-            queue,
-            frame({
-              ...result("resumed-result", false),
-              session_id: nativeId,
-              ...(failAgain
-                ? {
-                    is_error: true,
-                    terminal_reason: "api_error",
-                    api_error_status: 502,
-                    result: "API Error: 502 connection reset",
-                  }
-                : {}),
-            }),
-          );
+          if (healthCutoff && failAgain) yield* checkHealth;
+          else
+            yield* Queue.offer(
+              queues.get(nativeId)!,
+              frame({
+                ...result("resumed-result", false),
+                session_id: nativeId,
+                ...(failAgain
+                  ? {
+                      is_error: true,
+                      terminal_reason: "api_error",
+                      api_error_status: 502,
+                      result: "API Error: 502 connection reset",
+                    }
+                  : {}),
+              }),
+            );
           yield* Fiber.join(terminal);
           yield* worker.drain();
           const after = yield* orchestrator.getThreadProjection(childId);
-          assert.lengthOf(after.attempts, 2);
+          assert.lengthOf(after.attempts, expectedAttempts);
           assert.lengthOf(
             offers.filter((offer) => offer.session === nativeId),
-            2,
+            expectedAttempts,
           );
           if (failAgain) {
             const failure = after.turnItems
@@ -672,14 +1085,25 @@ it.effect.each([false, true])(
               failure?.type === "error" ? failure.failure.message : "",
               "First error:",
             );
-            assert.include(failure?.type === "error" ? failure.failure.message : "", "502");
+            assert.include(
+              failure?.type === "error" ? failure.failure.message : "",
+              healthCutoff ? "no response for 5 min" : "502",
+            );
           } else assert.equal(after.runs[0]?.status, "completed");
         }).pipe(
           Effect.provide(
-            ProviderReplayHarness.layerWithRegistry(
-              { name: "claude-delegated-recovery" },
-              ProviderAdapterRegistry.layerSingle(adapter),
-              { runEffectWorker: false },
+            ThreadManagementService.layer.pipe(
+              Layer.provideMerge(
+                Layer.mergeAll(
+                  ProviderReplayHarness.layerWithRegistry(
+                    { name: "claude-delegated-recovery" },
+                    ProviderAdapterRegistry.layerSingle(adapter),
+                    { runEffectWorker: false },
+                  ),
+                  CommandReceiptStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+                  ServerSettings.layerTest(),
+                ),
+              ),
             ),
           ),
         );

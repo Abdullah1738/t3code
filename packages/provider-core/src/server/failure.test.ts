@@ -14,13 +14,37 @@ import * as Effect from "effect/Effect";
 import {
   makeProviderFailure,
   makeProviderFailureTurnItem,
+  withPreviousFailure,
   MAX_PROVIDER_FAILURE_CODE_LENGTH,
   MAX_PROVIDER_FAILURE_MESSAGE_LENGTH,
+  ClaudeTurnPreparationTimeoutError,
   ContextHandoffBudgetError,
   ContextHandoffBackgroundWorkError,
 } from "./failure.ts";
 import * as IdAllocator from "./IdAllocator.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+
+it("retains Claude API diagnostics when an automatic resume also fails", () => {
+  const claudeApiError = {
+    model: "claude-opus-5-5",
+    host: "router.test",
+    path: "/v1",
+    status: 404,
+    errorCode: "model_not_found",
+    errorType: "not_found_error",
+    errorText: "Model missing",
+    attempt: 2,
+    resume: true,
+  };
+  const failure = {
+    ...makeProviderFailure({ message: "HTTP 404", code: "api_error_404" }),
+    claudeApiError,
+  };
+  const resumed = withPreviousFailure(failure, makeProviderFailure({ message: "HTTP 503" }));
+  assert.deepEqual(resumed.claudeApiError, claudeApiError);
+  assert.include(resumed.message, "First error: HTTP 503");
+  assert.include(resumed.message, "Resume error: HTTP 404");
+});
 
 it("redacts credentials and URL secrets from provider failures", () => {
   const failure = makeProviderFailure({
@@ -375,5 +399,34 @@ it("classifies a provider usage limit anywhere in the cause chain over a generic
       class: "provider_error",
     }).class,
     "provider_error",
+  );
+});
+
+it.each([
+  ["turn_preparation", "turn preparation"],
+  ["skill_discovery", "skill discovery"],
+  ["attachments", "attachment preparation"],
+  ["sdk_open", "SDK session setup"],
+  ["mcp_registration", "MCP registration"],
+] as const)("names safe Claude preparation timeout stage %s", (stage, label) => {
+  const failure = makeProviderFailure({
+    cause: Cause.fail({
+      _tag: "ProviderAdapterTurnStartError",
+      cause: new ClaudeTurnPreparationTimeoutError({ stage, cause: new Error("private config") }),
+    }),
+  });
+  assert.equal(
+    failure.message,
+    `Claude did not start within 15 s (${label}); nothing was sent to the model. Retry is safe.`,
+  );
+});
+
+it.each([
+  { _tag: "TimeoutError" },
+  { _tag: "ClaudeTurnPreparationTimeoutError", stage: "private-config" },
+])("does not call arbitrary startup errors safe to retry", (cause) => {
+  assert.equal(
+    makeProviderFailure({ cause: { _tag: "ProviderAdapterTurnStartError", cause } }).message,
+    "The provider could not start this turn. Retry the turn; if it keeps failing, check the provider setup and server logs.",
   );
 });

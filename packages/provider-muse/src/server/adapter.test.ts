@@ -677,6 +677,7 @@ describe("MuseAdapterV2", () => {
         environmentId: EnvironmentId.make("test-environment"),
         threadId: THREAD_ID,
         providerSessionId: "test-session",
+        runtimeProviderSessionId: ProviderSessionId.make(`session-${INSTANCE_ID}`),
         providerInstanceId: INSTANCE_ID,
         endpoint: "http://127.0.0.1:43210/mcp",
         authorizationHeader: "Bearer thread-scoped-test-token",
@@ -733,6 +734,7 @@ describe("MuseAdapterV2", () => {
         environmentId: EnvironmentId.make("test-environment"),
         threadId: THREAD_ID,
         providerSessionId: "test-session",
+        runtimeProviderSessionId: ProviderSessionId.make(`session-${INSTANCE_ID}`),
         providerInstanceId: INSTANCE_ID,
         endpoint: "http://127.0.0.1:43210/mcp",
         authorizationHeader: "Bearer thread-scoped-test-token",
@@ -1743,6 +1745,66 @@ describe("MuseAdapterV2", () => {
       assert.isTrue((yield* harness.adapter.getCapabilities()).planning.emitsPlanUpdated);
       assert.isTrue((yield* harness.adapter.getCapabilities()).planning.emitsTodoList);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect.each(["completed", "failed"] as const)(
+    "distinguishes unfinished tools from the completed wait when the turn is %s",
+    (status) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeMuse();
+        const harness = yield* makeHarness(fake);
+        const { nativeId } = yield* startConversation(harness, fake);
+        yield* fake.emit("item/completed", {
+          turnId: nativeId,
+          item: {
+            itemId: "finished-wait",
+            turnId: nativeId,
+            kind: "userShell",
+            revision: 1,
+            status: "completed",
+            commandText: "offbox wait run-watch",
+            visibleOutput: "exit 1 /logs/run-watch.log",
+            exitCode: 1,
+          },
+        });
+        const completed = yield* harness.takeEvent(
+          "turn_item.updated",
+          (event) =>
+            event.turnItem.type === "command_execution" && event.turnItem.status === "completed",
+        );
+        assert.deepInclude(completed.turnItem, {
+          toolResultIncomplete: false,
+          output: "exit 1 /logs/run-watch.log",
+          exitCode: 1,
+        });
+        for (const kind of ["userShell", "toolCall"] as const) {
+          yield* fake.emit("item/started", {
+            turnId: nativeId,
+            item: {
+              itemId: `unfinished-${kind}`,
+              turnId: nativeId,
+              kind,
+              tool: "external_tool",
+              revision: 1,
+              status: "inProgress",
+              visibleOutput: "partial progress",
+            },
+          });
+        }
+        yield* fake.emit("turn/completed", { turnId: nativeId, terminal: status });
+        assert.equal((yield* harness.takeEvent("turn.terminal")).status, status);
+        const cleanups = harness.allEvents.flatMap((event) =>
+          event.type === "turn_item.updated" &&
+          (event.turnItem.type === "command_execution" || event.turnItem.type === "dynamic_tool") &&
+          event.turnItem.status === status &&
+          typeof event.turnItem.output === "string" &&
+          event.turnItem.output.includes("partial progress")
+            ? [event.turnItem]
+            : [],
+        );
+        assert.lengthOf(cleanups, 2);
+        for (const item of cleanups) assert.isTrue(item.toolResultIncomplete);
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
   it.effect("opens a prompt-and-result child thread for a native subagent", () =>

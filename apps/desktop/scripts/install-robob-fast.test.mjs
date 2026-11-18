@@ -4,12 +4,16 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeHttp from "node:http";
+import * as NodeChildProcess from "node:child_process";
+import * as NodeUtil from "node:util";
 import { acquireInstallHold, finishInstallHold } from "./robob-install-hold.mjs";
 import {
   INSTALL_DATABASE_FILE,
+  BACKUP_FREE_BYTES,
   checkSignature,
   clearStaleStaging,
   cloneBackup,
+  cloneClosedDatabases,
   createBackupRetention,
   createDmgStage,
   getJson,
@@ -778,12 +782,97 @@ NodeTest.test("clones only the live databases, never the pre-shrink copy", () =>
     "boards.sqlite-wal",
     "boards.sqlite.pre-ledger14",
     "archive.sqlite",
+    "archive.sqlite-wal",
+    "archive.sqlite-shm",
+    "archive.pre-split.sqlite",
   ];
   NodeAssert.deepEqual(
     names.filter((n) => INSTALL_DATABASE_FILE.test(n)),
-    ["statev2.sqlite", "statev2.sqlite-wal", "boards.sqlite", "boards.sqlite-wal"],
+    ["statev2.sqlite", "statev2.sqlite-wal", "boards.sqlite", "boards.sqlite-wal",
+      "archive.sqlite", "archive.sqlite-wal"],
   );
 });
+
+NodeTest.test("closed backup includes the archive and WAL in its completion manifest", async (t) => {
+  const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "closed-backup-"));
+  t.after(() => NodeFSP.rm(root, { recursive: true, force: true }));
+  const data = NodePath.join(root, "data");
+  await NodeFSP.mkdir(data);
+  const files = ["statev2.sqlite", "boards.sqlite", "archive.sqlite", "archive.sqlite-wal"];
+  for (const name of [...files, "archive.sqlite-shm", "archive.old.sqlite"])
+    await NodeFSP.writeFile(NodePath.join(data, name), name);
+  const calls = [];
+  await cloneBackup({ backupRoot: root, stamp: "backup", clone: (destination) =>
+    cloneClosedDatabases({ data, destination, timeoutMs: () => 1234,
+      run: async (cmd, args, timeout) => {
+        calls.push({ cmd, args, timeout });
+        // The offbox filesystem need not support reflinks; only production requires them.
+        await NodeFSP.copyFile(args.at(-2), args.at(-1));
+      },
+    }),
+  });
+  const destination = NodePath.join(root, "backup");
+  NodeAssert.deepEqual((await NodeFSP.readdir(destination)).sort(), [".complete", ...files].sort());
+  const marker = JSON.parse(await NodeFSP.readFile(NodePath.join(destination, ".complete"), "utf8"));
+  NodeAssert.deepEqual(marker.files, files.sort());
+  for (const name of files)
+    NodeAssert.equal(await NodeFSP.readFile(NodePath.join(destination, name), "utf8"), name);
+  for (const call of calls) {
+    NodeAssert.equal(call.cmd, "/usr/bin/python3");
+    NodeAssert.equal(call.args[0], "-I");
+    NodeAssert.match(call.args[2], /\.clonefile/);
+    NodeAssert.equal(call.timeout, 1234);
+  }
+});
+
+NodeTest.test("native macOS backup clones stay independent of later source writes", {
+  skip: process.platform !== "darwin",
+}, async (t) => {
+  const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "native-backup-"));
+  t.after(() => NodeFSP.rm(root, { recursive: true, force: true }));
+  const data = NodePath.join(root, "data");
+  const destination = NodePath.join(root, "backup");
+  await NodeFSP.mkdir(data);
+  const files = ["archive.sqlite", "archive.sqlite-wal", "boards.sqlite", "statev2.sqlite"];
+  for (const name of files) await NodeFSP.writeFile(NodePath.join(data, name), `before:${name}`);
+  NodeAssert.deepEqual(await cloneClosedDatabases({ data, destination, timeoutMs: () => 5000,
+    run: (cmd, args, timeout) => NodeUtil.promisify(NodeChildProcess.execFile)(cmd, args, { timeout }),
+  }), files);
+  for (const name of files) {
+    await NodeFSP.writeFile(NodePath.join(data, name), "after");
+    NodeAssert.equal(await NodeFSP.readFile(NodePath.join(destination, name), "utf8"), `before:${name}`);
+  }
+});
+
+for (const failure of ["space", "volume", "symlink", "unsupported", "deadline", "missing"]) {
+  NodeTest.test(`closed backup fails without a complete marker on ${failure}`, async (t) => {
+    const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "backup-budget-"));
+    t.after(() => NodeFSP.rm(root, { recursive: true, force: true }));
+    const data = NodePath.join(root, "data");
+    await NodeFSP.mkdir(data);
+    for (const name of ["statev2.sqlite", "archive.sqlite"])
+      await NodeFSP.writeFile(NodePath.join(data, name), "synthetic");
+    let calls = 0;
+    const io = {
+      ...NodeFSP,
+      readdir: failure === "missing" ? async () => ["archive.sqlite"] : NodeFSP.readdir,
+      statfs: async () => ({ bsize: 1n, bavail: BigInt(BACKUP_FREE_BYTES) - (failure === "space" ? 1n : 0n) }),
+      lstat: async (file) => {
+        const stat = await NodeFSP.lstat(file);
+        return { dev: stat.dev + (failure === "volume" ? 1 : 0), isFile: () => failure !== "symlink" };
+      },
+    };
+    await NodeAssert.rejects(cloneBackup({ backupRoot: root, stamp: "backup", clone: (destination) =>
+      cloneClosedDatabases({ data, destination, fs: io,
+        timeoutMs: () => { if (failure === "deadline") throw new Error("backup deadline"); return 100; },
+        run: async () => { calls++; throw new Error("clone unsupported"); },
+      }),
+    }), /1 GiB|same volume|unsupported|deadline|Missing state/);
+    NodeAssert.equal(calls, failure === "unsupported" ? 1 : 0);
+    NodeAssert.deepEqual((await NodeFSP.readdir(root)).sort(), ["data", "partial-backup"]);
+    NodeAssert.deepEqual(await NodeFSP.readdir(NodePath.join(root, "partial-backup")), []);
+  });
+}
 
 NodeTest.test("prunes old backups only after the report, and a prune failure does not fail the install", async () => {
   const calls = [];

@@ -1640,6 +1640,7 @@ it.effect.each([owner, evaluator])("$_tag clears guessed gates with an audit tra
           respond: { ack: true },
           title: `Gate cleared on #${card.number} s1`,
           batchKey: "gate-cleared",
+          subtaskId: "s1",
         });
         const feed = yield* kanban.askFeed({ boardId: board.id });
         assert.isTrue(
@@ -1838,7 +1839,7 @@ it.effect.each(["open", "done", "skipped"] as const)(
         const first = cleared.asks[0]!;
         const preserved = [
           cleared.asks[1]!,
-          { ...first, id: "q4", title: `Gate cleared on #${card.number} s10` },
+          { ...first, id: "q4", subtaskId: "s10", title: `Gate cleared on #${card.number} s10` },
           { ...first, id: "q5", kind: "custom" },
           { ...first, id: "q6", batchKey: "another-notice" },
           { ...first, id: "q7", closedAt: cleared.updatedAt },
@@ -1897,8 +1898,11 @@ it.effect.each(["open", "done", "skipped"] as const)(
                 item.kind === "notice",
             )
             .map((item) => item.ask.id),
-          ["q9"],
+          state === "open" ? ["q9"] : [],
         );
+        const newest = recleared.asks.find((ask) => ask.id === "q9")!;
+        assert.equal(newest.subtaskId, "s1");
+        assert.equal(newest.answer?.verdict, state === "open" ? undefined : "auto_closed");
         assert.lengthOf(
           (yield* kanban.card(card.id)).events.filter((event) =>
             event.body?.startsWith("Cleared guessed"),
@@ -4025,7 +4029,7 @@ it.effect.each([true, false])(
       const fake = yield* makeFake;
       yield* Effect.gen(function* () {
         const { kanban, card, worker } = yield* workingCard();
-        yield* kanban.editCard(
+        const edited = yield* kanban.editCard(
           card.id,
           {
             subtasks: [
@@ -4035,6 +4039,8 @@ it.effect.each([true, false])(
           },
           owner,
         );
+        // Packet edits can advance updatedAt beyond the frozen clock to distinguish writes.
+        yield* TestClock.setTime(Date.parse(edited.updatedAt));
         yield* kanban.askOwner(
           card.id,
           {

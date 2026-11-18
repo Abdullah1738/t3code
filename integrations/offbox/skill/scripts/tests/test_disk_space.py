@@ -55,9 +55,9 @@ class DiskSpaceTests(unittest.TestCase):
                 self.log.write_text(self.log.read_text() + disk.MARKER + json.dumps(dict(phase='result', attempt=2, record=clean)) + '\n')
                 self.assertIsNone(disk.result(self.log, code)['infra_failure'])
 
-    def test_toolchain_marker_requires_infra_exit_and_known_reason(self):
+    def test_toolchain_marker_requires_infra_exit_and_string_reason(self):
         for code, reason in ((0, 'toolchain_unpack_crash'), (99, 'toolchain_unpack_crash'),
-                             (90, 'unknown')):
+                             (90, None), (90, 3)):
             with self.subTest(code=code, reason=reason):
                 self.log.write_text(disk.MARKER + json.dumps(dict(phase='toolchain', infra_failure='native_crash',
                                                                  infra_reason=reason)) + '\n')

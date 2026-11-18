@@ -1,5 +1,7 @@
+import type { OwnerAlertEpisode } from "./owner-alerts.ts";
+import { assertMacWatcher } from "./person-box.ts";
 import { toolLog, toolError } from "./toollog.ts";
-import { StderrCause, stderrCause } from "./cause.ts";
+import { StderrCause, stderrCause, type DependencyBusy } from "./cause.ts";
 import { Database } from "bun:sqlite";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -43,6 +45,7 @@ export const FAILURE_ALERT_AFTER = 5;
 export const FAILURE_NOTICE_AFTER = 2;
 /** Timeouts are transient (load spikes): no alert until the watcher has been failing at least this long. */
 export const TIMEOUT_ALERT_AFTER_MS = 10 * 60_000;
+export const BUSY_ALERT_AFTER_MS = Number(process.env.ROBOB_WATCH_BUSY_ALERT_AFTER_MS ?? 20 * 60_000);
 /** Timeouts retry at most this far apart, so a watcher catches up soon after a load spike. */
 export const TIMEOUT_BACKOFF_CAP_S = 120;
 /** Runs slower than this are logged with their duration. */
@@ -109,6 +112,8 @@ export type Watcher = {
   depends?: Dependency[];
   /** Opt-in: text the owner a short heads-up when a wake sits queued behind a busy turn. Off by default. */
   headsup?: boolean;
+  /** Opt-in owner-chat notices for a failure pause/escalation and its recovery. */
+  owner_imessage_alerts?: boolean;
   /**
    * Files whose change (mtime/size) runs the check on the next 1s tick instead of waiting for interval_s,
    * e.g. ~/Library/Messages/chat.db-wal. interval_s stays as the fallback cadence.
@@ -151,7 +156,12 @@ export type State = {
   load_timeouts?: number;
   load_timeout_since?: string;
   failure_paused_at?: string;
+  /** Separate from Telegram flags; retained through resume until bridge acceptance. */
+  owner_imessage_episodes?: OwnerAlertEpisode[];
   last_error?: string;
+  dependency_busy?: { dependency: string; since: string };
+  /** A changed failure kind needs a fresh bridge key without resetting backoff or grace periods. */
+  failure_episode?: string;
   /** Source names parsed before stderr is clipped for storage. */
   last_error_sources?: string[];
   /** When the current run of consecutive failures started. */
@@ -539,6 +549,8 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
   if (!Number.isInteger(maxFires) || maxFires < 0) errors.push("max_fires must be an integer >= 0 (0 = unlimited)");
   const maxFailures = input.max_consecutive_failures;
   if (maxFailures !== undefined && (!Number.isInteger(maxFailures) || maxFailures < 0)) errors.push("max_consecutive_failures must be an integer >= 0 (0 = never pause)");
+  if (input.owner_imessage_alerts !== undefined && typeof input.owner_imessage_alerts !== "boolean") errors.push("owner_imessage_alerts must be boolean");
+  if (input.owner_imessage_alerts === true && input.chat !== undefined) errors.push("owner_imessage_alerts requires an owner watcher");
   const noticeAfter = input.failure_notice_after;
   if (noticeAfter !== undefined && (!Number.isInteger(noticeAfter) || noticeAfter < 1)) errors.push("failure_notice_after must be an integer >= 1 (1 = every failure)");
   const depends = input.depends;
@@ -571,6 +583,7 @@ export function normalize(input: Partial<Watcher> & Record<string, unknown>): Wa
     ...(depends !== undefined ? { depends: [...new Set(depends)] } : {}),
     ...(triggers.length ? { triggers: (triggers as string[]).map(t => t.trim().replace(/^~(?=\/)/, HOME)) } : {}),
     ...(input.headsup === true ? { headsup: true } : {}),
+    ...(input.owner_imessage_alerts === true ? { owner_imessage_alerts: true } : {}),
     ...(Number.isFinite(Number(input.trigger_gap_s)) && Number(input.trigger_gap_s) > 0 ? { trigger_gap_s: Number(input.trigger_gap_s) } : {}),
     ...(quiet !== undefined ? { quiet: { start: quiet.start, end: quiet.end, time_zone: quiet.time_zone } } : {}),
     ...(trip !== undefined ? { trip } : {}),
@@ -618,7 +631,7 @@ export function log(id: string | null, message: string): void {
 
 export const clip = (text: string, max: number) => text.length <= max ? text : `${text.slice(0, max - 20)}\n...[truncated]`;
 
-export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number };
+export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string; timedOut: boolean; ms: number; busy?: DependencyBusy };
 
 /**
  * Runs a check in its own process group so a timeout kills everything it started. The result never waits more
@@ -627,6 +640,7 @@ export type CheckResult = { code: number | null; signal: NodeJS.Signals | null; 
  */
 export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string, string> = {}, timeoutMs = watcher.timeout_s === undefined ? CHECK_TIMEOUT_MS : watcher.timeout_s * 1_000, instance = watcherInstance(watcher.id)): Promise<CheckResult> {
   const shell = watcher.serial ? ["/usr/bin/lockf", "-k", "-t", "120", WA_LOCK, "/bin/zsh", "-c", watcher.check] : ["/bin/zsh", "-c", watcher.check];
+  assertMacWatcher(watcher.chat);
   const started = now();
   return new Promise(resolve => {
     let done = false;
@@ -642,8 +656,9 @@ export function runCheck(watcher: Watcher, dir: string, extraEnv: Record<string,
       clearTimeout(grace);
       const ms = now() - started;
       cause.add(extra);
-      toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code, signal, timedOut, ...(code === 0 && !timedOut ? {} : cause.props(timedOut)) }, ...(code === 0 && !timedOut ? {} : { error: { tag: timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
-      resolve({ code, signal, stdout, stderr: stderr + extra, timedOut, ms });
+      const busy = cause.busy(code);
+      toolLog({ component: "helpers", kind: code === 0 && !timedOut ? "perf" : "error", name: "helper.run", durationMs: ms, ok: code === 0 && !timedOut, ids: { watcher: watcher.id, helper: watcher.id }, props: { exitCode: code, signal, timedOut, ...(code === 0 && !timedOut ? {} : cause.props(timedOut, code)) }, ...(code === 0 && !timedOut ? {} : { error: { tag: busy ? "helper.dependency_busy" : timedOut ? "helper.timeout" : "helper.exit_failed" } }) });
+      resolve({ code, signal, stdout, stderr: stderr + extra, timedOut, ms, ...(busy ? { busy } : {}) });
     };
     const spawnChild = (closing = extraEnv.WATCH_CLOSING ?? (loadState(watcher.id).status === "closing" ? "1" : "0")) => spawn(shell[0]!, shell.slice(1), {
       cwd: dir, detached: true, stdio: ["ignore", "pipe", "pipe"],
@@ -951,13 +966,80 @@ export async function wakeChat(chat: string, source: string, text: string, key: 
   return run([BUN, cli, "wake", `--chat=${chat}`, `--source=${source.slice(0, 100)}`, `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
 }
 
-export async function imessage(text: string, key: string): Promise<{ ok: boolean; out: string }> {
+type ImessageResult = { ok: boolean; out: string; pending?: boolean; retryKey?: string };
+
+async function imessageReceipt(text: string, key: string): Promise<ImessageResult | undefined> {
+  const id = `send:${hash(key)}`;
+  // Read acceptance, its actual operation (including early-reply aliases), and
+  // transport evidence in one snapshot. /send's 202 only means queued.
+  const receipt = await run(["/usr/bin/sqlite3", "-readonly", BRIDGE_DB, `
+    with acceptance as (select value from kv where key='api:send:${id}'),
+    identity as (select coalesce((select json_extract(value,'$.operationId') from acceptance),'${id}') as id)
+    select json_object('saved',(select value from acceptance),
+      'operationId',identity.id,'payload',outbox.payload,'state',outbox.state,'attempts',outbox.attempts,'providerId',outbox.providerId,
+      'checkpoints',(select json_group_object(key,value) from kv
+        where key >= 'chunk:'||identity.id||':' and key < 'chunk:'||identity.id||';'),
+      'route',(select value from kv where key='route'),
+      'fenced',exists(select 1 from kv where key in ('cancelledSend:${id}','cancelledSend:'||identity.id)),
+      'attempted',exists(select 1 from kv where key in ('firstAttempt:'||identity.id,'sendAmbiguous:'||identity.id,'sent-at:'||identity.id))
+        or exists(select 1 from kv where key >= 'chunk:'||identity.id||':' and key < 'chunk:'||identity.id||';'))
+      from identity left join outbox on outbox.id=identity.id`], 10_000, 100_000);
+  if (!receipt.ok) return { ok: false, out: "bridge delivery lookup failed" };
+  try {
+    const row = JSON.parse(receipt.out) as { saved: string | null;
+      operationId: string; payload: string | null; state: string | null; attempts: number | null; providerId: string | null;
+      checkpoints: string | Record<string, string>;
+      route: string | null; fenced: number; attempted: number };
+    if (!row.saved) return;
+    const saved = JSON.parse(row.saved) as { spec?: string };
+    const spec = JSON.parse(saved.spec ?? "null") as { kind?: string; text?: string; sessionId?: string; generation?: number } | null;
+    if (spec?.kind !== "conversation" || spec.text !== clip(text, MAX_WAKE)) {
+      return { ok: false, out: "bridge acceptance content mismatch" };
+    }
+    if (!row.payload) return { ok: false, out: "bridge accepted operation missing" };
+    const payload = JSON.parse(row.payload) as { kind?: string; sessionId?: string; generation?: number; text?: string;
+      attachment?: unknown; poll?: unknown; app?: unknown };
+    if (payload.kind !== "conversation" || payload.sessionId !== spec.sessionId || payload.generation !== spec.generation) {
+      return { ok: false, out: "bridge accepted operation mismatch" };
+    }
+    if (row.state === "sent") return { ok: true, out: "bridge delivery confirmed" };
+    if (row.state === "cancelled" && typeof payload.text === "string" && !payload.attachment && !payload.poll && !payload.app) {
+      // Rotation can cancel after transport acceptance but before markSent. Use
+      // Delivery's exact formatter: a folded or multipart text needs every chunk.
+      const { BUBBLE_CHARS, formatText, splitFormatted } = await import("../../spectrum-bridge/src/formatting.ts");
+      const chunks = splitFormatted(formatText(payload.text.trim() ? payload.text : ""), BUBBLE_CHARS);
+      const checkpoints = typeof row.checkpoints === "string" ? JSON.parse(row.checkpoints) as Record<string, string> : row.checkpoints;
+      if (chunks.length && chunks.every((_, index) => {
+        const saved = checkpoints[`chunk:${row.operationId}:${index}`];
+        return saved !== undefined && (JSON.parse(saved) as { accepted?: unknown } | null)?.accepted === true;
+      })) return { ok: true, out: "bridge delivery checkpoints confirmed" };
+    }
+    const route = row.route ? JSON.parse(row.route) as { id?: string; generation?: number } | null : null;
+    if (row.state === "cancelled" && row.attempts === 0 && row.providerId === null && !row.fenced && !row.attempted
+      && typeof payload.generation === "number" && typeof payload.sessionId === "string"
+      && (route?.id !== payload.sessionId || route?.generation !== payload.generation)) {
+      // The cancelled operation is terminal and conclusively unsent. A deterministic
+      // successor survives a crash before the watcher's new key is persisted.
+      return { ok: false, out: "bridge cancelled an unattempted stale route", retryKey: `robob-watch:owner-alert:retry:${hash(key)}` };
+    }
+    return { ok: false, out: `bridge delivery ${row.state}`,
+      ...(["pending", "sending", "uncertain"].includes(row.state ?? "") ? { pending: true } : {}) };
+  } catch { return { ok: false, out: "bridge delivery receipt unreadable" }; }
+}
+
+export async function imessage(text: string, key: string, options: { reconcile?: boolean } = {}): Promise<ImessageResult> {
   // Decide the CLI before the await: an override removed while liveSession() is pending must not reopen the live path.
   const cli = spectrumCli();
   if (underTest() && !process.env.ROBOB_WATCH_SPECTRUM_CLI) return refused("imessage send");
+  if (options.reconcile) {
+    const receipt = await imessageReceipt(text, key);
+    if (receipt) return receipt;
+  }
   const session = await liveSession();
   if (!session) return { ok: false, out: "no live route session" };
-  return run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
+  const sent = await run([BUN, cli, "send", `--text=${clip(text, MAX_WAKE)}`, `--session=${session}`, `--key=${key}`]);
+  if (!options.reconcile || !sent.ok) return sent;
+  return await imessageReceipt(text, key) ?? { ok: false, pending: true, out: "bridge acceptance awaiting receipt" };
 }
 
 export function telegram(source: string, text: string, key: string, severity = "info", burstKey?: string): Promise<{ ok: boolean; out: string }> {
@@ -1386,20 +1468,23 @@ export async function confirmWakes(watcher: Watcher): Promise<void> {
 }
 
 /** Housekeeping notices (failures, expiry) go to the alert channel first, iMessage second. */
-export async function alert(watcher: Watcher, text: string, key: string, severity = "attention"): Promise<Delivery> {
+export async function alert(watcher: Watcher, text: string, key: string, severity = "attention", imessageFallback = true): Promise<Delivery> {
   const notified = await telegram(`Watcher ${watcher.id}`, text, key, severity,
     severity === "error" ? `watcher-failure:${watcher.id}` : undefined);
   if (notified.ok) return { ok: true, via: "telegram", detail: notified.out };
+  if (!imessageFallback) return { ok: false, via: "none", detail: notified.out };
   const sent = await imessage(`${watcher.title}: ${text}`, key);
   return sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${notified.out} | ${sent.out}` };
 }
 
 export function shouldNotifyFailure(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
   return state.consecutive_failures >= (watcher.failure_notice_after ?? FAILURE_NOTICE_AFTER)
+    && (!state.dependency_busy || t - Date.parse(state.dependency_busy.since) >= BUSY_ALERT_AFTER_MS)
     && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
 }
 
 export function shouldPause(watcher: Watcher, state: State, timedOut: boolean, t = now()): boolean {
+  if (state.dependency_busy) return false;
   const threshold = watcher.max_consecutive_failures ?? FAILURE_ALERT_AFTER;
   return threshold > 0 && state.consecutive_failures >= threshold
     && (!timedOut || t - Date.parse(state.failing_since ?? iso(t)) >= TIMEOUT_ALERT_AFTER_MS);
@@ -1414,10 +1499,19 @@ export const ESCALATE_AFTER_MS = Number(process.env.ROBOB_WATCH_ESCALATE_AFTER_M
 
 export function shouldEscalate(watcher: Watcher, state: State, t = now()): boolean {
   if (watcher.mode !== "wake" || state.failure_escalated || !state.failing_since) return false;
+  if (state.dependency_busy) return t - Date.parse(state.dependency_busy.since) >= BUSY_ALERT_AFTER_MS;
   return !!state.failure_paused_at || t - Date.parse(state.failing_since) >= ESCALATE_AFTER_MS;
 }
 
 export function escalationText(watcher: Watcher, state: State, mins: number): string {
+  if (state.dependency_busy) return [
+    `Dependency ${state.dependency_busy.dependency} has been busy for ${mins} min for watcher ${watcher.id} ("${watcher.title}").`,
+    "Don't edit the watcher. It retries its check; nothing is lost.",
+    ...(state.dependency_busy.dependency === "msgs" ? [
+      "Check ~/.local/share/message-archive/logs/daemon.log. Kickstart com.ardud.message-archive only if that log has been silent for more than 30 min.",
+    ] : ["Check the dependency's health before changing anything."]),
+    `Then robob-watch resume ${watcher.id} and robob-watch show ${watcher.id} to confirm.`,
+  ].join("\n");
   return [
     `Watcher ${watcher.id} ("${watcher.title}") has been FAILING for ${mins} min (${state.consecutive_failures} runs); ${failureSummary(state)}.`,
     ...(state.failure_paused_at ? ["It is paused and will not check again until resumed."] : []),
@@ -1448,20 +1542,24 @@ export function failureSources(error = ""): string[] {
 }
 
 function failureSummary(state: State): string {
+  if (state.dependency_busy) return `dependency ${state.dependency_busy.dependency} is busy`;
   const sources = state.last_error_sources ?? failureSources(state.last_error);
   return sources.length ? `failing sources: ${sources.join(", ")}` : "its check is failing";
 }
 
-export async function escalate(watcher: Watcher, state: State, key: string): Promise<Delivery> {
+export async function escalate(watcher: Watcher, state: State, key: string, imessageFallback = true): Promise<Delivery> {
   const started = now();
   let delivery: Delivery | undefined;
   try {
-    const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.failing_since!)) / 60_000);
+    const mins = Math.round((Date.parse(state.failure_paused_at ?? iso()) - Date.parse(state.dependency_busy?.since ?? state.failing_since!)) / 60_000);
     const text = escalationText(watcher, state, mins);
-    const woke = await wake(`robob-watch ${watcher.id} failing`, text, key);
+    const woke = await wake(`robob-watch ${watcher.id} ${state.dependency_busy ? "dependency busy" : "failing"}`, text, key);
     if (woke.ok) delivery = { ok: true, via: "wake", detail: woke.out };
+    else if (!imessageFallback) delivery = { ok: false, via: "none", detail: woke.out };
     else {
-      const sent = await imessage(`Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`, key);
+      const summary = state.dependency_busy ? `Dependency ${state.dependency_busy.dependency} has been busy for ${mins} min; watcher "${watcher.title}" keeps retrying; nothing is lost.`
+        : `Watcher "${watcher.title}" has been failing for ${mins} min; ${failureSummary(state)}. Last error: ${(state.last_error ?? "").slice(0, 300)}`;
+      const sent = await imessage(summary, key);
       delivery = sent.ok ? { ok: true, via: "imessage-send", detail: sent.out } : { ok: false, via: "none", detail: `${woke.out} | ${sent.out}` };
     }
     return delivery;

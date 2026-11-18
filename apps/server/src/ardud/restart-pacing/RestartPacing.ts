@@ -5,15 +5,19 @@ import * as Deferred from "effect/Deferred";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Semaphore from "effect/Semaphore";
+import * as Analytics from "../analytics/Analytics.ts";
+import * as StartupPhaseLog from "../observability/StartupPhaseLog.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as RestartPacingState from "./RestartPacingState.ts";
-import { makeRestartLoad } from "./RestartLoad.ts";
-import type {
-  RunId,
-  ThreadId,
-  ServerSettings as Settings,
-  ServerSettingsError,
+import { makeRestartLoad, type RestartLoadSample } from "./RestartLoad.ts";
+import {
+  OrchestrationV2RestartAdmissionFailure,
+  type RunId,
+  type ThreadId,
+  type ServerSettings as Settings,
+  type ServerSettingsError,
 } from "@t3tools/contracts";
 import { RestartPacingStateError, type RestartSource } from "./RestartPacingState.ts";
 
@@ -22,12 +26,13 @@ const MAX_RECHECK_MS = 60_000;
 const MAX_ORDER_RECHECK_MS = 100;
 const PASS_MS = 10_000;
 const MAX_LOAD_HOLD_MS = 20 * 60_000;
-// Allow the full load hold plus ten minutes for admission, but never let an
-// old restart registration silently block a new resume for hours.
+// A deep queue can outlast the load hold while still making progress.
 export const RESTART_ADMISSION_TIMEOUT_MS = 30 * 60_000;
+const RESTART_ADMISSION_ABSOLUTE_TIMEOUT_MS = 2 * 60 * 60_000;
+const BOUND_DEFERRED_LOG_MS = 10 * 60_000;
 export class RestartAdmissionTimeoutError extends Schema.TaggedError<RestartAdmissionTimeoutError>()(
   "RestartAdmissionTimeoutError",
-  { deadline: Schema.DateTimeUtc },
+  { deadline: Schema.DateTimeUtc, admission: OrchestrationV2RestartAdmissionFailure },
 ) {}
 export class RestartAdmissionSupersededError extends Schema.TaggedError<RestartAdmissionSupersededError>()(
   "RestartAdmissionSupersededError",
@@ -36,20 +41,35 @@ export class RestartAdmissionSupersededError extends Schema.TaggedError<RestartA
 const DISPATCH_GRACE_MS = 2 * 60_000;
 const STUCK_MS = 10 * 60_000;
 
+type AdmissionObservation = {
+  positionAtEntry: number;
+  maxQueueDepth: number;
+  recorded: boolean;
+};
 type LoadHold = {
   loadHoldMs: number;
   checkedAt: number;
   wasLoaded: boolean;
+  observation?: AdmissionObservation;
 };
-type WaitingHold = LoadHold & {
-  registeredAt?: number;
-  order?: number;
-  priority?: number;
-  activityAt?: number;
-  expiredEffectId?: string;
+type AdmissionProgress = {
+  bestPosition: number;
+  positionImprovedAt: number;
+  admissionProgressAt: number;
+  lastBoundDeferredAt?: number;
 };
+type WaitingHold = LoadHold &
+  Partial<AdmissionProgress> & {
+    registeredAt?: number;
+    order?: number;
+    priority?: number;
+    activityAt?: number;
+    expiredEffectId?: string;
+  };
 
-export class RestartLoad extends Context.Reference<() => number>("t3/ardud/RestartLoad", {
+export class RestartLoad extends Context.Reference<
+  (() => number) & { snapshot?: () => RestartLoadSample }
+>("t3/ardud/RestartLoad", {
   defaultValue: makeRestartLoad,
 }) {}
 
@@ -90,12 +110,10 @@ const make = Effect.gen(function* () {
   const state = yield* RestartPacingState.RestartPacingState;
   const settings = yield* ServerSettings.ServerSettingsService;
   const load = yield* RestartLoad;
-  // Keep CPU intervals short even when durable retries back off to a minute.
-  yield* Effect.sleep("10 seconds").pipe(
-    Effect.andThen(Effect.sync(load)),
-    Effect.forever,
-    Effect.forkScoped,
-  );
+  const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  const startup = yield* Effect.serviceOption(StartupPhaseLog.StartupPhaseLog);
+  const bootId = Option.isSome(startup) ? startup.value.snapshot().bootId : undefined;
+  const scope = yield* Effect.scope;
   const mutex = yield* Semaphore.make(1);
   let changed = yield* Deferred.make<void>();
   const settingsMutex = yield* Semaphore.make(1);
@@ -114,22 +132,24 @@ const make = Effect.gen(function* () {
   const settingsSnapshot = Effect.suspend(readSettingsSnapshot);
   const pending = new Map<
     string,
-    RestartSource & {
-      registeredAt: number;
-      order: number;
-      runId?: RunId;
-      readyAt?: number;
-      wakeRequested?: boolean;
-      priority: number;
-      activityAt: number;
-      loadHoldMs: number;
-      checkedAt: number;
-      wasLoaded: boolean;
-      retryMs: number;
-      position?: number;
-      waitKey?: string;
-      orderWait?: { head: string; retryMs: number };
-    }
+    RestartSource &
+      AdmissionProgress & {
+        registeredAt: number;
+        order: number;
+        runId?: RunId;
+        readyAt?: number;
+        wakeRequested?: boolean;
+        priority: number;
+        activityAt: number;
+        loadHoldMs: number;
+        checkedAt: number;
+        wasLoaded: boolean;
+        observation?: AdmissionObservation;
+        retryMs: number;
+        position?: number;
+        waitKey?: string;
+        orderWait?: { head: string; retryMs: number };
+      }
   >();
   // A requeued run can outlive its settled start effect. Keep its load budget
   // across pruning until a replacement effect registers it again.
@@ -149,10 +169,71 @@ const make = Effect.gen(function* () {
   const superseded = new Set<string>();
   let lastStartAt: number | undefined;
   let lastProgressAt = 0;
-  let pass: { at: number; config: Settings["restartPacing"]; loaded: boolean } | undefined;
+  let pass:
+    | {
+        at: number;
+        config: Settings["restartPacing"];
+        loaded: boolean;
+        loadScore: number;
+        loadSample?: RestartLoadSample;
+      }
+    | undefined;
   let activeCheckedAt: number | undefined;
   const runSources = new Map<string, RestartSource & { admitted?: boolean; hold?: LoadHold }>();
+  const updateLoadHolds = (now: number, loaded: boolean) => {
+    for (const entry of pending.values()) {
+      if (entry.wasLoaded) entry.loadHoldMs += Math.max(0, now - entry.checkedAt);
+      entry.checkedAt = now;
+      entry.wasLoaded = loaded;
+    }
+  };
   const key = (source: RestartSource) => `${source.threadId}:${source.sourceRunId}`;
+  const recordAdmission = Effect.fn("RestartPacing.recordAdmission")(function* (
+    source: RestartSource,
+    observation: AdmissionObservation | undefined,
+    outcome: {
+      readonly at: number;
+      readonly runId: RunId | undefined;
+      readonly queuedAtMs: number;
+      readonly position: number;
+      readonly total: number;
+      readonly active: number;
+      readonly maxActive: number;
+      readonly loaded: boolean;
+      readonly rule?: OrchestrationV2RestartAdmissionFailure["rule"];
+    },
+  ) {
+    if (Option.isNone(analytics) || observation === undefined || observation.recorded) return;
+    observation.recorded = true;
+    const event = {
+      ts: DateTime.formatIso(DateTime.makeUnsafe(outcome.at)),
+      kind: outcome.rule === undefined ? "restart.admission.admitted" : "restart.admission.failed",
+      surface: "server" as const,
+      route: "restart-pacing",
+      threadId: source.threadId,
+      ...(bootId === undefined ? {} : { bootId }),
+      restartAdmission: {
+        sourceRunId: source.sourceRunId,
+        ...(outcome.runId === undefined ? {} : { runId: outcome.runId }),
+        classification: source.classification ?? "continuation",
+        queuedAtMs: outcome.queuedAtMs,
+        waitedMs: outcome.at - outcome.queuedAtMs,
+        positionAtEntry: observation.positionAtEntry,
+        position: outcome.position,
+        total: outcome.total,
+        maxQueueDepth: observation.maxQueueDepth,
+        active: outcome.active,
+        maxActive: outcome.maxActive,
+        loaded: outcome.loaded,
+        ...(outcome.rule === undefined ? {} : { rule: outcome.rule }),
+      },
+    };
+    // Recording must never hold the pacing mutex or fail a provider start.
+    yield* Effect.suspend(() => analytics.value.record(event)).pipe(
+      Effect.catchCause(() => Effect.void),
+      Effect.forkIn(scope),
+    );
+  });
   const orderedQueue = (now: number, loaded: boolean) =>
     [...pending.values()].sort(
       (a, b) =>
@@ -167,12 +248,45 @@ const make = Effect.gen(function* () {
         a.priority - b.priority ||
         a.order - b.order,
     );
+  const noProgressDeadline = (entry: AdmissionProgress) =>
+    Math.min(entry.admissionProgressAt, entry.positionImprovedAt) + RESTART_ADMISSION_TIMEOUT_MS;
+  // Observe every waiter at queue mutations, including waiters whose durable
+  // retries are asleep. A late observation cannot revive an expired window.
+  const observeProgress = (
+    queue: ReadonlyArray<AdmissionProgress & { observation?: AdmissionObservation }>,
+    now: number,
+    admitted = false,
+  ) => {
+    for (const [index, entry] of queue.entries()) {
+      // Use the existing queue traversal. Observations live with the reservation
+      // and retained retry hold, and are freed when that source settles.
+      if (Option.isSome(analytics)) {
+        entry.observation ??= {
+          positionAtEntry: index + 1,
+          maxQueueDepth: queue.length,
+          recorded: false,
+        };
+        entry.observation.maxQueueDepth = Math.max(entry.observation.maxQueueDepth, queue.length);
+      }
+      if (now >= noProgressDeadline(entry)) continue;
+      if (entry.bestPosition === Infinity) {
+        // Establishing the queue baseline is not an improvement in position.
+        entry.bestPosition = index + 1;
+      } else if (index + 1 < entry.bestPosition) {
+        entry.bestPosition = index + 1;
+        entry.positionImprovedAt = now;
+      }
+      if (admitted) entry.admissionProgressAt = now;
+    }
+  };
   // Record readiness with the mutation that changes the head or frees a slot.
   // A late timer must expose the missed deadline instead of resetting its age.
   const queueChanged = Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis;
+    const queue = orderedQueue(now, pass?.loaded ?? false);
     if (pass !== undefined) {
-      const queue = orderedQueue(now, pass.loaded);
+      // Startup registers the whole batch before the first admission pass.
+      observeProgress(queue, now);
       const head = queue[0];
       const full = active.size >= pass.config.maxActive;
       for (const entry of queue) if (entry !== head || full) delete entry.readyAt;
@@ -187,6 +301,32 @@ const make = Effect.gen(function* () {
     }
     yield* Deferred.succeed(changed, undefined);
   });
+  // Keep CPU intervals short and wake load-held heads independently of durable retries.
+  yield* Effect.sleep(PASS_MS).pipe(
+    Effect.andThen(
+      mutex.withPermits(1)(
+        Effect.gen(function* () {
+          const now = yield* Clock.currentTimeMillis;
+          const loadScore = load();
+          const loaded = loadScore > 1;
+          const loadSample = load.snapshot?.();
+          updateLoadHolds(now, loaded);
+          if (pass !== undefined) {
+            const loadChanged = pass.loaded !== loaded;
+            pass = {
+              ...pass,
+              loaded,
+              loadScore,
+              ...(loadSample === undefined ? {} : { loadSample }),
+            };
+            if (loadChanged) yield* queueChanged;
+          }
+        }),
+      ),
+    ),
+    Effect.forever,
+    Effect.forkScoped,
+  );
   // Called only under the pacing mutex; the enclosing operation owns tracing.
   const releaseReservation = (source: RestartSource, now: number, retrying = false) => {
     const reservation = active.get(key(source));
@@ -220,7 +360,16 @@ const make = Effect.gen(function* () {
       if (retrying) runSources.set(runKey, { ...source, admitted: false });
       else runSources.delete(runKey);
     },
-    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
+    (effect, threadId, runId, effectId) =>
+      Effect.suspend(() => {
+        // Fresh starts own no reservation. Their finalizers must not queue
+        // behind recovery admission's projection reads and occupy start workers.
+        const source = runSources.get(`${threadId}:${runId}`);
+        if (source === undefined || source.effectId !== effectId || !source.admitted)
+          return Effect.void;
+        // Re-read ownership under the mutex before changing a reservation.
+        return mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged)));
+      }),
   );
   // Keep allocation/transfer and its finalizer metadata in the same mutex turn.
   const ownRunReservation = (source: RestartSource, runId: RunId) => {
@@ -267,9 +416,16 @@ const make = Effect.gen(function* () {
         order: entry.order,
         priority: entry.priority,
         activityAt: entry.activityAt,
+        bestPosition: entry.bestPosition,
+        positionImprovedAt: entry.positionImprovedAt,
+        admissionProgressAt: entry.admissionProgressAt,
+        ...(entry.lastBoundDeferredAt === undefined
+          ? {}
+          : { lastBoundDeferredAt: entry.lastBoundDeferredAt }),
         loadHoldMs: entry.loadHoldMs,
         checkedAt: entry.checkedAt,
         wasLoaded: entry.wasLoaded,
+        ...(entry.observation === undefined ? {} : { observation: entry.observation }),
       });
     pending.delete(key(source));
     for (const [runKey, runSource] of runSources) {
@@ -318,6 +474,7 @@ const make = Effect.gen(function* () {
       };
       delete replacement.waitKey;
       delete replacement.orderWait;
+      delete replacement.observation;
       pending.set(key(source), replacement);
       yield* Effect.logInfo("restart-pacing.replaced", {
         threadId: source.threadId,
@@ -334,16 +491,22 @@ const make = Effect.gen(function* () {
       retained?.expiredEffectId !== undefined && retained.expiredEffectId !== source.effectId
         ? undefined
         : retained;
+    const registeredAt = yield* Clock.currentTimeMillis;
     pending.set(key(source), {
       ...source,
       ...description,
       order: nextOrder++,
-      registeredAt: yield* Clock.currentTimeMillis,
+      registeredAt,
+      bestPosition: Infinity,
+      positionImprovedAt: registeredAt,
+      admissionProgressAt: registeredAt,
       loadHoldMs: 0,
       checkedAt: yield* Clock.currentTimeMillis,
       wasLoaded: false,
       retryMs: RECHECK_MS,
       ...hold,
+      // A fresh effect resets the allowance, but is still the same source run.
+      ...(retained?.observation === undefined ? {} : { observation: retained.observation }),
     });
     requeuedHolds.delete(key(source));
   });
@@ -370,13 +533,22 @@ const make = Effect.gen(function* () {
         const config = (yield* settingsSnapshot.pipe(
           Effect.mapError((cause) => new RestartPacingStateError({ cause })),
         )).restartPacing;
-        pass = { at: now, config, loaded: load() > 1 };
+        const loadScore = load();
+        const loadSample = load.snapshot?.();
+        pass = {
+          at: now,
+          config,
+          loaded: loadScore > 1,
+          loadScore,
+          ...(loadSample === undefined ? {} : { loadSample }),
+        };
       }
+      const { config, loaded } = pass;
       if (activeCheckedAt === undefined || now - activeCheckedAt >= PASS_MS) {
-        if (active.size >= pass.config.maxActive && now - lastProgressAt >= STUCK_MS) {
+        if (active.size >= config.maxActive && now - lastProgressAt >= STUCK_MS) {
           yield* Effect.logWarning("restart-pacing.stuck", {
             idleMs: now - lastProgressAt,
-            maxActive: pass.config.maxActive,
+            maxActive: config.maxActive,
             holders: [...active.values()].map((holder) => ({
               ...holder.source,
               dispatching: holder.dispatching,
@@ -416,15 +588,10 @@ const make = Effect.gen(function* () {
         }
         activeCheckedAt = now;
       }
-      const { config, loaded } = pass;
       const queue = [...pending.values()];
       const spacing =
         lastStartAt === undefined ? 0 : Math.max(0, config.spacingMs - (now - lastStartAt));
-      for (const entry of queue) {
-        if (entry.wasLoaded) entry.loadHoldMs += Math.max(0, now - entry.checkedAt);
-        entry.checkedAt = now;
-        entry.wasLoaded = loaded;
-      }
+      updateLoadHolds(now, loaded);
       // A new load-held arrival must not starve waiters whose load budget is spent.
       queue.sort(
         (a, b) =>
@@ -445,14 +612,51 @@ const make = Effect.gen(function* () {
       if (entry === undefined) return yield* new RestartAdmissionSupersededError();
       entry.wakeRequested = false;
       const position = queue.indexOf(entry) + 1;
-      if (now - entry.registeredAt >= RESTART_ADMISSION_TIMEOUT_MS) {
+      observeProgress(queue, yield* Clock.currentTimeMillis);
+      const absoluteDeadline = entry.registeredAt + RESTART_ADMISSION_ABSOLUTE_TIMEOUT_MS;
+      const progressDeadline = noProgressDeadline(entry);
+      const admissionDeadline = Math.min(absoluteDeadline, progressDeadline);
+      const lastAdmissionAgoMs = lastStartAt === undefined ? null : now - lastStartAt;
+      const checkBound = Effect.gen(function* () {
+        const checkedAt = yield* Clock.currentTimeMillis;
+        const rule =
+          checkedAt >= absoluteDeadline
+            ? "absolute_backstop"
+            : checkedAt >= progressDeadline
+              ? "no_progress"
+              : undefined;
+        if (rule === undefined) return checkedAt;
+        const admission = {
+          queuedAtMs: entry.registeredAt,
+          waitedMs: checkedAt - entry.registeredAt,
+          positionAtFailure: position,
+          totalAtFailure: queue.length,
+          rule,
+        } satisfies OrchestrationV2RestartAdmissionFailure;
         yield* Effect.logWarning("restart-pacing.bound_failed", {
           threadId: source.threadId,
           sourceRunId: source.sourceRunId,
           queuedAtMs: entry.registeredAt,
-          waitedMs: now - entry.registeredAt,
+          waitedMs: checkedAt - entry.registeredAt,
+          rule,
+          lastAdmissionAgoMs: lastStartAt === undefined ? null : checkedAt - lastStartAt,
+          admissionProgressAgoMs: checkedAt - entry.admissionProgressAt,
+          positionImprovedAgoMs: checkedAt - entry.positionImprovedAt,
+          total: queue.length,
+          active: active.size,
           position,
           hasSuccessor: yield* state.hasSuccessor(source, runId),
+        });
+        yield* recordAdmission(source, entry.observation, {
+          at: checkedAt,
+          runId,
+          queuedAtMs: entry.registeredAt,
+          position,
+          total: queue.length,
+          active: active.size,
+          maxActive: config.maxActive,
+          loaded,
+          rule,
         });
         yield* state.status(source, null);
         pending.delete(key(source));
@@ -460,16 +664,43 @@ const make = Effect.gen(function* () {
         // gets its own allowance instead of inheriting the retired registration.
         requeuedHolds.set(key(source), {
           registeredAt: entry.registeredAt,
+          bestPosition: entry.bestPosition,
+          positionImprovedAt: entry.positionImprovedAt,
+          admissionProgressAt: entry.admissionProgressAt,
+          ...(entry.lastBoundDeferredAt === undefined
+            ? {}
+            : { lastBoundDeferredAt: entry.lastBoundDeferredAt }),
           loadHoldMs: entry.loadHoldMs,
           checkedAt: entry.checkedAt,
           wasLoaded: entry.wasLoaded,
+          ...(entry.observation === undefined ? {} : { observation: entry.observation }),
           ...(source.effectId === undefined ? {} : { expiredEffectId: source.effectId }),
         });
         for (const [runKey, runSource] of runSources) {
           if (key(runSource) === key(source)) runSources.delete(runKey);
         }
         return yield* new RestartAdmissionTimeoutError({
-          deadline: DateTime.makeUnsafe(entry.registeredAt + RESTART_ADMISSION_TIMEOUT_MS),
+          deadline: DateTime.makeUnsafe(admissionDeadline),
+          admission,
+        });
+      });
+      yield* checkBound;
+      if (
+        now - entry.registeredAt >= RESTART_ADMISSION_TIMEOUT_MS &&
+        (entry.lastBoundDeferredAt === undefined ||
+          now - entry.lastBoundDeferredAt >= BOUND_DEFERRED_LOG_MS)
+      ) {
+        entry.lastBoundDeferredAt = now;
+        yield* Effect.logWarning("restart-pacing.bound_deferred", {
+          threadId: source.threadId,
+          sourceRunId: source.sourceRunId,
+          queuedAtMs: entry.registeredAt,
+          waitedMs: now - entry.registeredAt,
+          position,
+          total: queue.length,
+          active: active.size,
+          lastAdmissionAgoMs,
+          positionImprovedAgoMs: now - entry.positionImprovedAt,
         });
       }
       if (position === 0) return RECHECK_MS;
@@ -527,6 +758,8 @@ const make = Effect.gen(function* () {
             queueOrder: entry.order,
             queuedAtMs: entry.registeredAt,
             waitedMs: now - entry.registeredAt,
+            lastAdmissionAgoMs,
+            ...(loaded ? { loadScore: pass.loadScore, loadThreshold: 1, ...pass.loadSample } : {}),
             reasons: [
               ...(position > 1 ? ["queue"] : []),
               ...(active.size >= config.maxActive ? ["maxActive"] : []),
@@ -539,7 +772,7 @@ const make = Effect.gen(function* () {
         const remainingHold = MAX_LOAD_HOLD_MS - entry.loadHoldMs;
         const retryMs = Math.min(
           loaded && remainingHold > 0 ? Math.min(entry.retryMs, remainingHold) : entry.retryMs,
-          RESTART_ADMISSION_TIMEOUT_MS - (now - entry.registeredAt),
+          admissionDeadline - now,
         );
         entry.retryMs = Math.min(MAX_RECHECK_MS, retryMs * 2);
         return spacing > 0 &&
@@ -560,7 +793,8 @@ const make = Effect.gen(function* () {
         }
       }
       yield* state.status(source, null);
-      const admittedAt = yield* Clock.currentTimeMillis;
+      // Persistence can outlast either deadline while admission holds the mutex.
+      const admittedAt = yield* checkBound;
       active.set(key(source), {
         source,
         dispatching: true,
@@ -570,12 +804,40 @@ const make = Effect.gen(function* () {
           loadHoldMs: entry.loadHoldMs,
           checkedAt: admittedAt,
           wasLoaded: loaded,
+          ...(entry.observation === undefined ? {} : { observation: entry.observation }),
         },
       });
       pending.delete(key(source));
+      observeProgress(
+        queue.filter((waiting) => waiting !== entry),
+        admittedAt,
+        true,
+      );
+      // Pruned effects retain their queue age until a replacement registers.
+      // Admissions elsewhere still count while that replacement is pending.
+      for (const hold of requeuedHolds.values()) {
+        if (
+          hold.admissionProgressAt !== undefined &&
+          hold.positionImprovedAt !== undefined &&
+          admittedAt <
+            Math.min(hold.admissionProgressAt, hold.positionImprovedAt) +
+              RESTART_ADMISSION_TIMEOUT_MS
+        )
+          hold.admissionProgressAt = admittedAt;
+      }
       lastStartAt = admittedAt;
       lastProgressAt = admittedAt;
       if (runId !== undefined) ownRunReservation(source, runId);
+      yield* recordAdmission(source, entry.observation, {
+        at: admittedAt,
+        runId,
+        queuedAtMs: entry.registeredAt,
+        position,
+        total: queue.length,
+        active: active.size,
+        maxActive: config.maxActive,
+        loaded,
+      });
       yield* Effect.logInfo("restart-pacing.admitted", {
         threadId: source.threadId,
         sourceRunId: source.sourceRunId,
@@ -670,6 +932,7 @@ const make = Effect.gen(function* () {
       while (queue.length > 0 && !(yield* state.pending(queue[0]!))) {
         yield* retire(queue.shift()!, true);
       }
+      observeProgress(queue, yield* Clock.currentTimeMillis);
       const head = queue[0];
       if (head === undefined) return next(PASS_MS);
       const spacingAt =

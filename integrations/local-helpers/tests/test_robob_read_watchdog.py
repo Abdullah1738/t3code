@@ -3,9 +3,11 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = Path(__file__).resolve().parents[1]
@@ -22,6 +24,8 @@ class RobobReadWatchdogTest(unittest.TestCase):
         self.clock.write_text("0")
         self.sequence = self.home / "sequence.json"
         self.sequence.write_text("[]")
+        self.processes = []
+        self.child_records = self.home / "children.jsonl"
         fake = self.home / "fake command"
         fake.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
 from pathlib import Path
@@ -93,7 +97,90 @@ print(time.strftime(sys.argv[3][1:], time.localtime(int(sys.argv[2]))))
         }
 
     def tearDown(self):
+        for process in self.processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+        for child in self.probe_children():
+            if self.start_time(child["pid"]) == child["start"]:
+                try:
+                    os.kill(child["pid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         self.temp.cleanup()
+
+    def start_time(self, pid):
+        result = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+                                env={**os.environ, "TZ": "UTC0", "LC_ALL": "C"},
+                                capture_output=True, text=True, timeout=5)
+        return result.stdout.rstrip("\n") if result.returncode == 0 else None
+
+    def probe_children(self):
+        if not self.child_records.exists():
+            return []
+        return [json.loads(line) for line in self.child_records.read_text().splitlines()]
+
+    def use_blocking_probe(self, ignore_term=True, deadline=1):
+        blocker = self.home / "blocking_probe.py"
+        blocker.write_text('''import json, os, signal, subprocess, time
+from pathlib import Path
+root = Path(os.environ['HOME'])
+if os.environ['FAKE_IGNORE_TERM'] == '1':
+    def ignore_term(signum, frame):
+        with (root / 'terms.jsonl').open('a') as out:
+            out.write(str(os.getpid()) + '\\n')
+    signal.signal(signal.SIGTERM, ignore_term)
+pid = os.getpid()
+start = subprocess.check_output(['/bin/ps', '-o', 'lstart=', '-p', str(pid)],
+                                env={**os.environ, 'TZ': 'UTC0', 'LC_ALL': 'C'}, text=True).rstrip('\\n')
+with (root / 'children.jsonl').open('a') as out:
+    out.write(json.dumps({'pid': pid, 'start': start}) + '\\n')
+while root.exists() and not (root / 'release_probe').exists():
+    time.sleep(0.05)
+''')
+        self.env.update({
+            "ROBOB_WD_PROBE": f"{shlex.quote(sys.executable)} -I {shlex.quote(str(blocker))}",
+            "ROBOB_WD_PROBE_DEADLINE": str(deadline),
+            "FAKE_IGNORE_TERM": "1" if ignore_term else "0",
+        })
+
+    def assert_stuck_child(self):
+        children = self.probe_children()
+        self.assertEqual(len(children), 1)
+        child = children[0]
+        self.assertEqual((self.state / "stuck_probe").read_text(),
+                         f"{child['pid']} {child['start']}\n")
+        self.assertEqual(self.start_time(child["pid"]), child["start"])
+        return child["pid"]
+
+    def install_ps_fault(self, first_call, result):
+        (self.home / "ps-fault.json").write_text(json.dumps({"first_call": first_call, "result": result}))
+        wrapper = self.home / ".local/bin/ps"
+        wrapper.write_text(f"#!{sys.executable}\n" + '''import json, os, sys
+from pathlib import Path
+root = Path(os.environ['HOME'])
+counter = root / 'ps-count'
+number = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(number))
+fault = json.loads((root / 'ps-fault.json').read_text())
+if number >= fault['first_call']:
+    if fault['result'] == 'whitespace':
+        print('   ')
+    sys.exit(1 if fault['result'] == 'error' else 0)
+os.execv('/bin/ps', ['ps', *sys.argv[1:]])
+''')
+        wrapper.chmod(0o755)
+
+    def terms(self):
+        log = self.home / "terms.jsonl"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def release_children(self):
+        (self.home / "release_probe").touch()
+        deadline = time.monotonic() + 5
+        while any(self.start_time(row["pid"]) is not None for row in self.probe_children()):
+            self.assertLess(time.monotonic(), deadline, "fake child did not exit")
+            time.sleep(0.05)
 
     def run_script(self, *args, at=None, expected=0, **fake):
         env = self.env.copy()
@@ -244,7 +331,8 @@ print(time.strftime(sys.argv[3][1:], time.localtime(int(sys.argv[2]))))
         self.assertEqual(result.stdout, "reads healthy for 5 min\n")
         self.assertEqual(self.calls("notify"), [])
         self.assertEqual(self.calls("app"), [])
-        self.assertFalse(self.state.exists())
+        self.assertTrue(self.state.is_dir())
+        self.assertFalse((self.state / "first_fail").exists())
 
     def test_sustain_starts_clock_after_first_success_completes(self):
         self.run_script("--sustain", "30", "--every", "15", probe_rc=0, probe_seconds=10)
@@ -271,16 +359,180 @@ print(time.strftime(sys.argv[3][1:], time.localtime(int(sys.argv[2]))))
         self.assertEqual(self.clock.read_text(), "600")
         self.assertEqual(result.stdout,
                          "installed but reads still failing since 04:00 (request timed out)\n")
-        self.assertEqual(len(self.calls("probe")), 21)
-        self.assertFalse(self.state.exists())
+        self.assertEqual(len(self.calls("probe")), 20)
+        self.assertTrue(self.state.is_dir())
+        self.assertFalse((self.state / "first_fail").exists())
         self.assertEqual(self.calls("notify"), [])
 
     def test_sustain_deadline_is_not_extended_by_oversized_interval(self):
         self.run_script("--sustain", "300", "--every", "400", "--give-up", "100",
                         expected=1, probe_seconds=10)
-        self.assertEqual([row["at"] for row in self.calls("probe")], [0, 100])
-        self.assertEqual(self.clock.read_text(), "110")
+        self.assertEqual([row["at"] for row in self.calls("probe")], [0])
+        self.assertEqual(self.clock.read_text(), "100")
         self.assertEqual(self.calls("notify"), [])
+
+    def test_deadline_sends_term_and_records_failure_without_stuck_identity(self):
+        self.use_blocking_probe(ignore_term=False)
+        started = time.monotonic()
+        self.run_script(at=0)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual(len(self.probe_children()), 1)
+        self.assertFalse((self.state / "stuck_probe").exists())
+        self.assertEqual((self.state / "last_error").read_text().strip(), "probe timed out after 1s")
+
+    def test_ignored_term_is_abandoned_and_next_tick_does_not_spawn(self):
+        self.use_blocking_probe()
+        started = time.monotonic()
+        self.run_script(at=0)
+        self.assertLess(time.monotonic() - started, 4)
+        pid = self.assert_stuck_child()
+        self.assertRegex((self.state / "last_error").read_text(), rf"^probe stuck since \d\d:\d\d UTC \(pid {pid}\)")
+        self.run_script(at=30)
+        self.assertEqual(len(self.probe_children()), 1)
+        self.assertEqual(self.terms(), [str(pid)])
+        self.assertIn("prior probe still stuck", (self.state / "last_error").read_text())
+
+    def test_sustain_and_ticks_share_identity_across_time_zones(self):
+        # Fixed UTC, positive offset, negative/DST offset, and inherited system zone.
+        zones = ("UTC0", "Asia/Dubai", "America/New_York", None)
+        for capture_zone in zones:
+            with self.subTest(capture_zone=capture_zone):
+                self.child_records.unlink(missing_ok=True)
+                (self.home / "terms.jsonl").unlink(missing_ok=True)
+                (self.home / "release_probe").unlink(missing_ok=True)
+                self.use_blocking_probe()
+                if capture_zone is None:
+                    self.env.pop("TZ", None)
+                else:
+                    self.env["TZ"] = capture_zone
+                self.run_script("--sustain", "30", "--give-up", "1", expected=1)
+                pid = self.assert_stuck_child()
+                record = (self.state / "stuck_probe").read_text()
+                for retry_zone in zones:
+                    with self.subTest(retry_zone=retry_zone):
+                        if retry_zone is None:
+                            self.env.pop("TZ", None)
+                        else:
+                            self.env["TZ"] = retry_zone
+                        self.run_script(at=30)
+                        self.assertEqual(len(self.probe_children()), 1)
+                        self.assertEqual((self.state / "stuck_probe").read_text(), record)
+                        self.assertIn("prior probe still stuck", (self.state / "last_error").read_text())
+                        self.assertEqual(self.terms(), [str(pid)])
+                self.release_children()
+                (self.state / "stuck_probe").unlink()
+
+    def test_unreadable_start_time_never_releases_a_live_prior_guard(self):
+        prior = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"])
+        self.processes.append(prior)
+        self.state.mkdir()
+        record = f"{prior.pid} {self.start_time(prior.pid)}\n"
+        for result in ("error", "empty", "whitespace"):
+            with self.subTest(result=result):
+                self.install_ps_fault(first_call=1, result=result)
+                (self.state / "stuck_probe").write_text(record)
+                self.run_script(at=0)
+                self.assertEqual(self.calls("probe"), [])
+                self.assertEqual((self.state / "stuck_probe").read_text(), record)
+                self.assertIn("prior probe still stuck", (self.state / "last_error").read_text())
+
+    def test_unreadable_start_time_during_capture_or_timeout_keeps_suppression(self):
+        # Whole lookup-failure class: initial capture, before TERM, after TERM;
+        # each lookup may fail, succeed without output, or return whitespace.
+        for phase, first_call, expected_terms in (("capture", 1, 0), ("before_term", 2, 0),
+                                                   ("after_term", 3, 1)):
+            for result in ("error", "empty", "whitespace"):
+                with self.subTest(phase=phase, result=result):
+                    self.child_records.unlink(missing_ok=True)
+                    (self.home / "terms.jsonl").unlink(missing_ok=True)
+                    (self.home / "ps-count").unlink(missing_ok=True)
+                    (self.home / "release_probe").unlink(missing_ok=True)
+                    self.use_blocking_probe()
+                    self.install_ps_fault(first_call, result)
+                    self.run_script(at=0)
+                    child = self.probe_children()[0]
+                    expected_start = "unknown" if phase == "capture" else child["start"]
+                    record = f"{child['pid']} {expected_start}\n"
+                    self.assertEqual((self.state / "stuck_probe").read_text(), record)
+                    self.assertEqual(len(self.terms()), expected_terms)
+                    self.run_script(at=30)
+                    self.assertEqual(len(self.probe_children()), 1)
+                    self.assertEqual((self.state / "stuck_probe").read_text(), record)
+                    self.assertIn("prior probe still stuck", (self.state / "last_error").read_text())
+                    self.assertEqual(len(self.terms()), expected_terms)
+                    # Restoring ps cannot prove reuse when capture never had an identity.
+                    if phase == "capture":
+                        (self.home / ".local/bin/ps").unlink()
+                        self.run_script(at=60)
+                        self.assertEqual(len(self.probe_children()), 1)
+                        self.assertEqual((self.state / "stuck_probe").read_text(), record)
+                    self.release_children()
+                    (self.state / "stuck_probe").unlink()
+
+    def test_stale_record_is_cleared_for_dead_reused_and_malformed_identities(self):
+        dead = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+        dead.wait(timeout=5)
+        records = [f"{dead.pid} Tue Nov 17 00:00:00 2026\n",
+                   f"{os.getpid()} Tue Nov 17 00:00:00 1999\n", "", "not-a-pid\n", "0 x\n"]
+        for record in records:
+            with self.subTest(record=record):
+                self.state.mkdir(exist_ok=True)
+                (self.state / "stuck_probe").write_text(record)
+                before = len(self.calls("probe"))
+                self.run_script(at=0, probe_rc=0)
+                self.assertEqual(len(self.calls("probe")), before + 1)
+                self.assertFalse((self.state / "stuck_probe").exists())
+
+    def test_stuck_child_alerts_once_and_recovers_after_identity_exits(self):
+        normal_probe = self.env["ROBOB_WD_PROBE"]
+        self.use_blocking_probe()
+        self.fail_until_alert()
+        pid = self.assert_stuck_child()
+        self.run_script(at=210)
+        self.assertEqual(len(self.notifications()), 1)
+        self.assertEqual(self.notifications()[0]["--severity"], "attention")
+        self.assertIn(f"prior probe still stuck since", self.notifications()[0]["--text"])
+        self.assertIn(f"(pid {pid})", self.notifications()[0]["--text"])
+        (self.home / "release_probe").touch()
+        deadline = time.monotonic() + 5
+        while self.start_time(pid) is not None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIsNone(self.start_time(pid))
+        self.env["ROBOB_WD_PROBE"] = normal_probe
+        self.run_script(at=240, probe_rc=0)
+        self.run_script(at=270, probe_rc=0)
+        self.assertEqual([row["--severity"] for row in self.notifications()], ["attention", "info"])
+        self.assertFalse((self.state / "stuck_probe").exists())
+        self.assertFalse((self.state / "first_fail").exists())
+
+    def test_sustain_caps_probe_at_give_up_and_abandons_one_child(self):
+        self.use_blocking_probe(deadline=20)
+        started = time.monotonic()
+        result = self.run_script("--sustain", "30", "--every", "1", "--give-up", "1", expected=1)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIn("probe stuck since", result.stdout)
+        self.assert_stuck_child()
+        self.assertEqual(self.calls("notify"), [])
+        # --sustain must consume the same prior-child identity as a tick.
+        self.run_script("--sustain", "30", "--every", "1", "--give-up", "2", expected=1)
+        self.assertEqual(len(self.probe_children()), 1)
+        self.run_script(at=60)
+        self.assertEqual(len(self.probe_children()), 1)
+
+    def test_tick_and_sustain_race_does_not_spawn_two_children(self):
+        self.use_blocking_probe()
+        process = subprocess.Popen(["/bin/zsh", str(SCRIPT), "--sustain", "30", "--give-up", "4"],
+                                   env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.processes.append(process)
+        deadline = time.monotonic() + 5
+        while not self.probe_children() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(len(self.probe_children()), 1)
+        self.run_script(at=0)
+        self.assertEqual(len(self.probe_children()), 1)
+        self.assertEqual((self.state / "last_error").read_text().strip(), "another probe is running")
+        self.assertEqual(process.wait(timeout=7), 1)
+        self.assert_stuck_child()
 
     def test_invalid_arguments_do_not_probe_or_notify(self):
         for args in (("--sustain",), ("--sustain", "0"), ("--sustain", "-1"),
