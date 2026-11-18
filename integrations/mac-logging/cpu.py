@@ -539,6 +539,10 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
             # Apple's Python 3.9 monotonic epoch is per process, unlike Unix time.
             observed = time.time()
             previous = read_state('cpu')
+            from boot_identity import identity
+            boot_id = identity()
+            if boot_id and previous.get('bootEpoch') != boot_id['bootEpoch']:
+                previous = {}
             props, state = deltas(rows, previous, observed)
             props.update(churn(rows, previous, props))
             props.update(diagnostics)
@@ -581,6 +585,8 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
             # Reserve before emitting, under the sampler lock: a failed logger
             # write may cost a slot but cannot cause a duplicate over the cap.
             state.update(spikeDay=day, spikeCount=count+(snapshot is not None))
+            if boot_id:
+                state['bootEpoch'] = boot_id['bootEpoch']
             save_state('cpu', state)
             duration = (clock()-started)*1000
             emit('cpu', 'event', 'cpu.sample', ok=True, duration_ms=duration, props=props, now=observed_at)
@@ -598,6 +604,8 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
 
 
 def main():
+    from boot import check
+    check()
     try:
         from disk_low import check as check_disk_floor
         check_disk_floor()

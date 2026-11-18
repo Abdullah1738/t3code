@@ -70,6 +70,27 @@ UTC), `lastOk`, `lines` (matching lines in that window), `ageMin`, `gapMaxMin`,
 `since`, and `status`. `missingJobs` contains the `LATE` and `SILENT` job keys;
 backup keys are `backup.run:health` and `backup.run:memory`.
 
+Each row includes the exact `kern.boottime` epoch and UTC `bootTime` when
+available. The minute CPU sampler and hourly collector share a nonblocking boot
+lock. After a three-minute startup grace, `boot.observed` records the previous
+boot, the last prior sample's uptime, the gap from the last prior log row,
+ResetCounter faults/failure count, panic files within ten minutes of boot and
+Jetsam reports in the preceding two hours. Missing evidence remains null or
+carries a per-field source error. The gap measures logging silence; it does
+not establish how long the Mac froze.
+
+A clean boot requires the adjacent shutdown record from `last -y reboot shutdown`
+and no positive panic/reset-fault evidence. #92 found no numeric shutdown cause
+on this Apple-silicon host; any future numeric code is retained as unmapped,
+without Intel cause tables. One filtered unified-log query covers only the first
+three minutes of boot, with a 15-second process-group deadline and timestamp
+post-filtering. ResetCounter uses plain reads, without sudo. Observations are
+timestamped at boot (`observedAt` records collection time), persisted once per
+boot and survive the daily log cap. Unclean boots queue one
+Telegram alert with a stable boot key; failed sends retry that same key/text.
+CPU process, host-tick and child baselines reset on boot changes. Rollups add
+`boots` and `uncleanBoots`, also emitted in `log.rollup`.
+
 The collector reads DiagnosticReports and a filtered `log show`, retaining a
 separate cursor per source so an unavailable source is retried. Its first run
 looks back one hour. Report cursors cover since their last successful read.

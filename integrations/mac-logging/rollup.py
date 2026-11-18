@@ -78,6 +78,7 @@ def rollup(day, root=None):
     waits = dict(runs=0, maxStuckForS=None, latestStuckUnmountMountPoint=None, busyRuns=0, topBusyComms=[])
     busy_comms = Counter()
     latest_unmount_at = ''
+    boots = {}
     spikes = dict(minutes=0, highestLoad=[])
     u_episodes = {}
     total = oks = failed = outcomes = malformed = 0
@@ -93,6 +94,10 @@ def rollup(day, root=None):
                     names[name] += 1
                     kinds[kind] += 1
                     total += 1
+                    if name == 'boot.observed':
+                        props = safe_fields(row.get('props'), name)
+                        if props.get('bootTime') and type(props.get('clean')) is bool:
+                            boots[props['bootTime']] = props['clean']
                     if name == 'cpu.spike':
                         props = safe_fields(row.get('props', {}), name)
                         load = props.get('load')
@@ -191,7 +196,7 @@ def rollup(day, root=None):
     for name, values in durations.items():
         values.sort()
         stats[name] = {key: values[max(0, math.ceil(len(values) * pct) - 1)] for key, pct in [('p50', .5), ('p95', .95), ('max', 1)]}
-    result = dict(day=day, tool='mac', cpuSpikes=spikes, backup=backup, diskTooling=disk, diskWait=waits, diskInventory=inventory, total=total, countsByName=dict(names), countsByKind=dict(kinds),
+    result = dict(day=day, tool='mac', boots=len(boots), uncleanBoots=sum(not clean for clean in boots.values()), cpuSpikes=spikes, backup=backup, diskTooling=disk, diskWait=waits, diskInventory=inventory, total=total, countsByName=dict(names), countsByKind=dict(kinds),
                   outcomes=outcomes, okRate=oks / outcomes if outcomes else None,
                   errorRate=kinds['error'] / total if total else None,
                   failedRate=failed / outcomes if outcomes else None, durationMs=stats, malformed=malformed,

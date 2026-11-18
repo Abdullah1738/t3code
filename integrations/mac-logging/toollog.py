@@ -8,13 +8,15 @@ import os
 from pathlib import Path
 import re
 import uuid
+from boot_identity import identity
 
 RUN_ID = uuid.uuid4().hex
 VOLUME_THREAD_ID = re.compile(r'(?:thread:project:[^\s:]+:)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 
 CAP_BYTES = 50 * 1024 * 1024
 # Explicit schema: unknown keys and nested payloads cannot enter a log by accident.
-NUMBERS = set('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
+NUMBERS = {'boots', 'uncleanBoots'}
+NUMBERS.update('internalFreeGb externalFreeGb baseline count bytes files snapshotAgeS resticExitCode exitCode found killed ageS autoFixed needsOwner critical high moderate medium low unknown skipped sourceErrors reports inventoryAgeS'.split())
 NUMBERS.update('diskCount storagekitdPid storagekitdUptimeS diskarbitrationdPid diskarbitrationdUptimeS hdiutilMs'.split())
 NUMBERS.update('elapsedMs deniedCount partialChildCount inventorySourceErrors'.split())
 NUMBERS.update('rootsOk rootsTimeout rootsDenied scanMs'.split())
@@ -555,6 +557,55 @@ def janitor_mcp_fields(values):
     return result
 
 
+def boot_fields(values):
+    result = {}
+    def path(value):
+        # Date-bearing diagnostic names resemble card numbers to the generic
+        # secret detector; these fixed report roots contain requested metadata.
+        if isinstance(value, str) and len(value) <= 512 and re.fullmatch(
+                r'(?:/Library/Logs/DiagnosticReports|/Users/[^/]+/Library/Logs/DiagnosticReports)/(?:Retired/)?[A-Za-z0-9_.()+ -]+', value):
+            return value
+        return text(value)
+    def text(value, limit=512):
+        if value is None:
+            return None
+        if isinstance(value, str) and len(value) <= limit and not SECRET.search(value):
+            return ''.join(c for c in value if c.isprintable())
+        return None
+    for key, value in (values or {}).items():
+        if key in ('bootTime', 'previousBootTime'):
+            result[key] = text(value, 40)
+        elif key in ('uptimeAtPreviousSample', 'lastSampleGapS', 'observedAt'):
+            result[key] = value if finite_number(value) and value >= 0 else None
+        elif key == 'clean' and type(value) is bool:
+            result[key] = value
+        elif key == 'bootFaults':
+            result[key] = (dict(raw=text(value.get('raw'), 256),
+                                bootFailureCount=value.get('bootFailureCount')
+                                if type(value.get('bootFailureCount')) is int else None)
+                           if isinstance(value, dict) else None)
+        elif key == 'shutdownCause':
+            result[key] = (dict(code=value.get('code') if type(value.get('code')) is int else None,
+                                meaning='unmapped') if isinstance(value, dict) else None)
+        elif key == 'panic' and isinstance(value, dict):
+            result[key] = dict(present=value.get('present') is True, path=path(value.get('path')))
+        elif key == 'jetsamReportsLast2h' and isinstance(value, dict):
+            result[key] = dict(count=value.get('count') if type(value.get('count')) is int else None,
+                               newestPath=path(value.get('newestPath')))
+        elif key == 'source' and isinstance(value, dict):
+            result[key] = {}
+            for field, source in value.items():
+                if field not in ('bootTime', 'previousBootTime', 'uptimeAtPreviousSample',
+                                 'lastSampleGapS', 'clean', 'shutdownCause', 'bootFaults',
+                                 'panic', 'jetsamReportsLast2h') or not isinstance(source, dict):
+                    continue
+                result[key][field] = {k: (path(v) if k == 'path' else v if v is None or type(v) in (int, bool) else text(v))
+                    for k, v in source.items() if k in ('read', 'error', 'path', 'windowStart',
+                    'windowEnd', 'droppedRows', 'dumpPanic', 'lastRow', 'lastSample',
+                    'shutdownRecord', 'abnormalEvidence')}
+    return result
+
+
 def safe_fields(values, event=None):
     if event and event.startswith('macguard.'):
         return macguard_fields(values or {})
@@ -628,6 +679,8 @@ def safe_fields(values, event=None):
         return result
     if event in ('host.vitals', 'host.families_lite'):
         return host_fields(values, event)
+    if event == 'boot.observed':
+        return boot_fields(values)
     if event == 'scan.volume_crawl':
         result = {}
         for key, value in (values or {}).items():
@@ -853,6 +906,9 @@ def record(component, kind, name, now, duration_ms=None, ok=None, ids=None, prop
         raise ValueError('invalid component')
     row = dict(ts=now.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), tool='mac',
                component=component, kind=kind, name=name)
+    boot_id = identity()
+    if boot_id:
+        row.update(boot_id)
     if finite_number(duration_ms) and duration_ms >= 0:
         row['durationMs'] = round(duration_ms, 3)
     if type(ok) is bool:
@@ -1007,7 +1063,7 @@ def emit(component, kind, name, *, duration_ms=None, ok=None, ids=None, props=No
                     row.get('props', {}).get('skippedS', 0) > 0)
                 # Preserve the bounded host heartbeat through a noisy day's cap.
                 host_sample = name in ('host.vitals', 'host.families_lite', 'host.overload', 'host.spawn_sample')
-                if kind != 'error' and not coverage_gap and not host_sample and not dedup_id:
+                if kind != 'error' and not coverage_gap and not host_sample and not dedup_id and name != 'boot.observed':
                     return
             append(fd, row)
             return True

@@ -708,7 +708,8 @@ def collect(now=None, roots=None, log_reader=None, deadline=None):
             save_state('crashes', state)
             emit('rollup', 'event', 'log.rollup', ok=True,
                  props={'backup.'+key+'.'+target: count
-                        for key, targets in result['backup'].items() for target, count in targets.items()})
+                        for key, targets in result['backup'].items() for target, count in targets.items()} |
+                       dict(boots=result['boots'], uncleanBoots=result['uncleanBoots']))
         except Exception:
             emit('rollup', 'error', 'log.rollup', ok=False, error_tag='rollup.failed')
     return not errors
@@ -1349,6 +1350,8 @@ def main():
     missing_day()
     homebrew_integrity(lambda text, key: notify(text, key, subprocess.run))
     deadline = time.monotonic()+290
+    from boot import check
+    check()
     try:
         collect(deadline=deadline)
     except Exception:
