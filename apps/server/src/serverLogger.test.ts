@@ -503,6 +503,8 @@ it.effect("persists holder JSON in both lock and server logs even with logging d
       "board.acquired_at_ms": 0,
       "board.held_ms": 5_000,
       "board.waiters": 0,
+      subSteps: [{ subStep: "card.reviewResult", ms: 5_000 }],
+      threshold: { awaited: "card.reviewResult", readers: [], observedAtMs: 5_000 },
     });
     const serverLines = (yield* fs.readFileString(path.join(root, "server.log")))
       .trimEnd()
