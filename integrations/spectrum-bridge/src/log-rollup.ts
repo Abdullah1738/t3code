@@ -101,7 +101,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
     chainAggregation.accept(line);
     if (line.name === "inbound.overdue") overdue++;
     if (line.name === "inbound.watchdog_requeued") requeued_by_watchdog++;
-    if (["inbound.unanswered_alert", "unanswered.alert"].includes(line.name) && line.ids?.inboundId) alerts.add(`${line.ids.chat}:${line.ids.inboundId}`);
+    if (["inbound.overdue_notice", "inbound.unanswered_alert", "unanswered.alert"].includes(line.name) && line.ids?.inboundId) alerts.add(`${line.ids.chat}:${line.ids.inboundId}`);
     if (line.name === "inbound.answered_late") answered_late++;
     if (line.name === "inbound.answered" && line.durationMs !== undefined && ["owner", "moni"].includes(line.ids?.chat ?? "")) {
       const ms = Math.round(line.durationMs); firstReplies.set(ms, (firstReplies.get(ms) ?? 0) + 1);

@@ -169,8 +169,9 @@ test("remote fenced DM alerts once at ten minutes across restart, without requeu
   });
   expect(s.alerts.filter(a => a.key === `imessage-unanswered:${opaqueId("dm")}`)).toHaveLength(1);
   expect(s.requests).toHaveLength(before);
-  expect(logs.filter(l => l.name === "unanswered.alert")).toHaveLength(2);
-  expect(logs.find(l => l.name === "unanswered.alert")?.props?.backend).toBe("remote-box");
+  expect(logs.filter(l => l.name === "inbound.overdue_notice")).toHaveLength(2);
+  expect(logs.find(l => l.name === "inbound.overdue_notice")?.props?.backend).toBe("remote-box");
+  expect(logs.some(l => l.name === "inbound.unanswered" || l.error?.tag === "inbound.unanswered")).toBe(false);
   expect((await summarizeLog((async function* () { yield* logs; })())).unanswered_alerts).toBe(2);
   expect(s.store.db.query("SELECT 1 FROM inbound").get()).toBeNull();
   expect(files(s.mac)).not.toContain("PRIVATE_");

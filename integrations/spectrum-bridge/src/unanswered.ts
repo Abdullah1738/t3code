@@ -37,8 +37,8 @@ export class RemoteUnanswered {
       if (!row.alert) this.store.db.query("UPDATE remote_unanswered SET alert=? WHERE id=?").run(text, row.id);
       const sent = await this.notify("attention", text, `imessage-unanswered:${row.id}`).catch(() => false);
       if (sent) this.store.db.query("UPDATE remote_unanswered SET alerted_at=? WHERE id=?").run(now, row.id);
-      toolLog.capture(() => toolLog.write({ component: "remote-box", kind: "error", name: "unanswered.alert",
-        ids: { inboundId: row.id, chat: "moni" }, props: { backend: "remote-box", ageMs, telegram: sent ? "sent" : "failed" }, error: { tag: "inbound.unanswered" } }));
+      toolLog.capture(() => toolLog.write({ component: "remote-box", kind: "event", name: "inbound.overdue_notice",
+        ids: { inboundId: row.id, chat: "moni" }, props: { backend: "remote-box", ageMs, telegram: sent ? "sent" : "failed" } }));
     }
   }
 }
@@ -147,7 +147,8 @@ export function deliveredReplyCoverage(store: Store, op: OutboxOperation): strin
 /** Reconcile upgrade history before overdue rows can be replayed. Session identity alone is not proof. */
 export function reconcileLegacyReplies(store: Store, since: number, now: number): void {
   const rows = store.db.query<{ id: string }, []>(`SELECT o.id FROM outbox o
-    WHERE o.state IN ('pending', 'sending', 'uncertain', 'failed', 'sent') AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)`).all()
+    WHERE json_extract(o.payload, '$.kind') = 'conversation' AND o.state IN ('pending', 'sending', 'uncertain', 'failed', 'sent')
+      AND NOT EXISTS (SELECT 1 FROM kv WHERE key = 'reply-covered:' || o.id)`).all()
     .map(({ id }) => {
       const sentAt = store.get<number>(`sent-at:${id}`);
       const known = Number.isSafeInteger(sentAt) && sentAt! >= 0 && sentAt! <= now;
@@ -182,7 +183,9 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
       && input.unanswered?.requeuedAt !== undefined && store.get(`human-own-turn:${id}`)
       && sealedBatch(store, id).members.every(member => covered.has(member))).map(row => row.id));
     for (const { id, state, input } of rows) {
-      if (!humanInput(input)) continue;
+      // Explicit reply coverage also settles older normalized rows without a source field.
+      if (state === "cancelled" || state === "observed"
+        || !humanInput(input) && !(input.source === undefined && input.id === id && Array.isArray(input.attachments))) continue;
       const retryAnswered = (state === "pending" || state === "batched") && queuedRetries.has(sealedBatch(store, id).leader);
       const nextState = state === "admitted" || retryAnswered ? "done" : state;
       if (input.answeredAt !== undefined) {
@@ -200,13 +203,6 @@ export function markAnswered(store: Store, ids: string[], now = Date.now(), opts
       });
     }
   }).immediate();
-}
-
-export function markReactionAnswered(store: Store, target: string): void {
-  const turn = store.get<ReplyTurn | null>("activeTurn");
-  // A reaction to old history must not acknowledge an unrelated current turn.
-  const members = turn ? turnMembers(store, turn) : [];
-  markAnswered(store, members.includes(target) ? members : [target]);
 }
 
 export type Running = { members: readonly string[]; leaderKind: "human" | "wake" | "reset" | "background" };

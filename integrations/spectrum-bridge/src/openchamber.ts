@@ -298,7 +298,7 @@ export type OwnerWords = { inboundId: string; text: string };
  * became (or waits for) a run of its own; `refused` means nothing was sent.
  */
 export type SteerDelivery = "steered" | "started" | "queued" | "refused";
-export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolean> };
+export type SteerGuard = { signal: AbortSignal; beforeSend: () => Promise<boolean>; onFailure?: (error: unknown) => void };
 
 /**
  * What the router and the origin backfill need from a backend. OpenChamber
@@ -327,6 +327,10 @@ export interface ChatBackend {
   children(id: string, directory: string, complete?: boolean): Promise<SessionRecord[]>;
   messages(id: string, directory: string, options?: { until?: string; since?: number; limit?: number }): Promise<MessageRecord[]>;
   promptAccepted(id: string, directory: string, messageId: string): Promise<boolean>;
+  /** Discard a retained POST body only after readback proves this prompt was not admitted. */
+  releaseUnacceptedPrompt?(id: string, directory: string, messageId: string): Promise<void>;
+  /** A successful request-state read distinguishes pending from resolved responses. */
+  responseResolved?(id: string, directory: string, requestId: string): Promise<boolean>;
   /**
    * `owner` is set only when `text` ends with one message the owner typed,
    * exactly as he sent it; a backend that checks iMessages (Robob) sends those
@@ -355,8 +359,8 @@ export interface ChatBackend {
   permissions(sessionId: string, directory: string): Promise<PermissionRequest[]>;
   questions(sessionId: string, directory: string): Promise<QuestionRequest[]>;
   /** `inboundId` is the owner's typed reply the answer came from, when there is one. */
-  permissionReply(sessionId: string, requestId: string, directory: string, reply: "once" | "reject", inboundId?: string): Promise<boolean>;
-  questionReply(request: QuestionRequest, directory: string, answers: string[][], inboundId?: string): Promise<boolean>;
+  permissionReply(sessionId: string, requestId: string, directory: string, reply: "once" | "reject", inboundId?: string, beforeSend?: () => boolean): Promise<boolean>;
+  questionReply(request: QuestionRequest, directory: string, answers: string[][], inboundId?: string, beforeSend?: () => boolean): Promise<boolean>;
   cancelQuestion(sessionId: string, formId: string, directory: string, inboundId?: string): Promise<boolean>;
   isSessionAutoAccepting(sessionId: string, directory: string): Promise<boolean | undefined>;
 }
@@ -733,8 +737,9 @@ export class OpenChamber implements ChatBackend {
   }
 
   /** OpenCode 2.0.8 renamed the reply body field `reply` to `decision`; the route is session-scoped. */
-  async permissionReply(sessionId: string, requestId: string, directory: string, reply: "once" | "reject"): Promise<boolean> {
+  async permissionReply(sessionId: string, requestId: string, directory: string, reply: "once" | "reject", _inboundId?: string, beforeSend?: () => boolean): Promise<boolean> {
     if (reply !== "once" && reply !== "reject") throw new Error("Invalid permission reply");
+    if (beforeSend && !beforeSend()) return false;
     await this.request(`/api/session/${encodeURIComponent(sessionId)}/permission/${encodeURIComponent(requestId)}/reply`, {
       method: "POST", directory, body: { decision: reply },
     });
@@ -742,8 +747,9 @@ export class OpenChamber implements ChatBackend {
   }
 
   /** Answers a form with one entry per field, keyed by field and carrying option values. */
-  async questionReply(request: QuestionRequest, directory: string, answers: string[][]): Promise<boolean> {
+  async questionReply(request: QuestionRequest, directory: string, answers: string[][], _inboundId?: string, beforeSend?: () => boolean): Promise<boolean> {
     const answer = formAnswer(request, answers);
+    if (beforeSend && !beforeSend()) return false;
     await this.request(`/api/session/${encodeURIComponent(request.sessionID)}/form/${encodeURIComponent(request.id)}/reply`, {
       method: "POST", directory, body: { answer },
     });
