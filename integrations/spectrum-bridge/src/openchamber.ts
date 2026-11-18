@@ -292,6 +292,12 @@ function validRoot(root: unknown): root is string {
 
 /** The owner's own typed message inside a prompt: its inbound id and exact text. */
 export type OwnerWords = { inboundId: string; text: string };
+export class PromptExpiredError extends Error {
+  constructor() { super("Agent delivery expired"); }
+}
+export function assertPromptUnexpired(expiresAt?: number): void {
+  if (expiresAt !== undefined && Date.now() >= expiresAt) throw new PromptExpiredError();
+}
 
 /**
  * How a steer landed. `started`/`queued` mean the run ended first and the text
@@ -337,7 +343,7 @@ export interface ChatBackend {
    * words alone, with the inbound id, and everything else as guidance.
    */
   prompt(id: string, directory: string, messageId: string, text: string, system?: string, files?: readonly FilePart[],
-    model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }, owner?: OwnerWords, beforeSend?: () => void): Promise<void>;
+    model?: { providerID: string; modelID: string; variant?: string; instanceId?: string }, owner?: OwnerWords, beforeSend?: () => void, expiresAt?: number): Promise<void>;
   /**
    * Adds a message to the session's running turn, never queueing behind it. Backends
    * without it (OpenChamber) keep follow-ups as their own turns.
@@ -667,7 +673,9 @@ export class OpenChamber implements ChatBackend {
     model?: { providerID: string; modelID: string; variant?: string; instanceId?: string },
     _owner?: OwnerWords,
     beforeSend?: () => void,
+    expiresAt?: number,
   ): Promise<void> {
+    assertPromptUnexpired(expiresAt);
     const session = `/api/session/${encodeURIComponent(id)}`;
     // OpenCode takes `provider/model` only; another Robob instance's slashless id means nothing here.
     if (model && model.providerID) {
@@ -686,6 +694,7 @@ export class OpenChamber implements ChatBackend {
       });
     }
     beforeSend?.();
+    assertPromptUnexpired(expiresAt);
     await this.request(`${session}/prompt`, {
       method: "POST", directory,
       body: {

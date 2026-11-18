@@ -1,6 +1,6 @@
 import { MessageCache } from "./message-cache.ts";
 import { toolError } from "./toollog.ts";
-import { IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
+import { assertPromptUnexpired, IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
 import {
   ControlClient, ControlError, epoch, permissionFrom, questionFrom, ThreadDirectories,
   type ControlConfigOptions, type ControlMessage, type RunSummary, type ThreadDetail, type ThreadSummary,
@@ -715,7 +715,8 @@ export class RobobBackend implements ChatBackend {
    * exactly, and `inboundId` lets Robob check them against this store.
    */
   async prompt(id: string, _directory: string, messageId: string, text: string, system = "", files: readonly FilePart[] = [],
-    model?: PreferredModel, owner?: OwnerWords, beforeSend?: () => void): Promise<void> {
+    model?: PreferredModel, owner?: OwnerWords, beforeSend?: () => void, expiresAt?: number): Promise<void> {
+    assertPromptUnexpired(expiresAt);
     const threadId = await this.resolve(id);
     const attachments = await this.sendAttachments(threadId, messageId, files);
     const words = owner !== undefined && text.endsWith(owner.text) ? owner : undefined;
@@ -726,6 +727,7 @@ export class RobobBackend implements ChatBackend {
     this.sendRuns.set(receiptKey, receipt);
     this.firstTurnStore?.set(receiptKey, receipt);
     beforeSend?.();
+    assertPromptUnexpired(expiresAt);
     this.messageCache.afterWrite(threadId);
     try {
       const accepted = await this.client.request<{ runId?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, this.sendBody(threadId, messageId, {
