@@ -21,6 +21,46 @@ import {
 // Routing-only fixtures never execute SQL on this connection.
 const connection = {} as Connection;
 
+it.effect(
+  "#1747 pool snapshots preserve queue depth and oldest lease age before cancellation",
+  () =>
+    Effect.gen(function* () {
+      const pool = yield* makeReaderPool({
+        lane: "background",
+        slots: [Effect.succeed(connection)],
+        queueLimit: 4,
+      });
+      const slot = (yield* pool.acquire)!;
+      const held = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const holder = yield* slot.lock
+        .withPermits(1)(
+          Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        )
+        .pipe(Effect.withSpan("KanbanAskFeed.read"), Effect.forkChild);
+      yield* Deferred.await(held);
+      const queued = yield* Deferred.make<void>();
+      const waiter = yield* Deferred.succeed(queued, undefined).pipe(
+        Effect.andThen(slot.lock.withPermits(1)(Effect.void)),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(queued);
+      yield* TestClock.adjust(25_000);
+      const before = slot.snapshot();
+      assert.deepEqual(before, {
+        queueDepth: 1,
+        oldestInFlightAgeMs: 25_000,
+        holder: "KanbanAskFeed.read",
+      });
+      yield* Fiber.interrupt(waiter);
+      assert.equal(slot.snapshot().queueDepth, 0);
+      assert.equal(before.queueDepth, 1);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(holder);
+      assert.deepEqual(slot.snapshot(), { queueDepth: 0, oldestInFlightAgeMs: null, holder: null });
+    }),
+);
+
 it.effect("bounds startup admission and recovers capacity on interruption", () =>
   Effect.gen(function* () {
     const ready = yield* Deferred.make<Connection>();

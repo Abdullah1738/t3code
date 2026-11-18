@@ -46,8 +46,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--initiator", choices=["installer", "watchdog", "guard"], required=True)
     parser.add_argument("--reason", required=True)
+    parser.add_argument("--target-pid", type=int)
     args = parser.parse_args()
-    target = desktop_pid()
+    if args.target_pid is not None and args.target_pid < 2:
+        parser.error("a desktop target PID must be greater than one")
+    target = args.target_pid if args.target_pid is not None else desktop_pid()
     if target is not None:
         write_reason(Path.home(), args.initiator, args.reason, os.getppid(), target)
 

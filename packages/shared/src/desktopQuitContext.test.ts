@@ -134,6 +134,7 @@ describe("quit attribution", () => {
       const toolRequest = readSmallJson(
         NodePath.join(home, ".robob/userdata/logs/desktop-quit-request.json"),
       );
+      // @effect-diagnostics-next-line globalDate:off -- Match the Python handoff's wall clock for this plain-number API.
       const current = Date.now();
       assert.equal(
         classifyQuit({ ...base, now: current, processStartedAt: current - 60_000, toolRequest })
@@ -156,6 +157,7 @@ describe("quit attribution", () => {
       NodeFS.writeFileSync(
         file,
         JSON.stringify({
+          // @effect-diagnostics-next-line globalDate:off -- Fixture timestamp for a plain-number API.
           at: new Date(now - 1000).toISOString(),
           pid: 42,
           trigger: "signal",
@@ -182,6 +184,7 @@ describe("quit attribution", () => {
   it("does not carry the guard's environment into a later restart", () => {
     assert.deepEqual(guardLaunchContext(`guard:${now - 1000}`, now - 2000, now), {
       initiator: "guard",
+      // @effect-diagnostics-next-line globalDate:off -- Fixture timestamp for a plain-number API.
       requestedAt: new Date(now - 1000).toISOString(),
     });
     for (const value of [undefined, "guard", `guard:${now + 1}`, `guard:${now - 90_001}`])

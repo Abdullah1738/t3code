@@ -14,6 +14,7 @@ import {
   healthVerdict,
   TAIL_BYTES,
   ownsListener,
+  readRuntimeState,
 } from "./deep-health.mjs";
 
 const now = Date.parse("2026-11-13T10:10:00Z");
@@ -412,11 +413,11 @@ for (const [name, output, owned] of [
   });
 NodeTest.test("listener command failure never authorizes local evidence", async () => {
   for (const error of ["timeout", "not installed", "permission denied"]) {
-    NodeAssert.equal(
-      await ownsListener({ pid: 123, port: 3773 }, () => {
+    await NodeAssert.rejects(
+      ownsListener({ pid: 123, port: 3773 }, () => {
         throw new Error(error);
       }),
-      false,
+      { message: error },
     );
   }
 });
@@ -453,6 +454,350 @@ const localClient = {
         }
       : { threads: [] },
 };
+
+const socketFailure = () =>
+  Object.assign(new Error("fixture-private-token"), {
+    code: "EADDRNOTAVAIL",
+    syscall: "connect",
+    path: "/private/fixture-private-token/socket",
+  });
+const socketFields = { code: "EADDRNOTAVAIL", syscall: "connect", path: "socket" };
+for (const [name, makeError, expected] of [
+  ["direct", socketFailure, socketFields],
+  [
+    "fetch cause",
+    () => new TypeError("fixture-private-token", { cause: socketFailure() }),
+    socketFields,
+  ],
+  [
+    "nested cause",
+    () =>
+      new Error("fixture-private-token", {
+        cause: new TypeError("fetch failed", { cause: socketFailure() }),
+      }),
+    socketFields,
+  ],
+  [
+    "outer precedence",
+    () =>
+      Object.assign(socketFailure(), {
+        code: "EIO",
+        syscall: "read",
+        path: "/private/outer",
+        cause: socketFailure(),
+      }),
+    { code: "EIO", syscall: "read", path: "outer" },
+  ],
+  [
+    "unsafe wrapper fields",
+    () =>
+      Object.assign(new Error("fixture-private-token", { cause: socketFailure() }), {
+        code: "fixture-private-token",
+        syscall: "fixture-private-token",
+        path: "https://secret.test/?token=fixture-private-token",
+      }),
+    socketFields,
+  ],
+  [
+    "cyclic cause",
+    () => {
+      const error = new Error("fixture-private-token");
+      error.cause = error;
+      return error;
+    },
+    {},
+  ],
+  [
+    "depth limit",
+    () => {
+      let error = socketFailure();
+      for (let depth = 0; depth < 4; depth++)
+        error = new Error("fixture-private-token", { cause: error });
+      return error;
+    },
+    {},
+  ],
+  [
+    "primitive cause",
+    () => new Error("fixture-private-token", { cause: "fixture-private-token" }),
+    {},
+  ],
+  ["null cause", () => new Error("fixture-private-token", { cause: null }), {}],
+])
+  NodeTest.test(`stage error cause corpus: ${name}`, async () => {
+    const report = await deepHealth({
+      client: {
+        ...localClient,
+        request: async () => {
+          throw makeError();
+        },
+      },
+      readRuntime: async () => {
+        throw makeError();
+      },
+    });
+    for (const stage of ["connection", "roundTrip", "runtime"])
+      NodeAssert.deepEqual(report.stages[stage], {
+        status: "error",
+        ms: report.stages[stage].ms,
+        ...expected,
+      });
+    NodeAssert.equal(report.localIdentity.code, expected.code ?? null);
+    NodeAssert.doesNotMatch(
+      JSON.stringify(report),
+      /fixture-private-token|\/private\/|secret\.test/,
+    );
+  });
+
+for (const exhaustedAt of ["connection", "runtime", "listener"])
+  NodeTest.test(`deadline skips local identity work before ${exhaustedAt}`, async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(performance, "now");
+    let time = 0;
+    Object.defineProperty(performance, "now", { configurable: true, value: () => time });
+    try {
+      const report = await deepHealth({
+        timeoutMs: 25,
+        client: {
+          ...localClient,
+          request: async (...args) => {
+            if (exhaustedAt === "runtime") time = 25;
+            return localClient.request(...args);
+          },
+        },
+        onStage: (stage) => {
+          if (stage === exhaustedAt && stage === "connection") time = 25;
+        },
+        readRuntime: () => {
+          NodeAssert.equal(
+            exhaustedAt,
+            "listener",
+            "runtime must stay unread when budget exhausted",
+          );
+          time = 25;
+          return { ...localRuntime, bootId: undefined };
+        },
+        checkListener: () => NodeAssert.fail("must not check listener after budget exhausted"),
+        readTail: () => NodeAssert.fail("must not read lag after budget exhausted"),
+      });
+      const stage = exhaustedAt === "listener" ? "listener" : "runtime";
+      NodeAssert.deepEqual(report.localIdentity, {
+        ok: false,
+        reason: "deadline-exhausted",
+        stage,
+        code: null,
+      });
+      NodeAssert.equal(report.stages[stage].status, "skipped");
+      NodeAssert.match(report.summary, /deadline-exhausted/);
+      NodeAssert.doesNotMatch(report.summary, /runtime-unreadable|listener-error/);
+    } finally {
+      if (descriptor) Object.defineProperty(performance, "now", descriptor);
+      else delete performance.now;
+    }
+  });
+
+for (const code of ["EPERM", "EACCES", "ENOENT", "ETIMEDOUT"])
+  NodeTest.test(`runtime read failure preserves ${code} without sensitive details`, async () => {
+    const token = "fixture-private-token";
+    const path = `/private/${token}/server-runtime.json`;
+    const report = await deepHealth({
+      client: localClient,
+      readRuntime: async () => {
+        throw Object.assign(new Error(`${code}: ${path}?token=${token}`), {
+          code,
+          syscall: "open",
+          path,
+          token,
+        });
+      },
+      readTail: () => NodeAssert.fail("must not read unverified lag"),
+    });
+    NodeAssert.deepEqual(report.localIdentity, {
+      ok: false,
+      reason: "runtime-unreadable",
+      stage: "runtime",
+      code,
+    });
+    NodeAssert.deepEqual(report.stages.runtime, {
+      status: "error",
+      ms: report.stages.runtime.ms,
+      code,
+      syscall: "open",
+      path: "server-runtime.json",
+    });
+    NodeAssert.match(report.summary, new RegExp(`runtime-unreadable ${code}`));
+    NodeAssert.match(report.summary, /at runtime/);
+    NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-private-token|\/private\//);
+    NodeAssert.equal(report.stages.listener.status, "skipped");
+    NodeAssert.equal(report.stages.lagTail.status, "skipped");
+  });
+
+NodeTest.test("runtime read timeout retains its stage and reason", async () => {
+  const report = await deepHealth({
+    timeoutMs: 25,
+    client: localClient,
+    readRuntime: () => new Promise(() => {}),
+  });
+  NodeAssert.deepEqual(report.localIdentity, {
+    ok: false,
+    reason: "runtime-timeout",
+    stage: "runtime",
+    code: "ETIMEDOUT",
+  });
+  NodeAssert.equal(report.stages.runtime.status, "timeout");
+  NodeAssert.equal(report.stage, "runtime");
+  NodeAssert.equal(report.exitCode, 2);
+  NodeAssert.match(report.summary, /runtime-timeout ETIMEDOUT.*at runtime/);
+});
+
+for (const [name, runtime, url, reason, code] of [
+  ["missing", null, localClient.url, "runtime-invalid", null],
+  ["scalar", "fixture-private-token", localClient.url, "runtime-invalid", null],
+  ["invalid origin", { origin: "fixture-private-token" }, localClient.url, "runtime-invalid", null],
+  ["invalid pid", { pid: 0 }, localClient.url, "runtime-invalid", null],
+  ["dead pid", { pid: 2147483647 }, localClient.url, "pid-mismatch", "ESRCH"],
+  [
+    "invalid date",
+    { startedAt: "fixture-private-token" },
+    localClient.url,
+    "runtime-invalid",
+    null,
+  ],
+  ["object date", { startedAt: { toString: null } }, localClient.url, "runtime-invalid", null],
+  ["invalid boot", { bootId: "fixture-private-token" }, localClient.url, "runtime-invalid", null],
+  [
+    "different boot",
+    { bootId: "f2493692-950c-4f64-9025-73e929d67f42" },
+    localClient.url,
+    "bootid-mismatch",
+    null,
+  ],
+  ["remote target", {}, "https://remote.example?token=fixture-private-token", "non-loopback", null],
+  [
+    "remote runtime",
+    { origin: "http://remote.example:3773" },
+    localClient.url,
+    "non-loopback",
+    null,
+  ],
+  ["other port", {}, "http://127.0.0.1:9000", "origin-mismatch", null],
+  ["proxy", {}, `${localClient.url}/proxy`, "origin-mismatch", null],
+  ["protocol", {}, "https://127.0.0.1:3773", "origin-mismatch", null],
+  ["query", {}, `${localClient.url}?token=fixture-private-token`, "origin-mismatch", null],
+])
+  NodeTest.test(`local identity reason: ${name}`, async () => {
+    const report = await deepHealth({
+      client: { ...localClient, url },
+      readRuntime: () =>
+        runtime && typeof runtime === "object" ? { ...localRuntime, ...runtime } : runtime,
+      checkListener: () => NodeAssert.fail("identity must reject before checking listener"),
+      readTail: () => NodeAssert.fail("must not read unverified lag"),
+    });
+    NodeAssert.deepEqual(report.localIdentity, { ok: false, reason, stage: "runtime", code });
+    NodeAssert.ok(report.summary.includes(reason));
+    NodeAssert.match(report.summary, /at runtime/);
+    NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-private-token|remote\.example/);
+  });
+
+NodeTest.test("malformed runtime JSON is invalid rather than unreadable", async () => {
+  const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "deep-invalid-runtime-"));
+  try {
+    NodeFS.writeFileSync(
+      NodePath.join(dir, "server-runtime.json"),
+      '{"token":"fixture-private-token"',
+    );
+    const report = await deepHealth({
+      client: localClient,
+      logPath: NodePath.join(dir, "logs", "lag.ndjson"),
+    });
+    NodeAssert.equal(await readRuntimeState(NodePath.join(dir, "server-runtime.json")), null);
+    NodeAssert.equal(report.stages.runtime.status, "ok");
+    NodeAssert.equal(report.localIdentity.reason, "runtime-invalid");
+    NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-private-token|deep-invalid-runtime-/);
+  } finally {
+    NodeFS.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const [name, checkListener, reason, status, code] of [
+  ["another owner", () => false, "listener-not-owner", "ok", null],
+  [
+    "permission error",
+    () =>
+      ownsListener({ pid: process.pid, port: 3773 }, (_command, _args, _options, callback) => {
+        callback(
+          Object.assign(new Error("fixture-private-token /private/fixture/lsof"), {
+            code: "EACCES",
+            syscall: "spawn /private/fixture/lsof",
+            path: "/private/fixture/lsof",
+          }),
+        );
+      }),
+    "listener-error",
+    "error",
+    "EACCES",
+  ],
+  ["timeout", () => new Promise(() => {}), "listener-timeout", "timeout", "ETIMEDOUT"],
+])
+  NodeTest.test(`listener failure reason: ${name}`, async () => {
+    const report = await deepHealth({
+      timeoutMs: 25,
+      client: localClient,
+      readRuntime: () => ({ ...localRuntime, bootId: undefined }),
+      checkListener,
+      readTail: () => NodeAssert.fail("must not read unverified lag"),
+    });
+    NodeAssert.deepEqual(report.localIdentity, { ok: false, reason, stage: "listener", code });
+    NodeAssert.equal(report.stages.listener.status, status);
+    NodeAssert.ok(report.summary.includes(`${reason}${code ? ` ${code}` : ""}`));
+    NodeAssert.match(report.summary, /at listener/);
+    NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-private-token|\/private\//);
+    if (code === "EACCES") {
+      NodeAssert.equal(report.stages.listener.syscall, "spawn");
+      NodeAssert.equal(report.stages.listener.path, "lsof");
+    }
+  });
+
+for (const [name, fields, expected] of [
+  ["child exit code", { code: 1 }, { code: 1 }],
+  ["URL", { path: "https://example.test/runtime?token=fixture-private-token" }, {}],
+  [
+    "query on path",
+    { path: "/private/runtime.json?token=fixture-private-token" },
+    { path: "runtime.json" },
+  ],
+  [
+    "Windows path",
+    { path: "C:\\private\\fixture-private-token\\runtime.json" },
+    { path: "runtime.json" },
+  ],
+  [
+    "arbitrary error fields",
+    {
+      code: "fixture-private-token",
+      syscall: "fixture-private-token",
+      path: "/private/runtime\nfixture-private-token",
+    },
+    {},
+  ],
+])
+  NodeTest.test(`stage error redaction: ${name}`, async () => {
+    const report = await deepHealth({
+      client: localClient,
+      readRuntime: () => {
+        throw Object.assign(new Error("fixture-private-token"), fields);
+      },
+    });
+    NodeAssert.deepEqual(report.stages.runtime, {
+      status: "error",
+      ms: report.stages.runtime.ms,
+      ...expected,
+    });
+    NodeAssert.doesNotMatch(
+      JSON.stringify(report),
+      /fixture-private-token|\/private\/|example\.test/,
+    );
+  });
+
 for (const [name, runtimeBoot, responseBoot, readyDelayMs, listener, expected] of [
   ["long boot, same UUID", localRuntime.bootId, localRuntime.bootId, 534_000, false, true],
   [
@@ -501,6 +846,11 @@ for (const [name, runtimeBoot, responseBoot, readyDelayMs, listener, expected] o
     NodeAssert.equal(report.lag.status, expected ? "complete" : "unknown");
     NodeAssert.equal(report.lag.sampleCount, expected ? 20 : 0);
     NodeAssert.equal(report.verdict, expected ? "healthy" : "unknown");
+    NodeAssert.equal(report.localIdentity.ok, expected);
+    if (expected) {
+      NodeAssert.equal(report.localIdentity.reason, null);
+      NodeAssert.equal(report.localIdentity.code, null);
+    }
     NodeAssert.doesNotMatch(JSON.stringify(report), /fixture-secret/);
     if (runtimeBoot === localRuntime.bootId && responseBoot !== undefined)
       NodeAssert.equal(report.stages.listener.status, "skipped");

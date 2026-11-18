@@ -1,7 +1,8 @@
+import { createToolLog } from "../src/toollog.ts";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backendKind } from "../src/backend.ts";
@@ -27,7 +28,7 @@ type Thread = {
   /** The thread's driver; absent means OpenCode, the driver the OpenCode fixtures represent. */
   driver?: { instanceId: string; model: string };
 };
-type Call = { method: string; path: string; body?: any; auth: string | null };
+type Call = { rows?: number; bytes?: number; method: string; path: string; body?: any; auth: string | null };
 
 const servers: ReturnType<typeof Bun.serve>[] = [];
 const stores: Store[] = [];
@@ -100,7 +101,16 @@ function fakeControl() {
         return ok({ thread: detail(thread) });
       }
       if (thread && parts.length === 2) return ok({ thread: detail(thread) });
-      if (thread && parts[2] === "messages") return ok({ threadId: thread.threadId, state: state(thread), messages: thread.messages });
+      if (thread && parts[2] === "messages") {
+        const call = calls.at(-1)!;
+        const since = searchParams.has("since") ? Number(searchParams.get("since")) : -Infinity;
+        const response = ok({ threadId: thread.threadId, state: state(thread), status: thread.runs.at(-1)?.status ?? "idle", runId: thread.runs.at(-1)?.runId ?? null,
+          messages: thread.messages.filter(message => message.role !== "system" && Date.parse(message.updatedAt ?? "") > since)
+            .sort((a, b) => Date.parse(a.createdAt ?? "") - Date.parse(b.createdAt ?? "") || a.messageId.localeCompare(b.messageId)) });
+        const payload = await response.clone().text();
+        Object.assign(call, { rows: JSON.parse(payload).messages.length, bytes: Buffer.byteLength(payload) });
+        return response;
+      }
       if (thread && parts[2] === "runs" && parts[4] === "evidence") {
         const runId = parts[3]!;
         const run = thread.runs.find(candidate => candidate.runId === runId);
@@ -1683,4 +1693,324 @@ test("steering files: incomplete family lists are unknown to admission", async (
     expect(await backend.statuses()).toEqual({});
     expect(await backend.children(id, directory)).toEqual([]);
   } finally { list.mockRestore(); }
+});
+
+// The reference creates a fresh backend for each read, retaining the pre-cache full-read path.
+test("incremental message records equal full reads through streaming, phases, runs and route rotation", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  let chat = await backend.createChat();
+  const prompt = `msg_${"c".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, prompt, "first");
+  let thread = control.threads.get(chat.id)!;
+  thread.driver = { instanceId: "codex", model: "test" };
+  const verify = async () => {
+    for (const options of [{ limit: 1 }, { limit: 20, until: prompt }, { until: prompt, since: Date.now() - 60_000 },
+      { limit: 100 }, { until: `idle:${thread.runs[0]!.runId}`, limit: 20 }]) {
+      expect(await backend.messages(chat.id, chat.directory, options)).toEqual(await control.backend().messages(chat.id, chat.directory, options));
+    }
+  };
+  await verify();
+  const at = new Date().toISOString();
+  for (const id of ["a2", "a10", "A1"]) thread.messages.push({ messageId: id, role: "assistant", phase: "narration", streaming: true,
+    text: id, runId: thread.runs[0]!.runId, createdAt: at, updatedAt: at });
+  await verify();
+  for (let i = 1; i <= 3; i++) {
+    for (const message of thread.messages.filter(message => message.role === "assistant")) {
+      message.text += ` update ${i}`;
+      message.updatedAt = new Date(Date.now() + i).toISOString();
+      if (i === 3) { message.phase = "answer"; message.streaming = false; }
+    }
+    await verify();
+  }
+  thread.runs[0]!.status = "completed";
+  await verify();
+  await backend.prompt(chat.id, chat.directory, `msg_${"d".repeat(64)}`, "second");
+  control.reply(chat.id, "second reply", "waiting");
+  await verify();
+  thread.messages.push({ messageId: "background", runId: thread.runs[1]!.runId, role: "user", createdBy: "system",
+    text: "[Subagent completed] background result", streaming: false, createdAt: at, updatedAt: new Date(Date.now() + 4).toISOString() });
+  await verify();
+  chat = await backend.createChat();
+  await backend.retireOthers(chat.id);
+  await backend.prompt(chat.id, chat.directory, prompt, "new route");
+  thread = control.threads.get(chat.id)!;
+  thread.driver = { instanceId: "codex", model: "test" };
+  await verify();
+});
+
+test("message cache shares one read per tick, refreshes later ticks and invalidates after sends", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  const prompt = `msg_${"e".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, prompt, "hello");
+  const reads = () => control.calls.filter(call => call.path.includes("/messages?"));
+  await backend.messages(chat.id);
+  control.calls.length = 0;
+  await backend.messageReadScope(async () => {
+    await backend.messages(chat.id, chat.directory, { until: prompt, limit: 20 });
+    expect(await backend.promptAccepted(chat.id, chat.directory, prompt)).toBe(true);
+    await backend.messages(chat.id, chat.directory, { limit: 1 });
+  });
+  expect(reads()).toHaveLength(1); // Three paths, two fewer GETs (67%).
+  expect(reads()[0]!.path).toContain("since=");
+  await backend.messageReadScope(async () => {
+    await backend.messages(chat.id);
+    const steer = `msg_${"f".repeat(64)}`;
+    await backend.steer(chat.id, chat.directory, steer, "also this");
+    expect(await backend.promptAccepted(chat.id, chat.directory, steer)).toBe(true);
+    await backend.messages(chat.id, chat.directory, { until: steer, limit: 20 });
+    expect(await backend.promptAccepted(chat.id, chat.directory, steer)).toBe(true);
+  });
+  expect(reads()).toHaveLength(3); // Pre-write and post-write reads; write is a freshness boundary.
+  expect(reads().every(call => call.path.includes("since="))).toBe(true);
+  await backend.messages(chat.id);
+  expect(reads()).toHaveLength(4); // No cached-skip on future ticks.
+});
+
+test("missing until, route change, merge conflict and ten-minute redaction resync each full-read once", async () => {
+  const start = Date.now();
+  setSystemTime(start);
+  try {
+    const control = fakeControl();
+    const backend = control.backend();
+    const chat = await backend.createChat();
+    await backend.prompt(chat.id, chat.directory, `msg_${"a".repeat(64)}`, "hello");
+    control.reply(chat.id, "original", "completed");
+    const full = () => control.calls.filter(call => call.path.includes("/messages?") && !call.path.includes("since="));
+    await backend.messages(chat.id);
+    expect(full()).toHaveLength(1);
+    await backend.messageReadScope(async () => {
+      await backend.messages(chat.id, chat.directory, { until: "absent" });
+      await backend.messages(chat.id, chat.directory, { until: "absent" });
+    });
+    expect(full()).toHaveLength(2);
+    const row = control.threads.get(chat.id)!.messages[1]!;
+    row.createdAt = new Date(start + 100).toISOString();
+    await backend.messages(chat.id);
+    expect(full()).toHaveLength(3);
+    setSystemTime(start + 3_000);
+    control.threads.get(chat.id)!.messages.push({ messageId: "advance-cursor", runId: row.runId, role: "assistant", phase: "narration", text: "newer row",
+      streaming: false, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    await backend.messages(chat.id);
+    row.text = "redacted";
+    setSystemTime(start + 5_000);
+    expect(JSON.stringify(await backend.messages(chat.id))).toContain("original");
+    setSystemTime(start + 10 * 60_000);
+    const resynced = await backend.messages(chat.id);
+    expect(JSON.stringify(resynced)).toContain("redacted");
+    expect(full()).toHaveLength(4);
+    await backend.messages(chat.id);
+    expect(full()).toHaveLength(4);
+    await backend.retireOthers(chat.id);
+    await backend.messages(chat.id);
+    await backend.messages(chat.id);
+    expect(full()).toHaveLength(5);
+  } finally { setSystemTime(); }
+});
+
+test.each([100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(scenario => ({ historySize, scenario }))))(
+  "60-second router budgets preserve completion timing ($historySize rows, $scenario)", async ({ historySize, scenario }) => {
+  const start = Date.parse("2026-11-15T09:30:00Z");
+  const table: object[] = [];
+  try {
+    const results = [];
+    for (const legacy of [true, false]) {
+      setSystemTime(start);
+      const control = fakeControl();
+      const backend = control.backend();
+      if (legacy) {
+        backend.messageReadScope = body => body();
+        backend.client.messages = id => ControlClient.prototype.messages.call(backend.client, id);
+      }
+      const store = new Store(":memory:"); stores.push(store);
+      const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
+        owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alert",
+        alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 5_000,
+      });
+      const chat = await backend.createChat();
+      const thread = control.threads.get(chat.id)!;
+      thread.driver = { instanceId: "codex", model: "test" };
+      await backend.prompt(chat.id, chat.directory, `msg_${"0".repeat(64)}`, "history");
+      for (let i = 0; i < historySize; i++) thread.messages.push({ messageId: `history-${i}`, role: "assistant", phase: "narration", text: "old text ".repeat(100),
+        runId: thread.runs[0]!.runId, streaming: false, createdAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString(), updatedAt: new Date(start - (historySize + 100) * 1_000 + i * 1_000).toISOString() });
+      thread.messages[0]!.createdAt = thread.messages[0]!.updatedAt = new Date(start - 120_000).toISOString();
+      thread.runs[0]!.status = "completed";
+      store.set("route", { ...chat, generation: 1 });
+      if (scenario !== "idle") {
+        store.acceptInbound("budget", { id: "budget", text: "hello", attachments: [], isAudioMessage: false, source: "typed", receivedAt: start });
+        await router.tick();
+        thread.messages.push({ messageId: "stream", role: "assistant", phase: "narration", text: "working", streaming: true,
+          runId: thread.runs.at(-1)!.runId, createdAt: new Date(start + 500).toISOString(), updatedAt: new Date(start + 500).toISOString() });
+      }
+      const startup = control.calls.filter(call => call.path.includes("/messages?"));
+      control.calls.length = 0;
+      const paths: Record<string, { messages: number; thread: number; evidence: number }> = {};
+      const collect = (path: string, from: number) => {
+        paths[path] ??= { messages: 0, thread: 0, evidence: 0 };
+        for (const call of control.calls.slice(from)) if (call.method === "GET") {
+          if (call.path.includes("/messages?")) paths[path]!.messages++;
+          else if (call.path.endsWith("/evidence")) paths[path]!.evidence++;
+          else if (/^\/threads\/[^/?]+$/.test(call.path)) paths[path]!.thread++;
+        }
+      };
+      let completedAt = 0;
+      for (let second = 1; second <= 60; second++) {
+        setSystemTime(start + second * 1_000);
+        const stream = thread.messages.find(message => message.messageId === "stream");
+        if (stream && second < 50) { stream.text += "."; stream.updatedAt = new Date().toISOString(); }
+        if (second === 30 && scenario === "steer") store.acceptInbound("budget-steer", { id: "budget-steer", text: "also this", attachments: [], isAudioMessage: false, source: "typed", receivedAt: Date.now() });
+        if (second === 50 && scenario !== "idle") control.reply(chat.id, "done", "completed");
+        let from = control.calls.length; await router.checkCompletion(); collect("completion", from);
+        from = control.calls.length; await router.tick(); collect(second === 30 && scenario === "steer" ? "tick-steer" : "tick", from);
+        if (!completedAt && scenario !== "idle" && store.pendingOutbox().some(op => op.kind === "conversation" && op.text === "done")) completedAt = second;
+      }
+      const reads = control.calls.filter(call => call.path.includes("/messages?"));
+      const full = reads.filter(call => !call.path.includes("since="));
+      results.push({ legacy, paths, gets: reads.length, full: full.length + startup.length, startupGets: startup.length, incremental: reads.length - full.length,
+        rows: reads.reduce((sum, call) => sum + (call.rows ?? 0), 0), bytes: reads.reduce((sum, call) => sum + (call.bytes ?? 0), 0), completedAt });
+    }
+    const [before, after] = results;
+    expect(after!.full).toBeLessThanOrEqual(before!.full * .1);
+    expect(after!.rows).toBeLessThan(before!.rows * .2);
+    expect(after!.bytes).toBeLessThan(before!.bytes * .2);
+    expect(after!.gets).toBeLessThanOrEqual(before!.gets);
+    if (scenario !== "idle") { expect(before!.completedAt).toBe(50); expect(after!.completedAt).toBe(50); }
+    table.push({ historySize, scenario, before, after });
+    console.log("message-read-budget", JSON.stringify(table));
+  } finally { setSystemTime(); }
+});
+
+test("message read modes, full reasons and returned bytes survive the minute log aggregation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "message-reads-log-")); dirs.push(root);
+  let now = Date.parse("2026-11-15T09:30:01Z");
+  const log = createToolLog({ root, now: () => now });
+  for (const [mode, reason] of [["full", "first-read"], ["incremental", undefined], ["shared", undefined], ["cached-skip", undefined],
+    ["full", "missing-until"], ["full", "route-change"], ["full", "resync"], ["full", "merge-conflict"], ["full", "clock-skew"]]) {
+    log.write({ component: "robob", kind: "perf", name: "robob.messages_read", ids: { threadId: "thread-fixture" },
+      props: { readMode: mode!, ...(reason ? { fullReason: reason } : {}), rowsReturned: 2, bytesReturned: 500 } });
+  }
+  now += 60_000;
+  await log.tick();
+  const lines = readFileSync(join(root, "2026-11-15.ndjson"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  expect(lines.filter(line => line.name === "robob.messages_read")).toHaveLength(0);
+  expect(lines.find(line => line.name === "robob.message_reads")).toMatchObject({ ts: "2026-11-15T09:30:00.000Z", ids: { threadId: "thread-fixture" }, props: {
+    fullReads: 6, incrementalReads: 1, sharedReads: 1, cachedSkipReads: 1, rowsReturned: 18, bytesReturned: 4500,
+    firstReads: 1, missingUntils: 1, routeChanges: 1, resyncs: 1, mergeConflicts: 1, clockSkews: 1,
+  } });
+});
+
+test("a cached run removed by rollback forces one full repair instead of retaining its messages", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  await backend.prompt(chat.id, chat.directory, `msg_${"9".repeat(64)}`, "rolled back");
+  control.reply(chat.id, "old", "completed");
+  await backend.messages(chat.id);
+  const thread = control.threads.get(chat.id)!;
+  thread.messages = []; thread.runs = [];
+  control.calls.length = 0;
+  expect(await backend.messages(chat.id)).toEqual([]);
+  expect(control.calls.filter(call => call.path.includes("/messages?") && !call.path.includes("since="))).toHaveLength(1);
+});
+
+test("completion and external steer writes invalidate an existing tick's snapshot", async () => {
+  const control = fakeControl();
+  const backend = control.backend();
+  const chat = await backend.createChat();
+  const prompt = `msg_${"7".repeat(64)}`;
+  const steer = `msg_${"8".repeat(64)}`;
+  await backend.prompt(chat.id, chat.directory, prompt, "hello");
+  const ready = Promise.withResolvers<void>();
+  const written = Promise.withResolvers<void>();
+  const reading = backend.messageReadScope(async () => {
+    await backend.messages(chat.id);
+    ready.resolve();
+    await written.promise;
+    expect(await backend.promptAccepted(chat.id, chat.directory, steer)).toBe(true);
+    control.reply(chat.id, "complete", "completed");
+    expect((await backend.messages(chat.id)).at(-1)).toMatchObject({ type: "idle", outcome: "succeeded" });
+  });
+  await ready.promise;
+  try { await backend.steer(chat.id, chat.directory, steer, "also this"); }
+  finally { written.resolve(); }
+  await reading;
+});
+
+test.each([
+  { label: "future timestamp beyond overlap", cachedAt: 10_000, nextAt: 1_000, full: true },
+  { label: "future timestamp at exclusive since boundary", cachedAt: 2_000, nextAt: 0, full: true },
+  { label: "future cursor with delayed poll after clock catches up", cachedAt: 10_000, errorAt: 1_000, nextAt: 15_000, full: true },
+  { label: "exclusive future boundary with delayed poll", cachedAt: 2_000, errorAt: 0, nextAt: 10_000, full: true },
+  { label: "safe overlap with delayed poll", cachedAt: 1_999, errorAt: 0, nextAt: 10_000, full: false },
+  { label: "future timestamp within overlap", cachedAt: 1_999, nextAt: 0, full: false },
+  { label: "wall clock moves backwards beyond overlap", cachedAt: -20_000, nextAt: -10_000, full: true },
+  { label: "wall clock moves backwards at overlap boundary", cachedAt: -20_000, nextAt: -2_000, full: true },
+  { label: "wall clock moves backwards within overlap", cachedAt: -20_000, nextAt: -1_999, full: false },
+  { label: "equal timestamp", cachedAt: 0, nextAt: 0, full: false },
+])("clock skew preserves the first-turn model-error verdict: $label", async ({ cachedAt, nextAt, errorAt = nextAt, full }) => {
+  const start = Date.parse("2026-11-15T12:00:00Z");
+  setSystemTime(start);
+  try {
+    const control = fakeControl();
+    const alerts: string[] = [];
+    const backend = control.backend("/chats", { alert: async (_id, text) => { alerts.push(text); return true; } });
+    const chat = await backend.createChat();
+    await backend.prompt(chat.id, chat.directory, `msg_${"6".repeat(64)}`, "hello");
+    const thread = control.threads.get(chat.id)!;
+    thread.driver = { instanceId: "codex", model: "test" };
+    thread.messages[0]!.updatedAt = new Date(start + cachedAt).toISOString();
+    await backend.messages(chat.id);
+    control.calls.length = 0;
+    setSystemTime(start + errorAt);
+    control.reply(chat.id, "There's an issue with the selected model (test).", "completed");
+    thread.messages.at(-1)!.createdAt = thread.messages.at(-1)!.updatedAt = new Date().toISOString();
+    setSystemTime(start + nextAt);
+    const records = await backend.messages(chat.id);
+    const fullReads = control.calls.filter(call => call.path.includes("/messages?") && !call.path.includes("since="));
+    expect(fullReads).toHaveLength(full ? 1 : 0);
+    expect(records).toEqual(await control.backend().messages(chat.id));
+    expect(records.at(-1)).toMatchObject({ type: "idle", outcome: "failed", modelError: true });
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain("issue with the selected model");
+    await backend.messages(chat.id);
+    expect(alerts).toHaveLength(1);
+  } finally { setSystemTime(); }
+});
+
+test("a slow response retains the cursor's request-time skew before a later model error", async () => {
+  const start = Date.parse("2026-11-15T12:00:00Z");
+  const received = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  setSystemTime(start);
+  try {
+    const control = fakeControl();
+    const alerts: string[] = [];
+    const backend = control.backend("/chats", { alert: async (_id, text) => { alerts.push(text); return true; } });
+    const chat = await backend.createChat();
+    await backend.prompt(chat.id, chat.directory, `msg_${"5".repeat(64)}`, "hello");
+    const thread = control.threads.get(chat.id)!;
+    thread.driver = { instanceId: "codex", model: "test" };
+    thread.messages[0]!.updatedAt = new Date(start + 10_000).toISOString();
+    const messages = backend.client.messages.bind(backend.client);
+    backend.client.messages = async (...args) => {
+      const response = await messages(...args);
+      received.resolve();
+      await release.promise;
+      return response;
+    };
+    const initial = backend.messages(chat.id);
+    await received.promise;
+    setSystemTime(start + 1_000);
+    control.reply(chat.id, "There's an issue with the selected model (test).", "completed");
+    setSystemTime(start + 15_000);
+    release.resolve();
+    await initial;
+    backend.client.messages = messages;
+    const records = await backend.messages(chat.id);
+    expect(records).toEqual(await control.backend().messages(chat.id));
+    expect(records.at(-1)).toMatchObject({ type: "idle", outcome: "failed", modelError: true });
+    expect(alerts).toHaveLength(1);
+  } finally { release.resolve(); setSystemTime(); }
 });

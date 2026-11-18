@@ -58,7 +58,7 @@ export {
   ReaderContentionObserver,
 } from "./nodeSqliteReaderLanes.ts";
 export type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
-import type { ReaderLaneName } from "./nodeSqliteReaderLanes.ts";
+import type { ReaderLaneName, ReaderPoolSnapshot } from "./nodeSqliteReaderLanes.ts";
 
 import {
   annotateSqliteError,
@@ -183,6 +183,22 @@ export const ReaderWaitStartedObserver = Context.Reference<
   | undefined
 >("@t3tools/shared/nodeSqliteClient/ReaderWaitStartedObserver", { defaultValue: () => undefined });
 
+export interface ReaderSnapshot {
+  readonly db: string;
+  readonly connection: "reader" | "writer" | null;
+  readonly lane: ReaderLaneName | "writer";
+  readonly slot: number | null;
+  readonly stage: "worker" | "slot" | "query";
+  readonly queueDepth: number | null;
+  readonly oldestInFlightAgeMs: number | null;
+  readonly holder: string | null;
+}
+
+/** Registers a request-local getter; sample at the deadline before interrupting SQL. */
+export const ReaderSnapshotObserver = Context.Reference<
+  ((snapshot: () => ReaderSnapshot) => (() => void) | undefined) | undefined
+>("@t3tools/shared/nodeSqliteClient/ReaderSnapshotObserver", { defaultValue: () => undefined });
+
 const reportReaderWaitStarted = (fiber: Fiber.Fiber<unknown, unknown>) => {
   try {
     const observer = fiber.getRef(ReadOnly) ? fiber.getRef(ReaderWaitStartedObserver) : undefined;
@@ -217,6 +233,7 @@ interface RouteTarget {
   readonly name: "writer" | "reader";
   readonly lane?: ReaderLaneName;
   readonly slot?: number;
+  readonly snapshot?: () => ReaderPoolSnapshot;
   readonly connection: Connection;
   readonly lock: {
     readonly take: (permits: number) => Effect.Effect<unknown, SqlError>;
@@ -3327,6 +3344,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
             slot: slot.slot,
             lock: slot.lock,
             connection: slot.connection,
+            snapshot: slot.snapshot,
           }),
     );
   const route = (statementSpan?: Tracer.Span) =>
@@ -3434,6 +3452,46 @@ const make = Effect.fn("makeWithDatabase")(function* (
     ...(target.slot === undefined ? {} : { slot: target.slot }),
   });
   const dbName = String(options.spanAttributes?.["db.name"] ?? "sqlite");
+  const observePendingReader = (fiber: Fiber.Fiber<unknown, unknown>) => {
+    const observer = fiber.getRef(ReadOnly) ? fiber.getRef(ReaderSnapshotObserver) : undefined;
+    if (observer === undefined) return undefined;
+    let target: RouteTarget | undefined;
+    let granted = false;
+    let stop: (() => void) | undefined;
+    let active = true;
+    try {
+      stop = observer(() => ({
+        db: dbName,
+        connection: target?.name ?? null,
+        lane: target?.lane ?? (target?.name === "writer" ? "writer" : effectiveLane(fiber.context)),
+        slot: target?.slot ?? null,
+        stage: granted ? "query" : target === undefined ? "worker" : "slot",
+        queueDepth: null,
+        oldestInFlightAgeMs: null,
+        holder: null,
+        ...target?.snapshot?.(),
+      }));
+    } catch {
+      // Diagnostics cannot change acquisition, including when an observer throws.
+    }
+    return {
+      route: (next: RouteTarget) => {
+        target = next;
+      },
+      acquired: () => {
+        granted = true;
+      },
+      stop: () => {
+        if (!active) return;
+        active = false;
+        try {
+          stop?.();
+        } catch {
+          /* Keep SQL cleanup independent of diagnostics. */
+        }
+      },
+    };
+  };
   const observeReader = (target: RouteTarget, metric: typeof readerWait, ms: number) =>
     target.name === "reader"
       ? Metric.update(
@@ -3452,14 +3510,17 @@ const make = Effect.fn("makeWithDatabase")(function* (
       const start = clock.monotonicTimeNanosUnsafe();
       let started = false;
       const finishWait = reportReaderWaitStarted(requestFiber);
+      const observation = observePendingReader(requestFiber);
       const borrow = Effect.flatMap(route(span?._tag === "Span" ? span : undefined), (target) =>
         Effect.withFiber<A, E | SqlError, R>((fiber) => {
+          observation?.route(target);
           finishWait?.(target.lane ?? "writer", false);
           const traced =
             fiber.getRef(References.TracerEnabled) &&
             fiber.getRef(Statement.SpanPropagationEnabled);
           const useConnection = Effect.suspend(() => {
             started = true;
+            observation?.acquired();
             finishWait?.(target.lane ?? "writer", true);
             const grant = acquired(target, clock, start);
             if (target.name === "reader")
@@ -3527,8 +3588,12 @@ const make = Effect.fn("makeWithDatabase")(function* (
           return target.name === "writer" ? withWriterDemand(useTarget) : useTarget;
         }),
       );
-      if (requestFiber.getRef(ReaderWaitObserver) === undefined) return borrow;
-      return borrow.pipe(
+      const observed =
+        observation === undefined
+          ? borrow
+          : borrow.pipe(Effect.ensuring(Effect.sync(observation.stop)));
+      if (requestFiber.getRef(ReaderWaitObserver) === undefined) return observed;
+      return observed.pipe(
         Effect.onExit(() =>
           Effect.sync(() => {
             if (!started && requestFiber.getRef(ReadOnly))
@@ -3542,7 +3607,9 @@ const make = Effect.fn("makeWithDatabase")(function* (
     const start = clock.monotonicTimeNanosUnsafe();
     let acquiredSlot = false;
     const finishWait = reportReaderWaitStarted(requestFiber);
+    const observation = observePendingReader(requestFiber);
     const acquireReader = Effect.flatMap(route(), (target) => {
+      observation?.route(target);
       finishWait?.(target.lane ?? "writer", false);
       const useTarget = Effect.uninterruptibleMask((restore) => {
         const fiber = Fiber.getCurrent()!;
@@ -3561,6 +3628,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
         const acquire = Effect.tap((pending?.restore ?? restore)(target.lock.take(1)), () => {
           const grant = acquired(target, clock, start);
           acquiredSlot = true;
+          observation?.acquired();
           finishWait?.(target.lane ?? "writer", true);
           if (target.name === "reader")
             reportReaderWait(requestFiber, grant.lockWaitMs, target.lane);
@@ -3597,6 +3665,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
                     target.lock.release(1),
                   ),
                 ),
+                Effect.ensuring(Effect.sync(() => observation?.stop())),
                 Effect.andThen(
                   Effect.suspend(() => {
                     const held = holdMs(clock, granted);
@@ -3628,8 +3697,16 @@ const make = Effect.fn("makeWithDatabase")(function* (
       });
       return target.name === "writer" ? withWriterDemand(useTarget) : useTarget;
     });
-    if (requestFiber.getRef(ReaderWaitObserver) === undefined) return acquireReader;
-    return acquireReader.pipe(
+    const observed =
+      observation === undefined
+        ? acquireReader
+        : acquireReader.pipe(
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit) ? Effect.sync(() => observation?.stop()) : Effect.void,
+            ),
+          );
+    if (requestFiber.getRef(ReaderWaitObserver) === undefined) return observed;
+    return observed.pipe(
       Effect.onExit(() =>
         Effect.sync(() => {
           if (!acquiredSlot && requestFiber.getRef(ReadOnly))

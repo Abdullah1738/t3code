@@ -2178,7 +2178,7 @@ test("a watcher turn that errored before any tool is retried, then reported once
   await h.router.tick();
   expect(inbounds(h.store).find(row => row.id === wake)?.state).toBe("failed");
   expect(h.controls().map(op => op.text)).toEqual([syntheticDropped(wake, wakeBody(), "errored")]);
-  expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([{ id: wake, text: wakeBody() }]);
+  expect(h.store.get<unknown[]>("missedSynthetic")).toEqual([{ id: wake, text: wakeBody(), at: Date.now() }]);
 });
 
 test("a first-call provider error with no tool evidence is reported once and never retried, through the backend", async () => {

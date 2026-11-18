@@ -535,12 +535,17 @@ class ProcessTests(JanitorTestCase):
             cursor = report['next_cursor']
         self.assertEqual(runs, [[20, 40], [50, 30], [20, 40], [50, 30]])
 
-    def test_process_module_has_no_signal_or_delete_primitives(self):
+    def test_signal_primitive_is_only_in_opt_in_stop_and_deletion_stays_forbidden(self):
         import ast
         tree = ast.parse(Path(lp.__file__).read_text())
         forbidden = {'kill', 'killpg', 'unlink', 'remove', 'rmdir', 'rmtree'}
+        stop = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'stop_xcode_builds')
+        send_default = stop.args.kw_defaults[stop.args.kwonlyargs.index(
+            next(arg for arg in stop.args.kwonlyargs if arg.arg == 'send'))]
+        self.assertIsInstance(send_default, ast.Attribute)
+        self.assertEqual(ast.unparse(send_default), 'os.kill')
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute):
+            if isinstance(node, ast.Attribute) and node is not send_default:
                 self.assertNotIn(node.attr, forbidden)
 
 

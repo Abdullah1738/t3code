@@ -141,6 +141,7 @@ export function guardLaunchContext(value: string | undefined, previousBootAt: nu
   if (!value || !/^guard:\d{13}$/.test(value)) return null;
   const at = Number(value.slice(6));
   return at >= previousBootAt && at <= now && now - at <= 90_000
-    ? { initiator: "guard", requestedAt: new Date(at).toISOString() }
+    ? // @effect-diagnostics-next-line globalDate:off -- ISO text for an epoch-ms value the desktop caller passes in; not Effect code.
+      { initiator: "guard", requestedAt: new Date(at).toISOString() }
     : null;
 }
