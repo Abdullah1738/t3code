@@ -144,6 +144,152 @@ class RefreshTests(unittest.TestCase):
                     if not spawned:
                         os.close(write_fd)
 
+    def test_supervisor_interrupt_stops_group_before_unlocking(self):
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            for ignore_term in (False, True):
+                for close_pipes in (False, True):
+                    with self.subTest(signal=signum, ignore_term=ignore_term, close_pipes=close_pipes):
+                        self.check_supervisor_interrupt(signum, ignore_term, close_pipes)
+
+    def test_interrupt_during_spawn_is_deferred_until_child_is_owned_and_handlers_restore(self):
+        handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+        popen = subprocess.Popen
+        spawned = []
+        def interrupted_spawn(*args, **kwargs):
+            proc = popen(*args, **kwargs)
+            spawned.append(proc)
+            self.assertEqual(proc.stdout.readline(), b"ready\n")
+            os.kill(os.getpid(), signal.SIGTERM)
+            return proc
+        try:
+            with mock.patch.object(refresh.subprocess, "Popen", side_effect=interrupted_spawn):
+                result, output = self.run_refresh(
+                    "import time\nprint('ready', flush=True)\ntime.sleep(60)\n")
+            self.assertEqual(result, (143, "interrupted"))
+            self.assertIn("interrupted by SIGTERM", output)
+            self.assertEqual({sig: signal.getsignal(sig) for sig in handlers}, handlers)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(spawned[0].pid, 0)
+        finally:
+            for proc in spawned:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=1)
+
+    def check_supervisor_interrupt(self, signum, ignore_term, close_pipes):
+        event_r, event_w = os.pipe()
+        lifetime_r, lifetime_w = os.pipe()
+        gate_r, gate_w = os.pipe()
+        node = self.node(
+            "import os, signal, time\n"
+            "ready_r, ready_w = os.pipe()\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os.close(ready_r)\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            + ("    os.close(0); os.close(1); os.close(2)\n" if close_pipes else "") +
+            "    os.write(ready_w, b'1'); os.close(ready_w)\n"
+            "else:\n"
+            "    os.close(ready_w); os.read(ready_r, 1); os.close(ready_r)\n"
+            + ("    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_term else "") +
+            f"    os.write({event_w}, f'ready {{os.getpid()}}\\n'.encode())\n"
+            "time.sleep(60)\n")
+        # Gate cleanup so lock ownership is asserted at the cleanup boundary, without timing races.
+        driver = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(PACKAGE)!r})\n"
+            "import refresh\n"
+            "popen, stop = refresh.subprocess.Popen, refresh.stop_child\n"
+            "def spawn(*args, **kwargs):\n"
+            f"    proc = popen(*args, **kwargs, pass_fds=({event_w}, {lifetime_w}))\n"
+            f"    os.close({lifetime_w})\n"
+            "    return proc\n"
+            "def cleanup(proc):\n"
+            f"    os.write({event_w}, b'cleanup\\n')\n"
+            f"    assert os.read({gate_r}, 1) == b'1'\n"
+            "    return stop(proc)\n"
+            "refresh.subprocess.Popen, refresh.stop_child = spawn, cleanup\n"
+            "raise SystemExit(refresh.main(sys.argv[1:]))\n")
+        supervisor = subprocess.Popen(
+            [sys.executable, "-I", "-c", driver, "--home", str(self.home), "--node", node, "--deadline", "30"],
+            pass_fds=(event_w, lifetime_w, gate_r), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+        os.close(event_w)
+        os.close(lifetime_w)
+        os.close(gate_r)
+        helper_pid = None
+        try:
+            with os.fdopen(event_r, "rb", buffering=0) as events:
+                self.assertTrue(select.select([events], [], [], 3)[0], "helper did not become ready")
+                ready = events.readline()
+                self.assertTrue(ready.startswith(b"ready "), ready)
+                helper_pid = int(ready.split()[1])
+                supervisor.send_signal(signum)
+                self.assertTrue(select.select([events], [], [], 3)[0], "interruption skipped cleanup")
+                self.assertEqual(events.readline(), b"cleanup\n")
+                runtime = self.home / ".local/share/safe-chain-refresh"
+                with (runtime / "refresh.lock").open("a") as lock:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                supervisor.send_signal(signum)
+                os.write(gate_w, b"1")
+                _, err = supervisor.communicate(timeout=4)
+            self.assertEqual(supervisor.returncode, 128 + signum, err)
+            self.assertIn(b"interrupted", err)
+            self.assertNotIn(b"Traceback", err)
+            self.assertTrue(select.select([lifetime_r], [], [], 1)[0], "helper or descendant escaped")
+            self.assertEqual(os.read(lifetime_r, 1), b"")
+            with self.assertRaises(ProcessLookupError):
+                os.kill(helper_pid, 0)
+            with (runtime / "refresh.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            state = json.loads((runtime / "state.json").read_text())
+            self.assertEqual(state["status"], "interrupted")
+            self.assertEqual(self.cache.read_bytes(), self.cached)
+        finally:
+            if helper_pid is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(helper_pid, signal.SIGKILL)
+            if supervisor.poll() is None:
+                supervisor.kill()
+            supervisor.communicate(timeout=2)
+            os.close(lifetime_r)
+            os.close(gate_w)
+
+    def test_interrupt_during_finalization_never_persists_or_returns_success(self):
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            for boundary in ("write_text", "replace", "emit"):
+                for after in (False, True):
+                    with self.subTest(signal=signum, boundary=boundary, after=after):
+                        fired = False
+                        target = refresh.toollog if boundary == "emit" else Path
+                        original = getattr(target, boundary)
+                        handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+
+                        def at_boundary(*args, **kwargs):
+                            nonlocal fired
+                            if fired or (boundary != "emit" and not args[0].name.startswith("state.")):
+                                return original(*args, **kwargs)
+                            fired = True
+                            if not after:
+                                os.kill(os.getpid(), signum)
+                            value = original(*args, **kwargs)
+                            if after:
+                                os.kill(os.getpid(), signum)
+                            return value
+
+                        with mock.patch.object(target, boundary, side_effect=at_boundary,
+                                               autospec=boundary != "emit"):
+                            result, _ = self.run_refresh(
+                                "print('{\"expected\":5,\"refreshed\":5,\"cached\":0,\"failed\":0}')\n")
+                        self.assertTrue(fired)
+                        self.assertEqual(result, (128 + signum, "interrupted"))
+                        state = json.loads((self.home / ".local/share/safe-chain-refresh/state.json").read_text())
+                        self.assertEqual(state["status"], "interrupted")
+                        self.assertFalse(refresh.toollog.emit.call_args.kwargs["ok"])
+                        self.assertEqual({sig: signal.getsignal(sig) for sig in handlers}, handlers)
+                        self.assertEqual(self.cache.read_bytes(), self.cached)
+
     def test_cached_fallback_and_failure_are_not_reported_as_fresh_success(self):
         for code, expected in [
             ("print('{\"expected\":5,\"refreshed\":4,\"cached\":1,\"failed\":0}')\n", "cached"),

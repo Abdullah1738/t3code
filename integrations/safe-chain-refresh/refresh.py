@@ -25,6 +25,10 @@ FILES = {"refresh.py": 0o755, "refresh.mjs": 0o644, "toollog.py": 0o644,
          f"launchd/{LABEL}.plist": 0o644}
 
 
+class RefreshInterrupted(BaseException):
+    pass
+
+
 def node_path(home: Path) -> str | None:
     try:
         manifest = json.loads((home / ".local/share/harness-homes/manifest.json").read_text())
@@ -78,45 +82,84 @@ def refresh(home: Path, package_root: Path, node: str | None, deadline: float) -
         started = time.monotonic()
         status, rc = "failed", 1
         result = dict(expected=0, refreshed=0, cached=0, failed=0)
-        print(f"Safe-chain refresh: starting; deadline {deadline:g}s.", file=sys.stderr, flush=True)
+        interrupted, interruptible = 0, False
+        previous_handlers = {}
+
+        def interrupt(signum, _frame):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = signum
+                # Defer during Popen until its process handle is owned, and during group cleanup.
+                if interruptible:
+                    raise RefreshInterrupted()
+
         try:
-            if not node:
-                raise OSError("node unavailable")
-            env = dict(os.environ, HOME=str(home))
-            with tempfile.TemporaryDirectory(prefix="safe-chain-refresh-") as scratch:
-                proc = subprocess.Popen([node, str(PACKAGE / "refresh.mjs"), str(package_root)],
-                                        cwd=scratch, env=env, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, start_new_session=True)
-                try:
-                    out, _ = proc.communicate(timeout=deadline)
-                except subprocess.TimeoutExpired:
-                    status = "timeout"
-                    out, _ = stop_child(proc)
-                    print(f"Safe-chain refresh: deadline {deadline:g}s exceeded; stopped its process group. "
-                          "Existing valid caches are retained. Inline fetches still need an upstream deadline.",
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous_handlers[signum] = signal.signal(signum, interrupt)
+            print(f"Safe-chain refresh: starting; deadline {deadline:g}s.", file=sys.stderr, flush=True)
+            try:
+                if not node:
+                    raise OSError("node unavailable")
+                env = dict(os.environ, HOME=str(home))
+                with tempfile.TemporaryDirectory(prefix="safe-chain-refresh-") as scratch:
+                    proc = subprocess.Popen([node, str(PACKAGE / "refresh.mjs"), str(package_root)],
+                                            cwd=scratch, env=env, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, start_new_session=True)
+                    try:
+                        try:
+                            interruptible = True
+                            if interrupted:
+                                raise RefreshInterrupted()
+                            out, _ = proc.communicate(timeout=deadline)
+                        finally:
+                            interruptible = False
+                    except (subprocess.TimeoutExpired, RefreshInterrupted):
+                        status = "interrupted" if interrupted else "timeout"
+                        out, _ = stop_child(proc)
+                        reason = (f"interrupted by {signal.Signals(interrupted).name}" if interrupted else
+                                  f"deadline {deadline:g}s exceeded")
+                        print(f"Safe-chain refresh: {reason}; stopped its process group. "
+                              "Existing valid caches are retained. Inline fetches still need an upstream deadline.",
+                              file=sys.stderr, flush=True)
+                    result = summary(out)
+                    pending = result["expected"] - sum(result[key] for key in ("refreshed", "cached", "failed"))
+                    if status not in ("timeout", "interrupted"):
+                        if proc.returncode != 0 or result["failed"] or pending:
+                            status, rc = "failed", 1
+                        else:
+                            status, rc = ("cached", 1) if result["cached"] else ("ok", 0)
+                    print(f"Safe-chain refresh: {result['refreshed']} lists revalidated, "
+                          f"{result['cached']} cached fallbacks, {result['failed']} failed, {pending} pending.",
                           file=sys.stderr, flush=True)
-                result = summary(out)
-                pending = result["expected"] - sum(result[key] for key in ("refreshed", "cached", "failed"))
-                if status != "timeout":
-                    if proc.returncode != 0 or result["failed"] or pending:
-                        status, rc = "failed", 1
-                    else:
-                        status, rc = ("cached", 1) if result["cached"] else ("ok", 0)
-                print(f"Safe-chain refresh: {result['refreshed']} lists revalidated, "
-                      f"{result['cached']} cached fallbacks, {result['failed']} failed, {pending} pending.",
-                      file=sys.stderr, flush=True)
-        except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):
-            print("Safe-chain refresh: could not run the installed list API or read its summary; "
-                  "check the safe-chain installation. No package command was run.", file=sys.stderr)
-        elapsed = (time.monotonic() - started) * 1000
-        state = dict(result, status=status, elapsedMs=round(elapsed), attemptedAt=int(time.time()))
-        temporary = runtime / f"state.{os.getpid()}.tmp"
-        temporary.write_text(json.dumps(state) + "\n", encoding="utf-8")
-        temporary.replace(runtime / "state.json")
-        toollog.emit("safe-chain-refresh", "perf" if rc == 0 else "error", "refresh.run",
-                     duration_ms=elapsed, ok=rc == 0, props={"status": status, "count": result["refreshed"]},
-                     error_tag=None if rc == 0 else "refresh." + status)
-        return rc, status
+            except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):
+                print("Safe-chain refresh: could not run the installed list API or read its summary; "
+                      "check the safe-chain installation. No package command was run.", file=sys.stderr)
+            def finish():
+                final_status, final_rc = ("interrupted", 128 + interrupted) if interrupted else (status, rc)
+                elapsed = (time.monotonic() - started) * 1000
+                state = dict(result, status=final_status, elapsedMs=round(elapsed), attemptedAt=int(time.time()))
+                temporary = runtime / f"state.{os.getpid()}.tmp"
+                temporary.write_text(json.dumps(state) + "\n", encoding="utf-8")
+                temporary.replace(runtime / "state.json")
+                toollog.emit("safe-chain-refresh", "perf" if final_rc == 0 else "error", "refresh.run",
+                             duration_ms=elapsed, ok=final_rc == 0,
+                             props={"status": final_status, "count": result["refreshed"]},
+                             error_tag=None if final_rc == 0 else "refresh." + final_status)
+                return final_rc, final_status
+
+            try:
+                interruptible = True
+                return finish()
+            except RefreshInterrupted:
+                # A first signal can arrive after success was published; replace it before unlocking.
+                print(f"Safe-chain refresh: interrupted by {signal.Signals(interrupted).name}; "
+                      "recording interrupted status.", file=sys.stderr, flush=True)
+                return finish()
+            finally:
+                interruptible = False
+        finally:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
 
 
 def plist_bytes(home: Path) -> bytes:
