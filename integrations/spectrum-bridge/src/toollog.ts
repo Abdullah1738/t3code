@@ -7,6 +7,7 @@ import { writeFile, readFile, rename, unlink } from "node:fs/promises";
 import { logDirectory } from "./log-directory.ts";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { cleanPromptProbe, createPromptProbeAggregation, type PromptProbeStats } from "./log-prompt-probes.ts";
 import { createMessageReadAggregation } from "./log-message-reads.ts";
 import { cleanCalls, createCallAggregation, SLOW_CALL_MS, type CallSummary } from "./log-calls.ts";
 import { cleanRobobLink, createRobobLinkState, createRobobLinkAggregation, type RobobLink } from "./log-robob-link.ts";
@@ -26,6 +27,7 @@ export type LogLine = {
   site?: string;
   error?: { tag: string } & ErrorDetail;
   calls?: CallSummary;
+  promptProbe?: PromptProbeStats;
   renders?: { count: number; histogram: [number, number][] };
 };
 type Entry = Omit<LogLine, "ts" | "tool" | "error"> & { error?: { tag: string; cause?: unknown } & Partial<ErrorDetail> };
@@ -34,8 +36,10 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const TAG = /^[a-zA-Z][a-zA-Z0-9_.:-]{0,99}$/;
 const LABEL = /^[a-zA-Z][a-zA-Z0-9_.-]{0,99}$/;
 const ID_KEYS = new Set(["chat", "messageId", "inboundId", "outboxId", "threadId", "fromThreadId", "toThreadId", "operationId", "formId", "runId", "callBatchId", "requestId", "serverRequestId", "outageId"]);
-const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount"]);
+const NUMBERS = new Set(["attachmentCount", "attachmentBytes", "receiveLagMs", "batchSize", "filesTaken", "waitMs", "outboxDelayMs", "parts", "files", "count", "status", "exitCode", "labels", "slowestReadMs", "completionLagMs", "seedChars", "recapLines", "pendingOrdersChars", "attempt", "probeIndex", "probeCount", "ageMs", "generation", "rowsReturned", "bytesReturned", "fullReads", "incrementalReads", "cachedSkipReads", "sharedReads", "firstReads", "routeChanges", "missingUntils", "resyncs", "mergeConflicts", "clockSkews", "linkFailureCount", "boundMs", "elapsedMs", "msUntilAccepted"]);
 const ENUMS: Record<string, readonly string[]> = {
+  causeKind: ["timeout", "http", "transport"],
+  probeOutcome: ["accepted", "notAcceptedYet", "timeout", "http", "transport"],
   controlReason: CONTROL_REASONS,
   route: ["new_turn", "steer", "question_answer", "held_for_wake"],
   readMode: ["full", "incremental", "cached-skip", "shared"],
@@ -110,6 +114,7 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
     else if (key === "route" && typeof value === "string" && /^(?:\/(?:[a-z-]+|:id))*$/.test(value)) props[key] = value;
   }
   if (Object.keys(props).length) line.props = props;
+  if (entry.name === "router.prompt_probes" && entry.component === "router" && entry.kind === "perf") line.promptProbe = cleanPromptProbe(entry.promptProbe);
   if (entry.component === "robob" && ["robob.link_down", "robob.link_up", "robob.link_state", "robob.link_reply"].includes(entry.name)) line.link = cleanRobobLink(entry.link);
   if (entry.name === "card.renders" && entry.kind === "perf") line.renders = cleanRenders(entry.renders);
   if (entry.name === "turn.robob_calls" && entry.component === "robob" && entry.kind === "perf") line.calls = cleanCalls(entry.calls);
@@ -123,7 +128,13 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
       name, ...entry.error, status: entry.error?.status ?? (status ? Number(status) : typeof props.status === "number" ? props.status : undefined),
       code: entry.error?.code ?? (status ? safeLineFailureCode(tag) : undefined),
     }) };
-    if (["Error", "UnknownError", "TimeoutError"].includes(line.error.name)) line.error.causeKey = causeKey(line.error, line.error.tag);
+    if (["Error", "UnknownError", "TimeoutError", "BoundedTimeout"].includes(line.error.name)) line.error.causeKey = causeKey(line.error, line.error.tag);
+    if (line.error.tag === "router.catch1" && props.causeKind) {
+      line.error.causeKey = "prompt_acceptance_probe";
+      line.error.message = "[redacted]";
+      if (props.status === 0) line.error.status = 0;
+      if (props.causeKind === "timeout") line.error.code = "ETIMEDOUT";
+    }
     const site = cleanSite(entry.site);
     if (site) line.site = site;
   }
@@ -168,6 +179,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   let recovery: Promise<void> | undefined;
   const calls = createCallAggregation(processRunId);
   const messageReads = createMessageReadAggregation();
+  const promptProbes = createPromptProbeAggregation();
   const robobLink = createRobobLinkState({ root, now, checkpoint: () => {
     const day = new Date(now()).toISOString().slice(0, 10);
     const path = join(root(), `${day}.ndjson`);
@@ -243,7 +255,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
       }
       const link = robobLink.accept(line);
       for (const event of link.events) enqueue(event);
-      for (const messageRead of messageReads.accept(line)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
+      for (const probe of promptProbes.accept(line)) for (const messageRead of messageReads.accept(probe)) for (const render of renders.accept(messageRead)) for (const record of calls.accept(render, entry.ids?.runId !== undefined, link.keepDetail)) enqueue(record);
       if (!options.defer) robobLink.save();
       if (entry.name === "turn.end") void scheduleRollup(line.ts.slice(0, 10));
       if (["turn.start", "reply.sent", "inbound.answered"].includes(line.name) && line.ids?.chat && line.ids.inboundId) {
@@ -344,6 +356,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
   }
   function flushAll(): boolean {
     capture(() => { for (const line of robobLink.flush(now)) enqueue(line); });
+    for (const line of promptProbes.flush()) enqueue(line);
     for (const line of messageReads.flush()) enqueue(line);
     for (const line of renders.flush()) enqueue(line);
     for (const line of calls.flush()) enqueue(line);
@@ -432,6 +445,7 @@ export function createToolLog(options: { root?: string; now?: () => number; capB
     try {
       const at = now();
       for (const line of messageReads.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
+      for (const line of promptProbes.flush(Math.floor(at / 60_000) * 60_000)) enqueue(line);
       if (rolling) { await settled(); return; }
       const hour = Math.floor(at / 3_600_000);
       const hourly = hour !== rolledHour;

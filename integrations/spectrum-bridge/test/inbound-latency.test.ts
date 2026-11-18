@@ -14,6 +14,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ControlClient, ControlError } from "../src/control.ts";
+import { BoundedTimeout } from "../src/bounded.ts";
+import { PromptProbeTracker } from "../src/prompt-probe.ts";
 import { captureLogs } from "./log-fixture.ts";
 import { FAILED_INBOUND_REPLAY_MAX_AGE_MS } from "../src/inbound-failure.ts";
 
@@ -74,6 +76,64 @@ function setup(slug = "owner", overrides: Partial<ConstructorParameters<typeof R
   return { get store() { return store; }, backend, router, input, states, logs, alerts, ctx, restart, makeRouter };
 }
 
+test.each([
+  ["timeout", new BoundedTimeout(10_000)], ["http", new ControlError(503, "unavailable")],
+  ["transport", new ControlError(0, "ECONNRESET")],
+  ["http", Object.assign(new Error("OpenChamber request failed (HTTP 503)"), { status: 503 })],
+] as const)("probe %s remains inconclusive and a later accepted check delivers without another POST", async (kind, error) => {
+  const h = setup(); h.input("probe"); h.store.updateInbound("probe", "processing");
+  const waitMs = 61_000;
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 };
+  h.store.set("route", route);
+  h.store.set("failed-delivery:probe", { ...route, inboundId: "probe", messageId: hash("probe"), startedAt: now - 120_000, phase: "unknown" });
+  h.backend.promptAccepted = async () => { throw error; };
+  const rows = await captureLogs(async () => {
+    await h.router.checkInboundLatency();
+    expect(h.states()).toEqual(["processing"]);
+    expect(h.backend.prompts).toEqual([]);
+    h.backend.promptAccepted = async () => true;
+    setSystemTime(now + 1000); await h.router.checkInboundLatency();
+    expect(h.states()).toEqual(["processing"]);
+    setSystemTime(now + waitMs); await h.router.checkInboundLatency();
+  });
+  expect(h.states()).toEqual(["done"]);
+  expect(h.backend.prompts).toEqual([]);
+  const catches = rows.filter(row => row.error?.tag === "router.catch1");
+  expect(catches).toHaveLength(1);
+  expect(catches[0].props).toMatchObject({ causeKind: kind, boundMs: 10_000, attempt: 1, route: "/prompt-acceptance" });
+  expect(catches[0].error?.causeKey).toBe("prompt_acceptance_probe");
+  const probes = rows.filter(row => row.name === "router.prompt_probes");
+  expect(probes).toHaveLength(2);
+  expect(probes.reduce((n, row) => n + row.promptProbe!.calls, 0)).toBe(2);
+  expect(probes.reduce((n, row) => n + row.promptProbe!.accepted, 0)).toBe(1);
+  expect(probes.reduce((n, row) => n + row.promptProbe![kind], 0)).toBe(1);
+  expect(probes.flatMap(row => row.promptProbe!.attempts)).toEqual([[2, 1]]);
+  expect(probes.flatMap(row => row.promptProbe!.msUntilAccepted)).toEqual([[120_000 + waitMs, 1]]);
+});
+
+test.each([
+  { label: "root send", age: 120_000, attemptAge: undefined, steerAge: undefined, matches: true, expected: 120_000 },
+  { label: "retried root", age: 3_600_000, attemptAge: 120_000, steerAge: undefined, matches: true, expected: 120_000 },
+  { label: "earlier request id", age: 3_600_000, attemptAge: 120_000, steerAge: undefined, matches: true, expected: 3_600_000, earlier: true },
+  { label: "steered follow-up", age: 3_600_000, attemptAge: 3_600_000, steerAge: 120_000, matches: true, expected: 120_000 },
+  { label: "legacy root older than 24h", age: 108_000_000, attemptAge: undefined, steerAge: undefined, matches: true, expected: 108_000_000 },
+  { label: "steer for a different route", age: 3_600_000, attemptAge: undefined, steerAge: 120_000, matches: false, expected: 3_600_000 },
+])("probe latency uses the matching send timestamp: $label", async fixture => {
+  const { age, attemptAge, steerAge, matches, expected } = fixture;
+  const earlier = "earlier" in fixture && fixture.earlier;
+  const h = setup(); h.input("probe"); h.store.updateInbound("probe", "processing");
+  const route = { id: "ses_original", directory: "/Chats/ses_original", generation: 1 };
+  h.store.set("route", route);
+  h.store.set("failed-delivery:probe", { ...route, inboundId: "probe", messageId: hash("probe"), startedAt: now - age,
+    ...(attemptAge === undefined ? {} : { attemptAt: now - attemptAge }), ...(earlier ? { earlier: ["msg_earlier"] } : {}), phase: "unknown" });
+  if (steerAge !== undefined) h.store.set("steer-attempt:probe", { ...route, id: matches ? route.id : "ses_other", startedAt: now - steerAge });
+  h.backend.promptAccepted = async (_id, _directory, messageId) => !earlier || messageId === "msg_earlier";
+  const rows = await captureLogs(() => h.router.checkInboundLatency());
+  expect(rows.find(row => row.promptProbe)?.promptProbe).toMatchObject({ calls: earlier ? 2 : 1, accepted: 1, msUntilAccepted: [[expected, 1]] });
+  expect(h.states()).toEqual([steerAge !== undefined && matches ? "admitted" : "done"]);
+  expect(h.backend.prompts).toEqual([]);
+});
+
 function stalledProbe(id = "stalled", age = 120_000, earlier: string[] = []) {
   const h = setup();
   h.input(id, age);
@@ -83,7 +143,79 @@ function stalledProbe(id = "stalled", age = 120_000, earlier: string[] = []) {
   h.store.updateInbound(id, "processing");
   return h;
 }
-const probeTimeout = () => Object.assign(new Error("PRIVATE +971501234567 /Users/private/file https://private.test/?token=PRIVATE"), { name: "TimeoutError", code: "timeout" });
+const probeTimeout = () => Object.assign(new BoundedTimeout(10_000), { message: "PRIVATE +971501234567 /Users/private/file https://private.test/?token=PRIVATE" });
+
+test.each(["leader", "prompt", "budget"] as const)("a %s fence skips probe telemetry and acceptance attempts", async fence => {
+  const h = stalledProbe();
+  const policy = new ProbeBackoff(h.store);
+  const promptKey = `prompt:ses_original:${hash("stalled")}`;
+  const key = fence === "prompt" ? promptKey : "stalled";
+  policy.reserve(key); policy.failed(key);
+  if (fence === "budget") {
+    setSystemTime(now + 60_000);
+    const budget = new ProbeBudget(h.store);
+    for (let i = 0; i < 60; i++) expect(budget.take()).toBe(true);
+  }
+  let calls = 0;
+  h.backend.promptAccepted = async () => { calls++; return true; };
+  const skipped = await captureLogs(() => h.router.checkInboundLatency());
+  expect(calls).toBe(0);
+  expect(skipped.filter(row => row.promptProbe || row.error?.tag === "router.catch1")).toEqual([]);
+  expect(h.states()).toEqual(["processing"]);
+  setSystemTime(now + 121_000);
+  const accepted = await captureLogs(() => h.router.checkInboundLatency());
+  expect(calls).toBe(1);
+  expect(accepted.find(row => row.promptProbe)?.promptProbe).toMatchObject({ calls: 1, accepted: 1, attempts: [[1, 1]] });
+  expect(h.states()).toEqual(["done"]);
+});
+
+test("a late failed probe keeps its control error owner without restoring split leases", async () => {
+  const h = stalledProbe("wake:leader", 20 * 60_000);
+  const policy = new ProbeBackoff(h.store);
+  policy.reserve("wake:leader"); policy.failed("wake:leader");
+  setSystemTime(now + 60_000);
+  const entered = Promise.withResolvers<void>(), response = Promise.withResolvers<Response>();
+  const fetcher = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => {
+    entered.resolve(); return response.promise;
+  }, { preconnect: globalThis.fetch.preconnect }));
+  try {
+    const client = new ControlClient({ url: "http://127.0.0.1:3773", token: "PRIVATE_TOKEN" });
+    h.backend.promptAccepted = async () => { await client.request("GET", "/threads/ses_original/messages"); return false; };
+    let result: Awaited<ReturnType<typeof toolLog.rollup>>;
+    const rows = await captureLogs(async () => {
+      const scan = h.router.checkInboundLatency();
+      await entered.promise;
+      policy.split("wake:leader", ["wake:leader", "wake:member"]);
+      const leader = policy.get("wake:leader"), member = policy.get("wake:member");
+      response.resolve(new Response(JSON.stringify({ ok: false }), { status: 503 }));
+      await scan;
+      expect(policy.get("wake:leader")).toEqual(leader);
+      expect(policy.get("wake:member")).toEqual(member);
+      toolLog.flush();
+      result = await toolLog.rollup(new Date().toISOString().slice(0, 10));
+    });
+    expect(rows.find(row => row.promptProbe)?.promptProbe).toMatchObject({ calls: 1, http: 1, httpByStatus: { "503": 1 } });
+    expect(rows.find(row => row.error?.tag === "router.catch1")).toMatchObject({ alreadyLogged: true,
+      props: { causeKind: "http", attempt: 1 }, error: { name: "ControlError", causeKey: "prompt_acceptance_probe", status: 503 } });
+    expect(result!).toMatchObject({ failed: 1, dedupedFailures: 1 });
+    expect(result!.errorRate).toBe(1 / result!.total);
+    expect(result!.topErrorTags).toEqual([expect.objectContaining({ tag: "control.request_failed", count: 1 })]);
+    expect(h.backend.prompts).toEqual([]);
+    expect(JSON.stringify(rows)).not.toContain("PRIVATE_");
+  } finally { fetcher.mockRestore(); }
+});
+
+test.each([true, false])("telemetry exceptions leave probe admission unchanged (accepted=%s)", async accepted => {
+  const h = stalledProbe();
+  const tracker = spyOn(PromptProbeTracker.prototype, "start").mockImplementation(() => { throw new Error("PRIVATE_TELEMETRY"); });
+  h.backend.promptAccepted = async () => { if (!accepted) throw new ControlError(503); return true; };
+  try {
+    await h.router.checkInboundLatency();
+    expect(h.states()).toEqual([accepted ? "done" : "processing"]);
+    expect(h.backend.prompts).toEqual([]);
+    expect(new ProbeBackoff(h.store).cooling("stalled")).toBe(!accepted);
+  } finally { tracker.mockRestore(); }
+});
 
 test.each(["absent", "503"] as const)("a late %s leader read cannot settle split member history", async outcome => {
   const h = stalledProbe("wake:leader", 20 * 60_000);
@@ -142,7 +274,7 @@ test("replay catch records safe probe positions and a stable hashed row ref", as
   expect(rows.filter(row => row.name === "router.probe_backoff").map(row => row.props?.waitMs)).toEqual([60_000, 120_000]);
   for (const row of catches) expect(row).toMatchObject({
     ids: { inboundId: `row_${createHash("sha256").update(id).digest("hex").slice(0, 16)}` },
-    props: { probeIndex: 0, probeCount: 2 }, error: { name: "TimeoutError", code: "timeout", causeKey: "code.timeout" },
+    props: { probeIndex: 0, probeCount: 2, causeKind: "timeout" }, error: { name: "BoundedTimeout", code: "ETIMEDOUT", causeKey: "prompt_acceptance_probe" },
   });
   expect(JSON.stringify(rows)).not.toMatch(/PRIVATE|971501234567|\/Users\/private|https:\/\//);
 });
