@@ -23,6 +23,8 @@ This packet does not alter or restart 9router.
 
 The notification-only detector GETs `/api/providers`
 with local CLI auth every 60 seconds.
+The `boot` phase and private `supervisor.boot` event show shell-to-Node latency.
+Fetches share the remaining 45-second budget minus a 5-second journal reserve; exhausted budgets skip the tick through the same 15-minute outage bound. Deadlines after a valid fetch remain failures.
 The first fetch has a 6-second timeout. Transient timeouts, refused/reset sockets
 and HTTP 502/503/504 get one retry after 1 second, bounded at 15 seconds.
 Two transient failures skip that tick without changing incidents or pending
@@ -249,8 +251,8 @@ not spend another failure or pause the watcher at its failure limit. The `done`
 and `failed` markers prevent a stall warning on the next run.
 
 The 45-second timer includes shell-to-Node startup when invoked by `check.sh`.
-It does not unref; an unresolved provider promise still fails with the phase
-name. Fetch retains a six-second abort across headers and JSON body. Telegram
+It does not unref; an unresolved fetch skips within its reserved budget, while
+other unresolved work fails with the phase name. Fetch aborts cover both headers and JSON body. Telegram
 commands retain an eight-second cap, kill their own spawned process group and
 resolve on child exit without waiting for inherited stdout pipes. The whole-run
 deadline also cancels an active command. A blocked synchronous filesystem call

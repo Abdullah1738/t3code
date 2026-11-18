@@ -4,9 +4,10 @@ import datetime as dt
 import json
 import math
 import os
+import re
 from pathlib import Path
 import tempfile
-from toollog import directory
+from toollog import directory, safe_target, CONNECTION_ERRNOS
 from volume import REASONS, integer
 
 
@@ -19,6 +20,18 @@ def percentiles(values):
 
 def metric(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def proxy_key_id(value):
+    if isinstance(value, str) and (value in ('none', 'unknown', 'lookup_failed')
+                                  or re.fullmatch(r'(?:[a-f0-9]{16}|unreg:[a-f0-9]{12})', value)):
+        return value
+    return 'unknown'
+
+
+def caller_breakdown(groups, dimension):
+    return [dict(**{dimension: value}, **g, clientAbortRate=g['aborted'] / g['count'])
+            for value, g in sorted(groups.items())]
 
 
 def interval_total(intervals):
@@ -54,9 +67,13 @@ def rollup(day, root=None, now=None):
     root = Path(root) if root is not None else directory()
     counts, kinds, tags = Counter(), Counter(), Counter()
     times, samples = defaultdict(list), {}
+    targets = defaultdict(Counter)
     proxy = {}
     models = defaultdict(lambda: dict(count=0, aborted=0))
-    abort_clients, abort_keys, attempts = Counter(), Counter(), Counter()
+    clients = defaultdict(lambda: dict(count=0, aborted=0))
+    keys = defaultdict(lambda: dict(count=0, aborted=0))
+    other_products = defaultdict(lambda: dict(count=0, aborted=0))
+    attempts = Counter()
     abort_ttfb = []
     locks, lock_accounts = {}, Counter()
     distinct, account_distinct = set(), defaultdict(set)
@@ -64,6 +81,7 @@ def rollup(day, root=None, now=None):
     supervisor = dict(unresponsive=0, crawling=0, memoryHigh=0, killed=0,
                       exitedBySignal=Counter(), exitedByCode=Counter(), killedByReason=Counter())
     heartbeat_observations = {}
+    health_hours, health_late = {}, defaultdict(list)
     day_start = dt.datetime.combine(dt.date.fromisoformat(day), dt.time(), dt.timezone.utc).timestamp() * 1000
     day_end = day_start + 86400000
     volume_writers = {}
@@ -88,6 +106,22 @@ def rollup(day, root=None, now=None):
                             raise ValueError('invalid lock dimensions')
                     total += 1
                     counts[row['name']] += 1
+                    if row['name'] in ('health.request.late', 'supervisor.health_probe'):
+                        props = row.get('props') if isinstance(row.get('props'), dict) else {}
+                        at = dt.datetime.fromisoformat(row.get('ts', '').replace('Z', '+00:00'))
+                        if at.tzinfo is None:
+                            raise ValueError('health timestamp needs timezone')
+                        at = at.astimezone(dt.timezone.utc)
+                        if at.date().isoformat() == day:
+                            hour = at.replace(minute=0, second=0, microsecond=0).isoformat().replace('+00:00', 'Z')
+                            group = health_hours.setdefault(hour, dict(late=[], probes=[]))
+                            if row['name'] == 'health.request.late' and metric(props.get('acceptToHandlerMs')):
+                                group['late'].append(props['acceptToHandlerMs'])
+                                probe = props.get('probe')
+                                if isinstance(probe, str) and re.fullmatch('[a-f0-9]{8}', probe):
+                                    health_late[probe].append((at, props))
+                            elif row['name'] == 'supervisor.health_probe' and metric(props.get('totalMs')) and props['totalMs'] > 5000:
+                                group['probes'].append((at, props))
                     if row.get('component') == 'supervisor':
                         name = row['name']
                         props = row.get('props') if isinstance(row.get('props'), dict) else {}
@@ -127,7 +161,12 @@ def rollup(day, root=None, now=None):
                         times[row['name']].append(ms)
                     tag = row.get('error', {}).get('tag')
                     if tag:
-                        tags[tag] += 1
+                        props = row.get('props', {})
+                        count = props.get('count', 1) if tag in CONNECTION_ERRNOS else 1
+                        count = count if type(count) is int and 0 < count <= 9007199254740991 else 1
+                        tags[tag] += count
+                        if tag in CONNECTION_ERRNOS:
+                            targets[tag][safe_target(props.get('target')) or 'unknown'] += count
                         samples.setdefault(tag, row.get('ids', {}))
                     if row['name'] in ('account.lock', 'account.unlock'):
                         props = row.get('props', {})
@@ -166,16 +205,22 @@ def rollup(day, root=None, now=None):
                         model = models[key[0]]
                         model['count'] += 1
                         model['aborted'] += aborted
+                        client = props.get('client')
+                        if client not in ('claude-code', 'codex', 'opencode', 'ai-sdk', 'curl', 'node', 'python', 'browser', 'other'):
+                            client = 'unknown'
+                        key_id = proxy_key_id(props.get('keyId'))
+                        for group_identity in (clients[client], keys[key_id]):
+                            group_identity['count'] += 1
+                            group_identity['aborted'] += aborted
+                        if client == 'other':
+                            product = props.get('uaProduct', '')
+                            product = product if isinstance(product, str) and re.fullmatch(r'[a-z0-9._-]{0,24}', product) else ''
+                            other_products[product]['count'] += 1
+                            other_products[product]['aborted'] += aborted
                         attempt_count = props.get('attempts')
                         if isinstance(attempt_count, int) and not isinstance(attempt_count, bool) and attempt_count >= 0:
                             attempts[attempt_count] += 1
                         if aborted:
-                            client = props.get('client', 'unknown')
-                            abort_clients[client if client in ('claude-code', 'codex', 'curl', 'node', 'python', 'browser', 'other') else 'unknown'] += 1
-                            key_id = props.get('keyId', 'unknown')
-                            if not isinstance(key_id, str) or not (key_id in ('none', 'unknown') or len(key_id) == 16 and all(c in '0123456789abcdef' for c in key_id)):
-                                key_id = 'unknown'
-                            abort_keys[key_id] += 1
                             if metric(props.get('ttfbMs')):
                                 abort_ttfb.append(props['ttfbMs'])
                         if metric(ms):
@@ -194,6 +239,9 @@ def rollup(day, root=None, now=None):
     measured = ok + failed
     result = dict(day=day, total=total, malformed=malformed, countsByName=dict(counts), countsByKind=dict(kinds), okRate=ok / measured if measured else None, errorRate=kinds['error'] / total if total else None, failedRate=failed / measured if measured else None, durationMs=durations, topErrors=[dict(tag=tag, count=count, sampleIds=samples[tag]) for tag, count in tags.most_common(20)])
     result.update(generatedAt=generated.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), complete=generated >= next_day)
+    for error in result['topErrors']:
+        if error['tag'] in CONNECTION_ERRNOS:
+            error['byTarget'] = [dict(target=target, count=count) for target, count in targets[error['tag']].most_common()]
     result['proxy'] = []
     for (model, route, stream), group in sorted(proxy.items()):
         result['proxy'].append(dict(
@@ -204,8 +252,15 @@ def rollup(day, root=None, now=None):
             topErrors=[dict(tag=tag, count=count, sampleReq=group['samples'][tag]) for tag, count in group['errors'].most_common(20)],
         ))
     result['proxySummary'] = dict(
-        byModel=[dict(model=m, **g, clientAbortRate=g['aborted'] / g['count']) for m, g in sorted(models.items())],
-        abortsByClient=dict(sorted(abort_clients.items())), abortsByKeyId=dict(sorted(abort_keys.items())),
+        byModel=caller_breakdown(models, 'model'),
+        byClient=caller_breakdown(clients, 'client'),
+        byKeyId=caller_breakdown(keys, 'keyId'),
+        otherByUaProduct=caller_breakdown(other_products, 'uaProduct'),
+        unregisteredRequests=sum(g['count'] for k, g in keys.items() if k.startswith('unreg:')),
+        distinctUnregisteredKeys=sum(k.startswith('unreg:') for k in keys),
+        lookupFailedRequests=keys.get('lookup_failed', {}).get('count', 0),
+        abortsByClient={k: g['aborted'] for k, g in sorted(clients.items()) if g['aborted']},
+        abortsByKeyId={k: g['aborted'] for k, g in sorted(keys.items()) if g['aborted']},
         attemptsHistogram={str(n): count for n, count in sorted(attempts.items())},
         abortTtfbMs=percentiles(abort_ttfb),
     )
@@ -224,6 +279,57 @@ def rollup(day, root=None, now=None):
                 open_heartbeat.add((primary, worker))
     result['supervisor'] = {**supervisor, 'noHeartbeatMs': interval_total(heartbeat_intervals),
                             'openNoHeartbeatWorkers': len(open_heartbeat)}
+    adjacent_days, probe_ids = set(), set()
+    for group in health_hours.values():
+        for at, props in group['probes']:
+            if isinstance(props.get('probe'), str):
+                probe_ids.add(props['probe'])
+            for offset in (-300, 300):
+                neighbor = (at + dt.timedelta(seconds=offset)).date().isoformat()
+                if neighbor != day:
+                    adjacent_days.add(neighbor)
+    # Late handlers and completed probes can land on opposite sides of UTC
+    # midnight. Adjacent files contribute joins only, never this day's counts.
+    for neighbor in sorted(adjacent_days):
+        try:
+            with (root / (neighbor + '.ndjson')).open() as lines:
+                for line in lines:
+                    if 'health.request.late' not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                        props = row.get('props', {})
+                        probe = props.get('probe')
+                        if (row.get('tool') != '9router' or row.get('name') != 'health.request.late'
+                                or row.get('kind') != 'perf' or not isinstance(probe, str) or probe not in probe_ids
+                                or not metric(props.get('acceptToHandlerMs'))):
+                            continue
+                        at = dt.datetime.fromisoformat(row.get('ts', '').replace('Z', '+00:00'))
+                        if at.tzinfo is not None:
+                            health_late[probe].append((at.astimezone(dt.timezone.utc), props))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+        except FileNotFoundError:
+            pass
+    result['healthByHour'] = []
+    for hour, group in sorted(health_hours.items()):
+        probes = []
+        for at, props in group['probes']:
+            probe = props.get('probe')
+            candidates = health_late.get(probe, []) if isinstance(probe, str) else []
+            # Correlate by the probe's bounded ID, never by nearest traffic alone.
+            # A timed-out probe can reach the handler after its timeout row.
+            candidates = [(abs((late_at - at).total_seconds()), late) for late_at, late in candidates
+                          if abs((late_at - at).total_seconds()) <= 300]
+            late = min(candidates, key=lambda item: item[0])[1] if candidates else {}
+            probes.append(dict(ts=at.isoformat().replace('+00:00', 'Z'),
+                **{key: props.get(key) if metric(props.get(key)) else None for key in (
+                    'totalMs', 'maxLagMsSinceLast', 'lagMs', 'hbAgeMs', 'loopDelayP99Ms', 'loopDelayMaxMs', 'loopDelayWindowMs')},
+                **{key: late.get(key) if metric(late.get(key)) else None for key in (
+                    'acceptToHandlerMs', 'idleMs', 'loopLagAtAcceptMs')}))
+        result['healthByHour'].append(dict(hour=hour, lateRows=len(group['late']),
+            acceptToHandlerMs=percentiles(group['late']), probesOver5s=len(probes),
+            probesWithLateRow=sum(p['acceptToHandlerMs'] is not None for p in probes), probes=probes))
     drops = Counter()
     for writer in volume_writers.values():
         drops.update(writer)

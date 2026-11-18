@@ -1,6 +1,7 @@
 import {
   CommandId,
   MessageId,
+  TurnItemId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type ThreadId,
@@ -25,7 +26,9 @@ import {
   stallPhase,
   silentRecoveryStillSafe,
   supportsSilentRecovery,
+  commandProgressDeadline,
 } from "./delegatedTaskProgress.ts";
+import * as CommandOutputHub from "./CommandOutputHub.ts";
 
 const CLAUDE_NO_RESPONSE_BUDGET_MS = 5 * 60_000;
 const CLAUDE_RETRY_FLAP_LIMIT = 20;
@@ -45,6 +48,7 @@ type Child = Progress & {
   stopping: boolean;
   checking: boolean;
   blockers: Set<string>;
+  toolDeadlines: Map<string, number>;
   seen: Map<string, string>;
 };
 
@@ -66,6 +70,7 @@ const make = Effect.gen(function* () {
   const engine = yield* Orchestrator.OrchestratorV2;
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const analytics = yield* Effect.serviceOption(Analytics.Analytics);
+  const commandOutput = yield* Effect.serviceOption(CommandOutputHub.CommandOutputHub);
   const children = new Map<ThreadId, Child>();
   const limits = new Map<ThreadId, number>();
   const boot = yield* DateTime.now;
@@ -122,6 +127,7 @@ const make = Effect.gen(function* () {
           stopping: false,
           checking: false,
           blockers: new Set(),
+          toolDeadlines: new Map(),
           seen: new Map(),
         };
         children.set(event.threadId, child);
@@ -141,6 +147,7 @@ const make = Effect.gen(function* () {
       child.run = run;
       if (["completed", "failed", "interrupted", "cancelled", "rolled_back"].includes(run.status)) {
         child.blockers.clear();
+        child.toolDeadlines.clear();
         child.seen.clear();
         child.thinkingSince = null;
         if (
@@ -224,6 +231,8 @@ const make = Effect.gen(function* () {
         item.status === "running" || item.status === "pending" || item.status === "waiting";
       if (pending) child.blockers.add(key);
       else child.blockers.delete(key);
+      if (pending) child.toolDeadlines.set(key, commandProgressDeadline(item));
+      else child.toolDeadlines.delete(key);
       if (child.seen.get(key) !== item.status) {
         child.seen.set(key, item.status);
         progress(`${item.type}_${pending ? "started" : "finished"}`);
@@ -234,6 +243,7 @@ const make = Effect.gen(function* () {
   const check = Effect.fn("DelegatedTaskProgressGuard.check")(
     function* () {
       const now = yield* DateTime.now;
+      const nowMs = DateTime.toEpochMillis(now);
       yield* Effect.forEach(
         [...children],
         ([threadId, child]) =>
@@ -241,6 +251,20 @@ const make = Effect.gen(function* () {
             if (child.checking || children.get(threadId) !== child) return;
             child.checking = true;
             yield* Effect.gen(function* () {
+              const outputActivity = Option.isSome(commandOutput)
+                ? yield* commandOutput.value.activity(threadId)
+                : undefined;
+              const deadline = (key: string, at: number) =>
+                Math.max(
+                  at,
+                  (outputActivity?.get(TurnItemId.make(key.slice(5))) ?? -Infinity) + 60_000,
+                );
+              const blocked = () =>
+                [...child.blockers].some(
+                  (key) => deadline(key, child.toolDeadlines.get(key) ?? Infinity) > nowMs,
+                );
+              const expiredTool = () =>
+                [...child.toolDeadlines].some(([key, at]) => deadline(key, at) <= nowMs);
               if (
                 child.inactiveSince !== null &&
                 DateTime.toEpochMillis(now) - DateTime.toEpochMillis(child.inactiveSince) >=
@@ -294,9 +318,9 @@ const make = Effect.gen(function* () {
               if (
                 child.stopping ||
                 child.run.status !== "running" ||
-                child.blockers.size > 0 ||
-                DateTime.toEpochMillis(now) - DateTime.toEpochMillis(child.lastProgressAt) <
-                  child.idleTimeoutMs
+                blocked() ||
+                (!expiredTool() &&
+                  nowMs - DateTime.toEpochMillis(child.lastProgressAt) < child.idleTimeoutMs)
               )
                 return;
               const snapshot = yield* engine.getThreadRecords(
@@ -309,11 +333,19 @@ const make = Effect.gen(function* () {
                 },
               );
               const run = snapshot.runs.find((run) => run.id === child.run.id);
+              const timedOutTool = snapshot.turnItems.find(
+                (item) =>
+                  item.runId === run?.id &&
+                  (item.status === "running" ||
+                    item.status === "pending" ||
+                    item.status === "waiting") &&
+                  commandProgressDeadline(item, outputActivity?.get(item.id)) <= nowMs,
+              );
               if (
                 run?.status !== "running" ||
-                progressBlockers(snapshot, run.id) ||
-                DateTime.toEpochMillis(now) - DateTime.toEpochMillis(child.lastProgressAt) <
-                  child.idleTimeoutMs
+                progressBlockers(snapshot, run.id, nowMs, outputActivity) ||
+                (timedOutTool === undefined &&
+                  nowMs - DateTime.toEpochMillis(child.lastProgressAt) < child.idleTimeoutMs)
               )
                 return;
               const observed = latestQualifyingProgress(snapshot, run.id);
@@ -321,7 +353,7 @@ const make = Effect.gen(function* () {
                 child.lastProgressAt = DateTime.makeUnsafe(observed);
                 child.lastProgressKind = "projection_progress";
                 child.thinkingSince = null;
-                return;
+                if (timedOutTool === undefined) return;
               }
               const phase = stallPhase(
                 child.lastProgressKind,
@@ -355,9 +387,13 @@ const make = Effect.gen(function* () {
               const stall = {
                 idleTimeoutMs: child.idleTimeoutMs,
                 lastProgressAt: child.lastProgressAt,
-                lastProgressKind: child.lastProgressKind,
+                lastProgressKind:
+                  timedOutTool === undefined ? child.lastProgressKind : "command_execution_timeout",
                 phase,
                 ...(tool === undefined ? {} : { lastProgressTool: tool }),
+                ...(lastTool?.type === "command_execution" && lastTool.exitCode !== undefined
+                  ? { lastProgressExitCode: lastTool.exitCode }
+                  : {}),
                 silentSeconds:
                   (DateTime.toEpochMillis(now) - DateTime.toEpochMillis(child.lastProgressAt)) /
                   1000,
@@ -579,6 +615,7 @@ const make = Effect.gen(function* () {
             stopping: false,
             checking: false,
             blockers: new Set(),
+            toolDeadlines: new Map(),
             seen: new Map(),
           });
         }

@@ -591,7 +591,11 @@ export const layerExecutor: Layer.Layer<
                       sessionEnded ||
                       ("turnEnded" in error && error.turnEnded === true && !error.turnCompleted);
                     if (
-                      ((!("turnCompleted" in error) || !error.turnCompleted) && !queueFollowUp) ||
+                      !(
+                        ("turnCompleted" in error && error.turnCompleted) ||
+                        ("steerNotDelivered" in error && error.steerNotDelivered) ||
+                        queueFollowUp
+                      ) ||
                       effect.request.type !== "provider-turn.steer"
                     ) {
                       return yield* error;
@@ -609,6 +613,13 @@ export const layerExecutor: Layer.Layer<
                     const message = projection.messages.find((item) => item.id === messageId);
                     const run = projection.runs.find((item) => item.id === message?.runId);
                     if (message === undefined || run === undefined) return yield* error;
+                    // A live mailbox claim stays with its terminal/session recovery path.
+                    if (
+                      message.delegatedCompletion !== undefined &&
+                      !("turnCompleted" in error && error.turnCompleted) &&
+                      !queueFollowUp
+                    )
+                      return yield* error;
                     // A prior attempt may have queued this message before its outbox ack failed.
                     if (queueFollowUp && run.userMessageId === message.id) return;
                     yield* threads
@@ -628,6 +639,7 @@ export const layerExecutor: Layer.Layer<
                         dispatchMode: {
                           type:
                             !queueFollowUp &&
+                            !("steerNotDelivered" in error && error.steerNotDelivered) &&
                             message.delegatedCompletion === undefined &&
                             message.notification === undefined
                               ? "start_immediately"
@@ -1215,7 +1227,11 @@ export const layerWithOptions = (
           if (lane === "start") {
             // Idle lane probes must not queue write claims behind useful work.
             // The claim remains authoritative if another worker wins after this read.
-            const next = yield* outbox.nextStartClaimableAt;
+            const next = yield* outbox.nextStartClaimableAt.pipe(
+              Effect.withSpan("EffectWorker.startPreflight", {
+                attributes: { lane, "worker.id": workerId },
+              }),
+            );
             if (
               Option.isNone(next) ||
               DateTime.toEpochMillis(next.value) > DateTime.toEpochMillis(yield* DateTime.now)
@@ -1223,24 +1239,42 @@ export const layerWithOptions = (
               return false;
           }
           const claimExit = yield* Effect.exit(
-            outbox.claimNext({
-              workerId,
-              ...(threadId === undefined ? {} : { threadId }),
-              leaseDurationMs,
-              excludeRestartContinuations,
-              ...(lane === "control"
-                ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES }
-                : lane === "start"
-                  ? { onlyEffectTypes: EffectOutbox.START_LANE_EFFECT_TYPES }
-                  : threadId !== undefined
-                    ? {
-                        onlyEffectTypes: [
-                          "provider-runtime.continue",
-                          "provider-turn.start",
-                        ] as const,
-                      }
-                    : {}),
-            }),
+            outbox
+              .claimNext({
+                workerId,
+                ...(threadId === undefined ? {} : { threadId }),
+                leaseDurationMs,
+                excludeRestartContinuations,
+                ...(lane === "control"
+                  ? { onlyEffectTypes: EffectOutbox.CONTROL_LANE_EFFECT_TYPES }
+                  : lane === "start"
+                    ? { onlyEffectTypes: EffectOutbox.START_LANE_EFFECT_TYPES }
+                    : threadId !== undefined
+                      ? {
+                          onlyEffectTypes: [
+                            "provider-runtime.continue",
+                            "provider-turn.start",
+                          ] as const,
+                        }
+                      : {}),
+              })
+              .pipe(
+                Effect.tap((claimed) =>
+                  Effect.annotateCurrentSpan({
+                    result: Option.isSome(claimed) ? "claimed" : "empty",
+                    ...(Option.isSome(claimed)
+                      ? {
+                          "effect.id": claimed.value.id,
+                          "effect.type": claimed.value.request.type,
+                          "thread.id": claimed.value.threadId,
+                        }
+                      : {}),
+                  }),
+                ),
+                Effect.withSpan("EffectWorker.claim", {
+                  attributes: { lane, "worker.id": workerId },
+                }),
+              ),
           );
           yield* increment(orchestrationEffectClaimsTotal, {
             lane,

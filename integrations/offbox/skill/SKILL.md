@@ -24,9 +24,10 @@ offbox run --size xlarge -- make test-integration
 ```
 
 offbox finds the repo root (`git rev-parse --show-toplevel`, else cwd), rsyncs it to your box (only changed files;
-gitignored files git doesn't track, `.git`, secrets and `node_modules`/`.terraform`/caches are not sent; a tracked
-file sends even when .gitignore matches it, e.g. a committed `package-lock.json`), `cd`s into the same relative
-dir, runs, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
+gitignored files git doesn't track, `.git`, secrets and local installs/caches are excluded).
+Tracked files sync even through those filters, except root or symlinked `node_modules`; secret-pattern files
+sync automatically only in `--git` runs while unmodified against HEAD. Offbox runs in the same relative
+directory, streams stdout/stderr live, and exits with the remote exit code. Ctrl-C/SIGTERM kills the remote process.
 
 A repo’s pool name (at home and on the Boat standby alike) comes from its origin URL’s basename, normalized to lowercase letters, digits and dashes.
 If git is slow or fails, offbox reuses the last good name for that resolved checkout root and logs the fallback; a first failure warns before using the directory name.
@@ -177,7 +178,7 @@ A new worktree’s first run on a box can take minutes; it is seeded from a sibl
   `offbox run -- '<repo-install> && <repo-check>'`. Use `&&` so an install failure stops dependent checks;
   `--step` deliberately keeps going after a failed step.
   A missing node_modules bin (`command not found`, exit 127, or `not found` under npm/pnpm, exit 1/254) can mean
-  that box has no deps yet; local `node_modules` is never synced. Once #466's own-box affinity is installed,
+  that box has no deps yet; the root `node_modules` install is never synced. Once #466's own-box affinity is installed,
   separate runs can reuse deps while no box switch is reported.
 - Node version: offbox selects Node from the repo pin (`.nvmrc`/`.node-version`/`engines.node`), then the CI setup-node version, then the nvm default (or newest installed nvm Node, otherwise the box default), and prints its choice, provisioning a missing pinned version or stopping with exit 99; an open range pin (e.g. engines >=22) is narrowed to the CI setup-node version when that fits.
 - Bun-using runs match the Mac's installed Bun exactly, unless `.bun-version` or `packageManager: "bun@X.Y.Z"` pins it; `OFFBOX_BUN_VERSION=X.Y.Z` overrides once. Offbox installs a missing version and logs `offbox: bun X.Y.Z (from mac; box had …; box|cached|installed in Ns)`; without a working Mac Bun it uses 1.4.1.
@@ -469,7 +470,7 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 
 - Python/boto3 suites that take hours with idle pytest workers on a box: AWS instance-metadata lookups. Offbox now sets `AWS_EC2_METADATA_DISABLED=true` on every box run; older notes that say to pass `--env AWS_EC2_METADATA_DISABLED` by hand are no longer needed.
 - Go `unsafeTraceExpWriter redeclared`: stale overlay sources; the run preamble removes `runtime/traceexp.go` for Go 1.25+ and replaces mixed Go 1.26+ trees from the exact official release; template installs replace GOROOT, never overlay it.
-- Managed Go trees carry an official path/type/size manifest; a missing or mismatched manifest triggers a clean reinstall, verified with `go build std`. Healthy runs only scan the inventory, not compile it. Each repair first prints the old tree's state (`old tree manifest=missing|mismatch|ok`).
+- Managed Go trees carry an official path/type/size manifest; a missing or mismatched manifest triggers a clean reinstall, verified with `go build std`. An inventory that cannot run is unreadable, never triggers a reinstall, and a crashed inventory tool is an infra failure (exit 90) for runs that need Go. Healthy runs only scan the inventory, not compile it. Each repair first prints the old tree's state (`old tree manifest=missing|mismatch|ok|unreadable`).
 - Go `package unsafe is not in std` or `build constraints exclude all Go files in /usr/local/go/src/...` while other go commands in the same run pass: a box read glitch seen on the first run after a resume, not your code and not a repair race (one run per box). offbox prints a hint and logs a `go_std_glitch` event; rerun the same command. A nested `/usr/local/go/go` is a half-swapped GOROOT; the next run repairs it under a box-local lock and verifies the replacement.
 - Docker won't start on a box (`docker.service` 203/EXEC, `/usr/local/bin/sync-docker-firewall` missing): boat's Docker firewall hook was lost when the box resumed from an older snapshot. Every `offbox run` restores it from `templates/boat-sync-docker-firewall` and restarts a failed Docker; for an `offbox ssh` session, run any `offbox run -- true` first.
 - Python `libpq library not found` / psycopg `no pq wrapper available` (or `cannot open shared object file` for a library that is installed): the box resumed with a stale linker cache (`/etc/ld.so.cache`). Every `offbox run` runs `sudo ldconfig` first when an installed library is missing from the cache; in an `offbox ssh` session, run `sudo ldconfig` yourself. Reinstalling the package is not needed.
@@ -481,8 +482,8 @@ Detailed metadata logs are at `~/.robob/logs/tools/offbox/YYYY-MM-DD.ndjson` (UT
 - `remote dir ... missing`: you used `--no-sync` on a new box. Run once without it.
 - Tests can't find a file: it's gitignored and untracked, or matched a secret filter (`.env*`, `*.pem`, `*.key`,
   ...). Use `--include path`. Never sync real credentials; tests needing AWS stay local (`offbox local --reason`).
-  Tracked files go even when .gitignore matches them (offbox prints `also synced N git-tracked file(s) that
-  .gitignore matches: ...` when it sent any), so `npm ci`, `pnpm install --frozen-lockfile` and `go.sum` checks get their
+  Eligible tracked files go even when sync filters match them (offbox prints `also synced N git-tracked file(s)
+  that sync filters match: ...` only when it changed something on the box), so `npm ci`, `pnpm install --frozen-lockfile` and `go.sum` checks get their
   lockfile without `--include`.
 - Wrong arch: the box is linux/amd64. Don't sync built binaries; build on the box.
 - A box wedged after resume (kept image restore stuck and Docker not answering) is stopped and set aside, and the run moves once to another box; offbox release <box> --delete drops it for good.

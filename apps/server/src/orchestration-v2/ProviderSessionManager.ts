@@ -2988,13 +2988,22 @@ export const layerWithOptions = (
                 attemptId: turn.runAttemptId,
                 ended: entry.observedTurns.get(turn.id)?.ended ?? false,
               });
-            } else if (event.type === "turn.terminal" && event.nativeWorkEnded === true) {
+            } else if (
+              event.type === "turn.native-ended" ||
+              (event.type === "turn.terminal" && event.nativeWorkEnded === true)
+            ) {
               entry.observedTurns.set(event.providerTurnId, {
                 providerThreadId: event.providerThreadId,
-                attemptId: entry.observedTurns.get(event.providerTurnId)?.attemptId ?? null,
+                attemptId:
+                  event.type === "turn.native-ended"
+                    ? event.attemptId
+                    : (entry.observedTurns.get(event.providerTurnId)?.attemptId ?? null),
                 ended: true,
               });
             }
+            // Confirmation after local terminalization must not project another completion.
+            if (event.type === "turn.native-ended")
+              return publishToSubscribers(entry.eventSubscribers, { type: "event", event });
             // Live output skips run subscribers and ingestion entirely: it is
             // never persisted, and a flood of it must not queue ahead of real events.
             if (event.type === "command_output.delta") {

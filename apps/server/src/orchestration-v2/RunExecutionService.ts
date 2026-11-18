@@ -544,6 +544,8 @@ export function routeProviderEvent(
     case "command_output.delta":
       // The session manager hands live output to the command output hub; runs never see it.
       return [false, state];
+    case "turn.native-ended":
+      return [false, state];
     case "turn.terminal":
       return event.providerTurnId === state.rootProviderTurnId
         ? [true, { ...state, rootTurnEnded: true }]

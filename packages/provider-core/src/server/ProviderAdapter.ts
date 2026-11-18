@@ -144,6 +144,14 @@ export const ProviderAdapterV2Event = Schema.Union([
     plan: OrchestrationV2PlanArtifact,
   }),
   Schema.Struct({
+    /** Native settlement can follow an already-emitted local failure terminal. */
+    type: Schema.Literal("turn.native-ended"),
+    driver: ProviderDriverKind,
+    providerThreadId: ProviderThreadId,
+    providerTurnId: ProviderTurnId,
+    attemptId: RunAttemptId,
+  }),
+  Schema.Struct({
     type: Schema.Literal("turn.terminal"),
     /** A native result or authoritative idle observation, never local terminalization. */
     nativeWorkEnded: Schema.optional(Schema.Literal(true)),
@@ -326,6 +334,8 @@ export class ProviderAdapterSteerRunError extends Schema.TaggedError<ProviderAda
     driver: ProviderDriverKind,
     providerThreadId: ProviderThreadId,
     providerTurnId: ProviderTurnId,
+    // Only a rejection before handing input to the provider permits a follow-up.
+    delivery: Schema.optional(Schema.Literal("not_sent")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {

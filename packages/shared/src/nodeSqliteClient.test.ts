@@ -1839,6 +1839,7 @@ const blockCheckpointBehindReader = (
   sql: SqlClient.SqlClient,
   filename: string,
   worker: NodeWorkerThreads.Worker,
+  pages = 11000,
 ) =>
   Effect.gen(function* () {
     yield* sql.unsafe("PRAGMA journal_size_limit = 1").unprepared;
@@ -1854,7 +1855,7 @@ const blockCheckpointBehindReader = (
     const checkpointRequests = pauseCheckpointRequests(worker);
     yield* Effect.addFinalizer(() => Effect.sync(checkpointRequests.release));
     yield* sql.unsafe(`
-      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${pages})
       INSERT INTO pages(payload) SELECT randomblob(4000) FROM n
     `).unprepared;
     yield* writerBridgeBarrier();
@@ -1864,9 +1865,9 @@ const blockCheckpointBehindReader = (
     const blocked = waitForCheckpointMessage(worker, (request as { readonly id: unknown }).id);
     checkpointRequests.sendNext();
     const state = yield* Effect.promise(() => blocked);
-    assert.isTrue(state.blocked as boolean);
-    assert.isAbove(state.log as number, 0);
-    return { reader, checkpointRequests };
+    if (pages >= 10000) assert.isTrue(state.blocked as boolean);
+    assert.isAbove(state.log as number, pages);
+    return { reader, checkpointRequests, state };
   });
 
 const readCheckpointState = (db: NodeSqlite.DatabaseSync) => {
@@ -1876,6 +1877,36 @@ const readCheckpointState = (db: NodeSqlite.DatabaseSync) => {
   }
   return { log: state.log, checkpointed: state.checkpointed };
 };
+
+it.effect.skipIf(!supportsNoopCheckpoint)(
+  "admits concurrent writers while a reader pins an oversized WAL below the frame ceiling",
+  () =>
+    withCheckpointClient((sql, filename) =>
+      Effect.gen(function* () {
+        const worker = startedWorkers.at(-1)!;
+        const { reader, checkpointRequests, state } = yield* blockCheckpointBehindReader(
+          sql,
+          filename,
+          worker,
+          1200,
+        );
+        assert.isBelow(state.log as number, 10000);
+        assert.isBelow(state.checkpointed as number, state.log as number);
+        const finished = yield* Deferred.make<void>();
+        const writers = yield* Effect.all(
+          [1, 2].map((value) => sql.withTransaction(sql`INSERT INTO entries VALUES (${value})`)),
+          { concurrency: 2 },
+        ).pipe(Effect.andThen(Deferred.succeed(finished, undefined)), Effect.forkChild);
+        yield* Deferred.await(finished).pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+        yield* Fiber.join(writers);
+        assert.equal(reader.prepare("SELECT COUNT(*) AS count FROM entries").get()?.count, 0);
+        assert.deepEqual(yield* sql`SELECT value FROM entries ORDER BY value`.values, [[1], [2]]);
+        reader.exec("ROLLBACK");
+        checkpointRequests.release();
+        yield* checkpointWorkerReply(worker);
+      }),
+    ),
+);
 
 it.effect.each([false, true])(
   "names the acquired writer checkpoint wait and closes its spans (interrupted=%s)",
@@ -2498,8 +2529,8 @@ it.effect.each([false, true])(
           assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 1202 }]);
           assert.equal(reader.prepare("SELECT COUNT(*) AS count FROM pages").get()?.count, 1201);
         } else {
-          yield* eventLoopTurn;
-          assert.isUndefined(write.pollUnsafe(), "the physical size limit must still gate writes");
+          yield* Fiber.join(write).pipe(Effect.timeout("3 seconds"), TestClock.withLive);
+          assert.deepEqual(yield* sql`SELECT COUNT(*) AS count FROM pages`, [{ count: 1201 }]);
           assert.equal(reader.prepare("SELECT COUNT(*) AS count FROM pages").get()?.count, 1200);
         }
         reader.exec("ROLLBACK");
@@ -2510,7 +2541,7 @@ it.effect.each([false, true])(
           { count: resetDuringHandoff ? 1203 : 1202 },
         ]);
         assert.isAtMost(Number((yield* fs.stat(`${filename}-wal`)).size), limit);
-        assert.equal(reply.blocked, !resetDuringHandoff);
+        assert.isFalse(reply.blocked as boolean);
         // Both implementations eventually reply; only a bound distinguishes SQLite's 5s busy wait.
         assert.isBelow(elapsed, 1000, "TRUNCATE must return promptly while the reader stays open");
       }),
@@ -2737,7 +2768,7 @@ it.effect.each(["PRAGMA incremental_vacuum(1)", "PRAGMA user_version = 42"])(
         yield* sql`PRAGMA auto_vacuum = INCREMENTAL`;
         yield* sql`VACUUM`;
         yield* sql`CREATE TABLE reclaim(payload BLOB)`;
-        yield* sql`INSERT INTO reclaim VALUES (zeroblob(8000000))`;
+        yield* sql`INSERT INTO reclaim VALUES (zeroblob(64000000))`;
         yield* sql`DELETE FROM reclaim`;
         yield* checkpointWorkerReply(worker);
         const { reader, checkpointRequests } = yield* blockCheckpointBehindReader(

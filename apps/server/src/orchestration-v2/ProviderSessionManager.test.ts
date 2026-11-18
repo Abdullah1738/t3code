@@ -1422,95 +1422,109 @@ it.effect("retains unprojected start settlement without bypassing a projected li
   }),
 );
 
-it.effect("retains exact native terminal evidence independently of held background work", () =>
-  Effect.gen(function* () {
-    const state = yield* Ref.make(emptyState);
-    yield* Effect.gen(function* () {
-      const f = yield* makeSessionAudienceFixture(state, 2);
-      const threadId = f.threadIds[0]!;
-      const owner = f.providerThreadOf(threadId);
-      const runId = f.idAllocator.derive.run({ threadId, ordinal: 1 });
-      const attemptId = f.idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 });
-      const turnId = (nativeTurnId: string) =>
-        f.idAllocator.derive.providerTurn({ driver: f.runtime.driver, nativeTurnId });
-      const first = turnId("first-native-turn");
-      const second = turnId("overlapping-native-turn");
-      const target = { providerThreadId: owner.id, providerTurnId: first };
-      const startingTarget = {
-        ...target,
-        providerTurnId: turnId("unattached-placeholder"),
-        attemptId,
-      };
-      const observed = f.runtime.hasObservedTurnEnd!;
-      const update = (id: typeof first, status: "running" | "failed" = "running") =>
-        f.publish({
-          type: "provider_turn.updated",
-          driver: f.runtime.driver,
-          threadId,
-          providerTurn: {
-            id,
-            providerThreadId: owner.id,
-            nodeId: f.idAllocator.derive.rootNode({ runId }),
-            runAttemptId: attemptId,
-            nativeTurnRef: null,
-            ordinal: 1,
-            status,
-            startedAt: f.now,
-            completedAt: status === "failed" ? f.now : null,
-          },
-        });
-      const finish = (providerTurnId: typeof first) =>
-        f.publish({
+it.effect.each(["turn.terminal", "turn.native-ended"] as const)(
+  "retains exact %s evidence independently of held background work",
+  (evidence) =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      yield* Effect.gen(function* () {
+        const f = yield* makeSessionAudienceFixture(state, 2);
+        const threadId = f.threadIds[0]!;
+        const owner = f.providerThreadOf(threadId);
+        const runId = f.idAllocator.derive.run({ threadId, ordinal: 1 });
+        const attemptId = f.idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 });
+        const turnId = (nativeTurnId: string) =>
+          f.idAllocator.derive.providerTurn({ driver: f.runtime.driver, nativeTurnId });
+        const first = turnId("first-native-turn");
+        const second = turnId("overlapping-native-turn");
+        const target = { providerThreadId: owner.id, providerTurnId: first };
+        const startingTarget = {
+          ...target,
+          providerTurnId: turnId("unattached-placeholder"),
+          attemptId,
+        };
+        const observed = f.runtime.hasObservedTurnEnd!;
+        const update = (id: typeof first, status: "running" | "failed" = "running") =>
+          f.publish({
+            type: "provider_turn.updated",
+            driver: f.runtime.driver,
+            threadId,
+            providerTurn: {
+              id,
+              providerThreadId: owner.id,
+              nodeId: f.idAllocator.derive.rootNode({ runId }),
+              runAttemptId: attemptId,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status,
+              startedAt: f.now,
+              completedAt: status === "failed" ? f.now : null,
+            },
+          });
+        const finish = (providerTurnId: typeof first) =>
+          f.publish(
+            evidence === "turn.native-ended"
+              ? {
+                  type: evidence,
+                  driver: f.runtime.driver,
+                  providerThreadId: owner.id,
+                  providerTurnId,
+                  attemptId,
+                }
+              : {
+                  type: "turn.terminal",
+                  nativeWorkEnded: true,
+                  driver: f.runtime.driver,
+                  providerThreadId: owner.id,
+                  providerTurnId,
+                  runOrdinal: 1,
+                  status: "interrupted",
+                  failure: null,
+                  threadDisposition: "reusable",
+                },
+          );
+        assert.isFalse(yield* observed(target));
+        assert.isFalse(yield* observed(startingTarget));
+        yield* update(first);
+        yield* update(first, "failed");
+        yield* f.publish({
           type: "turn.terminal",
-          nativeWorkEnded: true,
           driver: f.runtime.driver,
           providerThreadId: owner.id,
-          providerTurnId,
+          providerTurnId: first,
           runOrdinal: 1,
           status: "interrupted",
           failure: null,
           threadDisposition: "reusable",
         });
-      assert.isFalse(yield* observed(target));
-      assert.isFalse(yield* observed(startingTarget));
-      yield* update(first);
-      yield* update(first, "failed");
-      yield* f.publish({
-        type: "turn.terminal",
-        driver: f.runtime.driver,
-        providerThreadId: owner.id,
-        providerTurnId: first,
-        runOrdinal: 1,
-        status: "interrupted",
-        failure: null,
-        threadDisposition: "reusable",
-      });
-      assert.isFalse(yield* observed(target));
-      assert.isFalse(yield* observed(startingTarget));
-      yield* update(second);
-      yield* finish(first);
-      assert.isTrue(yield* observed(target));
-      assert.isFalse(yield* observed(startingTarget));
-      yield* finish(second);
-      assert.isTrue(yield* observed(startingTarget));
-      assert.isTrue(yield* f.runtime.hasPendingBackgroundWorkForThread!(owner));
-      assert.isFalse(
-        yield* observed({ ...target, providerThreadId: f.providerThreadOf(f.threadIds[1]!).id }),
+        assert.isFalse(yield* observed(target));
+        assert.isFalse(yield* observed(startingTarget));
+        yield* update(second);
+        yield* finish(first);
+        assert.isTrue(yield* observed(target));
+        assert.isFalse(yield* observed(startingTarget));
+        yield* finish(second);
+        assert.isTrue(yield* observed(startingTarget));
+        assert.isTrue(yield* f.runtime.hasPendingBackgroundWorkForThread!(owner));
+        assert.isFalse(
+          yield* observed({ ...target, providerThreadId: f.providerThreadOf(f.threadIds[1]!).id }),
+        );
+        assert.isFalse(yield* observed({ ...target, providerTurnId: turnId("unknown") }));
+        assert.isFalse(
+          yield* observed({
+            ...startingTarget,
+            attemptId: f.idAllocator.derive.runAttempt({ runId, attemptOrdinal: 2 }),
+          }),
+        );
+        // Terminal can reach the pump before the delayed initial turn update.
+        const delayed = turnId("late-initial-update");
+        yield* finish(delayed);
+        yield* update(delayed);
+        assert.isTrue(yield* observed({ ...target, providerTurnId: delayed }));
+      }).pipe(
+        Effect.provide(layerTest({ state, pendingWorkForThread: () => Effect.succeed(true) })),
       );
-      assert.isFalse(yield* observed({ ...target, providerTurnId: turnId("unknown") }));
-      assert.isFalse(
-        yield* observed({
-          ...startingTarget,
-          attemptId: f.idAllocator.derive.runAttempt({ runId, attemptOrdinal: 2 }),
-        }),
-      );
-      // Terminal can reach the pump before the delayed initial turn update.
-      const delayed = turnId("late-initial-update");
-      yield* finish(delayed);
-      yield* update(delayed);
-      assert.isTrue(yield* observed({ ...target, providerTurnId: delayed }));
-    }).pipe(Effect.provide(layerTest({ state, pendingWorkForThread: () => Effect.succeed(true) })));
-  }),
+    }),
 );
 
 it.effect(

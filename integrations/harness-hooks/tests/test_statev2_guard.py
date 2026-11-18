@@ -371,7 +371,8 @@ class GuardTests(unittest.TestCase):
                 command = prefix + 'bash -n tmp/checked.py\npython3 -I tmp/checked.py'
                 rule, cause = guard.classify_detail(command, str(self.root))
                 self.assertEqual(rule, UNRESOLVED, cause)
-                self.assertIn('shell lookup or startup proof failed', cause)
+                self.assertIn('BASH_ENV: expected ', cause)
+                self.assertIn(str(Path.home() / '.local/libexec/repo-node-pin/bash-env.sh'), cause)
             with patch.dict(os.environ, {'BASH_FUNC_node%%': "() { printf 'print(2)\\n' > tmp/checked.py; }"}):
                 command = prefix + self.heredoc('tmp/checked.mjs', 'console.log(1)')
                 command += 'node --check tmp/checked.mjs\npython3 -I tmp/checked.py'
@@ -1493,8 +1494,11 @@ bash "$TASK_DIR/step5r.sh"
                 with patch.dict(os.environ, environment), self.subTest(mutation=mutation, execution=execution):
                     rule, cause = guard.classify_detail(source + mutation + '\n' + execution, str(self.root))
                     self.assertEqual(rule, UNRESOLVED, cause)
-                    self.assertIn('executable provenance or mutation proof failed' if mutation == 'opaque-mutator'
-                                  else 'startup proof failed', cause)
+                    if mutation == 'opaque-mutator':
+                        self.assertIn('executable provenance or mutation proof failed', cause)
+                    else:
+                        self.assertIn('may be changed by this command', cause)
+                        self.assertIn(str(package) if 'package-alias' in mutation else str(helper), cause)
         with patch.dict(os.environ, environment):
             for execution in ('bash tmp/a.sh', './tmp/a.sh'):
                 self.assertEqual(guard.classify_detail(source + "printf '%s' ok > sibling.txt\n" + execution,
@@ -5259,6 +5263,215 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
         return ('bash tmp/fixture.sh', '/bin/bash ' + str(self.root / 'tmp/fixture.sh'),
                 'offbox run --bg -- bash tmp/fixture.sh')
 
+    def test_repo_node_pin_node_path_parity(self):
+        self.root = self.root.resolve()
+        home, helper, environment = self.repo_node_pin()
+        node = home / '.nvm/versions/node/v26.0.0/bin/node'
+        node.chmod(0o700)
+        script = self.write('repo/scripts/x.mjs', 'console.log(1);\n')
+        repo = script.parent.parent
+        (repo / 'package.json').write_text('{"engines":{"node":">=22"}}')
+        unrelated = self.root / 'elsewhere'
+        unrelated.mkdir()
+        environment['PATH'] = str(node.parent) + os.pathsep + os.environ['PATH']
+        with patch.dict(os.environ, environment):
+            for git_kind in ('directory', 'file'):
+                git = repo / '.git'
+                git.mkdir() if git_kind == 'directory' else git.write_text('gitdir: /unused/worktree\n')
+                for cwd in (repo, script.parent, unrelated):
+                    for executable in (str(node), 'node'):
+                        for mode in ('--check ', ''):
+                            for chain in ('{}', '{} && git diff -- package.json'):
+                                for operand in (str(script), os.path.relpath(script, cwd)):
+                                    command = chain.format(shlex.quote(executable) + ' ' + mode + shlex.quote(operand))
+                                    with self.subTest(git=git_kind, cwd=cwd, command=command):
+                                        self.assertEqual(guard.classify_detail(command, str(cwd)), (None, None))
+                git.rmdir() if git.is_dir() else git.unlink()
+
+    def test_repo_node_pin_node_startup_mutations_stay_denied(self):
+        self.root = self.root.resolve()
+        home, helper, environment = self.repo_node_pin()
+        node = home / '.nvm/versions/node/v26.0.0/bin/node'
+        node.chmod(0o700)
+        script = self.write('scripts/x.mjs', 'console.log(1);\n')
+        (self.root / '.git').write_text('gitdir: /unused/worktree\n')
+        (self.root / 'package.json').write_text('{}')
+        environment['PATH'] = str(node.parent) + os.pathsep + os.environ['PATH']
+        targets = [node, node.parent / 'cat', helper / 'init.sh',
+                   home / '.safe-chain/scripts/init-posix.sh', self.root / 'package.json']
+        with patch.dict(os.environ, environment):
+            for executable in (str(node), 'node'):
+                for mode in ('--check ', ''):
+                    check = shlex.quote(executable) + ' ' + mode + shlex.quote(str(script))
+                    for target in targets:
+                        for writer in ('cp /untrusted ' + shlex.quote(str(target)) + '; ',
+                                       "cat > " + shlex.quote(str(target)) + " <<'EOF'\nchanged\nEOF\n"):
+                            with self.subTest(target=target, check=check, writer=writer):
+                                prepared = self.heredoc(str(script), 'console.log(1);') if not mode else ''
+                                rule, reason = guard.classify_detail(prepared + writer + check, str(self.root))
+                                self.assertEqual(rule, UNRESOLVED)
+                                self.assertIn('startup', reason)
+                    for prefix in ('NODE_OPTIONS=--require=/untrusted ', 'BASH_ENV=' + environment['BASH_ENV'] + ' '):
+                        with self.subTest(prefix=prefix, check=check):
+                            prepared = self.heredoc(str(script), 'console.log(1);') if not mode else ''
+                            self.assertEqual(self.classify(prepared + prefix + check), UNRESOLVED)
+            with patch.dict(os.environ, {'NODE_OPTIONS': '--require=/untrusted'}):
+                self.assertEqual(self.classify(str(node) + ' --check ' + str(script)), UNRESOLVED)
+
+    def test_repo_node_pin_startup_refusal_names_input(self):
+        self.root = self.root.resolve()
+        home, helper, environment = self.repo_node_pin()
+        node = home / '.nvm/versions/node/v26.0.0/bin/node'
+        node.chmod(0o700)
+        script = self.write('scripts/x.mjs', 'console.log(1);\n')
+        command = str(node) + ' --check ' + str(script)
+
+        def refused(extra, expected):
+            with patch.dict(os.environ, {**environment, **extra}):
+                rule, reason = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED)
+                self.assertIn(expected, reason)
+                message = guard.refusal_reason(rule, reason, str(self.root))
+                self.assertIn(expected, message)
+                self.assertNotIn('literal absolute script path', message)
+
+        refused({'PATH': '.:' + os.environ['PATH']}, "PATH entry '.' is not absolute")
+        refused({'PYTHONPATH': '/untrusted'}, 'PYTHONPATH')
+        shadow = node.parent / 'cat'
+        shadow.write_text('')
+        refused({}, str(shadow) + ' shadows trusted cat')
+        shadow.unlink()
+        package = self.root / 'package.json'
+        os.mkfifo(package)
+        refused({}, str(package) + ' unsafe')
+        package.unlink()
+        (helper / 'init.sh').write_text('changed')
+        refused({}, str(helper / 'init.sh') + ' hash does not match reviewed bytes')
+
+    def test_repo_node_pin_predecessors_remain_denied(self):
+        self.root = self.root.resolve()
+        home, helper, environment = self.repo_node_pin()
+        node = home / '.nvm/versions/node/v26.0.0/bin/node'
+        node.chmod(0o700)
+        python = self.write('unproved-bin/python3', '')
+        python.chmod(0o700)
+        environment['PATH'] = os.pathsep.join((str(node.parent), str(python.parent), os.environ['PATH']))
+        (self.root / '.git').write_text('gitdir: /unused/worktree\n')
+        (self.root / 'package.json').write_text('{}')
+        fixtures = Path(__file__).with_name('fixtures') / 'node-startup'
+        with patch.dict(os.environ, environment):
+            for row, predecessor in ((173, 'preceding python3 at line 1: python3: executable provenance'),
+                                     (775, 'preceding git at line 1: git: startup configuration unproved')):
+                command = (fixtures / f'crpko4207-row{row}.sh').read_text()
+                with self.subTest(row=row):
+                    rule, reason = guard.classify_detail(command, str(self.root))
+                    self.assertEqual(rule, UNRESOLVED)
+                    self.assertIn('startup input /opt/homebrew/bin/python3', reason)
+                    self.assertIn(predecessor, reason)
+                    message = guard.refusal_reason(rule, reason, str(self.root))
+                    self.assertIn(predecessor, message)
+                    self.assertNotIn('literal absolute script path', message)
+
+    def test_repo_node_pin_bindings_survive_offbox_boundary(self):
+        self.write_plain_subpath_fixture()
+        home, helper, environment = self.repo_node_pin()
+        (self.root / 'package.json').write_text('{}')
+        evil = self.write('tmp/evil.sh', 'printf bad > "$HOME/.robob/userdata/statev2.sqlite"\n')
+        bindings = {
+            'ROBOB_REPO_NODE_PYTHON': str(evil),
+            'ROBOB_REPO_NODE_HELPER': str(helper),
+            'ROBOB_REPO_PREVIOUS_BASH_ENV': environment['BASH_ENV'],
+            'ROBOB_REPO_NODE': '/unproved/node',
+            'ROBOB_REPO_PNPM_CLI': '/unproved/pnpm',
+            '_repo_node_added_node': '/usr/bin',
+            '_repo_node_hooked': '1',
+            '_repo_node_busy': '0',
+            '_repo_node_seen_pwd': str(self.root),
+            'COREPACK_HOME': '/unproved/corepack',
+            'NVM_DIR': str(home / '.nvm'),
+            'CDPATH': '/unproved',
+            'HOME': '/unproved',
+            'BASH_ENV': environment['BASH_ENV'],
+        }
+        with patch.dict(os.environ, environment):
+            for payload in ('offbox run -- bash tmp/fixture.sh', 'offbox run --bg -- bash tmp/fixture.sh'):
+                self.assertIsNone(self.classify(payload))
+                for name, value in bindings.items():
+                    assignment = name + '=' + shlex.quote(value)
+                    for prefix in (assignment + ' ', 'env ' + assignment + ' ', 'export ' + assignment + '; ',
+                                   'unset ' + name + '; '):
+                        with self.subTest(name=name, prefix=prefix, payload=payload):
+                            self.assertIsNotNone(self.classify(prefix + payload))
+            for prefix in ('NODE_OPTIONS=--require=/unproved ', 'env NODE_OPTIONS=--require=/unproved ',
+                           'export NODE_OPTIONS=--require=/unproved; '):
+                with self.subTest(prefix=prefix):
+                    self.assertIsNotNone(self.classify(prefix + 'offbox run -- node --check tmp/x.mjs'))
+
+    def test_repo_node_pin_unset_bindings_keep_startup_unproved(self):
+        self.root = self.root.resolve()
+        home, helper, environment = self.repo_node_pin()
+        node = home / '.nvm/versions/node/v26.0.0/bin/node'
+        node.chmod(0o700)
+        script = self.write('scripts/x.mjs', 'console.log(1);\n')
+        (self.root / 'package.json').write_text('{}')
+        (self.root / '.nvmrc').write_text('default\n')
+        (self.root / '.git').write_text('gitdir: /unused/worktree\n')
+        (self.root / 'sub').mkdir()
+        marker = self.write('marker/input', '{}')
+        alias = home / '.nvm/alias/default'
+        alias.parent.mkdir()
+        os.link(marker, alias)
+        safe_nvm = self.root / 'safe-nvm'
+        (safe_nvm / 'alias').mkdir(parents=True)
+        (safe_nvm / 'alias/default').write_text('v26.0.0\n')
+        environment['NVM_DIR'] = str(safe_nvm)
+        environment['PATH'] = str(node.parent) + os.pathsep + os.environ['PATH']
+        self.assertFalse(guard._repo_node_pin_input_safe(alias))
+        self.write_plain_subpath_fixture()
+        names = ('PATH', 'IFS', 'HOME', 'BASH_ENV', 'ENV', 'BASHOPTS', 'SHELLOPTS', 'CDPATH',
+                 'ZDOTDIR', 'NODE_OPTIONS', 'NVM_DIR', 'COREPACK_HOME', 'ROBOB_REPO_NODE_HELPER',
+                 'ROBOB_REPO_NODE_PYTHON', 'ROBOB_REPO_PREVIOUS_BASH_ENV', 'ROBOB_REPO_NODE',
+                 'ROBOB_REPO_PNPM_CLI', '_repo_node_added_node', '_repo_node_hooked',
+                 '_repo_node_busy', '_repo_node_seen_pwd', 'PYTHONPATH', 'DYLD_INSERT_LIBRARIES')
+        with patch.dict(os.environ, environment):
+            for executable in ('node', str(node)):
+                for operand in ('../scripts/x.mjs', str(script)):
+                    check = 'cd sub; ' + shlex.quote(executable) + ' --check ' + shlex.quote(operand)
+                    with self.subTest(executable=executable, operand=operand):
+                        self.assertEqual(guard.classify_detail(check, str(self.root)), (None, None))
+                        self.assertIsNone(self.classify('unset UNUSED; ' + check))
+                        rule, cause = guard.classify_detail('unset NVM_DIR; ' + check, str(self.root))
+                        self.assertEqual(rule, UNRESOLVED, cause)
+                        self.assertIn('NVM_DIR unset at line 1', cause)
+            check = 'node --check scripts/x.mjs'
+            for name in names:
+                with self.subTest(name=name):
+                    rule, cause = guard.classify_detail('unset ' + name + '; ' + check, str(self.root))
+                    self.assertEqual(rule, UNRESOLVED, cause)
+                    self.assertIn(name + ' unset at line 1', cause)
+                    self.assertNotIn('literal absolute script path', guard.refusal_reason(rule, cause, str(self.root)))
+            for wrapper in ('offbox run -- ', 'offbox run --bg -- '):
+                fixture = 'bash tmp/fixture.sh'
+                self.assertIsNone(self.classify(wrapper + fixture))
+                for name in names:
+                    for command in ('unset ' + name + '; ' + wrapper + fixture,
+                                    wrapper + shlex.quote('unset ' + name + '; ' + fixture)):
+                        with self.subTest(name=name, command=command):
+                            self.assertEqual(self.classify(command), SCRIPT)
+                    retained = self.heredoc('tmp/retained.sh', 'echo ok')
+                    command = retained + 'unset ' + name + '; ' + wrapper + 'bash tmp/retained.sh'
+                    with self.subTest(name=name, retained=True, wrapper=wrapper):
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, UNRESOLVED, cause)
+                        self.assertIn(name + ' unset at line ', cause)
+            for prefix in ('unset UNUSED NVM_DIR; ', 'unset NVM_DIR UNUSED; ', 'command unset NVM_DIR; ',
+                           'builtin unset NVM_DIR; ', 'unset -- NVM_DIR; ', 'unset -v NVM_DIR; ',
+                           'unset -v -- NVM_DIR; ', 'unset -n NVM_DIR; ', 'env -u NVM_DIR ',
+                           'env -uNVM_DIR ', 'env --unset NVM_DIR ', 'env --unset=NVM_DIR '):
+                for wrapper in ('', 'offbox run -- ', 'offbox run --bg -- '):
+                    with self.subTest(prefix=prefix, wrapper=wrapper):
+                        self.assertEqual(self.classify(prefix + wrapper + check), UNRESOLVED)
+
     def test_inherited_repo_node_pin_bash_env_keeps_fixture_proof(self):
         commands = self.write_plain_subpath_fixture()
         home, helper, environment = self.repo_node_pin()
@@ -6949,6 +7162,226 @@ class LiveDatabaseGuardTests(unittest.TestCase):
         self.assertEqual(result["context"]["rule"], "live-database-unavailable")
         self.assertNotIn("private error", result["reason"])
         self.assertNotIn("private error", (self.root / "state/decisions.jsonl").read_text())
+
+
+class ZshStartupTests(unittest.TestCase):
+    REPORTERS = (
+        '/Users/ardud/.robob/worktrees/t3code-fork/installer-backups/integrations/run-cloud/install.zsh',
+        '/Users/ardud/.robob/worktrees/t3code-fork/fix-offbox-pinned-hold-254/integrations/offbox/install.zsh',
+        '/Users/ardud/.robob/release-builds/release-20261113.13-s13/build/build.zsh',
+        '/Volumes/ExternalSSD/t3code-wt/mac-read-watchdog-bounded-probe/integrations/local-helpers/bin/robob-read-watchdog',
+        '/Volumes/ExternalSSD/t3code-fork/integrations/local-helpers/bin/opencode-web',
+        '/Users/ardud/.robob/install-20261113.14-sup/run-install.zsh',
+    )
+
+    def setUp(self):
+        clean = isolated_source_cases.fixture_environment_patch()
+        clean.start()
+        self.addCleanup(clean.stop)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.global_env = self.root / 'zshenv'
+        global_path = patch.object(guard, 'ZSH_GLOBAL_ENV', str(self.global_env))
+        global_path.start()
+        self.addCleanup(global_path.stop)
+        # Classification must not depend on zsh being installed on the box.
+        which = guard.shutil.which
+        lookup = patch.object(guard.shutil, 'which', side_effect=lambda name, *a, **kw:
+                              '/bin/zsh' if name == 'zsh' else which(name, *a, **kw))
+        lookup.start()
+        self.addCleanup(lookup.stop)
+        self.script = self.root / 'check.zsh'
+        self.script.write_text('echo ok\n')
+
+    def test_zsh_no_rcs_parse_only_forms(self):
+        rows = [
+            '/bin/zsh -f -n ' + str(self.script),
+            'zsh -fn check.zsh', 'zsh -nf check.zsh', 'zsh -efn check.zsh', 'zsh -n -f check.zsh',
+            '/bin/zsh --no-rcs -n ' + str(self.script),
+            'zsh --norcs -n check.zsh', 'zsh -o norcs -n check.zsh',
+            'zsh +o rcs -n check.zsh', 'zsh -f -n -- check.zsh',
+            *(f'zsh {flags} check.zsh' for flags in
+              ('-dfn', '-dnf', '-fdn', '-fnd', '-ndf', '-nfd', '-d -fn', '-f -d -n', '-fn -d')),
+            '/bin/zsh -dfn /Users/ardud/.robob/install-20261113.14-sup/run-install.zsh',
+            *('/bin/zsh -f -n ' + target for target in self.REPORTERS),
+        ]
+        lstat = os.lstat
+        root_file = os.stat_result((stat.S_IFREG | 0o644, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+        for present in (False, True):
+            with self.subTest(global_env_present=present):
+                def global_stat(path, *args, **kwargs):
+                    return root_file if present and os.fspath(path) == str(self.global_env) else lstat(path, *args, **kwargs)
+                with patch.object(os, 'lstat', side_effect=global_stat):
+                    for command in rows:
+                        with self.subTest(command=command):
+                            self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+
+    def test_zsh_startup_options_remain_bounded(self):
+        rows = ('-n', '-n check.zsh', '-l -f -n', '--login -f -n', '-i -f -n',
+                '-f -o rcs -n', '-f +o norcs -n', '-f +f -n', '-f --unknown -n',
+                '-o rcs -f -n', '-f -o unknown -n', '-fln', '-fin', '-n check.zsh -f',
+                '-dn', '-d -n', '-gfn', '-hfn', '-dgfn', '-fD -n', '-d -f -o rcs -n')
+        for options in rows:
+            with self.subTest(options=options):
+                rule, cause = guard.classify_detail('zsh ' + options + ' check.zsh', str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('zsh: implicit startup unproved', cause)
+                message = guard.refusal_reason(rule, cause, str(self.root))
+                self.assertIn('zsh -f -n', message)
+                self.assertIn('one file per call', message)
+                self.assertNotIn('literal absolute script path', message)
+
+        command = '/bin/zsh -n /Volumes/ExternalSSD/t3code-fork/integrations/local-helpers/bin/opencode-web'
+        rule, cause = guard.classify_detail(command, str(self.root))
+        self.assertEqual(rule, UNRESOLVED, cause)
+        self.assertIn('zsh: implicit startup unproved', cause)
+
+    def test_zsh_global_startup_file_trust(self):
+        for mode, uid in ((stat.S_IFREG | 0o664, 0), (stat.S_IFREG | 0o646, 0),
+                          (stat.S_IFREG | 0o644, 501), (stat.S_IFLNK | 0o777, 0),
+                          (stat.S_IFDIR | 0o755, 0), (stat.S_IFIFO | 0o600, 0)):
+            info = os.stat_result((mode, 1, 1, 1, uid, 0, 0, 0, 0, 0))
+            lstat = os.lstat
+            with self.subTest(mode=mode, uid=uid), patch.object(os, 'lstat', side_effect=lambda path, *a, **kw:
+                    info if os.fspath(path) == str(self.global_env) else lstat(path, *a, **kw)):
+                rule, cause = guard.classify_detail('zsh -f -n check.zsh', str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('zsh: /etc/zshenv startup unproved', cause)
+                message = guard.refusal_reason(rule, cause, str(self.root))
+                self.assertNotIn('literal absolute script path', message)
+                self.assertNotIn('Use zsh -f -n', message)
+        for error in (PermissionError('unreadable'), OSError('unavailable')):
+            lstat = os.lstat
+            def global_error(path, *args, **kwargs):
+                if os.fspath(path) == str(self.global_env):
+                    raise error
+                return lstat(path, *args, **kwargs)
+            with self.subTest(error=type(error).__name__), patch.object(os, 'lstat', side_effect=global_error):
+                self.assertEqual(guard.classify('zsh -f -n check.zsh', str(self.root)), UNRESOLVED)
+
+    def test_zsh_preserves_environment_and_mutation_checks(self):
+        for prefix in ('ZDOTDIR=/tmp/x ', 'ENV=/tmp/x ', 'BASH_ENV=/tmp/x ', 'DYLD_INSERT_LIBRARIES=/tmp/x '):
+            with self.subTest(prefix=prefix):
+                rule, cause = guard.classify_detail(prefix + 'zsh -f -n check.zsh', str(self.root))
+                self.assertEqual(rule, UNRESOLVED)
+                self.assertNotIn('literal absolute script path', guard.refusal_reason(rule, cause, str(self.root)))
+        with patch.dict(os.environ, {'ZDOTDIR': '/tmp/x'}):
+            self.assertEqual(guard.classify('zsh -f -n check.zsh', str(self.root)), UNRESOLVED)
+        for prefix in ('cp replacement ' + str(self.global_env), 'echo changed > ' + str(self.global_env),
+                       'cp replacement /bin/zsh'):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(guard.classify(prefix + '\nzsh -f -n check.zsh', str(self.root)), UNRESOLVED)
+        self.assertEqual(guard.classify('zsh -f -n ' + LIVE, str(self.root)), READ)
+        (self.root / 'database-alias').symlink_to(LIVE)
+        self.assertEqual(guard.classify('zsh -f -n database-alias', str(self.root)), READ)
+        self.script.write_text('cat ' + LIVE + '\n')
+        self.assertEqual(guard.classify('zsh -f check.zsh', str(self.root)), SCRIPT)
+        self.assertEqual(guard.classify('zsh -f -c ' + shlex.quote('cat ' + LIVE), str(self.root)), READ)
+
+    def test_zsh_execution_option_forms_scan_source(self):
+        source = 'cat ' + LIVE + '\n'
+        self.script.write_text(source)
+        options = ('-f -e', '-e -f', '-fe', '-ef', '-e -o norcs', '-o norcs -e',
+                   '-e +o rcs', '+o rcs -e', '--no-rcs -e', '-e --no-rcs',
+                   '-f -u', '-fu', '-uf', '-f -v', '-fv', '-vf', '-f -x', '-fx', '-xf')
+        writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+        for flags in options:
+            for prefix in ('', writer):
+                with self.subTest(flags=flags, same_call=bool(prefix)):
+                    command = prefix + '/bin/zsh ' + flags + ' check.zsh'
+                    self.assertEqual(guard.classify(command, str(self.root)), SCRIPT)
+            with self.subTest(flags=flags, mode='inline'):
+                command = '/bin/zsh ' + flags + ' -c ' + shlex.quote(source)
+                self.assertEqual(guard.classify(command, str(self.root)), READ)
+            with self.subTest(flags=flags, mode='stdin'):
+                command = '/bin/zsh ' + flags + " -s <<'SOURCE'\n" + source + 'SOURCE\n'
+                self.assertEqual(guard.classify(command, str(self.root)), READ)
+        self.script.write_text('echo ok\n')
+        for flags in options:
+            with self.subTest(flags=flags, mode='safe script'):
+                self.assertEqual(guard.classify('/bin/zsh ' + flags + ' check.zsh', str(self.root)), None)
+
+    def test_zsh_no_global_rcs_keeps_startup_and_execution_checks(self):
+        source = 'cat ' + LIVE + '\n'
+        self.script.write_text(source)
+        writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+        for flags in ('-df', '-fd', '-d -f', '-f -d'):
+            for prefix in ('', writer):
+                with self.subTest(flags=flags, same_call=bool(prefix)):
+                    self.assertEqual(guard.classify(prefix + '/bin/zsh ' + flags + ' check.zsh', str(self.root)), SCRIPT)
+            with self.subTest(flags=flags, inline=True):
+                self.assertEqual(guard.classify('/bin/zsh ' + flags + ' -c ' + shlex.quote(source), str(self.root)), READ)
+        info = os.stat_result((stat.S_IFREG | 0o666, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+        lstat = os.lstat
+        with patch.object(os, 'lstat', side_effect=lambda path, *a, **kw:
+                          info if os.fspath(path) == str(self.global_env) else lstat(path, *a, **kw)):
+            rule, cause = guard.classify_detail('/bin/zsh -dfn check.zsh', str(self.root))
+            self.assertEqual(rule, UNRESOLVED, cause)
+            self.assertIn('zsh: /etc/zshenv startup unproved', cause)
+        self.assertEqual(guard.classify('ZDOTDIR=/tmp/x /bin/zsh -dfn check.zsh', str(self.root)), UNRESOLVED)
+        self.assertEqual(guard.classify('/bin/zsh -dfn ' + LIVE, str(self.root)), READ)
+
+    def test_zsh_option_terminators_preserve_script_and_stdin_checks(self):
+        options = ('-f -', '-f -e -', '-ef -', '-f -n -', '-fn -',
+                   '-f -- -', '-f -e -- -', '-f -n -- -')
+        for source in ('echo ok\n', 'cat ' + LIVE + '\n'):
+            self.script.write_text(source)
+            writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+            for flags in options:
+                for prefix in ('', writer):
+                    with self.subTest(flags=flags, source=source, same_call=bool(prefix)):
+                        rule, cause = guard.classify_detail(prefix + '/bin/zsh ' + flags + ' check.zsh', str(self.root))
+                        self.assertEqual(rule, UNRESOLVED, cause)
+                        self.assertIn('bare dash input unproved', cause)
+        for target in ('check.zsh', '-e', '-n'):
+            (self.root / target).write_text('cat ' + LIVE + '\n')
+            with self.subTest(target=target):
+                self.assertEqual(guard.classify('/bin/zsh -f -- ' + target, str(self.root)), SCRIPT)
+        for flags in ('-f', '-f -', '-f --', '-f -- -'):
+            for source, rule in (('echo ok\n', None), ('cat ' + LIVE + '\n', READ)):
+                with self.subTest(flags=flags, stdin=source):
+                    command = '/bin/zsh ' + flags + " <<'SOURCE'\n" + source + 'SOURCE\n'
+                    self.assertEqual(guard.classify(command, str(self.root)), rule)
+
+    def test_zsh_post_c_options_cannot_hide_command_or_change_execution(self):
+        options = ('-f -c', '-fc', '-cf', '-fnc', '-fcn', '-nfc', '-f -nc', '-dfc', '-dcf', '-dfnc', '-d -f -c',
+                   '--no-rcs -c', '-o norcs -c', '+o rcs -c')
+        trailing = ('+n', '-e', '-u', '-v', '-x', '-n', '-f', '+f',
+                    '-o rcs', '+o norcs', '-o norcs', '+o rcs',
+                    '--rcs', '--no-rcs', '-l', '-i', '--unknown', '--', '-', '+')
+        for source in ('echo ok\n', 'cat ' + LIVE + '\n'):
+            self.script.write_text(source)
+            writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+            for flags in options:
+                for after_c in trailing:
+                    for prefix in ('', writer):
+                        with self.subTest(flags=flags, after_c=after_c, source=source, same_call=bool(prefix)):
+                            command = prefix + '/bin/zsh ' + flags + ' ' + after_c + " 'source check.zsh'"
+                            rule, cause = guard.classify_detail(command, str(self.root))
+                            self.assertEqual(rule, UNRESOLVED, cause)
+                            self.assertIn('zsh: options after -c unproved', cause)
+        for flags in options:
+            with self.subTest(flags=flags, missing_command=True):
+                rule, cause = guard.classify_detail('/bin/zsh ' + flags, str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                self.assertIn('zsh: options after -c unproved', cause)
+
+    def test_zsh_literal_c_commands_keep_source_and_argument_boundaries(self):
+        for flags in ('-f -c', '-fc', '-cf', '--no-rcs -c', '-o norcs -c', '+o rcs -c'):
+            for source, expected in (('echo ok\n', None), ('cat ' + LIVE + '\n', SCRIPT)):
+                self.script.write_text(source)
+                writer = "cat > check.zsh <<'SOURCE'\n" + source + 'SOURCE\n'
+                for prefix in ('', writer):
+                    for arguments in ('', ' +n', ' -e', ' -o rcs'):
+                        with self.subTest(flags=flags, source=source, same_call=bool(prefix), arguments=arguments):
+                            command = prefix + '/bin/zsh ' + flags + " 'source check.zsh'" + arguments
+                            self.assertEqual(guard.classify(command, str(self.root)), expected)
+            with self.subTest(flags=flags, inline_read=True):
+                command = '/bin/zsh ' + flags + ' ' + shlex.quote('cat ' + LIVE)
+                self.assertEqual(guard.classify(command, str(self.root)), READ)
+            with self.subTest(flags=flags, empty_command=True):
+                self.assertEqual(guard.classify('/bin/zsh ' + flags + " ''", str(self.root)), None)
 
 
 if __name__ == "__main__":

@@ -242,6 +242,7 @@ const layerOrchestratorProvided = Orchestrator.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       layerCheckpointServiceProvided,
+      layerCommandOutputHubProvided,
       CommandPolicy.layer,
       layerStores,
       layerEventSinkProvided,
@@ -457,7 +458,13 @@ export const layer = Layer.mergeAll(
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,
   DelegatedTaskProgressGuard.layer.pipe(
-    Layer.provide(Layer.mergeAll(layerOrchestratorProvided, layerThreadManagementProvided)),
+    Layer.provide(
+      Layer.mergeAll(
+        layerOrchestratorProvided,
+        layerThreadManagementProvided,
+        layerCommandOutputHubProvided,
+      ),
+    ),
   ),
   RunStartDeadline.layer.pipe(
     Layer.provide(Layer.merge(layerOrchestratorProvided, layerEventSinkProvided)),

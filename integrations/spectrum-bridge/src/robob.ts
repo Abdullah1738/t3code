@@ -1,3 +1,4 @@
+import { MessageCache } from "./message-cache.ts";
 import { toolError } from "./toollog.ts";
 import { IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
 import {
@@ -7,6 +8,8 @@ import {
 import { nativeMessageId, opencodeCompletedSteps, opencodeFinishes, opencodeRunEvidence, type CompletedSteps, type RunEvidence, type StepFinishes } from "./opencode-steps.ts";
 import { controlModelFields, imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
+import { controlDisposition } from "./control-errors.ts";
+import { createHash } from "node:crypto";
 
 /**
  * Per-turn channel guidance goes to Robob beside the message (`guidance`), and
@@ -34,7 +37,7 @@ export const SELECTED_MODEL_ISSUE = /^\s*(?:there['’]s|there is) an issue with
 function runFailure(thread: Pick<ThreadDetail, "lastError">, run: RunSummary, messages: ControlMessage[], latest: boolean): string | undefined {
   if (!TERMINAL.has(run.status)) return;
   const complaint = messages.find(message => message.runId === run.runId && message.role === "assistant" && SELECTED_MODEL_ISSUE.test(message.text))?.text;
-  return (latest && thread.lastError) || complaint || (run.status === "failed" ? "Run failed without error details" : undefined);
+  return (latest && (run.status === "failed" || run.ordinal === 1 || complaint) && thread.lastError) || complaint || (run.status === "failed" ? "Run failed without error details" : undefined);
 }
 
 /** The send route derives the message id from `clientRequestId`; this maps it back to the bridge's prompt id. */
@@ -169,6 +172,21 @@ export class RobobBackend implements ChatBackend {
    * an `unknown` can still resolve, so it is always asked again. A settled run's proof never changes.
    */
   private readonly settledEvidence = new Map<string, "ran" | "none">();
+  private readonly sendRuns = new Map<string, { at: number; runId?: string }>();
+  private readonly sendFiles = new Map<string, { fingerprint: string; attachments: Awaited<ReturnType<ControlClient["upload"]>>[] }>();
+  private readonly sendBodies = new Map<string, Record<string, unknown>>();
+  private readonly messageCache: MessageCache;
+
+  messageReadScope<T>(body: () => Promise<T>): Promise<T> {
+    return this.messageCache.withinTick(body);
+  }
+
+  private readMessages(threadId: string, thread: ThreadDetail, until?: string): Promise<ControlMessage[]> {
+    return this.messageCache.read(threadId, JSON.stringify([thread.run, thread.recentRuns, thread.lastError]), until === undefined ? undefined : messages =>
+      recordsFromThread(thread, messages).some(record => record.id === until)
+      || messages.some(message => until === `idle:${message.runId}` || until === `${message.runId}:error`));
+  }
+
   private readonly historicalRuns = new Map<string, RunSummary>();
   /** Threads createChat made whose first turn has not been judged yet. */
   private readonly firstTurns = new Map<string, string | null>();
@@ -195,6 +213,7 @@ export class RobobBackend implements ChatBackend {
     if (options.subdir !== undefined && !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/.test(options.subdir)) throw new Error("Invalid iMessage chat folder");
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
+    this.messageCache = new MessageCache(this.client);
     this.finishes = options.finishes ?? opencodeFinishes();
     this.completedSteps = options.completedSteps ?? opencodeCompletedSteps();
     this.runEvidence = options.runEvidence ?? opencodeRunEvidence();
@@ -345,6 +364,7 @@ export class RobobBackend implements ChatBackend {
 
   async retireOthers(keepId: string): Promise<number> {
     const keep = await this.resolve(keepId);
+    this.messageCache.routeChange();
     const { threads } = await this.client.listThreads({ origin: IMESSAGE_ORIGIN, limit: 500 });
     let settled = 0;
     for (const thread of threads) {
@@ -382,18 +402,45 @@ export class RobobBackend implements ChatBackend {
     return Promise.all(threads.filter(thread => thread.parentThreadId === threadId).map(thread => this.record(thread.threadId, thread, id)));
   }
 
-  async messages(id: string, _directory?: string, { until, limit = 100 }: { until?: string; since?: number; limit?: number } = {}): Promise<MessageRecord[]> {
+  async messages(id: string, _directory?: string, { until, since, limit = 100 }: { until?: string; since?: number; limit?: number } = {}): Promise<MessageRecord[]> {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid message limit");
     const threadId = await this.resolve(id);
     // Read messages after the run state: an earlier page must not make a just-completed
     // first turn look successful before its selected-model error text has arrived.
     let { thread } = await this.client.thread(threadId);
-    const { messages } = await this.client.messages(threadId);
-    thread = await this.restoreRunStatuses(thread, messages, until, limit);
+    let messages = await this.readMessages(threadId, thread, until);
+    try {
+      thread = await this.restoreRunStatuses(thread, messages, until, limit);
+    } catch (error) {
+      if (!(error instanceof ControlError) || error.status !== 404) throw error;
+      messages = await this.messageCache.resync(threadId, JSON.stringify([thread.run, thread.recentRuns, thread.lastError]));
+      thread = await this.restoreRunStatuses(thread, messages, until, limit);
+    }
     await this.checkFirstTurn(thread, messages);
     await this.flushFirstTurnAlert();
-    const records = recordsFromThread(thread, messages);
-    const found = until === undefined ? -1 : records.findIndex(record => record.id === until);
+    // The send receipt identifies the run even if an older failure is still in the page.
+    // Persist the send time before POST too: lost responses and bridge restarts keep the boundary.
+    const receiptKey = until === undefined ? undefined : `send-run:${threadId}:${until}`;
+    const receipt = receiptKey ? this.firstTurnStore?.get<{ at: number; runId?: string }>(receiptKey) ?? this.sendRuns.get(receiptKey) : undefined;
+    const sinceAt = since === undefined ? undefined : receipt?.at ?? since;
+    const runs = [...thread.recentRuns, ...(thread.run ? [thread.run] : [])];
+    const boundRun = receipt?.runId ?? messages.find(message => message.role === "user" && promptId(threadId, message) === until)?.runId;
+    const receiptOrdinal = boundRun ? runs.find(run => run.runId === boundRun)?.ordinal ?? runOrdinal(boundRun) : 0;
+    const stale = new Set(sinceAt === undefined ? [] : runs.filter(run => {
+      if (boundRun === run.runId) return false;
+      if (receiptOrdinal && run.ordinal) return run.ordinal < receiptOrdinal;
+      const times = messages.filter(message => message.runId === run.runId).map(message => epoch(message.createdAt));
+      const at = Date.parse(run.requestedAt ?? run.startedAt ?? "") || (times.length ? Math.min(...times) : NaN);
+      return Number.isFinite(at) && at < sinceAt;
+    }).map(run => run.runId));
+    let records = recordsFromThread(thread, messages);
+    let found = until === undefined ? -1 : records.findIndex(record => record.id === until);
+    // Once the prompt is visible, the router scopes its outcome after that prompt and
+    // still needs preceding completions. Before then, only this send's run can settle it.
+    if (until !== undefined && found < 0 && sinceAt !== undefined) {
+      records = recordsFromThread(thread, messages.filter(message => !message.runId || !stale.has(message.runId)));
+      found = records.findIndex(record => record.id === until);
+    }
     // Like the OpenChamber pager: the newest page, extended back to `until` when it is present.
     const start = found >= 0 ? Math.min(found, Math.max(0, records.length - limit)) : Math.max(0, records.length - limit);
     const page = records.slice(start);
@@ -591,8 +638,70 @@ export class RobobBackend implements ChatBackend {
 
   async promptAccepted(id: string, _directory: string, messageId: string): Promise<boolean> {
     const threadId = await this.resolve(id);
-    const { messages } = await this.client.messages(threadId);
+    const { thread } = await this.client.thread(threadId);
+    const messages = await this.readMessages(threadId, thread);
     return messages.some(message => message.role === "user" && promptId(threadId, message) === messageId);
+  }
+
+  async responseResolved(id: string, _directory: string, requestId: string): Promise<boolean> {
+    // /respond changes a runtime request, never a chat message. Only a successful
+    // thread read can prove that the formerly pending request is now resolved.
+    const thread = await this.detail(id);
+    return !thread.pendingRequests.some(request => request.requestId === requestId);
+  }
+
+  private async reconcileControl(threadId: string, messageId: string, error: unknown): Promise<boolean> {
+    try {
+      // A reader during the POST may have repopulated the same-tick snapshot before admission.
+      this.messageCache.afterWrite(threadId);
+      const accepted = await this.promptAccepted(threadId, "", messageId);
+      if (error instanceof ControlError) error.reconciled = true;
+      return accepted;
+    } catch (readError) {
+      toolError("robob", "robob.control_reconcile", readError);
+      throw error;
+    }
+  }
+
+  private sendBody(threadId: string, messageId: string, body: Record<string, unknown>) {
+    const key = `send-body:${threadId}:${messageId}`;
+    const saved = this.firstTurnStore?.get<Record<string, unknown>>(key) ?? this.sendBodies.get(key) ?? body;
+    if (saved.mode !== body.mode) throw new Error("Robob send retry changed mode");
+    // A held router retry may add outage guidance; an idempotent POST must keep its original body.
+    this.sendBodies.set(key, saved);
+    this.firstTurnStore?.set(key, saved);
+    return saved;
+  }
+
+  private clearSendBody(threadId: string, messageId: string) {
+    const key = `send-body:${threadId}:${messageId}`;
+    this.sendBodies.delete(key);
+    this.firstTurnStore?.set(key, null);
+  }
+
+  async releaseUnacceptedPrompt(id: string, _directory: string, messageId: string): Promise<void> {
+    this.clearSendBody(await this.resolve(id), messageId);
+  }
+
+  private async sendAttachments(threadId: string, messageId: string, files: readonly FilePart[], signal?: AbortSignal) {
+    const specs = files.map((file, index) => {
+      const { mimeType, bytes } = dataUrl(file.url);
+      return { name: file.filename ?? `attachment-${index + 1}`, mimeType: file.mime || mimeType, bytes };
+    });
+    const fingerprint = createHash("sha256").update(JSON.stringify(specs.map(spec => [spec.name, spec.mimeType,
+      createHash("sha256").update(spec.bytes).digest("hex")]))).digest("hex");
+    const key = `send-files:${createHash("sha256").update(JSON.stringify([threadId, messageId])).digest("hex")}`;
+    const entry = this.firstTurnStore?.get<{ fingerprint: string; attachments: Awaited<ReturnType<ControlClient["upload"]>>[] }>(key)
+      ?? this.sendFiles.get(key) ?? { fingerprint, attachments: [] };
+    if (entry.fingerprint !== fingerprint) throw new Error("Robob attachment retry changed");
+    this.sendFiles.set(key, entry);
+    this.firstTurnStore?.set(key, entry);
+    for (const spec of specs.slice(entry.attachments.length)) {
+      if (signal?.aborted) throw new ControlError(0, "upload_failed");
+      entry.attachments.push(await this.client.upload(spec, signal));
+      this.firstTurnStore?.set(key, entry);
+    }
+    return entry.attachments;
   }
 
   /**
@@ -606,23 +715,36 @@ export class RobobBackend implements ChatBackend {
    * exactly, and `inboundId` lets Robob check them against this store.
    */
   async prompt(id: string, _directory: string, messageId: string, text: string, system = "", files: readonly FilePart[] = [],
-    model?: PreferredModel, owner?: OwnerWords): Promise<void> {
+    model?: PreferredModel, owner?: OwnerWords, beforeSend?: () => void): Promise<void> {
     const threadId = await this.resolve(id);
-    const attachments = [];
-    for (const [index, file] of files.entries()) {
-      const { mimeType, bytes } = dataUrl(file.url);
-      attachments.push(await this.client.upload({ name: file.filename ?? `attachment-${index + 1}`, mimeType: file.mime || mimeType, bytes }));
-    }
+    const attachments = await this.sendAttachments(threadId, messageId, files);
     const words = owner !== undefined && text.endsWith(owner.text) ? owner : undefined;
     const lead = words ? text.slice(0, text.length - words.text.length).trim() : "";
     const guidance = [system.trim(), lead].filter(Boolean).join("\n\n");
-    await this.client.request("POST", `/threads/${encodeURIComponent(threadId)}/send`, {
-      text: words ? words.text : text, mode: "auto", clientRequestId: messageId,
-      ...(guidance ? { guidance } : {}),
-      ...(words ? { inboundId: words.inboundId } : {}),
-      ...(model ? controlModelFields(model) : {}),
-      ...(attachments.length ? { attachments } : {}),
-    }, { timeoutMs: 60_000 });
+    const receiptKey = `send-run:${threadId}:${messageId}`;
+    const receipt = this.firstTurnStore?.get<{ at: number; runId?: string }>(receiptKey) ?? this.sendRuns.get(receiptKey) ?? { at: Date.now() };
+    this.sendRuns.set(receiptKey, receipt);
+    this.firstTurnStore?.set(receiptKey, receipt);
+    beforeSend?.();
+    this.messageCache.afterWrite(threadId);
+    try {
+      const accepted = await this.client.request<{ runId?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, this.sendBody(threadId, messageId, {
+        text: words ? words.text : text, mode: "auto", clientRequestId: messageId,
+        ...(guidance ? { guidance } : {}),
+        ...(words ? { inboundId: words.inboundId } : {}),
+        ...(model ? controlModelFields(model) : {}),
+        ...(attachments.length ? { attachments } : {}),
+      }), { timeoutMs: 60_000 }).catch(async error => {
+        toolError("robob", "robob.send_failed", error);
+        if (controlDisposition(error) === "reconcile" && await this.reconcileControl(threadId, messageId, error)) return { runId: undefined };
+        throw error;
+      });
+      if (accepted.runId) {
+        const bound = { ...receipt, runId: accepted.runId };
+        this.sendRuns.set(receiptKey, bound);
+        this.firstTurnStore?.set(receiptKey, bound);
+      }
+    } finally { this.messageCache.afterWrite(threadId); }
   }
 
   /**
@@ -632,23 +754,25 @@ export class RobobBackend implements ChatBackend {
   async steer(id: string, _directory: string, messageId: string, text: string, guidance = "", files: readonly FilePart[] = [], guard?: SteerGuard): Promise<SteerDelivery> {
     if (guard?.signal.aborted) return "refused";
     const threadId = await this.resolve(id);
-    const attachments = [];
-    for (const [index, file] of files.entries()) {
-      if (guard?.signal.aborted) return "refused";
-      const { mimeType, bytes } = dataUrl(file.url);
-      attachments.push(await this.client.upload({ name: file.filename ?? `attachment-${index + 1}`, mimeType: file.mime || mimeType, bytes }, guard?.signal));
-    }
+    const attachments = await this.sendAttachments(threadId, messageId, files, guard?.signal);
     if (guard && (guard.signal.aborted || !await guard.beforeSend() || guard.signal.aborted)) return "refused";
+    this.messageCache.afterWrite(threadId);
     try {
-      const { delivery } = await this.client.request<{ delivery?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, {
+      const { delivery } = await this.client.request<{ delivery?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, this.sendBody(threadId, messageId, {
         text, mode: "steer", clientRequestId: messageId, ...(guidance.trim() ? { guidance: guidance.trim() } : {}),
         ...(attachments.length ? { attachments } : {}),
-      }, { timeoutMs: 60_000, signal: guard?.signal });
+      }), { timeoutMs: 60_000, signal: guard?.signal });
       return delivery === "started" || delivery === "queued" ? delivery : "steered";
     } catch (error) { toolError("robob", "robob.catch8", error);
-      if (error instanceof ControlError && error.status === 409) return "refused";
+      guard?.onFailure?.(error);
+      if (controlDisposition(error) === "refused") { this.clearSendBody(threadId, messageId); return "refused"; }
+      if (controlDisposition(error) === "reconcile") {
+        if (await this.reconcileControl(threadId, messageId, error)) return "steered";
+        this.clearSendBody(threadId, messageId);
+        return "refused";
+      }
       throw error;
-    }
+    } finally { this.messageCache.afterWrite(threadId); }
   }
 
   async abort(id: string, _directory?: string, cancelReason?: Parameters<ChatBackend["abort"]>[2]): Promise<boolean> {
@@ -697,25 +821,43 @@ export class RobobBackend implements ChatBackend {
   }
 
   /** With `inboundId`, Robob checks the owner's reply before it counts the answer as his. */
-  async permissionReply(sessionId: string, requestId: string, _directory: string, reply: "once" | "reject", inboundId?: string): Promise<boolean> {
+  async permissionReply(sessionId: string, requestId: string, _directory: string, reply: "once" | "reject", inboundId?: string, beforeSend?: () => boolean): Promise<boolean> {
     if (reply !== "once" && reply !== "reject") throw new Error("Invalid permission reply");
-    await this.client.respond(await this.resolve(sessionId), requestId, {
+    return this.respondControl(sessionId, requestId, {
       decision: reply === "once" ? "approve" : "deny", ...(inboundId ? { inboundId } : {}),
-    });
-    return true;
+    }, beforeSend);
   }
 
   /** Answers keyed by question id; values are the option labels (or free text where allowed). */
-  async questionReply(request: QuestionRequest, _directory: string, answers: string[][], inboundId?: string): Promise<boolean> {
+  async questionReply(request: QuestionRequest, _directory: string, answers: string[][], inboundId?: string, beforeSend?: () => boolean): Promise<boolean> {
     if (request.unsupported || answers.length !== request.questions.length) throw new Error("Invalid form answer");
     const body = Object.fromEntries(request.questions.map((question, index) =>
       [question.key, question.multiple === true ? answers[index]! : answers[index]![0]!]));
-    await this.client.respond(await this.resolve(request.sessionID), request.id, { answers: body, ...(inboundId ? { inboundId } : {}) });
-    return true;
+    return this.respondControl(request.sessionID, request.id, { answers: body, ...(inboundId ? { inboundId } : {}) }, beforeSend);
   }
 
   async cancelQuestion(sessionId: string, requestId: string, _directory?: string, inboundId?: string): Promise<boolean> {
-    await this.client.respond(await this.resolve(sessionId), requestId, { dismiss: true, ...(inboundId ? { inboundId } : {}) });
+    await this.respondControl(sessionId, requestId, { dismiss: true, ...(inboundId ? { inboundId } : {}) });
+    return true;
+  }
+
+  private async respondControl(sessionId: string, requestId: string, body: Record<string, unknown>, beforeSend?: () => boolean): Promise<boolean> {
+    const threadId = await this.resolve(sessionId);
+    const response = { ...body, clientRequestId: `respond_${createHash("sha256").update(JSON.stringify([requestId, body])).digest("hex")}` };
+    if (beforeSend && !beforeSend()) return false;
+    try { await this.client.respond(threadId, requestId, response); }
+    catch (error) {
+      toolError("robob", "robob.respond_failed", error);
+      if (controlDisposition(error) === "reconcile") {
+        try {
+          await this.responseResolved(threadId, "", requestId);
+          if (error instanceof ControlError) error.reconciled = true;
+          // Resolution can be cancellation or another actor's answer. It prevents
+          // another response POST, but cannot count this human's text as accepted.
+        } catch (readError) { toolError("robob", "robob.respond_reconcile", readError); }
+      }
+      throw error;
+    }
     return true;
   }
 

@@ -46,6 +46,7 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
     operation: Schema.Literals(["interrupt", "restart", "steer"]),
     providerTurnId: ProviderTurnId,
     turnCompleted: Schema.optional(Schema.Boolean),
+    steerNotDelivered: Schema.optional(Schema.Boolean),
     turnEnded: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
   },
@@ -53,6 +54,7 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
 
 const isProviderTurnControlError = Schema.is(ProviderTurnControlError);
 const isTurnNotActiveError = Schema.is(ProviderAdapter.ProviderAdapterTurnNotActiveError);
+const isSteerRunError = Schema.is(ProviderAdapter.ProviderAdapterSteerRunError);
 
 export interface ProviderTurnControlServiceV2Shape {
   readonly interrupt: (input: {
@@ -167,8 +169,8 @@ export const layer: Layer.Layer<
                 return yield* observedEnd;
               }
               if (
-                event.type !== "turn.terminal" ||
-                event.nativeWorkEnded !== true ||
+                (event.type !== "turn.native-ended" &&
+                  (event.type !== "turn.terminal" || event.nativeWorkEnded !== true)) ||
                 event.providerThreadId !== input.providerThreadId
               )
                 return false;
@@ -256,6 +258,7 @@ export const layer: Layer.Layer<
             operation: "steer",
             providerTurnId: input.providerTurnId,
             turnCompleted: providerTurn.status === "completed",
+            steerNotDelivered: true,
             turnEnded: true,
             cause: "The provider turn ended before the steering message was delivered.",
           });
@@ -295,6 +298,7 @@ export const layer: Layer.Layer<
           threadId: input.threadId,
           operation: input.operation,
           providerTurnId: input.providerTurnId,
+          steerNotDelivered: input.operation === "steer",
           cause: new ProviderSessionManager.ProviderSessionEndedError({
             providerSessionId: input.providerSessionId,
             ...(context.run === undefined ? {} : { runId: context.run.id }),
@@ -584,6 +588,7 @@ export const layer: Layer.Layer<
                     operation: "steer",
                     providerTurnId: input.providerTurnId,
                     turnCompleted: current.providerTurn?.status === "completed",
+                    steerNotDelivered: isSteerRunError(cause) && cause.delivery === "not_sent",
                     cause,
                   });
                 }),

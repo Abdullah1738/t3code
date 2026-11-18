@@ -6,7 +6,7 @@ import { assessCache, planRefresh, cachedSlugs, summarize, watchPolicy, MIN_REFR
 import * as realIo from './lib/io.mjs';
 import { pathToFileURL } from 'node:url';
 const io = realIo;
-const { emit, observed } = await import('../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
+const { emit, observed, errorScan = work => work() } = await import('../router-logging/toollog.mjs').catch(() => ({ emit: () => {}, observed: (_c, _n, work) => work() }));
 
 function parseArgs(argv) {
   const [cmd = 'check', ...rest] = argv;
@@ -24,7 +24,11 @@ function parseArgs(argv) {
 const log = (...parts) => console.log(new Date().toISOString(), 'catalog-guard', ...parts);
 
 export async function check(opts, io = realIo) {
-  return observed('catalog-guard', 'catalog.check', () => checkImpl(opts, io), { exitCodeResult: true });
+  const timed = {...io};
+  for (const step of ['harnessCutoverStatus', 'serviceSlugs', 'refreshProviders']) {
+    timed[step] = (...args) => observed('catalog-guard', `catalog.${step}`, () => io[step](...args), {props:{step}});
+  }
+  return errorScan(() => observed('catalog-guard', 'catalog.check', () => checkImpl(opts, timed), { exitCodeResult: true }));
 }
 
 async function checkImpl(opts, io) {

@@ -107,7 +107,8 @@ def keep_list():
 
 def running_sessions(snap=None):
     snap = active_sessions.checked_snapshot(timeout=20) if snap is None else snap
-    dirs, err = active_sessions.directories(snap)
+    # The hourly scan keeps its existing one-request-per-id liveness budget.
+    dirs, err = active_sessions.directories(snap, max_attempts=1)
     if err:
         return None, {}, err
     return set(snap["opencode"]), dirs, None
@@ -271,6 +272,16 @@ def close_browser_candidates(st):
         report, rescan=lambda: leftover_processes.scan_agent_browsers(active_sessions.checked_snapshot(), keep_list()))
     for entry in report["actions"]:
         audit({"ts": int(time.time()), "event": "agent_browser_close", **entry})
+
+
+def stop_xcode_candidates(st):
+    report = st.get("processes", {}).get("xcode_builds")
+    if report is None:
+        return
+    report["actions"] = leftover_processes.stop_xcode_builds(
+        report, rescan=lambda: leftover_processes.scan_xcode_builds(active_sessions.checked_snapshot(), keep_list()))
+    for entry in report["actions"]:
+        audit({"ts": int(time.time()), "event": "xcode_build_stop", **entry})
 
 
 def audit(entry):

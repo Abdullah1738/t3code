@@ -4,17 +4,20 @@ import { readFileSync } from "node:fs";
 import { Store } from "./store.ts";
 import { jsonBody, opaqueId, seal, tokenMatches, validId, type Fetch, type Sealed } from "./remote-protocol.ts";
 import type { AgentAnswerReceipt } from "./agent-bus.ts";
-import { LineError, type ChatKey, type Line } from "./line.ts";
+import { LineError, safeLineFailureCode, type ChatKey, type Line } from "./line.ts";
 import { RemoteUnanswered } from "./unanswered.ts";
+import type { ChatMirror } from "./mirror.ts";
 
 export type RemoteBoxConfig = { kind: "remote-box"; url: string; tokenFile: string; callbackTokenFile: string;
   publicKeyFile: string; boxRouterPort?: number; macRouterPort?: number; callbackPort: number; epoch: string; boxId: string;
-  noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number; wakeFenceAutoFailMs?: number };
+  noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number; wakeFenceAutoFailMs?: number; mirror?: boolean };
 type Outage = { id: string; unreachableSince: number | null; reachableSince: number | null; noticeAttempted?: boolean };
 type Fence = { id: string; since: number; queuedBehind: number };
 type FenceAlert = { key: string; text: string };
 type WaitingNotice = { id: string; since: number; attempted?: boolean };
 type BoxEvent = { id: string; state: string; failure: string | null; kind: "inbound" | "wake"; interruptedAt: number | null; hasSend: boolean; watcher?: string };
+type BoxAction = { id: string; path: string; attempts: number; lastStatus: number | null; nextAt: number | null; inboxId: string | null };
+const ACTION_PATHS = ["/send", "/files", "/react", "/agent-ask", "/agent-answer", "/agent-requests", "/share", "/unshare", "/shares"];
 export class RemoteRequestError extends Error {
   constructor(readonly status: number) { super("Box request failed"); }
 }
@@ -23,6 +26,7 @@ export function remoteBoxConfig(config: { chatBackends?: unknown }, slug: string
   const entry = entries?.[slug] as RemoteBoxConfig | undefined;
   if (entry === undefined || entry.kind === ("robob" as string)) return;
   if (slug !== "moni" || entry.kind !== "remote-box" || !/^http:\/\/127\.0\.0\.1:\d+$/.test(entry.url)
+    || entry.mirror !== undefined && typeof entry.mirror !== "boolean"
     || ![entry.tokenFile, entry.callbackTokenFile, entry.publicKeyFile].every(p => typeof p === "string" && p.startsWith("/"))
     || [entry.boxRouterPort, entry.macRouterPort].some(p => p !== undefined && (!Number.isInteger(p) || p < 1024 || p > 65535))
     || [entry.noticeAfterMs, entry.outageClearMs, entry.noticeMinGapMs, entry.wakeFenceAutoFailMs].some(ms => ms !== undefined && (!Number.isSafeInteger(ms) || ms < 0))
@@ -45,11 +49,13 @@ export class RemoteBox {
   private nextProbe = 0;
   private failures = 0;
   private nextStateLog = 0;
+  private readonly callbackErrors = new Map<string, { at: number; count: number; props: Record<string, string | number | boolean> }>();
   private readonly unanswered: RemoteUnanswered;
   constructor(readonly config: RemoteBoxConfig, readonly store: Store, private readonly io: {
     fetch?: Fetch; now?: () => number; log: (event: string, code?: string) => void;
     notice: (id: string, text: string) => Promise<void>; active: () => boolean;
     ownerAlert?: (severity: "attention", text: string, key: string) => Promise<boolean>;
+    mirror?: ChatMirror;
   }) {
     this.sessionId = `remote:moni:${config.epoch}`;
     this.publicKey = readFileSync(config.publicKeyFile, "utf8");
@@ -91,10 +97,33 @@ export class RemoteBox {
   checkUnanswered(now = this.now()): Promise<void> { return this.unanswered.check(now); }
   private emit(event: string, code?: string, durationMs?: number, props?: Record<string, string | number | boolean>) {
     this.io.log(event, props ? JSON.stringify(props) : code);
-    toolLog.capture(() => toolLog.write({ component: "remote-box", kind: durationMs === undefined ? "event" : "perf",
+    const error = event.endsWith("-error") || event === "moni-box-fenced" || event === "moni-box-down";
+    toolLog.capture(() => toolLog.write({ component: "remote-box", kind: error ? "error" : durationMs === undefined ? "event" : "perf",
       name: event, ids: { chat: "moni" }, ...(durationMs === undefined ? {} : { durationMs }),
       ...(props ? { props } : code?.startsWith("n=") ? { props: { count: Number(code.slice(2)) } }
         : event === "moni-notice-suppressed" && code ? { props: { reason: code } } : {}) }));
+  }
+  private emitCallbackError(key: string) {
+    const window = this.callbackErrors.get(key);
+    if (!window) return;
+    this.callbackErrors.delete(key);
+    this.emit("moni-runner-error", undefined, undefined, { ...window.props, count: window.count - 1 });
+  }
+  private flushCallbackErrors(all = false) {
+    for (const [key, window] of this.callbackErrors) {
+      if (all || this.now() - window.at >= 60_000) this.emitCallbackError(key);
+    }
+  }
+  stop() { this.flushCallbackErrors(true); }
+  private callbackError(path: string, status: number, error: unknown) {
+    // Emit the completed window so count includes every suppressed repeat, even if the failure stops.
+    this.flushCallbackErrors();
+    const key = `${path}:${status}`, window = this.callbackErrors.get(key);
+    if (window) { window.count++; return; }
+    this.callbackErrors.set(key, { at: this.now(), count: 1, props: { path, status,
+      errorClass: error instanceof LineError ? "LineError" : error instanceof RemoteSendError ? "RemoteSendError" : error instanceof Error ? "Error" : "UnknownError",
+      ...(error instanceof LineError ? { code: safeLineFailureCode(error.code) } : {}),
+      retryable: error instanceof LineError ? error.retryable : !(error instanceof RemoteSendError) || status !== 422 } });
   }
   private now() { return (this.io.now ?? Date.now)(); }
   accept(id: string, input: unknown, receipt?: AgentAnswerReceipt, kind: "inbound" | "wake" = "inbound"): boolean {
@@ -103,6 +132,7 @@ export class RemoteBox {
       const created = this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind,received_at) VALUES (?,?,?,?,?)")
         .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind, this.now()).changes === 1;
       if (created && kind === "inbound") this.unanswered.accept(key, this.now());
+      if (kind === "inbound") this.io.mirror?.inbound(id, input);
       return created;
     })();
   }
@@ -119,7 +149,7 @@ export class RemoteBox {
     if (!response.ok) throw new RemoteRequestError(response.status);
     return jsonBody(response as unknown as Request);
   }
-  async events(after?: string, headOnly = false): Promise<{ events: BoxEvent[]; nextCursor?: string; remaining?: number }> {
+  async events(after?: string, headOnly = false): Promise<{ events: BoxEvent[]; actions?: BoxAction[]; nextCursor?: string; remaining?: number }> {
     const response = await this.request("/events", { ...(after ? { after } : {}), ...(headOnly ? { headOnly: true } : {}) });
     if (!Array.isArray(response.events)) throw new Error("Invalid box events");
     if (response.remaining !== undefined && (!Number.isSafeInteger(response.remaining) || Number(response.remaining) < 1 || !validId(response.nextCursor))) throw new Error("Invalid event cursor");
@@ -133,7 +163,21 @@ export class RemoteBox {
         hasSend: row.hasSend, ...("watcher" in row && typeof row.watcher === "string" && /^[a-z0-9][a-z0-9-]{0,79}$/.test(row.watcher) ? { watcher: row.watcher } : {}),
         failure: "failure" in row && ["invalid", "unavailable", "too-large"].includes(String(row.failure)) ? String(row.failure) : null };
     });
-    return { events, ...(response.remaining === undefined ? {} : { remaining: response.remaining as number, nextCursor: response.nextCursor as string }) };
+    let actions: BoxAction[] | undefined;
+    if (response.actions !== undefined) {
+      if (!Array.isArray(response.actions)) throw new Error("Invalid box actions");
+      actions = response.actions.map((row: unknown): BoxAction => {
+        if (typeof row !== "object" || row === null || !("id" in row) || typeof row.id !== "string" || !/^[a-f0-9]{12}$/.test(row.id)
+          || !("path" in row) || !ACTION_PATHS.includes(String(row.path))
+          || !("attempts" in row) || !Number.isSafeInteger(row.attempts) || Number(row.attempts) < 0
+          || !("lastStatus" in row) || row.lastStatus !== null && (!Number.isSafeInteger(row.lastStatus) || Number(row.lastStatus) < 100 || Number(row.lastStatus) > 599)
+          || !("nextAt" in row) || row.nextAt !== null && (!Number.isSafeInteger(row.nextAt) || Number(row.nextAt) < 0)
+          || !("inboxId" in row) || row.inboxId !== null && (typeof row.inboxId !== "string" || !/^[a-f0-9]{12}$/.test(row.inboxId))) throw new Error("Invalid box action");
+        return { id: row.id, path: row.path as string, attempts: row.attempts as number, lastStatus: row.lastStatus as number | null,
+          nextAt: row.nextAt as number | null, inboxId: row.inboxId as string | null };
+      });
+    }
+    return { events, ...(actions ? { actions } : {}), ...(response.remaining === undefined ? {} : { remaining: response.remaining as number, nextCursor: response.nextCursor as string }) };
   }
   async resolve(id: string, state: "done" | "pending" | "failed", autoFailMs?: number) {
     // The runner's done tombstone is its existing terminal, no-replay resolution.
@@ -259,6 +303,7 @@ export class RemoteBox {
     catch { this.emit("moni-notice-error"); }
   }
   async tick(): Promise<void> {
+    this.flushCallbackErrors();
     if (this.now() >= this.nextStateLog) this.backendState();
     if (this.busy || this.now() < this.nextProbe || !this.io.active()) return;
     this.busy = true;
@@ -337,7 +382,10 @@ export class RemoteBox {
   }
   async send(id: string, text: string, mediaUrl: string | undefined, line: Line, chat: ChatKey): Promise<{ id: string; handle: string }> {
     const row = this.store.db.query<{ at: number; state: string; handle: string }, [string]>("SELECT * FROM remote_sends WHERE id=?").get(id);
-    if (row?.state === "sent") return { id, handle: row.handle };
+    if (row?.state === "sent") {
+      this.io.mirror?.outbound(id, text, mediaUrl, row.at);
+      return { id, handle: row.handle };
+    }
     if (row?.state === "failed") throw new RemoteSendError(422);
     if (row?.state === "uncertain") {
       const sent = (await line.outbound(chat, row.at - 5_000)).find(m => m.text === text && m.mediaUrl === mediaUrl && m.sentAt >= row.at
@@ -345,12 +393,14 @@ export class RemoteBox {
         && !this.store.db.query("SELECT 1 FROM remote_sends WHERE handle=? AND id!=?").get(m.handle, id));
       if (!sent) throw new RemoteSendError(409);
       this.store.db.query("UPDATE remote_sends SET state='sent',handle=? WHERE id=?").run(sent.handle, id);
+      this.io.mirror?.outbound(id, text, mediaUrl, sent.sentAt);
       return { id, handle: sent.handle };
     }
     this.store.db.query("INSERT INTO remote_sends VALUES (?,?,'uncertain',NULL) ON CONFLICT(id) DO UPDATE SET at=excluded.at,state='uncertain'").run(id, this.now());
     try {
       const sent = await line.sendText(chat, text, mediaUrl ? { mediaUrl } : undefined);
       this.store.db.query("UPDATE remote_sends SET state='sent',handle=? WHERE id=?").run(sent.handle, id);
+      this.io.mirror?.outbound(id, text, mediaUrl, this.now());
       this.emit("moni-reply-sent"); return { id, handle: sent.handle };
     } catch (error) {
       if (error instanceof LineError && !error.uncertain) {
@@ -380,7 +430,7 @@ export class RemoteBox {
       if (path === "/ready") return reply(200, { epoch: this.config.epoch });
       if (path.startsWith("/agent-")) {
         if (!validId(operation)) return reply(400, { error: "Operation id required" });
-        return io.bus(path, { ...body, sessionId: this.sessionId }, opaqueId(`moni:${operation}`),
+        return await io.bus(path, { ...body, sessionId: this.sessionId }, opaqueId(`moni:${operation}`),
           createHmac("sha256", this.callbackToken).update(JSON.stringify([path, body])).digest("hex"));
       }
       if (["/share", "/unshare", "/shares"].includes(path)) return reply(200, await this.request(path, body));
@@ -390,13 +440,21 @@ export class RemoteBox {
       }
       if (path === "/files") {
         if (typeof body.data !== "string" || body.data.length > 28_000_000 || typeof body.name !== "string" || typeof body.mime !== "string") return reply(400, { error: "Invalid file" });
-        return reply(200, { mediaUrl: await io.line.upload({ data: Buffer.from(body.data, "base64"), name: body.name, mimeType: body.mime }) });
+        const file = { data: Buffer.from(body.data, "base64"), name: body.name, mimeType: body.mime };
+        const mediaUrl = await io.line.upload(file);
+        this.io.mirror?.rememberFile(mediaUrl, file);
+        return reply(200, { mediaUrl });
       }
       if (!validId(body.id) || typeof body.text !== "string" || body.text.length > 12_000 || (body.mediaUrl !== undefined && (typeof body.mediaUrl !== "string" || !body.mediaUrl.startsWith("https://")))) return reply(400, { error: "Invalid send" });
       if (body.inboxId !== undefined && !validId(body.inboxId)) return reply(400, { error: "Invalid inbox id" });
       const result = await this.send(body.id, body.text, typeof body.mediaUrl === "string" ? body.mediaUrl : undefined, io.line, io.chat);
       if (validId(body.inboxId)) { this.unanswered.answered(body.inboxId, this.now()); this.finish(body.inboxId); }
       return reply(200, result);
-    } catch (error) { this.emit("moni-runner-error", "callback"); return reply(error instanceof RemoteSendError ? error.status : 502, { error: "Operation failed" }); }
+    } catch (error) {
+      // send() alone decides a terminal send; an outbound-history lookup cannot settle uncertain delivery.
+      const status = error instanceof RemoteSendError ? error.status : path !== "/send" && error instanceof LineError && !error.retryable && !error.uncertain ? 422 : 502;
+      this.callbackError(path, status, error);
+      return reply(status, { error: "Operation failed" });
+    }
   }
 }

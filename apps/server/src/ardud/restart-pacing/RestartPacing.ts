@@ -360,7 +360,16 @@ const make = Effect.gen(function* () {
       if (retrying) runSources.set(runKey, { ...source, admitted: false });
       else runSources.delete(runKey);
     },
-    (effect) => mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged))),
+    (effect, threadId, runId, effectId) =>
+      Effect.suspend(() => {
+        // Fresh starts own no reservation. Their finalizers must not queue
+        // behind recovery admission's projection reads and occupy start workers.
+        const source = runSources.get(`${threadId}:${runId}`);
+        if (source === undefined || source.effectId !== effectId || !source.admitted)
+          return Effect.void;
+        // Re-read ownership under the mutex before changing a reservation.
+        return mutex.withPermits(1)(effect.pipe(Effect.ensuring(queueChanged)));
+      }),
   );
   // Keep allocation/transfer and its finalizer metadata in the same mutex turn.
   const ownRunReservation = (source: RestartSource, runId: RunId) => {
