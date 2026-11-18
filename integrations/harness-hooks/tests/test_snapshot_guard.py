@@ -120,6 +120,13 @@ class SnapshotGuardTests(unittest.TestCase):
             with self.subTest(suffix=suffix):
                 self.assertEqual(self.decide(self.command + suffix)["decision"], "deny")
 
+    def test_hash_card_reference_stays_denied(self):
+        command = self.command.replace("card-fixture", "'#1568'")
+        for harness in ("codex", "claude"):
+            with self.subTest(harness=harness):
+                self.assertFalse(snapshot_guard.exact_invocation(command, str(self.home)))
+                self.assertEqual(self.decide(command, harness)["decision"], "deny")
+
     def test_unrelated_options_without_a_live_database_keep_their_policy(self):
         with patch.object(engine, "_offbox_mode", return_value="off"):
             self.assertEqual(self.decide("other-tool --card x --ask q1 --db /tmp/fixture.sqlite")["decision"], "allow")
