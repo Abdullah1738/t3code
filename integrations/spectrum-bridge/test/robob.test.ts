@@ -1,4 +1,4 @@
-import { createToolLog } from "../src/toollog.ts";
+import { createToolLog, toolLog } from "../src/toollog.ts";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test";
@@ -10,6 +10,7 @@ import { ControlClient, ControlError, discoverControlConfig, parseSse, questionF
 import type { NormalizedInbound, Photon } from "../src/photon.ts";
 import { GUIDANCE_END, GUIDANCE_START, recordsFromThread, retireUnresolvedRoute, RobobBackend, SELECTED_MODEL_ISSUE, sentMessagePrefix, withoutGuidance } from "../src/robob.ts";
 import { opencodeRunEvidence } from "../src/opencode-steps.ts";
+import { probeDeferred } from "../src/probe-policy.ts";
 import { imessagePreferences } from "../src/preferred-model.ts";
 import { Router, turnRanTools } from "../src/router.ts";
 import { Store } from "../src/store.ts";
@@ -2195,6 +2196,63 @@ test("marker polling: sibling chat backends share the marker pass and native ali
   expect(new URL("http://test" + pollingCalls(control.calls)[0]!.path).searchParams.get("ids")).toBe(chats.map(chat => chat.id).join(","));
 });
 
+test.each(["waiting", "running"].flatMap(prior => ["completed", "failed", "cancelled", "interrupted", "rolled_back"].map(status => ({ prior, status }))))
+  ("marker polling: retained $prior run becoming $status refreshes exact detail", async ({ prior, status }) => {
+  const { control, backend, chats, tick } = await markerFixture(1, true);
+  const chat = chats[0]!, thread = control.threads.get(chat.id)!;
+  thread.runs[0]!.status = prior;
+  await backend.prompt(chat.id, chat.directory, `msg_${"f".repeat(64)}`, "latest");
+  control.reply(chat.id, "latest partial", "running");
+  await tick(); control.calls.length = 0;
+  thread.runs[0]!.status = status;
+  const result = await tick();
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(1);
+  for (const options of [{ limit: 1 }, { limit: 100 }, { until: `msg_${"0".repeat(64)}`, limit: 20 }, { since: 0, limit: 100 }]) {
+    expect(await backend.messages(chat.id, chat.directory, options)).toEqual(await control.backend().messages(chat.id, chat.directory, options));
+  }
+  expect(result[0]!.find(record => record.id === `idle:${thread.runs[0]!.runId}`)).toMatchObject({
+    outcome: status === "completed" ? "succeeded" : status === "failed" ? "failed" : "interrupted",
+  });
+  control.calls.length = 0; await tick();
+  expect(control.calls.filter(call => call.path === `/threads/${chat.id}`)).toHaveLength(0);
+});
+
+test.each([false, true])("marker polling: Router tick deferral releases probe leases without backoff (landed=%s)", async landed => {
+  const start = Date.parse("2026-11-18T03:00:00Z"); setSystemTime(start);
+  const { control, backend, chats } = await markerFixture(1, true);
+  const chat = chats[0]!, id = "deferred-admission";
+  const prompt = `msg_${createHash("sha256").update(id).digest("hex")}`;
+  const store = new Store(":memory:"); stores.push(store);
+  store.set("route", { ...chat, generation: 1 });
+  store.acceptInbound(id, { id, text: "Please check", source: "typed", attachments: [], isAudioMessage: false, receivedAt: start - 120_000 });
+  store.updateInbound(id, "processing");
+  store.set(`failed-delivery:${id}`, { ...chat, generation: 1, inboundId: id, messageId: prompt, startedAt: start - 120_000, phase: "unknown" });
+  const lines: Parameters<typeof toolLog.write>[0][] = [];
+  const log = spyOn(toolLog, "write").mockImplementation(line => { lines.push(line); });
+  const router = new Router(store, backend, { async typing() {}, async read() {}, async downloadAttachment() { throw new Error("unused"); } }, {
+    owner: "+15555550123", chatGuid: "iMessage;-;+15555550123", timezone: "Asia/Dubai", skillPath: "/test/skill", alertSkillPath: "/test/alert",
+    alertSocketPath: "/test/socket", openCodeConfigRoot: "/nonexistent", quietMs: 0, watchMs: 0,
+  });
+  const request = backend.client.request.bind(backend.client), lost = new ControlError(0);
+  const post = spyOn(backend.client, "request").mockImplementation(async function<T>(...args: Parameters<ControlClient["request"]>): Promise<T> {
+    if (args[0] !== "POST" || !args[1].endsWith("/send")) return request<T>(...args);
+    if (landed) await request<T>(...args); throw lost;
+  });
+  try {
+    await expect(backend.prompt(chat.id, chat.directory, prompt, "Please check")).rejects.toBe(lost);
+    await router.checkInboundLatency(); await router.checkInboundLatency();
+    for (const key of [id, `prompt:${chat.id}:${prompt}`]) expect(store.get(`replay-probe-backoff:${key}`)).toMatchObject({ delay: 0, nextAt: 0 });
+    expect(lines.filter(line => line.name === "router.probe_backoff")).toHaveLength(0);
+    expect(lines.filter(line => line.name === "router.prompt_probe")).toHaveLength(0);
+    setSystemTime(start + 1000); await backend.beginMessageTick([chat.id]);
+    await router.checkInboundLatency();
+    expect(lines.filter(line => line.name === "router.prompt_probe").map(line => line.props?.probeOutcome)).toEqual([landed ? "accepted" : "notAcceptedYet"]);
+    expect(lines.filter(line => line.name === "router.probe_backoff")).toHaveLength(0);
+    expect(await backend.promptAccepted(chat.id, chat.directory, prompt)).toBe(landed);
+    expect(control.calls.filter(call => call.path.endsWith("/send") && call.body.clientRequestId === prompt)).toHaveLength(landed ? 1 : 0);
+  } finally { post.mockRestore(); log.mockRestore(); }
+});
+
 test.each((["auto", "steer"] as const).flatMap(mode => [false, true].flatMap(landed => [0, 500, 503].map(status => ({ mode, landed, status })))))
   ("marker polling: ambiguous $mode ($status, landed=$landed) waits for the next snapshot without another GET", async ({ mode, landed, status }) => {
   const { control, backend, chats, tick } = await markerFixture(1, true);
@@ -2212,7 +2270,7 @@ test.each((["auto", "steer"] as const).flatMap(mode => [false, true].flatMap(lan
     const sending = mode === "auto" ? backend.prompt(chat.id, chat.directory, prompt, "follow up") : backend.steer(chat.id, chat.directory, prompt, "follow up");
     await expect(sending).rejects.toBe(lost);
     expect(lost.reconciled).not.toBe(true);
-    await expect(backend.promptAccepted(chat.id, chat.directory, prompt)).rejects.toBeInstanceOf(ControlError);
+    await expect(backend.promptAccepted(chat.id, chat.directory, prompt)).rejects.toBe(probeDeferred);
     expect(control.calls.filter(call => call.method === "GET")).toHaveLength(0);
     await tick();
     expect(await backend.promptAccepted(chat.id, chat.directory, prompt)).toBe(landed);
@@ -2239,7 +2297,7 @@ test.each(["approval", "question", "dismiss"] as const)("marker polling: ambiguo
       : backend.questionReply((await backend.questions(chat.id))[0]!, chat.directory, [["yes"]]);
     await expect(sending).rejects.toBe(lost);
     expect(lost.reconciled).not.toBe(true);
-    await expect(backend.responseResolved(chat.id, chat.directory, "pending-one")).rejects.toBeInstanceOf(ControlError);
+    await expect(backend.responseResolved(chat.id, chat.directory, "pending-one")).rejects.toBe(probeDeferred);
     expect(control.calls.filter(call => call.method === "GET")).toHaveLength(0);
     await tick();
     expect(await backend.responseResolved(chat.id, chat.directory, "pending-one")).toBe(true);

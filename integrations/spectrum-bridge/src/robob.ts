@@ -9,6 +9,7 @@ import { nativeMessageId, opencodeCompletedSteps, opencodeFinishes, opencodeRunE
 import { controlModelFields, imessagePreferences, type PreferredModel } from "./preferred-model.ts";
 import type { Store } from "./store.ts";
 import { controlDisposition } from "./control-errors.ts";
+import { probeDeferred } from "./probe-policy.ts";
 import { createHash } from "node:crypto";
 
 /**
@@ -650,7 +651,7 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     if (await this.messageCache.prepared(threadId)) {
       if (this.messageCache.accepted(threadId, messageId)) return true;
-      if (this.messageCache.reconciliationDeferred(threadId, messageId)) throw new ControlError(0, "acceptance_pending");
+      if (this.messageCache.reconciliationDeferred(threadId, messageId)) throw probeDeferred;
       const messages = await this.messageCache.read(threadId, "accepted");
       return messages.some(message => message.role === "user" && promptId(threadId, message) === messageId);
     }
@@ -663,7 +664,7 @@ export class RobobBackend implements ChatBackend {
     // /respond changes a runtime request, never a chat message. Only a successful
     // thread read can prove that the formerly pending request is now resolved.
     const threadId = await this.resolve(id);
-    if (this.messageCache.reconciliationDeferred(threadId, `respond:${requestId}`)) throw new ControlError(0, "response_pending");
+    if (this.messageCache.reconciliationDeferred(threadId, `respond:${requestId}`)) throw probeDeferred;
     const thread = await this.detail(threadId);
     return !thread.pendingRequests.some(request => request.requestId === requestId);
   }
