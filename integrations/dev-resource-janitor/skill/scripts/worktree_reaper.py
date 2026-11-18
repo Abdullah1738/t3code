@@ -170,12 +170,27 @@ def worktrees(common, timeouts=None):
     return res, None
 
 
-def running_dirs():
-    snap = active_sessions.checked_snapshot(timeout=30)
-    dirs, err = active_sessions.directories(snap)
-    if err:
-        raise RuntimeError("liveness_unavailable: " + err)
-    return {path.rstrip("/") for path in dirs.values()}
+def running_dirs(stats=None):
+    stats = {} if stats is None else stats
+    started = time.monotonic()
+    previous_seconds = stats.get('seconds', 0)
+    try:
+        for step in range(2):
+            snap = active_sessions.checked_snapshot(timeout=30)
+            lookup = {}
+            dirs, err = active_sessions.directories(snap, timeout=45, overall_timeout=300, stats=lookup)
+            stats.update(attempts=stats.get('attempts', 0) + lookup.get('attempts', 0),
+                         opencode_ids=len(snap['opencode']), resolved=lookup.get('resolved', 0),
+                         per_id_max_s=max(stats.get('per_id_max_s', 0), lookup.get('per_id_max_s', 0)),
+                         retried_step=stats.get('retried_step', False) or step == 1,
+                         last_error=err or lookup.get('last_error') or stats.get('last_error'))
+            if not err:
+                return {path.rstrip('/') for path in dirs.values()}
+            if step == 0:
+                time.sleep(60)
+        raise RuntimeError('liveness_unavailable: ' + err)
+    finally:
+        stats['seconds'] = round(previous_seconds + time.monotonic() - started, 3)
 
 
 class Activity(dict):
@@ -219,7 +234,8 @@ def activity_for_repo(common, history, now, worktree_paths=None, timeouts=None):
         stats = {'root': root, 'common': common}
         history.project_stats[pid] = stats
         paths, err = active_sessions.project_activity(pid, history.projects[pid],
-                                                     int((now - STALE_DAYS * 86400) * 1000), stats=stats)
+                                                     int((now - STALE_DAYS * 86400) * 1000), stats=stats,
+                                                     traversal_timeout=300)
         if err:
             stats['error'] = err
             return None, err
@@ -394,11 +410,14 @@ def main():
     if not a.dry_run:
         os.makedirs(LOG_DIR, exist_ok=True)
     st = {"ts": int(t0), "dry_run": a.dry_run, "state": "done", "removed": [], "would_remove": [],
-          "kept": {}, "missing_directories": [], "errors": []}
+          "kept": {}, "missing_directories": [], "errors": [],
+          "liveness": dict(attempts=0, opencode_ids=0, resolved=0, seconds=0, per_id_max_s=0,
+                           retried_step=False, last_error=None),
+          "load_avg": {"start": list(os.getloadavg())}}
     timeouts = Timeouts()
     removal_timeouts = 0
     try:
-        running = running_dirs()
+        running = running_dirs(st['liveness'])
         activity = session_activity(write_cache=not a.dry_run)
         st["history_stats"] = getattr(activity, "stats", {})
         st["project_history_stats"] = getattr(activity, "project_stats", {})
@@ -460,7 +479,7 @@ def main():
             try:
                 again = evaluate({"worktree": r["path"], "common": r["common"], "main": False,
                                   "HEAD": r["head"], "branch": r.get("branch")},
-                                 time.time(), running_dirs(), removal_activity(r["common"], r["path"], time.time(), timeouts),
+                                 time.time(), running_dirs(st['liveness']), removal_activity(r["common"], r["path"], time.time(), timeouts),
                                  process_cwds(timeouts, r['path']), keep_list(), timeouts)
             except subprocess.TimeoutExpired as error:
                 timeouts.skip(r['path'], 'check', error)
@@ -511,6 +530,7 @@ def main():
     if len(st["errors"]) - removal_timeouts >= 5:
         st["state"] = "error"
     st["duration_s"] = round(time.time() - t0, 1)
+    st['load_avg']['end'] = list(os.getloadavg())
     if not a.dry_run:
         with open(STATUS, "w") as status_file:
             json.dump(st, status_file, indent=1)
