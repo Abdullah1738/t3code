@@ -29,6 +29,7 @@ import datetime
 import json
 import math
 import os
+import socket
 import time
 import tempfile
 import urllib.error
@@ -355,30 +356,82 @@ def checked_snapshot(timeout=20):
                         problems=[f"active sessions: {type(exc).__name__}"])
 
 
-def opencode_directories(ids, timeout=20):
-    """Resolve the active service ids through its supported session endpoint."""
+def opencode_directories(ids, timeout=20, *, overall_timeout=300, max_attempts=3, stats=None):
+    """Resolve every active id, with bounded transient retries; never return a partial map."""
+    if not 1 <= max_attempts <= 3:
+        raise ValueError('max_attempts must be between 1 and 3')
+    started = time.monotonic()
+    deadline = started + overall_timeout
+    ids = sorted(ids)
+    counts = dict(attempts=0, opencode_ids=len(ids), resolved=0, seconds=0,
+                  per_id_max_s=0, last_error=None)
     result = {}
-    for sid in ids:
-        try:
-            req = urllib.request.Request(OC_SERVICE_URL.rstrip("/") + "/api/session/" +
-                                         urllib.parse.quote(sid, safe=""))
-            pw = _password()
-            if pw:
-                req.add_header("Authorization", "Basic " + base64.b64encode(f"opencode:{pw}".encode()).decode())
-            with urllib.request.urlopen(req, timeout=timeout) as response:
-                data = json.load(response).get("data")
-            if not isinstance(data, dict) or not isinstance((data.get("location") or {}).get("directory", data.get("directory")), str) or not (data.get("location") or {}).get("directory", data.get("directory")):
-                return None, "opencode-service: session directory unavailable"
-            result[sid] = (data.get("location") or {}).get("directory", data.get("directory"))
-        except Exception as exc:
-            return None, f"opencode-service directory: {type(exc).__name__}"
-    return result, None
+    try:
+        for sid in ids:
+            id_started = time.monotonic()
+            attempts = 0
+
+            def reason(cause):
+                elapsed = time.monotonic() - id_started
+                return f"opencode-service directory: {sid[:8]} {cause} after {attempts} attempts, {elapsed:.1f} s"
+
+            try:
+                for attempt in range(max_attempts):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        counts['last_error'] = reason('overall deadline exceeded')
+                        return None, counts['last_error']
+                    attempts += 1
+                    counts['attempts'] += 1
+                    try:
+                        body = opencode_get('/api/session/' + urllib.parse.quote(sid, safe=''),
+                                            timeout=min(timeout, remaining))
+                        if time.monotonic() >= deadline:
+                            counts['last_error'] = reason('overall deadline exceeded')
+                            return None, counts['last_error']
+                        data = body.get('data') if isinstance(body, dict) else None
+                        location = data.get('location') if isinstance(data, dict) else None
+                        if location is not None and not isinstance(location, dict):
+                            raise ValueError('session directory unavailable')
+                        directory = (location.get('directory', data.get('directory'))
+                                     if isinstance(location, dict) else data.get('directory')
+                                     if isinstance(data, dict) else None)
+                        if not isinstance(directory, str) or not directory:
+                            raise ValueError('session directory unavailable')
+                        result[sid] = directory
+                        counts['resolved'] += 1
+                        break
+                    except Exception as exc:
+                        # HTTP errors (including 404) and malformed payloads do not
+                        # prove an active session is gone. Only transport failures retry.
+                        transport_error = isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError)
+                        cause = exc.reason if transport_error else exc
+                        label = (f'HTTPError {exc.code}' if isinstance(exc, urllib.error.HTTPError) else
+                                 'session directory unavailable' if isinstance(exc, ValueError) else
+                                 type(cause).__name__ if isinstance(cause, Exception) else type(exc).__name__)
+                        counts['last_error'] = reason(label)
+                        if time.monotonic() >= deadline:
+                            counts['last_error'] = reason(f'overall deadline exceeded ({label})')
+                            return None, counts['last_error']
+                        transient = isinstance(cause, (TimeoutError, socket.timeout, ConnectionError)) or transport_error
+                        if not transient or attempts >= max_attempts:
+                            return None, counts['last_error']
+                        time.sleep(min((2, 5)[attempt], max(0, deadline - time.monotonic())))
+            finally:
+                counts['per_id_max_s'] = max(counts['per_id_max_s'], time.monotonic() - id_started)
+        return result, None
+    finally:
+        counts['seconds'] = round(time.monotonic() - started, 3)
+        counts['per_id_max_s'] = round(counts['per_id_max_s'], 3)
+        if stats is not None:
+            stats.update(counts)
 
 
-def directories(snap):
+def directories(snap, timeout=20, *, overall_timeout=300, max_attempts=3, stats=None):
     if not snap["complete"]:
         return None, "; ".join(snap["problems"]) or "active set incomplete"
-    oc, err = opencode_directories(snap["opencode"])
+    oc, err = opencode_directories(snap["opencode"], timeout=timeout, overall_timeout=overall_timeout,
+                                  max_attempts=max_attempts, stats=stats)
     if err:
         return None, err
     return {**oc, **{"thread:" + tid: path for tid, path in snap["workspaces"].items()}}, None
@@ -491,7 +544,7 @@ def session_history(cache_path=None, write_cache=False, now=None):
         return None, {}, f'opencode history: {type(exc).__name__}: {exc}'
 
 
-def project_activity(project_id, root, since_ms, stats=None):
+def project_activity(project_id, root, since_ms, stats=None, *, traversal_timeout=CONTROL_TRAVERSAL_TIMEOUT):
     """Complete recent live and archived history; a failed read only disables this repo's reaping."""
     started = time.monotonic()
     activity = {}
@@ -504,7 +557,8 @@ def project_activity(project_id, root, since_ms, stats=None):
             query['archived'] = 'true'
         listing = {}
         threads, err = _control_threads('/threads?' + urllib.parse.urlencode(query), NATIVE_TIMEOUT,
-                                        f'history {project_id} archived={archived}', stats=listing)
+                                        f'history {project_id} archived={archived}',
+                                        traversal_timeout=traversal_timeout, stats=listing)
         stats['listings'][str(archived).lower()] = listing
         for key in ('pages', 'rows', 'catch_up_rows'):
             stats[key] += listing.get(key, 0)

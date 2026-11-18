@@ -27,7 +27,7 @@ from . import ssh_outage, home, api, capacity, identity, lease, node_tools, node
 from . import bun_version, command_usage, common, containers, java_version, prune, prepare, userns
 from . import resources, box_disk, queue_lifecycle
 from .common import (BOX_WEDGED_NOTE, EXIT_BUSY, EXIT_DETACHED, EXIT_INFRA, EXIT_INTERRUPTED, EXIT_LOCAL, EXIT_WAIT_TIMEOUT, LOGS_DIR, ORPHAN_RUN_MAX_S,
-                     RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, db, db_retry, event, file_lock, local_error, log, new_id, now,
+                     RUN_TTL_S, TTL_REFRESH_S, TTL_RETRY_S, OffboxError, atomic_write_json, checkpoint, db, db_retry, event, file_lock, local_error, log, new_id, now,
                      is_silenced, offsets_path, person, read_json, record_delivery, say, silence, size_summary, write)
 
 
@@ -2311,7 +2311,10 @@ class Runner:
     # ------------------------------------------------------------ streaming
     def stream(self, echo: bool = True) -> int | None:
         """Attach until exit. Returns exit code (None if lost)."""
-        return follow(self.box, self.pid, self.log_path, echo=echo, run_id=self.run_id)
+        ck = checkpoint(self.log_path)
+        # The same client consumed admission even if its checkpoint write failed.
+        start = getattr(self, 'admission_offsets', None) or ((ck['stdoutOffset'], ck['stderrOffset']) if ck else (0, 0))
+        return follow(self.box, self.pid, self.log_path, echo=echo, run_id=self.run_id, start_offsets=start)
 
     def kill(self):
         if self.box and self.pid and not self.killed:
@@ -2652,12 +2655,13 @@ _COMMAND_RUNNING = object()
 def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_id: str | None = None,
            start_offsets=(0, 0), stop_evt: threading.Event | None = None, until: float | None = None,
            replay_path: Path | None = None, mirror_path: Path | None = None, mirror_keep: int = 0,
-           receipt_locked: bool = False, until_command_started: bool = False):
+           receipt_locked: bool = False, until_command_started: bool = False, admission_offsets=None):
     """Stream a remote command's output until it exits. Setting stop_evt (see lease._follow_bounded) makes it
     return None at the next frame, reconnect or retry pause; it then closes its stream and joins its TTL keeper.
     Past `until` (a time.time()-style deadline) it raises EXIT_WAIT_TIMEOUT and leaves the remote run alone.
     The per-stream offsets are saved beside the local log after every chunk, so a waiter that takes over a dead
     holder's follow resumes from them (see offsets_path) instead of replaying output."""
+    row = None
     if run_id:
         from . import start_check
         with contextlib.closing(db()) as con:
@@ -2672,11 +2676,12 @@ def follow(box_id: str, pid: int, log_path: Path | None, echo: bool = True, run_
     guard = log_lock(run_id or Path(log_path).stem, until=until) if log_path else contextlib.nullcontext()
     with guard:
         return _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt, until,
-                              replay_path, mirror_path, mirror_keep, until_command_started)
+                              replay_path, mirror_path, mirror_keep, until_command_started,
+                              row['command_id'] if row else None, admission_offsets)
 
 
 def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt, until,
-                   replay_path, mirror_path, mirror_keep, until_command_started=False):
+                   replay_path, mirror_path, mirror_keep, until_command_started=False, command_id=None, admission_offsets=None):
     startup_tail = ""
     out_off, err_off = start_offsets
     stop_evt = stop_evt or threading.Event()
@@ -2687,6 +2692,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
     target = replay_path or log_path
     lf = open(target, "ab") if target else None
     delivered = 0
+    first_byte = True
     # A takeover also mirrors every committed chunk into the original log (`mirror_path`), so a lock-blocked
     # `logs --follow` sees the new output while the owner runs. The mirror is opened for append, never truncated.
     # Never truncated: the original keeps its committed prefix, and readers only trust bytes up to its checkpoint.
@@ -2810,7 +2816,10 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                 if down_from is not None:
                     # Inside an outage the attach may not outrun the outage window either.
                     read_s = max(1.0, min(read_s, window - (now() - down_from)))
-                frames = api.cmd_attach(box_id, pid, out_off, err_off, timeout=read_s, deadline=until)
+                from . import live_logs
+                frames = live_logs.frames(box_id, pid, out_off, err_off, timeout=read_s, until=until,
+                                          stop=stop_evt, run_id=run_id, clock=now, command=command_id,
+                                          log_dir=Path(log_path).parent if log_path else None)
                 for fr in frames:
                     if stop_evt.is_set():
                         return None
@@ -2850,9 +2859,17 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                                 mf.write(b)
                                 mf.flush()
                                 _commit(mirror_path, out_off, err_off, mf.tell())
+                        if b and log_path:
+                            if first_byte:
+                                live_logs.note(run_id, 'first_byte', directory=Path(log_path).parent)
+                                first_byte = False
+                            live_logs.note(run_id, 'flush', directory=Path(log_path).parent, bytes=len(b), stdoutOffset=out_off,
+                                           stderrOffset=err_off, logBytes=lf.tell() if lf else 0)
                         if until_command_started and t == 'stderr':
                             startup_tail += data
                             if COMMAND_STARTED_MARKER + ' ' + (run_id or '') in startup_tail.splitlines():
+                                if admission_offsets is not None:
+                                    admission_offsets[:] = (out_off, err_off)
                                 return _COMMAND_RUNNING
                             startup_tail = startup_tail[-4096:]
                     elif t == "reconnect":
@@ -2864,7 +2881,7 @@ def _follow_locked(box_id, pid, log_path, echo, run_id, start_offsets, stop_evt,
                             return code
                         again = True
                         break
-                    elif t == "heartbeat" and now() - probed["at"] >= QUIET_PROBE_S:
+                    elif t in ("heartbeat", "follow_tick") and now() - probed["at"] >= QUIET_PROBE_S:
                         # A stream that only sends heartbeats can't hide a finished process for long either.
                         code = probe_end()
                         if code is not _RUNNING:
@@ -3997,26 +4014,28 @@ def _run_remote(a, rn) -> int:
                 queue_lifecycle.note(rn.run_id, 'handoff', 'handoff', box_id=rn.box, recovered_code=rn.recovered_code)
             return 0
         if a.bg and rn.recovered_code is None:
-            # Nobody stays attached to refresh the deadline: give the box a long one. The reaper stops it
-            # IDLE_STOP_S after the process ends (it checks process status itself).
             lease.ensure_ttl(rn.box, BG_TTL_S, api.get(rn.box))
             # Keep the detached client through admission so a disk gate can recover before handing back.
+            rn.admission_offsets = []
             admission = follow(rn.box, rn.pid, rn.log_path, echo=False, run_id=rn.run_id,
-                               until_command_started=True)
+                               until_command_started=True, admission_offsets=rn.admission_offsets)
             if admission is _COMMAND_RUNNING:
                 print(rn.run_id)
                 background_wait_hint(rn.run_id)
                 say(f"started in background on {rn.box}")
                 if os.environ.get(BACKGROUND_RUN_ENV):
-                    queue_lifecycle.note(rn.run_id, 'handoff', 'handoff', box_id=rn.box, process_id=rn.pid)
-                return 0
-            rn.recovered_code = admission
+                    queue_lifecycle.note(rn.run_id, 'handoff', 'following', box_id=rn.box, process_id=rn.pid)
+                else:
+                    return 0
+            else:
+                rn.recovered_code = admission
         kill_hint = dict(run_id=rn.run_id, status='running', exit_code=None, process_id=getattr(rn, 'pid', None), box_id=rn.box,
                          step_count=len(getattr(a, 'steps', None) or []), mode='fg')
         stream_killed = None
         code = None
         try:
-            code = rn.recovered_code if rn.recovered_code is not None else rn.stream()
+            code = rn.recovered_code if rn.recovered_code is not None else (
+                rn.stream(echo=False) if a.bg else rn.stream())
             rn.remote_code = None if getattr(a, 'steps', None) else code
         except Interrupted as error:
             remember_interruption(rn.run_id, {'interruption': error.interruption})
@@ -4035,7 +4054,8 @@ def _run_remote(a, rn) -> int:
                 raise
             code = stream_killed['exit_code']
     except KeyboardInterrupt:
-        if rn.started and rn.box and _host_restarting(interrupted['sig']):
+        if rn.started and rn.box and (_host_restarting(interrupted['sig']) or
+                                     a.bg and os.environ.get(BACKGROUND_RUN_ENV)):
             return _detach(rn, interrupted['sig'])
         rn.kill()
         if not rn.started:

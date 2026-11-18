@@ -1477,8 +1477,8 @@ const initialize = () => {
 const atCeiling = (state) => state.log >= workerData.backpressureFrames;
 const exceedsSizeLimit = () =>
   journalSizeLimit >= 0 && statSync(workerData.filename + "-wal").size > journalSizeLimit;
-const schedule = (state, blocked) => {
-  if (blocked || state.log - state.checkpointed >= workerData.frames) {
+const schedule = (state, blocked, oversized) => {
+  if (blocked || oversized || state.log - state.checkpointed >= workerData.frames) {
     idle = setTimeout(() => check(undefined, undefined, true), workerData.idleMs);
   }
 };
@@ -1503,9 +1503,11 @@ const check = (id, nextJournalSizeLimit, force, nextGeneration = generation) => 
     });
     return;
   }
-  const blocked = (atCeiling(state) || oversized) && state.checkpointed < state.log;
+  // journal_size_limit is a cleanup target. A reader that prevents truncation
+  // must not stop commits below the independent frame ceiling.
+  const blocked = atCeiling(state) && state.checkpointed < state.log;
   parentPort.postMessage({ type: "checkpoint", id, generation, ...state, blocked });
-  schedule(state, blocked);
+  schedule(state, blocked, oversized);
 };
 const finishTruncate = (truncateId) => {
   if (pendingTruncate === undefined || pendingTruncate.truncateId !== truncateId) return;
@@ -1520,7 +1522,8 @@ const finishTruncate = (truncateId) => {
     db.exec("PRAGMA busy_timeout = 5000;");
   }
   const state = frames.get();
-  const blocked = (atCeiling(state) && (busy || state.checkpointed < state.log)) || exceedsSizeLimit();
+  const oversized = exceedsSizeLimit();
+  const blocked = atCeiling(state) && (busy || state.checkpointed < state.log);
   pendingTruncate = undefined;
   parentPort.postMessage({
     type: "checkpoint",
@@ -1534,7 +1537,7 @@ const finishTruncate = (truncateId) => {
     pendingBarriers--;
     parentPort.postMessage("barrier");
   }
-  schedule(state, blocked);
+  schedule(state, blocked, oversized);
 };
 parentPort.on("message", (request) => {
   clearTimeout(idle);

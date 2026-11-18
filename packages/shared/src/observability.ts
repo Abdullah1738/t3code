@@ -122,6 +122,8 @@ function keepFileSpan(record: TraceRecord, minDurationMs: number) {
     record.durationMs < 0 ||
     record.durationMs >= minDurationMs ||
     !record.parentSpanId ||
+    // Keep durable claim identities even when SQLite returns below the filter threshold.
+    (record.name === "EffectWorker.claim" && record.attributes["result"] === "claimed") ||
     (record.type === "effect-span"
       ? record.exit._tag !== "Success"
       : record.status?.code === "2" ||
