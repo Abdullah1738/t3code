@@ -13,6 +13,16 @@ import commerce_journal as journal
 import owner_go
 
 
+def isolated_owner_ledger(test):
+    temp = tempfile.TemporaryDirectory()
+    test.addCleanup(temp.cleanup)
+    root = Path(temp.name)
+    logs = patch.dict(os.environ, {'ROBOB_TOOL_LOG_DIR': str(root / 'logs'),
+                                  'TOOLLOG_ROOT': str(root / 'logs')})
+    logs.start(); test.addCleanup(logs.stop)
+    return owner_go.Ledger(root / 'ledger')
+
+
 def approve_test_flows(test):
     if getattr(test, '_owner_go_fixture', False):
         return
