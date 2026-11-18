@@ -26,6 +26,7 @@ import type { ProjectionRuntimeRecoveryState } from "./ProjectionStore.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { isNativeMaintenanceCommand } from "./CommandPolicy.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import { restartInterrupted } from "./delegatedTaskProgress.ts";
 import {
   awaitingProviderThreadId,
   cancelledRosterTaskWork,
@@ -481,6 +482,39 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       })
       .pipe(
         Effect.tap(() => Effect.sync(() => markContinuationDispatched(input.threadId))),
+        Effect.tap(({ storedEvents }) =>
+          Effect.gen(function* () {
+            const parentThreadId = projection.thread.lineage?.parentThreadId;
+            if (
+              !restartInterrupted(source) ||
+              projection.thread.lineage?.relationshipToParent !== "subagent" ||
+              parentThreadId == null ||
+              projection.thread.forkedFrom?.type !== "node" ||
+              !storedEvents.some(
+                ({ event }) =>
+                  event.type === "run.created" &&
+                  event.threadId === input.threadId &&
+                  event.payload.restartContinuationOfRunId === source.id,
+              )
+            )
+              return;
+            const taskId = source.delegatedTaskId ?? projection.thread.forkedFrom.nodeId;
+            const parent = yield* threads
+              .getThreadRecords(parentThreadId, ["subagents"])
+              .pipe(Effect.orElseSucceed(() => null));
+            if (parent === null) return;
+            const task = parent.subagents.find((row) => row.id === taskId);
+            // A fallback notice may have won the race with this continuation.
+            if (task === undefined || (task.result !== null && restartInterrupted(task))) return;
+            yield* Effect.logInfo("delegated-task.restart_interrupted", {
+              taskId,
+              parentThreadId,
+              childThreadId: input.threadId,
+              runId: source.id,
+              action: "resumed",
+            });
+          }),
+        ),
         // The project turned this instance off since the restart. No turn
         // resumes, and the success path below still runs so a delegated
         // child waiting on this run is recovered immediately instead of

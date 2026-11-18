@@ -1,3 +1,4 @@
+import { MessageCache } from "./message-cache.ts";
 import { toolError } from "./toollog.ts";
 import { IMESSAGE_ORIGIN, isCompletionNoticeText, subagentNoticeState, type ChatBackend, type FilePart, type MessageRecord, type OwnerWords, type PermissionRequest, type QuestionRequest, type SessionRecord, type SessionStatus, type SteerDelivery, type SteerGuard } from "./openchamber.ts";
 import {
@@ -174,6 +175,18 @@ export class RobobBackend implements ChatBackend {
   private readonly sendRuns = new Map<string, { at: number; runId?: string }>();
   private readonly sendFiles = new Map<string, { fingerprint: string; attachments: Awaited<ReturnType<ControlClient["upload"]>>[] }>();
   private readonly sendBodies = new Map<string, Record<string, unknown>>();
+  private readonly messageCache: MessageCache;
+
+  messageReadScope<T>(body: () => Promise<T>): Promise<T> {
+    return this.messageCache.withinTick(body);
+  }
+
+  private readMessages(threadId: string, thread: ThreadDetail, until?: string): Promise<ControlMessage[]> {
+    return this.messageCache.read(threadId, JSON.stringify([thread.run, thread.recentRuns, thread.lastError]), until === undefined ? undefined : messages =>
+      recordsFromThread(thread, messages).some(record => record.id === until)
+      || messages.some(message => until === `idle:${message.runId}` || until === `${message.runId}:error`));
+  }
+
   private readonly historicalRuns = new Map<string, RunSummary>();
   /** Threads createChat made whose first turn has not been judged yet. */
   private readonly firstTurns = new Map<string, string | null>();
@@ -200,6 +213,7 @@ export class RobobBackend implements ChatBackend {
     if (options.subdir !== undefined && !/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/.test(options.subdir)) throw new Error("Invalid iMessage chat folder");
     this.client = options.client ?? new ControlClient(options);
     this.directories = new ThreadDirectories(this.client);
+    this.messageCache = new MessageCache(this.client);
     this.finishes = options.finishes ?? opencodeFinishes();
     this.completedSteps = options.completedSteps ?? opencodeCompletedSteps();
     this.runEvidence = options.runEvidence ?? opencodeRunEvidence();
@@ -350,6 +364,7 @@ export class RobobBackend implements ChatBackend {
 
   async retireOthers(keepId: string): Promise<number> {
     const keep = await this.resolve(keepId);
+    this.messageCache.routeChange();
     const { threads } = await this.client.listThreads({ origin: IMESSAGE_ORIGIN, limit: 500 });
     let settled = 0;
     for (const thread of threads) {
@@ -393,8 +408,14 @@ export class RobobBackend implements ChatBackend {
     // Read messages after the run state: an earlier page must not make a just-completed
     // first turn look successful before its selected-model error text has arrived.
     let { thread } = await this.client.thread(threadId);
-    const { messages } = await this.client.messages(threadId);
-    thread = await this.restoreRunStatuses(thread, messages, until, limit);
+    let messages = await this.readMessages(threadId, thread, until);
+    try {
+      thread = await this.restoreRunStatuses(thread, messages, until, limit);
+    } catch (error) {
+      if (!(error instanceof ControlError) || error.status !== 404) throw error;
+      messages = await this.messageCache.resync(threadId, JSON.stringify([thread.run, thread.recentRuns, thread.lastError]));
+      thread = await this.restoreRunStatuses(thread, messages, until, limit);
+    }
     await this.checkFirstTurn(thread, messages);
     await this.flushFirstTurnAlert();
     // The send receipt identifies the run even if an older failure is still in the page.
@@ -617,7 +638,8 @@ export class RobobBackend implements ChatBackend {
 
   async promptAccepted(id: string, _directory: string, messageId: string): Promise<boolean> {
     const threadId = await this.resolve(id);
-    const { messages } = await this.client.messages(threadId);
+    const { thread } = await this.client.thread(threadId);
+    const messages = await this.readMessages(threadId, thread);
     return messages.some(message => message.role === "user" && promptId(threadId, message) === messageId);
   }
 
@@ -630,7 +652,8 @@ export class RobobBackend implements ChatBackend {
 
   private async reconcileControl(threadId: string, messageId: string, error: unknown): Promise<boolean> {
     try {
-      await this.client.thread(threadId);
+      // A reader during the POST may have repopulated the same-tick snapshot before admission.
+      this.messageCache.afterWrite(threadId);
       const accepted = await this.promptAccepted(threadId, "", messageId);
       if (error instanceof ControlError) error.reconciled = true;
       return accepted;
@@ -702,22 +725,25 @@ export class RobobBackend implements ChatBackend {
     const receipt = this.firstTurnStore?.get<{ at: number; runId?: string }>(receiptKey) ?? this.sendRuns.get(receiptKey) ?? { at: Date.now() };
     this.sendRuns.set(receiptKey, receipt);
     this.firstTurnStore?.set(receiptKey, receipt);
-    const accepted = await this.client.request<{ runId?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, this.sendBody(threadId, messageId, {
-      text: words ? words.text : text, mode: "auto", clientRequestId: messageId,
-      ...(guidance ? { guidance } : {}),
-      ...(words ? { inboundId: words.inboundId } : {}),
-      ...(model ? controlModelFields(model) : {}),
-      ...(attachments.length ? { attachments } : {}),
-    }), { timeoutMs: 60_000 }).catch(async error => {
-      toolError("robob", "robob.send_failed", error);
-      if (controlDisposition(error) === "reconcile" && await this.reconcileControl(threadId, messageId, error)) return { runId: undefined };
-      throw error;
-    });
-    if (accepted.runId) {
-      const bound = { ...receipt, runId: accepted.runId };
-      this.sendRuns.set(receiptKey, bound);
-      this.firstTurnStore?.set(receiptKey, bound);
-    }
+    this.messageCache.afterWrite(threadId);
+    try {
+      const accepted = await this.client.request<{ runId?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, this.sendBody(threadId, messageId, {
+        text: words ? words.text : text, mode: "auto", clientRequestId: messageId,
+        ...(guidance ? { guidance } : {}),
+        ...(words ? { inboundId: words.inboundId } : {}),
+        ...(model ? controlModelFields(model) : {}),
+        ...(attachments.length ? { attachments } : {}),
+      }), { timeoutMs: 60_000 }).catch(async error => {
+        toolError("robob", "robob.send_failed", error);
+        if (controlDisposition(error) === "reconcile" && await this.reconcileControl(threadId, messageId, error)) return { runId: undefined };
+        throw error;
+      });
+      if (accepted.runId) {
+        const bound = { ...receipt, runId: accepted.runId };
+        this.sendRuns.set(receiptKey, bound);
+        this.firstTurnStore?.set(receiptKey, bound);
+      }
+    } finally { this.messageCache.afterWrite(threadId); }
   }
 
   /**
@@ -729,6 +755,7 @@ export class RobobBackend implements ChatBackend {
     const threadId = await this.resolve(id);
     const attachments = await this.sendAttachments(threadId, messageId, files, guard?.signal);
     if (guard && (guard.signal.aborted || !await guard.beforeSend() || guard.signal.aborted)) return "refused";
+    this.messageCache.afterWrite(threadId);
     try {
       const { delivery } = await this.client.request<{ delivery?: string }>("POST", `/threads/${encodeURIComponent(threadId)}/send`, this.sendBody(threadId, messageId, {
         text, mode: "steer", clientRequestId: messageId, ...(guidance.trim() ? { guidance: guidance.trim() } : {}),
@@ -744,7 +771,7 @@ export class RobobBackend implements ChatBackend {
         return "refused";
       }
       throw error;
-    }
+    } finally { this.messageCache.afterWrite(threadId); }
   }
 
   async abort(id: string, _directory?: string, cancelReason?: Parameters<ChatBackend["abort"]>[2]): Promise<boolean> {

@@ -3,6 +3,7 @@ import type {
   OrchestrationV2DomainEvent,
   OrchestrationV2RuntimeRequest,
   OrchestrationV2Run,
+  OrchestrationV2ProviderSession,
   OrchestrationV2ThreadShellSnapshot,
   OrchestrationV2StoredEvent,
   OrchestrationV2ThreadProjection,
@@ -48,6 +49,11 @@ export type OrchestratorV2ScenarioStep =
   | {
       readonly type: "await_thread_idle";
       readonly threadId: ThreadId;
+    }
+  | {
+      readonly type: "await_provider_session_status";
+      readonly threadId: ThreadId;
+      readonly status: OrchestrationV2ProviderSession["status"];
     }
   | {
       readonly type: "await_no_background_work";
@@ -649,6 +655,26 @@ export function runOrchestratorV2Scenario(
           case "await_thread_idle":
             yield* waitForThreadIdle(step.threadId);
             break;
+          case "await_provider_session_status": {
+            // An idle run can precede session retirement. Replay committed events
+            // as well as the live tail so an already-committed stop is not missed.
+            const event = yield* orchestrator.streamStoredEvents.pipe(
+              Stream.filter(
+                ({ event }) =>
+                  event.threadId === step.threadId &&
+                  event.type === "provider-session.updated" &&
+                  event.payload.status === step.status,
+              ),
+              Stream.runHead,
+            );
+            if (Option.isNone(event)) {
+              return yield* new OrchestratorV2ScenarioStepError({
+                scenario: scenario.name,
+                step: `await_provider_session_status:${step.threadId}:${step.status}`,
+              });
+            }
+            break;
+          }
           case "await_no_background_work":
             yield* waitForNoBackgroundWork(step.threadId);
             break;

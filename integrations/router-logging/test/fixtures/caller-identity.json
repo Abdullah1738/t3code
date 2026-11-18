@@ -1,0 +1,14 @@
+[
+  {"client":"codex","keyId":"unreg:0123456789ab","status":499},
+  {"client":"codex","keyId":"unreg:0123456789ab","status":200},
+  {"client":"opencode","keyId":"unreg:abcdef012345","status":499},
+  {"client":"opencode","keyId":"unreg:abcdef012345","status":200},
+  {"client":"ai-sdk","keyId":"unreg:abcdef012345","status":200},
+  {"client":"other","uaProduct":"weird-agent","keyId":"lookup_failed","status":499},
+  {"client":"other","uaProduct":"weird-agent","keyId":"lookup_failed","status":200},
+  {"client":"other","uaProduct":"","keyId":"none","status":200},
+  {"client":"claude-code","keyId":"0123456789abcdef","status":200},
+  {"client":"claude-code","keyId":"0123456789abcdef","status":499},
+  {"client":"aborted","keyId":"unknown"},
+  {"client":"other","uaProduct":["invalid"],"keyId":"RAW_KEY_CANARY_65","status":499}
+]

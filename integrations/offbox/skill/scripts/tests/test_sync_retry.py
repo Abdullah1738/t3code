@@ -261,6 +261,24 @@ class PushResumeTests(Isolated):
         self.assertTrue(rn.started)
         self.log.assert_called_once_with('push_box_stopped_resumed box')
 
+    def test_sync_state_and_one_left_out_line(self):
+        stats = dict(tracked_total=10, tracked_heavy=2, tracked_heavy_sent=2,
+                     tracked_node_modules_sent=1, tracked_secret_sent=1,
+                     tracked_left_out={"secret": 1}, tracked_left_out_first=["fixtures/key.pem"],
+                     verified=9, seconds=1, files=4)
+        self.push.return_value = stats
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            rn = self.runner()
+            rn.start()
+        state = runs.read_json(runs.LOGS_DIR / f"{rn.run_id}.state.json", {})
+        for key in ssh_sync.TRACKED_SYNC_FIELDS:
+            self.assertEqual(state[key], stats[key])
+        text = output.getvalue()
+        self.assertEqual(text.count("tracked files not synced"), 1)
+        self.assertIn("verified 9 of 10 tracked files (1 left out, see above)", text)
+        self.assertNotIn("not synced (secret filter)", text)
+
     def test_stopped_during_push_resumes_once_then_starts_command(self):
         self.assert_resumed_start()
 

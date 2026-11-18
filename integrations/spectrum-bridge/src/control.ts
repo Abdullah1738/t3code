@@ -273,8 +273,8 @@ export class ControlClient {
     return this.request("GET", `/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/evidence`);
   }
 
-  messages(threadId: string): Promise<{ messages: ControlMessage[]; state: ThreadState; status: string; runId: string | null }> {
-    return this.request("GET", `/threads/${encodeURIComponent(threadId)}/messages?all=true&role=all`);
+  messages(threadId: string, since?: number): Promise<{ messages: ControlMessage[]; state: ThreadState; status: string; runId: string | null }> {
+    return this.request("GET", `/threads/${encodeURIComponent(threadId)}/messages?all=true&role=all${since === undefined ? "" : `&since=${since}`}`);
   }
 
   projects(): Promise<{ projects: Array<{ projectId: string; title: string; workspaceRoot: string; scratch?: boolean }> }> {

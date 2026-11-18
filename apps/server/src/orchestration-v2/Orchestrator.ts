@@ -107,6 +107,8 @@ import {
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import {
   normalizeIdleTimeout,
+  parentTaskCancellationRequest,
+  restartInterrupted,
   stalledSummary,
   silentRecoveryStillSafe,
   supportsSilentRecovery,
@@ -142,7 +144,7 @@ import {
   isNativeMaintenanceCommand,
   resolveMessageDispatchIntent,
 } from "./CommandPolicy.ts";
-import { CommandReceiptStoreV2 } from "./CommandReceiptStore.ts";
+import { type CommandReceiptV2, CommandReceiptStoreV2 } from "./CommandReceiptStore.ts";
 import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
 import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
 import {
@@ -815,6 +817,19 @@ function delegatedTaskTerminalStatus(
   }
 }
 
+function completionReceiverFailedBeforeAcceptance(
+  run: OrchestrationV2Run,
+  failureCode: string | null | undefined,
+): boolean {
+  return (
+    run.status === "failed" &&
+    (run.startedAt === null ||
+      failureCode === "provider_prompt_not_sent" ||
+      failureCode === PROVIDER_START_TIMEOUT_CODE ||
+      failureCode === "restart_admission_timeout")
+  );
+}
+
 function nextQueuedRun(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
 ): OrchestrationV2Run | undefined {
@@ -1013,6 +1028,18 @@ function lastDeliveredRunForProviderThread(
         projection.providerTurns.some((turn) => turn.runAttemptId === run.activeAttemptId)),
   );
 }
+
+const encodeRestartInterruption = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      status: Schema.Literal("interrupted"),
+      cancelReason: Schema.optional(Schema.String),
+      resumable: Schema.Literal(true),
+      childThreadId: ThreadId,
+      resumeTool: Schema.Literal("t3_thread_send"),
+    }),
+  ),
+);
 
 const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(function* () {
   const startTimeoutQueueOwner = yield* StartTimeoutQueueOwner;
@@ -5947,11 +5974,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       projection.thread.worktreePath === null
         ? latestRun
         : undefined;
+    // A durable completion must not reset a failed provider startup's retry budget.
+    // Keep it queued until an explicit send or Resume; admission timeouts can retry.
+    const completionFailureCode = latestRootProviderFailure(
+      latestRun ?? null,
+      projection.turnItems,
+    )?.code;
+    const completionStartFailure =
+      delegatedCompletion !== undefined &&
+      activeRun === undefined &&
+      latestRun?.status === "failed" &&
+      completionReceiverFailedBeforeAcceptance(latestRun, completionFailureCode) &&
+      latestRun.providerInstanceId === modelSelection.instanceId &&
+      ![PROVIDER_START_TIMEOUT_CODE, "restart_admission_timeout"].includes(
+        completionFailureCode ?? "",
+      )
+        ? latestRun
+        : undefined;
     const heldForCutover =
       !command.commandId.startsWith("harness-cutover:v1:") &&
       (yield* admissionHeld(command.threadId, modelSelection));
     const queueBehindRun =
-      activeRun ?? worktreeMissingRun ?? (heldForCutover ? (latestRun ?? undefined) : undefined);
+      activeRun ??
+      worktreeMissingRun ??
+      completionStartFailure ??
+      (heldForCutover ? (latestRun ?? undefined) : undefined);
     const pendingMergeBackTransfers = pendingMergeBackTransfersForThread(projection);
     // ardud: a pending fork or merge-back would carry another thread's context
     // into the run a context reset starts, so refuse and leave it pending.
@@ -6149,6 +6196,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         activeAttemptId: attemptId,
         status: "queued",
         ...(worktreeMissingRun !== undefined ||
+        completionStartFailure !== undefined ||
         stoppedBeforeWork ||
         (heldRunsToRelease.length === 0 && queueIsHeld && !wakeSkipsHold)
           ? { queueHeld: true }
@@ -12908,7 +12956,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           messageRoles: ["assistant"],
           messageRunIds: [childRun.id],
           turnItemRunId: childRun.id,
-          turnItemTypes: ["assistant_message", "error"],
+          turnItemTypes: ["assistant_message", "error", "run_interrupt_request"],
         },
       );
       const lastTool = needsPartialResult({ ...childRun, status: outcome })
@@ -13006,6 +13054,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const parentTurnItem = parentProjection.turnItems.find(
         (candidate) => candidate.type === "subagent" && candidate.subagentId === task.id,
       );
+      const parentCancelRequest = parentTaskCancellationRequest(childRun.id, childResult.turnItems);
+      const parentCancelReason =
+        task.cancelReason === "task_cancel" || task.cancelReason === "delegated_parent_cancelled"
+          ? task.cancelReason
+          : parentCancelRequest?.cancelReason;
+      const parentCancelled = parentCancelReason !== undefined || parentCancelRequest !== undefined;
+      const restartCancelled = restartInterrupted(childRun) && parentCancelled;
+      const interruptedByRestart = restartInterrupted(childRun) && !parentCancelled;
+      const taskTerminalStatus = restartCancelled
+        ? "cancelled"
+        : interruptedByRestart
+          ? "interrupted"
+          : terminalStatus;
       const updatedTask: OrchestrationV2Subagent = {
         ...task,
         ...(isTerminalDelegatedTaskStatus(task.status) &&
@@ -13018,14 +13079,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }
           : {}),
         providerThreadId: childRun.providerThreadId,
-        status: terminalStatus,
-        cancelReason: childRun.cancelReason,
-        cancelDetail: childRun.cancelDetail,
+        status: taskTerminalStatus,
+        cancelReason: restartCancelled ? parentCancelReason : childRun.cancelReason,
+        cancelDetail: restartCancelled
+          ? (task.cancelDetail ?? parentCancelRequest?.message.slice(0, 500))
+          : childRun.cancelDetail,
         ...(childRun.delegatedTaskStall === undefined ? {} : { failureReason: "stalled" as const }),
         ...(childRun.launchRecovery?.kind === "model_access"
           ? { model: childRun.modelSelection.model }
           : {}),
-        result: claudeRecoveryResult({ ...childRun, status: outcome }, result.text).text,
+        result: interruptedByRestart
+          ? `${encodeRestartInterruption({ status: "interrupted", cancelReason: childRun.cancelReason, resumable: true, childThreadId, resumeTool: "t3_thread_send" })}\nInterrupted by restart. Resume this same task with t3_thread_send using the childThreadId above; check preserved work before repeating actions.${partialResult.messageId === null && partialResult.turnItemId === null ? "" : `\n\nPartial assistant text:\n${result.text}`}`
+          : claudeRecoveryResult({ ...childRun, status: outcome }, result.text).text,
         completedAt: childRun.completedAt ?? now,
         updatedAt: now,
       };
@@ -13120,7 +13185,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 occurredAt: now,
                 payload: {
                   ...parentNode,
-                  status: terminalStatus,
+                  status: taskTerminalStatus,
                   providerThreadId: childRun.providerThreadId,
                   completedAt: now,
                 },
@@ -13138,8 +13203,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 occurredAt: now,
                 payload: {
                   ...parentTurnItem,
-                  status: terminalStatus,
-                  result: result.text,
+                  status: taskTerminalStatus,
+                  result: updatedTask.result,
                   completedAt: now,
                   updatedAt: now,
                 },
@@ -13177,9 +13242,91 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
 
+      if (interruptedByRestart) {
+        yield* Effect.logInfo("delegated-task.restart_interrupted", {
+          taskId: task.id,
+          parentThreadId,
+          childThreadId,
+          runId: childRun.id,
+          action: "parent_notified",
+        });
+      }
+
       if (completionPlan.offer && completionPlan.parentRun !== undefined) {
         yield* offerDelegatedCompletionDelivery(parentThreadId, completionPlan.parentRun.id);
       }
+    },
+  );
+
+  const settleDelegatedRestartWait = Effect.fn("Orchestrator.settleDelegatedRestartWait")(
+    function* (childThreadId: ThreadId, settledContinuationOf?: RunId) {
+      // Parent result publication and fresh child input must agree on who owns
+      // the wait. Parent-to-child is the same lock order as follow-up intake.
+      yield* threadDispatch.withLock(
+        childThreadId,
+        Effect.gen(function* () {
+          const child = yield* projectionStore.getThreadRecords(
+            childThreadId,
+            ["runs", "messages", "subagents", "providerThreads", "providerTurns", "turnItems"],
+            { messageRoles: ["user"], turnItemTypes: ["notification"] },
+          );
+          const progress = delegatedTaskProgress(child);
+          if (progress.state !== "result_available" || progress.resultRun === undefined) return;
+          if (
+            yield* childAwaitsRestartContinuation(
+              child.runs,
+              progress.resultRun,
+              settledContinuationOf,
+            )
+          )
+            return;
+          if (
+            yield* effectOutbox.hasPendingRunStart({
+              threadId: childThreadId,
+              runIds: child.runs.map((run) => run.id),
+            })
+          )
+            return;
+          const events: Array<Omit<OrchestrationV2DomainEvent, "id">> = [];
+          const now = yield* DateTime.now;
+          for (const wait of child.turnItems) {
+            if (wait.type !== "notification" || wait.status !== "waiting") continue;
+            const run = child.runs.find((candidate) => candidate.id === wait.runId);
+            if (
+              run === undefined ||
+              wait.id !== `turn-item:restart-pacing:${run.id}` ||
+              delegatedTaskTerminalStatus(runOutcome(run)) === null ||
+              runRanAfter(run, progress.resultRun)
+            )
+              continue;
+            const continuation =
+              run.id === settledContinuationOf
+                ? Option.none()
+                : yield* effectOutbox.get(`effect:restart-continuation:${run.id}`);
+            // An unsettled claim still owns its note; EffectWorker settles it
+            // after admission or decline, including replacement start effects.
+            if (
+              Option.isSome(continuation) &&
+              ["pending", "running"].includes(continuation.value.status)
+            )
+              continue;
+            events.push({
+              type: "turn-item.updated",
+              threadId: childThreadId,
+              runId: run.id,
+              occurredAt: now,
+              payload: {
+                ...wait,
+                status: "completed",
+                summary: "Restart wait ended",
+                completedAt: now,
+                updatedAt: now,
+              },
+            });
+          }
+          if (events.length > 0) yield* writeSystemEvents(events);
+        }),
+      );
     },
   );
 
@@ -13200,6 +13347,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     )
       return;
     const progress = delegatedTaskProgress(childControls);
+    if (progress.state === "result_available") {
+      yield* settleDelegatedRestartWait(childThreadId, options?.settledContinuationOf);
+    }
     const parent = yield* projectionStore.getThreadRecords(parentThreadId, [
       "subagents",
       "contextTransfers",
@@ -13346,6 +13496,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
+    // Local registration sets startedAt before native acceptance. Explicitly
+    // unsent failures also hold their replacement until an explicit Resume/send.
+    const failure =
+      deliveryRun.status === "failed" && deliveryRun.startedAt !== null
+        ? yield* projectionStore.getThreadRecords(threadId, ["turnItems"], {
+            turnItemRunId: deliveryRun.id,
+            turnItemTypes: ["error"],
+          })
+        : undefined;
+    const failedBeforeAcceptance = completionReceiverFailedBeforeAcceptance(
+      deliveryRun,
+      latestRootProviderFailure(deliveryRun, failure?.turnItems ?? [])?.code,
+    );
+    if (failedBeforeAcceptance) {
+      yield* Effect.logWarning("delegated-task.completion_held", {
+        parentThreadId: threadId,
+        runId: deliveryRun.id,
+        taskIds: delivery.taskIds,
+        reason: "parent_failed_before_start",
+      });
+    }
     const now = yield* DateTime.now;
     const nextTaskStates = new Map<
       OrchestrationV2Subagent["id"],
@@ -13968,21 +14139,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     };
   });
 
-  const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
+  // Both receipt paths share reader routing, error mapping and replay behavior.
+  const readCommandReceipt = Effect.fn("orchestrationV2.dispatch.readReceipt")(function* (
     command: OrchestrationV2ServerCommand,
-    options?: OrchestratorDispatchOptions,
-  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
-    yield* Effect.annotateCurrentSpan({
-      "orchestration_v2.command_id": command.commandId,
-      "orchestration_v2.command_type": command.type,
-      "orchestration_v2.thread_id": commandThreadId(command),
-    });
-
+  ) {
     const interactive =
       command.type === "message.dispatch" || command.type === "delegated_task.request";
     const receiptRead = commandReceipts.getByCommandId(command.commandId);
     // This point lookup runs before planning/COMMIT, outside the writer transaction.
-    const existingReceipt = yield* (
+    return yield* (
       interactive ? receiptRead.pipe(NodeSqliteClient.foregroundReads) : receiptRead
     ).pipe(
       Effect.mapError(
@@ -13997,59 +14162,76 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }),
       ),
     );
+  });
 
-    if (Option.isSome(existingReceipt)) {
-      const receipt = existingReceipt.value;
-      if (receipt.status === "rejected") {
-        return yield* new OrchestratorCommandPreviouslyRejectedError({
-          commandId: command.commandId,
-          commandType: command.type,
-          detail: receipt.error ?? "Previously rejected.",
-        });
-      }
-      const dispatchThreadId = commandThreadId(command);
-      if (!canReplayCommandReceipt(receipt.threadId, dispatchThreadId)) {
-        return yield* new OrchestratorCommandIdConflictError({
-          commandId: command.commandId,
-          commandType: command.type,
-          receiptThreadId: receipt.threadId,
-          commandThreadId: dispatchThreadId,
-        });
-      }
-      const storedEvents = yield* eventSink.readByCommandId({ commandId: command.commandId }).pipe(
-        Stream.runCollect,
-        Effect.map((events): ReadonlyArray<OrchestrationV2StoredEvent> => Array.from(events)),
-        Effect.mapError(
-          (cause) =>
-            new OrchestratorDispatchError({
-              commandId: command.commandId,
-              commandType: command.type,
-              cause,
-            }),
-        ),
-      );
-      const acknowledgement = yield* SendAcknowledgement.command;
-      if (command.type === "message.dispatch" && acknowledgement?.id === command.commandId) {
-        const snapshot = yield* loadProjectionForCommand(command, ["runs"]);
-        acknowledgement.captureRuns(snapshot.runs);
-      }
-      yield* SendAcknowledgement.replay(command.commandId, storedEvents);
-      if (command.type === "notification.delivery.accept") {
-        // Acceptance can commit before its sibling offer fails; receipt replay must finish that offer.
-        yield* mapDispatchError(command)(offerDelegatedCompletionDeliveries(command.threadId));
-      }
-      if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
-        yield* mapDispatchError(command)(
-          startNextQueuedRun(command.threadId, {
-            allowPendingContinuation: command.type === "queue.resume",
-          }),
-        );
-      }
-      return {
-        sequence: receipt.resultSequence,
-        storedEvents,
-      } satisfies OrchestratorV2DispatchResult;
+  const replayCommandReceipt = Effect.fn("orchestrationV2.dispatch.replayReceipt")(function* (
+    command: OrchestrationV2ServerCommand,
+    receipt: CommandReceiptV2,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    if (receipt.status === "rejected") {
+      return yield* new OrchestratorCommandPreviouslyRejectedError({
+        commandId: command.commandId,
+        commandType: command.type,
+        detail: receipt.error ?? "Previously rejected.",
+      });
     }
+    const dispatchThreadId = commandThreadId(command);
+    if (!canReplayCommandReceipt(receipt.threadId, dispatchThreadId)) {
+      return yield* new OrchestratorCommandIdConflictError({
+        commandId: command.commandId,
+        commandType: command.type,
+        receiptThreadId: receipt.threadId,
+        commandThreadId: dispatchThreadId,
+      });
+    }
+    const storedEvents = yield* eventSink.readByCommandId({ commandId: command.commandId }).pipe(
+      Stream.runCollect,
+      Effect.map((events): ReadonlyArray<OrchestrationV2StoredEvent> => Array.from(events)),
+      Effect.mapError(
+        (cause) =>
+          new OrchestratorDispatchError({
+            commandId: command.commandId,
+            commandType: command.type,
+            cause,
+          }),
+      ),
+    );
+    const acknowledgement = yield* SendAcknowledgement.command;
+    if (command.type === "message.dispatch" && acknowledgement?.id === command.commandId) {
+      const snapshot = yield* loadProjectionForCommand(command, ["runs"]);
+      acknowledgement.captureRuns(snapshot.runs);
+    }
+    yield* SendAcknowledgement.replay(command.commandId, storedEvents);
+    if (command.type === "notification.delivery.accept") {
+      // Acceptance can commit before its sibling offer fails; receipt replay must finish that offer.
+      yield* mapDispatchError(command)(offerDelegatedCompletionDeliveries(command.threadId));
+    }
+    if (command.type === "queue.resume" || command.type === "queue.cutover-release") {
+      yield* mapDispatchError(command)(
+        startNextQueuedRun(command.threadId, {
+          allowPendingContinuation: command.type === "queue.resume",
+        }),
+      );
+    }
+    return {
+      sequence: receipt.resultSequence,
+      storedEvents,
+    } satisfies OrchestratorV2DispatchResult;
+  });
+
+  const dispatchWithReceiptEffect = Effect.fn("orchestrationV2.dispatch.withReceipt")(function* (
+    command: OrchestrationV2ServerCommand,
+    options?: OrchestratorDispatchOptions,
+  ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    yield* Effect.annotateCurrentSpan({
+      "orchestration_v2.command_id": command.commandId,
+      "orchestration_v2.command_type": command.type,
+      "orchestration_v2.thread_id": commandThreadId(command),
+    });
+
+    const existingReceipt = yield* readCommandReceipt(command);
+    if (Option.isSome(existingReceipt))
+      return yield* replayCommandReceipt(command, existingReceipt.value);
 
     if (
       command.type === "message.dispatch" ||
@@ -14535,6 +14717,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     command: OrchestrationV2ServerCommand,
     options?: OrchestratorDispatchOptions,
   ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
+    const checkRevoked = Effect.suspend(() =>
+      options?.isStale?.()
+        ? Effect.fail(
+            new OrchestratorCommandRejectedError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause: "Delivery was revoked before dispatch.",
+              revoked: true,
+            }),
+          )
+        : Effect.void,
+    );
+    // Other receipt replays can start queues or finish delivery offers; those need their lock.
+    if (command.type === "delegated_task.request" || command.type === "thread.create") {
+      yield* checkRevoked;
+      const receipt = yield* readCommandReceipt(command);
+      if (Option.isSome(receipt)) {
+        yield* checkRevoked;
+        const result = yield* replayCommandReceipt(command, receipt.value);
+        yield* checkRevoked;
+        return result;
+      }
+    }
     const dispatch = threadDispatch.withLock(
       commandThreadId(command),
       Effect.suspend(() =>
