@@ -230,6 +230,7 @@ CANCEL_POLL_S = 0.5
 
 
 def _cancel_before_start(r):
+    from . import bg_cancel
     rid, client, start_at = r["run_id"], r["client_pid"], r["start_at"]
     if not client:
         raise OffboxError(f"run {rid}: no client pid is recorded, so kill cannot tell which process to stop. "
@@ -263,10 +264,18 @@ def _cancel_before_start(r):
         if alive and not sent:
             # Only the proven client may unwind its preparation and release the pool guard.
             try:
+                if r['mode'] == 'bg':
+                    bg_cancel.request(r)
                 os.kill(client, signal.SIGTERM)
                 sent = True
             except ProcessLookupError:
                 alive = False
+            except bg_cancel.ClientChanged:
+                # Replacement metadata is published before its row; wait for the PID/birth proof to catch up.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(CANCEL_POLL_S, max(0, deadline - time.monotonic())))
+                continue
             except PermissionError as e:
                 raise OffboxError(f"run {rid}: cannot signal client pid {client}: {e}", code=2) from e
         if not alive or time.monotonic() >= deadline:

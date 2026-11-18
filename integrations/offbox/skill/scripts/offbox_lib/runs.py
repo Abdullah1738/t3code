@@ -3629,6 +3629,7 @@ def run_remote(a, me: dict) -> int:
 
 
 def _background(a, me: dict) -> int:
+    from . import bg_cancel
     if not a.no_sync and getattr(a, "include", None):
         ssh_sync.push_filters(Path(me["repo_root"]), a.git, a.include)
     rn = Runner(a, me)
@@ -3648,7 +3649,9 @@ def _background(a, me: dict) -> int:
         ready_r, ready_w = os.pipe()
         accept_r, accept_w = os.pipe()
         import offbox_protection
+        cancel_token = bg_cancel.token()
         payload = json.dumps(dict(args=vars(a), me=me, env=dict(os.environ), backend=common.backend(),
+                                  cancel_token=cancel_token,
                                   caller=offbox_protection.caller(),
                                   home_wait_deadline=home.wait_budget_end(),
                                   ready_fd=ready_w, accept_fd=accept_r, signal_mask=list(mask))).encode()
@@ -3660,6 +3663,7 @@ def _background(a, me: dict) -> int:
                                      stdin=subprocess.PIPE, stdout=dst, stderr=subprocess.STDOUT, env=boot_env,
                                      cwd=str(rn.log_path.parent))
         # Until this publication the original caller remains the provable owner. No payload is sent before it.
+        bg_cancel.publish(rn.run_id, child.pid, cancel_token)
         rn.record(client_pid=child.pid, start_at=now())
         os.close(ready_w)
         ready_w = None
@@ -3722,7 +3726,8 @@ def background_wait_hint(run_id: str) -> None:
 
 
 def background_queue(run_id: str, payload: dict) -> int:
-    with queue_lifecycle.client(run_id) as result:
+    from . import bg_cancel
+    with bg_cancel.client(run_id, payload.get('cancel_token')), queue_lifecycle.client(run_id) as result:
         code = _background_queue(run_id, payload)
         result['exit_code'] = code
         return code
@@ -3770,8 +3775,9 @@ def background_client(a, me: dict, ready=None, accept=None, signal_mask=None, so
     from . import cli
     rid = os.environ[BACKGROUND_RUN_ENV]
     def interrupted(signum, frame):
-        queue_lifecycle.received(rid, signum)
-        raise _ClientSignal
+        from . import bg_cancel
+        if bg_cancel.interrupt(rid, signum):
+            raise _ClientSignal
     old = {s: signal.signal(s, interrupted) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     code = EXIT_LOCAL
     try:
@@ -4163,14 +4169,14 @@ def _run_remote(a, rn) -> int:
 
     def on_sig(signum, _frame):
         if interrupted['sig'] is None:
-            interrupted["sig"] = signum
             if os.environ.get(BACKGROUND_RUN_ENV):
-                queue_lifecycle.received(rn.run_id, signum)
+                from . import bg_cancel
+                if not bg_cancel.interrupt(rn.run_id, signum, started=rn.started):
+                    return
+            interrupted["sig"] = signum
             raise _ClientSignal
 
-    # Installed before rn.start(): a tool-call timeout's SIGTERM during the pool wait or the lease must reach
-    # run_remote's not-started finish ('killed'). With the default handler Python died there and the row stayed
-    # 'starting' with no box (31 Oct, run-1031-145121-2b9f).
+    # Foreground signals cancel preparation; detached clients require an explicit kill request before start.
     old = {s: signal.signal(s, on_sig) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         try:

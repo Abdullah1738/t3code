@@ -15,7 +15,7 @@ from unittest.mock import ANY, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests._env import clean_env
-from offbox_lib import api, cli, common, home, identity, lease, misc, pool, reap, runs, ssh_sync, start_check  # noqa: E402
+from offbox_lib import api, bg_cancel, cli, common, home, identity, lease, misc, pool, reap, runs, ssh_sync, start_check  # noqa: E402
 from offbox_lib.common import now  # noqa: E402
 
 from test_capacity import Isolated  # noqa: E402
@@ -344,6 +344,76 @@ while True:
                     self.con.execute('DELETE FROM leases WHERE box_id=?', (box,))
                     self.con.execute('DELETE FROM pool_members WHERE box_id=?', (box,))
                     self.con.commit()
+
+    def test_prestart_kill_follows_replacement_published_after_row_snapshot(self):
+        for timing in ('metadata_and_row', 'metadata_before_row'):
+            with self.subTest(timing=timing):
+                rid = f'run-replacement-{timing}'
+                self.run_row(rid, box=None, pid=None, mode='bg', status='starting', owner=self.me['owner'])
+                predecessor = self.client(rid, 'ignore')
+                old_start = misc._run_row(rid)['start_at']
+                replacement = self.client(rid)
+                new_start = misc._run_row(rid)['start_at']
+                self.con.execute('UPDATE runs SET client_pid=?, start_at=? WHERE run_id=?',
+                                 (predecessor.pid, old_start, rid))
+                self.con.commit()
+                bg_cancel.publish(rid, predecessor.pid, bg_cancel.token())
+                metadata = common.LOGS_DIR / f'{rid}.client.json'
+                read_json, sleep = common.read_json, time.sleep
+                published = False
+                updated = False
+
+                def update_row():
+                    nonlocal updated
+                    self.con.execute('UPDATE runs SET client_pid=?, start_at=? WHERE run_id=?',
+                                     (replacement.pid, new_start, rid))
+                    self.con.commit()
+                    updated = True
+
+                def read_with_replacement(path, default=None):
+                    nonlocal published
+                    if path == metadata and not published:
+                        published = True
+                        bg_cancel.publish(rid, replacement.pid, bg_cancel.token())
+                        if timing == 'metadata_and_row':
+                            update_row()
+                    return read_json(path, default)
+
+                def wait_for_publication(seconds):
+                    if published and not updated:
+                        update_row()
+                    else:
+                        sleep(seconds)
+
+                with self.no_remote_actions(), patch.object(common, 'read_json', side_effect=read_with_replacement), \
+                        patch.object(misc.time, 'sleep', side_effect=wait_for_publication), \
+                        patch.object(misc, '_pid_started_at', wraps=misc._pid_started_at) as birth, \
+                        patch.object(os, 'kill', wraps=os.kill) as kill, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(misc.kill_run(rid, self.me), 0)
+                self.assertTrue(published and updated)
+                self.assertEqual(replacement.wait(timeout=5), 130)
+                self.assertIsNone(predecessor.poll())
+                self.assertEqual(tuple(self.status_of(rid)), ('killed', 130))
+                self.assertEqual([c for c in kill.call_args_list if c.args[1] != 0],
+                                 [call(replacement.pid, signal.SIGTERM)])
+                self.assertIn(call(replacement.pid), birth.call_args_list)
+                request = read_json(common.LOGS_DIR / f'{rid}.cancel.json', {})
+                self.assertEqual(request['pid'], replacement.pid)
+
+    def test_prestart_metadata_mismatch_is_bounded_and_never_signals(self):
+        rid = 'run-stale-metadata'
+        self.run_row(rid, box=None, pid=None, mode='bg', status='starting', owner=self.me['owner'])
+        child = self.client(rid, 'ignore')
+        bg_cancel.publish(rid, child.pid + 1, bg_cancel.token())
+        before = tuple(misc._run_row(rid))
+        with self.no_remote_actions(), patch.object(misc, 'CANCEL_WAIT_S', 0), \
+                patch.object(os, 'kill', wraps=os.kill) as kill:
+            with self.assertRaisesRegex(common.OffboxError, 'identity changed') as error:
+                misc.kill_run(rid, self.me)
+        self.assertEqual(error.exception.code, 2)
+        self.assertFalse(any(c.args[1] != 0 for c in kill.call_args_list))
+        self.assertEqual(tuple(misc._run_row(rid)), before)
 
     def test_prestart_dead_or_reused_client_settles_lost_without_signal(self):
         for box in (None, 'bx_test'):
