@@ -319,7 +319,8 @@ class Logging(Base):
         self.assertFalse(row['ok'])
         self.assertEqual(row['durationMs'], 40000)
         self.assertEqual(row['props'], {'marketplace_refresh': 'skipped', 'budgetHit': True, 'openCases': 1, 'fired': 0, 'slowestPhase': 'follow', 'sourceLimits': 0, 'limitKinds': [], 'orderCoverage': {}, 'chargeCensus': {},
-            **dict.fromkeys((*mc.TIMING_KEYS, *mc.charges.OWNER_TIMING_KEYS), 0), 'owner_result': 'ok', 'follow_ms': 40000, 'questions_ms': 40000,
+            **dict.fromkeys((key for key in (*mc.TIMING_KEYS, *mc.charges.OWNER_TIMING_KEYS)
+                             if key != 'dataless_error'), 0), 'owner_result': 'ok', 'follow_ms': 40000, 'questions_ms': 40000,
             'starved_by': 'questions', **mc.charges.receipt_timing({})})
 
     def test_check_distinguishes_short_lock_timeout_from_work_deadline(self):
@@ -647,7 +648,7 @@ class Logging(Base):
         self.assertIsNone(mc.charges.TIMING_STATS.get())
 
     def test_step_timing_is_logged_and_private_values_are_rejected(self):
-        keys = mc.TIMING_KEYS
+        keys = tuple(key for key in mc.TIMING_KEYS if key != 'dataless_error')
         stats = {}
         clock = [1000.0]
         with patch.object(mc.time, 'monotonic', lambda: clock[0]), \
@@ -679,6 +680,16 @@ class Logging(Base):
         other = HERE.parents[2] / 'app-api-cli/toollog.py'
         if other.exists():
             self.assertEqual((HERE / 'toollog.py').read_bytes(), other.read_bytes())
+
+    def test_scan_diagnostics_keep_only_class_and_errno(self):
+        mc.toollog.emit('money-cases', 'check.run', props={
+            'eintr_retries': 3, 'dataless_files': None, 'dataless_error': 'InterruptedError errno=4'})
+        props = self.rows('check.run')[-1]['props']
+        self.assertEqual(props, {'eintr_retries': 3, 'dataless_files': None,
+                                 'dataless_error': 'InterruptedError errno=4'})
+        for value in ('PermissionError errno=13: PRIVATE', 'PRIVATE message', 'DataUnavailable errno=None\nPRIVATE'):
+            mc.toollog.emit('money-cases', 'check.run', props={'dataless_error': value})
+            self.assertEqual(self.rows('check.run')[-1]['props'], {})
 
     def test_production_modules_never_import_test_runners(self):
         for path in HERE.glob('*.py'):
