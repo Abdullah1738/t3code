@@ -1,3 +1,4 @@
+import * as ProviderRuntimeInventory from "../providers/ProviderRuntimeInventory.ts";
 import * as DatabaseDiagnostics from "../../persistence/DatabaseDiagnostics.ts";
 /**
  * `/threads?active=true` and `/requests` start from the live and pending ids
@@ -9,6 +10,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { assert, describe, it } from "@effect/vitest";
 import {
   AuthSessionId,
+  type AuthEnvironmentScopes,
   OrchestrationV2AppThreadJson,
   AnalyticsEvent,
   type OrchestrationV2ThreadProjection,
@@ -256,6 +258,7 @@ const makeHarness = (
   realSnapshots = false,
   heldList?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
   heldMessage?: { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> },
+  authScopes: AuthEnvironmentScopes = ["orchestration:read", "orchestration:operate"],
 ) =>
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
@@ -395,7 +398,7 @@ const makeHarness = (
                               sessionId: AuthSessionId.make("session-cli"),
                               subject: "cli-issued-session",
                               method: "bearer-access-token" as const,
-                              scopes: ["orchestration:read", "orchestration:operate"],
+                              scopes: authScopes,
                             }),
                           ),
                     ),
@@ -423,6 +426,15 @@ const makeHarness = (
                   scratchRoot: Effect.succeed(Option.none()),
                 }),
                 Layer.mock(ProviderRegistry.ProviderRegistry)({}),
+                Layer.mock(ProviderRuntimeInventory.ProviderRuntimeInventory)({
+                  snapshot: Effect.succeed({
+                    sampledAt: 1000,
+                    sampleAgeMs: 2000,
+                    tagsAvailable: true,
+                    runtimes: [],
+                    truncated: { runtimes: 0, retiredRuntimes: 0, tagProcesses: 0 },
+                  }),
+                }),
                 ServerSettings.layerTest(),
                 Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({
                   enqueueCommand: (effect) => effect,
@@ -2894,3 +2906,32 @@ describe("control listings", () => {
     ),
   );
 });
+
+it.effect(
+  "provider inventory is an authenticated cached read with explicit freshness and bounds",
+  () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const result = yield* harness.get("/provider-runtimes/inventory");
+      assert.strictEqual(result.status, 200);
+      assert.deepEqual(result.body, {
+        ok: true,
+        sampledAt: 1000,
+        sampleAgeMs: 2000,
+        tagsAvailable: true,
+        runtimes: [],
+        truncated: { runtimes: 0, retiredRuntimes: 0, tagProcesses: 0 },
+      });
+      assert.strictEqual(yield* Ref.get(harness.snapshotReads), 0);
+      assert.notInclude(JSON.stringify(result.body), "Bearer");
+    }).pipe(Effect.scoped, Effect.provide(Sqlite.layerMemory)),
+);
+
+it.effect("provider inventory requires orchestration read scope", () =>
+  Effect.gen(function* () {
+    const harness = yield* makeHarness(undefined, [], new Set(), [], false, undefined, undefined, [
+      "orchestration:operate",
+    ]);
+    assert.strictEqual((yield* harness.get("/provider-runtimes/inventory")).status, 403);
+  }).pipe(Effect.scoped, Effect.provide(Sqlite.layerMemory)),
+);

@@ -3010,6 +3010,11 @@ export const makeOpenCodeAdapterV2 = Effect.fn("makeOpenCodeAdapterV2")(function
         });
 
         const runtimeSession: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+          runtimeInventory: Effect.sync(() => ({
+            roots: connection.runtimeProcess === undefined ? [] : [connection.runtimeProcess],
+            loads: [],
+            nativeThreadIds: [...threads.keys()],
+          })),
           instanceId: options.instanceId,
           driver: OPENCODE_PROVIDER,
           providerSessionId: input.providerSessionId,

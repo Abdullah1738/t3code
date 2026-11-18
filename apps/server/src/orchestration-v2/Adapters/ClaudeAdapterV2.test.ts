@@ -2521,6 +2521,7 @@ function makeFakeClaudeCli(
   let homeConnected = false;
   const stdins: Array<NodeStream.PassThrough> = [];
   const pendingRegistrations: Array<() => void> = [];
+  const exit = Promise.withResolvers<void>();
   const spawn = (options: SpawnOptions): SpawnedProcess => {
     spawns.push(options);
     const stdin = new NodeStream.PassThrough();
@@ -2528,6 +2529,7 @@ function makeFakeClaudeCli(
     stdins.push(stdin);
     stdouts.push(stdout);
     const child = Object.assign(new NodeEvents.EventEmitter(), {
+      pid: 1800 + spawns.length,
       stdin,
       stdout,
       killed: false,
@@ -2585,6 +2587,7 @@ function makeFakeClaudeCli(
     stdin.on("end", () => {
       stdout.end();
       child.emit("exit", 0, null);
+      exit.resolve();
     });
     return child;
   };
@@ -2595,6 +2598,7 @@ function makeFakeClaudeCli(
     spawns,
     controlRequests,
     closed,
+    exited: Effect.promise(() => exit.promise),
     releaseRegistration: () => pendingRegistrations.shift()?.(),
     emitHomeFailure: () =>
       stdouts[0]!.write(
@@ -2655,6 +2659,17 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
       ),
       Effect.provide(NodeServices.layer),
     );
+
+  it.effect("inventory captures the CLI identity and drops it after exit", () =>
+    Effect.gen(function* () {
+      const cli = makeFakeClaudeCli();
+      const session = yield* openWith(cli);
+      assert.deepEqual(session.runtimeProcess?.(), { pid: 1801, spawnedAtMs: 0 });
+      yield* session.close;
+      yield* cli.exited;
+      assert.isUndefined(session.runtimeProcess?.());
+    }),
+  );
 
   it.effect("sends MCP servers over stdin, not argv or the environment", () =>
     Effect.gen(function* () {

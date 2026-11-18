@@ -47,7 +47,6 @@ import {
   type Query as ClaudeQuery,
   type Settings as ClaudeSdkSettings,
   type SpawnOptions as ClaudeSpawnOptions,
-  type SpawnedProcess as ClaudeSpawnedProcess,
   type SDKAssistantMessage,
   type SDKAPIRetryMessage,
   type SDKMessage,
@@ -334,7 +333,7 @@ function spawnClaudeProcessGroup(
   registry: ProviderProcessRegistry.ProviderProcessRegistry["Service"],
   threadId: string,
   providerCommandLine: string,
-): ClaudeSpawnedProcess {
+) {
   const child = NodeChildProcess.spawn(options.command, options.args, {
     cwd: options.cwd,
     env: options.env,
@@ -513,6 +512,18 @@ export interface ClaudeAgentSdkQueryOpenInput {
 }
 
 export interface ClaudeAgentSdkQuerySession {
+  readonly runtimeProcess?: () =>
+    | {
+        readonly pid: number;
+        readonly spawnedAtMs: number;
+        readonly teardown?: {
+          readonly reason: "teardown_sent" | "teardown_failed";
+          readonly since: number;
+          readonly detail: string;
+          readonly sentAt?: number;
+        };
+      }
+    | undefined;
   readonly retryMcp?: Effect.Effect<void>;
   readonly messages: Stream.Stream<SDKMessage, ClaudeAgentSdkQueryRunnerError>;
   readonly offer: (message: SDKUserMessage) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
@@ -942,6 +953,7 @@ export const layerQueryRunner: Layer.Layer<
         const logProtocolEvent = (event: ClaudeAgentSdkProtocolLogEvent) =>
           protocolLogger === undefined ? Effect.void : protocolLogger(event);
         const queryStarted = yield* Clock.currentTimeMillis;
+        const clock = yield* Clock.Clock;
         const promptQueue = yield* Queue.unbounded<SDKUserMessage>();
         const prompt = Stream.fromQueue(promptQueue).pipe(
           Stream.catchCause((cause) =>
@@ -985,7 +997,8 @@ export const layerQueryRunner: Layer.Layer<
                 executableArgs: [...launch.args, ...(queryOptions.executableArgs ?? [])],
               };
         // Windows has no process groups, so there the SDK spawns the CLI itself.
-        const spawnClaudeCodeProcess =
+        let runtimeProcess: ReturnType<NonNullable<ClaudeAgentSdkQuerySession["runtimeProcess"]>>;
+        const spawnProcess =
           options.spawnClaudeCodeProcess ??
           (platform === "win32"
             ? undefined
@@ -1000,6 +1013,27 @@ export const layerQueryRunner: Layer.Layer<
                     ...options.args.slice(launch === undefined ? 0 : launch.args.length),
                   ].join(" "),
                 ));
+        const spawnClaudeCodeProcess =
+          spawnProcess === undefined
+            ? undefined
+            : (options: ClaudeSpawnOptions) => {
+                const child = spawnProcess(options);
+                const pid: unknown = Reflect.get(child, "pid");
+                const spawnedAtMs = clock.currentTimeMillisUnsafe();
+                if (typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0)
+                  runtimeProcess = { pid, spawnedAtMs };
+                const on: unknown = Reflect.get(child, "on");
+                if (typeof on === "function")
+                  on.call(child, "exit", () => {
+                    if (
+                      runtimeProcess !== undefined &&
+                      runtimeProcess.pid === pid &&
+                      runtimeProcess.spawnedAtMs === spawnedAtMs
+                    )
+                      runtimeProcess = undefined;
+                  });
+                return child;
+              };
         const queryRuntime = yield* Effect.uninterruptibleMask((restore) =>
           Effect.try({
             try: () =>
@@ -1107,6 +1141,7 @@ export const layerQueryRunner: Layer.Layer<
           };
         };
         return {
+          runtimeProcess: () => runtimeProcess,
           retryMcp: Effect.suspend(() =>
             (registration?.attempt ?? Effect.void).pipe(
               Effect.andThen(homeRegistration?.attempt ?? Effect.void),
@@ -1271,11 +1306,17 @@ export const layerQueryRunner: Layer.Layer<
               }),
             ),
           ),
-          close: Effect.suspend(() =>
-            (registration?.close ?? Effect.void).pipe(
+          close: Effect.suspend(() => {
+            const sentAt = clock.currentTimeMillisUnsafe();
+            if (runtimeProcess !== undefined)
+              runtimeProcess = {
+                ...runtimeProcess,
+                teardown: { reason: "teardown_sent", since: sentAt, sentAt, detail: "stop_sent" },
+              };
+            return (registration?.close ?? Effect.void).pipe(
               Effect.andThen(homeRegistration?.close ?? Effect.void),
-            ),
-          ).pipe(
+            );
+          }).pipe(
             Effect.andThen(Queue.shutdown(promptQueue)),
             Effect.andThen(closeClaudeQuery(queryRuntime)),
             Effect.tap(() =>
@@ -1285,6 +1326,19 @@ export const layerQueryRunner: Layer.Layer<
                 payload: {
                   type: "query.close",
                 },
+              }),
+            ),
+            Effect.onExit((exit) =>
+              Effect.sync(() => {
+                if (Exit.isFailure(exit) && runtimeProcess !== undefined)
+                  runtimeProcess = {
+                    ...runtimeProcess,
+                    teardown: {
+                      reason: "teardown_failed",
+                      since: clock.currentTimeMillisUnsafe(),
+                      detail: "stop_failed",
+                    },
+                  };
               }),
             ),
           ),
@@ -4279,6 +4333,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const interruptedTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
         const steeredTurns = yield* Ref.make(new Set<OrchestrationV2ProviderTurn["id"]>());
         const queryContext = yield* Ref.make<ClaudeLiveQueryContext | null>(null);
+        const inventoryQueries: Array<{
+          nativeThreadId: string;
+          query: ClaudeAgentSdkQuerySession;
+        }> = [];
         const openedNativeThreads = yield* Ref.make(new Set<string>());
         const latestPlanByKind = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact>());
         // Claude 5 task tools edit one list per native session, across turns.
@@ -10601,6 +10659,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             status: "active",
           });
           const closed = yield* Deferred.make<void, never>();
+          inventoryQueries.push({ nativeThreadId, query: querySession });
           const context: ClaudeLiveQueryContext = {
             generation: yield* Ref.modify(queryGenerations, (current) => {
               const generation = (current.get(nativeThreadId) ?? 0) + 1;
@@ -11558,6 +11617,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           driver: CLAUDE_PROVIDER,
           providerSessionId: input.providerSessionId,
           providerSession: session,
+          runtimeInventory: Effect.sync(() => {
+            for (let i = inventoryQueries.length - 1; i >= 0; i--) {
+              if (inventoryQueries[i]!.query.runtimeProcess?.() === undefined)
+                inventoryQueries.splice(i, 1);
+            }
+            return {
+              roots: inventoryQueries.flatMap(({ nativeThreadId, query }) => {
+                const process = query.runtimeProcess?.();
+                return process === undefined ? [] : [{ ...process, nativeThreadId }];
+              }),
+              loads: [],
+            };
+          }),
           checkRetryHealth: Effect.fn("ClaudeAdapterV2.checkRetryHealth")(function* (healthInput) {
             return yield* turnControlLock.withPermits(1)(
               Effect.gen(function* () {

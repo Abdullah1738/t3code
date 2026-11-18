@@ -1,3 +1,4 @@
+import { field } from "../unknownField.ts";
 import * as ProviderRetryAnalytics from "../../ardud/analytics/ProviderRetry.ts";
 import * as CodexRetainedState from "../../ardud/orchestration/CodexRetainedState.ts";
 import {
@@ -1436,6 +1437,9 @@ export interface CodexAppServerClientFactoryShape {
     readonly environment: NodeJS.ProcessEnv;
   }) => Effect.Effect<
     CodexClient.CodexAppServerClient["Service"] & {
+      readonly runtimePid?: number;
+      readonly runtimeIsRunning?: Effect.Effect<boolean>;
+      readonly spawnedAtMs?: number;
       readonly awaitSessionExit?: Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>;
     },
     ProviderAdapter.ProviderAdapterOpenSessionError,
@@ -1463,7 +1467,15 @@ export const CODEX_THREAD_CONFIG = {
 // that limit so the server's own wait timeout ends a long call.
 const CODEX_T3_MCP_TOOL_TIMEOUT_SEC = 65 * 60;
 
-function codexThreadRuntimeParams(input: {
+export function codexThreadRuntimeParams(input: {
+  readonly attribution?:
+    | {
+        readonly threadId: string;
+        readonly loadId: string;
+        readonly nativeThreadId?: string;
+        readonly servers: ReadonlyArray<string>;
+      }
+    | undefined;
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly recall?: { readonly url: string; readonly threadId: ThreadId } | undefined;
   readonly modelSelection?: { readonly model: string };
@@ -1479,6 +1491,18 @@ function codexThreadRuntimeParams(input: {
     ...(input.modelSelection === undefined ? {} : { model: input.modelSelection.model }),
     config: {
       ...CODEX_THREAD_CONFIG,
+      ...Object.fromEntries(
+        (input.attribution?.servers ?? []).flatMap((name) => {
+          const tag = input.attribution!;
+          const prefix = `mcp_servers.${JSON.stringify(name)}.env`;
+          return [
+            [`${prefix}.ROBOB_THREAD_ID`, tag.threadId],
+            [`${prefix}.ROBOB_THREAD_LOAD_ID`, tag.loadId],
+            // Clear an inherited native id when start/fork has not allocated its own yet.
+            [`${prefix}.ROBOB_NATIVE_THREAD_ID`, tag.nativeThreadId ?? ""],
+          ];
+        }),
+      ),
       ...(mcpSession === undefined
         ? {}
         : {
@@ -1701,7 +1725,10 @@ function redactCodexProtocolValue(value: unknown): unknown {
   return Object.fromEntries(
     Object.entries(value).map(([key, nested]) => [
       key,
-      isSensitiveCodexProtocolKey(key) ? "[REDACTED]" : redactCodexProtocolValue(nested),
+      // Config reads can contain arbitrary environment names and credentials embedded in argv.
+      key === "config" || key === "layers" || isSensitiveCodexProtocolKey(key)
+        ? "[REDACTED]"
+        : redactCodexProtocolValue(nested),
     ]),
   );
 }
@@ -1820,6 +1847,9 @@ export const layerAppServerClientFactory: Layer.Layer<
         );
         return {
           ...client,
+          runtimePid: Number(handle.pid),
+          runtimeIsRunning: handle.isRunning.pipe(Effect.catchCause(() => Effect.succeed(false))),
+          spawnedAtMs,
           awaitSessionExit: awaitCodexProcessExit(handle, input.providerSessionId),
         };
       }),
@@ -2002,6 +2032,59 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           settings: resolvedRuntime?.config ?? adapterOptions.settings,
           environment,
         });
+        const inventoryLoads = new Map<
+          string,
+          { nativeThreadId: string; threadId: string | null; loadId: string }
+        >();
+        const ambiguousInventoryLoads = new Set<string>();
+        const inventoryAttribution = Effect.fn("CodexAdapterV2.inventoryAttribution")(function* (
+          threadId: ThreadId | null,
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy | undefined,
+          nativeThreadId?: string,
+        ) {
+          if (client.runtimePid === undefined) return undefined;
+          yield* ensureInitialized;
+          const loadId = yield* crypto.randomUUIDv4().pipe(Effect.orDie);
+          // Read effective config so launch-argument and workspace servers are included. Only
+          // stdio names survive this read; credentials and command arguments are never retained.
+          const servers = yield* client.raw
+            .request("config/read", {
+              includeLayers: false,
+              ...(runtimePolicy?.cwd == null ? {} : { cwd: runtimePolicy.cwd }),
+            })
+            .pipe(
+              Effect.map((response) => {
+                const config = field(field(response, "config"), "mcp_servers");
+                return typeof config === "object" && config !== null
+                  ? Object.entries(config)
+                      .filter(([, server]) => typeof field(server, "command") === "string")
+                      .map(([name]) => name)
+                  : [];
+              }),
+              Effect.timeout("5 seconds"),
+              Effect.catchCause(() => Effect.succeed([] as string[])),
+            );
+          return threadId === null
+            ? undefined
+            : {
+                threadId,
+                loadId,
+                servers,
+                ...(nativeThreadId === undefined ? {} : { nativeThreadId }),
+              };
+        });
+        const bindInventoryLoad = (
+          nativeThreadId: string,
+          tag: { readonly threadId: string; readonly loadId: string } | undefined,
+        ) => {
+          // Resume of a loaded thread ignores config. Its original token still owns its children.
+          if (tag !== undefined && !inventoryLoads.has(nativeThreadId))
+            inventoryLoads.set(nativeThreadId, {
+              nativeThreadId,
+              threadId: tag.threadId,
+              loadId: tag.loadId,
+            });
+        };
         const additionalContextByThread = yield* Ref.make(
           new Map<
             string,
@@ -3268,6 +3351,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             readonly ordinal: number;
             readonly emitInitialPrompt: boolean;
           }) {
+            const parentNativeId = input.context.providerThread.nativeThreadRef?.nativeId;
+            const parentLoad =
+              parentNativeId == null ? undefined : inventoryLoads.get(parentNativeId);
+            if (parentLoad !== undefined) ambiguousInventoryLoads.add(parentLoad.loadId);
             const registeredSubagents = yield* Ref.get(subagentThreads);
             if (registeredSubagents.has(input.nativeThreadId)) {
               return;
@@ -5281,6 +5368,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               providerSessionId: input.providerSessionId,
               nativeThreadId: payload.threadId,
             });
+            const load = inventoryLoads.get(payload.threadId);
+            if (load !== undefined) ambiguousInventoryLoads.delete(load.loadId);
+            inventoryLoads.delete(payload.threadId);
             yield* reportRetainedStateLoss(payload.threadId);
             yield* handleNativeThreadShutdown(payload.threadId);
           }),
@@ -7674,6 +7764,18 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           providerSession: session,
           events: Stream.fromQueue(events),
           backgroundTasksEndWithProcess: true,
+          runtimeInventory: Effect.gen(function* () {
+            const running =
+              client.runtimeIsRunning === undefined ? false : yield* client.runtimeIsRunning;
+            return {
+              roots:
+                client.runtimePid === undefined || !running
+                  ? []
+                  : [{ pid: client.runtimePid, spawnedAtMs: client.spawnedAtMs ?? 0 }],
+              loads: [...inventoryLoads.values()],
+              ambiguousLoadIds: [...ambiguousInventoryLoads],
+            };
+          }),
           ...(sessionExitObserver === undefined
             ? {}
             : {
@@ -7711,10 +7813,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           }),
           hasPendingBackgroundWorkForThread: Effect.fn(
             "CodexAdapterV2.hasPendingBackgroundWorkForThread",
-          )(function* (providerThread) {
+          )(function* (providerThread, options) {
             const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
             if (nativeThreadId) {
-              yield* retainedState.refresh(nativeThreadId);
+              if (!options?.readOnly) yield* retainedState.refresh(nativeThreadId);
               if (yield* retainedState.holds(nativeThreadId)) return true;
             }
             const contexts = [
@@ -7769,10 +7871,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   const mcpSession = yield* ensureInitialized.pipe(
                     Effect.andThen(readMcpSession(threadInput.threadId)),
                   );
+                  const attribution = yield* inventoryAttribution(
+                    threadInput.threadId,
+                    threadInput.runtimePolicy,
+                  );
                   const response = yield* client
                     .request(
                       "thread/start",
                       codexThreadRuntimeParams({
+                        attribution,
                         mcpSession,
                         recall: recallForThread(threadInput.threadId),
                         modelSelection: threadInput.modelSelection,
@@ -7782,6 +7889,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     .pipe(
                       ownNativeAllocation((nativeId) => {
                         loadedNativeId = nativeId;
+                        if (nativeId !== undefined) bindInventoryLoad(nativeId, attribution);
                       }),
                     );
                   if (seeded?.mode !== "codex-inject") return { response, history: undefined };
@@ -7891,11 +7999,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           resumeThread: Effect.fn("CodexAdapterV2.resumeThread")(
             function* (threadInput) {
               const nativeThreadId = yield* getNativeThreadId(threadInput.providerThread);
+              const attribution = yield* inventoryAttribution(
+                threadInput.threadId ?? threadInput.providerThread.appThreadId,
+                threadInput.runtimePolicy,
+                nativeThreadId,
+              );
               // excludeTurns is not in the generated request schema yet.
               const resume = client.raw.request("thread/resume", {
                 threadId: nativeThreadId,
                 excludeTurns: true,
                 ...codexThreadRuntimeParams({
+                  attribution,
                   mcpSession: yield* readMcpSession(
                     threadInput.threadId ?? threadInput.providerThread.appThreadId,
                   ),
@@ -7931,6 +8045,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
+              bindInventoryLoad(response.thread.id, attribution);
               yield* retainedState.register(response.thread.id, response.thread.path);
               return {
                 ...threadInput.providerThread,
@@ -8150,6 +8265,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 }
                 if (cursor !== undefined) cursors.add(cursor);
               } while (cursor !== undefined);
+              if ([...ids].some((nativeId) => !inventoryLoads.has(nativeId))) {
+                for (const load of inventoryLoads.values())
+                  ambiguousInventoryLoads.add(load.loadId);
+              }
               return [...ids];
             },
             Effect.mapError((cause) =>
@@ -8833,16 +8952,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               // process. After a restart or idle release, load it the same way
               // the next turn would before reverting.
               if (!loaded) {
+                const attribution = yield* inventoryAttribution(
+                  threadInput.providerThread.appThreadId,
+                  input.runtimePolicy,
+                  threadId,
+                );
                 yield* client.raw.request("thread/resume", {
                   threadId,
                   excludeTurns: true,
                   ...codexThreadRuntimeParams({
+                    attribution,
                     mcpSession: yield* readMcpSession(threadInput.providerThread.appThreadId),
                     recall: recallForThread(threadInput.providerThread.appThreadId),
                     modelSelection: input.modelSelection,
                     runtimePolicy: input.runtimePolicy,
                   }),
                 });
+                bindInventoryLoad(threadId, attribution);
               }
               const response = yield* ensureInitialized.pipe(
                 Effect.andThen(revertCodexThread(client, threadId, numTurns)),
@@ -8885,6 +9011,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 return Effect.gen(function* () {
                   const threadId = yield* getNativeThreadId(threadInput.sourceProviderThread);
                   const boundary = yield* resolveCodexForkBoundary(threadInput);
+                  const attribution = yield* inventoryAttribution(
+                    threadInput.targetThreadId,
+                    threadInput.runtimePolicy,
+                  );
                   const response = yield* ensureInitialized.pipe(
                     Effect.andThen(
                       client
@@ -8894,6 +9024,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                             ? {}
                             : { lastTurnId: boundary.lastTurnId }),
                           ...codexThreadRuntimeParams({
+                            attribution,
                             mcpSession: yield* readMcpSession(threadInput.targetThreadId),
                             recall: recallForThread(threadInput.targetThreadId),
                             ...(threadInput.modelSelection === undefined
@@ -8907,6 +9038,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                         .pipe(
                           ownNativeAllocation((nativeId) => {
                             loadedNativeId = nativeId;
+                            if (nativeId !== undefined) bindInventoryLoad(nativeId, attribution);
                           }),
                         ),
                     ),
