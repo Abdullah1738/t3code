@@ -1874,7 +1874,8 @@ export class Router {
       for (const row of rows) {
         const input = row.payload as NormalizedInbound;
         if (row.state === "processing") {
-          if (this.store.get<SteerAttempt>(`steer-attempt:${row.id}`)?.response?.linkRetry) {
+          const response = this.store.get<SteerAttempt>(`steer-attempt:${row.id}`)?.response;
+          if (response?.linkRetry || response?.linkUncertain) {
             await this.steer(row, preceding);
             if (linkDown() || this.store.get<SteerAttempt>(`steer-attempt:${row.id}`)?.response?.linkRetry) return;
             preceding.add(row.id);
@@ -2274,9 +2275,18 @@ export class Router {
           : Promise.all([this.backend.questions(response.sessionId, response.directory),
             this.backend.permissions(response.sessionId, response.directory)]).then(() => true)))
           .catch(error => { toolError("router", "router.respond_reconcile", error); return undefined; });
-        // A request disappearing after an outage cannot prove whose response landed.
-        // Keep the original operation sealed rather than replaying an approval as conversation.
-        if (resolved === undefined || response.linkUncertain) return;
+        if (resolved === undefined) return;
+        if (response.linkUncertain) {
+          // Only a fresh pending request permits the same sealed response, whose
+          // deterministic key also fences a response still committing at Robob.
+          if (!resolved && response.operation) {
+            this.store.set(`steer-attempt:${row.id}`, { ...attempt,
+              response: { ...response, retry: response.operation, linkRetry: true } } satisfies SteerAttempt);
+            await this.postResponse(row.id, response.turn, response.sessionId, response.directory, response.requestId, response.operation);
+          }
+          // A disappearing request cannot prove whose response landed.
+          return;
+        }
         this.store.set(`steer-attempt:${row.id}`, null);
         this.requeueHuman(row.id, "respond_failed");
         return;
@@ -2947,7 +2957,7 @@ export class Router {
       }).immediate();
       this.retireOthers();
     } catch (caughtError) { toolError("router", "router.catch20", caughtError);
-      if (caughtError instanceof RobobLinkDown) {
+      if (caughtError instanceof RobobLinkDown || this.backend.linkAvailable === false) {
         this.store.updateInbound(inboundId, "pending");
         throw caughtError;
       }

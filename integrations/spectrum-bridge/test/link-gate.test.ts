@@ -29,6 +29,7 @@ function harness(random = 0.5, network = false, options: { storePath?: string; r
   const runs: object[] = [];
   const requests: PendingRequest[] = [];
   const responses: { id: string; body: unknown }[] = [];
+  const responseReceipts = new Set<string>();
   const creates: string[] = [];
   const mirrored: MirrorItem[] = [];
   const uploads: string[] = [];
@@ -74,8 +75,13 @@ function harness(random = 0.5, network = false, options: { storePath?: string; r
     if (path.endsWith("/evidence")) return ok({ toolEvidence: "ran", complete: !!options.replies, status: options.replies ? "completed" : "running" });
     if (path.endsWith("/respond")) {
       const id = path.split("/").at(-2)!;
-      responses.push({ id, body: JSON.parse(String(init?.body)) });
-      requests.splice(requests.findIndex(request => request.requestId === id), 1);
+      const body = JSON.parse(String(init?.body)) as { clientRequestId: string };
+      if (!responseReceipts.has(body.clientRequestId)) {
+        responses.push({ id, body });
+        responseReceipts.add(body.clientRequestId);
+      }
+      const pending = requests.findIndex(request => request.requestId === id);
+      if (pending !== -1) requests.splice(pending, 1);
       if (loseReplyResponse) {
         healthy = false;
         for (let n = 0; n < 3; n++) await client.thread("thread").catch(() => {});
@@ -410,6 +416,52 @@ test.each(replyForms.flatMap(form => ["validation", "reply POST"].map(stage => (
   },
 );
 
+test.each(replyForms.flatMap(form => [false, true].map(restart => ({ ...form, restart }))))(
+  "$name resumes the sealed response when its refused POST closes the gate (restart=$restart)", async form => {
+  const h = harness();
+  try {
+    await captureLogs(async () => {
+      await prepareAnswer(h, form);
+      const respond = h.client.respond.bind(h.client);
+      let original: Parameters<typeof respond> | undefined;
+      const intercept = spyOn(h.client, "respond").mockImplementation(async (...args) => {
+        original = args;
+        h.healthy = false;
+        for (let n = 0; n < 2; n++) await h.client.thread("thread").catch(() => {});
+        return respond(...args);
+      });
+      try { await h.router.tick(); } finally { intercept.mockRestore(); }
+      expect(h.gate.available).toBe(false);
+      expect(h.responses).toEqual([]);
+      expect(h.store.pendingInbound().map(row => [row.id, row.state])).toEqual([["answer", "processing"], ["after", "pending"]]);
+      expect(h.store.get("steer-attempt:answer")).toMatchObject({ response: { linkUncertain: true, operation: { request: { id: "request" } } } });
+      h.input("status", "/status");
+      const router = form.restart ? h.restartRouter() : h.router;
+      const before = h.calls.length;
+      await router.tick();
+      expect(h.calls).toHaveLength(before);
+      h.healthy = true; await h.advance(start + 1_000);
+      const ordered = spyOn(h.client, "respond").mockImplementation(async (...args) => {
+        expect(args).toEqual(original!);
+        expect(h.store.pendingOutbox().filter(op => op.replyTo === "status")).toEqual([]);
+        expect(h.sends.map(send => send.text)).toEqual(["first"]);
+        return respond(...args);
+      });
+      try { await router.tick(); await router.tick(); } finally { ordered.mockRestore(); }
+      expect(h.responses).toHaveLength(1);
+      expect(h.responses[0]).toEqual({ id: "request", body: original![2] });
+      expect(h.responses[0]!.body).toMatchObject(form.body);
+      expect(h.calls.filter(path => path.endsWith("/respond"))).toHaveLength(2);
+      expect(h.requests).toEqual([]);
+      expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id = 'answer'").get()?.state).toBe("admitted");
+      expect(h.store.get("steer-attempt:answer")).toBeNull();
+      expect(h.store.pendingOutbox().filter(op => op.replyTo === "status")).toHaveLength(1);
+      expect(h.sends.map(send => send.text)).toEqual(["first", "Later message"]);
+      expect(h.store.db.query("SELECT id FROM inbound WHERE state IN ('failed','unknown')").all()).toEqual([]);
+    });
+  } finally { h.fetcher.mockRestore(); }
+});
+
 test.each(replyForms)("$name keeps submission uncertainty when an accepted POST loses its response", async form => {
   const h = harness();
   try {
@@ -439,6 +491,37 @@ test.each(replyForms)("$name keeps submission uncertainty when an accepted POST 
       expect(h.sends.map(send => send.text)).toEqual(["first", "Later message"]);
       expect(h.store.db.query<{ state: string }, []>("SELECT state FROM inbound WHERE id = 'answer'").get()?.state).toBe("processing");
       expect(h.store.get<typeof retained>("steer-attempt:answer")).toEqual(retained);
+    });
+  } finally { h.fetcher.mockRestore(); }
+});
+
+test.each([replyForms[0]!, replyForms[4]!])("$name reuses the response receipt when a pending read races an accepted operation", async form => {
+  const h = harness();
+  try {
+    await captureLogs(async () => {
+      await prepareAnswer(h, form);
+      const pending = h.requests[0]!;
+      const respond = h.client.respond.bind(h.client);
+      const attempts: Parameters<typeof respond>[] = [];
+      const intercept = spyOn(h.client, "respond").mockImplementation(async (...args) => { attempts.push(args); return respond(...args); });
+      try {
+        h.loseReplyResponse = true;
+        await h.router.tick();
+        expect(h.gate.available).toBe(false);
+        expect(h.responses).toHaveLength(1);
+        // Robob's command receipt can precede the pending-request projection.
+        h.requests.push(pending);
+        h.loseReplyResponse = false;
+        h.healthy = true; await h.advance(start + 1_000);
+        const router = h.restartRouter(); await router.tick(); await router.tick();
+        expect(attempts).toHaveLength(2);
+        expect(attempts[1]).toEqual(attempts[0]);
+        expect(h.calls.filter(path => path.endsWith("/respond"))).toHaveLength(2);
+        expect(h.responses).toHaveLength(1);
+        expect(h.store.get("steer-attempt:answer")).toBeNull();
+        expect(h.sends.map(send => send.text)).toEqual(["first", "Later message"]);
+        expect(h.store.db.query("SELECT id FROM inbound WHERE state IN ('failed','unknown')").all()).toEqual([]);
+      } finally { intercept.mockRestore(); }
     });
   } finally { h.fetcher.mockRestore(); }
 });
@@ -631,7 +714,7 @@ test("a typed gate refusal preserves a sealed steer across restart without reque
   } finally { h.fetcher.mockRestore(); }
 });
 
-test("a gate-refused /new stays queued ahead of following inbound and recovers without a failure acknowledgement", async () => {
+test.each(["closed gate", "projects read", "create POST"] as const)("a gate-refused /new stays queued ahead of following inbound at %s", async stage => {
   const h = harness();
   try {
     await captureLogs(async () => {
@@ -639,16 +722,26 @@ test("a gate-refused /new stays queued ahead of following inbound and recovers w
       h.store.set("route", null);
       h.input("new", "/new"); h.input("after", "Later message");
       const createChat = h.backend.createChat.bind(h.backend);
-      const intercept = spyOn(h.backend, "createChat").mockImplementation(async (...args) => {
-        h.healthy = false; await h.down(); return createChat(...args);
-      });
-      try { await expect(h.router.tick()).rejects.toBeInstanceOf(RobobLinkDown); }
+      const request = h.client.request.bind(h.client);
+      const close = async () => {
+        h.healthy = false;
+        for (let n = 0; n < (stage === "closed gate" ? 3 : 2); n++) await h.client.thread("thread").catch(() => {});
+      };
+      const intercept = stage === "create POST"
+        ? spyOn(h.client, "request").mockImplementation(async (...args) => {
+          if (args[0] === "POST" && args[1] === "/threads") await close();
+          return request(...args);
+        })
+        : spyOn(h.backend, "createChat").mockImplementation(async (...args) => { await close(); return createChat(...args); });
+      try { await expect(h.router.tick()).rejects.toBeInstanceOf(stage === "closed gate" ? RobobLinkDown : ControlError); }
       finally { intercept.mockRestore(); }
+      expect(h.gate.available).toBe(false);
       expect(h.store.pendingInbound().map(row => [row.id, row.state])).toEqual([["new", "pending"], ["after", "pending"]]);
       expect(h.store.pendingOutbox()).toEqual([]);
       expect(h.creates).toEqual([]); expect(h.sends).toEqual([]);
       h.healthy = true; await h.advance(start + 1_000);
-      await h.router.tick(); await h.router.tick();
+      const router = h.restartRouter();
+      await router.tick(); await router.tick();
       expect(h.creates).toHaveLength(1);
       expect(h.sends.map(send => send.text)).toEqual(["Later message"]);
       expect(h.calls.indexOf("/threads")).toBeLessThan(h.calls.indexOf("/threads/thread/send"));
