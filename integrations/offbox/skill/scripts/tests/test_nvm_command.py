@@ -257,6 +257,31 @@ class ClientTests(Isolated):
         runs.save_run_state('run-null', nvm_ref=True, nvm_sh=None)
         self.assertTrue(common.read_json(runs.LOGS_DIR / 'run-null.state.json', {})['nvm_ref'])
 
+    def test_foreground_recovered_steps_keep_nvm_advice_even_when_incomplete(self):
+        def start(runner):
+            runner.box, runner.pid, runner.started = 'bx_fake', 7, True
+            return {'box_id': runner.box}
+
+        for complete in (False, True):
+            with self.subTest(complete=complete):
+                content = ('/home/user/.nvm/nvm.sh: No such file or directory\n'
+                           'offbox step 1 rc=127: hidden script\n'
+                           + ('offbox step 2 rc=0: later\n' if complete else ''))
+                def follow(box, pid, log_path, **kwargs):
+                    log_path.write_text('prefix\n')
+                    Path(str(log_path) + '.remote').write_text(content)
+                    common.atomic_write_json(Path(str(log_path) + '.remote.json'),
+                                             dict(source='process log', merged=True))
+                    return 127
+                args = cli.build_parser().parse_args(['run', '--step', 'bash scripts/x.sh', '--step', 'true'])
+                with patch.object(runs.Runner, 'start', start), patch.object(runs, 'follow', follow), \
+                        patch.object(runs.lease, 'idle_ttl'), \
+                        contextlib.redirect_stderr(io.StringIO()) as output:
+                    self.assertEqual(cli.cmd_run(args, self.me), 127 if complete else 90)
+                self.assertEqual(output.getvalue().count('your command sourced ~/.nvm/nvm.sh'), 1)
+                self.assertIn('step 1 rc=127', output.getvalue())
+                self.assertNotIn('node_modules', output.getvalue())
+
 
 class NvmAdviceTests(unittest.TestCase):
     setUp = test_dependency_advice.DependencyAdviceTests.setUp
@@ -271,3 +296,43 @@ class NvmAdviceTests(unittest.TestCase):
         self.assertIn('your command sourced ~/.nvm/nvm.sh', hint)
         self.assertNotIn('node_modules is still missing', result.stderr + hint)
         self.assertNotIn('Install deps', hint)
+
+    def test_hidden_source_then_nvm_use_reports_exit_127_in_foreground_and_steps(self):
+        (self.root / 'scripts/x.sh').write_text('source "$HOME/.nvm/nvm.sh"\nnvm use 24\n')
+        command = 'bash scripts/x.sh && npm ci && node --version'
+        self.assertFalse(node_version.command_uses_nvm(command))
+        for steps in (None, [command, 'true']):
+            with self.subTest(steps=steps):
+                result, hint = self.run_command(command, steps=steps)
+                self.assertEqual(result.returncode, 127, result.stderr)
+                self.assertIn('.nvm/nvm.sh: No such file or directory', result.stderr)
+                results = runs.step_results(self.home / 'run.log') if steps else None
+                if steps:
+                    self.assertEqual(results, [(1, 127), (2, 0)])
+                with contextlib.redirect_stderr(io.StringIO()) as output:
+                    runs.report_exit(command, result.returncode, results, len(steps or []), deps_hint=hint)
+                lines = output.getvalue().splitlines()
+                self.assertEqual(lines[-2], 'offbox: ' + hint)
+                self.assertEqual(lines[-1], 'offbox: remote exit 127')
+                self.assertIn('your command sourced ~/.nvm/nvm.sh', output.getvalue())
+                self.assertNotIn('node_modules', output.getvalue())
+
+    def test_nvm_hint_reporting_exit_and_step_matrix(self):
+        log = self.home / 'run.log'
+        log.write_text('offbox: node v24.22.1 (box default)\n'
+                       '/home/user/.nvm/nvm.sh: No such file or directory\n'
+                       + runs.NO_NODE_MODULES_MARKER + '\n')
+        hint = runs.box_deps_hint(self.root, log)
+        for code, steps, where, expected in (
+                (1, None, 'remote', True), (127, None, 'remote', True),
+                (0, None, 'remote', False), (None, None, 'remote', False),
+                (0, [(1, 127), (2, 0)], 'remote', True),
+                (None, [(1, 127)], 'remote', True),
+                (1, [(1, 127), (2, 1)], 'remote', True),
+                (127, [(1, 1), (2, 127)], 'remote', True),
+                (127, None, 'local', False)):
+            with self.subTest(code=code, steps=steps, where=where):
+                with contextlib.redirect_stderr(io.StringIO()) as output:
+                    runs.report_exit('', code, steps, len(steps or []), where=where, deps_hint=hint)
+                self.assertEqual(output.getvalue().count(hint), int(expected))
+                self.assertNotIn('Install deps', output.getvalue())

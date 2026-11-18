@@ -931,6 +931,7 @@ def setup_failed(log_path: Path | None) -> bool:
 NO_NODE_MODULES_MARKER = "OFFBOX_NO_NODE_MODULES"
 DEPS_CONTEXT_MARKER = "offbox-missing-deps-context: "
 DEPS_INSTALL_MARKER = "offbox-deps-install: "
+NVM_HINT_PREFIX = "your command sourced ~/.nvm/nvm.sh, which home boxes don't have. "
 NVM_WARNING = ('your command sources ~/.nvm/nvm.sh, but home boxes keep Node at /usr/local/bin/node '
                'and have no ~/.nvm. offbox picks Node from the repo pin itself (see "offbox: node"). '
                'It will install nvm.sh before your command so this still works.')
@@ -967,7 +968,7 @@ def box_deps_hint(root: Path, log_path: Path | None) -> str:
         versions = [match[1] for line in lines
                     if (match := re.match(r'offbox: node (v\d+\.\d+\.\d+)\b', line))]
         version = versions[-1] if versions else '(see "offbox: node" above)'
-        return ("your command sourced ~/.nvm/nvm.sh, which home boxes don't have. "
+        return (NVM_HINT_PREFIX +
                 f"offbox already put Node {version} on PATH; drop the source line or see the "
                 "remote-compute skill's Node section.")
     if not marked:
@@ -1600,6 +1601,16 @@ def space_result(run_id, code, path=None, *, report=False):
     return code
 
 
+def report_box_hint(code: int | None, step_res: list[tuple[int, int]], hint: str) -> None:
+    failed_code = next((rc for _, rc in step_res if rc), code)
+    if not hint or not (code not in (0, None) or any(rc != 0 for _, rc in step_res)):
+        return
+    # A hidden source failure can be followed by `nvm: command not found`.
+    if (code == 127 or failed_code == 127) and not hint.startswith(NVM_HINT_PREFIX):
+        return
+    say(hint)
+
+
 def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | None = None, planned: int = 0,
                 where: str = "remote", deps_hint: str = "", box_id: str | None = None) -> None:
     """Always the last offbox line, so a caller's own `| tail` / `; echo` can't be mistaken for it."""
@@ -1609,10 +1620,8 @@ def report_exit(cmd: str, code: int | None, step_res: list[tuple[int, int]] | No
         say("exit 1 may be from the trailing grep (no match) or an earlier stage. Use --step for each command.")
     if code == 137 or any(rc == 137 for _, rc in (step_res or [])):
         say("exit 137 = the box killed the command for memory. Rerun with --size xlarge.")
-    failed_code = next((rc for _, rc in (step_res or []) if rc), code)
-    if (where == "remote" and code != 127 and failed_code != 127 and deps_hint
-            and (code not in (0, None) or any(rc != 0 for _, rc in (step_res or [])))):
-        say(deps_hint)
+    if where == "remote":
+        report_box_hint(code, step_res or [], deps_hint)
     if code is None:
         hint = f"; inspect with offbox ssh {box_id}" if box_id else ""
         say("remote exit unknown (process lost); offbox exits 90" + hint)
@@ -4202,7 +4211,8 @@ def _run_remote(a, rn) -> int:
     deps_hint = box_deps_hint(rn.root, rn.log_path)
     effective = space_result(rn.run_id, code, rn.log_path, report=True)
     if steps:
-        res = step_results(rn.log_path)
+        from .misc import _raw_log
+        res = step_results(_raw_log(rn.log_path))
         failed = next((n for n, rc in res if rc != 0), None)
         report_exit(steps[failed - 1] if failed else "", code, res, len(steps), deps_hint=deps_hint, box_id=rn.box)
     else:

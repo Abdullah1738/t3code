@@ -2171,13 +2171,11 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
 
 
 def _report_deps_hint(r, code, log_path) -> None:
-    from .runs import box_deps_hint, step_results
-    results = step_results(log_path)
-    failed_code = next((rc for _, rc in results if rc), code)
-    if code != 127 and failed_code != 127 and (code not in (0, None) or any(rc != 0 for _, rc in results)):
+    from .runs import box_deps_hint, report_box_hint, step_results
+    results = step_results(_raw_log(log_path))
+    if code not in (0, None) or any(rc != 0 for _, rc in results):
         hint = box_deps_hint(Path(r['repo_root'] or '.'), log_path)
-        if hint:
-            say(hint)
+        report_box_hint(code, results, hint)
 
 
 def _finalize(r, code, log_path, until=None, *, echo=False, show_failure=False) -> int:
