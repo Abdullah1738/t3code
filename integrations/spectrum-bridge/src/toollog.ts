@@ -74,6 +74,14 @@ function clean(entry: Entry, ts: string, runId?: string): LogLine | undefined {
   if (Object.keys(ids).length) line.ids = ids;
   const props: NonNullable<LogLine["props"]> = {};
   for (const [key, value] of Object.entries(entry.props ?? {})) {
+    if (entry.component === "mirror" && ["mirror-append", "mirror-queue", "mirror-fail", "mirror-backfill"].includes(entry.name)) {
+      if (key === "direction" && (value === "inbound" || value === "outbound")
+        || key === "kind" && (value === "text" || value === "file")
+        || key === "cause" && ["store", "queue_full", "file_cap", "retry_exhausted", "http", "sink"].includes(String(value))
+        || ["latency_ms", "depth"].includes(key) && typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        props[key] = value; continue;
+      }
+    }
     if (entry.name === "synthetic.carry_evicted" && key === "reason" && (value === "expired" || value === "overflow")
       || entry.name === "synthetic.carried_from_stranded" && key === "cause" && (value === "route_retired" || value === "stuck_attempt_used")) {
       props[key] = value; continue;

@@ -1,5 +1,6 @@
 import { ProbeBudget } from "./probe-policy.ts";
 import { RemoteBox, remoteBoxConfig } from "./remote-box.ts";
+import { createChatMirror, type ChatMirror } from "./mirror.ts";
 import { readFileSync } from "node:fs";
 import { toolError, toolLog, type LogLine } from "./toollog.ts";
 import { acknowledgeReceived, notifyFailedInbound } from "./inbound-failure.ts";
@@ -50,7 +51,7 @@ export type MainIo = {
   removeStaleSocket: (path: string) => Promise<void>;
 };
 
-type Parts = { remote?: RemoteBox; router?: Router; delivery?: Delivery; replyGap?: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend?: ChatBackend; busy: boolean };
+type Parts = { remote?: RemoteBox; mirror?: ChatMirror; router?: Router; delivery?: Delivery; replyGap?: ReplyGapMonitor; api: (request: Request) => Promise<Response>; backend?: ChatBackend; busy: boolean };
 
 export function acknowledgeSendblue(chat: Pick<ChatCore, "store" | "context" | "remote">, input: unknown, log: MainIo["log"]): void {
   if (chat.remote && (input as { logSource?: string }).logSource === "backfill") return;
@@ -222,7 +223,12 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   const build = (chat: ChatCore): Parts => {
     const remoteConfig = remoteBoxConfig(config, chat.info.slug);
     if (remoteConfig) {
+      const mirror = createChatMirror(remoteConfig.mirror, chat.store, undefined, {
+        download: (url, maxBytes, timeoutMs) => observed.download(url, maxBytes, timeoutMs),
+      });
+      mirror?.backfill();
       const remote = new RemoteBox(remoteConfig, chat.store, { log, ownerAlert: fenceOwnerAlert(telegramBridgeSocket),
+        mirror,
         active: () => {
           try { const live = JSON.parse(readFileSync(join(stateRoot, "config.json"), "utf8"));
             return remoteBoxConfig(live, "moni")?.epoch === remoteConfig.epoch; } catch { return false; }
@@ -230,7 +236,7 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
         notice: async (id, text) => { await remote.send(hash(`notice:${id}`), text, undefined, observed, chat.info.key); },
       });
       chat.remote = remote;
-      return { remote, api: async () => Response.json({ error: "This chat lives on its box" }, { status: 403 }), busy: false };
+      return { remote, mirror, api: async () => Response.json({ error: "This chat lives on its box" }, { status: 403 }), busy: false };
     }
     const isOwner = chat.info.kind === "owner";
     const chatBackend = !isOwner && backend instanceof RobobBackend
@@ -392,7 +398,11 @@ export async function serveSendblue(config: Config, mode: string, io: MainIo): P
   }, 60_000);
   const timer = setInterval(() => {
     for (const chat of chats.all()) {
-      if (chat.parts.remote) { if (ready()) void chat.parts.remote.tick(); continue; }
+      if (chat.parts.remote) {
+        void chat.parts.mirror?.tick().catch(() => log("mirror-worker-failed"));
+        if (ready()) void chat.parts.remote.tick();
+        continue;
+      }
       void chat.parts.delivery?.tick().catch((caughtError) => { toolError("sb-main", "sb-main.catch13", caughtError); return log("sender-failed"); });
       if (ready()) void chat.parts.router?.checkCompletion();
       if (ready()) void chat.parts.replyGap?.tick().catch((caughtError) => { toolError("sb-main", "reply-gap.check", caughtError); });

@@ -6,10 +6,11 @@ import { jsonBody, opaqueId, seal, tokenMatches, validId, type Fetch, type Seale
 import type { AgentAnswerReceipt } from "./agent-bus.ts";
 import { LineError, safeLineFailureCode, type ChatKey, type Line } from "./line.ts";
 import { RemoteUnanswered } from "./unanswered.ts";
+import type { ChatMirror } from "./mirror.ts";
 
 export type RemoteBoxConfig = { kind: "remote-box"; url: string; tokenFile: string; callbackTokenFile: string;
   publicKeyFile: string; boxRouterPort?: number; macRouterPort?: number; callbackPort: number; epoch: string; boxId: string;
-  noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number; wakeFenceAutoFailMs?: number };
+  noticeAfterMs?: number; outageClearMs?: number; noticeMinGapMs?: number; wakeFenceAutoFailMs?: number; mirror?: boolean };
 type Outage = { id: string; unreachableSince: number | null; reachableSince: number | null; noticeAttempted?: boolean };
 type Fence = { id: string; since: number; queuedBehind: number };
 type FenceAlert = { key: string; text: string };
@@ -25,6 +26,7 @@ export function remoteBoxConfig(config: { chatBackends?: unknown }, slug: string
   const entry = entries?.[slug] as RemoteBoxConfig | undefined;
   if (entry === undefined || entry.kind === ("robob" as string)) return;
   if (slug !== "moni" || entry.kind !== "remote-box" || !/^http:\/\/127\.0\.0\.1:\d+$/.test(entry.url)
+    || entry.mirror !== undefined && typeof entry.mirror !== "boolean"
     || ![entry.tokenFile, entry.callbackTokenFile, entry.publicKeyFile].every(p => typeof p === "string" && p.startsWith("/"))
     || [entry.boxRouterPort, entry.macRouterPort].some(p => p !== undefined && (!Number.isInteger(p) || p < 1024 || p > 65535))
     || [entry.noticeAfterMs, entry.outageClearMs, entry.noticeMinGapMs, entry.wakeFenceAutoFailMs].some(ms => ms !== undefined && (!Number.isSafeInteger(ms) || ms < 0))
@@ -53,6 +55,7 @@ export class RemoteBox {
     fetch?: Fetch; now?: () => number; log: (event: string, code?: string) => void;
     notice: (id: string, text: string) => Promise<void>; active: () => boolean;
     ownerAlert?: (severity: "attention", text: string, key: string) => Promise<boolean>;
+    mirror?: ChatMirror;
   }) {
     this.sessionId = `remote:moni:${config.epoch}`;
     this.publicKey = readFileSync(config.publicKeyFile, "utf8");
@@ -129,6 +132,7 @@ export class RemoteBox {
       const created = this.store.db.query("INSERT OR IGNORE INTO remote_inbox(id,sealed,receipt,kind,received_at) VALUES (?,?,?,?,?)")
         .run(key, JSON.stringify(seal(this.publicKey, typeof input === "object" && input !== null ? { ...input, kind } : input)), receipt ? JSON.stringify(receipt) : null, kind, this.now()).changes === 1;
       if (created && kind === "inbound") this.unanswered.accept(key, this.now());
+      if (kind === "inbound") this.io.mirror?.inbound(id, input);
       return created;
     })();
   }
@@ -378,7 +382,10 @@ export class RemoteBox {
   }
   async send(id: string, text: string, mediaUrl: string | undefined, line: Line, chat: ChatKey): Promise<{ id: string; handle: string }> {
     const row = this.store.db.query<{ at: number; state: string; handle: string }, [string]>("SELECT * FROM remote_sends WHERE id=?").get(id);
-    if (row?.state === "sent") return { id, handle: row.handle };
+    if (row?.state === "sent") {
+      this.io.mirror?.outbound(id, text, mediaUrl, row.at);
+      return { id, handle: row.handle };
+    }
     if (row?.state === "failed") throw new RemoteSendError(422);
     if (row?.state === "uncertain") {
       const sent = (await line.outbound(chat, row.at - 5_000)).find(m => m.text === text && m.mediaUrl === mediaUrl && m.sentAt >= row.at
@@ -386,12 +393,14 @@ export class RemoteBox {
         && !this.store.db.query("SELECT 1 FROM remote_sends WHERE handle=? AND id!=?").get(m.handle, id));
       if (!sent) throw new RemoteSendError(409);
       this.store.db.query("UPDATE remote_sends SET state='sent',handle=? WHERE id=?").run(sent.handle, id);
+      this.io.mirror?.outbound(id, text, mediaUrl, sent.sentAt);
       return { id, handle: sent.handle };
     }
     this.store.db.query("INSERT INTO remote_sends VALUES (?,?,'uncertain',NULL) ON CONFLICT(id) DO UPDATE SET at=excluded.at,state='uncertain'").run(id, this.now());
     try {
       const sent = await line.sendText(chat, text, mediaUrl ? { mediaUrl } : undefined);
       this.store.db.query("UPDATE remote_sends SET state='sent',handle=? WHERE id=?").run(sent.handle, id);
+      this.io.mirror?.outbound(id, text, mediaUrl, this.now());
       this.emit("moni-reply-sent"); return { id, handle: sent.handle };
     } catch (error) {
       if (error instanceof LineError && !error.uncertain) {
@@ -431,7 +440,10 @@ export class RemoteBox {
       }
       if (path === "/files") {
         if (typeof body.data !== "string" || body.data.length > 28_000_000 || typeof body.name !== "string" || typeof body.mime !== "string") return reply(400, { error: "Invalid file" });
-        return reply(200, { mediaUrl: await io.line.upload({ data: Buffer.from(body.data, "base64"), name: body.name, mimeType: body.mime }) });
+        const file = { data: Buffer.from(body.data, "base64"), name: body.name, mimeType: body.mime };
+        const mediaUrl = await io.line.upload(file);
+        this.io.mirror?.rememberFile(mediaUrl, file);
+        return reply(200, { mediaUrl });
       }
       if (!validId(body.id) || typeof body.text !== "string" || body.text.length > 12_000 || (body.mediaUrl !== undefined && (typeof body.mediaUrl !== "string" || !body.mediaUrl.startsWith("https://")))) return reply(400, { error: "Invalid send" });
       if (body.inboxId !== undefined && !validId(body.inboxId)) return reply(400, { error: "Invalid inbox id" });
