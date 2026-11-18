@@ -2106,6 +2106,7 @@ test("missing until, route change, merge conflict and ten-minute redaction resyn
   } finally { setSystemTime(); }
 });
 
+// Replaying both HTTP histories can exceed Bun's five-second default under shared CPU load.
 test.each([100, 1_500].flatMap(historySize => ["idle", "active", "steer"].map(scenario => ({ historySize, scenario }))))(
   "60-second router budgets preserve completion timing ($historySize rows, $scenario)", async ({ historySize, scenario }) => {
   const start = Date.parse("2026-11-15T09:30:00Z");
@@ -2572,7 +2573,7 @@ test("Sendblue finds a newly created child's question through the shared SSE-dow
   const listed = Promise.withResolvers<void>();
   const list = h.backend.client.listThreads.bind(h.backend.client);
   spyOn(h.backend.client, "listThreads").mockImplementation(async args => {
-    const result = await list(args); if (args.active) listed.resolve(); return result;
+    const result = await list(args); if (args?.active) listed.resolve(); return result;
   });
   setSystemTime(start + 10_000);
   await h.router.tick();
