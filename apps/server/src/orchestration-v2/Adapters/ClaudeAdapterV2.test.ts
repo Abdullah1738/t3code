@@ -38,7 +38,9 @@ import {
   ChatImageAttachment,
   CheckpointId,
   ClaudeSettings,
+  CommandId,
   EnvironmentId,
+  EventId,
   MessageId,
   type ModelSelection,
   NodeId,
@@ -110,7 +112,14 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { ClaudeOrchestratorReplayHarness } from "./ClaudeAdapterV2.testkit.ts";
 import { provideDeterministicTestRuntime } from "../testkit/DeterministicRuntime.ts";
 import { runOrchestratorV2Scenario } from "../testkit/OrchestratorScenario.ts";
-import { layerProviderReplay } from "../testkit/ProviderReplayHarness.ts";
+import { layerProviderReplay, layerWithRegistry } from "../testkit/ProviderReplayHarness.ts";
+import * as ProviderAdapterRegistry from "../ProviderAdapterRegistry.ts";
+import * as ProviderSessionManager from "../ProviderSessionManager.ts";
+import * as ProviderTurnControl from "../ProviderTurnControlService.ts";
+import * as Orchestrator from "../Orchestrator.ts";
+import * as EventSink from "../EventSink.ts";
+import * as EffectOutbox from "../EffectOutbox.ts";
+import * as EffectWorker from "../EffectWorker.ts";
 import {
   assertBaseProjection,
   assertSemanticProjectionIntegrity,
@@ -257,7 +266,7 @@ function makeClaudeTestTurnInput(input: {
 }
 
 describe("ClaudeAdapterV2 runtime query policy", () => {
-  it.effect.each(["local", "native", "retained"] as const)(
+  it.effect.each(["local", "native", "active", "retained"] as const)(
     "cancels a timed-out queued prompt without closing the query, placement=%s",
     (placement) =>
       Effect.gen(function* () {
@@ -292,6 +301,7 @@ describe("ClaudeAdapterV2 runtime query policy", () => {
           Effect.result,
         );
         assert.equal(result._tag, placement === "retained" ? "Failure" : "Success");
+        if (result._tag === "Success") assert.equal(result.success, placement !== "active");
         assert.deepEqual(
           requests,
           placement === "local"
@@ -2523,6 +2533,7 @@ function makeFakeClaudeCli(
   let homeConnected = false;
   const stdins: Array<NodeStream.PassThrough> = [];
   const pendingRegistrations: Array<() => void> = [];
+  const exited = Promise.withResolvers<void>();
   const exits: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
   const spawn = (options: SpawnOptions): SpawnedProcess => {
     spawns.push(options);
@@ -2531,6 +2542,7 @@ function makeFakeClaudeCli(
     stdins.push(stdin);
     stdouts.push(stdout);
     const child = Object.assign(new NodeEvents.EventEmitter(), {
+      pid: 1800 + spawns.length,
       stdin,
       stdout,
       killed: false,
@@ -2548,6 +2560,7 @@ function makeFakeClaudeCli(
       child.exitCode = code;
       child.signalCode = signal;
       child.emit("exit", code, signal);
+      exited.resolve();
     };
     exits.push(exit);
     let pending = "";
@@ -2607,6 +2620,7 @@ function makeFakeClaudeCli(
     spawns,
     controlRequests,
     closed,
+    exited: Effect.promise(() => exited.promise),
     exitWithoutClosingOutput: (code: number | null, signal: NodeJS.Signals | null) =>
       exits[0]!(code, signal),
     releaseRegistration: () => pendingRegistrations.shift()?.(),
@@ -2670,6 +2684,17 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
       Effect.provide(NodeServices.layer),
     );
 
+  it.effect("inventory captures the CLI identity and drops it after exit", () =>
+    Effect.gen(function* () {
+      const cli = makeFakeClaudeCli();
+      const session = yield* openWith(cli);
+      assert.deepEqual(session.runtimeProcess?.(), { pid: 1801, spawnedAtMs: 0 });
+      yield* session.close;
+      yield* cli.exited;
+      assert.isUndefined(session.runtimeProcess?.());
+    }),
+  );
+
   it.effect("sends MCP servers over stdin, not argv or the environment", () =>
     Effect.gen(function* () {
       const cli = makeFakeClaudeCli();
@@ -2701,15 +2726,17 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
         Effect.provide(Logger.layer([logger], { mergeWithExisting: false })),
       );
       assert.isDefined(session.processExit);
+      assert.isDefined(session.runtimeProcess?.());
       const exited = yield* session.processExit!.pipe(Effect.forkChild);
       cli.exitWithoutClosingOutput(exit.code, exit.signal);
       assert.deepEqual(yield* Fiber.join(exited), exit);
+      assert.isUndefined(session.runtimeProcess?.());
       assert.deepEqual(yield* Deferred.await(exitLog), [
         "orchestration-v2.claude-process-exited",
         {
           threadId: "thread-claude-mcp-channel",
           providerSessionId: "provider-session-claude-mcp-channel",
-          pid: null,
+          pid: 1801,
           exitCode: exit.code,
           signal: exit.signal,
         },
@@ -3250,7 +3277,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     readonly beforeOpen?: Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly cancelPendingPrompt?: (
       uuid: string,
-    ) => Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
+    ) => Effect.Effect<boolean, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
     readonly close?: (
       sdkMessages: Queue.Queue<SDKMessage>,
     ) => Effect.Effect<void, ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError>;
@@ -3283,6 +3310,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       index: number,
     ) => NonNullable<ClaudeAdapterV2.ClaudeAgentSdkQuerySession["processExit"]>;
     readonly fileSystem?: FileSystem.FileSystem;
+    readonly onEvent?: (event: ProviderAdapter.ProviderAdapterV2Event) => Effect.Effect<void>;
   }) =>
     Effect.gen(function* () {
       const fileSystem = options?.fileSystem ?? (yield* FileSystem.FileSystem);
@@ -3486,6 +3514,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             if (event.type === "turn_item.updated" && event.turnItem.type === "system_notice") {
               yield* Queue.offer(systemNoticeReceipts, event);
             }
+            yield* options?.onEvent?.(event) ?? Effect.void;
           }),
         ),
         Effect.forkScoped,
@@ -4788,6 +4817,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           yield* harness.offerAndWait(wakeTaskStarted);
           yield* harness.offerAndWait(turnOneResult);
           yield* Queue.take(harness.terminalReceipts);
+          yield* Queue.clear(harness.providerThreadReceipts);
           closeBeforeReplay = (
             scenario === "process_exit"
               ? Deferred.succeed(exited, { code: null, signal: "SIGKILL" })
@@ -4825,14 +4855,16 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             attemptId: continuation.attemptId,
             stopBackgroundWork: false,
           });
+          const stopped = yield* Queue.take(harness.terminalReceipts);
+          assert.equal(stopped.status, "interrupted");
+          assert.equal(stopped.nativeWorkEnded, scenario === "process_exit" ? true : undefined);
           const next = {
             ...first,
             runId: RunId.make("closed-reservation-next"),
             attemptId: RunAttemptId.make("closed-reservation-next"),
             providerTurnOrdinal: 3,
           };
-          assert.isTrue(Exit.isSuccess(yield* harness.runtime.startTurn(next).pipe(Effect.exit)));
-          assert.equal((yield* Queue.take(harness.terminalReceipts)).status, "interrupted");
+          yield* harness.runtime.startTurn(next);
           assert.lengthOf(harness.terminalEvents(), 2);
           assert.equal(interrupts, 0);
         }).pipe(
@@ -14711,7 +14743,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             cancelPendingPrompt: (uuid) =>
               Effect.sync(() => {
                 cancelled.push(uuid);
-              }).pipe(Effect.andThen(Effect.suspend(() => onCancel(uuid)))),
+              }).pipe(Effect.andThen(Effect.suspend(() => onCancel(uuid))), Effect.as(true)),
           });
           if (nativeResult)
             onCancel = (uuid) =>
@@ -16423,6 +16455,421 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         ),
       ),
     ),
+  );
+
+  it.effect.each(["interrupt", "cancel-fallback"] as const)(
+    "keeps Stop and the successor pending after a Claude %s receipt until the native result",
+    (route) =>
+      Effect.gen(function* () {
+        const receipt = yield* Deferred.make<void>();
+        const stopped = yield* Deferred.make<void>();
+        const successorSent = yield* Deferred.make<void>();
+        const deliverResult = yield* Deferred.make<void>();
+        let interrupts = 0;
+        const acknowledge = Effect.sync(() => {
+          interrupts++;
+        }).pipe(Effect.andThen(Deferred.succeed(receipt, undefined)));
+        const harness = yield* makeWakeHarnessWithOptions({
+          interrupt: acknowledge,
+          ...(route === "cancel-fallback"
+            ? {
+                cancelPendingPrompt: () => acknowledge.pipe(Effect.as(false)),
+              }
+            : {}),
+        });
+        const input = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("claude-expired-receipt"),
+          text: "Work the card",
+          attachments: [],
+        });
+        yield* harness.runtime.startTurn(input);
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "command_lifecycle",
+            command_uuid: harness.promptUuid(0),
+            state: "started",
+          }),
+        );
+        const stop = yield* harness.runtime.interruptStartingRun!({
+          providerThread: harness.providerThread,
+          runId: input.runId,
+          attemptId: input.attemptId,
+          stopBackgroundWork: false,
+        }).pipe(
+          Effect.tap(() => Deferred.succeed(stopped, undefined)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        yield* Deferred.await(receipt);
+        const next = makeClaudeTestTurnInput({
+          threadId: harness.threadId,
+          providerThread: harness.providerThread,
+          now: yield* DateTime.now,
+          attemptId: RunAttemptId.make("claude-retry-after-receipt"),
+          text: "Replacement",
+          attachments: [],
+          providerTurnOrdinal: 2,
+        });
+        const successor = yield* harness.runtime.startTurn(next).pipe(
+          Effect.tap(() => Deferred.succeed(successorSent, undefined)),
+          Effect.forkChild({ startImmediately: true }),
+        );
+        assert.isTrue(Option.isNone(yield* Deferred.poll(stopped)));
+        assert.isTrue(Option.isNone(yield* Deferred.poll(successorSent)));
+        assert.lengthOf(harness.offeredMessages, 1);
+        assert.lengthOf(harness.terminalEvents(), 0);
+        assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+        const nativeResult = yield* Deferred.await(deliverResult).pipe(
+          Effect.andThen(
+            harness.offerAndWait(
+              claudeSdkFrame({
+                ...turnOneResult,
+                user_message_uuid: harness.promptUuid(0),
+              }),
+            ),
+          ),
+          Effect.forkScoped,
+        );
+        yield* Deferred.succeed(deliverResult, undefined);
+        yield* Fiber.join(nativeResult);
+        yield* Fiber.join(stop);
+        yield* Fiber.join(successor);
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "interrupted");
+        assert.lengthOf(harness.terminalEvents(), 1);
+        assert.lengthOf(harness.offeredMessages, 2);
+        assert.equal(harness.offeredMessages[1]?.message.content, "Ultrathink:\nReplacement");
+        assert.equal(interrupts, 1);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+  );
+
+  it.effect.each(["no-receipt", "acknowledged"] as const)(
+    "keeps a timed-out Stop busy until the native Claude turn ends: %s",
+    (delivery) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const stopEntered = yield* Deferred.make<void>();
+          let interruptCalls = 0;
+          const harness = yield* makeWakeHarnessWithOptions({
+            interrupt: Effect.sync(() => {
+              interruptCalls++;
+            }).pipe(
+              Effect.andThen(Deferred.succeed(stopEntered, undefined)),
+              Effect.andThen(delivery === "no-receipt" ? Effect.never : Effect.void),
+            ),
+          });
+          const input = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("expired-start-stop-idle-probe"),
+            text: "Work the card.",
+            attachments: [],
+          });
+          yield* harness.runtime.startTurn(input);
+          const stop = yield* harness.runtime.interruptStartingRun!({
+            providerThread: harness.providerThread,
+            runId: input.runId,
+            attemptId: input.attemptId,
+            stopBackgroundWork: false,
+          }).pipe(Effect.exit, Effect.forkScoped);
+          yield* Deferred.await(stopEntered);
+          assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+          yield* TestClock.adjust("10 seconds");
+          assert.isTrue(Exit.isFailure(yield* Fiber.join(stop)));
+          assert.lengthOf(harness.terminalEvents(), 0);
+          assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+          const retry =
+            delivery === "acknowledged"
+              ? yield* harness.runtime.interruptStartingRun!({
+                  providerThread: harness.providerThread,
+                  runId: input.runId,
+                  attemptId: input.attemptId,
+                  stopBackgroundWork: false,
+                }).pipe(Effect.forkChild({ startImmediately: true }))
+              : undefined;
+          assert.equal(interruptCalls, 1);
+          yield* harness.offerAndWait(turnOneResult);
+          yield* Queue.take(harness.terminalReceipts);
+          if (retry !== undefined) yield* Fiber.join(retry);
+          assert.equal(interruptCalls, 1);
+          assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+      ),
+  );
+
+  it.effect.each([
+    "before-stop",
+    "during-stop",
+    "stream-end-first",
+    "stream-failure-first",
+  ] as const)(
+    "confirms an expired Claude turn's process exit with a buffered wake (%s)",
+    (timing) =>
+      Effect.gen(function* () {
+        const exited = yield* Deferred.make<{
+          code: number | null;
+          signal: NodeJS.Signals | null;
+        }>();
+        const stopSent = yield* Deferred.make<void>();
+        const idleProbed = yield* Deferred.make<void>();
+        const streamFailure = yield* Deferred.make<
+          never,
+          ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError
+        >();
+        const streamFirst = timing === "stream-end-first" || timing === "stream-failure-first";
+        const managerEvents = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        let interrupts = 0;
+        const h = yield* makeWakeHarnessWithOptions({
+          freshQueueOnReopen: true,
+          ...(timing === "stream-failure-first"
+            ? { streamFailure: Deferred.await(streamFailure) }
+            : {}),
+          onEvent: (event) => Queue.offer(managerEvents, event).pipe(Effect.asVoid),
+          processExit: (index) => (index === 0 ? Deferred.await(exited) : Effect.never),
+          interrupt: Effect.sync(() => {
+            interrupts++;
+          }).pipe(Effect.andThen(Deferred.succeed(stopSent, undefined))),
+        });
+        const registry = ProviderAdapterRegistry.layerFromAdapters([
+          {
+            ...h.adapter,
+            openSession: () =>
+              Effect.succeed({
+                ...h.runtime,
+                events: Stream.fromQueue(managerEvents),
+                holdsWorkForThread: (thread) =>
+                  h.runtime.holdsWorkForThread!(thread).pipe(
+                    Effect.tap(() => Deferred.succeed(idleProbed, undefined)),
+                  ),
+              }),
+          },
+        ]);
+        yield* Effect.gen(function* () {
+          const engine = yield* Orchestrator.OrchestratorV2;
+          const sink = yield* EventSink.EventSinkV2;
+          const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+          const control = yield* ProviderTurnControl.ProviderTurnControlServiceV2;
+          const outbox = yield* EffectOutbox.EffectOutboxV2;
+          const runtimePolicy = { ...CLAUDE_TEST_RUNTIME_POLICY, cwd: h.attachmentsDir };
+          yield* engine.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("claude-exit-create"),
+            threadId: h.threadId,
+            createdBy: "user",
+            creationSource: "web",
+            projectId: ProjectId.make("claude-exit-project"),
+            title: "Expiry with a buffered wake",
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: h.attachmentsDir,
+          });
+          const runtime = yield* sessions.open({
+            threadId: h.threadId,
+            providerSessionId: ProviderSessionId.make("provider-session-claude-wake"),
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy,
+          });
+          const owner = yield* runtime.ensureThread({
+            threadId: h.threadId,
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            runtimePolicy,
+          });
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make("claude-exit-owner"),
+                threadId: h.threadId,
+                type: "provider-thread.updated",
+                driver: runtime.driver,
+                providerInstanceId: h.adapter.instanceId,
+                occurredAt: yield* DateTime.now,
+                payload: owner,
+              },
+            ],
+          });
+          const turn = (ordinal: number, continuation = false) => ({
+            ...makeClaudeTestTurnInput({
+              threadId: h.threadId,
+              providerThread: owner,
+              now: DateTime.makeUnsafe(0),
+              attemptId: RunAttemptId.make(`claude-exit-${ordinal}`),
+              text: continuation ? "Background task completed." : "Work",
+              attachments: [],
+              providerTurnOrdinal: ordinal,
+              runtimePolicy,
+              ...(continuation
+                ? { messageCreatedBy: "agent" as const, messageCreationSource: "provider" as const }
+                : {}),
+            }),
+            runOrdinal: ordinal,
+          });
+          yield* runtime.startTurn(turn(1));
+          yield* h.offerAndWait(wakeTaskStarted);
+          yield* h.offerAndWait(turnOneResult);
+          yield* Queue.take(h.terminalReceipts);
+          yield* h.offerAndWait(wakeNotification);
+          yield* h.offerAndWait(wakeResult);
+          yield* Queue.take(h.continuationReceipts);
+          const expired = turn(2);
+          yield* runtime.startTurn(expired);
+          assert.lengthOf(h.offeredMessages, 2);
+          const request = {
+            type: "provider-turn.interrupt" as const,
+            startTimeout: true,
+            providerSessionId: ProviderSessionId.make("provider-session-claude-wake"),
+            providerThreadId: owner.id,
+            providerTurnId: ProviderTurnId.make("claude-exit-placeholder"),
+            startingRun: { runId: expired.runId, attemptId: expired.attemptId, runOrdinal: 2 },
+          };
+          yield* outbox.enqueue([
+            {
+              id: "claude-exit-stop",
+              commandId: CommandId.make("claude-exit-expire"),
+              threadId: h.threadId,
+              request,
+            },
+            {
+              id: "claude-exit-wake",
+              commandId: CommandId.make("claude-exit-wake"),
+              threadId: h.threadId,
+              request: { type: "provider-turn.start", runId: turn(3, true).runId },
+            },
+          ]);
+          if (timing === "before-stop") {
+            yield* Deferred.succeed(exited, { code: 0, signal: null });
+            yield* h.awaitQueryCleanup;
+          } else if (streamFirst) {
+            if (timing === "stream-end-first") yield* Queue.shutdown(h.sdkMessages);
+            else
+              yield* Deferred.fail(
+                streamFailure,
+                new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                  method: "messages",
+                  cause: new Error("SDK connection closed before process exit"),
+                }),
+              );
+            yield* h.awaitQueryCleanup;
+            const localFailure = yield* Queue.take(h.terminalReceipts);
+            assert.equal(localFailure.status, "failed");
+            assert.isUndefined(localFailure.nativeWorkEnded);
+          }
+          const workerLayer = EffectWorker.layerWithOptions({
+            workerId: "claude-exit",
+            maxAttempts: 1,
+          }).pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                Layer.succeed(EffectOutbox.EffectOutboxV2, outbox),
+                Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+                  execute: (effect) =>
+                    Effect.gen(function* () {
+                      if (effect.request.type === "provider-turn.interrupt") {
+                        yield* control.interrupt({
+                          ...request,
+                          threadId: h.threadId,
+                          stopBackgroundWork: false,
+                          confirmStopped: true,
+                        });
+                      } else {
+                        yield* runtime.startTurn(turn(3, true));
+                      }
+                    }).pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new EffectWorker.OrchestrationEffectExecutionError({
+                            effectId: effect.id,
+                            effectType: effect.request.type,
+                            cause,
+                          }),
+                      ),
+                    ),
+                }),
+              ),
+            ),
+          );
+          yield* Effect.gen(function* () {
+            const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+            const stopping = yield* worker
+              .drain()
+              .pipe(Effect.forkChild({ startImmediately: true }));
+            if (timing === "during-stop") {
+              yield* Deferred.await(stopSent);
+            } else if (streamFirst) {
+              yield* Deferred.await(idleProbed);
+              assert.isFalse(
+                yield* runtime.hasObservedTurnEnd!({
+                  providerThreadId: owner.id,
+                  providerTurnId: request.providerTurnId,
+                  attemptId: expired.attemptId,
+                }),
+              );
+              assert.equal(
+                Option.getOrThrow(yield* outbox.get("claude-exit-stop")).status,
+                "running",
+              );
+            }
+            if (timing !== "before-stop") {
+              assert.equal(
+                Option.getOrThrow(yield* outbox.get("claude-exit-wake")).status,
+                "pending",
+              );
+              assert.lengthOf(h.offeredMessages, 2);
+              yield* Deferred.succeed(exited, { code: 0, signal: null });
+            }
+            if (!streamFirst) {
+              const terminal = yield* Queue.take(h.terminalReceipts);
+              assert.isTrue(terminal.nativeWorkEnded);
+            }
+            yield* Fiber.join(stopping);
+            assert.equal(
+              Option.getOrThrow(yield* outbox.get("claude-exit-stop")).status,
+              "succeeded",
+            );
+            assert.equal(
+              Option.getOrThrow(yield* outbox.get("claude-exit-wake")).status,
+              "succeeded",
+            );
+            const continuation = yield* Queue.take(h.terminalReceipts);
+            assert.equal(continuation.status, "completed");
+            assert.lengthOf(h.terminalEvents(), 3);
+            assert.lengthOf(h.offeredMessages, 2);
+            assert.equal(interrupts, timing === "during-stop" ? 1 : 0);
+            assert.isTrue(
+              h.events.some(
+                (event) =>
+                  event.type === "message.updated" && event.message.text === WAKE_RESULT_TEXT,
+              ),
+            );
+          }).pipe(Effect.provide(workerLayer));
+        }).pipe(
+          Effect.provide(
+            layerWithRegistry(
+              { name: "claude-process-exit", runtimePolicyOverride: { cwd: h.attachmentsDir } },
+              registry,
+              { runEffectWorker: false },
+            ),
+          ),
+        );
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
   );
 
   it.effect("counts a wake buffered for the thread as work it still holds", () =>

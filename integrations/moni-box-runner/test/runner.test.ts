@@ -303,3 +303,139 @@ test("empty attachment succeeds and resolution of an unknown event refuses", asy
   expect(texts).toHaveLength(1);
   expect((await r.handle(s.request("/resolve", { id: opaqueId("unknown"), state: "done", reconciled: true }))).status).toBe(409);
 });
+
+
+test("delivery status exposes only requested ids and pickup times, including completed turns", async () => {
+  const s = setup({ run: async () => "NO_REPLY" }); await s.lease();
+  const id = opaqueId("bus-status");
+  s.runner.enqueue(id, { text: "PRIVATE_BUS_TEXT", agentExpiresAt: Date.now() + 600_000 });
+  const status = () => s.runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }));
+  expect(await (await status()).json()).toEqual({ deliveries: [{ id, accepted: true, deliveredAt: null }] });
+  await s.runner.tick();
+  const body = await (await status()).text();
+  expect(JSON.parse(body)).toEqual({ deliveries: [{ id, accepted: true, deliveredAt: expect.any(Number) }] });
+  expect(body).not.toContain("PRIVATE_BUS_TEXT");
+  expect((await s.runner.handle(s.request("/delivery-status", { ids: [id], epoch: "wrong" }))).status).toBe(400);
+  expect((await s.runner.handle(s.request("/delivery-status", { ids: Array(51).fill(id), epoch: "test" }))).status).toBe(400);
+});
+
+test.each(["missing-executable", "not-executable", "missing-workdir"])("Claude %s failure never confirms bus pickup", async failure => {
+  const s = setup({ run: async () => "NO_REPLY" });
+  const root = join(s.root, "launch-failure"); mkdirSync(root);
+  if (failure !== "missing-workdir") mkdirSync(join(root, "work"));
+  const keyFile = join(root, "router-key"); writeFileSync(keyFile, "test-router-key", { mode: 0o600 });
+  const executable = join(root, "fake-claude");
+  if (failure !== "missing-executable") writeFileSync(executable, '#!/bin/sh\ncat >/dev/null\nprintf \'{"result":"NO_REPLY"}\'\n', { mode: failure === "not-executable" ? 0o600 : 0o700 });
+  const runner = new BoxRunner({ ...s.runner.config, root }, claudeHarness(root, executable, "test", { routerKeyFile: keyFile }), {
+    callbackReady: async () => true, modelReady: async () => true, fetch: async () => Response.json({ accepted: true }),
+  }); clean.push(() => runner.db.close());
+  await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  const id = opaqueId(failure); runner.enqueue(id, { id: `wake:agent-bus:${failure}`, text: "PRIVATE_BUS_TEXT", agentExpiresAt: Date.now() + 600_000 });
+  await runner.tick();
+  expect(runner.db.query("SELECT state,delivered_at FROM inbox WHERE id=?").get(id)).toEqual({ state: "interrupted", delivered_at: null });
+  expect(runner.db.query("SELECT 1 FROM settings WHERE key='started'").get()).toBeNull();
+  expect(runner.db.query("SELECT 1 FROM settings WHERE key='bus-yield-human'").get()).toBeNull();
+  const status = await (await runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).text();
+  expect(JSON.parse(status)).toEqual({ deliveries: [{ id, accepted: true, deliveredAt: null }] });
+  expect(status).not.toContain("PRIVATE_BUS_TEXT");
+});
+
+test.each([false, true])("an unfinished harness reports pickup only after handoff (fails=%s)", async fails => {
+  const entered = Promise.withResolvers<void>(), handoff = Promise.withResolvers<void>(), acknowledged = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  const s = setup({ run: async ({ onStarted }) => {
+    entered.resolve(); await handoff.promise; onStarted!(); onStarted!(); acknowledged.resolve(); await finish.promise;
+    if (fails) throw new Error("PRIVATE_HARNESS_FAILURE");
+    return "NO_REPLY";
+  } }); await s.lease();
+  const id = opaqueId("delayed-handoff"); s.runner.enqueue(id, { id: "wake:agent-bus:handoff", text: "PRIVATE_BUS_TEXT" });
+  const status = async () => (await (await s.runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).json()).deliveries[0].deliveredAt;
+  const tick = s.runner.tick();
+  try {
+    await entered.promise; expect(await status()).toBeNull();
+    expect(s.runner.db.query("SELECT 1 FROM settings WHERE key='started'").get()).toBeNull();
+    handoff.resolve(); await acknowledged.promise;
+    const pickedUpAt = await status(); expect(pickedUpAt).toBeGreaterThan(0);
+    expect(s.runner.db.query("SELECT value FROM settings WHERE key='bus-yield-human'").get()).toEqual({ value: "true" });
+    finish.resolve(); await tick;
+    expect(await status()).toBe(pickedUpAt);
+    expect(s.runner.db.query<{ state: string }, [string]>("SELECT state FROM inbox WHERE id=?").get(id)?.state).toBe(fails ? "interrupted" : "done");
+  } finally { handoff.resolve(); finish.resolve(); await tick; }
+});
+
+test.each([false, true])("Claude handoff is confirmed before its result, including later failure=%s", async fails => {
+  const s = setup({ run: async () => "NO_REPLY" });
+  const root = join(s.root, "handoff"); mkdirSync(join(root, "work"), { recursive: true });
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() { entered.resolve(); await finish.promise; return new Response(); } });
+  clean.push(() => server.stop(true));
+  const keyFile = join(root, "router-key"); writeFileSync(keyFile, "test-router-key", { mode: 0o600 });
+  const executable = join(root, "fake-claude");
+  writeFileSync(executable, `#!${process.execPath}\nawait Bun.stdin.text();\nawait fetch("http://127.0.0.1:${server.port}");\n${fails ? "process.exit(7);" : 'console.log(JSON.stringify({ result: "NO_REPLY" }));'}\n`, { mode: 0o700 });
+  const runner = new BoxRunner({ ...s.runner.config, root }, claudeHarness(root, executable, "test", { routerKeyFile: keyFile }), {
+    callbackReady: async () => true, fetch: async () => Response.json({ accepted: true }),
+  }); clean.push(() => runner.db.close());
+  await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  const id = opaqueId("real-handoff"); runner.enqueue(id, { id: "wake:agent-bus:real-handoff", text: "PRIVATE_BUS_TEXT" });
+  const tick = runner.tick();
+  try {
+    await Promise.race([entered.promise, tick.then(() => { throw new Error("Harness ended before the result gate"); })]);
+    const before = await (await runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).json();
+    expect(before.deliveries[0].deliveredAt).toBeGreaterThan(0);
+    expect(runner.db.query("SELECT state FROM inbox WHERE id=?").get(id)).toEqual({ state: "running" });
+    finish.resolve(); await tick;
+    expect(await (await runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).json()).toEqual(before);
+    expect(runner.db.query("SELECT state FROM inbox WHERE id=?").get(id)).toEqual({ state: fails ? "interrupted" : "done" });
+  } finally { finish.resolve(); await tick; }
+});
+
+test("expired bus input never starts a new target turn", async () => {
+  let calls = 0; const s = setup({ run: async () => { calls++; return "NO_REPLY"; } }); await s.lease();
+  const id = opaqueId("bus-expired"); s.runner.enqueue(id, { text: "PRIVATE", agentExpiresAt: Date.now() - 1 });
+  await s.runner.tick(); expect(calls).toBe(0);
+  const body = await (await s.runner.handle(s.request("/delivery-status", { ids: [id], epoch: "test" }))).json();
+  expect(body).toEqual({ deliveries: [{ id, accepted: true, deliveredAt: null }] });
+});
+
+
+test("a readiness check crossing the bus deadline does not start expired work", async () => {
+  const s = setup({ run: async () => "NO_REPLY" }); let now = 1_000, calls = 0, checks = 0;
+  const runner = new BoxRunner({ ...s.runner.config, root: join(s.root, "expiry-ready") }, { run: async () => { calls++; return "NO_REPLY"; } }, {
+    now: () => now, callbackReady: async () => true, fetch: async () => Response.json({ accepted: true }),
+    modelReady: async () => { if (++checks > 1) now = 3_000; return true; },
+  }); clean.push(() => runner.db.close());
+  await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" }));
+  runner.enqueue(opaqueId("expires-during-readiness"), { text: "PRIVATE", agentExpiresAt: 2_000 });
+  await runner.tick(); expect(runner.active()).toBe(true); expect(calls).toBe(0);
+});
+
+test.each([false, true])("a human gets the next separate box turn between bus turns, restart=%s", async restart => {
+  const texts: string[] = []; const harness = { run: async ({ text }: { text: string }) => { texts.push(text); return "NO_REPLY"; } };
+  const s = setup(harness); await s.lease();
+  for (const id of ["wake:agent-bus:a", "wake:agent-bus:b", "human-next"]) s.runner.enqueue(opaqueId(id), { id, text: id, receivedAt: Date.now() - 120_000 });
+  await s.runner.tick();
+  const runner = restart ? new BoxRunner(s.runner.config, harness, { callbackReady: async () => true, fetch: async () => Response.json({ accepted: true }) }) : s.runner;
+  if (restart) { clean.push(() => runner.db.close()); await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" })); }
+  await runner.tick(); await runner.tick();
+  expect(texts.map(text => text.split("\n").at(-1))).toEqual(["wake:agent-bus:a", "human-next", "wake:agent-bus:b"]);
+});
+
+test("continuous box human traffic gives an overdue bus the next free turn, then a human", async () => {
+  const texts: string[] = []; const s = setup({ run: async ({ text }) => { texts.push(text); return "NO_REPLY"; } }); await s.lease();
+  for (const id of ["human-first", "human-second", "wake:agent-bus:due", "wake:agent-bus:next"]) s.runner.enqueue(opaqueId(id), { id, text: id, receivedAt: Date.now() - 61_000 });
+  await s.runner.tick(); await s.runner.tick();
+  expect(texts.map(text => text.split("\n").at(-1))).toEqual(["wake:agent-bus:due", "human-first"]);
+});
+
+test("legacy box asks wait for authoritative deadline metadata across repeated upgrades", async () => {
+  let calls = 0; const s = setup({ run: async () => { calls++; return "NO_REPLY"; } });
+  const id = opaqueId("legacy-deadline"), payload = { id: "wake:agent-bus:legacy", text: `[Agent request areq_${"a".repeat(64)} from Owner's assistant]PRIVATE`, receivedAt: Date.now() - 700_000 };
+  s.runner.db.query("INSERT INTO inbox(id,payload,state) VALUES (?,?,'pending')").run(id, JSON.stringify(payload));
+  for (let upgrade = 0; upgrade < 2; upgrade++) {
+    const runner = new BoxRunner(s.runner.config, { run: async () => { calls++; return "NO_REPLY"; } }, { callbackReady: async () => true }); clean.push(() => runner.db.close());
+    await runner.handle(s.request("/lease", { boxId: "bx_test", epoch: "test" })); await runner.tick(); expect(calls).toBe(0);
+    const expiresAt = Date.now() - 1;
+    expect((await runner.handle(s.request("/delivery-status", { epoch: "test", ids: [id], deadlines: [{ id, expiresAt }] }))).status).toBe(200);
+    await runner.tick(); expect(calls).toBe(0);
+    expect(runner.db.query<{ state: string; delivered_at: number | null }, [string]>("SELECT state,delivered_at FROM inbox WHERE id=?").get(id)).toEqual({ state: "done", delivered_at: null });
+  }
+});

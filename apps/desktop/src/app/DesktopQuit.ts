@@ -1,3 +1,4 @@
+import type { BackendProcessAction } from "../backend/DesktopBackendProcess.ts";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Quit callbacks must persist synchronously before Electron exits.
 import * as NodeFS from "node:fs";
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Signals expose a parent PID, not the sender PID.
@@ -125,3 +126,62 @@ function signalParent() {
     return { pid: process.ppid };
   }
 }
+
+const encodeBackendAction = Schema.encodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      at: Schema.String,
+      component: Schema.String,
+      event: Schema.Literal("backend-process"),
+      message: Schema.String,
+      pid: Schema.Number,
+      elapsedMs: Schema.Number,
+      signals: Schema.Array(Schema.String),
+      evidence: Schema.optional(Schema.Unknown),
+      error: Schema.optional(Schema.String),
+      appQuitTrigger: Schema.optional(Schema.String),
+      appQuitAt: Schema.optional(Schema.String),
+    }),
+  ),
+);
+
+export const recordBackendAction = Effect.fn("desktop.lifecycle.recordBackendAction")(function* (
+  action: BackendProcessAction,
+) {
+  const environment = yield* DesktopEnvironment.DesktopEnvironment;
+  const state = yield* DesktopState.DesktopState;
+  const quit = yield* Ref.get(state.quitTrigger);
+  const entry = {
+    at: DateTime.formatIso(yield* DateTime.now),
+    component: "desktop-backend-process",
+    event: "backend-process" as const,
+    ...action,
+    ...(quit === undefined ? {} : { appQuitTrigger: quit.trigger, appQuitAt: quit.at }),
+  };
+  yield* encodeBackendAction(entry).pipe(
+    Effect.flatMap((line) =>
+      Effect.try(() => {
+        const processLog = environment.path.join(
+          environment.logDir,
+          "desktop-backend-process.ndjson",
+        );
+        if (NodeFS.existsSync(processLog) && NodeFS.statSync(processLog).size >= 256 * 1024) {
+          NodeFS.renameSync(processLog, `${processLog}.1`);
+        }
+        NodeFS.appendFileSync(processLog, `${line}\n`, { mode: 0o600 });
+        if (quit !== undefined) {
+          NodeFS.appendFileSync(
+            environment.path.join(environment.logDir, "desktop-quits.ndjson"),
+            `${line}\n`,
+            { mode: 0o600 },
+          );
+        }
+      }),
+    ),
+    Effect.catch((cause) => logError("failed to persist backend process action", { cause })),
+  );
+  const logger = makeComponentLogger("desktop-backend-process");
+  yield* action.signals.includes("SIGKILL")
+    ? logger.logWarning(action.message, { ...entry })
+    : logger.logInfo(action.message, { ...entry });
+});

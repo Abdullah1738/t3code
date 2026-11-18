@@ -31,6 +31,33 @@ const layer = Layer.merge(
 );
 
 describe("DesktopQuit", () => {
+  it.effect.each([true, false])(
+    "persists backend actions with available quit context (quitting=%s)",
+    (quitting) =>
+      Effect.gen(function* () {
+        files.appendFileSync.mockClear();
+        if (quitting) yield* DesktopQuit.prepare({ trigger: "before-quit" });
+        yield* DesktopQuit.recordBackendAction({
+          message: "backend force-killed at quit",
+          pid: 12345,
+          elapsedMs: 10_001,
+          signals: ["SIGTERM", "SIGKILL"],
+        });
+        const records = files.appendFileSync.mock.calls.map(([file, line]) => ({
+          file,
+          value: JSON.parse(line),
+        }));
+        assert.equal(records.length, quitting ? 2 : 1);
+        assert.equal(records[0]!.file, "/logs/desktop-backend-process.ndjson");
+        assert.equal(records[0]!.value.pid, 12345);
+        assert.deepEqual(records[0]!.value.signals, ["SIGTERM", "SIGKILL"]);
+        if (quitting) {
+          assert.equal(records[1]!.file, "/logs/desktop-quits.ndjson");
+          assert.equal(records[1]!.value.appQuitTrigger, "before-quit");
+        } else assert.isUndefined(records[0]!.value.appQuitTrigger);
+      }).pipe(Effect.provide(layer)),
+  );
+
   it.effect.each([
     { trigger: "before-quit" },
     { trigger: "windowAllClosed" },

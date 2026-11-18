@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { imessage, iso, loadState, loadWatcher, now, saveState, watcherInstance, withRelayLock, type State, type Watcher } from "./lib.ts";
+import { CheckShutdownError, imessage, iso, loadState, loadWatcher, now, saveState, watcherInstance, withRelayLockAsync, pauseRetryText, type State, type Watcher } from "./lib.ts";
 import { toolError, toolLog } from "./toollog.ts";
 
 export type OwnerAlertEpisode = {
@@ -33,18 +33,18 @@ export function queueOwnerFailure(watcher: Watcher, state: State, kind: "pause" 
   const error = (state.last_error ?? "unknown error").split(/\r?\n/, 1)[0]!.slice(0, 300);
   episodes.push({ key: `robob-watch:${watcher.id}:owner-alert:${randomUUID()}`, since,
     ...(state.failure_paused_at ? { paused_at: state.failure_paused_at } : {}), kind,
-    text: `${watcher.title} ${kind === "pause" ? `is paused after ${state.consecutive_failures} failed runs` : "is FAILING"} (since ${clock(since)} Dubai): ${error}. Screening is interrupted. Resume: robob-watch resume ${watcher.id}`,
+    text: `${watcher.title} ${kind === "pause" ? `is paused after ${state.consecutive_failures} failed runs` : "is FAILING"} (since ${clock(since)} Dubai): ${error}. Screening is interrupted. ${state.failure_paused_at ? pauseRetryText(watcher, state) : `Resume: robob-watch resume ${watcher.id}`}`,
   });
   return true;
 }
 
-export function queueOwnerRecovery(watcher: Watcher, state: State): void {
+export function queueOwnerRecovery(watcher: Watcher, state: State, text?: string): void {
   if (!enabled(watcher)) return;
   for (const episode of state.owner_imessage_episodes ?? []) {
     if (episode.recovery) continue;
     const minutes = Math.max(0, Math.floor((now() - Date.parse(episode.paused_at ?? episode.since)) / 60_000));
     const duration = minutes >= 60 ? `${Math.floor(minutes / 60)}h${minutes % 60}m` : `${minutes}m`;
-    episode.recovery = `${watcher.title} is running again (${episode.paused_at ? "paused" : "interrupted"} ${duration}). Missed messages: checking.`;
+    episode.recovery = text ?? `${watcher.title} is running again (${episode.paused_at ? "paused" : "interrupted"} ${duration}). Missed messages: checking.`;
     delete episode.retry_at;
   }
 }
@@ -53,10 +53,10 @@ const sending = new Map<string, Promise<void>>();
 const completed = new Map<string, { instance?: string; key: string; kind: "pause" | "failing" | "recovered"; retryKey?: string }>();
 
 // Apply between checks: an async send must never race a check's state.json snapshot.
-export function applyOwnerAlertResults(id: string): void {
+export async function applyOwnerAlertResults(id: string): Promise<void> {
   const result = completed.get(id);
   if (!result) return;
-  withRelayLock(() => {
+  await withRelayLockAsync(() => {
     if (!loadWatcher(id) || watcherInstance(id) !== result.instance) return;
     const state = loadState(id);
     const episode = state.owner_imessage_episodes?.find(episode => episode.key === result.key);
@@ -79,7 +79,7 @@ export function applyOwnerAlertResults(id: string): void {
 
 async function flush(id: string): Promise<void> {
   const instance = watcherInstance(id);
-  const pending = withRelayLock(() => {
+  const pending = await withRelayLockAsync(() => {
     const watcher = loadWatcher(id);
     if (!watcher || !enabled(watcher) || watcherInstance(id) !== instance) return;
     const state = loadState(id);
@@ -116,7 +116,7 @@ async function flush(id: string): Promise<void> {
 /** Separate from checks and Telegram: each receipt/route lookup is bounded to 10s, the send to 20s. */
 export function dispatchOwnerAlerts(id: string): void {
   if (sending.has(id) || completed.has(id)) return;
-  const job = flush(id).catch(() => toolError("runner", "alert.imessage.dispatch_failed", { watcher: id }))
+  const job = flush(id).catch(error => { if (!(error instanceof CheckShutdownError)) toolError("runner", "alert.imessage.dispatch_failed", { watcher: id }); })
     .finally(() => { sending.delete(id); });
   sending.set(id, job);
 }

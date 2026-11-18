@@ -1,6 +1,7 @@
 """Small commands: local exemptions, list, release, ssh, ports, status, logs, wait."""
 
 from __future__ import annotations
+import offbox_protocol as protocol
 
 import codecs
 import contextlib
@@ -832,12 +833,13 @@ def _diagnostic_only(r, path):
     if checkpoint(path) is None:
         return False
     wrapper = False
-    marker = f"offbox-command-started: {r['run_id']}\n".encode()
+    identity = protocol.for_run(r, path)
     with path.open('rb') as src:
         while line := src.readline(4096):
-            if line == marker:
+            marker = identity.parse(line.decode(errors='replace'))
+            if marker and marker.kind == 'command_started':
                 return False
-            wrapper |= line.startswith(b'offbox evidence wrapper pid=')
+            wrapper |= bool(marker and marker.kind == 'wrapper')
     return wrapper
 
 
@@ -1055,13 +1057,14 @@ def _empty_log_fallback(r, path, deadline, result) -> str:
 def _preamble_first(dst, stdout_bytes, run_id):
     # History has separate streams, so its stdout-first merge otherwise puts setup after the command's output.
     # Only a fresh settled recovery can reorder bytes: existing checkpoints and delivery cursors must stay valid.
-    marker = f'offbox-command-started: {run_id}\n'.encode()
+    identity = protocol.for_run(run_id)
     end = dst.tell()
     dst.seek(stdout_bytes)
     with tempfile.TemporaryFile() as prefix:
         while line := dst.readline(64 * 1024):
             prefix.write(line)
-            if line == marker:
+            marker = identity.parse(line.decode(errors='replace'))
+            if marker and marker.kind == 'command_started':
                 break
         else:
             dst.seek(end)
@@ -1286,9 +1289,10 @@ def _catch_up_log_locked(r, path, budget, *, live=False, stats=None) -> str:
                                 payload = b''
                             else:
                                 payload = bytes(header)
-                                match = re.match(rb'offbox evidence wrapper pid=\d+\n', payload)
-                                if match:
-                                    payload = payload[match.end():]
+                                line, sep, rest = payload.partition(b'\n')
+                                marker = protocol.for_run(r, path).parse(line.decode(errors='replace'))
+                                if sep and marker and marker.kind == 'wrapper':
+                                    payload = rest
                                 trimming = False
                         chunk = payload[:max(0, expected - copied[i])]
                         digests[i].update(chunk)
@@ -2320,7 +2324,7 @@ def _resolve_exit(r, log_path, until, start_offsets, replay_path, echo=True, mir
 
 def _report_deps_hint(r, code, log_path) -> None:
     from .runs import box_deps_hint, report_box_hint, step_results
-    results = step_results(_raw_log(log_path))
+    results = step_results(_raw_log(log_path), r)
     if code not in (0, None) or any(rc != 0 for _, rc in results):
         hint = box_deps_hint(Path(r['repo_root'] or '.'), log_path)
         report_box_hint(code, results, hint)

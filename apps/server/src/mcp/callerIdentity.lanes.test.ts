@@ -7,7 +7,9 @@ import {
   NodeId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProviderSessionId,
   ProviderThreadId,
+  RuntimeRequestId,
   RunId,
   ThreadId,
   TurnItemId,
@@ -24,10 +26,14 @@ import * as TestClock from "effect/testing/TestClock";
 import { runMigrations } from "../persistence/Migrations.ts";
 import { ensureShellLookupIndexes } from "../ardud/persistence/shellIndexes.ts";
 import { initializeHistoryArchive } from "../ardud/persistence/HistoryArchive.ts";
+import { historyReaderSql } from "../ardud/persistence/historyArchiveSql.ts";
+import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as DateTime from "effect/DateTime";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as ThreadAccess from "./threadAccess.ts";
+import { isLiveCallerShell } from "./OrchestratorMcpService.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 
 const importedPrefix =
@@ -46,9 +52,47 @@ type WorkCase = {
   itemRows?: number;
   activeProvider?: boolean;
   fallback?: boolean;
+  runShape?: "active-fork" | "queued" | "held-queue" | "rolled-back" | "usage-limit-queue";
+  auxiliary?:
+    | "runtime-request"
+    | "secret-request"
+    | "terminal-failure"
+    | "blocking-failure"
+    | "session-error";
 };
 const workCases: ReadonlyArray<WorkCase> = [
   { work: "idle" },
+  {
+    work: "active-fork-over-cap",
+    source: "item",
+    itemRows: 17,
+    providerRows: 17,
+    runShape: "active-fork",
+  },
+  { work: "queued-over-cap", source: "item", itemRows: 17, providerRows: 17, runShape: "queued" },
+  { work: "held-queue", source: "roster", runShape: "held-queue" },
+  { work: "rolled-back", source: "roster", runShape: "rolled-back" },
+  { work: "usage-limit-queue", source: "roster", runShape: "usage-limit-queue" },
+  ...(["runtime-request", "secret-request", "terminal-failure"] as const).map((auxiliary) => ({
+    work: `queued-large-${auxiliary}`,
+    runShape: auxiliary === "terminal-failure" ? ("held-queue" as const) : ("queued" as const),
+    auxiliary,
+    description: "界".repeat(24000),
+  })),
+  ...(["blocking-failure", "session-error"] as const).flatMap((auxiliary) =>
+    [
+      { suffix: "small", description: "Plan limit reached." },
+      { suffix: "utf8-under", description: "界".repeat(20000) },
+      { suffix: "utf8-over", description: "界".repeat(24000), fallback: true },
+      { suffix: "utf8-4-over", description: "𐐀".repeat(18000), fallback: true },
+    ].map(({ suffix, ...payload }) => ({
+      work: `queued-${auxiliary}-${suffix}`,
+      runShape: "usage-limit-queue" as const,
+      auxiliary,
+      source: "roster" as const,
+      ...payload,
+    })),
+  ),
   { work: "native-subagent", source: "roster" },
   { work: "item-subagent", source: "item", itemRows: 1 },
   { work: "item-cap", source: "item", itemRows: 17, fallback: true },
@@ -85,17 +129,21 @@ it.effect.each(callers.flatMap((caller) => workCases.map((work) => ({ ...caller,
     itemRows = 0,
     activeProvider = false,
     fallback: expectedFallback = false,
+    runShape,
+    auxiliary,
   }) =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const dir = yield* fs.makeTempDirectoryScoped({ prefix: "caller-fallback-" });
+      const filename = path.join(dir, "state.sqlite");
       const sqlLayer = SqliteClient.layer({
-        filename: path.join(dir, "state.sqlite"),
+        filename,
         readerWorker: true,
         identityReaderProcess: true,
         foregroundReaderSlots: 2,
         backgroundReaderSlots: 1,
+        readerInitializationSql: historyReaderSql(filename),
       });
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
@@ -121,6 +169,15 @@ it.effect.each(callers.flatMap((caller) => workCases.map((work) => ({ ...caller,
             occurredAt: now,
             payload: {
               ...idleThreadProjection(base).thread,
+              ...(runShape === "active-fork"
+                ? {
+                    forkedFrom: {
+                      type: "run" as const,
+                      threadId: ThreadId.make("fork-source"),
+                      runId: RunId.make("fork-source-run"),
+                    },
+                  }
+                : {}),
               activeProviderThreadId: activeProvider
                 ? ProviderThreadId.make(`provider:${providerRows - 1}`)
                 : null,
@@ -134,21 +191,163 @@ it.effect.each(callers.flatMap((caller) => workCases.map((work) => ({ ...caller,
             payload: {
               id: runId,
               threadId: id,
-              ordinal: 1,
+              ordinal: auxiliary === "terminal-failure" ? 2 : 1,
               providerInstanceId: provider,
               modelSelection: base.modelSelection,
               providerThreadId: null,
               userMessageId: MessageId.make("input"),
               rootNodeId: NodeId.make("root"),
               activeAttemptId: null,
-              status,
+              status:
+                runShape === "active-fork"
+                  ? "running"
+                  : runShape === "usage-limit-queue" || auxiliary === "terminal-failure"
+                    ? "failed"
+                    : status,
               requestedAt: now,
               startedAt: now,
-              completedAt: status === "completed" ? now : null,
+              completedAt:
+                status === "completed" ||
+                runShape === "usage-limit-queue" ||
+                auxiliary === "terminal-failure"
+                  ? now
+                  : null,
               checkpointId: null,
               contextHandoffId: null,
             },
           });
+          if (runShape === "usage-limit-queue" || auxiliary === "terminal-failure")
+            yield* store.apply({
+              id: EventId.make("limit-error"),
+              type: "turn-item.updated",
+              threadId: id,
+              occurredAt: now,
+              payload: {
+                id: TurnItemId.make("limit-error"),
+                threadId: id,
+                runId,
+                nodeId: NodeId.make("root"),
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 0,
+                status: "failed",
+                title:
+                  auxiliary === "blocking-failure" || auxiliary === "terminal-failure"
+                    ? description!
+                    : "Usage limit",
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                type: "error",
+                failure: {
+                  class: "usage_limit",
+                  message: "Plan limit reached.",
+                  resetAt: null,
+                  code: null,
+                  retryable: null,
+                },
+              },
+            });
+          if (runShape !== undefined && runShape !== "active-fork") {
+            const records = yield* store.getThreadRecords(id, ["runs"]);
+            const original = records.runs[0]!;
+            if (auxiliary === "terminal-failure")
+              yield* store.apply({
+                id: EventId.make("newer-completion"),
+                type: "run.created",
+                threadId: id,
+                occurredAt: now,
+                payload: {
+                  ...original,
+                  id: RunId.make("newer-completion"),
+                  ordinal: 1,
+                  status: "completed",
+                  completedAt: DateTime.add(now, { seconds: 1 }),
+                },
+              });
+            yield* store.apply({
+              id: EventId.make("later-run"),
+              type: "run.created",
+              threadId: id,
+              occurredAt: now,
+              payload: {
+                ...original,
+                id: RunId.make("later-run"),
+                ordinal: auxiliary === "terminal-failure" ? 3 : 2,
+                status: runShape === "rolled-back" ? "rolled_back" : "queued",
+                ...(runShape === "held-queue" ? { queueHeld: true } : {}),
+                startedAt: null,
+                completedAt: null,
+              },
+            });
+          }
+          if (auxiliary === "runtime-request")
+            yield* store.apply({
+              id: EventId.make("request"),
+              type: "runtime-request.updated",
+              threadId: id,
+              runId,
+              occurredAt: now,
+              payload: {
+                id: RuntimeRequestId.make("request"),
+                nodeId: NodeId.make("root"),
+                providerTurnId: null,
+                nativeRequestRef: null,
+                kind: "user_input",
+                status: "pending",
+                responseCapability: { type: "not_resumable", reason: description! },
+                createdAt: now,
+                resolvedAt: null,
+              },
+            });
+          if (auxiliary === "secret-request")
+            yield* store.apply({
+              id: EventId.make("secret"),
+              type: "turn-item.updated",
+              threadId: id,
+              occurredAt: now,
+              payload: {
+                id: TurnItemId.make("secret"),
+                threadId: id,
+                runId,
+                nodeId: NodeId.make("root"),
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 0,
+                status: "waiting",
+                title: null,
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+                type: "secret_request",
+                label: "Test credential",
+                reason: description!,
+                secretStatus: "pending",
+              },
+            });
+          if (auxiliary === "session-error")
+            yield* store.apply({
+              id: EventId.make("session"),
+              type: "provider-session.attached",
+              threadId: id,
+              occurredAt: now,
+              payload: {
+                id: ProviderSessionId.make("session"),
+                driver: ProviderDriverKind.make("claude"),
+                providerInstanceId: provider,
+                status: "error",
+                cwd: "/workspace",
+                model: base.modelSelection.model,
+                capabilities: CodexProviderCapabilitiesV2,
+                createdAt: now,
+                updatedAt: now,
+                lastError: description!,
+              },
+            });
           for (let i = 0; i < providerRows; i++)
             yield* store.apply({
               id: EventId.make(`provider:${i}`),
@@ -175,7 +374,9 @@ it.effect.each(callers.flatMap((caller) => workCases.map((work) => ({ ...caller,
                         {
                           taskId: "native-task",
                           kind: "subagent",
-                          ...(description === undefined ? {} : { description }),
+                          ...(description === undefined || auxiliary !== undefined
+                            ? {}
+                            : { description }),
                         },
                       ]
                     : [],
@@ -298,12 +499,13 @@ it.effect.each(callers.flatMap((caller) => workCases.map((work) => ({ ...caller,
               const result = yield* Fiber.join(caller);
               assert.equal(result._tag, "Success");
               if (result._tag === "Success") {
-                assert.equal(result.success.caller?.activeRunId, null);
+                assert.equal(result.success.caller?.activeRunId, exact?.activeRunId);
                 assert.deepEqual(
                   result.success.caller?.pendingBackgroundTasks,
                   exact?.pendingBackgroundTasks,
                 );
-                if (source !== undefined) yield* ThreadAccess.assertLiveCaller(result.success);
+                if (isLiveCallerShell(exact, provider))
+                  yield* ThreadAccess.assertLiveCaller(result.success);
                 else
                   assert.equal(
                     (yield* ThreadAccess.assertLiveCaller(result.success).pipe(Effect.flip)).code,

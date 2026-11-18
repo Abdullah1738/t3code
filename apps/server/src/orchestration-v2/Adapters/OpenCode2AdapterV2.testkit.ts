@@ -133,6 +133,7 @@ const replayHttpClient = (
   replayGate: ProviderReplayGate | undefined,
   onPrompt: ((input: unknown) => void) | undefined,
   onRequest: ((operation: string, signal: AbortSignal) => void) | undefined,
+  beforeResponse: ((operation: string) => Promise<void>) | undefined,
 ) =>
   HttpClient.make((request, url) =>
     Effect.tryPromise({
@@ -173,6 +174,7 @@ const replayHttpClient = (
         }
         // Recorded responses are the raw HTTP bodies; `null` is an empty 204.
         const body = await controller.response(operation.type);
+        await beforeResponse?.(operation.type);
         if (body === "<hang>") return new Promise<Response>(() => {});
         if (body === "<transport-error>") throw new TypeError("fetch failed");
         if (body === "<body-error>") {
@@ -214,6 +216,7 @@ export const replayServer = (
     readonly external?: boolean;
     readonly onPrompt?: (input: unknown) => void;
     readonly onRequest?: (operation: string, signal: AbortSignal) => void;
+    readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly replayGate?: ProviderReplayGate;
     readonly borrowers?: { current: number };
   },
@@ -229,7 +232,13 @@ export const replayServer = (
     const opencode = yield* OpenCode2Client.make.pipe(
       Effect.provideService(
         HttpClient.HttpClient,
-        replayHttpClient(controller, options?.replayGate, options?.onPrompt, options?.onRequest),
+        replayHttpClient(
+          controller,
+          options?.replayGate,
+          options?.onPrompt,
+          options?.onRequest,
+          options?.beforeResponse,
+        ),
       ),
     );
     const connection = {
@@ -262,6 +271,7 @@ const makeReplayAdapter = (
     readonly external?: boolean;
     readonly onPrompt?: (input: unknown) => void;
     readonly onRequest?: (operation: string, signal: AbortSignal) => void;
+    readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly replayGate?: ProviderReplayGate;
     readonly borrowers?: { current: number };
   },
@@ -303,9 +313,11 @@ function layerRegistry(
 export const openCode2ReplayRuntime = (
   entries: ReadonlyArray<ProviderReplayEntry>,
   options?: {
+    readonly cwd?: string;
     readonly external?: boolean;
     readonly onPrompt?: (input: unknown) => void;
     readonly onRequest?: (operation: string, signal: AbortSignal) => void;
+    readonly beforeResponse?: (operation: string) => Promise<void>;
     readonly borrowers?: { current: number };
     readonly replayGate?: ProviderReplayGate;
     readonly attachmentsDir?: string;
@@ -335,7 +347,7 @@ export const openCode2ReplayRuntime = (
       runtimePolicy: {
         runtimeMode: "full-access",
         interactionMode: "default",
-        cwd: "/work/opencode2",
+        cwd: options?.cwd ?? "/work/opencode2",
       },
     });
   }).pipe(

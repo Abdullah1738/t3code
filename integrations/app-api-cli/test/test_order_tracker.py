@@ -354,6 +354,28 @@ class TrackerTest(unittest.TestCase):
     def result(self, status='unknown'):
         return {'status': status, 'errors': []}
 
+    def test_delivered_elapsed_subjects_in_native_and_web_modes(self):
+        subjects = ['Delivered in 10 hrs 31 mins', 'Delivered in 1 hr',
+                    'Delivered in 2 hours 5 minutes', 'Delivered in 1 hour 1 minute.',
+                    'Delivered in 2 hrs!', '  DELIVERED  in\t10 hrs\n31 mins  ']
+        for web in (False, True):
+            for subject in subjects:
+                with self.subTest(web=web, subject=subject):
+                    self.assertEqual(t.classify(subject, web=web), 'delivered')
+
+    def test_elapsed_delivery_estimates_and_non_subject_text_are_not_delivered(self):
+        subjects = ['Delivery in 2 days', 'Arriving in 3 hrs', 'Will be delivered in 2 hrs',
+                    'Expected to be delivered in 4 hours', 'Not delivered in 10 hrs',
+                    'Never delivered in 10 hrs', 'Once delivered in 10 hrs',
+                    'Cancelled: Delivered in 10 hrs', 'Re: Delivered in 10 hrs',
+                    'Fwd: Delivered in 10 hrs', 'Delivered in 10 hrs if all goes well',
+                    'Your package: Delivered in 10 hrs', 'Delivered in 45 mins',
+                    'Delivered in 10 hrs. Remaining items tomorrow']
+        for web in (False, True):
+            for subject in subjects:
+                with self.subTest(web=web, subject=subject):
+                    self.assertNotEqual(t.classify(subject, web=web), 'delivered')
+
     def test_delivery_promises_are_not_delivery(self):
         for text in ['Your order will be delivered today', 'Your order is not delivered',
                      'Free delivery when you order', 'Your rider has arrived at the restaurant']:

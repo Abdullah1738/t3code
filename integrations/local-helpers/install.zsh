@@ -22,6 +22,7 @@ typeset -A restarts=(
   com.abdullah.juno-proxy "$state_dir/restart-juno-proxy"
   com.ardud.lydia-ticks-server "$state_dir/restart-lydia-ticks-server"
   com.ardud.lydia-ticks-tunnel "$state_dir/restart-lydia-ticks-tunnel"
+  com.ardud.vnc-hold "$state_dir/restart-vnc-hold"
 )
 # Same for plists: reload-<label> is set before a new plist lands and cleared once launchd has loaded it,
 # so a run that dies between the copy and the reload leaves the reload for the next run. It holds
@@ -264,6 +265,7 @@ for p in "${pairs[@]}"; do
       mkdir -p "$state_dir"; : > "${restarts[local.ardud.otp-idle]}" ;;
     */juno-proxy/juno_proxy.py) mkdir -p "$state_dir"; : > "${restarts[com.abdullah.juno-proxy]}" ;;
     */lydia-ticks/server.ts) mkdir -p "$state_dir"; : > "${restarts[com.ardud.lydia-ticks-server]}" ;;
+    */bin/vnc-hold) mkdir -p "$state_dir"; : > "${restarts[com.ardud.vnc-hold]}" ;;
     */lydia-ticks/tunnel.sh) mkdir -p "$state_dir"; : > "${restarts[com.ardud.lydia-ticks-tunnel]}" ;;
     */LaunchAgents/*.plist)
       mkdir -p "$state_dir" "${dst:h}"
@@ -316,6 +318,8 @@ fi
 if (( dry )); then
   exit 0
 fi
+
+mkdir -p "$HOME/Library/Logs"
 
 # Agents. Log dirs first: launchd won't create them and the job dies without them.
 for f in "${plists[@]}"; do
@@ -380,7 +384,8 @@ for f in "${plists[@]}"; do
     agent_fail=1; print -u2 "local-helpers: $label is not loaded and failed to load"
   fi
 done
-# otp-idle, the Juno proxy and the Lydia server and tunnel stay running, so their new code needs a restart; the other agents are short runs.
+# Long-running agents need a restart after a code change. Keep a second shared
+# vnc-hold session connected during its cutover (see README).
 for label marker in "${(@kv)restarts}"; do
   if [[ ! -e "$marker" ]] || ! loaded "$label"; then
     continue

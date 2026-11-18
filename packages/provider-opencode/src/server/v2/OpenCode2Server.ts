@@ -19,6 +19,7 @@ import * as OpenCode2Client from "./OpenCode2Client.ts";
 const INFO_TIMEOUT = "5 seconds";
 
 export interface OpenCode2Connection extends OpenCode2Client.OpenCode2Api {
+  readonly runtimeProcess?: { readonly pid: number; readonly spawnedAtMs: number };
   readonly url: string;
   readonly version: string;
   readonly external: boolean;
@@ -176,7 +177,12 @@ export const make = Effect.fn("OpenCode2Server.make")(function* (input: {
     withConnection: (use) =>
       owner.withServer((server) =>
         latest?.url === server.url
-          ? use(latest)
+          ? use({
+              ...latest,
+              ...(server.runtimeProcess === undefined
+                ? {}
+                : { runtimeProcess: server.runtimeProcess }),
+            })
           : Effect.die(new Error("OpenCode 2 server was lent before verification.")),
       ),
   });

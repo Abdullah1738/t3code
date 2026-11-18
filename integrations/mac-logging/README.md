@@ -218,6 +218,36 @@ Partial inventories and older snapshots without that evidence remain unknown.
 An unknown directory baseline also makes the event incomplete.
 These events never alert or launch extra scans.
 
+The minute CPU sampler also checks the severe free-space floors every two
+minutes: internal 15 GB, ExternalSSD 100 GB. `disk.floor_check` reads statvfs
+only; it neither runs du nor traverses the SSD. Each volume has an independent
+episode in `state/disk-low.json`, separate from the older 150 GB advisory's
+12-hour cooldown. Recovery emits `disk.low_cleared` with the episode duration.
+
+On a crossing, a separate child has six seconds to measure recent direct
+children of the user's `getconf DARWIN_USER_TEMP_DIR`, with at most 0.5 seconds
+per du. Symlinks are excluded. Budget failures emit `disk.movers_skipped`;
+completed sizes survive a later timeout. Other growers, including the opencode
+directory, reuse the swing inventory and delta calculation. First sightings
+report size without claiming a measured delta. The child emits `disk.low` with
+up to three movers, then sends through the existing Telegram notify command.
+Successful sends happen once per episode; failures log `disk.alert` and retry
+the frozen text/key on the next check. The inherited directory lock prevents
+overlapping workers without creating a file on an exhausted filesystem.
+No new watcher or LaunchAgent is needed.
+
+Checkpoint failures never block launch or notification: the detector passes its
+observation directly to the child. Only the child can use the small emergency
+checkpoint at `/Volumes/ExternalSSD/.mac-upkeep/disk-low.json`, with a 250 ms
+budget per operation. It skips that copy when the SSD is unmounted, unavailable
+or below its floor. The backup preserves frozen messages and send receipts and
+migrates back to normal state when writes recover. If neither location can be
+written, notification still uses a deterministic episode key; Telegram retains
+the first accepted payload and rejects changed retries. Local event/receipt
+durability then depends on storage recovering. Mover cache writes are optional,
+so failed writes retain attribution already measured. The listing deadline
+covers opening, advancing, statting and closing the iterator.
+
 ## Mac tailnet guard
 
 `com.abdullah.mac-tailnet` invokes `collector.py --tailnet` every 60 seconds,
@@ -469,11 +499,24 @@ redacted. No du stdout, unified log messages, report contents or arbitrary
 exception text is logged. Parse failures use fixed messages. Commands use the
 C locale so permission diagnostics can be identified consistently.
 
-A completed du that exits 1 solely because of unreadable entries still supplies
-a usable root total. That source emits a successful event with `partial=true`
-and `deniedCount` plus the readable `bytes`; the cached inventory retains those flags in `partials`.
-Other exits and timeouts do not supply usable du totals. A partial total measures
-only readable entries; permission grants remain an owner action.
+Denied children retain readable bytes (zero when du can read nothing), with
+`denied=true`, `estimate=true`, and `partial=false` on the child. They are
+refreshed only by the deep pass. Roots whose only gaps are denied children
+report `completeWithDenied`; `disk.inventory.rootsComplete` includes these
+roots and `rootsCompleteWithDenied` names their count. Their cached root stays
+in `partials` so disk-growth attribution does not treat estimates as exact.
+Vanished children count as zero only after lstat confirms absence on available
+storage. Attributable batch errors affect only their child; unknown diagnostics
+retain conservative batch handling.
+
+Child source events retain deep probe cost metrics, errors and notable successes
+(new ≥1 GiB, change ≥1 GiB or ≥20%, or ≥10 seconds). Root summaries and the hourly inventory
+carry denial, timeout, backoff and estimate counts and the top three child costs.
+Batch costs are equal shares of command time, not individual timings.
+`disk.deep.end.secondsByRoot` accounts for root turns without double-counting
+batched child rows. Failed 600-second leaf scans retry only in deep passes,
+with delays of 1, 2, 4 then 8 days. Budget-truncated probes do not acquire this
+backoff. Parent probes still descend immediately into checkpointed parts.
 
 Big roots emit child source events with `bytes`, `exitCode`, `elapsedMs`,
 `partial`, and `deniedCount`, plus a root aggregate with `completedCount` and
@@ -544,6 +587,29 @@ wait check follows with at most 45 s for ps and alerts, shortened to the remaini
 absolute budget. The disk tooling probe follows, then inventory uses what remains.
 No log command starts once its shared budget is exhausted. No live configuration
 or schedule change is needed for this order.
+
+## Folder budgets
+
+`disk-budgets.json`, installed beside the collector, assigns folder budgets in
+GiB to owner boards. The hourly collector emits `disk.budget` for every path,
+using complete inventory child/parts caches or root sums. `~/.robob/userdata`
+is excluded from its parent sum; symlinked targets are never measured. Missing
+paths report zero, while unavailable or incomplete measurements report a stale
+last complete size (or null). `sizeAgeS` is the measurement's age, rather than
+the last collector run's age.
+
+Targets outside those cached levels are measured only by the daily deep pass,
+using its existing lock, wall budget, per-folder cap and checkpointed scanner.
+`disk.budget.over` follows three consecutive UTC hourly over-budget samples,
+at most once per path per UTC day. Stale/missing observations and gaps reset
+the streak. These events do not send notifications.
+
+`mac-log-rollup` includes `diskBudgets.topOverBudget`, ordered by excess at each
+path's latest fresh daily observation. Growth uses the nearest fresh sample to
+24 hours earlier (within two hours), using measurement times from `sizeAgeS`;
+it is null when that baseline is missing. `sizeTs` and `growthWindowS` record
+the measurement time and actual comparison interval. Overlapping parent and
+child budgets are independent and must not be added together.
 
 ## diskutil hangs
 

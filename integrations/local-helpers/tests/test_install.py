@@ -194,7 +194,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         self.assertTrue(os.access(self.live(".local/libexec/vp/toolchain"), os.X_OK))
         self.assertTrue(os.access(self.live(".local/bin/timeout"), os.X_OK))
         loads = [c for c in self.calls_log() if c.startswith("bootstrap")]
-        self.assertEqual(len(loads), 14, self.calls_log())
+        self.assertEqual(len(loads), 15, self.calls_log())
         self.assertTrue(os.access(self.live(".local/bin/mirage-beacon-keepalive"), os.X_OK))
         self.assertFalse(os.path.exists(self.live(".local/state/mirage-beacon-keepalive")))
         self.assertTrue(os.access(self.live(".local/bin/robob-read-watchdog"), os.X_OK))
@@ -213,6 +213,30 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
         self.assertIn("deploy that integration first", err)
         self.assertNotIn("differs", err)
         self.assertNotIn("not loaded", err)
+
+    def test_vnc_hold_install_and_code_restart(self):
+        self.ready()
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        binary = self.live(".local/bin/vnc-hold")
+        self.assertTrue(os.access(binary, os.X_OK))
+        self.assertTrue(os.path.isdir(self.live("Library/Logs")))
+        with open(self.live("Library/LaunchAgents/com.ardud.vnc-hold.plist"), "rb") as source:
+            plist = plistlib.load(source)
+        self.assertEqual(plist["ProgramArguments"], ["/usr/bin/python3", "-I", binary, "run"])
+        self.assertTrue(plist["KeepAlive"])
+        self.assertTrue(plist["RunAtLoad"])
+        self.assertEqual(plist["ThrottleInterval"], 15)
+        # Offline smoke must never connect to Screen Sharing or read Keychain.
+        self.assertFalse(os.path.exists(self.live(".local/state/vnc-hold")))
+        with open(binary, "a") as out:
+            out.write("\n# drift\n")
+        os.remove(self.calls)
+        rc, _, err = self.run_install()
+        self.assertEqual(rc, 0, err)
+        changes = [c for c in self.calls_log() if c.startswith(("kickstart", "bootstrap", "bootout"))]
+        self.assertEqual(changes, [f"kickstart -k gui/{os.getuid()}/com.ardud.vnc-hold"])
+        self.assertEqual(self.run_install("--check")[0], 0)
 
     def test_installed_read_watchdog_starts_with_granted_shell(self):
         rc, _, err = self.run_install()
@@ -452,7 +476,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
             for key in ("StandardOutPath", "StandardErrorPath"):
                 r = subprocess.run(["plutil", "-extract", key, "raw", os.path.join(plist_dir, f)],
                                    env=env, capture_output=True, text=True)
-                if r.returncode == 0:
+                if r.returncode == 0 and r.stdout.strip() != "/dev/null":
                     logs.add(os.path.dirname(r.stdout.strip()))
         self.assertTrue(logs)
         for d in logs:
@@ -467,7 +491,7 @@ print(format(stat.S_IMODE(os.stat(sys.argv[3]).st_mode), 'o'))
                           "com.ardud.battery-low-telegram", "com.ardud.cards-health",
                           "com.ardud.cards-tunnel", "com.ardud.lydia-ticks-server",
                           "com.ardud.lydia-ticks-tunnel", "com.ardud.mirage-beacon-keepalive", "com.ardud.opencode-web",
-                          "com.ardud.power-unplug-telegram", "com.ardud.robob-read-watchdog",
+                          "com.ardud.power-unplug-telegram", "com.ardud.robob-read-watchdog", "com.ardud.vnc-hold",
                           "local.ardud.mail-token-refresh", "local.ardud.otp-idle", "local.ardud.otp-watch"])
 
     def test_modes_are_checked_and_repaired_on_their_own(self):

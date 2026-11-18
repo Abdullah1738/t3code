@@ -1,5 +1,6 @@
 import { inputRejection, excessArgumentRejection } from "./inputRejection.ts";
 import { boardInputErrorHint, withBoardInputHint } from "../ardud/kanban/tools/inputErrors.ts";
+import * as MainThreadWatchdog from "../observability/MainThreadWatchdog.ts";
 import { KanbanService } from "../ardud/kanban/engine/KanbanService.ts";
 import * as ThreadReadMetrics from "../ardud/analytics/ThreadReadMetrics.ts";
 import * as OwnerAnalytics from "../ardud/analytics/Analytics.ts";
@@ -1029,6 +1030,7 @@ const withToolAnalytics =
     const server = yield* McpServer.McpServer;
     const ledger = yield* McpCallLedger.McpCallLedger;
     const kanbanContext = yield* Effect.serviceOption(KanbanService);
+    const watchdog = yield* Effect.serviceOption(MainThreadWatchdog.MainThreadWatchdog);
     const startup = yield* Effect.serviceOption(StartupPhaseLog.StartupPhaseLog);
     const callBootId = Option.isSome(startup) ? startup.value.snapshot().bootId : bootId;
     const analytics = yield* Effect.serviceOption(AnalyticsService.AnalyticsService);
@@ -1159,12 +1161,25 @@ const withToolAnalytics =
                 yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
               );
               return yield* Effect.acquireUseRelease(
-                ledger.enter(
-                  encodeJsonText([
-                    invocation?.requestNamespace,
-                    Option.isSome(capture) ? capture.value.sessionId : undefined,
-                  ]),
-                ),
+                ledger
+                  .enter(
+                    encodeJsonText([
+                      invocation?.requestNamespace,
+                      Option.isSome(capture) ? capture.value.sessionId : undefined,
+                    ]),
+                  )
+                  .pipe(
+                    Effect.map((activity) => ({
+                      ...activity,
+                      finishWatchdog: Option.isSome(watchdog)
+                        ? watchdog.value.enter(
+                            options.tool.name,
+                            payload,
+                            invocation?.thread?.threadId,
+                          )
+                        : () => {},
+                    })),
+                  ),
                 (activity) =>
                   Effect.gen(function* () {
                     // The shared tools/call span otherwise cannot be matched to a
@@ -1399,6 +1414,14 @@ const withToolAnalytics =
                         ...(callState.requestTiming === undefined
                           ? {}
                           : { requestTiming: callState.requestTiming }),
+                        ...(callState.dispatchFenceAt === undefined
+                          ? {}
+                          : {
+                              fenceToReplyMs: Math.max(
+                                0,
+                                Number(ended - callState.dispatchFenceAt) / 1e6,
+                              ),
+                            }),
                         callerResolved: callState.callerResolved,
                         callerResolveMs:
                           callState.callerResolveMs +
@@ -1870,7 +1893,8 @@ const withToolAnalytics =
                       }),
                     );
                   }),
-                (activity) => activity.release,
+                (activity) =>
+                  Effect.sync(activity.finishWatchdog).pipe(Effect.andThen(activity.release)),
               );
             }),
         }),

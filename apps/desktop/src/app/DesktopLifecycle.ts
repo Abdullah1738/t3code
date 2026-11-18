@@ -1,3 +1,8 @@
+import {
+  forceKillCapturedBackends,
+  setBackendProcessReporter,
+  waitForBackendShutdown,
+} from "../backend/DesktopBackendProcess.ts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -89,10 +94,18 @@ const requestDesktopShutdownAndWait = Effect.fn("desktop.lifecycle.requestShutdo
   ): Effect.fn.Return<void, never, DesktopShutdown.DesktopShutdown | DesktopWindow.DesktopWindow> {
     const shutdown = yield* DesktopShutdown.DesktopShutdown;
     const desktopWindow = yield* DesktopWindow.DesktopWindow;
-    yield* desktopWindow.flushMainWindowBounds;
-    yield* afterBoundsFlush;
-    yield* shutdown.request;
-    yield* shutdown.awaitComplete;
+    const shutdownContext = yield* Effect.context<never>();
+    yield* Effect.promise(() =>
+      waitForBackendShutdown(
+        Effect.runPromiseWith(shutdownContext)(
+          desktopWindow.flushMainWindowBounds.pipe(
+            Effect.andThen(afterBoundsFlush),
+            Effect.andThen(shutdown.request),
+            Effect.andThen(shutdown.awaitComplete),
+          ),
+        ),
+      ),
+    );
   },
 );
 
@@ -131,6 +144,7 @@ function handleBeforeQuit(
       );
     }).pipe(Effect.withSpan("desktop.lifecycle.beforeQuit")),
   ).finally(() => {
+    forceKillCapturedBackends();
     markQuitAllowed();
     void runEffect(
       Effect.gen(function* () {
@@ -207,6 +221,9 @@ export const make = DesktopLifecycle.of({
       ).pipe(Effect.catch(() => Effect.succeed(() => {})));
       yield* Effect.addFinalizer(() => Effect.sync(release));
     }
+    setBackendProcessReporter((action) => {
+      Effect.runSyncWith(context)(DesktopQuit.recordBackendAction(action));
+    });
     const runEffect = Effect.runPromiseWith(context);
     let quitAllowed = false;
     let updaterQuitAllowed = false;
@@ -220,6 +237,8 @@ export const make = DesktopLifecycle.of({
       // Cancelling the following app "before-quit" event breaks that sequence,
       // most visibly on macOS where the native updater performs the relaunch.
       updaterQuitAllowed = true;
+      Effect.runSyncWith(context)(DesktopQuit.record({ trigger: "quitAndInstall" }));
+      forceKillCapturedBackends();
       // This event is synchronous and the updater's quit proceeds as soon as
       // the listener returns, so a forked destroyAll would race the quit
       // and windows could still be open when the process exits (visible on

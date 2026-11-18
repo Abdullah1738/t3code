@@ -37,6 +37,7 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
@@ -851,4 +852,191 @@ it.effect.each([
 
     assert.deepEqual(yield* Ref.get(steered), state.endsWith("pending") ? [text] : []);
   }).pipe(Effect.provide(KanbanStore.layer.pipe(Layer.provide(Sqlite.layerMemory)))),
+);
+
+it.effect.each([
+  { driver: "codex", result: "terminal" },
+  { driver: "opencode", result: "terminal" },
+  { driver: "claudeAgent", result: "terminal" },
+  { driver: "codex", result: "idle" },
+  { driver: "opencode", result: "timeout" },
+  { driver: "opencode", result: "synthetic" },
+  { driver: "claudeAgent", result: "unregistered" },
+  { driver: "claudeAgent", result: "observed-native-only" },
+  { driver: "codex", result: "observed-known-turn" },
+] as const)(
+  "confirms start-expire Stop on $driver via $result without stopping a shared session",
+  (row) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("expiry-confirm");
+      const sessionId = ProviderSessionId.make("shared-expiry-session");
+      const turnId = ProviderTurnId.make("expired-turn");
+      const attemptId = RunAttemptId.make("expired-attempt");
+      const providerThread: OrchestrationV2ProviderThread = {
+        id: ProviderThreadId.make("expired-thread"),
+        driver: ProviderDriverKind.make(row.driver),
+        providerInstanceId,
+        providerSessionId: sessionId,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "idle",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const projection = makeProjection({
+        now,
+        threadId,
+        providerThread,
+        providerTurnId: turnId,
+        attemptId,
+      });
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      const stopEntered = yield* Deferred.make<void>();
+      const ignored = yield* Deferred.make<void>();
+      const finished = yield* Deferred.make<void>();
+      let interrupts = 0;
+      let closedSubscriptions = 0;
+      const runtime = {
+        hasObservedTurnEnd: (
+          target: Parameters<
+            NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["hasObservedTurnEnd"]>
+          >[0],
+        ) =>
+          Effect.sync(() => {
+            assert.equal(target.providerThreadId, providerThread.id);
+            assert.equal(target.providerTurnId, turnId);
+            assert.equal(
+              target.attemptId,
+              row.result === "observed-native-only" || row.result === "unregistered"
+                ? attemptId
+                : undefined,
+            );
+            return row.result === "observed-native-only" || row.result === "observed-known-turn";
+          }),
+        subscribeEvents: Effect.succeed({
+          events: Stream.fromQueue(events).pipe(
+            Stream.tap((event) =>
+              event.type === "turn.terminal" &&
+              (event.providerTurnId !== turnId || event.nativeWorkEnded !== true)
+                ? Deferred.succeed(ignored, undefined)
+                : Effect.void,
+            ),
+          ),
+          close: Effect.sync(() => {
+            closedSubscriptions++;
+          }),
+        }),
+        holdsWorkForThread: () =>
+          Effect.succeed(row.result !== "idle" && row.result !== "unregistered"),
+        interruptTurn: (
+          request: Parameters<ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptTurn"]>[0],
+        ) =>
+          Effect.sync(() => {
+            interrupts++;
+            assert.equal(request.providerTurnId, turnId);
+            assert.isFalse(request.requestRuntimeRestart);
+            assert.isFalse(request.stopBackgroundWork);
+          }).pipe(Effect.andThen(Deferred.succeed(stopEntered, undefined))),
+        interruptStartingRun: (
+          request: Parameters<
+            NonNullable<ProviderAdapter.ProviderAdapterV2SessionRuntime["interruptStartingRun"]>
+          >[0],
+        ) =>
+          Effect.sync(() => {
+            interrupts++;
+            assert.equal(request.attemptId, attemptId);
+            assert.isFalse(request.stopBackgroundWork);
+          }).pipe(Effect.andThen(Deferred.succeed(stopEntered, undefined))),
+      };
+      const layer = ProviderTurnControlService.layer.pipe(
+        Layer.provide(
+          Layer.mergeAll(
+            Layer.mock(ProjectionStore.ProjectionStoreV2)({
+              getProviderControlContext: () =>
+                Effect.succeed({
+                  providerThread,
+                  providerTurn:
+                    row.result === "unregistered" || row.result === "observed-native-only"
+                      ? undefined
+                      : {
+                          ...projection.providerTurns[0]!,
+                          status: "failed",
+                          completedAt: now,
+                        },
+                  attempt: projection.attempts[0],
+                  message: undefined,
+                  run: undefined,
+                }),
+            }),
+            Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+              get: () =>
+                Effect.succeedSome(
+                  runtime as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
+                ),
+            }),
+          ),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const control = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+        const stopping = yield* control
+          .interrupt({
+            threadId,
+            providerSessionId: sessionId,
+            providerThreadId: providerThread.id,
+            providerTurnId: turnId,
+            stopBackgroundWork: false,
+            confirmStopped: true,
+            ...(row.result === "unregistered" || row.result === "observed-native-only"
+              ? { startingRun: { runId: RunId.make("expired-run"), attemptId, runOrdinal: 1 } }
+              : {}),
+          })
+          .pipe(
+            Effect.result,
+            Effect.ensuring(Deferred.succeed(finished, undefined)),
+            Effect.forkChild({ startImmediately: true }),
+          );
+        yield* Deferred.await(stopEntered);
+        if (row.result === "terminal" || row.result === "timeout" || row.result === "synthetic") {
+          yield* Queue.offer(events, {
+            type: "turn.terminal",
+            ...(row.result === "synthetic" ? {} : { nativeWorkEnded: true as const }),
+            driver,
+            providerThreadId: providerThread.id,
+            providerTurnId:
+              row.result === "synthetic" ? turnId : ProviderTurnId.make("sibling-live-turn"),
+            runOrdinal: 2,
+            status: "completed",
+            failure: null,
+            threadDisposition: "reusable",
+          });
+          yield* Deferred.await(ignored);
+          assert.isFalse(yield* Deferred.isDone(finished));
+          if (row.result === "timeout") yield* TestClock.adjust(PROVIDER_START_CLEANUP_TIMEOUT_MS);
+          else
+            yield* Queue.offer(events, {
+              type: "turn.terminal",
+              nativeWorkEnded: true,
+              driver,
+              providerThreadId: providerThread.id,
+              providerTurnId: turnId,
+              runOrdinal: 1,
+              status: "interrupted",
+              failure: null,
+              threadDisposition: "reusable",
+            });
+        }
+        const result = yield* Fiber.join(stopping);
+        assert.equal(result._tag, row.result === "timeout" ? "Failure" : "Success");
+        assert.equal(interrupts, 1);
+        assert.equal(closedSubscriptions, 1);
+      }).pipe(Effect.provide(layer));
+    }).pipe(Effect.scoped),
 );

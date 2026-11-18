@@ -230,6 +230,7 @@ interface ActiveTurn {
   compaction: { readonly nativeId: string; readonly startedAt: DateTime.Utc } | undefined;
   compactions: number;
   interrupted: boolean;
+  interruptAcknowledged?: boolean;
   unsent: boolean;
   /**
    * Installed while the event stream reconnects, and not set up yet. The
@@ -326,6 +327,7 @@ interface ThreadState {
    * so the next execution end belongs to that run; it clears this and ends no turn.
    */
   unsettled: boolean;
+  unsettledTurn: ActiveTurn | undefined;
   /**
    * A prompt whose request failed may start its run late; that start is the
    * run's own, and only a start after it means its end was lost.
@@ -889,8 +891,26 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     const ownerOf = (sessionId: string) => childOwners.get(sessionId) ?? threads.get(sessionId);
     const markUnsettled = (state: ThreadState) => {
       state.unsettled = true;
+      state.unsettledTurn ??= state.active;
       state.unsettledStarted = busy.has(state.sessionId);
     };
+
+    const confirmUnsettledTurn = Effect.fnUntraced(function* (state: ThreadState) {
+      const turn = state.unsettledTurn;
+      if (turn === undefined) return;
+      state.unsettledTurn = undefined;
+      yield* emit({
+        type: "turn.terminal",
+        nativeWorkEnded: true,
+        driver,
+        providerThreadId: turn.providerTurn.providerThreadId,
+        providerTurnId: turn.providerTurn.id,
+        runOrdinal: turn.input.runOrdinal,
+        status: turn.interrupted ? "interrupted" : "completed",
+        failure: null,
+        threadDisposition: "reusable",
+      });
+    });
 
     const newThreadState = (
       sessionId: string,
@@ -907,6 +927,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       active: undefined,
       model: undefined,
       unsettled: false,
+      unsettledTurn: undefined,
       unsettledStarted: false,
       directory,
       agent: "build",
@@ -1673,6 +1694,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       state: ThreadState,
       terminal: TurnTerminal,
       threadDisposition: "reusable" | "broken" = "reusable",
+      nativeWorkEnded = false,
     ) {
       const turn = state.active;
       if (turn === undefined) return;
@@ -1789,6 +1811,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       yield* setSessionStatus(pending.size > 0 ? "waiting" : anyActive ? "running" : "ready", null);
       const base = {
         type: "turn.terminal" as const,
+        ...(nativeWorkEnded ? { nativeWorkEnded: true as const } : {}),
         driver,
         // After a native fork the session's own thread has a fresh id, and the
         // terminal must name the thread the start was recorded against.
@@ -2488,12 +2511,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
         turn.heldEnd = end;
         return;
       }
-      yield* finishTurn(state, end);
+      yield* finishTurn(state, end, "reusable", true);
     });
 
     const endIfSettled = (state: ThreadState, turn: ActiveTurn) =>
       turn.heldEnd !== undefined && turn.steers.size === 0
-        ? finishTurn(state, turn.heldEnd)
+        ? finishTurn(state, turn.heldEnd, "reusable", true)
         : Effect.void;
 
     const handleEvent = Effect.fnUntraced(function* (event: OpenCode2Client.OpenCode2StreamEvent) {
@@ -2522,8 +2545,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           // execution's own.
           const state = threads.get(sessionId);
           if (state?.unsettled === true) {
-            if (state.unsettledStarted) state.unsettled = false;
-            else state.unsettledStarted = true;
+            if (state.unsettledStarted) {
+              state.unsettled = false;
+              yield* confirmUnsettledTurn(state);
+            } else state.unsettledStarted = true;
           }
           busy.add(sessionId);
           shellWakePending.delete(sessionId);
@@ -2577,6 +2602,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           : undefined;
       if (ended?.unsettled === true) {
         ended.unsettled = false;
+        yield* confirmUnsettledTurn(ended);
         return;
       }
       if (
@@ -3099,6 +3125,8 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                   }),
                 }
               : { status: "interrupted" },
+          "reusable",
+          true,
         );
       }
       // Read after the backfill, which can start background calls made in the gap.
@@ -4082,6 +4110,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 .pipe(Effect.timeout(INTERRUPT_TIMEOUT), Effect.ignore({ log: true }));
             } else {
               state.unsettled = false;
+              yield* confirmUnsettledTurn(state);
             }
           }
           // Installs the turn; every path after it ends the turn with a terminal.
@@ -4202,7 +4231,37 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       );
     });
 
+    const joinTurnStop = ProviderAdapter.makeTurnStopJoiner();
     const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
+      holdsWorkForThread: Effect.fn("OpenCode2Adapter.holdsWorkForThread")(
+        function* (providerThread) {
+          const nativeId = providerThread.nativeThreadRef?.nativeId;
+          const state = nativeId == null ? undefined : threads.get(nativeId);
+          if (state === undefined) return false;
+          const locallyRunning = () =>
+            state.active !== undefined || state.wakes.some((wake) => wake.running);
+          if (locallyRunning()) return true;
+          if (!state.unsettled) return busy.has(state.sessionId);
+          const execution = state.executions;
+          // An unclear prompt failure leaves a quarantine for late execution
+          // events. It is not proof of native work and must not pin an old Stop.
+          const active = yield* client.session.active().pipe(
+            Effect.timeoutOption(ACTIVE_CHECK_TIMEOUT),
+            Effect.orElseSucceed(() => Option.none()),
+          );
+          const running =
+            locallyRunning() ||
+            (busy.has(state.sessionId) && state.executions !== execution) ||
+            (state.unsettled && (Option.isNone(active) || state.sessionId in active.value));
+          if (!running) yield* confirmUnsettledTurn(state);
+          return running;
+        },
+      ),
+      runtimeInventory: Effect.sync(() => ({
+        roots: connection.runtimeProcess === undefined ? [] : [connection.runtimeProcess],
+        loads: [],
+        nativeThreadIds: [...threads.keys()],
+      })),
       sessionUpdateFanout: "interested_threads",
       instanceId,
       driver,
@@ -4494,12 +4553,35 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             ),
           ),
       ),
+      interruptStartingRun: Effect.fn("OpenCode2Adapter.interruptStartingRun")(function* (run) {
+        const state = threads.get(yield* sessionIdOf(run.providerThread));
+        const turn = state?.active ?? state?.unsettledTurn;
+        // A native end does not settle an in-flight session-wide interrupt.
+        // Retained attempt ownership must still reach its delivery joiner.
+        const target =
+          turn?.input.runId === run.runId &&
+          turn.providerTurn.runAttemptId === run.attemptId &&
+          turn.providerTurn.providerThreadId === run.providerThread.id
+            ? turn.providerTurn
+            : [...(state?.providerTurns.values() ?? [])].find(
+                (candidate) =>
+                  candidate.runAttemptId === run.attemptId &&
+                  candidate.providerThreadId === run.providerThread.id,
+              );
+        if (target === undefined) return;
+        yield* runtime.interruptTurn({
+          providerThread: run.providerThread,
+          providerTurnId: target.id,
+          requestRuntimeRestart: false,
+          stopBackgroundWork: false,
+        });
+      }),
       interruptTurn: Effect.fn("OpenCode2Adapter.interruptTurn")(
         function* (interruptInput) {
           const sessionId = yield* sessionIdOf(interruptInput.providerThread);
           const state = threads.get(sessionId);
           if (state === undefined) return;
-          const turn = state.active;
+          const turn = state.active ?? state.unsettledTurn;
           // A delayed Stop must not reach the new turn's background work.
           if (turn !== undefined && turn.providerTurn.id !== interruptInput.providerTurnId) return;
           // User Stop also stops background work on a settled thread. A turn
@@ -4516,17 +4598,29 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
           // the turn. A server that does not answer in time is stuck, so the turn
           // ends here instead of waiting on it.
           turn.interrupted = true;
-          const reply = yield* client.session
-            .interrupt({ sessionID: Session.ID.make(sessionId) })
-            .pipe(
-              Effect.timeoutOption(INTERRUPT_TIMEOUT),
-              Effect.tapError(() =>
-                Effect.sync(() => {
-                  turn.interrupted = false;
-                }),
-              ),
-            );
+          const reply = turn.interruptAcknowledged
+            ? Option.some({ interrupted: true })
+            : yield* client.session.interrupt({ sessionID: Session.ID.make(sessionId) }).pipe(
+                Effect.timeoutOption(INTERRUPT_TIMEOUT),
+                Effect.tap((receipt) =>
+                  Effect.sync(() => {
+                    if (Option.isSome(receipt)) turn.interruptAcknowledged = true;
+                  }),
+                ),
+                Effect.tapError(() =>
+                  Effect.sync(() => {
+                    turn.interrupted = false;
+                  }),
+                ),
+              );
           if (reply._tag === "None") {
+            if (interruptInput.stopBackgroundWork === false)
+              return yield* new ProviderAdapter.ProviderAdapterInterruptError({
+                driver,
+                providerThreadId: interruptInput.providerThread.id,
+                providerTurnId: interruptInput.providerTurnId,
+                cause: "The OpenCode server did not confirm that the previous turn stopped.",
+              });
             markUnsettled(state);
             return yield* lock.withPermit(finishTurn(state, { status: "interrupted" }));
           }
@@ -4569,6 +4663,10 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                   }),
             ),
           ),
+        (effect, target) =>
+          target.stopBackgroundWork === false
+            ? joinTurnStop(target.providerTurnId, effect)
+            : effect,
       ),
       unloadThread: Effect.fn("OpenCode2Adapter.unloadThread")(function* ({ providerThread }) {
         const nativeId = providerThread.nativeThreadRef?.nativeId;

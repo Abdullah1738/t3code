@@ -111,7 +111,7 @@ ORDER_SCREEN_BUDGET = 1
 FOLLOW_STEPS = ('merchants', 'order_charges', 'payments', 'questions', 'refunds',
                 'owner_threads', 'msgs', 'history', 'receipt', 'lookups', 'order_screen', 'census', 'loads', 'writes', 'locks')
 TIMING_KEYS = tuple(name + '_ms' for name in FOLLOW_STEPS) + ('msgs_max_ms', 'follow_ms', 'untimed_ms', 'writes_n',
-    'edeadlk_retries', 'edeadlk_ms', 'dataless_files', 'edeadlk_skips_before')
+    'edeadlk_retries', 'edeadlk_ms', 'eintr_retries', 'dataless_files', 'dataless_error', 'edeadlk_skips_before')
 FOLLOW_EACH = 6  # at most this many of them per question, least recently checked first
 DONT_ASK = 3
 # The runner clips an event at 6,000 characters; cases past this limit wait for the next check.
@@ -3539,10 +3539,14 @@ def run_check(wd, run, data=None, root=None, now=None, find=None, said=None):
     stats = parent['stats'] if parent is not None else {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
     started = parent['deadline'] - CHECK_BUDGET if parent is not None else time.time()
     run_history.current()['stats'] = stats
+    run_history.current()['slowest'] = 'loads'
     with data_io.scope(started + CHECK_BUDGET, stats):
         stats['dataless_files'] = data_io.dataless_files(data or DATA)
         skip = read_json(wd / 'data-skips.json', {})
         stats['edeadlk_skips_before'] = skip.get('skip_streak', 0)
+        if skip:
+            stats.update(skip_last_file=skip.get('last_file'), skip_last_reason=skip.get('last_reason'),
+                         skip_first_at=skip.get('first_skip_at'))
         # Discover an evicted dependency before any book or ping mutations.
         for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json',
                      'owner-texts.json', 'msgs-searches.json', 'order-details.json', 'marketplace-placements.json'):
@@ -3653,6 +3657,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
             retained_outbox = state.get('outbox')
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'follow', time.time()
+            diagnostic['slowest'] = phase
             errors = []
             with follow_timing(stats):
                 try:
@@ -3673,6 +3678,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                     errors += refund_mails(data or DATA, now, time.time() + 8, find, stats=stats)
             phases[phase] = time.time() - phase_at
             phase, phase_at = 'attention', time.time()
+            diagnostic['slowest'] = phase
             if errors:
                 state['question_errors'] = {'at': stamp(now), 'errors': errors[:10]}
             else:
@@ -3737,6 +3743,7 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                                               'Run `money-cases unasked --ask` and send its output as one message')], '', None))
                 phases[phase] = time.time() - phase_at
                 phase, phase_at = 'build_write', time.time()
+                diagnostic['slowest'] = phase
                 if entries:
                     header = f'Money cases: {len(entries)} need attention.'
                     footer = 'Details: money-cases show ID.'
@@ -3807,12 +3814,14 @@ def _run_check(wd, run, data=None, root=None, now=None, find=None, said=None, *,
                 **{f'{key}_s': round(value, 3) for key, value in phases.items()},
                 **{k: stats[k] for k in ('lookups', 'owner_queries', 'msgs_calls')},
                 **{k: stats.get(k, 0) for k in (*TIMING_KEYS, *charges.OWNER_TIMING_KEYS)},
+                **{k: stats[k] for k in ('skip_last_file', 'skip_last_reason', 'skip_first_at') if k in stats},
                 'owner_result': stats.get('owner_result', 'ok'),
                 **charges.receipt_timing(stats),
                 'starved_by': stats.get('starved_by', 'none'), 'slowest': max(phases, key=phases.get)}
 
     saved = False
     state.pop('timing', None)
+    diagnostic['slowest'] = 'build_write'
     try:
         with within(end, CheckTimeout('out of time saving pings; the rest next check')):
             write_json(pings, state, timing=timing)
@@ -3977,7 +3986,7 @@ def record_data_skip(wd, error):
     now = time.time()
     state.update(skip_streak=state.get('skip_streak', 0) + 1,
                  first_skip_at=state.get('first_skip_at', now), last_skip_at=now,
-                 last_file=error.path.name,
+                 last_file=error.path.name, last_reason=error.reason,
                  edeadlk_retries=error.stats.get('edeadlk_retries', 0),
                  edeadlk_ms=error.stats.get('edeadlk_ms', 0))
     write_json(path, state)
@@ -3987,6 +3996,7 @@ def record_data_skip(wd, error):
 @run_history.record_check
 def check_command(wd, run, data):
     stats = {'lookups': 0, 'owner_queries': 0, 'msgs_calls': 0}
+    run_history.current().update(stats=stats, slowest='loads')
     wd.mkdir(parents=True, exist_ok=True)
     started = time.time()
     with data_io.scope(started + CHECK_BUDGET, stats):
@@ -4196,9 +4206,16 @@ def main(argv=None):
                                              exit=True)
             _CLI_WATCHDOG.set(True)
             wd = Path(os.environ.get('WATCH_DIR', LIVE))
-            event = check_command(wd, os.environ.get('WATCH_RUN', ''), DATA)
-            if event:
-                print(event)
+            with run_history.recording(wd) as row:
+                try:
+                    event = check_command(wd, os.environ.get('WATCH_RUN', ''), DATA)
+                except data_io.DataUnavailable as error:
+                    print(f'money-cases: {error}', file=sys.stderr)
+                    rc = record_data_skip(wd, error)
+                    run_history.record_skip(row, error, rc)
+                    return rc
+                if event:
+                    print(event)
         elif args.command == 'brief':
             line = brief(visible_cases(DATA))
             if line:

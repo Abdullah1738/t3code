@@ -37,6 +37,7 @@ import {
   rootRuntimeLoss,
 } from "@t3tools/shared/orchestrationV2ThreadError";
 
+import * as ControlStore from "../../control/ControlStore.ts";
 import * as ThreadLaunchService from "../../../orchestration-v2/ThreadLaunchService.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as EffectOutbox from "../../../orchestration-v2/EffectOutbox.ts";
@@ -159,6 +160,7 @@ type KanbanInterruptResult =
  * steer when supported by a live turn, otherwise it starts or queues a turn.
  */
 export interface KanbanThreadsShape {
+  readonly liveThreadIds: () => Effect.Effect<ReadonlyArray<ThreadId>, KanbanThreadError>;
   readonly pendingUserInputs: (threadId: ThreadId) => Effect.Effect<
     ReadonlyArray<{
       readonly requestId: RuntimeRequestId;
@@ -420,6 +422,7 @@ export const prWatchesOf = (shell: Pick<OrchestrationV2ThreadShell, "pullRequest
 
 const make = Effect.gen(function* () {
   const threads = yield* ThreadManagementService.ThreadManagementService;
+  const control = yield* ControlStore.ControlStore;
   const launcher = yield* ThreadLaunchService.ThreadLaunchService;
   const receipts = yield* OrchestrationCommandReceipts.OrchestrationCommandReceiptRepository;
   const outbox = yield* EffectOutbox.EffectOutboxV2;
@@ -1614,6 +1617,13 @@ const make = Effect.gen(function* () {
   );
 
   return KanbanThreads.of({
+    liveThreadIds: () =>
+      control.liveThreadIds().pipe(
+        Effect.map((ids) => ids.map((id) => ThreadId.make(id))),
+        Effect.mapError(
+          (error) => new KanbanThreadError({ operation: "liveThreadIds", detail: detailOf(error) }),
+        ),
+      ),
     pendingUserInputs,
     claimContext,
     view,
@@ -1639,6 +1649,7 @@ const make = Effect.gen(function* () {
 
 export const layerFromApplicationReceipts = Layer.effect(KanbanThreads, make).pipe(
   Layer.provide(EffectOutbox.layer),
+  Layer.provide(ControlStore.layer),
 );
 export const layer = layerFromApplicationReceipts.pipe(
   Layer.provide(OrchestrationCommandReceipts.layer),

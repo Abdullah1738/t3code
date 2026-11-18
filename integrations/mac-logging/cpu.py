@@ -588,6 +588,12 @@ def sample(run=subprocess.run, clock=time.monotonic, ticks_read=cpu_ticks, spike
 
 def main():
     try:
+        from disk_low import check as check_disk_floor
+        check_disk_floor()
+    except Exception:
+        emit('disk', 'error', 'disk.floor_check', ok=False,
+             error_tag='disk.floor_check_failed')
+    try:
         from u_sample import sample as sample_u
         sample_u()
     except Exception:

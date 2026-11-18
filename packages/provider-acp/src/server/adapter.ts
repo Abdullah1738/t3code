@@ -1033,6 +1033,7 @@ interface ActiveAcpTurn {
   readonly nativeTurnId: string;
   readonly startedAt: DateTime.Utc;
   readonly completed: Deferred.Deferred<void, never>;
+  cancelAcknowledged?: boolean;
   readonly itemOrdinals: Map<string, number>;
   readonly user: ActiveTextStream;
   readonly assistant: ActiveTextStream;
@@ -1085,6 +1086,7 @@ interface ActiveAcpTurn {
   interrupted: boolean;
   finalized: boolean;
   finalizedStatus: "completed" | "interrupted" | "failed" | "cancelled" | null;
+  nativePromptEnded: boolean;
   promptSettled: boolean;
   promptSettledStatus: "completed" | "interrupted" | "failed" | "cancelled" | null;
   workAccepted: boolean;
@@ -1562,6 +1564,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         let latestRuntimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy =
           input.runtimePolicy;
         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        const joinTurnStop = ProviderAdapter.makeTurnStopJoiner();
         const activeTurn = yield* Ref.make<ActiveAcpTurn | null>(null);
         let pendingStopCloseTurn: ActiveAcpTurn | null = null;
         let followsAgentWorkState = false;
@@ -7080,6 +7083,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             settledStatus === "failed"
               ? {
                   type: "turn.terminal",
+                  ...(context.nativePromptEnded || context.promptSettled
+                    ? { nativeWorkEnded: true as const }
+                    : {}),
                   driver,
                   providerThreadId: context.input.providerThread.id,
                   providerTurnId: context.providerTurnId,
@@ -7105,6 +7111,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 }
               : {
                   type: "turn.terminal",
+                  ...(context.nativePromptEnded || context.promptSettled
+                    ? { nativeWorkEnded: true as const }
+                    : {}),
                   driver,
                   providerThreadId: context.input.providerThread.id,
                   providerTurnId: context.providerTurnId,
@@ -7420,6 +7429,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               interrupted: false,
               finalized: false,
               finalizedStatus: null,
+              nativePromptEnded: false,
               promptSettled: false,
               promptSettledStatus: null,
               workAccepted: false,
@@ -7574,6 +7584,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               // settled-soft classification can observe the native return even when
               // the completion fiber has not yet set promptSettled under the permit.
               Effect.tap(() =>
+                Effect.sync(() => {
+                  context.nativePromptEnded = true;
+                }),
+              ),
+              Effect.tap(() =>
                 Deferred.succeed(context.promptWireSettled, undefined).pipe(Effect.asVoid),
               ),
               Effect.flatMap((result) =>
@@ -7617,12 +7632,13 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     if (context.finalized) return;
                     const error = Cause.findError(cause);
                     // Native close rejects prompts cancelled before insertion with -32800.
-                    const interrupted =
-                      context.interrupted ||
-                      (pendingStopCloseTurn === context &&
-                        Result.isSuccess(error) &&
-                        error.success._tag === "AcpRequestError" &&
-                        error.success.code === -32800);
+                    const nativeCancellation =
+                      pendingStopCloseTurn === context &&
+                      Result.isSuccess(error) &&
+                      error.success._tag === "AcpRequestError" &&
+                      error.success.code === -32800;
+                    if (nativeCancellation) context.nativePromptEnded = true;
+                    const interrupted = context.interrupted || nativeCancellation;
                     yield* finalizeTurn(
                       context,
                       interrupted ? "interrupted" : "failed",
@@ -7777,24 +7793,25 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           ...(postSettleContinuationEnabled || followsAgentWorkState
             ? {
                 hasPendingBackgroundWork: Effect.sync(pendingBackgroundWorkNow),
-                // ardud: a finished task leaves the running set before its wake is
-                // buffered and offered, all inside one runtime callback, so a busy
-                // callback counts as held work. Never wait for it: the offer calls
-                // into the orchestrator. A deferred finalize offers for unreported
-                // mid-turn completions outside the permit, so those count too.
-                holdsWorkForThread: () =>
-                  runtimeCallbackPermit
-                    .withPermitsIfAvailable(1)(
-                      Effect.sync(
-                        () =>
-                          pendingBackgroundWorkNow() ||
-                          (postSettleContinuationEnabled &&
-                            Ref.getUnsafe(midTurnUnreportedCompletedTaskIds).size > 0),
-                      ),
-                    )
-                    .pipe(Effect.map(Option.getOrElse(() => true))),
               }
             : {}),
+          // Callback offers can reenter orchestration, so a busy callback must
+          // count as held work instead of waiting for its permit here.
+          holdsWorkForThread: (owner) =>
+            runtimeCallbackPermit
+              .withPermitsIfAvailable(1)(
+                Effect.sync(() => {
+                  const active = Ref.getUnsafe(activeTurn);
+                  return (
+                    Ref.getUnsafe(runtimeTeardownState)._tag !== "Idle" ||
+                    (active !== null && active.input.providerThread.id === owner.id) ||
+                    pendingBackgroundWorkNow() ||
+                    (postSettleContinuationEnabled &&
+                      Ref.getUnsafe(midTurnUnreportedCompletedTaskIds).size > 0)
+                  );
+                }),
+              )
+              .pipe(Effect.map(Option.getOrElse(() => true))),
           ensureThread: Effect.fn("AcpAdapterV2.ensureThread")(
             function* (threadInput: ProviderAdapter.ProviderAdapterV2EnsureThreadInput) {
               return yield* runtimeTransitionPermit.withPermit(
@@ -7943,6 +7960,23 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 providerThreadId: turnInput.providerThread.id,
               }),
             ),
+          interruptStartingRun: Effect.fn("AcpAdapterV2.interruptStartingRun")(function* (run) {
+            const context = yield* Ref.get(activeTurn);
+            if (
+              context === null ||
+              context.input.runId !== run.runId ||
+              context.input.attemptId !== run.attemptId ||
+              context.input.providerThread.id !== run.providerThread.id ||
+              context.nativeThreadId !== run.providerThread.nativeThreadRef?.nativeId
+            )
+              return;
+            yield* sessionRuntime.interruptTurn({
+              providerThread: run.providerThread,
+              providerTurnId: context.providerTurnId,
+              requestRuntimeRestart: false,
+              stopBackgroundWork: false,
+            });
+          }),
           interruptTurn: Effect.fn("AcpAdapterV2.interruptTurn")(
             function* (turnInput: ProviderAdapter.ProviderAdapterV2InterruptInput) {
               return yield* Effect.uninterruptibleMask((restore) =>
@@ -8216,8 +8250,14 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         // returned, so session/cancel has nothing to
                         // acknowledge and would only threaten still-running
                         // background subagents.
-                        if (!settledSoftInterrupt) {
-                          yield* runtime.cancel;
+                        if (!settledSoftInterrupt && !context.cancelAcknowledged) {
+                          yield* runtime.cancel.pipe(
+                            Effect.tap(() =>
+                              Effect.sync(() => {
+                                context.cancelAcknowledged = true;
+                              }),
+                            ),
+                          );
                         }
                         if (restartRuntime && flavor.restartRuntimeAfterInterrupt === true) {
                           yield* Ref.set(runtimeRestartRequired, true);
@@ -8227,7 +8267,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         Effect.timeoutOption("10 seconds"),
                       );
                       if (Option.isNone(stopped)) {
-                        if (!context.finalized) {
+                        if (!context.finalized && turnInput.stopBackgroundWork !== false) {
                           yield* finalizeTurn(context, "interrupted");
                         }
                         return yield* new ProviderAdapter.ProviderAdapterProtocolError({
@@ -8269,6 +8309,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     }),
                 ),
               ),
+            (effect, target) =>
+              target.stopBackgroundWork === false
+                ? joinTurnStop(target.providerTurnId, effect)
+                : effect,
           ),
           respondToRuntimeRequest: (requestInput) =>
             Effect.uninterruptibleMask((restore) =>

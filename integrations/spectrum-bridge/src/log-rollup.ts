@@ -42,6 +42,7 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
       }
       return;
     }
+    if (line.ids?.outageId && line.props?.linkGated === true) return;
     // Legacy request diagnostics are owned by control.catch1/2, including in mixed-version days.
     const requestFailure = line.component === "robob" && line.name === "turn.robob_call" && line.kind === "perf" && line.ok === false;
     if (requestFailure && line.props?.failureFormat === "single"
@@ -116,12 +117,17 @@ export async function summarizeLog(lines: AsyncIterable<LogLine>, laterLines?: A
         const key = "router.probe_backoff\0admission_read_failed";
         const item = causes.get(key) ?? { tag: "router.probe_backoff", causeKey: "admission_read_failed", count: 0 };
         item.count++; causes.set(key, item); probeCause(key, probeRow);
-      } else if (line.error?.tag === "router.catch1") {
+      } else if (line.error?.tag === "router.catch1" && line.error.name !== "RobobLinkDown") {
         // Keep row concentration visible even when the request layer owns the failure count.
         const key = "router.catch1\0admission_read_failed";
         const item = causes.get(key) ?? { tag: "router.catch1", causeKey: "admission_read_failed", count: 0 };
         item.count++; causes.set(key, item); probeCause(key, probeRow);
       }
+    }
+    if (line.name === "robob.link_down" && line.link) {
+      const key = "robob.link_down\0robob_unavailable";
+      const item = causes.get(key) ?? { tag: "robob.link_down", causeKey: "robob_unavailable", count: 0 };
+      item.count++; causes.set(key, item);
     }
     robobLink.accept(line);
     chainAggregation.accept(line);

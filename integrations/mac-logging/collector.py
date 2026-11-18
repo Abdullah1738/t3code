@@ -216,7 +216,7 @@ def unified(since, until, run=unified_command, timeout=60):
         return dt.datetime.fromtimestamp(value, dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     result = run(['/usr/bin/log', 'show', '--style', 'json', '--timezone', 'UTC',
                   '--start', stamp(since), '--end', stamp(until+1), '--predicate',
-                  'eventMessage CONTAINS "=== system boot" OR (process == "kernel" AND eventMessage CONTAINS "PMU") OR (process == "watchdogd" AND eventMessage CONTAINS "unresponsive")'],
+                  '(type == timesyncEvent AND eventMessage CONTAINS "=== system boot") OR (process == "kernel" AND eventMessage CONTAINS "PMU") OR (process == "watchdogd" AND eventMessage CONTAINS "unresponsive")'],
                  capture_output=True, text=True, timeout=min(UNIFIED_CALL_S, timeout),
                  env={**os.environ, 'LC_ALL': 'C'})
     if result.returncode:
@@ -1061,6 +1061,11 @@ def main():
         directory_inventory(deadline=deadline)
     except Exception:
         emit('disk', 'error', 'disk.inventory', ok=False, error_tag='disk.inventory_failed')
+    try:
+        from disk_budgets import sample
+        sample()
+    except Exception:
+        emit('disk', 'error', 'disk.budget.failed', ok=False, error_tag='disk.budget_failed')
 
 
 if __name__ == '__main__':

@@ -4341,3 +4341,47 @@ it.effect("find exposes the oldest active tool from the run projection without i
     );
   }),
 );
+
+it.effect(
+  "live inventory includes queued, running and waiting work but excludes ended history",
+  () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      for (const [ordinal, status] of [
+        "queued",
+        "preparing",
+        "starting",
+        "running",
+        "waiting",
+        "completed",
+        "failed",
+        "cancelled",
+      ].entries()) {
+        yield* sql`INSERT INTO orchestration_v2_projection_runs ${sql.insert({
+          run_id: `inventory-${ordinal}`,
+          thread_id: `inventory-thread-${ordinal}`,
+          ordinal,
+          provider: "codex",
+          status,
+          requested_at: "2026-01-01T00:00:00.000Z",
+          completed_at: null,
+          payload_json: "{}",
+        })}`;
+      }
+      yield* Effect.gen(function* () {
+        const threads = yield* KanbanThreads;
+        expect([...(yield* threads.liveThreadIds())].sort()).toEqual(
+          Array.from({ length: 5 }, (_, i) => `inventory-thread-${i}`),
+        );
+        yield* sql`UPDATE orchestration_v2_projection_runs SET status = 'running' WHERE run_id = 'inventory-5'`;
+        expect(yield* threads.liveThreadIds()).toContain("inventory-thread-5");
+      }).pipe(
+        Effect.provide(
+          layer.pipe(
+            Layer.provide(Layer.mock(ThreadManagementService.ThreadManagementService)({})),
+            Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
+          ),
+        ),
+      );
+    }).pipe(Effect.provide(Sqlite.layerMemory)),
+);

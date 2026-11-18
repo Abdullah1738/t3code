@@ -19,7 +19,8 @@ Recipients: abdullah + moni + bridge-backed rider + booker + extras, deduped. No
 a bridge chat and the off-bridge rider are excluded, including from old metadata. Abdullah gets the tailnet
 URL; everyone else gets the public share URL (group chats always get it as a link: the bridge has no
 app cards in groups). The caller's chat comes from the bridge's own route for --session, never from a
-flag. From the owner session every recipient is reachable (--to SLUG), and --chat SLUG sends only to
+flag. From the owner session local recipients use --to SLUG and remote chats use agent-ask to
+relay their public link from their own box. --chat SLUG sends only to
 those chats and adds them to the ride. From any other chat only that chat itself, which is always
 allowed. Session ids rotate, so never store one in a watcher: wakes land in the owner thread, which
 sends with its current session and --chat SLUG.
@@ -58,6 +59,25 @@ STALE_S = 120
 NAMES = {"abdullah": "Abdullah", "moni": "Moni"}
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 BASE_RECIPIENTS = ("abdullah", "moni")
+
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from toollog import helper_main, tool_log, stderr_cause
+except ImportError:
+    def helper_main(_name, fn, *args):
+        return fn(*args)
+    def tool_log(_entry):
+        pass
+    def stderr_cause(_text, **_kwargs):
+        return {}
+
+
+def log_event(name, *, who=None, key=None, ack=None, command=None, error=None, exit_code=None):
+    tool_log({"component": "ride-card", "name": name, "kind": "error" if error else "event",
+              "ok": not bool(error), "ids": {"helper": "ride-card." + command if command else "ride-card", "chat": who, "key": key,
+              "item": ack, "operation": command},
+              "props": {"exitCode": exit_code, **stderr_cause(error or "")},
+              **({"error": {"tag": "bridge.request_failed"}} if error else {})})
 
 
 def root():
@@ -757,7 +777,18 @@ def sent_to(uuid):
     """Recipients whose card the bridge took, minus any the bridge's outbox shows it later dropped."""
     j = read_json(journal_path(uuid), {}) or {}
     return {who for who, r in (j.get("recipients") or {}).items()
-            if r.get("status") == "sent" and not dropped(who, r)}
+            if r.get("status") in ("sent", "relayed") and not dropped(who, r)}
+
+
+def remote_refusal(error):
+    return bool(re.search(r"\(HTTP 403\)", error or "")
+                and "Use agent-ask to reach this chat on its box" in error)
+
+
+class BridgeError(RuntimeError):
+    def __init__(self, command, error, exit_code):
+        super().__init__(f"bridge {command} failed ({exit_code}): {error.strip()[:300]}")
+        self.remote_chat = remote_refusal(error)
 
 
 def bridge(*args, timeout=60):
@@ -766,15 +797,21 @@ def bridge(*args, timeout=60):
         sys.exit(f"refused: test run; ride-card would send via the real bridge ({args[0] if args else '?'}); "
                  "set RIDE_CARD_BRIDGE to a stub")
     env = {k: v for k, v in os.environ.items() if k != "BUN_INSPECT"}
-    p = subprocess.run([*bridge_cmd(), *args], capture_output=True, text=True, timeout=timeout, env=env,
-                       stdin=subprocess.DEVNULL)
+    try:
+        p = subprocess.run([*bridge_cmd(), *args], capture_output=True, text=True, timeout=timeout, env=env,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        log_event("bridge.error", command=args[0], error=str(ex))
+        raise
     out = p.stdout.strip()
     try:
         data = json.loads(out.splitlines()[-1]) if out else {}
     except Exception:
         data = {"raw": out[:300]}
     if p.returncode != 0:
-        raise RuntimeError(f"bridge {args[0]} failed ({p.returncode}): {(p.stderr or out).strip()[:300]}")
+        error = p.stderr or out
+        log_event("bridge.error", command=args[0], error=error, exit_code=p.returncode)
+        raise BridgeError(args[0], error, p.returncode)
     return data
 
 
@@ -925,6 +962,8 @@ def bridge_app_to():
 
 
 def moni_has_cards():
+    if remote_chat("moni"):
+        return False
     if not bridge_app_to():
         return False
     tool = os.environ.get("RIDE_CARD_ENROLL") or "/Volumes/ExternalSSD/t3code-fork/integrations/robob-cards/bin/robob-cards-enroll"
@@ -953,6 +992,10 @@ def payload_for(c, recipient, url, mode):
     if mode == "link":
         p["text"] = f"{caption}, live: {url}"
     return p
+
+
+def link_payload(p):
+    return {**p, "mode": "link", "text": p.get("text") or f"{p['caption']}, live: {p['url']}"}
 
 
 def read_route(db):
@@ -992,7 +1035,32 @@ def chat_for_session(session):
 
 
 def known_chat(slug):
-    return slug == "abdullah" or (bridge_state() / "chats" / slug / "state.sqlite").is_file()
+    return slug == "abdullah" or remote_chat(slug) or (bridge_state() / "chats" / slug / "state.sqlite").is_file()
+
+
+def remote_chat(who):
+    config = read_json(bridge_state() / "config.json", {}) or {}
+    return who != "abdullah" and (config.get("chatBackends", {}).get(who) or {}).get("kind") == "remote-box"
+
+
+def relay_id(key):
+    return "areq_" + hashlib.sha256(json.dumps(["owner", key], separators=(",", ":")).encode()).hexdigest()
+
+
+def relay_outbox(who, keys):
+    try:
+        with sqlite3.connect(f"{chat_db('abdullah').absolute().as_uri()}?mode=ro", uri=True, timeout=5) as con:
+            rows = con.execute("select id, to_slug, status from agent_requests where id in ("
+                               + ",".join("?" * len(keys)) + ")", [relay_id(k) for k in keys]).fetchall()
+        if any(target != who for _, target, _ in rows):
+            return None
+        # The bus commits the row before queuing its wake. An open row with no ack
+        # needs the same ask replayed; only an answer proves the remote agent saw it.
+        return {oid: ("live" if state in ("pending", "done", "done_late")
+                      else "retry" if state == "open" else "maybe", state)
+                for oid, _, state in rows}
+    except (OSError, sqlite3.Error):
+        return None
 
 
 def bridge_slug(who):
@@ -1087,11 +1155,20 @@ def no_to(err):
 
 def _ops(who, r):
     keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
-    mode = (r.get("payload") or {}).get("mode")
+    mode = r.get("direct_mode") or (r.get("payload") or {}).get("mode")
     if not keys or not mode:
         return keys, {}, None, None
     route, states = outbox(who, {op for k in keys for op in op_ids(who, mode, k).values()})
-    return keys, {(k, via): op for k in keys for via, op in op_ids(who, mode, k).items()}, route, states
+    ids = {(k, via): op for k in keys for via, op in op_ids(who, mode, k).items()}
+    if r.get("relay"):
+        bus = relay_outbox(who, keys)
+        # A clean refusal queued nothing. Remote chats need not retain a local outbox.
+        direct_open = any(a.get("via") != "relay" for a in open_attempts(r))
+        if states is None and not direct_open and (r.get("via") == "relay" or remote_refusal(r.get("error")) or not r.get("attempts")):
+            states = {}
+        states = {**states, **bus} if states is not None and bus is not None else None
+        ids.update({(k, "relay"): relay_id(k) for k in keys})
+    return keys, ids, route, states
 
 
 def open_attempts(r):
@@ -1100,7 +1177,7 @@ def open_attempts(r):
         return list(r["open"])
     # A journal from before per-attempt records: only its last attempt can still be open.
     keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
-    if r.get("attempts") and keys and r.get("status") != "sent" and not r.get("refused"):
+    if r.get("attempts") and keys and r.get("status") not in ("sent", "relayed") and not r.get("refused") and not remote_refusal(r.get("error")):
         return [{"via": r.get("via"), "key": r.get("key") or keys[-1], "session": None}]
     return []
 
@@ -1112,7 +1189,7 @@ def waiting(r, ids, route, states):
     an unanswered --to request except an op, so only the same op may carry its retry."""
     out = []
     for a in open_attempts(r):
-        vias = [a.get("via")] if a.get("via") in ("self", "to") else ["self", "to"]
+        vias = [a.get("via")] if a.get("via") in ("self", "to", "relay") else ["self", "to"]
         if any(ids.get((a.get("key"), v)) in states for v in vias):
             continue
         if vias == ["self"] and a.get("session") and isinstance(route, dict) and not session_matches(route, a["session"]):
@@ -1141,7 +1218,9 @@ def standing(uuid, who, r, planned):
     still land can only be retried as the same bridge op (same route and key); once every attempt
     is settled, a dead op lets any route go again on a key it never used."""
     keys, ids, route, states = _ops(who, r)
-    sent = r.get("status") == "sent"
+    sent = r.get("status") in ("sent", "relayed")
+    accepted = "relayed" if r.get("status") == "relayed" else "sent"
+    already = f"relayed via {NAMES.get(who, who)}'s box" if accepted == "relayed" else "already sent"
     # A relinked recipient's old keys are retired with the dead link: a new key family, so the
     # bridge can't answer "already had it" for the new one.
     base = f"uber:{uuid}:card:{who}" + (f":relink{r['relink']}" if r.get("relink") else "")
@@ -1149,11 +1228,11 @@ def standing(uuid, who, r, planned):
                      else f"{base}:{len(keys) + 1}")
     if not ids:
         if sent:
-            return ("sent", "already sent"), None
+            return (accepted, already), None
         return None, (keys[-1] if keys else base)
     if states is None:
         if sent:
-            return ("sent", "already sent"), None
+            return (accepted, already), None
         if r.get("attempts"):
             return ("failed", f"failed: can't read the bridge outbox for {who}, and an earlier attempt "
                               "may have gone through; not sending again"), None
@@ -1162,14 +1241,25 @@ def standing(uuid, who, r, planned):
     for kind, state in states.values():
         seen.setdefault(kind, set()).add(state)
     if "live" in seen:
+        if any(oid.startswith("areq_") and kind == "live" for oid, (kind, _) in states.items()):
+            return ("relayed", f"relayed via {NAMES.get(who, who)}'s box"), None
         return ("sent", "already sent" if sent
                 else f"already queued (bridge: {', '.join(sorted(seen['live']))})"), None
     if "maybe" in seen:
+        if r.get("relay"):
+            return ("failed", f"failed: an earlier attempt may have reached {who}; check the chat before sending again"), None
         if sent:
             return ("sent", f"already sent (bridge: {', '.join(sorted(seen['maybe']))})"), None
         return ("failed", f"failed: an earlier attempt may have reached {who} (bridge: "
                           f"{', '.join(sorted(seen['maybe']))}); check the chat before sending again"), None
     held = waiting(r, ids, route, states)
+    retry = [k for k in keys if (states.get(ids.get((k, "relay"))) or (None,))[0] == "retry"]
+    if retry:
+        if sent:
+            return (accepted, already), None  # the journal holds the validated bus ack
+        if planned == "relay" and len(retry) == 1 and all((a.get("key"), a.get("via")) == (retry[0], "relay") for a in held):
+            return None, retry[0]
+        return ("failed", f"failed: an earlier attempt may have reached {who}; check the chat before sending again"), None
     if held:
         ops = {(a.get("key"), a.get("via")) for a in held}
         if len(ops) == 1 and next(iter(ops))[1] == planned:
@@ -1178,16 +1268,22 @@ def standing(uuid, who, r, planned):
         return ("failed", f"failed: an earlier attempt for {who} went {gone}, got no answer and may still land; "
                           "retry the same way, or check the chat first"), None
     last_key, last_via = r.get("key") or keys[-1], r.get("via")
-    last = [ids[(last_key, last_via)]] if last_via in ("self", "to") else [ids[(last_key, v)] for v in ("self", "to")]
+    last = [ids[(last_key, last_via)]] if last_via in ("self", "to", "relay") else [ids[(last_key, v)] for v in ("self", "to")]
     if any(op in states for op in last):
         return None, fresh()  # the bridge took the last one and dropped it unsent
     if sent:
-        return ("sent", "already sent"), None  # nothing shows it was lost
+        return (accepted, already), None  # nothing shows it was lost
     return None, fresh()
 
 
-def deliver(uuid, recipient, p, session, to, key):
-    if p["mode"] == "card":
+def deliver(uuid, recipient, p, session, to, key, relay=False):
+    if relay:
+        request = ("Send this ride card link once in your own chat, using bridge send with dedupe key "
+                   + json.dumps(key) + ". Keep that same key on any retry; reconcile an ambiguous send. "
+                   "The exact message is the JSON string below. Answer done only after bridge acceptance; "
+                   "otherwise answer declined with the send error.\n" + json.dumps(p["text"]))
+        args = ["agent-ask", "--text=" + request, "--session", session, "--key", key]
+    elif p["mode"] == "card":
         args = ["app", "--url", p["url"], f"--caption={p['caption']}", f"--summary={p['summary']}",
                 "--session", session, "--key", key]
         if p.get("subcaption"):
@@ -1265,11 +1361,17 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
         _add_extras(uuid, [who for who, _ in plan if who != "abdullah" and who not in everyone])
     for who, to in plan:
         r = recips.setdefault(who, {})
+        relay = bool(to and who != "abdullah" and (remote_chat(who) or r.get("relay") or remote_refusal(r.get("error"))))
+        if relay:
+            r["relay"] = True
         mode = (r.get("payload") or {}).get("mode") or r.get("mode") or modes.get(who) or (
             "card" if who == "abdullah" else "card" if who == "moni" and moni_has_cards() else "link")
+        if relay:
+            r.setdefault("direct_mode", mode)
+            mode = "link"
         if who == "abdullah" and r.get("via") == "self" and r.get("no_to"):
             to = None  # this bridge refused `--to owner` before: the owner session reaches itself
-        via = "to" if to else "self"
+        via = "relay" if relay else "to" if to else "self"
         where = f" --to {to}" if to else " to this chat"
         outcome, key = standing(uuid, who, r, via)
         if outcome:
@@ -1277,14 +1379,17 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
             result[who] = text
             if kind == "failed":
                 failed = True
-            elif not dry_run and r.get("status") != "sent":
-                r.update(status="sent", sent_at=r.get("sent_at") or iso(time.time()), error=None)
+            elif not dry_run and r.get("status") != kind:
+                r.update(status=kind, sent_at=r.get("sent_at") or iso(time.time()), error=None)
+                if kind == "relayed":
+                    r["agent_request_id"] = relay_id(r["key"])
+                    log_event("relay", who=who, key=r["key"], ack=r["agent_request_id"])
                 _save_journal(uuid, j)
             continue
         try:
             if "payload" not in r:
                 if dry_run:
-                    result[who] = f"would publish+send {mode}{where}"
+                    result[who] = f"would publish+relay link via agent-ask{where}" if relay else f"would publish+send {mode}{where}"
                     continue
                 if mode == "card" and to and who != "abdullah" and not bridge_app_to():
                     # An old server ignores `to` and posts in the caller's chat. For the owner's own
@@ -1304,8 +1409,11 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
                 r["created_at"] = iso(time.time())
                 _save_journal(uuid, j)
             if dry_run:
-                result[who] = f"would send {r['payload']['mode']} {r['payload']['url']}{where}"
+                result[who] = (f"would relay link {r['payload']['url']} via agent-ask{where}" if relay
+                               else f"would send {r['payload']['mode']} {r['payload']['url']}{where}")
                 continue
+            if relay:
+                r["payload"] = link_payload(r["payload"])
             keys = r.get("keys") or ([r["key"]] if r.get("key") else [])
             r["open"] = open_attempts(r)
             for attempt in (1, 2):
@@ -1318,10 +1426,22 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
                          attempted_at=entry["at"])
                 _save_journal(uuid, j)
                 try:
-                    ack = deliver(uuid, who, r["payload"], session, to, key)
+                    ack = deliver(uuid, who, r["payload"], session, to, key, relay=relay)
                 except Exception as ex:
                     if refused(str(ex)):
                         r["open"].remove(entry)  # the bridge said no to this one: it queued nothing
+                    if attempt == 1 and to and who != "abdullah" and isinstance(ex, BridgeError) and ex.remote_chat:
+                        r.update(relay=True, direct_mode=r["payload"]["mode"], error=str(ex))
+                        relay, via = True, "relay"
+                        outcome, key = standing(uuid, who, r, via)
+                        if outcome and outcome[0] == "failed":
+                            raise RuntimeError(outcome[1].removeprefix("failed: "))
+                        if outcome:
+                            done = outcome[1]
+                            relay = outcome[0] == "relayed"
+                            break
+                        r["payload"] = link_payload(r["payload"])
+                        continue
                     if attempt == 1 and who == "abdullah" and to and no_to(str(ex)):
                         # An older bridge. From the owner session the owner's own route reaches the
                         # same chat, but that route may hold an earlier op under this key.
@@ -1335,7 +1455,8 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
                             break
                         continue
                     raise
-                r["open"] = [a for a in r["open"] if (a.get("key"), a.get("via")) != (key, via)]
+                if relay and (not isinstance(ack, dict) or ack.get("id") != relay_id(key) or type(ack.get("created")) is not bool):
+                    raise RuntimeError("bridge agent-ask returned a bad ack")
                 if isinstance(ack, dict) and ack.get("created") is False:
                     # The bridge already had this op; that is only a send if the op is still going.
                     _, ids, _, states = _ops(who, r)
@@ -1346,9 +1467,15 @@ def _send_locked(uuid, c, session, caller, dry_run, modes, force, targets=()):
                     if had[0] == "dead":
                         raise RuntimeError("the bridge already had this card under that key and dropped it; "
                                            "send again for a fresh key")
-                done = "sent"
+                    if had[0] == "maybe":
+                        raise RuntimeError(f"an earlier attempt may have reached {who}; check the chat first")
+                r["open"] = [a for a in r["open"] if (a.get("key"), a.get("via")) != (key, via)]
+                if relay:
+                    r["agent_request_id"] = ack["id"]
+                    log_event("relay", who=who, key=key, ack=ack["id"])
+                done = f"relayed via {NAMES.get(who, who)}'s box" if relay else "sent"
                 break
-            r.update(status="sent", sent_at=iso(time.time()), error=None)
+            r.update(status="relayed" if relay else "sent", sent_at=iso(time.time()), error=None)
             result[who] = done
         except Exception as ex:
             err = str(ex)[:300]
@@ -1518,12 +1645,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    try:
-        from pathlib import Path as _LogPath
-        sys.path.insert(0, str(_LogPath(__file__).resolve().parents[1]))
-        from toollog import helper_main
-    except Exception:
-        # Standalone copies of helpers can run before the optional logger is installed.
-        def helper_main(_name, fn, *args):
-            return fn(*args)
     sys.exit(helper_main("ride-card", main))

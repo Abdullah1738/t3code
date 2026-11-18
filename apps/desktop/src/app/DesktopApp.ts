@@ -1,3 +1,5 @@
+import { BACKEND_STOP_DEADLINE_MS } from "../backend/DesktopBackendProcess.ts";
+import { reclaimBackendPort } from "../backend/DesktopBackendOrphan.ts";
 import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -153,7 +155,7 @@ export const stopAllPoolInstances = Effect.fn("desktop.app.stopAllPoolInstances"
     const instances = yield* pool.list;
     yield* Effect.forEach(
       instances,
-      (instance) => instance.stop({ timeout: Duration.seconds(5) }),
+      (instance) => instance.stop({ timeout: Duration.millis(BACKEND_STOP_DEADLINE_MS) }),
       { concurrency: "unbounded" },
     );
   },
@@ -203,6 +205,28 @@ const bootstrap = Effect.gen(function* () {
     return yield* new DesktopDevelopmentBackendPortRequiredError();
   }
 
+  const net = yield* NetService.NetService;
+  const startupPort = Option.getOrElse(
+    environment.configuredBackendPort,
+    () => DEFAULT_DESKTOP_BACKEND_PORT,
+  );
+  yield* Effect.tryPromise(() =>
+    reclaimBackendPort({
+      platform: environment.platform,
+      isPackaged: environment.isPackaged,
+      isDevelopment: environment.isDevelopment,
+      executable: process.execPath,
+      entryPath: environment.backendEntryPath,
+      homeDir: environment.baseDir,
+      port: startupPort,
+      isPortFree: () =>
+        Effect.runPromise(
+          Effect.forEach(DESKTOP_BACKEND_PORT_PROBE_HOSTS, (host) =>
+            net.canListenOnHost(startupPort, host),
+          ).pipe(Effect.map((available) => available.every(Boolean))),
+        ),
+    }),
+  );
   const backendPortSelection = yield* resolveDesktopBackendPort(environment.configuredBackendPort);
   const backendPort = backendPortSelection.port;
   yield* logBootstrapInfo(

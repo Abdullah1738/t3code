@@ -99,6 +99,7 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
         return dict(loadAvg1Start=load_start, loadAvg1End=load_end, loadAvg1Max=load_max,
                     **{key: metrics[key] for key in ('cpuSecondsDu', 'wallSecondsDu',
                        'firstAttempts', 'firstAttemptTimeouts', 'secondsWasted')})
+    seconds_by_root = {}
     roots = list(jobs.DIRECTORY_ROOTS if paths is None else paths)
     priorities = {str(Path('/Volumes/ExternalSSD')/name): i for i, name in enumerate(SLOW_ROOTS)}
     roots.sort(key=lambda p: (priorities.get(str(p), len(priorities)), str(p)))
@@ -212,6 +213,14 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                        for root, (entries, listed) in listings.items() for entry in entries)
         queue = list(roots)
         try:
+            if paths is None:
+                from disk_budgets import deep_refresh, load_budgets
+                # Extra targets share this pass's lock and wall/monotonic budget.
+                try:
+                    deep_refresh(load_budgets(), state, runner,
+                                 min(deadline, time.monotonic()+max(0, wall_deadline-time.time())), stopped)
+                except Exception:
+                    emit('disk', 'error', 'disk.budget.failed', ok=False, error_tag='disk.budget_failed')
             while queue:
                 path = queue.pop(0)
                 key = str(path)
@@ -258,7 +267,9 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                                                      descend=lambda: not part_work[key] or not healthy_pending(),
                                                      inventory_log=inventory_logs[key])
                 finally:
-                    inventory_logs[key].elapsed_ms += max(0, (time.monotonic()-scan_started)*1000)
+                    elapsed = max(0, time.monotonic()-scan_started)
+                    inventory_logs[key].elapsed_ms += elapsed*1000
+                    seconds_by_root[key] = seconds_by_root.get(key, 0)+elapsed
                 checkpoint(*result)
                 # Yield after 60 s or four cheap batches; an expensive parts
                 # command is capped at 600 s across this child for the pass.
@@ -304,6 +315,8 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
                 emit('disk', 'event', 'disk.deep.root', props=dict(duMode='links', source=key,
                      completedCount=complete, partial=not listed or complete != len(entries),
                      failedCount=len(entries)-complete, ageS=max(ages, default=0),
+                     completeWithDenied=status['completeWithDenied'],
+                     **jobs.inventory_diagnostics(cache, time.time()),
                      childrenWithPartsInProgress=sum(isinstance(v.get('parts'), dict)
                          and v.get('partial') is not False for v in cache.values())))
             state['sourceErrors'] = len(state['partials'])
@@ -312,7 +325,8 @@ def run_pass(paths=None, run=None, budget=BUDGET_S, stopped=lambda: False):
             if stop_reason == 'done' and (time.monotonic() >= deadline or time.time() >= wall_deadline):
                 stop_reason = 'budget'
             sample_load()
-            emit('disk', 'perf', 'disk.deep.end', duration_ms=(time.monotonic()-started)*1000, props=props())
+            emit('disk', 'perf', 'disk.deep.end', duration_ms=(time.monotonic()-started)*1000,
+                 props=dict(props(), secondsByRoot=seconds_by_root))
 
 
 def main():

@@ -8,6 +8,7 @@ Mail auth reuses mailsearch/mail_oauth; each account is isolated in a timed chil
 import argparse
 import collections
 import concurrent.futures
+from contextlib import contextmanager
 import copy
 import datetime as dt
 import email
@@ -26,6 +27,7 @@ import re
 import shlex
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -33,6 +35,10 @@ import threading
 import types
 import urllib.error
 import urllib.request
+
+# Stop helper imports from writing beside the live installation before main parses args.
+if any(arg.startswith('--dry') for arg in sys.argv[1:]):
+    sys.dont_write_bytecode = True
 
 # robob-watch test copies the watcher into scratch, while helpers stay installed.
 REDACT_HELPERS = Path(__file__).resolve().parents[2] / 'helpers'
@@ -175,6 +181,59 @@ def log_failure(tag, item=None, *, watcher=None):
     if watcher is not None:
         ids['watcher'] = watcher
     tool_error('triage', tag, ids)
+
+
+@contextmanager
+def dry_environment(args):
+    if args.dry_run_hours is None:
+        yield
+        return
+    directory = os.environ.get('WATCH_DIR')
+    if not directory:
+        raise ValueError('dry run requires an explicit scratch WATCH_DIR')
+    wd = Path(directory).resolve()
+    if wd == Path(__file__).resolve().parent or wd == LIVE.parent.resolve() or LIVE.parent.resolve() in wd.parents:
+        raise ValueError('dry run requires a scratch WATCH_DIR outside the live install')
+    report = getattr(args, 'report', None)
+    if report and wd not in Path(report).resolve().parents:
+        raise ValueError('dry-run report must be inside the scratch WATCH_DIR')
+    if wd.exists():
+        scratch_tree(wd, wd)
+    updates = {'WATCH_DIR': str(wd), 'PYTHONDONTWRITEBYTECODE': '1', 'INBOX_TRIAGE_DRY_RUN': '1'}
+    for key, fallback in (('TOOLLOG_DIR', wd / 'diagnostics/tools/watchers'),
+                          ('ROBOB_TOOL_LOG_DIR', wd / 'diagnostics/tools'),
+                          ('MSGS_LOG_DIR', wd / 'diagnostics/archive')):
+        requested = Path(os.environ.get(key, str(fallback))).resolve()
+        updates[key] = str(requested if wd in requested.parents or requested == wd else fallback)
+        if wd not in Path(updates[key]).resolve().parents and Path(updates[key]).resolve() != wd:
+            raise ValueError('dry-run logs must be inside the scratch WATCH_DIR')
+    # Admission is for live replay commits. A diagnostic must not contact its runner's lease.
+    removed = {key for key in os.environ if key.startswith('ROBOB_') and key != 'ROBOB_TEST'}
+    removed |= {'WATCH_ATTEMPT', 'WATCH_RUN', 'WATCH_PENDING', 'WATCH_MAIN_CHECKED', 'WATCH_CLOSING',
+                'HEALTH_TOOLLOG_RUN', 'HEALTH_TOOLLOG_TRIGGER'}
+    previous = {key: os.environ.get(key) for key in removed | updates.keys()}
+    bytecode = sys.dont_write_bytecode
+    try:
+        for key in removed:
+            os.environ.pop(key, None)
+        os.environ.update(updates)
+        sys.dont_write_bytecode = True
+        yield
+    finally:
+        sys.dont_write_bytecode = bytecode
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def dry_run_scope(fn):
+    @functools.wraps(fn)
+    def wrapped(args):
+        with dry_environment(args):
+            return fn(args)
+    return wrapped
 
 
 def trace_run(name):
@@ -495,7 +554,7 @@ def answered(items, deadline=None):
     chats = [i for i in items if i['source'] == 'whatsapp']
     if chats:
         try:
-            wa = load_module('triage_wadb', HELPERS / 'wa-db')
+            wa = whatsapp_helper()
             with db(HOME / '.wacli/wacli.db') as c:
                 for item in chats:
                     if late(deadline):
@@ -563,6 +622,11 @@ def money_books(wd, mc, dry=False):
     if not dry and wd.resolve() == LIVE.resolve():
         return None
     data = wd / ('scratch-renewals' if dry else 'scratch-money')
+    if dry:
+        scratch_destination(data, wd)
+        # Existing book, temp and lock files can all be opened by money-cases.
+        if data.exists():
+            scratch_tree(data, wd)
     if not data.exists():
         data.mkdir(mode=0o700, parents=True)
         for name in ('cases.json', 'questions.json', 'cards.json', 'subscriptions.json'):
@@ -570,8 +634,76 @@ def money_books(wd, mc, dry=False):
                 contents = expected_auth.read_bytes(mc.DATA / name)
             except FileNotFoundError:
                 continue
-            (data / name).write_bytes(contents)
+            if dry:
+                scratch_destination(data / name, wd)
+                with (data / name).open('xb') as target:
+                    target.write(contents)
+            else:
+                (data / name).write_bytes(contents)
     return data
+
+
+def scratch_destination(path, wd):
+    path, wd = Path(path), Path(wd).resolve()
+    resolved = path.resolve()
+    if resolved == wd or wd not in resolved.parents or path.is_symlink():
+        raise ValueError('dry run refused: scratch destination escapes WATCH_DIR or is a symlink')
+    if path.exists():
+        info = path.stat()
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            raise ValueError('dry run refused: scratch destination is a hardlink')
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            raise ValueError('dry run refused: scratch destination is not a regular file or directory')
+
+
+def scratch_tree(directory, wd):
+    # rglob silently skips unreadable subdirectories, which can hide unsafe log/book files.
+    try:
+        for path in directory.iterdir():
+            scratch_destination(path, wd)
+            if path.is_dir():
+                scratch_tree(path, wd)
+    except OSError as error:
+        raise ValueError('dry run refused: cannot inspect scratch directory (' + type(error).__name__ + ')') from error
+
+
+@contextmanager
+def archive_reads(mc, dry):
+    if not dry:
+        yield
+        return
+    python = Path('/opt/homebrew/opt/python@3.14/bin/python3.14')
+    command = [str(python) if python.exists() else sys.executable, '-I', '-B',
+               str(Path(__file__).resolve()), '--dry-archive-worker']
+    original = mc.charges.msgs
+    def msgs(argv, *args, **kwargs):
+        return original(command + argv[1:], *args, **kwargs)
+    try:
+        mc.charges.msgs = msgs
+        yield
+    finally:
+        mc.charges.msgs = original
+
+
+def dry_archive_worker(argv):
+    if not argv or argv[0] not in ('search', 'show'):
+        raise ValueError('dry archive worker only permits search and show')
+    # Archive search now records timing even for reads; keep that child log in scratch.
+    logs = os.environ.get('TOOLLOG_DIR') or str(Path(os.environ['WATCH_DIR']) / 'diagnostics/archive')
+    os.environ['MSGS_LOG_DIR'] = logs
+    source = Path(__file__).resolve().parents[3] / 'message-archive/src/msgs.py'
+    if not source.is_file():
+        source = HOME / '.local/share/message-archive/src/msgs.py'
+    archive = load_module('triage_dry_archive', source)
+    def connect(readonly=False):
+        if not readonly:
+            raise ValueError('dry archive worker refused a writable connection')
+        connection = sqlite_reader(archive.common.DB_PATH, timeout=30, dry=True)
+        connection.row_factory = sqlite3.Row
+        return connection
+    archive.store.connect = connect
+    archive.main(argv)
+    return 0
 
 
 def payment_notice(item, text):
@@ -671,7 +803,7 @@ def charge_checks(items, now, dry, deadline=None, wd=None):
     try:
         mc = load_module('triage_money_cases', MONEY_CASES)
         parse = mc.charges.parse
-        data = None if dry or wd is None else money_books(wd, mc)
+        data = money_books(wd, mc, dry=dry) if wd is not None else None
     except Exception as e:
         log_failure('charge.load_failed')
         return reasons, held, f'{type(e).__name__}: {str(e)[:160]}'
@@ -698,8 +830,9 @@ def charge_checks(items, now, dry, deadline=None, wd=None):
         # A dry run has no next tick to hold anything for.
         hold = not dry and charge['kind'] == 'charge' and age is not None and age < CHARGE_SETTLE
         try:
-            r = mc.screen(text, sender, at=dt.datetime.fromtimestamp(item['ts'], mc.TZ) if age is not None else None,
-                          now=when, deadline=deadline, data=data, record=not dry, item=item['id'])
+            with archive_reads(mc, dry):
+                r = mc.screen(text, sender, at=dt.datetime.fromtimestamp(item['ts'], mc.TZ) if age is not None else None,
+                              now=when, deadline=deadline, data=data, record=not dry, item=item['id'])
         except Exception as e:
             log_failure('charge.screen_failed', item)
             problems.append(f'{type(e).__name__}: {str(e)[:100]}')
@@ -889,6 +1022,10 @@ class MailAuthRejected(RuntimeError):
 
 def mail_credentials(account, refresh=False):
     mail = load_module('triage_mail_credentials', HOME / '.local/bin/mailsearch')
+    if os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1':
+        if refresh:
+            raise RuntimeError('mail: skipped (dry run, credential refresh disabled)')
+        return dry_mail_credential(mail, account, 7)
     if account == 'icloud':
         return mail.secret([mail.KC_READ, 'himalaya-icloud', 'himalaya'], 15)
     oauth = mail.mail_oauth
@@ -934,12 +1071,22 @@ def cached_mail_credential(account, seconds):
         return None
 
 
-def prepare_mail_credentials(account, seconds, diagnostics=None, *, refresh=False):
+def prepare_mail_credentials(account, seconds, diagnostics=None, *, refresh=False, dry=False):
     # The runner kills its entire process group. A refresh must survive that too,
     # not just the narrower mail-worker timeout. Only the wait is bounded here.
     command = [sys.executable, str(Path(__file__).resolve()), '--mail-credentials', account]
     if refresh:
         command.append('--refresh-mail-credentials')
+    if dry or os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1':
+        if refresh:
+            raise RuntimeError('mail: skipped (dry run, credential refresh disabled)')
+        response = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=seconds, env={**os.environ, 'INBOX_TRIAGE_DRY_RUN': '1',
+                                                       'PYTHONDONTWRITEBYTECODE': '1'})
+        if response.returncode or not response.stdout.strip():
+            # The credential child emits only fixed dry-mode errors, never the token.
+            raise RuntimeError(response.stderr.strip() or 'mail: skipped (dry run, cached credential unavailable)')
+        return response.stdout.strip()
     path = credential_guard_path(account)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open('a+') as guard:
@@ -993,13 +1140,51 @@ def mail_auth_transport(factory, *args, **kwargs):
     return connection
 
 
+def dry_mail_credential(mail, account, timeout):
+    if mail.ACCOUNTS[account]['auth'] == 'icloud':
+        return mail.secret([mail.KC_READ, 'himalaya-icloud', 'himalaya'], timeout)
+    # ortie token show can refresh. Read only the stored access token; the normal OAuth
+    # connection also writes heal/good-IP state, so replay authenticates directly.
+    response = subprocess.run([mail.KC_READ, f'ortie-{account}'], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=timeout)
+    try:
+        blob = json.loads(response.stdout) if response.returncode == 0 else {}
+        token = blob.get('access_token')
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError('missing token')
+        expires = float(blob.get('issued_at', 0)) + float(blob.get('expires_in', 0))
+        if not expires > time.time() + 60:
+            raise RuntimeError('mail: skipped (dry run, cached token expired)')
+    except (ValueError, TypeError, AttributeError):
+        raise RuntimeError('mail: skipped (dry run, cached credential unavailable)') from None
+    return token
+
+
+def dry_mail_connect(mail, account, timeout, credential=None):
+    cfg = mail.ACCOUNTS[account]
+    if cfg['auth'] == 'icloud':
+        return mail.connect(account, timeout)
+    token = credential if credential is not None else dry_mail_credential(mail, account, timeout)
+    connection = mail.imaplib.IMAP4_SSL(cfg['host'], timeout=timeout)
+    try:
+        connection.authenticate('XOAUTH2', lambda _: f'user={cfg["user"]}\x01auth=Bearer {token}\x01\x01'.encode())
+        return connection
+    except Exception:
+        try:
+            connection.shutdown()
+        except Exception:
+            pass
+        raise RuntimeError('mail: skipped (dry run, cached credential rejected or connection failed)') from None
+
+
 def mail_worker(account, request):
     deadline = time.monotonic() + (7 if request.get('fast') else 10)
     mail = load_module('triage_mailsearch', HOME / '.local/bin/mailsearch')
     # Credentials only cross stdin. No refresh-capable command runs in this process.
     credential = request['credential']
     mail.secret = lambda *_: credential
-    if account != 'icloud':
+    dry = request.get('since') is not None or os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1'
+    if account != 'icloud' and not dry:
         oauth = mail.mail_oauth
         oauth.get_token = lambda *_: credential
         def refresh_outside_fetch(*_, **__):
@@ -1021,11 +1206,14 @@ def mail_worker(account, request):
         if result is not None:
             progress['result'] = copy.deepcopy(result)
         if request.get('progress_path'):
-            atomic(Path(request['progress_path']), progress)
+            path = Path(request['progress_path'])
+            if dry:
+                scratch_destination(path, Path(os.environ['WATCH_DIR']))
+            atomic(path, progress)
     stage_started = time.monotonic()
     save('connect')
     connect_start = time.monotonic()
-    M = mail.connect(account, 7)
+    M = dry_mail_connect(mail, account, 7, credential) if dry else mail.connect(account, 7)
     progress['connect_ms'] = round((time.monotonic() - connect_start) * 1000)
     stage_started = time.monotonic()
     try:
@@ -1103,10 +1291,14 @@ def run_mail(account, request):
             'credential_refresh_attempts': 0,
             'timed_out': False, 'stage': 'credential', 'connect_ms': None}
     payload = dict(request)
+    dry = request.get('since') is not None or os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1'
     wd = Path(os.environ.get('WATCH_DIR', Path(__file__).resolve().parent))
-    path = wd / f'mail-progress-{account}.json' if request.get('since') is None else None
-    if path:
-        payload['progress_path'] = str(path)
+    path = wd / f'mail-progress-{account}.json'
+    if dry:
+        scratch_destination(path, wd)
+        # A prior replay's result must not hide this run's credential or fetch failure.
+        atomic(path, {'cursor_before': request.get('cursor'), 'stage': 'credential', 'result': None})
+    payload['progress_path'] = str(path)
     def saved():
         record = read_json(path, {}) if path else {}
         return record if record.get('cursor_before') == request.get('cursor') else {}
@@ -1123,7 +1315,8 @@ def run_mail(account, request):
             if remaining <= 0:
                 raise TimeoutError('mail credential budget exceeded')
             payload['credential'] = prepare_mail_credentials(
-                account, min(5 if request.get('fast') else 8, remaining), info, refresh=refresh)
+                account, min(5 if request.get('fast') else 8, remaining), info, refresh=refresh,
+                **({'dry': True} if dry else {}))
         except Exception as error:
             info['credential_error'] = ('refresh_inflight' if str(error) == 'refresh_inflight' else
                                         f'{type(error).__name__}: {clean(str(error), 160)}')
@@ -1132,7 +1325,7 @@ def run_mail(account, request):
             info['credential_ms'] += round((time.monotonic()-credential_start)*1000)
         info['stage'] = 'connect'
     try:
-        old = saved()
+        old = saved() if not dry else {}
         if old.get('result'):
             info.update(stage='recovered', credential_ms=0)
             return complete(old['result'])
@@ -1140,6 +1333,8 @@ def run_mail(account, request):
         try:
             result = run_mail_fetch(account, payload, deadline=deadline)
         except MailAuthRejected:
+            if dry:
+                raise RuntimeError('mail: skipped (dry run, cached credential rejected)') from None
             info['credential_refresh_attempts'] = 1
             credentials(refresh=True)
             payload['credential_refreshed'] = True
@@ -1218,10 +1413,29 @@ def run_mail_fetch(account, request, *, deadline=None):
             raise error
 
 
+def sqlite_reader(path, timeout=2, *, dry=None):
+    dry = os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1' if dry is None else dry
+    path = Path(path).resolve()
+    uri = path.as_uri() + '?mode=ro'
+    if dry:
+        if not Path(str(path) + '-wal').exists():
+            uri += '&immutable=1'
+        elif not Path(str(path) + '-shm').exists():
+            raise ValueError('dry SQLite read refused: WAL has no existing shared-memory file')
+    return sqlite3.connect(uri, uri=True, timeout=timeout)
+
+
 def db(path):
-    c = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=2)
+    c = sqlite_reader(path)
     c.row_factory = sqlite3.Row
     return c
+
+
+def whatsapp_helper():
+    wa = load_module('triage_wadb', HELPERS / 'wa-db')
+    if os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1':
+        wa.connect = lambda path=wa.DB: sqlite_reader(path, timeout=5)
+    return wa
 
 
 def too_old(ts, now, since):
@@ -1233,7 +1447,7 @@ def too_old(ts, now, since):
 
 def collect_whatsapp(cursor, now, excluded, initialized_at=None, since=None):
     config = settings()
-    wa = load_module('triage_wadb', HELPERS / 'wa-db')
+    wa = whatsapp_helper()
     ok, why = wa.daemon_status()
     if not ok:
         raise RuntimeError(why)
@@ -1753,7 +1967,7 @@ def withdrawal_refs(item):
         r'\b(?:0x[0-9a-f]{64}|[0-9a-f]{64}|\d{10,})\b', text, re.I))
 
 
-def withdrawal_statuses(hits, items, now, deadline=None):
+def withdrawal_statuses(hits, items, now, deadline=None, dry=False):
     # Share one three-second archive budget across the batch, rather than three seconds per hit.
     deadline = min(deadline, time.time() + 3) if deadline is not None else time.time() + 3
     cached = {}
@@ -1774,14 +1988,15 @@ def withdrawal_statuses(hits, items, now, deadline=None):
                     if ref not in cached:
                         start = dt.datetime.fromtimestamp(now - 86400, DUBAI).date().isoformat()
                         checked = []
-                        result = mc.charges.search('"' + ref + '"', start, source='email', n=20, deadline=deadline)
-                        for row in sorted(result, key=lambda r: r.get('ts', 0), reverse=True):
-                            if now - 86400 <= row.get('ts', 0) <= now and not row.get('from_me'):
-                                # Search snippets are highlighted and can omit the status or reference.
-                                body = mc.charges.show(row, deadline=deadline)
-                                checked.append({**row, 'preview': body})
-                                if ref in withdrawal_refs(checked[-1]):
-                                    break
+                        with archive_reads(mc, dry):
+                            result = mc.charges.search('"' + ref + '"', start, source='email', n=20, deadline=deadline)
+                            for row in sorted(result, key=lambda r: r.get('ts', 0), reverse=True):
+                                if now - 86400 <= row.get('ts', 0) <= now and not row.get('from_me'):
+                                    # Search snippets can omit the status or reference.
+                                    body = mc.charges.show(row, deadline=deadline)
+                                    checked.append({**row, 'preview': body})
+                                    if ref in withdrawal_refs(checked[-1]):
+                                        break
                         cached[ref] = checked
                     rows += cached[ref]
                 found = latest_withdrawal_status(hit, refs, rows)
@@ -1828,7 +2043,7 @@ def withdrawal_terminal_status(row):
 def owner_route():
     # Same live route used by robob-watch's plain iMessage sender; no Robob backend call.
     deadline = time.monotonic() + 0.25
-    with sqlite3.connect(f'file:{BRIDGE_DB}?mode=ro', uri=True, timeout=0.25) as connection:
+    with sqlite_reader(BRIDGE_DB, timeout=0.25) as connection:
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
         row = connection.execute("SELECT json_extract(value,'$.id') FROM kv WHERE key='route'").fetchone()
     route = row[0] if row else None
@@ -1839,7 +2054,7 @@ def owner_route():
 
 def imessage_status(key):
     deadline = time.monotonic() + 0.25
-    with sqlite3.connect(f'file:{BRIDGE_DB}?mode=ro', uri=True, timeout=0.25) as connection:
+    with sqlite_reader(BRIDGE_DB, timeout=0.25) as connection:
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
         row = connection.execute('SELECT state, attempts, providerId FROM outbox WHERE id=?',
                                  ('send:' + hashlib.sha256(key.encode()).hexdigest(),)).fetchone()
@@ -1936,6 +2151,7 @@ def expect_auth(sender, account=None):
     expected_auth.record((sender,), account, data=DATA)
 
 
+@dry_run_scope
 @trace_run('triage.fastpath')
 def run_fast(args):
     expected_auth.reset_retry_budget()
@@ -2398,6 +2614,7 @@ def source_exit(results, errors, label='inbox-triage'):
     return 0
 
 
+@dry_run_scope
 @trace_run('triage.run')
 def run(args):
     expected_auth.reset_retry_budget()
@@ -2592,7 +2809,7 @@ def run(args):
     if held:
         report['held_for_receipt'] = sorted(held)
     withdrawal_statuses(selected, items + state['queue'] + [i for r in results.values() for i in r['items']],
-                        now, deadline=now + 50 if not dry else None)
+                        now, deadline=now + 50 if not dry else None, dry=dry)
     urgent = urgent_alerts(state, report, wd, now, dry, deadline=now + 57)
     if dry:
         for item in selected:
@@ -2601,6 +2818,9 @@ def run(args):
         report['dropped_ids'] = dropped
         report['candidates'] = items
         report['current_context'] = context
+        report['dry_run_notes'] = {'scratch_dir': str(wd), 'money_cases_data': str(wd / 'scratch-renewals'),
+                                   'payment_tracking': 'skipped (dry run; detection only)',
+                                   'mail_auth': 'cached credentials only; refresh disabled'}
         if args.report:
             atomic(Path(args.report), report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -2640,18 +2860,40 @@ def run(args):
     return source_exit(results, errors)
 
 
+@dry_run_scope
+def run_locked(args):
+    wd = Path(os.environ.get('WATCH_DIR', Path(__file__).resolve().parent))
+    wd.mkdir(parents=True, exist_ok=True)
+    with (wd / ('dry-run.lock' if args.dry_run_hours is not None else 'check.lock')).open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log_failure('check.lock_busy')
+            # Nonzero means the runner must not overwrite .run-ok: a successful
+            # empty check could otherwise make an acknowledged outbox replay.
+            print('inbox-triage check already running', file=sys.stderr)
+            return 75
+        return run_fast(args) if args.fast_only else run(args)
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser()
     parser.add_argument('--mail-worker', choices=ACCOUNTS)
     parser.add_argument('--mail-credentials', choices=ACCOUNTS)
     parser.add_argument('--refresh-mail-credentials', action='store_true')
+    parser.add_argument('--dry-archive-worker', nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     parser.add_argument('--dry-run-hours', type=float)
     parser.add_argument('--report')
     parser.add_argument('--fast-only', action='store_true')
     parser.add_argument('--expect-auth', metavar='SENDER')
     parser.add_argument('--account', choices=ACCOUNTS)
     args = parser.parse_args()
+    if args.dry_archive_worker is not None:
+        return dry_archive_worker(args.dry_archive_worker)
+    if args.dry_run_hours is not None and (args.expect_auth or args.mail_worker or args.mail_credentials
+                                           or args.refresh_mail_credentials):
+        parser.error('--dry-run-hours cannot be combined with auth or mail worker options')
     if args.expect_auth:
         expect_auth(args.expect_auth, args.account)
         return 0
@@ -2660,7 +2902,9 @@ def main():
             return 75
         try:
             print(mail_credentials(args.mail_credentials, refresh=args.refresh_mail_credentials))
-        except Exception:
+        except Exception as error:
+            if os.environ.get('INBOX_TRIAGE_DRY_RUN') == '1':
+                print(str(error), file=sys.stderr)
             return 1
         return 0
     if args.mail_worker:
@@ -2675,18 +2919,13 @@ def main():
             print(f'{type(e).__name__}: {str(e)[:160]}', file=sys.stderr)
             return 1
         return 0
-    wd = Path(os.environ.get('WATCH_DIR', Path(__file__).resolve().parent))
-    wd.mkdir(parents=True, exist_ok=True)
-    with (wd / ('dry-run.lock' if args.dry_run_hours is not None else 'check.lock')).open('a') as lock:
+    if args.dry_run_hours is not None:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            log_failure('check.lock_busy')
-            # Nonzero means the runner must not overwrite .run-ok: a successful
-            # empty check could otherwise make an acknowledged outbox replay.
-            print('inbox-triage check already running', file=sys.stderr)
-            return 75
-        return run_fast(args) if args.fast_only else run(args)
+            return run_locked(args)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 2
+    return run_locked(args)
 
 
 if __name__ == '__main__':

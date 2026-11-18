@@ -653,6 +653,85 @@ class GuardTests(unittest.TestCase):
                 self.adapters(command)
 
     @trusted_node_test
+    def test_same_call_python_provenance_retry_hint(self):
+        hint = ('Accepted: retry this same call with /usr/bin/python3 -I … instead of bare python3; '
+                'the executable, startup and mutation checks still apply.')
+        shadow = self.write('shadow-bin/python3', '#!/bin/sh\necho WRAPPER_MUST_NOT_RUN\n')
+        shadow.chmod(0o755)
+        self.write('config/sibling.txt', 'old')
+        shapes = {
+            'case3': ('d=$(mktemp -d)\n'
+                      'PYTHON -I -c \'print("PRIVATE_CODE (( ${t.name}")\'\n' +
+                      self.heredoc('"$d/x.mjs"', 'console.log(1)') + 'node "$d/x.mjs"'),
+            '4504': (self.heredoc('scripts/a.mjs', 'console.log(1)', append=True) +
+                     "PYTHON -I - <<'EDIT'\nfrom pathlib import Path\n"
+                     "Path('config/sibling.txt').write_text('new')\nEDIT\nnode --test scripts/a.mjs"),
+            'script': ('d=$(mktemp -d)\n' + self.heredoc('"$d/port.py"', 'print(1)') +
+                       'PYTHON -I "$d/port.py"'),
+        }
+        with patch.dict(os.environ, {'PATH': str(shadow.parent) + os.pathsep + os.environ['PATH']}):
+            for label, shape in shapes.items():
+                for python in ('python3', 'command python3'):
+                    command = shape.replace('PYTHON', python)
+                    with self.subTest(shape=label, python=python):
+                        rule, cause = guard.classify_detail(command, str(self.root))
+                        self.assertEqual(rule, UNRESOLVED, cause)
+                        self.assertIn('python3: executable provenance or mutation proof failed', cause)
+                        reason = guard.refusal_reason(rule, cause, str(self.root))
+                        self.assertIn(hint, reason)
+                        self.assertEqual(reason.count('Accepted:'), 1)
+                        self.assertNotIn('PRIVATE_CODE', reason)
+                        self.assertNotIn('WRAPPER_MUST_NOT_RUN', reason)
+                        self.adapters(command, UNRESOLVED, expected_reason=hint)
+                command = shape.replace('PYTHON', '/usr/bin/python3')
+                with self.subTest(shape=label, python='absolute'):
+                    self.assertEqual(guard.classify_detail(command, str(self.root)), (None, None))
+                    self.adapters(command)
+
+    @trusted_node_test
+    def test_same_call_python_retry_preserves_refusals(self):
+        writer = self.heredoc('scripts/a.mjs', 'console.log(1)')
+        rows = {
+            'checked source write': writer + "/usr/bin/python3 -I - <<'EDIT'\n"
+                                    "from pathlib import Path\nPath('scripts/a.mjs').write_text('changed')\n"
+                                    'EDIT\nnode --test scripts/a.mjs',
+            'binary mutation': writer + 'cp replacement /usr/bin/python3\n'
+                               "/usr/bin/python3 -I -c 'print(1)'\nnode --test scripts/a.mjs",
+            'non-isolated': writer + "/usr/bin/python3 -c 'print(1)'\nnode --test scripts/a.mjs",
+            'live read': writer + "/usr/bin/python3 -I -c " + shlex.quote(f'open({LIVE!r}).read()') +
+                         '\nnode --test scripts/a.mjs',
+            'arbitrary function': writer + 'python3() { echo changed; }\n'
+                                  "python3 -I -c 'print(1)'\nnode --test scripts/a.mjs",
+        }
+        for label, command in rows.items():
+            with self.subTest(case=label):
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertIsNotNone(rule, cause)
+                self.assertNotIn('instead of bare python3', guard.refusal_reason(rule, cause, str(self.root)))
+                self.adapters(command, rule)
+
+        for predecessor in ('opaque-mutator', "sed 's/a/b/e' config/sibling.txt",
+                            "python3 -c 'print(1)'", "perl -e 'print 1'"):
+            command = writer + predecessor + "\n/usr/bin/python3 -I -c 'print(1)'\nnode scripts/a.mjs"
+            with self.subTest(predecessor=predecessor):
+                rule, cause = guard.classify_detail(command, str(self.root))
+                self.assertEqual(rule, UNRESOLVED, cause)
+                reason = guard.refusal_reason(rule, cause, str(self.root))
+                self.assertNotIn('instead of bare python3', reason)
+                self.assertIn('Split source preparation and execution into separate calls', reason)
+                self.adapters(command, rule, expected_reason='Split source preparation and execution into separate calls')
+
+        for marker in ('python3: executable provenance or mutation proof failed',
+                       'python3: bare executable lookup unproved; '):
+            for target in (shlex.quote('$d/' + marker + '.mjs'), '"$d/' + marker + '.mjs"'):
+                command = 'd=$(mktemp -d)\nnode ' + target
+                with self.subTest(filename=target):
+                    rule, cause = guard.classify_detail(command, str(self.root))
+                    self.assertEqual(rule, UNRESOLVED, cause)
+                    self.assertNotIn('instead of bare python3', guard.refusal_reason(rule, cause, str(self.root)))
+                    self.adapters(command, rule, expected_reason='same-call heredoc')
+
+    @trusted_node_test
     def test_same_call_inline_node_does_not_run_sibling(self):
         prefix = 'W=$(mktemp -d)\n' + self.heredoc('"$W/prep.py"', 'print(1)')
         prefix += self.heredoc('scripts/a.mjs', 'console.log(1)', append=True)
@@ -5843,6 +5922,153 @@ const fixture = { root: mkdtempSync(join(tmpdir(), 'guard95-')) };
             for command in ('CDPATH=/tmp bash nested/tests/fixture.sh', 'export CDPATH=/tmp; bash nested/tests/fixture.sh'):
                 with self.subTest(command=command):
                     self.assertEqual(self.classify(command), SCRIPT)
+
+    def fixture_wrapper_commands(self):
+        script, root = 'tmp/fixture.sh', str(self.root)
+        return (
+            f'bash {script} | tail -3', f'bash {script} 2>&1 | tail -n 3', f'bash {script} | tail -n3',
+            f'bash {script} 2>&1 | head -5', f'bash {script} | grep -v noise',
+            f'bash {script} 2>&1 | grep -Ei "pass|fail" | tail -5', f"bash {script} | grep -E 'ok|FAIL'",
+            f'bash {script}; echo "exit=$?"', f'bash {script}; echo $?', f'bash {script} && echo ok',
+            f'bash {script} 2>&1 | tail -5; echo "exit=$?"',
+            f'cd {root} && bash {script}', f'cd {root} && bash {script} 2>&1 | tail -3',
+            'cd ./tmp && bash fixture.sh | tail -3', f'cd ./tmp && bash {root}/{script} && echo ok',
+            # Quoted punctuation keeps a whole pattern literal, globs included.
+            f'bash {script} 2>&1 | grep -E "PASS|FAIL.*" | tail -5', f"bash {script} | grep -v '[x]|y*'",
+            f"bash {script} | grep 'files/*'", f'bash {script} | grep "files/[ab]"',
+            f'/bin/bash {root}/{script} 2>&1 | tail -3',
+            f'offbox run -- bash {script} 2>&1 | tail -3', f'offbox run --bg -- bash {script}; echo $?',
+        )
+
+    def test_fixture_wrappers_keep_fixture_proof(self):
+        # Agents pipe test runs into tail or cd first; the run is unchanged.
+        self.write_plain_subpath_fixture()
+        original = (self.root / 'tmp/fixture.sh').read_text()
+        _, _, inherited = self.repo_node_pin()
+        for label, environment in (('no-bash-env', {}), ('inherited-bash-env', inherited)):
+            with patch.dict(os.environ, environment):
+                self.write('tmp/fixture.sh', original)
+                for command in self.fixture_wrapper_commands():
+                    with self.subTest(case=label, command=command):
+                        self.assertIsNone(self.classify(command))
+                # The same wrappers never excuse a fixture that reads a live path.
+                self.write('tmp/fixture.sh', original + '\ncat "' + LIVE + '"\n')
+                for command in self.fixture_wrapper_commands():
+                    with self.subTest(case=label + ':live-fixture', command=command):
+                        self.assertEqual(self.classify(command), SCRIPT)
+
+    def test_fixture_wrapper_refusals(self):
+        self.write_plain_subpath_fixture()
+        _, _, inherited = self.repo_node_pin()
+        run, root = 'bash tmp/fixture.sh', str(self.root)
+        live = '~/' + '.ro' + 'bob/userdata/' + 'state' + 'v2.sqlite'
+        rows = [
+            # Other stages, redirects, substitutions, background, statements.
+            run + ' | tee out', run + ' | sh', run + ' | xargs cat', run + ' > out', run + ' 2>&1 > out',
+            run + ' | tail -3 > out 2>&1', run + ' | grep -f file', run + ' | grep --file=file x',
+            run + ' | grep -e x', run + ' | grep -r x', run + ' | grep x file', run + ' | tail 3', run + ' | tail -f',
+            run + ' | head -c 5', run + ' | tail -3 | head -2 | grep x', run + ' |& tail -3', run + ' 2 >&1 | tail',
+            run + ' x | tail -3', run + ' &', run + ' | tail -3 &', run + ' | grep &', run + ' | grep -v ;',
+            '(' + run + ') | tail -3', run + ' || echo ok', run + '; echo ok', run + '; echo $HOME',
+            run + ' && echo $(id)', run + ' | grep "$(id)"', run + ' | grep "`id`"', run + ' | grep "$X"',
+            run + ' | grep "a|$X"', run + ' $(id) | tail -3',
+            run + ' | tail -3 # comment', run + ' | tail -3\nls', run + ' | tail -3; ls', 'ls; ' + run, 'ls tmp/; ' + run,
+            # Only one literal, anchored cd.
+            'cd "$X" && ' + run, 'cd - && ' + run, 'cd tmp && bash fixture.sh',
+            'cd ' + root + ' && cd ' + root + ' && ' + run, 'cd /tm* && ' + run, 'CDPATH=' + root + ' cd ./tmp && bash fixture.sh',
+            'cd ./tmp; bash fixture.sh', 'pushd ' + root + ' && ' + run, 'cd ' + root + ' && offbox run -- ' + run,
+            # `..` in a cd target: Bash's logical cd and the resolved path differ.
+            'cd ../' + self.root.name + ' && ' + run, 'cd ./tmp/.. && ' + run, 'cd ' + root + '/tmp/.. && ' + run,
+            # Unquoted expansion turns one pattern into pattern + file operands.
+            run + ' | grep files/*', run + ' 2>&1 | grep -v files/? | tail -3', run + ' | grep files/[ab]',
+            run + ' | grep {x,files/b}', run + ' | grep ~', run + ' | grep -E files/*',
+            "bash tmp/fixture.s? | tail -3", "bash tmp/{fixture.sh,x} | tail -3",
+            # Quoting only part of the pattern leaves the rest to expand.
+            run + ' | grep files/"*"x*', run + " | grep 'a'\"b\"*",
+            # A live read in a later stage is refused on its own.
+            run + ' | grep x ' + live, run + ' | tail -3; cat ' + live,
+        ]
+        # The glob's second match is a protected-path marker.
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        self.write('files/a', '')
+        (self.root / 'files/b').symlink_to(marker)
+        for label, environment in (('no-bash-env', {}), ('inherited-bash-env', inherited)):
+            with patch.dict(os.environ, environment):
+                for command in rows:
+                    with self.subTest(case=label, command=command):
+                        self.assertIsNotNone(self.classify(command))
+        # `~` follows HOME; point it at the fixture's parent so the cd lands.
+        tilde = 'cd ~/' + self.root.name + ' && ' + run
+        with patch.dict(os.environ, {'HOME': str(self.root.parent)}):
+            self.assertEqual(self.classify(tilde), SCRIPT)
+        rows.append(tilde)
+        # The grammar itself rejects each row, except where only the run
+        # check refuses: an extra script argument, and a cd before offbox,
+        # whose remote cwd the proof does not follow.
+        passes_grammar = {run + ' x | tail -3': (None, ['bash', 'tmp/fixture.sh', 'x']),
+                          'cd ' + root + ' && offbox run -- ' + run: (root, ['offbox', 'run', '--', 'bash', 'tmp/fixture.sh'])}
+        for command in rows + ['$(echo bash) tmp/fixture.sh | tail -3']:
+            with self.subTest(grammar=command):
+                self.assertEqual(guard._fixture_wrapped_invocation(command), passes_grammar.get(command))
+
+    def test_fixture_wrapper_cd_reproves_selector_inputs(self):
+        # A cd moves the selector walk; both the target and the caller's
+        # starting cwd must be clean.
+        self.write_plain_subpath_fixture()
+        _, _, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        for directory in ('good', 'bad'):
+            (self.root / directory).mkdir()
+        (self.root / 'bad/.nvmrc').symlink_to(marker)
+        good, bad = str(self.root / 'good'), str(self.root / 'bad')
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(guard.classify(f'cd {good} && bash ../tmp/fixture.sh | tail -3', str(self.root)))
+            self.assertEqual(guard.classify(f'cd {bad} && bash ../tmp/fixture.sh | tail -3', str(self.root)), SCRIPT)
+            self.assertEqual(guard.classify(f'cd {good} && bash ../tmp/fixture.sh | tail -3', bad), SCRIPT)
+            self.assertEqual(guard.classify('bash ../tmp/fixture.sh | tail -3', bad), SCRIPT)
+        # Without BASH_ENV there is no selector, so the cd target is all that moves.
+        self.assertIsNone(guard.classify(f'cd {good} && bash ../tmp/fixture.sh | tail -3', bad))
+
+    def test_fixture_wrapper_cd_logical_parent(self):
+        # Bash's logical cd resolves `alias/..` to start/bad, not the parent of
+        # alias's physical target; start/bad's selector input must not be missed.
+        self.write_plain_subpath_fixture()
+        _, _, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        (self.root / 'physical/deep').mkdir(parents=True)
+        (self.root / 'start/bad').mkdir(parents=True)
+        (self.root / 'start/bad/alias').symlink_to(self.root / 'physical/deep')
+        (self.root / 'start/bad/.nvmrc').symlink_to(marker)
+        start, fixture = str(self.root / 'start'), str(self.root / 'tmp/fixture.sh')
+        with patch.dict(os.environ, environment):
+            for target in ('./bad/alias/..', start + '/bad/alias/..', './bad/alias/../alias/..'):
+                with self.subTest(target=target):
+                    self.assertEqual(guard.classify(f'cd {target} && bash {fixture} | tail -3', start), SCRIPT)
+            # A symlinked target is walked on both its logical and physical chains.
+            self.assertEqual(guard.classify(f'cd ./bad/alias && bash {fixture} | tail -3', start), SCRIPT)
+            self.assertIsNone(guard.classify(f'cd {self.root}/physical/deep && bash {fixture} | tail -3', start))
+
+    def test_fixture_wrapper_cd_logical_script_here(self):
+        # A relative script's HERE cd ($0/..) also runs against the logical
+        # $PWD: from start/parent/alias it reaches start/parent/other, not
+        # physical/other.
+        self.write_plain_subpath_fixture()
+        source = (self.root / 'tmp/fixture.sh').read_text()
+        _, _, environment = self.repo_node_pin()
+        marker = self.write('marker/.robob/userdata/statev2.sqlite', '{}')
+        self.write('physical/other/tests/fixture.sh', source)
+        (self.root / 'physical/deep').mkdir(parents=True)
+        (self.root / 'start/parent/other').mkdir(parents=True)
+        (self.root / 'start/parent/alias').symlink_to(self.root / 'physical/deep')
+        start = str(self.root / 'start')
+        command = 'cd ./parent/alias && bash ../other/tests/fixture.sh | tail -3'
+        with patch.dict(os.environ, environment):
+            self.assertIsNone(guard.classify(command, start))
+            (self.root / 'start/parent/other/.nvmrc').symlink_to(marker)
+            self.assertEqual(guard.classify(command, start), SCRIPT)
+            self.assertEqual(guard.classify(command.replace(' | tail -3', ''), start), SCRIPT)
+        # Without BASH_ENV no selector runs, so the fixture proof stands.
+        self.assertIsNone(guard.classify(command, start))
 
     def test_repo_node_pin_hashes_cover_fork_helpers(self):
         # Editing local-helpers' repo-node-pin turns the fixture proof off

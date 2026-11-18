@@ -11,7 +11,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import api, capacity, common, ssh_sync
+from . import api, capacity, common, ssh_sync, ssh_outage
 from .common import (SIZES, BOX_WEDGED_NOTE, CAP_PATH, DEAD_MOUNT_NOTE, EXIT_BUSY, EXIT_CAP, EXIT_INFRA, RUN_TTL_S, TEMPLATES_DIR, TOO_BIG_NOTE, OffboxError, db, event,
                      SshHostKeyMismatch, file_lock, iso, kv_get, kv_set, log, mine, new_id, now, read_json, say, token_owner, write)
 from .identity import remote_dir_for
@@ -498,6 +498,20 @@ def remote_protection(box_id):
     return snapshot
 
 
+def remote_reuse_blocked(box_id, holder=None):
+    if api.BACKEND != 'server':
+        return False
+    try:
+        snapshot = remote_protection(box_id)
+        return offbox_protection.blocked(snapshot, automatic=False, reuse=True,
+                                         holder=holder or offbox_protection.caller().get('holder')) is not None
+    except api.ApiError as error:
+        # A confirmed deletion must reach reuse's existing lease retirement path.
+        return not (error.status == 404 and error.api_code == 'sandbox_not_found')
+    except OffboxError:
+        return True
+
+
 def box_name(me: dict, repo_key: str) -> str:
     who = (me.get("title") or me.get("thread") or me.get("owner") or "local")[:50]
     return f"offbox {repo_key} | {who}"
@@ -555,7 +569,7 @@ def bootstrap_fresh(box_id: str) -> None:
     fetch = (TEMPLATES_DIR / "tools/fetch.sh").read_text() + "\n"
     script = (fetch + "bash -c " + shlex.quote(fetch + (TEMPLATES_DIR / "tools/sqlite.sh").read_text()) +
               " || exit 1\n" + (TEMPLATES_DIR / "common-env.sh").read_text()).encode()
-    p = ssh_sync.ssh(box_id, "bash -s", input=script, timeout=120)
+    p = ssh_outage.retry_readiness(lambda: ssh_sync.ssh(box_id, "bash -s", input=script, timeout=120))
     if p.returncode != 0:
         say(f"warning: cache env bootstrap failed on {box_id}: {p.stderr.decode(errors='replace')[-200:]}")
 
@@ -745,13 +759,14 @@ def run_recipe(box_id: str, name: str, box_held: bool = False) -> None:
             if not box_held:
                 held.enter_context(file_lock("box-" + box_id, timeout=60))
             script, _sha = bases.recipe(name)
-            ssh_sync.put_file(box_id, "/home/user/.offbox/recipe.sh", script.encode(), mode="700")
-            bases.template_uploads(name, box_id)
+            ssh_outage.retry_readiness(lambda: ssh_sync.put_file(
+                box_id, "/home/user/.offbox/recipe.sh", script.encode(), mode="700"))
+            ssh_outage.retry_readiness(lambda: bases.template_uploads(name, box_id))
             r = api.cmd_start(box_id, "bash -lc " + shlex.quote("bash ~/.offbox/recipe.sh"))
             pid = r["processId"]
             event(db(), box_id, "lease_recipe_pid", str(pid))
             code = _follow_bounded(box_id, pid, log_path, RECIPE_TIMEOUT_S)
-    except (SshHostKeyMismatch, StartWaitFailed):
+    except (SshHostKeyMismatch, StartWaitFailed, ssh_outage.SshUnreachable):
         raise
     except Exception as e:  # noqa: BLE001 - an upload/start/follow error is a failed recipe like any other
         code = f"error: {e}"
@@ -829,8 +844,8 @@ def _bring_up(box_id: str, fresh: bool = False, recipe: str | None = None, box_h
         _check_held(box_id, s)
         try:
             ssh_sync.setup(box_id)
-            ssh_sync.wait_ssh(box_id)
-        except (capacity.CapacityError, SshHostKeyMismatch, StartWaitFailed):
+            ssh_outage.retry_readiness(lambda: ssh_sync.wait_ssh(box_id))
+        except (capacity.CapacityError, SshHostKeyMismatch, StartWaitFailed, ssh_outage.SshUnreachable):
             raise
         except OffboxError as e:
             raise BoxNotReady(box_id, s, e) from e
@@ -972,7 +987,7 @@ if [ -d "$src" ] && [ ! -e "$dst" ] && [ ! -L "$dst" ]; then
     printf 'CMake cache cleanup failed (rc=%s); continuing lease\\n' "$?"
 fi'''
         try:
-            result = ssh_sync.ssh(box_id, command, timeout=120)
+            result = ssh_outage.retry_readiness(lambda: ssh_sync.ssh(box_id, command, timeout=120))
         except subprocess.TimeoutExpired as exc:
             # Only a confirmed move makes a cleanup timeout non-fatal. Keep pre-move timeouts unchanged.
             if b"offbox-base-checkout-relocated\n" not in (exc.stdout or b""):
@@ -1027,7 +1042,7 @@ def _create_row(con, me: dict, box_id: str, source: str, base_dir, sz, t, box_he
                 pass
             if relocating:
                 _relocate_base_checkout(con, box_id, base_dir, rdir, box_held=box_held)
-    except (SshHostKeyMismatch, StartWaitFailed):
+    except (SshHostKeyMismatch, StartWaitFailed, ssh_outage.SshUnreachable):
         raise
     except api.SupplyOut as e:
         # boat never gave the box a machine: a plain box is dropped from our records; a recipe box is retired below.
@@ -1197,12 +1212,12 @@ class _ResumeWatch:
         prepare.track_resume(self)
 
     @contextlib.contextmanager
-    def pause(self):
+    def pause(self, *, extra_seconds=0):
         self.paused_at = time.monotonic()
         try:
             yield
         finally:
-            elapsed = time.monotonic() - self.paused_at
+            elapsed = time.monotonic() - self.paused_at + extra_seconds
             self.progress_at += elapsed
             self.paused_at = None
 
@@ -1590,7 +1605,7 @@ def _bring_up_resumed(con, box_id, confirmed, retried, request_resume=None, *, s
         error.resume_retry_box = box_id
         raise
     except (api.BoxBootFailed, api.SupplyOut, capacity.CapacityError, ArchivingSkip, ResumeProvisionStalled, BoxNotReady,
-            SshHostKeyMismatch, StartWaitFailed):
+            SshHostKeyMismatch, StartWaitFailed, ssh_outage.SshUnreachable):
         raise
     except OffboxError as e:
         if isinstance(e, common.SourceGone):
@@ -1630,6 +1645,8 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
     if not unfit.available(con, row['box_id']):
         return None
     check_deletion(con, row['box_id'])
+    if remote_reuse_blocked(row['box_id']):
+        return None
     # Selection may have preceded another holder's quarantine. Re-read after the caller acquired the box lock.
     current = con.execute('SELECT state, note FROM leases WHERE box_id=?', (row['box_id'],)).fetchone()
     if not current or current['state'] not in ('running', 'stopped') or \
@@ -1670,16 +1687,28 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
     # A local master can outlive the remote machine, so verify a round trip before trusting the cached endpoint.
     if row["state"] == "running" and not _bigger(size, row["size"]) and ssh_sync.cfg_path(box_id).exists():
         try:
-            p = subprocess.run(ssh_sync.ssh_base(box_id) + ["-o", "ConnectTimeout=5", box_id, "true"],
-                               capture_output=True, timeout=10)
+            def cached_round_trip():
+                p = None
+                try:
+                    p = subprocess.run(ssh_sync.ssh_base(box_id) + ["-o", "ConnectTimeout=5", box_id, "true"],
+                                       capture_output=True, timeout=10)
+                    if ssh_outage.checking_pre_start():
+                        ssh_sync.check_host_key(box_id, p.stderr)
+                        ssh_outage.classify(box_id, p.returncode, p.stderr)
+                except ssh_outage.SshUnreachable as error:
+                    state = ssh_outage.control_state(error)
+                    if not state or state in api.LIVE_STATES:
+                        raise
+                return p
+            p = ssh_outage.retry_readiness(cached_round_trip)
         except subprocess.TimeoutExpired:
             reason = "timeout"
         except OSError:
             reason = "oserror"
         else:
-            if p.returncode == 255:
+            if p is not None and p.returncode == 255:
                 ssh_sync.check_host_key(box_id, p.stderr)
-            if p.returncode == 0:
+            if p is not None and p.returncode == 0:
                 if api.BACKEND == 'server':
                     _check_held(box_id, _readiness_get(box_id))
                 ensure_ttl(box_id, max(RUN_TTL_S, idle_for(con, box_id, row["size"])))
@@ -1687,7 +1716,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
                     con.execute("DELETE FROM kv WHERE k=?", (f"resize_size:{box_id}",))
                     con.commit()
                 return dict(row)
-            reason = f"rc={p.returncode}"
+            reason = f"rc={p.returncode}" if p is not None else 'endpoint selection failed'
         ssh_sync.close_master(box_id)
         event(con, box_id, "ssh_master_stale", reason)
     try:
@@ -1844,7 +1873,7 @@ def _reuse_available(con, row, size, skip_archiving=False, retrying=False, befor
             else:
                 _bring_up(box_id)
         except (allocation.Busy, allocation.Fenced, api.BoxBootFailed, ResumeProvisionStalled,
-                BoxNotReady, SshHostKeyMismatch, StartWaitFailed):
+                BoxNotReady, SshHostKeyMismatch, StartWaitFailed, ssh_outage.SshUnreachable):
             raise
         except OffboxError as e:
             raise ResumeUnresolved(f"{box_id} did not become ready; nothing ran: {e}", e) from e

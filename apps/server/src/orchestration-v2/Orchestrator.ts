@@ -9985,6 +9985,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "providerTurns",
       "turnItems",
       "providerThreads",
+      "providerSessions",
     ]);
     const run = projection.runs.find((run) => run.id === command.runId);
     if (
@@ -10021,8 +10022,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const startExpiryCleanupTargets = (
-    projection: Pick<OrchestrationV2ThreadProjection, "providerTurns" | "providerThreads">,
+    projection: Pick<
+      OrchestrationV2ThreadProjection,
+      "providerTurns" | "providerThreads" | "providerSessions"
+    >,
     run: OrchestrationV2Run,
+    nativeSessionAttached = false,
   ) => {
     const targets: Array<
       Omit<NonNullable<OrchestrationV2Run["providerRestartCleanup"]>, "completed">
@@ -10046,6 +10051,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (!targets.some((existing) => existing.providerTurnId === target.providerTurnId))
         targets.push(target);
     }
+    // Native admission can precede the first provider-turn event. Keep its
+    // run/attempt identity so the adapter can stop exactly that pending offer.
+    const owner = projection.providerThreads.find((thread) => thread.id === run.providerThreadId);
+    if (
+      targets.length === 0 &&
+      owner?.providerSessionId != null &&
+      (owner.nativeThreadRef !== null ||
+        nativeSessionAttached ||
+        projection.providerSessions.some((session) => session.id === owner.providerSessionId)) &&
+      run.activeAttemptId !== null
+    ) {
+      targets.push({
+        providerThreadId: owner.id,
+        providerSessionId: owner.providerSessionId,
+        providerTurnId: idAllocator.derive.providerTurn({
+          driver: owner.driver,
+          nativeTurnId: `start-expire:${run.activeAttemptId}`,
+        }),
+      });
+    }
     return targets;
   };
 
@@ -10063,6 +10088,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       command.phase === "provider" &&
       command.nativeEvidence?.runId === run.id &&
       command.nativeEvidence.attemptId === run.activeAttemptId;
+    const code =
+      command.phase === "restart_admission"
+        ? "restart_admission_timeout"
+        : lostEvents
+          ? "provider_events_lost"
+          : PROVIDER_START_TIMEOUT_CODE;
     const message =
       command.phase === "restart_admission"
         ? "The restart admission queue never released this run (waited 30 min)."
@@ -10096,7 +10127,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         payload: { ...turn, status: "failed", completedAt: now },
       });
     }
-    for (const target of startExpiryCleanupTargets(projection, run)) {
+    for (const target of startExpiryCleanupTargets(projection, run, lostEvents)) {
       yield* Ref.update(effects, (current) => [
         ...current,
         {
@@ -10106,6 +10137,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           request: {
             type: "provider-turn.interrupt",
             startTimeout: true,
+            startTimeoutContext: { runId: run.id, code, provider: run.providerInstanceId },
+            ...(!projection.providerTurns.some((turn) => turn.id === target.providerTurnId) &&
+            run.activeAttemptId !== null
+              ? {
+                  startingRun: {
+                    runId: run.id,
+                    attemptId: run.activeAttemptId,
+                    runOrdinal: run.ordinal,
+                  },
+                }
+              : {}),
             ...target,
           },
         } satisfies PendingOrchestrationEffectV2,
@@ -14577,7 +14619,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                       : [],
                   )
                   .sort(([left], [right]) => left.localeCompare(right));
-                const currentStops = startExpiryCleanupTargets(current.projection, current.run)
+                const currentStops = startExpiryCleanupTargets(
+                  current.projection,
+                  current.run,
+                  command.nativeEvidence?.runId === current.run.id &&
+                    command.nativeEvidence.attemptId === current.run.activeAttemptId,
+                )
                   .map(
                     (target) =>
                       [

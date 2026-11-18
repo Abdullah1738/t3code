@@ -470,6 +470,8 @@ install -m 0644 "$tool_log" /opt/boatd/toollog.py
 disk_space="$HERE/offbox_disk_space.py"
 [ -f "$disk_space" ] || disk_space="$HERE/../skill/scripts/offbox_disk_space.py"
 install -m 0644 "$disk_space" /opt/boatd/offbox_disk_space.py
+protocol="$(dirname "$disk_space")/offbox_protocol.py"
+install -m 0644 "$protocol" /opt/boatd/offbox_protocol.py
 protection="$HERE/offbox_protection.py"
 [ -f "$protection" ] || protection="$HERE/../skill/scripts/offbox_protection.py"
 install -m 0644 "$protection" /opt/boatd/offbox_protection.py

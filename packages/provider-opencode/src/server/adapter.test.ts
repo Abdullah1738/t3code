@@ -2016,172 +2016,290 @@ describe("OpenCodeAdapterV2", () => {
     ),
   );
 
-  it.effect("interrupts an initial prompt while its SDK request is pending", () =>
-    Effect.gen(function* () {
-      const nativeEvents = asyncEventStream();
-      const promptStarted = promiseGate<void>();
-      const abortCalled = promiseGate<void>();
-      let abortCalls = 0;
-      const client = {
-        event: {
-          subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
-            options.signal?.addEventListener("abort", () => nativeEvents.close(), { once: true });
-            return { stream: nativeEvents.stream };
+  it.effect.each(["turn", "run"] as const)(
+    "interrupts an initial prompt by %s while its SDK request is pending",
+    (target) =>
+      Effect.gen(function* () {
+        const nativeEvents = asyncEventStream();
+        const promptStarted = promiseGate<void>();
+        const abortCalled = promiseGate<void>();
+        let abortCalls = 0;
+        const client = {
+          event: {
+            subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
+              options.signal?.addEventListener("abort", () => nativeEvents.close(), { once: true });
+              return { stream: nativeEvents.stream };
+            },
           },
-        },
-        session: {
-          create: async () => ({
-            data: { id: "native-opencode-initial-stop", time: { created: 1, updated: 1 } },
-          }),
-          get: async () => ({
-            data: { id: "native-opencode-initial-stop", time: { created: 1, updated: 1 } },
-          }),
-          promptAsync: async (_input: unknown, options?: { readonly signal?: AbortSignal }) => {
-            promptStarted.resolve();
-            await new Promise<void>((_resolve, reject) => {
-              const signal = options?.signal;
-              if (signal?.aborted) {
-                reject(signal.reason);
-                return;
-              }
-              signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
-            });
-            return { data: true };
+          session: {
+            create: async () => ({
+              data: { id: "native-opencode-initial-stop", time: { created: 1, updated: 1 } },
+            }),
+            get: async () => ({
+              data: { id: "native-opencode-initial-stop", time: { created: 1, updated: 1 } },
+            }),
+            promptAsync: async (_input: unknown, options?: { readonly signal?: AbortSignal }) => {
+              promptStarted.resolve();
+              await new Promise<void>((_resolve, reject) => {
+                const signal = options?.signal;
+                if (signal?.aborted) {
+                  reject(signal.reason);
+                  return;
+                }
+                signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+              });
+              return { data: true };
+            },
+            status: async () => ({
+              data: { "native-opencode-initial-stop": { type: "idle" as const } },
+            }),
+            messages: async () => ({ data: [] }),
+            children: async () => ({ data: [] }),
+            abort: async () => {
+              abortCalls += 1;
+              abortCalled.resolve();
+              return { data: true };
+            },
           },
-          status: async () => ({
-            data: { "native-opencode-initial-stop": { type: "idle" as const } },
-          }),
-          messages: async () => ({ data: [] }),
-          children: async () => ({ data: [] }),
-          abort: async () => {
-            abortCalls += 1;
-            abortCalled.resolve();
-            return { data: true };
-          },
-        },
-        mcp: { add: async () => ({ data: true }) },
-      };
-      const adapter = yield* makeOpenCodeAdapterV2({
-        instanceId: ProviderInstanceId.make("opencode-initial-stop-test"),
-        settings: OPEN_CODE_TEST_SETTINGS,
-        environment: {},
-      }).pipe(
-        Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, {
-          connectToOpenCodeServer: () =>
-            Effect.succeed({ url: "http://test.invalid", external: true }),
-          createOpenCodeSdkClient: () => client,
-        } as unknown as OpenCodeRuntime.OpenCodeRuntime["Service"]),
-        Effect.provideService(ProviderHost.ProviderHost, {
-          paths: { cwd: "/workspace" },
-          resolveAttachmentPath: () => null,
-        } as unknown as ProviderHost.ProviderHost["Service"]),
-      );
-      const threadId = ThreadId.make("thread-opencode-initial-stop");
-      const providerSessionId = ProviderSessionId.make("session-opencode-initial-stop");
-      const modelSelection = {
-        instanceId: ProviderInstanceId.make("opencode-initial-stop-test"),
-        model: "anthropic/claude-sonnet",
-        options: [],
-      };
-      const policy = runtimePolicy("full-access", { cwd: "/workspace" });
-      const runtime = yield* adapter.openSession({
-        threadId,
-        providerSessionId,
-        modelSelection,
-        runtimePolicy: policy,
-      });
-      const providerThread = yield* runtime.ensureThread({
-        threadId,
-        modelSelection,
-        runtimePolicy: policy,
-      });
-      const terminalEvents = yield* runtime.events.pipe(
-        Stream.takeUntil((event) => event.type === "turn.terminal"),
-        Stream.runCollect,
-        Effect.forkScoped,
-      );
-      const now = yield* DateTime.now;
-      const start = yield* runtime
-        .startTurn({
-          appThread: {
-            id: threadId,
-            projectId: ProjectId.make("project-opencode-initial-stop"),
-            title: "initial stop",
-            providerInstanceId: modelSelection.instanceId,
-            modelSelection,
-            runtimeMode: "full-access",
-            interactionMode: "default",
-            branch: null,
-            worktreePath: null,
-            activeProviderThreadId: providerThread.id,
-            lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
-            forkedFrom: null,
-            createdBy: "user",
-            creationSource: "web",
-            createdAt: now,
-            updatedAt: now,
-            archivedAt: null,
-            settledOverride: null,
-            settledAt: null,
-            lastVisitedAt: null,
-            deletedAt: null,
-          },
+          mcp: { add: async () => ({ data: true }) },
+        };
+        const adapter = yield* makeOpenCodeAdapterV2({
+          instanceId: ProviderInstanceId.make("opencode-initial-stop-test"),
+          settings: OPEN_CODE_TEST_SETTINGS,
+          environment: {},
+        }).pipe(
+          Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, {
+            connectToOpenCodeServer: () =>
+              Effect.succeed({ url: "http://test.invalid", external: true }),
+            createOpenCodeSdkClient: () => client,
+          } as unknown as OpenCodeRuntime.OpenCodeRuntime["Service"]),
+          Effect.provideService(ProviderHost.ProviderHost, {
+            paths: { cwd: "/workspace" },
+            resolveAttachmentPath: () => null,
+          } as unknown as ProviderHost.ProviderHost["Service"]),
+        );
+        const threadId = ThreadId.make("thread-opencode-initial-stop");
+        const providerSessionId = ProviderSessionId.make("session-opencode-initial-stop");
+        const modelSelection = {
+          instanceId: ProviderInstanceId.make("opencode-initial-stop-test"),
+          model: "anthropic/claude-sonnet",
+          options: [],
+        };
+        const policy = runtimePolicy("full-access", { cwd: "/workspace" });
+        const runtime = yield* adapter.openSession({
           threadId,
-          runId: RunId.make("run-opencode-initial-stop"),
-          runOrdinal: 1,
-          providerTurnOrdinal: 1,
-          attemptId: RunAttemptId.make("attempt-opencode-initial-stop"),
-          rootNodeId: NodeId.make("node-opencode-initial-stop"),
-          providerThread,
-          message: {
-            createdBy: "user",
-            creationSource: "web",
-            messageId: MessageId.make("message-opencode-initial-stop"),
-            text: "hello",
-            attachments: [],
-          },
+          providerSessionId,
           modelSelection,
           runtimePolicy: policy,
-        })
-        .pipe(Effect.forkScoped);
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy: policy,
+        });
+        const terminalEvents = yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        const now = yield* DateTime.now;
+        const start = yield* runtime
+          .startTurn({
+            appThread: {
+              id: threadId,
+              projectId: ProjectId.make("project-opencode-initial-stop"),
+              title: "initial stop",
+              providerInstanceId: modelSelection.instanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: providerThread.id,
+              lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+              forkedFrom: null,
+              createdBy: "user",
+              creationSource: "web",
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+            threadId,
+            runId: RunId.make("run-opencode-initial-stop"),
+            runOrdinal: 1,
+            providerTurnOrdinal: 1,
+            attemptId: RunAttemptId.make("attempt-opencode-initial-stop"),
+            rootNodeId: NodeId.make("node-opencode-initial-stop"),
+            providerThread,
+            message: {
+              createdBy: "user",
+              creationSource: "web",
+              messageId: MessageId.make("message-opencode-initial-stop"),
+              text: "hello",
+              attachments: [],
+            },
+            modelSelection,
+            runtimePolicy: policy,
+          })
+          .pipe(Effect.forkScoped);
 
-      yield* Effect.promise(() => promptStarted.promise);
-      const running = yield* runtime.readThreadSnapshot({ providerThread });
-      const activeTurn = running.providerTurns.at(-1)!;
-      const interrupt = yield* runtime
-        .interruptTurn({ providerThread, providerTurnId: activeTurn.id })
-        .pipe(Effect.forkScoped);
+        yield* Effect.promise(() => promptStarted.promise);
+        const running = yield* runtime.readThreadSnapshot({ providerThread });
+        const activeTurn = running.providerTurns.at(-1)!;
+        const startingRun = {
+          providerThread,
+          runId: RunId.make("run-opencode-initial-stop"),
+          attemptId: RunAttemptId.make("attempt-opencode-initial-stop"),
+          stopBackgroundWork: false,
+        };
+        if (target === "run") {
+          yield* runtime.interruptStartingRun!({
+            ...startingRun,
+            attemptId: RunAttemptId.make("different-attempt"),
+          });
+          assert.equal(abortCalls, 0);
+        }
+        const interrupt = yield* (
+          target === "turn"
+            ? runtime.interruptTurn({ providerThread, providerTurnId: activeTurn.id })
+            : runtime.interruptStartingRun!(startingRun)
+        ).pipe(Effect.forkScoped);
 
-      yield* Effect.promise(() => abortCalled.promise);
-      yield* Fiber.join(start);
-      yield* Fiber.join(interrupt);
-      yield* Effect.promise(() =>
-        nativeEvents.push({
-          type: "session.status",
-          properties: {
-            sessionID: "native-opencode-initial-stop",
-            status: { type: "idle" },
+        yield* Effect.promise(() => abortCalled.promise);
+        yield* Fiber.join(start);
+        yield* Fiber.join(interrupt);
+        yield* Effect.promise(() =>
+          nativeEvents.push({
+            type: "session.status",
+            properties: {
+              sessionID: "native-opencode-initial-stop",
+              status: { type: "idle" },
+            },
+          }),
+        );
+
+        const events = Array.from(yield* Fiber.join(terminalEvents));
+        const terminals = events.filter((event) => event.type === "turn.terminal");
+        assert.equal(abortCalls, 1);
+        assert.lengthOf(terminals, 1);
+        assert.equal(terminals[0]?.status, "interrupted");
+        assert.isNull(terminals[0]?.failure ?? null);
+        assert.isFalse(
+          events.some(
+            (event) =>
+              (event.type === "turn.terminal" && event.status === "failed") ||
+              (event.type === "provider_session.updated" &&
+                event.providerSession.status === "error"),
+          ),
+        );
+      }).pipe(
+        Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+        Effect.scoped,
+      ),
+  );
+
+  it.effect.each(["idle", "busy", "unavailable", "late busy"] as const)(
+    "retains an ambiguous prompt until authoritative native settlement: %s",
+    (outcome) =>
+      Effect.gen(function* () {
+        const events = asyncEventStream();
+        const probing = promiseGate<void>();
+        const reply = promiseGate<void>();
+        const nativeId = "native-opencode-ambiguous";
+        const harness = yield* makeOpenCodeRuntimeHarness("ambiguous", nativeId, {
+          event: {
+            subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
+              options.signal?.addEventListener("abort", () => events.close(), { once: true });
+              return { stream: events.stream };
+            },
           },
-        }),
-      );
+          session: {
+            create: async () => ({ data: { id: nativeId, time: { created: 1, updated: 1 } } }),
+            promptAsync: async () => {
+              throw new Error("HTTP response lost");
+            },
+            status: async () => {
+              probing.resolve();
+              await reply.promise;
+              if (outcome === "unavailable") throw new Error("status unavailable");
+              return { data: outcome === "busy" ? { [nativeId]: { type: "busy" } } : {} };
+            },
+          },
+        });
+        assert.isTrue(Exit.isFailure(yield* harness.startTurn().pipe(Effect.exit)));
+        const probe = yield* harness.runtime.holdsWorkForThread!(harness.providerThread).pipe(
+          Effect.forkScoped,
+        );
+        yield* Effect.promise(() => probing.promise);
+        if (outcome === "late busy")
+          yield* Effect.promise(() =>
+            events.push({
+              type: "session.status",
+              properties: { sessionID: nativeId, status: { type: "busy" } },
+            }),
+          );
+        reply.resolve();
+        assert.equal(yield* Fiber.join(probe), outcome !== "idle");
+        assert.equal(yield* harness.runtime.hasPendingBackgroundWork!, outcome !== "idle");
+        yield* Effect.promise(() =>
+          events.push({ type: "session.idle", properties: { sessionID: nativeId } }),
+        );
+        assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+      }).pipe(
+        Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+        Effect.scoped,
+      ),
+  );
 
-      const events = Array.from(yield* Fiber.join(terminalEvents));
-      const terminals = events.filter((event) => event.type === "turn.terminal");
-      assert.equal(abortCalls, 1);
-      assert.lengthOf(terminals, 1);
-      assert.equal(terminals[0]?.status, "interrupted");
-      assert.isNull(terminals[0]?.failure ?? null);
-      assert.isFalse(
-        events.some(
-          (event) =>
-            (event.type === "turn.terminal" && event.status === "failed") ||
-            (event.type === "provider_session.updated" && event.providerSession.status === "error"),
-        ),
-      );
-    }).pipe(
-      Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
-      Effect.scoped,
-    ),
+  it.effect(
+    "retries a failed Stop delivery and retains its successful receipt until native end",
+    () =>
+      Effect.gen(function* () {
+        const events = asyncEventStream();
+        const nativeId = "native-opencode-retry-abort";
+        let aborts = 0;
+        const harness = yield* makeOpenCodeRuntimeHarness("retry-abort", nativeId, {
+          event: {
+            subscribe: async (_input: unknown, options: { signal?: AbortSignal }) => {
+              options.signal?.addEventListener("abort", () => events.close(), { once: true });
+              return { stream: events.stream };
+            },
+          },
+          session: {
+            create: async () => ({ data: { id: nativeId, time: { created: 1, updated: 1 } } }),
+            promptAsync: async () => ({ data: true }),
+            abort: async () => {
+              if (++aborts === 1) throw new Error("Stop refused");
+              return { data: true };
+            },
+          },
+        });
+        yield* harness.startTurn();
+        const target = {
+          providerThread: harness.providerThread,
+          runId: harness.runId,
+          attemptId: RunAttemptId.make("attempt-opencode-retry-abort"),
+          stopBackgroundWork: false,
+        };
+        assert.isTrue(
+          Exit.isFailure(yield* harness.runtime.interruptStartingRun!(target).pipe(Effect.exit)),
+        );
+        yield* harness.runtime.interruptStartingRun!(target);
+        yield* harness.runtime.interruptStartingRun!(target);
+        assert.equal(aborts, 2);
+        assert.isTrue(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+        yield* Effect.promise(() =>
+          events.push({ type: "session.idle", properties: { sessionID: nativeId } }),
+        );
+        assert.isFalse(yield* harness.runtime.holdsWorkForThread!(harness.providerThread));
+      }).pipe(
+        Effect.provide(Layer.merge(IdAllocator.layer, McpProviderSessions.layer)),
+        Effect.scoped,
+      ),
   );
 
   it.effect("fails an active turn when the OpenCode event stream ends cleanly", () =>
